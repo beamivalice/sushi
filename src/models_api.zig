@@ -1,5 +1,6 @@
 const std = @import("std");
 const cache_stats = @import("cache_stats.zig");
+const test_note = @import("test_note.zig");
 const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
@@ -97,6 +98,8 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
 }
 
 test "bf16 streaming marker is a property of the checkpoint, not of the launch flags" {
+
+    try test_note.needArchs(&.{"qwen4"});
     try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
     try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
     try std.testing.expect(!streamingStubMarker("qwen4_exp", false, true));
@@ -105,6 +108,8 @@ test "bf16 streaming marker is a property of the checkpoint, not of the launch f
 }
 
 test "a quantized pack is streaming capable and only the dense one is streaming required" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     try std.testing.expect(streamingStubMarker("qwen4_exp", true, true));
     try std.testing.expect(streamingRequiredMarker("qwen4_exp", 0, false, true, true));
     try std.testing.expect(!streamingRequiredMarker("qwen4_exp", 4, false, true, true));
@@ -117,6 +122,8 @@ test "a quantized pack is streaming capable and only the dense one is streaming 
 }
 
 test "the streaming markers read the ONE arch gate: no other arch carries them" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     var buf: [96]u8 = undefined;
     for ([_][]const u8{ "qwen4_exp_text", "not_a_served_arch", "gguf", "" }) |arch| {
@@ -129,6 +136,8 @@ test "the streaming markers read the ONE arch gate: no other arch carries them" 
 }
 
 test "an unloaded qwen4 stub is text-only only when the checkpoint must stream" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -1250,6 +1259,8 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
 }
 
 test "/v1/models rows, loaded or not, name each model's effort words and the one a silent request runs at" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });
     const t = std.testing;
     const io = t.io;
     const saved = effort_mod.think_effort_flag;

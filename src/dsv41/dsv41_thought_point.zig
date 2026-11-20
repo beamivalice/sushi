@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("../test_note.zig");
 const testTrunk = @import("../test_support.zig").testTrunk;
 const arch_handle = @import("../arch/handle.zig");
 const sched_policy = @import("../sched_policy.zig");
@@ -104,6 +105,8 @@ test "visionChoiceFor: DeepSeek-V4.1 loads its tower by default streamed or resi
 }
 
 test "a streamed DeepSeek load bills its union workspace and MLX pool and no fill peak" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const fill: u64 = 9_911 << 20;
     const workspace: u64 = 3_525 << 20;
     const ds = ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const fx = @import("request_media_fixtures_test.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const chat_mod = @import("chat.zig");
@@ -317,6 +318,8 @@ test "mediaRejectReason: media on a tower-less model is refused by name, text pa
 }
 
 test "only a streamed load whose tower is off by default names --vision in its media refusal" {
+
+    try test_note.needArchs(&.{"dsv41"});
     const t = std.testing;
     const saved = model_settings.vision_flag;
     defer model_settings.vision_flag = saved;

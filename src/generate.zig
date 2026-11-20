@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
 const gpu_mem = @import("gpu_mem.zig");
@@ -4376,6 +4377,8 @@ test "MtpAdaptive: only a bucket crossing re-opens the serial decision" {
 }
 
 test "a warm prefill grows its restored layers to the reservation before the first chunk writes" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     // seq <= C < R: left to the decode, the first step past C grows every layer inside one forward.
     try mlx.requireGpu();
     const t = std.testing;

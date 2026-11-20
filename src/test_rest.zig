@@ -16,30 +16,6 @@ pub const Held = struct {
 };
 pub var held: Held = .{};
 
-var note_buf: [512]u8 = undefined;
-var note_len: usize = 0;
-
-/// A part of the running test that did not run (an arch whose fixture is missing): the runner writes it on the test's
-/// log line, so a run that passes says what it did not cover.
-pub fn notePartSkipped(what: []const u8) void {
-    var w = std.Io.Writer.fixed(note_buf[note_len .. note_buf.len - 1]);
-    w.print("{s}{s}", .{ if (note_len > 0) "; " else "", what }) catch {};
-    note_len += w.end;
-}
-
-/// The running test's notes so far, for a test that checks its own.
-pub fn notes() []const u8 {
-    return note_buf[0..note_len];
-}
-
-/// The running test's notes, cleared as they are read (`scripts/test_runner.zig`).
-fn testNote() callconv(.c) ?[*:0]const u8 {
-    if (note_len == 0) return null;
-    note_buf[note_len] = 0;
-    note_len = 0;
-    return @ptrCast(&note_buf);
-}
-
 fn afterEach() callconv(.c) ?[*:0]const u8 {
     var w = std.Io.Writer.fixed(report[0 .. report.len - 1]);
     var left = mlx.engine.leftByTest(&w, held.holds) catch true;
@@ -79,5 +55,4 @@ fn afterAll() callconv(.c) ?[*:0]const u8 {
 comptime {
     @export(&afterEach, .{ .name = "sushi_after_each" });
     @export(&afterAll, .{ .name = "sushi_after_all" });
-    @export(&testNote, .{ .name = "sushi_test_note" });
 }

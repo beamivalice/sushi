@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const arch_load = @import("arch/load.zig");
 const http = @import("http.zig");
 const trunk = @import("trunk.zig");
@@ -2397,6 +2398,8 @@ test "every load refusal the registry preserves answers under its own name" {
 pub const LoadRefusal = struct { type: []const u8, message: []const u8, retry_after: ?u32 = null };
 
 test "streaming layout refusal explains MiMo repacking without assuming Qwen" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const layout = loadRefusalFor(error.ExpertStreamingUnsupportedLayout).?;
     try std.testing.expect(std.mem.indexOf(u8, layout.message, "For MiMo, repack") != null);
     const budget = loadRefusalFor(error.ExpertStreamingRequired).?;

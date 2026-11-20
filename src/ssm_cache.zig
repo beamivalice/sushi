@@ -2,6 +2,7 @@ const model_handle = @import("model_handle.zig");
 const mlx_util = @import("mlx_util.zig");
 pub const materializedOwnedCopy = mlx_util.materializedOwnedCopy;
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
 const testing = std.testing;
 const kv_cache = @import("kv_cache.zig");
@@ -1400,6 +1401,8 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 }
 
 test "handOverSsmCheckpoint moves a tight live state without a copy, gives a view its own buffer, and leaves the QSA history live" {
+
+    try test_note.needArchs(&.{"qwen4"});
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     const a = testing.allocator;
@@ -1543,6 +1546,8 @@ test "hidden capture: a verify's stays lazy for its one dispatch, a prefill chun
 }
 
 test "a QSA pooled bank and score bank append in place at a reservation off MLX's page grid when MLX's pool holds buffers two pages past them" {
+
+    try test_note.needArchs(&.{"qwen4"});
     try mlx.requireGpu();
     const s = mlx.gpuStream();
     // Flash-Next's indexer: 128-wide BF16 pooled rows (256 B) on axis 1, FP32 score columns (512 B) on axis 3. A

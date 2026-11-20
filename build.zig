@@ -65,6 +65,7 @@ pub fn build(b: *std.Build) void {
     const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
     build_options.addOption([]const u8, "git_sha", git_sha);
     const archs = archList(b);
+    built_archs = archs;
     build_options.addOption([]const []const u8, "archs", archs);
     build_options.addOption(bool, "host_tier", false);
     // The host test root links no MLX, so gpu_mem.zig refuses a live GPU read under it.
@@ -282,6 +283,16 @@ pub fn build(b: *std.Build) void {
 
 /// `-Darchs=qwen4,glm5`: the architectures this build serves, named as `src/arch/registry.zig` names them; empty is
 /// every registered one. An arch left out has no prong in the dispatch unions, so none of its code is analysed.
+var built_archs: []const []const u8 = &.{};
+
+/// An arch folder (one with `build_roots.zon`) whose arch `-Darchs` leaves out: its tests have no step.
+fn archLeftOut(b: *std.Build, folder: []const u8) bool {
+    if (built_archs.len == 0 or folder.len == 0) return false;
+    for (built_archs) |a| if (std.mem.eql(u8, a, folder)) return false;
+    buildRootHandle(b).access(b.graph.io, b.fmt("src/{s}/build_roots.zon", .{folder}), .{}) catch return false;
+    return true;
+}
+
 fn archList(b: *std.Build) []const []const u8 {
     const raw = b.option([]const u8, "archs", "Architectures to build, comma separated (default: every registered one)") orelse return &.{};
     var out: std.ArrayList([]const u8) = .empty;
@@ -482,7 +493,7 @@ const test_domains = [_]TestDomain{
         },
     },
     .{ .name = "deepseek", .folders = &.{"dsv41"}, .compile_gib = 8, .run_gib = 9 },
-    .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true },
+    .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true, .run_gib = 6 },
     .{ .name = "glm", .folders = &.{"glm5"} },
     .{ .name = "mimo", .folders = &.{"mimo2"} },
     .{ .name = "kernels", .folders = &.{"tensor"}, .run_gib = 6, .files = &.{
@@ -680,7 +691,7 @@ fn scanTestFiles(b: *std.Build, model: ?TestModel) []TestFile {
     var files: std.ArrayList(TestFile) = .empty;
     for (test_dirs) |dir_path| {
         const folder = if (std.mem.eql(u8, dir_path, "src")) "" else dir_path["src/".len..];
-        const in_scope = if (model) |m| folder.len == 0 or std.mem.eql(u8, folder, "arch") or std.mem.eql(u8, folder, "tensor") or std.mem.eql(u8, folder, @tagName(m)) else true;
+        const in_scope = !archLeftOut(b, folder) and if (model) |m| folder.len == 0 or std.mem.eql(u8, folder, "arch") or std.mem.eql(u8, folder, "tensor") or std.mem.eql(u8, folder, @tagName(m)) else true;
         // A dropped architecture has no folder.
         var src = buildRootHandle(b).openDir(io, dir_path, .{ .iterate = true }) catch |e| switch (e) {
             error.FileNotFound => continue,

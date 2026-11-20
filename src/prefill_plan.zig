@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const trunk = @import("trunk.zig");
 const attn_kernels = @import("attn_kernels.zig");
@@ -922,6 +923,8 @@ test "clear cadence survives variable spec strides" {
 }
 
 test "the allocator pool is returned at the prefill/decode handover, on archs that reserve their KV" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     // The per-chunk clear runs BEFORE the last chunks' transient is freed, so it
     // parks in MLX's pool up to the cap and the first decode tick allocates on top
     // of it (measured 8.1 GB parked at the first tick of a 393k prefill; a cold

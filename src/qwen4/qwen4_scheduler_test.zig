@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("../test_note.zig");
 const qwen4_config = @import("qwen4_config.zig");
 const arch_handle = @import("../arch/handle.zig");
 const trunk_mod = @import("../trunk.zig");
@@ -36,6 +37,8 @@ const Scheduler = scheduler_mod.Scheduler;
 const Slot = scheduler_mod.Slot;
 
 test "LoadDrafterDir: Flash-Next loads a drafter only when --drafter names it, every other model also finds the pack's own" {
+
+    try test_note.needArchs(&.{"glm5"});
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});

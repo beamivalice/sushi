@@ -135,7 +135,7 @@ def summary(path, build_log, step_failed):
                 if n:
                     noted.append((line.split("\t")[1], line.split("\t")[4], n))
     if noted:
-        print(f"gate: {len(noted)} tests ran with parts skipped")
+        print(f"gate: {len(noted)} tests with a part, or all of them, left out by name")
         for step, name, n in noted:
             print(f"  [{step}] {name}: {n}")
 

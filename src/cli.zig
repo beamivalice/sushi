@@ -16,6 +16,7 @@
 //! in-process HTTP client: spawning curl would fork the resident MLX process.
 
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const chat = @import("chat.zig");
 const effort_mod = @import("effort.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -2151,6 +2152,8 @@ test "cli: --no-mtp-lookup is its own flag, not --no-mtp" {
 }
 
 test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });
     // Bare alias picks the family default.
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", resolveShortName("qwen3.8-flash-next").?.repo);
     // Tagged alias, case-insensitive.
@@ -2187,6 +2190,8 @@ test "pull: a listed path that leaves the pack folder is never downloaded" {
 }
 
 test "pull: only the beamster org, an alias or beamster/<repo>, before anything downloads" {
+
+    try test_note.needArchs(&.{"qwen4"});
     try testing.expectEqualStrings("beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", (try checkPullable("qwen3.8-flash-next:2.75bpw")).repo);
     try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("beamster/Some-Pack")).repo);
     try testing.expectEqualStrings("beamster/Some-Pack", (try checkPullable("hf.co/beamster/Some-Pack:latest")).repo);
@@ -2209,6 +2214,8 @@ test "pull and list reject stray arguments" {
 }
 
 test "memory tiers: installed RAM rounds down to whole GB and picks fits or may stream" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });
     const gb: u64 = 1 << 30;
     try testing.expectEqual(@as(u64, 64), installedGb(68_719_476_736));
     try testing.expectEqual(@as(u64, 63), installedGb(64 * gb - 1));
@@ -2240,6 +2247,8 @@ test "memory tiers: installed RAM rounds down to whole GB and picks fits or may 
 }
 
 test "list recommends one pack per family from the tier table" {
+
+    try test_note.needArchs(&.{ "mimo2", "glm5", "dsv41" });
     const q = "qwen3.8-flash-next";
     try testing.expect(recommendedAlias(q, 16) == null);
     try testing.expectEqualStrings("2bpw", recommendedAlias(q, 32).?.tag);
@@ -2259,6 +2268,8 @@ test "list recommends one pack per family from the tier table" {
 }
 
 test "pull warns only below the documented tier, naming --ssd-budget-gb" {
+
+    try test_note.needArchs(&.{ "qwen4", "dsv41" });
     var buf: [256]u8 = undefined;
     try testing.expect(tierWarning(&buf, "beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw", 64) == null);
     try testing.expect(tierWarning(&buf, "beamster/unlisted-pack", 8) == null);
@@ -2292,6 +2303,8 @@ test "list: Hugging Face unreachable falls back to the local models, with no siz
 }
 
 test "list: a pack the API does not return is listed as not yet published, without a size" {
+
+    try test_note.needArchs(&.{"glm5"});
     var api = FakeFetch{ .reachable = true, .missing = "beamster/GLM-5.3-Flash-Sushi-2bpw" };
     var outcomes: [aliases.len]FetchOutcome = undefined;
     try testing.expect(fetchCatalogSizes(&api, &FakeFetch.fetch, &outcomes));
@@ -2323,6 +2336,8 @@ test "pull: Hugging Face's 401/403/404 mean a missing repo, other failures mean 
 }
 
 test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended" {
+
+    try test_note.needArchs(&.{"qwen4"});
     var rows: [aliases.len]CatalogRow = undefined;
     for (aliases, 0..) |a, i| rows[i] = .{ .alias = a, .size = (@as(u64, i) + 1) << 30, .downloaded = i == 1 };
     var buf: [2048]u8 = undefined;
@@ -2367,6 +2382,8 @@ test "cli: modelDestPath layout" {
 }
 
 test "cli: shouldDownload chat-default selection" {
+
+    try test_note.needArchs(&.{"glm5"});
     try testing.expect(shouldDownload("config.json"));
     try testing.expect(shouldDownload("model.safetensors"));
     try testing.expect(shouldDownload("model-00001-of-00002.safetensors"));

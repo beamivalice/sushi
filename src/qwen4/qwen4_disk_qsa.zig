@@ -4,6 +4,7 @@ const disk_placement = @import("../disk_placement.zig");
 const write_stats = @import("../disk_write_stats.zig");
 const log = @import("../log.zig");
 const std = @import("std");
+const test_note = @import("../test_note.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
 const trunk_mod = @import("../trunk.zig");
@@ -1205,6 +1206,8 @@ test "DiskTier: an inherited QSA history is dropped on extend past the common pr
 }
 
 test "modelFingerprint: the f32 and the --qwen-gdn 16 GDN layouts each get their own SSD namespace" {
+
+    try test_note.needArchs(&.{"glm5"});
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

@@ -33,6 +33,7 @@
 
 const forward_refusal_mod = @import("forward_refusal.zig");
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const testTrunk = @import("test_support.zig").testTrunk;
 const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
@@ -2247,6 +2248,8 @@ test "a loaded model's hot-cache budget is the resolver's clamp, never the raw l
 }
 
 test "a load bills weights, then the larger of the measured warmup plus a 1 GiB net and the context bill" {
+
+    try test_note.needArchs(&.{ "mimo2", "glm5" });
     const gib: u64 = 1 << 30;
     var f = try @import("bills_fixtures_test.zig").LoadBillFixtures.init();
     defer f.deinit();
@@ -2265,6 +2268,8 @@ test "a load bills weights, then the larger of the measured warmup plus a 1 GiB 
 }
 
 test "a streamed Flash-Next load bills no expert fill peak; MiMo and GLM keep theirs" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const fill: u64 = 1_848_000_000;
     const qwen = ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true };
     const mimo = ModelConfig{ .model_type = "mimo_v2", .expert_streaming = true };
@@ -5637,6 +5642,8 @@ test "a slot with no pipeline state is stop-checked before it joins a batch, EOS
 }
 
 test "a slot the batched tick hands back to the serial path counts its pending pad once" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const Serial = struct {
         var calls: usize = 0;
         fn tick(_: *Scheduler, slot: *Slot) !void {
@@ -5817,6 +5824,8 @@ test "an empty prompt is refused at submit, before any slot reaches the inferenc
 }
 
 test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
+
+    try test_note.needArchs(&.{"mimo2"});
     try mlx.requireGpu();
     const allocator = testing.allocator;
     var sch = submitTestScheduler(allocator, 2);

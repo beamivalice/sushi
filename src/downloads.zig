@@ -5,6 +5,7 @@
 //! never a connection thread. Partials and the pull manifest stay on disk, so a stopped download resumes when it is
 //! started again, after a restart too. The byte accounting, speed and space rules are in `download_progress.zig`.
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const http = @import("http.zig");
 const cli = @import("cli.zig");
 const dp = @import("download_progress.zig");
@@ -680,6 +681,8 @@ pub fn handleCancel(allocator: Allocator, stream: *http_conn.Conn, body: []const
 const testing = std.testing;
 
 test "downloads: a pack row carries the tier verdict, the recommended pack and its recommended launch" {
+
+    try test_note.needArchs(&.{ "qwen4", "dsv41" });
     const Row = struct { repo: []const u8, tier_gb: ?u32 = null, fits: ?bool = null, recommended: bool, installed: bool, streams_experts: bool, name: []const u8, launch: ?[]const u8 = null };
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

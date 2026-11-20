@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const expert_stream_mod = @import("expert_stream.zig");
 const expert_usage = @import("expert_usage.zig");
 const imatrix_capture = @import("imatrix.zig");
@@ -594,6 +595,8 @@ extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 test "a streamed expert engine whose imatrix collector fails is deinit'd, not only freed" {
+
+    try test_note.needArchs(&.{"qwen4"});
     try mlx.requireGpu();
     const t = std.testing;
     var tmp = t.tmpDir(.{});

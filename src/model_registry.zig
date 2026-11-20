@@ -17,6 +17,7 @@
 //! broadcasts on `state_cond` so blocked callers wake.
 
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const model_mod = @import("model.zig");
 const expert_quant = @import("expert_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -2734,6 +2735,8 @@ test "ModelRegistry: rescan roots: the settings file's models directory is walke
 }
 
 test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {
+
+    try test_note.needArchs(&.{ "mimo2", "glm5" });
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2766,6 +2769,8 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
 }
 
 test "ModelRegistry: a --model-only server lists the pack it downloaded outside every root it walks, and nothing beside it" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2789,6 +2794,8 @@ test "ModelRegistry: a --model-only server lists the pack it downloaded outside 
 }
 
 test "ModelRegistry: rescan reads the settings file the registry names instead of the home one" {
+
+    try test_note.needArchs(&.{"glm5"});
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2868,6 +2875,8 @@ test "ModelRegistry: a finished download that refreshes a failed entry ends its 
 }
 
 test "upstream bugfix: ModelRegistry: rescan clears a failed load so the completed dir can load again" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2914,6 +2923,8 @@ test "upstream bugfix: ModelRegistry: rescan clears a failed load so the complet
 }
 
 test "discovered bytes_linked reaches the registry entry and its snapshot" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();

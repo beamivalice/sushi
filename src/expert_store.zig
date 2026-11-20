@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const io_mod = @import("expert_io.zig");
 const arch_config = @import("arch/config.zig");
 const expert_drop = @import("expert_drop.zig");
@@ -1603,6 +1604,8 @@ test "quantized expert geometry solves bits and group size from packed shapes" {
 }
 
 test "routed expert layout is read off the weight map" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const fused =
         \\{"weight_map":{"model.language_model.layers.0.mlp.experts.gate_up_proj":"a","model.language_model.layers.0.mlp.experts.down_proj":"a"}}
@@ -1632,6 +1635,7 @@ test "routed expert layout is read off the weight map" {
 // An STQ pack's constants live in the codebook table config.json's expert_quant names (`parseExpertQuant`), never as
 // per-tensor keys: the index lists only trellis/suh/svh, and a projection with other parts is no EXL3 bank.
 test "an EXL3 index is the EXL3 layout when the codebook table is named in config only" {
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const served =
         \\{"weight_map":{"language_model.model.layers.0.mlp.switch_mlp.gate_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.gate_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.up_proj.svh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.trellis":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.suh":"a","language_model.model.layers.0.mlp.switch_mlp.down_proj.svh":"a"}}
@@ -1644,6 +1648,8 @@ test "an EXL3 index is the EXL3 layout when the codebook table is named in confi
 }
 
 test "layout resolution is qwen4_exp only: the same index declares nothing for another arch" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const fused =
         \\{"weight_map":{"model.language_model.layers.0.mlp.experts.gate_up_proj":"a","model.language_model.layers.0.mlp.experts.down_proj":"a"}}
@@ -1673,6 +1679,8 @@ test "mxfp4 geometry proves native U32/U8 biasless 4-bit group-32 storage" {
 }
 
 test "mxfp4 layout requires the complete converter bank and never claims the raw HF source" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const t = std.testing;
     const mxfp4_index =
         \\{"weight_map":{
@@ -1707,6 +1715,8 @@ test "mxfp4 layout requires the complete converter bank and never claims the raw
 }
 
 test "mxfp4 individual source detection requires every expert pair and rejects mixed families" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();
@@ -1880,6 +1890,8 @@ fn stackedExl3IndexJson(allocator: std.mem.Allocator, layers: u16, first_moe: u1
 }
 
 test "mimo_v2 EXL3 stacked experts resolve as a layout and keep the dense prefix" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const t = std.testing;
     const index = try stackedExl3IndexJson(t.allocator, 3, 1);
     defer t.allocator.free(index);
@@ -1910,6 +1922,8 @@ test "mimo_v2 EXL3 beside an MXFP4 bank is a mixed pack and resolves to nothing"
 }
 
 test "mimo_v2 is the only additional expert streaming architecture" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     const t = std.testing;
     try t.expect(isExpertStreamingArch("qwen4_exp"));
     try t.expect(isExpertStreamingArch("mimo_v2"));
@@ -1918,6 +1932,8 @@ test "mimo_v2 is the only additional expert streaming architecture" {
 }
 
 test "GLM BF16 individual index recognizes separate gate up down experts" {
+
+    try test_note.needArchs(&.{"glm5"});
     const t = std.testing;
     const raw =
         \\{"weight_map":{"model.language_model.layers.3.mlp.experts.0.gate_proj.weight":"gate.safetensors","model.language_model.layers.3.mlp.experts.0.up_proj.weight":"up.safetensors","model.language_model.layers.3.mlp.experts.0.down_proj.weight":"down.safetensors"}}
@@ -1950,6 +1966,8 @@ test "DeepSeek expert keys round trip and the layout claims only the trunk's exp
 }
 
 test "GLM EXL3 index uses native source nesting and refuses mixed expert formats" {
+
+    try test_note.needArchs(&.{"glm5"});
     const raw =
         \\{"weight_map":{
         \\"model.language_model.layers.3.mlp.switch_mlp.gate_proj.trellis":"g.safetensors",
@@ -2001,6 +2019,8 @@ test "a cached shard header types f16 and u16 tensors as the uncached read does"
 }
 
 test "streamingLayoutOfDir names the layout of a supported arch and refuses any other" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     var tmp = t.tmpDir(.{});
     defer tmp.cleanup();

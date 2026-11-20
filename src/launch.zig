@@ -11,6 +11,7 @@
 //! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
 const effort_mod = @import("effort.zig");
@@ -1277,6 +1278,8 @@ test "piEffortFor: every pi level lands on a word the model accepts" {
 }
 
 test "pi models.json sends each thinking level as reasoning_effort the model accepts" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     // thinkingFormat "qwen" made pi send only enable_thinking, so low/medium never reached the server.
     const entries = [_]Entry{
         .{ .id = "qwen", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true, .efforts = &fx.qwen4_efforts },
@@ -1302,6 +1305,8 @@ test "pi models.json sends each thinking level as reasoning_effort the model acc
 }
 
 test "omp models.yml: off rides enable_thinking, every other level an accepted reasoning_effort" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     // The shape verified against omp 18.3.0: the qwen dialect sends off as enable_thinking false,
     // `whenThinking` switches a thinking request to reasoning_effort, remapped per model.
     const entries = [_]Entry{
@@ -1492,6 +1497,8 @@ test "zcode config escapes arbitrary model ids and declares server budgets and w
 }
 
 test "zcode starts MiMo thinking, its own default" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const entries = [_]Entry{.{ .id = "mimo", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &fx.mimo_efforts }};
     const json = try zcodeConfigJson(t.allocator, "http://localhost:12345", entries[0].id, &entries);
     defer t.allocator.free(json);
@@ -1515,6 +1522,8 @@ test "zcode exposes only a model's advertised reasoning efforts" {
 }
 
 test "opencode config for GLM: tool calls on, reasoning_content round-trips, variants are only the words GLM accepts" {
+
+    try test_note.needArchs(&.{"glm5"});
     const entries = [_]Entry{fx.glmEntry()};
     const json = try opencodeJson(t.allocator, "http://127.0.0.1:12345", entries[0].id, &entries);
     defer t.allocator.free(json);
@@ -1643,6 +1652,8 @@ test "grok compaction threshold leaves the compaction reserve free" {
 }
 
 test "grok config.toml for GLM: chat completions at the server, advertised budgets, only accepted efforts" {
+
+    try test_note.needArchs(&.{"glm5"});
     const entries = [_]Entry{fx.glmEntry()};
     const toml = try grokConfigToml(t.allocator, "http://127.0.0.1:12345", entries[0].id, entries[0].budget, &entries);
     defer t.allocator.free(toml);
@@ -1775,6 +1786,8 @@ test "config writers escape ids and urls so hostile ones stay data" {
 }
 
 test "opencode --think applies only to selected model and uses SDK spelling" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const entries = [_]Entry{
         .{ .id = "qwen", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true, .efforts = &fx.qwen4_efforts },
         .{ .id = "glm", .budget = FALLBACK_BUDGET, .vision = false, .loaded = false, .efforts = &fx.glm5_efforts },

@@ -636,8 +636,9 @@ test "cooler contract: the first served DeepSeek request after a Cooler load's w
             errdefer std.debug.print("first request: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; second: MLX cache {d} KB, pool in use {d} KB, grew {d} KB, pool rest {d} KB; borrowed {}\n", .{ starts[0].mlx_cache >> 10, in_use[0] >> 10, grew[0] >> 10, starts[0].pool_free >> 10, starts[1].mlx_cache >> 10, in_use[1] >> 10, grew[1] >> 10, starts[1].pool_free >> 10, LateUnwireHeadroom.borrowed });
             // The late-unwiring borrow ran in the first request, and the request was served. Only a streamed load's
             // decoder holds expert-cache pools a prefill can borrow: a resident one never takes the borrow path.
-            const stq = arch_handle.trunk(sv.entry.handle.?).arch_state.dsv41.stq_experts;
-            const lends = if (stq) |x| x.engine.borrow_from < x.engine.layers.len else false;
+            const state = &arch_handle.trunk(sv.entry.handle.?).arch_state;
+            // A build without DeepSeek (`-Darchs`) has no streamed decoder that lends.
+            const lends = if (comptime @hasField(@TypeOf(state.*), "dsv41")) (if (state.dsv41.stq_experts) |x| x.engine.borrow_from < x.engine.layers.len else false) else false;
             try testing.expectEqual(lends, LateUnwireHeadroom.borrowed);
             // A headroom read counts MLX's cache and the pool's free buffers as free: the first request starts as the second.
             try testing.expectEqual(starts[1].mlx_cache, starts[0].mlx_cache);

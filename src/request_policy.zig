@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const arch_chat = @import("arch/chat.zig");
 const arch_handle = @import("arch/handle.zig");
 const settings_resolve = @import("settings_resolve.zig");
@@ -1002,6 +1003,8 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
 }
 
 test "reasoningEffortFromWord: a served arch refuses unknown words, and re-routes only the announced folds" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     const qwen = effort_mod.effortArms("qwen4_exp").?;
     const mimo = effort_mod.effortArms("mimo_v2").?;
     const glm = effort_mod.effortArms("glm5_next").?;
@@ -1066,6 +1069,8 @@ test "withEffortNoticeJson appends the notice and leaves the answer bytes" {
 }
 
 test "effort refusal and /v1/models list name the model's accepted words" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const allocator = std.testing.allocator;
     const qwen = effort_mod.effortArms("qwen4_exp").?;
     const msg = try effortRefusal(allocator, "minimal", "Qwen3.8-Flash-Next-EXL3-K4", qwen);
@@ -1308,6 +1313,8 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
 }
 
 test "thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     for ([_]struct { arch: []const u8, accepted: []const effort_mod.Effort }{
         .{ .arch = "glm5_next", .accepted = &.{ .low, .high, .max } },
         .{ .arch = "qwen4_exp", .accepted = &.{ .off, .low, .medium, .xhigh } },
@@ -1384,6 +1391,8 @@ fn charDefault(config: *const model_mod.ModelConfig) CharResolved {
 }
 
 test "effort table: with no edits, every word on every family resolves and renders as before the table" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });
     const a = std.testing.allocator;
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
@@ -1468,6 +1477,8 @@ fn resetTables() void {
 }
 
 test "effort table: a remapped word is served as itself with its own value and cap, with no notice" {
+
+    try test_note.needArchs(&.{ "qwen4", "glm5", "dsv41" });
     defer resetTables();
     publishRow(.qwen4_exp, .high, .{ .offered = true, .sends = .{ .word = .medium }, .cap = @as(?i32, 64) });
     publishRow(.deepseek_v41, .medium, .{ .sends = .{ .scale = 40 }, .cap = @as(?i32, 64) });
@@ -1494,6 +1505,8 @@ test "effort table: a remapped word is served as itself with its own value and c
 }
 
 test "effort table: a word turned off is refused; a built-in fold still folds, with its notice" {
+
+    try test_note.needArchs(&.{ "qwen4", "glm5", "dsv41" });
     defer resetTables();
     publishRow(.qwen4_exp, .low, .{ .offered = false });
     publishRow(.qwen4_exp, .high, .{ .offered = false });
@@ -1514,6 +1527,8 @@ test "effort table: a word turned off is refused; a built-in fold still folds, w
 }
 
 test "effort table: a request's own budget outranks the table's cap" {
+
+    try test_note.needArchs(&.{"qwen4"});
     defer resetTables();
     publishRow(.qwen4_exp, .high, .{ .offered = true, .cap = @as(?i32, 64) });
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"reasoning_effort\":\"high\",\"reasoning_budget_tokens\":300}", .{});
@@ -1528,6 +1543,8 @@ test "effort table: a request's own budget outranks the table's cap" {
 }
 
 test "effort table: /v1/models rows follow the served table, with each word's template value" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "dsv41" });
     defer resetTables();
     const a = std.testing.allocator;
     {
@@ -1586,6 +1603,8 @@ fn setOffDefault(how: OffDefault, f: effort_mod.Family) void {
 }
 
 test "effort off default: Qwen stays off on chat, Anthropic and Responses for a request naming no effort word or budget" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const qwen38_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1622,6 +1641,8 @@ test "effort off default: Qwen stays off on chat, Anthropic and Responses for a 
 }
 
 test "effort off default: a Qwen request naming an effort word or a budget still thinks, at that word or Qwen's unnamed level" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const qwen38_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja");
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -1655,6 +1676,8 @@ test "effort off default: a Qwen request naming an effort word or a budget still
 }
 
 test "effort off default: DeepSeek and GLM resolve and render as before" {
+
+    try test_note.needArchs(&.{ "glm5", "dsv41" });
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -1728,6 +1751,8 @@ test "effort table: a request resolves against one table while a save publishes 
 }
 
 test "effort table: with off unoffered, chat, Anthropic and Responses refuse a request that turns thinking off, as GLM does" {
+
+    try test_note.needArchs(&.{ "qwen4", "glm5", "dsv41" });
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();

@@ -1,6 +1,7 @@
 //! Bills, admission, context and chunk math. It reads the GPU only through gpu_mem.zig, so a test that reaches no
 //! live reading runs in the host tier.
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const arch_config = @import("arch/config.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const cooler_side = @import("cooler_side.zig");
@@ -6604,6 +6605,8 @@ test "bill pin: the refusal sentences" {
 }
 
 test "a memory refusal names a max_tokens and a maximum context its own request admits, on every served pack's bill" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });
     const saved = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
@@ -8223,6 +8226,8 @@ test "the ssd budget is admitted against the ceiling the preflight and admission
 }
 
 test "a request refusal offers a smaller pack only when the load found one, and one built without that fact offers none" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const a = testing.allocator;
     const mib: u64 = 1 << 20;
     // Built without the fact: the default names none.

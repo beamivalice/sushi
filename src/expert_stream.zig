@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const expert_stats = @import("expert_stats.zig");
 const fill_marks = @import("fill_marks.zig");
 const mlx = @import("mlx.zig");
@@ -5761,10 +5762,14 @@ fn checkMimoExl3Streaming(model_type: []const u8, runtime: bool) !void {
 }
 
 test "MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefix" {
+
+    try test_note.needArchs(&.{"mimo2"});
     try checkMimoExl3Streaming("mimo_v2", false);
 }
 
 test "MiMo EXL3 streaming imported slabs warm and reuse different layer rates" {
+
+    try test_note.needArchs(&.{"mimo2"});
     try checkMimoExl3Streaming("mimo_v2", true);
 }
 

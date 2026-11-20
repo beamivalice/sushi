@@ -27,6 +27,7 @@
 //!      truncate back — the committed context is unchanged).
 
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
@@ -2272,6 +2273,8 @@ test "dflash: an assistant merged into the checkpoint is found without a flag" {
 }
 
 test "dflash: dflash2 folder is preferred with valid legacy fallback" {
+
+    try test_note.needArchs(&.{"glm5"});
     const a = testing.allocator;
     const io = testing.io;
     var tmp = testing.tmpDir(.{});

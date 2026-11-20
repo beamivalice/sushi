@@ -1,6 +1,7 @@
 const trunk = @import("trunk.zig");
 const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const imatrix_capture = @import("imatrix.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const trunk_stq = @import("trunk_stq.zig");
@@ -1514,6 +1515,8 @@ test "QuantParamsCache put/lookup round-trip" {
 }
 
 test "qwen4 expert streaming targets only the trunk bank" {
+
+    try test_note.needArchs(&.{"qwen4"});
     var config = ModelConfig{ .model_type = "qwen4_exp", .weight_prefix = "language_model.model", .expert_streaming = true };
     try std.testing.expect(shouldStreamExpertBank(&config, "language_model.model"));
     try std.testing.expect(!shouldStreamExpertBank(&config, "language_model.mtp"));

@@ -11,10 +11,13 @@ const server = @import("server.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const slot_admission = @import("slot_admission.zig");
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const testing = std.testing;
 const trunk = @import("trunk.zig");
 
 test "GLM serving memory bills one latent at the request's KV width and pooled index per token" {
+
+    try test_note.needArchs(&.{"glm5"});
     const cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const saved = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved;
@@ -38,6 +41,8 @@ test "GLM serving memory bills one latent at the request's KV width and pooled i
 }
 
 test "a streamed GLM bills its fill peak per request and its latent at the KV width plus the pooled index per planned token" {
+
+    try test_note.needArchs(&.{"glm5"});
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const saved = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved;
@@ -57,6 +62,8 @@ test "a streamed GLM bills its fill peak per request and its latent at the KV wi
 }
 
 test "GLM requests prefill at 2048 and step down a rung only where a chunk stops fitting" {
+
+    try test_note.needArchs(&.{"glm5"});
     const t = std.testing;
     const cfg = try fixtures.glmAssistantFixture();
     const kv_bits: u64 = 8;
@@ -90,6 +97,8 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
 }
 
 test "GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused" {
+
+    try test_note.needArchs(&.{"glm5"});
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.dflash_loaded = true;
     cfg.dflash_window_bytes = 5 * 8 * 128 * 4 * 2304;
@@ -224,6 +233,8 @@ test "getEffectiveContextLength computes safe default from GPU memory" {
 }
 
 test "a second GLM admission leaves free the cache growth the first was admitted to allocate" {
+
+    try test_note.needArchs(&.{"glm5"});
     var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     cfg.pinned_context = 1_048_576;
     const gib: u64 = 1 << 30;

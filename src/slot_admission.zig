@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const arch_handle = @import("arch/handle.zig");
 const arch_kernels = @import("arch/kernels.zig");
 const trunk = @import("trunk.zig");
@@ -385,6 +386,8 @@ test "admitsWithinMemory: siblings are billed together, a lone request always pr
 }
 
 test "admissionPassArmed: the evict-to-admit pass runs for every served arch, never an unserved one" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     const mimo = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 1, .has_sliding_window = true, .sliding_window = 128, .head_dim = 192 };
     const qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
     const glm = ModelConfig{ .model_type = "glm5_next" };
@@ -397,6 +400,8 @@ test "admissionPassArmed: the evict-to-admit pass runs for every served arch, ne
 }
 
 test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial" {
+
+    try test_note.needArchs(&.{"mimo2"});
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     cfg.model_type = "mimo_v2";
     cfg.num_experts = 256;
@@ -421,6 +426,8 @@ test "the batched group is capped by padding waste: the longest slot sorts last 
 }
 
 test "the pad-waste cap reads the arch's TRUE attention KV length, not cache.step" {
+
+    try test_note.needArchs(&.{"qwen4"});
     // `cache.step` is 0 forever on a linear-layer-0 trunk, so the cap never fired there.
     const lens = [_]usize{ 1_000, 1_000, 60_000 };
     const first_attn = [_]u32{ 3, 2, 7 }; // GDN / gated-conv / KDA spacings

@@ -15,6 +15,7 @@ const registry = @import("arch/registry.zig");
 
 comptime {
     _ = @import("test_rest.zig");
+    _ = @import("test_note.zig");
 }
 const expert_stream = @import("expert_stream.zig");
 const expert_bf16_kernels = @import("expert_bf16_kernels.zig");

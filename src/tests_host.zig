@@ -10,6 +10,10 @@ pub const model_handle = @import("model_handle.zig");
 const std = @import("std");
 const registry = @import("arch/registry.zig");
 
+comptime {
+    _ = @import("test_note.zig");
+}
+
 test {
     // The arch's `host_tests` read nothing of MLX; its `tests` stay unanalysed.
     inline for (comptime std.meta.tags(registry.Tag)) |tag| {

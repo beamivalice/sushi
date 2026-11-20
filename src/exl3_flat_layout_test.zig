@@ -3,6 +3,7 @@
 //! accounting exercise the same index/file paths as a downloaded pack.
 
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const expert_quant = @import("expert_quant.zig");
 const model = @import("model.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -235,6 +236,8 @@ fn createFixture(
 }
 
 test "flat EXL3 semantic shards remain a complete discovery candidate" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -448,6 +451,8 @@ test "flat EXL3 routed-key filtering is independent of shard filename" {
 }
 
 test "EXL3 streaming CPU config engages only with a budget and refuses MTP" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const stream = @import("expert_stream.zig");
     const cfg = model.ModelConfig{
         .model_type = "qwen4_exp",
@@ -618,6 +623,8 @@ fn writeGroupedPack(dir: std.Io.Dir, a: std.mem.Allocator, hidden: u32, inter: u
 }
 
 test "EXL3 streaming CPU reads a rate-grouped layer as per-expert spans and bills its average expert" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -87,7 +87,7 @@ const Needs = struct {
 
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
 /// with what `needs` asks. An arch whose fixture is missing is left out before any load and named on the test's log
-/// line (`test_rest.notePartSkipped`); the test skips only when no arch is left.
+/// line (`test_note.notePartSkipped`); the test skips only when no arch is left.
 /// The arch whose server fixture a test reads as missing, the process's environment left as it is.
 var arch_missing_for_test: ?[]const u8 = null;
 
@@ -110,7 +110,7 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
                     if (e != error.SkipZigTest) return e;
                     archs[i].?.tmp.cleanup();
                     archs[i] = null;
-                    @import("test_rest.zig").notePartSkipped(@tagName(t) ++ ": its server fixture is missing");
+                    @import("test_note.zig").notePartSkipped(@tagName(t) ++ ": its server fixture is missing");
                     break;
                 };
             }
@@ -138,7 +138,7 @@ test "server: a served cell runs on every arch whose fixture is present and note
         }
     }.body);
     try testing.expectEqual(@as(u32, 1), each_arch_ran);
-    try testing.expect(std.mem.indexOf(u8, @import("test_rest.zig").notes(), "qwen4") != null);
+    try testing.expect(std.mem.indexOf(u8, @import("test_note.zig").notes(), "qwen4") != null);
 }
 
 fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void) !void {

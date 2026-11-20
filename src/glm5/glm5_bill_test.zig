@@ -1,5 +1,6 @@
 //! GLM-5.3's bill tests that read the live GPU: they run in the MLX tier, beside glm5_bill.zig's tests.
 const std = @import("std");
+const test_note = @import("../test_note.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const glm5_generate = @import("glm5_generate.zig");
@@ -85,6 +86,8 @@ test "GLM bills two KDA states, not eight, while its prefill moves each to SSD a
 }
 
 test "a thought point is one more checkpoint state in the bill: every Qwen request, a GLM request that keeps checkpoints" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const saved = .{ bills.launch_state.prefix_cache_capacity, bills.launch_state.ssm_checkpoint_stride, bills.launch_state.ssm_checkpoint_max, bills.launch_state.prefix_cache_disk_bytes, bills.launch_state.prefix_cache_ram_enabled };
     defer {

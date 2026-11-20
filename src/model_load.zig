@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
@@ -464,6 +465,8 @@ test "the width a load warms its spec verify at is the one it resolved, a file k
 }
 
 test "a model-settings kv_quant the MLA latent cannot store is dropped at stamping, never a refused load" {
+
+    try test_note.needArchs(&.{"glm5"});
     var glm = ModelConfig{ .model_type = "glm5_next" };
     applyModelSettings(&glm, .{ .kv_quant = trunk.KVQuantConfig.affine(4) });
     try testing.expect(glm.kv_quant_override == null);
@@ -1610,6 +1613,8 @@ test "the ssd budget falls back to the per-model setting, and a non-streaming mo
 }
 
 test "EXL3 streaming CPU settings budget engages the EXL3 loader" {
+
+    try test_note.needArchs(&.{"qwen4"});
     // The streamed load refuses an EXL3 layout by name; the budget used to engage it anyway, so a
     // settings-file budget made the pack unloadable with a "re-convert the pack" 503.
     const t = std.testing;

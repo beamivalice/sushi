@@ -138,9 +138,13 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **A bill test pins every probed arm its bill reads** (`qsaScoreFusedOffGuard` and its kin): a kernel trial runs once a
   process, so an unpinned bill reads whatever arm an earlier test's forward tried.
 - **A part of a test that did not run is said, never silent**: a cell that runs once per arch leaves out an arch whose
-  fixture is missing and calls `test_rest.notePartSkipped` naming it; the runner writes it as the test's log line's
+  fixture is missing and calls `test_note.notePartSkipped` naming it; the runner writes it as the test's log line's
   sixth field (`parts skipped: ...`) and tests/gate.sh's summary lists every such test, so a box's run says what it
   did not cover. The test skips only when no part of it ran.
+- **A test whose arch this build leaves out skips by name, never runs**: a shared test that reads an arch's config or
+  fixture starts with `test_note.needArchs(&.{...})`; under `-Darchs` it skips with `<arch>: not in this build
+  (-Darchs)` on its log line, and an arch's own steps are not made. Check: `zig build test -Darchs=<one>` with no
+  fixture envs fails nothing.
 - **Held loads** (`heldLoad` in `cooler_contract_test.zig`): a request-level contract cell that proves nothing about
   a load asks for the step's served load of its fixture instead of making one; such cells sit in the
   `cooler_held_*_test.zig` files, run steps of their own, so no cell that makes its own load shares their process.

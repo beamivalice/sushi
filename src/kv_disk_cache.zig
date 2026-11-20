@@ -51,6 +51,7 @@
 //! (`Load::eval_gpu` is Not Implemented — the lora.zig/model.zig precedent).
 
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
 const kv_quant = @import("kv_quant.zig");
 const trunk = @import("trunk.zig");
@@ -9553,6 +9554,7 @@ fn pinDigest(base: []const u8, fp: []const u8, io: std.Io) ![64]u8 {
 // The SSD file bytes are a contract with files already on users' disks: a record the engine wrote
 // must read back unchanged, and a new one must be byte-identical for the same state. Armed as production arms it.
 test "DiskTier: the bytes of a dense, a hybrid-with-QSA and a head-sidecar record are pinned" {
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });

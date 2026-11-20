@@ -15,6 +15,7 @@
 const arch_packs = @import("arch/packs.zig");
 const FolderId = @import("folder_identity.zig").FolderId;
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const log = @import("log.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
@@ -1000,6 +1001,8 @@ fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
 const testing = std.testing;
 
 test "discoverModels finds flat and org/repo model dirs" {
+
+    try test_note.needArchs(&.{ "mimo2", "glm5" });
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1092,6 +1095,8 @@ fn writeStreamingQuantFixture(io: std.Io, dir: std.Io.Dir, model_type: []const u
 }
 
 test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candidate under another model_type" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var root = std.testing.tmpDir(.{ .iterate = true });
@@ -1136,6 +1141,8 @@ test "expert streaming is qwen4_exp only: the same switch_mlp pack is no candida
 }
 
 test "qwen4 streaming index completeness requires every target bank and PLE shard" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const complete = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":\"a\",\"model.language_model.layers.0.mlp.experts.down_proj\":\"b\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":\"c\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_1.weight\":\"d\"}}";
     const missing = "{\"weight_map\":{\"model.language_model.layers.0.mlp.experts.gate_up_proj\":\"a\",\"model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight\":\"c\"}}";
     try std.testing.expectEqual(expert_quant.Layout.bf16_fused, streamingIndexLayout(std.testing.allocator, "qwen4_exp", complete, 1, 2).?);
@@ -1143,6 +1150,8 @@ test "qwen4 streaming index completeness requires every target bank and PLE shar
 }
 
 test "a quantized index is a streaming candidate without any PLE shard" {
+
+    try test_note.needArchs(&.{"qwen4"});
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     try buf.appendSlice(std.testing.allocator, "{\"weight_map\":{");
@@ -1183,6 +1192,8 @@ test "real qwen checkpoint is a complete streaming discovery candidate" {
 }
 
 test "discoverModelsMany merges roots in order and de-dups by id" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var a_dir = std.testing.tmpDir(.{ .iterate = true });
@@ -1254,6 +1265,8 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
 }
 
 test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1278,6 +1291,8 @@ test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
 }
 
 test "discovery counts shard bytes that come through symlinks leaving the pack" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1307,6 +1322,8 @@ test "discovery counts shard bytes that come through symlinks leaving the pack" 
 }
 
 test "bytes_total counts every regular file of the pack, a symlink at its target's size, and bytes_on_disk stays the weights" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1342,6 +1359,8 @@ test "bytes_total counts every regular file of the pack, a symlink at its target
 }
 
 test "modelKindFromType labels every family (list TYPE column + run preflight)" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen4_exp"));
     try testing.expectEqual(ModelKind.chat, modelKindFromType("mimo_v2"));
     try testing.expectEqual(ModelKind.unsupported, modelKindFromType("gemma4"));
@@ -1494,6 +1513,8 @@ test "isSupportedQuantMode accepts affine, mxfp4 and mxfp8, rejects nvfp4 and un
 }
 
 test "parseStubMeta mimo_v2 reports routed count and image input without video" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const m = parseStubMeta(testing.allocator,
         \\{"model_type":"mimo_v2", "num_hidden_layers":4, "hidden_size":384,
         \\ "n_routed_experts":16, "num_experts_per_tok":4, "moe_intermediate_size":192,
@@ -1508,6 +1529,8 @@ test "parseStubMeta mimo_v2 reports routed count and image input without video" 
 }
 
 test "mimo_v2 streaming discovery validates MXFP4 headers without a PLE table" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const a = testing.allocator;
     try testing.expect(isSupportedModelType("mimo_v2"));
     var tmp = testing.tmpDir(.{});
@@ -1538,6 +1561,8 @@ test "real mimo_v2 original checkpoint discovers complete streamed expert header
 }
 
 test "mimo_v2 original source discovery validates individual MXFP4 tensors" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const a = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1648,6 +1673,8 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
 }
 
 test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1750,6 +1777,8 @@ test "a stub states what its arch wires: the dense prefix from moe_layer_freq, t
 }
 
 test "parseStubMeta: an arch that renders its own chat template is chat-capable without a template file" {
+
+    try test_note.needArchs(&.{"dsv41"});
     const dsv = parseStubMeta(testing.allocator,
         \\{"model_type":"deepseek_v41", "num_hidden_layers":4, "hidden_size":384, "vision_config":{}}
     , false);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const settings_resolve = @import("settings_resolve.zig");
@@ -1600,6 +1601,9 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 
 
 test "Sushi quant memory request refusal prices the actual KV width and MTP, and its maximum reaches the wire" {
+
+
+    try test_note.needArchs(&.{"qwen4"});
     const saved_ctx = server_state.server_config.max_context_size;
     defer server_state.server_config.max_context_size = saved_ctx;
     const saved_mtp = server_state.configured_mtp;
@@ -2914,6 +2918,8 @@ pub fn requestBillsMtpHead(
 }
 
 test "the bill prices the MTP head only for a request that runs it: a DFlash2 request never builds the head's cache" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const saved_force = server_state.server_config.default_force_mtp;
     defer server_state.server_config.default_force_mtp = saved_force;
@@ -4074,6 +4080,8 @@ test "a streamed --vision load proves its largest image encode beside the budget
 }
 
 test "the concurrency verdict: a resident GLM and qwen4 batch, an exclusive model queues, another MoE interleaves" {
+
+    try test_note.needArchs(&.{ "qwen4", "glm5" });
     const glm = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("fixtures/glm5_config.json"));
     const qwen4 = model_mod.ModelConfig{ .model_type = "qwen4_exp", .full_attention_interval = 4, .num_experts = 8, .num_experts_per_tok = 2 };
     const moe = model_mod.ModelConfig{ .model_type = "qwen3_moe", .num_experts = 8, .num_experts_per_tok = 2 };
@@ -4169,6 +4177,8 @@ test "promptOpensThink: only the think token opens a think block, never its spel
 }
 
 test "a request a non-Sushi bill refuses for its max_tokens names the max_tokens that fits, and that one is admitted" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const a = t.allocator;
     const saved_ctx = server_state.server_config.max_context_size;
@@ -4204,6 +4214,8 @@ test "a request a non-Sushi bill refuses for its max_tokens names the max_tokens
 }
 
 test "a request whose max_tokens alone does not fit is refused on the connection thread in the inference thread's words, with the max_tokens that fits" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const a = t.allocator;
     const saved_ctx = server_state.server_config.max_context_size;

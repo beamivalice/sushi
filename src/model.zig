@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const load_clock = @import("load_clock.zig");
@@ -3052,6 +3053,8 @@ test "defaultEnableThinking: opt-in per arch, and every existing arch stays off"
 }
 
 test "effortArms: every engine word on each served arch" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     const Budget = struct { on: bool, cap: ?i32 };
     const Want = struct { word: []const u8, qwen: ?Budget, mimo: ?Budget };
     const off: Budget = .{ .on = false, .cap = null };
@@ -3533,6 +3536,8 @@ test "a streamed load that fails mid-transform frees the tensor it was holding" 
 }
 
 test "the streamed load drops the MTP head the ledger bills at zero" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const io = t.io;
     const allocator = t.allocator;
@@ -3561,6 +3566,8 @@ test "the streamed load drops the MTP head the ledger bills at zero" {
 }
 
 test "a resident load with MTP off never reads the head's bytes; with MTP on it keeps them" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const io = t.io;
     const allocator = t.allocator;
@@ -3590,6 +3597,8 @@ test "a resident load with MTP off never reads the head's bytes; with MTP on it 
 }
 
 test "qwen resident bill: the tower bills as affine 8-bit codes, and as stored under --vision-bf16" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{ .iterate = true });
@@ -3727,6 +3736,8 @@ test "parseConfigFromJson: --config-overrides replaces scalars and arrays, creat
 }
 
 test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, qwen4_exp only" {
+
+    try test_note.needArchs(&.{"qwen4"});
     const t = std.testing;
     var qwen4 = ModelConfig{ .model_type = "qwen4_exp" };
     try t.expect(qwen4.longCtxGated());
@@ -3740,6 +3751,8 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
 }
 
 test "isExpertStreamingArch admits only implemented streaming families" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     const t = std.testing;
     try t.expect(expert_quant.isExpertStreamingArch("qwen4_exp"));
     try t.expect(expert_quant.isExpertStreamingArch("mimo_v2"));
@@ -3835,6 +3848,8 @@ test "the loader refuses a mixed-revision pack by name before reading any weight
 }
 
 test "the loader refuses a model_type this build does not serve, by name, before reading the checkpoint" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2" });
     const missing = "/nonexistent/sushi-arch-gate";
     const unserved = ModelConfig{ .model_type = "not_a_served_arch" };
     try std.testing.expectError(error.ArchitectureUnsupported, loadWeightsForConfig(std.testing.io, std.testing.allocator, missing, &unserved, false));
@@ -3879,6 +3894,8 @@ test "parseConfig releases owned paths when an EXL3 pack is refused" {
 }
 
 test "MiMo EXL3 streaming CPU accepts budgets and preserves the resident default" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const stream = @import("expert_stream.zig");
     const c = ModelConfig{ .model_type = "mimo_v2", .num_hidden_layers = 48, .first_k_dense_replace = 1, .num_experts = 256, .num_experts_per_tok = 8, .hidden_size = 4096, .moe_intermediate_size = 2048, .expert_layout = .exl3_k4 };
     try testing.expect(c.supportsExpertStreaming());
@@ -4080,6 +4097,8 @@ test "--qwen-gdn is what parseConfig reads, on a loaded config; the f32 state is
 }
 
 test "the GDN state checkpoint bills four bytes per element at f32 and two at bf16; GLM's KDA state is f32 always" {
+
+    try test_note.needArchs(&.{"glm5"});
     const t = std.testing;
     var c = ModelConfig{ .num_hidden_layers = 48, .full_attention_interval = 4, .linear_num_key_heads = 16, .linear_num_value_heads = 48 };
     const conv: u64 = 3 * (2 * 16 * 128 + 48 * 128) * 2;
@@ -4091,6 +4110,8 @@ test "the GDN state checkpoint bills four bytes per element at f32 and two at bf
 }
 
 test "GLM serving accepts native effort levels and thinks by default" {
+
+    try test_note.needArchs(&.{"glm5"});
     const cfg = ModelConfig{ .model_type = "glm5_next" };
     try testing.expect(isServedArch(cfg.model_type));
     try testing.expect(cfg.defaultEnableThinking());
@@ -4105,6 +4126,8 @@ test "GLM serving accepts native effort levels and thinks by default" {
 }
 
 test "thinking policy launch defaults are model-specific and preserve GLM high" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
     const glm = ModelConfig{ .model_type = "glm5_next" };
@@ -4123,6 +4146,8 @@ test "thinking policy launch defaults are model-specific and preserve GLM high" 
 }
 
 test "thinking policy: --think binds the models that take it, the rest keep their own default" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
     const glm = ModelConfig{ .model_type = "glm5_next" };
@@ -4158,6 +4183,8 @@ test "thinking policy: --think binds the models that take it, the rest keep thei
 }
 
 test "thinking policy: default_reasoning_effort is the word a request naming none runs at" {
+
+    try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5" });
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
     const glm = ModelConfig{ .model_type = "glm5_next" };
@@ -4183,6 +4210,8 @@ test "thinking policy: default_reasoning_effort is the word a request naming non
 }
 
 test "Qwen3.8-Flash-Next thinks at medium effort by default, under the launch flag and the checkpoint's own word" {
+
+    try test_note.needArchs(&.{ "qwen4", "glm5" });
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
     const qwen = ModelConfig{ .model_type = "qwen4_exp" };
@@ -4353,6 +4382,8 @@ test "readTensorArray returns the file's tensor, imported without a copy when la
 }
 
 test "deepseek_v41 thinks by default, at its native high effort" {
+
+    try test_note.needArchs(&.{"dsv41"});
     const dsv41 = ModelConfig{ .model_type = "deepseek_v41" };
     try testing.expect(dsv41.defaultEnableThinking());
     try testing.expectEqualStrings("high", defaultReasoningEffort(&dsv41).?);
@@ -4478,6 +4509,8 @@ test "a text prompt's BOS comes from the release config, whose bos_token_id sits
 }
 
 test "a pair-major pack is refused by name by an architecture that reads only the pack order" {
+
+    try test_note.needArchs(&.{"mimo2"});
     const fx = arch_chat.Fixtures("qwen4");
     if (!@hasDecl(fx, "goodJson")) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -4508,6 +4541,8 @@ test "a pair-major pack is refused by name by an architecture that reads only th
 }
 
 test "effort table: the file's default word outranks the built-in one, --think outranks both" {
+
+    try test_note.needArchs(&.{ "qwen4", "dsv41" });
     const saved = effort_mod.think_effort_flag;
     defer effort_mod.think_effort_flag = saved;
     defer for (effort_mod.families) |f| effort_mod.publish(f, .{});

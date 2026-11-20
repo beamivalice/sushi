@@ -1,4 +1,5 @@
 const std = @import("std");
+const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const model_mod = @import("model.zig");
@@ -692,6 +693,8 @@ test "a submit that fails once its slot is built hands the slot to the inference
 }
 
 test "a submit that fails before its slot exists hands the vision array to the inference thread" {
+
+    try test_note.needArchs(&.{"glm5"});
     const Probe = struct {
         var inference_id: std.Thread.Id = undefined;
         var frees: usize = 0;
