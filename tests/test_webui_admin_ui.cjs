@@ -1157,6 +1157,7 @@ async function main() {
       assert.equal(await page.textContent('.set[data-key="wired_margin_gib"] label'), 'Safety margin (GB)');
       assert.equal(await page.getAttribute('#marginGib', 'placeholder'), 'Default (1)');
       assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .help'), /macOS, the window server and your other apps/, 'the row says who the margin protects');
+      assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .help'), /Raise it if your Mac stutters or apps misbehave while sushi works\. It applies once a GPU limit is set with the command above\.$/, 'the row says the margin binds only under a declared GPU limit');
       for (const value of ['0', '33', '1.5', 'abc']) {
         await page.fill('#marginGib', value);
         assert.equal(await page.isDisabled('#marginSave'), true);

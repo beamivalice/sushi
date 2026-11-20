@@ -4629,7 +4629,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (A.marginText === shown) A.marginText = null;
     if ((locked || A.marginText === null) && marginIn.value !== shown) marginIn.value = shown;
     marginIn.placeholder = `Default (${p.default})`;
-    setText(marginRow.help, "Memory under the GPU limit that sushi never plans to use. macOS, the window server and your other apps use GPU memory too; this keeps room for them so a long prompt cannot push the Mac into a freeze or make other apps fail when the limit is reached. Default 1 GB; sushi keeps more on its own when it measures that other apps already use more. Raise it if your Mac stutters or apps misbehave while sushi works.");
+    setText(marginRow.help, "Memory under the GPU limit that sushi never plans to use. macOS, the window server and your other apps use GPU memory too; this keeps room for them so a long prompt cannot push the Mac into a freeze or make other apps fail when the limit is reached. Default 1 GB; sushi keeps more on its own when it measures that other apps already use more. Raise it if your Mac stutters or apps misbehave while sushi works. It applies once a GPU limit is set with the command above.");
     setText(marginRow.hint, locked ? flagHelp("wired_margin_gib", p.flag) : "");
     const text = marginIn.value.trim(), parsed = adminControlValue(marginSpec(p), text), dirty = !locked && text !== file, busy = marginSave.getAttribute("aria-busy") === "true";
     marginIn.disabled = locked;
