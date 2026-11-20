@@ -245,14 +245,14 @@ fn dirBytesIn(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
 
 /// The id of the model in memory served from `folder`, or null. Caller holds the registry's mutex. An unloading model
 /// counts: requests still read it until its drain ends, and the unload may be refused and the model serve on.
-fn loadedModelAtLocked(allocator: Allocator, folder: *const FolderId) ?[]u8 {
+fn loadedModelAtLocked(allocator: Allocator, folder: *const FolderId) Allocator.Error!?[]u8 {
     const reg = server_state.global_registry orelse return null;
     const e = reg.peekByPathLocked(folder) orelse return null;
     switch (e.state) {
         .unloaded, .error_state => return null,
         .loading, .ready, .evicting => {},
     }
-    return allocator.dupe(u8, e.id) catch null;
+    return try allocator.dupe(u8, e.id);
 }
 
 /// The registry's load gate: a pack folder a queued or running download or update fills cannot load, since its
@@ -608,7 +608,8 @@ fn claimDest(arena: Allocator, io: std.Io, repo: []const u8, dest: []const u8, f
     const reg = server_state.global_registry;
     if (reg) |r| r.mutex.lockUncancelable(r.io);
     defer if (reg) |r| r.mutex.unlock(r.io);
-    const loaded_as = loadedModelAtLocked(arena, folder);
+    // A model whose id cannot be copied is still in memory: the claim fails, never queues over it.
+    const loaded_as = loadedModelAtLocked(arena, folder) catch |err| return .{ .loaded_as = null, .queued = err };
     return .{ .loaded_as = loaded_as, .queued = if (loaded_as != null) false else enqueue(io, repo, dest, update) };
 }
 
@@ -720,10 +721,14 @@ test "downloads: an update is refused for a model in memory, also while it loads
     defer server_state.global_registry = prev;
     for (std.enums.values(@import("model_registry.zig").LoadState)) |state| {
         e.state = state;
-        const id = loadedModelAtLocked(testing.allocator, &(try FolderId.of(testing.io, "/packs/m/")));
+        const folder = try FolderId.of(testing.io, "/packs/m/");
+        const id = try loadedModelAtLocked(testing.allocator, &folder);
         defer if (id) |i| testing.allocator.free(i);
         const in_memory = state == .loading or state == .ready or state == .evicting;
         try testing.expectEqual(in_memory, id != null);
+        // A copy of the id that fails is an error, never "no model here": an update must not start over it.
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        if (in_memory) try testing.expectError(error.OutOfMemory, loadedModelAtLocked(failing.allocator(), &folder));
     }
     e.state = .unloaded;
 }
@@ -836,7 +841,7 @@ test "downloads: with --model-dir typed with a trailing slash, an update of the 
     defer arena_state.deinit();
     const installed = try s.installed(arena_state.allocator());
     s.reg.mutex.lockUncancelable(testing.io);
-    const loaded_as = loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
+    const loaded_as = try loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
     s.reg.mutex.unlock(testing.io);
     try testing.expect(loaded_as != null);
 }
@@ -914,7 +919,7 @@ test "downloads: a pack folder spelled in another case than the catalog's still 
     var roots_buf: [9][]const u8 = undefined;
     const installed = installedPath(arena_state.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io).path), repo) orelse return error.PackNotInstalled;
     reg.mutex.lockUncancelable(io);
-    const loaded_as = loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
+    const loaded_as = try loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
     reg.mutex.unlock(io);
     try testing.expect(loaded_as != null);
 }
