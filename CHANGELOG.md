@@ -46,6 +46,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Logprobs list exactly the text a reply returns**: a streamed chat reply listed the tokens of the stop sequence that
   cut it and of a thought the token cap left open, and `/v1/completions` listed a stop's tokens streamed or not; none of
   them is listed now, on any surface, and a non-streamed completion no longer leaks its logprobs.
+- **A reply with a tool call lists logprobs only for its content**: a streamed call chunk carried every pending entry,
+  reasoning and call tokens included, and a non-streamed reply with calls carried no `logprobs` field; both now list the
+  text before the call, and `null` when there is none.
 - **`logprobs: true` with `top_logprobs: 0` and legacy `logprobs: 0` return the sampled tokens' logprobs**: both read as
   logprobs off and answered `null`; they now list each token with an empty alternatives list, and chat `logprobs: true`
   without `top_logprobs` lists none where it listed one.

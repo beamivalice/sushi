@@ -249,7 +249,8 @@ before reading a completed stream and requires clean EOF.
   are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.
 - **Logprobs list exactly the tokens whose bytes the reply returns**, chat and legacy completions, streamed or not
   (`listed_tokens.Listing`): a stop's own tokens (the stop gate's `released` bytes) and a thought the reply does not ship
-  are never listed, and a chunk with no content (the final one) lists only what sent content left behind.
+  are never listed, and a chunk with no content (the final one) lists only what sent content left behind. A tool call's tokens
+  are never listed either: a streamed call chunk carries no logprobs, and a non-streamed reply with calls lists its preamble, `null` without one.
 - **`logprobs: true` (chat) or an integer `logprobs` (legacy) turns logprobs on, whatever the alternatives count**: `top_logprobs`
   absent or 0 lists the sampled token with an empty alternatives list (`request_parse.Logprobs`; the engine ranks at least one
   candidate, `engineN`, and the reply lists `top` of them).

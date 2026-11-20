@@ -6,6 +6,7 @@ const sampler = @import("sampler.zig");
 const server = @import("server.zig");
 const generation_stream = @import("generation_stream.zig");
 const contentTokenRange = generation_stream.contentTokenRange;
+const contentLogprobsJson = generation_stream.contentLogprobsJson;
 const Listing = @import("listed_tokens.zig").Listing;
 const jsonEscape = server.jsonEscape;
 
@@ -521,4 +522,39 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     // A token straddling the boundary belongs to content — it put bytes there.
     const mid = contentTokenRange(allocator, &tok, &token_ids, full, full[("<think>\nBecause.\n</thi").len..]);
     try std.testing.expectEqual(@as(usize, 2), mid.start);
+}
+
+test "contentLogprobsJson: a reply with a call lists the tokens of its content, never the call's, and `top` alternatives each" {
+    const allocator = std.testing.allocator;
+
+    var tok = Tokenizer.initEmpty(allocator);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.id_to_token.put(1, "Check");
+    try tok.id_to_token.put(2, " it.\n");
+    try tok.id_to_token.put(3, "<tool_call>");
+    try tok.id_to_token.put(4, "{x}");
+
+    const token_ids = [_]u32{ 1, 2, 3, 4 };
+    const full = "Check it.\n<tool_call>{x}";
+    var alt = [_]sampler.TokenLogprob{.{ .token_id = 1, .logprob = -0.5 }};
+    const lps = [_]sampler.LogprobResult{
+        .{ .token_logprob = -0.5, .top_logprobs = &alt },
+        .{ .token_logprob = -0.5, .top_logprobs = &alt },
+        .{ .token_logprob = -0.5, .top_logprobs = &alt },
+        .{ .token_logprob = -0.5, .top_logprobs = &alt },
+    };
+    for ([_]u32{ 0, 1 }) |top| {
+        const json = try contentLogprobsJson(allocator, &tok, &token_ids, &lps, full, full[0..10], top);
+        defer allocator.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+        defer parsed.deinit();
+        const entries = parsed.value.object.get("content").?.array.items;
+        try std.testing.expectEqual(@as(usize, 2), entries.len);
+        try std.testing.expectEqualStrings(" it.\n", entries[1].object.get("token").?.string);
+        for (entries) |e| try std.testing.expectEqual(@as(usize, top), e.object.get("top_logprobs").?.array.items.len);
+    }
 }

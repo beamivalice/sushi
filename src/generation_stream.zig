@@ -737,6 +737,15 @@ pub fn handleNonStreamingGeneration(
             defer if (tc_content_esc.owned) allocator.free(tc_content_esc.slice);
             const tc_content_json: []const u8 = if (tc_preamble.len > 0) tc_content_esc.slice else "null";
 
+            // `logprobs.content` lists the message's content, never a call's tokens: null when there is no content.
+            var tc_logprobs_json: []const u8 = "null";
+            var tc_logprobs_owned = false;
+            defer if (tc_logprobs_owned) allocator.free(tc_logprobs_json);
+            if (result.logprobs) |lps| if (tc_preamble.len > 0) {
+                tc_logprobs_json = try contentLogprobsJson(allocator, tok, result.token_ids, lps, final_text, tc_preamble, if (asked_logprobs) |l| l.top else 0);
+                tc_logprobs_owned = true;
+            };
+
             const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
             const tc_timings_field = if (tc_timings.len > 0)
@@ -752,7 +761,7 @@ pub fn handleNonStreamingGeneration(
 
             // finish_reason always carries finish_details beside it.
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
                 nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
                 nowSecs(stream.io),
@@ -760,6 +769,7 @@ pub fn handleNonStreamingGeneration(
                 tc_content_json,
                 tc_reasoning_json,
                 tc_buf.items,
+                tc_logprobs_json,
                 toolCallFinishReason(finish_reason),
                 finishDetailsField(toolCallFinishReason(finish_reason), result.finish_details),
                 tc_usage_obj,
@@ -795,11 +805,7 @@ pub fn handleNonStreamingGeneration(
     var logprobs_json: []const u8 = "null";
     var logprobs_allocated = false;
     if (result.logprobs) |lps| {
-        const n = @min(result.token_ids.len, lps.len);
-        const r = contentTokenRange(allocator, tok, result.token_ids[0..n], final_text, content_text);
-        const a = @min(r.start, n);
-        const b = @min(@max(r.end, a), n);
-        logprobs_json = try formatLogprobsObject(allocator, tok, result.token_ids[a..b], lps[a..b], if (asked_logprobs) |l| l.top else 0);
+        logprobs_json = try contentLogprobsJson(allocator, tok, result.token_ids, lps, final_text, content_text, if (asked_logprobs) |l| l.top else 0);
         logprobs_allocated = true;
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
@@ -1837,7 +1843,7 @@ pub fn handleStreamingGeneration(
                 // First delta: name + id + full arguments (clients accumulate these)
                 const first_delta = try formatChatStreamToolCall(allocator, i, tc_id, tc.name, tc.arguments);
                 defer allocator.free(first_delta);
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = try lps.take() });
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = null });
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
@@ -2460,6 +2466,23 @@ fn formatChatStreamToolCall(allocator: std.mem.Allocator, index: usize, id: []co
     return std.fmt.allocPrint(allocator,
         \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
     , .{ index, id, quotedJsonInner(escaped_name), quotedJsonInner(escaped_args) });
+}
+
+/// The `logprobs` object of a non-streamed reply: the entries of the tokens whose bytes are `content`, a slice of `full_text`.
+pub fn contentLogprobsJson(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    token_ids: []const u32,
+    lps: []const sampler.LogprobResult,
+    full_text: []const u8,
+    content: []const u8,
+    top: u32,
+) ![]const u8 {
+    const n = @min(token_ids.len, lps.len);
+    const r = contentTokenRange(allocator, tok, token_ids[0..n], full_text, content);
+    const a = @min(r.start, n);
+    const b = @min(@max(r.end, a), n);
+    return formatLogprobsObject(allocator, tok, token_ids[a..b], lps[a..b], top);
 }
 
 /// The half-open token range whose decoded text lands inside `content`.

@@ -658,6 +658,8 @@ fn expectSameEnd(allocator: std.mem.Allocator, generated: []const u8, stops: []c
 /// when the think split of the delivered text grows, and the final chunk lists what lagged behind (the newest entry
 /// has not landed when its chunk goes out).
 fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: []const []const u8, opens_think: bool, listed: []bool) !void {
+    // A tools stream buffers from the first tool markup on and sends no content after it (`ToolHoldScan`).
+    var tool_scan: think_tags.ToolHoldScan = .{};
     var listing: listed_tokens.Listing = .{};
     defer listing.deinit(allocator);
     var gate = stop_seq_mod.Gate{ .stops = stops };
@@ -679,7 +681,7 @@ fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: 
         listing.released = gate.released;
         try delivered.appendSlice(allocator, piece);
         // The content arm holds a tail that may still grow into a think opener.
-        const content = if (think_tags.endsWithPartialThinkOpen(delivered.items)) delivered.items[0..0] else think_tags.splitThinkBlock(delivered.items, true, opens_think).content;
+        const content = if (think_tags.endsWithPartialThinkOpen(delivered.items) or think_tags.streamShouldBufferForToolsScan(delivered.items, &tool_scan)) delivered.items[0..0] else think_tags.splitThinkBlock(delivered.items, true, opens_think).content;
         if (content.len > sent_content) {
             listing.skipTo(@intFromPtr(content.ptr) - @intFromPtr(delivered.items.ptr));
             sent_content = content.len;
@@ -692,8 +694,7 @@ fn streamListed(allocator: std.mem.Allocator, frags: []const []const u8, stops: 
     for (r.start..r.end) |k| listed[k] = true;
 }
 
-/// A stream and a non-stream reply list logprobs for the same tokens: those whose bytes the reply returned. Prose only:
-/// a stream gates tool markup before it sends, which this driver does not model.
+/// A stream and a non-stream reply list logprobs for the same tokens: those whose bytes the reply returned.
 fn expectSameListing(allocator: std.mem.Allocator, generated: []const u8, frag_len: usize, stops: []const []const u8, ask_in: Ask) !void {
     var ask = ask_in;
     ask.stops = stops;
@@ -711,7 +712,8 @@ fn expectSameListing(allocator: std.mem.Allocator, generated: []const u8, frag_l
     var listing: listed_tokens.Listing = .{};
     defer listing.deinit(allocator);
     for (frags.items) |f| try listing.note(allocator, f.len);
-    const content = think_tags.splitThinkBlock(whole.text, true, ask.opens_think).content;
+    // A reply with calls lists its preamble: the message's content, never a call's tokens.
+    const content = if (whole.reply) |r| r.preamble else think_tags.splitThinkBlock(whole.text, true, ask.opens_think).content;
     const from = if (content.len > 0) @intFromPtr(content.ptr) - @intFromPtr(whole.text.ptr) else 0;
     const r = listing.touching(from, from + content.len);
     for (got, 0..) |g, k| try testing.expectEqual(k >= r.start and k < r.end, g);
@@ -750,6 +752,9 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
         try expectSameListing(a, "an answer that runs on STOP and more", 5, &stops, ask);
         try expectSameListing(a, "<think>a thought the cap cut off", 5, &stops, ask);
         try expectSameListing(a, "<think>a thought</think>then an answer STOP more", 5, &stops, ask);
+        // A call's own tokens are not listed: logprobs describe the content before it, as `logprobs.content` does.
+        try expectSameListing(a, "Check it.\n" ++ call, 5, &stops, ask);
+        try expectSameListing(a, "Check it.\n" ++ call ++ "\nSTOP and more", 5, &stops, ask);
         // A stop prefix one token holds is not listed while a later token releases the text before it.
         try expectSameListing(a, "ab STXQ more", 1, &.{ "STOP", "TXQ" }, ask);
     }
