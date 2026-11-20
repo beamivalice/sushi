@@ -989,7 +989,9 @@ pub fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx
         errdefer _ = mlx.mlx_array_free(out);
         joined_pending = .{ .out = out, .inj = try Join.array(s, injs[0..values.len]) };
     }
-    const full = (try hcReadPreparedWidth(s, joined, w, total, eps, joined_pending, HC_FUSED_MAX_ROWS)) orelse return null;
+    // On the engine of our own the prepared closure declines; the fused read takes every request's rows in one launch.
+    const full = (try hcReadPreparedWidth(s, joined, w, total, eps, joined_pending, HC_FUSED_MAX_ROWS)) orelse
+        (try hcReadFused(s, joined, 1, total, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, 8, 64, joined_pending)) orelse return null;
     defer inline for (.{ "mixed", "inj", "stream" }) |name| {
         if (@field(full, name).ctx != null) _ = mlx.mlx_array_free(@field(full, name));
     };
@@ -2107,5 +2109,103 @@ test "the PLE gate on the engine is one dispatch with MLX's bytes, at decode and
             made += 1;
         }
         try t.expectEqualSlices(u8, bytes[0], bytes[1]);
+    }
+}
+
+test "qwen4 hc: a joined verify read on the engine's stream reads every request's rows at once, each with its own read's bytes" {
+    try mlx.requireGpu();
+    // A verify of four requests' rows, as the joined forward sets it.
+    const verify_moe = @import("../verify_moe.zig");
+    verify_moe.group_rows = 4;
+    defer verify_moe.group_rows = 1;
+    if (!verifySharedHardware()) return error.SkipZigTest;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const s = mlx.engine.stream();
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    const a = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4843_4a4e);
+    const rnd = prng.random();
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |x| _ = mlx.mlx_array_free(x);
+        owned.deinit(a);
+    }
+    const Make = struct {
+        fn bf16(al: std.mem.Allocator, list: *std.ArrayList(mlx.mlx_array), r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const host = try al.alloc(f32, n);
+            defer al.free(host);
+            for (host) |*v| v.* = scale * r.floatNorm(f32);
+            const f = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, st));
+            try mlx.check(mlx.mlx_array_eval(out));
+            try list.append(al, out);
+            return out;
+        }
+        fn quant8(al: std.mem.Allocator, list: *std.ArrayList(mlx.mlx_array), r: std.Random, st: mlx.mlx_stream, rows: c_int, cols: c_int) ![3]mlx.mlx_array {
+            const w = try bf16(al, list, r, st, &.{ rows, cols }, 0.05);
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, st));
+            var q: [3]mlx.mlx_array = undefined;
+            for (&q, 0..) |*x, i| {
+                x.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(x, triple, i));
+                try mlx.check(mlx.mlx_array_eval(x.*));
+                try list.append(al, x.*);
+            }
+            return q;
+        }
+    };
+    const down = try Make.quant8(a, &owned, rnd, s, 320, 10240);
+    const up = try Make.quant8(a, &owned, rnd, s, 10240, 320);
+    const w: HcWeights = .{ .norm_w = try Make.bf16(a, &owned, rnd, s, &.{ 4, 2560 }, 1), .down_w = down[0], .down_s = down[1], .down_b = down[2], .up_w = up[0], .up_s = up[1], .up_b = up[2], .inject_flat = try Make.bf16(a, &owned, rnd, s, &.{ 10240, 4 }, 0.05) };
+    const width: c_int = 3;
+    for ([_]bool{ false, true }) |with_pending| {
+        var inputs: [4]mlx.mlx_array = undefined;
+        var pending: [4]HcPending = undefined;
+        for (&inputs, &pending) |*x, *p| {
+            x.* = try Make.bf16(a, &owned, rnd, s, &.{ 1, width, 10240 }, 1);
+            p.* = .{ .out = try Make.bf16(a, &owned, rnd, s, &.{ 1, width, 2560 }, 1), .inj = try Make.bf16(a, &owned, rnd, s, &.{ 1, width, 4, 1 }, 1) };
+        }
+        const calls = mlx.engine.mlxCalls();
+        const joined = (try hcReadJoined(a, s, &inputs, w, width, 1e-6, if (with_pending) &pending else null)) orelse return error.JoinedReadDeclined;
+        defer {
+            for (joined) |r| inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(r, name).ctx != null) _ = mlx.mlx_array_free(@field(r, name));
+            };
+            a.free(joined);
+        }
+        try testing.expectEqual(calls, mlx.engine.mlxCalls());
+        for (inputs, pending, joined) |x, p, got| {
+            const want = (try hcReadFused(s, x, 1, width, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, 1e-6, 4, 2560, 8, 64, if (with_pending) p else null)) orelse return error.HcFusedDeclined;
+            defer inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(want, name).ctx != null) _ = mlx.mlx_array_free(@field(want, name));
+            };
+            inline for (.{ "mixed", "inj", "stream" }) |name| {
+                const wv = @field(want, name);
+                const gv = @field(got, name);
+                try testing.expectEqual(wv.ctx != null, gv.ctx != null);
+                if (wv.ctx != null) {
+                    var gc = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(gc);
+                    try mlx.check(mlx.mlx_contiguous(&gc, gv, false, s));
+                    try mlx.check(mlx.mlx_array_eval(wv));
+                    try mlx.check(mlx.mlx_array_eval(gc));
+                    const wb = mlx.mlx_array_data_bfloat16(wv) orelse return error.MlxArrayDataNull;
+                    const gb = mlx.mlx_array_data_bfloat16(gc) orelse return error.MlxArrayDataNull;
+                    const n = mlx.mlx_array_size(wv);
+                    try testing.expectEqual(n, mlx.mlx_array_size(gc));
+                    try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
+                }
+            }
+        }
     }
 }

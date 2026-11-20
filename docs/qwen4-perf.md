@@ -1153,3 +1153,13 @@ about 3% (155 against 150), and one cap alone cost a 2-row speculative group abo
 plain). A 4-row plain tick's GPU time (engine kernel profile) went 52 to 38 ms. The batched MTP planner still picks no
 drafts for sampled rows: a 4-row round of two drafts each costs about twice a plain tick (52 against 26 ms), which
 sampled acceptance (~55% a draft) does not repay; greedy rows keep `{2,2,2,2}` rounds.
+
+## Joined verify: the hyper-connection read of every request at once on Sushi Cooler
+
+The joined verify's hyper-connection read (`hcReadJoined`, two a layer) ran as an MLX compiled closure, which declines
+on the engine's own stream, so on Cooler every joined group read each request's rows alone: a 4-request `{2,2,2,2}`
+round issued ~360 HC read launches against ~94 for one request's 12-row forward. It now runs the fused read over every
+request's rows in one launch, each request's bytes unchanged (`a joined verify read on the engine's stream`).
+b8c4b7bd against it, M5 Ultra, Qwen STQ 2.75bpw, `--max-concurrent 4 --prefix-cache-entries 0`, 4 sampled rows x 400
+tokens, same boot sequence A B B A, `taskpolicy -a`, GPU lock: plain 154.9 / 154.5 -> 172.1 / 171.5 tok/s (+11%),
+sampled MTP 154.2 / 154.7 -> 168.1 / 167.1; a `{2,2,2,2}` round 55.5 -> 53.2 ms (verify 46.2 -> 43.9).
