@@ -591,14 +591,15 @@ test "server: an unload whose model stays held past its drain bound is refused b
     }.run);
 }
 
-test "server: a shutdown during an unload's drain ends the unload and the request waiting behind it with the shutdown error" {
+test "server: a shutdown during an unload's drain ends the unload and the requests waiting behind it with the shutdown error" {
     const was = http_conn.send_limit_ms;
     http_conn.send_limit_ms = 3000;
     defer http_conn.send_limit_ms = was;
     try eachArch(4, .{}, struct {
-        var asked: [2]Asked = undefined;
-        fn bothDone() bool {
-            return asked[0].done.load(.acquire) and asked[1].done.load(.acquire);
+        var asked: [3]Asked = undefined;
+        fn allDone() bool {
+            for (asked) |q| if (!q.done.load(.acquire)) return false;
+            return true;
         }
         fn run() !void {
             var b: [2][512]u8 = undefined;
@@ -608,18 +609,20 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
             defer _ = std.c.close(stalled);
             try send(stalled, "POST", "/v1/completions", try completionBody(&b[1], "a long tale of the sea", 100, true));
             gpa.free(try readUntil(stalled, "\"choices\""));
-            asked = .{ .{ .path = "/v1/unload-model", .body = "{\"model\":\"tiny\"}" }, .{ .path = "/v1/completions", .body = try completionBody(&b[0], "hello", 4, false) } };
+            // A generation and an explicit load wait behind the unload.
+            asked = .{ .{ .path = "/v1/unload-model", .body = "{\"model\":\"tiny\"}" }, .{ .path = "/v1/completions", .body = try completionBody(&b[0], "hello", 4, false) }, .{ .path = "/v1/load-model", .body = "{\"model\":\"tiny\"}" } };
             const unload = try std.Thread.spawn(.{}, Asked.run, .{&asked[0]});
             const marked = within(5000, unloadPending);
-            const behind = try std.Thread.spawn(.{}, Asked.run, .{&asked[1]});
-            // The request reaches its wait behind the unload before the shutdown is asked.
+            var behind: [2]std.Thread = undefined;
+            for (&behind, asked[1..]) |*t, *q| t.* = try std.Thread.spawn(.{}, Asked.run, .{q});
+            // The requests reach their wait behind the unload before the shutdown is asked.
             var none = [_]std.posix.pollfd{};
             _ = std.posix.poll(&none, 300) catch {};
             server.requestShutdown();
-            const answered = within(2000, bothDone);
+            const answered = within(2000, allDone);
             _ = std.c.shutdown(stalled, std.posix.SHUT.RDWR);
             unload.join();
-            behind.join();
+            for (behind) |t| t.join();
             defer for (asked) |q| gpa.free(q.out);
             if (!marked) return error.UnloadNeverMarked;
             if (!answered) return error.ShutdownLeftAWaiterUnanswered;
@@ -631,6 +634,25 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
                 std.debug.print("{s} answered at the shutdown: {s}\n", .{ q.path, q.out[0..@min(q.out.len, 300)] });
                 return error.NotTheShutdownError;
             };
+        }
+    }.run);
+}
+
+test "server: a load-model asked after the shutdown answers the shutdown error, for a resident model or one to load" {
+    try eachArch(4, .{ .tiny2 = true }, struct {
+        fn run() !void {
+            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            server.requestShutdown();
+            for ([_][]const u8{ "{\"model\":\"tiny\"}", "{\"model\":\"tiny2\"}" }) |body| {
+                const answer = try request("POST", "/v1/load-model", body);
+                defer gpa.free(answer);
+                if (!std.mem.startsWith(u8, answer, "HTTP/1.1 503") or std.mem.indexOf(u8, answer, @import("http.zig").shutting_down_message) == null or
+                    std.mem.indexOf(u8, answer, "\"shutting_down\"") == null)
+                {
+                    std.debug.print("/v1/load-model {s} after the shutdown: {s}\n", .{ body, answer[0..@min(answer.len, 300)] });
+                    return error.NotTheShutdownError;
+                }
+            }
         }
     }.run);
 }

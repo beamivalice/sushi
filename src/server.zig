@@ -1757,53 +1757,44 @@ fn refuseNonTextModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, reg
     return true;
 }
 
-/// Holds `id`'s model (`ensureLoaded`, loading it when it is not resident); null once the refusal is sent. `props`:
-/// the request is `GET /props`, answered without a model when none is the default.
-fn holdModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, props: bool) !?*LoadedModel {
-    const lm = scheduler.ensureLoaded(id) catch |err| switch (err) {
-        error.UnknownModelId => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
-            return null;
-        },
-        error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503);
-            return null;
-        },
-        error.NoDefaultModel => {
-            // Headless gen-only boot (media models resident, no default chat
-            // model): /props keeps answering with the live memory counters —
-            // the app's tray polls it, and a 503 here read as "0 MB".
-            if (props) {
-                try models_api.handlePropsNoModel(allocator, stream);
-                return null;
-            }
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
-            return null;
-        },
-        error.LoadFailed => {
-            try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, id);
-            return null;
-        },
-        error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503);
-            return null;
-        },
+/// The answer to a request whose model `ensureLoaded` or `ensureLoadedFresh` refused with `err`: the one map every
+/// route that holds or loads a model answers through. `props`: the request is `GET /props`, answered without a model
+/// when none is the default.
+fn sendModelRefusal(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, err: anyerror, props: bool) !void {
+    switch (err) {
+        error.UnknownModelId => try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404),
+        error.NotLoaded => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503),
+        // Headless gen-only boot (media models resident, no default chat
+        // model): /props keeps answering with the live memory counters —
+        // the app's tray polls it, and a 503 here read as "0 MB".
+        error.NoDefaultModel => if (props)
+            try models_api.handlePropsNoModel(allocator, stream)
+        else
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503),
+        error.LoadFailed => try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, id),
+        error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", http.shutting_down_type, http.shutting_down_message, 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. A refusal the
         // registry preserves by name answers 503 under that name; anything
         // else is a 500 with the error name, never a hung connection.
         else => {
-            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, id, err)) return null;
+            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, id, err)) return;
             log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
-            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
-                return null;
-            };
+            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch
+                return sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
             defer allocator.free(msg);
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
-            return null;
         },
+    }
+}
+
+/// Holds `id`'s model (`ensureLoaded`, loading it when it is not resident); null once the refusal is sent. `props`:
+/// the request is `GET /props`, answered without a model when none is the default.
+fn holdModel(allocator: std.mem.Allocator, stream: *http_conn.Conn, scheduler: *scheduler_mod.Scheduler, id: []const u8, props: bool) !?*LoadedModel {
+    const lm = scheduler.ensureLoaded(id) catch |err| {
+        try sendModelRefusal(allocator, stream, scheduler, id, err, props);
+        return null;
     };
     // The launch model turns ready before its boot pins its context and installs the request hooks.
     boot_gate.process.waitOpen(stream.io);
@@ -1946,35 +1937,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn, 
             else => return err,
         };
     }
-    const lm = scheduler.ensureLoadedFresh(requested_id) catch |err| switch (err) {
-        error.UnknownModelId => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
-            return;
-        },
-        error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", http.model_not_loaded_message, 503);
-            return;
-        },
-        error.NoDefaultModel => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", http.no_model_message, 503);
-            return;
-        },
-        error.LoadFailed => {
-            try generation_stream.sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
-            return;
-        },
-        else => {
-            if (try generation_stream.sendNamedLoadRefusal(allocator, stream, scheduler, requested_id, err)) return;
-            log.warn("  -> 500 ({s}) on /v1/load-model\n", .{@errorName(err)});
-            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
-                return;
-            };
-            defer allocator.free(msg);
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
-            return;
-        },
-    };
+    const lm = scheduler.ensureLoadedFresh(requested_id) catch |err| return sendModelRefusal(allocator, stream, scheduler, requested_id, err, false);
     defer scheduler.release(lm);
     boot_gate.process.waitOpen(stream.io);
     // Promotion happens only past ensureLoaded's error switch: a load that

@@ -1725,13 +1725,20 @@ pub const Scheduler = struct {
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
-        return self.ensureLoadedWith(id_or_empty, false);
+        return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, false));
     }
 
     /// `ensureLoaded` for an explicit load request: a model whose last load failed is tried again with the
     /// current settings and memory instead of answering from the stored failure.
     pub fn ensureLoadedFresh(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
-        return self.ensureLoadedWith(id_or_empty, true);
+        return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, true));
+    }
+
+    /// A model held or loaded once a shutdown was asked, a resident one's too, answers the shutdown as every route does.
+    fn refuseAfterShutdown(self: *Scheduler, lm: *LoadedModel) error{Shutdown}!*LoadedModel {
+        if (!self.registry.shutting_down.load(.acquire) and !server_state.shutdown_requested.load(.acquire)) return lm;
+        self.registry.releaseStatus(lm);
+        return error.Shutdown;
     }
 
     fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool) !*LoadedModel {

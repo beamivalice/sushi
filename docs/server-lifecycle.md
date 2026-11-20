@@ -480,6 +480,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A shutdown ends every wait on a model's state**: `requestShutdown` (`stopServing` runs it too) calls
   `ModelRegistry.beginShutdown`, so `waitStateChangeLocked` (the one wait on a `loading`/`evicting` entry) and an
   unload's drain return `error.Shutdown`; a request behind an unload otherwise hung the shutdown to exit 1.
+- **Every route asked after a shutdown answers the shutdown error**: `Scheduler.ensureLoaded`/`ensureLoadedFresh`
+  return `error.Shutdown` once one is asked, for a resident model too, and every route that holds or loads a model
+  (generation, Responses WebSocket turns, `/v1/load-model`) answers through one map, `server.sendModelRefusal`.
 - **A load or unload the inference thread never took undoes its marks**: a load's `LoadAttempt.end` returns its claimed
   entry and its `evicting` victims on every way out (a refusal at the queue, a shutdown), and an unload refused at the
   queue sets its model back to `ready`, or a request waiting on them waits forever.
