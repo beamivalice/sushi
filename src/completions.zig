@@ -215,14 +215,15 @@ pub fn handleCompletions(
     // handler passed a hardcoded 0 while still emitting a `logprobs` key — a
     // silently ignored field, which reads to a client as "this model has no
     // opinion" rather than "this server never asked".
-    const logprobs_n: u32 = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| if (i >= 0 and i <= request_parse.MAX_TOP_LOGPROBS) std.math.cast(u32, i).? else {
+    const asked_logprobs: ?request_parse.Logprobs = if (root.get("logprobs")) |v| switch (v) {
+        .integer => |i| if (i >= 0 and i <= request_parse.MAX_TOP_LOGPROBS) .{ .top = std.math.cast(u32, i).? } else {
             log.warn("POST /v1/completions -> 400 (logprobs out of range)\n", .{});
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'logprobs' must be an integer from 0 to 20", 400);
             return;
         },
-        else => 0,
-    } else 0;
+        else => null,
+    } else null;
+    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     if (echoRejectReason(root)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
@@ -342,12 +343,12 @@ pub fn handleCompletions(
     sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, asked_logprobs, cache_key, kv_quant_override) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .completions) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_drafter, enable_mtp, allow_batch_mtp, logprobs_n, cache_key, kv_quant_override) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, ignoreEosRequested(root), stop_sequences.items, model_name, enable_drafter, enable_mtp, allow_batch_mtp, asked_logprobs, cache_key, kv_quant_override) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .completions) catch {};
         };
@@ -426,10 +427,11 @@ fn handleNonStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    logprobs_n: u32,
+    asked_logprobs: ?request_parse.Logprobs,
     cache_key: u64,
     kv_quant_override: ?trunk.KVQuantConfig,
 ) !void {
+    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     var timer = Stopwatch.init(stream.io);
 
     // Spec dispatch: `requestSpecModes` (DFlash > MTP).
@@ -475,12 +477,12 @@ fn handleNonStreamingCompletion(
     // `null` unless the request asked: OpenAI omits the field's content rather
     // than shipping an empty object that reads as "no alternatives exist".
     var lp_offset_base: usize = 0;
-    const lp_json: []const u8 = if (logprobs_n > 0 and result.logprobs != null) lp: {
+    const lp_json: []const u8 = if (asked_logprobs != null and result.logprobs != null) lp: {
         // The tokens whose bytes the text kept: a stop's own tokens are cut from the text, and from the list.
         const lps = result.logprobs.?;
         const n = @min(result.token_ids.len, lps.len);
         const r = try listedBy(allocator, tok, result.token_ids[0..n], skip_special, final_text.len);
-        break :lp try formatCompletionsLogprobs(allocator, tok, result.token_ids[r.start..r.end], lps[r.start..r.end], &lp_offset_base);
+        break :lp try formatCompletionsLogprobs(allocator, tok, result.token_ids[r.start..r.end], lps[r.start..r.end], asked_logprobs.?.top, &lp_offset_base);
     } else "null";
     defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
 
@@ -532,10 +534,11 @@ fn handleStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    logprobs_n: u32,
+    asked_logprobs: ?request_parse.Logprobs,
     cache_key: u64,
     kv_quant_override: ?trunk.KVQuantConfig,
 ) !void {
+    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     const cmpl_id = nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io));
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
@@ -580,7 +583,8 @@ fn handleStreamingCompletion(
         .allocator = allocator,
         .tok = tok,
         .slot = slot_handle,
-        .enabled = logprobs_n > 0,
+        .enabled = asked_logprobs != null,
+        .top = if (asked_logprobs) |l| l.top else 0,
         .legacy = true,
     };
     defer lps.deinit();

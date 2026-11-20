@@ -25,6 +25,8 @@ pub const StreamLogprobs = struct {
     tok: *const Tokenizer,
     slot: ?*scheduler_mod.Slot,
     enabled: bool,
+    /// Alternatives listed beside each token (`request_parse.Logprobs.top`): the slot ranks at least one, the reply lists these.
+    top: u32,
     /// High-water mark in the slot's buffer (what we have copied out).
     cursor: usize = 0,
     /// Which noted tokens the reply returned text for.
@@ -113,9 +115,9 @@ pub const StreamLogprobs = struct {
         const ids = self.ids.items[r.start..r.end];
         const lps = self.entries.items[r.start..r.end];
         const json = if (self.legacy)
-            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, &self.text_offset)
+            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, self.top, &self.text_offset)
         else
-            try formatLogprobsObject(self.allocator, self.tok, ids, lps);
+            try formatLogprobsObject(self.allocator, self.tok, ids, lps, self.top);
         self.rendered = json;
         return json;
     }
@@ -203,6 +205,7 @@ pub fn formatCompletionsLogprobs(
     tok: *const Tokenizer,
     token_ids: []const u32,
     logprobs: []const sampler.LogprobResult,
+    top: u32,
     offset_base: *usize,
 ) ![]const u8 {
     var toks = std.ArrayList(u8).empty;
@@ -239,7 +242,7 @@ pub fn formatCompletionsLogprobs(
         offset += text.len;
 
         try tops.appendSlice(allocator, "{");
-        for (logprobs[i].top_logprobs, 0..) |t, j| {
+        for (logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)], 0..) |t, j| {
             if (j > 0) try tops.appendSlice(allocator, ",");
             const ttext = try tok.decode(allocator, &[_]u32{t.token_id});
             defer allocator.free(ttext);
@@ -268,6 +271,7 @@ pub fn formatLogprobsObject(
     tok: *const Tokenizer,
     token_ids: []const u32,
     logprobs: []const sampler.LogprobResult,
+    top: u32,
 ) ![]const u8 {
     var content_buf = std.ArrayList(u8).empty;
     defer content_buf.deinit(allocator);
@@ -276,7 +280,7 @@ pub fn formatLogprobsObject(
     const count = @min(token_ids.len, logprobs.len);
     for (0..count) |i| {
         if (i > 0) try content_buf.appendSlice(allocator, ",");
-        const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs);
+        const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)]);
         defer allocator.free(entry);
         try content_buf.appendSlice(allocator, entry);
     }
@@ -309,7 +313,7 @@ test "skipToContent keeps the content token when a multi-byte character splits a
     @memcpy(joined[lead.len..], cont);
     try std.testing.expectEqualStrings("é", joined);
 
-    var lps = StreamLogprobs{ .allocator = a, .tok = &tok, .slot = null, .enabled = true };
+    var lps = StreamLogprobs{ .allocator = a, .tok = &tok, .slot = null, .enabled = true, .top = 1 };
     defer lps.deinit();
     try lps.note(1, 1);
     try lps.note(2, 1);
@@ -355,7 +359,7 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     };
 
     var tbase: usize = 0;
-    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, &tbase);
+    const json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &lps, 20, &tbase);
     defer allocator.free(json);
 
     // Must be parseable at all — the control byte is the reason that matters.
@@ -451,7 +455,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     };
     const comp_lps = [_]sampler.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
     var tbase: usize = 0;
-    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, &tbase);
+    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, 20, &tbase);
     defer allocator.free(comp_json);
     try std.testing.expect(std.unicode.utf8ValidateSlice(comp_json));
     const comp_parsed = try std.json.parseFromSlice(std.json.Value, allocator, comp_json, .{});

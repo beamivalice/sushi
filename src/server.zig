@@ -2459,14 +2459,8 @@ pub fn handleChatCompletions(
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
-    // Parse logprobs: "logprobs": true, "top_logprobs": N (0-20)
-    const logprobs_n: u32 = blk: {
-        const lp = root.get("logprobs") orelse break :blk 0;
-        if (lp != .bool or !lp.bool) break :blk 0;
-        // logprobs=true without top_logprobs defaults to 0 (just the chosen token's logprob)
-        const tlp = root.get("top_logprobs") orelse break :blk 1;
-        break :blk if (request_parse.wholeNumber(tlp)) |n| @intCast(n) else 1;
-    };
+    const asked_logprobs = request_parse.chatLogprobs(root);
+    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
@@ -2854,13 +2848,13 @@ pub fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };

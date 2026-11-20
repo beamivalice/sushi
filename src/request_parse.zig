@@ -394,6 +394,26 @@ fn reasoningBudgetFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
 
 pub const MAX_TOP_LOGPROBS: i64 = 20;
 
+/// What a request asks of logprobs when it asks: `top` alternatives beside each sampled token's own logprob, 0 for
+/// the sampled token alone. Null, where a request carries one, is off: `top` 0 is not.
+pub const Logprobs = struct {
+    top: u32,
+
+    /// The engine's per-step count, which reads 0 as off: a request for the sampled token alone still ranks one
+    /// candidate, and the reply lists `top` of them.
+    pub fn engineN(self: Logprobs) u32 {
+        return @max(self.top, 1);
+    }
+};
+
+/// Chat's `logprobs: true` with its `top_logprobs` (absent or null: none; the range is `generationFieldFault`'s).
+pub fn chatLogprobs(root: std.json.ObjectMap) ?Logprobs {
+    const on = root.get("logprobs") orelse return null;
+    if (on != .bool or !on.bool) return null;
+    const top = root.get("top_logprobs") orelse return .{ .top = 0 };
+    return .{ .top = if (wholeNumber(top)) |n| @intCast(@max(n, 0)) else 0 };
+}
+
 /// The first bad value among the fields every generation surface reads the same way, as a message naming the
 /// field. A field that is absent or null is the default; a value of the wrong type or outside its range is
 /// refused, never clamped or read as absent. A `max_tokens` of 0 is an omission: the server fills the default.
@@ -1331,5 +1351,25 @@ test "toolResultIsError reads the flag, and disableParallelToolUse the Anthropic
         defer parsed.deinit();
         try testing.expectEqual(c.error_flag, toolResultIsError(parsed.value.object));
         try testing.expectEqual(c.no_parallel, disableParallelToolUse(parsed.value.object));
+    }
+}
+
+test "chat logprobs: true is on whatever top_logprobs says, 0 and absent included; only a missing true is off" {
+    const cases = [_]struct { body: []const u8, want: ?u32 }{
+        .{ .body = "{}", .want = null },
+        .{ .body = "{\"logprobs\":false,\"top_logprobs\":3}", .want = null },
+        .{ .body = "{\"top_logprobs\":3}", .want = null },
+        .{ .body = "{\"logprobs\":true}", .want = 0 },
+        .{ .body = "{\"logprobs\":true,\"top_logprobs\":null}", .want = 0 },
+        .{ .body = "{\"logprobs\":true,\"top_logprobs\":0}", .want = 0 },
+        .{ .body = "{\"logprobs\":true,\"top_logprobs\":20}", .want = 20 },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        const got = chatLogprobs(parsed.value.object);
+        try std.testing.expectEqual(c.want, if (got) |l| l.top else null);
+        // The engine reads 0 as off: a request that is on always asks it for at least one candidate.
+        if (got) |l| try std.testing.expect(l.engineN() >= 1);
     }
 }

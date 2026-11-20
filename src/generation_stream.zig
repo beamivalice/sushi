@@ -28,6 +28,7 @@ const request_policy = @import("request_policy.zig");
 const withEffortNoticeJson = request_policy.withEffortNoticeJson;
 const logprobs = @import("logprobs.zig");
 const listed_tokens = @import("listed_tokens.zig");
+const request_parse = @import("request_parse.zig");
 const StreamLogprobs = logprobs.StreamLogprobs;
 const formatLogprobsObject = logprobs.formatLogprobsObject;
 const io_util = @import("io_util.zig");
@@ -586,7 +587,7 @@ pub fn handleNonStreamingGeneration(
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
-    logprobs_n: u32,
+    asked_logprobs: ?request_parse.Logprobs,
     enable_thinking: bool,
     reasoning_budget: i32,
     enable_drafter: bool,
@@ -602,6 +603,7 @@ pub fn handleNonStreamingGeneration(
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
 ) !void {
+    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     // Phase A8: this handler owns the vision array on entry; ownership
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
     // it). Nulled before transfer so the early-return defer is a no-op.
@@ -797,7 +799,7 @@ pub fn handleNonStreamingGeneration(
         const r = contentTokenRange(allocator, tok, result.token_ids[0..n], final_text, content_text);
         const a = @min(r.start, n);
         const b = @min(@max(r.end, a), n);
-        logprobs_json = try formatLogprobsObject(allocator, tok, result.token_ids[a..b], lps[a..b]);
+        logprobs_json = try formatLogprobsObject(allocator, tok, result.token_ids[a..b], lps[a..b], if (asked_logprobs) |l| l.top else 0);
         logprobs_allocated = true;
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
@@ -1208,7 +1210,7 @@ pub fn handleStreamingGeneration(
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
-    logprobs_n: u32,
+    asked_logprobs: ?request_parse.Logprobs,
     enable_thinking: bool,
     reasoning_budget: i32,
     enable_drafter: bool,
@@ -1226,6 +1228,7 @@ pub fn handleStreamingGeneration(
     /// non-streaming.
     tokenize_ns: u64,
 ) !void {
+    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     // Vision array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer so
     // the early-return defer is a no-op.
@@ -1308,7 +1311,8 @@ pub fn handleStreamingGeneration(
         .allocator = allocator,
         .tok = tok,
         .slot = slot_handle,
-        .enabled = logprobs_n > 0,
+        .enabled = asked_logprobs != null,
+        .top = if (asked_logprobs) |l| l.top else 0,
     };
     defer lps.deinit();
 
