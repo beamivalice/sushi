@@ -1224,6 +1224,25 @@ pub const ModelRegistry = struct {
 
     /// Phase D: count of currently-loaded (`.ready` or `.evicting`) entries.
     /// Caller holds `mutex`. Used by the cap-check before starting a load.
+    /// What the count cap holds: models resident or being evicted, and those another load than `exclude_id`'s has
+    /// claimed, which turn resident when it ends. Caller holds `mutex`.
+    pub fn countHeldLocked(self: *const ModelRegistry, exclude_id: []const u8) u32 {
+        var n: u32 = self.countLoadedLocked();
+        var it = self.entries.valueIterator();
+        while (@constCast(&it).next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state == .loading and !std.mem.eql(u8, entry.id, exclude_id)) n += 1;
+        }
+        return n;
+    }
+
+    /// A load of another model than `entry` is in flight. Caller holds `mutex`.
+    pub fn otherLoadInFlightLocked(self: *const ModelRegistry, entry: *const LoadedModel) bool {
+        var it = self.entries.valueIterator();
+        while (@constCast(&it).next()) |entry_ptr| if (entry_ptr.* != entry and entry_ptr.*.state == .loading) return true;
+        return false;
+    }
+
     pub fn countLoadedLocked(self: *const ModelRegistry) u32 {
         var n: u32 = 0;
         var it = self.entries.valueIterator();
@@ -1421,9 +1440,9 @@ pub const ModelRegistry = struct {
             // Resident-after-plan = current minus what these victims free, plus
             // every in-flight reservation (including this load's own estimate).
             const projected_mem = (self.current_resident_bytes -| freed) + self.reserved_bytes;
-            // Count: .ready+.evicting now, minus the victims we'll drop, plus
+            // Count: every model held now, minus the victims we'll drop, plus
             // this load (currently `.loading`, becomes resident).
-            const projected_count = self.countLoadedLocked() - @as(u32, @intCast(n)) + 1;
+            const projected_count = self.countHeldLocked(exclude_id) - @as(u32, @intCast(n)) + 1;
             const mem_ok = self.max_resident_mem == 0 or projected_mem <= self.max_resident_mem;
             const count_ok = projected_count <= self.max_resident_models;
             if (mem_ok and count_ok) return n;
@@ -2153,6 +2172,33 @@ test "ModelRegistry: a startup load that fails reaches the waiting request by na
     try expectError(error.InsufficientMemory, w.got.?);
     try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
     reg.releaseStatus(e);
+}
+
+test "ModelRegistry: a cold load planned while another model's load still runs keeps --max-resident-models" {
+    const io = testing.io;
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 1, 0, null);
+    defer reg.deinit();
+    const a = try reg.registerStub("a", "/count-cap/a", 10);
+    const b = try reg.registerStub("b", "/count-cap/b", 10);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    reg.markReadyLocked(a, 10);
+    // A load of b claims it and plans: a is its victim, freed before b's load body runs.
+    try testing.expect(reg.tryBeginLoadLocked(b));
+    reg.reserveLoadLocked(b, 10);
+    var out: [4]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked("b", &out));
+    reg.finalizeEvictionLocked(a);
+    // A load of a claims it while b still loads, and plans.
+    try testing.expect(reg.tryBeginLoadLocked(a));
+    reg.reserveLoadLocked(a, 10);
+    const planned = reg.planEvictionsLocked("a", &out);
+    reg.markReadyLocked(b, 10);
+    if (planned != null) reg.markReadyLocked(a, 10) else reg.markUnloadedLocked(a);
+    const resident = reg.countLoadedLocked();
+    a.refcount.store(0, .release);
+    b.refcount.store(0, .release);
+    try testing.expect(resident <= reg.max_resident_models);
 }
 
 test "ModelRegistry: a refused load is unloaded, any other failure is stored, and a retrying request starts a new attempt after either" {

@@ -234,7 +234,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `settings.mtp.depth_source` names `--mtp-min-depth/--mtp-max-depth` when they bound the depth, and `adaptive` is false
   while equal values pin one depth.
 - A load refused by `--max-resident-models` (every resident model serving a request) is a 503 `resident_models_cap`
-  naming that flag, with `Retry-After`; `--max-resident-mem` is a 503 `out_of_memory` naming its own flag.
+  naming that flag, with `Retry-After`; `--max-resident-mem` is a 503 `out_of_memory` naming its own flag. The count
+  cap counts a model another load has claimed (`countHeldLocked`), and a cold load waits for another model's load in
+  flight before it plans its evictions, so a model switch queues behind it; a model still pinned by its requests then
+  refuses as above.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
   `mtp`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`, `qwen_cooler` (bool, the same for Qwen3.8 and `--qwen-mlx-engine`; each arch reads only its own key, `arch_flags.coolerSettingOf`, and another arch's key is ignored with a log line), `ds41_cooler` (bool, default true: DeepSeek-V4.1 decodes on Sushi Cooler; false decodes on MLX, as `--ds41-mlx-engine` pins; ignored with a log line on other archs, disabled with its reason on the page for a pack or Mac Cooler cannot serve), `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), `expert_cache_bias` (0..8, the twin of `--expert-cache-bias`, which wins; `ModelConfig.expertCacheBias` hands the load's own value to its expert engine and its prefix namespace; offered only to a DeepSeek-V4.1 STQ pack that streams), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as

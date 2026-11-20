@@ -1863,12 +1863,16 @@ pub const Scheduler = struct {
                         try self.registry.waitStateChangeLocked();
                         continue :wait_loop;
                     },
-                    .error_state => {
-                        if (!retry_failed) return ModelRegistry.loadErrorFromName(entry.error_name);
-                        // The stored failure stays until this attempt claims the slot, in the same hold.
+                    .unloaded, .error_state => {
+                        if (entry.state == .error_state and !retry_failed) return ModelRegistry.loadErrorFromName(entry.error_name);
+                        // Another model's load turns resident when it ends: plan after it, so a model switch queues
+                        // behind it instead of loading past the count cap. A stored failure stays until the claim.
+                        if (self.registry.otherLoadInFlightLocked(entry)) {
+                            try self.registry.waitStateChangeLocked();
+                            continue :wait_loop;
+                        }
                         break :wait_loop;
                     },
-                    .unloaded => break :wait_loop,
                 }
             }
             // Checked again under the mutex a download start holds while it enqueues, so the two never overlap.
@@ -1895,7 +1899,7 @@ pub const Scheduler = struct {
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
                 // the flag that moves it is not otherwise discoverable.
-                const count_cap = self.registry.countLoadedLocked() + 1 > self.registry.max_resident_models;
+                const count_cap = self.registry.countHeldLocked(entry.id) + 1 > self.registry.max_resident_models;
                 if (count_cap) {
                     log.err("Refusing to load {s}: --max-resident-models is {d} and {d} model(s) are resident, none evictable (each is serving a request). Retry when one ends, or raise the cap.\n", .{
                         entry.id, self.registry.max_resident_models, self.registry.countLoadedLocked(),

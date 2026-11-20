@@ -745,6 +745,88 @@ test "server: a model loaded beside the current one with no hot cache of its own
     try testing.expect(Scenario.seen > 0);
 }
 
+/// Holds the next load at its prefix-cache sizing (or, streamed, its expert-cache fit) until `released`: the load has
+/// claimed its model and freed its victims, and its body has not run.
+const LoadBodyHold = struct {
+    const Resolver = *const fn (*model_mod.ModelConfig, u64, scheduler_mod.BudgetRevise, *u64) u64;
+    var served: ?Resolver = null;
+    var fit_served: ?model_load.FitResolver = null;
+    var armed: std.atomic.Value(bool) = .init(false);
+    var held: std.atomic.Value(bool) = .init(false);
+    var released: std.atomic.Value(bool) = .init(false);
+    fn hold() void {
+        if (!armed.swap(false, .acq_rel)) return;
+        held.store(true, .release);
+        var waited: u32 = 0;
+        while (!released.load(.acquire) and waited < 60_000) : (waited += 1) {
+            var none = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&none, 1) catch {};
+        }
+    }
+    fn mem(cfg: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle: *u64) u64 {
+        hold();
+        return if (served) |f| f(cfg, requested, revise, idle) else requested;
+    }
+    fn fit(cfg: *const model_mod.ModelConfig, bytes: u64) ?bills.ExpertCacheRefusal {
+        hold();
+        return if (fit_served) |f| f(cfg, bytes) else null;
+    }
+    fn isHeld() bool {
+        return held.load(.acquire);
+    }
+};
+
+test "server: a cold load asked while another model's load runs keeps --max-resident-models" {
+    const ram_was = server_state.prefix_cache_ram_enabled;
+    defer server_state.prefix_cache_ram_enabled = ram_was;
+    server_state.prefix_cache_ram_enabled = true;
+    const Scenario = struct {
+        var held: u32 = 0;
+    };
+    try eachArch(4, .{ .tiny2 = true, .max_resident = 1 }, struct {
+        fn run() !void {
+            var b: [512]u8 = undefined;
+            gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "hi", 2, false)));
+            const sch = server_state.global_scheduler.?;
+            const reg = server_state.global_registry.?;
+            LoadBodyHold.held.store(false, .release);
+            LoadBodyHold.released.store(false, .release);
+            LoadBodyHold.armed.store(true, .release);
+            LoadBodyHold.served = sch.prefix_cache_mem_resolver;
+            sch.prefix_cache_mem_resolver = &LoadBodyHold.mem;
+            defer sch.prefix_cache_mem_resolver = LoadBodyHold.served;
+            LoadBodyHold.fit_served = sch.expert_cache_fit_resolver;
+            sch.expert_cache_fit_resolver = &LoadBodyHold.fit;
+            defer sch.expert_cache_fit_resolver = LoadBodyHold.fit_served;
+            var second = Background{ .path = "/v1/completions", .body = "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" };
+            const t2 = try std.Thread.spawn(.{}, Background.run, .{&second});
+            defer gpa.free(second.out);
+            if (!within(30_000, LoadBodyHold.isHeld)) {
+                // An arch whose load asks neither hook has no hold; the count below fails when no arch does.
+                LoadBodyHold.armed.store(false, .release);
+                LoadBodyHold.released.store(true, .release);
+                t2.join();
+                return;
+            }
+            Scenario.held += 1;
+            // tiny2's load evicted tiny and is held: a request for tiny finds it unloaded.
+            var first = Background{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}" };
+            const t1 = try std.Thread.spawn(.{}, Background.run, .{&first});
+            defer gpa.free(first.out);
+            var none = [_]std.posix.pollfd{};
+            _ = std.posix.poll(&none, 200) catch {};
+            LoadBodyHold.released.store(true, .release);
+            t2.join();
+            t1.join();
+            reg.mutex.lockUncancelable(reg.io);
+            const resident = reg.countLoadedLocked();
+            reg.mutex.unlock(reg.io);
+            if (resident > 1) return error.ResidentModelsCapBroken;
+        }
+    }.run);
+    try testing.expect(Scenario.held > 0);
+}
+
 /// The next WebSocket frame the server sends (unmasked), its payload; the caller frees.
 fn wsReadFrame(fd: std.posix.fd_t) ![]u8 {
     return (try wsReadFrameOf(fd)).payload;
