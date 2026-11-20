@@ -1696,18 +1696,25 @@ pub const Scheduler = struct {
     ///   error.Shutdown          — scheduler is shutting down.
     /// `report` (null: nobody answers from it) receives what this call's own load reports beside its error.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8, report: ?*LoadReport) !*LoadedModel {
+        if (self.shutdownAsked()) return error.Shutdown;
         return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, false, report));
     }
 
     /// `ensureLoaded` for an explicit load request: a model whose last load failed is tried again with the
     /// current settings and memory instead of answering from the stored failure.
     pub fn ensureLoadedFresh(self: *Scheduler, id_or_empty: []const u8, report: ?*LoadReport) !*LoadedModel {
+        if (self.shutdownAsked()) return error.Shutdown;
         return self.refuseAfterShutdown(try self.ensureLoadedWith(id_or_empty, true, report));
     }
 
-    /// A model held or loaded once a shutdown was asked, a resident one's too, answers the shutdown as every route does.
+    /// Every route asked after a shutdown answers it, whatever the model's state: checked at the entry of every model
+    /// call, and again on a model held or loaded as the shutdown came.
+    fn shutdownAsked(self: *const Scheduler) bool {
+        return self.registry.shutting_down.load(.acquire) or server_state.shutdown_requested.load(.acquire);
+    }
+
     fn refuseAfterShutdown(self: *Scheduler, lm: *LoadedModel) error{Shutdown}!*LoadedModel {
-        if (!self.registry.shutting_down.load(.acquire) and !server_state.shutdown_requested.load(.acquire)) return lm;
+        if (!self.shutdownAsked()) return lm;
         self.registry.releaseStatus(lm);
         return error.Shutdown;
     }
@@ -1932,6 +1939,7 @@ pub const Scheduler = struct {
         };
 
         try self.post(&self.load_queue, &req);
+        attempt.posted();
 
         // Block until the inference thread signals done.
         req.done_mu.lockUncancelable(self.io);
@@ -2009,6 +2017,7 @@ pub const Scheduler = struct {
     /// before committing. (`planEvictionsLocked` picks and marks under one
     /// hold instead; the sweep cannot, because the unload itself is slow.)
     pub fn unloadModelIfIdle(self: *Scheduler, id_or_empty: []const u8, idle_window_ms: ?i64) !void {
+        if (self.shutdownAsked()) return error.Shutdown;
         const entry = try self.registry.resolveEntry(id_or_empty);
         {
             self.registry.mutex.lockUncancelable(self.io);
@@ -6273,7 +6282,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     resident.refcount.store(0, .release);
 }
 
-test "ensureLoadedFresh: a model whose load failed is tried again, not answered from the failure" {
+test "ensureLoadedFresh: a model whose load failed is tried again, not answered from the failure, and a refusal keeps the failure" {
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -6306,10 +6315,12 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     // An ordinary request keeps failing fast, and the failure stays on /v1/models.
     try testing.expectError(error.InsufficientMemory, sch.ensureLoaded("b", null));
     try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
-    // An explicit load runs the whole attempt again: here it reaches the eviction gate and its own verdict.
+    // An explicit load runs the whole attempt again: here it reaches the eviction gate and its own verdict, which
+    // decides nothing about the model, so the stored failure stays as it was.
     try testing.expectError(error.ResidentModelsCapReached, sch.ensureLoadedFresh("b", null));
-    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
-    try testing.expect(target.error_name == null);
+    try testing.expectEqual(model_registry_mod.LoadState.error_state, target.state);
+    try testing.expectEqualStrings("OutOfMemory", target.error_name.?);
+    try testing.expectEqual(@as(u32, 0), target.refcount.load(.acquire));
     try testing.expect(reg.mutex.tryLock());
     reg.mutex.unlock(io);
     resident.refcount.store(0, .release);
@@ -6861,5 +6872,52 @@ test "a cold load whose files read runs out of memory is not stored, as a load's
     const got = sch.ensureLoaded("b", null);
     sch.allocator = testing.allocator;
     try testing.expectError(error.InsufficientMemory, got);
+    try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
+}
+
+test "a files-read failure is not stored on a model another request loaded and unloaded during the read" {
+    const io = testing.io;
+    if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    const C = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    // tokenizer.json is a FIFO that holds the files read until the test writes it.
+    var fifo_buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+    const fifo = try std.fmt.bufPrintSentinel(&fifo_buf, "{s}/tokenizer.json", .{dir}, 0);
+    if (C.mkfifo(fifo.ptr, 0o600) != 0) return error.MkfifoFailed;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const target = try reg.registerStub("b", dir, 10);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.load_queue.deinit(testing.allocator);
+    var call: ModelCall = .{ .sch = &sch, .id = "b", .load = true };
+    const t = try std.Thread.spawn(.{}, ModelCall.run, .{&call});
+    defer t.join();
+    var fd: c_int = -1;
+    for (0..20_000) |_| {
+        fd = std.c.open(fifo.ptr, .{ .ACCMODE = .WRONLY, .NONBLOCK = true });
+        if (fd >= 0) break;
+        const ts = std.c.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.c.nanosleep(&ts, null);
+    }
+    if (fd < 0) return error.LoadNeverReadItsTokenizer;
+    // Meanwhile another request loads the model, serves, and an unload frees it.
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(target));
+    reg.markReadyLocked(target, 10);
+    _ = target.refcount.fetchSub(1, .acq_rel);
+    reg.markEvictingLocked(target);
+    reg.finalizeEvictionLocked(target);
+    reg.mutex.unlock(io);
+    _ = std.c.write(fd, "not json", 8);
+    _ = std.c.close(fd);
+    try testing.expect(call.answeredWithin(20_000));
+    try testing.expectError(error.LoadFailed, call.got);
     try testing.expectEqual(model_registry_mod.LoadState.unloaded, target.state);
 }

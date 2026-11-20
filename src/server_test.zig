@@ -638,6 +638,36 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
     }.run);
 }
 
+test "server: a request asked after the shutdown for a model whose files fail to read answers the shutdown error" {
+    try eachArch(4, .{ .tiny2 = true }, struct {
+        fn run() !void {
+            gpa.free(try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}"));
+            const reg = server_state.global_registry.?;
+            const path = reg.entries.get("tiny2").?.path;
+            var dir = try std.Io.Dir.cwd().openDir(io, path, .{});
+            defer dir.close(io);
+            // A link (Flash-Next's tokenizer is the cut fixture's) goes first, so the shared fixture is never written.
+            dir.deleteFile(io, "tokenizer.json") catch {};
+            try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "not json" });
+            server.requestShutdown();
+            // The completion twice: the first must not store a failure the second answers from.
+            for ([_][2][]const u8{
+                .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
+                .{ "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}" },
+                .{ "/v1/load-model", "{\"model\":\"tiny2\"}" },
+                .{ "/v1/unload-model", "{\"model\":\"tiny2\"}" },
+            }) |q| {
+                const answer = try request("POST", q[0], q[1]);
+                defer gpa.free(answer);
+                if (!std.mem.startsWith(u8, answer, "HTTP/1.1 503") or std.mem.indexOf(u8, answer, @import("http.zig").shutting_down_message) == null) {
+                    std.debug.print("{s} {s} after the shutdown: {s}\n", .{ q[0], q[1], answer[0..@min(answer.len, 200)] });
+                    return error.NotTheShutdownError;
+                }
+            }
+        }
+    }.run);
+}
+
 test "server: a load-model asked after the shutdown answers the shutdown error, for a resident model or one to load" {
     try eachArch(4, .{ .tiny2 = true }, struct {
         fn run() !void {

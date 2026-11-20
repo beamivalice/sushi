@@ -156,6 +156,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **Stopping the server during an unload answers the requests waiting on that model**: a request sent while an unload
   waited for its model's last stream never got an answer once a shutdown came, and the server exited with an error
   after 35 s without its cleanup; it now gets the shutdown error at once.
+- **Every request after a shutdown is answered with the shutdown error**: a request for a model whose files fail to
+  read answered 500 and stored the failure, and unloading a model not in memory answered 200; and **a load of a failed
+  model refused for room or at the queue keeps the model's failure**, which it erased without loading.
 - **A load that fails after a setting was saved during it names its failure**: it answered a bare "Model load failed",
   or another load's failure.
 - **A model whose files could not be read for lack of memory is not marked failed**: every later request failed fast

@@ -311,6 +311,9 @@ pub const LoadedModel = struct {
     /// Counts the saves of a setting that reaches loading (`forgetLoadFailureLocked`): a `LoadAttempt` that read its
     /// settings at an older count never stores its failure.
     settings_gen: u64 = 0,
+    /// Counts the claims of this entry (`tryBeginLoadLocked`): an attempt whose files read failed stores the failure
+    /// only on an entry no other load claimed since it began.
+    claim_gen: u64 = 0,
 
     /// Token → bytes table backing the JSON grammar mask, built lazily on this
     /// entry's first schema-constrained request. Its lifetime matches
@@ -579,7 +582,12 @@ pub const LoadAttempt = struct {
     entry: *LoadedModel,
     /// `entry.settings_gen` before the attempt read model-settings.json.
     settings_gen: u64,
+    /// `entry.claim_gen` at the start, then after this attempt's own claim.
+    claim_gen: u64,
     claimed: bool = false,
+    /// The entry's stored failure, kept through the claim until the load is posted (`posted`): a refusal decides
+    /// nothing about the model, so it leaves the failure as it was.
+    kept_failure: bool = false,
     /// Marked `.evicting` by this attempt; once the inference thread takes the load they are its to free.
     victims: []const *LoadedModel = &.{},
     outcome: Outcome = .pending,
@@ -610,12 +618,24 @@ pub const LoadAttempt = struct {
         return false;
     }
 
-    /// Claims the entry, the caller holding `mutex`. An explicit retry's stored failure ends here, in the hold that
-    /// claims, never before a refusal at the claim.
+    /// Claims the entry, the caller holding `mutex`. An explicit retry's stored failure is kept until `posted`.
     pub fn claimLocked(self: *LoadAttempt) void {
-        if (self.entry.state == .error_state) self.registry.markUnloadedLocked(self.entry);
+        self.kept_failure = self.entry.state == .error_state;
+        if (self.kept_failure) self.entry.state = .unloaded;
         std.debug.assert(self.registry.tryBeginLoadLocked(self.entry));
         self.claimed = true;
+        self.claim_gen = self.entry.claim_gen;
+    }
+
+    /// The load is the inference thread's now: an explicit retry's stored failure ends here.
+    pub fn posted(self: *LoadAttempt) void {
+        if (!self.kept_failure) return;
+        const reg = self.registry;
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        if (self.entry.error_name) |n| reg.allocator.free(n);
+        self.entry.error_name = null;
+        self.kept_failure = false;
     }
 
     pub fn end(self: *LoadAttempt) void {
@@ -627,14 +647,18 @@ pub const LoadAttempt = struct {
             .ok => {},
             .pending, .shutdown => {
                 for (self.victims) |v| if (v.state == .evicting) reg.unmarkEvictingLocked(v);
-                if (self.claimed and entry.state == .loading) reg.markUnloadedLocked(entry);
+                if (self.claimed and entry.state == .loading) {
+                    if (self.kept_failure) reg.restoreFailureLocked(entry) else reg.markUnloadedLocked(entry);
+                }
             },
-            // Unclaimed, the failure is of the files read before the claim: stored only on an entry no other request
-            // has claimed or loaded since.
-            .failed => |err| if (isRefusal(err) or entry.settings_gen != self.settings_gen) {
-                if (self.claimed) reg.markUnloadedLocked(entry);
-            } else if (self.claimed or entry.state == .unloaded or entry.state == .error_state) {
-                reg.markErrorLocked(entry, @errorName(err));
+            // Stored only when nothing it read has changed since: no setting saved, no other load of the entry (for a
+            // files read, which claims nothing), no shutdown asked. Unclaimed, there is nothing to set back.
+            .failed => |err| {
+                // Unclaimed, the entry must also be at rest: a claim held now is another load's.
+                const at_rest = self.claimed or entry.state == .unloaded or entry.state == .error_state;
+                const store = !isRefusal(err) and entry.settings_gen == self.settings_gen and entry.claim_gen == self.claim_gen and
+                    at_rest and !reg.shutting_down.load(.acquire);
+                if (store) reg.markErrorLocked(entry, @errorName(err)) else if (self.claimed) reg.markUnloadedLocked(entry);
             },
         }
         if (self.claimed and !self.kept) reg.releaseRefLocked(entry);
@@ -994,7 +1018,8 @@ pub const ModelRegistry = struct {
     fn refreshFactsLocked(self: *ModelRegistry, e: *LoadedModel, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool) void {
         switch (e.state) {
             .unloaded => {},
-            .error_state => self.markUnloadedLocked(e),
+            // As a settings save does: an attempt reading the files meanwhile stores no failure over it.
+            .error_state => self.forgetLoadFailureLocked(e),
             else => return,
         }
         e.bytes_on_disk = bytes_on_disk;
@@ -1135,6 +1160,7 @@ pub const ModelRegistry = struct {
     pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
         if (entry.state != .unloaded) return false;
         entry.state = .loading;
+        entry.claim_gen +%= 1;
         _ = entry.refcount.fetchAdd(1, .acq_rel);
         entry.memory_context_refusal = null;
         self.state_cond.broadcast(self.io);
@@ -1162,6 +1188,13 @@ pub const ModelRegistry = struct {
         entry.bytes_resident = 0;
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = null;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// A claim that never reached the inference thread gives its entry back to the failure it kept. Caller holds `mutex`.
+    fn restoreFailureLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        self.releaseReservationLocked(entry);
+        entry.state = .error_state;
         self.state_cond.broadcast(self.io);
     }
 
@@ -1623,7 +1656,7 @@ pub const ModelRegistry = struct {
     pub fn beginAttempt(self: *ModelRegistry, entry: *LoadedModel) LoadAttempt {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return .{ .registry = self, .entry = entry, .settings_gen = entry.settings_gen };
+        return .{ .registry = self, .entry = entry, .settings_gen = entry.settings_gen, .claim_gen = entry.claim_gen };
     }
 
     /// Duped copy of the stored load-failure name for `id` (empty/"sushi"
@@ -2787,6 +2820,37 @@ test "ModelRegistry: rescan under a models root never absorbs test-fixtures or d
     try testing.expect(reg.peek("org/second") != null);
     try testing.expect(reg.peek("x") == null);
     try testing.expect(reg.peek("y") == null);
+}
+
+test "ModelRegistry: a finished download that refreshes a failed entry ends its failure, and an attempt that read the old files stores none" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/.pull-incomplete", .data = "" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rb[0..try tmp.dir.realPath(io, &rb)];
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, "{s}/beamster/P", .{root});
+    const e = reg.peek(try reg.registerByPath(io, path)) orelse return error.PartialPackNotListed;
+    reg.mutex.lockUncancelable(io);
+    reg.markErrorLocked(e, "FileNotFound");
+    reg.mutex.unlock(io);
+    // A request's files read starts on the partial pack, then the pull finishes.
+    var attempt = reg.beginAttempt(e);
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    try tmp.dir.deleteFile(io, "beamster/P/.pull-incomplete");
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try reg.absorbDownloadWithSettings(try std.fmt.bufPrint(&sb, "{s}/settings.json", .{root}), path);
+    try testing.expectEqual(LoadState.unloaded, e.state);
+    try testing.expectEqual(attempt.settings_gen + 1, e.settings_gen);
+    attempt.outcome = .{ .failed = error.FileNotFound };
+    attempt.end();
+    try testing.expectEqual(LoadState.unloaded, e.state);
+    try testing.expectEqual(@as(?[]const u8, null), e.error_name);
 }
 
 test "upstream bugfix: ModelRegistry: rescan clears a failed load so the completed dir can load again" {
