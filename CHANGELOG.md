@@ -27,6 +27,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A repeat start or reload of a model skips its served warm when its own pipeline manifest already made it**: the
   warm's requests ran on every DeepSeek load (1.7 s of 1.8 s on the tiny fixture) and every reload; the manifest now
   records the warm it ran under its pack's scope, chunk, drafter and MTP settings, and a load of that key skips it.
+- **`--log-level debug` names every term of a prefill's memory bill** (`[bill] prefill seq=… envelope=… gross=…`), so a
+  long-context request's cost is read off a live server instead of re-derived; a measured walkthrough on a 64 GB M1 Max
+  is in the Qwen performance notes. Thanks @catalinb13.
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 
