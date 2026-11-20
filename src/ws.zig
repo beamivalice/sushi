@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const http_head = @import("http_head.zig");
+const ByteBudget = @import("byte_budget.zig").ByteBudget;
 
 /// Magic GUID per RFC 6455 §1.3.
 const ws_magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -44,9 +45,9 @@ pub fn WsConn(comptime ConnT: type) type {
         /// (continuation) and != control is a protocol violation.
         in_message: ?std.ArrayList(u8) = null,
         in_opcode: Opcode = .continuation,
-        /// What the fragments read so far cost against `message_limit`: each at least one byte, so frames that carry
-        /// nothing still end at the cap.
-        charged: usize = 0,
+        /// What the fragments read so far cost: their payload against `message_limit`, their wire bytes against it
+        /// plus the framing allowance, so frames that carry nothing still end.
+        budget: ByteBudget = .init(0),
 
         pub fn init(conn: *ConnT, limit: *const std.atomic.Value(usize)) Self {
             return .{ .conn = conn, .limit = limit };
@@ -91,12 +92,12 @@ pub fn WsConn(comptime ConnT: type) type {
                     try buf.appendSlice(allocator, frame.payload);
                     self.in_message = buf;
                     self.in_opcode = frame.opcode;
-                    self.charged = @max(frame.payload.len, 1);
+                    self.budget = .init(self.message_limit);
+                    try self.charge(frame);
                 } else {
                     if (frame.opcode != .continuation) return error.WsProtocol;
                     var buf = &self.in_message.?;
-                    self.charged += @max(frame.payload.len, 1);
-                    if (self.charged > self.message_limit) return error.WsTooLarge;
+                    try self.charge(frame);
                     try buf.appendSlice(allocator, frame.payload);
                     if (frame.fin) {
                         const owned = try buf.toOwnedSlice(allocator);
@@ -106,6 +107,13 @@ pub fn WsConn(comptime ConnT: type) type {
                     }
                 }
             }
+        }
+
+        fn charge(self: *Self, frame: RawFrame) error{ WsTooLarge, WsFraming }!void {
+            self.budget.take(frame.wire, frame.payload.len) catch |err| return switch (err) {
+                error.TooLarge => error.WsTooLarge,
+                error.FramingOverAllowance => error.WsFraming,
+            };
         }
 
         pub fn writeText(self: *Self, payload: []const u8) !void {
@@ -148,6 +156,8 @@ const RawFrame = struct {
     opcode: Opcode,
     fin: bool,
     payload: []u8,
+    /// The frame's bytes on the wire: its head, extended length, mask and payload.
+    wire: usize,
 };
 
 fn readExact(conn: anytype, buf: []u8) !void {
@@ -194,7 +204,8 @@ fn readFrame(conn: anytype, allocator: std.mem.Allocator, limit: usize) !RawFram
     if (len_usize > 0) try readExact(conn, payload);
     for (payload, 0..) |*b, i| b.* ^= mask_key[i & 3];
 
-    return .{ .opcode = opcode, .fin = fin, .payload = payload };
+    const ext_len: usize = if (len7 == 126) 2 else if (len7 == 127) 8 else 0;
+    return .{ .opcode = opcode, .fin = fin, .payload = payload, .wire = 2 + ext_len + 4 + len_usize };
 }
 
 fn writeFrame(conn: anytype, opcode: Opcode, fin: bool, payload: []const u8) !void {

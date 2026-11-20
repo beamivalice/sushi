@@ -468,8 +468,11 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `error.Shutdown`), returns the bytes the reader holds alone and reads the socket only after it was seen readable,
   since a `readVec` past the held bytes blocks in the socket with no limit and no shutdown poll (a chunked upload sent
   whole got no answer); lint `conn-read-unbounded` keeps the reader and `takeReadable` inside it.
-- **Every byte a decoder takes counts toward a cap**: a chunked body takes a CR only right before its LF, and each
-  WebSocket fragment costs at least one byte of the message cap, so a flood of bytes that decode to nothing ends.
+- **Every byte a decoder takes counts toward a cap**: one `ByteBudget` for the chunked reader and the WebSocket reader
+  charges decoded payload against the cap (a message of exactly the cap is read) and raw bytes, framing included,
+  against the cap plus an eighth and 1 KiB (a chunk's size line and CRLFs, or a frame's head, is 6 bytes on a piece
+  under 256 bytes: pieces of 64 bytes and up always fit; smaller ones at the cap are refused by name, 413 or 1009), so
+  chunk extensions or empty fragments end near it; a chunked body takes a CR only right before its LF.
 - **The gate shuts when the shutdown is asked, not when it begins**: `refusingLocked` reads
   `server_state.shutdown_requested` too, since `beginShutdown` runs only when the accept loop next sees the flag (up to
   1 s later); a pending slot is neither admitted nor counted as work then, so the loop parks instead of spinning.

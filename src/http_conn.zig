@@ -19,6 +19,7 @@ const writeEffortNoticeHeader = request_policy.writeEffortNoticeHeader;
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
 const http_head = @import("http_head.zig");
+const ByteBudget = @import("byte_budget.zig").ByteBudget;
 const nowMsMonotonic = io_util.nowMsMonotonic;
 const testing = std.testing;
 const server_mod = @import("server.zig");
@@ -706,13 +707,14 @@ const ChunkDecoder = struct {
 
     const max_trailer_bytes = 8 * 1024;
 
-    /// Appends the decoded bytes of `input` to `out` (never past `cap`); returns how much of `input` it used.
-    fn feed(d: *ChunkDecoder, a: std.mem.Allocator, out: *std.ArrayList(u8), input: []const u8, cap: usize) error{ BadChunk, TooLarge, OutOfMemory }!usize {
+    /// Appends the decoded bytes of `input` to `out`, charging them to `budget`'s payload; returns how much of `input`
+    /// it used. The caller charges the raw bytes.
+    fn feed(d: *ChunkDecoder, a: std.mem.Allocator, out: *std.ArrayList(u8), input: []const u8, budget: *ByteBudget) (ByteBudget.Error || error{ BadChunk, OutOfMemory })!usize {
         var i: usize = 0;
         while (i < input.len and d.state != .done) {
             if (d.state == .data) {
                 const n = @min(d.remaining, input.len - i);
-                if (out.items.len +| n > cap) return error.TooLarge;
+                try budget.take(0, n);
                 try out.appendSlice(a, input[i..][0..n]);
                 i += n;
                 d.remaining -= n;
@@ -791,15 +793,25 @@ fn readChunkedRequest(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, head);
     var decoder: ChunkDecoder = .{};
+    // Framing counts too: raw bytes against the cap plus its framing allowance, so chunk extensions cannot run on.
+    var budget = ByteBudget.init(max_request_bytes -| head.len);
     var buf: [8 * 1024]u8 = undefined;
     var pending = leftover;
     var asked = false;
     while (true) {
-        _ = decoder.feed(allocator, &out, pending, max_request_bytes) catch |err| switch (err) {
+        const fed = if (budget.take(pending.len, 0)) |_| decoder.feed(allocator, &out, pending, &budget) else |e| e;
+        _ = fed catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.TooLarge => {
                 var msg_buf: [128]u8 = undefined;
                 const msg = payloadTooLargeMessage(&msg_buf, null, max_request_bytes);
+                log.warn("[http] 413: {s}\n", .{msg});
+                try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
+                out.deinit(allocator);
+                return .refused;
+            },
+            error.FramingOverAllowance => {
+                const msg = "The chunked body's framing (size lines and CRLFs) is over its allowance of an eighth of the request limit and 1 KiB: send chunks of 64 bytes or more";
                 log.warn("[http] 413: {s}\n", .{msg});
                 try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
                 out.deinit(allocator);
@@ -1540,6 +1552,7 @@ fn wsEndOf(err: anyerror, message_limit: usize, reason_buf: *[123]u8) WsEnd {
         error.WsClosed => .{ .code = null },
         error.Shutdown => .{ .code = 1001, .reason = "server shutting down" },
         error.WsProtocol => .{ .code = 1002, .reason = "protocol error" },
+        error.WsFraming => .{ .code = 1009, .reason = "fragments too small: framing over its allowance" },
         error.WsTooLarge => blk: {
             const msg = payloadTooLargeMessage(reason_buf, null, message_limit);
             log.warn("[http] WS 1009: {s}\n", .{msg});
@@ -2371,10 +2384,11 @@ test "chunked decoder: any split of the bytes decodes the same body" {
     var step: usize = 1;
     while (step <= wire.len) : (step += 1) {
         var d: ChunkDecoder = .{};
+        var budget = ByteBudget.init(1024);
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(t.allocator);
         var at: usize = 0;
-        while (at < wire.len) : (at += step) _ = try d.feed(t.allocator, &out, wire[at..@min(wire.len, at + step)], 1024);
+        while (at < wire.len) : (at += step) _ = try d.feed(t.allocator, &out, wire[at..@min(wire.len, at + step)], &budget);
         try t.expectEqualStrings("hello world0123456789", out.items);
         try t.expect(d.state == .done);
     }
@@ -2384,12 +2398,14 @@ test "chunked decoder: a bad size, an over-cap body and a bare line are refused"
     const t = std.testing;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(t.allocator);
+    var roomy = ByteBudget.init(1024);
     var bad: ChunkDecoder = .{};
-    try t.expectError(error.BadChunk, bad.feed(t.allocator, &out, "zz\r\nab\r\n", 1024));
+    try t.expectError(error.BadChunk, bad.feed(t.allocator, &out, "zz\r\nab\r\n", &roomy));
+    var small = ByteBudget.init(8);
     var big: ChunkDecoder = .{};
-    try t.expectError(error.TooLarge, big.feed(t.allocator, &out, "20\r\n" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\r\n", 8));
+    try t.expectError(error.TooLarge, big.feed(t.allocator, &out, "20\r\n" ++ "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" ++ "\r\n", &small));
     var stray: ChunkDecoder = .{};
-    try t.expectError(error.BadChunk, stray.feed(t.allocator, &out, "1\r\nab\r\n", 1024));
+    try t.expectError(error.BadChunk, stray.feed(t.allocator, &out, "1\r\nab\r\n", &roomy));
 }
 
 test "request framing: a chunked body is decoded and routed like its Content-Length twin" {
@@ -2842,9 +2858,9 @@ test "ws: a shutdown ends a fragmented message whose empty continuation frames a
     }
 }
 
-test "ws: empty continuation frames end at the message cap" {
+test "ws: empty continuation frames end at the framing allowance" {
     const r = try wsReadAgainst(.{ .sent = comptime clientFrame(0x01, "{"), .flood = comptime clientFrame(0x00, ""), .limit_ms = 0, .wait_ms = 3000, .ws_limit = 4096 });
-    if (!r.returned or r.err == null or r.err.? != error.WsTooLarge) {
+    if (!r.returned or r.err == null or r.err.? != error.WsFraming) {
         std.debug.print("an empty-continuation flood under a 4 KB cap: returned={any} err={s}\n", .{ r.returned, if (r.err) |e| @errorName(e) else "none" });
         return error.UncappedMessage;
     }
@@ -2957,4 +2973,100 @@ test "read: a HEAD refused by the reader (431, 413, 503 at a shutdown) carries n
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "ws: a message of exactly the cap, its last fragment empty, is read, never refused as over it" {
+    const a = std.testing.allocator;
+    const pay: [4096]u8 = @splat('m');
+    var bad: usize = 0;
+    for ([_][]const []const u8{
+        // 4096 bytes, then an empty final continuation.
+        &.{ comptime clientFrame(0x01, &pay), comptime clientFrame(0x80, "") },
+        // An empty first fragment, then 4096 bytes.
+        &.{ comptime clientFrame(0x01, ""), comptime clientFrame(0x80, &pay) },
+        // Control: 4096 bytes in two halves.
+        &.{ comptime clientFrame(0x01, pay[0..2048]), comptime clientFrame(0x80, pay[2048..]) },
+    }, 0..) |frames, i| {
+        const sent = try std.mem.concat(a, u8, frames);
+        defer a.free(sent);
+        const r = try wsReadAgainst(.{ .sent = sent, .limit_ms = 0, .ws_limit = 4096, .half_close = true, .wait_ms = 2000 });
+        if (r.messages != 1) {
+            std.debug.print("ws exact-cap message {d}: messages={d} err={s}\n", .{ i, r.messages, if (r.err) |e| @errorName(e) else "none" });
+            bad += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "read: chunk-size lines (extensions) count toward the request cap, so raw bytes stop near it" {
+    const a = std.testing.allocator;
+    const previous = server_state.max_request_bytes.swap(4096, .monotonic);
+    defer server_state.max_request_bytes.store(previous, .monotonic);
+    // Each chunk: an 80-byte size line (1 data byte and an extension), its byte, CRLF: 85 raw bytes per decoded byte.
+    const chunk = "1;" ++ @as([78]u8, @splat('e')) ++ "\r\nA\r\n";
+    var sent: std.ArrayList(u8) = .empty;
+    defer sent.deinit(a);
+    try sent.appendSlice(a, chunked_head);
+    // 200 decoded bytes, far under the 4 KB cap, in 17 KB of raw bytes: 4x the cap.
+    for (0..200) |_| try sent.appendSlice(a, chunk);
+    try sent.appendSlice(a, "0\r\n\r\n");
+    const r = try readAgainst(.{ .sent = sent.items, .limit_ms = 1000 });
+    defer freeRead(r);
+    if (r.outcome == .request) {
+        std.debug.print("chunk extensions: {d} raw bytes under a 4096 B cap routed as a request of {d} B (body {d} B)\n", .{ sent.items.len, r.len orelse 0, r.body.len });
+        return error.RawBytesUncapped;
+    }
+}
+
+/// A chunked body of `total` bytes in chunks of `size` (one or two hex digits), after `chunked_head`.
+fn chunkedOf(a: std.mem.Allocator, total: usize, comptime size: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(a, chunked_head);
+    const line = std.fmt.comptimePrint("{x}\r\n", .{size});
+    for (0..total / size) |_| {
+        try out.appendSlice(a, line);
+        try out.appendNTimes(a, 'c', size);
+        try out.appendSlice(a, "\r\n");
+    }
+    try out.appendSlice(a, "0\r\n\r\n");
+    return out.toOwnedSlice(a);
+}
+
+test "read: a chunked body at the cap in 64-byte chunks is read; in 32-byte chunks its framing is refused by name" {
+    const a = std.testing.allocator;
+    const previous = server_state.max_request_bytes.swap(chunked_head.len + 64 * 1024, .monotonic);
+    defer server_state.max_request_bytes.store(previous, .monotonic);
+    const fits = try chunkedOf(a, 64 * 1024, 64);
+    defer a.free(fits);
+    const r = try readAgainst(.{ .sent = fits, .limit_ms = 1000 });
+    defer freeRead(r);
+    try std.testing.expectEqual(@as(?usize, chunked_head.len + 64 * 1024), r.len);
+    const small = try chunkedOf(a, 64 * 1024, 32);
+    defer a.free(small);
+    const s = try readAgainst(.{ .sent = small, .limit_ms = 1000 });
+    defer freeRead(s);
+    if (s.len != null or !std.mem.startsWith(u8, s.reply, "HTTP/1.1 413 ") or std.mem.indexOf(u8, s.reply, "framing") == null) {
+        std.debug.print("32-byte chunks at the cap: len={?d} reply '{s}'\n", .{ s.len, s.reply[0..@min(s.reply.len, 200)] });
+        return error.FramingNotNamed;
+    }
+}
+
+test "ws: a message at the cap in 64-byte fragments is read; in 32-byte fragments its framing is refused by name" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 64, 32 }) |size| {
+        var frames: std.ArrayList(u8) = .empty;
+        defer frames.deinit(a);
+        const n = 64 * 1024 / size;
+        for (0..n) |i| {
+            const b0: u8 = (if (i == n - 1) @as(u8, 0x80) else 0) | @as(u8, if (i == 0) 0x01 else 0x00);
+            try frames.appendSlice(a, &.{ b0, 0x80 | @as(u8, @intCast(size)), 0, 0, 0, 0 });
+            try frames.appendNTimes(a, 'f', size);
+        }
+        const r = try wsReadAgainst(.{ .sent = frames.items, .limit_ms = 0, .ws_limit = 64 * 1024, .half_close = true, .wait_ms = 3000 });
+        const ok = if (size == 64) r.messages == 1 else r.messages == 0 and r.err != null and r.err.? == error.WsFraming;
+        if (!ok) {
+            std.debug.print("{d}-byte fragments at the cap: messages={d} err={s}\n", .{ size, r.messages, if (r.err) |e| @errorName(e) else "none" });
+            return error.FramingNotNamed;
+        }
+    }
 }

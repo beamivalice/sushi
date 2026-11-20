@@ -93,6 +93,7 @@ test {
     _ = @import("responses.zig");
     _ = @import("ws.zig");
     _ = @import("http_head.zig");
+    _ = @import("byte_budget.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
