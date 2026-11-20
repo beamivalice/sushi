@@ -2508,6 +2508,8 @@ pub const Trunk = struct {
             kv_cache.row_axis_verify_logged = true;
             log.info("[batched] row-axis mtp verify engaged (slots={d}, width={d})\n", .{ token_rows.len, mlx.getShape(token_rows[0])[1] });
         }
+        verify_moe.group_rows = token_rows.len;
+        defer verify_moe.group_rows = 1;
         if (row_ns) |ns| @memset(ns[0..token_rows.len], 0);
         self.verify_laps = .{};
         self.releaseJoinedVerifyLogits();
