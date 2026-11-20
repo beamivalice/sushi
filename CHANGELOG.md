@@ -66,6 +66,9 @@ Bugs found for 1.7.2 so far, as fixed on main / found, by severity and area (ref
 - **A DeepSeek-V4.1 request admitted while another request's borrowed decoder pools are out is no longer promised the
   memory they take back**: pools a long prefill released and had not yet read back counted as free, so a request
   admitted then could run short, or keep the pools from coming back, when they did.
+- **A DeepSeek-V4.1 request sent after a cancelled long prompt is no longer refused for the memory that prompt's pools
+  hold**: pools the cancelled request left lent were taken off the memory available and off what the next prefill may
+  borrow, so a retry near the advertised context was refused with a 400 though it fit.
 - **Continuing a cut reply of a long Qwen3.8 conversation near the memory limit is no longer refused**: a turn whose
   prompt was exactly the cached conversation (an assistant prefill continuing a reply cut at `max_tokens`) was refused
   for memory where a longer or shorter one took the cached conversation over; it now takes it over too.

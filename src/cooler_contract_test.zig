@@ -6357,3 +6357,94 @@ test "cooler contract: a DeepSeek decode forward reads back every pool its prefi
         try testing.expect(grew <= kept);
     }
 }
+
+test "cooler contract: a DeepSeek request admitted while an earlier borrower's pools stay lent has its margin moved by the pools once: held off, and not taken out of the lendable too" {
+    try mlx.requireGpu();
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const bills = @import("bills.zig");
+    const borrow = @import("dsv41/dsv41_borrow.zig");
+    var lease: LentLease = undefined;
+    try lease.open(dir, true);
+    defer lease.close();
+    const engine = lease.engine;
+    const config = &lease.ld.config;
+    const m = @import("dsv41/dsv41_state.zig").modelOf(arch_handle.trunk(lease.ld.h)).?;
+    const ceil_was = bills.static_ceiling_override;
+    defer bills.static_ceiling_override = ceil_was;
+    bills.static_ceiling_override = 256 << 30;
+    if (engine.layers.len - engine.borrow_from < 3) return error.SkipZigTest;
+    const last: u16 = @intCast(engine.layers.len - 1);
+    // The union workspace made before the reading at rest, as `lentHeldOff` does: only the pools move the readings.
+    _ = try engine.borrowLayer(last - 2);
+    defer engine.restoreLayer(last - 2) catch {};
+    // A prompt whose prefill working set passes what the pools lend at rest, so the prefill term binds the bill.
+    const on = @import("cooler_side.zig").onEngine(config);
+    var seq: u64 = 2048;
+    var chunk: u64 = 2048;
+    const mt: u32 = 8;
+    const borrowable_rest = bills.borrowableBytes(config);
+    while (m.cfg.chunkCapOn(on, chunk, seq) -| borrowable_rest <= m.cfg.forwardCap(borrow.verify_rows, seq + mt + borrow.verify_rows) + (64 << 20)) {
+        if (seq >= 1 << 20) return error.SkipZigTest;
+        seq *= 2;
+        chunk = @min(seq, 8192);
+    }
+    const need_rest = bills.prefillNeededAtChunk(config, seq, mt, 8, chunk, .{});
+    const avail_rest = bills.admissionAvailableNow(config);
+    const own_rest = @import("dsv41/dsv41_bill.zig").dsv41Headroom(config).bound();
+    var lent = try engine.borrowLayer(last);
+    lent += engine.borrowLayer(last - 1) catch |e| {
+        try engine.restoreLayer(last);
+        return e;
+    };
+    const need_lent = bills.prefillNeededAtChunk(config, seq, mt, 8, chunk, .{});
+    const avail_lent = bills.admissionAvailableNow(config);
+    const own_lent = @import("dsv41/dsv41_bill.zig").dsv41Headroom(config).bound();
+    const borrowable_lent = bills.borrowableBytes(config);
+    try engine.restoreLayer(last - 1);
+    try engine.restoreLayer(last);
+    const margin_rest: i64 = @as(i64, @intCast(avail_rest)) - @as(i64, @intCast(need_rest));
+    const margin_lent: i64 = @as(i64, @intCast(avail_lent)) - @as(i64, @intCast(need_lent));
+    errdefer std.debug.print("double hold: seq {d} chunk {d}: lent {d} B; borrowable {d} -> {d}; need {d} -> {d} (+{d}); available {d} -> {d} (-{d}); margin {d} -> {d} (moved {d}); lessee's own headroom {d} -> {d}\n", .{
+        seq, chunk, lent, borrowable_rest, borrowable_lent, need_rest, need_lent, need_lent -| need_rest, avail_rest, avail_lent, avail_rest -| avail_lent, margin_rest, margin_lent, margin_rest - margin_lent, own_rest, own_lent,
+    });
+    try testing.expect(lent > 0);
+    // The verdict on a box whose free RAM binds the live ceiling: the request fits at rest by half the lent bytes; with
+    // the pools lent, the RAM they left is free again (the reclaimable pages rise by what the footprint fell).
+    {
+        const gm = @import("gpu_mem.zig");
+        const status = @import("status.zig");
+        const avail_was = status.available_mem_override;
+        defer status.available_mem_override = avail_was;
+        const r0: u64 = 4 << 30;
+        status.available_mem_override = r0;
+        const a0 = bills.admissionAvailableNow(config);
+        const n0 = bills.prefillNeededAtChunk(config, seq, mt, 8, chunk, .{});
+        const fp_rest = gm.activeBytes() + gm.cacheBytes();
+        const r_rest: u64 = r0 + n0 + lent / 2 - a0;
+        status.available_mem_override = r_rest;
+        const fits_rest = bills.prefillNeededAtChunk(config, seq, mt, 8, chunk, .{}) <= bills.admissionAvailableNow(config);
+        const at_rest = bills.admissionAvailableNow(config);
+        _ = try engine.borrowLayer(last);
+        _ = try engine.borrowLayer(last - 1);
+        const fp_lent = gm.activeBytes() + gm.cacheBytes();
+        status.available_mem_override = r_rest + (fp_rest -| fp_lent);
+        const need_v = bills.prefillNeededAtChunk(config, seq, mt, 8, chunk, .{});
+        const at_lent = bills.admissionAvailableNow(config);
+        const fits_lent = need_v <= at_lent;
+        const lessee_room = @import("dsv41/dsv41_bill.zig").dsv41Headroom(config).bound();
+        try engine.restoreLayer(last - 1);
+        try engine.restoreLayer(last);
+        errdefer std.debug.print("double hold verdict: footprint {d} -> {d}; at rest available {d}, need {d}, fits {}; with the pools lent available {d}, need {d}, fits {}; the lessee's own headroom then {d} B (its prefill working set {d} B, the lendable left {d} B)\n", .{ fp_rest, fp_lent, at_rest, n0, fits_rest, at_lent, need_v, fits_lent, lessee_room, m.cfg.chunkCapOn(on, chunk, seq), borrowable_lent });
+        try testing.expect(fits_rest);
+        try testing.expect(fits_lent);
+    }
+    // Held off once (`lentHeldOff`: "a reading that credits no free buffer falls by those the release parked, none by
+    // the pools again"): the request's prefill runs over the released pools as their lessee (`leaseHolderHeadroomNow`
+    // counts them free), so its verdict may not move by the pools a second time through the lendable term.
+    try testing.expect(margin_rest - margin_lent < @as(i64, @intCast(lent / 2)));
+}

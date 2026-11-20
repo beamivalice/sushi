@@ -2616,6 +2616,7 @@ pub fn prefillNeededAtChunkUnlent(
 ) u64 {
     var own = config.*;
     own.expert_borrow_bytes = 0;
+    own.expert_lent_bytes = 0;
     return prefillNeededAtChunk(&own, seq, max_tokens, kv_bits, chunk, warm);
 }
 
@@ -2849,6 +2850,13 @@ pub fn warmFloorChunkBytes(config: *const model_mod.ModelConfig) u64 {
 /// The decoder pools a prefill may still release for its working set (`ModelConfig.expert_borrow_bytes`); 0 where the arch lends none.
 pub fn borrowableBytes(config: *const model_mod.ModelConfig) u64 {
     return @atomicLoad(u64, &config.expert_borrow_bytes, .monotonic);
+}
+
+/// What this model's next prefill takes its working set from: the pools it may still release and those already lent out
+/// of it, whose lessee it becomes (`leaseHolderHeadroomNow` counts them free). A request bill nets this out, and the
+/// live reading it is compared with holds the lent pools off (`promisedActive`): each pool is moved once.
+pub fn lendableBytes(config: *const model_mod.ModelConfig) u64 {
+    return borrowableBytes(config) +| @atomicLoad(u64, &config.expert_lent_bytes, .monotonic);
 }
 
 /// The width the next chunk runs at. Asymmetric because a Metal abort is uncatchable: HOLD
