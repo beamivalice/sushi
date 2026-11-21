@@ -1743,3 +1743,78 @@ test "cooler contract: the dearest decode regrow of a request holds beside the g
     };
     try testing.expectEqual(@as(usize, 0), over);
 }
+
+/// The MTP head's one-layer cache on the engine (its own scheme, `qwen4MtpHeadKvConfig`) holding `rows` rows, bound as the
+/// engine binds the head for the request of `seq` tokens and `max_tokens` reply (`DraftCache.reserve`).
+fn heldHeadCache(cfg: *const model_mod.ModelConfig, rows: usize, seq: u64, max_tokens: u64) !@import("kv_cache.zig").KVCache {
+    const KV = @import("kv_cache.zig");
+    const bills = @import("bills.zig");
+    var cache = try KV.KVCache.initWithConfig(testing.allocator, 1, @import("qwen4/qwen4_forward.zig").qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(cfg)));
+    errdefer cache.deinit();
+    cache.reserve(@intCast(@import("prefill_plan.zig").reservedPrefillTokens(cfg, seq, max_tokens, cfg.prefillStartWidth())));
+    cache.bound(@intCast(KV.KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(cfg), bills.speculativeRowsPastEnd(cfg, .{ .mtp_on = true }))));
+    try fillHeadCache(cfg, &cache, rows);
+    return cache;
+}
+
+/// Writes the head's layer from its stored rows to `rows`; the write grows the cache inside the graph, as the head's forward does.
+fn fillHeadCache(cfg: *const model_mod.ModelConfig, cache: *@import("kv_cache.zig").KVCache, rows: usize) !void {
+    const s = mlx.engine.stream();
+    const add: c_int = @intCast(rows - cache.seqLen(0));
+    if (add == 0) return;
+    var k = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k);
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_ones(&k, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(3)), add, @intCast(cfg.layerHeadDim(3)) }, 4, .bfloat16, s));
+    try mlx.check(mlx.mlx_ones(&v, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(3)), add, @intCast(cfg.layerVHeadDim(3)) }, 4, .bfloat16, s));
+    var view = try cache.update(0, k, v, s, 0);
+    view.deinit();
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    cache.appendEvalArrays(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+}
+
+test "cooler contract: the dearest decode regrow of the MTP head's cache holds beside the grown cache no more than the request's bill carries beyond it, at every prompt and reply" {
+    const KV = @import("kv_cache.zig").KVCache;
+    const bills = @import("bills.zig");
+    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    const cfg = @import("qwen4/qwen4_bill_test.zig").coolerFlashNext();
+    // The head's own scheme is dense unless the kv-quant lever is on: its buffers are K and V alone.
+    if (@import("qwen4/qwen4_forward.zig").qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(&cfg)).scheme != .off) return error.SkipZigTest;
+    const chunk: u64 = cfg.prefillStartWidth();
+    var over: usize = 0;
+    for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
+        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{ .mtp_on = true });
+        var cache = try heldHeadCache(&cfg, seq, seq, max_tokens);
+        defer cache.deinit();
+        const end = seq + max_tokens + bills.speculativeRowsPastEnd(&cfg, .{ .mtp_on = true });
+        // The head's decode: a row past a capacity step regrows its cache inside the forward's graph.
+        var dearest: u64 = 0;
+        var offset: usize = seq;
+        while (offset < end) {
+            mlx.engine.close();
+            mlx.engine.trim();
+            mlx.engine.resetPoolPeak(.process);
+            try fillHeadCache(&cfg, &cache, offset + 1);
+            mlx.engine.close();
+            const peak = mlx.engine.poolPeak(.process);
+            mlx.engine.trim();
+            dearest = @max(dearest, peak -| (mlx.engine.poolTotal() - mlx.engine.poolFree()));
+            offset = @min(KV.bufferCapacity(cache.entries[0].keys), end);
+            try fillHeadCache(&cfg, &cache, offset);
+        }
+        const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
+        // The peak is the cache's old copies and zero tails whole, which the bill prices at a sixteenth over their size classes.
+        if (dearest > billed or billed > dearest + billed / 16) {
+            over += 1;
+            std.debug.print("cooler contract: a {d}-token prompt + {d}: the head's dearest regrow holds {d} B past its grown cache, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), over);
+}

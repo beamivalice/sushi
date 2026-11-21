@@ -2337,9 +2337,10 @@ fn widestBufferRowBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 
     return widest;
 }
 
-/// What a decode step's regrow (`KVCache.growAhead`) holds past the grown cache the request's storage prices at its last
-/// row (`cacheStorage`): it rebuilds one buffer at a time, the kept rows joined to a zero tail of the rows it adds, so at
-/// its peak the widest buffer's old copy and that tail are alive beside the new buffer. Priced at the dearest regrow of the
+/// What a decode step's regrow holds past the grown cache the request's storage prices at its last row (`cacheStorage`).
+/// The trunk's (`KVCache.growAhead`) rebuilds one buffer at a time, the kept rows joined to a zero tail of the rows it adds,
+/// so at its peak the widest buffer's old copy and that tail are alive beside the new buffer; the MTP head's rebuilds inside
+/// its forward's graph, so its whole cache's old copies and tails are. Priced at the dearest regrow of the
 /// request: its cache starts from the capacity the restore holds (`warm.capacity_tokens`, else none), the prefill grows it
 /// to the prompt (`KVCache.heldRows`, the one rule the cache grows by) and every decode row past a capacity step grows it
 /// again until the request's last row. Nothing where a reservation already holds the whole reply, and on MLX.
@@ -2348,11 +2349,14 @@ fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens:
     const KV = trunk.KVCache;
     const hold = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm));
     const row = widestBufferRowBytes(config, kv_bits);
+    // The head's cache grows inside its forward's graph, which keeps every buffer's old copy and tail beside the new.
+    const head_row: u64 = if (headBilled(config, warm)) mtpHeadKvBytesPerToken(config) else 0;
     var cap = KV.heldRows(if (warm.matched_tokens > 0) warm.capacity_tokens else 0, seq, hold, &.{});
     var most: u64 = 0;
     while (cap < hold.end) {
         const grown = KV.heldRows(cap, cap + 1, hold, &.{});
-        most = @max(most, pooledCacheBytes(config, cap *| row) +| pooledCacheBytes(config, (grown - cap) *| row));
+        // The two never coexist: the trunk's grows ahead of its forward, the head's inside its own.
+        for ([_]u64{ row, head_row }) |bytes| most = @max(most, pooledCacheBytes(config, cap *| bytes) +| pooledCacheBytes(config, (grown - cap) *| bytes));
         cap = grown;
     }
     return most;
