@@ -36,6 +36,7 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   The chat's prompt-cache meter reads `/props` (`readPrefixCache`, the latest read wins) when the loaded set changes
   and after a clear, a cache-size save or a reload; `/props` has no prefix cache while nothing is loaded.
   Guards: the meter scenarios in `tests/test_webui_admin_ui.cjs`, `tests/test_webui_prefix_cache.cjs`.
+  The API-key overlay is modal only while the server asks for a key: the first authorized answer from any request hides it.
 
 ## Palette
 

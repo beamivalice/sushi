@@ -1864,6 +1864,16 @@ async function main() {
       const m = await chatMeter(page);
       assert.match(m.usage, /41\.0 \/ 50\.0/, `the budget is 50 GiB now; the meter reads "${m.usage}"`);
     });
+    await scenario('the API-key overlay goes once the server answers without a key', { path: '/models', setup: (s) => {
+      s.state.needKey = true;
+      for (const p of ['/v1/models', '/v1/settings', '/props', '/v1/prefix-cache', '/metrics.json', '/v1/tools']) s.state.hooks[p] = () => s.state.needKey ? { status: 401, contentType: 'application/json', headers: { 'WWW-Authenticate': 'Basic realm="sushi"' }, body: JSON.stringify({ error: { message: 'invalid api key' } }) } : null;
+    } }, async ({ page, server }) => {
+      await page.waitForFunction(() => !document.getElementById('keyOverlay').hidden);
+      server.state.needKey = false;
+      await settle(page, 35_000);
+      assert.equal(await page.evaluate(() => !document.getElementById('keyOverlay').hidden), false, 'the modal overlay is gone');
+      assert.equal(await page.evaluate(() => document.getElementById('appShell').inert), false, 'and the page takes input again');
+    });
 
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
     console.log('Web UI admin views (browser): passed');

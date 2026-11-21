@@ -1239,6 +1239,8 @@ async function api(path, options = {}) {
   // "omit": the server's 401 carries a Basic challenge that would open the browser's own login box.
   const response = await fetch(path, { ...options, headers, credentials: "omit", cache: "no-store" });
   if (response.status === 401) showKeyOverlay(apiKey ? "That key was not accepted. Check it and try again." : "");
+  // The server answered a request: whatever it asked for, it asks no more (it restarted without --api-key, or the key was taken).
+  else if (response.ok) hideKeyOverlay();
   return response;
 }
 async function apiJson(path, options = {}) {
@@ -1256,6 +1258,10 @@ function showKeyOverlay(error) {
   $("appShell").inert = true;
   $("keyInput").focus();
 }
+function hideKeyOverlay() {
+  $("keyOverlay").hidden = true;
+  $("appShell").inert = false;
+}
 $("keyForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const key = $("keyInput").value.trim();
@@ -1268,8 +1274,7 @@ $("keyForm").addEventListener("submit", async (event) => {
   apiKey = key;
   dropStore("sushi-api-key");
   writeStore("sushi-api-key", key, !$("keyRemember").checked);
-  $("keyOverlay").hidden = true;
-  $("appShell").inert = false;
+  hideKeyOverlay();
   renderForgetKey();
   window.sushiAdmin?.refresh();
   await refreshModels();

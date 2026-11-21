@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The web UI's API-key box closes by itself once the server stops asking for a key** (a server restarted without `--api-key`): it stayed modal over a page that was answering again.
 - **A thinking-effort cap saved on Settings reaches the chat's Thinking budget box**: the box kept the cap it had filled in and the next request ran under the old one; it now takes the new cap (or empties when the cap is removed) unless you typed a value over it.
 - **The chat's prompt-cache meter follows the server**: it stayed on its old reading after Clear all caches, a saved cache size or an unload (where it kept showing a cache that was gone) until the next chat turn or five minutes; it now re-reads when the loaded model changes and after each of those actions.
 - **A pack that finished downloading reaches the Models list and the chat's picker within a few seconds**: the page asked for the model list once when the download turned done, and a pack the server registered a moment later stayed missing for up to 30 s; it now asks again until the model is listed (and, for an Update, until the update badge is gone).
