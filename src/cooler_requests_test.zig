@@ -1004,3 +1004,209 @@ test "cooler contract: three DeepSeek DSpark requests decoding at once run as jo
         try testing.expect(together.last_end_rounds > together.last_alone_rounds);
     }
 }
+
+/// Requests through one scheduler as serve runs them: each prefilled at its tick, then every live row ticked together
+/// in one `runDecodeTick`. A row's tokens are what it published; the planner's counts are its own.
+const Group = struct {
+    const Req = struct {
+        prompt: []const u32,
+        max: u32,
+        mtp: bool = true,
+        sampling: SamplingParams = .{ .temperature = 0 },
+        /// Submitted once this many ticks have run (0: before the first).
+        at_tick: u32 = 0,
+        logprobs_n: u32 = 0,
+        /// An M-RoPE table of text positions, as a request with an image builds (the row's tokens are not compared).
+        mrope: bool = false,
+        /// Another model's entry on the same scheduler; null: the served one.
+        entry: ?*@import("model_registry.zig").LoadedModel = null,
+    };
+
+    const Out = struct {
+        published: [8]std.ArrayList(u32) = @splat(.empty),
+        failed: [8]?[]const u8 = @splat(null),
+        ticks: u32 = 0,
+        /// Per row: the planner's plain ticks, prime ticks and speculative rounds.
+        planner: [8][3]u32 = @splat(.{ 0, 0, 0 }),
+
+        fn deinit(self: *Out) void {
+            for (&self.published) |*t| t.deinit(testing.allocator);
+        }
+    };
+
+    fn run(sv: *Served, reqs: []const Req) !Out {
+        const a = testing.allocator;
+        const scheduler = Served.scheduler;
+        const sch = &sv.sch;
+        sch.queue_cap = @intCast(reqs.len + 1);
+        var slots: [8]*scheduler.Slot = undefined;
+        var made: usize = 0;
+        var out: Out = .{};
+        errdefer out.deinit();
+        defer {
+            for (slots[0..made]) |slot| sch.complete(slot);
+            for (sch.cleanup_queue.items) |s| s.deinit();
+            sch.cleanup_queue.clearRetainingCapacity();
+        }
+        var tick: u32 = 0;
+        while (true) : (tick += 1) {
+            while (made < reqs.len and reqs[made].at_tick <= tick) {
+                const r = reqs[made];
+                const entry = r.entry orelse sv.entry;
+                const head = @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(entry.handle.?), true, null);
+                var table: ?[]i32 = null;
+                if (r.mrope) {
+                    const t = try a.alloc(i32, 3 * r.prompt.len);
+                    for (0..3) |d| for (0..r.prompt.len) |i| {
+                        t[d * r.prompt.len + i] = @intCast(i);
+                    };
+                    table = t;
+                }
+                const slot = try sch.submit(.{ .model = entry, .prompt_ids = r.prompt, .sampling = r.sampling, .eos_token_ids = &.{}, .max_tokens = r.max, .enable_mtp = r.mtp, .mtp = if (r.mtp) head else null, .logprobs_n = r.logprobs_n, .mrope_pos = table, .mrope_total = r.prompt.len });
+                slots[made] = slot;
+                _ = sch.pending.orderedRemove(0);
+                try scheduler.runPrefill(sch, slot);
+                made += 1;
+                if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(a, slot);
+            }
+            var live: [8]*scheduler.Slot = undefined;
+            var k: usize = 0;
+            for (slots[0..made]) |s| if (s.joinsTick()) {
+                live[k] = s;
+                k += 1;
+            };
+            if (k == 0 and made == reqs.len) break;
+            if (k > 0) {
+                try scheduler.runDecodeTick(sch, live[0..k]);
+                scheduler.cullDecoding(sch);
+            }
+            if (tick > 4000) return error.TooManyTicks;
+        }
+        out.ticks = tick;
+        for (slots[0..made], 0..) |s, i| {
+            out.failed[i] = s.error_code;
+            if (s.legacy_gen) |*g| out.planner[i] = .{ g.mtp_planner_plain_ticks, g.mtp_planner_prime_ticks, g.mtp_planner_spec_rounds };
+            try out.published[i].appendSlice(a, s.out_buf.items);
+        }
+        return out;
+    }
+
+    /// The request alone, plain, on a fresh scheduler: the tokens a row in company must say.
+    fn solo(ld: *Load, dir: []const u8, req: Req) !std.ArrayList(u32) {
+        var sv: Served = undefined;
+        try sv.init(ld, dir);
+        defer sv.deinit();
+        var one = [_]Req{.{ .prompt = req.prompt, .max = req.max, .mtp = false, .sampling = req.sampling, .logprobs_n = req.logprobs_n }};
+        var o = try run(&sv, &one);
+        defer o.deinit();
+        if (o.failed[0]) |e| {
+            std.debug.print("cooler contract: the solo request failed ({s})\n", .{e});
+            return error.SoloFailed;
+        }
+        var got: std.ArrayList(u32) = .empty;
+        try got.appendSlice(testing.allocator, o.published[0].items);
+        return got;
+    }
+
+    /// Every row says its solo tokens.
+    fn expectSolo(ld: *Load, dir: []const u8, reqs: []const Req, got: *const Out) !void {
+        for (reqs, 0..) |r, i| {
+            var want = try solo(ld, dir, r);
+            defer want.deinit(testing.allocator);
+            if (got.failed[i]) |e| {
+                std.debug.print("cooler contract: row {d} failed ({s})\n", .{ i, e });
+                return error.RequestFailed;
+            }
+            if (std.mem.indexOfDiff(u32, want.items, got.published[i].items)) |at| {
+                std.debug.print("cooler contract: row {d} differs from its solo tokens at {d}\n", .{ i, at });
+                return error.RowDiffersFromSolo;
+            }
+        }
+    }
+};
+
+test "cooler contract: a plain request, or one near its token budget, beside long speculative rows leaves them the planner's speculation" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var bufs: [3][120]u32 = undefined;
+            for (&bufs, 0..) |*b, r| for (b, 0..) |*t, i| {
+                t.* = ids[(i * (r + 3) + 5 * r + 1) % ids.len];
+            };
+            // A speculative third row is the control: the long rows speculate beside it. A plain third row cannot
+            // speculate, and a short-budget one is always under the 96 tokens a calibration round needs.
+            const thirds = [_]Group.Req{
+                .{ .prompt = bufs[2][0..51], .max = 240 },
+                .{ .prompt = bufs[2][0..51], .max = 240, .mtp = false },
+            };
+            for (thirds, 0..) |third, ti| {
+                var sv: Served = undefined;
+                try sv.init(&ld, dir);
+                defer sv.deinit();
+                const set = [_]Group.Req{ .{ .prompt = bufs[0][0..23], .max = 200 }, .{ .prompt = bufs[1][0..37], .max = 200 }, third };
+                var got = try Group.run(&sv, &set);
+                defer got.deinit();
+                errdefer std.debug.print("cooler contract: third row {s}: planner plain/prime/spec {any}\n", .{ if (ti == 0) "speculative" else "plain", got.planner[0..3] });
+                try testing.expect(got.planner[0][2] > 0);
+                try testing.expect(got.planner[1][2] > 0);
+                try Group.expectSolo(&ld, dir, &set, &got);
+            }
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var shorts: [8]Group.Req = undefined;
+            shorts[0] = .{ .prompt = bufs[0][0..23], .max = 200 };
+            shorts[1] = .{ .prompt = bufs[1][0..37], .max = 200 };
+            for (shorts[2..], 0..) |*r, k| r.* = .{ .prompt = bufs[2][k .. 40 + k], .max = 40, .at_tick = @intCast(k * 40) };
+            var got = try Group.run(&sv, &shorts);
+            defer got.deinit();
+            errdefer std.debug.print("cooler contract: short-budget rows beside: planner plain/prime/spec {any}\n", .{got.planner[0..2]});
+            try testing.expect(got.planner[0][2] > 0);
+            try testing.expect(got.planner[1][2] > 0);
+            try Group.expectSolo(&ld, dir, shorts[0..2], &got);
+        }
+    }.run);
+}
+
+test "cooler contract: a request that cannot join the planner's tick leaves the rows that can their speculation" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var bufs: [3][700]u32 = undefined;
+            for (&bufs, 0..) |*b, r| for (b, 0..) |*t, i| {
+                t.* = ids[(i * (r + 3) + 5 * r + 1) % ids.len];
+            };
+            // Each third row has a reason of its own to decode outside the planner: a penalty its plain tick does not
+            // sample, logprobs it does not return, a position table it does not read, a context so much longer than
+            // its neighbours' that padding them to it wastes the verify.
+            const thirds = [_]struct { name: []const u8, req: Group.Req }{
+                .{ .name = "penalty", .req = .{ .prompt = bufs[2][0..51], .max = 120, .sampling = .{ .temperature = 0, .presence_penalty = 0.5 } } },
+                .{ .name = "logprobs", .req = .{ .prompt = bufs[2][0..51], .max = 120, .mtp = false, .logprobs_n = 3 } },
+                .{ .name = "mrope", .req = .{ .prompt = bufs[2][0..51], .max = 120, .mrope = true } },
+                .{ .name = "pad waste", .req = .{ .prompt = bufs[2][0..650], .max = 120 } },
+            };
+            var bad: u32 = 0;
+            for (thirds) |third| {
+                var sv: Served = undefined;
+                try sv.init(&ld, dir);
+                defer sv.deinit();
+                const set = [_]Group.Req{ .{ .prompt = bufs[0][0..23], .max = 200 }, .{ .prompt = bufs[1][0..37], .max = 200 }, third.req };
+                var got = try Group.run(&sv, &set);
+                defer got.deinit();
+                if (got.planner[0][2] == 0 or got.planner[1][2] == 0) {
+                    std.debug.print("cooler contract: a {s} row beside: planner plain/prime/spec {any}\n", .{ third.name, got.planner[0..3] });
+                    bad += 1;
+                }
+                Group.expectSolo(&ld, dir, set[0..2], &got) catch |e| {
+                    std.debug.print("cooler contract: a {s} row beside: {s}\n", .{ third.name, @errorName(e) });
+                    bad += 1;
+                };
+            }
+            try testing.expectEqual(@as(u32, 0), bad);
+        }
+    }.run);
+}

@@ -122,6 +122,18 @@ pub fn sortByModel(comptime T: type, items: []T) void {
     }.lt);
 }
 
+/// Moves the items `want` takes to the front, both parts in their order; returns how many it took. A permutation, so a
+/// caller's slice still holds every item it held.
+pub fn takeFront(comptime T: type, items: []T, ctx: anytype, comptime want: fn (@TypeOf(ctx), T) bool) usize {
+    var taken: usize = 0;
+    for (0..items.len) |i| {
+        if (!want(ctx, items[i])) continue;
+        std.mem.rotate(T, items[taken .. i + 1], i - taken);
+        taken += 1;
+    }
+    return taken;
+}
+
 /// The end of the run that starts at `start` and shares its `model` (items sorted by it).
 pub fn modelRunEnd(comptime T: type, items: []const T, start: usize) usize {
     var end = start + 1;
@@ -864,4 +876,21 @@ test "decode share: 0.25 owes a third of the chunk time in ticks" {
     const r = runOwedDecodeTicks(0.25, 3000 * ms, 10 * ms, &f, FakeDecodeTicks.tick);
     try testing.expectEqual(@as(u32, 100), r.ticks);
     try testing.expectEqual(@as(u64, 1000 * ms), r.spent_ns);
+}
+
+test "takeFront moves the taken items to the front in their order and keeps every item" {
+    var items = [_]u8{ 1, 2, 3, 4, 5, 6 };
+    const odd = struct {
+        fn want(_: void, x: u8) bool {
+            return x % 2 == 1;
+        }
+    }.want;
+    try testing.expectEqual(@as(usize, 3), takeFront(u8, &items, {}, odd));
+    try testing.expectEqualSlices(u8, &.{ 1, 3, 5, 2, 4, 6 }, &items);
+    var none = [_]u8{ 2, 4 };
+    try testing.expectEqual(@as(usize, 0), takeFront(u8, &none, {}, odd));
+    try testing.expectEqualSlices(u8, &.{ 2, 4 }, &none);
+    var all = [_]u8{ 1, 3 };
+    try testing.expectEqual(@as(usize, 2), takeFront(u8, &all, {}, odd));
+    try testing.expectEqualSlices(u8, &.{ 1, 3 }, &all);
 }

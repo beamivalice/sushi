@@ -250,8 +250,8 @@ var planner_depth_two_reject_logged = false;
 
 const ProbeSource = enum { calibrate, recovery };
 
-/// Widths for a calibration or recovery probe round, priced against the plain
-/// tick. False leaves `decision` untouched: no candidate, no price, or over budget.
+/// Widths for a calibration or recovery probe round, priced against the plain tick. False leaves `decision`
+/// untouched: no row can probe, no price, or over budget.
 fn planProbe(
     prices: *PlannerPrices,
     active: []*Slot,
@@ -261,13 +261,18 @@ fn planProbe(
 ) bool {
     const zero_widths: [Planner.MAX_ROWS]u8 = @splat(0);
     var candidate: [Planner.MAX_ROWS]u8 = @splat(0);
+    var probing = false;
     for (active, rows, 0..) |slot, row, i| {
         const gen = &slot.legacy_gen.?;
+        // A row that cannot probe (a plain row, a room of 1, a budget under the probe's floor) rides the round plain;
+        // the rows that can still calibrate.
         candidate[i] = switch (source) {
             .calibrate => Planner.probeWidth(gen.mtp_planner_probes, gen.max_tokens -| gen.completion_tokens, row.cap),
             .recovery => gen.mtp_planner_recovery.width(gen.completion_tokens, gen.max_tokens -| gen.completion_tokens, row.cap, gen.mtp_planner_probes),
-        } orelse return false;
+        } orelse 0;
+        probing = probing or candidate[i] > 0;
     }
+    if (!probing) return false;
     const plain = prices.price(zero_widths[0..active.len]) orelse return false;
     const estimate = prices.probeEstimate(candidate[0..active.len], plain);
     var latency_limit: f32 = std.math.floatMax(f32);
@@ -296,38 +301,88 @@ fn plannerRowCap(gen: *const Generator) u32 {
     return if (thinkBoundDraftLimit(gen)) |limit| @min(cap, limit) else cap;
 }
 
-pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
-    if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
-    const xfm = arch_handle.trunk(active[0].model.handle orelse return false);
-    if (!arch_state.rowVerify(&xfm.arch_state) or arch_state.headCache(&xfm.arch_state) == null) return false;
-    if (active.len == 1) {
-        const gen = if (active[0].legacy_gen) |*g| g else return false;
-        if (!gen.mtp_planner_owned) return false;
+/// Whether a slot can be a row of the planner's tick. Each of these is the slot's own: the rows that can still group,
+/// and it decodes in the regular path beside them.
+fn plannerRowFits(sch: *const Scheduler, slot: *Slot) bool {
+    // A request that opted out of batched MTP, and a penalty neither the plain batched tick nor the head tick's row
+    // samples.
+    if (!slot.allow_batch_mtp or sampler.penaltyActive(slot.sampling)) return false;
+    const gen = if (slot.legacy_gen) |*g| g else return false;
+    // M-RoPE positions are a table the grouped rows do not read.
+    if (arch_state.mropeOf(&gen.ctx.arch_ctx) != null) return false;
+    // Logprobs, a grammar, a forced call, a head release still to land: a slot that is neither a plain batchable row
+    // nor an MTP row the planner groups.
+    const why = sch.batchVerdict(slot);
+    return why == .ok or (why == .spec_active and slotMtpGroupable(slot));
+}
+
+/// The rows a pad-waste cap keeps: those no longer than `longest`, the ties at it only while `room` lasts.
+const PadWasteKeep = struct {
+    longest: u32,
+    room: usize,
+
+    fn keeps(self: *PadWasteKeep, slot: *Slot) bool {
+        const len: u32 = @intCast(slot.moe_seq_offset);
+        if (len < self.longest) return true;
+        if (len > self.longest or self.room == 0) return false;
+        self.room -= 1;
+        return true;
     }
+};
+
+/// Moves the rows that ride the planner's tick to the front of `active` and returns how many: the rows that fit
+/// (`plannerRowFits`), and of those the ones whose contexts pad no more than the batched kernel's cap lets one verify
+/// waste (`batchedKvKeepCount`), the longest left to the regular path.
+fn plannerRows(sch: *const Scheduler, active: []*Slot) usize {
+    const n = sched_policy.takeFront(*Slot, active, sch, plannerRowFits);
+    if (n < 2) return n;
+    var lens: [Planner.MAX_ROWS]u32 = undefined;
+    if (n > lens.len) return n;
+    for (active[0..n], 0..) |slot, i| lens[i] = @intCast(slot.moe_seq_offset);
+    std.sort.insertion(u32, lens[0..n], {}, std.sort.asc(u32));
+    const keep = batchedKvKeepCount(lens[0..n]);
+    if (keep == n) return n;
+    if (keep == 0) return 0;
+    var cap: PadWasteKeep = .{ .longest = lens[keep - 1], .room = keep };
+    for (lens[0..keep]) |len| {
+        if (len < cap.longest) cap.room -= 1;
+    }
+    return sched_policy.takeFront(*Slot, active[0..n], &cap, PadWasteKeep.keeps);
+}
+
+/// The planner's tick for the rows of `active` that can ride it, which it moves to the front of `active`; returns
+/// how many it ticked (0: the planner declined, and every row is the regular path's).
+pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!usize {
+    if (!Planner.enabled() or active.len == 0) return 0;
+    const xfm = arch_handle.trunk(active[0].model.handle orelse return 0);
+    if (!arch_state.rowVerify(&xfm.arch_state) or arch_state.headCache(&xfm.arch_state) == null) return 0;
+    for (active) |slot| if (slot.model != active[0].model) return 0;
+    const n = plannerRows(sch, active);
+    if (n == 0 or n > Planner.MAX_ROWS) return 0;
+    if (n == 1) {
+        const gen = &active[0].legacy_gen.?;
+        if (!gen.mtp_planner_owned) return 0;
+    }
+    return if (try plannerTickRows(sch, active[0..n])) n else 0;
+}
+
+/// One planner tick for `active`, rows that all fit and share a model.
+fn plannerTickRows(sch: *Scheduler, active: []*Slot) anyerror!bool {
     var rows: [Planner.MAX_ROWS]Planner.Row = undefined;
-    var lenses: [Planner.MAX_ROWS]u32 = undefined;
     var has_mtp = false;
     var pending_pipeline = false;
     var pending_draft = false;
     for (active, 0..) |slot, i| {
-        if (slot.model != active[0].model or !slot.allow_batch_mtp) return false;
-        if (sampler.penaltyActive(slot.sampling)) return false;
-        const gen = if (slot.legacy_gen) |*g| g else return false;
-        if (arch_state.mropeOf(&gen.ctx.arch_ctx) != null) return false;
+        const gen = &slot.legacy_gen.?;
         pending_pipeline = pending_pipeline or gen.pending != null;
         pending_draft = pending_draft or gen.mtp_pre_draft != null;
-        const why = sch.batchVerdict(slot);
-        const mtp_row = why == .spec_active and slotMtpGroupable(slot);
-        if (why != .ok and !mtp_row) return false;
+        const mtp_row = sch.batchVerdict(slot) == .spec_active;
         has_mtp = has_mtp or mtp_row;
         if (gen.sampling.think_bound) |tb| tb.observe(gen.generated_ids.items);
         const cap = if (mtp_row) plannerRowCap(gen) else 0;
         rows[i] = .{ .history = &gen.mtp_planner_history, .cap = @intCast(cap), .latency_ms = Planner.LATENCY_MS };
-        lenses[i] = @intCast(slot.moe_seq_offset);
     }
     if (!has_mtp) return false;
-    std.sort.insertion(u32, lenses[0..active.len], {}, std.sort.asc(u32));
-    if (active.len > 1 and batchedKvKeepCount(lenses[0..active.len]) != active.len) return false;
     const entry = Planner.entry(pending_pipeline, pending_draft);
     if (entry == .wait_predraft) {
         // Consume the pending rounds without perpetually replacing their successors.

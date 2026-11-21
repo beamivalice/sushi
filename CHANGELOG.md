@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next streams that group their MTP verify keep speculating beside a request that cannot join them**: a plain request, one under 96 tokens from its budget, or one with a penalty, logprobs, an image or a much longer context stopped the speculation of every other stream in the group; the others now keep their rounds and it decodes on its own.
 - **Rescan drops a model whose folder now holds a config sushi cannot serve**: an unsupported architecture or quantization, a drafter or a half-written `config.json` left the model listed with its old architecture and size, though loading it was refused.
 - **Logprobs of a reply with a thought in the middle list the content it returned**: a non-streamed reply with content, a thought and more content listed a piece of the closing tag and missed the first content token, and a stream listed thought tokens and stray closers and missed the tokens next to a thought; the stream and the whole reply now list the same entries, and the "\n" that joins the parts has no token, so no entry lists it.
 - **A Qwen3.8-Flash-Next boot with `--expert-pick-tolerance` no longer shares the saved prompt-cache states of an exact boot**: the states a lossy pick builds depend on what the cache held, so they now live in a namespace of their own, as DeepSeek's did.

@@ -4260,27 +4260,31 @@ pub fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
 }
 
 /// One tick of the slots of one side: models on MLX (`own` false), or on the engine's own stream.
-fn runSideTick(sch: *Scheduler, active: []*Slot, own: bool) anyerror!void {
+fn runSideTick(sch: *Scheduler, all: []*Slot, own: bool) anyerror!void {
     // MLX's command buffers are a model on MLX's; the engine commits its own.
     const buffers: ?mlx.DecodeBuffers = if (own) null else .begin();
     defer if (buffers) |b| b.end();
 
+    // The slots the planner's tick did not take: the regular path's.
+    var active = all;
     if (Planner.enabled()) {
-        for (active) |slot| if (slot.legacy_gen) |*gen| {
+        for (all) |slot| if (slot.legacy_gen) |*gen| {
             gen.mtp_planner_width = null;
             gen.mtp_planner_probe = false;
             gen.mtp_planner_recovering = false;
             slot.planner_plain_transition = false;
             slot.planner_force_plain = false;
         };
-        const planned = mtp_tick.tryPlannerTick(sch, active) catch |e| {
-            failTick(active, e, "[mtp-planner]");
+        const taken = mtp_tick.tryPlannerTick(sch, all) catch |e| {
+            failTick(all, e, "[mtp-planner]");
             return;
         };
-        if (planned) return;
+        active = all[taken..];
+        // A slot the planner owns and did not take decodes plain this tick, not in a round of its own.
         for (active) |slot| if (slot.legacy_gen) |*gen| {
             if (gen.mtp_planner_owned) slot.planner_force_plain = true;
         };
+        if (active.len == 0) return;
     }
     defer if (Planner.enabled()) for (active) |slot| {
         slot.planner_force_plain = false;

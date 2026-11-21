@@ -128,6 +128,11 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   a request opts out with `enable_batch_mtp:false`) runs a grouped round (`[mtp-planner] rows=N widths=…`, row-axis
   verify) when it prices one cheaper, and `mtpRoundsStaySolo` does not gate it. Only when the planner declines the
   tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`).
+  **One row never takes the group's speculation with it**: a row that cannot probe (a plain request, a thought room of
+  1, under 96 tokens left) rides a calibration or recovery round at width 0 while the rows that can, probe
+  (`planProbe` declines only when none can); a row that cannot ride the planner's tick at all (a penalty, logprobs or
+  another non-batchable verdict, M-RoPE, an `enable_batch_mtp:false` opt-out, a context the pad-waste cap leaves out)
+  decodes in the regular path while the others group (`plannerRowFits`, `plannerRows`).
   A price key names a round as `observeGroupRound` records it: its proposal bit is whether the chain keeps its drafts'
   probabilities (`mtp_round.mtpKeepsDraftProbs`; a served request draws at positions and keeps none), never the draft
   temperature alone. A key no round writes leaves the planner no price, and it never drafts those rows. Four MTP streams on MCG K3
