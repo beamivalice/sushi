@@ -3985,12 +3985,18 @@ test "under a hold MLX's allocator is not asked: its readings are the hold's fir
         var unused: usize = 0;
         _ = mlx.mlx_set_cache_limit(&unused, orig);
     }
-    // Something for MLX's pool to hold: the hold empties it as it begins.
+    // Something for MLX's pool to hold: the hold empties it as it begins. A host array's buffer goes to the pool as it
+    // is freed; an evaluated one's goes when its command buffer's completion runs, which may be after the hold began.
     {
-        var ones = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ones);
-        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{ 1 << 20, 4 }, 2, .float32, mlx.gpuStream()));
-        try mlx.check(mlx.mlx_array_eval(ones));
+        const bytes: usize = 16 << 20;
+        const host = try std.testing.allocator.alloc(u8, bytes);
+        defer std.testing.allocator.free(host);
+        @memset(host, 1);
+        const made = mlx.mlx_array_new_data(host.ptr, &[_]c_int{bytes}, 1, .uint8);
+        _ = mlx.mlx_array_free(made);
+        var pooled: usize = 0;
+        try mlx.check(mlx.mlx_get_cache_memory(&pooled));
+        try std.testing.expect(pooled >= bytes);
     }
     hold();
     var is_held = true;
