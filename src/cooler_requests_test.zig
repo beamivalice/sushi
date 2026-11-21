@@ -303,16 +303,16 @@ test "cooler contract: a wide forward's cap is its own model's to lift: another 
     {
         const turn = mlx.engine.turnToModel(true, &a);
         defer turn.end();
-        cooler.enterWide(1 << 20);
+        cooler.enterWide(&a, 1 << 20);
     }
     {
         const turn = mlx.engine.turnToModel(true, &b);
         defer turn.end();
-        cooler.enterJoined(&config, 2, 64);
+        cooler.enterJoined(&config, &b, 2, 64);
     }
     const turn = mlx.engine.turnToModel(true, &a);
     defer turn.end();
-    cooler.enterJoined(&config, 2, 64);
+    cooler.enterJoined(&config, &a, 2, 64);
     try testing.expectEqual(@as(?u64, null), capInForce());
 }
 
@@ -385,6 +385,152 @@ fn capInForce() ?u64 {
 fn poolInUse() u64 {
     const st = mlx.engine.stats();
     return st.pool_bytes - st.pool_free;
+}
+
+test "cooler contract: Qwen grouped MTP ticks after a DeepSeek request ends run under no cap the DeepSeek model left, and all serve" {
+    try qwenBesideDeepSeek(struct {
+        fn run(qsv: *Served, dsv: *Served, qids: []const u32, dids: []const u32) !void {
+            const got = try ticksAfterDeepSeek(qsv, dsv, qids, dids, .{ 40, 60, 80 });
+            errdefer std.debug.print("cooler contract: {d} of {d} Qwen ticks after the DeepSeek request ran under a cap, the last {d} KB over {d} KB the pool's tensors held\n", .{ got.capped, got.ticks, got.last_cap >> 10, got.last_in_use >> 10 });
+            try testing.expectEqual(@as(u32, 0), got.capped);
+            try got.served();
+        }
+    }.run);
+}
+
+test "cooler contract: Qwen grouped MTP ticks that grow their caches after a DeepSeek request add nothing to the DeepSeek model's cap" {
+    try qwenBesideDeepSeek(struct {
+        fn run(qsv: *Served, dsv: *Served, qids: []const u32, dids: []const u32) !void {
+            const got = try ticksAfterDeepSeek(qsv, dsv, qids, dids, .{ 200, 220, 240 });
+            try testing.expect(got.ds_before != null);
+            try testing.expectEqual(got.ds_before, got.ds_after);
+            try got.served();
+        }
+    }.run);
+}
+
+/// The Qwen and DeepSeek STQ tinies loaded at once on Sushi Cooler, each served by a scheduler of its own.
+fn qwenBesideDeepSeek(comptime body: fn (qsv: *Served, dsv: *Served, qids: []const u32, dids: []const u32) anyerror!void) !void {
+    try @import("test_note.zig").needArchs(&.{ "qwen4", "dsv41" });
+    try mlx.requireGpu();
+    const Q = ContractOf("qwen4");
+    const D = ContractOf("dsv41");
+    if (comptime !@hasDecl(Q, "prompt") or !@hasDecl(D, "prompt")) return error.SkipZigTest;
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    defer mlx.engine.fault.disarm();
+    const qdir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const ddir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const qids = try Q.prompt(a, qdir);
+    defer a.free(qids);
+    const dids = try D.prompt(a, ddir);
+    defer a.free(dids);
+    var qld: Load = undefined;
+    try qld.open(Q, qdir, true);
+    defer _ = qld.close();
+    var dld: Load = undefined;
+    try dld.open(D, ddir, true);
+    defer _ = dld.close();
+    var qsv: Served = undefined;
+    try qsv.init(&qld, qdir);
+    defer qsv.deinit();
+    var dsv: Served = undefined;
+    try dsv.init(&dld, ddir);
+    defer dsv.deinit();
+    try body(&qsv, &dsv, qids, dids);
+}
+
+/// What the Qwen ticks after a DeepSeek request ran under (`ticksAfterDeepSeek`).
+const AfterDeepSeek = struct {
+    ticks: u32 = 0,
+    /// Ticks that left a cap in force, the last such cap and the pool's bytes in use then.
+    capped: u32 = 0,
+    last_cap: u64 = 0,
+    last_in_use: u64 = 0,
+    /// The DeepSeek model's cap as its request ended, and after the Qwen ticks.
+    ds_before: ?u64 = null,
+    ds_after: ?u64 = null,
+    refused: u64 = 0,
+    failed: ?[]const u8 = null,
+
+    /// No ask of the Qwen ticks was refused and every request served.
+    fn served(self: AfterDeepSeek) !void {
+        try testing.expectEqual(@as(u64, 0), self.refused);
+        if (self.failed) |e| {
+            std.debug.print("cooler contract: a served request failed ({s})\n", .{e});
+            return error.RequestFailed;
+        }
+    }
+};
+
+/// Three Qwen speculative requests of `lens` tokens, prefilled in turn, tick together at depth 2; after their third
+/// tick a DeepSeek request runs to its cleanup, whose end leaves the DeepSeek model's resting cap in force, and the
+/// Qwen requests tick on to their ends.
+fn ticksAfterDeepSeek(qsv: *Served, dsv: *Served, qids: []const u32, dids: []const u32, lens: [3]usize) !AfterDeepSeek {
+    const a = testing.allocator;
+    const scheduler = Served.scheduler;
+    const sch = &qsv.sch;
+    const depth_bounds = @import("mtp_depth_bounds.zig");
+    const saved = depth_bounds.active;
+    defer depth_bounds.active = saved;
+    depth_bounds.active = .{ .min = 2, .max = 2 };
+    const head = @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(qsv.entry.handle.?), true, null);
+    var long: [256]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = qids[(i * 7 + i / qids.len) % qids.len];
+    var slots: [3]*scheduler.Slot = undefined;
+    var made: usize = 0;
+    defer {
+        for (slots[0..made]) |slot| sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    sch.queue_cap = 3;
+    for (lens) |n| {
+        const slot = try sch.submit(.{ .model = qsv.entry, .prompt_ids = long[0..n], .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 40, .enable_mtp = true, .mtp = head });
+        slots[made] = slot;
+        made += 1;
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, slot);
+        if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(a, slot);
+    }
+    const ds_slot = &arch_handle.trunk(dsv.entry.handle.?).cooler_budget;
+    var got: AfterDeepSeek = .{};
+    var refusals: u64 = 0;
+    var at: u32 = 0;
+    while (true) : (at += 1) {
+        var live: [3]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (slots[0..made]) |s| if (s.joinsTick()) {
+            live[k] = s;
+            k += 1;
+        };
+        if (k == 0) break;
+        if (at == 3) {
+            var prompt: [24]u32 = undefined;
+            for (&prompt, 0..) |*t, i| t.* = dids[(i * 5 + 2) % dids.len];
+            _ = try dsv.requestToCleanup(&prompt, 6, false);
+            got.ds_before = ds_slot.cap;
+            refusals = mlx.engine.poolRefusals();
+        }
+        try scheduler.runDecodeTick(sch, live[0..k]);
+        scheduler.cullDecoding(sch);
+        if (at < 3) continue;
+        got.ticks += 1;
+        if (capInForce()) |c| {
+            got.capped += 1;
+            got.last_cap = c;
+            got.last_in_use = poolInUse();
+        }
+    }
+    try testing.expect(got.ticks > 0);
+    got.refused = mlx.engine.poolRefusals() - refusals;
+    for (slots[0..made]) |slot| if (slot.error_code) |e| {
+        got.failed = e;
+    };
+    got.ds_after = ds_slot.cap;
+    return got;
 }
 
 /// `n` ids of real text: Pride and Prejudice (public domain, the bench's corpus) through the fixture's own tokenizer.

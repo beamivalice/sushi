@@ -78,9 +78,9 @@ pub const Rows = struct {
     }
 };
 
-/// A forward of the model of `config` begins: its rows, and the position its last row ends at, read only when the
-/// shared seam acts on them or `want` asks (each read of a shape is a query of MLX's on an MLX load).
-pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array, head: *const Trunk, want: bool) ?Rows {
+/// A forward of the model of `config`, whose trunk is `head`, begins: its rows, and the position its last row ends at,
+/// read only when the shared seam acts on them or `want` asks (each read of a shape is a query of MLX's on an MLX load).
+pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array, head: *Trunk, want: bool) ?Rows {
     const seam = onEngine(config) and !ownCaps(config);
     if (!seam and !want) return null;
     const shape = mlx.getShape(ids);
@@ -92,39 +92,40 @@ pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.Forward
         // A prefill chunk holds no more than its bill: under the cap the pool gives up its free buffers before it asks
         // Metal for more. Uncapped, a 4096-row chunk of the Qwen cut kept ~2 GB of them on 2.9 GB in use, 1.4 GB past
         // its bill. The model's next narrow forward, or the request's end, lifts it.
-        enterWide(at.cap(config));
+        enterWide(&head.cooler_budget, at.cap(config));
         return at;
     }
     // A capturing verify keeps its round's states (`bills.roundCaptureBytes`) beside its forward's transient.
-    liftWide(config, rows, at.seq, if (ctx.capture_ssm_seq) bills.roundCaptureBytes(config) else 0);
+    liftWide(config, &head.cooler_budget, rows, at.seq, if (ctx.capture_ssm_seq) bills.roundCaptureBytes(config) else 0);
     return at;
 }
 
-/// A forward wider than a verify block begins on the engine under `bytes`: its model's cap until that model's next
-/// narrow forward.
-pub fn enterWide(bytes: u64) void {
+/// A forward wider than a verify block of the model of `slot` begins on the engine under `bytes`: its model's cap until
+/// that model's next narrow forward.
+pub fn enterWide(slot: *mlx.engine.BudgetSlot, bytes: u64) void {
     mlx.engine.close();
-    mlx.engine.budgetWide(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
+    mlx.engine.budgetWide(slot, bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
 }
 
-/// A forward of several requests' rows begins (joined decode rows, a grouped verify): `rows` in all, the longest
-/// ending at `seq`. It is a narrow forward whatever its rows: a wide forward's cap is lifted for it, none installed.
-pub fn enterJoined(config: *const ModelConfig, rows: u64, seq: u64) void {
-    if (!joinedLifts(config)) return;
-    liftWide(config, rows, seq, 0);
+/// A forward of several requests' rows of the model of `config` and `slot` begins (joined decode rows, a grouped
+/// verify): `rows` in all, the longest ending at `seq`. It is a narrow forward whatever its rows: the model's wide
+/// forward's cap is lifted for it, none installed.
+pub fn enterJoined(config: *const ModelConfig, slot: *mlx.engine.BudgetSlot, rows: u64, seq: u64) void {
+    if (!joinedLifts(config, slot)) return;
+    liftWide(config, slot, rows, seq, 0);
 }
 
-/// Whether a joined forward of `config`'s model would lift a cap now, so its rows are worth reading.
-pub fn joinedLifts(config: *const ModelConfig) bool {
-    return mlx.engine.wideInForce() and onEngine(config) and !ownCaps(config);
+/// Whether a joined forward of the model of `config` and `slot` would lift its cap now, so its rows are worth reading.
+pub fn joinedLifts(config: *const ModelConfig, slot: *const mlx.engine.BudgetSlot) bool {
+    return slot.wide and onEngine(config) and !ownCaps(config);
 }
 
-/// After a wide forward of this model, the free buffers past a narrow forward's cap go and no cap stays in force.
-fn liftWide(config: *const ModelConfig, rows: u64, seq: u64, capture: u64) void {
-    if (!mlx.engine.wideInForce()) return;
+/// After a wide forward of this model, the free buffers past a narrow forward's cap go and its cap is lifted.
+fn liftWide(config: *const ModelConfig, slot: *mlx.engine.BudgetSlot, rows: u64, seq: u64, capture: u64) void {
+    if (!slot.wide) return;
     mlx.engine.close();
     const bytes = forwardCap(config, rows, seq) +| capture;
-    mlx.engine.liftWide(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
+    mlx.engine.liftWide(slot, bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
 }
 
 fn install(bytes: u64) void {

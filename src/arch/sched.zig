@@ -252,9 +252,9 @@ pub fn batchedForward(
 }
 
 /// A joined forward over `ctxs` begins (`arch_cooler.enterJoined`): one row a request, or each request's `token_rows`.
-pub fn enterJoinedRows(xfm: *const Trunk, ctxs: []const *ForwardCtx, token_rows: ?[]const mlx.mlx_array) void {
+pub fn enterJoinedRows(xfm: *Trunk, ctxs: []const *ForwardCtx, token_rows: ?[]const mlx.mlx_array) void {
     const cooler = @import("cooler.zig");
-    if (!cooler.joinedLifts(&xfm.config)) return;
+    if (!cooler.joinedLifts(&xfm.config, &xfm.cooler_budget)) return;
     var rows: u64 = 0;
     var seq: u64 = 0;
     for (ctxs, 0..) |c, i| {
@@ -262,7 +262,7 @@ pub fn enterJoinedRows(xfm: *const Trunk, ctxs: []const *ForwardCtx, token_rows:
         rows += n;
         seq = @max(seq, @as(u64, c.cache.kvLenForBatching()) + n);
     }
-    cooler.enterJoined(&xfm.config, rows, seq);
+    cooler.enterJoined(&xfm.config, &xfm.cooler_budget, rows, seq);
 }
 
 /// Whether the arch runs joined decode rows outside a scheduler (`rowsForward`); one whose rows need a request's
