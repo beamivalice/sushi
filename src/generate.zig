@@ -4121,26 +4121,32 @@ test "tokensPerSec basic and zero-time" {
     try testing.expectEqual(@as(f64, 0.0), tokensPerSec(100, 0));
 }
 
-const PrefillMem = struct { active: usize, cache: usize, peak: usize };
+/// `pool_in_use` and `pool_in_use_peak`: the engine pool's bytes in use now and at its fullest, free buffers left out:
+/// what a Cooler bill prices.
+const PrefillMem = struct { active: usize, cache: usize, peak: usize, pool_in_use: usize, pool_in_use_peak: usize };
 
 fn prefillMem() PrefillMem {
-    return .{ .active = gpu_mem.activeBytes(), .cache = gpu_mem.cacheBytes(), .peak = gpu_mem.peakBytes() };
+    return .{ .active = gpu_mem.activeBytes(), .cache = gpu_mem.cacheBytes(), .peak = gpu_mem.peakBytes(), .pool_in_use = mlx.engine.poolTotal() - mlx.engine.poolFree(), .pool_in_use_peak = mlx.engine.poolPeak(.process) };
 }
 
 fn formatPrefillMemLine(buf: []u8, pos: usize, end: usize, eval_ms: u64, mem: PrefillMem) []const u8 {
-    return std.fmt.bufPrint(buf, "  [prefill-trace] mem pos={d} end={d} eval_ms={d} active_bytes={d} cache_bytes={d} peak_bytes={d}\n", .{
+    return std.fmt.bufPrint(buf, "  [prefill-trace] mem pos={d} end={d} eval_ms={d} active_bytes={d} cache_bytes={d} peak_bytes={d} pool_in_use_bytes={d} pool_in_use_peak_bytes={d}\n", .{
         pos,
         end,
         eval_ms,
         mem.active,
         mem.cache,
         mem.peak,
+        mem.pool_in_use,
+        mem.pool_in_use_peak,
     }) catch "";
 }
 
-test "prefill-trace mem line names active_bytes and cache_bytes" {
+test "prefill-trace mem line names active_bytes, cache_bytes and the engine pool's in-use bytes and peak" {
     var buf: [256]u8 = undefined;
-    const line = formatPrefillMemLine(&buf, 8192, 16384, 12, .{ .active = 11, .cache = 22, .peak = 33 });
+    const line = formatPrefillMemLine(&buf, 8192, 16384, 12, .{ .active = 11, .cache = 22, .peak = 33, .pool_in_use = 55, .pool_in_use_peak = 44 });
+    try std.testing.expect(std.mem.indexOf(u8, line, "pool_in_use_bytes=55") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "pool_in_use_peak_bytes=44") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "active_bytes=11") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "cache_bytes=22") != null);
     try std.testing.expect(std.mem.indexOf(u8, line, "peak_bytes=33") != null);
