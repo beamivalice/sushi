@@ -3274,3 +3274,48 @@ test "ModelRegistry: the launch model attaches to the entry at its own folder, n
     try testing.expectEqual(launch, try reg.registerLaunchFolder("/old/Pk/"));
     try testing.expectEqual(@as(usize, 2), reg.entries.count());
 }
+
+// ── The inventory against the disk ──────────────────────────────────────────────────────────────────────────────────
+
+fn tmpRoot(io: std.Io, dir: std.Io.Dir, buf: *[std.fs.max_path_bytes]u8) ![]const u8 {
+    return buf[0..try dir.realPath(io, buf)];
+}
+
+test "ModelRegistry: bytes_on_disk of one folder is the shards the loader reads, whichever path registered or refreshed it" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    // The index names one shard; a stray shard (an older revision's, or one a re-shard left) sits beside it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors.index.json", .data = "{\"weight_map\":{\"a\":\"model-00001-of-00001.safetensors\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001-of-00001.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001-of-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    const e = reg.peek("beamster/P") orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 10), e.bytes_on_disk);
+    // A download (an update) finishes in that folder: the rescan and then the folder's own refresh.
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try reg.absorbDownloadWithSettings(no_settings, try std.fmt.bufPrint(&pb, "{s}/beamster/P", .{root}));
+    try testing.expectEqual(@as(?u64, 10), e.bytes_on_disk);
+}
+
+test "ModelRegistry: register-by-path bills the shards the loader reads, as discovery does" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors.index.json", .data = "{\"weight_map\":{\"a\":\"model-00001-of-00001.safetensors\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001-of-00001.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00001-of-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const e = reg.peek(try reg.registerByPath(io, try std.fmt.bufPrint(&pb, "{s}/beamster/P", .{root}))) orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 10), e.bytes_on_disk);
+}
+

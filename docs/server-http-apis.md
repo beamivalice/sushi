@@ -112,7 +112,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   `bytes_on_disk - bytes_linked`. The Models tab details show it as "linked from elsewhere".
 - `/v1/models` `bytes_total` (absent when the folder holds nothing readable) is the sum of every regular file in the pack's
   folder, subfolders to three levels, the n-gram table included, a symlink at its target's size. `bytes_on_disk` stays the
-  `*.safetensors` the engine loads and bills; the Models tab shows them as "in-memory size" and "full weight size".
+  `*.safetensors` the engine loads and bills (the shards `model.safetensors.index.json` names, whichever way the pack was listed or refreshed); the Models tab shows them as "in-memory size" and "full weight size".
 - An unloaded `/v1/models` row lists `chat` when the pack ships a `chat_template.jinja` or its arch renders its own (`Facts.renders_own_chat_template`, DeepSeek-V4.1), so the chat page offers the model before it is loaded.
 - `/v1/models` rows carry `context_length` + `max_model_len` at TOP level. Context-overflow 400s name BOTH counts.
 - A prompt that tokenizes to zero tokens is a 400 `invalid_request_error` and never reaches generate: completions

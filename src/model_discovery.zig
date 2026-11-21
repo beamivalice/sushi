@@ -556,10 +556,6 @@ fn tryAddModel(
     var sub = parent.openDir(io, name, .{ .iterate = true }) catch return false;
     defer sub.close(io);
 
-    var bytes: u64 = 0;
-    var linked: u64 = 0;
-    var bytes_ok = false;
-
     const model_type: []const u8 = blk: {
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config) return false;
@@ -593,26 +589,7 @@ fn tryAddModel(
     };
     errdefer if (model_type.len > 0) allocator.free(model_type);
 
-    // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
-    if (!bytes_ok) {
-        var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
-        if (sub_iter_dir) |*sd| {
-            defer sd.close(io);
-            var referenced = indexShardSet(io, sd.*);
-            defer if (referenced) |*r| freeShardSet(r);
-            var sd_iter = sd.iterate();
-            while (sd_iter.next(io) catch null) |sub_entry| {
-                if (sub_entry.kind != .file and sub_entry.kind != .sym_link) continue;
-                if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
-                if (referenced) |r| if (!r.contains(sub_entry.name)) continue;
-                const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
-                if (st.kind != .file) continue;
-                bytes += @intCast(st.size);
-                linked += linkedOutside(io, sd.*, sub_entry, @intCast(st.size));
-                bytes_ok = true;
-            }
-        }
-    }
+    const weights = weightBytes(io, sub);
 
     const id = if (id_prefix.len > 0)
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ id_prefix, name })
@@ -630,8 +607,8 @@ fn tryAddModel(
         .id = id,
         .path = path,
         .folder = try FolderId.of(io, path),
-        .bytes_on_disk = if (bytes_ok) bytes else null,
-        .bytes_linked = linked,
+        .bytes_on_disk = weights.bytes,
+        .bytes_linked = weights.linked,
         .bytes_total = if (total > 0) total else null,
         .model_type = model_type,
         .streaming_index_complete = streaming_index_complete,
@@ -688,6 +665,28 @@ fn linkedOutside(io: std.Io, dir: std.Io.Dir, entry: std.Io.Dir.Entry, size: u64
     return if (inside) 0 else size;
 }
 
+/// The weight bytes of the model folder `dir`: what the loader reads, the shards `model.safetensors.index.json` names
+/// (every `*.safetensors` when there is no usable index). The one count discovery, register-by-path and a refresh share.
+fn weightBytes(io: std.Io, dir: std.Io.Dir) struct { bytes: ?u64, linked: u64 } {
+    var bytes: u64 = 0;
+    var linked: u64 = 0;
+    var found = false;
+    var referenced = indexShardSet(io, dir);
+    defer if (referenced) |*r| freeShardSet(r);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        if (referenced) |r| if (!r.contains(entry.name)) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
+        bytes += @intCast(st.size);
+        linked += linkedOutside(io, dir, entry, @intCast(st.size));
+        found = true;
+    }
+    return .{ .bytes = if (found) bytes else null, .linked = linked };
+}
+
 /// Validate an arbitrary absolute model directory the way discovery would
 /// (config.json present, supported model_type and quant mode) and report its
 /// weight bytes. Used by /v1/load-model's register-by-path branch for models
@@ -717,26 +716,11 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     };
     errdefer allocator.free(model_type);
 
-    var bytes: u64 = 0;
-    var linked: u64 = 0;
-    var total: u64 = 0;
-    var bytes_ok = false;
-    var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
-    if (sub) |*sd| {
-        defer sd.close(io);
-        total = folderBytes(io, sd.*, 3);
-        var it = sd.iterate();
-        while (it.next(io) catch null) |entry| {
-            if (entry.kind != .file and entry.kind != .sym_link) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
-            const st = sd.statFile(io, entry.name, .{}) catch continue;
-            if (st.kind != .file) continue;
-            bytes += @intCast(st.size);
-            linked += linkedOutside(io, sd.*, entry, @intCast(st.size));
-            bytes_ok = true;
-        }
-    }
-    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null, .bytes_linked = linked, .bytes_total = if (total > 0) total else null };
+    var sub = dir.openDir(io, base, .{ .iterate = true }) catch return .{ .model_type = model_type, .bytes_on_disk = null };
+    defer sub.close(io);
+    const weights = weightBytes(io, sub);
+    const total = folderBytes(io, sub, 3);
+    return .{ .model_type = model_type, .bytes_on_disk = weights.bytes, .bytes_linked = weights.linked, .bytes_total = if (total > 0) total else null };
 }
 
 /// Metadata an `unloaded` stub can advertise via `/v1/models` without faulting
