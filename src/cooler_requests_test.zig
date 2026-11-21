@@ -237,6 +237,156 @@ fn groupedAfterPrefill(sv: *Served, long: []const u32, mtp: bool) !void {
     };
 }
 
+test "cooler contract: four requests, three speculative and one plain, the last prefilled beside three decoding, tick under no cap a prefill chunk installed, at every tick and every turn of the model after it, and all serve (#106)" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            sv.sch.queue_cap = 4;
+            var long: [101]u32 = undefined;
+            for (&long, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+            // The issue's widths: every speculative row at depth 2. The plain row's tick joins the speculative rounds.
+            try joinedAfterPrefill(&sv, &.{ long[0..40], long[0..60], long[0..80], long[0..101] }, &.{ true, true, true, false });
+        }
+    }.run);
+}
+
+test "cooler contract: three speculative requests, one restored from its last turn and prefilled beside two decoding, tick under no cap that prefill installed, at every tick and every turn of the model after it, and all serve (#112)" {
+    try eachQwenServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            sv.sch.queue_cap = 3;
+            const a = testing.allocator;
+            var conv: std.ArrayList(u32) = .empty;
+            defer conv.deinit(a);
+            for (0..1500) |i| try conv.append(a, ids[(i * 7 + i / ids.len) % ids.len]);
+            var f: u32 = 0;
+            var reply = try sv.request(conv.items, 16, &f);
+            defer reply.deinit(a);
+            try conv.appendSlice(a, reply.items);
+            for (0..200) |i| try conv.append(a, ids[(i * 13 + 101) % ids.len]);
+            // Rows of like lengths, as the issue's long sessions: the planner groups them only within its pad waste.
+            var other: [1600]u32 = undefined;
+            for (&other, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+            try joinedAfterPrefill(&sv, &.{ other[0..1500], other[0..1600], conv.items }, &.{ true, true, true });
+            try testing.expect(sv.reused > 0);
+        }
+    }.run);
+}
+
+test "cooler contract: a wide forward's cap is its own model's to lift: another Cooler model's narrow forward between leaves it, and the model's own next narrow forward lifts it" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    mlx.engine.hold();
+    defer arch_handle.engineHoldEnd();
+    const cooler = @import("arch/cooler.zig");
+    const config: @import("model.zig").ModelConfig = .{ .model_type = "qwen4_exp", .expert_layout = .exl3_k4, .expert_quant_codebook = .spec1, .cooler_for_test = true };
+    var made = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(made);
+    try mlx.check(mlx.mlx_zeros(&made, &[_]c_int{64}, 1, .float32, mlx.engine.stream()));
+    try mlx.check(mlx.mlx_array_eval(made));
+    var a: mlx.engine.BudgetSlot = .{};
+    var b: mlx.engine.BudgetSlot = .{};
+    defer mlx.engine.forgetSlot(&a);
+    defer mlx.engine.forgetSlot(&b);
+    {
+        const turn = mlx.engine.turnToModel(true, &a);
+        defer turn.end();
+        cooler.enterWide(1 << 20);
+    }
+    {
+        const turn = mlx.engine.turnToModel(true, &b);
+        defer turn.end();
+        cooler.enterJoined(&config, 2, 64);
+    }
+    const turn = mlx.engine.turnToModel(true, &a);
+    defer turn.end();
+    cooler.enterJoined(&config, 2, 64);
+    try testing.expectEqual(@as(?u64, null), capInForce());
+}
+
+/// Requests arrive one at a time, each prefilled (wide forwards, each installing its chunk's cap) while those before it
+/// decode, speculative rows at depth 2 where `mtp` says; then all of them tick together to their ends. After every
+/// tick, and at the model's next turn, no cap is in force: a tick's forwards are narrow, and lift a chunk's cap.
+fn joinedAfterPrefill(sv: *Served, prompts: []const []const u32, mtp: []const bool) !void {
+    const a = testing.allocator;
+    const scheduler = Served.scheduler;
+    const sch = &sv.sch;
+    const depth_bounds = @import("mtp_depth_bounds.zig");
+    const saved = depth_bounds.active;
+    defer depth_bounds.active = saved;
+    depth_bounds.active = .{ .min = 2, .max = 2 };
+    const head = @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null);
+    var slots: [4]*scheduler.Slot = undefined;
+    var made: usize = 0;
+    defer {
+        for (slots[0..made]) |slot| sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    const refusals = mlx.engine.poolRefusals();
+    var ticks: u32 = 0;
+    for (prompts, mtp) |p, spec| {
+        const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = p, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = spec, .mtp = if (spec) head else null });
+        slots[made] = slot;
+        made += 1;
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, slot);
+        sv.reused = slot.cached_tokens;
+        if (!scheduler.postPrefillTerminal(sch, slot)) try sch.decoding.append(a, slot);
+        if (made == prompts.len) try testing.expect(capInForce() != null);
+        while (true) {
+            var live: [4]*scheduler.Slot = undefined;
+            var k: usize = 0;
+            for (slots[0..made]) |s| if (s.joinsTick()) {
+                live[k] = s;
+                k += 1;
+            };
+            if (k == 0) break;
+            try scheduler.runDecodeTick(sch, live[0..k]);
+            scheduler.cullDecoding(sch);
+            ticks += 1;
+            errdefer std.debug.print("cooler contract: after tick {d} of {d} rows a cap of {d} KB is in force over {d} KB the pool's tensors hold\n", .{ ticks, k, (capInForce() orelse 0) >> 10, poolInUse() >> 10 });
+            try testing.expectEqual(@as(?u64, null), capInForce());
+            {
+                const turn = arch_handle.turnFor(sv.entry.handle, sv.entry.config);
+                defer turn.end();
+                errdefer std.debug.print("cooler contract: at the model's turn after tick {d} a cap of {d} KB is in force over {d} KB the pool's tensors hold\n", .{ ticks, (capInForce() orelse 0) >> 10, poolInUse() >> 10 });
+                try testing.expectEqual(@as(?u64, null), capInForce());
+            }
+            // Requests before the last decode a few ticks while the next arrives; the last group ticks to its end.
+            if (made < prompts.len and ticks % 3 == 0) break;
+        }
+    }
+    try testing.expectEqual(refusals, mlx.engine.poolRefusals());
+    for (slots[0..made]) |slot| if (slot.error_code) |e| {
+        std.debug.print("cooler contract: a served request failed ({s})\n", .{e});
+        return error.RequestFailed;
+    };
+}
+
+/// The pool's cap in force; null when none is (a lifted cap is the largest one).
+fn capInForce() ?u64 {
+    const limit = mlx.engine.poolLimit() orelse return null;
+    return if (limit == std.math.maxInt(u64)) null else limit;
+}
+
+fn poolInUse() u64 {
+    const st = mlx.engine.stats();
+    return st.pool_bytes - st.pool_free;
+}
+
 /// `n` ids of real text: Pride and Prejudice (public domain, the bench's corpus) through the fixture's own tokenizer.
 pub fn realTextIds(a: std.mem.Allocator, dir: []const u8, n: usize) ![]u32 {
     const prose = @embedFile("fixtures/prose_pride_and_prejudice.txt");

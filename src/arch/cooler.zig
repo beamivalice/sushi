@@ -1,7 +1,8 @@
 //! What every load on the engine of our own owes, whatever its arch, in one place:
 //! - the first narrow forward after a wide one (decode after a prefill) trims the free buffers to its bill's transient,
 //!   so a decode does not park a prefill's scratch; nothing is refused, since the shared bill is not a measured cap
-//!   of the engine's own forward (buffers an open pass binds outlive their tensors);
+//!   of the engine's own forward (buffers an open pass binds outlive their tensors). The wide cap is its model's: that
+//!   model's next narrow forward lifts it, in whatever turn it runs (`engine.budgetWide`);
 //! - a request's end closes its pass and leaves the pool at most its resting cap of free buffers (what the next
 //!   request's first verify forward takes, which the ledger bills as parked);
 //! - an unload leaves the pool empty;
@@ -66,9 +67,6 @@ pub fn restCap(config: *const ModelConfig) u64 {
     return forwardCap(config, verify_rows, 1);
 }
 
-/// A forward wider than a verify block ran since the last trim: the next narrow one trims its scratch.
-var after_wide = false;
-
 /// `readout`: the head's bytes over a wide forward's rows when it reads them out (`readoutCap`), else 0.
 pub const Rows = struct {
     rows: u64,
@@ -93,15 +91,20 @@ pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.Forward
         if (!ctx.skip_lm_head) at.readout = head.lmHeadReadoutBytes(rows);
         // A prefill chunk holds no more than its bill: under the cap the pool gives up its free buffers before it asks
         // Metal for more. Uncapped, a 4096-row chunk of the Qwen cut kept ~2 GB of them on 2.9 GB in use, 1.4 GB past
-        // its bill. The next narrow forward, or the request's end, lifts it.
-        after_wide = true;
-        mlx.engine.close();
-        install(at.cap(config));
+        // its bill. The model's next narrow forward, or the request's end, lifts it.
+        enterWide(at.cap(config));
         return at;
     }
     // A capturing verify keeps its round's states (`bills.roundCaptureBytes`) beside its forward's transient.
     liftWide(config, rows, at.seq, if (ctx.capture_ssm_seq) bills.roundCaptureBytes(config) else 0);
     return at;
+}
+
+/// A forward wider than a verify block begins on the engine under `bytes`: its model's cap until that model's next
+/// narrow forward.
+pub fn enterWide(bytes: u64) void {
+    mlx.engine.close();
+    mlx.engine.budgetWide(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
 }
 
 /// A forward of several requests' rows begins (joined decode rows, a grouped verify): `rows` in all, the longest
@@ -113,15 +116,15 @@ pub fn enterJoined(config: *const ModelConfig, rows: u64, seq: u64) void {
 
 /// Whether a joined forward of `config`'s model would lift a cap now, so its rows are worth reading.
 pub fn joinedLifts(config: *const ModelConfig) bool {
-    return after_wide and onEngine(config) and !ownCaps(config);
+    return mlx.engine.wideInForce() and onEngine(config) and !ownCaps(config);
 }
 
-/// After a wide forward, the free buffers past a narrow forward's cap go and no cap stays in force.
+/// After a wide forward of this model, the free buffers past a narrow forward's cap go and no cap stays in force.
 fn liftWide(config: *const ModelConfig, rows: u64, seq: u64, capture: u64) void {
-    if (!after_wide) return;
-    after_wide = false;
+    if (!mlx.engine.wideInForce()) return;
     mlx.engine.close();
-    trimTo(forwardCap(config, rows, seq) +| capture);
+    const bytes = forwardCap(config, rows, seq) +| capture;
+    mlx.engine.liftWide(bytes) catch |e| log.warn("[engine] pool: the cap of {d} MB was not installed: {s}\n", .{ bytes >> 20, @errorName(e) });
 }
 
 fn install(bytes: u64) void {
@@ -141,7 +144,6 @@ pub fn endRequest(config: *const ModelConfig) void {
     if (!onEngine(config)) return;
     @import("cooler_pipelines.zig").requestEnded();
     mlx.engine.close();
-    after_wide = false;
     if (ownCaps(config)) install(restCap(config)) else trimTo(restCap(config));
 }
 

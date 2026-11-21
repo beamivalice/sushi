@@ -15,6 +15,12 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that is
   neither a mode (`none`, `auto`, `any`, `required`) nor a function or tool it names (OpenAI's `allowed_tools`
   included, as on Responses), and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
+- **Concurrent speculative requests on Sushi Cooler no longer fail with `PoolOverBudget` rounds after another
+  request's prefill**: a grouped MTP round lifted that prefill chunk's memory cap without clearing it from the model,
+  so the model's next step installed it again and every round after ran under it; the cap is now lifted for the
+  model that set it (#106, #112).
+- **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that names
+  no function, and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
   `truncation` or `max_tool_calls` of the wrong type (on `/v1/responses/compact` too) are now a 400 naming the field;
   they were read as absent.
 - **Clearing the prefix-cache namespace of a model that is loading or unloading answers 409 `namespace_in_use`**, as

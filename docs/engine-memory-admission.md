@@ -592,6 +592,10 @@ in for the booted pack's bytes).
   `enterJoined` for joined decode rows, a grouped verify and batched head chains): grouped ticks that bypassed the
   seam ran under the last prefill chunk's cap, ~291 MB over what was in use on the cut, and a fold met
   `PoolOverBudget` (#106).
+- **A wide chunk's cap is its model's, and so is its lift** (`engine.budgetWide`, `engine.liftWide`): the model's
+  budget slot marks the cap wide, and its next narrow forward lifts it in that slot whatever turn it runs in. A lift
+  recorded elsewhere (a grouped MTP round runs in the engine side's turn of no model) left the chunk's cap in the
+  model's slot, and its next turn installed it again over every round after (#106, #112).
 - **A chunk's cap counts from the buffers in use, not their asks** (`core.budget`): a turn restored at 58,180 tokens
   of a 58,334-token prompt (Qwen STQ 4bpw, kv8, reserving 256,000 more) holds 8.8 GB of state as its 154-row chunk's
   564 MB cap goes in; at the refusal the pool held 9,366 MB for tensors asking 9,109 (257 MB of size rounding, no
