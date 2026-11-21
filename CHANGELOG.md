@@ -21,15 +21,13 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that is
   neither a mode (`none`, `auto`, `any`, `required`) nor a function or tool it names (OpenAI's `allowed_tools`
   included, as on Responses), and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
+  `truncation` or `max_tool_calls` of the wrong type (on `/v1/responses/compact` too) are now a 400 naming the field;
+  they were read as absent.
 - **Concurrent speculative requests on Sushi Cooler no longer fail with `PoolOverBudget` rounds after another
   request's prefill**: a grouped MTP round lifted that prefill chunk's memory cap without clearing it from the model,
   so the model's next step installed it again and every round after ran under it; the cap is now lifted for the
   model that set it (#106, #112).
 - **A DeepSeek-V4.1 prefill that lends decoder pools no longer compiles a kernel inside the request**: the load's warm never lent a pool, so the kernels a lent layer's route makes (the router's own launch, the grouped GEMM planes' combine at the expert width) were first compiled in the first request that needed the memory; the load now makes them, with no pool lent and no read, and a load from the manifest makes them ahead.
-- **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that names
-  no function, and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
-  `truncation` or `max_tool_calls` of the wrong type (on `/v1/responses/compact` too) are now a 400 naming the field;
-  they were read as absent.
 - **Clearing the prefix-cache namespace of a model that is loading or unloading answers 409 `namespace_in_use`**, as
   for a loaded one; it answered 200 with nothing removed. The stale sweep keeps that namespace, and an `all` clear
   lists the model as busy.
