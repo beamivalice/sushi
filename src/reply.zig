@@ -237,7 +237,11 @@ fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, 
     const defects = try tool_reading.defects(allocator, text, origin.model_ended);
     defer allocator.free(defects);
     if (defects.len == 0) return declinedBareCall(allocator, text, origin, tools_json);
-    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[defects[0].start..defects[0].end], origin.dialect)) orelse return .{ .name = null };
+    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[defects[0].start..defects[0].end], origin.dialect)) orelse {
+        // A body cut before it names the tool: the opener's own `name="…"` attribute does.
+        const attr = tool_reading.attributeName(text, defects[0].start) orelse return .{ .name = null };
+        return .{ .name = try allocator.dupe(u8, attr) };
+    };
     defer {
         for (calls) |c| {
             allocator.free(c.name);
@@ -1042,8 +1046,10 @@ test "a closer spelled inside a parameter value does not close the call: the gen
         .{ .text = "<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">a </\u{ff5c}DSML\u{ff5c}invoke> b" },
         .{ .text = "<invoke name=\"write_file\">\n<parameter name=\"path\">notes.md</parameter>\n<parameter name=\"content\">a </invoke> b" },
         .{ .text = "<function name=\"write_file\"><param name=\"content\">a </function> b" },
-        // The attribute names the tool, but the parser salvages a name from a JSON body only, so a cut body leaves it unnamed.
-        .{ .text = "<tool name=\"write_file\">{\"path\": \"notes.md\", \"content\": \"a </tool> b", .cut = .unnamed },
+        // The attribute names the tool: a body cut inside its JSON is declined under that name.
+        .{ .text = "<tool name=\"write_file\">{\"path\": \"notes.md\", \"content\": \"a </tool> b" },
+        .{ .text = "<tool name=\"write_file\">{\"path\": \"notes.md\", \"content\": \"abc" },
+        .{ .text = "<tool_call name=\"write_file\">{\"path\": \"notes.md\", \"content\": \"abc" },
         .{ .text = "<tool_request>{\"name\": \"write_file\", \"arguments\": {\"content\": \"a </tool_request> b" },
     };
     for (open) |call| for ([_][]const u8{ "", "Let me write it.\n" }) |lead| for ([_][]const u8{ "stop", "length" }) |finish| {

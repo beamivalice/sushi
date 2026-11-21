@@ -495,3 +495,14 @@ pub fn openerMayGrow(tail: []const u8) bool {
     for (families) |f| for (f.openers) |o| if (tail.len < o.len and std.mem.startsWith(u8, o, tail)) return true;
     return false;
 }
+
+/// The tool the `name="…"` attribute of the opener at `start` names (`<tool name="x">`, `<tool_call name="x">`), for a
+/// call cut before its body gave the parser a name. Null when the opener has no whole tag or no plain name.
+pub fn attributeName(text: []const u8, start: usize) ?[]const u8 {
+    const tail = text[start..];
+    const gt = std.mem.indexOfScalar(u8, tail[0..@min(tail.len, 512)], '>') orelse return null;
+    const attrs_at = std.mem.indexOfAny(u8, tail[0..gt], " \t\n") orelse return null;
+    const name = tool_calls.miniCpm5AttrValue(tail[attrs_at..gt], "name") orelse return null;
+    if (name.len == 0 or std.mem.indexOfAny(u8, name, "<>\r\n") != null) return null;
+    return name;
+}

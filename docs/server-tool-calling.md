@@ -22,7 +22,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   closer) is declined however the generation ended (a stop sequence, the length cap, a cancel, the model's own end) and
   the reply NAMES it: `finish_details` (`stop_details` on `/v1/messages`, the response object's `finish_details` on
   Responses) is `{"type":"tool_call_cut","name":"<tool>"}`, `name` left out when the markup stopped before it
-  (`Settled.declined`, `reply.detailsField`; the name is the parser's salvage of the open tail). It outranks a thought's
+  (`Settled.declined`, `reply.detailsField`; the name is the parser's salvage of the open tail, else the opener's own `name="…"` attribute). It outranks a thought's
   note in that slot, and the finish stays the end's own (`stop`, `length`, `cancelled`; Anthropic's `stop_sequence`
   stays set); a loop cut names its own cause and parses no call. A call the model finished before the end ships as it
   is. Every dialect the parse chain reads has a family in `think_tags.tool_markup_families`; one whose opener alone is
