@@ -426,7 +426,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - Detach every per-connection `std.Thread` immediately; on teardown drain conn threads before `scheduler.deinit`.
 - **Downloads run on `downloads.zig`'s own detached thread**, one pack at a time, spawning `curl` per file (on Darwin
   `std.process.spawn` is `posix_spawn`, so the resident engine is never forked); the catalog builds on another detached
-  thread. Neither touches MLX. `stopServing` SIGTERMs a running curl and refuses new starts (`downloads.stop`); the partial stays to resume.
+  thread. Neither touches MLX. `stopServing` SIGTERMs a running curl and refuses new starts (`downloads.stop`); the partial stays to resume. A detached thread cannot be joined, so each of the two reaches the registry only through `RegistryUse` (the pack's registration after a pull, the catalog refresh's folder list): `downloads.stop` closes that gate and `stopServing` waits for `downloads.registryBusy` beside the connection threads, ending without the teardown when it stays set. The lint rule `detached-global-read` names a read of `server_state.global_registry`/`global_scheduler` in a file that detaches a thread.
 - Sleep inhibition follows the inference-thread wait.
 - **The inference loop re-arms a declined SSD tier between requests** (`rearmDeclinedTiers`): once a minute while a
   ready model's tier is declined (the idle wait is then timed instead of unbounded), and at once when

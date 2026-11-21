@@ -449,6 +449,17 @@ printf '%s\n' 'fn side(c: *const C) bool {' '    return c.cooler_ask == .none;' 
 printf '%s\n' 'test "t" {' '    c.cooler_for_test = true;' '}' > "$TMP/t/src/p.zig"
 expect_green "cooler_side itself, and a test"
 
+# rule detached-global-read
+tree
+printf '%s\n' 'fn spawn() void {' '    const t = std.Thread.spawn(.{}, worker, .{}) catch return;' '    t.detach();' '}' 'fn worker() void {' '    const r = server_state.global_registry orelse return;' '    r.rescan();' '}' > "$TMP/t/src/p.zig"
+expect_red "a detached thread's fn that reads the registry global" "src/p.zig:6:28 \[detached-global-read\] worker: server_state.global_registry read"
+
+tree
+printf '%s\n' 'fn spawn() void {' '    const t = std.Thread.spawn(.{}, worker, .{}) catch return;' '    t.join();' '}' 'fn worker() void {' '    _ = server_state.global_scheduler;' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn handler() void {' '    _ = server_state.global_scheduler;' '}' 'fn go() void {' '    t.detach();' '}' 'test "t" {' '    _ = server_state.global_registry;' '}' 'const F = struct { fn deinit() void { server_state.global_registry = null; } };' > "$TMP/t/src/q.zig"
+printf '%s\n' 'detached-global-read src/q.zig:handler a connection thread the shutdown waits for' > "$TMP/t/allow"
+expect_green "a joined thread, an allowlisted handler, a test and a fixture after it"
+
 # rule promise-active
 tree
 printf '%s\n' 'fn contextNow(c: *const C) u32 {' '    const active = gpu_mem.activeBytes();' '    return contextAt(c, active);' '}' > "$TMP/t/src/p.zig"

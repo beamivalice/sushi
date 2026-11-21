@@ -18,6 +18,7 @@ const log = @import("log.zig");
 const http_conn = @import("http_conn.zig");
 const server_state = @import("server_state.zig");
 const FolderId = @import("folder_identity.zig").FolderId;
+const ModelRegistry = @import("model_registry.zig").ModelRegistry;
 
 const Allocator = std.mem.Allocator;
 const Phase = dp.Phase;
@@ -81,6 +82,37 @@ var mu: std.c.pthread_mutex_t = .{};
 var jobs: std.ArrayList(*Job) = .empty;
 var worker_running = false;
 var stopping = false;
+/// Downloads threads reading the registry now. A detached thread cannot be joined, so `stopServing` waits for this to
+/// reach zero (`registryBusy`) before the registry is freed, and `stop` closes the gate that raises it.
+var registry_users: u32 = 0;
+
+/// The one way a downloads thread of its own (the worker, the catalog refresh) reaches the registry: a handler runs
+/// on a connection thread that shutdown drains, these two are not drained, so each holds a use that `registryBusy`
+/// counts. `begin` is null once the server is stopping.
+const RegistryUse = struct {
+    registry: ?*ModelRegistry,
+
+    fn begin() ?RegistryUse {
+        lock();
+        defer unlock();
+        if (stopping) return null;
+        registry_users += 1;
+        return .{ .registry = server_state.global_registry };
+    }
+
+    fn end(_: RegistryUse) void {
+        lock();
+        defer unlock();
+        registry_users -= 1;
+    }
+};
+
+/// Whether a downloads thread may still be reading the registry; once `stop` returned and this reads false, none will.
+pub fn registryBusy() bool {
+    lock();
+    defer unlock();
+    return registry_users > 0;
+}
 
 fn lock() void {
     _ = std.c.pthread_mutex_lock(&mu);
@@ -137,11 +169,29 @@ fn buildCatalog(arena: Allocator, io: std.Io, rs: []const []const u8, updates: b
     return .{ .entries = entries.items, .state = if (offline) .offline else .ready };
 }
 
+/// The folders the catalog thread looks installed packs up in, copied into `arena`.
+fn catalogRoots(arena: Allocator, io: std.Io) error{ShuttingDown, OutOfMemory}![]const []const u8 {
+    const use = RegistryUse.begin() orelse return error.ShuttingDown;
+    defer use.end();
+    var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var roots_buf: [9][]const u8 = undefined;
+    const found = roots(&roots_buf, destRoot(&dest_buf, io, use.registry).path, use.registry);
+    const copy = try arena.alloc([]const u8, found.len);
+    for (found, copy) |r, *c| c.* = try arena.dupe(u8, r);
+    return copy;
+}
+
 fn refreshThread(io: std.Io, updates: bool) void {
     var arena: std.heap.ArenaAllocator = .init(gpa);
-    var roots_buf: [9][]const u8 = undefined;
-    var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const built = buildCatalog(arena.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io).path), updates);
+    const rs = catalogRoots(arena.allocator(), io) catch |err| {
+        log.debug("[download] catalog refresh abandoned: {t}\n", .{err});
+        arena.deinit();
+        lock();
+        defer unlock();
+        cat_busy = false;
+        return;
+    };
+    const built = buildCatalog(arena.allocator(), io, rs, updates);
     lock();
     defer unlock();
     if (cat_arena) |*old| old.deinit();
@@ -179,12 +229,11 @@ fn catalogRepoLocked(repo: []const u8) ?[]const u8 {
 const Dest = struct { path: []const u8, source: []const u8, locked: bool };
 
 /// The models folder the Settings tab edits: the `--model-dir` flag, else `server.models_dir`, else the default.
-fn destRoot(buf: []u8, io: std.Io) Dest {
+fn destRoot(buf: []u8, io: std.Io, registry: ?*ModelRegistry) Dest {
     const locks = &model_settings.launch_locks;
     if (locks.models_dir.set) return .{ .path = locks.models_dir.text(), .source = "flag", .locked = true };
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const reg = server_state.global_registry;
-    const settings_path = if (reg) |r| r.settings_path orelse model_settings.defaultPath(&path_buf) else model_settings.defaultPath(&path_buf);
+    const settings_path = if (registry) |r| r.settings_path orelse model_settings.defaultPath(&path_buf) else model_settings.defaultPath(&path_buf);
     var file = model_settings.load(gpa, io, settings_path);
     defer file.deinit();
     if (model_settings.server(&file).models_dir) |d| if (d.len <= buf.len) {
@@ -196,10 +245,10 @@ fn destRoot(buf: []u8, io: std.Io) Dest {
 }
 
 /// The destination first, then the folders the server discovered from.
-fn roots(buf: *[9][]const u8, dest: []const u8) []const []const u8 {
+fn roots(buf: *[9][]const u8, dest: []const u8, registry: ?*ModelRegistry) []const []const u8 {
     buf[0] = dest;
     var n: usize = 1;
-    const boot = if (server_state.global_registry) |r| if (r.discovery) |d| d.roots else &.{} else &.{};
+    const boot = if (registry) |r| if (r.discovery) |d| d.roots else &.{} else &.{};
     for (boot) |r| {
         if (n == buf.len) break;
         if (std.mem.eql(u8, r, buf[0])) continue;
@@ -368,13 +417,15 @@ fn finishJob(job: *Job, ok: bool) void {
     for (cat_entries) |*e| if (std.ascii.eqlIgnoreCase(e.repo, job.repo)) {
         e.update = null;
     };
-    const rescan = !stopping;
     unlock();
     packPulled(job.dest);
-    if (rescan) if (server_state.global_registry) |r| {
-        const added = r.absorbDownload(job.dest) catch 0;
-        log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ job.repo, added });
-    };
+    if (RegistryUse.begin()) |use| {
+        defer use.end();
+        if (use.registry) |r| {
+            const added = r.absorbDownload(job.dest) catch 0;
+            log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ job.repo, added });
+        }
+    }
     lock();
     defer unlock();
     job.phase = .done;
@@ -433,7 +484,8 @@ fn cancel(repo: []const u8) bool {
     return false;
 }
 
-/// Server shutdown: no curl outlives the server, nothing queued starts and nothing new is queued.
+/// Server shutdown: no curl outlives the server, nothing queued starts, nothing new is queued and no downloads
+/// thread begins reading the registry (the ones that already do are waited for through `registryBusy`).
 pub fn stop() void {
     lock();
     defer unlock();
@@ -547,9 +599,9 @@ fn render(allocator: Allocator, io: std.Io) ![]u8 {
     }
 
     var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dest = destRoot(&dest_buf, io);
+    const dest = destRoot(&dest_buf, io, server_state.global_registry);
     var roots_buf: [9][]const u8 = undefined;
-    const rs = roots(&roots_buf, dest.path);
+    const rs = roots(&roots_buf, dest.path, server_state.global_registry);
     const volume = try disk_placement.cacheVolumeAt(allocator, dest.path, false);
     defer volume.deinit(allocator);
     const ram = status.getTotalMemBytes();
@@ -650,9 +702,9 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
     } orelse return http.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Not a published Sushi pack; Check again refreshes the list", 404);
 
     var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const root = destRoot(&dest_buf, stream.io).path;
+    const root = destRoot(&dest_buf, stream.io, server_state.global_registry).path;
     var roots_buf: [9][]const u8 = undefined;
-    const installed = installedPath(arena, stream.io, roots(&roots_buf, root), repo);
+    const installed = installedPath(arena, stream.io, roots(&roots_buf, root, server_state.global_registry), repo);
     const dest = installed orelse try ownFolder(arena, root, repo);
     var warning: ?[]const u8 = null;
     if (installed == null) if (size) |s| if (disk_placement.volumeSpaceNear(dest)) |v| {
@@ -725,7 +777,6 @@ test "downloads: a pack row carries the tier verdict, the recommended pack and i
 }
 
 test "downloads: an update is refused for a model in memory, also while it loads or unloads" {
-    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
     const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
     defer reg.deinit();
     const e = try reg.registerStub("m", "/packs/m", 10);
@@ -806,7 +857,7 @@ const FolderFixture = struct {
     tmp: testing.TmpDir,
     root_buf: [std.fs.max_path_bytes]u8 = undefined,
     root: []const u8 = "",
-    reg: *@import("model_registry.zig").ModelRegistry = undefined,
+    reg: *ModelRegistry = undefined,
     prev_reg: ?*@import("model_registry.zig").ModelRegistry = null,
     saved_locks: model_settings.LaunchLocks = undefined,
 
@@ -844,7 +895,7 @@ const FolderFixture = struct {
         _ = self;
         var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
         var roots_buf: [9][]const u8 = undefined;
-        return installedPath(arena, testing.io, roots(&roots_buf, destRoot(&dest_buf, testing.io).path), cli.aliases[0].repo) orelse error.PackNotInstalled;
+        return installedPath(arena, testing.io, roots(&roots_buf, destRoot(&dest_buf, testing.io, server_state.global_registry).path, server_state.global_registry), cli.aliases[0].repo) orelse error.PackNotInstalled;
     }
 };
 
@@ -905,7 +956,6 @@ test "downloads: with --model-dir typed with a trailing slash, a finished update
 test "downloads: a pack folder spelled in another case than the catalog's still refuses an update while loaded" {
     const io = testing.io;
     const md = @import("model_discovery.zig");
-    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const repo = cli.aliases[0].repo;
@@ -935,7 +985,7 @@ test "downloads: a pack folder spelled in another case than the catalog's still 
     tmp.dir.access(io, name, .{}) catch return error.SkipZigTest;
     var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
     var roots_buf: [9][]const u8 = undefined;
-    const installed = installedPath(arena_state.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io).path), repo) orelse return error.PackNotInstalled;
+    const installed = installedPath(arena_state.allocator(), io, roots(&roots_buf, destRoot(&dest_buf, io, server_state.global_registry).path, server_state.global_registry), repo) orelse return error.PackNotInstalled;
     reg.mutex.lockUncancelable(io);
     const loaded_as = try loadedModelAtLocked(arena_state.allocator(), &(try FolderId.of(testing.io, installed)));
     reg.mutex.unlock(io);
@@ -965,7 +1015,7 @@ const GateFixture = struct {
     tmp: std.testing.TmpDir,
     root_buf: [std.fs.max_path_bytes]u8 = undefined,
     root: []const u8 = "",
-    reg: *@import("model_registry.zig").ModelRegistry = undefined,
+    reg: *ModelRegistry = undefined,
     prev: ?*@import("model_registry.zig").ModelRegistry = null,
 
     fn deinit(s: *GateFixture) void {
@@ -978,7 +1028,6 @@ const GateFixture = struct {
 test "downloads: a loaded pack folder renamed in case only still refuses an update, and its running update still gates the load" {
     const io = testing.io;
     const md = @import("model_discovery.zig");
-    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
     var s: GateFixture = .{ .tmp = testing.tmpDir(.{ .iterate = true }) };
     try md.writePackStub(io, s.tmp.dir, "beamster/Pack");
     try s.tmp.dir.writeFile(io, .{ .sub_path = "beamster/Pack/model.safetensors", .data = "0123456789" });
@@ -1023,7 +1072,6 @@ test "downloads: a loaded pack folder renamed in case only still refuses an upda
 test "downloads: a symlinked models folder pointed at a stopped pull's copy: the load gate sees its marker" {
     const io = testing.io;
     const md = @import("model_discovery.zig");
-    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
     var s: GateFixture = .{ .tmp = testing.tmpDir(.{ .iterate = true }) };
     try md.writePackStub(io, s.tmp.dir, "diskA/beamster/P");
     try s.tmp.dir.writeFile(io, .{ .sub_path = "diskA/beamster/P/model.safetensors", .data = "0123" });
@@ -1051,7 +1099,6 @@ test "downloads: a symlinked models folder pointed at a stopped pull's copy: the
 test "downloads: a pull reports done only once its pack is registered, so the one refresh the page makes on done lists it" {
     const io = testing.io;
     const md = @import("model_discovery.zig");
-    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try md.writePackStub(io, tmp.dir, "beamster/Fresh");
@@ -1100,4 +1147,107 @@ test "downloads: a pull reports done only once its pack is registered, so the on
     try testing.expect(phase_while_unlisted != .done);
     try testing.expectEqual(Phase.done, job.phase);
     try testing.expect(reg.peekByPath(dest) != null);
+}
+
+test "downloads: a pull that finishes as the server stops registers its pack before the drain reports the registry free" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try md.writePackStub(io, tmp.dir, "beamster/Late");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Late/model.safetensors", .data = "0123456789" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const dest = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Late", .{rb[0..try tmp.dir.realPath(io, &rb)]});
+    defer testing.allocator.free(dest);
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    const job = try Job.create(testing.allocator, "beamster/Late", dest, false);
+    defer job.destroy();
+    job.phase = .verifying;
+    // A request holds the registry as the pull ends; the pull's own rescan waits for it.
+    reg.mutex.lockUncancelable(io);
+    const finisher = try std.Thread.spawn(.{}, struct {
+        fn run(j: *Job) void {
+            finishJob(j, true);
+        }
+    }.run, .{job});
+    var spins: usize = 0;
+    while (reg.mutex.state.load(.monotonic) != .contended) : (spins += 1) {
+        if (spins == 200_000_000) {
+            reg.mutex.unlock(io);
+            finisher.join();
+            return error.FinisherNeverWaited;
+        }
+        std.Thread.yield() catch {};
+    }
+    // The server stops: the request ends, and `stopServing` waits until nothing of the downloads reads the registry.
+    stop();
+    defer {
+        lock();
+        stopping = false;
+        unlock();
+    }
+    reg.mutex.unlock(io);
+    spins = 0;
+    while (registryBusy()) : (spins += 1) {
+        if (spins == 200_000_000) {
+            finisher.join();
+            return error.DrainNeverIdle;
+        }
+        std.Thread.yield() catch {};
+    }
+    // What `registry.deinit` would free now is read once more, as the teardown does: the pull's registration is over.
+    reg.mutex.lockUncancelable(io);
+    const listed_when_idle = reg.entries.count();
+    reg.mutex.unlock(io);
+    finisher.join();
+    try testing.expectEqual(@as(usize, 1), listed_when_idle);
+    try testing.expectEqual(listed_when_idle, reg.entries.count());
+}
+
+test "downloads: a catalog refresh that starts after the server stopped reads no registry" {
+    const io = testing.io;
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    stop();
+    defer {
+        lock();
+        stopping = false;
+        unlock();
+    }
+    try testing.expectError(error.ShuttingDown, catalogRoots(arena_state.allocator(), io));
+    try testing.expect(!registryBusy());
+}
+
+test "downloads: a pull that finishes after the server stopped registers nothing and leaves the registry free" {
+    const io = testing.io;
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    const job = try Job.create(testing.allocator, "beamster/Never", "/nonexistent/sushi-test/beamster/Never", false);
+    defer job.destroy();
+    job.phase = .verifying;
+    stop();
+    defer {
+        lock();
+        stopping = false;
+        unlock();
+    }
+    finishJob(job, true);
+    try testing.expectEqual(Phase.done, job.phase);
+    try testing.expect(!registryBusy());
+    try testing.expectEqual(@as(usize, 0), reg.entries.count());
 }

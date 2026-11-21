@@ -1133,7 +1133,9 @@ const CONN_DRAIN_MS: u64 = 35_000;
 /// connection threads to finish — `serve` runs `scheduler.deinit` on return, which
 /// frees the slots, the models and the stores those threads hold. The inference
 /// thread is still alive here (deinit joins it later), so cancelled slots settle
-/// promptly. False when a thread is still alive past the bound: it would read what
+/// promptly. The detached threads of `downloads.zig` are not connection threads: the one that registers a finished
+/// pack and the catalog refresh read the registry, so the wait covers them too (`downloads.registryBusy`).
+/// False when a thread is still alive past the bound: it would read what
 /// the teardown frees, so `serve` skips that teardown and returns
 /// `error.ConnectionsOutliveShutdown`, and its caller must free nothing it passed in.
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
@@ -1149,15 +1151,16 @@ fn stopServing(io: std.Io, accept_thread: *?std.Thread) bool {
     if (server_state.global_scheduler) |sch| sch.beginShutdown();
     var waited_ms: u64 = 0;
     var idle_fds = [_]std.posix.pollfd{};
-    while (active_conn_threads.load(.acquire) > 0 and waited_ms < CONN_DRAIN_MS) {
+    while ((active_conn_threads.load(.acquire) > 0 or downloads.registryBusy()) and waited_ms < CONN_DRAIN_MS) {
         _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
         waited_ms += 20;
     }
     const remaining = active_conn_threads.load(.acquire);
-    if (remaining > 0) {
+    const downloads_busy = downloads.registryBusy();
+    if (remaining > 0 or downloads_busy) {
         var held_buf: [512]u8 = undefined;
         const held = if (server_state.global_scheduler) |sch| sch.stillHeld(&held_buf) else "nothing the scheduler knows";
-        log.warn("shutdown: {d} connection thread(s) still active after {d}ms, holding {s}: ending without the teardown that would free it\n", .{ remaining, waited_ms, held });
+        log.warn("shutdown: {d} connection thread(s) and {s} still active after {d}ms, holding {s}: ending without the teardown that would free it\n", .{ remaining, if (downloads_busy) "a downloads thread reading the registry" else "no downloads thread", waited_ms, held });
         return false;
     }
     return true;

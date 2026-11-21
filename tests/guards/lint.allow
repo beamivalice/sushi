@@ -84,3 +84,8 @@ folder-bytes-compare src/model_registry.zig:registerByPath trims the stored path
 folder-bytes-compare src/model_registry.zig:newFolderIdLocked slices the id's names out of the path; folders are compared as FolderId
 result-field-free src/generate.zig:deinit the one owner of a GenerationResult: frees its fields together
 reply-bypass src/generation_stream.zig:continueAfterThought a continuation is never offered to a constrained request (`ThoughtKept.keptFor`), so its ask has no span-routed case
+detached-global-read src/downloads.zig:begin RegistryUse is the gate: the downloads threads of their own read the registry only through it, and stopServing waits on registryBusy
+detached-global-read src/downloads.zig:loadedModelAtLocked runs on a connection thread (claimDest), which the shutdown drain waits for
+detached-global-read src/downloads.zig:claimDest runs on a connection thread (handleStart), which the shutdown drain waits for
+detached-global-read src/downloads.zig:handleStart runs on a connection thread, which the shutdown drain waits for
+detached-global-read src/downloads.zig:render runs on a connection thread (GET /v1/downloads), which the shutdown drain waits for
