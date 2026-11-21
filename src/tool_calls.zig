@@ -76,8 +76,8 @@ pub fn parseToolCallsAs(allocator: std.mem.Allocator, text: []const u8, dialect:
 pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect, open_bare: *?[]u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
     var effective_text = text;
-    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
-        effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
+    if (tool_reading.outsideCalls(text, 0, tool_reading.channelCloseAt)) |end| {
+        effective_text = std.mem.trimStart(u8, text[end.pos + end.len ..], "\n ");
     } else if (indexOfThinkCloseTag(text, 0)) |close| {
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }

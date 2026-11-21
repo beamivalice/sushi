@@ -33,7 +33,7 @@ pub const families = [_]Family{
     .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"}, .reads_as_call = wrapperReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
     .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
     .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"}, .values = .dsml, .container = true },
-    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .values = .dsml },
+    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .reads_as_call = dsmlInvokeReadsAsCall, .values = .dsml },
     .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"}, .values = .invoke, .container = true },
     .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall, .values = .invoke },
     .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall, .values = .function_tag },
@@ -48,17 +48,20 @@ fn gemmaReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
     return std.mem.startsWith(u8, body, "call:") or std.mem.startsWith(u8, "call:", body);
 }
 
-/// A bare `<tool_call>` opens a call when a JSON object, a tag or a tool name leads its body, or the text stops
-/// there: `I could emit <tool_call> here` is prose. Another spelling (`<tool_call name=`, `<tool_calls>`) is a call.
+/// A bare `<tool_call>` opens a call when a JSON object, a tag or a tool name followed by its first argument tag
+/// leads its body, or the text stops there: `I could emit <tool_call> here` is prose, and so is a mention followed
+/// by another opener. Another spelling (`<tool_call name=`, `<tool_calls>`) is a call.
 fn wrapperReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
     const tail = text[at..];
     const open = "<tool_call";
     if (tail.len <= open.len or tail[open.len] != '>') return true;
     const body = std.mem.trimStart(u8, tail[open.len + 1 ..], " \t\r\n");
-    if (body.len == 0 or body[0] == '{' or body[0] == '<') return true;
+    if (body.len == 0 or body[0] == '{') return true;
+    if (body[0] == '<') return !(std.mem.startsWith(u8, body, "<|tool_call") or std.mem.startsWith(u8, body, "<tool_call") or std.mem.startsWith(u8, body, "<\u{ff5c}DSML"));
     var name: usize = 0;
     while (name < body.len and (std.ascii.isAlphanumeric(body[name]) or body[name] == '_' or body[name] == '-' or body[name] == '.')) name += 1;
-    return name > 0 and (name == body.len or body[name] == '<');
+    const after = std.mem.trimStart(u8, body[name..], " \t\r\n");
+    return name > 0 and (after.len == 0 or std.mem.startsWith(u8, after, "<arg_") or std.mem.startsWith(u8, after, "</"));
 }
 
 /// `<tool name="x">{…`, `<tool>{"name":…` and `<tool_request>{…`: the tag's `>` opens a body that is a JSON object or Hermes' function tag.
@@ -70,6 +73,19 @@ fn genericToolTagReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
     const body = std.mem.trimStart(u8, tail[gt + 1 ..], " \t\n\r");
     if (std.mem.startsWith(u8, body, "{")) return std.mem.startsWith(u8, std.mem.trimStart(u8, body[1..], " \t\n\r"), "\"");
     return std.mem.startsWith(u8, body, "<function=");
+}
+
+/// `<｜DSML｜invoke name="x">` with a parameter or its close before the next invoke, or with the text stopping inside
+/// it: a mention of the opener in prose has neither.
+fn dsmlInvokeReadsAsCall(text: []const u8, at: usize, scan: *Scan) bool {
+    const tail = text[at..];
+    const gt = std.mem.indexOfScalar(u8, tail[0..@min(tail.len, 512)], '>') orelse return tail.len < 512;
+    if ((tool_calls.dsmlAttr(tail[0..gt], "name") orelse return false).len == 0) return false;
+    const from = at + gt + 1;
+    const next = earliestOf(scan.dsml_invoke.find(text, from, &scan.work), scan.dsml_invoke_spaced.find(text, from, &scan.work)) orelse return true;
+    const own = text[from..next];
+    return std.mem.indexOf(u8, own, "<｜DSML｜parameter") != null or std.mem.indexOf(u8, own, "<｜DSML｜ parameter") != null or
+        std.mem.indexOf(u8, own, "</｜DSML｜invoke>") != null or std.mem.indexOf(u8, own, "</｜DSML｜ invoke>") != null;
 }
 
 /// `<invoke name="x">` with a `<parameter ` of its own before the next `<invoke`: the opener alone is prose.
@@ -137,11 +153,14 @@ const opener_count = blk: {
 /// byte, and where each opener spelling and each needle an opener's reading looks for next stands.
 pub const Scan = struct {
     fed: usize = 0,
+    started: bool = false,
     state: think_tags.CodeSpan = .{},
     openers: [opener_count]Next,
     parameter_eq: Next = .{ .needle = "<parameter=" },
     param: Next = .{ .needle = "<param" },
     gt: Next = .{ .needle = ">" },
+    dsml_invoke: Next = .{ .needle = "<｜DSML｜invoke" },
+    dsml_invoke_spaced: Next = .{ .needle = "<｜DSML｜ invoke" },
     /// Bytes the searches covered; a test holds it to a multiple of the text.
     work: usize = 0,
 
@@ -156,9 +175,11 @@ pub const Scan = struct {
     }
 
     fn openAt(self: *Scan, text: []const u8, at: usize) bool {
-        if (at < self.fed) {
-            self.fed = 0;
+        // A span ends with its line, so a text is read from the line of the first byte asked.
+        if (at < self.fed or !self.started) {
+            self.fed = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
             self.state = .{};
+            self.started = true;
         }
         self.state.feed(text[self.fed..at]);
         self.fed = at;
@@ -206,6 +227,12 @@ fn callEnd(f: *const Family, text: []const u8, at: usize, model_ended: bool) ?En
         for (f.body_closers) |c| best = earlierEnd(best, firstEnd(f, text, at, c));
     }
     return best;
+}
+
+fn earliestOf(a: ?usize, b: ?usize) ?usize {
+    const x = a orelse return b;
+    const y = b orelse return a;
+    return @min(x, y);
 }
 
 fn earlierEnd(a: ?End, b: ?End) ?End {
@@ -337,6 +364,12 @@ pub fn defects(allocator: std.mem.Allocator, text: []const u8, model_ended: bool
 
 const Style = enum { any, think, channel };
 
+/// The first tag `find` finds at or after `from` that no call's value holds: a think or channel tag inside a call is
+/// the call's payload, wherever its closer stands.
+pub fn outsideCalls(text: []const u8, from: usize, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
+    return firstOutsideCalls(text, from, true, find);
+}
+
 /// A thought's close at or after `from` that no call spans: a call that opens before it and ends after it holds it
 /// as payload. A call that never ends is leaked markup, not a span.
 fn thoughtClose(text: []const u8, from: usize, model_ended: bool, style: Style) ?think_tags.TagAt {
@@ -347,12 +380,17 @@ fn thoughtClose(text: []const u8, from: usize, model_ended: bool, style: Style) 
     return if (c.pos < t.pos) c else t;
 }
 
-fn channelCloseAt(text: []const u8, from: usize) ?think_tags.TagAt {
+pub fn channelThoughtAt(text: []const u8, from: usize) ?think_tags.TagAt {
+    const p = std.mem.indexOfPos(u8, text, from, "<|channel>thought") orelse return null;
+    return .{ .pos = p, .len = "<|channel>thought".len };
+}
+
+pub fn channelCloseAt(text: []const u8, from: usize) ?think_tags.TagAt {
     const p = std.mem.indexOfPos(u8, text, from, "<channel|>") orelse return null;
     return .{ .pos = p, .len = "<channel|>".len };
 }
 
-fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
+pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
     var i = from;
     var scan = Scan.init();
     outer: while (find(text, i)) |m| {

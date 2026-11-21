@@ -1419,3 +1419,35 @@ test "r173-f-foreign-opener: DSML: a finished call whose value spells its closer
     };
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+
+test "r173-f-foreign-opener: a finished call whose value spells think tags keeps the value as written" {
+    const a = testing.allocator;
+    const value = "a <think>b</think> c";
+    const leads = [_][]const u8{ "", "<think>plan</think>\n\n", "plan</think>\n\n" };
+    var bad: usize = 0;
+    for (leads, [_]bool{ false, false, true }) |lead, opens| for ([_]?tool_calls_mod.Dialect{ .function_tag, .arg_key, .dsml }) |dialect| {
+        const call = switch (dialect.?) {
+            .function_tag => "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>",
+            .arg_key => "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>",
+            .dsml => "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">a.md</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">" ++ value ++ "</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+        };
+        const text = try std.mem.concat(a, u8, &.{ lead, call });
+        defer a.free(text);
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = opens };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        var got: []const u8 = "(no call)";
+        var p: ?std.json.Parsed(std.json.Value) = null;
+        defer if (p) |q| q.deinit();
+        if (s.reply) |r| {
+            p = try std.json.parseFromSlice(std.json.Value, a, r.calls[0].arguments, .{});
+            got = if (p.?.value.object.get("content")) |v| v.string else r.calls[0].arguments;
+        }
+        if (!std.mem.eql(u8, got, value) or s.declined != null) {
+            bad += 1;
+            std.debug.print("think-value {s} lead={f}: content {f} declined={?s}\n", .{ @tagName(dialect.?), std.zig.fmtString(lead), std.zig.fmtString(got), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}

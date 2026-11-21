@@ -4115,3 +4115,37 @@ test "format corpus: a call whose value spells another call's markup is read as 
         try testing.expectEqualStrings(want, std.mem.trim(u8, (parsed.value.object.get("content") orelse return error.ValueDropped).string, "\n"));
     };
 }
+
+test "format corpus: a think tag a call's value spells is the value's text, whatever thought leads the call, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const value = "a <think>b</think> c </think> d <|channel>thought e<channel|> f";
+    const calls = [_][]const u8{
+        "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"" ++ value ++ "\"}}\n</tool_call>",
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>",
+        "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">a.md</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">" ++ value ++ "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls>",
+    };
+    const Lead = struct { text: []const u8, opens: bool };
+    const leads = [_]Lead{ .{ .text = "", .opens = false }, .{ .text = "Let me write it.\n", .opens = false }, .{ .text = "<think>plan</think>\n\n", .opens = false }, .{ .text = "plan</think>\n\n", .opens = true } };
+    for (calls) |call| for (leads) |lead| for ([_]bool{ true, false }) |normalize| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(allocator, u8, &.{ lead.text, call });
+        defer allocator.free(text);
+        errdefer std.debug.print("[{s} normalize {}] {f}\n", .{ finish, normalize, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = normalize, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = lead.opens };
+        const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer whole.deinit(allocator);
+        const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
+        defer streamed.deinit(allocator);
+        for ([_]reply_mod.Settled{ whole, streamed }) |got| {
+            try testing.expect(got.declined == null);
+            const calls_read = (got.reply orelse return error.FinishedCallDropped).calls;
+            try testing.expectEqual(@as(usize, 1), calls_read.len);
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls_read[0].arguments, .{});
+            defer parsed.deinit();
+            try testing.expectEqualStrings(value, std.mem.trim(u8, (parsed.value.object.get("content") orelse return error.ValueDropped).string, "\n"));
+        }
+        try testing.expectEqualStrings(whole.text, streamed.text);
+    };
+}
+

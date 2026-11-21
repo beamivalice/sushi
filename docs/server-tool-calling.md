@@ -292,7 +292,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An argument key never carries markup or a line break** (corpus invariant): a doubled `<arg_key><arg_key>K` keys on
   the LAST opener; a special token spelled where `<` belongs before `function=` right after `<tool_call>` is read as
   `<` (`hermesSpecialOpenerRepair`).
-- **A `</think>` inside a tool ARGUMENT is payload** (`thinkCloseIsToolCallPayload`): decline a close whose nearest
+- **A think or channel tag inside a call's value is payload** (`tool_reading.outsideCalls`, read by `indexOfThinkOpenTag`, `indexOfThinkCloseTag`, the channel scans, `normalizeEmbeddedThinkBlocks`, the parse's thought strip and `splitThinkBlock`): a tag is structure only where no call that opens before it ends after it, in any family; a call that never ends is leaked markup, not a payload container. `ThinkScan` stops latching a close once any call opener's start appears.
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).
   A tag dialect's value (Qwen, GLM, `<invoke>`, DSML without `string="false"`) is the string the model wrote; with

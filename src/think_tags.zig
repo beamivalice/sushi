@@ -3,6 +3,7 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const BARE_INVOKE = tool_calls_mod.BARE_INVOKE;
+const tool_reading = @import("tool_reading.zig");
 const ChatConfig = chat.ChatConfig;
 const FUNCTION_CALLS_TAG = tool_calls_mod.FUNCTION_CALLS_TAG;
 const Message = chat.Message;
@@ -27,10 +28,8 @@ fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
     while (nextThinkOpen(text, from)) |o| {
         const close = if (o.is_think_style)
             indexOfThinkCloseTag(text, o.after)
-        else if (std.mem.indexOfPos(u8, text, o.after, "<channel|>")) |p|
-            TagAt{ .pos = p, .len = "<channel|>".len }
         else
-            null;
+            tool_reading.outsideCalls(text, o.after, tool_reading.channelCloseAt);
         if (close) |c| {
             // This block IS closed — keep scanning past its close.
             from = c.pos + c.len;
@@ -65,7 +64,13 @@ pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
     return tagLenAt(text, "</think");
 }
 
+/// The first `<think>` at or after `from` outside an inline code span and outside every call's value: the one scan
+/// every surface and `normalizeEmbeddedThinkBlocks` use.
 fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
+    return tool_reading.outsideCalls(text, from, rawThinkOpenAt);
+}
+
+fn rawThinkOpenAt(text: []const u8, from: usize) ?TagAt {
     var i = from;
     while (std.mem.indexOfPos(u8, text, i, "<think")) |p| {
         if (thinkOpenTagLenAt(text[p..])) |l| {
@@ -76,15 +81,9 @@ fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
     return null;
 }
 
+/// The first `</think>` at or after `from` outside an inline code span and outside every call's value.
 pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
-    var i = from;
-    while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
-        if (thinkCloseTagLenAt(text[p..])) |l| {
-            if (!thinkCloseIsToolCallPayload(text, p) and openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
-        }
-        i = p + "</think".len;
-    }
-    return null;
+    return tool_reading.outsideCalls(text, from, rawThinkCloseAt);
 }
 
 /// The first `</think>` at or after `from` outside an inline code span, whatever call it stands in.
@@ -282,62 +281,6 @@ fn spanSettledLen(text: []const u8) usize {
     var n = text.len;
     while (n > 0 and text[n - 1] == '`') n -= 1;
     return openCodeSpanStart(text[0..n]) orelse n;
-}
-
-/// Whether a `</think>` at `pos` is an ARGUMENT VALUE rather than a block close.
-///
-/// The think split runs before tool parse, and this is the shared close-tag
-/// scan every surface uses — so a model writing about its own prompt format
-/// (`<arg_value>…closes a thought with </think>…</arg_value>`) had the split cut
-/// straight through the call, losing it entirely and leaking the fragments.
-/// Agent traffic writes files about prompts.
-///
-/// Payload ⟺ the nearest tool opener before `pos` is still OPEN there (no
-/// `</tool_call` between it and `pos`) AND the block does close afterwards.
-/// Both halves are load-bearing:
-///   • without the first, a call the model emitted and CLOSED inside its
-///     thought would make the real `</think>` after it look like payload;
-///   • without the second, an unclosed opener inside a thought (the leaked-
-///     markup case, which `trimLeakedToolMarkup` handles downstream) would
-///     swallow the answer that follows the close.
-fn thinkCloseIsToolCallPayload(text: []const u8, pos: usize) bool {
-    // `streamThinkGate2` calls the close scan once per TOKEN on a growing
-    // buffer, so the common case — text with no tool markup at all — must cost
-    // one substring scan, not a walk per opener spelling. Both spellings share
-    // this needle.
-    if (std.mem.indexOf(u8, text[0..pos], "tool_call") == null) return false;
-    // Nearest `<tool_call`-family opener before `pos`. Only this family is
-    // considered: it is the one whose bodies carry free-form argument text.
-    var open: ?usize = null;
-    for ([_][]const u8{ "<tool_call", "<|tool_call" }) |m| {
-        var i: usize = 0;
-        while (std.mem.indexOfPos(u8, text, i, m)) |p| {
-            if (p >= pos) break;
-            if (open == null or p > open.?) open = p;
-            i = p + 1;
-        }
-    }
-    const o = open orelse return false;
-    var from = o;
-    while (std.mem.indexOfPos(u8, text, from, "</tool_call")) |c| {
-        if (c >= pos) return true;
-        // A close spelled inside the argument is not the call's own end.
-        if (valueStillOpen(text, o, c, "<arg_value", "</arg_value>") or
-            valueStillOpen(text, o, c, "<parameter", "</parameter>"))
-        {
-            from = c + "</tool_call".len;
-            continue;
-        }
-        return false; // that call already closed — a real block close
-    }
-    return false; // never closes — treat as leaked markup, not payload
-}
-
-fn valueStillOpen(text: []const u8, from: usize, at: usize, open_tag: []const u8, close_tag: []const u8) bool {
-    const rel = std.mem.lastIndexOf(u8, text[from..at], open_tag) orelse return false;
-    const open_at = from + rel;
-    if (std.mem.indexOfPos(u8, text, open_at + open_tag.len, close_tag)) |end| return end > at;
-    return true;
 }
 
 /// Length of the trailing bytes of `buf` that could still GROW into a think
@@ -741,7 +684,8 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
 /// above so a new arm cannot forget it.
 pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
-    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+    if (tool_reading.outsideCalls(text, 0, tool_reading.channelCloseAt)) |close| {
+        const end = close.pos;
         const think_tag = "<|channel>thought\n";
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
@@ -825,7 +769,7 @@ pub const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
 
 /// Earliest think/thought opener at or after `from` (either tag family).
 pub fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
-    const chan = std.mem.indexOfPos(u8, text, from, "<|channel>thought");
+    const chan = if (tool_reading.outsideCalls(text, from, tool_reading.channelThoughtAt)) |c| c.pos else null;
     const think = indexOfThinkOpenTag(text, from);
     if (chan == null and think == null) return null;
     if (think == null or (chan != null and chan.? < think.?.pos)) {
@@ -836,7 +780,7 @@ pub fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
 
 /// Earliest close tag at or after `from` (either tag family).
 fn nextThinkClose(text: []const u8, from: usize) ?ThinkOpen {
-    const chan = std.mem.indexOfPos(u8, text, from, "<channel|>");
+    const chan = if (tool_reading.outsideCalls(text, from, tool_reading.channelCloseAt)) |c| c.pos else null;
     const think = indexOfThinkCloseTag(text, from);
     if (chan == null and think == null) return null;
     if (think == null or (chan != null and chan.? < think.?.pos)) {
@@ -933,10 +877,8 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
         };
         const found: ?TagAt = if (o.is_think_style)
             indexOfThinkCloseTag(text, o.after)
-        else if (std.mem.indexOfPos(u8, text, o.after, "<channel|>")) |cp|
-            TagAt{ .pos = cp, .len = "<channel|>".len }
         else
-            null;
+            tool_reading.outsideCalls(text, o.after, tool_reading.channelCloseAt);
         const close = found orelse {
             // With no closed block the split's own unclosed arm reads the opener.
             if (closed_blocks == 0) {
@@ -1298,11 +1240,11 @@ pub const ThinkScan = struct {
     saw_channel_thought: bool = false,
     saw_open: bool = false,
     saw_channel_close: bool = false,
-    /// Tool markup anywhere in the buffer. This is what makes a found close
-    /// UNSTABLE and therefore un-latchable: `thinkCloseIsToolCallPayload`
-    /// reclassifies a close as an argument value once a `</tool_call` arrives
-    /// AFTER it, so a close that was real at token N is payload at token N+k.
-    /// With no tool markup the close is stable and latching is exact.
+    /// A call opener's start anywhere in the buffer. This is what makes a found close
+    /// UNSTABLE and therefore un-latchable: `tool_reading.outsideCalls` reclassifies a
+    /// close as a call's value once the call's closer arrives AFTER it, so a close that
+    /// was real at token N is payload at token N+k. With no call opener the close is
+    /// stable and latching is exact.
     saw_tool_marker: bool = false,
     /// First real close tag, once found and stable.
     close: ?TagAt = null,
@@ -1351,8 +1293,8 @@ pub const ThinkScan = struct {
                 self.saw_channel_thought = true;
             if (!self.saw_channel_close and std.mem.indexOf(u8, win, "<channel|>") != null)
                 self.saw_channel_close = true;
-            if (!self.saw_tool_marker and std.mem.indexOf(u8, win, "tool_call") != null)
-                self.saw_tool_marker = true;
+            // An opener's `name=` may arrive a token after its `<function`: judge it with the bytes it can straddle.
+            if (!self.saw_tool_marker and hasCallMarker(buf[from -| 256 ..])) self.saw_tool_marker = true;
             // The open scan takes the FULL buffer with a start offset: it
             // consults nothing before the match, but a windowed slice would
             // shift the reported position. Monotone — a complete opener stays
@@ -1372,6 +1314,19 @@ pub const ThinkScan = struct {
         }
     }
 };
+
+/// Whether `win` holds the start of a call opener of any family (`tool_reading.families`): `<function foo>` and
+/// `<invoke>` with no name attribute near by never open a call.
+fn hasCallMarker(win: []const u8) bool {
+    inline for (.{ "<tool", "<|tool", "<function=", "<｜DSML" }) |m| if (std.mem.indexOf(u8, win, m) != null) return true;
+    inline for (.{ "<function", "<invoke" }) |m| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, win, from, m)) |p| : (from = p + m.len) {
+            if (std.mem.indexOf(u8, win[p..@min(win.len, p + 256)], "name=") != null) return true;
+        }
+    }
+    return false;
+}
 
 /// The settled reasoning of a thought still open on a tools stream, or null when it must wait for
 /// its close: only a thought that starts the undelivered buffer (prompt-opened, or its opener first)
