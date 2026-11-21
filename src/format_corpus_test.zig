@@ -2384,6 +2384,57 @@ test "format corpus: an unfinished call of any dialect never ships, and prose th
     }
 }
 
+test "format corpus: a finished call ships and declines nothing, whatever markup the text around it or its value mentions, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const leads = [_][]const u8{
+        "",
+        "Let me check.\n",
+        "<think>I could emit <tool_call> or <|tool_call> or <\u{ff5c}DSML\u{ff5c}invoke name=\"x\"> here.</think>\n\n",
+    };
+    const tails = [_][]const u8{ "", "\nI used the `<tool_call>` tag.", "\nGemma writes `<|tool_call>`, DeepSeek `<\u{ff5c}DSML\u{ff5c}tool_calls>`." };
+    for (dialect_calls) |call| for (leads) |lead| for (tails) |tail| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(allocator, u8, &.{ lead, call, tail });
+        defer allocator.free(text);
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer whole.deinit(allocator);
+        const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
+        defer streamed.deinit(allocator);
+        for ([_]reply_mod.Settled{ whole, streamed }) |got| {
+            errdefer std.debug.print("calls {?d} declined {?s}\n", .{ if (got.reply) |r| @as(?usize, r.calls.len) else null, if (got.declined) |d| d.name orelse "(unnamed)" else null });
+            try testing.expectEqual(@as(usize, 1), (got.reply orelse return error.FinishedCallDropped).calls.len);
+            try testing.expect(got.declined == null);
+        }
+        try testing.expectEqualStrings(whole.reply.?.calls[0].arguments, streamed.reply.?.calls[0].arguments);
+    };
+}
+
+test "format corpus: a call whose inner call closed but whose wrapper did not ships at the model's own end and is declined at a cut" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const open_wrapper = [_][]const u8{
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n",
+        "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">Tokyo</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n",
+        "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tokyo</parameter>\n</invoke>\n",
+    };
+    for (open_wrapper) |call| for ([_]bool{ false, true }) |ended| {
+        errdefer std.debug.print("[ended {}] {f}\n", .{ ended, std.zig.fmtString(call) });
+        const got = try reply_mod.settle(allocator, .{ .text = call, .source = .whole, .finish_reason = if (ended) "stop" else "length", .finish_details = null }, .{
+            .stops = &.{},
+            .normalize = true,
+            .has_tools = true,
+            .tools_json = weather_tool_schema,
+            .allow_parallel = true,
+            .dialect = null,
+            .opens_think = false,
+        });
+        defer got.deinit(allocator);
+        try testing.expectEqual(ended, got.reply != null);
+        try testing.expectEqual(!ended, got.declined != null);
+    };
+}
+
 /// Where `needle` ends in `text`, counted from `from`.
 fn endOf(text: []const u8, from: usize, needle: []const u8) usize {
     return std.mem.indexOfPos(u8, text, from, needle).? + needle.len;
@@ -3904,4 +3955,29 @@ test "format corpus: a function name the client forces is its text in the prompt
     const call = try chat.encodeCallText(a, &tok, "<call>", "<eot>", "<call>");
     defer a.free(call);
     try testing.expectEqualSlices(u32, &.{ tok.specialTokenId("<call>").?, '<', 'e', 'o', 't', '>', tok.specialTokenId("<call>").? }, call);
+}
+
+test "format corpus: an opener the model wrote and nothing more is a cut call: declined, no markup in the content, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const openers = [_][]const u8{ "<tool_call>", "<tool_call>\n", "<|tool_call>", "<|tool_call>call:", "<tool_call>get_wea", "<\u{ff5c}DSML\u{ff5c}tool_calls>\n" };
+    const stops = [_][]const u8{"STOP"};
+    for (openers) |opener| for ([_][]const u8{ "stop", "length", "cancelled" }) |finish| for ([_][]const u8{ "", "STOP and more" }) |after| {
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", opener, after });
+        defer allocator.free(text);
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const gen_finish = if (after.len > 0) "length" else finish;
+        const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = gen_finish, .finish_details = null }, ask);
+        defer whole.deinit(allocator);
+        // A stream's gate has cut the stop already.
+        const delivered = text[0 .. text.len - after.len];
+        const streamed = try reply_mod.settle(allocator, .{ .text = delivered, .source = .{ .gated = if (after.len > 0) "STOP" else null }, .finish_reason = if (after.len > 0) "stop" else finish, .finish_details = null }, ask);
+        defer streamed.deinit(allocator);
+        for ([_]reply_mod.Settled{ whole, streamed }) |got| {
+            try testing.expect(got.reply == null);
+            try testing.expect(got.declined != null);
+            const content = think_tags.splitThinkBlock(got.text, true, false).content;
+            try testing.expectEqualStrings("Let me check.", std.mem.trim(u8, content, " \n"));
+        }
+    };
 }

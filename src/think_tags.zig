@@ -87,11 +87,23 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
     return null;
 }
 
+/// The first `</think>` at or after `from` outside an inline code span, whatever call it stands in.
+pub fn rawThinkCloseAt(text: []const u8, from: usize) ?TagAt {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
+        if (thinkCloseTagLenAt(text[p..])) |l| {
+            if (openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
+        }
+        i = p + "</think".len;
+    }
+    return null;
+}
+
 /// Start of the inline code span still open at the end of `text`, or null. A model writing about its own
 /// format quotes the tag in backticks (`` `<think>plan</think>` ``): inside a span a close tag is text,
 /// not the end of the thought. Judged from the bytes before the tag alone, so a stream's verdict on a
 /// tag never changes as more arrive. A span ends with its line; three backticks are a fence, not a span.
-fn openCodeSpanStart(text: []const u8) ?usize {
+pub fn openCodeSpanStart(text: []const u8) ?usize {
     const line = if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| nl + 1 else 0;
     var span = CodeSpan{ .at = line };
     span.feed(text[line..]);
@@ -540,108 +552,6 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
-/// One call dialect: the openers that may start a call, the closers that end it, and for a dialect whose opener
-/// alone is prose, what the text from the opener on must hold for the parser to read a call there.
-const ToolMarkupFamily = struct {
-    openers: []const []const u8,
-    closers: []const []const u8,
-    /// Spellings that begin with an opener and are another dialect's closer.
-    not_openers: []const []const u8 = &.{},
-    reads_as_call: ?*const fn (tail: []const u8) bool = null,
-    /// How the dialect writes a parameter value: a closer spelled inside one is the value's text, not the call's close.
-    values: tool_calls_mod.ValueSpans,
-};
-
-const hermes_closers = [_][]const u8{ "</tool_call>", "</tool_calls>", "</tool>", "</tool_request>", "</tool_requests>" };
-
-/// Every dialect `parseToolCallsAs` reads, so a call left open in any of them is found.
-const tool_markup_families = [_]ToolMarkupFamily{
-    .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"}, .values = .gemma },
-    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"}, .values = .wrapper },
-    .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall, .values = .wrapper },
-    .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"}, .values = .dsml },
-    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .values = .dsml },
-    .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"}, .values = .invoke },
-    .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall, .values = .invoke },
-    .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall, .values = .function_tag },
-};
-
-/// `<tool name="x">{…`, `<tool>{"name":…` and `<tool_request>{…`: the tag's `>` opens a body that is a JSON object or Hermes' function tag.
-/// A self-closing `<tool …/>` is a whole call, never an open one.
-fn genericToolTagReadsAsCall(tail: []const u8) bool {
-    const gt = std.mem.indexOfScalar(u8, tail[0..@min(tail.len, 256)], '>') orelse return false;
-    if (tail[gt - 1] == '/') return false;
-    const body = std.mem.trimStart(u8, tail[gt + 1 ..], " \t\n\r");
-    if (std.mem.startsWith(u8, body, "{")) return std.mem.startsWith(u8, std.mem.trimStart(u8, body[1..], " \t\n\r"), "\"");
-    return std.mem.startsWith(u8, body, "<function=");
-}
-
-/// `<invoke name="x">` with a `<parameter ` of its own before the next `<invoke`: the opener alone is prose.
-fn invokeReadsAsCall(tail: []const u8) bool {
-    const after = BARE_INVOKE.invoke.len;
-    if (tail.len <= after or !std.ascii.isWhitespace(tail[after])) return false;
-    const name = tool_calls_mod.dsmlAttr(tail[after..@min(tail.len, after + 512)], "name") orelse return false;
-    if (name.len == 0) return false;
-    const own = tail[after .. std.mem.indexOfPos(u8, tail, after, BARE_INVOKE.invoke) orelse tail.len];
-    return std.mem.indexOf(u8, own, BARE_INVOKE.param ++ " ") != null;
-}
-
-/// MiniCPM5's `<function name="x">` with a `<param` after its tag, and Hermes' bare `<function=x>` with a
-/// `<parameter=`: either opener alone is prose.
-fn functionReadsAsCall(tail: []const u8) bool {
-    const after = "<function".len;
-    if (tail.len <= after) return false;
-    if (tail[after] == '=') return std.mem.indexOf(u8, tail, "<parameter=") != null;
-    if (!std.ascii.isWhitespace(tail[after])) return false;
-    const gt = std.mem.indexOfScalarPos(u8, tail, after, '>') orelse return false;
-    const name = tool_calls_mod.miniCpm5AttrValue(tail[after..gt], "name") orelse return false;
-    return name.len > 0 and std.mem.indexOf(u8, tail[gt + 1 ..], "<param") != null;
-}
-
-/// Where the call `text` leaves open starts: the first dialect whose last call opener has no closer after it. Null when
-/// the text stops outside a call.
-pub fn openToolCallStart(text: []const u8) ?usize {
-    var first: ?usize = null;
-    for (&tool_markup_families) |*f| {
-        const at = lastCallOpener(f, text) orelse continue;
-        if (closedAfter(f, text, at)) continue;
-        if (first == null or at < first.?) first = at;
-    }
-    return first;
-}
-
-/// Whether a closer of `f` after the opener at `from` ends the call: one a parameter value spells is the value's text.
-fn closedAfter(f: *const ToolMarkupFamily, text: []const u8, from: usize) bool {
-    for (f.closers) |c| {
-        var p = from;
-        while (std.mem.indexOfPos(u8, text, p, c)) |at| : (p = at + 1) {
-            if (!tool_calls_mod.closerInsideValue(f.values, text, from, at)) return true;
-        }
-    }
-    return false;
-}
-
-/// The last place in `text` where `f` has a call opener: one that is no closer of another dialect and that the
-/// dialect's own reading accepts as a call.
-fn lastCallOpener(f: *const ToolMarkupFamily, text: []const u8) ?usize {
-    var last: ?usize = null;
-    for (f.openers) |o| {
-        var end = text.len;
-        while (std.mem.lastIndexOf(u8, text[0..end], o)) |at| : (end = at + o.len - 1) {
-            if (last != null and at < last.?) break;
-            if (!opensCall(f, text[at..])) continue;
-            last = at;
-            break;
-        }
-    }
-    return last;
-}
-
-fn opensCall(f: *const ToolMarkupFamily, tail: []const u8) bool {
-    for (f.not_openers) |n| if (std.mem.startsWith(u8, tail, n)) return false;
-    return if (f.reads_as_call) |reads| reads(tail) else true;
-}
-
 /// The text the model said before the tool markup, byte for byte as the stream flushes it.
 pub fn visibleToolPreamble(content: []const u8) []const u8 {
     return if (std.mem.trim(u8, content, " \t\r\n").len > 0) content else "";
@@ -911,10 +821,10 @@ fn openThoughtBody(text: []const u8, opened_by_template: bool) ?[]const u8 {
     return if (opened_by_template) std.mem.trimStart(u8, text, "\n ") else null;
 }
 
-const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
+pub const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
 
 /// Earliest think/thought opener at or after `from` (either tag family).
-fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
+pub fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
     const chan = std.mem.indexOfPos(u8, text, from, "<|channel>thought");
     const think = indexOfThinkOpenTag(text, from);
     if (chan == null and think == null) return null;

@@ -264,6 +264,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `</arg_value>` or `</｜DSML｜ parameter>` that the next parameter or the call's close follows (`hermesParamEndsAt`,
   `argValueEndsAt`, `dsmlParamEndsAt`); a close that another close follows is the value's own bytes. A value that forges
   its own next parameter is the one ambiguity left.
+- **The text is read once, by `tool_reading.Reader`**: closed thoughts, then calls from their opener to the closer outside every value (the dialect's own value end), so a foreign opener, a closer or a think tag inside a value is payload, an opener inside a closed thought or an inline code span is text, and the open-call finder reads nothing else. A DSML or `<function_calls>` container is read through to its `<invoke>` calls; a `<tool_call>` whose `<function=…>` closed ships without its own close once the model ended the generation (`Origin.model_ended`), and is declined at a cut end.
+- **An opener inside an inline code span is text to the open-call finder only** (a rule new in 1.7.3): a reply that writes `` `<tool_call>` `` is not an open call; the parser does not use the rule, so a real call a model backticks still parses.
 - **A parsed NAME is one identifier** (`isToolName`, applied after every tagged family and at the end): no line break,
   no `<` or `>`; a call under a name that fails it is dropped, so another family's markup read as a name never ships.
 - **A `<tool_call>` body carrying `<function=` is the XML dialect and is read FIRST** (qwen 3.5+ template mandates

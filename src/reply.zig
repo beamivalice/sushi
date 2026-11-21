@@ -2,6 +2,7 @@
 //! finish that goes with them. Chat, Anthropic and Responses, streamed or not, ask here.
 const std = @import("std");
 const think_tags = @import("think_tags.zig");
+const tool_reading = @import("tool_reading.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const tool_schema = @import("tool_schema.zig");
 const server_state = @import("server_state.zig");
@@ -101,6 +102,8 @@ pub const Origin = struct {
     dialect: ?tool_calls_mod.Dialect,
     /// The prompt ended inside a think block (`promptOpensThink`): text with no closer is reasoning.
     opens_think: bool = false,
+    /// The model itself ended the generation (its stop token): a wrapper whose call closed ships without its own close.
+    model_ended: bool = false,
 };
 
 /// `finish_details.type` (Anthropic `stop_details`, the Responses `finish_details`) of a reply that declined a call.
@@ -219,7 +222,8 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
         if (out.normalized) |n| out.text = n;
     }
     if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
-        const origin: Origin = .{ .dialect = ask.dialect, .opens_think = ask.opens_think };
+        const model_ended = cut.stop == null and std.mem.eql(u8, gen.finish_reason, "stop");
+        const origin: Origin = .{ .dialect = ask.dialect, .opens_think = ask.opens_think, .model_ended = model_ended };
         out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, origin);
         out.declined = try declinedCall(allocator, out.text, origin, ask.tools_json);
     }
@@ -229,7 +233,7 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
 /// The call `text` leaves open, named as far as its markup went, or null when it leaves none. A bare JSON call has
 /// no marker: it is a call only once its name is whole and `tools_json` declares it, as the parse chain reads it.
 fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Declined {
-    const open = think_tags.openToolCallStart(text) orelse return declinedBareCall(allocator, text, origin, tools_json);
+    const open = tool_reading.openCallStart(text, origin.model_ended) orelse return declinedBareCall(allocator, text, origin, tools_json);
     const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[open..], origin.dialect)) orelse return .{ .name = null };
     defer {
         for (calls) |c| {
@@ -281,7 +285,7 @@ pub fn parseToolCallsForRequest(
     // An unfinished call is never shipped, whatever ended the generation (the model's own end included): the calls the
     // model finished before it stay, and `declinedCall` names the one left open.
     var body = text;
-    if (think_tags.openToolCallStart(text)) |open| {
+    if (tool_reading.openCallStart(text, origin.model_ended)) |open| {
         tool_schema.noteUnparsedToolMarkup(text);
         body = text[0..open];
     }
@@ -1102,4 +1106,112 @@ test "a reply holds only its thought when it has no visible text and no call, it
     try testing.expect(thoughtDetailsJson(thought_continued) != null);
     try testing.expect(!shouldParseToolCalls(thought_loop));
     for (std.enums.values(ThoughtKept)) |k| try testing.expect(thoughtDetailsJson(k.details()) != null);
+}
+
+
+
+
+test "r173-f-foreign-opener: an opener mentioned inside a thought that closed is no open call" {
+    const a = testing.allocator;
+    const texts = [_][]const u8{
+        "<think>I could emit <tool_call> here, but the answer is known.</think>\n\nIt is sunny.",
+        "<think>Maybe <|tool_call>call:get_weather{city: no.</think>\n\nIt is sunny.",
+    };
+    for (texts) |text| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        errdefer std.debug.print("thought {f}: declined={?s}\n", .{ std.zig.fmtString(text), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        try testing.expect(s.reply == null);
+        try testing.expect(s.declined == null);
+    }
+}
+
+test "r173-f-foreign-opener: served dialects: a finished call whose value spells a foreign opener keeps every argument" {
+    const a = testing.allocator;
+    const Case = struct { dialect: tool_calls_mod.Dialect, text: []const u8 };
+    const value = "x = 1\nif s.startswith(\"<|tool_call>\"): pass";
+    const cases = [_]Case{
+        .{ .dialect = .function_tag, .text = "<tool_call>\n<function=write_file>\n<parameter=path>\nparse.py\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>" },
+        .{ .dialect = .arg_key, .text = "<tool_call>write_file<arg_key>path</arg_key><arg_value>parse.py</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>" },
+        .{ .dialect = .dsml, .text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">parse.py</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">" ++ value ++ "</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    };
+    var bad: usize = 0;
+    for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        const args = if (s.reply) |r| r.calls[0].arguments else "(no call)";
+        const ok = s.declined == null and s.reply != null and std.mem.indexOf(u8, args, "\"content\"") != null;
+        if (!ok) {
+            bad += 1;
+            std.debug.print("{s}/{s}: args {s} declined={?s}\n", .{ @tagName(c.dialect), finish, args, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: a foreign opener mentioned in a closed thought does not drop the real call after it" {
+    const a = testing.allocator;
+    const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const leads = [_][]const u8{
+        "<think>Gemma would write <|tool_call> here; I use my own format.</think>\n\n",
+        "Gemma would write <|tool_call> here; I use my own format.</think>\n\n",
+    };
+    var bad: usize = 0;
+    for (leads, [_]bool{ false, true }) |lead, opens| {
+        const text = try std.mem.concat(a, u8, &.{ lead, call });
+        defer a.free(text);
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .function_tag, .opens_think = opens };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const n = if (s.reply) |r| r.calls.len else 0;
+        if (n != 1 or s.declined != null) {
+            bad += 1;
+            std.debug.print("thought-lead opens={}: calls={d} declined={?s}\n", .{ opens, n, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: a finished call followed by prose that mentions an opener is not declined" {
+    const a = testing.allocator;
+    const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    const tails = [_][]const u8{ "\nI used the `<tool_call>` tag.", "\nGemma would write `<|tool_call>`." };
+    var bad: usize = 0;
+    for (tails) |tail| {
+        const text = try std.mem.concat(a, u8, &.{ call, tail });
+        defer a.free(text);
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .function_tag, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const n = if (s.reply) |r| r.calls.len else 0;
+        if (n != 1 or s.declined != null) {
+            bad += 1;
+            std.debug.print("tail {f}: calls={d} declined={?s}\n", .{ std.zig.fmtString(tail), n, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-lost-close-wrapper: a call whose inner call closed but whose wrapper did not ships at the model's own end" {
+    const a = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const Case = struct { dialect: ?tool_calls_mod.Dialect, text: []const u8 };
+    const cases = [_]Case{
+        .{ .dialect = .function_tag, .text = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n" },
+        .{ .dialect = .dsml, .text = "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">Tokyo</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n" },
+        .{ .dialect = null, .text = "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tokyo</parameter>\n</invoke>\n" },
+    };
+    var bad: usize = 0;
+    for (cases) |c| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        if ((if (s.reply) |r| r.calls.len else 0) != 1 or s.declined != null) {
+            bad += 1;
+            std.debug.print("wrapper open {s}: calls={d} declined={?s}\n", .{ if (c.dialect) |d| @tagName(d) else "null", if (s.reply) |r| r.calls.len else 0, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
 }
