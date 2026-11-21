@@ -1255,3 +1255,51 @@ test "r173-f-lost-close-merge: a call that lost its last parameter close, follow
     };
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+
+test "r173-f-foreign-opener: Gemma: a string value ending in a brace right before a spelled closer keeps the call whole" {
+    const a = testing.allocator;
+    const text = "<|tool_call>call:write_file{path:<|\"|>a.rs<|\"|>,content:<|\"|>fn f() {}<tool_call|> tail<|\"|>}<tool_call|>";
+    var bad: usize = 0;
+    for ([_][]const u8{ "stop", "length" }) |finish| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.indexOf(u8, r.calls[0].arguments, "tail") != null else false;
+        if (!ok or s.declined != null) {
+            bad += 1;
+            std.debug.print("gemma-brace [{s}]: declined={?s}\n", .{ finish, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: Hermes JSON: a string value ending in a brace right before a spelled closer" {
+    const a = testing.allocator;
+    const Case = struct { text: []const u8, finish: []const u8, calls: ?usize, declined: bool, want: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{ .text = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a\", \"content\": \"x = {}</tool_call> y", .finish = "length", .calls = null, .declined = true },
+        .{ .text = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a\", \"content\": \"x = {}</tool_call> y\"}}\n</tool_call>", .finish = "stop", .calls = 1, .declined = false, .want = "x = {}</tool_call> y" },
+        .{ .text = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=content>\nx = {}</tool_call> y", .finish = "length", .calls = null, .declined = true },
+        .{ .text = "<invoke name=\"write_file\">\n<parameter name=\"path\">a</parameter>\n<parameter name=\"content\">x = {}</invoke> y", .finish = "length", .calls = null, .declined = true },
+    };
+    var bad: usize = 0;
+    for (cases) |c| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = c.finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        var ok = (if (s.reply) |r| @as(?usize, r.calls.len) else null) == c.calls and (s.declined != null) == c.declined;
+        if (c.want) |w| if (s.reply) |r| {
+            const p = try std.json.parseFromSlice(std.json.Value, a, r.calls[0].arguments, .{});
+            defer p.deinit();
+            ok = ok and if (p.value.object.get("content")) |v| std.mem.eql(u8, v.string, w) else false;
+        };
+        if (!ok) {
+            bad += 1;
+            std.debug.print("brace [{s}] {f}: declined={?s}\n", .{ c.finish, std.zig.fmtString(c.text[0..@min(c.text.len, 70)]), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

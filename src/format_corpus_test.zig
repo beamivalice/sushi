@@ -4054,3 +4054,32 @@ test "format corpus: the reading is linear in the text: quoted and prose openers
     }
     try testing.expect(work[1] <= 5 * work[0] / 2);
 }
+
+test "format corpus: a string value that ends in a brace right before a spelled closer ships whole, in Gemma and JSON bodies" {
+    const allocator = testing.allocator;
+    const Case = struct { call: []const u8, value: []const u8 };
+    const cases = [_]Case{
+        .{ .call = "<|tool_call>call:write_file{path:<|\"|>a.rs<|\"|>,content:<|\"|>fn f() {}<tool_call|> tail<|\"|>}<tool_call|>", .value = "fn f() {}<tool_call|> tail" },
+        .{ .call = "<|tool_call>call:write_file{content:<|\"|>{}<tool_call|><|\"|>,path:<|\"|>a.rs<|\"|>}<tool_call|>", .value = "{}<tool_call|>" },
+        .{ .call = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a\", \"content\": \"x = {}</tool_call> y\"}}\n</tool_call>", .value = "x = {}</tool_call> y" },
+        .{ .call = "<tool>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a\", \"content\": \"{}</tool> y\"}}</tool>", .value = "{}</tool> y" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("call: {f}\n", .{std.zig.fmtString(c.call)});
+        const calls = (try tool_calls_mod.parseToolCalls(allocator, c.call)) orelse return error.WholeCallDropped;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(c.value, (parsed.value.object.get("content") orelse return error.ValueDropped).string);
+        const open = try settleCut(allocator, c.call);
+        defer open.deinit(allocator);
+        try testing.expect(open.reply != null);
+    }
+}

@@ -2628,18 +2628,21 @@ pub fn closerInsideValue(spans: ValueSpans, text: []const u8, from: usize, at: u
             if (std.mem.startsWith(u8, body, "<function=")) break :blk hermesValueOpenAt(text, from, at);
             break :blk argValueOpenAt(text, from, at);
         },
-        .gemma => gemmaStringOpenAt(text[from..at]),
+        .gemma => gemmaStringOpenAt(text, from, at),
         .dsml => dsmlValueOpenAt(text, from, at),
         .invoke => invokeValueOpenAt(text, from, at),
         .function_tag => if (std.mem.startsWith(u8, text[from..], "<function=")) hermesValueOpenAt(text, from, at) else miniCpm5ValueOpenAt(text, from, at),
     };
 }
 
-/// Whether `before`, a Gemma call's text up to a closer, leaves a `<|"|>` string open. Text that ends in the arguments'
-/// own `}` is a finished call whatever the delimiters count: a model that drops one delimiter flips every string after it.
-fn gemmaStringOpenAt(before: []const u8) bool {
-    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, before, " \t\r\n"), "}")) return false;
-    return std.mem.count(u8, before, "<|\"|>") % 2 == 1;
+/// Whether the closer at `at` of the Gemma call that starts at `from` stands in a `<|"|>` string. A model that drops one
+/// delimiter flips every string after it, so arguments that end in their own `}` with no delimiter after the closer
+/// are a finished call; a value that spells `}` before a closer is told by the delimiter that still follows it.
+fn gemmaStringOpenAt(text: []const u8, from: usize, at: usize) bool {
+    const before = text[from..at];
+    if (std.mem.count(u8, before, "<|\"|>") % 2 == 0) return false;
+    const ends_arguments = std.mem.endsWith(u8, std.mem.trimEnd(u8, before, " \t\r\n"), "}");
+    return !(ends_arguments and std.mem.indexOfPos(u8, text, at, "<|\"|>") == null);
 }
 
 /// Where the Gemma call whose body starts at `from` ends, relative to `from`: its first `<tool_call|>` outside every
@@ -2653,12 +2656,12 @@ fn gemmaCloserOutsideValue(text: []const u8, from: usize) ?usize {
 }
 
 /// Whether `at` falls inside a string of the JSON object `body` opens with. A model that mangles a quote (a key with no
-/// opening one) flips every string after it, so text that ends in the object's own `}` is a finished object whatever
-/// the quotes count.
+/// opening one) flips every string after it, so text that ends in the object's own `}` with no quote after `at` is a
+/// finished object whatever the quotes count; a string that spells `}` before a closer is told by the quote that follows.
 fn jsonBodyStringOpenAt(body: []const u8, at: usize) bool {
     const trimmed = std.mem.trimStart(u8, body[0..at], " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "{")) return false;
-    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, trimmed, " \t\r\n"), "}")) return false;
+    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, trimmed, " \t\r\n"), "}") and std.mem.indexOfScalarPos(u8, body, at, '"') == null) return false;
     return jsonStringOpenAt(body, at - trimmed.len, at);
 }
 
