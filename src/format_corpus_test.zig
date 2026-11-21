@@ -2384,6 +2384,82 @@ test "format corpus: an unfinished call of any dialect never ships, and prose th
     }
 }
 
+/// Where `needle` ends in `text`, counted from `from`.
+fn endOf(text: []const u8, from: usize, needle: []const u8) usize {
+    return std.mem.indexOfPos(u8, text, from, needle).? + needle.len;
+}
+
+test "format corpus: bare JSON cut short ships no cut call, declines it once named, and an array ships its complete elements" {
+    const allocator = testing.allocator;
+    const tokyo = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}";
+    const osaka = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Osaka\"}}";
+    const lead = "Let me check.\n";
+
+    // One object: no prefix ships; the whole ships and declines nothing.
+    const object = try std.mem.concat(allocator, u8, &.{ lead, tokyo });
+    defer allocator.free(object);
+    const object_name_end = endOf(object, lead.len, "\"get_weather\"");
+    var cut: usize = lead.len;
+    while (cut <= object.len) : (cut += 1) {
+        const got = try settleCut(allocator, object[0..cut]);
+        defer got.deinit(allocator);
+        errdefer std.debug.print("object cut at {d}: {f}\n", .{ cut, std.zig.fmtString(object[0..cut]) });
+        if (cut == object.len) {
+            try testing.expectEqual(@as(usize, 1), (got.reply orelse return error.WholeCallDropped).calls.len);
+            try testing.expect(got.declined == null);
+            continue;
+        }
+        try testing.expect(got.reply == null);
+        // Declined and named from the byte its name is whole, never before.
+        if (cut < object_name_end) {
+            try testing.expect(got.declined == null);
+        } else {
+            try testing.expectEqualStrings("get_weather", (got.declined orelse return error.DeclineNotNamed).name orelse return error.DeclineNotNamed);
+        }
+    }
+
+    // Two elements: the complete ones ship, the cut one is declined.
+    const array = try std.mem.concat(allocator, u8, &.{ "[", tokyo, ",", osaka, "]" });
+    defer allocator.free(array);
+    const first_end = 1 + tokyo.len;
+    const second_end = first_end + 1 + osaka.len;
+    const names = [_]struct { from: usize, name_end: usize, end: usize }{
+        .{ .from = 1, .name_end = endOf(array, 1, "\"get_weather\""), .end = first_end },
+        .{ .from = first_end + 1, .name_end = endOf(array, first_end + 1, "\"get_weather\""), .end = second_end },
+    };
+    cut = 1;
+    while (cut <= array.len) : (cut += 1) {
+        const got = try settleCut(allocator, array[0..cut]);
+        defer got.deinit(allocator);
+        errdefer std.debug.print("array cut at {d}: {f}\n", .{ cut, std.zig.fmtString(array[0..cut]) });
+        const want: usize = if (cut >= second_end) 2 else if (cut >= first_end) 1 else 0;
+        try testing.expectEqual(want, if (got.reply) |r| r.calls.len else 0);
+        if (got.reply) |r| {
+            try testing.expectEqualStrings("{\"city\":\"Tokyo\"}", r.calls[0].arguments);
+            if (want == 2) try testing.expectEqualStrings("{\"city\":\"Osaka\"}", r.calls[1].arguments);
+        }
+        var cut_element = false;
+        for (names) |n| {
+            if (cut > n.from and cut < n.end) {
+                cut_element = true;
+                if (cut < n.name_end) {
+                    try testing.expect(got.declined == null);
+                } else {
+                    try testing.expectEqualStrings("get_weather", (got.declined orelse return error.DeclineNotNamed).name orelse return error.DeclineNotNamed);
+                }
+            }
+        }
+        if (!cut_element) try testing.expect(got.declined == null);
+    }
+
+    // A finished call that dropped a closer keeps its repair: its own close tag after it says the model ended it.
+    const finished = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}</tool_call>";
+    const kept = try settleCut(allocator, finished);
+    defer kept.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), (kept.reply orelse return error.FinishedCallDropped).calls.len);
+    try testing.expect(kept.declined == null);
+}
+
 test "format corpus: a parameter VALUE never decides the call" {
     // A parameter value is arbitrary bytes. Feed each wrapper dialect a value
     // that LOOKS like call syntax — a balanced JSON object carrying its own

@@ -28,7 +28,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   is. Every dialect the parse chain reads has a family in `think_tags.tool_markup_families`; one whose opener alone is
   prose (MiniCPM5 `<function name=`, bare `<function=`, `<invoke`, `<tool name=`, `<tool_request`) opens a call only
   where the parser would read one (a name attribute and a `<param`, a `<parameter=`, a JSON body), so text that
-  mentions the markup stays text. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
+  mentions the markup stays text. Bare JSON with no marker follows the same rule (`tool_calls.parseToolCallsOpen`): an object, or an array element, that runs to the end of the text unclosed is declined and named once its `"name"` is whole and
+  declared, never repaired, and an array ships the elements complete before the cut; the repair of a dropped closer (`completeUnbalancedJsonObject`) holds only for a
+  call the model finished, its own close tag after it. The stop is read once, by `reply.settle` (`stop_sequences.cut`): a stream's reply carries
   its gate's match (`GenerationResult.stop_source`), never a stop searched for again in text the gate already cut. Lint
   `reply-bypass`: a surface never calls the raw `parseToolCalls`, and an `Ask`'s `normalize` is `!generate.payloadRouted(constraint)`, never a
   literal: a span-routed constrained reply keeps marker text in its payload as data, streamed or not.

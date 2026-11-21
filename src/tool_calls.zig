@@ -64,6 +64,15 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
 /// Parse tool calls from model output. The served dialect is read first and the others only when it finds no call:
 /// a parameter VALUE carrying another family's markup must never decide the call.
 pub fn parseToolCallsAs(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect) !?[]ParsedToolCall {
+    var open: ?[]u8 = null;
+    defer if (open) |name| allocator.free(name);
+    return parseToolCallsOpen(allocator, text, dialect, &open);
+}
+
+/// `parseToolCallsAs`, and `open_bare`: the tool a bare unmarked JSON call names when the generation left it open (the
+/// name is whole, the object or its array element never closed), owned by the caller. Bare JSON is read only when no
+/// marked call is, so a marked call's text never sets it.
+pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect, open_bare: *?[]u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
     var effective_text = text;
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
@@ -491,38 +500,8 @@ pub fn parseToolCallsAs(allocator: std.mem.Allocator, text: []const u8, dialect:
 
     // If no <tool_call> tags, try to find raw JSON tool call(s).
     if (calls.items.len == 0) {
-        var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
-        if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
-            trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
-        }
-        // JSON ARRAY of {name, arguments} objects — parallel tool calls from
-        // models without a trained tool format. Gemma 3 emits a ```json fence
-        // around the array; skip one leading fence line before the check so
-        // the array (not the first object inside it) is what we parse —
-        // otherwise only the first call survives and the rest silently drop.
-        var array_probe = trimmed;
-        if (std.mem.startsWith(u8, array_probe, "```")) {
-            if (std.mem.indexOfScalar(u8, array_probe, '\n')) |nl| {
-                array_probe = std.mem.trim(u8, array_probe[nl + 1 ..], " \t\n\r");
-            }
-        }
-        if (array_probe.len > 0 and array_probe[0] == '[') {
-            if (balancedJsonArray(array_probe)) |arr_body| {
-                try appendJsonToolCallArray(allocator, arr_body, &calls);
-            }
-        }
-        if (calls.items.len == 0) {
-            if (std.mem.indexOf(u8, trimmed, "{")) |brace_pos| {
-                const json_start = trimmed[brace_pos..];
-                // Snap the first balanced object so trailing garbage can't poison
-                // the parse — models without a trained tool format (Gemma 3) emit
-                // the call inside a ```json fence, leaving "\n```" after the `}`.
-                const json_body = balancedJsonObject(json_start) orelse json_start;
-                if (tryParseJsonToolCall(allocator, json_body)) |tc| {
-                    try calls.append(allocator, tc);
-                }
-            }
-        }
+        const open = try appendBareJsonCalls(allocator, effective_text, &calls);
+        if (open) |tail| open_bare.* = if (truncatedJsonCallName(tail)) |name| try allocator.dupe(u8, name) else null;
         // Everything appended in this block was inferred from BARE JSON — no
         // tag syntax anywhere. Mark provenance so the request chokepoint
         // (server.parseToolCallsForRequest → filterInferredBySchema) can
@@ -1426,6 +1405,111 @@ fn parseXmlElementToolCall(allocator: std.mem.Allocator, body: []const u8) ?Pars
         return null;
     };
     return .{ .name = name_owned, .arguments = args_str };
+}
+
+/// Whether the JSON value `text` starts (`{` or `[`) is still open where the text ends: no bracket of it is left
+/// unclosed by a mismatch, and no closer of a call's own markup stands outside a string. A value the model ended with
+/// a closer after it is finished, however malformed; only one that runs to the end of the generation is cut.
+fn jsonValueOpenAtEnd(text: []const u8) bool {
+    var stack: [64]u8 = undefined;
+    var depth: usize = 0;
+    var in_string = false;
+    var escape = false;
+    for (text, 0..) |c, i| {
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') escape = true else if (c == '"') in_string = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{', '[' => {
+                if (depth == stack.len) return false;
+                stack[depth] = if (c == '{') '}' else ']';
+                depth += 1;
+            },
+            '}', ']' => {
+                if (depth == 0 or stack[depth - 1] != c) return false;
+                depth -= 1;
+                if (depth == 0) return false;
+            },
+            '<' => if (std.mem.startsWith(u8, text[i..], "</tool")) return false,
+            else => {},
+        }
+    }
+    return depth > 0;
+}
+
+/// The calls bare JSON holds: an array of `{name, arguments}` objects, or the first object. A value the model
+/// finished ships (or not) as it reads; one cut at the end of the text never does, its complete array elements aside,
+/// and its text from its first byte on is returned.
+fn appendBareJsonCalls(allocator: std.mem.Allocator, effective_text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !?[]const u8 {
+    var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
+    if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
+        trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
+    }
+    // JSON ARRAY of {name, arguments} objects — parallel tool calls from
+    // models without a trained tool format. Gemma 3 emits a ```json fence
+    // around the array; skip one leading fence line before the check so
+    // the array (not the first object inside it) is what we parse —
+    // otherwise only the first call survives and the rest silently drop.
+    var array_probe = trimmed;
+    if (std.mem.startsWith(u8, array_probe, "```")) {
+        if (std.mem.indexOfScalar(u8, array_probe, '\n')) |nl| {
+            array_probe = std.mem.trim(u8, array_probe[nl + 1 ..], " \t\n\r");
+        }
+    }
+    var array_cut: ?[]const u8 = null;
+    if (array_probe.len > 0 and array_probe[0] == '[') {
+        if (balancedJsonArray(array_probe)) |arr_body| {
+            try appendJsonToolCallArray(allocator, arr_body, calls);
+        } else if (jsonValueOpenAtEnd(array_probe)) {
+            array_cut = try appendCompleteArrayElements(allocator, array_probe, calls);
+        }
+    }
+    if (calls.items.len > 0) return array_cut;
+    const brace_pos = std.mem.indexOf(u8, trimmed, "{") orelse return null;
+    const json_start = trimmed[brace_pos..];
+    // Snap the first balanced object so trailing garbage can't poison
+    // the parse — models without a trained tool format (Gemma 3) emit
+    // the call inside a ```json fence, leaving "\n```" after the `}`.
+    if (balancedJsonObject(json_start)) |json_body| {
+        if (tryParseJsonToolCall(allocator, json_body)) |tc| try calls.append(allocator, tc);
+        return null;
+    }
+    if (jsonValueOpenAtEnd(json_start)) return json_start;
+    if (tryParseJsonToolCall(allocator, json_start)) |tc| try calls.append(allocator, tc);
+    return null;
+}
+
+/// The elements of an array that never closed, up to the one the text cut: the complete ones are appended (as
+/// `appendJsonToolCallArray` does, all or none), and the cut one's text from its `{` on is returned.
+fn appendCompleteArrayElements(allocator: std.mem.Allocator, array: []const u8, calls: *std.ArrayList(ParsedToolCall)) !?[]const u8 {
+    var i: usize = 1;
+    var complete_end: usize = 1;
+    var cut: ?[]const u8 = null;
+    while (true) {
+        while (i < array.len and (std.ascii.isWhitespace(array[i]) or array[i] == ',')) i += 1;
+        if (i == array.len) break;
+        if (array[i] != '{') return null;
+        const element = balancedJsonObject(array[i..]) orelse {
+            cut = array[i..];
+            break;
+        };
+        i += element.len;
+        complete_end = i;
+    }
+    if (complete_end > 1) {
+        const closed = try std.mem.concat(allocator, u8, &.{ array[0..complete_end], "]" });
+        defer allocator.free(closed);
+        const before = calls.items.len;
+        try appendJsonToolCallArray(allocator, closed, calls);
+        if (calls.items.len == before) return null;
+    }
+    return cut;
 }
 
 /// Repair a JSON object whose trailing closer(s) were dropped — e.g. the

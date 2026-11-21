@@ -221,14 +221,15 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
     if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
         const origin: Origin = .{ .dialect = ask.dialect, .opens_think = ask.opens_think };
         out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, origin);
-        out.declined = try declinedCall(allocator, out.text, origin);
+        out.declined = try declinedCall(allocator, out.text, origin, ask.tools_json);
     }
     return out;
 }
 
-/// The call `text` leaves open, named as far as its markup went, or null when it leaves none.
-fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin) !?Declined {
-    const open = think_tags.openToolCallStart(text) orelse return null;
+/// The call `text` leaves open, named as far as its markup went, or null when it leaves none. A bare JSON call has
+/// no marker: it is a call only once its name is whole and `tools_json` declares it, as the parse chain reads it.
+fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Declined {
+    const open = think_tags.openToolCallStart(text) orelse return declinedBareCall(allocator, text, origin, tools_json);
     const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[open..], origin.dialect)) orelse return .{ .name = null };
     defer {
         for (calls) |c| {
@@ -238,6 +239,24 @@ fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin) 
         allocator.free(calls);
     }
     return .{ .name = try allocator.dupe(u8, calls[0].name) };
+}
+
+fn declinedBareCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Declined {
+    var open: ?[]u8 = null;
+    errdefer if (open) |name| allocator.free(name);
+    if (try tool_calls_mod.parseToolCallsOpen(allocator, text, origin.dialect, &open)) |calls| {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    const name = open orelse return null;
+    if (tools_json) |tj| if (!tool_schema.toolNameIsDeclared(allocator, tj, name)) {
+        allocator.free(name);
+        return null;
+    };
+    return .{ .name = name };
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
@@ -696,7 +715,7 @@ test "a generation that ended inside a call (the model's own end, a stop, the le
     for (cut) |text| {
         try expectCalls(text, .{ .dialect = null }, 0);
         // The call it left open is named by its markup, in each dialect.
-        const left = (try declinedCall(testing.allocator, text, .{ .dialect = null })) orelse return error.DeclineNotNamed;
+        const left = (try declinedCall(testing.allocator, text, .{ .dialect = null }, test_tools)) orelse return error.DeclineNotNamed;
         defer left.deinit(testing.allocator);
         errdefer std.debug.print("declined {?s} for {f}\n", .{ left.name, std.zig.fmtString(text) });
         try testing.expectEqualStrings("write_file", left.name orelse return error.DeclineNotNamed);
@@ -938,6 +957,56 @@ test "an unfinished call of every dialect the parse chain reads is declined and 
         defer a.free(text);
         try expectSameEnd(a, text, &.{}, finish, ask, null, finish, null, .{ .named = "get_weather" });
     };
+}
+
+test "bare JSON cut short is declined and named, never repaired; a finished call keeps its repair, and an array keeps its complete elements" {
+    const a = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    const stops = [_][]const u8{"STOP"};
+    const asks = [_]Ask{
+        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
+    };
+    const whole = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}";
+    const one_short = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}";
+    const first = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}";
+    const named: Cut = .{ .named = "get_weather" };
+    for (asks) |ask| for ([_][]const u8{ "", "Let me check.\n" }) |lead| {
+        // A whole object ships; the same object one `}` short at the end of the generation is declined and named.
+        for ([_][]const u8{ "stop", "length", "cancelled" }) |finish| {
+            const call = try std.mem.concat(a, u8, &.{ lead, whole });
+            defer a.free(call);
+            try expectSameEnd(a, call, &stops, finish, ask, null, finish, 1, .none);
+            const cut = try std.mem.concat(a, u8, &.{ lead, one_short });
+            defer a.free(cut);
+            try expectSameEnd(a, cut, &stops, finish, ask, null, finish, null, named);
+            // A cut in the middle of a value or a key is declined the same, once the name is read.
+            const mid = try std.mem.concat(a, u8, &.{ lead, "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tok" });
+            defer a.free(mid);
+            try expectSameEnd(a, mid, &stops, finish, ask, null, finish, null, named);
+            // An array (it leads the text: prose before it reads the first object only) whose second element is cut
+            // ships the complete first and declines the second.
+            const arr = try std.mem.concat(a, u8, &.{ "[", first, ",{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Osa" });
+            defer a.free(arr);
+            try expectSameEnd(a, arr, &stops, finish, ask, null, finish, 1, named);
+            // Both elements complete and the array not closed: nothing is cut, both ship.
+            const open_arr = try std.mem.concat(a, u8, &.{ "[", first, ",", first });
+            defer a.free(open_arr);
+            try expectSameEnd(a, open_arr, &stops, finish, ask, null, finish, 2, .none);
+        }
+        // A stop that cut the object short.
+        const stopped = try std.mem.concat(a, u8, &.{ lead, one_short, "STOP and more" });
+        defer a.free(stopped);
+        try expectSameEnd(a, stopped, &stops, "length", ask, "STOP", "stop", null, named);
+        // A name the request never declared is a data object, not a call: nothing is declined.
+        try expectSameEnd(a, "{\"name\":\"George Washington\",\"num\":1,", &stops, "length", ask, null, "length", null, .none);
+        try expectSameEnd(a, "{\"city\": \"Tok", &stops, "length", ask, null, "length", null, .none);
+    };
+    // A call the model finished (a close tag after it) keeps its repair: one `}` short, then its own close.
+    const finished = "<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}</tool_call>";
+    try expectSameEnd(a, finished, &stops, "stop", asks[0], null, "stop", 1, .none);
 }
 
 test "a declined call is named in the details field of every surface's key, and outranks a thought's note" {
