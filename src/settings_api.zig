@@ -148,7 +148,17 @@ fn writeKey(w: *std.Io.Writer, spec: model_settings.KeySpec, file_value: ?std.js
     const pinned = if (lock) |l| l.set else false;
     try w.writeAll(",\"flag\":");
     if (pinned) try writeJson(w, lock.?.text()) else try w.writeAll("null");
-    try w.print(",\"source\":\"{s}\",\"locked\":{}}}", .{ if (pinned) "flag" else if (valid) "file" else "default", pinned });
+    try w.print(",\"source\":\"{s}\",\"locked\":{}", .{ if (pinned) "flag" else if (valid) "file" else "default", pinned });
+    // A saved value the loader ignores is named where the person sets it: the key, the value and what the key takes.
+    if (file_value) |v| if (!valid and v != .null) {
+        var expected_buf: [160]u8 = undefined;
+        try w.print(",\"invalid\":{{\"key\":\"{s}\",\"value\":", .{spec.name});
+        try writeJson(w, v);
+        try w.writeAll(",\"expected\":");
+        try writeJson(w, model_settings.expectedText(&expected_buf, spec));
+        try w.writeAll("}");
+    };
+    try w.writeAll("}");
 }
 
 /// What a model's keys may be set to, for every key with a constraint: `disabled` (the key does nothing), `choices` (the
@@ -1493,6 +1503,32 @@ test "settings api: render names the keys a model honours, what a loaded model l
     const b = root.get("models").?.array.items[1].object;
     try testing.expect(b.get("loaded_with").? == .null);
     for (b.get("keys").?.array.items) |k| try testing.expect(!std.mem.startsWith(u8, k.string, "ssd_"));
+}
+
+test "settings api: a saved value the loader ignores is reported on its key as invalid, with the value and what the key takes" {
+    // A cache bias saved under the old 0 to 8 range, beside a valid saved value and a key never saved.
+    var file = try model_settings.parse(testing.allocator,
+        \\{"/m/a": {"expert_cache_bias": 3, "kv_quant": "8"}}
+    );
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const rows = [_]ModelRow{
+        .{ .id = "a", .path = "/m/a", .state = "unloaded", .bytes = 5, .fit = .{ .arch = "prefetcher", .prefetch = true, .cache_bias = true, .streams_experts = true, .has_vision = true } },
+    };
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const settings = parsed.value.object.get("models").?.array.items[0].object.get("settings").?.object;
+    const bias = settings.get("expert_cache_bias").?.object;
+    try testing.expect(bias.get("file").? == .null);
+    try testing.expectEqualStrings("default", bias.get("source").?.string);
+    const bad = bias.get("invalid").?.object;
+    try testing.expectEqualStrings("expert_cache_bias", bad.get("key").?.string);
+    try testing.expectEqual(@as(i64, 3), bad.get("value").?.integer);
+    try testing.expectEqualStrings("a number from 0 to 2", bad.get("expected").?.string);
+    try testing.expect(settings.get("kv_quant").?.object.get("invalid") == null);
+    try testing.expect(settings.get("ssd_budget_gb").?.object.get("invalid") == null);
 }
 
 test "settings api: each model lists the limits its arch and pack put on its keys, and nothing for a key it does not constrain" {

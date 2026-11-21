@@ -628,7 +628,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   the macOS default; `in_use_mb`, the GPU limit this process read at start; `standard_mb`, the RAM less 4 GiB; `command`,
   the one `sudo sysctl` line that sets all three to it; `applies`), the
   `model_keys` metadata (type, range, choices) and, per registered model, each key's `file` value, `flag`, `source` and
-  `locked`. A pinned model key reports its value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
+  `locked`; a saved value the loader ignores (out of range, or the wrong type) has `file: null`, `source: default` and `invalid: {key, value, expected}`, which the page shows on the key's row. A pinned model key reports its value alone; and `effort`, the thinking-effort tables ([Effort tables](#effort-tables)). `POST /v1/settings` takes `{"server":{key:value|null}}`, `{"model":id,"set":{key:value|null}}` and/or `{"effort":{...}}`; null removes
   a key. Each model row also carries `keys`, the keys that apply to that model (`model_settings.applies`, the same gates
   the loader's ignored-key log lines use: `ssd_budget_gb` needs expert streaming, `ssd_prefetch` and `ds41_cooler` (Sushi Cooler on or off; reports `--ds41-mlx-engine` when pinned) are DeepSeek-V4.1's,
   `kv_quant` is not DeepSeek-V4.1's, `vision` needs a tower), and `loaded_with`,

@@ -293,7 +293,7 @@ fn fromValue(v: std.json.Value) Override {
 }
 
 /// What a key takes, as the clause after "expected" in a rejection line.
-fn expectedText(buf: []u8, spec: KeySpec) []const u8 {
+pub fn expectedText(buf: []u8, spec: KeySpec) []const u8 {
     return (switch (spec.kind) {
         .bool => std.fmt.bufPrint(buf, "true or false", .{}),
         .int => std.fmt.bufPrint(buf, "a whole number from {d} to {d}", .{ spec.min, spec.max }),

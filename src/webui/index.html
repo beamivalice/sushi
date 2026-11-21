@@ -4133,7 +4133,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (key === "yarn_factor" && !locked && !why) hint = ropeHint(m.rope, Number(text));
     if (changed) hint = [hint, `was ${saved || "Default"}`].filter(Boolean).join(" · ");
     setText(S.hint, hint);
-    setText(S.bad, why ? "" : P.errors[key] || P.refused[key] || "");
+    const ignored = s.invalid ? `The saved value ${JSON.stringify(s.invalid.value)} is not valid (expected ${s.invalid.expected}), so it is ignored until you change it.` : "";
+    setText(S.bad, why ? "" : P.errors[key] || P.refused[key] || ignored);
   }
 
   function buildDetail(m) {

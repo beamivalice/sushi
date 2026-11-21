@@ -1487,6 +1487,17 @@ async function main() {
       await page.waitForSelector('.toast');
       assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { expert_cache_bias: 0.2 } });
     });
+    await scenario('a saved Faster SSD streaming (not exact) value the server ignores shows on its row, with the toggle off', { path: '/models#Deep-C', open: { mode: 'advanced' },
+      setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'ssd_budget_gb', 'expert_cache_bias']; s.state.models[2].defaults = { ...s.state.models[2].defaults, expert_cache_bias: 0 };
+        s.state.models[2].settings = allKeys({ expert_cache_bias: keyState({ invalid: { key: 'expert_cache_bias', value: 3, expected: 'a number from 0 to 2' } }) }); } }, async ({ page }) => {
+      const toggle = `${row('expert_cache_bias')} input[type="checkbox"]`;
+      await page.waitForSelector(toggle);
+      assert.equal(await page.isChecked(toggle), false, 'an ignored saved value loads exact, so the toggle is off');
+      const bad = await page.textContent(`${row('expert_cache_bias')} .bad`);
+      assert.match(bad, /3/);
+      assert.match(bad, /a number from 0 to 2/);
+      assert.match(bad, /ignored/);
+    });
     await scenario('turning Faster SSD streaming (not exact) off saves 0 and hides its slider', { path: '/models#Deep-C', open: { mode: 'advanced' },
       setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'ssd_budget_gb', 'expert_cache_bias']; s.state.models[2].defaults = { ...s.state.models[2].defaults, expert_cache_bias: 0 };
         s.state.models[2].settings = allKeys({ expert_cache_bias: keyState({ file: 0.6, source: 'file' }) }); } }, async ({ page, server }) => {
