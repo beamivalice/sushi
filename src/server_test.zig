@@ -3054,3 +3054,41 @@ test "server: request fields: a key that silently dropped behaviour is a 400 nam
         }
     }.run);
 }
+
+test "server: /v1/messages reads a system message inside messages into the prompt" {
+    try eachArch(2, .{}, struct {
+        const with_sys = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"system\",\"content\":\"note\"},{\"role\":\"user\",\"content\":\"say ok\"}]}";
+        const without_sys = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"user\",\"content\":\"say ok\"}]}";
+        const bad_role = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"developer\",\"content\":\"note\"},{\"role\":\"user\",\"content\":\"say ok\"}]}";
+        const bad_content = "{\"model\":\"x\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"system\",\"content\":5},{\"role\":\"user\",\"content\":\"say ok\"}]}";
+        fn countTokens(body: []const u8) !u64 {
+            const resp = try request("POST", "/v1/messages/count_tokens", body);
+            defer gpa.free(resp);
+            errdefer std.debug.print("/v1/messages/count_tokens: {s}\n", .{resp[0..@min(resp.len, 600)]});
+            if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) return error.NotServed;
+            return lastNumber(bodyOf(resp), "\"input_tokens\":") orelse error.NoCount;
+        }
+        fn run() !void {
+            const without = try countTokens(without_sys);
+            const with = try countTokens(with_sys);
+            try testing.expect(with > without);
+
+            const served = try request("POST", "/v1/messages", with_sys);
+            defer gpa.free(served);
+            errdefer std.debug.print("/v1/messages: {s}\n", .{served[0..@min(served.len, 600)]});
+            try testing.expect(std.mem.startsWith(u8, served, "HTTP/1.1 200"));
+
+            const bad = try request("POST", "/v1/messages", bad_role);
+            defer gpa.free(bad);
+            errdefer std.debug.print("/v1/messages bad role: {s}\n", .{bad[0..@min(bad.len, 600)]});
+            try testing.expect(std.mem.startsWith(u8, bad, "HTTP/1.1 400"));
+            try testing.expect(std.mem.indexOf(u8, bodyOf(bad), "messages[1].role") != null);
+
+            const bad_type = try request("POST", "/v1/messages", bad_content);
+            defer gpa.free(bad_type);
+            errdefer std.debug.print("/v1/messages system content 5: {s}\n", .{bad_type[0..@min(bad_type.len, 600)]});
+            try testing.expect(std.mem.startsWith(u8, bad_type, "HTTP/1.1 400"));
+            try testing.expect(std.mem.indexOf(u8, bodyOf(bad_type), "messages[1].content") != null);
+        }
+    }.run);
+}

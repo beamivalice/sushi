@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`/v1/messages` takes a `system` message inside `messages` again, so Claude Code sessions run** ([#115](https://github.com/beamivalice/sushi/issues/115)): 1.7.2 refused it with a 400 naming `messages[N].role`, though the server reads it into the prompt where it sits, as 1.7.1 did.
 - **Qwen3.8-Flash-Next streams keep their grouped MTP speculation while a DeepSeek-V4.1 request decodes beside them on the same server**: every Qwen stream decoded plain for as long as the other model's request ran (a 400-token DeepSeek reply cost the Qwen streams all of their rounds); each model's streams now group among themselves.
 - **Qwen3.8-Flash-Next streams that group their MTP verify keep speculating beside a request that cannot join them**: a plain request, one under 96 tokens from its budget, or one with a penalty, logprobs, an image or a much longer context stopped the speculation of every other stream in the group; the others now keep their rounds and it decodes on its own.
 - **OpenAI's legacy `functions` and `function_call`, the `grammar` and `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` constraint fields, and any Messages tool whose `type` is not `custom` (the `web_search_*`, `web_fetch_*` and `code_execution_*` server tools, and `bash_*`, `text_editor_*` and `computer_*`) are a 400 naming them, where they were dropped and the model ran without the tool or the constraint**.

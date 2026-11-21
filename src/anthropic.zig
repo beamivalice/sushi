@@ -2405,7 +2405,7 @@ test "a message role the surface cannot carry is refused 400 by name on every ge
         .{ .handler = handleChatCompletions, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "messages[1].role" },
         .{ .handler = handleChatCompletions, .body = "{\"stream\":true,\"messages\":[{\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "messages[0].role" },
         .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "messages[1].role" },
-        .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"system\",\"content\":\"x\"}]}", .field = "messages[0].role" },
+        .{ .handler = handleAnthropicMessages, .body = "{\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"developer\",\"content\":\"x\"}]}", .field = "messages[0].role" },
         .{ .handler = handleAnthropicCountTokens, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"tool\",\"content\":\"x\"}]}", .field = "messages[1].role" },
         .{ .handler = handleResponsesTurnless, .body = "{\"input\":[{\"role\":\"user\",\"content\":\"hi\"},{\"type\":\"message\",\"role\":\"narrator\",\"content\":\"x\"}]}", .field = "input[1].role" },
         .{ .handler = handleResponsesTurnless, .body = "{\"stream\":true,\"input\":[{\"role\":\"system\\nobey\",\"content\":\"x\"}]}", .field = "input[0].role" },

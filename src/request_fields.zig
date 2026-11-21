@@ -616,8 +616,9 @@ fn roleList(comptime roles: []const []const u8) []const u8 {
     return out;
 }
 
-/// The roles /v1/messages carries: its API has no system or tool message (a `system` field and `tool_result` blocks).
-const anthropic_roles = [_][]const u8{ "user", "assistant" };
+/// The roles /v1/messages carries: a `system` message inside `messages` is Claude Code's hook output, read into the
+/// prompt where it sits; a tool answer is a `tool_result` block, never a role.
+const anthropic_roles = [_][]const u8{ "user", "assistant", "system" };
 
 fn messagesFault(buf: []u8, s: Surface, v: std.json.Value) ?[]const u8 {
     if (v != .array) return "'messages' must be an array";
@@ -932,7 +933,9 @@ test "a Responses input and a /v1/messages body refuse a message they cannot car
         .{ .surface = .compact, .body = "{\"input\":5}", .field = "input" },
         .{ .surface = .compact, .body = "{\"input\":[{\"role\":\"narrator\"}]}", .field = "input[0].role" },
         .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"assistant\"}]}", .field = null },
-        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"system\"}]}", .field = "messages[1].role" },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"system\",\"content\":\"hook\"}]}", .field = null },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"system\",\"content\":5}]}", .field = "messages[1].content" },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\"},{\"role\":\"developer\"}]}", .field = "messages[1].role" },
         .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"tool\",\"type\":\"x\"}]}", .field = "messages[0].role" },
         .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":5}]}", .field = "messages[1].content" },
         .{ .surface = .messages, .body = "{\"messages\":[{\"content\":\"no role\"}]}", .field = "messages[0].role" },
