@@ -210,8 +210,9 @@ answers while the weights load:
   While a stream waits in the queue behind another request, the comment reads `: queued behind N
   request(s); running G of M tokens (~S s at R tok/s)` (G/M: the running request's generated tokens and max); an
   Anthropic stream gets it before each `ping`.
-  A chat stream buffering a named tool call beats with `tool_calls` fragments instead, which add no bytes to the
-  arguments ([server-tool-calling](server-tool-calling.md#the-pipeline)).
+  A stream buffering a named tool call beats with an event that adds no bytes to its arguments instead (a chat
+  `tool_calls` fragment, an Anthropic `input_json_delta`, a Responses `function_call_arguments.delta`), one per 5 s of
+  silence ([server-tool-calling](server-tool-calling.md#the-pipeline)).
   `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's

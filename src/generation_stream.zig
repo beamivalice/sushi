@@ -2082,18 +2082,18 @@ pub fn handleStreamingGeneration(
             }
 
             // Emit tool call deltas in OpenAI streaming format
+            tool_stream.settle(if (tool_calls.len > 0) tool_calls[0] else null);
             for (tool_calls, 0..) |tc, i| {
-                // A call the stream opened early gets its arguments whole; any other is delivered whole.
-                const first_delta = try tool_stream.deliver(allocator, stream.io, i, tc);
+                // A call that went out early owes its arguments (or nothing); any other is delivered whole.
+                const first_delta = try tool_progress.chatEnd(allocator, stream.io, &tool_stream, i, tc);
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = null });
             }
+            try endCutCall(allocator, stream, chat_id, model_name, &tool_stream);
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
-            if (tool_stream.opened) |o| {
-                log.info("  [tool-stream] the call \"{s}\" opened to the client was left unfinished; it ends under a finish that is not tool_calls\n", .{o.name});
-                if (tool_stream.cutEnding()) |ending| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = ending }, null, null, null, .{ .logprobs_json = null });
-            }
+            tool_stream.settle(null);
+            try endCutCall(allocator, stream, chat_id, model_name, &tool_stream);
             // No tool calls found — flush buffered tokens, splitting thinking
             // from content. Runs regardless of the request's thinking flag:
             // reasoning the model produced ships as reasoning_content, and
@@ -2832,12 +2832,21 @@ fn beatToolCall(
 ) !void {
     // A WebSocket has liveness of its own, and its frames are not a stream a client times.
     if (stream.ws_mode == null) {
-        if (try progress.beat(allocator, stream.io, buffered, origin, tools_json)) |delta| {
+        if (try progress.beat(allocator, stream.io, buffered, origin, tools_json, .{})) |beat| {
+            const delta = try tool_progress.chatBeat(allocator, progress, beat);
             defer allocator.free(delta);
             return sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = delta }, null, null, null, .{ .logprobs_json = null });
         }
     }
     try beatStreamKeepalive(stream, .sse_comment);
+}
+
+/// A call sent to the client that the reply does not hold (the generation ended inside it) stays as it was sent,
+/// `arguments` empty; the finish is never `tool_calls` and names the cut.
+fn endCutCall(allocator: std.mem.Allocator, stream: *Conn, chat_id: i64, model_name: []const u8, progress: *const tool_progress.Progress) !void {
+    const open = progress.cut() orelse return;
+    log.info("  [tool-stream] the call \"{s}\" sent to the client was left unfinished; it ends under a finish that is not tool_calls\n", .{open.name});
+    if (progress.cutEnding()) |ending| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = ending }, null, null, null, .{ .logprobs_json = null });
 }
 
 test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to emitting everything" {
@@ -3445,4 +3454,39 @@ test "a continued thought keeps the request's forced tool_choice: the call is co
             try std.testing.expectEqualStrings(want, text);
         }
     }
+}
+
+/// A tool whose call the cells below stream; `tool_call_head` is the text up to the first argument's value.
+const stream_cell_tools =
+    \\[{"type":"function","function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+;
+const stream_cell_head = "Writing it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n";
+
+test "tool stream: a chat call that buffers for 23 s sends a data event within every beat interval, never only a comment" {
+    const a = std.testing.allocator;
+    var wire: http_conn.TestWire = undefined;
+    try wire.init();
+    defer wire.deinit();
+    var progress: tool_progress.Progress = .{};
+    defer progress.deinit(a);
+    var buffered = std.ArrayList(u8).empty;
+    defer buffered.deinit(a);
+    var since: i64 = 0;
+    var worst: i64 = 0;
+    for (0..230) |i| {
+        wire.advance(100);
+        since += 100;
+        try buffered.appendSlice(a, if (i == 0) stream_cell_head else "- item: pending review\n");
+        if (!wire.conn.keepaliveDue()) continue;
+        worst = @max(worst, since);
+        since = 0;
+        try beatToolCall(a, &wire.conn, 7, "m", &progress, buffered.items, .{ .dialect = null }, stream_cell_tools);
+    }
+    var buf: [8192]u8 = undefined;
+    const raw = wire.read(&buf);
+    try std.testing.expect(worst <= Conn.STREAM_KEEPALIVE_MS);
+    try std.testing.expect(std.mem.indexOf(u8, raw, ": keepalive") == null);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, raw, "data: "));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "\"name\":\"write_file\""));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, raw, "\"arguments\":\"\""));
 }

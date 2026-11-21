@@ -4277,28 +4277,51 @@ fn prefixTools(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-test "format corpus: a call named while it is written keeps that name to its end, in every dialect, at every cut" {
+test "format corpus: a call named while it is written keeps that name to its end, and the calls before it are the finished text's, in every dialect, at every cut" {
     const allocator = testing.allocator;
     const tools = try prefixTools(allocator, "get_weather");
     defer allocator.free(tools);
+    var two_calls: usize = 0;
     for (dialect_calls) |call| {
-        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call });
+        // Two calls, the second one pending at most cuts.
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call, "\n", call });
         defer allocator.free(text);
+        const whole = (try reply_mod.parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse return error.NoCalls;
+        defer {
+            for (whole) |c| {
+                allocator.free(c.name);
+                allocator.free(c.arguments);
+            }
+            allocator.free(whole);
+        }
+        // A wrapper family (DSML's `tool_calls`, a function-call list) reads a call twice as the one reading.
+        if (whole.len != 2) continue;
+        two_calls += 1;
         var named: usize = 0;
+        var after_first: usize = 0;
         var cut: usize = 0;
         while (cut <= text.len) : (cut += 1) {
             if (cut < text.len and text[cut] & 0xC0 == 0x80) continue;
-            const got = try reply_mod.pendingCallName(allocator, text[0..cut], .{ .dialect = null }, tools);
-            defer if (got) |g| allocator.free(g);
+            const got = try reply_mod.pendingCall(allocator, text[0..cut], .{ .dialect = null }, tools);
+            defer if (got) |g| g.deinit(allocator);
             errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
-            if (got) |name| {
-                try testing.expectEqualStrings("get_weather", name);
+            if (got) |p| {
+                // The pending call is the call the whole text holds at its place, and every finished call before it too.
+                try testing.expect(p.finished.len < whole.len);
+                try testing.expectEqualStrings(whole[p.finished.len].name, p.name);
+                for (p.finished, 0..) |f, i| {
+                    try testing.expectEqualStrings(whole[i].name, f.name);
+                    try testing.expectEqualStrings(whole[i].arguments, f.arguments);
+                }
                 named += 1;
+                if (p.finished.len == 1) after_first += 1;
             }
-            // The whole call is a call, never a pending one.
+            // The whole text is calls, never a pending one.
             if (cut == text.len) try testing.expect(got == null);
         }
         errdefer std.debug.print("never named: {f}\n", .{std.zig.fmtString(text)});
         try testing.expect(named > 0);
+        try testing.expect(after_first > 0);
     }
+    try testing.expect(two_calls >= 6);
 }

@@ -254,9 +254,14 @@ fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, 
     const defects = try tool_reading.defects(allocator, text, origin.model_ended);
     defer allocator.free(defects);
     if (defects.len == 0) return declinedBareCall(allocator, text, origin, tools_json);
-    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[defects[0].start..defects[0].end], origin.dialect)) orelse {
+    return try unfinishedCall(allocator, text, origin, defects[0]);
+}
+
+/// The call `defect` marks, named as far as its markup went.
+fn unfinishedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, defect: tool_reading.Defect) !Declined {
+    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[defect.start..defect.end], origin.dialect)) orelse {
         // A body cut before it names the tool: the opener's own `name="…"` attribute does.
-        const attr = tool_reading.attributeName(text, defects[0].start) orelse return .{ .name = null };
+        const attr = tool_reading.attributeName(text, defect.start) orelse return .{ .name = null };
         return .{ .name = try allocator.dupe(u8, attr) };
     };
     defer {
@@ -287,22 +292,43 @@ fn declinedBareCall(allocator: std.mem.Allocator, text: []const u8, origin: Orig
     return .{ .name = name };
 }
 
-/// The tool the first call of `text` names while the model is still writing it, owned, or null: the text holds no
-/// finished call, its first unfinished call has a name, and the request declares that name. A client is told this
-/// name before the call is whole, so it is one the finished call keeps (`declinedCall` reads the same parse).
-pub fn pendingCallName(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?[]u8 {
-    const tools = tools_json orelse return null;
-    if (try toolReply(allocator, text, tools_json, true, origin)) |done| {
-        done.deinit(allocator);
-        return null;
+/// The call a generation is still writing, and the calls it finished before it.
+pub const Pending = struct {
+    /// The calls `text` finished before the pending one, in order: the end delivers them as they are.
+    finished: []tool_schema.ParsedToolCall,
+    /// The tool the pending call names, a name the request declares.
+    name: []u8,
+    /// Where its markup starts in `text`: what precedes it is what the stream has already delivered or still owes.
+    start: usize,
+
+    pub fn deinit(self: Pending, allocator: std.mem.Allocator) void {
+        for (self.finished) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(self.finished);
+        allocator.free(self.name);
     }
-    const open = (try declinedCall(allocator, text, origin, tools_json)) orelse return null;
+};
+
+/// The call `text` is still writing, or null: its first unfinished call is marked up, has a name, and the request
+/// declares it. A client is told this name, and the calls before it, before the generation ends, so they are the ones
+/// the finished text holds (`unfinishedCall` reads the same parse). A bare JSON call has no markup to start from and
+/// names itself only by its arguments, so it is never pending.
+pub fn pendingCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Pending {
+    const tools = tools_json orelse return null;
+    const defects = try tool_reading.defects(allocator, text, origin.model_ended);
+    defer allocator.free(defects);
+    if (defects.len == 0) return null;
+    const open = try unfinishedCall(allocator, text, origin, defects[0]);
     const name = open.name orelse return null;
+    errdefer allocator.free(name);
     if (!tool_schema.toolNameIsDeclared(allocator, tools, name)) {
         allocator.free(name);
         return null;
     }
-    return name;
+    const finished: []tool_schema.ParsedToolCall = if (try toolReply(allocator, text, tools_json, true, origin)) |done| done.calls else try allocator.alloc(tool_schema.ParsedToolCall, 0);
+    return .{ .finished = finished, .name = name, .start = defects[0].start };
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to

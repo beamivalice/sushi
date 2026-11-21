@@ -78,6 +78,8 @@ const byteTokenizerForTests = tokenizer_mod.byteTokenizerForTests;
 const deinitTestTokenizer = tokenizer_mod.deinitTestTokenizer;
 const server_mod = @import("server.zig");
 const reply_mod = @import("reply.zig");
+const tool_progress = @import("tool_progress.zig");
+const tool_schema = @import("tool_schema.zig");
 const server_state = @import("server_state.zig");
 const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
 const MropeData = server_mod.MropeData;
@@ -1382,6 +1384,10 @@ fn handleAnthropicStreaming(
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools;
+    // The call the stream opens to the client while it is still being written (`tool_progress`), and its block.
+    var tool_stream: tool_progress.Progress = .{};
+    defer tool_stream.deinit(allocator);
+    var tool_block: u32 = 0;
     // Constrained requests route through the protocol, not the response-side
     // close scan. The stream seeds the think arm while the payload has not
     // begun (a generated opener must strip, not leak), and flips straight to
@@ -1691,7 +1697,14 @@ fn handleAnthropicStreaming(
         // See the chat-completions loop: a buffered tool call / thinking block
         // emits no events at all, so liveness must be driven off socket
         // silence, not off token arrival.
-        beatStreamKeepalive(stream, .anthropic_ping) catch {
+        const beaten = if (gated_stream and stream.keepaliveDue())
+            beatToolUse(allocator, stream, &tool_stream, &tool_block, &block_index, &text_block_open, &thinking_block_open, text_buf.items, .{
+                .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?),
+                .opens_think = opens_think and !think_closed,
+            }, tools_json)
+        else
+            beatStreamKeepalive(stream, .anthropic_ping);
+        beaten catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
             ts.slot.?.cancel();
             client_gone = true;
@@ -1773,37 +1786,13 @@ fn handleAnthropicStreaming(
             };
             try closeAnthropicBlock(allocator, stream, &block_index, &text_block_open, &thinking_block_open);
 
-            for (tool_calls) |tc| {
-                const tc_id = try io_util.callId(stream.io, allocator, "toolu");
-                defer allocator.free(tc_id);
-                const esc_name = try jsonEscape(allocator, tc.name);
-                defer allocator.free(esc_name);
-
-                // content_block_start
-                const start = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"tool_use","id":"{s}","name":{s},"input":{{}}}}}}
-                , .{ block_index, tc_id, esc_name });
-                defer allocator.free(start);
-                try sendAnthropicEvent(stream, "content_block_start", start);
-
-                // input_json_delta
-                const esc_args_full = try jsonEscape(allocator, tc.arguments);
-                defer allocator.free(esc_args_full);
-                const args_inner = esc_args_full[1 .. esc_args_full.len - 1];
-                const delta = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"input_json_delta","partial_json":"{s}"}}}}
-                , .{ block_index, args_inner });
-                defer allocator.free(delta);
-                try sendAnthropicEvent(stream, "content_block_delta", delta);
-
-                // content_block_stop
-                const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
-                defer allocator.free(stop);
-                try sendAnthropicEvent(stream, "content_block_stop", stop);
-                block_index += 1;
-            }
+            tool_stream.settle(if (tool_calls.len > 0) tool_calls[0] else null);
+            try endCutToolUse(stream, &tool_stream, tool_block, &block_index);
+            try sendToolUseBlocks(allocator, stream, &tool_stream, &block_index, tool_calls);
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
+            tool_stream.settle(null);
+            try endCutToolUse(stream, &tool_stream, tool_block, &block_index);
             // No tool calls — flush buffered tokens, splitting thinking from
             // content regardless of the request's thinking flag (split.content
             // passes trimLeakedToolMarkup, so the unparsed-markup cut the old
@@ -1873,6 +1862,95 @@ fn handleAnthropicStreaming(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
+}
+
+/// The keepalive of a stream that is buffering tool markup: while a call is being written, its `tool_use` block, open,
+/// and an `input_json_delta` that adds nothing to its input (`tool_progress`), which a client that watches block
+/// deltas, not `ping`, sees as progress. The call is the next block, so the one before it ends first.
+fn beatToolUse(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    progress: *tool_progress.Progress,
+    tool_block: *u32,
+    block_index: *u32,
+    text_open: *bool,
+    thinking_open: *bool,
+    buffered: []const u8,
+    origin: reply_mod.Origin,
+    tools_json: ?[]const u8,
+) !void {
+    // A WebSocket has liveness of its own.
+    if (stream.ws_mode == null) {
+        if (try progress.beat(allocator, stream.io, buffered, origin, tools_json, .{ .id_prefix = "toolu" })) |beat| {
+            switch (beat) {
+                .open => {
+                    try closeAnthropicBlock(allocator, stream, block_index, text_open, thinking_open);
+                    tool_block.* = block_index.*;
+                    const o = progress.opened.?;
+                    try sendToolUseStart(allocator, stream, tool_block.*, o.id, o.name);
+                },
+                .tick => try sendInputJsonDelta(allocator, stream, tool_block.*, ""),
+            }
+            return;
+        }
+    }
+    try beatStreamKeepalive(stream, .anthropic_ping);
+}
+
+/// The reply's calls as `tool_use` blocks from `block_index`: the call the stream opened gets its input whole and its
+/// block ends; any other is a whole block.
+fn sendToolUseBlocks(allocator: std.mem.Allocator, stream: *Conn, progress: *const tool_progress.Progress, block_index: *u32, calls: []const tool_schema.ParsedToolCall) !void {
+    for (calls, 0..) |tc, i| {
+        switch (progress.owed(i)) {
+            .arguments => {},
+            .whole => {
+                const tc_id = try io_util.callId(stream.io, allocator, "toolu");
+                defer allocator.free(tc_id);
+                try sendToolUseStart(allocator, stream, block_index.*, tc_id, tc.name);
+            },
+        }
+        try sendInputJsonDelta(allocator, stream, block_index.*, tc.arguments);
+        try sendBlockStop(allocator, stream, block_index.*);
+        block_index.* += 1;
+    }
+}
+
+/// A call the stream opened that the reply does not hold stays as it was sent, its input empty; its block ends, and the
+/// stop reason is never `tool_use` for it.
+fn endCutToolUse(stream: *Conn, progress: *const tool_progress.Progress, tool_block: u32, block_index: *u32) !void {
+    const open = progress.cut() orelse return;
+    log.info("  [tool-stream] the call \"{s}\" sent to the client was left unfinished; its block ends with an empty input\n", .{open.name});
+    var buf: [64]u8 = undefined;
+    const stop = try std.fmt.bufPrint(&buf, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{tool_block});
+    try sendAnthropicEvent(stream, "content_block_stop", stop);
+    block_index.* += 1;
+}
+
+fn sendToolUseStart(allocator: std.mem.Allocator, stream: *Conn, index: u32, id: []const u8, name: []const u8) !void {
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const start = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"tool_use","id":"{s}","name":{s},"input":{{}}}}}}
+    , .{ index, id, esc_name });
+    defer allocator.free(start);
+    try sendAnthropicEvent(stream, "content_block_start", start);
+}
+
+/// An `input_json_delta` carrying `json` (empty: nothing added to the input).
+fn sendInputJsonDelta(allocator: std.mem.Allocator, stream: *Conn, index: u32, json: []const u8) !void {
+    const esc = try jsonEscape(allocator, json);
+    defer allocator.free(esc);
+    const delta = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"input_json_delta","partial_json":"{s}"}}}}
+    , .{ index, esc[1 .. esc.len - 1] });
+    defer allocator.free(delta);
+    try sendAnthropicEvent(stream, "content_block_delta", delta);
+}
+
+fn sendBlockStop(allocator: std.mem.Allocator, stream: *Conn, index: u32) !void {
+    const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{index});
+    defer allocator.free(stop);
+    try sendAnthropicEvent(stream, "content_block_stop", stop);
 }
 
 /// Emit a text_delta event for Anthropic streaming.
@@ -2655,4 +2733,60 @@ test "an Anthropic tools array with a non-object entry converts to a JSON array 
     const tools = try request_parse.buildOpenAIToolsJson(a, parsed.value.array);
     defer a.free(tools);
     try std.testing.expectEqualStrings("[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"\",\"parameters\":{\"type\":\"object\"}}}]", tools);
+}
+
+test "tool stream: an Anthropic call that buffers for 23 s opens its tool_use block and sends an input_json_delta within every beat interval, never only a ping" {
+    const a = std.testing.allocator;
+    var wire: http_conn.TestWire = undefined;
+    try wire.init();
+    defer wire.deinit();
+    var progress: tool_progress.Progress = .{};
+    defer progress.deinit(a);
+    const tools =
+        \\[{"type":"function","function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+    ;
+    var buffered = std.ArrayList(u8).empty;
+    defer buffered.deinit(a);
+    // The preamble is a text block already open: the call is the next block.
+    var block_index: u32 = 0;
+    var text_open = true;
+    var thinking_open = false;
+    var tool_block: u32 = 0;
+    var since: i64 = 0;
+    var worst: i64 = 0;
+    for (0..230) |i| {
+        wire.advance(100);
+        since += 100;
+        try buffered.appendSlice(a, if (i == 0) "Writing it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n" else "- item: pending review\n");
+        if (!wire.conn.keepaliveDue()) continue;
+        worst = @max(worst, since);
+        since = 0;
+        try beatToolUse(a, &wire.conn, &progress, &tool_block, &block_index, &text_open, &thinking_open, buffered.items, .{ .dialect = null }, tools);
+    }
+    var buf: [8192]u8 = undefined;
+    const raw = wire.read(&buf);
+    try std.testing.expect(worst <= Conn.STREAM_KEEPALIVE_MS);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "event: ping") == null);
+    // The text block ends, then the call opens at the next index and is never closed before the end.
+    const stop = std.mem.indexOf(u8, raw, "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}").?;
+    const start = std.mem.indexOf(u8, raw, "\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_").?;
+    try std.testing.expect(stop < start);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "\"name\":\"write_file\""));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, raw, "\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "\"type\":\"content_block_stop\""));
+    try std.testing.expectEqual(@as(u32, 1), tool_block);
+
+    // The end completes that block with the whole input, and a second call is a block of its own.
+    const calls = [_]tool_schema.ParsedToolCall{
+        .{ .name = "write_file", .arguments = "{\"path\":\"report.md\",\"content\":\"x\"}" },
+        .{ .name = "write_file", .arguments = "{\"path\":\"b.md\",\"content\":\"y\"}" },
+    };
+    progress.settle(calls[0]);
+    try sendToolUseBlocks(a, &wire.conn, &progress, &block_index, &calls);
+    const rest = wire.read(&buf);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rest, "\"type\":\"tool_use\""));
+    try std.testing.expect(std.mem.indexOf(u8, rest, "\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"report.md\\\",\\\"content\\\":\\\"x\\\"}\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rest, "\"index\":2,\"content_block\":{\"type\":\"tool_use\"") != null);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, rest, "\"type\":\"content_block_stop\""));
+    try std.testing.expectEqual(@as(u32, 3), block_index);
 }

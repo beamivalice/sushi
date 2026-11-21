@@ -38,15 +38,32 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
   anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
 - **A call's id comes from `io_util.callId`, on every surface** (`call_`, Anthropic `toolu_`): random digits beside a per-process count, never a clock tick, so two requests in one millisecond or one restart apart never share an id.
-- **A chat stream that buffers a call shows it before it is whole** (`tool_progress.zig`): SSE comments are no event to a
-  client that counts parsed events (pi-ai: only non-empty text or reasoning, or any `tool_calls` entry). Once the first
-  call's name is read and declared (`reply.pendingCallName`, the parse `declinedCall` names a cut call by; no finished call
-  before it), each due keepalive (5 s of byte silence) is the call's opening (`index`, `id`, `type`, `name`,
-  `arguments: ""`), then `arguments: ""` fragments; the end adds the whole arguments to that id. The name
-  is never one the finished call lacks (`deliver` refuses a renamed call; a corpus pin cuts every dialect's call at every byte).
-  A call left unfinished after its opening stays at `arguments: ""` under a finish that is never `tool_calls`, with `tool_call_cut`
-  (`Progress.cutEnding`). Anthropic's `ping` is an event already; Responses and a call that is not first beat with comments.
-- **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
+- **A stream that buffers a call shows it before it is whole, on every surface** (`tool_progress.zig`). SSE comments and
+  Anthropic `ping` are no progress to a client that counts parsed events (pi-ai: non-empty text or reasoning, or any
+  `tool_calls` entry) or block deltas. The beat is one event per 5 s of byte silence (`Conn.STREAM_KEEPALIVE_MS`), so
+  a 300 s watchdog sees sixty. Once the first call's name is read and declared (`reply.pendingCall`, the parse
+  `declinedCall` names a cut call by), a due keepalive is the call's opening, then an event that adds nothing to its
+  arguments; the end adds them whole. Chat: `tool_calls` `{index, id, type, name, arguments: ""}`, then `arguments: ""`.
+  Anthropic: the text block ends, the `tool_use` block opens, then `input_json_delta` with `partial_json: ""`.
+  Responses: `output_item.added` and `function_call_arguments.delta` with `""`, after the thought and text before the
+  call, which it sends first (it buffers them to the end otherwise). Rules:
+  - Only the first call, and only while no finished call stands before it: the end decides whether a finished call ships
+    at all (a stop cut, a repetition loop, `parallel_tool_calls: false`), and a client cannot take one back. While the
+    opened call is open its beats continue through the calls after it; a first call that finished before any beat leaves
+    the later calls with comments (`ping`).
+  - The name is never one the finished call lacks (a corpus pin cuts every dialect's calls at every byte); when the
+    reply's first call is another tool's, the opened call stays as sent and the reply's calls follow it
+    (`Progress.settle`, `at`). A bare JSON call names itself by its arguments, so it never opens early.
+  - No thought stands in the way: reasoning that followed a call's opening would reach the client after it, and
+    Anthropic's blocks and Responses' items are sequential. Chat and Anthropic send a call only when the text before it
+    holds no thought (a call inside a thought, or after one still unsent, beats with comments); Responses sends a closed
+    thought first, so its items stay in order (`OpenedCallMoved` fails the stream if the item's place ever moved).
+  - **The one exception to valid-JSON arguments**: a call the generation leaves open after its opening stays as the
+    client holds it, `arguments` empty (Anthropic: `input` empty, its block ended; Responses: the item never done), under
+    a finish that is never `tool_calls` and names the cut (`tool_call_cut`), the owner's choice over closing it with a
+    fabricated `{}` (`Progress.cutEnding`, null). A reply that holds another tool's call after it still finishes
+    `tool_calls`, as the non-stream reply does.
+- **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON (bar the opened call a generation leaves open, above); every converter escapes + dedups; coercion
   never worsens conformance; a parsed NAME never contains `<|`; no tag leaks. Harness:
   `src/tool_traffic_replay_test.zig` over `src/fixtures/tool_traffic.jsonl`.
 - **Control-token text a client sends is text**: every byte of a render knows who wrote it (`Template.renderSpans`):

@@ -67,6 +67,7 @@ const Stopwatch = io_util.Stopwatch;
 const testing = std.testing;
 const server_mod = @import("server.zig");
 const reply_mod = @import("reply.zig");
+const tool_progress = @import("tool_progress.zig");
 const server_state = @import("server_state.zig");
 const anthropic = @import("anthropic.zig");
 const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
@@ -977,6 +978,12 @@ fn handleResponsesInner(
     var streamed_message_started = false;
     defer if (streamed_reasoning_id) |id| allocator.free(id);
     defer if (streamed_message_id) |id| allocator.free(id);
+    // The call the stream opens to the client while it is still being written (`tool_progress`): its item id and index.
+    var tool_stream: tool_progress.Progress = .{};
+    defer tool_stream.deinit(allocator);
+    var call_item_id: ?[]u8 = null;
+    defer if (call_item_id) |id| allocator.free(id);
+    var call_item_index: u32 = 0;
 
     // Wave 1.A: per-request KV-quant override (Responses path mirror).
 
@@ -1128,7 +1135,25 @@ fn handleResponsesInner(
             // emits nothing for its whole generation, and the thinking branch
             // holds until its close tag. Both look identical to a dead server
             // from the client's socket.
-            beatStreamKeepalive(stream, .sse_comment) catch {
+            const beaten = if (active_has_tools and delivery == null and stream.keepaliveDue())
+                beatFunctionCall(allocator, stream, seq_num, &tool_stream, .{
+                    .reasoning_id = &streamed_reasoning_id,
+                    .reasoning_index = &streamed_reasoning_index,
+                    .reasoning_started = &streamed_reasoning_started,
+                    .message_id = &streamed_message_id,
+                    .message_index = &streamed_message_index,
+                    .message_started = &streamed_message_started,
+                    .live_output_index = &live_output_index,
+                    .join = &join,
+                    .call_item_id = &call_item_id,
+                    .call_item_index = &call_item_index,
+                }, raw_buf.items, .{
+                    .dialect = try chat_mod.callDialect(allocator, chat_config),
+                    .opens_think = promptOpensThink(allocator, tok, prompt_ids),
+                }, active_tools_json)
+            else
+                beatStreamKeepalive(stream, .sse_comment);
+            beaten catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                 ts.slot.?.cancel();
                 client_gone = true;
@@ -1395,34 +1420,45 @@ fn handleResponsesInner(
         output_index += 1;
     }
 
-    if (tool_calls) |tcs| if (tcs.len > 0) {
-        for (tcs) |tc| {
-            if (!responsesToolExists(root.get("tools"), tc.name)) {
-                log.warn("[responses] dropping undeclared tool call: {s}\n", .{tc.name});
-                continue;
-            }
-            if (!isJsonObjectString(allocator, tc.arguments)) {
-                log.warn("[responses] dropping tool call with non-object arguments: {s}\n", .{tc.name});
-                continue;
-            }
-            const fc_id = try responses_mod.makeId(stream.io, allocator, "fc");
-            defer allocator.free(fc_id);
-            const call_id = try io_util.callId(stream.io, allocator, "call");
-            defer allocator.free(call_id);
-            const stored_call_id = try allocator.dupe(u8, call_id);
-            emitted_tool_calls.append(allocator, .{ .id = stored_call_id, .name = tc.name, .arguments = tc.arguments }) catch |err| {
-                allocator.free(stored_call_id);
-                return err;
-            };
-            if (emitted > 0) try out_buf.append(allocator, ',');
-            try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
-            emitted += 1;
-            if (is_stream) {
-                try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments);
-            }
-            output_index += 1;
-        }
+    // The reply's first call that ships: the call the stream opened early is that one, or it is cut.
+    const reply_calls: []const tool_schema.ParsedToolCall = tool_calls orelse &.{};
+    var first_kept: ?tool_schema.ParsedToolCall = null;
+    for (reply_calls) |tc| if (responsesCallDropped(allocator, root.get("tools"), tc) == null) {
+        first_kept = tc;
+        break;
     };
+    tool_stream.settle(first_kept);
+    // The call the client saw opened keeps its place even when it is cut: the reply's calls follow it.
+    if (tool_stream.cut() != null) output_index += 1;
+    var kept: usize = 0;
+    for (reply_calls) |tc| {
+        if (responsesCallDropped(allocator, root.get("tools"), tc)) |why| {
+            log.warn("[responses] dropping {s}: {s}\n", .{ why, tc.name });
+            continue;
+        }
+        defer kept += 1;
+        const owed = tool_stream.owed(kept);
+        // A call the client saw opened stays at the place it was opened.
+        if (owed == .arguments and output_index != call_item_index) return error.OpenedCallMoved;
+        const fc_id: []const u8 = if (owed == .arguments) call_item_id.? else try responses_mod.makeId(stream.io, allocator, "fc");
+        defer if (owed == .whole) allocator.free(fc_id);
+        const call_id: []const u8 = if (owed == .arguments) tool_stream.opened.?.id else try io_util.callId(stream.io, allocator, "call");
+        defer if (owed == .whole) allocator.free(call_id);
+        const stored_call_id = try allocator.dupe(u8, call_id);
+        emitted_tool_calls.append(allocator, .{ .id = stored_call_id, .name = tc.name, .arguments = tc.arguments }) catch |err| {
+            allocator.free(stored_call_id);
+            return err;
+        };
+        if (emitted > 0) try out_buf.append(allocator, ',');
+        try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
+        emitted += 1;
+        if (is_stream) switch (owed) {
+            .arguments => try emitResponsesFunctionCallRest(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments),
+            .whole => try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments),
+        };
+        output_index += 1;
+    }
+    if (tool_stream.cut()) |open| log.info("  [tool-stream] the call \"{s}\" sent to the client was left unfinished; its item is never done\n", .{open.name});
 
     try out_buf.append(allocator, ']');
 
@@ -2012,9 +2048,120 @@ fn emitResponsesReasoningEvents(
     try emitResponsesReasoningEnd(allocator, stream, seq, output_index, item_id, reasoning_text);
 }
 
+/// Why the reply drops a call of its own (a call the request does not declare, arguments that are no object), or null.
+fn responsesCallDropped(allocator: std.mem.Allocator, tools_val: ?std.json.Value, tc: tool_schema.ParsedToolCall) ?[]const u8 {
+    if (!responsesToolExists(tools_val, tc.name)) return "undeclared tool call";
+    if (!isJsonObjectString(allocator, tc.arguments)) return "tool call with non-object arguments";
+    return null;
+}
+
+/// The items a response has streamed live, by reference: the thought and the text a call stands after are sent before it.
+const LiveItems = struct {
+    reasoning_id: *?[]u8,
+    reasoning_index: *u32,
+    reasoning_started: *bool,
+    message_id: *?[]u8,
+    message_index: *u32,
+    message_started: *bool,
+    live_output_index: *u32,
+    join: *think_tags.ThoughtJoin,
+    call_item_id: *?[]u8,
+    call_item_index: *u32,
+};
+
+/// The keepalive of a tool request, which buffers its whole generation: while a call is being written, its item,
+/// opened, and a `function_call_arguments.delta` that adds nothing to its arguments (`tool_progress`). The thought
+/// and the text before the call are sent first, as the live path sends them, so the call opens at its own place.
+fn beatFunctionCall(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    seq: *u64,
+    progress: *tool_progress.Progress,
+    live: LiveItems,
+    buffered: []const u8,
+    origin: reply_mod.Origin,
+    tools_json: ?[]const u8,
+) !void {
+    // A WebSocket has liveness of its own.
+    if (stream.ws_mode == null) {
+        if (try progress.beat(allocator, stream.io, buffered, origin, tools_json, .{ .closed_thought_first = true })) |beat| {
+            if (beat == .open) {
+                const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, buffered);
+                defer if (norm) |n| allocator.free(n);
+                const split = think_tags.splitThinkBlock(norm orelse buffered, true, origin.opens_think);
+                if (split.reasoning_content) |reasoning| {
+                    try emitResponsesReasoning(allocator, stream, seq, live.reasoning_id, live.reasoning_index, live.reasoning_started, reasoningItemIndex(live.live_output_index.*, live.message_started.*, live.message_index.*), live.join, reasoning);
+                    if (live.reasoning_started.* and !live.message_started.*) live.live_output_index.* += 1;
+                }
+                const preamble = think_tags.visibleToolPreamble(split.content);
+                if (preamble.len > 0) try emitResponsesMessage(allocator, stream, seq, live.message_id, live.message_index, live.message_started, live.live_output_index.*, preamble);
+                live.call_item_index.* = live.live_output_index.* + @intFromBool(live.message_started.*);
+                live.call_item_id.* = try responses_mod.makeId(stream.io, allocator, "fc");
+                const o = progress.opened.?;
+                try emitResponsesFunctionCallAdded(allocator, stream, seq, live.call_item_index.*, live.call_item_id.*.?, o.id, o.name);
+            }
+            try emitResponsesFunctionCallDelta(allocator, stream, seq, live.call_item_index.*, live.call_item_id.*.?, "");
+            return;
+        }
+    }
+    try beatStreamKeepalive(stream, .sse_comment);
+}
+
 /// Emit the SSE event sequence for a function_call output item: output_item.added,
 /// function_call_arguments.delta (single full-args delta), .done, output_item.done.
 fn emitResponsesFunctionCallEvents(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    seq: *u64,
+    output_index: u32,
+    fc_id: []const u8,
+    call_id: []const u8,
+    name: []const u8,
+    arguments_json: []const u8,
+) !void {
+    try emitResponsesFunctionCallAdded(allocator, stream, seq, output_index, fc_id, call_id, name);
+    try emitResponsesFunctionCallRest(allocator, stream, seq, output_index, fc_id, call_id, name, arguments_json);
+}
+
+/// The function_call item opening: `output_item.added` with its arguments empty.
+fn emitResponsesFunctionCallAdded(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    seq: *u64,
+    output_index: u32,
+    fc_id: []const u8,
+    call_id: []const u8,
+    name: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, fc_id);
+    defer allocator.free(esc_id);
+    const esc_call = try jsonEscape(allocator, call_id);
+    defer allocator.free(esc_call);
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const item_added = try std.fmt.allocPrint(allocator,
+        \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":"","status":"in_progress"}}}}
+    , .{ output_index, esc_id, esc_call, esc_name });
+    defer allocator.free(item_added);
+    try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
+}
+
+/// A `function_call_arguments.delta` of the item (empty: nothing added to its arguments, which a client still counts
+/// as an event).
+fn emitResponsesFunctionCallDelta(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, output_index: u32, fc_id: []const u8, delta_text: []const u8) !void {
+    const esc_id = try jsonEscape(allocator, fc_id);
+    defer allocator.free(esc_id);
+    const esc_delta = try jsonEscape(allocator, delta_text);
+    defer allocator.free(esc_delta);
+    const delta = try std.fmt.allocPrint(allocator,
+        \\{{"type":"response.function_call_arguments.delta","item_id":{s},"output_index":{d},"delta":{s}}}
+    , .{ esc_id, output_index, esc_delta });
+    defer allocator.free(delta);
+    try sendResponsesEvent(allocator, stream, seq, "response.function_call_arguments.delta", delta);
+}
+
+/// What an opened function_call item still owes: its arguments as one delta, then `.done` and `output_item.done`.
+fn emitResponsesFunctionCallRest(
     allocator: std.mem.Allocator,
     stream: *Conn,
     seq: *u64,
@@ -2032,21 +2179,7 @@ fn emitResponsesFunctionCallEvents(
     defer allocator.free(esc_name);
     const esc_args = try jsonEscape(allocator, arguments_json);
     defer allocator.free(esc_args);
-
-    {
-        const item_added = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":"","status":"in_progress"}}}}
-        , .{ output_index, esc_id, esc_call, esc_name });
-        defer allocator.free(item_added);
-        try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
-    }
-    {
-        const delta = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.function_call_arguments.delta","item_id":{s},"output_index":{d},"delta":{s}}}
-        , .{ esc_id, output_index, esc_args });
-        defer allocator.free(delta);
-        try sendResponsesEvent(allocator, stream, seq, "response.function_call_arguments.delta", delta);
-    }
+    try emitResponsesFunctionCallDelta(allocator, stream, seq, output_index, fc_id, arguments_json);
     {
         const done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.function_call_arguments.done","item_id":{s},"output_index":{d},"arguments":{s}}}
@@ -2526,4 +2659,75 @@ test "the Responses envelope echoes max_tool_calls as the whole number the field
     try std.testing.expectEqual(@as(?u32, 3), maxToolCallsEcho(.{ .float = 3.0 }));
     try std.testing.expectEqual(@as(?u32, null), maxToolCallsEcho(null));
     try std.testing.expectEqual(@as(?u32, null), maxToolCallsEcho(.null));
+}
+
+test "tool stream: a Responses call that buffers for 23 s sends its item and a function_call_arguments.delta within every beat interval, after the thought and text before it" {
+    const a = std.testing.allocator;
+    var wire: http_conn.TestWire = undefined;
+    try wire.init();
+    defer wire.deinit();
+    var progress: tool_progress.Progress = .{};
+    defer progress.deinit(a);
+    const tools =
+        \\[{"type":"function","function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+    ;
+    var seq: u64 = 0;
+    var reasoning_id: ?[]u8 = null;
+    defer if (reasoning_id) |id| a.free(id);
+    var reasoning_index: u32 = 0;
+    var reasoning_started = false;
+    var message_id: ?[]u8 = null;
+    defer if (message_id) |id| a.free(id);
+    var message_index: u32 = 0;
+    var message_started = false;
+    var live_output_index: u32 = 0;
+    var join: think_tags.ThoughtJoin = .{};
+    var call_item_id: ?[]u8 = null;
+    defer if (call_item_id) |id| a.free(id);
+    var call_item_index: u32 = 0;
+    const live: LiveItems = .{
+        .reasoning_id = &reasoning_id,
+        .reasoning_index = &reasoning_index,
+        .reasoning_started = &reasoning_started,
+        .message_id = &message_id,
+        .message_index = &message_index,
+        .message_started = &message_started,
+        .live_output_index = &live_output_index,
+        .join = &join,
+        .call_item_id = &call_item_id,
+        .call_item_index = &call_item_index,
+    };
+    var buffered = std.ArrayList(u8).empty;
+    defer buffered.deinit(a);
+    var since: i64 = 0;
+    var worst: i64 = 0;
+    for (0..230) |i| {
+        wire.advance(100);
+        since += 100;
+        try buffered.appendSlice(a, if (i == 0) "<think>The file is long.</think>\n\nWriting it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n" else "- item: pending review\n");
+        if (!wire.conn.keepaliveDue()) continue;
+        worst = @max(worst, since);
+        since = 0;
+        try beatFunctionCall(a, &wire.conn, &seq, &progress, live, buffered.items, .{ .dialect = null }, tools);
+    }
+    var buf: [16384]u8 = undefined;
+    const raw = wire.read(&buf);
+    try std.testing.expect(worst <= Conn.STREAM_KEEPALIVE_MS);
+    try std.testing.expect(std.mem.indexOf(u8, raw, ": keepalive") == null);
+    // Reasoning at 0, the text at 1, the call opened at 2; every beat after the first adds nothing to the arguments.
+    const reasoning = std.mem.indexOf(u8, raw, "\"output_index\":0,\"item\":{\"type\":\"reasoning\"").?;
+    const message = std.mem.indexOf(u8, raw, "\"output_index\":1,\"item\":{\"type\":\"message\"").?;
+    const call = std.mem.indexOf(u8, raw, "\"output_index\":2,\"item\":{\"type\":\"function_call\"").?;
+    try std.testing.expect(reasoning < message and message < call);
+    try std.testing.expectEqual(@as(u32, 2), call_item_index);
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, raw, "event: response.function_call_arguments.delta"));
+    try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, raw, "\"output_index\":2,\"delta\":\"\""));
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, raw, "output_item.done"));
+
+    // The end completes that item: its arguments in one delta, then the done events, and no second `added`.
+    try emitResponsesFunctionCallRest(a, &wire.conn, &seq, call_item_index, call_item_id.?, progress.opened.?.id, "write_file", "{\"path\":\"report.md\"}");
+    const rest = wire.read(&buf);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, rest, "response.output_item.added"));
+    try std.testing.expect(std.mem.indexOf(u8, rest, "\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"report.md\\\"}\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rest, "\"type\":\"response.output_item.done\",\"output_index\":2") != null);
 }

@@ -1892,6 +1892,38 @@ test "Conn.close stops waiting when the server shuts down" {
     try expectCloseWaitsForPeer(true, true);
 }
 
+/// A connection on one end of a socket pair, for a test that reads what a stream writes: silence grows by `advance`
+/// (a fake clock for `keepaliveDue`), and `read` returns the bytes written since the last read.
+pub const TestWire = struct {
+    conn: Conn,
+    peer: std.posix.fd_t,
+    far: std.posix.fd_t,
+
+    /// In place: the connection holds its own address.
+    pub fn init(self: *TestWire) !void {
+        var sv: [2]std.posix.fd_t = undefined;
+        if (std.c.socketpair(1, 1, 0, &sv) != 0) return error.SocketPairFailed;
+        self.peer = sv[1];
+        self.far = sv[0];
+        Conn.init(&self.conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
+    }
+
+    pub fn deinit(self: *TestWire) void {
+        _ = std.c.close(self.far);
+        _ = std.c.close(self.peer);
+    }
+
+    /// `ms` more of silence: the last write moves back.
+    pub fn advance(self: *TestWire, ms: i64) void {
+        self.conn.heartbeat.last_write_ms -= ms;
+    }
+
+    pub fn read(self: *TestWire, buf: []u8) []u8 {
+        const n = std.c.recv(self.peer, buf.ptr, buf.len, std.c.MSG.DONTWAIT);
+        return buf[0..if (n > 0) @intCast(n) else 0];
+    }
+};
+
 test "StreamHeartbeat: a write resets the deadline, silence expires it" {
     var hb = StreamHeartbeat{ .last_write_ms = 1_000, .interval_ms = 5_000 };
 
