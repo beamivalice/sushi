@@ -2608,19 +2608,21 @@ pub const Engine = struct {
         return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
     }
 
-    /// The pick-score penalty `--expert-cache-bias` gives a rate-grouped layer's decode-width router (f32 `[experts]`).
+    /// The pick-score penalty `--expert-cache-bias` gives a layer's decode-width router (f32 `[experts]`).
     /// Null where the bias is off, `--expert-pick-tolerance` is set (it swaps on the host and keeps nothing queued), or
-    /// the layer has no map (the cases `specGrouped` answers null for).
-    pub fn penaltyGrouped(self: *Engine, layer_index: u16) !?mlx.mlx_array {
+    /// the layer has no map (the cases `specGrouped` and `specRoute` answer null for).
+    pub fn cachePenalty(self: *Engine, layer_index: u16) !?mlx.mlx_array {
         if (!(self.cache_bias > 0)) return null;
         if (pick_tolerance > 0) {
             if (!self.bias_logged) log.warn("[expert-bias] --expert-cache-bias is ignored: --expert-pick-tolerance is set\n", .{});
             self.bias_logged = true;
             return null;
         }
-        if (try self.specGrouped(layer_index) == null) return null;
+        const grouped = layer_index < self.layers.len and self.layers[layer_index].grouped != null;
+        const has_map = if (grouped) (try self.specGrouped(layer_index)) != null else (try self.specRoute(layer_index)) != null;
+        if (!has_map) return null;
         const pen = self.layers[layer_index].spec_pen;
-        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged on rate-grouped layers: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths; the chain stays queued)\n", .{self.cache_bias});
+        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths)\n", .{self.cache_bias});
         self.bias_logged = true;
         return if (pen.ctx != null) pen else null;
     }

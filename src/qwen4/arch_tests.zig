@@ -38,6 +38,7 @@ pub const tests = .{
     @import("qwen4_cooler.zig"),
     @import("qwen4_flags.zig"),
     @import("qwen4_load.zig"),
+    @import("qwen4_cache_bias_test.zig"),
 };
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.

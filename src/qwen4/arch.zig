@@ -166,10 +166,11 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
     return false;
 }
 
-/// A quantized pack drops experts by its usage list; the BF16 checkpoint's fused banks are read whole.
+/// A quantized pack drops experts by its usage list and its router can favour the cached ones; the BF16 checkpoint's
+/// fused banks are read whole.
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
     const bf16 = config.expert_layout == .bf16_fused or config.expert_layout == .bf16_individual;
-    return .{ .drop_expert = !bf16 };
+    return .{ .drop_expert = !bf16, .stq_experts = !bf16, .cache_bias = !bf16 };
 }
 
 test "a model stamped as qwen4 is dispatched to qwen4" {

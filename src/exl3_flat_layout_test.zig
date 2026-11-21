@@ -1053,6 +1053,49 @@ test "EXL3 streaming GPU mixed grouped and uniform layers stay within the worksp
     try std.testing.expectEqual(ledger.workspace_bytes, engine.plan.workspace_bytes);
 }
 
+test "EXL3 streaming GPU the cache penalty reads each layer's map, grouped or uniform, and is null while the bias is off or a pick tolerance swaps on the host" {
+    const stream = @import("expert_stream.zig");
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const mlx = @import("mlx.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var specs: std.ArrayList(TensorSpec) = .empty;
+    var entries: std.ArrayList(IndexSpec) = .empty;
+    try appendBankSpecs(arena.allocator(), &specs, &entries, 0, &.{ .{ .experts = 2, .n = 32, .group = 0 }, .{ .experts = 4, .n = 48, .group = 1 } }, 128, 256);
+    try appendBankSpecs(arena.allocator(), &specs, &entries, 1, &.{.{ .experts = 6, .n = 48, .group = null }}, 128, 256);
+    try writeSafetensors(io, a, tmp.dir, "experts.safetensors", specs.items);
+    try writeIndex(io, a, tmp.dir, entries.items);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const geom: stream.Geometry = .{ .layers = 2, .experts = 6, .hidden = 128, .intermediate = 256, .exl3_n = 64 };
+    const bill = try stream.expertBillFor(a, path, geom, .exl3_k4);
+    const bias: f32 = 2.5;
+    var engine = try stream.Engine.initWithOptions(a, path, geom, 2 * 3 * bill.expert_bytes, mlx.gpuStream(), .{ .layout = .exl3_k4, .bounce_size = 1 << 20, .cache_bias = bias });
+    defer engine.deinit();
+    try engine.warmCache();
+    for ([_]u16{ 0, 1 }) |layer| {
+        const pen = (try engine.cachePenalty(layer)) orelse return error.TestUnexpectedResult;
+        try mlx.check(mlx.mlx_array_eval(pen));
+        const got = mlx.mlx_array_data_float32(pen).?[0..6];
+        var cached: usize = 0;
+        for (engine.layers[layer].spec_host, got) |slot, v| {
+            try std.testing.expectEqual(if (slot >= 0) @as(f32, 0) else -bias, v);
+            cached += @intFromBool(slot >= 0);
+        }
+        try std.testing.expect(cached > 0 and cached < 6);
+    }
+    const saved = stream.pick_tolerance;
+    defer stream.pick_tolerance = saved;
+    stream.pick_tolerance = 0.3;
+    try std.testing.expect((try engine.cachePenalty(1)) == null);
+    stream.pick_tolerance = 0;
+    engine.cache_bias = 0;
+    try std.testing.expect((try engine.cachePenalty(1)) == null);
+}
+
 test "EXL3 streaming GPU a cache profile moves slots to the layer that reuses its experts, within the uniform bytes" {
     const stream = @import("expert_stream.zig");
     const a = std.testing.allocator;

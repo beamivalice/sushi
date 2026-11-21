@@ -293,16 +293,23 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 
 ## Cache-favoring pick (`--expert-cache-bias <n>`, 0..8, default 0 = exact)
 
-- DeepSeek-V4.1 STQ, decode widths (DSpark verify rows included): the router's bias gets `-n` on every expert the layer's
-  cache lacks (`Engine.penaltyGrouped`, f32 `[experts]` rebuilt with the GPU cache map in `LayerState.refreshSpec`), in
-  the router's sqrt-softplus score units, so a cached near-tie wins. The weights stay the unbiased scores.
-- Unlike `--expert-pick-tolerance` the pick stays on the GPU and the routed chain is still queued ahead of the host
-  (`canQueue` stays true): a tolerance above 0 turns the queue off, so a boot with both ignores the bias (and says so).
-- Prefill chunks, image rows and layers without a pooled map route exactly. `layoutKey` names a non-zero bias (`-cbias`),
-  so its states never mix with an exact boot's. `kld compare` takes it, `capture` refuses it.
-- Per model: model-settings.json `expert_cache_bias` (the web UI's "Faster SSD streaming (not exact)", offered only to a DeepSeek
-  STQ pack that streams); the flag outranks it. `ModelConfig.expertCacheBias` resolves it per load and the load hands it
-  to its own engine (`Options.cache_bias`) and namespace, so a second resident model never reads another's bias.
+- DeepSeek-V4.1 and Qwen3.8 STQ, decode widths (DSpark and MTP verify rows included, up to `DECODE_ROWS_MAX`): the pick
+  scores an expert the layer's cache lacks `n` lower (`Engine.cachePenalty`, f32 `[experts]` rebuilt with the GPU cache
+  map in `LayerState.refreshSpec`), so a cached near-tie wins. The weights stay the unbiased scores: a bias changes the
+  pick, never a weight.
+- DeepSeek adds the penalty to its router's bias, in sqrt-softplus score units, on the GPU, and the routed chain is
+  still queued ahead of the host (`canQueue` stays true). Qwen's softmax router picks on logits plus the penalty
+  (`Trunk.cachePenalizedRouting`, `moeRoutingChainOn`; `n` is in router logits, a probability factor of e^-n) and
+  weights the picked experts by the plain softmax; it queues no chain of its own, so the gain is fewer SSD reads.
+- A tolerance above 0 swaps on the host and keeps nothing queued, so a boot with both ignores the bias (and says so).
+- Prefill chunks, image rows and layers without a pooled map route exactly. `ExpertStreamTraits.cache_bias` names the
+  archs whose router takes it; another arch's engine keeps the bias 0. The prefix-cache namespace names a non-zero bias
+  (`-cbias`: `dsv41_prefix.layoutKey`, `qwen4_prefix.diskLayoutKey`), so its states never mix with an exact boot's.
+  `kld compare` takes it, `capture` refuses it.
+- Per model: model-settings.json `expert_cache_bias` (the web UI's "Faster SSD streaming (not exact)", offered only to a
+  DeepSeek or Qwen STQ pack that streams); the flag outranks it. `ModelConfig.expertCacheBias` resolves it per load and
+  the load hands it to its own engine (`Options.cache_bias`) and namespace, so a second resident model never reads
+  another's bias.
 - Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
   non-zero tolerance: the teacher is exact routing. Numbers: [quality-kld](quality-kld.md#lossy-expert-pick).
 

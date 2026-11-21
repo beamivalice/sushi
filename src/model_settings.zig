@@ -518,6 +518,8 @@ pub const Fit = struct {
     stq_experts: bool = true,
     /// The arch has an expert prefetcher (`arch/admission.zig` `ExpertStreamTraits.prefetch`). It keeps no KV cache either.
     prefetch: bool = false,
+    /// The arch's router takes `expert_cache_bias` (`ExpertStreamTraits.cache_bias`).
+    cache_bias: bool = false,
     /// The `kv_quant` spellings the cache stores, when it stores fewer than all of them; empty = every width.
     kv_choices: []const []const u8 = &.{},
     /// The model's context window; 0 = unknown.
@@ -599,8 +601,8 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
     if (eql(u8, key, "yarn_factor")) return if (fit.reads_yarn) null else "This model's RoPE has no YaRN context extension.";
     if (eql(u8, key, "think_penalty")) return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
     if (eql(u8, key, "expert_cache_bias")) {
-        // The pick runs in DeepSeek's router, on the rate-grouped (STQ) layers whose cache map the GPU holds.
-        if (!fit.prefetch) return "Only DeepSeek-V4.1's router can favour the experts already in memory.";
+        // The pick runs in the router, on the STQ layers whose cache map the GPU holds.
+        if (!fit.cache_bias) return "Only DeepSeek-V4.1's and Qwen3.8's routers can favour the experts already in memory.";
         if (!fit.streams_experts) return "This model does not stream its experts from SSD.";
         if (!fit.stq_experts) return "This pack has no STQ experts, so its router has no cached experts to favour.";
     }
@@ -1148,9 +1150,9 @@ test "model_settings: expert_cache_bias is a number from 0 to 8, anything else i
     try std.testing.expect(!s.lookup("/m/f").isEmpty());
 }
 
-test "model_settings: expert_cache_bias shows only for a DeepSeek pack whose STQ experts stream" {
+test "model_settings: expert_cache_bias shows only for a DeepSeek or Qwen pack whose STQ experts stream" {
     const t = std.testing;
-    const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true };
+    const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .cache_bias = true, .streams_experts = true, .has_vision = true };
     try t.expect(applies("expert_cache_bias", dsv));
     var not_stq = dsv;
     not_stq.stq_experts = false;
@@ -1158,8 +1160,10 @@ test "model_settings: expert_cache_bias shows only for a DeepSeek pack whose STQ
     var resident = dsv;
     resident.streams_experts = false;
     try t.expectEqualStrings("This model does not stream its experts from SSD.", unavailable("expert_cache_bias", resident).?);
-    const qwen: Fit = .{ .arch = "qwen4_exp", .streams_experts = true, .has_vision = true };
-    try t.expectEqualStrings("Only DeepSeek-V4.1's router can favour the experts already in memory.", unavailable("expert_cache_bias", qwen).?);
+    const qwen: Fit = .{ .arch = "qwen4_exp", .cache_bias = true, .streams_experts = true, .has_vision = true };
+    try t.expect(applies("expert_cache_bias", qwen));
+    const glm: Fit = .{ .arch = "glm5_next", .streams_experts = true, .has_vision = false };
+    try t.expectEqualStrings("Only DeepSeek-V4.1's and Qwen3.8's routers can favour the experts already in memory.", unavailable("expert_cache_bias", glm).?);
 }
 
 test "model_settings: preserve_thinking is a bool, anything else is unset" {

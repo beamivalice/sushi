@@ -250,13 +250,14 @@ const shared =
     \\                        0.3 is a mild setting. A sigmoid router (MiMo)
     \\                        compares sigmoid probabilities.
     \\  --expert-cache-bias <n>
-    \\                      LOSSY, DeepSeek-V4.1 streamed packs only (default: 0 =
-    \\                        off, exact routing). At decode widths the router
-    \\                        scores an expert the layer's cache lacks n lower, so
-    \\                        a cached expert within n of it wins the pick; the
-    \\                        weights stay the unbiased scores and the routed chain
-    \\                        stays queued ahead of the host. 0..8; 0.2 is a mild
-    \\                        setting. Ignored when --expert-pick-tolerance is set.
+    \\                      LOSSY, DeepSeek-V4.1 and Qwen3.8 streamed STQ packs only
+    \\                        (default: 0 = off, exact routing). At decode widths
+    \\                        the router scores an expert the layer's cache lacks
+    \\                        n lower, so a cached expert within n of it wins the
+    \\                        pick; the weights stay the unbiased scores. DeepSeek
+    \\                        counts n in its sqrt-softplus scores (0.2 is mild),
+    \\                        Qwen in router logits. 0..8. Ignored when
+    \\                        --expert-pick-tolerance is set.
     \\  --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
     \\                        source checkpoint) with a
     \\                        TOTAL resident target of <n> GiB; the expert

@@ -202,7 +202,7 @@ pub fn ownsModuleDecodeState(xfm: Model) bool {
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {
-    return .{ .drop_expert = true, .prefetch = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
+    return .{ .drop_expert = true, .prefetch = true, .cache_bias = true, .tile_major = config.expert_layout == .exl3_k4, .stq_experts = if (config.dsv41) |c| c.expert_dec != null else false };
 }
 
 test "a model stamped as dsv41 is dispatched to dsv41" {

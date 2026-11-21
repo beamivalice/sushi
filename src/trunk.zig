@@ -205,6 +205,7 @@ pub const moeRouterFusedEnabled = moe_router.moeRouterFusedEnabled;
 pub const moeRouterTopK = moe_router.moeRouterTopK;
 const moeRouterTopKGate = moe_router.moeRouterTopKGate;
 const moeRoutingChain = moe_router.moeRoutingChain;
+const moeRoutingChainOn = moe_router.moeRoutingChainOn;
 pub const moeDecodeDispatchArm = moe_gqmv.moeDecodeDispatchArm;
 const moeRowsFusedEnabled = moe_gqmv.moeRowsFusedEnabled;
 pub const msvQmvRows = moe_gqmv.msvQmvRows;
@@ -1481,6 +1482,24 @@ pub const Trunk = struct {
         return moeRoutingChain(router_logits, k, self.s);
     }
 
+
+    /// The streamed layer's `--expert-cache-bias` penalty for a decode-width softmax route; null picks exactly.
+    fn cachePenaltyOf(self: *const Trunk, stream_ctx: ?MoeStreamCtx, router_logits: mlx.mlx_array) !?mlx.mlx_array {
+        const sc = stream_ctx orelse return null;
+        const engine = self.expert_stream orelse return null;
+        if (self.imatrix != null or router_logits.ctx == null) return null;
+        if (streamRows(mlx.getShape(router_logits)) > sushi_exl3.kernels.DECODE_ROWS_MAX) return null;
+        return engine.cachePenalty(sc.layer);
+    }
+
+    /// The route picked on the logits less the penalty: an expert the cache lacks scores lower, its weight stays the
+    /// unbiased softmax.
+    fn cachePenalizedRouting(self: *const Trunk, router_logits: mlx.mlx_array, penalty: mlx.mlx_array) !MoeRouting {
+        var select = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(select);
+        try mlx.check(mlx.mlx_add(&select, router_logits, penalty, self.s));
+        return moeRoutingChainOn(router_logits, select, @intCast(self.config.num_experts_per_tok), self.s);
+    }
 
     /// Apply the compiled MoE routing closure if available, else fall back.
     /// Returns owned `inds` + `norm_scores` — caller must free both.
@@ -2983,7 +3002,7 @@ pub const Trunk = struct {
         };
         var geometry = config.expertGeometry();
         geometry.drop = drop;
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major, .cache_bias = config.expertCacheBias() });
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major, .cache_bias = if (traits.cache_bias) config.expertCacheBias() else 0 });
         return engine;
     }
 
@@ -4166,6 +4185,8 @@ pub const Trunk = struct {
             break :blk .{ .inds = ids, .norm_scores = weights };
         } else if (mw.expert_bias) |bias|
             try arch_moe.biasRouting(self, router_logits, bias)
+        else if (try self.cachePenaltyOf(stream_ctx, router_logits)) |penalty|
+            try self.cachePenalizedRouting(router_logits, penalty)
         else
             try self.computeMoeRouting(router_logits, gate_fold);
         defer if (routed.gate_logit.ctx != null) {

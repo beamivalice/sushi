@@ -16,6 +16,8 @@ pub const ExpertStreamTraits = struct {
     tile_major: bool = false,
     /// The routed experts are STQ rate groups, which the prefetcher reads.
     stq_experts: bool = false,
+    /// The router takes `--expert-cache-bias` on the STQ experts it streams.
+    cache_bias: bool = false,
 };
 
 /// Bytes a streamed load keeps resident beside the trunk that only the arch knows of; 0 where it has none.
@@ -77,10 +79,10 @@ test "a streamed MTP head is an arch's own declaration, and the refusal names th
 test "expert-stream traits per model type and layout" {
     const T = ExpertStreamTraits;
     const rows = [_]struct { model_type: []const u8, layout: @TypeOf(@as(model.ModelConfig, .{}).expert_layout), want: T }{
-        .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true } },
-        .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false } },
+        .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true, .cache_bias = true } },
+        .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false, .cache_bias = true } },
         .{ .model_type = "glm5_next", .layout = .exl3_k4, .want = .{} },
-        .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{ .drop_expert = true } },
+        .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{ .drop_expert = true, .stq_experts = true, .cache_bias = true } },
         .{ .model_type = "qwen4_exp", .layout = .bf16_fused, .want = .{} },
         .{ .model_type = "mimo_v2", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "mistral", .layout = .exl3_k4, .want = .{} },

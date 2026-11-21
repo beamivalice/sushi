@@ -227,7 +227,7 @@ pub const StqStream = struct {
 
     fn penaltyOpaque(ctx: *anyopaque, layer: usize) anyerror!?A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        return self.engine.penaltyGrouped(@intCast(layer));
+        return self.engine.cachePenalty(@intCast(layer));
     }
 
     fn canQueue(ctx: *anyopaque, layer: usize) bool {

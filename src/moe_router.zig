@@ -14,9 +14,15 @@ const transposeBf16Weight = mlx_util.transposeBf16Weight;
 const routerRefRow = test_support.routerRefRow;
 
 pub fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Trunk.MoeRouting {
+    return moeRoutingChainOn(router_logits, router_logits, k, s);
+}
+
+/// `moeRoutingChain` with the top-k picked on `select` while the weights stay the softmax of `router_logits`
+/// (renormalized over the picked experts): a pick that leans on something the weights must not.
+pub fn moeRoutingChainOn(router_logits: mlx.mlx_array, select: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Trunk.MoeRouting {
     var neg_logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(neg_logits);
-    try mlx.check(mlx.mlx_negative(&neg_logits, router_logits, s));
+    try mlx.check(mlx.mlx_negative(&neg_logits, select, s));
 
     var partitioned = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(partitioned);
@@ -936,6 +942,40 @@ test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     try testing.expect(@abs(gs[1] - 15.0) < tol);
     try testing.expect(@abs(ss[0] - 1.0) < tol);
     try testing.expect(@abs(ss[1] - 1.0) < tol);
+}
+
+test "moeRoutingChainOn picks on the selection logits and weights the picked experts by the plain logits' softmax" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    // Expert 0 leads on the logits but is penalized in the selection, as an expert the cache lacks is.
+    const logits_host = [_]f32{ 3.0, 2.9, 2.8, -5.0 };
+    const select_host = [_]f32{ 2.0, 2.9, 2.8, -5.0 };
+    const shape = [_]c_int{ 1, 4 };
+    const logits = mlx.mlx_array_new_data(&logits_host, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const select = mlx.mlx_array_new_data(&select_host, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(select);
+    const routed = try moeRoutingChainOn(logits, select, 2, s);
+    defer _ = mlx.mlx_array_free(routed.inds);
+    defer _ = mlx.mlx_array_free(routed.norm_scores);
+    var ids: [2]f32 = undefined;
+    var weights: [2]f32 = undefined;
+    var ids_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_f);
+    try mlx.check(mlx.mlx_astype(&ids_f, routed.inds, .float32, s));
+    try testReadF32(ids_f, &ids, s);
+    try testReadF32(routed.norm_scores, &weights, s);
+    const e1 = @exp(@as(f64, 2.9));
+    const e2 = @exp(@as(f64, 2.8));
+    for (ids, weights) |id, w| {
+        const want: f64 = switch (@as(usize, @intFromFloat(id))) {
+            1 => e1 / (e1 + e2),
+            2 => e2 / (e1 + e2),
+            else => return error.TestUnexpectedResult,
+        };
+        try testing.expectApproxEqAbs(@as(f32, @floatCast(want)), w, 1e-6);
+    }
+    try testing.expect(ids[0] != ids[1]);
 }
 
 test "a route scale the engine's pool refuses is an error and is not kept: the next call makes it" {

@@ -226,6 +226,7 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .head_streams = admission.streamedMtpHead(config, config.expert_layout),
         .stq_experts = admission.expertStream(config).stq_experts,
         .prefetch = admission.expertStream(config).prefetch,
+        .cache_bias = admission.expertStream(config).cache_bias,
         .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),

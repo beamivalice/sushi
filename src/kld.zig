@@ -248,7 +248,7 @@ pub const USAGE =
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
-    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1: score an uncached expert n lower at decode widths (0..8)
+    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1 and Qwen3.8: score an uncached expert n lower at decode widths (0..8)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher or a streamed checkpoint's calibration capture, --tokens 1:
     \\                        batches of windows run layer by layer, each layer's experts read once per batch;

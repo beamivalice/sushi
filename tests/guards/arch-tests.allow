@@ -168,7 +168,7 @@ mimo_v2 streaming discovery validates MXFP4 headers without a PLE table
 mimo_v2 warm bill credits only the restored global rows, never the ring
 mimo_v2 with an SSD tier bills a restored global layer beside its first grow
 mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room
-model_settings: expert_cache_bias shows only for a DeepSeek pack whose STQ experts stream
+model_settings: expert_cache_bias shows only for a DeepSeek or Qwen pack whose STQ experts stream
 mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not
 mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never a batched head or a planner-owned round
 ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got
