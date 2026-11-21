@@ -756,8 +756,15 @@ pub const KVCache = struct {
                 const sh = mlx.getShape(buf.*);
                 try growQuantBuf(s, buf, true, false, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.*));
                 try mlx.check(mlx.mlx_array_eval(buf.*));
-                // The engine's pool keeps a freed buffer as a free one, which MLX's cache clear never reaches.
-                if (mlx.engine.isStream(s)) mlx.engine.trim() else _ = mlx.mlx_clear_cache();
+                // The engine's pool keeps a freed buffer as a free one, which MLX's cache clear never reaches. MLX releases
+                // an evaluated graph's inputs when the GPU's command buffer completes, a moment after the eval returns, so
+                // the stream is synchronized first or the next buffer's rebuild starts beside this one's old copy and tail.
+                if (mlx.engine.isStream(s)) {
+                    mlx.engine.trim();
+                } else {
+                    try mlx.check(mlx.mlx_synchronize(s));
+                    _ = mlx.mlx_clear_cache();
+                }
             }
             kv_cap_buf_grows += 1;
         }
@@ -3895,3 +3902,175 @@ test "a KV cache no request has bound cannot grow" {
 /// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
 /// sizes its grows (`KVCache.heldRows`).
 const test_request_end: usize = 1 << 20;
+
+/// Writes every KV layer of `cfg`'s cache from its stored rows to `rows` on `s`: the layers a regrow rebuilds.
+fn fillGrowingLayers(cfg: *const ModelConfig, cache: *KVCache, rows: usize, s: mlx.mlx_stream) !void {
+    var li: u32 = 0;
+    while (li < cfg.num_hidden_layers) : (li += 1) {
+        if (!cfg.isKvPerTokenLayer(li)) continue;
+        const add: c_int = @intCast(rows - cache.seqLen(li));
+        if (add == 0) continue;
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        var v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_ones(&k, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(li)), add, @intCast(cfg.layerHeadDim(li)) }, 4, .bfloat16, s));
+        try mlx.check(mlx.mlx_ones(&v, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(li)), add, @intCast(cfg.layerVHeadDim(li)) }, 4, .bfloat16, s));
+        var view = try cache.update(li, k, v, s, 0);
+        view.deinit();
+    }
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    cache.appendEvalArrays(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+}
+
+/// MLX's active bytes at the peak of `work` past what it leaves live, with MLX's pool emptied before and after.
+fn mlxPeakOver(s: mlx.mlx_stream, comptime Work: type, work: Work) !u64 {
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    _ = mlx.mlx_reset_peak_memory();
+    try work.run();
+    try mlx.check(mlx.mlx_synchronize(s));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    _ = mlx.mlx_clear_cache();
+    var live: usize = 0;
+    _ = mlx.mlx_get_active_memory(&live);
+    return peak -| live;
+}
+
+/// One MLX page: a buffer past it is whole pages, and a step's scalars are the few bytes beside them.
+const regrow_page_slack: u64 = mlx_pages.page;
+
+test "the dearest decode regrow of a request on MLX holds beside the grown cache no more than the request's bill carries beyond it, at every prompt and reply" {
+    try mlx.requireGpu();
+    const bills = @import("bills.zig");
+    const fixtures = @import("bills_fixtures_test.zig");
+    const s = mlx.gpuStream();
+    var over: usize = 0;
+    var regrows: usize = 0;
+    inline for (.{ .{ "qwen4", fixtures.qwen4ExpLive364kConfig }, .{ "mimo2", fixtures.mimoV2FlashBillConfig } }) |arch| for ([_]u64{ 8, 16 }) |bits| for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
+        if (!bills.archBuilt(arch[0])) continue;
+        var cfg = arch[1]();
+        const chunk: u64 = 2048;
+        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, bits, chunk, .{});
+        var cache = try KVCache.initWithConfig(testing.allocator, cfg.num_hidden_layers, if (bits == 16) KVQuantConfig.dense else KVQuantConfig.affine(8));
+        defer cache.deinit();
+        _ = try @import("generate.zig").reserveRequestCapacity(&cache, &cfg, seq, max_tokens, chunk, 0, s);
+        try fillGrowingLayers(&cfg, &cache, seq, s);
+        var last: usize = cfg.num_hidden_layers;
+        while (!cfg.isKvPerTokenLayer(@intCast(last - 1))) last -= 1;
+        last -= 1;
+        const Grow = struct {
+            cache: *KVCache,
+            s: mlx.mlx_stream,
+            fn run(self: @This()) !void {
+                try self.cache.growAhead(1, self.s);
+            }
+        };
+        // The request's decode: every row past a capacity step regrows the cache, as `forwardWith` grows it ahead of the forward.
+        var offset: usize = seq;
+        var dearest: u64 = 0;
+        var later_most: u64 = 0;
+        while (offset < seq + max_tokens) {
+            const old_rows = KVCache.bufferCapacity(cache.entries[last].keys);
+            const peak = try mlxPeakOver(s, Grow, .{ .cache = &cache, .s = s });
+            const new_rows = KVCache.bufferCapacity(cache.entries[last].keys);
+            dearest = @max(dearest, peak);
+            if (new_rows != old_rows) {
+                regrows += 1;
+                // The peak is the widest buffer's old copy and tail, less what the layer's buffers after it have not yet grown by.
+                const e = &cache.entries[last];
+                const bufs = [_]mlx.mlx_array{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+                var row: [6]u64 = @splat(0);
+                var widest: u64 = 0;
+                for (bufs[0..if (bits == 16) 2 else 6], row[0..if (bits == 16) 2 else 6]) |b, *r| {
+                    r.* = mlx.mlx_array_size(b) * mlx.mlx_array_itemsize(b) / new_rows;
+                    widest = @max(widest, r.*);
+                }
+                var after_widest: u64 = 0;
+                var seen = false;
+                for (0..6) |i| {
+                    if (seen) after_widest += row[i] * (new_rows - old_rows);
+                    if (row[i] == widest) {
+                        seen = true;
+                        after_widest = 0;
+                    }
+                }
+                later_most = @max(later_most, after_widest);
+            }
+            offset = @min(new_rows, seq + max_tokens);
+            try fillGrowingLayers(&cfg, &cache, offset, s);
+        }
+        const billed = terms.decode_regrow_bytes;
+        if (dearest > billed + regrow_page_slack or billed > dearest + later_most + regrow_page_slack) {
+            over += 1;
+            std.debug.print("{s} kv{d}: a {d}-token prompt + {d}: the dearest regrow holds {d} B past the grown buffers, billed {d} B\n", .{ cfg.model_type, bits, seq, max_tokens, dearest, billed });
+        }
+    };
+    try testing.expect(regrows > 0);
+    try testing.expectEqual(@as(usize, 0), over);
+}
+
+test "the dearest decode regrow of the MTP head's cache on MLX holds beside the grown cache no more than the request's bill carries beyond it, at every prompt and reply" {
+    try mlx.requireGpu();
+    const bills = @import("bills.zig");
+    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const cfg = @import("bills_fixtures_test.zig").qwen4ExpLive364kConfig();
+    var first: u32 = 0;
+    while (!cfg.isKvPerTokenLayer(first)) first += 1;
+    // The head's own scheme is dense unless the kv-quant lever is on: its buffers are K and V alone, one layer of the trunk's shape.
+    const kv_heads: u64 = cfg.layerKVHeads(first);
+    if (bills.mtpHeadKvBytesPerToken(&cfg) != kv_heads * (cfg.layerHeadDim(first) + cfg.layerVHeadDim(first)) * 2) return error.SkipZigTest;
+    const chunk: u64 = 2048;
+    var over: usize = 0;
+    for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
+        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{ .mtp_on = true });
+        const end = KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(&cfg), bills.speculativeRowsPastEnd(&cfg, .{ .mtp_on = true }));
+        var cache = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.reserve(@intCast(@import("prefill_plan.zig").reservedPrefillTokens(&cfg, seq, max_tokens, chunk)));
+        cache.bound(@intCast(end));
+        const Fill = struct {
+            cache: *KVCache,
+            cfg: *const ModelConfig,
+            layer: u32,
+            rows: usize,
+            s: mlx.mlx_stream,
+            // Writes the head's layer from its stored rows to `rows`; the write grows the cache inside the graph, as the head's forward does.
+            fn run(self: @This()) !void {
+                const add: c_int = @intCast(self.rows - self.cache.seqLen(0));
+                if (add == 0) return;
+                var k = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(k);
+                var v = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(v);
+                try mlx.check(mlx.mlx_ones(&k, &[_]c_int{ 1, @intCast(self.cfg.layerKVHeads(self.layer)), add, @intCast(self.cfg.layerHeadDim(self.layer)) }, 4, .bfloat16, self.s));
+                try mlx.check(mlx.mlx_ones(&v, &[_]c_int{ 1, @intCast(self.cfg.layerKVHeads(self.layer)), add, @intCast(self.cfg.layerVHeadDim(self.layer)) }, 4, .bfloat16, self.s));
+                var view = try self.cache.update(0, k, v, self.s, 0);
+                view.deinit();
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                self.cache.appendEvalArrays(vec);
+                try mlx.check(mlx.mlx_eval(vec));
+            }
+        };
+        try (Fill{ .cache = &cache, .cfg = &cfg, .layer = first, .rows = seq, .s = s }).run();
+        var dearest: u64 = 0;
+        var offset: usize = seq;
+        while (offset < end) {
+            dearest = @max(dearest, try mlxPeakOver(s, Fill, .{ .cache = &cache, .cfg = &cfg, .layer = first, .rows = offset + 1, .s = s }));
+            offset = @min(KVCache.bufferCapacity(cache.entries[0].keys), end);
+            try (Fill{ .cache = &cache, .cfg = &cfg, .layer = first, .rows = offset, .s = s }).run();
+        }
+        // The peak is the cache's old copies and zero tails whole.
+        const billed = terms.decode_regrow_bytes;
+        if (dearest > billed + regrow_page_slack or billed > dearest + regrow_page_slack) {
+            over += 1;
+            std.debug.print("a {d}-token prompt + {d}: the head's dearest regrow holds {d} B past its grown cache, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), over);
+}

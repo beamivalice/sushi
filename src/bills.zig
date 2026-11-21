@@ -2356,34 +2356,49 @@ fn layerBufferRowBytes(config: *const model_mod.ModelConfig, li: u32, kv_bits: u
     return if (kv_bits >= 16) .{ k, v, 0, 0 } else .{ k * kv_bits / 16, v * kv_bits / 16, k / 64, v / 64 };
 }
 
-/// One row of the widest single buffer any layer's cache holds: the buffer a regrow rebuilds beside its old copy.
-fn widestBufferRowBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    var widest: u64 = 0;
-    var li: u32 = 0;
-    while (li < config.num_hidden_layers) : (li += 1) {
-        if (!config.isKvPerTokenLayer(li)) continue;
-        for (layerBufferRowBytes(config, li, kv_bits)) |row| widest = @max(widest, row);
-    }
-    return widest;
-}
-
 /// What a decode step's regrow holds past the grown cache the request's storage prices at its last row (`cacheStorage`).
 /// The trunk's (`KVCache.growAhead`) rebuilds one buffer at a time, the kept rows joined to a zero tail of the rows it adds,
 /// so at its peak the widest buffer's old copy and that tail are alive beside the new buffer; the MTP head's rebuilds inside
 /// its forward's graph, so its whole cache's old copies and tails are. Old copy and tail make up the new buffer whole, so
 /// the dearest regrow of a request is its last, whatever capacity the cache grew from: a buffer of the request's final
 /// capacity (`KVCache.heldRows`, the one rule the cache grows by, from the capacity a restore holds, `warm.capacity_tokens`,
-/// else none). Nothing where the prompt's own capacity already holds the reply, as a reservation or a restore leaves it,
-/// on MLX and for an arch whose requests reserve no capacity.
+/// else none). Each buffer takes the rows its side allows: any on the engine, the page grid of its layer's buffers on MLX.
+/// Nothing where the prompt's own capacity already holds the reply, as a reservation or a restore leaves it, and for an arch
+/// whose requests reserve no capacity.
 pub fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
-    if (!config.reservesKvCapacity() or !cooler_side.onEngine(config)) return 0;
-    const KV = trunk.KVCache;
+    if (!config.reservesKvCapacity()) return 0;
     const hold = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm));
-    if (KV.heldRows(if (warm.matched_tokens > 0) warm.capacity_tokens else 0, seq, hold, &.{}) >= hold.end) return 0;
-    // The head's cache grows inside its forward's graph, which keeps every buffer's old copy and tail beside the new.
-    const head_row: u64 = if (headBilled(config, warm)) mtpHeadKvBytesPerToken(config) else 0;
-    // The two never coexist: the trunk's grows ahead of its forward, the head's inside its own.
-    return pooledCacheBytes(config, KV.heldRows(0, hold.end, hold, &.{}) *| @max(widestBufferRowBytes(config, kv_bits), head_row));
+    const start = if (warm.matched_tokens > 0) warm.capacity_tokens else 0;
+    // The head's cache grows inside its forward's graph, which keeps every buffer's old copy and tail beside the new; it holds
+    // the shape of the trunk's first attention layer. The two never coexist: the trunk's grows ahead of its forward.
+    var head_row: u64 = if (headBilled(config, warm)) mtpHeadKvBytesPerToken(config) else 0;
+    const head_bits = archHook("headKvBits", u64, config, .{}) orelse defaultKvBits(config);
+    const on_engine = cooler_side.onEngine(config);
+    var most: u64 = 0;
+    var last: ?[4]u64 = null;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (!config.isKvPerTokenLayer(li)) continue;
+        const parts = layerBufferRowBytes(config, li, kv_bits);
+        if (head_row > 0) {
+            const head_parts = layerBufferRowBytes(config, li, head_bits);
+            most = @max(most, lastRegrowBytes(config, start, seq, hold, if (on_engine) &.{} else &head_parts, head_row));
+            head_row = 0;
+        }
+        if (last) |p| if (std.mem.eql(u64, &p, &parts)) continue;
+        last = parts;
+        most = @max(most, lastRegrowBytes(config, start, seq, hold, if (on_engine) &.{} else &parts, std.mem.max(u64, &parts)));
+    }
+    return most;
+}
+
+/// A buffer of `row` bytes a row that must still grow after the prompt's prefill rebuilds, at its last regrow, a buffer of its
+/// final capacity from its old rows and a zero tail; none where the prompt's capacity holds the request's last row. `grid`:
+/// the page grid its rows land on (none: any rows).
+fn lastRegrowBytes(config: *const model_mod.ModelConfig, start: u64, seq: u64, hold: trunk.Hold, grid: []const u64, row: u64) u64 {
+    const KV = trunk.KVCache;
+    if (KV.heldRows(start, seq, hold, grid) >= hold.end) return 0;
+    return pooledCacheBytes(config, KV.heldRows(0, hold.end, hold, grid) *| row);
 }
 
 /// On a Cooler load each cache buffer is held at its pool size class, at most a sixteenth over its bytes.
@@ -5974,7 +5989,8 @@ test "a Qwen request commits its whole cache at admission, as admission counts w
         const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, 8);
         const history = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, null);
         try std.testing.expect(cap >= seq + 4096);
-        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg), admissionCommitBytes(&cfg, seq, 4096, 8, chunk, .{}));
+        // Beside it the old copy and tail of the dearest decode regrow, which the request allocates after admission too.
+        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg) + decodeRegrowBytes(&cfg, seq, 4096, 8, chunk, .{}), admissionCommitBytes(&cfg, seq, 4096, 8, chunk, .{}));
     }
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
     try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, chunk, .{}));
@@ -6562,12 +6578,12 @@ test "bill pin: growCoexistBytes and the eval-window terms" {
 
 test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
-        1158641464, 1170118456, 929714176, 1285576504, 1473158464, 1484635456, 1290853696, 1600093504,
-        1215575864, 1227052856, 927666176, 1342510904, 1530092864, 1541569856, 1288805696, 1657027904,
+        1161262904, 1180604216, 929714176, 1296062264, 1475779904, 1495121216, 1290853696, 1610579264,
+        1220818744, 1237538616, 927666176, 1352996664, 1535335744, 1552055616, 1288805696, 1667513664,
         4598979200, 4892344960, 3701379200, 5036667520, 6443059712, 6740603392, 5545459712, 6884925952,
         5838183040, 6131548800, 4148583040, 6275871360, 7712737792, 8010281472, 6023137792, 8154604032,
-        1803507840, 1822474880, 1624913280, 1822474880, 2374163840, 2393130880, 2280160640, 2393130880,
-        2030576000, 2049543040, 1798528640, 2049543040, 2601232000, 2620199040, 2453776000, 2620199040,
+        1809406080, 1828373120, 1624913280, 1828373120, 2380062080, 2399029120, 2280160640, 2399029120,
+        2040406400, 2059373440, 1798528640, 2059373440, 2611062400, 2630029440, 2453776000, 2630029440,
         3712812640, 3731779680, 2726812640, 3731779680, 6033032800, 6051999840, 5047032800, 6051999840,
         5215395200, 5234362240, 3359395200, 5234362240, 7579852160, 7598819200, 5723852160, 7598819200,
         2172301720, 2172301720, 2089683520, 2356826520, 2729646720, 2729646720, 2729646720, 2914171520,
@@ -6690,7 +6706,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
         10737418240, 12884901888, 5368709120, 3221225472, 1024, 1, 1, 0,
         2147483648, 12884901888, 10737418240, 5368709120, 3221225472, 1024, 0, 1,
         1, 2147483648, 12884901888, 11811160064, 5368709120, 3221225472, 1024, 0,
-        1, 1, 2147483648, 141557760, 10737418240, 12884901888, 5368709120, 3221225472,
+        1, 1, 2147483648, 146276352, 10737418240, 12884901888, 5368709120, 3221225472,
         1024, 1, 1, 0, 2147483648, 12884901888, 10737418240, 5368709120,
         3221225472, 1024, 0, 1, 1, 2147483648, 12884901888, 11811160064,
         5368709120, 3221225472, 1024, 0, 1, 1, 2147483648, 0,

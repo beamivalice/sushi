@@ -2599,8 +2599,8 @@ test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edg
     try std.testing.expect(named > 0);
 }
 
-// Pricing a split walks its cache growth (on MLX a page grid a layer a step): the search prices two a probe, the prompt
-// alone and the longest prompt under the reservation. Counted, not timed.
+// Pricing a split reads its cache growth (on MLX a page grid a layer): the search prices two a probe at a context past the
+// reservation, the prompt alone and the longest prompt under it, which is also the longest that still regrows. Counted, not timed.
 test "Flash-Next on MLX: a max-context search with no cap or a large one prices two bills a probe, the prompt alone and the reservation's edge" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
@@ -2647,7 +2647,8 @@ pub fn nextSplitPrompt(p: u64, ctx: u64) u64 {
 }
 
 /// Whether the capacity a request's prefill leaves its cache already holds the reply (`KVCache.heldRows` under the hold the
-/// request binds): the cache has nothing to regrow in decode.
+/// request binds, on the grid its side gives each buffer): the trunk's, and the MTP head's where the request runs it. The
+/// cache has nothing to regrow in decode.
 fn prefillHoldsReply(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, chunk: u64, warm: WarmPrefix) bool {
     const KV = trunk.KVCache;
     var probe = cfg.*;
@@ -2657,7 +2658,16 @@ fn prefillHoldsReply(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, c
         .reserve = @import("../prefill_plan.zig").reservedPrefillTokens(&probe, prompt, reply, chunk),
         .end = @max(KV.requestEnd(prompt, reply, bills.getEffectiveContextLength(&probe), bills.speculativeRowsPastEnd(&probe, warm)), prompt),
     };
-    return KV.heldRows(0, prompt, hold, &.{}) >= hold.end;
+    // On MLX a buffer's rows sit on its page grid: the codes and the scale rows of K and V at kv8, K and V dense for the head.
+    var first: u32 = 0;
+    while (!probe.isKvPerTokenLayer(first)) first += 1;
+    const k: u64 = @as(u64, probe.layerKVHeads(first)) * probe.layerHeadDim(first) * 2;
+    const v: u64 = @as(u64, probe.layerKVHeads(first)) * probe.layerVHeadDim(first) * 2;
+    const on_engine = @import("../cooler_side.zig").onEngine(&probe);
+    const kv8 = [_]u64{ k / 2, v / 2, k / 64, v / 64 };
+    const dense = [_]u64{ k, v, 0, 0 };
+    if (KV.heldRows(0, prompt, hold, if (on_engine) &.{} else &kv8) < hold.end) return false;
+    return !warm.mtp_on or KV.heldRows(0, prompt, hold, if (on_engine) &.{} else &dense) >= hold.end;
 }
 
 test "Flash-Next: a request's bill less its decode regrow never falls as its prompt grows within a context, and the regrow alone falls, to nothing, where the prompt's cache already holds its reply, on Cooler and MLX, MTP on and off, across the reservation" {
@@ -2684,7 +2694,7 @@ test "Flash-Next: a request's bill less its decode regrow never falls as its pro
                 if (falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B, {d} B under prompt {d}, regrow aside\n", .{ cfg.model_type, mtp, chunk, ctx, p, rest, prev - rest, prev_p });
             }
             // The regrow falls only where the prompt's cache already holds its reply, and to nothing; it is billed exactly where it does not.
-            if (@import("../cooler_side.zig").onEngine(cfg) and (regrow == 0) != prefillHoldsReply(cfg, ctx, p, chunk, warm)) {
+            if ((regrow == 0) != prefillHoldsReply(cfg, ctx, p, chunk, warm)) {
                 regrow_falls += 1;
                 if (regrow_falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B of regrow, its cache {s} its reply\n", .{ cfg.model_type, mtp, chunk, ctx, p, regrow, if (regrow == 0) "does not hold" else "holds" });
             }
