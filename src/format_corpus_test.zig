@@ -2435,6 +2435,42 @@ test "format corpus: a call whose inner call closed but whose wrapper did not sh
     };
 }
 
+test "format corpus: a call that lost its last value's close is declined and named, the calls around it ship whole, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const Shape = struct { open: []const u8, whole: []const u8, lost: []const u8, close: []const u8 };
+    const shapes = [_]Shape{
+        .{ .open = "", .whole = "<tool_call>\n<function=get_weather>\n<parameter=city>\n{s}\n</parameter>\n</function>\n</tool_call>", .lost = "<tool_call>\n<function=get_weather>\n<parameter=city>\n{s}\n</function>\n</tool_call>", .close = "" },
+        .{ .open = "<" ++ dsml ++ "tool_calls>\n", .whole = "<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">{s}</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n", .lost = "<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">{s}\n</" ++ dsml ++ "invoke>\n", .close = "</" ++ dsml ++ "tool_calls>" },
+        .{ .open = "", .whole = "<invoke name=\"get_weather\">\n<parameter name=\"city\">{s}</parameter>\n</invoke>\n", .lost = "<invoke name=\"get_weather\">\n<parameter name=\"city\">{s}\n</invoke>\n", .close = "" },
+        .{ .open = "<function_calls>\n", .whole = "<invoke name=\"get_weather\">\n<parameter name=\"city\">{s}</parameter>\n</invoke>\n", .lost = "<invoke name=\"get_weather\">\n<parameter name=\"city\">{s}\n</invoke>\n", .close = "</function_calls>" },
+        .{ .open = "", .whole = "<function name=\"get_weather\"><param name=\"city\">{s}</param></function>\n", .lost = "<function name=\"get_weather\"><param name=\"city\">{s}</function>\n", .close = "" },
+    };
+    for (shapes) |shape| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const paris = try std.mem.replaceOwned(u8, allocator, shape.whole, "{s}", "Paris");
+        defer allocator.free(paris);
+        const tokyo = try std.mem.replaceOwned(u8, allocator, shape.lost, "{s}", "Tokyo");
+        defer allocator.free(tokyo);
+        const osaka = try std.mem.replaceOwned(u8, allocator, shape.whole, "{s}", "Osaka");
+        defer allocator.free(osaka);
+        const text = try std.mem.concat(allocator, u8, &.{ shape.open, paris, tokyo, osaka, shape.close });
+        defer allocator.free(text);
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer whole.deinit(allocator);
+        const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
+        defer streamed.deinit(allocator);
+        for ([_]reply_mod.Settled{ whole, streamed }) |got| {
+            const calls = (got.reply orelse return error.WholeCallsDropped).calls;
+            try testing.expectEqual(@as(usize, 2), calls.len);
+            try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "Paris") != null);
+            try testing.expect(std.mem.indexOf(u8, calls[1].arguments, "Osaka") != null);
+            try testing.expectEqualStrings("get_weather", (got.declined orelse return error.DeclineNotNamed).name orelse return error.DeclineNotNamed);
+        }
+    };
+}
+
 /// Where `needle` ends in `text`, counted from `from`.
 fn endOf(text: []const u8, from: usize, needle: []const u8) usize {
     return std.mem.indexOfPos(u8, text, from, needle).? + needle.len;

@@ -119,30 +119,72 @@ pub fn nextOpener(text: []const u8, from: usize) ?Opener {
     return best;
 }
 
-/// Where the call of `f` that opens at `at` ends (just past its closer): its first closer outside every parameter
-/// value, as the parser ends it. Null when the text stops before one. `model_ended` is the model's own end of the
-/// generation: a wrapper whose function closed is whole then.
-fn callEnd(f: *const Family, text: []const u8, at: usize, model_ended: bool) ?usize {
-    var best: ?usize = null;
-    for (f.closers) |c| best = earlier(best, firstOutside(f, text, at, c));
+/// Where a call ends: just past its closer, or, for a call that lost the close of its last value, where the next
+/// call opens.
+const End = struct { at: usize, lost: bool = false };
+
+/// Where the call of `f` that opens at `at` ends: its first closer outside every parameter value, as the parser
+/// ends it. A closer a value is still open at, that the next call's opener follows, belongs to a call that lost
+/// its value's close: the value never runs across a call. Null when the text stops before an end. `model_ended`
+/// is the model's own end of the generation: a wrapper whose function closed is whole then.
+fn callEnd(f: *const Family, text: []const u8, at: usize, model_ended: bool) ?End {
+    var best: ?End = null;
+    for (f.closers) |c| best = earlierEnd(best, firstEnd(f, text, at, c));
     if (model_ended and f.body_closers.len > 0 and bodyIsFunction(text, at)) {
-        for (f.body_closers) |c| best = earlier(best, firstOutside(f, text, at, c));
+        for (f.body_closers) |c| best = earlierEnd(best, firstEnd(f, text, at, c));
     }
     return best;
 }
 
-fn earlier(a: ?usize, b: ?usize) ?usize {
+fn earlierEnd(a: ?End, b: ?End) ?End {
     const x = a orelse return b;
     const y = b orelse return a;
-    return @min(x, y);
+    return if (y.at < x.at) y else x;
 }
 
-fn firstOutside(f: *const Family, text: []const u8, at: usize, closer: []const u8) ?usize {
+fn firstEnd(f: *const Family, text: []const u8, at: usize, closer: []const u8) ?End {
     var p = at;
     while (std.mem.indexOfPos(u8, text, p, closer)) |c| : (p = c + 1) {
-        if (!tool_calls.closerInsideValue(f.values, text, at, c)) return c + closer.len;
+        if (!tool_calls.closerInsideValue(f.values, text, at, c)) return .{ .at = c + closer.len };
+        if (valueQuotesAreExact(f, text, at)) continue;
+        if (nextCallAfterClosers(f, text, c + closer.len)) |next| return .{ .at = next, .lost = true };
     }
     return null;
+}
+
+/// Whether a value of the call at `at` ends where its quotes say (a JSON string, Gemma's `<|"|>`): such a value
+/// is never judged by the call that follows it.
+fn valueQuotesAreExact(f: *const Family, text: []const u8, at: usize) bool {
+    return switch (f.values) {
+        .gemma => true,
+        .wrapper => blk: {
+            const gt = std.mem.indexOfScalarPos(u8, text, at, '>') orelse break :blk false;
+            break :blk std.mem.startsWith(u8, std.mem.trimStart(u8, text[gt + 1 ..], " \t\r\n"), "{");
+        },
+        else => false,
+    };
+}
+
+/// Where the next call opens when only whitespace and closers of `f` stand between `from` and it.
+fn nextCallAfterClosers(f: *const Family, text: []const u8, from: usize) ?usize {
+    var p = skipSpace(text, from);
+    while (closerAt(f, text, p)) |c| p = skipSpace(text, p + c.len);
+    for (&families) |*g| for (g.openers) |o| {
+        if (std.mem.startsWith(u8, text[p..], o) and opensCall(g, text[p..])) return p;
+    };
+    return null;
+}
+
+fn closerAt(f: *const Family, text: []const u8, p: usize) ?[]const u8 {
+    for (f.closers) |c| if (std.mem.startsWith(u8, text[p..], c)) return c;
+    for (f.body_closers) |c| if (std.mem.startsWith(u8, text[p..], c)) return c;
+    return null;
+}
+
+fn skipSpace(text: []const u8, from: usize) usize {
+    var i = from;
+    while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+    return i;
 }
 
 /// Whether the wrapper that opens at `at` carries Hermes' `<function=` body.
@@ -152,7 +194,8 @@ fn bodyIsFunction(text: []const u8, at: usize) bool {
 }
 
 /// A call of the text and where it ends (null: the text stops inside it).
-pub const Call = struct { start: usize, end: ?usize, family: *const Family };
+/// `lost`: the call lost the close of its last value, so it ends where the next call opens.
+pub const Call = struct { start: usize, end: ?usize, lost: bool = false, family: *const Family };
 
 /// The calls of a text, in order, outside every thought that closed. A thought still open at the end of the text
 /// holds calls as the rest of the text does; the one the prompt opened ends at its first close.
@@ -185,13 +228,13 @@ pub const Reader = struct {
             if (o.family.container) {
                 const inner = nextOpener(self.text, o.at + o.len);
                 const whole = end != null or self.model_ended;
-                if (inner != null and whole and (end == null or inner.?.at < end.?)) {
+                if (inner != null and whole and (end == null or inner.?.at < end.?.at)) {
                     self.pos = o.at + o.len;
                     continue;
                 }
             }
-            self.pos = end orelse self.text.len;
-            return .{ .start = o.at, .end = end, .family = o.family };
+            self.pos = if (end) |e| e.at else self.text.len;
+            return .{ .start = o.at, .end = if (end) |e| e.at else null, .lost = if (end) |e| e.lost else false, .family = o.family };
         }
     }
 };
@@ -201,6 +244,21 @@ pub fn openCallStart(text: []const u8, model_ended: bool) ?usize {
     var reader = Reader.init(text, model_ended);
     while (reader.next()) |c| if (c.end == null) return c.start;
     return null;
+}
+
+/// A call the generation did not finish: it stops inside the call, or lost the close of its last value.
+pub const Defect = struct { start: usize, end: usize };
+
+/// The unfinished calls of the text, in order: the parser reads the text without them and the reply names the first.
+pub fn defects(allocator: std.mem.Allocator, text: []const u8, model_ended: bool) ![]Defect {
+    var out = std.ArrayList(Defect).empty;
+    errdefer out.deinit(allocator);
+    var reader = Reader.init(text, model_ended);
+    while (reader.next()) |c| {
+        if (c.end == null) try out.append(allocator, .{ .start = c.start, .end = text.len });
+        if (c.lost) try out.append(allocator, .{ .start = c.start, .end = c.end.? });
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 const Style = enum { any, think, channel };
@@ -226,10 +284,10 @@ fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find: *co
         var q = i;
         while (nextOpener(text, q)) |o| {
             if (o.at >= m.pos) break;
-            const end = callEnd(o.family, text, o.at, model_ended) orelse {
+            const end = (callEnd(o.family, text, o.at, model_ended) orelse {
                 q = o.at + o.len;
                 continue;
-            };
+            }).at;
             if (end > m.pos) {
                 i = end;
                 continue :outer;

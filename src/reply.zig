@@ -230,11 +230,14 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
     return out;
 }
 
-/// The call `text` leaves open, named as far as its markup went, or null when it leaves none. A bare JSON call has
-/// no marker: it is a call only once its name is whole and `tools_json` declares it, as the parse chain reads it.
+/// The call `text` leaves unfinished (open at its end, or a lost value close), named as far as its markup went, or
+/// null when it leaves none. A bare JSON call has no marker: it is a call only once its name is whole and `tools_json`
+/// declares it, as the parse chain reads it.
 fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Declined {
-    const open = tool_reading.openCallStart(text, origin.model_ended) orelse return declinedBareCall(allocator, text, origin, tools_json);
-    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[open..], origin.dialect)) orelse return .{ .name = null };
+    const defects = try tool_reading.defects(allocator, text, origin.model_ended);
+    defer allocator.free(defects);
+    if (defects.len == 0) return declinedBareCall(allocator, text, origin, tools_json);
+    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[defects[0].start..defects[0].end], origin.dialect)) orelse return .{ .name = null };
     defer {
         for (calls) |c| {
             allocator.free(c.name);
@@ -283,11 +286,21 @@ pub fn parseToolCallsForRequest(
     origin: Origin,
 ) !?[]tool_schema.ParsedToolCall {
     // An unfinished call is never shipped, whatever ended the generation (the model's own end included): the calls the
-    // model finished before it stay, and `declinedCall` names the one left open.
+    // model finished stay, and `declinedCall` names the first unfinished one.
+    const defects = try tool_reading.defects(allocator, text, origin.model_ended);
+    defer allocator.free(defects);
+    var rest = std.ArrayList(u8).empty;
+    defer rest.deinit(allocator);
     var body = text;
-    if (tool_reading.openCallStart(text, origin.model_ended)) |open| {
+    if (defects.len > 0) {
         tool_schema.noteUnparsedToolMarkup(text);
-        body = text[0..open];
+        var at: usize = 0;
+        for (defects) |d| {
+            try rest.appendSlice(allocator, text[at..d.start]);
+            at = d.end;
+        }
+        try rest.appendSlice(allocator, text[at..]);
+        body = rest.items;
     }
     return tool_schema.parseForRequest(allocator, body, tools_json, .{
         .allow_parallel = allow_parallel,
@@ -1213,5 +1226,32 @@ test "r173-f-lost-close-wrapper: a call whose inner call closed but whose wrappe
             std.debug.print("wrapper open {s}: calls={d} declined={?s}\n", .{ if (c.dialect) |d| @tagName(d) else "null", if (s.reply) |r| r.calls.len else 0, if (s.declined) |d| d.name orelse "(unnamed)" else null });
         }
     }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+
+test "r173-f-lost-close-merge: a call that lost its last parameter close, followed by a whole call, is declined and the whole call ships" {
+    const a = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const texts = [_][]const u8{
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOsaka\n</parameter>\n</function>\n</tool_call>",
+        "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">a.md\n</" ++ dsml ++ "invoke>\n<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">Osaka</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls>",
+        "<invoke name=\"write_file\">\n<parameter name=\"path\">a.md\n</invoke>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Osaka</parameter>\n</invoke>",
+        "<function_calls>\n<invoke name=\"write_file\">\n<parameter name=\"path\">a.md\n</invoke>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Osaka</parameter>\n</invoke>\n</function_calls>",
+        "<function name=\"write_file\"><param name=\"path\">a.md</function>\n<function name=\"get_weather\"><param name=\"city\">Osaka</param></function>",
+    };
+    var bad: usize = 0;
+    for (texts) |text| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .dsml }) |dialect| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const shipped = if (s.reply) |r| r.calls.len == 1 and std.mem.eql(u8, r.calls[0].name, "get_weather") and std.mem.indexOf(u8, r.calls[0].arguments, "\"Osaka\"") != null else false;
+        const named = if (s.declined) |d| if (d.name) |n| std.mem.eql(u8, n, "write_file") else false else false;
+        if (!shipped or !named) {
+            bad += 1;
+            std.debug.print("lost close {f} [{s}]: shipped={} declined={?s}\n", .{ std.zig.fmtString(text[0..@min(text.len, 60)]), if (dialect) |d| @tagName(d) else "null", shipped, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    };
     try testing.expectEqual(@as(usize, 0), bad);
 }
