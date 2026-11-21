@@ -210,11 +210,11 @@ first EOS, against the previous release's reading (within ~1%). The fixture and 
 Public numbers (pack cards, the README) are the eight-category reading ([below](#eight-category)). A 16-prompt prose
 fixture is a regression gate only: without the other categories its mean leans on raw prose, so it is never reported.
 
-| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) | 1.6.0 (`ac3da7aa`) | 1.7.0 |
-|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 | 0.061793, 92.48%, 7061 positions (`c59df290`) |
-| Qwen3.8-Flash-Next-Sushi-STQ-4bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | | | | 0.031214, 94.42%, 7061 positions (`c59df290`) |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`, `--ssd-budget-gb 108`) |
+| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) | 1.6.0 (`ac3da7aa`) | 1.7.0 | 1.7.3 (`fc2fd843`) |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 | 0.061793, 92.48%, 7061 positions (`c59df290`) | 0.061793, 92.48%, 7061 positions |
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | | | | 0.031214, 94.42%, 7061 positions (`c59df290`) | · |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`, `--ssd-budget-gb 108`) | 0.210682, 86.38%, 7533 positions (`--ssd-budget-gb 108`) |
 
 DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46% (`--ssd-budget-gb 64`), so
 1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
@@ -235,6 +235,7 @@ With the wide hyper-connection mix on the matrix units (the source tree of that 
 it reads 0.210682, 86.38%, 7533 positions: -0.15% in KLD, -0.13 points of top-1. `42c364c6` itself, run in the same
 session, reads 0.211004283. The kernel is within 2e-6 of the f64 truth ([dsv41-arch](dsv41-arch.md)); the move is the
 size of the router tile's above and of mixed sign (NLL +0.10%).
+1.7.3 reads both packs equal to 1.7.0 to the last digit shown, on Sushi Cooler.
 
 The Qwen 1.5.0 reading equals the 1.4.0 Homebrew binary's on the same settings to the last digit; the 0.0692 / 92.76%
 quoted for this pack in [qwen4-kld](qwen4-kld.md) was taken on settings it does not name.
