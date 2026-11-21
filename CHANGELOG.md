@@ -4,111 +4,47 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.7.3 — Claude Code and tool calls that hold, requests checked end to end
 
-- **`/v1/messages` takes a `system` message inside `messages` again, so Claude Code sessions run** ([#115](https://github.com/beamivalice/sushi/issues/115)): 1.7.2 refused it with a 400 naming `messages[N].role`, though the server reads it into the prompt where it sits, as 1.7.1 did.
-- **Qwen3.8-Flash-Next streams keep their grouped MTP speculation while a DeepSeek-V4.1 request decodes beside them on the same server**: every Qwen stream decoded plain for as long as the other model's request ran (a 400-token DeepSeek reply cost the Qwen streams all of their rounds); each model's streams now group among themselves.
-- **Qwen3.8-Flash-Next streams that group their MTP verify keep speculating beside a request that cannot join them**: a plain request, one under 96 tokens from its budget, or one with a penalty, logprobs, an image or a much longer context stopped the speculation of every other stream in the group; the others now keep their rounds and it decodes on its own.
-- **OpenAI's legacy `functions` and `function_call`, the `grammar` and `guided_json`, `guided_regex`, `guided_choice` and `guided_grammar` constraint fields, and any Messages tool whose `type` is not `custom` (the `web_search_*`, `web_fetch_*` and `code_execution_*` server tools, and `bash_*`, `text_editor_*` and `computer_*`) are a 400 naming them, where they were dropped and the model ran without the tool or the constraint**.
-- **`/v1/responses` and `/v1/responses/compact` check and read their fields from the same table, and a field they dropped is a 400 naming it**: `stop` (never checked: a number was served, an array of strings was read), a `top_k` of 2.5, `logit_bias` (ignored), a `reasoning` that is not an object or a `text.format.type` that names no format (read as off), an `input` item or message whose `role` or `content` has the wrong type (the turn vanished); a `text.format` of type `text` beside a schema no longer enforces the schema.
-- **`/v1/messages` and `/v1/messages/count_tokens` run one set of checks, and a field they dropped is a 400 naming it**: the OpenAI penalties, `enable_thinking`, `reasoning_budget_tokens`, `top_logprobs`, `parallel_tool_calls`, `continue_final_message` and `stream_options` (accepted and ignored), a `thinking` that is not an object typed enabled, disabled or adaptive (read as off), a `system` that is not text, a message or `tool_result` whose `role` or `content` has the wrong type (the turn vanished), a `top_k` of 2.5, and on count_tokens the bad `tools` that /v1/messages refused; `stop_sequences` as a string now stops the reply as the array does.
-- **A field `/v1/chat/completions` or `/v1/completions` does not read, or of the wrong shape, is a 400 naming it, where it was dropped**: a `top_k` of 2.5 (served as 2), a message whose `role` is not a string or whose `content` is not text or parts (the turn vanished), and on chat Anthropic's `thinking` or `stop_sequences`, on completions `messages`, `tools`, `enable_thinking`, `response_format`, `reasoning_effort` and the other chat fields it has no reading for.
-- **Rescan drops a model whose folder now holds a config sushi cannot serve**: an unsupported architecture or quantization, a drafter or a half-written `config.json` left the model listed with its old architecture and size, though loading it was refused.
-- **Logprobs of a reply with a thought in the middle list the content it returned**: a non-streamed reply with content, a thought and more content listed a piece of the closing tag and missed the first content token, and a stream listed thought tokens and stray closers and missed the tokens next to a thought; the stream and the whole reply now list the same entries, and the "\n" that joins the parts has no token, so no entry lists it.
-- **A Qwen3.8-Flash-Next boot with `--expert-pick-tolerance` no longer shares the saved prompt-cache states of an exact boot**: the states a lossy pick builds depend on what the cache held, so they now live in a namespace of their own, as DeepSeek's did.
-- **`sushi kld capture` always captures with exact routing**: a model's saved `expert_cache_bias` is ignored by a capture (the line says so) instead of making the teacher lossy, and a load whose model has no cache-favoring pick says that `--expert-cache-bias` is ignored.
-- **`--expert-cache-bias <n>` and the web UI's "Faster SSD streaming (not exact)" now serve a Qwen3.8-Flash-Next STQ pack that streams from the SSD, and take 0 to 2** (an enable toggle in the web UI whose slider starts at 0.2; off, exact routing, is still the default): at decode widths the router scores an expert the cache lacks n lower, so it reads fewer experts from the SSD at a cost in answer quality, each model in its own router units; a biased load keeps its own prompt-cache namespace, and `sushi kld compare` takes the flag. DeepSeek-V4.1's range narrowed from 0 to 8 to the same 0 to 2: a larger value is refused by name, never clamped: a saved one is ignored until it is changed, the model loads exact, and the settings page shows the ignored value on its row.
-- **The web UI no longer shows an old answer over a newer one**: a late or failed read of the settings, the cache table or the model list could replace a newer good one, an older model list could erase a refused load's note, Reload now left its callout up, the chat's prompt-cache meter read the server's default model instead of the chat's, and a slow 401 sent before the API key was entered reopened the key box over a good key.
-- **A streamed reply no longer goes silent to event-counting clients while the model writes a long tool call**: a client whose idle watchdog counts parsed events, not SSE comments (pi-ai, so dsh), killed the request after its timeout; once the call's name is known, chat, `/v1/messages` and `/v1/responses` send the call's opening and an event that adds nothing to its arguments every 5 s, and the arguments whole at the end.
-- **A Qwen3.8-Flash-Next STQ request on Sushi Cooler is billed the copy its KV rebuild makes, and the rebuild beside an
-  attention layer's rows rather than on top of the forward's peak**: past about 680k tokens a 512-row prefill chunk
-  could ask more than its bill (about 160 MB at 1M, from the buffers a 78k trace lists); long contexts now bill a little more (the 2.75bpw pack advertises
-  603,904 tokens at a 59,000 MB limit, 606,464 before) and wide chunks less (a 4,096-row chunk admits a 557,311-token
-  prompt there, 528,127 before).
-- **A Qwen3.8-Flash-Next STQ request on Sushi Cooler is billed up to 128 MB less at prefill chunks of 1,024 rows and
-  wider on an M5**: the f16 weight a wide trunk linear decodes into lives only through its own matmul, beside fewer
-  rows than the forward's peak, and was billed on top of that peak (a 4,096-row chunk now admits a 528,127-token prompt
-  of the 2.75bpw pack at a 59,000 MB limit, 521,727 before; the advertised context is unchanged).
-- **The decode meter's prefill (`SUSHI_DECODE_FWD_UBENCH_KV`) runs on Sushi Cooler**: it read out the logits of every chunk nobody samples, which a served prefill never does, and met `PoolOverBudget` at the head on a Qwen pack; it now prefills as a served prompt does.
-- **The first decode after a long prompt keeps less of the prefill's scratch parked on Sushi Cooler**: it left up to a decode's whole transient bill of free buffers a decode never asks for, and the decode's own buffers came on top, past the bill; it now leaves only the bill's margin.
-- **A GLM decode step past the latent's page grid no longer holds several layers' old caches at once**: the staged decode rebuilt each MLA layer's latent and pooled index inside its graph with up to every layer's old copy alive beside its new one (4 at once on the tiny); each layer's cache now grows one buffer at a time ahead of the forward.
-- **A Stop sent as a download finishes answers what happened**: it said stopped while the job went on to report done with its pack registered; it is now refused as too late (409) once the pack is being registered, and a Stop that landed before that ends the job stopped.
-- **A server stopped while a download was finishing no longer risks a crash at exit**: the download's thread could still be registering the finished pack in the model list that shutdown was freeing, and the catalog refresh read the same list; shutdown now waits for them, or ends without freeing it.
-- **A long Qwen3.8-Flash-Next prompt on MLX with MTP on no longer holds about 5 KB a prompt token beyond its admission
-  bill while it prefills** (380 MB at 78k tokens, a forward billed short of what it ran on): the MTP head's state is
-  evaluated with each chunk.
-- **A Flash-Next request on Sushi Cooler that decodes past a cache capacity step bills the buffer its regrow rebuilds beside the old one**: a prompt below the long-context reservation grows its KV during decode, and the old copy and zero tail of the widest buffer were alive beside the grown cache with no term in the admission bill.
-- **A Flash-Next request on Sushi Cooler that decodes past a cache capacity step bills the buffer its regrow rebuilds beside the old one**: a prompt below the long-context reservation grows its KV during decode, and the old copy and zero tail of the widest buffer, and the whole old MTP head cache, were alive beside the grown cache with no term in the admission bill.
-- **A Qwen decode step past its QSA history's capacity grows each layer's history buffers one at a time ahead of the forward**, where every layer's old copy was alive beside its new one at once (the whole history twice, unbilled): the transient is one layer's, which the KV regrow term already prices.
-- **A MiMo request bills the compaction of its sliding-window rings**: a decode step past a ring's cap held the old ring, a grown buffer and a fresh ring beside the live one in every sliding layer at once, which the bill did not carry (up to 409 MB at kv16 on the Flash geometry), so MiMo's bills grow by that term.
-- **A Flash-Next or MiMo request on MLX bills the decode regrow of its cache, and its cache growth lets go of each buffer's old copy before it rebuilds the next**: a decode step past a capacity step held the old copy and zero tail of the widest buffer, and up to two buffers' when MLX released the last one late, beside the grown cache, which no term of the MLX bill carried (the bills of short prompts with long replies grow by that term).
-- **The maximum context and max_tokens a Sushi Cooler refusal names for a Flash-Next request are now admitted when applied, at every prompt and reply split**: the longest prompt that still regrows its cache in decode bills its regrow, which the context search had not priced, so a named context could be refused by a few MB.
-- **A resident DeepSeek STQ load no longer bills the spill pools its routes never make**: a prefill chunk's transient cap carried twice the pack's rate groups of decoder pools, so an 8,192-row chunk on the STQ-1.75bpw pack was billed 10.775 GB of tensors against the 9.299 GB its five cache pools hold; a streamed load keeps the worst case.
-- **A launch with the prefix cache off no longer bills SSM checkpoints its prefill never takes**: with `--prefix-cache-entries 0`, or with RAM retention and the SSD tier both off, a Qwen request's admission still held up to 16 GDN checkpoints (346 MB at 8.7K tokens, 1,847 MB at 78K on the STQ 2.75 pack), which refused prompts and shrank the advertised context for nothing.
-- **A DeepSeek-V4.1 request makes its state's row stores at its last row before its first chunk, and its bill drops the 412 B a context token the stores' growth cost**: the stores grew a sixteenth at a time by copying, so every forward's cap carried their slack and one layer's old rows; on the release config the whole context now fits 2,931 MiB of room where 3,320 MiB was needed, and the served tokens are unchanged.
-- **A DeepSeek-V4.1 prefill chunk's cache growth is priced by the rule DeepSeek's row stores grow by, from the rows they hold at the chunk's boundary**: it was priced by the KV cache's +25% step from a cache of that many rows, so a chunk's cost named a regrow the stores do not make.
-- **The web UI's API-key box closes by itself once the server stops asking for a key** (a server restarted without `--api-key`): it stayed modal over a page that was answering again.
-- **A thinking-effort cap saved on Settings reaches the chat's Thinking budget box**: the box kept the cap it had filled in and the next request ran under the old one; it now takes the new cap (or empties when the cap is removed) unless you typed a value over it.
-- **The chat's prompt-cache meter follows the server**: it stayed on its old reading after Clear all caches, a saved cache size or an unload (where it kept showing a cache that was gone) until the next chat turn or five minutes; it now re-reads when the loaded model changes and after each of those actions.
-- **A pack that finished downloading reaches the Models list and the chat's picker within a few seconds**: the page asked for the model list once when the download turned done, and a pack the server registered a moment later stayed missing for up to 30 s; it now asks again until the model is listed (and, for an Update, until the update badge is gone).
-- **The web UI stops saying "Load failed" once the server no longer reports it**: a Rescan, a settings Save, a removed saved value or a server restart clears a failed load's row and alert, which the page kept for the session; and a Rescan that drops a model drops its row even when `/v1/settings` fails once.
-- **Rescan refreshes a model loaded by path or by `--model` whose folder was replaced or whose link moved**: it kept the old size, which the load estimate reserves, until a download touched it.
-- **A finished download appears in the model list the moment Downloads says done**: `GET /v1/downloads` reported `done` before the pack was registered, so the page's one refresh on done missed it.
-- **A model folder replaced by a pack of another architecture lists the new architecture, reasoning efforts and fit after a Rescan**; the list kept the old one.
-- **Rescan refreshes a pack the app loaded by path while it was still downloading**: it kept the partial size it was listed with, reserved as the model's memory estimate, because the rescan matched an entry by its id and the app's id differs from the listing's.
-- **A model folder renamed in case, or reached through a models-folder link pointed elsewhere, still refuses an update while loaded and still blocks a load while a download or a stopped pull fills it**: the download queue and the load gate compared a folder identity kept from when the model was listed, which no longer named the folder its path opens.
-- **A pack loaded by path, or refreshed after a download, bills only the shards its index names**, as the listing and the loader do; a stray shard beside them was counted in `bytes_on_disk` and reserved in the load estimate.
-- **A model whose folder was deleted, or lost its `config.json`, leaves the model list at the next Rescan** ([#114](https://github.com/beamivalice/sushi/issues/114)): a rescan only added before, so the deleted model stayed listed; a loaded model is never dropped, and `/v1/models/rescan` now also answers how many it removed.
-- **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that is
-  neither a mode (`none`, `auto`, `any`, `required`) nor a function or tool it names (OpenAI's `allowed_tools`
-  included, as on Responses), and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
-  `truncation` or `max_tool_calls` of the wrong type (on `/v1/responses/compact` too) are now a 400 naming the field;
-  they were read as absent.
-- **Concurrent speculative requests on Sushi Cooler no longer fail with `PoolOverBudget` rounds after another
-  request's prefill**: a grouped MTP round lifted that prefill chunk's memory cap without clearing it from the model,
-  so the model's next step installed it again and every round after ran under it; the cap is now lifted for the
-  model that set it (#106, #112).
-- **Speculative requests on Sushi Cooler beside a DeepSeek model no longer run under the memory cap a DeepSeek
-  request left**: their grouped MTP rounds ran under it after every DeepSeek request and could fail with
-  `PoolOverBudget`; work of no single model now runs under no model's cap.
-- **A DeepSeek-V4.1 prefill that lends decoder pools no longer compiles a kernel inside the request**: the load's warm never lent a pool, so the kernels a lent layer's route makes (the router's own launch, the grouped GEMM planes' combine at the expert width) were first compiled in the first request that needed the memory; the load now makes them, with no pool lent and no read, and a load from the manifest makes them ahead.
-- **Clearing the prefix-cache namespace of a model that is loading or unloading answers 409 `namespace_in_use`**, as
-  for a loaded one; it answered 200 with nothing removed. The stale sweep keeps that namespace, and an `all` clear
-  lists the model as busy.
-- **Two settings saves at once can no longer land a pair of model settings one of them is refused for**: a model's
-  edits are checked against the file each save rewrites.
-- **A download whose files are all present is never refused for disk space**, however full the disk already is.
-- **A tool call the model's own end leaves open is no longer sent as a half call, and every reply that declines a call names it**: `finish_details` (`stop_details` on Messages, the response object on Responses) reads `{"type":"tool_call_cut","name":"read_file"}` when a stop sequence, the length limit, a cancel or the model's end cut a call open.
-- **A finished tool call is no longer declined for text that only mentions markup**: an opener a parameter value, a closed thought or an inline code span spells, and a call whose wrapper the model never closed, ship as the call they are.
-- **A tool call that lost the close of its last parameter no longer swallows the call after it**: the next call's text ran into the value; the call after ships whole and the one that lost its close is declined and named.
-- **A Gemma string value that ends in a brace right before a spelled `<tool_call|>` is no longer cut there**: `fn f() {}<tool_call|> tail` shipped as `fn f() {`; the closer a value spells stays the value's text.
-- **A tool call whose argument spells another call is no longer replaced by a phantom call**: a JSON string or XML value that held `<tool_call>x</tool_call>` shipped a call named `x` with no arguments and lost the real call.
-- **A tool-call argument that spells `<think>b</think>` is shipped as written**: DeepSeek calls had it rewritten and Qwen and GLM calls after a leading thought were declined, on the strength of a think tag the model only quoted.
-- **A tool call cut after a stray backtick is declined and named, and a call the model backticks is read as written**: a call cut after a backtick that had no partner shipped as a call with empty arguments, and a backticked Hermes call whose value spelled DeepSeek's markup shipped a phantom call in place of its own.
-- **A reply of hundreds of tool calls followed by a think tag settles in milliseconds again**: reading the calls cost time quadratic in their number (ten seconds for 32 KB of calls), as did a reply of many thoughts each followed by a call, and a value that spelled its call's closer thousands of times.
-- **A tool call cut inside a value that spells `</think>` is declined and named, and nothing of its value reaches the content**: the spelled tag was read as the end of a thought, which hid the cut call and shipped the rest of its value as the answer.
-- **A finished bare-JSON tool call no longer also ships as the reply's text**: the call's JSON (and a ```json fence around it) rode along as content beside the call; the content is now only what the model said before it, and a stream holds the JSON back as the whole reply cuts it.
-- **Call markup no longer reaches the content of a reply**: a bare `<function=`, `<tool name=>`, `<tool_request>` or `<function_calls>` call left its whole markup in the text before a finished call, and its half markup in a declined one; a stream held none of a bare `<function=` until its `<parameter=` arrived.
-- **A `<tool name="x">` or `<tool_call name="x">` call cut inside its JSON body is declined under its name**: the `tool_call_cut` detail left the name out.
-- **A bare JSON array of tool calls after prose ships every call**: only its first object was read when text came before the `[`.
-- **A call left open in MiniCPM5, bare `<function=`, `<invoke>`, `<tool>` and DSML-invoke markup is declined and named like every other dialect**, where it still shipped as a half call; prose that only mentions such markup stays text.
-- **Bare JSON tool-call text cut short at the end of a generation is declined and named (`tool_call_cut`), no longer repaired into a call**: `{"name":"get_weather","arguments":{"city":"Tokyo"}` one `}` short shipped a completed call, as did the cut last element of a JSON array; a JSON array now ships the elements complete before the cut, and a call the model finished with its own close tag after it keeps its repair.
-- **A closer a tool-call parameter spells in its value no longer closes the call early**: a call cut inside a value such as `print("</function>")` or a `</tool_call>` in a JSON string was read as finished and shipped as a half call; it is declined and named like any open call. A call whose last parameter lost its close (`</parameter>` in Hermes, the parameter close in DSML) is now declined and named too, instead of shipping without that parameter.
-- **A tool-call argument the model wrote is no longer dropped when its value spells the call's closer**: `<invoke>`, Gemma and MiniCPM5 calls ended at the first `</invoke>`, `<tool_call|>` or `</function>` in the text, so `print("</invoke>")` cut the value and every parameter after it.
-- **A streamed Chat or Messages reply to a request with tools and a response format settles as the non-stream one does**: marker text such as a think tag inside the constrained payload is data in both, where the stream rewrote it.
-- **A boot that fails after its port opened no longer holds a waiting request for 35 seconds**: a request that got the model before the boot finished waited at the boot gate through the shutdown drain, which ended without its teardown; the gate now fails before the drain.
-- **A DeepSeek-V4.1 load that waits for memory a closed process has not returned waits at most 60 seconds in all, and says so**: the default ssd budget's wait and the preflight's each waited up to 60 seconds, silently in the first, so a boot could hang for two minutes.
-- **A DeepSeek-V4.1 prefill after a cancelled long prompt keeps the chunk width its request was admitted at**: the pools the
-  cancelled request left lent were held off the width's headroom but not netted from its cost, so the prefill stepped
-  down to a narrower, slower chunk for memory admission had already counted.
-- **A repeat start or reload of a model skips its served warm when its own pipeline manifest already made it**: the
-  warm's requests ran on every DeepSeek load (1.7 s of 1.8 s on the tiny fixture) and every reload; the manifest now
-  records the warm it ran under its pack's scope, chunk, drafter and MTP settings, and a load of that key skips it.
-- **`--log-level debug` names every term of a prefill's memory bill** (`[bill] prefill seq=… envelope=… gross=…`), so a
-  long-context request's cost is read off a live server instead of re-derived; a measured walkthrough on a 64 GB M1 Max
-  is in the Qwen performance notes. Thanks @catalinb13.
-- **A Sushi Cooler prefill chunk is billed for the size class and capacity step of the cache it grows**, where its rows' bytes alone left a long chunk about a megabyte over its bill when the pool sits at its cap.
-- **A Sushi Cooler prefill chunk is billed for the cache it regrows from the capacity it holds, at the pool's size classes**, where its rows' bytes alone left a chunk part-way through a long prompt many megabytes over its bill when the pool sits at its cap.
+Bugs fixed in this release, by severity and area:
+
+| Severity | Memory & admission | Server & API | Models & loads | Engine & tests | Total |
+|---|---|---|---|---|---|
+| High | 3 | 4 | 5 | 1 | 13 |
+| Medium | 9 | 12 | 5 | 7 | 33 |
+| Low | 7 | 9 | 3 | 9 | 28 |
+| Total | 19 | 25 | 13 | 17 | 74 |
+
+- **Claude Code sessions run again, and long tool calls keep streams alive**: `/v1/messages` takes a `system`
+  message inside `messages` again and reads it into the prompt where it sits, as 1.7.1 did
+  ([#115](https://github.com/beamivalice/sushi/issues/115)). While the model writes a long tool call, every surface
+  now sends the call's opening and an empty arguments event every 5 s, so clients whose idle watchdog counts events
+  (not keepalive comments) no longer give up and retry mid-call.
+- **Every request field is checked and read from one table, per surface**: a field a surface would have dropped, or
+  one of the wrong shape, is a 400 naming it, where it was silently ignored (a `top_k` of 2.5 is refused, not served
+  as 2; a Responses `stop` is read). Newly refused: OpenAI's legacy `functions` and `function_call`, the `grammar`
+  and `guided_*` constraint fields, and Messages tools of any type but `custom`. Responses now serves
+  `stream_options`; Codex's `store`, `service_tier`, `safety_identifier` and `metadata` stay accepted.
+- **Tool calls come out right in a dozen more shapes**: calls cut short or left open by the model's own end,
+  backticked, spelling their own closer or `</think>` in a value, bare JSON after prose, and MiniCPM5, `<invoke>`,
+  `<tool>` and DSML markup are each shipped as written or declined by name, never sent half-made or leaked into the
+  reply's text; a reply of hundreds of calls settles in milliseconds again.
+- **Memory bills match what runs**: cache regrows, KV rebuild copies, MiMo's ring compaction and DeepSeek's row
+  stores are billed where they happen, so a request never holds more than it was admitted for. A resident DeepSeek
+  STQ 8,192-row chunk bills 9.30 GB, not 10.78; a DeepSeek request makes its row stores at its last row (a 1M-token
+  request bills 2.51 GB of state, not 2.91); with the prefix cache off no SSM checkpoints are billed; a Sushi Cooler
+  refusal names a context that is then admitted.
+- **Concurrent speculation holds up**: Qwen3.8-Flash-Next streams keep their grouped MTP speculation beside a
+  DeepSeek-V4.1 request or a row that cannot join them, and concurrent speculative requests on Sushi Cooler no longer
+  fail with `PoolOverBudget`.
+- **The model list, downloads and web UI stay current**: Rescan drops a deleted or unservable model and refreshes a
+  replaced one ([#114](https://github.com/beamivalice/sushi/issues/114)); a finished download shows within seconds,
+  and Stop or shutdown during its last step no longer misreports or crashes; the web UI never shows an older answer
+  over a newer one. `--expert-cache-bias` (0 to 2) now serves streamed Qwen STQ packs, and `sushi kld capture` always
+  captures with exact routing.
+- **Thanks** @catalinb13 for the debug line that names every term of a prefill's memory bill (`--log-level debug`).
+
+---
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 
