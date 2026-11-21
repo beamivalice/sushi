@@ -29,6 +29,7 @@ earlier history is mlx-serve's, in that project's changelog.
   wider on an M5**: the f16 weight a wide trunk linear decodes into lives only through its own matmul, beside fewer
   rows than the forward's peak, and was billed on top of that peak (a 4,096-row chunk now admits a 528,127-token prompt
   of the 2.75bpw pack at a 59,000 MB limit, 521,727 before; the advertised context is unchanged).
+- **The decode meter's prefill (`SUSHI_DECODE_FWD_UBENCH_KV`) runs on Sushi Cooler**: it read out the logits of every chunk nobody samples, which a served prefill never does, and met `PoolOverBudget` at the head on a Qwen pack; it now prefills as a served prompt does.
 - **The first decode after a long prompt keeps less of the prefill's scratch parked on Sushi Cooler**: it left up to a decode's whole transient bill of free buffers a decode never asks for, and the decode's own buffers came on top, past the bill; it now leaves only the bill's margin.
 - **A Stop sent as a download finishes answers what happened**: it said stopped while the job went on to report done with its pack registered; it is now refused as too late (409) once the pack is being registered, and a Stop that landed before that ends the job stopped.
 - **A server stopped while a download was finishing no longer risks a crash at exit**: the download's thread could still be registering the finished pack in the model list that shutdown was freeing, and the catalog refresh read the same list; shutdown now waits for them, or ends without freeing it.

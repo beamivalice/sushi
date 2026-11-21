@@ -58,8 +58,8 @@ fn forwardMargin(config: *const ModelConfig) u64 {
 }
 
 /// PURE: `forwardCap` of a forward that reads out every row through the head, which asks `readout` bytes
-/// (`Trunk.lmHeadReadoutBytes`) past the last layer. A served prefill chunk reads out none; a tool's (`sushi kld`, the
-/// decode meter) reads out its whole width.
+/// (`Trunk.lmHeadReadoutBytes`) past the last layer. A served prefill chunk reads out none, and so does the decode meter's
+/// (`model_load.meterPrefill`); `sushi kld` reads out its whole width.
 pub fn readoutCap(config: *const ModelConfig, rows: u64, seq: u64, readout: u64) u64 {
     return forwardCap(config, rows, seq) +| bills.atTrunkRows(config, rows, readout);
 }

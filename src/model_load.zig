@@ -2358,20 +2358,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // The prefilled context and its first pass; a later pass grows to exactly its own rows.
             xfm_ptr.bindOwnRows(kv_pre + 1);
             if (kv_pre > 0) {
-                var done_pre: usize = 0;
-                const pre_buf = try sch.allocator.alloc(i32, 2048);
-                defer sch.allocator.free(pre_buf);
-                for (pre_buf, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
-                while (done_pre < kv_pre) {
-                    const n_chunk = @min(2048, kv_pre - done_pre);
-                    const psh = [_]c_int{ 1, @intCast(n_chunk) };
-                    const ti = try mlx.newData(pre_buf.ptr, &psh, .int32);
-                    defer _ = mlx.mlx_array_free(ti);
-                    const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
-                    _ = mlx.mlx_array_eval(lg);
-                    _ = mlx.mlx_array_free(lg);
-                    done_pre += n_chunk;
-                }
+                const done_pre = try meterPrefill(sch.allocator, xfm_ptr, &ctx, kv_pre);
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
             for (widths[0..n_widths]) |rows| {
@@ -2988,6 +2975,28 @@ test "unwireSettled: the unload waits until most of the freed bytes left the wir
     try testing.expect(unwireSettled(53 * gib, 7 * gib, 50 * gib)); // t+0.7 s
     try testing.expect(unwireSettled(53 * gib, 60 * gib, 0)); // nothing freed, nothing to wait for
     try testing.expect(!unwireSettled(10 * gib, 12 * gib, 5 * gib)); // wired grew: never underflows
+}
+
+/// The decode meter's context: `tokens` ids through the model in chunks of 2048, as a served prefill runs them. No
+/// row of a chunk is sampled, so none reads out its logits (`skip_lm_head`).
+pub fn meterPrefill(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("model_handle.zig").ForwardCtx, tokens: usize) !usize {
+    const ids = try allocator.alloc(i32, 2048);
+    defer allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
+    ctx.skip_lm_head = true;
+    defer ctx.skip_lm_head = false;
+    var done: usize = 0;
+    while (done < tokens) {
+        const n_chunk = @min(2048, tokens - done);
+        const shape = [_]c_int{ 1, @intCast(n_chunk) };
+        const ti = try mlx.newData(ids.ptr, &shape, .int32);
+        defer _ = mlx.mlx_array_free(ti);
+        const logits = try xfm.forwardWith(ctx, ti);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+        done += n_chunk;
+    }
+    return done;
 }
 
 /// DIAGNOSTIC (SUSHI_PREFILL_UBENCH=N): N cold one-chunk prefills per arm at load, each from an

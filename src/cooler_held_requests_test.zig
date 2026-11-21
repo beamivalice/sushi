@@ -17,6 +17,7 @@ const Sheet = contract.Sheet;
 const eachArch = contract.eachArch;
 const eachFixture = contract.eachFixture;
 const eachLayout = contract.eachLayout;
+const onTheCut = contract.onTheCut;
 const firstAsks = contract.firstAsks;
 const greedy = contract.greedy;
 const Generator = @import("generate.zig").Generator;
@@ -27,7 +28,7 @@ const servedOn = contract.servedOn;
 const serial = contract.serial;
 const heldRest = contract.heldRest;
 
-test "cooler contract: a wide forward that reads out every row's logits, as `sushi kld` and the decode meter run one, runs under its cap" {
+test "cooler contract: a wide forward that reads out every row's logits, as `sushi kld` runs one, runs under its cap" {
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const ld = try heldLoad(C, dir);
@@ -149,6 +150,33 @@ test "cooler contract: a decode after a wide forward that left free buffers of s
                 if (grew > cap) std.debug.print("cooler contract: a decode forward after a {d}-row one grew the pool {d} KB over its {d} KB cap\n", .{ wide_rows, grew >> 10, cap >> 10 });
                 try testing.expect(grew <= cap);
             }
+        }
+    }.run);
+}
+
+test "cooler contract: the decode meter's prefill, whose chunks nobody reads, runs on Sushi Cooler as a served prefill does" {
+    try onTheCut(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const ld = try heldLoad(C, dir);
+            const turn = arch_handle.turnFor(ld.h, &ld.config);
+            defer turn.end();
+            defer arch_sched.endRequest(&ld.config);
+            const tokens: usize = 4096;
+            try ld.xfm.resetCache();
+            ld.xfm.bindOwnRows(tokens + 1);
+            var ctx = ld.xfm.defaultCtx();
+            mlx.engine.close();
+            const in0 = Sheet.now().in_use;
+            mlx.engine.resetPoolPeak(.process);
+            try testing.expectEqual(tokens, try @import("model_load.zig").meterPrefill(testing.allocator, ld.xfm, &ctx, tokens));
+            mlx.engine.close();
+            // A served chunk reads out no logits, so no chunk holds more than its forward's cap beyond the request
+            // state the prefill commits (the cache it grew), which a cap counts as in use.
+            const cap = @import("arch/cooler.zig").forwardCap(&ld.config, 2048, tokens);
+            const committed = Sheet.now().in_use -| in0;
+            const scratch = mlx.engine.poolHeldPeak(.process) -| in0 -| committed;
+            if (scratch > cap) std.debug.print("cooler contract: the decode meter's {d}-token prefill held {d} KB of scratch over its chunks' {d} KB cap\n", .{ tokens, scratch >> 10, cap >> 10 });
+            try testing.expect(scratch <= cap);
         }
     }.run);
 }

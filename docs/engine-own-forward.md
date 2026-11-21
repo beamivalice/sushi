@@ -370,7 +370,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   the host builds on. Waiting for all of them drained the queue at each trim: on DeepSeek STQ 1.75bpw (M5 Ultra, 29k
   tokens) GPU idle 254 to 140 ms a request at 2048-row chunks and 1,063 to 364 ms at 8192 rows.
 - **A wide forward that reads out every row is billed for its readout** (`cooler.readoutCap`): a served chunk sets
-  `skip_lm_head`, but `sushi kld` and the decode meter read out the whole chunk, whose logits (`rows x vocab x 2`) and
+  `skip_lm_head` (so does the decode meter's prefill, `model_load.meterPrefill`), but `sushi kld` reads out the whole chunk, whose logits (`rows x vocab x 2`) and
   head scratch (a trellis GEMM's f16 plane, an affine head's dequantized weight; `Trunk.lmHeadReadoutBytes`) the chunk
   bill never named. Under the bare chunk cap a 418-row KLD prompt on the STQ 2.75 pack met `PoolOverBudget` at the
   head's `sushi_exl3_finish_h128`.
