@@ -59,7 +59,7 @@ test "cooler contract: an exact Cooler prefill bill is what each kind of layer a
                     defer a.free(wide);
                     for (wide, 0..) |*t, i| t.* = ids[i % ids.len];
                     const grew = try chunkAsked(&ld, wide);
-                    const bill = bills.prefillChunkCost(&ld.config, kv_bits, width, width);
+                    const bill = bills.prefillChunkCost(&ld.config, kv_bits, width, width, .{});
                     // The margin covers the small tensors no term names, and no term may bill more than a margin it does not
                     // hold beyond the allowance the bill names: the rows' in-flight planes, and the f16 weight a decoded
                     // trunk linear holds at its own matmul (`bills.trunkDecodeScratchBytes`, NAX only), never at a chunk's

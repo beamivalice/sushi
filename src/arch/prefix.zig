@@ -424,6 +424,9 @@ pub const aux = firstWith("aux") orelse struct {
     pub fn qsaKeyAppendPlan(rows: usize, cap: usize, add: usize, _: trunk.Hold, _: usize) struct { new_cap: usize, write_at: usize, new_rows: usize } {
         return .{ .new_cap = @max(cap, rows + add), .write_at = rows, .new_rows = rows + add };
     }
+    pub fn qsaPooledCapacity(_: ?[]const ssm_cache.SSMCacheEntry) usize {
+        return 0;
+    }
     pub fn qsaLeftoverAt(_: mlx.mlx_array, _: c_int, _: c_int, _: c_int, _: mlx.mlx_stream) !mlx.mlx_array {
         return .{ .ctx = null };
     }

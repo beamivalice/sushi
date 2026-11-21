@@ -49,6 +49,7 @@ const arch_moe = @import("arch/moe.zig");
 pub const DenseKVView = kv_cache.DenseKVView;
 pub const KVCache = kv_cache.KVCache;
 pub const Hold = kv_cache.Hold;
+pub const Room = kv_cache.Room;
 pub const KVCacheEntry = kv_cache.KVCacheEntry;
 pub const KVCacheSnapshot = kv_cache.KVCacheSnapshot;
 pub const KvPrefixView = kv_cache.KvPrefixView;

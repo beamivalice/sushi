@@ -130,6 +130,17 @@ pub var qsa_cap_buf_allocs: usize = 0;
 pub var qsa_history_seeds: usize = 0;
 
 
+/// Pooled blocks every entry's history buffer has room for: the fewest, and 0 where none holds one (a cold or restored
+/// history grows its first buffer at its first append). What the chunk bill prices the history's next growth from.
+pub fn qsaPooledCapacity(entries: ?[]const SSMCacheEntry) usize {
+    var fewest: usize = std.math.maxInt(usize);
+    for (entries orelse return 0) |*e| {
+        if (e.qsa_pooled_buf.ctx == null) continue;
+        fewest = @min(fewest, @as(usize, @intCast(mlx.getShape(e.qsa_pooled_buf)[1])));
+    }
+    return if (fewest == std.math.maxInt(usize)) 0 else fewest;
+}
+
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
 pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, hold: Hold) void {
     const es = entries orelse return;

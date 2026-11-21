@@ -209,6 +209,7 @@ pub var prefill_chunk_widen_ok: ?*const fn (
     usize,
     u32,
     ?usize,
+    trunk.Room,
     u64,
 ) bool = null;
 
@@ -3488,6 +3489,8 @@ const ChunkWidthCtx = struct {
     hc: ?*prefix_cache_mod.HotPrefixCache,
     /// The prefill loop's end the width was last asked at (`AdaptiveWidthState.loop_end`), which a widen re-prices at.
     loop_end: ?usize = null,
+    /// The cache's room the width was last asked at (`AdaptiveWidthState.room`), which a widen re-prices from.
+    room: trunk.Room = .{},
 };
 
 /// Host bytes the SSD writer is holding for this slot right now.
@@ -3500,7 +3503,7 @@ fn chunkWidenConfirmCb(opaque_ctx: *anyopaque, pos: usize, want: u32) bool {
     const wc: *ChunkWidthCtx = @ptrCast(@alignCast(opaque_ctx));
     const cfg = wc.cfg orelse return false;
     const ok = prefill_chunk_widen_ok orelse return false;
-    return ok(cfg, wc.kv_bits, pos, want, wc.loop_end, chunkWidthStagedBytes(wc));
+    return ok(cfg, wc.kv_bits, pos, want, wc.loop_end, wc.room, chunkWidthStagedBytes(wc));
 }
 
 fn chunkWidthCb(
@@ -3514,6 +3517,7 @@ fn chunkWidthCb(
     const cfg = wc.cfg orelse return cur;
     const pick = prefill_chunk_adapt orelse return cur;
     wc.loop_end = st.loop_end;
+    wc.room = st.room;
     const next = pick(cfg, wc.kv_bits, pos, cur, cap, st, chunkWidthStagedBytes(wc));
     return next;
 }

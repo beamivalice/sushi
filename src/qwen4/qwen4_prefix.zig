@@ -31,6 +31,7 @@ pub const aux = struct {
     pub const ssmAuxIsQsaHistory = qsa_state.ssmAuxIsQsaHistory;
     pub const ssmFreeQsaState = qsa_state.ssmFreeQsaState;
     pub const qsaKeyAppendPlan = qsa_state.qsaKeyAppendPlan;
+    pub const qsaPooledCapacity = qsa_state.qsaPooledCapacity;
     pub const qsaLeftoverAt = qsa_state.qsaLeftoverAt;
     pub const qsaResliceToKeep = qsa_state.qsaResliceToKeep;
     pub const applyQsaHistoryAt = qsa_state.applyQsaHistoryAt;

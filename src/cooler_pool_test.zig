@@ -83,7 +83,12 @@ test "cooler contract: a Cooler prefill chunk, the widest on the load's first re
             for ([_]usize{ top, 1024, top }, 0..) |pin, at| {
                 const prompt = long[0 .. pin + 1];
                 const width = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, prompt.len, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pin);
-                const bill = bills.prefillChunkHeldMax(&ld.config, if (kv.scheme == .off) 16 else kv.bits, width, prompt.len);
+                // The request's own hold on the cache's growth, which a chunk at the prompt's end regrows from full.
+                const hold: @import("kv_cache.zig").Hold = .{ .reserve = prefill_plan.reservedPrefillTokens(&ld.config, prompt.len, 1, width), .end = prompt.len + 1 };
+                const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+                // A reserved request's cache is its admission commit's, which this request, never admitted, does not carry.
+                const commit: u64 = if (hold.reserve > 0) bills.cacheCommitBytes(&ld.config, prompt.len, 1, bits, width, false) else 0;
+                const bill = bills.prefillChunkHeldMax(&ld.config, bits, width, prompt.len, .{ .hold = hold }) +| commit;
                 mlx.engine.trim();
                 mlx.engine.resetPoolPeak(.process);
                 const held = mlx.engine.poolTotal();
@@ -296,10 +301,13 @@ const AdmittedBox = struct {
     widths: [64]u32 = @splat(0),
     n: usize = 0,
     widened: u32 = 0,
+    /// The cache's room at the boundary the hook was last asked at, which the confirmation prices a widen from.
+    room: @import("kv_cache.zig").Room = .{},
 
     fn call(ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *@import("mtp_plan.zig").AdaptiveWidthState) u32 {
         const box: *AdmittedBox = @ptrCast(@alignCast(ctx));
         const used = (mlx.engine.poolTotal() - mlx.engine.poolFree()) -| box.in0;
+        box.room = st.room;
         const w = @import("bills.zig").adaptivePrefillWidth(box.cfg, box.bits, pos, box.avail -| used, cur, cap, st);
         if (box.n < box.widths.len) box.widths[box.n] = if (w != 0) w else cur;
         box.n += 1;
@@ -309,7 +317,7 @@ const AdmittedBox = struct {
         const box: *AdmittedBox = @ptrCast(@alignCast(ctx));
         const bills = @import("bills.zig");
         const used = (mlx.engine.poolTotal() - mlx.engine.poolFree()) -| box.in0;
-        const fits = bills.prefillChunkHeldMax(box.cfg, box.bits, want, pos) <= box.avail -| used;
+        const fits = bills.prefillChunkHeldMax(box.cfg, box.bits, want, pos, box.room) <= box.avail -| used;
         if (fits) box.widened += 1;
         return fits;
     }

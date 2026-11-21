@@ -31,6 +31,7 @@ earlier history is mlx-serve's, in that project's changelog.
   long-context request's cost is read off a live server instead of re-derived; a measured walkthrough on a 64 GB M1 Max
   is in the Qwen performance notes. Thanks @catalinb13.
 - **A Sushi Cooler prefill chunk is billed for the size class and capacity step of the cache it grows**, where its rows' bytes alone left a long chunk about a megabyte over its bill when the pool sits at its cap.
+- **A Sushi Cooler prefill chunk is billed for the cache it regrows from the capacity it holds, at the pool's size classes**, where its rows' bytes alone left a chunk part-way through a long prompt many megabytes over its bill when the pool sits at its cap.
 
 ## v1.7.2 — Memory you can count on, faster concurrent Qwen
 

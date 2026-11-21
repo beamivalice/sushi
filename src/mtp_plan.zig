@@ -37,6 +37,8 @@ pub const AdaptiveWidthState = struct {
     /// The prefill loop's end, in absolute positions: a candidate width is priced as the forward the loop runs at it
     /// there, a tail it absorbs included. Null prices the width alone.
     loop_end: ?usize = null,
+    /// What the cache holds at the boundary the width is asked at (`KVCache.roomAt`): a chunk's growth is priced from it.
+    room: trunk.Room = .{},
 };
 
 /// Why a request left speculative decoding for the rest of its generation.

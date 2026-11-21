@@ -776,15 +776,15 @@ test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it tak
 
     {
         var st: mtp_plan.AdaptiveWidthState = .{};
-        const h = prefillChunkCost(&cfg, kv_bits, 2048, kv);
-        try t.expect(h < prefillChunkCost(&cfg, kv_bits, cap, kv));
+        const h = prefillChunkCost(&cfg, kv_bits, 2048, kv, .{});
+        try t.expect(h < prefillChunkCost(&cfg, kv_bits, cap, kv, .{}));
         try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
         try t.expect(st.ratcheted);
     }
     // Several rungs in one call.
     {
         var st: mtp_plan.AdaptiveWidthState = .{};
-        const h = prefillChunkCost(&cfg, kv_bits, 512, kv);
+        const h = prefillChunkCost(&cfg, kv_bits, 512, kv, .{});
         try t.expectEqual(@as(u32, 512), adaptivePrefillWidth(&cfg, kv_bits, kv, h, cap, cap, &st));
     }
     // No headroom at all: the ladder floor, never 0 (the loop reads 0 as "no change").
@@ -812,7 +812,7 @@ test "adaptivePrefillWidth: HOLD is margin 1.0 — the admitted width is not sec
     const kv_bits: u64 = 8;
     const kv: u64 = 786_432;
     const cap = adaptCapFor(&cfg, 786_432);
-    const cost_2k = prefillChunkCost(&cfg, kv_bits, 2048, kv);
+    const cost_2k = prefillChunkCost(&cfg, kv_bits, 2048, kv, .{});
 
     var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, cost_2k, 2048, cap, &st));
@@ -836,7 +836,7 @@ test "adaptivePrefillWidth: a widen costs 1.25x AND two consecutive supporting p
     const cap = adaptCapFor(&cfg, 524_288);
     // Starts at half the cap so one widen step lands exactly on the cap.
     const from: u32 = cap / 2;
-    const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv);
+    const cost_up = prefillChunkCost(&cfg, kv_bits, cap, kv, .{});
 
     var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(from, adaptivePrefillWidth(&cfg, kv_bits, kv, cost_up * 4, from, cap, &st));
@@ -905,7 +905,7 @@ test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
 
     // Step down once, then hand it the whole machine: it stays (a re-widen would be a metronome).
     var st: mtp_plan.AdaptiveWidthState = .{};
-    const narrowed = adaptivePrefillWidth(&cfg, kv_bits, kv, prefillChunkCost(&cfg, kv_bits, 1024, kv), cap, cap, &st);
+    const narrowed = adaptivePrefillWidth(&cfg, kv_bits, kv, prefillChunkCost(&cfg, kv_bits, 1024, kv, .{}), cap, cap, &st);
     try t.expect(narrowed < cap);
     try t.expect(st.ratcheted);
     var i: usize = 0;
@@ -946,7 +946,7 @@ test "adaptivePrefillWidth: a 1M prompt walks DOWN as the box fills, and a small
         try t.expect(next <= width); // never widens after the first step-down
         try t.expect(next >= @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
         try t.expect(next <= cap);
-        try t.expect(prefillChunkCost(&cfg, kv_bits, next, kv) <= headroom or
+        try t.expect(prefillChunkCost(&cfg, kv_bits, next, kv, .{}) <= headroom or
             next == @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
         if (next < width) seen_narrower += 1;
         width = next;
@@ -983,8 +983,8 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
     const long_kv: u64 = 400_000;
 
     // The bill is strictly larger at the live KV.
-    const at_short = prefillChunkCost(&cfg, kv_bits, cap, short_kv);
-    const at_long = prefillChunkCost(&cfg, kv_bits, cap, long_kv);
+    const at_short = prefillChunkCost(&cfg, kv_bits, cap, short_kv, .{});
+    const at_long = prefillChunkCost(&cfg, kv_bits, cap, long_kv, .{});
     try t.expect(at_long > at_short);
     // `prefillTransientReserve` is exactly the `kv = chunk` case.
     try t.expectEqual(
@@ -1010,7 +1010,7 @@ test "adaptivePrefillWidth: the widen prices the QSA sheet at the LIVE KV, not a
     try t.expectEqual(@as(u8, 0), st_long.supporting);
 
     // The hold keeps its margin-1.0 semantics at the live KV.
-    const hold = prefillChunkCost(&cfg, kv_bits, 2048, long_kv);
+    const hold = prefillChunkCost(&cfg, kv_bits, 2048, long_kv, .{});
     var st_hold: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, long_kv, hold, 2048, cap, &st_hold));
     var st_down: mtp_plan.AdaptiveWidthState = .{};
@@ -2002,14 +2002,14 @@ test "the adaptive width prices a candidate as the forward the loop runs at it, 
     const cfg = fixtures.qwen4ExpLive364kConfig();
     const kv_bits: u64 = 8;
     const kv: u64 = 4096;
-    const headroom = bills.prefillChunkCost(&cfg, kv_bits, 1024, kv);
+    const headroom = bills.prefillChunkCost(&cfg, kv_bits, 1024, kv, .{});
     // Mid-prompt a 1024-row chunk runs 1024 rows, which the headroom holds.
     var mid: State = .{ .loop_end = kv + 8192 };
     try t.expectEqual(@as(u32, 1024), bills.adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, 1024, 1024, &mid));
     // 1,124 rows from the end the loop runs them as one forward (a tail under an eighth), which it does not.
     var last: State = .{ .loop_end = kv + 1124 };
     const got = bills.adaptivePrefillWidth(&cfg, kv_bits, kv, headroom, 1024, 1024, &last);
-    errdefer std.debug.print("1,124 rows left at a 1024-row width: kept {d}, headroom {d} MB, the merged forward costs {d} MB\n", .{ got, headroom >> 20, bills.prefillChunkCost(&cfg, kv_bits, 1124, kv) >> 20 });
+    errdefer std.debug.print("1,124 rows left at a 1024-row width: kept {d}, headroom {d} MB, the merged forward costs {d} MB\n", .{ got, headroom >> 20, bills.prefillChunkCost(&cfg, kv_bits, 1124, kv, .{}) >> 20 });
     try t.expect(got < 1024);
 }
 
@@ -2082,34 +2082,94 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expectEqual(@as(u64, 15_748), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
-test "on Sushi Cooler a prefill chunk bills its cache growth at the pool size class of the buffers it takes from empty, at every width" {
+/// The bytes a Cooler cache's buffers take from the pool at `kv_rows` of KV and `state_rows` of history: each buffer (K and
+/// V codes, scales and biases of each group of 64 per global layer, the QSA history and score bank) at its pool size class.
+fn coolerCacheBufferBytes(cfg: *const model_mod.ModelConfig, kv_rows: u64, state_rows: u64) u64 {
+    const pool_class = @import("../tensor/pool_class.zig");
+    const layers: u64 = cfg.attnCacheLayerCount();
+    var held: u64 = 0;
+    var li: u32 = 0;
+    while (li < cfg.num_hidden_layers) : (li += 1) {
+        if (!cfg.isGlobalLayer(li)) continue;
+        const k: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerHeadDim(li) * 2;
+        const v: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerVHeadDim(li) * 2;
+        // Codes, then the scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
+        for ([_]u64{ k / 2, v / 2, k / 64, v / 64 }) |part| held += pool_class.poolBytes(kv_rows * part);
+        held += pool_class.poolBytes(state_rows * cfg.qsaHistoryBytesPerToken() / layers);
+        held += pool_class.poolBytes(state_rows * cfg.qsaScoreBankBytesPerToken() / layers);
+    }
+    return held;
+}
+
+test "on Sushi Cooler an unreserved prompt's chunk bills its cache growth at the pool size class of the buffers it takes from empty, at every width" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     qwen4_qsa_select.qsa_score_fused_override = false;
     defer qwen4_qsa_select.qsa_score_fused_override = null;
     const cfg = coolerFlashNext();
-    const pool_class = @import("../tensor/pool_class.zig");
     const ratio: u64 = @max(cfg.indexer_compress_ratio, 1);
     const layers: u64 = cfg.attnCacheLayerCount();
     try t.expect(layers > 0 and cfg.qsaHistoryBytesPerToken() > 0 and cfg.qsaScoreBankBytesPerToken() > 0);
     for ([_]u64{ 1, 100, 511, 512, 2048, 8192 }) |width| {
-        // The chunk ends the prompt and one reply token follows: the cache grows once, to the request's end.
-        const end = width + 1;
+        // An unreserved prompt's chunk ends it: the cache grows once from empty, to the chunk's rows on the capacity step.
+        const end = width;
         const kv_rows = trunk.KVCache.heldRows(0, end, .{ .end = end }, &.{});
         const state_rows = trunk.KVCache.heldRows(0, (end + ratio - 1) / ratio, (trunk.Hold{ .end = end }).per(ratio), &.{}) * ratio;
-        var held: u64 = 0;
-        var li: u32 = 0;
-        while (li < cfg.num_hidden_layers) : (li += 1) {
-            if (!cfg.isGlobalLayer(li)) continue;
-            const k: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerHeadDim(li) * 2;
-            const v: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerVHeadDim(li) * 2;
-            // Codes, then the scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
-            for ([_]u64{ k / 2, v / 2, k / 64, v / 64 }) |part| held += pool_class.poolBytes(kv_rows * part);
-            held += pool_class.poolBytes(state_rows * cfg.qsaHistoryBytesPerToken() / layers);
-            held += pool_class.poolBytes(state_rows * cfg.qsaScoreBankBytesPerToken() / layers);
+        const held = coolerCacheBufferBytes(&cfg, kv_rows, state_rows);
+        errdefer std.debug.print("a {d}-row chunk's cache takes {d} B from the pool, billed {d} B\n", .{ width, held, bills.chunkGrowthBytes(&cfg, 8, width, 0, .{ .hold = .{ .end = end } }) });
+        try t.expect(bills.chunkGrowthBytes(&cfg, 8, width, 0, .{ .hold = .{ .end = end } }) >= held);
+    }
+}
+
+test "on Sushi Cooler a chunk part-way through a prompt bills the cache growth the +25% policy makes from the capacity the cache holds" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    qwen4_qsa_select.qsa_score_fused_override = false;
+    defer qwen4_qsa_select.qsa_score_fused_override = null;
+    const cfg = coolerFlashNext();
+    const ratio: u64 = @max(cfg.indexer_compress_ratio, 1);
+    const far: trunk.Hold = .{ .end = 1 << 30 };
+    for ([_]u64{ 4096, 16_384, 20_480 }) |held_rows| {
+        for ([_]u64{ 1, 512, 2048, 8192 }) |width| {
+            // A cache full at `held_rows` takes the chunk's rows past its capacity: it regrows by the policy, not by the chunk.
+            const kv_rows = trunk.KVCache.heldRows(held_rows, held_rows + width, far, &.{});
+            const state_rows = trunk.KVCache.heldRows((held_rows + ratio - 1) / ratio, (held_rows + width + ratio - 1) / ratio, far.per(ratio), &.{}) * ratio;
+            const takes = coolerCacheBufferBytes(&cfg, kv_rows, state_rows);
+            errdefer std.debug.print("a {d}-row chunk at {d} rows: the cache regrows to {d} KV rows, {d} B from the pool, billed {d} B\n", .{ width, held_rows, kv_rows, takes, bills.chunkGrowthBytes(&cfg, 8, width, held_rows, .{ .hold = far }) });
+            try t.expect(bills.chunkGrowthBytes(&cfg, 8, width, held_rows, .{ .hold = far }) >= takes);
         }
-        errdefer std.debug.print("a {d}-row chunk's cache takes {d} B from the pool, billed {d} B\n", .{ width, held, bills.chunkGrowthBytes(&cfg, 8, width) });
-        try t.expect(bills.chunkGrowthBytes(&cfg, 8, width) >= held);
+    }
+}
+
+test "on Sushi Cooler a reserved request's first chunk bills no growth for the cache its admission commit already holds, so its width holds at every long prompt" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    qwen4_qsa_select.qsa_score_fused_override = false;
+    defer qwen4_qsa_select.qsa_score_fused_override = null;
+    const cfg = coolerFlashNext();
+    try t.expect(cfg.reservesKvCapacity());
+    const ctx = getEffectiveContextLength(&cfg);
+    const max_tokens: u64 = 4096;
+    for ([_]u64{ 131_072, 262_144 }) |seq| {
+        // The cache the request holds when its first chunk is asked: empty, bound to the request's reservation and last row.
+        const chunk: u64 = 2048;
+        const hold: trunk.Hold = .{
+            .reserve = prefill_plan.reservedPrefillTokens(&cfg, seq, max_tokens, chunk),
+            .end = trunk.KVCache.requestEnd(seq, max_tokens, ctx, 0),
+        };
+        try t.expect(hold.reserve > seq);
+        // The headroom that admitted the chunk: what the width's bill asks of a cache whose growth is the chunk's own rows.
+        const headroom = prefillChunkCost(&cfg, 8, chunk, 0, .{});
+        var st_cold: mtp_plan.AdaptiveWidthState = .{};
+        var st_live: mtp_plan.AdaptiveWidthState = .{ .room = .{ .hold = hold } };
+        const cold = adaptivePrefillWidth(&cfg, 8, 0, headroom, @intCast(chunk), 8192, &st_cold);
+        const live = adaptivePrefillWidth(&cfg, 8, 0, headroom, @intCast(chunk), 8192, &st_live);
+        errdefer std.debug.print("a {d}-token reserved prompt: first chunk {d} rows without the reservation's growth, {d} with it; growth billed {d} MB\n", .{ seq, cold, live, bills.chunkGrowthBytes(&cfg, 8, chunk, 0, .{ .hold = hold }) >> 20 });
+        try t.expectEqual(@as(u32, chunk), cold);
+        try t.expectEqual(cold, live);
+        // Past its reservation the cache regrows, and that growth is the chunk's.
+        const full = trunk.Room{ .hold = hold, .kv_free = 0 };
+        try t.expect(bills.chunkGrowthBytes(&cfg, 8, chunk, hold.reserve, full) > 0);
     }
 }
 
@@ -2193,7 +2253,7 @@ fn warmFits(config: *const model_mod.ModelConfig, bits: u64, chunk: u64, headroo
         var pos: usize = 0;
         while (pos < loop_end) {
             const end = pp.nextChunkEnd(pos, loop_end, @intCast(chunk), stride > 0, stride, 0, false);
-            const cost = bills.prefillChunkCost(config, bits, end - pos, pos);
+            const cost = bills.prefillChunkCost(config, bits, end - pos, pos, .{});
             errdefer std.debug.print("the warm at {d}-row chunks, stride {d}: its {d}-row forward at {d} costs {d} MB, the headroom is {d} MB\n", .{ chunk, stride, end - pos, pos, cost >> 20, headroom >> 20 });
             try std.testing.expect(cost <= headroom);
             pos = end;
@@ -2210,7 +2270,7 @@ test "Flash-Next: the served warm's widest forward is its longest prompt's merge
     const bits = defaultKvBits(&config);
     // 2,348 tokens at 512-row chunks: three chunks, then an 811-row one at 1,536 with the tail merged.
     try std.testing.expectEqual(@as(u64, 2348), bills.warmLongestPrompt(&config, 512));
-    try std.testing.expect(bills.warmFloorChunkBytes(&config) >= bills.prefillChunkCost(&config, bits, 811, 1536));
+    try std.testing.expect(bills.warmFloorChunkBytes(&config) >= bills.prefillChunkCost(&config, bits, 811, 1536, .{}));
     try warmFits(&config, bits, 512, bills.warmFloorChunkBytes(&config));
 }
 

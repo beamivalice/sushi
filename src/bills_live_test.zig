@@ -86,14 +86,14 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
     try t.expect(bills.prefillNeededAtChunk(&cfg, top, 256, kv_bits, 1024, .{}) <= at_2048 - 1);
     // Early chunks keep 2048; the chunk that no longer fits beside the KV steps down one rung.
     st = .{};
-    try t.expectEqual(@as(u32, 2048), bills.adaptivePrefillWidth(&cfg, kv_bits, 4096, bills.prefillChunkCost(&cfg, kv_bits, 2048, 4096), 2048, 2048, &st));
-    try t.expectEqual(@as(u32, 1024), bills.adaptivePrefillWidth(&cfg, kv_bits, top, bills.prefillChunkCost(&cfg, kv_bits, 2048, top) - 1, 2048, 2048, &st));
+    try t.expectEqual(@as(u32, 2048), bills.adaptivePrefillWidth(&cfg, kv_bits, 4096, bills.prefillChunkCost(&cfg, kv_bits, 2048, 4096, .{}), 2048, 2048, &st));
+    try t.expectEqual(@as(u32, 1024), bills.adaptivePrefillWidth(&cfg, kv_bits, top, bills.prefillChunkCost(&cfg, kv_bits, 2048, top, .{}) - 1, 2048, 2048, &st));
     // Once stepped down, a request never widens again.
     try t.expectEqual(@as(u32, 1024), bills.adaptivePrefillWidth(&cfg, kv_bits, top, available, 1024, 2048, &st));
 
     // A small box narrows from the first chunk.
     st = .{};
-    try t.expectEqual(@as(u32, 512), bills.adaptivePrefillWidth(&cfg, kv_bits, 0, bills.prefillChunkCost(&cfg, kv_bits, 512, 0), 2048, 2048, &st));
+    try t.expectEqual(@as(u32, 512), bills.adaptivePrefillWidth(&cfg, kv_bits, 0, bills.prefillChunkCost(&cfg, kv_bits, 512, 0, .{}), 2048, 2048, &st));
 }
 
 test "GLM near the top of its context keeps fewer checkpoints at the start width instead of being refused" {
@@ -696,6 +696,26 @@ test "a 64 GB Mac at a declared 59,000 MB serves the 2.75 pack at kv8 to 262,144
         errdefer std.debug.print("free {d} MB: advertised {d}; the 124K request needs {d} MB of {d} MB; the image encode needs {d} MB of {d} MB\n", .{ free_mb, advertised, bill.needed >> 20, bill.available >> 20, image_bill >> 20, request_media.visionEncodeAvailable(&cfg) >> 20 });
         try testing.expectEqual(bills.AdmissionVerdict.admit, bills.admissionVerdict(bill));
         try testing.expect(advertised >= 262_144);
+        // The first chunk's width, asked with the headroom that admitted the request, on the pack's Cooler load: the
+        // reservation's rows are its commit's, so the cache's first growth never steps the width below the admitted one.
+        var cooler = cfg;
+        cooler.cooler_for_test = true;
+        cooler.expert_quant_codebook = .spec1;
+        cooler.trunk_quant = null;
+        cooler.quant_bits = 0;
+        const chunk: u32 = @intCast(bill.chunk);
+        const hold: trunk.Hold = .{
+            .reserve = @import("prefill_plan.zig").reservedPrefillTokens(&cooler, 124_000, 32_000, chunk),
+            .end = trunk.KVCache.requestEnd(124_000, 32_000, advertised, 0),
+        };
+        var st_ungrown: mtp_plan.AdaptiveWidthState = .{};
+        var st_reserved: mtp_plan.AdaptiveWidthState = .{ .room = .{ .hold = hold } };
+        const ungrown = bills.adaptivePrefillWidth(&cooler, 8, 0, bill.available, chunk, chunk, &st_ungrown);
+        const reserved = bills.adaptivePrefillWidth(&cooler, 8, 0, bill.available, chunk, chunk, &st_reserved);
+        errdefer std.debug.print("free {d} MB: admitted at {d} rows, first chunk {d} without the reservation's growth, {d} with it\n", .{ free_mb, chunk, ungrown, reserved });
+        try testing.expectEqual(@as(u64, 0), bills.chunkGrowthBytes(&cooler, 8, chunk, 0, .{ .hold = hold }));
+        try testing.expectEqual(chunk, reserved);
+        try testing.expectEqual(ungrown, reserved);
         // The context is the model's own, so the request is the whole window, as the user's client sent it.
         for ([_]u32{ 131_072, 262_144 }) |context| {
             cfg.pinned_context = context;

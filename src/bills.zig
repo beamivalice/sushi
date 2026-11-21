@@ -2224,8 +2224,8 @@ fn chunkAsk(config: *const model_mod.ModelConfig, cost: u64) u64 {
 
 /// The most a prefill chunk may grow the engine's pool: its cost, and where that cost is exact the one margin, which
 /// the forward's cap (`cooler.forwardCap`) lets the pool keep in free buffers.
-pub fn prefillChunkHeldMax(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64) u64 {
-    const cost = prefillChunkCost(config, kv_bits, width, kv_len);
+pub fn prefillChunkHeldMax(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room) u64 {
+    const cost = prefillChunkCost(config, kv_bits, width, kv_len, room);
     return if (coolerPrefillRowBytes(config) > 0) cost +| BILL_MARGIN_BYTES else cost;
 }
 
@@ -2784,33 +2784,70 @@ pub fn prefillChunkCost(
     kv_bits: u64,
     width: u64,
     kv_len: u64,
+    room: trunk.Room,
 ) u64 {
-    return chunkCostLending(config, kv_bits, width, kv_len, lendableBytes(config));
+    return chunkCostLending(config, kv_bits, width, kv_len, room, lendableBytes(config));
 }
 
-fn chunkCostLending(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, lent: u64) u64 {
+fn chunkCostLending(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room, lent: u64) u64 {
     // An arch whose forward's cap grows with the position it ends at prices the chunk as the forward it becomes.
     const transient = archHook("chunkTransientAt", u64, config, .{ kv_bits, width, kv_len }) orelse prefillTransientReserveAtKv(config, kv_bits, width, kv_len);
-    return (transient -| lent) +| chunkGrowthBytes(config, kv_bits, width);
+    return (transient -| lent) +| chunkGrowthBytes(config, kv_bits, width, kv_len, room);
 }
 
-/// What a chunk's rows add to the cache. On a Cooler load each buffer is held at its pool size class and its capacity
-/// is whole `chunk_step`s: the KV's buffers at most one step past the rows, the QSA history's (a row spans
-/// `indexer_compress_ratio` tokens) a step of such rows, which `pooledCacheBytes` prices.
-pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64) u64 {
+/// The rows each cache buffer is regrown to when a chunk of `width` rows at `kv_len` passes what the cache holds (`room`):
+/// the allocators' own growth rule (`KVCache.heldRows`), the KV's in tokens and the history's in rows of
+/// `indexer_compress_ratio` tokens, as tokens. 0 where the buffer has the rows already, or where the request's commit holds them.
+const ChunkGrowth = struct { kv_rows: u64, state_rows: u64 };
+
+fn chunkGrowth(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: trunk.Room) ChunkGrowth {
+    const KV = trunk.KVCache;
+    const ratio: u64 = @max(config.indexer_compress_ratio, 1);
+    const end = kv_len +| width;
+    const kv_cap = kv_len +| room.kv_free;
+    const state_cap = (kv_len +| ratio - 1) / ratio +| room.state_free;
+    const state_need = (end +| ratio - 1) / ratio;
+    const state_hold = room.hold.per(ratio);
+    // A reserved request's admission commit (`cacheCommitBytes`) already holds the rows its reservation grows the cache
+    // to: only a regrow past them is the chunk's.
+    const kv_commit: u64 = if (room.hold.reserve > 0) KV.heldRows(0, room.hold.reserve, room.hold, &.{}) else 0;
+    const state_commit: u64 = if (room.hold.reserve > 0) KV.heldRows(0, state_hold.reserve, state_hold, &.{}) else 0;
+    const kv_rows = if (end <= kv_cap) 0 else KV.heldRows(kv_cap, end, room.hold, &.{});
+    const state_rows = if (state_need <= state_cap) 0 else KV.heldRows(state_cap, state_need, state_hold, &.{});
+    return .{
+        .kv_rows = if (kv_rows <= kv_commit) 0 else kv_rows,
+        .state_rows = if (state_rows <= state_commit) 0 else state_rows *| ratio,
+    };
+}
+
+/// What a chunk's rows add to the cache. On a Cooler load a buffer that outgrows its capacity is replaced by one of the
+/// rows the allocators' growth rule makes of it from the capacity it holds now (`room`), held at its pool size class
+/// (`pooledCacheBytes`) beside the old one, which the pool's in-use reading already counts: the whole new buffer is
+/// what the chunk takes. A cache with the rows to spare grows nothing.
+pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room) u64 {
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const state_tok = statePerTokenBilled(config);
     if (!cooler_side.onEngine(config)) return width *| (kv_tok +| state_tok);
-    const step: u64 = trunk.KVCache.chunk_step;
+    const grown = chunkGrowth(config, width, kv_len, room);
+    return pooledCacheBytes(config, grown.kv_rows *| kv_tok) +| pooledCacheBytes(config, grown.state_rows *| state_tok);
+}
+
+/// The room a cache gives the chunk after the one `chunkGrowth` priced, which grew it to those rows: a cold cache's, which the
+/// policy alone grows (a reservation's rows are its commit's, which this does not walk).
+fn roomAfter(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: trunk.Room) trunk.Room {
     const ratio: u64 = @max(config.indexer_compress_ratio, 1);
-    return pooledCacheBytes(config, (width +| step) *| kv_tok) +| pooledCacheBytes(config, (width +| step *| ratio) *| state_tok);
+    const grown = chunkGrowth(config, width, kv_len, room);
+    const end = kv_len +| width;
+    const kv_cap = if (grown.kv_rows > 0) grown.kv_rows else kv_len +| room.kv_free;
+    const state_cap = if (grown.state_rows > 0) grown.state_rows / ratio else (kv_len +| ratio - 1) / ratio +| room.state_free;
+    return .{ .kv_free = kv_cap -| end, .state_free = state_cap -| (end +| ratio - 1) / ratio, .hold = room.hold };
 }
 
 /// The widest ladder width, at most `top`, whose first chunk fits `headroom` with no decoder pool borrowed: a load's
 /// served warm runs before the server installs the borrow. 0 when none does.
 pub fn widestChunkAdmitted(config: *const model_mod.ModelConfig, kv_bits: u64, top: u64, headroom: u64) u32 {
     for (PREFILL_CHUNK_LADDER) |w| {
-        if (w <= top and chunkCostLending(config, kv_bits, w, 0, 0) <= headroom) return w;
+        if (w <= top and chunkCostLending(config, kv_bits, w, 0, .{}, 0) <= headroom) return w;
     }
     return 0;
 }
@@ -2830,7 +2867,12 @@ pub fn warmChunkPeakBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ch
     var peak: u64 = 0;
     for ([_]usize{ 0, launch_state.ssm_checkpoint_stride }) |stride| {
         var walk = prefill_plan.ForwardWalk.init(prefix_len, @intCast(chunk), stride, false);
-        while (walk.next()) |f| peak = @max(peak, chunkCostLending(config, kv_bits, f.end - f.pos, f.pos, 0));
+        // A cold cache: each forward finds what the ones before it grew it to.
+        var room: trunk.Room = .{};
+        while (walk.next()) |f| {
+            peak = @max(peak, chunkCostLending(config, kv_bits, f.end - f.pos, f.pos, room, 0));
+            room = roomAfter(config, f.end - f.pos, f.pos, room);
+        }
     }
     return peak;
 }
@@ -2878,14 +2920,14 @@ pub fn adaptivePrefillWidth(
     if (cap == 0 or current == 0) return current;
     const floor: u32 = @min(cap, @as(u32, @intCast(prefill_plan.PREFILL_CHUNK_FLOOR)));
 
-    if (adaptiveChunkCost(config, kv_bits, current, kv_len, st.loop_end) > headroom) {
+    if (adaptiveChunkCost(config, kv_bits, current, kv_len, st.room, st.loop_end) > headroom) {
         st.supporting = 0;
         st.ratcheted = true;
         var best: u32 = floor;
         for (PREFILL_CHUNK_LADDER) |rung| {
             const w: u32 = @min(rung, cap);
             if (w >= current) continue;
-            if (adaptiveChunkCost(config, kv_bits, w, kv_len, st.loop_end) <= headroom) {
+            if (adaptiveChunkCost(config, kv_bits, w, kv_len, st.room, st.loop_end) <= headroom) {
                 best = w;
                 break;
             }
@@ -2902,7 +2944,7 @@ pub fn adaptivePrefillWidth(
         st.supporting = 0;
         return current;
     }
-    const asked: u64 = chunkAsk(config, adaptiveChunkCost(config, kv_bits, next, kv_len, st.loop_end));
+    const asked: u64 = chunkAsk(config, adaptiveChunkCost(config, kv_bits, next, kv_len, st.room, st.loop_end));
     if (asked > headroom) {
         st.supporting = 0;
         return current;
@@ -3017,11 +3059,12 @@ pub fn adaptivePrefillWidenStillFits(
     pos: usize,
     want: u32,
     loop_end: ?usize,
+    room: trunk.Room,
     staged_host: u64,
 ) bool {
     if (!adaptivePrefillChunkEnabled(config)) return false;
     const headroom = prefillHeadroomNow(config, staged_host);
-    const asked: u64 = chunkAsk(config, adaptiveChunkCost(config, kv_bits, want, pos, loop_end));
+    const asked: u64 = chunkAsk(config, adaptiveChunkCost(config, kv_bits, want, pos, room, loop_end));
     if (asked <= headroom) return true;
     log.info("[prefill] widen to {d} withdrawn at pos {d} (headroom {d} MB after the decode tick, cost {d} MB)\n", .{
         want,
@@ -3054,7 +3097,7 @@ pub fn adaptivePrefillWidthNow(
             next,
             pos,
             headroom >> 20,
-            adaptiveChunkCost(config, kv_bits, next, pos, st.loop_end) >> 20,
+            adaptiveChunkCost(config, kv_bits, next, pos, st.room, st.loop_end) >> 20,
         });
     }
     return next;
@@ -3062,9 +3105,9 @@ pub fn adaptivePrefillWidthNow(
 
 /// `prefillChunkCost` of the forward a chunk of `width` at `kv_len` runs, a tail the loop absorbs at `loop_end` included
 /// (`prefill_plan.adaptiveForwardRows`); the width alone where the end is not known.
-fn adaptiveChunkCost(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, loop_end: ?usize) u64 {
+fn adaptiveChunkCost(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room, loop_end: ?usize) u64 {
     const rows: u64 = if (loop_end) |e| prefill_plan.adaptiveForwardRows(@intCast(kv_len), e, @intCast(width)) else width;
-    return prefillChunkCost(config, kv_bits, rows, kv_len);
+    return prefillChunkCost(config, kv_bits, rows, kv_len, room);
 }
 
 /// What a request may allocate: the ceiling less MLX's allocations. The SSD writers' host bytes are
@@ -3745,7 +3788,7 @@ test "a load's served warm prefills at most the widest ladder chunk the headroom
         fn cost(c: *const model_mod.ModelConfig, w: u64) u64 {
             var own = c.*;
             own.expert_borrow_bytes = 0;
-            return prefillChunkCost(&own, 8, w, 0);
+            return prefillChunkCost(&own, 8, w, 0, .{});
         }
     }.cost;
     try t.expectEqual(@as(u32, 8192), widestChunkAdmitted(&cfg, kv_bits, 8192, std.math.maxInt(u64)));
@@ -6538,7 +6581,7 @@ test "bill pin: prefillChunkCost and the adaptive width" {
         0, 0, 2048, 4096, 0, 0, 1, 1,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
-            for ([_]u64{ 512, 4096 }) |width| g.add(prefillChunkCost(c, 8, width, 100_000));
+            for ([_]u64{ 512, 4096 }) |width| g.add(prefillChunkCost(c, 8, width, 100_000, .{}));
             for ([_]u64{ pin_gib, 6 * pin_gib, 40 * pin_gib }) |headroom| for ([_]u32{ 512, 2048 }) |current| {
                 var st = mtp_plan.AdaptiveWidthState{};
                 g.add(adaptivePrefillWidth(c, 8, 100_000, headroom, current, 8192, &st));
@@ -7974,7 +8017,7 @@ test "a long cold prompt admitted at the edge runs its first chunk at a width wh
                 const peak = if (reserves)
                     prefillNeededAtChunk(&config, seq, max_tokens, bits, width, warm) - prefillTransientReserveAtKv(&config, bits, width, seq) + prefillTransientReserveAtKv(&config, bits, width, width)
                 else
-                    prefillChunkCost(&config, bits, width, 0);
+                    prefillChunkCost(&config, bits, width, 0, .{});
                 if (peak > avail) {
                     std.debug.print("{s}: {d} tokens, MTP {}, admitted with {d} MB at width {d}: the first chunk runs {d} rows and holds about {d} MB\n", .{ arch, seq, mtp, avail / MiB, billed, width, peak / MiB });
                     return error.TestUnexpectedResult;

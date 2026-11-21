@@ -306,6 +306,16 @@ pub const Hold = struct {
     }
 };
 
+/// What a prefill chunk finds in the cache it grows (`KVCache.roomAt`), which `bills.chunkGrowthBytes` prices the growth
+/// from. The default is a full cache no request has bound: the growth the policy makes from the rows stored.
+pub const Room = struct {
+    /// KV rows the buffers hold past the rows stored; 0 = full.
+    kv_free: u64 = 0,
+    /// History rows (one per `indexer_compress_ratio` tokens) the buffers hold past those the stored tokens fill.
+    state_free: u64 = 0,
+    hold: Hold = .{ .end = std.math.maxInt(u32) },
+};
+
 pub const KVCache = struct {
     entries: []KVCacheEntry,
     step: usize, // absolute sequence position (not affected by sliding window trimming)
@@ -1309,6 +1319,15 @@ pub const KVCache = struct {
         var fold = CapacityFold{};
         for (self.entries) |*e| fold.add(if (e.initialized and !e.ringed) inPlaceCapacity(e) else null);
         return fold.result();
+    }
+
+    /// The room the KV buffers give a chunk that starts `kv_len` rows in: the rows they hold past those stored (the
+    /// fewest across the layers, `residentCapacityTokens`) and what the request asks of their growth. The history's
+    /// rows are the arch's own to read (`state_free`).
+    pub fn roomAt(self: *const KVCache, kv_len: u64) Room {
+        var room: Room = .{ .kv_free = @as(u64, self.residentCapacityTokens()) -| kv_len };
+        if (self.hold()) |h| room.hold = h;
+        return room;
     }
 
     /// Buffer-grow / slice-update / view-build, parameterized over the
