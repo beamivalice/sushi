@@ -140,6 +140,9 @@ inference thread frees. A pointer-keyed cache is invalidated by an ATOMIC MARK, 
 - A rollback that re-forwards is a SECOND forward: capture only what verify overwrites, truncate the rest by offset.
 - A multi-token forward is not a prefill (`prefillEvalCadenceApplies`, seq ≥ 32).
 - A weight outside every warmup forward is still LAZY at serve time (`appendWeightArrays`).
+- **A prefill chunk's one eval takes every state the chunk wrote** (`ssm_cache.appendEvalArrays`: trunk and MTP head):
+  a state no evaluated output reads stays a lazy node holding the chunk's graph and inputs; the head's QSA history held
+  each chunk's hidden rows (5,120 B a prompt token on Flash-Next, 380 MB at 78k) until the prefill ended.
 - Helpers that could take a block use the `_axis` op.
 
 ## What MLX's bytes depend on

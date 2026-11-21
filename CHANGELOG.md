@@ -8,6 +8,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **A Stop sent as a download finishes answers what happened**: it said stopped while the job went on to report done with its pack registered; it is now refused as too late (409) once the pack is being registered, and a Stop that landed before that ends the job stopped.
 - **A server stopped while a download was finishing no longer risks a crash at exit**: the download's thread could still be registering the finished pack in the model list that shutdown was freeing, and the catalog refresh read the same list; shutdown now waits for them, or ends without freeing it.
+- **A long Qwen3.8-Flash-Next prompt on MLX with MTP on no longer holds about 5 KB a prompt token beyond its admission
+  bill while it prefills** (380 MB at 78k tokens, a forward billed short of what it ran on): the MTP head's state is
+  evaluated with each chunk.
 - **The web UI's API-key box closes by itself once the server stops asking for a key** (a server restarted without `--api-key`): it stayed modal over a page that was answering again.
 - **A thinking-effort cap saved on Settings reaches the chat's Thinking budget box**: the box kept the cap it had filled in and the next request ran under the old one; it now takes the new cap (or empties when the cap is removed) unless you typed a value over it.
 - **The chat's prompt-cache meter follows the server**: it stayed on its old reading after Clear all caches, a saved cache size or an unload (where it kept showing a cache that was gone) until the next chat turn or five minutes; it now re-reads when the loaded model changes and after each of those actions.

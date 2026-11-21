@@ -99,10 +99,13 @@ pub const Cache = struct {
         self.allocator.destroy(self.st);
     }
 
-    /// Adds this cache's storage to a prefill eval batch, so the chunk's graph is freed with the chunk.
+    /// Adds this cache's storage, its KV and its state, to a prefill eval batch, so the chunk's graph is freed with
+    /// the chunk.
     pub fn appendEvalArrays(self: *const Cache, vec: mlx.mlx_vector_array) void {
         self.activate();
-        self.t.arch_state.qwen4.mtp.?.cache.appendEvalArrays(vec);
+        const m = &self.t.arch_state.qwen4.mtp.?;
+        m.cache.appendEvalArrays(vec);
+        @import("../ssm_cache.zig").appendEvalArrays(vec, &m.entry);
     }
 };
 

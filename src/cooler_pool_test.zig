@@ -175,6 +175,68 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8, spec: bool) !void {
     try testing.expect(held <= bill);
 }
 
+test "an MLX Flash-Next prefill with its MTP head holds no more per prompt token than its bill's storage" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    var ran = false;
+    for ([_][:0]const u8{ "QWEN4_STQ_TINY", "QWEN4_TEST_MODEL" }) |env| {
+        if (!fixtureChosen(selection(), env)) continue;
+        const dir = std.mem.span(std.c.getenv(env) orelse continue);
+        try headPrefillWithinStorage(Q, dir);
+        ran = true;
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+/// What a prefill's chunks start on, and what the bill's storage terms price, for two prompt lengths: the growth between
+/// them is the hold a prompt token adds, which no fixed part of either reading can hide.
+fn headPrefillWithinStorage(comptime Q: type, dir: []const u8) !void {
+    const a = testing.allocator;
+    const bills = @import("bills.zig");
+    const generate = @import("generate.zig");
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, false);
+    defer _ = ld.close();
+    const c = &ld.config;
+    const chunk: usize = prefill_plan.PREFILL_CHUNK_FLOOR;
+    const kv = bills.configuredKvQuantFor(c);
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    var held: [2]u64 = undefined;
+    var storage: [2]u64 = undefined;
+    const lens = [2]usize{ 16 * 1024 + 1, 48 * 1024 + 1 };
+    for (lens, 0..) |len, k| {
+        const long = try a.alloc(u32, len);
+        defer a.free(long);
+        for (long, 0..) |*t, i| t.* = ids[(i * 7919) % ids.len];
+        const terms = bills.prefillRequestTerms(c, len, 1, kv_bits, chunk, .{ .mtp_on = true });
+        storage[k] = len * bills.kvBytesPerTokenAtBits(c.kvBytesPerToken(), kv_bits) + terms.reserved_kv_bytes + terms.state_bytes +
+            terms.checkpoint_bytes + terms.grow_coexist_bytes + terms.qsa_ring_bytes + terms.mtp_head_kv_bytes;
+        const turn = arch_handle.turnFor(ld.h, c);
+        defer turn.end();
+        defer arch_sched.endRequest(c);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        _ = mlx.mlx_clear_cache();
+        var active0: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active0);
+        generate.held_between_chunks_for_test = 0;
+        var opts = Q.specOptions(ld.xfm, 0);
+        opts.pinned_prefill_chunk = chunk;
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, long, 1, .{ .temperature = 0.0 }, &.{}, opts);
+        defer gen.deinit(a);
+        if (try gen.nextMtp(a)) |r| a.free(r.tokens);
+        held[k] = generate.held_between_chunks_for_test -| active0;
+    }
+    const grew = held[1] -| held[0];
+    const billed = storage[1] -| storage[0];
+    if (grew > billed) std.debug.print("{s}: from {d} to {d} prompt tokens at {d}-row chunks a chunk started on {d} KB more, the billed storage {d} KB more\n", .{ dir, lens[0], lens[1], chunk, grew >> 10, billed >> 10 });
+    try testing.expect(grew <= billed);
+}
+
 /// A greedy request's slot, submitted and prefilled as the inference loop runs it (`failPrefill` on a failure).
 /// `refuse_first`: its prefill's first pool buffer is refused, as when it meets a full pool.
 fn servedAdmit(sv: *Served, prompt: []const u32, n: u32, refuse_first: bool) !*Served.scheduler.Slot {

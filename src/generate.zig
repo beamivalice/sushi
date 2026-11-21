@@ -125,6 +125,10 @@ const TickProf = struct {
 /// admission gate and by `nextMtp` per round (`mtp.mtpCtxWithinLimit`).
 pub var max_mtp_ctx: u32 = 0;
 
+/// In tests, the most MLX held as a prefill's chunk starts: the cache and the state the forward carries in, none of a
+/// forward's transient.
+pub var held_between_chunks_for_test: usize = 0;
+
 pub const CommittedArgmax = spec_types.CommittedArgmax;
 pub const verifyArgmax = spec_types.verifyArgmax;
 pub const verifyRows2d = spec_types.verifyRows2d;
@@ -1599,6 +1603,13 @@ pub const Generator = struct {
                 // An MLX failure in a previous chunk latched instead of killing the process (#353);
                 // abandon this request, keep the server. No checkpoint salvage: the state failed.
                 try mlx.checkError();
+                if (comptime @import("builtin").is_test) {
+                    // Every buffer the last chunk freed is returned once its passes complete.
+                    _ = mlx.mlx_synchronize(xfm.s);
+                    var active: usize = 0;
+                    _ = mlx.mlx_get_active_memory(&active);
+                    held_between_chunks_for_test = @max(held_between_chunks_for_test, active);
+                }
                 // Pick this chunk's end. Normal path: hit the configured chunk
                 // size. Phase 1 path: if a checkpoint stride boundary lands
                 // inside the would-be chunk, shrink the chunk so it ends
@@ -1722,27 +1733,11 @@ pub const Generator = struct {
                     if (mtp_cache) |*mc| if (!mc.rebuiltFromTail() or end < loop_end) mc.appendEvalArrays(eval_vec);
                     // Same discipline for the DFlash context appended above.
                     if (dflash_ctx) |*dc| dc.appendEvalArrays(eval_vec);
-                    // Phase 1: also force SSM state to materialize so any
-                    // snapshot below holds a concrete tensor, not a lazy node
-                    // that would re-execute the prefill graph if anyone reads
-                    // from it later. Unconditional on EVERY chunk (not just
-                    // stride-aligned ones): a tail-merged final chunk ends
-                    // off-boundary, and the always-on end-of-prompt snapshot
-                    // then hits exactly that re-execution — capturing an
-                    // un-evaluated state re-ran the whole last chunk's GDN
-                    // scan (measured −4% on an 8K 27B prefill). The
-                    // states are ~KB-to-MB scale; evaluating them alongside
-                    // the KV costs nothing measurable.
-                    if (want_ssm_cp) if (ctx.ssm_entries) |entries| {
-                        for (entries) |*ssm| {
-                            if (!ssm.initialized) continue;
-                            if (ssm.conv_state.ctx != null) {
-                                _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.conv_state);
-                            }
-                            if (ssm.ssm_state.ctx != null) {
-                                _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.ssm_state);
-                            }
-                        }
+                    // Every chunk materializes the state it wrote, checkpointing or not: a snapshot then holds a concrete
+                    // tensor (a lazy one re-ran the last chunk's GDN scan, -4% on an 8K 27B prefill), and no state keeps
+                    // the chunk's graph and inputs alive into the next.
+                    if (ctx.ssm_entries) |entries| for (entries) |*ssm| {
+                        if (ssm.initialized) @import("ssm_cache.zig").appendEvalArrays(eval_vec, ssm);
                     };
                     // A chunk that left nothing to materialize asks for no eval.
                     if (mlx.mlx_vector_array_size(eval_vec) > 0) _ = mlx.mlx_eval(eval_vec);

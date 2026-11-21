@@ -116,6 +116,15 @@ pub fn kvEntriesBytes(entries: []const KVCacheEntry) u64 {
     return total;
 }
 
+/// An entry's state, recurrent and QSA, for a prefill chunk's one eval. A state left lazy keeps the chunk's graph and the
+/// rows it was fed: until the next chunk reads it, or, on an entry no evaluated output reads (the MTP head's, whose
+/// prefill outputs are dropped), until the prefill ends.
+pub fn appendEvalArrays(vec: mlx.mlx_vector_array, e: *const SSMCacheEntry) void {
+    inline for (.{ e.conv_state, e.ssm_state, e.aux_state, e.qsa_pooled, e.qsa_key_buf, e.qsa_pooled_buf, e.qsa_score_bank, e.qsa_score_buf }) |arr| {
+        if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
+    }
+}
+
 /// A live request's recurrent state, the hybrid's counterpart of its KV. Each QSA bank is billed
 /// by its capacity buffer when it has one, never again through the view that reads it.
 pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
