@@ -21,6 +21,7 @@ const MixedTick = contract.MixedTick;
 const Served = contract.Served;
 const Sheet = contract.Sheet;
 const inUsePeak = contract.inUsePeak;
+const eachArch = contract.eachArch;
 const eachFixture = contract.eachFixture;
 const eachQwenServed = contract.eachQwenServed;
 const eachResidency = contract.eachResidency;
@@ -99,6 +100,32 @@ test "cooler contract: a Cooler prefill chunk, the widest on the load's first re
                 if (grew > bill) std.debug.print("cooler contract: the pool grew {d} MB\n", .{grew >> 20});
                 try testing.expect(grew <= bill);
             }
+        }
+    }.run);
+}
+
+test "cooler contract: a contract load bills a chunk from what its trunk serves, the facts its load recorded past the parse (a probe serving the arm the parse did not guess) included" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            _ = ids;
+            const against = comptime @hasDecl(C, "armsAgainstParse");
+            if (against) C.armsAgainstParse(true);
+            defer if (against) C.armsAgainstParse(false);
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            const bills = @import("bills.zig");
+            const kv = bills.configuredKvQuantFor(&ld.config);
+            const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+            const top: u64 = 8192;
+            const room: @import("kv_cache.zig").Room = .{ .hold = .{ .reserve = 0, .end = top + 2 } };
+            // The config the cells bill from, given what the trunk recorded at its load as a served load hands it over.
+            var recorded = ld.config;
+            @import("arch/config.zig").adoptLoaded(&recorded, &ld.xfm.config);
+            const billed = bills.prefillChunkHeldMax(&ld.config, bits, top, top + 1, room);
+            const served = bills.prefillChunkHeldMax(&recorded, bits, top, top + 1, room);
+            errdefer std.debug.print("cooler contract: a {d}-row chunk billed {d} KB from the load's config, {d} KB with what its trunk recorded\n", .{ top, billed >> 10, served >> 10 });
+            try testing.expectEqual(served, billed);
         }
     }.run);
 }

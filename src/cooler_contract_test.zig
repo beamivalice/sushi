@@ -65,7 +65,8 @@ pub const Load = struct {
         model_mod.resolveWeightPrefix(&self.config, &self.weights);
         self.xfm = try a.create(Trunk);
         errdefer a.destroy(self.xfm);
-        self.xfm.* = try Trunk.init(io, a, self.config, &self.weights);
+        // As a served load makes it: the config every cell bills from takes what the load recorded past the parse.
+        self.xfm.* = try model_load.initTrunk(io, a, &self.config, &self.weights);
         model_load.publishEngine(self.xfm, &self.config);
         @import("model_load.zig").compileClosures(self.xfm, .all);
         self.h = arch_handle.adopt(self.xfm);

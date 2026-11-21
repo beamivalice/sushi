@@ -32,6 +32,12 @@ pub fn prepare(a: std.mem.Allocator, config: *model_mod.ModelConfig, dir: []cons
     config.expert_source_dir = try a.dupe(u8, dir);
 }
 
+/// While on, the load's expand probe serves the arm its parse did not guess (`dsv41_config.Config.wide_arms`), so a
+/// config that kept the guess prices a wide forward the model does not run.
+pub fn armsAgainstParse(on: bool) void {
+    @import("dsv41_kernels.zig").hc_expand_probe_override = if (on) !@import("sushi_exl3").kernels.gemmNaxOn() else null;
+}
+
 /// The served tiny ends a chat or Responses reply within a few tokens, and holds 128: a long reply is a completion
 /// with `ignore_eos`.
 pub const server_long_replies = false;

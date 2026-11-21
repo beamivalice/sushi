@@ -138,6 +138,8 @@ combined chain), and a ratio-r compressor bills `r - 1` pending rows. A resident
 its bill carries the spill pools it never makes. Decode forwards keep their scores term and `forward_held_bytes`.
 The expand and Engram arms are the priced model's (`Config.wide_arms`): two loads, or a load under
 `SUSHI_DSV41_COMPOSED`, each bill their own, and the load hands its arms to the trunk's and the server's configs.
+A config that bills a load's forwards takes the load's arms through `model_load.initTrunk`; one left at the parse's guess
+under-bills a load whose probe serves the expand chain by 68 B a hidden channel a row (136 MB at 8,192 rows of the tiny).
 
 Measured (`dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the spill pools its route did not
 take`, DSV41_STQ_TINY and DSV41_TINY at 512 to 8192 rows, one row in, all experts cached; the pair-major tiny is left out: tile order is fixed at the slab fill, never in the forward pool): the shape sum at the pools taken sits over the

@@ -119,7 +119,9 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   teardown asking MLX nothing, an exact speculative request saying its greedy tokens, fault sweeps over the load and a
   request, nothing compiled after it, and a load of more than one row (`coolerRows`) giving each row its solo request's
   tokens (the arch's `greedyRows`; skipped at one row). It holds no cell against the MLX load: Sushi Cooler is proven.
-  Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. An arch on Sushi
+  Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. A contract load makes its
+  trunk as serve does (`model_load.initTrunk`), so the config a cell bills from carries what the load recorded past
+  the parse (DeepSeek's wide arms). An arch on Sushi
   Cooler is admitted by declaring it. A cell runs on the fixtures whose paths differ for its property: every fixture
   (`eachFixture`: a kernel, a bill or a late compile, which a geometry changes), one per arch and expert layout
   (`eachLayout`, residency and tile order: the loader, its cleanup, the calls a request makes), one per arch and
