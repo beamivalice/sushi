@@ -1698,3 +1698,65 @@ test "r173-f-bare-json-preamble: a finished bare-JSON call's own JSON is the cal
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+test "r173-f-bare-json-hold: an ordinary reply with tools declared streams: each wait the bare-JSON hold takes ends at the first byte that rules out a call, and the stream sends what the whole reply returns" {
+    const a = testing.allocator;
+    // `rule_out` is the byte that rules the waiting arm's call out: the prefix before it is held, the prefix through it
+    // is not.
+    const Case = struct { text: []const u8, rule_out: usize };
+    const py = "Here it is:\n```python\ndef f():\n    return [1, 2]\n```\nDone.";
+    const data = "The record:\n```json\n{\"id\": 1, \"tags\": [\"a\", \"b\"]}\n```\nDone.";
+    const brace = "In C, write if (x) {\n  y();\n}\nand return.";
+    const inline_ = "`ls -la` lists files; ```x``` is code too.";
+    const fence_inline = "```x``` is code.";
+    const list = "Pick from [\n1, 2] and go.";
+    const cases = [_]Case{
+        .{ .text = py, .rule_out = std.mem.indexOf(u8, py, "def").? },
+        .{ .text = data, .rule_out = std.mem.indexOf(u8, data, "id").? },
+        .{ .text = brace, .rule_out = std.mem.indexOf(u8, brace, "y()").? },
+        .{ .text = inline_, .rule_out = 1 },
+        .{ .text = fence_inline, .rule_out = 4 },
+        .{ .text = list, .rule_out = std.mem.indexOf(u8, list, "1,").? },
+    };
+    // A wait never lasts longer than the line that took it.
+    const longest_wait = 16;
+    var bad: usize = 0;
+    for (cases) |c| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const whole = think_tags.splitThinkBlock(s.text, true, false).content;
+        if (s.reply != null or !std.mem.eql(u8, whole, c.text)) {
+            bad += 1;
+            std.debug.print("{f}: whole calls={d} content={f}\n", .{ std.zig.fmtString(c.text), if (s.reply) |r| r.calls.len else 0, std.zig.fmtString(whole) });
+        }
+        var scan: think_tags.ToolHoldScan = .{};
+        var run: usize = 0;
+        var longest: usize = 0;
+        for (1..c.text.len + 1) |end| {
+            const held = think_tags.streamShouldBufferForToolsScan(c.text[0..end], &scan);
+            run = if (held) run + 1 else 0;
+            longest = @max(longest, run);
+            if (end == c.rule_out and !held) {
+                bad += 1;
+                std.debug.print("{f}: the arm under test did not wait at {d}\n", .{ std.zig.fmtString(c.text), end });
+            }
+            if (end == c.rule_out + 1 and held) {
+                bad += 1;
+                std.debug.print("{f}: still held after the byte that rules the call out ({d})\n", .{ std.zig.fmtString(c.text), end });
+            }
+            if (held) continue;
+            const sent = think_tags.splitThinkBlock(c.text[0..end], true, false).content;
+            if (!std.mem.startsWith(u8, whole, sent)) {
+                bad += 1;
+                std.debug.print("{f}: the stream sent {f}, not a prefix of the whole reply\n", .{ std.zig.fmtString(c.text), std.zig.fmtString(sent) });
+                break;
+            }
+        }
+        if (run > 0 or longest > longest_wait) {
+            bad += 1;
+            std.debug.print("{f}: held to the end={} longest wait {d} bytes\n", .{ std.zig.fmtString(c.text), run > 0, longest });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
