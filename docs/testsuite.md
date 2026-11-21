@@ -106,6 +106,13 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   The slow tests: `sort -t$'\t' -k4,4rn <file> | head`.
   `SUSHI_TEST_SELECT` (one name prefix a line, `!<prefix>` drops) makes the runner run only the tests it selects, so
   several run steps can share one binary; one that selects nothing fails, naming its step.
+- **An env set at the invocation reaches every test**: a run step gets only its own variables (`SUSHI_TEST_STEP`,
+  `SUSHI_TEST_SELECT`, `SUSHI_TEST_FIXTURE_CUT`, `SUSHI_TEST_LOG`, the step's `SUSHI_PREFIX_FS`, `QWEN_PREPROCESS_FIXTURE`) as
+  `--env=NAME=VALUE` arguments, never through `run.setEnvironmentVariable`, which snapshots the build's whole environment
+  into the cached configure and replays it over the next invocation's (`SUSHI_CONTRACT_FIXTURE`, the fixture envs, any
+  `SUSHI_*` a test reads); the runner sets them over the live environment and refuses, naming it, one the invocation
+  also sets to another value. `tests/test_build_cache_env.sh` (hermetic tier) runs `zig build test-host` twice per env
+  and reads what the test saw (`SUSHI_TEST_ENV_DUMP`).
 - Every test compile and run step declares its peak RSS (`max_rss`: a domain's `compile_gib` and `run_gib` in
   build.zig, `exl3_test_bins` alike), so `zig build test --maxrss <bytes>` runs only the steps that fit at once. A
   compile's is its measured cold MaxRSS; a run's is generous, since RSS does not see Metal. A step that can load the

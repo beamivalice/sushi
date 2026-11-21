@@ -113,16 +113,37 @@ fn isSelected(name: []const u8) bool {
     return kept;
 }
 
-/// The runner's own copy of the environment it started with, array and strings. A test's setenv or unsetenv rebuilds
+/// The runner's own copy of the process environment, array and strings. A test's setenv or unsetenv rebuilds
 /// libc's environment and can free the array (and the strings libc made) that the start block points into, so every
 /// later read the runner and each test's Io make goes through this copy.
 fn ownedEnviron(start: std.process.Environ) std.process.Environ {
     if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return start;
     const gpa = std.heap.page_allocator;
-    const from = start.block.slice;
-    const copy = gpa.allocSentinel(?[*:0]const u8, from.len, null) catch @panic("OOM");
-    for (from, copy) |entry, *out| out.* = (gpa.dupeSentinel(u8, std.mem.span(entry.?), 0) catch @panic("OOM")).ptr;
+    var n: usize = 0;
+    while (std.c.environ[n] != null) n += 1;
+    const copy = gpa.allocSentinel(?[*:0]const u8, n, null) catch @panic("OOM");
+    for (copy, std.c.environ[0..n]) |*out, entry| out.* = (gpa.dupeSentinel(u8, std.mem.span(entry.?), 0) catch @panic("OOM")).ptr;
     return .{ .block = .{ .slice = copy } };
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+/// The run step's own variables arrive as `--env=NAME=VALUE`, not in the environment the build runner hands the process:
+/// a run step's environment is a snapshot taken at configure, and a cached configure replays it, so a variable set at
+/// this invocation would never reach the test. The process keeps the invocation's environment as it is now and takes
+/// the step's on top; a name the invocation also sets to another value is refused, naming it.
+fn applyStepEnv(args: []const [:0]const u8) void {
+    for (args) |arg| {
+        const pair = std.mem.cutPrefix(u8, arg, "--env=") orelse continue;
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse panic("{s}: expected --env=NAME=VALUE", .{arg});
+        const name = std.heap.page_allocator.dupeSentinel(u8, pair[0..eq], 0) catch @panic("OOM");
+        const value = std.heap.page_allocator.dupeSentinel(u8, pair[eq + 1 ..], 0) catch @panic("OOM");
+        if (std.c.getenv(name)) |set| if (!std.mem.eql(u8, std.mem.span(set), value)) {
+            std.debug.print("{s} is set to '{s}' at this invocation, but the run step sets it to '{s}': unset it (the step owns it)\n", .{ name, std.mem.span(set), value });
+            std.process.exit(1);
+        };
+        if (setenv(name, value, 1) != 0) panic("setenv {s} failed", .{name});
+    }
 }
 
 /// A step that can load the Qwen cut gets `SUSHI_TEST_FIXTURE_CUT`: `1` when the build declared the cut's memory
@@ -185,8 +206,6 @@ pub const std_options: std.Options = .{
 };
 
 var log_err_count: usize = 0;
-var fba: std.heap.FixedBufferAllocator = .init(&fba_buffer);
-var fba_buffer: [8192]u8 = undefined;
 var stdin_buffer: [4096]u8 = undefined;
 var stdout_buffer: [4096]u8 = undefined;
 var stdin_reader: Io.File.Reader = undefined;
@@ -206,8 +225,6 @@ const need_simple = switch (builtin.zig_backend) {
 
 pub fn main(start: std.process.Init.Minimal) void {
     @disableInstrumentation();
-    const init: std.process.Init.Minimal = .{ .environ = ownedEnviron(start.environ), .args = start.args };
-
     if (builtin.cpu.arch.isSpirV()) {
         // SPIR-V needs an special test-runner
         return;
@@ -217,7 +234,9 @@ pub fn main(start: std.process.Init.Minimal) void {
         return mainSimple() catch |err| panic("test failure: {t}", .{err});
     }
 
-    const args = init.args.toSlice(fba.allocator()) catch |err| panic("unable to parse command line args: {t}", .{err});
+    const args = start.args.toSlice(std.heap.page_allocator) catch |err| panic("unable to parse command line args: {t}", .{err});
+    applyStepEnv(args[1..]);
+    const init: std.process.Init.Minimal = .{ .environ = ownedEnviron(start.environ), .args = start.args };
 
     var listen = false;
     var opt_cache_dir: ?[]const u8 = null;
@@ -230,6 +249,8 @@ pub fn main(start: std.process.Init.Minimal) void {
                 @panic("unable to parse --seed command line argument");
         } else if (std.mem.startsWith(u8, arg, "--cache-dir")) {
             opt_cache_dir = arg["--cache-dir=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--env=")) {
+            // Taken by `applyStepEnv` above.
         } else {
             panic("unrecognized command line argument: {s}", .{arg});
         }

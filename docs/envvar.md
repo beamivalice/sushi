@@ -37,7 +37,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_FIXTURE_ROWS` | `qwen4_fixture_test.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
 | `SUSHI_TEST_NO_GPU` | `mlx.zig` (`testNoGpuEnv`) | a test build sees no Metal backend, so `requireGpu` tests skip | test | yes: testsuite |
 | `SUSHI_TEST_LOG` | `scripts/test_runner.zig` (`main`) | `<abs path>` (`-Dtest-log` sets it): every test appends `<UTC>\t<step>\t<PASS\|SKIP\|FAIL>\t<ms>\t<name>`, its at-rest check included, and each process a `DONE` line with its totals; prints nothing; a relative path panics | test | yes: testsuite |
-| `SUSHI_TEST_STEP` | `scripts/test_runner.zig` (`main`) | the run step's name, which the log lines and a refusal carry (the build sets it on every test run step); `SUSHI_TEST_LOG` without it panics | test | yes: testsuite |
+| `SUSHI_TEST_STEP` | `scripts/test_runner.zig` (`main`) | the run step's name, which the log lines and a refusal carry (the build passes it on every test run step as `--env=`; the runner refuses a different value set at the invocation); `SUSHI_TEST_LOG` without it panics | test | yes: testsuite |
 | `SUSHI_TEST_SELECT` | `scripts/test_runner.zig` (`main`, `isSelected`) | one test-name prefix a line, and `!<prefix>` lines that drop what they match: the process runs only the tests it selects; one that selects none fails, naming `SUSHI_TEST_STEP`; unset, every test runs | test | yes: testsuite |
 | `SUSHI_TEST_FIXTURE_CUT` | `scripts/test_runner.zig` (`refuseUndeclaredCut`) | set by the build on a run step that can load the Qwen cut: `1` under `-Dfixture-cut=true`, `0` without, and a `0` step that sees `QWEN4_TEST_MODEL` fails before its first test, naming the flag | test | yes: testsuite |
 | `QWEN4_GDN_CHECK` | `qwen4_gdn.zig:2703, 2849` | runs the composed GDN prework beside the fused kernel and compares | once | no |
@@ -111,7 +111,7 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_LEVER`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load, the untimed first one logged; arm list; `decoded`: arm 0 keeps the trunk on the sorted GEMM instead of the NAX reference body; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
-## Test-only seams (58)
+## Test-only seams (59)
 
 Inputs and hooks that real-pack tests and scripts use.
 
@@ -132,6 +132,7 @@ Inputs and hooks that real-pack tests and scripts use.
 | `SUSHI_MLX_FAULT_CHUNK`, `SUSHI_MLX_FAULT_STEP` | `mlx.zig` | `<n>` latches a synthetic Metal OOM at the n-th prefill-chunk check / decode step (`tests/test_mlx_error_recovery.sh`) | once | yes: tests/CLAUDE |
 | `SUSHI_TEST_CRASH_AFTER_LANDINGS` | `kv_disk_writer.zig` (`noteLanding`) | `<k>` kills the process (SIGKILL) once the SSD writer has landed k of a tier's files (a rename, or an op's publish on the content-addressed layer; never the pace probe), so a crash test cuts the writer between two landings (`tests/replay_ssd_writes.py` flow `crash`) | once | yes: engine-prefix-cache, tests/CLAUDE |
 | `SUSHI_TEST_LOAD_DELAY_MS` | `model_load.zig` (`startupLoadDelayMs`) | `<ms>` holds the `--model` startup load after its refusals, before the weights, so a test can observe the server listening during the load (`tests/test_early_listener.sh`) | load | yes: server-lifecycle, tests/CLAUDE |
+| `SUSHI_TEST_ENV_DUMP` | `test_env.zig` | `<abs path>`: the `test env` test writes the process's `SUSHI_*` variables there as `NAME=VALUE` lines, which `tests/test_build_cache_env.sh` reads to prove an env set at the invocation reaches the test; unset, it skips | test | yes: testsuite |
 | `SUSHI_MODELS_DIR` | `test_models.zig:7` | root for real-pack tests (`${SUSHI_MODELS_DIR:-~/.sushi/models}`); the engine itself does not read it | test | yes: tests/CLAUDE |
 | `SUSHI_NO_SUCH_DIAG_SWITCH_PROBE` | `trunk.zig` | unit probe that `diagEnvOnCached` honors `0`/empty/set | test | no |
 | `SUSHIBAR_TEST_POLLS`, `SUSHIBAR_TEST_ACTIONS` | `sushibar_main.zig` (`readTestSeams`) | `sushibar` (not the engine): `N` prints each poll's title, status, Port data, version, note, header (stat labels and spoken text too) and button lines to stderr and quits after N polls; `start@2,stop@10,load@4,unload@8,check@3,update@4,menu@2,port18802@2,remove18802@3,type8080@3,lan@2,confirm@1` runs that action at that poll (`models<port>` asks that sushi listener for its models, as opening the Port submenu asks every one) (`remove<port>` forgets that added port, as its x button does; `type<N>` types N into the Port field and applies it; `lan` flips the Listen on LAN switch, as its menu item does; `confirm` answers every stop confirmation Yes; without it a test never stops a sushi it did not start) (`tests/test_sushibar.sh`) | once | yes: tests/CLAUDE |

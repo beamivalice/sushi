@@ -21,6 +21,7 @@ test {
             inline for (registry.Tests(tag).host_tests) |file| _ = file;
         }
     }
+    _ = @import("test_env.zig");
     _ = @import("chat.zig");
     _ = @import("tool_schema.zig");
     _ = @import("tool_calls.zig");

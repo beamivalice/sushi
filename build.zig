@@ -1294,8 +1294,10 @@ const TestRuns = struct {
         const run = b.addRunArtifact(compile);
         runEveryTime(run);
         run.setName(b.fmt("run {s}", .{name}));
-        for (all.items) |kv| run.setEnvironmentVariable(kv[0], kv[1]);
-        if (self.log) |path| run.setEnvironmentVariable("SUSHI_TEST_LOG", path);
+        // The step's variables ride the argv, never `run.setEnvironmentVariable`: that snapshots the build's whole environment
+        // into the configuration, and a cached configure would replay it over the environment this invocation sets.
+        for (all.items) |kv| run.addArg(b.fmt("--env={s}={s}", .{ kv[0], kv[1] }));
+        if (self.log) |path| run.addArg(b.fmt("--env=SUSHI_TEST_LOG={s}", .{path}));
         run.step.max_rss = (if (self.fixture_cut and holds_cut) cut_run_gib else run_gib) * gib;
         return run;
     }
