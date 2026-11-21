@@ -461,11 +461,12 @@ pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelCon
 }
 
 /// What the caches give the next chunk, read where the width is asked at `kv_len` rows in (`bills.chunkGrowthBytes`
-/// prices the growth from it): the KV buffers' rows and the QSA history's.
-fn chunkRoom(ctx: *const ForwardCtx, config: *const model_mod.ModelConfig, kv_len: usize) trunk.Room {
+/// prices the growth from it): the KV buffers' rows, the QSA history's and the arch's own row stores' (`Room.rows`).
+fn chunkRoom(xfm: *Trunk, ctx: *const ForwardCtx, config: *const model_mod.ModelConfig, kv_len: usize) !trunk.Room {
     var room = ctx.cache.roomAt(kv_len);
     const ratio: u64 = @max(config.indexer_compress_ratio, 1);
     room.state_free = prefix_arch.aux.qsaPooledCapacity(ctx.ssm_entries) -| (kv_len + ratio - 1) / ratio;
+    try prefix_arch.rowCaps(xfm, ctx, &room.rows);
     return room;
 }
 
@@ -1562,7 +1563,7 @@ pub const Generator = struct {
                 adapt_state.width_min = @intCast(start_chunk);
                 adapt_state.width_max = @intCast(start_chunk);
                 if (options.chunk_width_hook) |hk| {
-                    adapt_state.room = chunkRoom(&ctx, &xfm.config, ssm_cp_offset);
+                    adapt_state.room = try chunkRoom(xfm, &ctx, &xfm.config, ssm_cp_offset);
                     const w = hk.call(hk.ctx, ssm_cp_offset, @intCast(cur_chunk), cap_adapt, &adapt_state);
                     if (w != 0 and w < cur_chunk) mtp_plan.commitAdaptiveWidth(&cur_chunk, &adapt_state, w);
                 }
@@ -1807,7 +1808,7 @@ pub const Generator = struct {
                 var widen_ctx: ?*anyopaque = null;
                 if (adapt_chunked and pos < loop_end) {
                     if (options.chunk_width_hook) |hk| {
-                        adapt_state.room = chunkRoom(&ctx, &xfm.config, ssm_cp_offset + pos);
+                        adapt_state.room = try chunkRoom(xfm, &ctx, &xfm.config, ssm_cp_offset + pos);
                         const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
                         if (next_w != 0 and next_w != cur_chunk) {
                             if (next_w < cur_chunk) {

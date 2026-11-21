@@ -3,6 +3,7 @@
 const std = @import("std");
 const log = @import("../log.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const pool_class = @import("../tensor/pool_class.zig");
 
 pub const max_layers = 64;
 pub const max_engram = 4;
@@ -293,6 +294,25 @@ pub const Config = struct {
         return if (engine) self.forwardCap(rows, seq) else self.mlxForwardCap(rows, seq);
     }
 
+    /// What a forward of `rows` rows from position `kv_len` makes of the row stores, which hold `caps` rows a layer: each
+    /// store its rows overflow is regrown by `grownRows`, its codes and its scales a buffer each at their pool size class.
+    /// Returns those buffers' bytes; `caps` becomes what the stores hold after.
+    pub fn growRowStores(self: *const Config, caps: *[max_layers]u32, kv_len: u64, rows: u64) u64 {
+        var bytes: u64 = 0;
+        for (0..self.layers) |l| {
+            if (!self.isKvSource(l)) continue;
+            const r: u64 = @max(self.ratios[l], 1);
+            const used = kv_len / r;
+            const n = (kv_len +| rows) / r - used;
+            if (used + n <= caps[l]) continue;
+            const grown = grownRows(caps[l], used, n);
+            caps[l] = @intCast(grown);
+            bytes += packedStoreBytes(grown, self.head_dim, 16);
+            if (self.isOwner(l)) bytes += packedStoreBytes(grown, self.index_head_dim, 32);
+        }
+        return bytes;
+    }
+
     fn growthBytes(self: *const Config, ctx: u64) u64 {
         return ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
     }
@@ -324,6 +344,11 @@ const act_bytes: u64 = 2;
 /// A compressed KV row: FP4 codes and one E4M3 scale per 16.
 fn compRowBytes(width: u64) u64 {
     return width / 2 + width / 16;
+}
+
+/// A packed store of `rows` rows of `width` values: its codes and its scales, each a pool buffer.
+fn packedStoreBytes(rows: u64, width: u64, group: u64) u64 {
+    return pool_class.poolBytes(@intCast(rows * (width / 2))) + pool_class.poolBytes(@intCast(rows * (width / group)));
 }
 
 /// An index key: FP4 codes and one E8M0 scale per 32.
@@ -372,6 +397,18 @@ pub const narrow_rows: u64 = 16;
 pub const verify_rows: u64 = 17;
 /// A row store grows by its length over this: slack is that fraction of the state, and each growth copies the store.
 pub const rows_grow_div: u64 = 16;
+
+/// The rows a row store of `cap` rows that holds `used` has once it appends `n` (`dsv41_model.Rows.append`): as it is
+/// while they fit, else the rows it needs or its capacity a sixteenth over, the larger, and at least 64.
+pub fn grownRows(cap: u64, used: u64, n: u64) u64 {
+    if (used + n <= cap) return cap;
+    return @max(used + n, @max(64, cap + cap / rows_grow_div));
+}
+
+/// The rows `dsv41_model.Rows.reserve` makes a store holding `used` rows: the slack its next append would have taken.
+pub fn reservedRows(used: u64) u64 {
+    return @max(64, used + @max(1, used / rows_grow_div));
+}
 
 fn refuse(comptime fmt: []const u8, args: anytype) error{UnsupportedDsv41Config} {
     log.err("deepseek_v41: " ++ fmt ++ "\n", args);

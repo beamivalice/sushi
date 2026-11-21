@@ -112,6 +112,8 @@ The request bill (`dsv41_bill.requestBill`) takes the larger of the chunk's cap 
 (`seq + max_tokens + 17`, where the last verify runs), and on Sushi Cooler the cap less its margin: `bills.billMargin`
 adds the one margin, which a cap taken whole billed twice (512 MB, not 256).
 
+A prefill chunk's cache growth is priced by the rule the stores grow by, from the rows each layer holds at the chunk's boundary (`dsv41_bill.chunkGrowthBytes`, `dsv41_config.grownRows`), not by the KV cache's +25% step.
+
 <a id="wide-shape-sum"></a>
 **The shape sum** (`dsv41_wide_bytes.bytes`, Sushi Cooler) is what the engine's pool holds in use at the fullest point
 of a wide forward, each tensor at its pool size class, from the shapes the forward makes. A layer's intermediates live

@@ -289,6 +289,14 @@ pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *trunk.Trunk, ctx: *
     }
 }
 
+/// The rows each layer's own row stores hold now, into the chunk's room (`trunk.Room.rows`); untouched where the arch
+/// keeps none beside its KV cache.
+pub fn rowCaps(xfm: *trunk.Trunk, ctx: *const trunk.ForwardCtx, into: *@FieldType(trunk.Room, "rows")) !void {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(P(t), "rowCaps")) try P(t).rowCaps(m, ctx, into),
+    }
+}
+
 /// Checkpoints one RAM entry or one prefill keeps in memory, when the arch caps them below the launch value `global`.
 pub fn checkpointMax(config: *const model.ModelConfig, global: u32) u32 {
     const tag = registry.ofModelType(config.model_type) orelse return global;

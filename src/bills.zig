@@ -3003,6 +3003,8 @@ fn chunkGrowth(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, ro
 /// (`pooledCacheBytes`) beside the old one, which the pool's in-use reading already counts: the whole new buffer is
 /// what the chunk takes. A cache with the rows to spare grows nothing.
 pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room) u64 {
+    // An arch whose rows are not the KV cache's grows them by its own rule, from the capacity it holds.
+    if (archHook("chunkGrowthBytes", u64, config, .{ width, kv_len, room })) |bytes| return bytes;
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const state_tok = statePerTokenBilled(config);
     if (!cooler_side.onEngine(config)) return width *| (kv_tok +| state_tok);
@@ -3013,6 +3015,7 @@ pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, widt
 /// The room a cache gives the chunk after the one `chunkGrowth` priced, which grew it to those rows: a cold cache's, which the
 /// policy alone grows (a reservation's rows are its commit's, which this does not walk).
 fn roomAfter(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: trunk.Room) trunk.Room {
+    if (archHook("roomAfter", trunk.Room, config, .{ width, kv_len, room })) |after| return after;
     const ratio: u64 = @max(config.indexer_compress_ratio, 1);
     const grown = chunkGrowth(config, width, kv_len, room);
     const end = kv_len +| width;

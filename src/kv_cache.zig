@@ -306,6 +306,9 @@ pub const Hold = struct {
     }
 };
 
+/// Cache layers whose own row stores a `Room` reports (`Room.rows`): DeepSeek's backbone layers.
+pub const store_layers_max = 64;
+
 /// What a prefill chunk finds in the cache it grows (`KVCache.roomAt`), which `bills.chunkGrowthBytes` prices the growth
 /// from. The default is a full cache no request has bound: the growth the policy makes from the rows stored.
 pub const Room = struct {
@@ -314,6 +317,9 @@ pub const Room = struct {
     /// History rows (one per `indexer_compress_ratio` tokens) the buffers hold past those the stored tokens fill.
     state_free: u64 = 0,
     hold: Hold = .{ .end = std.math.maxInt(u32) },
+    /// Rows each layer's own row stores hold (an arch that keeps them beside the KV cache: DeepSeek's compressed rows),
+    /// by layer; 0 where a layer has none or none is made yet. The arch's bill grows them by the rule they grow by.
+    rows: [store_layers_max]u32 = @splat(0),
 };
 
 pub const KVCache = struct {

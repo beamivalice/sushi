@@ -105,6 +105,78 @@ test "cooler contract: a Cooler prefill chunk, the widest on the load's first re
     }.run);
 }
 
+/// A prefill's chunk boundaries as the served width hook meets them: where each is, the room the loop reads there and
+/// the arch's row stores.
+fn BoundaryLog(comptime D: type) type {
+    return struct {
+        const Self = @This();
+        const Room = @import("kv_cache.zig").Room;
+        xfm: *@import("trunk.zig").Trunk,
+        n: usize = 0,
+        pos: [128]usize = undefined,
+        room: [128]Room = undefined,
+        stores: [128]D.RowStores = undefined,
+        failed: ?anyerror = null,
+
+        fn call(ctx: *anyopaque, pos: usize, cur: u32, cap: u32, st: *@import("mtp_plan.zig").AdaptiveWidthState) u32 {
+            _ = cur;
+            _ = cap;
+            const self: *Self = @ptrCast(@alignCast(ctx));
+            if (self.n == self.pos.len) return 0;
+            self.pos[self.n] = pos;
+            self.room[self.n] = st.room;
+            self.stores[self.n] = D.rowStores(self.xfm) catch |e| blk: {
+                self.failed = e;
+                break :blk .{};
+            };
+            self.n += 1;
+            return 0;
+        }
+
+        fn confirm(_: *anyopaque, _: usize, _: u32) bool {
+            return false;
+        }
+    };
+}
+
+test "cooler contract: a DeepSeek chunk's cache growth is billed from the rows its stores hold at the chunk's boundary, as its stores grow" {
+    try servedOn("dsv41", &.{"DSV41_STQ_TINY"}, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const bills = @import("bills.zig");
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            // Narrow chunks of a long prompt: the stores' growth is the policy's sixteenth in some, the rows asked in others.
+            const prompt = try a.alloc(u32, 3000);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+            const Log = BoundaryLog(D);
+            var log: Log = .{ .xfm = ld.xfm };
+            var got = try serialWith(&ld, prompt, 1, .{ .temperature = 0.0 }, .{ .pinned_prefill_chunk = 64, .chunk_width_hook = .{ .ctx = &log, .call = Log.call, .confirm = Log.confirm } });
+            got.deinit(a);
+            if (log.failed) |e| return e;
+            const bits = bills.defaultKvBits(&ld.config);
+            var wrong: usize = 0;
+            var grew: usize = 0;
+            var stayed: usize = 0;
+            for (0..log.n - 1) |k| {
+                const rows = log.pos[k + 1] - log.pos[k];
+                const billed = bills.chunkGrowthBytes(&ld.config, bits, rows, log.pos[k], log.room[k]);
+                const took = log.stores[k].madeBy(&log.stores[k + 1]);
+                if (took > 0) grew += 1 else stayed += 1;
+                if (billed != took) {
+                    wrong += 1;
+                    if (wrong <= 6) std.debug.print("cooler contract: the {d}-row chunk at {d}: billed {d} B of growth, its stores took {d} B\n", .{ rows, log.pos[k], billed, took });
+                }
+            }
+            // The prompt reaches both: chunks that regrow the stores and chunks that fit the rows they hold.
+            try testing.expect(grew > 0 and stayed > 0);
+            try testing.expectEqual(@as(usize, 0), wrong);
+        }
+    }.run);
+}
+
 test "cooler contract: a contract load bills a chunk from what its trunk serves, the facts its load recorded past the parse (a probe serving the arm the parse did not guess) included" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {

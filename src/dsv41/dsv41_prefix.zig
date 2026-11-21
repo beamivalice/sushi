@@ -398,6 +398,16 @@ pub fn restorePointModel(xfm: *const transformer.Trunk) bool {
     return dsv41_state.modelOf(xfm) != null;
 }
 
+/// The rows each layer's row stores hold between two chunks of a prefill (`dsv41_model.rowCaps`): the state the request
+/// will run, else the model's own.
+pub fn rowCaps(xfm: *transformer.Trunk, ctx: *const transformer.ForwardCtx, into: *[cfg_mod.max_layers]u32) !void {
+    const m = dsv41_state.modelOf(xfm) orelse return;
+    const lent = model.lendFor(m, dsv41_state.requestOf(ctx)) orelse (if (m.serves_rows) model.lendOwn(m) else null);
+    defer if (lent) |l| l.end();
+    const st = (try model.currentState(m)) orelse return;
+    model.rowCaps(st, into);
+}
+
 pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, ctx: *const transformer.ForwardCtx, pos: usize, to_ssd: bool) !?SSMCheckpoint {
     const m = dsv41_state.modelOf(xfm) orelse return null;
     const lent = model.lendFor(m, dsv41_state.requestOf(ctx));

@@ -6,6 +6,7 @@ const model_mod = @import("../model.zig");
 const Trunk = @import("../trunk.zig").Trunk;
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_state = @import("dsv41_state.zig");
+const pool_class = @import("../tensor/pool_class.zig");
 const Generator = @import("../generate.zig").Generator;
 const Tokenizer = @import("../tokenizer.zig").Tokenizer;
 
@@ -36,6 +37,44 @@ pub fn prepare(a: std.mem.Allocator, config: *model_mod.ModelConfig, dir: []cons
 /// config that kept the guess prices a wide forward the model does not run.
 pub fn armsAgainstParse(on: bool) void {
     @import("dsv41_kernels.zig").hc_expand_probe_override = if (on) !@import("sushi_exl3").kernels.gemmNaxOn() else null;
+}
+
+/// What each layer's row stores of the state the model runs hold now: the rows of their buffers (0 where a layer keeps
+/// none) and those buffers' bytes at their pool size classes. Read between forwards.
+pub const RowStores = struct {
+    rows: [64]u32 = @splat(0),
+    bytes: [64]u64 = @splat(0),
+
+    pub fn total(self: *const RowStores) u64 {
+        var sum: u64 = 0;
+        for (self.bytes) |b| sum += b;
+        return sum;
+    }
+
+    /// What a chunk made between `self` and `after`: the buffers of each layer whose store regrew, as they are in `after`
+    /// (the old buffer is in use beside them already).
+    pub fn madeBy(self: *const RowStores, after: *const RowStores) u64 {
+        var sum: u64 = 0;
+        for (self.rows, after.rows, after.bytes) |was, now, b| {
+            if (now != was) sum += b;
+        }
+        return sum;
+    }
+};
+
+pub fn rowStores(xfm: *Trunk) !RowStores {
+    const m = dsv41_state.modelOf(xfm).?;
+    const lent = dsv41_model.lendOwn(m);
+    defer lent.end();
+    var out: RowStores = .{};
+    const st = (try dsv41_model.currentState(m)) orelse return out;
+    for (st.layers, 0..) |*ls, li| {
+        if (ls.comp) |r| out.rows[li] = @intCast(r.cap);
+        for ([_]?dsv41_model.Rows{ ls.comp, ls.idx_k }) |rows| if (rows) |r| {
+            out.bytes[li] += pool_class.poolBytes(dsv41_model.arrayBytes(r.buf.array)) + pool_class.poolBytes(dsv41_model.arrayBytes(r.sbuf.array));
+        };
+    }
+    return out;
 }
 
 /// The served tiny ends a chat or Responses reply within a few tokens, and holds 128: a long reply is a completion

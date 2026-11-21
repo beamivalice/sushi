@@ -390,7 +390,7 @@ pub const Rows = struct {
     /// The grow the next append would make, made now: a buffer of this state's own with that append's slack.
     fn reserve(self: *Rows, s: S) !void {
         if (self.used == 0) return;
-        const cap = self.pagedCap(@max(64, self.used + @max(1, self.used / cfg_mod.rows_grow_div)), s);
+        const cap = self.pagedCap(cfg_mod.reservedRows(self.used), s);
         if (self.pack) |pk| {
             try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
             try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
@@ -413,7 +413,7 @@ pub const Rows = struct {
         if (n == 0) return;
         const s = sc.s;
         if (self.used + n > self.cap) {
-            const cap = self.pagedCap(@max(self.used + n, @max(64, self.cap + self.cap / cfg_mod.rows_grow_div)), s);
+            const cap = self.pagedCap(cfg_mod.grownRows(self.cap, self.used, n), s);
             if (self.pack) |pk| {
                 try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
                 try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
@@ -3470,6 +3470,11 @@ pub fn checkLent(m: *const Model) !void {
 fn liveSlot(m: *Model) !*?State {
     try checkLent(m);
     return if (m.bound) |r| &r.state else &m.dec_state;
+}
+
+/// The rows each layer's compressed-row store holds now, by layer (`kv_cache.Room.rows`); 0 where a layer has none.
+pub fn rowCaps(st: *const State, into: *[cfg_mod.max_layers]u32) void {
+    for (st.layers, 0..) |*ls, li| into[li] = if (ls.comp) |r| @intCast(r.cap) else 0;
 }
 
 /// The state the model runs; null when it holds none.

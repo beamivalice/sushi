@@ -9,6 +9,11 @@ const dsv41_prefix = @import("dsv41_prefix.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
 const prefill_plan = @import("../prefill_plan.zig");
 const prefix_cache_mod = @import("../prefix_cache.zig");
+const Room = @import("../kv_cache.zig").Room;
+
+comptime {
+    std.debug.assert(dsv41_config.max_layers == @import("../kv_cache.zig").store_layers_max);
+}
 
 /// The restore points a DeepSeek prefill holds in RAM while it runs: with a RAM tier the capped list plus the copy
 /// taken before a thin, each a full copy of the state at most `seq` tokens deep; SSD-first only what is in flight to
@@ -74,6 +79,24 @@ pub fn chunkTransientAt(config: *const model_mod.ModelConfig, kv_bits: u64, widt
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
     return c.forwardCapOn(@import("../cooler_side.zig").onEngine(config), width, kv_len +| width) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
+}
+
+/// What a prefill chunk of `width` rows from `kv_len` adds to the cache on a Cooler load: the row stores its rows overflow,
+/// regrown from the rows each holds (`room.rows`) by the rule `Rows.append` grows them by. Not the KV cache's policy.
+pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: Room) ?u64 {
+    const c = config.dsv41 orelse return null;
+    if (!@import("../cooler_side.zig").onEngine(config)) return null;
+    var caps = room.rows;
+    return c.growRowStores(&caps, kv_len, width);
+}
+
+/// The room the next chunk finds once the one of `width` rows from `kv_len` has grown the stores.
+pub fn roomAfter(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: Room) ?Room {
+    const c = config.dsv41 orelse return null;
+    if (!@import("../cooler_side.zig").onEngine(config)) return null;
+    var after = room;
+    _ = c.growRowStores(&after.rows, kv_len, width);
+    return after;
 }
 
 pub fn sessionBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
