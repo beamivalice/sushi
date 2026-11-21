@@ -14,7 +14,7 @@ pub const Family = struct {
     closers: []const []const u8,
     /// Spellings that begin with an opener and are another dialect's closer.
     not_openers: []const []const u8 = &.{},
-    reads_as_call: ?*const fn (tail: []const u8) bool = null,
+    reads_as_call: ?*const fn (text: []const u8, at: usize, scan: *Scan) bool = null,
     /// How the dialect writes a parameter value: a closer spelled inside one is the value's text, not the call's close.
     values: tool_calls.ValueSpans,
     /// Holds calls of other families (`<｜DSML｜tool_calls>`, `<function_calls>`): they are read where they stand,
@@ -40,8 +40,8 @@ pub const families = [_]Family{
 };
 
 /// `<|tool_call>call:name{…`: the body starts with `call:`, or has not got that far.
-fn gemmaReadsAsCall(tail: []const u8) bool {
-    const rest = tail["<|tool_call".len..];
+fn gemmaReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
+    const rest = text[at + "<|tool_call".len ..];
     if (rest.len == 0) return true;
     if (rest[0] != '>') return false;
     const body = std.mem.trimStart(u8, rest[1..], " \t\r\n");
@@ -50,7 +50,8 @@ fn gemmaReadsAsCall(tail: []const u8) bool {
 
 /// A bare `<tool_call>` opens a call when a JSON object, a tag or a tool name leads its body, or the text stops
 /// there: `I could emit <tool_call> here` is prose. Another spelling (`<tool_call name=`, `<tool_calls>`) is a call.
-fn wrapperReadsAsCall(tail: []const u8) bool {
+fn wrapperReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
+    const tail = text[at..];
     const open = "<tool_call";
     if (tail.len <= open.len or tail[open.len] != '>') return true;
     const body = std.mem.trimStart(u8, tail[open.len + 1 ..], " \t\r\n");
@@ -62,7 +63,8 @@ fn wrapperReadsAsCall(tail: []const u8) bool {
 
 /// `<tool name="x">{…`, `<tool>{"name":…` and `<tool_request>{…`: the tag's `>` opens a body that is a JSON object or Hermes' function tag.
 /// A self-closing `<tool …/>` is a whole call, never an open one.
-fn genericToolTagReadsAsCall(tail: []const u8) bool {
+fn genericToolTagReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
+    const tail = text[at..];
     const gt = std.mem.indexOfScalar(u8, tail[0..@min(tail.len, 256)], '>') orelse return false;
     if (tail[gt - 1] == '/') return false;
     const body = std.mem.trimStart(u8, tail[gt + 1 ..], " \t\n\r");
@@ -71,7 +73,8 @@ fn genericToolTagReadsAsCall(tail: []const u8) bool {
 }
 
 /// `<invoke name="x">` with a `<parameter ` of its own before the next `<invoke`: the opener alone is prose.
-fn invokeReadsAsCall(tail: []const u8) bool {
+fn invokeReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
+    const tail = text[at..];
     const after = BARE_INVOKE.invoke.len;
     if (tail.len <= after or !std.ascii.isWhitespace(tail[after])) return false;
     const name = tool_calls.dsmlAttr(tail[after..@min(tail.len, after + 512)], "name") orelse return false;
@@ -82,41 +85,110 @@ fn invokeReadsAsCall(tail: []const u8) bool {
 
 /// MiniCPM5's `<function name="x">` with a `<param` after its tag, and Hermes' bare `<function=x>` with a
 /// `<parameter=`: either opener alone is prose.
-fn functionReadsAsCall(tail: []const u8) bool {
-    const after = "<function".len;
-    if (tail.len <= after) return false;
-    if (tail[after] == '=') return std.mem.indexOf(u8, tail, "<parameter=") != null;
-    if (!std.ascii.isWhitespace(tail[after])) return false;
-    const gt = std.mem.indexOfScalarPos(u8, tail, after, '>') orelse return false;
-    const name = tool_calls.miniCpm5AttrValue(tail[after..gt], "name") orelse return false;
-    return name.len > 0 and std.mem.indexOf(u8, tail[gt + 1 ..], "<param") != null;
+fn functionReadsAsCall(text: []const u8, at: usize, scan: *Scan) bool {
+    const after = at + "<function".len;
+    if (after >= text.len) return false;
+    if (text[after] == '=') return scan.parameter_eq.find(text, after, &scan.work) != null;
+    if (!std.ascii.isWhitespace(text[after])) return false;
+    const gt = scan.gt.find(text, after, &scan.work) orelse return false;
+    const name = tool_calls.miniCpm5AttrValue(text[after..gt], "name") orelse return false;
+    return name.len > 0 and scan.param.find(text, gt + 1, &scan.work) != null;
 }
 
-/// Whether `tail`, which starts with an opener of `f`, opens a call there: no other dialect's closer, and the
+/// Whether the text at `at`, which starts with an opener of `f`, opens a call there: no other dialect's closer, and the
 /// dialect's own reading accepts it.
-fn opensCall(f: *const Family, tail: []const u8) bool {
-    for (f.not_openers) |n| if (std.mem.startsWith(u8, tail, n)) return false;
-    return if (f.reads_as_call) |reads| reads(tail) else true;
+fn opensCall(f: *const Family, text: []const u8, at: usize, scan: *Scan) bool {
+    for (f.not_openers) |n| if (std.mem.startsWith(u8, text[at..], n)) return false;
+    return if (f.reads_as_call) |reads| reads(text, at, scan) else true;
 }
 
 /// A call opener found in a text.
 pub const Opener = struct { at: usize, len: usize, family: *const Family };
 
+/// The first place a needle stands at or after a byte, asked for rising bytes: an answer stays valid for every byte
+/// between the one asked and the place found (or, with none found, for every later byte), so a needle is searched
+/// once however many candidates ask.
+const Next = struct {
+    needle: []const u8,
+    from: usize = 0,
+    at: ?usize = null,
+    known: bool = false,
+
+    fn find(self: *Next, text: []const u8, p: usize, work: *usize) ?usize {
+        if (self.known and p >= self.from) {
+            const at = self.at orelse return null;
+            if (at >= p) return at;
+        }
+        self.from = p;
+        self.at = std.mem.indexOfPos(u8, text, p, self.needle);
+        self.known = true;
+        work.* += (self.at orelse text.len) -| p;
+        return self.at;
+    }
+};
+
+const opener_count = blk: {
+    var n: usize = 0;
+    for (families) |f| n += f.openers.len;
+    break :blk n;
+};
+
+/// What reading one text keeps forward, so the read is linear in the text: whether an inline code span is open at a
+/// byte, and where each opener spelling and each needle an opener's reading looks for next stands.
+pub const Scan = struct {
+    fed: usize = 0,
+    state: think_tags.CodeSpan = .{},
+    openers: [opener_count]Next,
+    parameter_eq: Next = .{ .needle = "<parameter=" },
+    param: Next = .{ .needle = "<param" },
+    gt: Next = .{ .needle = ">" },
+    /// Bytes the searches covered; a test holds it to a multiple of the text.
+    work: usize = 0,
+
+    pub fn init() Scan {
+        var scan: Scan = .{ .openers = undefined };
+        var k: usize = 0;
+        for (families) |f| for (f.openers) |o| {
+            scan.openers[k] = .{ .needle = o };
+            k += 1;
+        };
+        return scan;
+    }
+
+    fn openAt(self: *Scan, text: []const u8, at: usize) bool {
+        if (at < self.fed) {
+            self.fed = 0;
+            self.state = .{};
+        }
+        self.state.feed(text[self.fed..at]);
+        self.fed = at;
+        return self.state.openStart() != null;
+    }
+};
+
 /// The first call opener at or after `from`. An opener inside an inline code span is text: a model explaining its
 /// format quotes it.
-pub fn nextOpener(text: []const u8, from: usize) ?Opener {
-    var best: ?Opener = null;
-    for (&families) |*f| for (f.openers) |o| {
-        var p = from;
-        while (std.mem.indexOfPos(u8, text, p, o)) |at| : (p = at + 1) {
-            if (best != null and at >= best.?.at) break;
-            if (!opensCall(f, text[at..])) continue;
-            if (think_tags.openCodeSpanStart(text[0..at]) != null) continue;
-            best = .{ .at = at, .len = o.len, .family = f };
-            break;
-        }
+pub fn nextOpener(text: []const u8, from: usize, scan: *Scan) ?Opener {
+    var fam: [opener_count]*const Family = undefined;
+    var k: usize = 0;
+    for (&families) |*f| for (f.openers) |_| {
+        fam[k] = f;
+        k += 1;
     };
-    return best;
+    // Each spelling's next candidate: the cache answers for a byte at or after the last one asked.
+    var next: [opener_count]?usize = undefined;
+    for (&scan.openers, 0..) |*n, i| next[i] = n.find(text, from, &scan.work);
+    while (true) {
+        var best: ?usize = null;
+        for (next, 0..) |n, i| {
+            const at = n orelse continue;
+            if (best == null or at < next[best.?].?) best = i;
+        }
+        const i = best orelse return null;
+        const at = next[i].?;
+        if (opensCall(fam[i], text, at, scan) and !scan.openAt(text, at)) return .{ .at = at, .len = scan.openers[i].needle.len, .family = fam[i] };
+        next[i] = scan.openers[i].find(text, at + 1, &scan.work);
+    }
 }
 
 /// Where a call ends: just past its closer, or, for a call that lost the close of its last value, where the next
@@ -167,10 +239,11 @@ fn valueQuotesAreExact(f: *const Family, text: []const u8, at: usize) bool {
 
 /// Where the next call opens when only whitespace and closers of `f` stand between `from` and it.
 fn nextCallAfterClosers(f: *const Family, text: []const u8, from: usize) ?usize {
+    var scan = Scan.init();
     var p = skipSpace(text, from);
     while (closerAt(f, text, p)) |c| p = skipSpace(text, p + c.len);
     for (&families) |*g| for (g.openers) |o| {
-        if (std.mem.startsWith(u8, text[p..], o) and opensCall(g, text[p..])) return p;
+        if (std.mem.startsWith(u8, text[p..], o) and opensCall(g, text, p, &scan)) return p;
     };
     return null;
 }
@@ -204,6 +277,7 @@ pub const Reader = struct {
     pos: usize = 0,
     started: bool = false,
     model_ended: bool,
+    scan: Scan = Scan.init(),
 
     pub fn init(text: []const u8, model_ended: bool) Reader {
         return .{ .text = text, .model_ended = model_ended };
@@ -215,7 +289,7 @@ pub const Reader = struct {
             if (leadingThoughtEnd(self.text, self.model_ended)) |end| self.pos = end;
         }
         while (true) {
-            const opener = nextOpener(self.text, self.pos);
+            const opener = nextOpener(self.text, self.pos, &self.scan);
             if (think_tags.nextThinkOpen(self.text, self.pos)) |t| {
                 if (opener == null or t.pos < opener.?.at) {
                     const style: Style = if (t.is_think_style) .think else .channel;
@@ -226,7 +300,7 @@ pub const Reader = struct {
             const o = opener orelse return null;
             const end = callEnd(o.family, self.text, o.at, self.model_ended);
             if (o.family.container) {
-                const inner = nextOpener(self.text, o.at + o.len);
+                const inner = nextOpener(self.text, o.at + o.len, &self.scan);
                 const whole = end != null or self.model_ended;
                 if (inner != null and whole and (end == null or inner.?.at < end.?.at)) {
                     self.pos = o.at + o.len;
@@ -280,9 +354,10 @@ fn channelCloseAt(text: []const u8, from: usize) ?think_tags.TagAt {
 
 fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
     var i = from;
+    var scan = Scan.init();
     outer: while (find(text, i)) |m| {
         var q = i;
-        while (nextOpener(text, q)) |o| {
+        while (nextOpener(text, q, &scan)) |o| {
             if (o.at >= m.pos) break;
             const end = (callEnd(o.family, text, o.at, model_ended) orelse {
                 q = o.at + o.len;

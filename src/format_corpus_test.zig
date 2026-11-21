@@ -45,6 +45,7 @@ const tool_calls_mod = @import("tool_calls.zig");
 const tool_schema = @import("tool_schema.zig");
 const stop_sequences = @import("stop_sequences.zig");
 const reply_mod = @import("reply.zig");
+const tool_reading = @import("tool_reading.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
     const Worker = struct {
@@ -4016,4 +4017,40 @@ test "format corpus: an opener the model wrote and nothing more is a cut call: d
             try testing.expectEqualStrings("Let me check.", std.mem.trim(u8, content, " \n"));
         }
     };
+}
+
+/// The bytes the reading's searches covered over `text`, and the open call it left.
+fn readWork(text: []const u8) struct { work: usize, open: ?usize } {
+    var reader = tool_reading.Reader.init(text, false);
+    var open: ?usize = null;
+    while (reader.next()) |c| if (c.end == null) {
+        open = c.start;
+    };
+    return .{ .work = reader.scan.work, .open = open };
+}
+
+test "format corpus: the reading is linear in the text: quoted and prose openers cost their own bytes, however many, and the calls after them are found" {
+    const allocator = testing.allocator;
+    const cut = "\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok";
+    const whole = cut ++ "yo\"}}\n</tool_call>";
+    // One long line: every opener is quoted in an inline code span or is prose (`<function=x>` with no <parameter= after
+    // it, `<invoke>`, `<function name=x>` with no name attribute), so none opens a call. Then three calls.
+    const unit = "`<tool_call>` `<|tool_call>` <function=x> <invoke> `<\u{ff5c}DSML\u{ff5c}invoke name=\"x\">` <function y> <function name=\"\"> ";
+    var work: [2]usize = undefined;
+    for ([_]usize{ 200_000, 400_000 }, 0..) |size, i| {
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(allocator);
+        while (text.items.len < size) try text.appendSlice(allocator, unit);
+        const lead = text.items.len;
+        try testing.expectEqual(@as(?usize, null), readWork(text.items).open);
+        for (0..3) |_| try text.appendSlice(allocator, whole);
+        try testing.expectEqual(@as(?usize, null), readWork(text.items).open);
+        try text.appendSlice(allocator, cut);
+        const read = readWork(text.items);
+        try testing.expectEqual(@as(?usize, lead + 3 * whole.len + 1), read.open);
+        work[i] = read.work;
+        // Each searched needle covers the text once: a bounded multiple of it, never a multiple per candidate.
+        try testing.expect(read.work <= 24 * text.items.len);
+    }
+    try testing.expect(work[1] <= 5 * work[0] / 2);
 }
