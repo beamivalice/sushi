@@ -11,6 +11,10 @@ const Tokenizer = @import("../tokenizer.zig").Tokenizer;
 
 pub const fixtures = [_][:0]const u8{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" };
 
+/// A drafting request on a resident load rides the joined plain rows once three requests decode (`dsv41_sched.tickClass`):
+/// a cell that needs one drafting request in a unit of its own asks it for logprobs.
+pub const drafting_rides_rows = true;
+
 /// A forward reads out its last row alone (`dsv41_model.Want.last`), however wide, under its own caps.
 pub const reads_out_last_row_only = true;
 

@@ -134,6 +134,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   call, and each step of its warm at its first. A checked call is one that makes a result on a stream: a call on the
   stream handle itself is not (a fault there skipped its free), and a test-only reading made on the way to the call
   under test (the TF32 probe) goes past the fault (`mlx.past_fault`), so a test passes alone as in the suite.
+  A cell that names a tick unit builds it and checks it (`tickClass`): a request joins another's unit by the scheduler's rule (DeepSeek's drafting request rides the joined rows from three slots), so a request meant to tick alone is made unjoinable, not left to a slot count.
   Its no-late-kernel tests prove their property only on a fresh pipeline cache, which is the process's: they run alone.
 - **A bill test pins every probed arm its bill reads** (`qsaScoreFusedOffGuard` and its kin): a kernel trial runs once a
   process, so an unpinned bill reads whatever arm an earlier test's forward tried.

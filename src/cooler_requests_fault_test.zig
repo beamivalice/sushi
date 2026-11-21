@@ -178,15 +178,25 @@ test "cooler contract: speculative rows failed at any checked MLX call site thei
     }.run);
 }
 
-test "cooler contract: a tick unit failed by an error no latch explains fails its own requests only, not a drafting request or the joined rows beside it" {
-    try eachFixture(struct {
+/// Which units a tick fault cell builds: one drafting request in a unit of its own beside two joined plain rows, or a
+/// joined unit that holds a drafting request beside a drafting request of its own.
+const UnitShape = enum { alone, company };
+
+/// A tick whose allocator refused once fails the requests of the unit that allocation reached, and no request of another.
+fn unitFaultCell(comptime shape: UnitShape) fn (comptime type, []const u8, []const u32) anyerror!void {
+    return struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            // A drafting request rides the joined rows in company on an arch that says so; it asks its logprobs to tick
+            // alone, which no joined round takes.
+            const rides_rows = comptime @hasDecl(C, "drafting_rides_rows") and C.drafting_rides_rows;
+            if (shape == .company and !rides_rows) return error.SkipZigTest;
             const a = testing.allocator;
             const scheduler = Served.scheduler;
             var ld: Load = undefined;
             try ld.open(C, dir, true);
             defer _ = ld.close();
-            if ((arch_sched.rowCap(&ld.config) orelse 1) < 2) return error.SkipZigTest;
+            // The joined unit's rows: two for the alone shape, three for the company shape.
+            if ((arch_sched.rowCap(&ld.config) orelse 1) < (if (shape == .company) 3 else 2)) return error.SkipZigTest;
             // The bucket path: a planner's round is one unit over every row it plans.
             const planner = @import("mtp_group_planner.zig");
             const planner_was = planner.enabled_override;
@@ -196,8 +206,13 @@ test "cooler contract: a tick unit failed by an error no latch explains fails it
             try sv.init(&ld, dir);
             defer sv.deinit();
             const sch = &sv.sch;
-            sch.queue_cap = 3;
-            var prompts: [3][40]u32 = undefined;
+            const Req = struct { drafting: bool, own_unit: bool };
+            const reqs = switch (shape) {
+                .alone => [_]Req{ .{ .drafting = true, .own_unit = true }, .{ .drafting = false, .own_unit = false }, .{ .drafting = false, .own_unit = false } },
+                .company => [_]Req{ .{ .drafting = true, .own_unit = true }, .{ .drafting = true, .own_unit = false }, .{ .drafting = false, .own_unit = false }, .{ .drafting = false, .own_unit = false } },
+            };
+            sch.queue_cap = reqs.len;
+            var prompts: [reqs.len][40]u32 = undefined;
             for (&prompts, 0..) |*p, r| for (p, 0..) |*t, i| {
                 t.* = ids[(i * (5 + 2 * r) + r + 1) % ids.len];
             };
@@ -211,18 +226,19 @@ test "cooler contract: a tick unit failed by an error no latch explains fails it
             var fired_n: usize = 0;
             var collateral: usize = 0;
             while (true) : (k += 1) {
-                // One drafting request (a unit of its own) and two plain rows (one joined group), each decoding.
-                var slots: [3]*scheduler.Slot = undefined;
-                for (&slots, 0..) |*slot, r| {
-                    const spec = r == 0;
-                    const head = if (spec) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
-                    slot.* = try sch.submit(.{ .model = sv.entry, .prompt_ids = &prompts[r], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = spec, .mtp = head });
+                var slots: [reqs.len]*scheduler.Slot = undefined;
+                for (&slots, reqs, 0..) |*slot, req, r| {
+                    const head = if (req.drafting) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+                    slot.* = try sch.submit(.{ .model = sv.entry, .prompt_ids = &prompts[r], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = req.drafting, .mtp = head, .logprobs_n = @intFromBool(req.own_unit and rides_rows) });
                     for (sch.pending.items, 0..) |p, i| if (p == slot.*) {
                         _ = sch.pending.orderedRemove(i);
                         break;
                     };
                     scheduler.runPrefill(sch, slot.*) catch |e| scheduler.failPrefill(slot.*, e);
                     if (!scheduler.postPrefillTerminal(sch, slot.*)) try sch.decoding.append(a, slot.*);
+                    // The cell builds the units it names: a drafting request rides the joined rows exactly when it is not
+                    // the one asked to tick alone.
+                    if (req.drafting) try testing.expectEqual(!req.own_unit and rides_rows, arch_sched.tickClass(slot.*) == .rows_company);
                 }
                 MixedTick.tick(sch);
                 refuse.n = 0;
@@ -231,13 +247,17 @@ test "cooler contract: a tick unit failed by an error no latch explains fails it
                 MixedTick.tick(sch);
                 refuse.at = std.math.maxInt(usize);
                 if (k == 0) asks = refuse.n;
-                const drafting_failed = slots[0].error_code != null;
-                const rows_failed = slots[1].error_code != null or slots[2].error_code != null;
-                if (k == 0) try testing.expect(!drafting_failed and !rows_failed);
+                var own_failed: usize = 0;
+                var joined_failed: usize = 0;
+                for (slots, reqs) |s, req| {
+                    if (s.error_code == null) continue;
+                    if (req.own_unit) own_failed += 1 else joined_failed += 1;
+                }
+                if (k == 0) try testing.expect(own_failed + joined_failed == 0);
                 if (refuse.fired) fired_n += 1;
-                if (refuse.fired and drafting_failed and rows_failed) {
+                if (refuse.fired and own_failed > 0 and joined_failed > 0) {
                     collateral += 1;
-                    if (collateral <= 3) std.debug.print("allocation {d} of {d} refused in a tick: drafting {s}, rows {s} / {s}\n", .{ k - 1, asks, slots[0].error_code.?, slots[1].error_code orelse "ok", slots[2].error_code orelse "ok" });
+                    if (collateral <= 3) std.debug.print("allocation {d} of {d} refused in a tick: the own unit's requests failed {d}, the joined unit's {d}\n", .{ k - 1, asks, own_failed, joined_failed });
                 }
                 for (slots) |s| sch.complete(s);
                 MixedTick.drain(sch);
@@ -246,7 +266,15 @@ test "cooler contract: a tick unit failed by an error no latch explains fails it
             try testing.expect(fired_n > 0);
             try testing.expectEqual(@as(usize, 0), collateral);
         }
-    }.run);
+    }.run;
+}
+
+test "cooler contract: a tick unit failed by an error no latch explains fails its own requests only, not a drafting request or the joined rows beside it" {
+    try eachFixture(unitFaultCell(.alone));
+}
+
+test "cooler contract: a joined unit holding a drafting request, failed by an error no latch explains, fails its own requests only, not the drafting request of its own unit beside it" {
+    try eachFixture(unitFaultCell(.company));
 }
 
 test "cooler contract: joined speculative rows under a logit bias, failed at any checked MLX call their unbiased rows lack, leave the next rows their tokens and the pool as it was" {
