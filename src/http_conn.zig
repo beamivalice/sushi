@@ -14,7 +14,7 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 const request_policy = @import("request_policy.zig");
-const request_parse = @import("request_parse.zig");
+const request_fields = @import("request_fields.zig");
 const writeEffortNoticeHeader = request_policy.writeEffortNoticeHeader;
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
@@ -1693,12 +1693,15 @@ fn wsServeTurns(allocator: std.mem.Allocator, stream: *Conn, ws_conn: *WsConnT, 
         //    so handleResponses always keeps the result: in the shared store,
         //    or on this connection when the user asked for `store: false`.
         // The body below forces `store` true, so the client's own is checked and read here.
-        var fault_buf: [160]u8 = undefined;
-        if (request_parse.boolFieldFault(&fault_buf, root)) |why| {
-            try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", why);
-            continue;
-        }
-        const want_user_store: bool = request_parse.boolField(root, .store) orelse true;
+        var fault_buf: [384]u8 = undefined;
+        const turn_req = switch (request_fields.check(.responses, &fault_buf, root)) {
+            .fault => |why| {
+                try wsSendErrorTurn(allocator, ws_conn, 400, "invalid_request_error", why);
+                continue;
+            },
+            .ok => |c| c,
+        };
+        const want_user_store: bool = turn_req.flag("store") orelse true;
         const body = try buildResponsesBodyFromWsRequest(allocator, root);
         defer allocator.free(body);
 

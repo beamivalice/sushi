@@ -143,7 +143,7 @@ pub const rows = [_]Row{
     .{ .key = "echo", .kind = .flag, .on = &.{.completions} },
     .{ .key = "ignore_eos", .kind = .flag, .on = &.{.completions}, .unread = "'ignore_eos' is supported on /v1/completions only: a chat reply ends at its end of turn" },
     .{ .key = "truncation", .kind = .{ .shaped = truncationFault }, .on = &.{.responses} },
-    .{ .key = "max_tool_calls", .kind = .{ .shaped = maxToolCallsFault }, .on = &.{.responses} },
+    .{ .key = "max_tool_calls", .kind = .{ .whole = .{ .min = 0, .max = std.math.maxInt(u32) } }, .on = &.{.responses} },
     .{ .key = "background", .kind = .flag, .on = &.{.responses} },
     .{ .key = "metadata", .kind = .{ .shaped = metadataFault }, .on = &.{ .messages, .responses }, .elsewhere = .carried },
     .{ .key = "prompt_cache_key", .kind = .text, .on = &all },
@@ -363,6 +363,17 @@ pub fn Checked(comptime surface: Surface) type {
             return .{ .kind = kind, .budget_tokens = budget };
         }
 
+        /// Responses' `truncation` (auto or disabled, the default).
+        pub fn truncation(self: Self) []const u8 {
+            comptime _ = rowFor(surface, "truncation");
+            const v = self.root.get("truncation") orelse return "disabled";
+            return switch (v) {
+                .string => |t| t,
+                .null => "disabled",
+                else => unreachable,
+            };
+        }
+
         /// The thinking switch the client set: top-level `enable_thinking`, else the vLLM `chat_template_kwargs` one.
         pub fn enableThinking(self: Self) ?bool {
             return self.flag("enable_thinking") orelse self.templateKwarg("enable_thinking");
@@ -536,12 +547,6 @@ fn bestOfFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
 fn truncationFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
     const ok = v == .string and (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "disabled"));
     return if (ok) null else "'truncation' must be auto or disabled";
-}
-
-fn maxToolCallsFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
-    const n = wholeNumber(v) orelse return "'max_tool_calls' must be a whole number of 0 or more";
-    if (n < 0 or n > std.math.maxInt(u32)) return "'max_tool_calls' must be a whole number of 0 or more";
-    return null;
 }
 
 fn metadataFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
@@ -1000,6 +1005,14 @@ test "the readers give the values the check accepted" {
     try testing.expectEqual(@as(u32, 3), req.logprobs().?.top);
     try testing.expect(req.includeUsage());
     try testing.expectEqual(@as(?i32, -1), req.reasoningBudget());
+
+    var responses = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tool_calls\":3.0,\"truncation\":\"auto\",\"service_tier\":\"flex\",\"top_logprobs\":2}", .{});
+    defer responses.deinit();
+    const resp = check(.responses, &buf, responses.value.object).ok;
+    try testing.expectEqual(@as(?i64, 3), resp.whole("max_tool_calls"));
+    try testing.expectEqualStrings("auto", resp.truncation());
+    try testing.expectEqualStrings("flex", resp.text("service_tier").?);
+    try testing.expectEqual(@as(?i64, 2), resp.whole("top_logprobs"));
 }
 
 test "contentOf reads text, parts or nothing, and refuses any other type" {
@@ -1071,5 +1084,104 @@ test "legacy completions' integer logprobs reads as the alternatives asked, 0 in
         var buf: [128]u8 = undefined;
         const got = check(.completions, &buf, parsed.value.object).ok.logprobs();
         try testing.expectEqual(c.top, if (got) |l| l.top else null);
+    }
+}
+
+test "a surface's first positive token budget key wins, and a null or zero one leaves the next in force" {
+    const Budget = struct { surface: Surface, body: []const u8, want: ?i64 };
+    const cases = [_]Budget{
+        .{ .surface = .chat, .body = "{\"max_tokens\":20,\"max_completion_tokens\":7}", .want = 7 },
+        .{ .surface = .chat, .body = "{\"max_tokens\":20,\"max_completion_tokens\":null}", .want = 20 },
+        .{ .surface = .chat, .body = "{\"max_tokens\":5,\"max_completion_tokens\":0}", .want = 5 },
+        .{ .surface = .completions, .body = "{\"max_tokens\":5.0}", .want = 5 },
+        .{ .surface = .chat, .body = "{\"max_tokens\":0,\"max_completion_tokens\":null}", .want = null },
+        .{ .surface = .chat, .body = "{}", .want = null },
+        .{ .surface = .responses, .body = "{\"max_output_tokens\":null,\"max_tokens\":1}", .want = 1 },
+        .{ .surface = .responses, .body = "{\"max_output_tokens\":0,\"max_tokens\":1}", .want = 1 },
+        .{ .surface = .responses, .body = "{\"max_output_tokens\":9,\"max_tokens\":1}", .want = 9 },
+        .{ .surface = .messages, .body = "{\"max_tokens\":4}", .want = 4 },
+    };
+    inline for (comptime std.meta.tags(Surface)) |s| {
+        if (s == .compact) continue;
+        for (cases) |c| {
+            if (c.surface != s) continue;
+            var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+            defer parsed.deinit();
+            var buf: [128]u8 = undefined;
+            const req = check(s, &buf, parsed.value.object).ok;
+            errdefer std.debug.print("\nbody: {s}\n", .{c.body});
+            const got = req.requestedMaxTokens();
+            try testing.expectEqual(c.want, if (got) |v| wholeNumber(v) else null);
+        }
+    }
+}
+
+test "Responses tool_choice refuses a form this server cannot honour, by name" {
+    try expectCases(&.{
+        .{ .surface = .responses, .body = "{}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":null}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":\"auto\"}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":\"none\"}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":\"required\"}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"f\"}}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"f\"}}}", .field = null },
+        .{ .surface = .responses, .body = "{\"tool_choice\":\"bogus\"}", .field = "tool_choice" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":\"any\"}", .field = "tool_choice" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":5}", .field = "tool_choice" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":true}", .field = "tool_choice" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":[]}", .field = "tool_choice" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":5}}", .field = "tool_choice.type" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":\"allowed_tools\",\"mode\":\"auto\"}}", .field = "tool_choice.type" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":\"function\"}}", .field = "tool_choice.name" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"\"}}", .field = "tool_choice.name" },
+        .{ .surface = .responses, .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":7}}", .field = "tool_choice.name" },
+    });
+}
+
+test "a seed reads as an unsigned number, a negative one is unseeded" {
+    for ([_]struct { body: []const u8, want: ?u64 }{
+        .{ .body = "{\"seed\":7}", .want = 7 },
+        .{ .body = "{\"seed\":7.0}", .want = 7 },
+        .{ .body = "{\"seed\":-1}", .want = null },
+        .{ .body = "{\"seed\":null}", .want = null },
+        .{ .body = "{}", .want = null },
+    }) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        var buf: [128]u8 = undefined;
+        try testing.expectEqual(c.want, check(.chat, &buf, parsed.value.object).ok.seed());
+    }
+}
+
+test "a bool of chat_template_kwargs reads as the bool the client sent" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"chat_template_kwargs\":{\"enable_thinking\":false,\"n\":1}}", .{});
+    defer parsed.deinit();
+    var buf: [128]u8 = undefined;
+    const req = check(.chat, &buf, parsed.value.object).ok;
+    try testing.expectEqual(@as(?bool, false), req.templateKwarg("enable_thinking"));
+    try testing.expectEqual(@as(?bool, null), req.templateKwarg("preserve_thinking"));
+}
+
+test "repeat_penalty: 0 is unset, then off; frequency and presence are additive and never a repeat multiplier" {
+    const Penalties = struct { body: []const u8, repeat: f32, frequency: f32 = 0, presence: f32 = 0 };
+    for ([_]Penalties{
+        .{ .body = "{}", .repeat = 1.0 },
+        .{ .body = "{\"repeat_penalty\":1.3}", .repeat = 1.3 },
+        .{ .body = "{\"repeat_penalty\":0}", .repeat = 1.0 },
+        .{ .body = "{\"frequency_penalty\":1}", .repeat = 1.0, .frequency = 1 },
+        .{ .body = "{\"frequency_penalty\":0.5,\"presence_penalty\":-0.25}", .repeat = 1.0, .frequency = 0.5, .presence = -0.25 },
+        .{ .body = "{\"frequency_penalty\":-2,\"presence_penalty\":2}", .repeat = 1.0, .frequency = -2, .presence = 2 },
+        .{ .body = "{\"repetition_penalty\":1.3}", .repeat = 1.3 },
+        .{ .body = "{\"repetition_penalty\":0}", .repeat = 1.0 },
+        .{ .body = "{\"repeat_penalty\":1.2,\"repetition_penalty\":1.5}", .repeat = 1.2 },
+    }) |c| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
+        defer parsed.deinit();
+        var buf: [128]u8 = undefined;
+        const req = check(.chat, &buf, parsed.value.object).ok;
+        try testing.expectApproxEqAbs(c.repeat, req.repeatPenalty(), 1e-6);
+        try testing.expectEqual(c.frequency, req.additivePenalty("frequency_penalty"));
+        try testing.expectEqual(c.presence, req.additivePenalty("presence_penalty"));
     }
 }

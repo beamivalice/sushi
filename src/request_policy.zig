@@ -30,10 +30,8 @@ const Conn = http_conn.Conn;
 const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
 const StreamMode = generation_stream.StreamMode;
 const atomicTokenId = server.atomicTokenId;
-const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const jsonEscape = http.jsonEscape;
 const parseOnOff = server.parseOnOff;
-const parseRequestSeed = request_parse.parseRequestSeed;
 const pickStreamMode = generation_stream.pickStreamMode;
 const promptOpensThink = server.promptOpensThink;
 const renderConfigFor = server.renderConfigFor;
@@ -232,12 +230,8 @@ pub fn reasoningEffortFromWord(word: []const u8, template_consumes_effort: bool,
 }
 
 /// The thinking cap a request runs under: its own `reasoning_budget_tokens`, else its effort's (`effort_budget`).
-pub fn requestThinkBudget(root: std.json.ObjectMap, effort_budget: i32) i32 {
-    const v = root.get("reasoning_budget_tokens") orelse return effort_budget;
-    return switch (v) {
-        .integer => |i| std.math.cast(i32, i) orelse effort_budget,
-        else => effort_budget,
-    };
+pub fn requestThinkBudget(req: anytype, effort_budget: i32) i32 {
+    return req.reasoningBudget() orelse effort_budget;
 }
 
 pub const EffortNotice = struct {
@@ -408,16 +402,11 @@ pub fn effortRefusalFor(allocator: std.mem.Allocator, lm: *LoadedModel, word: []
 }
 
 /// The client's thinking bool: top-level `enable_thinking`, else `chat_template_kwargs.enable_thinking`.
-fn requestEnableThinking(root: std.json.ObjectMap) ?bool {
-    if (request_parse.boolField(root, .enable_thinking)) |b| return b;
-    return chatTemplateKwargBool(root, "enable_thinking");
-}
-
 /// Responses thinking: a `reasoning` object decides alone; without one the request
-/// bool (`requestEnableThinking`), else the arch default, as on chat.
-pub fn responsesEnableThinking(root: std.json.ObjectMap, from_reasoning: bool, arch_default: bool) bool {
-    if (root.get("reasoning")) |r| if (r != .null) return from_reasoning;
-    return requestEnableThinking(root) orelse arch_default;
+/// bool (`Checked.enableThinking`), else the arch default, as on chat.
+pub fn responsesEnableThinking(req: request_fields.Checked(.responses), from_reasoning: bool, arch_default: bool) bool {
+    if (req.root.get("reasoning")) |r| if (r != .null) return from_reasoning;
+    return req.enableThinking() orelse arch_default;
 }
 
 /// Resolve thinking for a chat request. An EXPLICIT client signal always wins —
@@ -448,8 +437,8 @@ pub fn thinkingOffRefused(config: *const model_mod.ModelConfig, snap: *const eff
     return config.defaultEnableThinkingIn(snap);
 }
 
-pub fn resolveEnableThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
-    const et = requestEnableThinking(root);
+pub fn resolveEnableThinking(req: anytype, effort_cfg: ?ReasoningEffort, arch_default: bool) bool {
+    const et = req.enableThinking();
     if (et == null and effort_cfg == null) return arch_default;
     return (et orelse false) or (if (effort_cfg) |e| e.enable else false);
 }
@@ -466,21 +455,20 @@ fn holdOffDefault(t: *Thinking, config: *const model_mod.ModelConfig, snap: *con
     t.template = model_mod.defaultTemplateEffortIn(config, snap);
 }
 
-fn namesThinkBudget(root: std.json.ObjectMap) bool {
-    const v = root.get("reasoning_budget_tokens") orelse return false;
-    return v == .integer;
+fn namesThinkBudget(req: anytype) bool {
+    return req.reasoningBudget() != null;
 }
 
 /// `/v1/chat/completions`: `effort_cfg` is the request's `reasoning_effort`; the cap is `reasoning_budget_tokens`, else the word's.
 /// `snap` is the effort table the request read its word from (`effort.snapshot`).
-pub fn chatThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot) Thinking {
+pub fn chatThinking(req: request_fields.Checked(.chat), effort_cfg: ?ReasoningEffort, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot) Thinking {
     const effort_budget = if (effort_cfg) |e| e.budget else model_mod.defaultThinkBudgetIn(config, snap);
     var t: Thinking = .{
-        .enable = resolveEnableThinking(root, effort_cfg, config.defaultEnableThinkingIn(snap)),
-        .budget = requestThinkBudget(root, effort_budget),
+        .enable = resolveEnableThinking(req, effort_cfg, config.defaultEnableThinkingIn(snap)),
+        .budget = requestThinkBudget(req, effort_budget),
         .template = if (effort_cfg) |e| e.sends else model_mod.defaultTemplateEffortIn(config, snap),
     };
-    holdOffDefault(&t, config, snap, effort_cfg != null, namesThinkBudget(root), requestEnableThinking(root) == false);
+    holdOffDefault(&t, config, snap, effort_cfg != null, namesThinkBudget(req), req.enableThinking() == false);
     return t;
 }
 
@@ -522,14 +510,14 @@ pub fn responsesEffortWord(root: std.json.ObjectMap, parsed: responses_mod.Reaso
 
 /// `/v1/responses`: `word_cfg` is the resolved `responsesEffortWord`; `named` says the request named it. A `reasoning`
 /// object decides alone.
-pub fn responsesThinking(root: std.json.ObjectMap, reasoning_enable: bool, word_cfg: ?ReasoningEffort, named: bool, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot) Thinking {
+pub fn responsesThinking(req: request_fields.Checked(.responses), reasoning_enable: bool, word_cfg: ?ReasoningEffort, named: bool, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot) Thinking {
     const effort_budget = if (word_cfg) |c| c.budget else model_mod.defaultThinkBudgetIn(config, snap);
     var t: Thinking = .{
-        .enable = responsesEnableThinking(root, if (word_cfg) |c| c.enable else reasoning_enable, config.defaultEnableThinkingIn(snap)),
-        .budget = requestThinkBudget(root, effort_budget),
+        .enable = responsesEnableThinking(req, if (word_cfg) |c| c.enable else reasoning_enable, config.defaultEnableThinkingIn(snap)),
+        .budget = requestThinkBudget(req, effort_budget),
         .template = if (word_cfg) |c| c.sends else null,
     };
-    holdOffDefault(&t, config, snap, named, namesThinkBudget(root), requestEnableThinking(root) == false);
+    holdOffDefault(&t, config, snap, named, namesThinkBudget(req), req.enableThinking() == false);
     return t;
 }
 
@@ -587,92 +575,6 @@ test "requestSpecModes: a repeat, presence or frequency penalty keeps the sideca
 /// model-settings.json; null leaves the template's own default.
 pub fn resolvePreserveThinking(request: ?bool, flag: ?bool, setting: ?bool) ?bool {
     return request orelse flag orelse setting;
-}
-
-/// The multiplicative `repeat_penalty` (llama.cpp's, at most 10), else vLLM's `repetition_penalty`;
-/// 0 or absent is 1.0 (off). OpenAI's `frequency_penalty` is a separate additive penalty.
-pub fn parseRepeatPenalty(root: std.json.ObjectMap) f32 {
-    const rp = parseJsonFloat(root, "repeat_penalty", 0.0);
-    if (rp > 0.0) return rp;
-    const rep_p = parseJsonFloat(root, "repetition_penalty", 0.0);
-    return if (rep_p > 0.0) rep_p else 1.0;
-}
-
-/// OpenAI's `presence_penalty` and `frequency_penalty`: -2 to 2, 0 = off.
-pub fn parseAdditivePenalty(root: std.json.ObjectMap, key: []const u8) f32 {
-    return parseJsonFloat(root, key, 0.0);
-}
-
-fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32) f32 {
-    return if (root.get(key)) |v| switch (v) {
-        .float => |f| @as(f32, @floatCast(f)),
-        .integer => |i| @as(f32, @floatFromInt(i)),
-        else => default,
-    } else default;
-}
-
-test "repeat_penalty: 0 is unset, then off, on chat and completions alike" {
-    const a = std.testing.allocator;
-    const Case = struct { body: []const u8, want: f32 };
-    const cases = [_]Case{
-        .{ .body = "{}", .want = 1.0 },
-        .{ .body = "{\"repeat_penalty\":1.3}", .want = 1.3 },
-        .{ .body = "{\"repeat_penalty\":0}", .want = 1.0 },
-        .{ .body = "{\"repeat_penalty\":\"x\",\"frequency_penalty\":0.1}", .want = 1.0 },
-        .{ .body = "{\"frequency_penalty\":1}", .want = 1.0 },
-        .{ .body = "{\"repetition_penalty\":1.3}", .want = 1.3 },
-        .{ .body = "{\"repetition_penalty\":0}", .want = 1.0 },
-        .{ .body = "{\"repeat_penalty\":1.2,\"repetition_penalty\":1.5}", .want = 1.2 },
-    };
-    for (cases) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
-        defer parsed.deinit();
-        try std.testing.expectApproxEqAbs(c.want, parseRepeatPenalty(parsed.value.object), 1e-6);
-    }
-}
-
-test "OpenAI frequency and presence penalties are additive fields in -2..2, never a repeat_penalty multiplier" {
-    const a = std.testing.allocator;
-    const Case = struct { body: []const u8, frequency: f32, presence: f32 };
-    const cases = [_]Case{
-        .{ .body = "{}", .frequency = 0, .presence = 0 },
-        .{ .body = "{\"frequency_penalty\":1,\"presence_penalty\":0}", .frequency = 1, .presence = 0 },
-        .{ .body = "{\"frequency_penalty\":0.5,\"presence_penalty\":-0.25}", .frequency = 0.5, .presence = -0.25 },
-        .{ .body = "{\"frequency_penalty\":-2,\"presence_penalty\":2}", .frequency = -2, .presence = 2 },
-        .{ .body = "{\"frequency_penalty\":\"x\"}", .frequency = 0, .presence = 0 },
-    };
-    for (cases) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
-        defer parsed.deinit();
-        const root = parsed.value.object;
-        try std.testing.expectEqual(c.frequency, parseAdditivePenalty(root, "frequency_penalty"));
-        try std.testing.expectEqual(c.presence, parseAdditivePenalty(root, "presence_penalty"));
-        try std.testing.expectEqual(@as(f32, 1.0), parseRepeatPenalty(root));
-    }
-}
-
-test "parseJsonFloat returns value when present" {
-    const allocator = testing.allocator;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":0.7}", .{});
-    defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 1.0);
-    try testing.expectApproxEqAbs(@as(f32, 0.7), result, 0.001);
-}
-
-test "parseJsonFloat returns default when missing" {
-    const allocator = testing.allocator;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
-    defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 1.0);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
-}
-
-test "parseJsonFloat handles integer value" {
-    const allocator = testing.allocator;
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":1}", .{});
-    defer parsed.deinit();
-    const result = parseJsonFloat(parsed.value.object, "temp", 0.5);
-    try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
 }
 
 test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-size)" {
@@ -1099,20 +1001,16 @@ test "resolveEnableThinking: an explicit request value outranks the arch default
         // Both present stay OR'd, as they always were.
         .{ .body = "{\"enable_thinking\":false,\"reasoning_effort\":\"high\"}", .arch = false, .want = true },
         .{ .body = "{\"enable_thinking\":true,\"reasoning_effort\":\"none\"}", .arch = false, .want = true },
-        // A non-bool `enable_thinking` is not a signal; with nothing else in
-        // the body the arch default still applies.
-        .{ .body = "{\"enable_thinking\":\"yes\"}", .arch = true, .want = true },
         // vLLM / SGLang clients send the template switch nested; the top-level field wins over it.
         .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = true, .want = false },
         .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":true}}", .arch = false, .want = true },
         .{ .body = "{\"enable_thinking\":true,\"chat_template_kwargs\":{\"enable_thinking\":false}}", .arch = false, .want = true },
-        .{ .body = "{\"chat_template_kwargs\":{\"enable_thinking\":\"no\"}}", .arch = true, .want = true },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
         const effort = try parseReasoningEffort(parsed.value.object, false, null);
-        try std.testing.expectEqual(case.want, resolveEnableThinking(parsed.value.object, effort, case.arch));
+        try std.testing.expectEqual(case.want, resolveEnableThinking(try checkedOf(.chat, parsed.value.object), effort, case.arch));
     }
 }
 
@@ -1134,7 +1032,7 @@ test "responsesEnableThinking: no reasoning object takes the request bool, else 
         defer parsed.deinit();
         const root = parsed.value.object;
         const from_reasoning = responses_mod.parseReasoning(root.get("reasoning")).enable;
-        try std.testing.expectEqual(case.want, responsesEnableThinking(root, from_reasoning, case.arch));
+        try std.testing.expectEqual(case.want, responsesEnableThinking(try checkedOf(.responses, root), from_reasoning, case.arch));
     }
 }
 
@@ -1195,12 +1093,6 @@ test "optSamplingRecJson emits number when present, null when absent" {
 
 test "a request integer from a client is read without a blind cast" {
     const t = std.testing;
-    try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .integer = -1 }));
-    try t.expectEqual(@as(?u64, 0), parseRequestSeed(.{ .integer = 0 }));
-    try t.expectEqual(@as(?u64, 42), parseRequestSeed(.{ .integer = 42 }));
-    try t.expectEqual(@as(?u64, null), parseRequestSeed(.{ .string = "42" }));
-    try t.expectEqual(@as(?u64, null), parseRequestSeed(null));
-
     try t.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .integer = 1 << 32 }, 7));
     try t.expectEqual(@as(u32, 512), resolveRequestMaxTokens(.{ .integer = 512 }, 7));
     try t.expectEqual(@as(u32, 7), resolveRequestMaxTokens(.{ .integer = 0 }, 7));
@@ -1278,7 +1170,7 @@ test "format corpus: one-shot thinking reaches served templates and effort budge
             defer parsed.deinit();
             const root = parsed.value.object;
             const effort = try parseReasoningEffort(root, false, effort_mod.effortArms(family[0]));
-            const enable = resolveEnableThinking(root, effort, true);
+            const enable = resolveEnableThinking(try checkedOf(.chat, root), effort, true);
             try std.testing.expectEqual(think != .effort or think.effort != .off, enable);
             if (think == .effort) {
                 try std.testing.expectEqual(@as(i32, switch (think.effort) {
@@ -1526,10 +1418,10 @@ test "effort table: a request's own budget outranks the table's cap" {
     const arms = effort_mod.servedArms("qwen4_exp").?;
     const cfg = (try parseReasoningEffort(parsed.value.object, false, arms.slice())).?;
     try std.testing.expectEqual(@as(i32, 64), cfg.budget);
-    try std.testing.expectEqual(@as(i32, 300), requestThinkBudget(parsed.value.object, cfg.budget));
+    try std.testing.expectEqual(@as(i32, 300), requestThinkBudget(try checkedOf(.chat, parsed.value.object), cfg.budget));
     const plain = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "{\"reasoning_effort\":\"high\"}", .{});
     defer plain.deinit();
-    try std.testing.expectEqual(@as(i32, 64), requestThinkBudget(plain.value.object, cfg.budget));
+    try std.testing.expectEqual(@as(i32, 64), requestThinkBudget(try checkedOf(.chat, plain.value.object), cfg.budget));
 }
 
 test "effort table: /v1/models rows follow the served table, with each word's template value" {
@@ -1558,27 +1450,31 @@ test "effort table: /v1/models rows follow the served table, with each word's te
 const OffSurface = enum { chat, anthropic, responses };
 
 /// What `surface`'s handler resolves for `body` before the render (no `effortWordOnly` template).
+/// A test body's fields checked for `surface`: a body the table refuses is a test defect.
+fn checkedOf(comptime surface: request_fields.Surface, root: std.json.ObjectMap) error{RequestRefused}!request_fields.Checked(surface) {
+    var buf: [256]u8 = undefined;
+    return switch (request_fields.check(surface, &buf, root)) {
+        .ok => |c| c,
+        .fault => error.RequestRefused,
+    };
+}
+
 fn surfaceThinking(a: std.mem.Allocator, surface: OffSurface, config: *const model_mod.ModelConfig, body: []const u8) !Thinking {
     const root = (try std.json.parseFromSliceLeaky(std.json.Value, a, body, .{})).object;
     const snap = effort_mod.snapshot();
     const arms = effort_mod.servedArmsIn(&snap, config.model_type);
     const table: ?[]const effort_mod.EffortArm = if (arms) |*x| x.slice() else null;
     switch (surface) {
-        .chat => return chatThinking(root, try parseReasoningEffort(root, false, table), config, &snap),
+        .chat => return chatThinking(try checkedOf(.chat, root), try parseReasoningEffort(root, false, table), config, &snap),
         .anthropic => {
             const word: ?[]const u8 = if (root.get("output_config")) |oc| (if (oc.object.get("effort")) |e| e.string else null) else null;
-            var fb: [128]u8 = undefined;
-            const req = switch (request_fields.check(.messages, &fb, root)) {
-                .ok => |c| c,
-                .fault => return error.RequestRefused,
-            };
-            return anthropicThinking(req, if (word) |w| try reasoningEffortFromWord(w, false, table) else null, config, &snap);
+            return anthropicThinking(try checkedOf(.messages, root), if (word) |w| try reasoningEffortFromWord(w, false, table) else null, config, &snap);
         },
         .responses => {
             var rc = responses_mod.parseReasoning(root.get("reasoning"));
             const named = rc.effort != null;
             rc.effort = responsesEffortWord(root, rc, config, &snap);
-            return responsesThinking(root, rc.enable, if (rc.effort) |w| try reasoningEffortFromWord(w, false, table) else null, named, config, &snap);
+            return responsesThinking(try checkedOf(.responses, root), rc.enable, if (rc.effort) |w| try reasoningEffortFromWord(w, false, table) else null, named, config, &snap);
         },
     }
 }
@@ -1706,7 +1602,9 @@ test "effort off default: DeepSeek and GLM resolve and render as before" {
     const glm_template = @embedFile("fixtures/glm53_chat_template.jinja");
     const glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
     for ([_]OffSurface{ .chat, .anthropic, .responses }) |surface| {
-        for ([_][]const u8{ "{}", "{\"enable_thinking\":true}" }) |body| {
+        // Messages has no `enable_thinking`: its on switch is a `thinking` object.
+        const on = if (surface == .anthropic) "{\"thinking\":{\"type\":\"enabled\"}}" else "{\"enable_thinking\":true}";
+        for ([_][]const u8{ "{}", on }) |body| {
             effort_mod.think_effort_flag = null;
             const before = try surfaceThinking(a, surface, &glm, body);
             effort_mod.think_effort_flag = .off;
@@ -1738,7 +1636,7 @@ test "effort table: a request resolves against one table while a save publishes 
     const root: std.json.ObjectMap = .empty;
     for (0..20_000) |_| {
         const snap = effort_mod.snapshot();
-        const t = chatThinking(root, null, &config, &snap);
+        const t = chatThinking(.{ .root = root }, null, &config, &snap);
         // Default off: off, no cap, no level. Default low: on at low, its 2048 cap.
         const whole = if (t.enable) t.budget == 2048 and t.template != null and std.mem.eql(u8, t.template.?, "low") else t.budget == -1 and t.template == null;
         try testing.expect(whole);

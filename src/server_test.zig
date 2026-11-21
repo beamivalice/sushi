@@ -2913,3 +2913,101 @@ test "server: request fields: /v1/messages reads stop_sequences as a string as i
         }
     }.run);
 }
+
+test "server: request fields: /v1/responses and its compaction refuse a field they do not read or of the wrong shape, by name" {
+    try eachArch(2, .{}, struct {
+        const resp = "/v1/responses";
+        const head = "{\"model\":\"tiny\",\"max_output_tokens\":2,";
+        const cases = [_]FieldCase{
+            .{ .path = resp, .body = head ++ "\"stop\":5,\"input\":\"hi\"}", .field = "stop" },
+            .{ .path = resp, .body = head ++ "\"stop\":[\"a\",7],\"input\":\"hi\"}", .field = "stop" },
+            .{ .path = resp, .body = head ++ "\"top_k\":2.5,\"input\":\"hi\"}", .field = "top_k" },
+            .{ .path = resp, .body = head ++ "\"stream_options\":{\"include_usage\":true},\"input\":\"hi\"}", .field = "stream_options" },
+            .{ .path = resp, .body = head ++ "\"logit_bias\":{},\"input\":\"hi\"}", .field = "logit_bias" },
+            .{ .path = resp, .body = head ++ "\"reasoning\":\"high\",\"input\":\"hi\"}", .field = "reasoning" },
+            .{ .path = resp, .body = head ++ "\"text\":{\"format\":{\"type\":\"json_shema\",\"schema\":{\"type\":\"object\"}}},\"input\":\"hi\"}", .field = "text.format.type" },
+            .{ .path = resp, .body = head ++ "\"input\":[{\"type\":\"message\",\"role\":\"developer\",\"content\":5},{\"type\":\"message\",\"role\":\"user\",\"content\":\"hi\"}]}", .field = "input[0].content" },
+            .{ .path = resp, .body = head ++ "\"input\":[{\"type\":\"message\",\"role\":7,\"content\":\"hi\"}]}", .field = "input[0].role" },
+            .{ .path = resp, .body = head ++ "\"input\":5}", .field = "input" },
+            .{ .path = "/v1/responses/compact", .body = "{\"model\":\"tiny\",\"input\":[{\"type\":\"message\",\"role\":\"user\",\"content\":5}]}", .field = "input[0].content" },
+            .{ .path = "/v1/responses/compact", .body = "{\"model\":\"tiny\",\"input\":\"hi\",\"instructions\":5}", .field = "instructions" },
+        };
+        fn run() !void {
+            try expectEachRefusedByName(&cases);
+            // A compaction carries the Responses request it folds and generates nothing from the rest.
+            const ok = try request("POST", "/v1/responses/compact", "{\"model\":\"tiny\",\"input\":\"hi\",\"tools\":[],\"reasoning\":{\"effort\":\"low\"},\"temperature\":1,\"parallel_tool_calls\":true}");
+            defer gpa.free(ok);
+            if (!std.mem.startsWith(u8, ok, "HTTP/1.1 200")) {
+                std.debug.print("compaction refused a Responses request's own fields: {s}\n", .{ok[0..@min(ok.len, 300)]});
+                return error.CompactRefusedResponsesFields;
+            }
+        }
+    }.run);
+}
+
+test "server: request fields: a Responses stop sequence cuts the reply, and a text format of type text means plain text" {
+    try eachArch(2, .{}, struct {
+        fn text(body: []const u8) ![]u8 {
+            const resp = try request("POST", "/v1/responses", body);
+            defer gpa.free(resp);
+            const p = try parseBody(bodyOf(resp));
+            defer p.deinit();
+            var out: std.ArrayList(u8) = .empty;
+            errdefer out.deinit(gpa);
+            for (p.value.object.get("output").?.array.items) |it| {
+                const t = it.object.get("type") orelse continue;
+                if (t != .string or !std.mem.eql(u8, t.string, "message")) continue;
+                for (it.object.get("content").?.array.items) |c| {
+                    if (c.object.get("text")) |tx| if (tx == .string) try out.appendSlice(gpa, tx.string);
+                }
+            }
+            return out.toOwnedSlice(gpa);
+        }
+        fn run() !void {
+            const plain_body = "{\"model\":\"tiny\",\"max_output_tokens\":12,\"temperature\":0,\"reasoning\":{\"effort\":\"none\"},\"input\":\"tell me a story\"";
+            const plain = try text(plain_body ++ "}");
+            defer gpa.free(plain);
+            const typed = try text(plain_body ++ ",\"text\":{\"format\":{\"type\":\"text\",\"schema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"integer\"}},\"required\":[\"a\"]}}}}");
+            defer gpa.free(typed);
+            if (!std.mem.eql(u8, plain, typed)) {
+                std.debug.print("text.format type text with a schema changed the reply: \"{s}\" -> \"{s}\"\n", .{ plain, typed });
+                return error.TextFormatEnforcedASchema;
+            }
+            // Two printable, JSON-safe bytes after the reply's first stop it there.
+            var at: usize = 1;
+            const cut: []const u8 = while (at + 2 <= plain.len) : (at += 1) {
+                const w = plain[at .. at + 2];
+                if (for (w) |c| {
+                    if (c < 0x21 or c > 0x7e or c == '"' or c == '\\') break false;
+                } else true) break w;
+            } else {
+                std.debug.print("no two printable bytes to stop at in \"{s}\"\n", .{plain});
+                return error.Inconclusive;
+            };
+            var sb: [512]u8 = undefined;
+            const body = try std.fmt.bufPrint(&sb, "{s},\"stop\":[\"{s}\"]}}", .{ plain_body, cut });
+            const stopped = try text(body);
+            defer gpa.free(stopped);
+            if (stopped.len >= plain.len or !std.mem.startsWith(u8, plain, stopped)) {
+                std.debug.print("stop \"{s}\": \"{s}\" -> \"{s}\"\n", .{ cut, plain, stopped });
+                return error.StopNotRead;
+            }
+        }
+    }.run);
+}
+
+test "server: request fields: a Responses max_tool_calls as a whole float echoes as the integer the check accepted" {
+    try eachArch(2, .{}, struct {
+        fn run() !void {
+            const resp = try request("POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":2,\"max_tool_calls\":3.0,\"input\":\"hi\"}");
+            defer gpa.free(resp);
+            const p = try parseBody(bodyOf(resp));
+            defer p.deinit();
+            const got = p.value.object.get("max_tool_calls") orelse .null;
+            if (got != .integer or got.integer != 3) {
+                std.debug.print("max_tool_calls 3.0 echoed as {any}\n", .{got});
+                return error.EchoReadsAnotherWay;
+            }
+        }
+    }.run);
+}

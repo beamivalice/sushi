@@ -1,6 +1,7 @@
 const std = @import("std");
 const json_text = @import("json_text.zig");
 const request_parse = @import("request_parse.zig");
+const request_fields = @import("request_fields.zig");
 const http = @import("http.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
@@ -57,8 +58,6 @@ const withEffortNoticeJson = request_policy.withEffortNoticeJson;
 const effortRefusalFor = request_policy.effortRefusalFor;
 const checkThinkingSupport = request_policy.checkThinkingSupport;
 const schemaMasksThinking = request_policy.schemaMasksThinking;
-const parseRepeatPenalty = request_policy.parseRepeatPenalty;
-const parseAdditivePenalty = request_policy.parseAdditivePenalty;
 const io_util = @import("io_util.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const sampler = @import("sampler.zig");
@@ -85,10 +84,7 @@ const getTimeoutNs = server_mod.getTimeoutNs;
 const jsonEscape = http.jsonEscape;
 const logHttpSseData = http.logHttpSseData;
 const nativeMeasuredMoeHead = server_mod.nativeMeasuredMoeHead;
-const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
-const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
-const parseRequestSeed = request_parse.parseRequestSeed;
 const promptOpensThink = server_mod.promptOpensThink;
 const renderConfigFor = server_mod.renderConfigFor;
 const renderQwenForResponsesTest = server_mod.renderQwenForResponsesTest;
@@ -365,23 +361,20 @@ pub fn handleResponsesCompact(
         return;
     };
     var fault_buf: [384]u8 = undefined;
-    if (request_parse.responsesFieldFault(&fault_buf, root)) |reason| {
-        log.warn("POST /v1/responses/compact -> 400 ({s})\n", .{reason});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-        return;
-    }
+    const req = switch (request_fields.check(.compact, &fault_buf, root)) {
+        .fault => |reason| {
+            log.warn("POST /v1/responses/compact -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .ok => |c| c,
+    };
 
     // ── instructions (optional) ──
-    const instructions: ?[]const u8 = if (root.get("instructions")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
+    const instructions: ?[]const u8 = req.text("instructions");
 
     // ── previous_response_id (optional) ──
-    const prev_id: ?[]const u8 = if (root.get("previous_response_id")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
+    const prev_id: ?[]const u8 = req.text("previous_response_id");
 
     var prev_messages: ?[]const chat_mod.Message = null;
     var prev_held: ?*responses_mod.StoredResponse = null;
@@ -480,11 +473,14 @@ fn handleResponsesInner(
     defer spelled.deinit();
 
     var fault_buf: [384]u8 = undefined;
-    if (request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &request_parse.responses_max_tokens, .stop = null }) orelse request_parse.responsesToolChoiceFault(&fault_buf, root) orelse request_parse.responsesFieldFault(&fault_buf, root)) |reason| {
-        log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-        return;
-    }
+    const req = switch (request_fields.check(.responses, &fault_buf, root)) {
+        .fault => |reason| {
+            log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .ok => |c| c,
+    };
 
     // ── input (required) ──
     const input_val = spelled.value.object.get("input") orelse {
@@ -493,24 +489,18 @@ fn handleResponsesInner(
     };
 
     // ── instructions ──
-    const instructions: ?[]const u8 = if (root.get("instructions")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
+    const instructions: ?[]const u8 = req.text("instructions");
 
     // ── previous_response_id ──
-    const prev_id: ?[]const u8 = if (root.get("previous_response_id")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
+    const prev_id: ?[]const u8 = req.text("previous_response_id");
 
     // ── store (default true) ──
-    const should_store = request_parse.boolField(root, .store) orelse true;
+    const should_store = req.flag("store") orelse true;
     // A WebSocket `store:false` turn comes forced to store and is kept on its connection (`turn.kept`).
     const store_echo = should_store and turn.kept == null;
 
     // ── streaming ──
-    const is_stream = request_parse.boolField(root, .stream) orelse false;
+    const is_stream = req.flag("stream") orelse false;
 
     // ── text.format (or chat-style response_format alias) ──
     var text_format = responses_mod.parseTextFormat(root.get("text"));
@@ -548,28 +538,25 @@ fn handleResponsesInner(
     // Track whether the user explicitly supplied max_output_tokens so we can
     // echo `null` (vs. our internal default) in the response envelope.
     const req_max_output_tokens: ?u32 = blk: {
-        const r = resolveRequestMaxTokens(request_parse.requestedMaxTokens(root, &request_parse.responses_max_tokens), 0);
+        const r = resolveRequestMaxTokens(req.requestedMaxTokens(), 0);
         break :blk if (r > 0) r else null;
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else filledMaxTokens(config));
-    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
-    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
-    const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
-    const frequency_penalty = parseAdditivePenalty(root, "frequency_penalty");
-    const repeat_penalty = parseRepeatPenalty(root);
-    const presence_penalty = parseAdditivePenalty(root, "presence_penalty");
+    const temperature = request_policy.samplingTemperature(config, req.number("temperature"));
+    const top_p = request_policy.samplingTopP(config, req.number("top_p"));
+    const top_k = request_policy.samplingTopK(config, req.topK());
+    const frequency_penalty = req.additivePenalty("frequency_penalty");
+    const repeat_penalty = req.repeatPenalty();
+    const presence_penalty = req.additivePenalty("presence_penalty");
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
-    const top_logprobs_echo: u32 = if (root.get("top_logprobs")) |v| (if (request_parse.wholeNumber(v)) |n| @intCast(n) else 0) else 0;
-    const max_tool_calls_echo = maxToolCallsEcho(root.get("max_tool_calls"));
-    const truncation_echo: []const u8 = if (root.get("truncation")) |v|
-        (if (v == .string and (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "disabled"))) v.string else "disabled")
-    else
-        "disabled";
-    const parallel_tool_calls_echo = request_parse.boolField(root, .parallel_tool_calls) orelse true;
-    const background_echo = request_parse.boolField(root, .background) orelse false;
+    const top_logprobs_echo: u32 = if (req.whole("top_logprobs")) |n| @intCast(n) else 0;
+    const max_tool_calls_echo: ?u32 = if (req.whole("max_tool_calls")) |n| @intCast(n) else null;
+    const truncation_echo: []const u8 = req.truncation();
+    const parallel_tool_calls_echo = req.flag("parallel_tool_calls") orelse true;
+    const background_echo = req.flag("background") orelse false;
     // Honest rejection: there is no queue/poll machinery behind `background`.
     // Accepting it and running synchronously returns status "completed" on a
     // request the caller expects to come back "queued" — a silent lie strict
@@ -578,30 +565,15 @@ fn handleResponsesInner(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "background mode is not supported; remove \"background\": true and run the request synchronously", 400);
         return;
     }
-    const service_tier_echo: []const u8 = if (root.get("service_tier")) |v|
-        (if (v == .string) v.string else "default")
-    else
-        "default";
-    const safety_identifier_echo: ?[]const u8 = if (root.get("safety_identifier")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
-    const prompt_cache_key_echo: ?[]const u8 = if (root.get("prompt_cache_key")) |v|
-        (if (v == .string) v.string else null)
-    else
-        null;
-    const seed: ?u64 = parseRequestSeed(root.get("seed"));
+    const service_tier_echo: []const u8 = req.text("service_tier") orelse "default";
+    const safety_identifier_echo: ?[]const u8 = req.text("safety_identifier");
+    const prompt_cache_key_echo: ?[]const u8 = req.text("prompt_cache_key");
+    const seed: ?u64 = req.seed();
 
     // ── stop sequences ──
     var stop_sequences = std.ArrayList([]const u8).empty;
     defer stop_sequences.deinit(allocator);
-    if (root.get("stop")) |sv| switch (sv) {
-        .string => |s| if (s.len > 0) try stop_sequences.append(allocator, s),
-        .array => |arr| for (arr.items) |it| {
-            if (it == .string and it.string.len > 0) try stop_sequences.append(allocator, it.string);
-        },
-        else => {},
-    };
+    try req.stops(allocator, &stop_sequences);
 
     // ── reasoning ──
     // Budget precedence as on chat: reasoning_budget_tokens > the effort word's cap.
@@ -626,7 +598,7 @@ fn handleResponsesInner(
         effort_notice = try holdEffortNotice(allocator, stream, effortModelName(lm), cfg);
         word_cfg = cfg;
     }
-    const thinking = request_policy.responsesThinking(root, reasoning_cfg.enable, word_cfg, effort_named, config, &effort_snap);
+    const thinking = request_policy.responsesThinking(req, reasoning_cfg.enable, word_cfg, effort_named, config, &effort_snap);
     var enable_thinking = thinking.enable;
     const reasoning_budget: i32 = thinking.budget;
     const template_effort = thinking.template;
@@ -742,7 +714,7 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    const render_config = renderConfigFor(chat_config, request_parse.chatTemplateKwargBool(root, "preserve_thinking"), model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    const render_config = renderConfigFor(chat_config, req.templateKwarg("preserve_thinking"), model_settings.preserve_thinking_flag, config.preserve_thinking_override);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, prompt_messages, active_tools_json, active_tool_choice_instruction, enable_thinking, template_effort, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
@@ -805,12 +777,12 @@ fn handleResponsesInner(
     // Clamp max_tokens first: the memory guard bills the reserved generation headroom.
     const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, req_max_output_tokens != null, prompt_ids.len, effective_ctx);
 
-    const allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
+    const allow_batch_mtp = req.flag("enable_batch_mtp") orelse true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, req.flag("enable_mtp") orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
-    var enable_mtp_resp: bool = request_parse.boolField(root, .enable_mtp) orelse
+    var enable_mtp_resp: bool = req.flag("enable_mtp") orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
@@ -818,7 +790,7 @@ fn handleResponsesInner(
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const lm_default_enable_drafter_resp: bool = lm.dflash != null;
-    var enable_drafter_resp: bool = request_parse.boolField(root, .enable_drafter) orelse lm_default_enable_drafter_resp;
+    var enable_drafter_resp: bool = req.flag("enable_drafter") orelse lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
 
     // Check if attention computation would exceed GPU memory.
@@ -830,7 +802,7 @@ fn handleResponsesInner(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
-        .min_p = request_parse.parseMinP(root),
+        .min_p = req.minP(),
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .frequency_penalty = frequency_penalty,
@@ -865,7 +837,7 @@ fn handleResponsesInner(
     }
 
     // Enforced at decode: the bound closes the thought, so this surface parses a closed block.
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(parseJsonFloatOpt(root, "think_penalty"), model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
@@ -2646,19 +2618,6 @@ test "a Responses envelope names the call a reply declined, ahead of a thought's
         try testing.expectEqualStrings(c.want.?, details.object.get("type").?.string);
         if (c.declined != null) try testing.expectEqualStrings("read_file", details.object.get("name").?.string);
     }
-}
-
-/// The `max_tool_calls` the envelope echoes: the whole number the field check accepted (3 or 3.0), else null.
-fn maxToolCallsEcho(v: ?std.json.Value) ?u32 {
-    const n = request_parse.wholeNumber(v orelse return null) orelse return null;
-    return std.math.cast(u32, n);
-}
-
-test "the Responses envelope echoes max_tool_calls as the whole number the field check accepted" {
-    try std.testing.expectEqual(@as(?u32, 3), maxToolCallsEcho(.{ .integer = 3 }));
-    try std.testing.expectEqual(@as(?u32, 3), maxToolCallsEcho(.{ .float = 3.0 }));
-    try std.testing.expectEqual(@as(?u32, null), maxToolCallsEcho(null));
-    try std.testing.expectEqual(@as(?u32, null), maxToolCallsEcho(.null));
 }
 
 test "tool stream: a Responses call that buffers for 23 s sends its item and a function_call_arguments.delta within every beat interval, after the thought and text before it" {

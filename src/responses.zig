@@ -6,6 +6,7 @@
 
 const arch_fx = @import("arch_fixtures_test.zig");
 const std = @import("std");
+const request_fields = @import("request_fields.zig");
 const json_text = @import("json_text.zig");
 const chat_mod = @import("chat.zig");
 
@@ -116,6 +117,8 @@ pub fn parseTextFormat(text_val: ?std.json.Value) TextFormat {
     if (fmt_val != .object) return .{ .kind = "text", .schema_value = null };
     const t_val = fmt_val.object.get("type") orelse return .{ .kind = "text", .schema_value = null };
     const t = if (t_val == .string) t_val.string else "text";
+    // Only a json_schema format carries a schema: one beside another type is not enforced.
+    if (!std.mem.eql(u8, t, "json_schema")) return .{ .kind = t, .schema_value = null };
     // Prefer flat `schema`; fall back to nested `json_schema.schema`.
     var schema = fmt_val.object.get("schema");
     var holder = fmt_val.object;
@@ -139,6 +142,7 @@ pub fn parseResponseFormatAlias(rf_val: ?std.json.Value) TextFormat {
     if (v != .object) return .{ .kind = "text", .schema_value = null };
     const t_val = v.object.get("type") orelse return .{ .kind = "text", .schema_value = null };
     const t = if (t_val == .string) t_val.string else "text";
+    if (!std.mem.eql(u8, t, "json_schema")) return .{ .kind = t, .schema_value = null };
     var schema = v.object.get("schema");
     var holder = v.object;
     if (schema == null) {
@@ -375,10 +379,7 @@ pub fn parseInput(
             // The assistant message the items before this one opened, still open to join.
             var open_turn: ?usize = null;
             for (arr.items, 0..) |item, item_index| {
-                if (item != .object) {
-                    open_turn = null;
-                    continue;
-                }
+                if (item != .object) return error.InputItemWrongShape;
                 const obj = item.object;
                 const sink: ImageSink = .{ .decoder = image_decoder, .vp = vp, .item = item_index };
                 const before = pi.messages.items.len;
@@ -388,10 +389,7 @@ pub fn parseInput(
                     joinAssistantTurn(&pi, &open_turn, before);
                     continue;
                 };
-                if (t_val != .string) {
-                    open_turn = null;
-                    continue;
-                }
+                if (t_val != .string) return error.InputItemWrongShape;
                 const t = t_val.string;
                 if (!std.mem.eql(u8, t, "message") and !std.mem.eql(u8, t, "function_call")) open_turn = null;
                 if (std.mem.eql(u8, t, "message")) {
@@ -412,7 +410,7 @@ pub fn parseInput(
                 }
             }
         },
-        else => {},
+        else => return error.InputWrongShape,
     }
 
     return pi;
@@ -573,16 +571,14 @@ fn appendMessageItem(
     obj: std.json.ObjectMap,
     sink: ImageSink,
 ) !void {
-    const role_val = obj.get("role") orelse return;
-    if (role_val != .string) return;
-    const role = chat_mod.canonicalRole(role_val.string);
+    const message = try request_fields.messageOf(.{ .object = obj });
+    const role = chat_mod.canonicalRole(message.role);
 
-    const content_val = obj.get("content") orelse return;
     var read: InputParts = .{};
-    switch (content_val) {
-        .string => |s| read.text = s,
-        .array => |arr| read = try readInputParts(allocator, pi, arr.items, sink),
-        else => {},
+    switch (try request_fields.contentOf(obj.get("content"))) {
+        .none => {},
+        .text => |t| read.text = t,
+        .parts => |parts| read = try readInputParts(allocator, pi, parts, sink),
     }
 
     const msg: chat_mod.Message = .{ .role = role, .content = read.text, .images = read.images, .media_parts = read.media_parts };

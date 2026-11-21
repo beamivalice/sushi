@@ -125,7 +125,6 @@ const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
 const parseCancelRequestId = request_parse.parseCancelRequestId;
 const joinedTextParts = request_parse.joinedTextParts;
 pub const requestCacheKey = request_parse.requestCacheKey;
-const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
 /// Number of live per-connection threads. Incremented before each spawn,
@@ -2594,7 +2593,7 @@ pub fn handleChatCompletions(
     defer if (effort_notice) |n| n.deinit(allocator);
     defer request_policy.clearEffortNotice(stream);
     if (effort_cfg) |e| effort_notice = try request_policy.holdEffortNotice(allocator, stream, request_policy.effortModelName(lm), e);
-    const thinking = request_policy.chatThinking(root, effort_cfg, config, &effort_snap);
+    const thinking = request_policy.chatThinking(req, effort_cfg, config, &effort_snap);
     var enable_thinking = thinking.enable;
     if (!try request_policy.checkThinkingSupport(allocator, stream, lm, &effort_snap, enable_thinking, false)) return;
     // Reasoning budget (max tokens in <think> block, -1 = unlimited).
@@ -3954,24 +3953,6 @@ test "tool_choice none bans each family's one-token call opener, and nothing els
         try std.testing.expectEqual(@as(f32, -100), ban.delta);
         // An opener the tokenizer splits would ban its first piece, a plain `<`, everywhere.
         try std.testing.expect(noneCallBan(a, &split, &config) == null);
-    }
-}
-
-test "chat_template_kwargs is read in one place, and only a bool counts" {
-    const a = std.testing.allocator;
-    const Case = struct { body: []const u8, want: ?bool };
-    const cases = [_]Case{
-        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":false}}", .want = false },
-        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":true}}", .want = true },
-        .{ .body = "{\"chat_template_kwargs\":{\"preserve_thinking\":\"off\"}}", .want = null },
-        .{ .body = "{\"chat_template_kwargs\":[1]}", .want = null },
-        .{ .body = "{\"preserve_thinking\":false}", .want = null },
-        .{ .body = "{}", .want = null },
-    };
-    for (cases) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(c.want, chatTemplateKwargBool(parsed.value.object, "preserve_thinking"));
     }
 }
 
