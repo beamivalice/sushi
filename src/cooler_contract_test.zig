@@ -667,6 +667,11 @@ pub const Served = struct {
     /// Requests through the scheduler, each prefilled in turn and then decoded together, their rows joined in its ticks
     /// as concurrent requests are, with the model's MTP head when `mtp`. `reused`: what the last took from a tier.
     pub fn concurrent(self: *Served, prompts: []const []const u32, n: u32, sampling: SamplingParams, mtp: bool) !void {
+        return self.concurrentInto(prompts, n, sampling, mtp, null);
+    }
+
+    /// `concurrent`, with each request's tokens appended to `out[i]` when given.
+    pub fn concurrentInto(self: *Served, prompts: []const []const u32, n: u32, sampling: SamplingParams, mtp: bool, out: ?[]std.ArrayList(u32)) !void {
         const a = testing.allocator;
         const sch = &self.sch;
         var slots: [4]*scheduler.Slot = undefined;
@@ -701,9 +706,36 @@ pub const Served = struct {
             std.debug.print("cooler contract: a served request failed ({s})\n", .{e});
             return error.RequestFailed;
         };
+        if (out) |o| for (slots[0..made], o) |slot, *into| try into.appendSlice(a, slot.legacy_gen.?.generated_ids.items);
         const hc = &self.entry.prefix_cache.?;
         hc.flushPendingDisk(arch_handle.trunk(self.entry.handle.?).s);
         hc.disk.?.drainWriter();
+    }
+
+    /// A request asked for `n` tokens that its client cancels after `ticks` decode ticks, ended as a cancel ends it (the
+    /// slot culled, completed and deinitialised); the tokens it said before.
+    pub fn requestCancelled(self: *Served, prompt: []const u32, n: u32, ticks: usize) !std.ArrayList(u32) {
+        const a = testing.allocator;
+        const sch = &self.sch;
+        const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = n });
+        defer {
+            sch.complete(slot);
+            for (sch.cleanup_queue.items) |s| s.deinit();
+            sch.cleanup_queue.clearRetainingCapacity();
+        }
+        _ = sch.pending.orderedRemove(0);
+        try scheduler.runPrefill(sch, slot);
+        if (!scheduler.postPrefillTerminal(sch, slot)) {
+            try sch.decoding.append(a, slot);
+            var one = [_]*scheduler.Slot{slot};
+            for (0..ticks) |_| if (slot.joinsTick()) try scheduler.runDecodeTick(sch, &one);
+            slot.cancelled.store(true, .release);
+            scheduler.cullDecoding(sch);
+        }
+        var got: std.ArrayList(u32) = .empty;
+        errdefer got.deinit(a);
+        try got.appendSlice(a, slot.legacy_gen.?.generated_ids.items);
+        return got;
     }
 };
 

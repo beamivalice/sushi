@@ -408,6 +408,17 @@ pub fn rowCaps(xfm: *transformer.Trunk, ctx: *const transformer.ForwardCtx, into
     model.rowCaps(st, into);
 }
 
+/// Binds the request that ends at token `end` to the state it runs (`dsv41_model.bindRequest`).
+pub fn bindRows(xfm: *transformer.Trunk, ctx: *const transformer.ForwardCtx, end: usize) !void {
+    const m = dsv41_state.modelOf(xfm) orelse return;
+    const request = dsv41_state.requestOf(ctx);
+    // A load of one row runs the request's state from its first forward on: it takes it now, as that forward would.
+    if (request) |r| if (!m.serves_rows) try model.bind(m, r);
+    const lent = model.lendFor(m, request) orelse (if (m.serves_rows) model.lendOwn(m) else null);
+    defer if (lent) |l| l.end();
+    try model.bindRequest(m, end, ctx.cache.step == 0);
+}
+
 pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, ctx: *const transformer.ForwardCtx, pos: usize, to_ssd: bool) !?SSMCheckpoint {
     const m = dsv41_state.modelOf(xfm) orelse return null;
     const lent = model.lendFor(m, dsv41_state.requestOf(ctx));

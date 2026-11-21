@@ -38,7 +38,9 @@ pub fn checkpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: 
 pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, chunk: u64, warm: bills.WarmPrefix) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
-    const held = (@as(u64, seq) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
+    // The row stores are made at the request's last row, so it holds them whole from its first chunk on.
+    const engine_side = @import("../cooler_side.zig").onEngine(config);
+    const held = c.stateReservedBytes(engine_side, @as(u64, seq) +| max_tokens) +| c.stateFixedBytes(config.dsparkOn());
     // The cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder pools it
     // may release or already holds lent (`bills.lendableBytes`, `dsv41_borrow`); a decode forward's never does, and the
     // last runs at the reply's end, its verify block past it. On MLX the decode pool is parked beside either. On a
@@ -63,7 +65,7 @@ pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_
     const c = config.dsv41 orelse return null;
     // As `dsv41_sched.coolerRows`: rows are a resident load's on Sushi Cooler.
     if (!config.expert_resident or !@import("../cooler_side.zig").onEngine(config)) return null;
-    return (@as(u64, prompt_len) +| max_tokens) *| c.stateBytesPerToken() +| c.stateFixedBytes(config.dsparkOn());
+    return c.stateReservedBytes(true, @as(u64, prompt_len) +| max_tokens) +| c.stateFixedBytes(config.dsparkOn());
 }
 
 pub fn transientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, seq: u64) ?u64 {
@@ -81,13 +83,18 @@ pub fn chunkTransientAt(config: *const model_mod.ModelConfig, kv_bits: u64, widt
     return c.forwardCapOn(@import("../cooler_side.zig").onEngine(config), width, kv_len +| width) +| (if (config.expert_streaming) config.expert_fill_peak_bytes else 0);
 }
 
+/// The request's last row the stores are bound to, null while none is (`Room`'s default).
+fn boundEnd(room: Room) ?u64 {
+    return if (room.hold.end == Room.unbound_end) null else room.hold.end;
+}
+
 /// What a prefill chunk of `width` rows from `kv_len` adds to the cache on a Cooler load: the row stores its rows overflow,
 /// regrown from the rows each holds (`room.rows`) by the rule `Rows.append` grows them by. Not the KV cache's policy.
 pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: Room) ?u64 {
     const c = config.dsv41 orelse return null;
     if (!@import("../cooler_side.zig").onEngine(config)) return null;
     var caps = room.rows;
-    return c.growRowStores(&caps, kv_len, width);
+    return c.growRowStores(&caps, kv_len, width, boundEnd(room));
 }
 
 /// The room the next chunk finds once the one of `width` rows from `kv_len` has grown the stores.
@@ -95,7 +102,7 @@ pub fn roomAfter(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, 
     const c = config.dsv41 orelse return null;
     if (!@import("../cooler_side.zig").onEngine(config)) return null;
     var after = room;
-    _ = c.growRowStores(&after.rows, kv_len, width);
+    _ = c.growRowStores(&after.rows, kv_len, width, boundEnd(room));
     return after;
 }
 

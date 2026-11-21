@@ -1520,6 +1520,7 @@ pub const Generator = struct {
         // billed (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after a prefix-cache hit.
         const past_end = @import("bills.zig").speculativeRowsPastEnd(&xfm.config, .{ .mtp_on = mtp_active });
         const reserved_tokens = try reserveRequestCapacity(ctx.cache, &xfm.config, total_ctx_for_chunk, max_tokens, default_chunk, past_end, s);
+        try prefix_arch.bindRows(xfm, &ctx, ctx.cache.end_tokens);
         // The arch's own per-request buffers reserve at the same length; the head's rows start at its base.
         if (mtp_cache) |*mc| try mc.reserve(.{ .reserve = reserved_tokens -| mtp_position_base, .end = ctx.cache.end_tokens -| mtp_position_base }, s);
         prefix_arch.aux.reserveQsaHistoryWithHead(

@@ -221,7 +221,7 @@ pub const Config = struct {
 
     /// Bytes ONE token adds to a request's state: the compressed KV rows of each KV source (FP4 with an E4M3 scale per
     /// 16) and the index keys of each owner (MXFP4), at their `ratio`-to-1 compression, stored as the round trips
-    /// left them. Growth slack and the copy a growth makes are transient (`forwardCap`).
+    /// left them. A request's stores are made at its last row (`stateReservedBytes`), so they never grow.
     pub fn stateBytesPerToken(self: *const Config) u64 {
         var raw: u64 = 0;
         for (0..self.layers) |l| {
@@ -230,19 +230,6 @@ pub const Config = struct {
             if (self.isOwner(l)) raw += indexRowBytes(self.index_head_dim) / r;
         }
         return raw;
-    }
-
-    /// The largest one layer's state per token: a growth holds its old rows beside the new buffer.
-    fn worstLayerBytesPerToken(self: *const Config) u64 {
-        var worst: u64 = 0;
-        for (0..self.layers) |l| {
-            const r: u64 = @max(self.ratios[l], 1);
-            var b: u64 = 0;
-            if (self.isKvSource(l)) b += compRowBytes(self.head_dim) / r;
-            if (self.isOwner(l)) b += indexRowBytes(self.index_head_dim) / r;
-            worst = @max(worst, b);
-        }
-        return worst;
     }
 
     /// What a request holds whatever its length: every layer's window ring and open pooling group, and with DSpark
@@ -262,20 +249,18 @@ pub const Config = struct {
     /// transients and the state rows it appends. The transient cap installs it (`dsv41_borrow`) and admission bills it.
     /// A prefill-width forward holds the tensors `dsv41_wide_bytes` counts from its shapes, the state rows among them; a
     /// decode or verify block scores every key (`narrow_rows` rows, `score_copies` copies) beside `forward_held_bytes`.
-    /// Both carry the rows' growth (its slack plus one layer's old rows beside the new buffer during the copy) and the
-    /// bill's one margin.
+    /// Both carry the bill's one margin; the row stores are made at the request's last row, so neither grows one.
     pub fn forwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         const ctx = @max(seq, 1);
-        if (rows > verify_rows) return wide_bytes.bytes(self, rows, ctx) +| self.growthBytes(ctx) +| BILL_MARGIN_BYTES;
-        return narrow_rows * ctx * 4 * score_copies +| self.growthBytes(ctx) +| cap_fixed_bytes;
+        if (rows > verify_rows) return wide_bytes.bytes(self, rows, ctx) +| BILL_MARGIN_BYTES;
+        return narrow_rows * ctx * 4 * score_copies +| cap_fixed_bytes;
     }
 
     /// `forwardCap` of a load on MLX's stream: MLX's graph holds what its evaluation order keeps, which no shape sum
     /// of ours counts, so a prefill-width forward there keeps the per-row rate measured on it.
     pub fn mlxForwardCap(self: *const Config, rows: u64, seq: u64) u64 {
         if (rows <= verify_rows) return self.forwardCap(rows, seq) +| self.rowsGridBytes();
-        const ctx = @max(seq, 1);
-        return rows *| self.dim *| mlx_row_bytes_per_dim +| self.growthBytes(ctx) +| self.rowsGridBytes() +| cap_fixed_bytes;
+        return rows *| self.dim *| mlx_row_bytes_per_dim +| self.rowsGridBytes() +| cap_fixed_bytes;
     }
 
     /// The most MLX's page grid adds to the row stores (`Rows.pagedCap`): under one grid step of each packed buffer.
@@ -294,10 +279,43 @@ pub const Config = struct {
         return if (engine) self.forwardCap(rows, seq) else self.mlxForwardCap(rows, seq);
     }
 
+    /// The rows layer `l`'s row stores hold for a request that ends at token `end`, which they are made at up front
+    /// (`dsv41_model.bindRequest`): the rows of `end` and of a verify block written past it.
+    pub fn storeRows(self: *const Config, l: usize, end: u64) u64 {
+        return (end +| verify_rows) / @max(self.ratios[l], 1);
+    }
+
+    /// What a request that ends at token `end` holds in its row stores, made at those rows up front: each store's codes
+    /// and scales a pool buffer of their own on the engine, the rows' exact bytes on MLX (whose page grid `rowsGridBytes`
+    /// adds to the caps).
+    pub fn stateReservedBytes(self: *const Config, engine: bool, end: u64) u64 {
+        var bytes: u64 = 0;
+        for (0..self.layers) |l| {
+            if (!self.isKvSource(l)) continue;
+            const rows = self.storeRows(l, end);
+            bytes += storeBytes(engine, rows, self.head_dim, 16);
+            if (self.isOwner(l)) bytes += storeBytes(engine, rows, self.index_head_dim, 32);
+        }
+        return bytes;
+    }
+
+    /// What the row stores of a state at token `n` keep once their request has ended (`dsv41_model.Request.reset`): the
+    /// rows they hold and a sixteenth over (`reservedRows`), each buffer at its pool size class.
+    pub fn keptStoreBytes(self: *const Config, n: u64) u64 {
+        var bytes: u64 = 0;
+        for (0..self.layers) |l| {
+            if (!self.isKvSource(l)) continue;
+            const rows = n / @max(self.ratios[l], 1);
+            bytes += if (rows == 0) 0 else packedStoreBytes(reservedRows(rows), self.head_dim, 16);
+            if (self.isOwner(l) and rows > 0) bytes += packedStoreBytes(reservedRows(rows), self.index_head_dim, 32);
+        }
+        return bytes;
+    }
+
     /// What a forward of `rows` rows from position `kv_len` makes of the row stores, which hold `caps` rows a layer: each
-    /// store its rows overflow is regrown by `grownRows`, its codes and its scales a buffer each at their pool size class.
-    /// Returns those buffers' bytes; `caps` becomes what the stores hold after.
-    pub fn growRowStores(self: *const Config, caps: *[max_layers]u32, kv_len: u64, rows: u64) u64 {
+    /// store its rows overflow is regrown by `grownRows` (to the request's `end` when one is bound), its codes and its
+    /// scales a buffer each at their pool size class. Returns those buffers' bytes; `caps` becomes what the stores hold after.
+    pub fn growRowStores(self: *const Config, caps: *[max_layers]u32, kv_len: u64, rows: u64, end: ?u64) u64 {
         var bytes: u64 = 0;
         for (0..self.layers) |l| {
             if (!self.isKvSource(l)) continue;
@@ -305,7 +323,7 @@ pub const Config = struct {
             const used = kv_len / r;
             const n = (kv_len +| rows) / r - used;
             if (used + n <= caps[l]) continue;
-            const grown = grownRows(caps[l], used, n);
+            const grown = grownRows(caps[l], used, n, if (end) |e| self.storeRows(l, e) else 0);
             caps[l] = @intCast(grown);
             bytes += packedStoreBytes(grown, self.head_dim, 16);
             if (self.isOwner(l)) bytes += packedStoreBytes(grown, self.index_head_dim, 32);
@@ -313,12 +331,8 @@ pub const Config = struct {
         return bytes;
     }
 
-    fn growthBytes(self: *const Config, ctx: u64) u64 {
-        return ctx * (self.stateBytesPerToken() / rows_grow_div + self.worstLayerBytesPerToken());
-    }
-
-    /// `forwardCap` of a joined decode forward, a row per request at `seqs`: each request's scores and state growth are
-    /// its own, `cap_fixed_bytes` the forward's.
+    /// `forwardCap` of a joined decode forward, a row per request at `seqs`: each request's scores are its own,
+    /// `cap_fixed_bytes` the forward's.
     pub fn joinedCap(self: *const Config, seqs: []const u64) u64 {
         return self.joinedCapOn(true, seqs);
     }
@@ -349,6 +363,11 @@ fn compRowBytes(width: u64) u64 {
 /// A packed store of `rows` rows of `width` values: its codes and its scales, each a pool buffer.
 fn packedStoreBytes(rows: u64, width: u64, group: u64) u64 {
     return pool_class.poolBytes(@intCast(rows * (width / 2))) + pool_class.poolBytes(@intCast(rows * (width / group)));
+}
+
+/// `packedStoreBytes` on the engine, else the rows' bytes as they are.
+fn storeBytes(engine: bool, rows: u64, width: u64, group: u64) u64 {
+    return if (engine) packedStoreBytes(rows, width, group) else rows * (width / 2 + width / group);
 }
 
 /// An index key: FP4 codes and one E8M0 scale per 32.
@@ -399,9 +418,11 @@ pub const verify_rows: u64 = 17;
 pub const rows_grow_div: u64 = 16;
 
 /// The rows a row store of `cap` rows that holds `used` has once it appends `n` (`dsv41_model.Rows.append`): as it is
-/// while they fit, else the rows it needs or its capacity a sixteenth over, the larger, and at least 64.
-pub fn grownRows(cap: u64, used: u64, n: u64) u64 {
+/// while they fit, else the rows its request ends at (`goal`, the larger when the rows asked pass it) or, for a store no
+/// request has bound (`goal` 0), the rows it needs or its capacity a sixteenth over, the larger, and at least 64.
+pub fn grownRows(cap: u64, used: u64, n: u64, goal: u64) u64 {
     if (used + n <= cap) return cap;
+    if (goal > 0) return @max(used + n, goal);
     return @max(used + n, @max(64, cap + cap / rows_grow_div));
 }
 
@@ -747,7 +768,7 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
         .{ .c = &rel_stq, .rows = 8192, .shapes = 10_775_347_200 },
         .{ .c = &rel, .rows = 2048, .shapes = 1_333_067_776 },
     }) |k| {
-        const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
+        const got = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
         errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
         try testing.expectEqual(k.shapes, got);
     }
@@ -767,9 +788,9 @@ test "dsv41 forward cap: a resident plan's route makes no spill pool, so its wid
         .{ .c = &rel_stq, .rows = 8192, .shapes = 9_298_886_656 },
     }) |k| {
         k.c.spill_pools = true;
-        const streamed = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
+        const streamed = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
         k.c.spill_pools = false;
-        const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
+        const got = k.c.forwardCap(k.rows, k.rows) - BILL_MARGIN_BYTES;
         errdefer std.debug.print("{d} rows: resident shape sum {d}, streamed {d}\n", .{ k.rows, got, streamed });
         try testing.expectEqual(k.shapes, got);
         try testing.expectEqual(wide_bytes.bytesAt(k.c, k.rows, k.rows, k.c.rate_groups), got);
@@ -807,11 +828,10 @@ test "dsv41 forward cap: a joined decode forward bills each request's one-row ca
     try testing.expectEqual(3 * c.forwardCap(1, 9_000) - 2 * cap_fixed_bytes, c.joinedCap(&.{ 9_000, 9_000, 9_000 }));
 }
 
-test "dsv41 forward cap: grows with the rows and the context, a chunk's tail merge is priced, and 1M fits" {
+test "dsv41 forward cap: grows with the rows, a decode block's with the context, a chunk's tail merge is priced, and 1M fits" {
     const c = try releaseStqForTest();
     const m: u64 = 1 << 20;
     try testing.expect(c.forwardCap(2048, 9_000) > c.forwardCap(1024, 9_000));
-    try testing.expect(c.forwardCap(2048, m) > c.forwardCap(2048, 9_000));
     try testing.expect(c.forwardCap(verify_rows, m) > c.forwardCap(1, 9_000));
     try testing.expect(c.forwardCap(verify_rows, m) * 3 < c.forwardCap(2048, m));
     // A prompt's widest forward is a chunk with the longest tail it absorbs; one 300 rows past a chunk runs them whole.
@@ -819,10 +839,11 @@ test "dsv41 forward cap: grows with the rows and the context, a chunk's tail mer
     try testing.expectEqual(c.forwardCap(2348, 2349), c.chunkCap(2048, 2349));
     // A prompt shorter than the chunk cannot run more rows than it has.
     try testing.expectEqual(c.forwardCap(100, 100), c.chunkCap(2048, 100));
-    // The measured growth beyond the state rows (1094 B a token less 890) is a fraction of the cap's per-token slope.
-    const measured: u64 = (gibs(0.336) - gibs(0.116)) / (225_000 - 9_000) - c.stateBytesPerToken();
+    // A request's row stores are made whole at its last row, so a cap's slope in the context is the decode block's scores
+    // alone, and a prefill-width cap has none.
     const slope = (c.forwardCap(1, m) - c.forwardCap(1, 9_000)) / (m - 9_000);
-    try testing.expect(slope >= measured);
+    try testing.expectEqual(narrow_rows * 4 * score_copies, slope);
+    try testing.expectEqual(c.forwardCap(2048, 9_000), c.forwardCap(2048, m));
     // The extrapolation to 1M context: a decode forward under 1.05 GB, a tail-merged 2048-row chunk under 7.2 GB.
     try testing.expect(c.forwardCap(verify_rows, m) < 1_050_000_000);
     try testing.expect(c.chunkCap(2048, m) < 7_200_000_000);

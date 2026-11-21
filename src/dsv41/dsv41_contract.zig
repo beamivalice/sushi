@@ -42,6 +42,8 @@ pub fn armsAgainstParse(on: bool) void {
 /// What each layer's row stores of the state the model runs hold now: the rows of their buffers (0 where a layer keeps
 /// none) and those buffers' bytes at their pool size classes. Read between forwards.
 pub const RowStores = struct {
+    /// The state's position.
+    n: usize = 0,
     rows: [64]u32 = @splat(0),
     bytes: [64]u64 = @splat(0),
 
@@ -66,8 +68,16 @@ pub fn rowStores(xfm: *Trunk) !RowStores {
     const m = dsv41_state.modelOf(xfm).?;
     const lent = dsv41_model.lendOwn(m);
     defer lent.end();
-    var out: RowStores = .{};
-    const st = (try dsv41_model.currentState(m)) orelse return out;
+    return rowStoresOf((try dsv41_model.currentState(m)) orelse return .{});
+}
+
+/// How many appends have had to grow a store, process-wide (`dsv41_model.store_grows`).
+pub fn storeGrows() u64 {
+    return dsv41_model.store_grows;
+}
+
+fn rowStoresOf(st: *const dsv41_model.State) RowStores {
+    var out: RowStores = .{ .n = st.n };
     for (st.layers, 0..) |*ls, li| {
         if (ls.comp) |r| out.rows[li] = @intCast(r.cap);
         for ([_]?dsv41_model.Rows{ ls.comp, ls.idx_k }) |rows| if (rows) |r| {
@@ -75,6 +85,113 @@ pub fn rowStores(xfm: *Trunk) !RowStores {
         };
     }
     return out;
+}
+
+/// A prefill of `ids` in forwards of `chunk` rows, run as the contract's other rows are (a decode state of the request's
+/// own, no `Generator`, so no request has bound its stores to a last row): `at[k]` is the position before chunk `k` and
+/// `stores[k]` what the stores hold there, with one more of each at the prompt's end.
+pub const UnboundChunks = struct {
+    at: std.ArrayList(usize) = .empty,
+    stores: std.ArrayList(RowStores) = .empty,
+
+    pub fn deinit(self: *UnboundChunks, a: std.mem.Allocator) void {
+        self.at.deinit(a);
+        self.stores.deinit(a);
+    }
+};
+
+pub fn unboundChunks(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, chunk: usize, out: *UnboundChunks) !void {
+    const trunk_mod = @import("../trunk.zig");
+    const m = dsv41_state.modelOf(xfm).?;
+    var req: dsv41_model.Request = .{};
+    defer req.deinit();
+    var cache = try trunk_mod.KVCache.initWithConfig(a, m.cfg.layers, @import("../kv_quant.zig").KVQuantConfig.dense);
+    defer cache.deinit();
+    var offset: usize = 0;
+    var ctx = xfm.defaultCtx();
+    ctx.cache = &cache;
+    ctx.moe_seq_offset = &offset;
+    ctx.arch_ctx.dsv41.request = &req;
+    var at: usize = 0;
+    while (true) {
+        {
+            const lent = dsv41_model.lend(m, &req);
+            defer lent.end();
+            try out.at.append(a, at);
+            try out.stores.append(a, if (try dsv41_model.currentState(m)) |st| rowStoresOf(st) else .{});
+        }
+        if (at == ids.len) break;
+        const n = @min(chunk, ids.len - at);
+        _ = mlx.mlx_array_free(try forwardIds(xfm, &ctx, ids[at..][0..n]));
+        at += n;
+    }
+}
+
+/// What a request's bind makes in the pool before its first forward: a fresh request is bound to its last row `end` as
+/// `Generator` binds it, and the pool's in-use bytes it grew by are returned, with the bytes of the window rings the state
+/// holds then (the stores are `Config.stateReservedBytes`).
+pub fn bindMade(xfm: *Trunk, end: usize) !struct { made: u64, rings: u64 } {
+    const trunk_mod = @import("../trunk.zig");
+    const m = dsv41_state.modelOf(xfm).?;
+    const a = std.testing.allocator;
+    var cache = try trunk_mod.KVCache.initWithConfig(a, m.cfg.layers, @import("../kv_quant.zig").KVQuantConfig.dense);
+    defer cache.deinit();
+    var offset: usize = 0;
+    var ctx = xfm.defaultCtx();
+    ctx.cache = &cache;
+    ctx.moe_seq_offset = &offset;
+    try xfm.resetCache();
+    mlx.engine.close();
+    const s0 = mlx.engine.stats();
+    try @import("dsv41_prefix.zig").bindRows(xfm, &ctx, end);
+    mlx.engine.close();
+    const s1 = mlx.engine.stats();
+    var rings: u64 = 0;
+    const lent = dsv41_model.lendOwn(m);
+    defer lent.end();
+    if (try dsv41_model.currentState(m)) |st| {
+        for (st.layers) |*ls| rings += pool_class.poolBytes(dsv41_model.arrayBytes(ls.win.buf.array));
+        for (st.ds) |*r| rings += pool_class.poolBytes(dsv41_model.arrayBytes(r.buf.array));
+    }
+    return .{ .made = (s1.pool_bytes - s1.pool_free) - (s0.pool_bytes - s0.pool_free), .rings = rings };
+}
+
+/// What a restored request makes in the pool: `ids[0..at]` are prefilled and captured as a restore point, the state is
+/// dropped, and the point is restored and the request bound to its last row `end` as `Generator` does. The pool's in-use
+/// bytes at their fullest over the restore and the bind, past those in use before them (the point's own arrays among
+/// them), which are the request's stores' and nothing else.
+pub fn restoredPeak(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, at: usize, end: usize) !u64 {
+    const trunk_mod = @import("../trunk.zig");
+    const prefix = @import("dsv41_prefix.zig");
+    const m = dsv41_state.modelOf(xfm).?;
+    var cache = try trunk_mod.KVCache.initWithConfig(a, m.cfg.layers, @import("../kv_quant.zig").KVQuantConfig.dense);
+    defer cache.deinit();
+    var offset: usize = 0;
+    var ctx = xfm.defaultCtx();
+    ctx.cache = &cache;
+    ctx.moe_seq_offset = &offset;
+    try xfm.resetCache();
+    _ = mlx.mlx_array_free(try forwardIds(xfm, &ctx, ids[0..at]));
+    var cp = blk: {
+        const lent = if (m.serves_rows) dsv41_model.lendOwn(m) else null;
+        defer if (lent) |l| l.end();
+        break :blk try prefix.capture(a, m, at);
+    };
+    defer cp.deinit(a);
+    try xfm.resetCache();
+    cache.step = at;
+    mlx.engine.close();
+    const s0 = mlx.engine.stats();
+    const in0 = s0.pool_bytes - s0.pool_free;
+    mlx.engine.resetPoolPeak(.process);
+    {
+        const lent = if (m.serves_rows) dsv41_model.lendOwn(m) else null;
+        defer if (lent) |l| l.end();
+        try prefix.restore(m, &cp, ids[0..at]);
+    }
+    try prefix.bindRows(xfm, &ctx, end);
+    mlx.engine.close();
+    return mlx.engine.poolPeak(.process) - in0;
 }
 
 /// The served tiny ends a chat or Responses reply within a few tokens, and holds 128: a long reply is a completion
@@ -200,6 +317,36 @@ pub fn greedyRows(a: std.mem.Allocator, xfm: *Trunk, prompts: []const []const u3
         defer _ = mlx.mlx_array_free(rows);
         try argmaxRows(xfm, rows, next);
         for (out, next) |*o, t| try o.append(a, t);
+    }
+    return out;
+}
+
+/// `n` greedy tokens over `ids` on the model's own decode state, no request and no `Generator`: its row stores grow by the
+/// policy, as no request has bound them to a last row.
+pub fn greedyUnbound(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32) !std.ArrayList(u32) {
+    const trunk_mod = @import("../trunk.zig");
+    const m = dsv41_state.modelOf(xfm).?;
+    var cache = try trunk_mod.KVCache.initWithConfig(a, m.cfg.layers, @import("../kv_quant.zig").KVQuantConfig.dense);
+    defer cache.deinit();
+    var offset: usize = 0;
+    var ctx = xfm.defaultCtx();
+    ctx.cache = &cache;
+    ctx.moe_seq_offset = &offset;
+    var out: std.ArrayList(u32) = .empty;
+    errdefer out.deinit(a);
+    if (ids.len > 1) _ = mlx.mlx_array_free(try forwardIds(xfm, &ctx, ids[0 .. ids.len - 1]));
+    var next: [1]u32 = undefined;
+    {
+        const logits = try forwardIds(xfm, &ctx, ids[ids.len - 1 ..]);
+        defer _ = mlx.mlx_array_free(logits);
+        try argmaxRows(xfm, logits, &next);
+    }
+    try out.append(a, next[0]);
+    while (out.items.len < n) {
+        const logits = try forwardIds(xfm, &ctx, &next);
+        defer _ = mlx.mlx_array_free(logits);
+        try argmaxRows(xfm, logits, &next);
+        try out.append(a, next[0]);
     }
     return out;
 }

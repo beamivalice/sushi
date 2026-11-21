@@ -324,7 +324,11 @@ const Rope = struct { freqs: A };
 
 // ── state ────────────────────────────────────────────────────────────────
 
-/// Rows appended one chunk at a time, in a buffer that grows by `rows_grow_div`'s fraction.
+/// Appends that had to grow a store: none while a request that bound its stores (`bindRequest`) runs.
+pub var store_grows: u64 = 0;
+
+/// Rows appended one chunk at a time, in a buffer made at the rows its request ends at, or for a store no request has
+/// bound, grown by `rows_grow_div`'s fraction.
 pub const Rows = struct {
     /// The rows `[cap, width]` in `dtype`, or packed: E2M1 codes `[cap, width/2]` u8.
     buf: mlx_pages.InPlace = .none,
@@ -332,6 +336,9 @@ pub const Rows = struct {
     sbuf: mlx_pages.InPlace = .none,
     used: usize = 0,
     cap: usize = 0,
+    /// The rows the request that holds this store ends at (`bindRequest`); 0 = no request has bound it, and it grows by
+    /// `rows_grow_div`'s fraction.
+    goal: usize = 0,
     width: usize,
     dtype: mlx.mlx_dtype,
     /// The rows are an FP4 round trip's output, stored in its own format (`qat_mod.packFp4`).
@@ -390,7 +397,19 @@ pub const Rows = struct {
     /// The grow the next append would make, made now: a buffer of this state's own with that append's slack.
     fn reserve(self: *Rows, s: S) !void {
         if (self.used == 0) return;
-        const cap = self.pagedCap(cfg_mod.reservedRows(self.used), s);
+        try self.regrow(self.pagedCap(cfg_mod.reservedRows(self.used), s), s);
+    }
+
+    /// The store of a request that ends at `goal` rows: its buffers made that long now with the rows it holds kept (none
+    /// yet, when it holds none), so no append makes or grows one.
+    fn bind(self: *Rows, goal: usize, s: S) !void {
+        self.goal = goal;
+        const cap = self.pagedCap(@max(goal, self.used), s);
+        if (cap != self.cap) try self.regrow(cap, s);
+    }
+
+    /// The buffers made `cap` rows long with the rows held kept.
+    fn regrow(self: *Rows, cap: usize, s: S) !void {
         if (self.pack) |pk| {
             try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
             try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
@@ -413,7 +432,8 @@ pub const Rows = struct {
         if (n == 0) return;
         const s = sc.s;
         if (self.used + n > self.cap) {
-            const cap = self.pagedCap(cfg_mod.grownRows(self.cap, self.used, n), s);
+            store_grows += 1;
+            const cap = self.pagedCap(cfg_mod.grownRows(self.cap, self.used, n, self.goal), s);
             if (self.pack) |pk| {
                 try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
                 try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
@@ -553,6 +573,9 @@ pub const State = struct {
     /// The stage rings hold a commit no pass has submitted yet (`commitMain` lazy); `flushMain` submits it.
     main_lazy: bool = false,
     verify: ?Verify = null,
+    /// `bindRequest` made this state for a request that has not run yet: its first forward keeps it, where it would
+    /// reset a state left by another (`takeBoundState`).
+    bound_fresh: bool = false,
 
     pub fn deinit(self: *State) void {
         for (self.layers) |*l| l.deinit();
@@ -3346,6 +3369,7 @@ pub const Request = struct {
     /// (`deinit`), so the slot's commit still writes its points from it.
     pub fn reset(self: *Request) void {
         self.endLease();
+        self.trimReserve();
         if (self.model) |m| if (m.serves_rows) {
             if (m.bound == self) m.bound = null;
             return;
@@ -3365,6 +3389,21 @@ pub const Request = struct {
     fn endLease(self: *const Request) void {
         const m = self.model orelse return;
         if (m.lessee == self) m.lessee = null;
+    }
+
+    /// The rows the request's stores were made for past those it used go back as it ends (`bindRequest`), whether it ran
+    /// to its last row or stopped early: what parks on the model or stays for the slot is the rows it used and a
+    /// sixteenth over, as a restore leaves them (`Rows.reserve`).
+    fn trimReserve(self: *Request) void {
+        const m = self.model orelse return;
+        const st = &(self.state orelse return);
+        pipeDrain(m) catch |e| log.warn("[dsv41] a pipelined layer failed as its request ended: {s}\n", .{@errorName(e)});
+        const cap = mlx.engine.uncapped();
+        defer mlx.engine.capped(cap);
+        for (st.layers) |*ls| for ([_]*?Rows{ &ls.comp, &ls.idx_k }) |slot| if (slot.*) |*rows| {
+            rows.goal = 0;
+            rows.trim(stateStream(m)) catch |e| log.warn("[dsv41] a row store was not trimmed as its request ended: {s}\n", .{@errorName(e)});
+        };
     }
 
     fn park(self: *Request) void {
@@ -3470,6 +3509,32 @@ pub fn checkLent(m: *const Model) !void {
 fn liveSlot(m: *Model) !*?State {
     try checkLent(m);
     return if (m.bound) |r| &r.state else &m.dec_state;
+}
+
+/// Binds the request that ends at token `end` to the state the model runs: every row store is made the rows it holds at
+/// that last row (and a verify block past it) before the first forward, so no append grows one. `fresh`: the request
+/// starts at position 0, so the state it runs is made new here and its first forward keeps it. Between forwards, with no
+/// cap, as a restore makes its slack (`restoreState`).
+pub fn bindRequest(m: *Model, end: usize, fresh: bool) !void {
+    const cap = mlx.engine.uncapped();
+    defer mlx.engine.capped(cap);
+    if (fresh) resetState(m);
+    const st = try ensureState(m);
+    st.bound_fresh = fresh;
+    for (st.layers, 0..) |*ls, li| {
+        const goal: usize = @intCast(m.cfg.storeRows(li, end));
+        if (ls.comp) |*rows| try rows.bind(goal, stateStream(m));
+        if (ls.idx_k) |*rows| try rows.bind(goal, stateStream(m));
+    }
+}
+
+/// Whether the state the model runs was made for the request whose first forward this is (`bindRequest`); the forward
+/// takes it, so a second one at position 0 resets as it always did.
+pub fn takeBoundState(m: *Model) bool {
+    const at = liveSlot(m) catch return false;
+    const st = &(at.* orelse return false);
+    defer st.bound_fresh = false;
+    return st.bound_fresh and st.n == 0;
 }
 
 /// The rows each layer's compressed-row store holds now, by layer (`kv_cache.Room.rows`); 0 where a layer has none.
@@ -4040,7 +4105,9 @@ fn restoreRows(r: *Rows, buf: A, sbuf: A, want: usize) !void {
 }
 
 /// Makes the request's state the restore point `slots` at position `n`, over the first `n` of the request's
-/// token ids (the Engram history); the arrays are shared, never written. A failure leaves the state reset.
+/// token ids (the Engram history); the arrays are shared, never written. The rows stay the point's own: the request's
+/// bind (`bindRequest`) makes its stores at its last row from them, one copy and none beside it. A failure leaves the
+/// state reset.
 pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
     if (slots.len != slotCount(m) or ids.len < n) return error.Dsv41CheckpointMismatch;
     resetState(m);
@@ -4067,15 +4134,6 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
     if (m.hash != null) {
         try st.hist.ensureTotalCapacity(m.gpa, n);
         for (ids[0..n]) |t| st.hist.appendAssumeCapacity(m.compressedId(t));
-    }
-    // The append-only rows become the state's own here, with their slack, as the state's room and not a forward's: a
-    // restored buffer has none, so the first forward would copy every layer's rows inside a cap that prices one
-    // layer's, and beside the point's own where someone keeps it (a RAM entry).
-    const cap = mlx.engine.uncapped();
-    defer mlx.engine.capped(cap);
-    for (st.layers) |*ls| {
-        if (ls.comp) |*rows| try rows.reserve(stateStream(m));
-        if (ls.idx_k) |*rows| try rows.reserve(stateStream(m));
     }
 }
 

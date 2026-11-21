@@ -481,7 +481,7 @@ pub fn tailUnread(window: usize, rows: usize, ahead_min_rows: usize, holds_point
 pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *dsv41_model.Model) !mlx.mlx_array {
     const scope = try dsv41_model.enterForward(m, dsv41_state.requestOf(ctx));
     defer scope.endForward();
-    if (ctx.cache.step == 0) dsv41_model.resetState(m);
+    if (ctx.cache.step == 0 and !dsv41_model.takeBoundState(m)) dsv41_model.resetState(m);
     const st = try dsv41_model.ensureState(m);
     if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
     st.owner = @intFromPtr(ctx.cache);

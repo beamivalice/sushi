@@ -97,13 +97,15 @@ pool on demand and the phase's bytes plus the pool never pass the limit. A reque
 
 The phase's bytes are the bill: `Config.forwardCap(rows, seq)` for a forward, `request_media.visionEncodeBill` for an image.
 
-    prefill-width forward (> 17 rows):  shape sum(rows, seq) + seq x (state/16 + worst layer) + 256 MiB
-    decode or verify forward (<= 17):   seq x 16 x 4 x 3 + seq x (state/16 + worst layer) + 123 MiB + 256 MiB
+    prefill-width forward (> 17 rows):  shape sum(rows, seq) + 256 MiB
+    decode or verify forward (<= 17):   seq x 16 x 4 x 3 + 123 MiB + 256 MiB
     joined decode forward (a row each): the sum of each request's decode term at its own seq, + 379 MiB once
-    prefill-width forward on MLX:       rows x dim x 480 + seq x (state/16 + worst layer) + 123 MiB + 256 MiB
+    prefill-width forward on MLX:       rows x dim x 480 + grid step + 123 MiB + 256 MiB
 
-The per-context term is a decode block's scores (16 rows, 3 copies, f32) and the row stores' growth (a sixteenth of the
-state, plus one layer's old rows beside the new buffer: 55 + 356 B a token); the 123 MiB is the 0.12 GiB of small
+The per-context term is a decode block's scores (16 rows, 3 copies, f32) alone: a request's row stores are made at its
+last row before its first forward (`dsv41_model.bindRequest`, the rows of `Config.storeRows`), so none grows and a forward's
+cap carries no slack or old copy for them; the request bill holds them whole, each buffer at its pool size class
+(`Config.stateReservedBytes`); when the request ends, early or not, they go back to the rows it used and a sixteenth over (`Request.reset`, `Config.keptStoreBytes`), so a parked state or a slot's holds no reserve. A restored request's stores are made once, at its last row, from the point's rows (`restoreState` leaves them shared; a live state rolled back to a point regrows from its own, the old rows beside the new buffer, which the bill's restore point in flight, `checkpointReserve`, prices). The 123 MiB is the 0.12 GiB of small
 tensors a decode forward holds (`forward_held_bytes`) and the 256 MiB the bill's one margin (`BILL_MARGIN_BYTES`); no
 term is multiplied. A last chunk absorbs a tail, so a chunk bills `chunk + 511` rows (`chunkCap`).
 On MLX the row stores grow on MLX's page grid (`Rows.pagedCap`), so each append writes in place, and the MLX caps add
@@ -352,8 +354,8 @@ never squeezes the state.
 What squeezed a 1M request was the prefill transient's context term: the indexer's scores, span x context x f32,
 billed three copies (3.9 KB a context token with the keys unpacked and the growth). The indexer now streams key tiles
 into a running top-k (`indexStream`), so one span's peak is flat in the context (44-81 MB at the release shapes, 948 MB
-whole at 1M). The context-scaled bill is 0.6 KB a token (the decode block's scores 192 B, growth slack 56 B, one
-layer's old rows during a growth 356 B) on top of the state's 0.89 KB. The prefix cache's restore points no longer
+whole at 1M). The context-scaled bill is the decode block's scores, 192 B a token (it was 0.6 KB with the row stores'
+growth slack and old copy, which stores made at the request's last row never take), on top of the state's 0.89 KB. The prefix cache's restore points no longer
 hold RAM ([below](#borrow)), so a 1M request bills 3.4 GB.
 
 <a id="borrow"></a>

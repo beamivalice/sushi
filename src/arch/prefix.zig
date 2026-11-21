@@ -297,6 +297,14 @@ pub fn rowCaps(xfm: *trunk.Trunk, ctx: *const trunk.ForwardCtx, into: *@FieldTyp
     }
 }
 
+/// The request's last row, bound to the arch's own row stores before its first forward (`kv_cache.Hold.end`): they are
+/// made that long now, as the KV cache is made its reservation. No-op where the arch keeps none.
+pub fn bindRows(xfm: *trunk.Trunk, ctx: *const trunk.ForwardCtx, end: usize) !void {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(P(t), "bindRows")) try P(t).bindRows(m, ctx, end),
+    }
+}
+
 /// Checkpoints one RAM entry or one prefill keeps in memory, when the arch caps them below the launch value `global`.
 pub fn checkpointMax(config: *const model.ModelConfig, global: u32) u32 {
     const tag = registry.ofModelType(config.model_type) orelse return global;

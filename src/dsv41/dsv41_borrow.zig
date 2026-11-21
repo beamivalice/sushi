@@ -922,10 +922,14 @@ test "dsv41 borrow: every phase installs the cap it bills and the decode pool be
             try testing.expectEqual(c.mlxForwardCap(17, 225_000) + pool, PoolProbe.transient);
             _ = enterForward(2048, 225_000, &config, c, PoolProbe.ops);
             try testing.expectEqual(c.mlxForwardCap(2048, 225_000) + pool, PoolProbe.transient);
-            // The same rows further into the context cost more: the cap follows the position.
+            // A decode block's scores follow the position, so its cap does; a prefill-width cap adds nothing for the context,
+            // the request's row stores being made whole before its first forward.
+            _ = enterForward(1, 9_000, &config, c, PoolProbe.ops);
             const before = PoolProbe.transient;
-            _ = enterForward(2048, 1 << 20, &config, c, PoolProbe.ops);
+            _ = enterForward(1, 1 << 20, &config, c, PoolProbe.ops);
             try testing.expect(PoolProbe.transient > before);
+            _ = enterForward(2048, 1 << 20, &config, c, PoolProbe.ops);
+            try testing.expectEqual(c.mlxForwardCap(2048, 225_000) + pool, PoolProbe.transient);
             // An image encode is capped at its own bill.
             enterVision(1_100_000_000, &config, PoolProbe.ops);
             try testing.expectEqual(@as(u64, 1_100_000_000) + pool, PoolProbe.transient);

@@ -2270,7 +2270,7 @@ test "dsv41 engine: the first step after a restore from a point someone keeps co
     defer a.free(ids);
     _ = fx.prompt(ids);
     // The fixed arrays a point shares (the window rings, the open group, the DSpark stages) are copied at their first
-    // write, the same bytes at any length; the rows, which grow with the context, are the state's own from the restore.
+    // write, the same bytes at any length; the rows, which grow with the context, are the state's own from the bind.
     var beyond: [2]u64 = undefined;
     for ([_]usize{ 4096, 8192 }, &beyond) |n, *extra| {
         var growth: [2]u64 = undefined;
@@ -2290,6 +2290,11 @@ test "dsv41 engine: the first step after a restore from a point someone keeps co
                 try fx.xfm.resetCache();
                 try dsv41_prefix.restore(m, &cp, ids[0..n]);
             }
+            // As `Generator` binds a request to its last row before its first forward: the restored rows are copied once,
+            // there, into the stores the forward then finds whole.
+            ctx = fx.xfm.defaultCtx();
+            ctx.cache.step = n;
+            try dsv41_prefix.bindRows(&fx.xfm, &ctx, n + 16);
             mlx.engine.close();
             const before = mlx.engine.stats();
             ctx = fx.xfm.defaultCtx();

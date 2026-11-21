@@ -147,7 +147,45 @@ test "cooler contract: a DeepSeek chunk's cache growth is billed from the rows i
             var ld: Load = undefined;
             try ld.open(D, dir, true);
             defer _ = ld.close();
-            // Narrow chunks of a long prompt: the stores' growth is the policy's sixteenth in some, the rows asked in others.
+            // Stores no request has bound grow by the policy: a sixteenth in some chunks, the rows asked in others.
+            const prompt = try a.alloc(u32, 3000);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+            var run_: D.UnboundChunks = .{};
+            defer run_.deinit(a);
+            try D.unboundChunks(a, ld.xfm, prompt, 64, &run_);
+            const bits = bills.defaultKvBits(&ld.config);
+            var wrong: usize = 0;
+            var grew: usize = 0;
+            var stayed: usize = 0;
+            for (0..run_.at.items.len - 1) |k| {
+                var room: @import("kv_cache.zig").Room = .{};
+                room.rows = run_.stores.items[k].rows;
+                const rows = run_.at.items[k + 1] - run_.at.items[k];
+                const billed = bills.chunkGrowthBytes(&ld.config, bits, rows, run_.at.items[k], room);
+                // Equal, not at most: a bill under what the stores take is a cap a forward exceeds, one over it a refusal
+                // of a request that fits.
+                const took = run_.stores.items[k].madeBy(&run_.stores.items[k + 1]);
+                if (took > 0) grew += 1 else stayed += 1;
+                if (billed != took) {
+                    wrong += 1;
+                    if (wrong <= 6) std.debug.print("cooler contract: the {d}-row chunk at {d}: billed {d} B of growth, its stores took {d} B\n", .{ rows, run_.at.items[k], billed, took });
+                }
+            }
+            // The prompt reaches both: chunks that regrow the stores and chunks that fit the rows they hold.
+            try testing.expect(grew > 0 and stayed > 0);
+            try testing.expectEqual(@as(usize, 0), wrong);
+        }
+    }.run);
+}
+
+test "cooler contract: a DeepSeek request's row stores are made at its last row before its first chunk, and no chunk grows one" {
+    try servedOn("dsv41", &.{"DSV41_STQ_TINY"}, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
             const prompt = try a.alloc(u32, 3000);
             defer a.free(prompt);
             for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
@@ -156,23 +194,48 @@ test "cooler contract: a DeepSeek chunk's cache growth is billed from the rows i
             var got = try serialWith(&ld, prompt, 1, .{ .temperature = 0.0 }, .{ .pinned_prefill_chunk = 64, .chunk_width_hook = .{ .ctx = &log, .call = Log.call, .confirm = Log.confirm } });
             got.deinit(a);
             if (log.failed) |e| return e;
-            const bits = bills.defaultKvBits(&ld.config);
-            var wrong: usize = 0;
-            var grew: usize = 0;
-            var stayed: usize = 0;
-            for (0..log.n - 1) |k| {
-                const rows = log.pos[k + 1] - log.pos[k];
-                const billed = bills.chunkGrowthBytes(&ld.config, bits, rows, log.pos[k], log.room[k]);
-                const took = log.stores[k].madeBy(&log.stores[k + 1]);
-                if (took > 0) grew += 1 else stayed += 1;
-                if (billed != took) {
-                    wrong += 1;
-                    if (wrong <= 6) std.debug.print("cooler contract: the {d}-row chunk at {d}: billed {d} B of growth, its stores took {d} B\n", .{ rows, log.pos[k], billed, took });
-                }
+            const end = try D.rowStores(ld.xfm);
+            var grown: usize = 0;
+            for (log.stores[0..log.n]) |boundary| {
+                if (!std.mem.eql(u32, &boundary.rows, &end.rows)) grown += 1;
             }
-            // The prompt reaches both: chunks that regrow the stores and chunks that fit the rows they hold.
-            try testing.expect(grew > 0 and stayed > 0);
-            try testing.expectEqual(@as(usize, 0), wrong);
+            // The bill's own term for them: what a request ending at its last row holds, at pool size classes.
+            const request_end = log.room[0].hold.end;
+            try testing.expect(request_end >= prompt.len and request_end != @import("kv_cache.zig").Room.unbound_end);
+            const reserved = ld.config.dsv41.?.stateReservedBytes(true, request_end);
+            if (end.total() != reserved) std.debug.print("cooler contract: the stores hold {d} B when the request ends, its bill's state term is {d} B\n", .{ end.total(), reserved });
+            try testing.expectEqual(reserved, end.total());
+            if (grown > 0) std.debug.print("cooler contract: the stores hold {d} B when the request ends; {d} of {d} chunk boundaries found them at other row counts, the first at {d} B\n", .{ end.total(), grown, log.n, log.stores[0].total() });
+            try testing.expectEqual(@as(usize, 0), grown);
+            // So no chunk it runs from its first boundary on is billed a growth.
+            const bills = @import("bills.zig");
+            const bits = bills.defaultKvBits(&ld.config);
+            for (0..log.n - 1) |k| try testing.expectEqual(@as(u64, 0), bills.chunkGrowthBytes(&ld.config, bits, log.pos[k + 1] - log.pos[k], log.pos[k], log.room[k]));
+        }
+    }.run);
+}
+
+test "cooler contract: a DeepSeek request whose row stores are made at its last row gives the tokens of one whose stores grow by the policy" {
+    try servedOn("dsv41", &.{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" }, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            // Long enough that the policy regrows the stores several times; the model's own state, no request having bound its stores.
+            const prompt = try a.alloc(u32, 1500);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+            var bound = try greedy(&ld, prompt, 24);
+            defer bound.deinit(a);
+            var grown = blk: {
+                const turn = arch_handle.turnFor(ld.h, &ld.config);
+                defer turn.end();
+                defer arch_sched.endRequest(&ld.config);
+                break :blk try D.greedyUnbound(a, ld.xfm, prompt, 24);
+            };
+            defer grown.deinit(a);
+            try testing.expectEqualSlices(u32, grown.items, bound.items);
         }
     }.run);
 }
@@ -1977,4 +2040,133 @@ test "cooler contract: the dearest decode regrow of the QSA history holds beside
     };
     try testing.expect(regrows > 0);
     try testing.expectEqual(@as(usize, 0), over);
+}
+
+const dsv41_tinies: []const [:0]const u8 = &.{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" };
+
+test "cooler contract: a DeepSeek request restored from a tier makes no store grow, from the SSD or RAM, after a prompt or after a reply" {
+    try servedOn("dsv41", dsv41_tinies, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            const first = try a.alloc(u32, 1300);
+            defer a.free(first);
+            for (first, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+            for ([_]u64{ 0, 64 << 20 }) |ram| for ([_]bool{ false, true }) |after_reply| {
+                errdefer std.debug.print("cooler contract: the second request, RAM tier {d} B, after a reply {}\n", .{ ram, after_reply });
+                var sv: Served = undefined;
+                try sv.initTiers(&ld, dir, ram);
+                defer sv.deinit();
+                var f: u32 = 0;
+                var said = try sv.request(first, 8, &f);
+                defer said.deinit(a);
+                var next: std.ArrayList(u32) = .empty;
+                defer next.deinit(a);
+                try next.appendSlice(a, first);
+                if (after_reply) try next.appendSlice(a, said.items);
+                for (0..40) |i| try next.append(a, ids[(i * 5 + 2) % ids.len]);
+                const grows = D.storeGrows();
+                var again = try sv.request(next.items, 8, &f);
+                again.deinit(a);
+                // The restore took rows from a tier or the live state, and the request ran on stores made whole.
+                try testing.expect(sv.reused > 0);
+                try testing.expectEqual(grows, D.storeGrows());
+            };
+        }
+    }.run);
+}
+
+test "cooler contract: DeepSeek requests decoding together keep their stores whole and say their solo tokens" {
+    try servedOn("dsv41", dsv41_tinies, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            // A load of one row has no decode of requests together to check.
+            if (arch_sched.coolerRows(&ld.config).rows <= 1) return;
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var long: [70]u32 = undefined;
+            for (&long, 0..) |*t, i| t.* = ids[(i * 7 + 3) % ids.len];
+            var short: [41]u32 = undefined;
+            for (&short, 0..) |*t, i| t.* = ids[(i * 5 + 1) % ids.len];
+            const prompts = [_][]const u32{ &long, &short };
+            var solo: [2]std.ArrayList(u32) = .{ .empty, .empty };
+            defer for (&solo) |*o| o.deinit(a);
+            var f: u32 = 0;
+            for (prompts, &solo) |p, *o| o.* = try sv.request(p, 24, &f);
+            var together: [2]std.ArrayList(u32) = .{ .empty, .empty };
+            defer for (&together) |*o| o.deinit(a);
+            const grows = D.storeGrows();
+            try sv.concurrentInto(&prompts, 24, .{ .temperature = 0.0 }, false, &together);
+            try testing.expectEqual(grows, D.storeGrows());
+            for (solo, together) |want, got| try testing.expectEqualSlices(u32, want.items, got.items);
+        }
+    }.run);
+}
+
+test "cooler contract: a DeepSeek request cancelled well before its last row gives back the stores it was made for" {
+    try servedOn("dsv41", dsv41_tinies, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            var prompt: [64]u32 = undefined;
+            for (&prompt, 0..) |*t, i| t.* = ids[(i * 7 + 3) % ids.len];
+            // Asked for 3000 tokens, cancelled after three ticks: the stores were made for the 3000.
+            var said = try sv.requestCancelled(&prompt, 3000, 3);
+            defer said.deinit(a);
+            try testing.expect(said.items.len > 0 and said.items.len < 100);
+            // What stays parked on the model, or none where the slot's state went with it, is the rows the request used.
+            const left = try D.rowStores(ld.xfm);
+            const c = ld.config.dsv41.?;
+            errdefer std.debug.print("cooler contract: {d} B of stores stay at position {d}, its used rows keep {d} B, its 3000-token reservation {d} B\n", .{ left.total(), left.n, c.keptStoreBytes(left.n), c.stateReservedBytes(true, prompt.len + 3000) });
+            try testing.expectEqual(c.keptStoreBytes(left.n), left.total());
+        }
+    }.run);
+}
+
+test "cooler contract: a DeepSeek request restored from a point makes its stores once, at its last row" {
+    try servedOn("dsv41", dsv41_tinies, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            const prompt = try a.alloc(u32, 1300);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+            const end: usize = 1300 + 64;
+            const made = try D.restoredPeak(a, ld.xfm, prompt, 1200, end);
+            const reserved = ld.config.dsv41.?.stateReservedBytes(true, end);
+            errdefer std.debug.print("cooler contract: the restore and the bind took {d} B of the pool at their fullest, the stores at the request's last row are {d} B\n", .{ made, reserved });
+            // Each store is made once, at its last row: no copy of the restored rows waits beside it.
+            try testing.expectEqual(reserved, made);
+        }
+    }.run);
+}
+
+test "cooler contract: a DeepSeek request's first forward finds its whole state made: the stores and the window rings" {
+    try servedOn("dsv41", dsv41_tinies, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            _ = ids;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            const end: usize = 1300 + 64;
+            const bound = try D.bindMade(ld.xfm, end);
+            const stores = ld.config.dsv41.?.stateReservedBytes(true, end);
+            errdefer std.debug.print("cooler contract: the bind made {d} B, the stores are {d} B and the window rings {d} B\n", .{ bound.made, stores, bound.rings });
+            // The rings are zeros a pass would otherwise make inside its first forward, past the shapes its cap prices.
+            try testing.expectEqual(stores + bound.rings, bound.made);
+        }
+    }.run);
 }
