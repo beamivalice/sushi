@@ -1811,6 +1811,59 @@ async function main() {
       const ids = await listIds(page);
       assert.equal(ids.includes('GLM-B'), false, `/v1/models dropped GLM-B; the list shows ${ids}`);
     });
+    const cacheProps = (server) => {
+      server.state.diskUsed = 41 * GiB;
+      server.state.diskBudget = 100 * GiB;
+      server.state.hooks['/props'] = () => {
+        const ready = server.state.models.some((m) => m.state === 'ready');
+        return reply({ settings: { version: '9.9.9', mtp: {}, ...(ready ? { prefix_cache: { disk_bytes: server.state.diskBudget, disk_used_bytes: server.state.diskUsed, disk_entries: server.state.diskUsed ? 37 : 0 } } : {}) }, memory: { available_bytes: 5e9, total_bytes: 48 * GiB }, batching: {} });
+      };
+      server.state.hooks['/v1/prefix-cache/clear'] = (body) => {
+        if (body.scope !== 'model' && body.scope !== 'all') return null;
+        server.state.cache.namespaces = server.state.cache.namespaces.filter((n) => body.scope === 'all' ? n.held_by_other_process : n.model !== body.model);
+        server.state.diskUsed = 0;
+        return reply({ freed_bytes: 41 * GiB });
+      };
+    };
+    const chatMeter = (page) => page.evaluate(() => ({ hidden: document.getElementById('prefixCacheSection').hidden, usage: document.getElementById('prefixCacheUsage').textContent }));
+    await scenario('the chat\'s prompt-cache meter follows Clear all caches on Settings', { path: '/chat', open: { mode: 'advanced' }, setup: cacheProps }, async ({ page, server }) => {
+      await page.waitForFunction(() => /41\.0/.test(document.getElementById('prefixCacheUsage').textContent));
+      await page.click('#navSettings');
+      await page.waitForSelector('#clearAll:not([disabled])');
+      await page.click('#clearAll');
+      await page.click('#cdOk');
+      await settle(page, 500);
+      await page.click('#navChat');
+      await settle(page, 500);
+      assert.equal(server.state.diskUsed, 0, 'the clear reached the server');
+      const m = await chatMeter(page);
+      assert.doesNotMatch(m.usage, /41\.0/, `/props reports nothing used; the meter reads "${m.usage}"`);
+    });
+    await scenario('the chat\'s prompt-cache meter goes when the model is unloaded on Models', { path: '/chat', open: { mode: 'advanced' }, setup: cacheProps }, async ({ page, server }) => {
+      await page.waitForFunction(() => /41\.0/.test(document.getElementById('prefixCacheUsage').textContent));
+      await page.click('#navModels');
+      await page.waitForSelector('#modelsDetail button:text-is("Unload")');
+      await page.click('#modelsDetail button:text-is("Unload")');
+      await settle(page, 500);
+      await page.click('#navChat');
+      await settle(page, 500);
+      assert.equal(server.state.models[0].state, 'unloaded');
+      const m = await chatMeter(page);
+      assert.equal(m.hidden, true, `no model is loaded and /props has no prefix_cache; the meter shows "${m.usage}"`);
+    });
+    await scenario('the chat\'s prompt-cache meter follows a saved cache size', { path: '/chat', open: { mode: 'advanced' }, setup: cacheProps }, async ({ page, server }) => {
+      await page.waitForFunction(() => /41\.0 \/ 100\.0/.test(document.getElementById('prefixCacheUsage').textContent));
+      server.state.hooks['/v1/settings'] = (body, method) => { if (method === 'POST' && body.server?.prefix_cache_disk_gb) server.state.diskBudget = body.server.prefix_cache_disk_gb * GiB; return null; };
+      await page.click('#navSettings');
+      await page.waitForSelector('#cacheGb');
+      await page.fill('#cacheGb', '50');
+      await page.press('#cacheGb', 'Enter');
+      await page.waitForSelector('.toast');
+      await page.click('#navChat');
+      await settle(page, 500);
+      const m = await chatMeter(page);
+      assert.match(m.usage, /41\.0 \/ 50\.0/, `the budget is 50 GiB now; the meter reads "${m.usage}"`);
+    });
 
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
     console.log('Web UI admin views (browser): passed');

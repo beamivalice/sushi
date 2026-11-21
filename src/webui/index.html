@@ -1380,7 +1380,8 @@ const modelStore = {
       if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err", { stay: true });
     }
     this.pending.delete(id);
-    await this.refresh();
+    // A reload empties the model's cache without changing who is loaded.
+    await invalidate({ models: true, cache: true });
     this.emit();
     if (!done) return;
     // A load can evict other models to fit; the list after it says which.
@@ -1389,11 +1390,11 @@ const modelStore = {
   },
 };
 document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(modelStore.timer); else modelStore.refresh(); });
-// The one way an action tells the page what it moved on the server: each store named is read again, and every view
-// renders the answer. `failures` (true, or a model id) ends the refusal note of an action that may have lifted it.
-function invalidate({ models = false, settings = false, failures = false }) {
+// The one way an action tells the page what it moved on the server: each store named (models, settings, the chat's
+// prompt-cache meter) is read again, and every view renders the answer. `failures` (true, or a model id) ends the refusal note of an action that may have lifted it.
+function invalidate({ models = false, settings = false, cache = false, failures = false }) {
   if (failures) modelStore.forgetFailures(failures);
-  return Promise.all([models && modelStore.refresh(), settings && window.sushiAdmin?.refresh()]);
+  return Promise.all([models && modelStore.refresh(), settings && window.sushiAdmin?.refresh(), cache && readPrefixCache()]);
 }
 /* The status in the top bar: what is loaded, or why nothing is. */
 function renderServerStatus() {
@@ -1962,23 +1963,39 @@ function cacheVolumeText(volume) {
   const warning = free <= 5 * 1024 ** 3 ? ' · almost full: free some disk space' : free / Number(volume.total_bytes) < 0.1 ? ' · less than 10% free' : '';
   return `${volume.name} · ${n.toFixed(unit ? 2 : 0)} ${units[unit]} free (${percent}%)${warning}`;
 }
+// The meter shows the latest /props answer: a read that lands after a newer one is dropped.
+let propsSeq = 0, propsApplied = 0;
+function readPrefixCache() {
+  const mine = ++propsSeq;
+  return apiJson("/props").then((props) => {
+    if (mine < propsApplied) return;
+    propsApplied = mine;
+    renderPrefixCache(props?.settings?.prefix_cache);
+  }).catch(() => {});
+}
 // The server flushes a turn's entry after it answers, so a second read catches the stored bytes.
 function refreshPrefixCache() {
-  const read = () => apiJson("/props").then((props) => renderPrefixCache(props?.settings?.prefix_cache)).catch(() => {});
-  read();
-  setTimeout(read, 2500);
+  readPrefixCache();
+  setTimeout(readPrefixCache, 2500);
 }
 function loadVersion() {
+  const mine = ++propsSeq;
   apiJson("/props")
     .then((props) => {
       const version = props?.update?.current ?? props?.settings?.version;
       if (version) $("brandVersion").textContent = $("aboutVersion").textContent = `v${String(version).replace(/^v/, "")}`;
       showUpdate(props?.update);
       reportUpdateResult(props?.update);
-      renderPrefixCache(props?.settings?.prefix_cache);
+      if (mine >= propsApplied) { propsApplied = mine; renderPrefixCache(props?.settings?.prefix_cache); }
     })
     .catch(() => {});
 }
+// /props carries a prefix cache only while a model is loaded, so a load or an unload, by any tab, changes the meter.
+let readyModels = "";
+modelStore.subscribe(() => {
+  const ready = modelStore.list.filter((model) => model.state === "ready").map((model) => model.id).sort().join("|");
+  if (ready !== readyModels) { readyModels = ready; readPrefixCache(); }
+});
 
 /* ------------------------------------------------------------
    Self-update: the server offers a newer release and restarts into it
@@ -4257,7 +4274,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       if (r.skipped_live_namespaces) parts.push(`${r.skipped_live_namespaces} in use by another server, kept.`);
       toast(parts.join(" "));
     } catch (e) { failToast("Clear", e); }
-    try { await refresh(); } finally { A.busy.clear(); renderAll(); }
+    try { await invalidate({ settings: true, cache: true }); } finally { A.busy.clear(); renderAll(); }
   }
   const reqModel = (id) => ({ scope: "model", model: id });
   const clearModel = (id) => clearCache({ title: `Clear ${id}'s cache?`, body: "Deletes this model's saved conversations. Follow-up requests re-read their prompts in full until it rebuilds.",
@@ -4551,7 +4568,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         saved = true;
       } catch (e) { A.serr[key] = adminErrorText(e); }
     });
-    await invalidate({ models: true, settings: true, failures: saved });
+    await invalidate({ models: true, settings: true, cache: saved && key === "prefix_cache_disk_gb", failures: saved });
   }
   async function saveCache() {
     const v = adminControlValue(GB_SPEC, cacheIn.value);

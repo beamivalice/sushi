@@ -56,8 +56,17 @@ assert.ok(timers[0][1] >= 1000);
 timers[0][0]();
 assert.equal(reads, 2);
 // apiJson resolves on a microtask; the render lands after it.
-Promise.resolve().then(() => Promise.resolve()).then(() => {
+Promise.resolve().then(() => Promise.resolve()).then(async () => {
   assert.equal(node('prefixCacheUsage').textContent, '2.00 / 10.0 GiB');
+  // An older read that answers after a newer one is dropped: the meter shows the latest answer.
+  const held = [];
+  page.apiJson = () => new Promise((resolve) => held.push(resolve));
+  const older = page.readPrefixCache(), newer = page.readPrefixCache();
+  held[1]({ settings: {} });
+  await newer;
+  held[0]({ settings: { prefix_cache: { disk_bytes: 10 * GiB, disk_used_bytes: 9 * GiB, disk_entries: 9 } } });
+  await older;
+  assert.equal(node('prefixCacheSection').hidden, true, 'a late older answer does not bring the meter back');
   console.log('Web UI prefix-cache meter: passed');
 });
 

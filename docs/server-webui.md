@@ -32,6 +32,9 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   A finished download is listed by the server a moment after it reports it done, so the page asks again (`landed`, six
   answers, one second apart) until the pack's model is listed, and for an Update until its row stops offering one.
   Guard: the finished-download blocks in `tests/test_webui_downloads.cjs`.
+  The chat's prompt-cache meter reads `/props` (`readPrefixCache`, the latest read wins) when the loaded set changes
+  and after a clear, a cache-size save or a reload; `/props` has no prefix cache while nothing is loaded.
+  Guards: the meter scenarios in `tests/test_webui_admin_ui.cjs`, `tests/test_webui_prefix_cache.cjs`.
 
 ## Palette
 
