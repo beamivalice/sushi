@@ -1617,3 +1617,28 @@ test "r173-f-settle-linear: settling k thoughts each followed by a call reads th
     for (work, bytes) |w, n| try testing.expect(w <= settle_work_per_byte * n);
     try testing.expect(work[3] <= 5 * work[2] / 2);
 }
+
+test "r173-f-cut-think-tag: a think tag inside a cut call's value is that call's text: the call is declined and named, nothing of its value ships as content, in every dialect" {
+    const a = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const texts = [_][]const u8{
+        "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nuse </think> tags\nline one\n",
+        "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.md\", \"content\": \"use </think> tags, line",
+        "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>use </think> tags\nline",
+        "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">notes.md</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">use </think> tags\nline",
+        "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>use </think> tags\nline",
+        "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.md\", \"content\": \"use <think>x</think> tags, line",
+    };
+    var bad: usize = 0;
+    for (texts) |t| for ([_]bool{ false, true }) |opens| for ([_][]const u8{ "length", "stop" }) |finish| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = opens };
+        const s = try settle(a, .{ .text = t, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        const content = think_tags.splitThinkBlock(s.text, true, opens).content;
+        if (s.reply != null or s.declined == null or std.mem.indexOf(u8, content, "tags") != null or std.mem.indexOf(u8, content, "line") != null) {
+            bad += 1;
+            std.debug.print("opens_think={} [{s}] {f}: calls={d} declined={?s} content={f}\n", .{ opens, finish, std.zig.fmtString(t), if (s.reply) |r| r.calls.len else 0, if (s.declined) |d| d.name orelse "(unnamed)" else null, std.zig.fmtString(content) });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}

@@ -541,7 +541,8 @@ pub fn outsideCalls(text: []const u8, from: usize, tag: think_tags.Tag) ?think_t
 }
 
 /// A thought's close at or after `from` that no call spans: a call that opens before it and ends after it holds it
-/// as payload. A call that never ends is leaked markup, not a span.
+/// as payload, and so does a call the text stops inside unless a thought is open where it starts: that thought's text may
+/// mention an opener.
 fn thoughtClose(text: []const u8, from: usize, model_ended: bool, style: Style, tags: *think_tags.Tags) ?think_tags.TagAt {
     const think = if (style == .channel) null else firstOutsideCalls(text, from, model_ended, tags, .think_close);
     const channel = if (style == .think) null else firstOutsideCalls(text, from, model_ended, tags, .channel_close);
@@ -561,6 +562,8 @@ pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, tags:
             const c = nextCall(text, q, model_ended, &scan) orelse return m;
             if (c.start >= m.pos) return m;
             const end = c.end orelse {
+                // A thought's own text may mention an opener; a call cut outside any thought holds every tag after it.
+                if (!thoughtOpenAt(text, c.start)) return null;
                 q = c.start + c.open_len;
                 continue;
             };
@@ -572,6 +575,22 @@ pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, tags:
         }
     }
     return null;
+}
+
+/// Whether a thought has opened and not closed by `at`, by the tags alone.
+fn thoughtOpenAt(text: []const u8, at: usize) bool {
+    const head = text[0..at];
+    var tags: think_tags.Tags = .{};
+    var open: ?usize = null;
+    var close: ?usize = null;
+    inline for (.{ .{ think_tags.Tag.think_open, think_tags.Tag.think_close }, .{ think_tags.Tag.channel_thought, think_tags.Tag.channel_close } }) |kind| {
+        var p: usize = 0;
+        while (tags.find(kind[0], head, p)) |t| : (p = t.pos + t.len) open = @max(open orelse 0, t.pos);
+        p = 0;
+        while (tags.find(kind[1], head, p)) |t| : (p = t.pos + t.len) close = @max(close orelse 0, t.pos);
+    }
+    const o = open orelse return false;
+    return close == null or close.? < o;
 }
 
 /// Where the thought the text starts with ends (just past its close): a close before any opener is the template-opened
