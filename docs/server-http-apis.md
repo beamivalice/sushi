@@ -304,9 +304,9 @@ before reading a completed stream and requires clean EOF.
   `text`), built once per surface.
 - **A field the server reads is used or refused by name, never read as absent** (`request_parse.generationFieldFault`,
   one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`,
-  `tool_choice` (an object one names a function) and chat's boolean `logprobs`, `responsesFieldFault` the Responses
+  `tool_choice` (an object is a mode `parseToolChoice` honours, none, auto, any or required, or a function or tool it names; `allowed_tools` is refused by name) and chat's boolean `logprobs`, `responsesFieldFault` the Responses
   strings (`instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`), `truncation` (auto or
-  disabled) and `max_tool_calls` (on `/v1/responses/compact` too), `completionsFieldFault` the legacy integer `logprobs`): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
+  disabled) and `max_tool_calls` (on `/v1/responses/compact` too; the envelope echoes the whole number accepted, `3.0` as 3), `completionsFieldFault` the legacy integer `logprobs`): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
   float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties and `top_logprobs` take a number; `stop` a string or
   strings; `kv_quant` `off|0|4|6|8|16`; every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000

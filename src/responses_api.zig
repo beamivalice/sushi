@@ -562,10 +562,7 @@ fn handleResponsesInner(
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
     const top_logprobs_echo: u32 = if (root.get("top_logprobs")) |v| (if (request_parse.wholeNumber(v)) |n| @intCast(n) else 0) else 0;
-    const max_tool_calls_echo: ?u32 = if (root.get("max_tool_calls")) |v| switch (v) {
-        .integer => |i| std.math.cast(u32, i),
-        else => null,
-    } else null;
+    const max_tool_calls_echo = maxToolCallsEcho(root.get("max_tool_calls"));
     const truncation_echo: []const u8 = if (root.get("truncation")) |v|
         (if (v == .string and (std.mem.eql(u8, v.string, "auto") or std.mem.eql(u8, v.string, "disabled"))) v.string else "disabled")
     else
@@ -2516,4 +2513,17 @@ test "a Responses envelope names the call a reply declined, ahead of a thought's
         try testing.expectEqualStrings(c.want.?, details.object.get("type").?.string);
         if (c.declined != null) try testing.expectEqualStrings("read_file", details.object.get("name").?.string);
     }
+}
+
+/// The `max_tool_calls` the envelope echoes: the whole number the field check accepted (3 or 3.0), else null.
+fn maxToolCallsEcho(v: ?std.json.Value) ?u32 {
+    const n = request_parse.wholeNumber(v orelse return null) orelse return null;
+    return std.math.cast(u32, n);
+}
+
+test "the Responses envelope echoes max_tool_calls as the whole number the field check accepted" {
+    try std.testing.expectEqual(@as(?u32, 3), maxToolCallsEcho(.{ .integer = 3 }));
+    try std.testing.expectEqual(@as(?u32, 3), maxToolCallsEcho(.{ .float = 3.0 }));
+    try std.testing.expectEqual(@as(?u32, null), maxToolCallsEcho(null));
+    try std.testing.expectEqual(@as(?u32, null), maxToolCallsEcho(.null));
 }

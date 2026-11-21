@@ -12,8 +12,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A pack that finished downloading reaches the Models list and the chat's picker within a few seconds**: the page asked for the model list once when the download turned done, and a pack the server registered a moment later stayed missing for up to 30 s; it now asks again until the model is listed (and, for an Update, until the update badge is gone).
 - **The web UI stops saying "Load failed" once the server no longer reports it**: a Rescan, a settings Save, a removed saved value or a server restart clears a failed load's row and alert, which the page kept for the session; and a Rescan that drops a model drops its row even when `/v1/settings` fails once.
 - **A model whose folder was deleted, or lost its `config.json`, leaves the model list at the next Rescan** ([#114](https://github.com/beamivalice/sushi/issues/114)): a rescan only added before, so the deleted model stayed listed; a loaded model is never dropped, and `/v1/models/rescan` now also answers how many it removed.
-- **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that names
-  no function, and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
+- **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that is
+  neither a mode (`none`, `auto`, `any`, `required`) nor a function or tool it names (OpenAI's `allowed_tools`
+  included, as on Responses), and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,
   `truncation` or `max_tool_calls` of the wrong type (on `/v1/responses/compact` too) are now a 400 naming the field;
   they were read as absent.
 - **Clearing the prefix-cache namespace of a model that is loading or unloading answers 409 `namespace_in_use`**, as

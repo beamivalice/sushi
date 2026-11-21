@@ -481,10 +481,14 @@ pub fn responsesToolChoiceFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8
     }
 }
 
-/// An object `tool_choice` on chat and Responses: a function to call, named flat or under `function`.
+/// An object `tool_choice` on chat and Responses: a form `parseToolChoice` honours, a mode (none, auto, any, required)
+/// or a function to call (type function or tool, named flat or under `function`).
 fn functionChoiceFault(o: std.json.ObjectMap) ?[]const u8 {
-    const t = o.get("type") orelse return "'tool_choice.type' is required: this server calls function tools only, so it is function";
-    if (t != .string or !std.mem.eql(u8, t.string, "function")) return "'tool_choice.type' must be function: this server calls function tools only";
+    const t = o.get("type") orelse return "'tool_choice.type' is required: none, auto, required or function";
+    if (t != .string) return "'tool_choice.type' must be none, auto, required or function";
+    for ([_][]const u8{ "none", "auto", "any", "required" }) |mode| if (std.mem.eql(u8, t.string, mode)) return null;
+    if (std.mem.eql(u8, t.string, "allowed_tools")) return "'tool_choice.type' allowed_tools is not supported: send only the allowed tools in 'tools' and set 'tool_choice' to their mode";
+    if (!std.mem.eql(u8, t.string, "function") and !std.mem.eql(u8, t.string, "tool")) return "'tool_choice.type' must be none, auto, required or function: this server calls function tools only";
     const holder = if (o.get("function")) |f| (if (f == .object) f.object else o) else o;
     const name = holder.get("name") orelse return "'tool_choice.name' is required: the function the model must call";
     if (name != .string or name.string.len == 0) return "'tool_choice.name' must be the name of a declared function";
@@ -958,8 +962,16 @@ test "chatFieldFault refuses an unknown role, response_format type, malformed to
         .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"my tool/v1.2\"}}]}", .field = "tools[0]" },
         .{ .body = "{\"tool_choice\":\"sometimes\"}", .field = "tool_choice" },
         .{ .body = "{\"tool_choice\":7}", .field = "tool_choice" },
-        // An object tool_choice names a function to call, or it is refused: never read as auto.
+        // An object tool_choice is a form the reader honours (a mode, a named function or tool), or it is refused by
+        // name: never read as auto. allowed_tools would be read as auto, its mode and subset dropped, so it is refused.
         .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"a\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"none\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"auto\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"any\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"required\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"a\"}}", .field = null },
+        .{ .body = "{\"tool_choice\":{\"type\":\"allowed_tools\",\"mode\":\"required\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\"}}]}}", .field = "tool_choice.type" },
+        .{ .body = "{\"tool_choice\":{\"type\":\"tool\"}}", .field = "tool_choice.name" },
         .{ .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
         .{ .body = "{\"tool_choice\":{\"type\":\"bogus\"}}", .field = "tool_choice.type" },
         .{ .body = "{\"tool_choice\":{\"type\":\"function\"}}", .field = "tool_choice.name" },
