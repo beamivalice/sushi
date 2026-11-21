@@ -429,39 +429,10 @@ pub const LoadedModel = struct {
             self.allocator.destroy(w);
             self.weights = null;
         }
-        if (self.token_bytes) |*tb| {
-            // Decoded from `tokenizer`'s vocabulary — same lifetime, freed
-            // first so the table never outlives the ids it describes.
-            tb.deinit();
-            self.token_bytes = null;
-        }
-        for (self.reasoning_markers.items) |marker| {
-            marker.arena.deinit();
-            self.allocator.destroy(marker);
-        }
-        self.reasoning_markers.deinit(self.allocator);
-        if (self.tokenizer) |tok| {
-            tok.deinit();
-            self.allocator.destroy(tok);
-            self.tokenizer = null;
-        }
-        if (self.chat_config) |cc| {
-            cc.deinit();
-            self.allocator.destroy(cc);
-            self.chat_config = null;
-        }
-        if (self.config) |c| {
-            c.deinit(self.allocator);
-            self.allocator.destroy(c);
-            self.config = null;
-        }
+        self.freeCpuState();
         if (self.prefix_cache) |*hc| {
             hc.deinit();
             self.prefix_cache = null;
-        }
-        if (self.tokenize_cache) |*tc| {
-            tc.deinit();
-            self.tokenize_cache = null;
         }
         if (self.error_name) |n| self.allocator.free(n);
         if (self.drafter_path.len > 0) self.allocator.free(self.drafter_path);
@@ -470,7 +441,7 @@ pub const LoadedModel = struct {
     }
 
     /// Free the CPU-only state `unloadResident` deliberately RETAINS —
-    /// `token_bytes`, `tokenizer`, `chat_config`, `config`, `tokenize_cache`. A
+    /// `token_bytes`, `reasoning_markers`, `tokenizer`, `chat_config`, `config`, `tokenize_cache`. A
     /// reload installs a fresh set over the retained one, so every install site
     /// calls this first or the previous generation is orphaned. Idempotent.
     ///
@@ -492,10 +463,30 @@ pub const LoadedModel = struct {
         // `.loading` would make every guarded reader a use-after-free, so fail
         // loudly here rather than silently there.
         std.debug.assert(self.state == .loading or self.config == null);
+        self.freeCpuState();
+    }
+
+    /// The CPU state a past load left, for an entry the registry no longer lists (`retireLocked`, under
+    /// `mutex`). No reader can reach it: a lookup by id no longer finds it, a request holds no reference to an unheld
+    /// entry, and a holder of its pointer from before the retire reads only `id`, `path`, `state` and `bytes_on_disk`
+    /// (a load claims only a listed entry, `LoadAttempt.claimLocked`), so no `.loading` guard is needed.
+    pub fn releaseRetiredCpuState(self: *LoadedModel) void {
+        std.debug.assert((self.state == .unloaded or self.state == .error_state) and self.refcount.load(.seq_cst) == 0);
+        self.freeCpuState();
+    }
+
+    /// The one free of the five retained CPU fields and what is derived from them. Order matches the dependency:
+    /// `token_bytes` and the markers are decoded from the tokenizer's vocabulary, so none outlives the ids it describes.
+    fn freeCpuState(self: *LoadedModel) void {
         if (self.token_bytes) |*tb| {
             tb.deinit();
             self.token_bytes = null;
         }
+        for (self.reasoning_markers.items) |marker| {
+            marker.arena.deinit();
+            self.allocator.destroy(marker);
+        }
+        self.reasoning_markers.clearAndFree(self.allocator);
         if (self.tokenizer) |tok| {
             tok.deinit();
             self.allocator.destroy(tok);
@@ -1108,25 +1099,10 @@ pub const ModelRegistry = struct {
         return added + 1;
     }
 
-    /// After a download into `path`: the entry at that folder takes the folder's facts as they are now.
+    /// After a download into `path`: the entry at that folder takes the folder's facts as they are now, or leaves the
+    /// list when the folder is no model discovery lists.
     fn refreshFolderFacts(self: *ModelRegistry, path: []const u8) void {
-        if (self.peekByPath(path)) |e| self.refreshEntryFacts(e);
-    }
-
-    /// What a probe of one folder read: the arguments of `refreshFactsLocked`.
-    const Probed = struct { model_type: []const u8, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool };
-
-    fn probeFacts(self: *ModelRegistry, path: []const u8) ?Probed {
-        const probe = model_discovery.probeModelDir(self.io, self.allocator, path) catch return null;
-        const streaming = expert_quant.isExpertStreamingArch(probe.model_type) and
-            model_discovery.streamingIndexComplete(self.io, self.allocator, path) != null;
-        return .{ .model_type = probe.model_type, .bytes_on_disk = probe.bytes_on_disk, .bytes_linked = probe.bytes_linked, .bytes_total = probe.bytes_total, .streaming_index_complete = streaming };
-    }
-
-    /// `e` takes the facts of the folder its own path opens, for an entry no walked root lists, which no discovery
-    /// refreshes. The probe reads a copy of the path outside the mutex (a streaming pack's index opens stores), and its
-    /// result lands only on an entry that still has that path and no load.
-    fn refreshEntryFacts(self: *ModelRegistry, e: *LoadedModel) void {
+        const e = self.peekByPath(path) orelse return;
         self.mutex.lockUncancelable(self.io);
         const read = self.beginReadLocked();
         const at = e.path;
@@ -1136,11 +1112,60 @@ pub const ModelRegistry = struct {
         };
         self.mutex.unlock(self.io);
         defer self.allocator.free(copy);
-        const probed = self.probeFacts(copy) orelse return;
+        const verdict = self.probeVerdict(copy);
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        self.applyProbedLocked(e, at, read, probed) catch |err|
-            log.warn("[registry] {s}: facts not refreshed: {s}\n", .{ e.id, @errorName(err) });
+        switch (verdict) {
+            .facts => |probed| self.applyProbedLocked(e, at, read, probed) catch |err|
+                log.warn("[registry] {s}: facts not refreshed: {s}\n", .{ e.id, @errorName(err) }),
+            .not_listable => if (self.mayRetireLocked(e, at, read)) self.retireLocked(e) catch |err|
+                log.warn("[registry] {s}: not dropped from the model list: {s}\n", .{ e.id, @errorName(err) }),
+            .unknown => {},
+        }
+    }
+
+    /// What a probe of one folder read: the arguments of `refreshFactsLocked`.
+    const Probed = struct { model_type: []const u8, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool };
+
+    /// What a read of one folder says of the entry whose path opens it.
+    const Verdict = union(enum) {
+        /// A folder discovery lists: its facts now.
+        facts: Probed,
+        /// A folder discovery skips (gone, no or unreadable config.json, an arch or quantization no build serves, a
+        /// drafter) with no pull writing it: the entry is no model.
+        not_listable,
+        /// Nothing to apply: a pull writes the folder (its own rescan settles the entry), or the read failed for a
+        /// reason that is not the folder's.
+        unknown,
+    };
+
+    /// An unheld entry no walk found. `at` is the entry's own path string when `copy` was taken (the probe reads the
+    /// copy outside the mutex); `verdict` is what that read said.
+    const Candidate = struct { entry: *LoadedModel, at: []const u8, copy: []u8, verdict: Verdict = .unknown };
+
+    /// Reads the folder at `path`, which the caller owns (never the mutex held: a streaming pack's index opens stores).
+    fn probeVerdict(self: *ModelRegistry, path: []const u8) Verdict {
+        const probe = model_discovery.probeModelDir(self.io, self.allocator, path) catch |err| switch (err) {
+            error.ModelDirNotFound, error.UnsupportedArch, error.UnsupportedQuantMode => return if (self.pullWritesAt(path)) .unknown else .not_listable,
+            else => return .unknown,
+        };
+        const streaming = expert_quant.isExpertStreamingArch(probe.model_type) and
+            model_discovery.streamingIndexComplete(self.io, self.allocator, path) != null;
+        return .{ .facts = .{ .model_type = probe.model_type, .bytes_on_disk = probe.bytes_on_disk, .bytes_linked = probe.bytes_linked, .bytes_total = probe.bytes_total, .streaming_index_complete = streaming } };
+    }
+
+    /// Whether a pull writes the folder `path` opens (the load gate): its config.json may be half written.
+    fn pullWritesAt(self: *ModelRegistry, path: []const u8) bool {
+        const gate = self.load_gate orelse return false;
+        const folder = FolderId.of(self.io, path) catch return false;
+        var buf: [512]u8 = undefined;
+        return gate(self.io, &buf, &folder) != null;
+    }
+
+    /// Whether a `not_listable` verdict read from the path string `at`, as of read `read`, still stands for `e`: it is
+    /// listed under that path, nothing holds it and no newer read gave it facts. Caller holds `mutex`.
+    fn mayRetireLocked(self: *ModelRegistry, e: *LoadedModel, at: []const u8, read: u64) bool {
+        return self.listsLocked(e) and e.path.ptr == at.ptr and e.path.len == at.len and unheldLocked(e) and read >= e.facts_read;
     }
 
     /// `probed`, read from a copy of the path `read_from` (the entry's own string when the probe began), is the entry's
@@ -1191,46 +1216,58 @@ pub const ModelRegistry = struct {
         };
         var found: ?model_discovery.DiscoveryResult = if (roots.len == 0) null else try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer if (found) |*f| f.deinit();
-        var unlisted: std.ArrayList(*LoadedModel) = .empty;
-        defer unlisted.deinit(self.allocator);
-        const result = blk: {
+        const walked = if (found) |f| f.models else &.{};
+        // The folders no walk found are read here too, outside the mutex and under the walk's number, and reconcile
+        // applies every verdict: it reads no config.json itself.
+        var candidates: std.ArrayList(Candidate) = .empty;
+        defer {
+            for (candidates.items) |c| self.allocator.free(c.copy);
+            candidates.deinit(self.allocator);
+        }
+        {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            break :blk try self.applyWalkLocked(read, if (found) |f| f.models else &.{}, &unlisted);
-        };
-        for (unlisted.items) |e| self.refreshEntryFacts(e);
-        return result orelse .{};
+            try self.collectUnlistedLocked(walked, &candidates);
+        }
+        for (candidates.items) |*c| c.verdict = self.probeVerdict(c.copy);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return (try self.applyWalkLocked(read, walked, candidates.items)) orelse .{};
     }
 
     /// Walk `read`'s reconcile, unless a newer walk already reconciled: then null, and nothing changes (the newer walk
-    /// read the disk after this one did). Caller holds `mutex`.
-    fn applyWalkLocked(self: *ModelRegistry, read: u64, found: []const model_discovery.DiscoveredModel, unlisted: *std.ArrayList(*LoadedModel)) !?Rescanned {
+    /// read the disk after this one did). `candidates` are the entries no found folder is, with what a read of their
+    /// own folders said. Caller holds `mutex`.
+    fn applyWalkLocked(self: *ModelRegistry, read: u64, found: []const model_discovery.DiscoveredModel, candidates: []const Candidate) !?Rescanned {
         if (read < self.walk_applied) return null;
         self.walk_applied = read;
-        const done = try self.reconcileLocked(found, read);
-        try self.collectUnlistedLocked(found, unlisted);
-        return done;
+        return try self.reconcileLocked(found, read, candidates);
     }
 
-    /// The unheld entries whose folder no found folder is: no root lists them (registered by path, or `--model`), so
-    /// discovery gave them no facts. Caller holds `mutex`.
-    fn collectUnlistedLocked(self: *ModelRegistry, found: []const model_discovery.DiscoveredModel, out: *std.ArrayList(*LoadedModel)) !void {
+    /// The unheld entries whose folder no found folder is: no root lists them (registered by path, or `--model`), or a
+    /// root's walk skipped their folder (gone, or a config discovery skips). Each comes with a copy of its path for the
+    /// read that follows outside the mutex. Caller holds `mutex`.
+    fn collectUnlistedLocked(self: *ModelRegistry, found: []const model_discovery.DiscoveredModel, out: *std.ArrayList(Candidate)) !void {
         var it = self.entries.valueIterator();
         entries: while (it.next()) |entry_ptr| {
             const e = entry_ptr.*;
             if (!unheldLocked(e)) continue;
-            const now = e.folderNow(self.io) catch continue;
-            for (found) |m| if (m.folder.eql(&now)) continue :entries;
-            try out.append(self.allocator, e);
+            if (e.folderNow(self.io)) |now| {
+                for (found) |m| if (m.folder.eql(&now)) continue :entries;
+            } else |_| {}
+            const copy = try self.allocator.dupe(u8, e.path);
+            errdefer self.allocator.free(copy);
+            try out.append(self.allocator, .{ .entry = e, .at = e.path, .copy = copy });
         }
     }
 
     /// The inventory against the disk, in one pass under `mutex`: drops what is gone (`retireVanishedLocked`), then
     /// joins each folder discovery found to the entry whose path opens it, whatever id registered that entry, and
     /// refreshes it (`refreshFactsLocked`); a folder no entry opens is added under its discovery id, unless that id
-    /// names another folder's entry (first wins, as at boot).
-    fn reconcileLocked(self: *ModelRegistry, found: []const model_discovery.DiscoveredModel, read: u64) !Rescanned {
-        const removed = try self.retireVanishedLocked();
+    /// names another folder's entry (first wins, as at boot). It reads no config.json: a folder is listable when the
+    /// walk found it, and an entry the walk did not find is judged by its `candidates` verdict.
+    fn reconcileLocked(self: *ModelRegistry, found: []const model_discovery.DiscoveredModel, read: u64, candidates: []const Candidate) !Rescanned {
+        const removed = try self.retireVanishedLocked(read, candidates);
         var added: u32 = 0;
         for (found) |m| {
             if (self.peekByPathLocked(&m.folder)) |e| {
@@ -1244,6 +1281,11 @@ pub const ModelRegistry = struct {
             stub.facts_read = read;
             added += 1;
         }
+        for (candidates) |c| switch (c.verdict) {
+            .facts => |probed| self.applyProbedLocked(c.entry, c.at, read, probed) catch |err|
+                log.warn("[registry] {s}: facts not refreshed: {s}\n", .{ c.entry.id, @errorName(err) }),
+            .not_listable, .unknown => {},
+        };
         return .{ .added = added, .removed = removed };
     }
 
@@ -1252,33 +1294,23 @@ pub const ModelRegistry = struct {
         return (e.state == .unloaded or e.state == .error_state) and e.refcount.load(.seq_cst) == 0;
     }
 
-    /// Takes out of `entries` every unheld entry whose folder is gone from its path (deleted, or its config.json gone),
-    /// whatever root, or none, listed it, and every unheld entry whose path now opens the folder of another entry (a
-    /// link moved onto it): one folder has one entry. An entry whose path opens another folder, nothing else's, stays
-    /// and follows it (`FolderId` is derived from the path each time). A load in flight, a loaded model and a held one
-    /// stay. Caller holds `mutex`.
-    fn retireVanishedLocked(self: *ModelRegistry) !u32 {
+    /// Takes out of `entries` every unheld entry whose read says its folder is no model discovery lists (gone, without
+    /// a config.json or with one discovery skips, no pull writing it), whatever root, or none, listed it, and every
+    /// unheld entry whose path now opens the folder of another entry (a link moved onto it): one folder has one entry.
+    /// An entry whose path opens another folder, nothing else's, stays and follows it (`FolderId` is derived from the
+    /// path each time). A load in flight, a loaded model and a held one stay. Caller holds `mutex`.
+    fn retireVanishedLocked(self: *ModelRegistry, read: u64, candidates: []const Candidate) !u32 {
         var gone: std.ArrayList(*LoadedModel) = .empty;
         defer gone.deinit(self.allocator);
+        for (candidates) |c| if (c.verdict == .not_listable and self.mayRetireLocked(c.entry, c.at, read)) try gone.append(self.allocator, c.entry);
+        const dropped = gone.items.len;
         const Seen = struct { e: *LoadedModel, folder: FolderId };
         var seen: std.ArrayList(Seen) = .empty;
         defer seen.deinit(self.allocator);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             const e = entry_ptr.*;
-            if (unheldLocked(e)) {
-                var dir = std.Io.Dir.cwd().openDir(self.io, e.path, .{}) catch {
-                    try gone.append(self.allocator, e);
-                    continue;
-                };
-                // A folder without its config.json is no model any more (discovery would not list it).
-                const has_config = if (dir.statFile(self.io, "config.json", .{})) |_| true else |_| false;
-                dir.close(self.io);
-                if (!has_config) {
-                    try gone.append(self.allocator, e);
-                    continue;
-                }
-            }
+            if (std.mem.indexOfScalar(*LoadedModel, gone.items[0..dropped], e) != null) continue;
             try seen.append(self.allocator, .{ .e = e, .folder = e.folderNow(self.io) catch continue });
         }
         // Held entries first, then by id: the copy that stays does not depend on the map's order.
@@ -1296,13 +1328,17 @@ pub const ModelRegistry = struct {
                 break;
             };
         }
-        try self.retired.ensureUnusedCapacity(self.allocator, gone.items.len);
-        for (gone.items) |e| {
-            _ = self.entries.remove(e.id);
-            self.retired.appendAssumeCapacity(e);
-            log.info("[registry] {s}: its folder is gone, or another entry holds it; dropped from the model list\n", .{e.id});
-        }
+        for (gone.items) |e| try self.retireLocked(e);
         return @intCast(gone.items.len);
+    }
+
+    /// Takes `e` out of `entries`; its memory is kept until the registry goes, since `peek` pointers and `default_id`
+    /// borrow its id and path, but its CPU state of past loads is not. Caller holds `mutex`; `e` is unheld.
+    fn retireLocked(self: *ModelRegistry, e: *LoadedModel) !void {
+        try self.retired.append(self.allocator, e);
+        _ = self.entries.remove(e.id);
+        e.releaseRetiredCpuState();
+        log.info("[registry] {s}: its folder is gone, is no model discovery lists, or another entry holds it; dropped from the model list\n", .{e.id});
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -3828,14 +3864,12 @@ test "ModelRegistry: a rescan whose walk began before another rescan reconciled 
     reg.mutex.unlock(io);
     var fresh = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
     defer fresh.deinit();
-    var unlisted: std.ArrayList(*LoadedModel) = .empty;
-    defer unlisted.deinit(testing.allocator);
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     // The newer walk reconciles first, then the older one takes the mutex.
-    try testing.expect(try reg.applyWalkLocked(fresh_read, fresh.models, &unlisted) != null);
+    try testing.expect(try reg.applyWalkLocked(fresh_read, fresh.models, &.{}) != null);
     try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
-    try testing.expect(try reg.applyWalkLocked(stale_read, stale.models, &unlisted) == null);
+    try testing.expect(try reg.applyWalkLocked(stale_read, stale.models, &.{}) == null);
     try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
 }
 
@@ -3851,4 +3885,213 @@ test "ModelRegistry: one folder's probe that began before a rescan reconciled le
     try reg.refreshFactsLocked(e, walk_read, "alpha_arch", 1010, 0, null, false);
     try reg.applyProbedLocked(e, e.path, probe_read, old);
     try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
+}
+
+/// Every field a past load leaves on an entry that a reload or a retire frees: the CPU state, and what derives from it.
+fn attachTestCpuState(lm: *LoadedModel) !void {
+    try attachTestTokenizer(lm, &.{.{ 0, "a" }});
+    _ = try lm.grammarTokenBytes(testing.allocator, testing.io);
+    _ = try lm.reasoningMarker(testing.allocator, testing.io, "a");
+    lm.config = try testing.allocator.create(model_mod.ModelConfig);
+    lm.config.?.* = std.mem.zeroes(model_mod.ModelConfig);
+    const cc = try testing.allocator.create(ChatConfig);
+    cc.* = .{ .chat_template = try testing.allocator.dupe(u8, "x"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    lm.chat_config = cc;
+    lm.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(testing.allocator, 4);
+}
+
+fn holdsCpuState(lm: *const LoadedModel) bool {
+    return lm.tokenizer != null or lm.config != null or lm.chat_config != null or lm.tokenize_cache != null or
+        lm.token_bytes != null or lm.reasoning_markers.items.len != 0;
+}
+
+test "ModelRegistry: a retired entry holds no CPU state of a past load, so retires do not pile up memory" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    var cycle: usize = 0;
+    while (cycle < 8) : (cycle += 1) {
+        // A past load left its CPU state (unloadResident keeps it for a reload); the user deletes the pack and
+        // downloads it again, the page rescanning each time.
+        try attachTestCpuState(reg.peek("beamster/P") orelse return error.TestExpectedResult);
+        try tmp.dir.rename("beamster/P", tmp.dir, "beamster/.P-away", io);
+        _ = try reg.rescanWithSettings(no_settings);
+        try tmp.dir.rename("beamster/.P-away", tmp.dir, "beamster/P", io);
+        _ = try reg.rescanWithSettings(no_settings);
+    }
+    var holding: usize = 0;
+    for (reg.retired.items) |r| holding += @intFromBool(holdsCpuState(r));
+    try testing.expectEqual(@as(usize, 8), reg.retired.items.len);
+    try testing.expectEqual(@as(usize, 0), holding);
+}
+
+test "ModelRegistry: a rescan drops an unheld entry whose folder holds a config discovery skips" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const served = @import("arch/registry.zig").served_model_types[0];
+    const Case = struct { dir: []const u8, config: []const u8 };
+    const cases = [_]Case{
+        .{ .dir = "beamster/Unsupported", .config = "{\"model_type\":\"llama\"}" },
+        .{ .dir = "beamster/HalfWritten", .config = "{\"model_type\":\"" ++ served[0 .. served.len - 1] },
+        .{ .dir = "beamster/Drafter", .config = "{\"model_type\":\"" ++ served ++ "\",\"block_size\":4,\"mask_token_id\":3,\"target_layer_ids\":[1]}" },
+        .{ .dir = "beamster/Quant", .config = "{\"model_type\":\"" ++ served ++ "\",\"quantization\":{\"mode\":\"nope\"}}" },
+    };
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    for (cases) |c| {
+        try model_discovery.writePackStub(io, tmp.dir, c.dir);
+        var wb: [128]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&wb, "{s}/model.safetensors", .{c.dir}), .data = "0123" });
+    }
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/Stays");
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    // One more entry no root lists: registered by path, outside every walked folder.
+    try model_discovery.writePackStub(io, tmp.dir, "dl/ByPath");
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const by_path = try reg.registerByPath(io, try std.fmt.bufPrint(&pb, "{s}/dl/ByPath", .{root}));
+    for (cases) |c| try testing.expect(reg.peek(c.dir) != null);
+    // Each folder's config becomes one the discovery skips, and its weights grow.
+    for (cases) |c| {
+        var cb: [128]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&cb, "{s}/config.json", .{c.dir}), .data = c.config });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&cb, "{s}/model.safetensors", .{c.dir}), .data = &@as([1000]u8, @splat('x')) });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "dl/ByPath/config.json", .data = "{\"model_type\":\"llama\"}" });
+    const result = try reg.rescanWithSettings(no_settings);
+    var still_listed: usize = 0;
+    for (cases) |c| still_listed += @intFromBool(reg.peek(c.dir) != null);
+    still_listed += @intFromBool(reg.peek(by_path) != null);
+    try testing.expect(reg.peek("beamster/Stays") != null);
+    try testing.expectEqual(@as(usize, 0), still_listed);
+    try testing.expectEqual(@as(u32, cases.len + 1), result.removed);
+}
+
+test "ModelRegistry: an unloaded and loaded again model derives the reasoning markers its first load did" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try makeReadyStub(reg, "m", 1024);
+    const vocab = [_]struct { u32, []const u8 }{ .{ 0, "a" }, .{ 1, "b" }, .{ 2, "ab" } };
+    try attachTestTokenizer(entry, &vocab);
+    const first = try entry.reasoningMarker(testing.allocator, testing.io, "ab");
+    const open = try testing.allocator.dupe(u32, first.open_candidates);
+    defer testing.allocator.free(open);
+    const close = try testing.allocator.dupe(u32, first.close_candidates);
+    defer testing.allocator.free(close);
+    const tokens = try testing.allocator.dupe(u32, first.tokens);
+    defer testing.allocator.free(tokens);
+    const atomic = first.atomic;
+    try testing.expect(close.len > 0);
+    entry.unloadResident();
+    // The reload claims `.loading`, frees the retained set and installs the new load's.
+    entry.state = .loading;
+    entry.releaseRetainedCpuState();
+    try testing.expectEqual(@as(usize, 0), entry.reasoning_markers.items.len);
+    try attachTestTokenizer(entry, &vocab);
+    entry.state = .ready;
+    const again = try entry.reasoningMarker(testing.allocator, testing.io, "ab");
+    try testing.expectEqualSlices(u32, open, again.open_candidates);
+    try testing.expectEqualSlices(u32, close, again.close_candidates);
+    try testing.expectEqualSlices(u32, tokens, again.tokens);
+    try testing.expectEqual(atomic, again.atomic);
+}
+
+test "ModelRegistry: a rescan never retires a held or loading entry whose folder vanished or turned invalid, and retires it once the hold ends" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "beamster/Gone", "beamster/Invalid" }) |dir| {
+        try model_discovery.writePackStub(io, tmp.dir, dir);
+        var wb: [64]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&wb, "{s}/model.safetensors", .{dir}), .data = "0123" });
+    }
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 3, 0, null);
+    defer reg.deinit();
+    const gone = reg.peek("beamster/Gone") orelse return error.TestExpectedResult;
+    const invalid = reg.peek("beamster/Invalid") orelse return error.TestExpectedResult;
+    // One entry is held by a request, the other is mid-load.
+    try attachTestCpuState(gone);
+    try attachTestCpuState(invalid);
+    gone.state = .ready;
+    _ = gone.refcount.fetchAdd(1, .seq_cst);
+    invalid.state = .loading;
+    try tmp.dir.deleteTree(io, "beamster/Gone");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Invalid/config.json", .data = "{\"model_type\":\"llama\"}" });
+    const held = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(u32, 0), held.removed);
+    try testing.expect(reg.peek("beamster/Gone") == gone and reg.peek("beamster/Invalid") == invalid);
+    try testing.expect(holdsCpuState(gone) and holdsCpuState(invalid));
+    // The holds end: the next rescan retires both, and only then is their state freed.
+    _ = gone.refcount.fetchSub(1, .seq_cst);
+    gone.state = .unloaded;
+    invalid.state = .unloaded;
+    const after = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(u32, 2), after.removed);
+    try testing.expect(reg.peek("beamster/Gone") == null and reg.peek("beamster/Invalid") == null);
+    try testing.expect(!holdsCpuState(gone) and !holdsCpuState(invalid));
+}
+
+test "ModelRegistry: reconcile reads no config.json: the walk's result and the candidates' verdicts decide what is listed" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "beamster/Dropped", "beamster/Listed" }) |dir| {
+        try model_discovery.writePackStub(io, tmp.dir, dir);
+        var wb: [64]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&wb, "{s}/model.safetensors", .{dir}), .data = "0123" });
+    }
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    var walk = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    defer walk.deinit();
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    const dropped = reg.peek("beamster/Dropped") orelse return error.TestExpectedResult;
+    const listed = reg.peek("beamster/Listed") orelse return error.TestExpectedResult;
+    // The disk now says the opposite of the walk: Dropped's config is fine, Listed's is one discovery skips.
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Listed/config.json", .data = "{\"model_type\":\"llama\"}" });
+    var found: std.ArrayList(model_discovery.DiscoveredModel) = .empty;
+    defer found.deinit(testing.allocator);
+    for (walk.models) |m| if (std.mem.eql(u8, m.id, "beamster/Listed")) try found.append(testing.allocator, m);
+    var none: [0]u8 = .{};
+    const candidates = [_]ModelRegistry.Candidate{.{ .entry = dropped, .at = dropped.path, .copy = &none, .verdict = .not_listable }};
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    const result = (try reg.applyWalkLocked(reg.beginReadLocked(), found.items, &candidates)) orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(u32, 1), result.removed);
+    try testing.expect(reg.peekLocked("beamster/Dropped") == null);
+    try testing.expect(reg.peekLocked("beamster/Listed") == listed);
+}
+
+test "ModelRegistry: a folder a pull writes is never dropped for its config, and is once the pull ends" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    reg.load_gate = &markerGate;
+    const e = reg.peek("beamster/P") orelse return error.TestExpectedResult;
+    // The pull rewrites the folder: its config.json is half written.
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/.pull-incomplete", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/config.json", .data = "{\"model_ty" });
+    const during = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(u32, 0), during.removed);
+    try testing.expect(reg.peek("beamster/P") == e);
+    try tmp.dir.deleteFile(io, "beamster/P/.pull-incomplete");
+    const after = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(u32, 1), after.removed);
+    try testing.expect(reg.peek("beamster/P") == null);
 }

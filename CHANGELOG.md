@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Rescan drops a model whose folder now holds a config sushi cannot serve**: an unsupported architecture or quantization, a drafter or a half-written `config.json` left the model listed with its old architecture and size, though loading it was refused.
 - **A Stop sent as a download finishes answers what happened**: it said stopped while the job went on to report done with its pack registered; it is now refused as too late (409) once the pack is being registered, and a Stop that landed before that ends the job stopped.
 - **A server stopped while a download was finishing no longer risks a crash at exit**: the download's thread could still be registering the finished pack in the model list that shutdown was freeing, and the catalog refresh read the same list; shutdown now waits for them, or ends without freeing it.
 - **A long Qwen3.8-Flash-Next prompt on MLX with MTP on no longer holds about 5 KB a prompt token beyond its admission
