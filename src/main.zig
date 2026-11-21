@@ -597,7 +597,7 @@ fn runCli(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--expert-cache-bias") and flag_value.follows(args, i)) {
             i += 1;
             model_settings_mod.expert_cache_bias_flag = expert_stream_mod.parseCacheBias(args[i]) catch {
-                log.err("--expert-cache-bias: expected a number from 0 to 8, got '{s}'\n", .{args[i]});
+                log.err("--expert-cache-bias: expected a number from 0 to {d}, got '{s}'\n", .{ expert_stream_mod.MAX_CACHE_BIAS, args[i] });
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--prefill-decode-share") and flag_value.follows(args, i)) {

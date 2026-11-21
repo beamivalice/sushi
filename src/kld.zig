@@ -248,7 +248,7 @@ pub const USAGE =
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
-    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1 and Qwen3.8: score an uncached expert n lower at decode widths (0..8)
+    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1 and Qwen3.8: score an uncached expert n lower at decode widths (0..2)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher or a streamed checkpoint's calibration capture, --tokens 1:
     \\                        batches of windows run layer by layer, each layer's experts read once per batch;
@@ -1085,7 +1085,7 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(f32, 0.3), routed.pick_tolerance);
     const biased = try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-cache-bias", "0.2" });
     try testing.expectEqual(@as(f32, 0.2), biased.cache_bias);
-    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-cache-bias", "9" }));
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-cache-bias", "2.5" }));
     try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-cache-bias", "0.2" }));
     try testing.expectEqual(@as(u64, 5) << 30, routed.wired_margin_bytes);
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.7" }));

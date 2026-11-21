@@ -35,7 +35,7 @@ pub const wired_margin_gib_max: u32 = 32;
 /// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
 pub var expert_cache_bias_flag: ?f32 = null;
 /// The most `--expert-cache-bias` / `expert_cache_bias` takes, in the router's own score units.
-pub const expert_cache_bias_max: f32 = 8;
+pub const expert_cache_bias_max: f32 = 2;
 
 /// The manual context: `--ctx-size` > `ctx_size` > auto. 0 = auto, i.e. not given, on both sides.
 pub fn contextPick(flag: u32, setting: u32) settings_resolve.Setting(u32) {
@@ -1138,16 +1138,22 @@ test "model_settings: think_penalty is a non-negative number, anything else is u
     try std.testing.expect(!s.lookup("/m/e").isEmpty());
 }
 
-test "model_settings: expert_cache_bias is a number from 0 to 8, anything else is unset" {
+test "model_settings: expert_cache_bias is a number from 0 to 2, anything else is ignored by name, never clamped" {
     var s = try parse(std.testing.allocator,
-        \\{"/m/a": {"expert_cache_bias": 0.2}, "/m/b": {"expert_cache_bias": 8}, "/m/c": {"expert_cache_bias": 8.5}, "/m/d": {"expert_cache_bias": -0.1}, "/m/e": {"expert_cache_bias": "0.2"}, "/m/f": {"expert_cache_bias": 0}}
+        \\{"/m/a": {"expert_cache_bias": 0.2}, "/m/b": {"expert_cache_bias": 2}, "/m/c": {"expert_cache_bias": 2.5}, "/m/d": {"expert_cache_bias": -0.1}, "/m/e": {"expert_cache_bias": "0.2"}, "/m/f": {"expert_cache_bias": 0}, "/m/g": {"expert_cache_bias": 8}}
     );
     defer s.deinit();
     try std.testing.expectEqual(@as(?f32, 0.2), s.lookup("/m/a").expert_cache_bias);
-    try std.testing.expectEqual(@as(?f32, 8), s.lookup("/m/b").expert_cache_bias);
-    for ([_][]const u8{ "/m/c", "/m/d", "/m/e" }) |m| try std.testing.expect(s.lookup(m).isEmpty());
+    try std.testing.expectEqual(@as(?f32, 2), s.lookup("/m/b").expert_cache_bias);
+    for ([_][]const u8{ "/m/c", "/m/d", "/m/e", "/m/g" }) |m| try std.testing.expect(s.lookup(m).isEmpty());
     try std.testing.expectEqual(@as(?f32, 0), s.lookup("/m/f").expert_cache_bias);
     try std.testing.expect(!s.lookup("/m/f").isEmpty());
+    // A value saved under the old 0 to 8 range is named when the model loads, and its row stays exact.
+    var buf: [512]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "[model-settings] /m/g: expert_cache_bias 8 is ignored; expected a number from 0 to 2",
+        rejectionLine(&buf, "/m/g", findKey(&model_keys, "expert_cache_bias").?, .{ .integer = 8 }).?,
+    );
 }
 
 test "model_settings: expert_cache_bias shows only for a DeepSeek or Qwen pack whose STQ experts stream" {
@@ -1228,6 +1234,8 @@ test "model_settings: validate takes the values the loader reads and names the r
         .{ .k = "ssd_prefetch", .v = .{ .integer = 0 } },
         .{ .k = "think_penalty", .v = .{ .integer = 2 } },
         .{ .k = "think_penalty", .v = .{ .float = 0.5 } },
+        .{ .k = "expert_cache_bias", .v = .{ .float = 0.2 } },
+        .{ .k = "expert_cache_bias", .v = .{ .integer = 2 } },
     };
     for (ok) |c| try validate(findKey(&model_keys, c.k).?, c.v);
     const bad = [_]struct { k: []const u8, v: std.json.Value }{
@@ -1237,6 +1245,8 @@ test "model_settings: validate takes the values the loader reads and names the r
         .{ .k = "ssd_budget_gb", .v = .{ .integer = 513 } },
         .{ .k = "ssd_prefetch", .v = .{ .integer = 101 } },
         .{ .k = "think_penalty", .v = .{ .float = 20.5 } },
+        .{ .k = "expert_cache_bias", .v = .{ .float = 2.5 } },
+        .{ .k = "expert_cache_bias", .v = .{ .integer = 8 } },
         .{ .k = "vision", .v = .{ .integer = 1 } },
     };
     for (bad) |c| try t.expectError(error.InvalidSetting, validate(findKey(&model_keys, c.k).?, c.v));

@@ -434,6 +434,10 @@ dialog.confirm .acts { display: flex; justify-content: flex-end; gap: var(--s2);
 .set .help { grid-column: 1; color: var(--text-2); font-size: var(--fs-sm); overflow-wrap: anywhere; }
 .set .ctl { grid-row: 1 / span 2; grid-column: 2; align-self: center; display: flex; flex-direction: column; gap: var(--s1); min-width: 0; }
 .set .ctl input, .set .ctl select { height: var(--h-ctl); }
+.set .ctl .slide { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
+.set .ctl .slide input[type="range"] { flex: 1 1 8rem; min-width: 6rem; padding: 0; }
+.set .ctl .slide input[type="checkbox"] { width: auto; height: auto; }
+.set .ctl .slide .slide-read { min-width: 4.5rem; font-variant-numeric: tabular-nums; }
 .set .ctl .row-in { display: flex; align-items: center; gap: var(--s2); }
 .set .ctl .hint { font-size: var(--fs-xs); color: var(--text-3); }
 .set .ctl .bad { font-size: var(--fs-xs); color: var(--err); }
@@ -3710,8 +3714,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Ticked is the default and the better choice. Untick it only if Qwen3.8 answers wrongly or crashes, then report the issue so it can be fixed. It takes effect the next time the model loads.", "Sushi Cooler engine"],
     max_tokens: ["Max generated tokens", "The most tokens a request may generate, thinking included, when an app sets no limit of its own. An app's own limit wins.", "--max-tokens",
       "A token is about three quarters of a word. Empty uses the model's default.", ""],
-    expert_cache_bias: ["Faster SSD streaming (not exact)", "Lower quality for speed: when DeepSeek or Qwen runs partly from the SSD, its router may pick a slightly worse expert that is already in memory instead of reading the best one from the SSD. Answers are no longer exact and can be a little worse. 0 is off (exact, the default); the most is 8.", "--expert-cache-bias",
-      "Only worth it when generation is slow because the model streams from the SSD. Higher values are faster and less exact; around 0.2 is mild. Leave it at 0 for exact answers or when the model fits in memory. It takes effect the next time the model loads.", "expert cache bias"],
+    expert_cache_bias: ["Faster SSD streaming (not exact)", "Lower quality for speed: when DeepSeek or Qwen runs partly from the SSD, its router may pick a slightly worse expert that is already in memory instead of reading the best one from the SSD. Answers are no longer exact and can be worse. 0 is off (exact, the default); the most is 2.", "--expert-cache-bias",
+      "Only worth it when generation is slow because the model streams from the SSD. Higher values are faster and less exact; Enabling starts at 0.2. Leave it off for exact answers or when the model fits in memory. It takes effect the next time the model loads.", "expert cache bias"],
     yarn_factor: ["Context extension", "Stretches the model's context window with YaRN. It can lower quality on short prompts, and a longer context needs more memory.", "",
       "Use it only when you need a conversation longer than the model's own window. Leave it on Model default otherwise.", "YaRN rope scaling"],
   };
@@ -4033,6 +4037,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   // Keys whose bool control is a checkbox, ticked by default, rather than the Default/On/Off segments.
   const CHECKBOX_KEYS = ["ds41_cooler", "qwen_cooler"];
+  // Keys whose number control is an enable toggle over a slider, with the value enabling starts at (the engine default stays off).
+  const SLIDER_KEYS = { expert_cache_bias: { start: 0.2 } };
   // The page that takes a report of a breaking bug.
   const ISSUES_URL = "https://github.com/beamivalice/sushi/issues/new";
   // A key's settings group: its rows sit under this heading, outside the "More settings" fold.
@@ -4058,6 +4064,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       return { node: h("div", { class: "tri", role: "group", "aria-label": label }, ...btns), get: () => cur, set: (v) => { cur = v; paint(); }, focused: () => false,
         def: (t) => setText(btns[0], t),
         lock: (on, flag) => { btns.forEach((b) => { b.disabled = on; }); paint(on && flag !== undefined ? (isOff(flag) ? "false" : "true") : cur); } };
+    }
+    if (SLIDER_KEYS[key]) {
+      // An enable toggle over a slider. Off is exact and the default; enabling starts the slider at `start`, and turning it off saves 0.
+      const { start } = SLIDER_KEYS[key];
+      let cur = "";
+      const enabled = () => cur !== "" && Number(cur) > 0;
+      const toggle = h("input", { type: "checkbox", id: `set-${key}`, "aria-label": label, onchange: () => { cur = toggle.checked ? String(start) : "0"; paint(); onChange(); } });
+      const range = h("input", { type: "range", min: "0.05", max: String(spec.max), step: "0.05", "aria-label": `${label}: how far`, oninput: () => { cur = range.value; paint(); onChange(); } });
+      const read = h("span", { class: "slide-read" });
+      const paint = () => { toggle.checked = enabled(); range.value = enabled() ? cur : String(start); range.hidden = !enabled(); setText(read, enabled() ? cur : "Off"); };
+      paint();
+      return { node: h("div", { class: "slide" }, toggle, range, read), get: () => cur, set: (v) => { cur = v; paint(); }, focused: () => document.activeElement === toggle || document.activeElement === range,
+        def: () => {},
+        lock: (on, flag) => { toggle.disabled = on; range.disabled = on; if (on && flag !== undefined) { toggle.checked = Number(flag) > 0; range.hidden = !(Number(flag) > 0); range.value = flag; setText(read, Number(flag) > 0 ? flagShown(spec, flag) : "Off"); } else paint(); } };
     }
     const choice = spec.type === "choice";
     const node = choice ? h("select", { "aria-label": label, onchange: () => onChange() }, h("option", { value: "", text: "Default" }), ...spec.choices.map((c) => h("option", { value: c, text: choiceLabel(key, c) })))

@@ -5789,12 +5789,12 @@ test "expert pick tolerance accepts 0 through 0.6 and names a bad value" {
     try t.expectError(error.InvalidPickTolerance, parsePickTolerance(""));
 }
 
-test "expert cache bias accepts 0 through 8 and penalizes only the experts the cache lacks" {
+test "expert cache bias accepts 0 through 2 and penalizes only the experts the cache lacks" {
     const t = std.testing;
     try t.expectEqual(@as(f32, 0.0), try parseCacheBias("0"));
     try t.expectEqual(@as(f32, 0.2), try parseCacheBias("0.2"));
-    try t.expectEqual(@as(f32, 8.0), try parseCacheBias("8"));
-    for ([_][]const u8{ "8.5", "-0.1", "nan", "inf", "nope", "" }) |bad| try t.expectError(error.InvalidCacheBias, parseCacheBias(bad));
+    try t.expectEqual(@as(f32, 2.0), try parseCacheBias("2"));
+    for ([_][]const u8{ "2.5", "8", "-0.1", "nan", "inf", "nope", "" }) |bad| try t.expectError(error.InvalidCacheBias, parseCacheBias(bad));
     var pen: [4]f32 = undefined;
     biasPenalty(&.{ 3, -1, 0, -1 }, 0.25, &pen);
     try t.expectEqualSlices(f32, &.{ 0, -0.25, 0, -0.25 }, &pen);

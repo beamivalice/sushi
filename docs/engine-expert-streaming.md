@@ -291,7 +291,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   one-row steps that score the generated tokens; its prompt prefill is exact.
 - A streamed GLM has no pick: `glm5_stream` always fetches a miss, so the flag does nothing there.
 
-## Cache-favoring pick (`--expert-cache-bias <n>`, 0..8, default 0 = exact)
+## Cache-favoring pick (`--expert-cache-bias <n>`, 0..2, default 0 = exact)
 
 - DeepSeek-V4.1 and Qwen3.8 STQ, decode widths (DSpark and MTP verify rows included, up to `DECODE_ROWS_MAX`): the pick
   scores an expert the layer's cache lacks `n` lower (`Engine.cachePenalty`, f32 `[experts]` rebuilt with the GPU cache

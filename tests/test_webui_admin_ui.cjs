@@ -24,7 +24,7 @@ const KEYS = [
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
   { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' }, { name: 'qwen_cooler', type: 'bool' },
   { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
-  { name: 'expert_cache_bias', type: 'number', min: 0, max: 8 },
+  { name: 'expert_cache_bias', type: 'number', min: 0, max: 2 },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
 const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'preserve_thinking', 'think_penalty', 'max_tokens'];
@@ -1471,24 +1471,38 @@ async function main() {
       await page.fill('#portNum', '81');
       assert.equal(await page.textContent('.set[data-key="port"] .bad'), '', 'typing clears the refusal');
     });
-    await scenario('DeepSeek\'s Faster SSD streaming (not exact) saves a number from 0 to 8, refuses one past 8, and its launch flag locks it', { path: '/models#Deep-C', open: { mode: 'advanced' },
+    await scenario('Faster SSD streaming (not exact) is an enable toggle, off by default, whose slider starts at 0.2 and stops at 2, and turning it off saves 0', { path: '/models#Deep-C', open: { mode: 'advanced' },
       setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'ssd_budget_gb', 'expert_cache_bias']; s.state.models[2].defaults = { ...s.state.models[2].defaults, expert_cache_bias: 0 }; } }, async ({ page, server }) => {
-      const box = `${row('expert_cache_bias')} input`;
-      await page.waitForSelector(box);
+      const toggle = `${row('expert_cache_bias')} input[type="checkbox"]`, slider = `${row('expert_cache_bias')} input[type="range"]`;
+      await page.waitForSelector(toggle);
       assert.match(await page.textContent(`${row('expert_cache_bias')} .lab`), /Faster SSD streaming \(not exact\)/);
       assert.match(await page.textContent(`${row('expert_cache_bias')}`), /Lower quality for speed/);
-      assert.equal(await page.getAttribute(box, 'placeholder'), 'Default (0)');
-      await page.fill(box, '9');
-      assert.match(await page.textContent(`${row('expert_cache_bias')} .bad`), /from 0 to 8/);
-      await page.fill(box, '0.2');
-      assert.equal(await page.textContent(`${row('expert_cache_bias')} .bad`), '');
+      assert.equal(await page.isChecked(toggle), false, 'off, so exact, until the person enables it');
+      assert.equal(await page.isVisible(slider), false, 'no slider while off');
+      await page.check(toggle);
+      assert.equal(await page.isVisible(slider), true);
+      assert.equal(await page.inputValue(slider), '0.2', 'enabling starts at 0.2');
+      assert.equal(await page.getAttribute(slider, 'max'), '2');
       await page.click('.savebar button:text-is("Save")');
       await page.waitForSelector('.toast');
       assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { expert_cache_bias: 0.2 } });
     });
+    await scenario('turning Faster SSD streaming (not exact) off saves 0 and hides its slider', { path: '/models#Deep-C', open: { mode: 'advanced' },
+      setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'ssd_budget_gb', 'expert_cache_bias']; s.state.models[2].defaults = { ...s.state.models[2].defaults, expert_cache_bias: 0 };
+        s.state.models[2].settings = allKeys({ expert_cache_bias: keyState({ file: 0.6, source: 'file' }) }); } }, async ({ page, server }) => {
+      const toggle = `${row('expert_cache_bias')} input[type="checkbox"]`, slider = `${row('expert_cache_bias')} input[type="range"]`;
+      await page.waitForSelector(toggle);
+      assert.equal(await page.isChecked(toggle), true);
+      assert.equal(await page.inputValue(slider), '0.6');
+      await page.uncheck(toggle);
+      assert.equal(await page.isVisible(slider), false);
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForSelector('.toast');
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { model: 'Deep-C', set: { expert_cache_bias: 0 } });
+    });
     await scenario('--expert-cache-bias at launch locks Faster SSD streaming (not exact) and names the flag', { path: '/models#Deep-C', open: { mode: 'advanced' },
       setup: (s) => { s.state.models[2].keys = [...BASE_KEYS, 'expert_cache_bias']; s.state.models[2].settings = allKeys({ expert_cache_bias: keyState({ flag: '0.3', source: 'flag', locked: true }) }); } }, async ({ page }) => {
-      const box = `${row('expert_cache_bias')} input`;
+      const box = `${row('expert_cache_bias')} input[type="checkbox"]`;
       await page.waitForSelector(box);
       assert.equal(await page.isDisabled(box), true);
       assert.match(await page.textContent(row('expert_cache_bias')), /--expert-cache-bias 0\.3/);

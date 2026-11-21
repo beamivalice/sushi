@@ -279,10 +279,11 @@ Options:
                         (default: 0 = off, exact routing). At decode widths
                         the router scores an expert the layer's cache lacks
                         n lower, so a cached expert within n of it wins the
-                        pick; the weights stay the unbiased scores. DeepSeek
-                        counts n in its sqrt-softplus scores (0.2 is mild),
-                        Qwen in router logits. 0..8. Ignored when
-                        --expert-pick-tolerance is set.
+                        pick; the weights stay the unbiased scores. A bigger
+                        n is more lossy and, when streaming, faster. 0..2,
+                        0.2 suggested; each model reads n in its own router
+                        units, so a value does not carry from one to the
+                        other. Ignored when --expert-pick-tolerance is set.
   --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
                         source checkpoint) with a
                         TOTAL resident target of <n> GiB; the expert
