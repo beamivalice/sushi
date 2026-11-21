@@ -358,6 +358,7 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
 /// The load lines for each setting and flag the model takes no effect from.
 pub fn logIgnoredSettings(config: *const ModelConfig) void {
     if (arch_flags.settingsSsdPrefetchIgnoredLine(config)) |line| log.info("{s}\n", .{line});
+    if (arch_flags.expertCacheBiasIgnoredLine(config)) |line| log.info("{s}\n", .{line});
     if (arch_flags.settingsCoolerIgnoredLine(config)) |line| log.info("{s}\n", .{line});
     for (arch_flags.coolerOffIgnoredLines(config)) |line| if (line) |l| log.info("{s}\n", .{l});
     if (arch_flags.settingsKvQuantIgnoredLine(config)) |line| log.info("{s}\n", .{line});

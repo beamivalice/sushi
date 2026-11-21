@@ -97,7 +97,7 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
 would silently do nothing is refused by name at load (`kld_capture.refuse`): `--kv-quant` (`Dsv41KvQuantUnsupported`),
 `--qwen-gdn 16` (`Dsv41HasNoQwenGdnState`), `--hidden-out` (`Dsv41HiddenCaptureUnsupported`) and `SUSHI_IMATRIX_OUT`
 (`Dsv41ImatrixCaptureUnsupported`; the layer-major capture below takes it). The teacher is exact routing: `capture` refuses `--drop-expert`,
-`--expert-pick-tolerance` and `--expert-cache-bias`; `compare --drop-expert n` scores a pruned student against it
+`--expert-pick-tolerance` and `--expert-cache-bias` (a model setting `expert_cache_bias` is ignored by a capture, with a `[kld]` line); `compare --drop-expert n` scores a pruned student against it
 ([dsv41-arch](dsv41-arch.md#drop-expert)). `compare --expert-pick-tolerance n` acts on the one-row steps that score the
 generated tokens (the prompt prefill is exact) and only where an expert can miss: a budget that holds every expert loads
 resident, logs that the flag has no effect, and scores the exact KLD; a real streamed load logs

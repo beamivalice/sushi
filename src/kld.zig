@@ -313,6 +313,7 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         return error.LaunchFlagUnsupported;
     }
     model_load.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
+    if (exactTeacherLine(opts.command, &self.config)) |line| log.info("{s}\n", .{line});
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
 
     const kld_budget = model_load.resolveSsdBudget(opts.ssd_budget_bytes, self.config.ssd_budget_gb_override, self.config.supportsExpertStreaming());
@@ -985,6 +986,26 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
         .capture => try runCapture(io, allocator, loaded, opts, &out),
         .compare => try runCompare(io, allocator, loaded, opts, &out),
     }
+}
+
+/// A teacher capture routes exactly: a lossy pick the model's settings carry is dropped, and the line says so.
+fn exactTeacherLine(command: Command, config: *model_mod.ModelConfig) ?[]const u8 {
+    if (command != .capture or (config.expert_cache_bias_override orelse 0) == 0) return null;
+    config.expert_cache_bias_override = null;
+    return "[kld] capture routes exactly: model-settings expert_cache_bias is ignored";
+}
+
+test "kld: a capture ignores the lossy pick a model's settings carry and says so, a compare keeps it" {
+    const saved = model_settings_mod.expert_cache_bias_flag;
+    defer model_settings_mod.expert_cache_bias_flag = saved;
+    model_settings_mod.expert_cache_bias_flag = null;
+    var config = model_mod.ModelConfig{ .expert_cache_bias_override = 0.5 };
+    try testing.expectEqualStrings("[kld] capture routes exactly: model-settings expert_cache_bias is ignored", exactTeacherLine(.capture, &config).?);
+    try testing.expectEqual(@as(f32, 0), config.expertCacheBias());
+    try testing.expect(exactTeacherLine(.capture, &config) == null);
+    var student = model_mod.ModelConfig{ .expert_cache_bias_override = 0.5 };
+    try testing.expect(exactTeacherLine(.compare, &student) == null);
+    try testing.expectEqual(@as(f32, 0.5), student.expertCacheBias());
 }
 
 test "kld: --help lists every flag the parser accepts" {

@@ -304,8 +304,8 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - A tolerance above 0 swaps on the host and keeps nothing queued, so a boot with both ignores the bias (and says so).
 - Prefill chunks, image rows and layers without a pooled map route exactly. `ExpertStreamTraits.cache_bias` names the
   archs whose router takes it; another arch's engine keeps the bias 0. The prefix-cache namespace names a non-zero bias
-  (`-cbias`: `dsv41_prefix.layoutKey`, `qwen4_prefix.diskLayoutKey`), so its states never mix with an exact boot's.
-  `kld compare` takes it, `capture` refuses it.
+  (`-cbias`, and `-pick` for a tolerance: `dsv41_prefix.layoutKey`, `qwen4_prefix.diskLayoutKey`), so its states never mix with an exact boot's. A load whose arch has no such pick says so (`[expert-bias] ignored`).
+  `kld compare` takes it; `capture` refuses the flag and ignores a model setting, with a log line.
 - Per model: model-settings.json `expert_cache_bias` (the web UI's "Faster SSD streaming (not exact)", offered only to a
   DeepSeek or Qwen STQ pack that streams); the flag outranks it. `ModelConfig.expertCacheBias` resolves it per load and
   the load hands it to its own engine (`Options.cache_bias`) and namespace, so a second resident model never reads

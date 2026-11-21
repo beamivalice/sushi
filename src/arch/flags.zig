@@ -249,6 +249,13 @@ pub fn settingsSsdPrefetchIgnoredLine(config: *const model.ModelConfig) ?[]const
     return "model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher";
 }
 
+/// A non-zero `--expert-cache-bias` (flag or model setting) on an engine whose arch has no cache-favoring pick is ignored
+/// with this one line.
+pub fn expertCacheBiasIgnoredLine(config: *const model.ModelConfig) ?[]const u8 {
+    if (!(config.expertCacheBias() > 0) or admission.expertStream(config).cache_bias) return null;
+    return "[expert-bias] ignored: this model has no cache-favoring pick";
+}
+
 /// Another arch's Sushi Cooler setting in the model's row is ignored with this one line, as `ssd_prefetch` is.
 pub fn settingsCoolerIgnoredLine(config: *const model.ModelConfig) ?[]const u8 {
     const stray = config.cooler_setting_stray orelse return null;
@@ -445,6 +452,27 @@ test "--ssd-prefetch is refused where there is no expert prefetcher, before the 
         cfg.ssd_prefetch_override = 30;
         try testing.expectEqualStrings("model-settings.json ssd_prefetch is ignored: this model has no expert prefetcher", settingsSsdPrefetchIgnoredLine(&cfg).?);
     }
+}
+
+test "a cache bias on a model whose router has no cache-favoring pick is ignored with one line, and where it applies with none" {
+    const saved = model_settings.expert_cache_bias_flag;
+    defer model_settings.expert_cache_bias_flag = saved;
+    model_settings.expert_cache_bias_flag = null;
+    for ([_][]const u8{ "deepseek_v41", "qwen4_exp", "mimo_v2", "glm5_next" }) |arch| {
+        if (!built(arch)) continue;
+        var cfg = model.ModelConfig{ .model_type = arch, .expert_layout = .exl3_k4 };
+        try testing.expect(expertCacheBiasIgnoredLine(&cfg) == null);
+        cfg.expert_cache_bias_override = 0.5;
+        const applies = admission.expertStream(&cfg).cache_bias;
+        try testing.expectEqual(applies, expertCacheBiasIgnoredLine(&cfg) == null);
+        if (!applies) try testing.expectEqualStrings("[expert-bias] ignored: this model has no cache-favoring pick", expertCacheBiasIgnoredLine(&cfg).?);
+        cfg.expert_cache_bias_override = null;
+        model_settings.expert_cache_bias_flag = 0.5;
+        try testing.expectEqual(applies, expertCacheBiasIgnoredLine(&cfg) == null);
+        model_settings.expert_cache_bias_flag = null;
+    }
+    var bf16 = model.ModelConfig{ .model_type = "qwen4_exp", .expert_layout = .bf16_fused, .expert_cache_bias_override = 0.5 };
+    if (built("qwen4_exp")) try testing.expect(expertCacheBiasIgnoredLine(&bf16) != null);
 }
 
 test "--drop-expert is refused on every pack but a quantized one whose experts stream, before the weights load" {
