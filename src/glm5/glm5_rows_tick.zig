@@ -416,8 +416,14 @@ test "a grouped GLM tick destroys every verified row whichever slot holds the tr
 }
 
 test "a drafting GLM slot rides plain rows only in company of its own model" {
+    // The company check reads each slot's arch from its model: a model with no handle yet answers from its config.
+    var cfg = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("../fixtures/glm5_config.json"));
     var glm_a: LoadedModel = undefined;
     var glm_b: LoadedModel = undefined;
+    for ([_]*LoadedModel{ &glm_a, &glm_b }) |m| {
+        m.handle = null;
+        m.config = &cfg;
+    }
     var slots: [4]Slot = undefined;
     for (&slots, 0..) |*s, i| s.model = if (i == 3) &glm_b else &glm_a;
     try testing.expect(!sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{}));
