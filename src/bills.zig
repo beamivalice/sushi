@@ -2343,9 +2343,10 @@ fn widestBufferRowBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 
 /// its forward's graph, so its whole cache's old copies and tails are. Priced at the dearest regrow of the
 /// request: its cache starts from the capacity the restore holds (`warm.capacity_tokens`, else none), the prefill grows it
 /// to the prompt (`KVCache.heldRows`, the one rule the cache grows by) and every decode row past a capacity step grows it
-/// again until the request's last row. Nothing where a reservation already holds the whole reply, and on MLX.
-fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
-    if (!cooler_side.onEngine(config)) return 0;
+/// again until the request's last row. Nothing where a reservation or a restore already holds the whole reply, on MLX and for
+/// an arch whose requests reserve no capacity.
+pub fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
+    if (!config.reservesKvCapacity() or !cooler_side.onEngine(config)) return 0;
     const KV = trunk.KVCache;
     const hold = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm));
     const row = widestBufferRowBytes(config, kv_bits);
@@ -2415,7 +2416,7 @@ pub fn cacheStorage(config: *const model_mod.ModelConfig, seq: u64, max_tokens: 
 /// prices it (`cacheStorage`), the MTP head's where the request runs it, drained as the cache becomes resident.
 pub fn cacheCommitBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u64, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
     const st = cacheStorage(config, prompt_len, max_tokens, kv_bits, chunk, .{ .mtp_on = mtp_on });
-    return st.kv +| st.state +| st.head_kv +| st.regrow;
+    return st.kv +| st.state +| st.head_kv;
 }
 
 /// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
@@ -3315,15 +3316,17 @@ pub fn prefillFitsNow(config: *const model_mod.ModelConfig, prompt_len: usize, m
 pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_cfg: trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) slot_admission.MemoryBill {
     const bill = prefillAdmissionBill(config, null, prompt_len, max_tokens, kv_cfg, unchunked_prefill, null, .{ .mtp_on = enable_mtp });
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, bill.chunk, enable_mtp), .held = bill.needed -| billMargin(config) };
+    return .{ .needed = bill.needed, .available = bill.available, .commit = admissionCommitBytes(config, prompt_len, max_tokens, kv_bits, bill.chunk, .{ .mtp_on = enable_mtp }), .held = bill.needed -| billMargin(config) };
 }
 
 /// Bytes the bill prices for a request's cache that it allocates AFTER admission. A native GLM
 /// MLA cache grows row by row (a DFlash2 request reserves it after prefill); a Qwen or MiMo
 /// request takes its reserved capacity at its first grow, so it is resident before the next admission. `chunk` is the
 /// width the request is admitted and reserved at.
-pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
-    return archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, chunk, mtp_on }) orelse 0;
+pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
+    const stored = archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, chunk, warm.mtp_on }) orelse return 0;
+    // The decode regrow (`decodeRegrowBytes`) starts from the capacity a restore holds, which the arch's hook is not given.
+    return stored +| decodeRegrowBytes(config, prompt_len, max_tokens, kv_bits, chunk, warm);
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
@@ -5948,10 +5951,10 @@ test "a Qwen request commits its whole cache at admission, as admission counts w
         const cap = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, 8);
         const history = cacheCapacityTokens(&cfg, seq, 4096, chunk, ctx, 0, null);
         try std.testing.expect(cap >= seq + 4096);
-        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg), admissionCommitBytes(&cfg, seq, 4096, 8, chunk, false));
+        try std.testing.expectEqual(cap * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + history * statePerTokenBilled(&cfg), admissionCommitBytes(&cfg, seq, 4096, 8, chunk, .{}));
     }
     const mimo = model_mod.ModelConfig{ .model_type = "mimo_v2" };
-    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, chunk, false));
+    try std.testing.expectEqual(@as(u64, 0), admissionCommitBytes(&mimo, 40_000, 4096, 8, chunk, .{}));
 }
 
 test "GLM release defaults advertise the full context at the widest prefill chunk that keeps it" {
@@ -6689,7 +6692,7 @@ test "bill pin: creditedAdmissionBill and its verdict" {
                 g.add(admissionVerdict(bill));
                 g.add(pinnedResidentBytes(bill));
             }
-            g.add(admissionCommitBytes(c, 5000, 4096, 8, settings_resolve.prefill_chunk.value, false));
+            g.add(admissionCommitBytes(c, 5000, 4096, 8, settings_resolve.prefill_chunk.value, .{}));
         }
     }.run);
 }

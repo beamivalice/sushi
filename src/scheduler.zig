@@ -4034,7 +4034,9 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         );
         const decision = slot_admission.postEvictionPrefillChunk(admitted_prefill_chunk, reasked);
         const kv_bits: u64 = if (slot.cache.config.scheme == .off) 16 else slot.cache.config.bits;
-        slot.growth_commit = slot_admission.growthCommitAt(cfg, slot.full_prompt.len, slot.max_tokens, kv_bits, slot.growth_commit, decision, slot.enable_mtp);
+        // The request's restore: its decode regrow starts from the capacity the restored cache holds.
+        const warm: @import("bills.zig").WarmPrefix = .{ .matched_tokens = hot_matched, .capacity_tokens = slot.cache.residentCapacityTokens(), .will_donate = hot_checked_out, .mtp_on = slot.enable_mtp };
+        slot.growth_commit = slot_admission.growthCommitAt(cfg, slot.full_prompt.len, slot.max_tokens, kv_bits, slot.growth_commit, decision, warm);
         if (decision.widened) {
             log.info("[prefill] re-ask: width {d} -> {d} after the eviction pass returned {d} MB\n", .{ admitted_prefill_chunk, decision.width, evicted_live_bytes >> 20 });
         } else if (decision.moved) {

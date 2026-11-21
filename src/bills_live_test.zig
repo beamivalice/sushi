@@ -243,7 +243,7 @@ test "a second GLM admission leaves free the cache growth the first was admitted
     for ([_]u64{ 16, 8 }) |kv_bits| {
         const bill = bills.prefillAdmissionBill(&cfg, null, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, null, .{});
         const nums = bills.prefillBillNumbersNow(&cfg, prompt, max_tokens, if (kv_bits == 16) trunk.KVQuantConfig.dense else trunk.KVQuantConfig.affine(8), false, false);
-        const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits, bill.chunk, false);
+        const commit = bills.admissionCommitBytes(&cfg, prompt, max_tokens, kv_bits, bill.chunk, .{});
         try std.testing.expectEqual(commit, nums.commit);
         // What the request retains is most of its bill, and it is not resident at admission.
         try std.testing.expect(commit > bill.needed / 2 and commit <= bill.needed);
@@ -254,9 +254,9 @@ test "a second GLM admission leaves free the cache growth the first was admitted
         try std.testing.expectEqual(@as(usize, 0), slot_admission.admitsWithinMemory(&.{b}, true, commit));
     }
     // kv8 audit shape: one request's eventual state is 6.669 GiB.
-    const kv8 = bills.admissionCommitBytes(&cfg, prompt, max_tokens, 8, 2048, false);
+    const kv8 = bills.admissionCommitBytes(&cfg, prompt, max_tokens, 8, 2048, .{});
     try std.testing.expect(kv8 > 6 * gib + gib * 2 / 3 and kv8 < 6 * gib + gib * 7 / 10);
-    try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16, 2048, false) > kv8);
+    try std.testing.expect(bills.admissionCommitBytes(&cfg, prompt, max_tokens, 16, 2048, .{}) > kv8);
 }
 
 test "GPU memory readings are MLX's plus the engine's pool: tensors in use as active, free buffers as cache" {
@@ -975,7 +975,7 @@ test "a Qwen request's growth commit covers the cache it reserves at the width t
         if (reasked <= admitted) continue;
         widened += 1;
         const reserved = bills.cacheCommitBytes(&cfg, seq, 4096, 8, reasked, false);
-        const commit = slot_admission.growthCommitAt(&cfg, seq, 4096, 8, nums.commit, slot_admission.postEvictionPrefillChunk(admitted, reasked), false);
+        const commit = slot_admission.growthCommitAt(&cfg, seq, 4096, 8, nums.commit, slot_admission.postEvictionPrefillChunk(admitted, reasked), .{});
         if (commit < reserved) {
             bad += 1;
             std.debug.print("{d} MiB free at admission: commit {d} MiB at width {d}; the re-ask after 8 GiB evicted runs {d} rows and reserves {d} MiB (+{d} MiB uncommitted)\n", .{ before / MiB, commit / MiB, admitted, reasked, reserved / MiB, (reserved - commit) / MiB });

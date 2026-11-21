@@ -2141,6 +2141,33 @@ test "on Sushi Cooler a chunk part-way through a prompt bills the cache growth t
     }
 }
 
+test "on Sushi Cooler a restore's admission commit holds the decode regrow its bill holds: none where the restored cache holds the reply, the cold term where it does not" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = coolerFlashNext();
+    const chunk: u64 = cfg.prefillStartWidth();
+    const seq: u64 = 4000;
+    const max_tokens: u32 = 4096;
+    const stored = bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false);
+    const cold = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{}).decode_regrow_bytes;
+    try t.expect(cold > 0);
+    // Restored capacities below the request's last row (its regrow is the cold one) and at or past it (the cache holds the reply).
+    for ([_]struct { capacity: u64, regrow: u64 }{ .{ .capacity = 4096, .regrow = cold }, .{ .capacity = 6144, .regrow = cold }, .{ .capacity = 8192, .regrow = 0 }, .{ .capacity = 9000, .regrow = 0 } }) |c| {
+        const warm: WarmPrefix = .{ .matched_tokens = 3000, .capacity_tokens = c.capacity, .will_donate = true };
+        const bill = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, warm).decode_regrow_bytes;
+        const commit = bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, warm);
+        errdefer std.debug.print("a restore holding {d} rows: its bill holds a {d} B regrow, its commit {d} B of {d} B stored\n", .{ c.capacity, bill, commit -| stored, stored });
+        try t.expectEqual(c.regrow, bill);
+        try t.expectEqual(stored + bill, commit);
+    }
+    // A cold request commits the term too, and admission re-prices a restore's commit where it does not move the width.
+    try t.expectEqual(stored + cold, bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, .{}));
+    const same = slot_admission.postEvictionPrefillChunk(@intCast(chunk), @intCast(chunk));
+    const held: WarmPrefix = .{ .matched_tokens = 3000, .capacity_tokens = 9000, .will_donate = true };
+    try t.expectEqual(stored + cold, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + cold, same, .{}));
+    try t.expectEqual(stored, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + cold, same, held));
+}
+
 test "on Sushi Cooler a reserved request's first chunk bills no growth for the cache its admission commit already holds, so its width holds at every long prompt" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
@@ -2443,10 +2470,10 @@ test "Flash-Next on Cooler: a drafted request's growth commit holds the MTP head
         // Every row the bill prices that grows after admission: the trunk's KV past the prompt's raw rows, the
         // histories and the head's KV; the head's fixed rings are not per row.
         const grows = seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + terms.reserved_kv_bytes + terms.state_bytes - bills.mtpHeadQsaRingBytes(&cfg) + terms.mtp_head_kv_bytes;
-        const commit = bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, chunk, true);
+        const commit = bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, chunk, .{ .mtp_on = true });
         errdefer std.debug.print("seq {d} + {d}: the commit holds {d} KB, the bill's growing storage {d} KB\n", .{ seq, n, commit >> 10, grows >> 10 });
         try t.expect(commit + 4096 >= grows);
-        try t.expect(commit > bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, chunk, false));
+        try t.expect(commit > bills.admissionCommitBytes(&cfg, @intCast(seq), n, 8, chunk, .{}));
     };
 }
 
