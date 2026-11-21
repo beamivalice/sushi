@@ -1904,7 +1904,12 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
             entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
             entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(config, "state_beside_kv");
         }
-        if (disk_tier) |tier| entry.prefix_cache.?.disk = tier;
+        if (disk_tier) |tier| {
+            entry.prefix_cache.?.disk = tier;
+            // Published at attach: a model owns its namespace while it loads, before the publisher reads it ready.
+            const d = &entry.prefix_cache.?.disk.?;
+            entry.disk_stats.publish(.{ .budget = d.max_bytes, .namespace = disk_placement.namespaceOfRoot(d.root, d.private_root) });
+        }
         entry.prefix_cache.?.arrays_on = prefix_arch.arraysOn(config);
         if (entry.prefix_cache.?.disk) |*d| d.arrays_on = entry.prefix_cache.?.arrays_on;
         // SSD-first: arch + env switch + a live disk tier (attached above); without one qwen4_exp takes the RAM arm.
@@ -3291,6 +3296,17 @@ test "attachPrefixCache: at a load, an allocation that fails in the tier's grown
         try testing.expectEqual(f.entry.prefix_cache == null, f.config.prefix_cache_disk_declined);
     }
     try testing.expect(induced > 0);
+}
+
+test "attachPrefixCache: a tier attached at a load publishes its namespace, so the loading model owns it before it is ready" {
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(false), 1 << 30, .load);
+    const disk = &f.entry.prefix_cache.?.disk.?;
+    const ns = disk_placement.namespaceOfRoot(disk.root, disk.private_root);
+    try testing.expect(ns != 0);
+    try testing.expectEqual(ns, f.entry.disk_stats.snapshot().namespace);
 }
 
 test "attachPrefixCache: RAM beside the tier keeps the RAM cache and the legacy checkpoint cap" {

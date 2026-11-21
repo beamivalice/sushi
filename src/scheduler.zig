@@ -52,6 +52,7 @@ const prefix_cache_mod = @import("prefix_cache.zig");
 const restore_dump = @import("restore_dump.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const disk_placement = @import("disk_placement.zig");
 const model_registry_mod = @import("model_registry.zig");
 const FolderId = @import("folder_identity.zig").FolderId;
 const model_settings = @import("model_settings.zig");
@@ -3324,13 +3325,16 @@ pub fn publishDiskStats(sch: *Scheduler) void {
     var it = sch.registry.entries.valueIterator();
     while (it.next()) |entry_ptr| {
         const entry = entry_ptr.*;
+        // A loading model's snapshot is its load's (the namespace its tier attached), and an evicting one keeps its
+        // last: it owns that namespace until it is unloaded, so a namespace clear meets its 409.
+        if (entry.state == .loading or entry.state == .evicting) continue;
         var snap: model_registry_mod.DiskStats.Snapshot = .{};
         if (entry.state == .ready) {
             if (asked) if (entry.config) |c| {
                 if (c.prefix_cache_disk_declined) declined += 1;
             };
             if (entry.prefix_cache) |*hc| if (hc.disk) |*d| {
-                snap = .{ .budget = d.max_bytes, .used = d.diskBytes(), .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten(), .namespace = prefix_cache_admin.namespaceOfRoot(d.root, d.private_root) };
+                snap = .{ .budget = d.max_bytes, .used = d.diskBytes(), .entries = d.entryCount(), .written = d.stats.snapshot().totalWritten(), .namespace = disk_placement.namespaceOfRoot(d.root, d.private_root) };
             };
         }
         entry.disk_stats.publish(snap);
@@ -7134,4 +7138,25 @@ test "a request answered fast from a stored failure carries that failure's name 
     try testing.expectError(error.LoadFailed, sch.ensureLoaded("b", &report));
     try testing.expectEqualStrings("FileNotFound", report.stored.get().?);
     try testing.expect(report.failed == null);
+}
+
+test "the disk-stats publisher keeps the namespace of a model that is loading or evicting, so a namespace clear meets its 409" {
+    var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("m", "/m", 1);
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    sch.tiers_declined = std.atomic.Value(u32).init(0);
+    defer entry.state = .unloaded;
+    for ([_]model_registry_mod.LoadState{ .loading, .evicting }) |st| {
+        entry.state = st;
+        entry.disk_stats.publish(.{ .namespace = 0xa1, .budget = 1 });
+        publishDiskStats(&sch);
+        try testing.expectEqual(@as(u64, 0xa1), entry.disk_stats.snapshot().namespace);
+    }
+    // An unloaded model owns none.
+    entry.state = .unloaded;
+    publishDiskStats(&sch);
+    try testing.expectEqual(@as(u64, 0), entry.disk_stats.snapshot().namespace);
 }

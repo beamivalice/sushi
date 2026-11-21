@@ -756,6 +756,27 @@ fn evictionDuringStoreRound(selected: usize, evicted: usize, ssm_only: bool) !vo
     }
 }
 
+pub const ns_name_len = 16;
+
+/// A namespace directory is `<16 lowercase hex>`, the model fingerprint (`modelFingerprint`).
+pub fn isNamespaceName(name: []const u8) bool {
+    if (name.len != ns_name_len) return false;
+    for (name) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return false;
+    return true;
+}
+
+pub fn namespaceId(name: []const u8) ?u64 {
+    if (!isNamespaceName(name)) return null;
+    return std.fmt.parseInt(u64, name, 16) catch null;
+}
+
+/// The namespace a tier root lives in: `<base>/<fp>` or, for a private root, `<base>/<fp>/p<pid>-<n>`.
+/// 0 when the root is not under a namespace directory.
+pub fn namespaceOfRoot(root: []const u8, private_root: bool) u64 {
+    const dir = if (private_root) std.fs.path.dirname(root) orelse return 0 else root;
+    return namespaceId(std.fs.path.basename(dir)) orelse 0;
+}
+
 test "prefix cache root: explicit absolute directory and default home path" {
     const a = std.testing.allocator;
     const explicit = try cacheBaseDir(a, null, "/tmp/sushi-cache-test");
