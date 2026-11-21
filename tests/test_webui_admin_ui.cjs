@@ -2018,6 +2018,27 @@ async function main() {
       assert.equal((await chatMeter(page)).hidden, true, 'no chat model, so no meter');
       assert.deepEqual(server.calls.filter((c) => c.path === '/props' && c.query).map((c) => c.query), [], 'and no read for a model');
     });
+    await scenario('a 401 to a request sent before the key was entered leaves the overlay closed over a good key', { path: '/chat', setup: (s) => {
+      for (const p of ['/v1/models', '/v1/settings', '/props', '/v1/prefix-cache', '/metrics.json', '/v1/tools']) s.state.hooks[p] = async () => {
+        if (s.calls.at(-1)?.auth === 'Bearer K') return null;
+        if (p === '/v1/models' && s.state.holdNext) { s.state.holdNext = false; await new Promise((r) => { s.state.held = r; }); }
+        return { status: 401, contentType: 'application/json', body: JSON.stringify({ error: { message: 'invalid api key' } }) };
+      };
+    } }, async ({ page, server }) => {
+      await page.waitForFunction(() => !document.getElementById('keyOverlay').hidden);
+      server.state.holdNext = true;
+      await page.clock.runFor(31_000); // a keyless poll goes out, and its 401 is slow
+      await page.waitForTimeout(100);
+      assert.ok(server.state.held, 'a keyless poll is in flight');
+      await page.fill('#keyInput', 'K');
+      await page.press('#keyInput', 'Enter');
+      await page.waitForTimeout(300);
+      assert.equal(await page.evaluate(() => document.getElementById('keyOverlay').hidden), true, 'the good key closes the overlay');
+      server.state.held();
+      await page.waitForTimeout(300);
+      const shown = await page.evaluate(() => ({ hidden: document.getElementById('keyOverlay').hidden, err: document.getElementById('keyError').textContent }));
+      assert.equal(shown.hidden, true, `the key K is accepted, yet the overlay is back saying "${shown.err}"`);
+    });
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
     console.log('Web UI admin views (browser): passed');
   } finally {

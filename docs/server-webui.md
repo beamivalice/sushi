@@ -43,7 +43,7 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   wins; bare `/props` answers for the server's default model) when the picked model or its loaded state changes
   (`syncPrefixCache`) and after a reply, a clear, a cache-size save or a reload; with no model chosen there is no meter.
   Guards: the meter scenarios in `tests/test_webui_admin_ui.cjs`, `tests/test_webui_prefix_cache.cjs`.
-  The API-key overlay is modal only while the server asks for a key: the first authorized answer from any request hides it.
+  The API-key overlay is modal only while the server asks for a key: the first authorized answer from any request hides it, and a 401 judges only the key its own request carried (`api`), so a slow one sent before a key was entered never reopens it.
 
 ## Palette
 
