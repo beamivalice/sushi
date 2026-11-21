@@ -346,31 +346,39 @@ fn workerLoop(io: std.Io) void {
         const reporter: cli.Reporter = .{ .impl = job, .reportFn = &onLine, .eventFn = &onEvent, .stop = &job.cancel };
         const ok = if (cli.pullRepo(gpa, io, .{ .repo = job.repo }, job.dest, reporter, false)) |_| true else |_| false;
 
-        var repo_buf: [256]u8 = undefined;
-        var dest_buf: [std.fs.max_path_bytes]u8 = undefined;
-        lock();
-        const repo = repo_buf[0..@min(job.repo.len, repo_buf.len)];
-        @memcpy(repo, job.repo[0..repo.len]);
-        const dest = dest_buf[0..@min(job.dest.len, dest_buf.len)];
-        @memcpy(dest, job.dest[0..dest.len]);
-        job.progress.endFile(job.allocator, ok);
-        job.pid = null;
-        job.phase = if (ok) .done else if (job.cancel.load(.monotonic)) .cancelled else .failed;
+        finishJob(job, ok);
+    }
+}
+
+/// A pull's end. A failed or stopped pull is over at once. A finished one stays active (`verifying`) until its pack
+/// is registered: `GET /v1/downloads` reporting `done` is the page's one cue to refresh `/v1/models`, so the pack
+/// must be listed by then. The job is not dropped while active, so it is used through the registry rescan.
+fn finishJob(job: *Job, ok: bool) void {
+    lock();
+    job.progress.endFile(job.allocator, ok);
+    job.pid = null;
+    if (!ok) {
+        job.phase = if (job.cancel.load(.monotonic)) .cancelled else .failed;
         if (job.phase == .failed and job.message.len == 0) job.setMessage("the download failed");
         if (job.phase != .failed) job.setMessage("");
-        // The pack is now the published revision: its row drops the update without asking Hugging Face again.
-        if (ok) for (cat_entries) |*e| if (std.ascii.eqlIgnoreCase(e.repo, repo)) {
-            e.update = null;
-        };
-        const rescan = ok and !stopping;
         unlock();
-        if (ok) packPulled(dest);
-        // `job` may be dropped from here on: a new start of the same pack replaces a finished one.
-        if (rescan) if (server_state.global_registry) |r| {
-            const added = r.absorbDownload(dest) catch 0;
-            log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ repo, added });
-        };
+        return;
     }
+    // The pack is now the published revision: its row drops the update without asking Hugging Face again.
+    for (cat_entries) |*e| if (std.ascii.eqlIgnoreCase(e.repo, job.repo)) {
+        e.update = null;
+    };
+    const rescan = !stopping;
+    unlock();
+    packPulled(job.dest);
+    if (rescan) if (server_state.global_registry) |r| {
+        const added = r.absorbDownload(job.dest) catch 0;
+        log.info("[download] {s} is ready; models rescanned, {d} added\n", .{ job.repo, added });
+    };
+    lock();
+    defer unlock();
+    job.phase = .done;
+    job.setMessage("");
 }
 
 /// A finished pull leaves the pack at the published revision: its `/v1/models` row stops naming an update.
@@ -1038,4 +1046,58 @@ test "downloads: a symlinked models folder pointed at a stopped pull's copy: the
     var gb: [512]u8 = undefined;
     const why = s.reg.loadBlocked(&gb, e);
     try testing.expect(why != null);
+}
+
+test "downloads: a pull reports done only once its pack is registered, so the one refresh the page makes on done lists it" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try md.writePackStub(io, tmp.dir, "beamster/Fresh");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Fresh/model.safetensors", .data = "0123456789" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const dest = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Fresh", .{rb[0..try tmp.dir.realPath(io, &rb)]});
+    defer testing.allocator.free(dest);
+    // A server that walks no root: the pack is listed through its own folder (`absorbDownload`).
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    pack_update.record(dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Fresh" } });
+    defer pack_update.record(dest, .current);
+    const job = try Job.create(testing.allocator, "beamster/Fresh", dest, true);
+    defer job.destroy();
+    job.phase = .verifying;
+
+    // The registry is busy (a request holds its mutex): the pack cannot be listed yet. The pull's end has made its
+    // update row current by the time we see it; done must not be published before the listing.
+    reg.mutex.lockUncancelable(io);
+    const finisher = try std.Thread.spawn(.{}, struct {
+        fn run(j: *Job) void {
+            finishJob(j, true);
+        }
+    }.run, .{job});
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        const row = try pack_update.rowFragment(testing.allocator, dest);
+        defer testing.allocator.free(row);
+        if (row.len == 0) break;
+        if (spins == 50_000_000) {
+            reg.mutex.unlock(io);
+            finisher.join();
+            return error.PullEndNeverRecordedItsPack;
+        }
+        std.Thread.yield() catch {};
+    }
+    lock();
+    const phase_while_unlisted = job.phase;
+    unlock();
+    reg.mutex.unlock(io);
+    finisher.join();
+    try testing.expect(phase_while_unlisted != .done);
+    try testing.expectEqual(Phase.done, job.phase);
+    try testing.expect(reg.peekByPath(dest) != null);
 }
