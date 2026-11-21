@@ -8,6 +8,7 @@ const SSMCacheEntry = ssm_cache.SSMCacheEntry;
 const trunk = @import("trunk.zig");
 const Trunk = trunk.Trunk;
 const arch_forward = @import("arch/forward.zig");
+const arch_prefix = @import("arch/prefix.zig");
 const arch_life = @import("arch/life.zig");
 const arch_request = @import("arch/request.zig");
 const arch_registry = @import("arch/registry.zig");
@@ -198,11 +199,15 @@ pub fn forward(self: *Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
 }
 
 pub fn forwardWith(self: *Trunk, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
-    // A decode or verify forward past its cache's capacity grows it here, a layer per eval, not inside its graph.
+    // A decode or verify forward past its cache's capacity grows it here, a layer per eval, not inside its graph: the KV
+    // cache's buffers, then an arch's history buffers.
     // A prefill chunk takes its reservation (`KVCache.reserve`) at the first grow and is left to it.
     const shape = mlx.getShape(token_ids);
     const rows: usize = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
-    if (rows <= grow_ahead_rows) try ctx.cache.growAhead(rows, self.s);
+    if (rows <= grow_ahead_rows) {
+        try ctx.cache.growAhead(rows, self.s);
+        try arch_prefix.aux.growQsaHistoryAhead(ctx.ssm_entries, rows, self.s);
+    }
     return arch_forward.forward(arch_registry.handleOf(self), ctx, token_ids);
 }
 

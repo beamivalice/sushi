@@ -141,6 +141,55 @@ pub fn qsaPooledCapacity(entries: ?[]const SSMCacheEntry) usize {
     return if (fewest == std.math.maxInt(usize)) 0 else fewest;
 }
 
+/// Grow every bound entry's pooled block-key bank and score bank that the next `rows` tokens would pass the capacity of, one
+/// buffer per eval, before a decode or verify forward builds. Left to the forward, each layer's growth sat in its lazy graph
+/// and every layer's old buffer was alive beside its new one until the step ran: the whole history twice, unbilled. The
+/// capacity is the one `capBufAppend` would take (`qsaKeyAppendPlan`), so the forward finds it grown and appends in place.
+pub fn growQsaHistoryAhead(entries: ?[]SSMCacheEntry, rows: usize, s: mlx.mlx_stream) !void {
+    for (entries orelse return) |*e| {
+        const hold = qsaHold(e) orelse continue;
+        if (e.qsa_pooled_buf.ctx == null or e.qsa_pooled.ctx == null or e.qsa_ratio <= 0) continue;
+        const ratio: usize = @intCast(e.qsa_ratio);
+        const hist: usize = @intCast(qsaHistoryRows(e));
+        const need: c_int = @intCast((hist + rows) / ratio);
+        try growCapBufAhead(s, &e.qsa_pooled_buf, &e.qsa_pooled, e.qsa_pooled_blocks, 1, need, hold, ratio);
+        if (e.qsa_score_buf.ctx != null and e.qsa_score_blocks > 0) try growCapBufAhead(s, &e.qsa_score_buf, &e.qsa_score_bank, e.qsa_score_blocks, 3, need, hold, ratio);
+    }
+}
+
+/// One capacity buffer of `count` rows along `axis`, grown to hold `need` by the append's own plan when it does not: built,
+/// evaluated and its old copy released (a synchronized stream, the engine's pool trimmed) before the caller's next buffer.
+fn growCapBufAhead(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: c_int, axis: usize, need: c_int, hold: Hold, ratio: usize) !void {
+    if (need <= count) return;
+    const cap: usize = @intCast(mlx.getShape(buf.*)[axis]);
+    const plan = qsaKeyAppendPlan(@intCast(count), cap, @intCast(need - count), hold, ratio);
+    if (plan.new_cap == cap) return;
+    // The view is a slice of the old buffer, which stays alive while it does.
+    if (view.ctx != null) _ = mlx.mlx_array_free(view.*);
+    view.* = .{ .ctx = null };
+    qsa_cap_buf_allocs += 1;
+    try @import("../ssm_cache.zig").growCapBuf(s, buf, count, axis, buf.*, plan.new_cap);
+    try mlx.check(mlx.mlx_array_eval(buf.*));
+    if (mlx.engine.isStream(s)) {
+        mlx.engine.trim();
+    } else {
+        try mlx.check(mlx.mlx_synchronize(s));
+        _ = mlx.mlx_clear_cache();
+    }
+    const sh = mlx.getShape(buf.*);
+    var start = [_]c_int{ 0, 0, 0, 0 };
+    var stop = [_]c_int{ 0, 0, 0, 0 };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    for (sh, 0..) |d, i| stop[i] = d;
+    stop[axis] = count;
+    view.* = mlx.mlx_array_new();
+    errdefer {
+        _ = mlx.mlx_array_free(view.*);
+        view.* = .{ .ctx = null };
+    }
+    try mlx.check(mlx.mlx_slice(view, buf.*, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
+}
+
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
 pub fn reserveQsaHistory(entries: ?[]SSMCacheEntry, hold: Hold) void {
     const es = entries orelse return;
@@ -2421,3 +2470,90 @@ test "QSA checkpoint copy failure preserves the destination pooled bank" {
 /// A unit test's cache stands for one request whose end lies past every row the test writes: the +25% policy alone
 /// sizes its grows (`KVCache.heldRows`).
 const test_request_end: usize = 1 << 20;
+
+test "a decode step past the QSA history's capacity holds beside the grown history no more than one layer's buffer, not every layer's old copy" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const layers = 12;
+    const idx_hd = 128;
+    const ratio: c_int = 4;
+    const cap: c_int = 1024;
+    const Fill = struct {
+        fn make(shape: []const c_int, dtype: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(a);
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dtype, st));
+            try mlx.check(mlx.mlx_array_eval(a));
+            return a;
+        }
+        fn view(buf: mlx.mlx_array, axis: usize, n: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            const sh = mlx.getShape(buf);
+            var stop = [_]c_int{ 0, 0, 0, 0 };
+            for (sh, 0..) |d, i| stop[i] = d;
+            stop[axis] = n;
+            var v = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(v);
+            try mlx.check(mlx.mlx_slice(&v, buf, &[_]c_int{ 0, 0, 0, 0 }, sh.len, &stop, sh.len, &[_]c_int{ 1, 1, 1, 1 }, sh.len, st));
+            return v;
+        }
+    };
+    var entries: [layers]SSMCacheEntry = undefined;
+    for (&entries) |*e| {
+        e.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
+        e.qsa_ratio = ratio;
+        e.qsa_pooled_buf = try Fill.make(&.{ 1, cap, idx_hd }, .bfloat16, s);
+        e.qsa_pooled = try Fill.view(e.qsa_pooled_buf, 1, cap, s);
+        e.qsa_pooled_blocks = cap;
+        e.qsa_score_buf = try Fill.make(&.{ 1, 1, idx_hd, cap }, .float32, s);
+        e.qsa_score_bank = try Fill.view(e.qsa_score_buf, 3, cap, s);
+        e.qsa_score_blocks = cap;
+        // Three tokens past the last block: the next row completes block 1,025.
+        e.qsa_hist_rows = cap * ratio + 3;
+        e.qsa_reserve_rows = 0;
+        e.qsa_end_rows = 1 << 20;
+    }
+    defer for (&entries) |*e| ssmFreeQsaState(e);
+
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    _ = mlx.mlx_reset_peak_memory();
+    // The step: every layer's growth ahead of the forward, then the forward's in-place appends of the new block, in one graph.
+    try growQsaHistoryAhead(entries[0..], 1, s);
+    const outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    for (&entries) |*e| {
+        const pooled_new = try Fill.make(&.{ 1, 1, idx_hd }, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(pooled_new);
+        const hold = qsaHold(e).?;
+        const cols = try Fill.make(&.{ 1, 1, idx_hd, 1 }, .float32, s);
+        defer _ = mlx.mlx_array_free(cols);
+        const capBufAppend = @import("../ssm_cache.zig").capBufAppend;
+        try capBufAppend(s, &e.qsa_pooled_buf, &e.qsa_pooled, &e.qsa_pooled_blocks, pooled_new, 1, hold, ratio);
+        try capBufAppend(s, &e.qsa_score_buf, &e.qsa_score_bank, &e.qsa_score_blocks, cols, 3, hold, ratio);
+        _ = mlx.mlx_vector_array_append_value(outs, e.qsa_pooled_buf);
+        _ = mlx.mlx_vector_array_append_value(outs, e.qsa_score_buf);
+    }
+    try mlx.check(mlx.mlx_eval(outs));
+    try mlx.check(mlx.mlx_synchronize(s));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    _ = mlx.mlx_clear_cache();
+    var live: usize = 0;
+    _ = mlx.mlx_get_active_memory(&live);
+
+    const grown: u64 = @intCast(mlx.getShape(entries[0].qsa_pooled_buf)[1]);
+    try testing.expect(grown > cap);
+    // The forward's appends found the room: one block more in every bank, written in place of the grown buffers.
+    for (&entries) |*e| {
+        try testing.expectEqual(cap + 1, e.qsa_pooled_blocks);
+        try testing.expectEqual(cap + 1, mlx.getShape(e.qsa_pooled)[1]);
+        try testing.expectEqual(cap + 1, e.qsa_score_blocks);
+        try testing.expectEqual(grown, @as(u64, @intCast(mlx.getShape(e.qsa_score_buf)[3])));
+    }
+    const pooled_buf: u64 = grown * idx_hd * 2;
+    const score_buf: u64 = grown * idx_hd * 4;
+    const one_layer = @max(pooled_buf, score_buf);
+    const held = @as(u64, peak) -| live;
+    errdefer std.debug.print("the history's growth holds {d} B past the grown history, one layer's widest buffer is {d} B\n", .{ held, one_layer });
+    try testing.expect(held <= one_layer + @import("../mlx_pages.zig").page);
+}

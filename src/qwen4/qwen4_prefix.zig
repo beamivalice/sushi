@@ -45,6 +45,7 @@ pub const aux = struct {
     pub const dropQsaHistory = qsa_state.dropQsaHistory;
     pub const qsaRestoreSatisfiesForward = qsa_state.qsaRestoreSatisfiesForward;
     pub const reserveQsaHistoryWithHead = qsa_state.reserveQsaHistoryWithHead;
+    pub const growQsaHistoryAhead = qsa_state.growQsaHistoryAhead;
     pub const sliceQsaHistoryOntoCheckpoint = qsa_state.sliceQsaHistoryOntoCheckpoint;
     pub const snapshotHasQsaHistory = qsa_state.snapshotHasQsaHistory;
 

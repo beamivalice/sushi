@@ -178,6 +178,41 @@ fn pagedAxis(s: mlx.mlx_stream, like: mlx.mlx_array, axis: usize, len: usize) us
     return @intCast(@import("mlx_pages.zig").pagedCount(len, row_bytes));
 }
 
+/// Replaces `buf`, which holds `count` rows along `axis`, by a buffer of `new_cap` rows (on MLX's page grid) that has those rows
+/// at its front: the shape and dtype of `like` (a chunk that is appended, or `buf` itself) give its other dimensions.
+pub fn growCapBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, count: c_int, axis: usize, like: mlx.mlx_array, new_cap: usize) !void {
+    const csh = mlx.getShape(like);
+    const nd: usize = csh.len;
+    const dtype = mlx.mlx_array_dtype(like);
+    var start = [_]c_int{ 0, 0, 0, 0 };
+    var stop = [_]c_int{ 0, 0, 0, 0 };
+    const strides = [_]c_int{ 1, 1, 1, 1 };
+    var shape = [_]c_int{ 0, 0, 0, 0 };
+    for (csh, 0..) |d, i| {
+        shape[i] = d;
+        stop[i] = d;
+    }
+    shape[axis] = @intCast(pagedAxis(s, like, axis, new_cap));
+    var grown = try @import("mlx_pages.zig").inPlaceBuffer(shape[0..nd], dtype, s);
+    errdefer _ = mlx.mlx_array_free(grown);
+    if (buf.ctx != null) {
+        if (count > 0) {
+            stop[axis] = count;
+            var old = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(old);
+            try mlx.check(mlx.mlx_slice(&old, buf.*, &start, nd, &stop, nd, &strides, nd, s));
+            var seeded = mlx.mlx_array_new();
+            // Safe unscoped: on failure `grown` is still the old handle, so the two errdefers free two different arrays.
+            errdefer _ = mlx.mlx_array_free(seeded);
+            try mlx.check(mlx.mlx_slice_update(&seeded, grown, old, &start, nd, &stop, nd, &strides, nd, s));
+            _ = mlx.mlx_array_free(grown);
+            grown = seeded;
+        }
+        _ = mlx.mlx_array_free(buf.*);
+    }
+    buf.* = grown;
+}
+
 /// `hold` is in tokens and a row holds `ratio` of them (a pooled block holds `indexer_compress_ratio`).
 pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, hold: Hold, ratio: usize) !void {
     const csh = mlx.getShape(chunk);
@@ -196,27 +231,7 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
 
     if (plan.new_cap != cap) {
         arch_aux.noteCapBufAlloc();
-        var shape = [_]c_int{ 0, 0, 0, 0 };
-        for (csh, 0..) |d, i| shape[i] = d;
-        shape[axis] = @intCast(pagedAxis(s, chunk, axis, plan.new_cap));
-        var grown = try @import("mlx_pages.zig").inPlaceBuffer(shape[0..nd], mlx.mlx_array_dtype(chunk), s);
-        errdefer _ = mlx.mlx_array_free(grown);
-        if (buf.ctx != null) {
-            if (count.* > 0) {
-                stop[axis] = count.*;
-                var old = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(old);
-                try mlx.check(mlx.mlx_slice(&old, buf.*, &start, nd, &stop, nd, &strides, nd, s));
-                var seeded = mlx.mlx_array_new();
-                // Safe unscoped: on failure `grown` is still the old handle, so the two errdefers free two different arrays.
-                errdefer _ = mlx.mlx_array_free(seeded);
-                try mlx.check(mlx.mlx_slice_update(&seeded, grown, old, &start, nd, &stop, nd, &strides, nd, s));
-                _ = mlx.mlx_array_free(grown);
-                grown = seeded;
-            }
-            _ = mlx.mlx_array_free(buf.*);
-        }
-        buf.* = grown;
+        try growCapBuf(s, buf, count.*, axis, chunk, plan.new_cap);
     }
     start[axis] = count.*;
     stop[axis] = @intCast(plan.new_rows);

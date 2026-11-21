@@ -2782,3 +2782,24 @@ test "Flash-Next: the max-context search names the largest context whose every p
     }
     try std.testing.expectEqual(@as(u32, 0), bad);
 }
+
+test "a layer's QSA history buffer, grown ahead of a decode forward one at a time, is no wider than the layer's widest KV buffer the decode regrow term prices" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    qwen4_qsa_select.qsa_score_fused_override = false;
+    defer qwen4_qsa_select.qsa_score_fused_override = null;
+    for ([_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4ExpLive364kConfig() }) |cfg| {
+        const layers: u64 = cfg.attnCacheLayerCount();
+        try t.expect(layers > 0 and cfg.qsaHistoryBytesPerToken() > 0 and cfg.qsaScoreBankBytesPerToken() > 0);
+        var li: u32 = 0;
+        while (li < cfg.num_hidden_layers) : (li += 1) {
+            if (!cfg.isKvPerTokenLayer(li)) continue;
+            // At 4 bits, the narrowest the quantizer takes, a token's K codes are a quarter of its K bytes.
+            const k: u64 = @as(u64, cfg.layerKVHeads(li)) * cfg.layerHeadDim(li) * 2;
+            const widest_kv = k / 4;
+            errdefer std.debug.print("layer {d}: history {d} B, score bank {d} B a token, widest KV buffer {d} B\n", .{ li, cfg.qsaHistoryBytesPerToken() / layers, cfg.qsaScoreBankBytesPerToken() / layers, widest_kv });
+            try t.expect(cfg.qsaHistoryBytesPerToken() / layers <= widest_kv);
+            try t.expect(cfg.qsaScoreBankBytesPerToken() / layers <= widest_kv);
+        }
+    }
+}
