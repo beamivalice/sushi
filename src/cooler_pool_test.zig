@@ -1818,3 +1818,88 @@ test "cooler contract: the dearest decode regrow of the MTP head's cache holds b
     };
     try testing.expectEqual(@as(usize, 0), over);
 }
+
+test "cooler contract: the dearest decode regrow of the QSA history holds beside the grown history no more than the request's bill carries beyond it, every layer's regrow in one graph" {
+    const bills = @import("bills.zig");
+    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was);
+    // The unfused score bank is the history's dearest layout: its f32 columns grow beside the pooled keys.
+    @import("qwen4/qwen4_qsa_select.zig").qsa_score_fused_override = false;
+    defer @import("qwen4/qwen4_qsa_select.zig").qsa_score_fused_override = null;
+    const trunk = @import("trunk.zig");
+    const cfg = @import("qwen4/qwen4_bill_test.zig").coolerFlashNext();
+    const chunk: u64 = cfg.prefillStartWidth();
+    const s = mlx.engine.stream();
+    const layers: usize = cfg.attnCacheLayerCount();
+    const hd: c_int = @intCast(cfg.indexer_head_dim);
+    const ratio: usize = cfg.indexer_compress_ratio;
+    var over: usize = 0;
+    var regrows: usize = 0;
+    for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
+        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{});
+        const hold: trunk.Hold = .{
+            .reserve = @import("prefill_plan.zig").reservedPrefillTokens(&cfg, seq, max_tokens, chunk),
+            .end = trunk.KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(&cfg), 0),
+        };
+        var pooled: [64]mlx.mlx_array = @splat(.{ .ctx = null });
+        var pooled_view: [64]mlx.mlx_array = @splat(.{ .ctx = null });
+        var bank: [64]mlx.mlx_array = @splat(.{ .ctx = null });
+        var bank_view: [64]mlx.mlx_array = @splat(.{ .ctx = null });
+        var pooled_count: [64]c_int = @splat(0);
+        var bank_count: [64]c_int = @splat(0);
+        defer for (0..layers) |i| {
+            for ([_]mlx.mlx_array{ pooled[i], pooled_view[i], bank[i], bank_view[i] }) |a| _ = mlx.mlx_array_free(a);
+        };
+        // Every layer's history, grown to the prompt's blocks and then a block at a time (a block per `ratio` tokens).
+        var blocks: usize = 0;
+        var dearest: u64 = 0;
+        const end_blocks = (hold.end + ratio - 1) / ratio;
+        var target: usize = (seq + ratio - 1) / ratio;
+        while (blocks < end_blocks) {
+            const add: c_int = @intCast(target - blocks);
+            mlx.engine.close();
+            mlx.engine.trim();
+            mlx.engine.resetPoolPeak(.process);
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var chunks: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+            defer for (chunks) |c| {
+                _ = mlx.mlx_array_free(c);
+            };
+            try mlx.check(mlx.mlx_ones(&chunks[0], &[_]c_int{ 1, add, hd }, 3, .bfloat16, s));
+            try mlx.check(mlx.mlx_ones(&chunks[1], &[_]c_int{ 1, 1, hd, add }, 4, .float32, s));
+            const before = mlx.engine.poolTotal() - mlx.engine.poolFree();
+            const caps: usize = if (pooled[0].ctx != null) @intCast(mlx.getShape(pooled[0])[1]) else 0;
+            for (0..layers) |i| {
+                try trunk.capBufAppend(s, &pooled[i], &pooled_view[i], &pooled_count[i], chunks[0], 1, hold, ratio);
+                try trunk.capBufAppend(s, &bank[i], &bank_view[i], &bank_count[i], chunks[1], 3, hold, ratio);
+                _ = mlx.mlx_vector_array_append_value(vec, pooled[i]);
+                _ = mlx.mlx_vector_array_append_value(vec, bank[i]);
+            }
+            try mlx.check(mlx.mlx_eval(vec));
+            mlx.engine.close();
+            const peak = mlx.engine.poolPeak(.process);
+            mlx.engine.trim();
+            const after = mlx.engine.poolTotal() - mlx.engine.poolFree();
+            _ = before;
+            // A regrow beyond the first fill: the history held its capacity and the block did not fit.
+            if (caps != 0 and @as(usize, @intCast(mlx.getShape(pooled[0])[1])) != caps) {
+                regrows += 1;
+                dearest = @max(dearest, peak -| after);
+            }
+            blocks = target;
+            target = @min(end_blocks, @as(usize, @intCast(mlx.getShape(pooled[0])[1])) + 1);
+            if (target == blocks) break;
+        }
+        const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
+        if (dearest > billed) {
+            over += 1;
+            std.debug.print("cooler contract: a {d}-token prompt + {d}: the history's dearest regrow holds {d} B past its grown buffers, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
+        }
+    };
+    try testing.expect(regrows > 0);
+    try testing.expectEqual(@as(usize, 0), over);
+}
