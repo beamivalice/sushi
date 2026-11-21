@@ -1252,6 +1252,13 @@ async function apiJson(path, options = {}) {
   if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
   return response.json();
 }
+// A GET's body; a failed answer throws `${status} ${body}`, which `adminErrorText` words.
+async function apiText(path) {
+  const response = await api(path);
+  const body = await response.text();
+  if (!response.ok) throw new Error(`${response.status} ${body}`);
+  return body;
+}
 function showKeyOverlay(error) {
   $("keyError").textContent = error;
   $("keyError").hidden = !error;
@@ -1304,11 +1311,13 @@ const postJson = (path, body) => apiJson(path, { method: "POST", headers: { "Con
    strip subscribe; an identical answer notifies nobody, and loads and unloads run through `act`.
    ------------------------------------------------------------ */
 // Load failures this session recorded: only a refusal needs one, since the server keeps no record of it and lists the
-// model unloaded. A model the server lists loaded, loading or failed has its own answer, which owns the row from then on
-// (a failure it reports is its `error`; one it no longer reports is gone). True when one was dropped.
-function forgetAnsweredLoads(failed, models) {
+// model unloaded. A note is { message, seq }, `seq` the models read last sent when it was written. A model the server
+// lists loaded, loading or failed has its own answer, which owns the row from then on (a failure it reports is its
+// `error`; one it no longer reports is gone), but only when that answer's read (`mine`) was sent after the note was
+// written. True when one was dropped.
+function forgetAnsweredLoads(failed, models, mine) {
   let dropped = false;
-  for (const m of models) if ((m.state === "ready" || m.state === "loading" || m.state === "error") && failed.delete(m.id)) dropped = true;
+  for (const m of models) if ((m.state === "ready" || m.state === "loading" || m.state === "error") && failed.get(m.id)?.seq < mine && failed.delete(m.id)) dropped = true;
   return dropped;
 }
 // The one reading of a token count, everywhere it is shown: thousands, not 1024s.
@@ -1326,33 +1335,52 @@ function loadFailureText(message) {
     OutOfMemory: "Not enough memory to load this model. Unload another model or close other apps, then try again.",
   }[tag] ?? `The model could not be loaded (${tag}). The server log has the details.`;
 }
+// One server answer, as every view reads it. A read takes a number as it goes out, and one that answers after a newer
+// read was applied is dropped whatever it says (ok or failed): the newest answer owns the store. An applied answer sets
+// its text and the value parsed from it together; a failed one sets only `error`, so the last good value stays.
+class Store {
+  seq = 0; applied = 0; text = null; value = null; error = null;
+  // `fetchText` resolves the answer's text (null: nothing to keep, as for a 401) or throws a failed read. Never rejects.
+  async read(fetchText, parse = JSON.parse) {
+    const mine = ++this.seq;
+    let text = null, error = null;
+    try { text = await fetchText(); } catch (e) { error = e; }
+    if (mine < this.applied) return { mine, stale: true, changed: false, error: null, previous: this.value };
+    this.applied = mine;
+    const previous = this.value;
+    let changed = false;
+    if (text !== null && text !== this.text) {
+      try { this.value = parse(text); this.text = text; changed = true; } catch (e) { error = e; }
+    }
+    this.error = error;
+    return { mine, stale: false, changed, error, previous, value: this.value };
+  }
+}
 const modelStore = {
-  list: [], text: "", online: null, error: "", view: "chat", seq: 0, applied: 0, timer: null,
+  store: new Store(), online: null, error: "", view: "chat", timer: null,
   subs: new Set(), pending: new Map(), failed: new Map(),
+  get list() { return this.store.value?.data ?? []; },
+  get answered() { return this.store.value !== null; },
   byId(id) { return this.list.find((model) => model.id === id); },
   subscribe(fn) { this.subs.add(fn); return () => this.subs.delete(fn); },
   emit() { for (const fn of this.subs) fn(this); },
   async refresh() {
     clearTimeout(this.timer);
-    const mine = ++this.seq;
-    let text = null, online = true, error = "";
-    try {
-      const response = await api("/v1/models");
-      if (response.ok) text = await response.text();
-      else if (response.status !== 401) error = adminErrorText(new Error(`${response.status} ${await response.text()}`));
-    } catch { online = false; }
-    if (mine < this.applied) return;
-    this.applied = mine;
-    let changed = online !== this.online;
-    if (text !== null && text !== this.text) {
-      try { this.list = JSON.parse(text).data ?? []; this.text = text; changed = true; } catch { error = "The server sent a model list this page cannot read."; }
-    }
-    if (error !== this.error) changed = true;
+    const read = await this.store.read(async () => {
+      let response, body;
+      try { response = await api("/v1/models"); body = await response.text(); } catch (e) { throw Object.assign(e, { offline: true }); }
+      if (response.status === 401) return null;
+      if (!response.ok) throw new Error(`${response.status} ${body}`);
+      return body;
+    }, (text) => { try { return JSON.parse(text); } catch { throw new Error("The server sent a model list this page cannot read."); } });
+    if (read.stale) return;
+    const online = !read.error?.offline, error = read.error && online ? adminErrorText(read.error) : "";
+    let changed = read.changed || online !== this.online || error !== this.error;
     this.error = error;
-    // A server that was unreachable may have restarted, and a restarted server remembers no refusal.
-    if (this.online === false && online && this.failed.size) { this.failed.clear(); changed = true; }
+    // A server that was unreachable may have restarted, and a restarted server remembers no refusal written before this read.
+    if (this.online === false && online) for (const [id, note] of this.failed) if (note.seq < read.mine && this.failed.delete(id)) changed = true;
     this.online = online;
-    if (forgetAnsweredLoads(this.failed, this.list)) changed = true;
+    if (forgetAnsweredLoads(this.failed, this.list, read.mine)) changed = true;
     if (changed) this.emit();
     this.schedule();
   },
@@ -1385,12 +1413,13 @@ const modelStore = {
       done = true;
     } catch (error) {
       const message = loadFailureText(adminErrorText(error));
-      this.failed.set(id, message);
+      this.failed.set(id, { message, seq: this.store.seq });
       if (!window.sushiAdmin?.shows(id)) toast(`${verbs[1]} failed: ${message}`, "err", { stay: true });
     }
     this.pending.delete(id);
-    // A reload empties the model's cache without changing who is loaded.
-    await invalidate({ models: true, cache: true });
+    // A reload empties the model's cache without changing who is loaded, and a load or unload changes what the models
+    // run with: the models, their settings and the chat's cache meter are read again.
+    await invalidate({ models: true, settings: true, cache: true });
     this.emit();
     if (!done) return;
     // A load can evict other models to fit; the list after it says which.
@@ -3751,28 +3780,20 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     return hit ? choiceLabel(spec.name, hit) : "Set at launch";
   };
 
-  const A = { view: "chat", settings: null, cache: null, texts: {}, seq: {}, applied: {}, error: null,
+  const A = { view: "chat", stores: { settings: new Store(), cache: new Store() },
+    get settings() { return this.stores.settings.value; },
+    get cache() { return this.stores.cache.value; },
+    // The cache's failure counts only while the page wants the cache.
+    get error() { const e = this.stores.settings.error ?? (needCache() ? this.stores.cache.error : null); return e && adminErrorText(e); },
     sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, wiredText: null, requestText: null, marginText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, refused: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
-  // One fetch per kind: an older answer is dropped, an unchanged one returns undefined.
-  async function pull(kind, path) {
-    const mine = A.seq[kind] = (A.seq[kind] ?? 0) + 1;
-    const response = await api(path);
-    if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
-    const body = await response.text();
-    if (mine < (A.applied[kind] ?? 0)) return null;
-    A.applied[kind] = mine;
-    if (body === A.texts[kind]) return undefined;
-    A.texts[kind] = body;
-    return JSON.parse(body);
-  }
   // /v1/models says which models exist and /v1/settings adds each one's saved settings: a model the settings still list
   // after the server dropped it is gone. Until /v1/models has answered, the settings stand in.
   const rowsOf = () => {
     const saved = new Map((A.settings?.models ?? []).map((m) => [m.id, m]));
-    const byId = modelStore.text ? new Map() : saved;
+    const byId = modelStore.answered ? new Map() : saved;
     for (const m of modelStore.list) byId.set(m.id, { ...saved.get(m.id), ...m });
     return [...byId.values()].map((m) => ({ ...m, settings: m.settings ?? {}, state: m.state === "error_state" ? "error" : m.state === "evicting" ? "unloaded" : m.state }));
   };
@@ -3798,16 +3819,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     A.wsample = { t: now, cur };
   }
   async function refresh() {
-    if (A.view !== "models" && A.view !== "settings") return;
+    if (A.view !== "models" && A.view !== "settings" && A.view !== "downloads") return;
     const wantCache = needCache();
     clearTimeout(A.retry);
-    try {
-      const [s, c] = await Promise.all([pull("settings", "/v1/settings"), wantCache ? pull("cache", "/v1/prefix-cache") : undefined]);
-      A.error = null;
-      if (s) A.settings = s;
-      if (c) A.cache = c;
-      if (wantCache && c !== null && A.cache) sampleWrites(A.cache, Date.now());
-    } catch (e) { A.error = adminErrorText(e); A.retry = setTimeout(refresh, 4000); }
+    // Each store applies its own answer: one failing read never costs the other its good one.
+    const [, cache] = await Promise.all([A.stores.settings.read(() => apiText("/v1/settings")), wantCache ? A.stores.cache.read(() => apiText("/v1/prefix-cache")) : null]);
+    if (wantCache && cache && !cache.stale && !cache.error && A.cache) sampleWrites(A.cache, Date.now());
+    if (A.error) { clearTimeout(A.retry); A.retry = setTimeout(refresh, 4000); }
     renderAll();
     // The selected model turned out loaded only now (the page opened on its link): its cache has not been asked for.
     if (!wantCache && needCache() && !A.cache && !A.error) refresh();
@@ -3854,7 +3872,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const streamsExperts = (m) => !!(m.streaming_required || m.ssd_budget_gb);
 
   // Why the last load failed: the server's own answer for a failed model, else this session's note of a refusal.
-  const loadError = (m) => m.state === "error" ? loadFailureText(m.error ?? "") : modelStore.failed.get(m.id) || "";
+  const loadError = (m) => m.state === "error" ? loadFailureText(m.error ?? "") : modelStore.failed.get(m.id)?.message ?? "";
   const evictNote = (m) => { const others = modelStore.list.filter((x) => x.state === "ready" && x.id !== m.id).map((x) => x.id); return others.length ? `May unload ${others.join(", ")} to make room` : ""; };
   function metaOf(m) {
     const failed = loadError(m), n = savedCount(m);
@@ -4245,7 +4263,6 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   async function actOn(id, kind) {
     if (kind === "unload" && chatAbort && $("modelSelect").value === id && !(await confirmAction({ title: `Unload ${id}?`, body: "The reply being written will stop.", confirm: "Unload" }))) return;
     await modelStore.act(id, kind);
-    await invalidate({ settings: true });
   }
   // The page's copy of the file follows a save at once, so the form is clean before the next poll.
   function noteSaved(F, set) {
@@ -4658,7 +4675,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     setText(cacheWarn, want > room ? `More than this disk has free (${adminBytes(room)}, counting this cache's own use).` : "");
     setHidden(cacheWarn, want <= room);
     // The table is rebuilt only when the answer or the loaded set changed.
-    const sig = A.texts.cache + rowsOf().filter((m) => m.state === "ready").map((m) => m.id) + [...A.busy] + JSON.stringify([...A.rates]);
+    const sig = A.stores.cache.text + rowsOf().filter((m) => m.state === "ready").map((m) => m.id) + [...A.busy] + JSON.stringify([...A.rates]);
     if (A.tbody !== sig) {
       A.tbody = sig;
       const now = Date.now(), td = (text, cls, extra) => h("td", { class: cls, text, ...extra });
@@ -4757,7 +4774,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       q(id).classList.toggle("stale-view", off);
       if (q(id).inert !== off) q(id).inert = off;
     }
-    if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings();
+    if (A.view === "models") renderModels(); else if (A.view === "settings") renderSettings(); else if (A.view === "downloads") renderDownloads();
   }
   modelStore.subscribe(() => {
     if (modelStore.online && A.error) refresh();
@@ -4769,7 +4786,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   window.addEventListener("focus", () => refresh());
 
   // Downloads: the packs on Hugging Face, this Mac's fit and the server's download queue (/v1/downloads).
-  const D = { data: null, error: null, timer: null, rows: new Map(), order: "", seen: null, pick: null, scrolled: false };
+  const D = { store: new Store(), get data() { return this.store.value; }, get error() { return this.store.error && adminErrorText(this.store.error); }, timer: null, rows: new Map(), order: "", seen: null, pick: null, scrolled: false };
   const SEEN_KEY = "sushi-seen-packs";
   const packKeys = (d) => d.packs.flatMap((p) => [p.repo, ...(p.update ? [`${p.repo}@${p.update.latest}`] : [])]);
   // The dot names a pack (or an update) this browser has not listed before; the first full catalog seeds the list
@@ -4797,7 +4814,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // A downloaded pack opens in the installed list (its id is its folder's name), where it loads.
   function openInstalled(p) {
     landed([{ dest: p.path }]);
-    history.pushState(null, "", `/models#${encodeURIComponent(p.path.split("/").pop())}`);
+    history.pushState(null, "", `/models#${encodeURIComponent(modelAt(p.path)?.id ?? p.path.split("/").pop())}`);
     window.dispatchEvent(new PopStateEvent("popstate"));
   }
   const eta = (s) => s < 90 ? `${Math.max(1, Math.round(s))} s left` : s < 5400 ? `${Math.round(s / 60)} min left` : `${Math.floor(Math.round(s / 60) / 60)} h ${Math.round(s / 60) % 60} min left`;
@@ -4870,7 +4887,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   function renderDownloads() {
     const d = D.data;
-    alertIn(q("dlAlert"), D.error ? `Couldn't load: ${D.error}` : "", false);
+    const failed = D.error || A.error;
+    alertIn(q("dlAlert"), failed ? `Couldn't load: ${failed}` : "", false);
     if (!d) return;
     const where = d.dest.locked ? "set by --model-dir" : d.dest.source === "file" ? "the models folder chosen on Models" : "the default models folder";
     const space = d.dest.free_bytes != null ? `${adminBytes(d.dest.free_bytes)} free${d.dest.volume ? ` on ${d.dest.volume}` : ""}` : "unknown";
@@ -4892,30 +4910,30 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (D.pick && !D.scrolled && D.rows.has(D.pick)) { D.scrolled = true; D.rows.get(D.pick).el.scrollIntoView({ block: "center" }); }
   }
   // The server marks a download done a moment before it lists the pack: ask again, for a bounded few answers, until
-  // each finished pack's model is listed (an Update's, until its row stops offering the update).
+  // each finished pack's model is listed (an Update's, until its row stops offering the update). A pack is found by its
+  // folder, which settings list as `path`: a model's id may be `org/name`.
   const landing = new Set();
+  const modelAt = (dest) => rowsOf().find((m) => samePath(m.path, dest));
   async function landed(jobs) {
-    const ids = jobs.map((j) => (j.dest ?? "").split("/").filter(Boolean).pop()).filter((id) => id && !landing.has(id));
-    ids.forEach((id) => landing.add(id));
-    for (let tries = 0; ids.length && tries < 6; tries++) {
+    const dests = jobs.map((j) => j.dest).filter((dest) => dest && ![...landing].some((l) => samePath(l, dest)));
+    dests.forEach((dest) => landing.add(dest));
+    for (let tries = 0; dests.length && tries < 6; tries++) {
       if (tries) await new Promise((resolve) => setTimeout(resolve, 1000));
       await invalidate({ models: true, settings: true });
-      if (ids.every((id) => modelStore.byId(id) && !modelStore.byId(id).meta?.pack_update)) break;
+      if (dests.every((dest) => modelAt(dest) && !modelAt(dest).meta?.pack_update)) break;
     }
-    ids.forEach((id) => landing.delete(id));
+    dests.forEach((dest) => landing.delete(dest));
   }
   async function refreshDownloads(force) {
     clearTimeout(D.timer);
     const viewing = A.view === "downloads", near = () => viewing || (A.view === "models" && !!D.data?.jobs.some(isActive));
     if (document.hidden && near()) { D.timer = setTimeout(refreshDownloads, 5000); return; }
-    try {
-      const d = await pull("downloads", force ? "/v1/downloads?refresh=1" : viewing ? "/v1/downloads" : "/v1/downloads?background=1");
-      D.error = null;
+    const read = await D.store.read(() => apiText(force ? "/v1/downloads?refresh=1" : viewing ? "/v1/downloads" : "/v1/downloads?background=1"));
+    if (!read.stale && !read.error) {
       // A finished download is a new model: the Models tab and the chat's list hear of it now.
-      if (d) landed(d.jobs.filter((j) => j.phase === "done" && !D.data?.jobs.some((o) => o.repo === j.repo && o.phase === "done")));
-      if (d) D.data = d;
-      if (D.data && (d || viewing)) markNew(D.data, viewing);
-    } catch (e) { D.error = adminErrorText(e); }
+      if (read.changed) landed(read.value.jobs.filter((j) => j.phase === "done" && !read.previous?.jobs.some((o) => o.repo === j.repo && o.phase === "done")));
+      if (D.data && (read.changed || viewing)) markNew(D.data, viewing);
+    }
     if (viewing) renderDownloads();
     else if (A.view === "models" && A.sel) patchDetail(info(A.sel));
     tabProgress();
@@ -4950,6 +4968,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       A.timer = null;
       A.wsample = null;
       A.rates = new Map();
+      if (view === "downloads") { refresh(); return; }
       if (view !== "models" && view !== "settings") return;
       if (view === "models" && !hashId() && A.sel && wide()) history.replaceState(null, "", `/models#${encodeURIComponent(A.sel)}`);
       renderAll();

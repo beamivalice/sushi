@@ -24,6 +24,11 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
 - Status text pairs (`--info`, `--ok`, `--warn`, `--err` on their `-soft` washes) keep AA in both themes; the theme test checks all four.
 - An action that can hurt the machine asks first (`confirmAction`): skipping the memory check, turning the cache off, clearing caches.
 - A failure message belongs to one attempt: the action clears it (`adminAttempt`) before it sends, so Load, Save and Retry show only what the new attempt returned, and a refused value never blocks the next Save (`adminSaveRefused`). Guard: `tests/test_webui_admin.cjs`.
+- A server answer lives in one `Store` (`seq`, `applied`, `text`, `value`, `error`): freshness is decided per store, never
+  per request, so a read that answers after a newer one is dropped before its ok or its error is looked at, a failed read
+  keeps the last good value, and text and value are stored together once applied; each store applies on its own, and a
+  note the page writes (a refused load) carries the `seq` of the read it outlives. `modelStore.act` owns its
+  `invalidate` (models, settings, the chat's cache meter), so no caller has to remember it.
 - One refresh rule: the server's latest answer owns what the page shows. An action that moves server state (Rescan, a
   Save, a Remove, a clear, a load) calls `invalidate`, which reads the stores it names again; no view keeps a copy of
   an answer an action has outdated. A failed load is the server's `error` for a failed model; the page's own
@@ -31,7 +36,8 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   Remove, Rescan or restart. The model list is `/v1/models`; `/v1/settings` only adds each model's settings. Guards: the
   load-failure, refusal-note and rescan scenarios in `tests/test_webui_admin_ui.cjs`.
   A finished download is listed by the server a moment after it reports it done, so the page asks again (`landed`, six
-  answers, one second apart) until the pack's model is listed, and for an Update until its row stops offering one.
+  answers, one second apart) until the model at the pack's folder is listed (never by the folder's name: a model's id may
+  be `org/name`), and for an Update until its row stops offering one.
   Guard: the finished-download blocks in `tests/test_webui_downloads.cjs`.
   The chat's prompt-cache meter reads `/props` (`readPrefixCache`, the latest read wins) when the loaded set changes
   and after a clear, a cache-size save or a reload; `/props` has no prefix cache while nothing is loaded.

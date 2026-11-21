@@ -117,10 +117,39 @@ page.adminAttempt(failedObj);
 assert.deepEqual(JSON.parse(JSON.stringify(failedObj)), {});
 // A refusal note this session recorded goes once the server answers for the model: loaded, loading or failed (its own
 // `error` is then the reason), wherever it was loaded. A model still listed unloaded keeps the note.
-const loadFailures = new Map([['a', 'out of memory'], ['b', 'bad config'], ['c', 'x'], ['d', 'no room']]);
-assert.equal(page.forgetAnsweredLoads(loadFailures, [{ id: 'a', state: 'ready' }, { id: 'b', state: 'error' }, { id: 'c', state: 'loading' }, { id: 'd', state: 'unloaded' }]), true);
-assert.deepEqual([...loadFailures], [['d', 'no room']], 'a model the server lists unloaded keeps its refusal');
-assert.equal(page.forgetAnsweredLoads(loadFailures, [{ id: 'd', state: 'unloaded' }]), false);
+const loadFailures = new Map([['a', 'out of memory'], ['b', 'bad config'], ['c', 'x'], ['d', 'no room']].map(([id, message]) => [id, { message, seq: 1 }]));
+assert.equal(page.forgetAnsweredLoads(loadFailures, [{ id: 'a', state: 'ready' }, { id: 'b', state: 'error' }, { id: 'c', state: 'loading' }, { id: 'd', state: 'unloaded' }], 2), true);
+assert.deepEqual([...loadFailures].map(([id, note]) => [id, note.message]), [['d', 'no room']], 'a model the server lists unloaded keeps its refusal');
+assert.equal(page.forgetAnsweredLoads(loadFailures, [{ id: 'd', state: 'unloaded' }], 2), false);
+// An answer to a read sent before the note was written (seq 5 note, read 3 or 5) says nothing about it.
+const noted = new Map([['a', { message: 'out of memory', seq: 5 }]]);
+assert.equal(page.forgetAnsweredLoads(noted, [{ id: 'a', state: 'loading' }], 3), false);
+assert.equal(page.forgetAnsweredLoads(noted, [{ id: 'a', state: 'loading' }], 5), false);
+assert.equal(page.forgetAnsweredLoads(noted, [{ id: 'a', state: 'loading' }], 6), true);
+// A Store is the newest answer: staleness is decided before ok or error, a failed read keeps the last good value, and
+// text and value arrive together.
+const storeChecks = (async () => {
+  const store = new (vm.runInContext('Store', page))();
+  const gate = () => { let go; const wait = new Promise((r) => { go = r; }); return { wait, go }; };
+  const slow = gate();
+  const older = store.read(async () => { await slow.wait; throw new Error('502 proxy reset'); });
+  const newer = await store.read(async () => '{"v":1}');
+  assert.deepEqual([newer.stale, newer.changed, store.value.v, store.text], [false, true, 1, '{"v":1}']);
+  slow.go();
+  const late = await older;
+  assert.equal(late.stale, true, 'an older failed read is dropped');
+  assert.equal(store.error, null, 'and sets no error');
+  const failed = await store.read(async () => { throw new Error('500 boom'); });
+  assert.deepEqual([failed.stale, failed.changed, store.value.v, store.error.message], [false, false, 1, '500 boom'], 'a failed read keeps the good value');
+  const same = await store.read(async () => '{"v":1}');
+  assert.deepEqual([same.changed, store.error], [false, null], 'the same text is no change and ends the error');
+  const bad = await store.read(async () => 'not json');
+  assert.deepEqual([bad.changed, store.value.v, store.text, bad.error.name === 'SyntaxError'], [false, 1, '{"v":1}', true], 'text that does not parse is kept nowhere');
+  const none = await store.read(async () => null);
+  assert.deepEqual([none.changed, store.value.v, store.error], [false, 1, null], 'a read with nothing to keep ends the error');
+  const next = await store.read(async () => '{"v":2}');
+  assert.deepEqual([next.previous.v, next.value.v], [1, 2]);
+})();
 // A refused Save names a setting or the form; the next Save and an edit of that value answer it, and it blocks nothing.
 const form = () => ({ texts: {}, errors: {}, refused: {}, saveError: '' });
 const shown = (P) => JSON.parse(JSON.stringify({ refused: P.refused, saveError: P.saveError, errors: P.errors }));
@@ -161,4 +190,4 @@ assert.match(page.refusalText(429, 'busy'), /^busy\. Wait a moment, then Retry\.
 for (const rule of ['.alert span', '.toast', '.chat-error span']) {
   assert.match(source, new RegExp(`\\${rule.replace(' ', ' ')}[^{]*\\{[^}]*white-space: pre-line`), `${rule} shows a message's lines`);
 }
-console.log('Web UI admin views: passed');
+storeChecks.then(() => console.log('Web UI admin views: passed'), (e) => { console.error(e); process.exitCode = 1; });

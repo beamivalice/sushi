@@ -44,7 +44,7 @@ function makeServer() {
     switch (p) {
       case '/v1/models': state.onModels?.(); return route.fulfill(json({ data: state.models }));
       case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 64 * GiB }, batching: {} }));
-      case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: GiB } }, models: [] }));
+      case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: GiB } }, models: state.settingsModels ?? [] }));
       case '/metrics.json': return route.fulfill(json({ counters: {}, gauges: {}, histograms: {}, sessions: [] }));
       case '/v1/downloads':
         if (request.method() === 'POST') {
@@ -220,6 +220,22 @@ async function main() {
       await page.waitForFunction((i) => !!modelStore.byId(i), id, { timeout: 8000 });
       await page.click('#modelsTabInstalled');
       await page.waitForSelector(`#modelsList [data-id="${id}"]`);
+      await context.close();
+    }
+
+    {
+      // A pack in an org folder is listed as org/name: the page finds it by its folder, so it stops asking at the first answer.
+      const server = makeServer();
+      const repo = PACKS[0].repo, id = `beamster/${repo.split('/')[1]}`, dest = `/m/${id}`;
+      server.state.jobs = [{ repo, dest, phase: 'downloading', files: 12, file_index: 3, total_bytes: 40 * GiB, done_bytes: 10 * GiB, file: null, speed_bps: 1, eta_s: 9, message: null }];
+      const { page, context } = await open(browser, server, '/downloads');
+      await page.waitForSelector(`${row(repo)} .prog:not([hidden])`);
+      server.state.onModels = () => { if (server.state.jobs[0].phase === 'done') { server.state.models = [{ id, object: 'model', state: 'unloaded', bytes_on_disk: 40 * GiB }]; server.state.settingsModels = [{ id, path: dest, state: 'unloaded', settings: {} }]; } };
+      server.state.jobs[0] = { ...server.state.jobs[0], phase: 'done', done_bytes: 40 * GiB };
+      await page.waitForFunction((i) => !!modelStore.byId(i), id, { timeout: 8000 });
+      await page.waitForTimeout(3500);
+      const asks = server.calls.filter((c) => c.path === '/v1/models').length;
+      assert.ok(asks <= 3, `the model is listed at the first answer after done, yet the page asked ${asks} times`);
       await context.close();
     }
 

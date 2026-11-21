@@ -77,12 +77,12 @@ function makeServer(opts = {}) {
   const hold = (name) => new Promise((resolve) => { gates[name] = resolve; });
   async function handle(route) {
     const request = route.request(), url = new URL(request.url()), p = url.pathname, method = request.method();
-    if (/^\/(chat|dashboard|models|settings)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
+    if (/^\/(chat|dashboard|models|settings|downloads)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     const body = method === 'POST' ? JSON.parse(request.postData() || '{}') : null;
-    calls.push({ path: p, method, body, auth: request.headers().authorization });
+    calls.push({ path: p, method, body, auth: request.headers().authorization, query: url.search });
     if (state.down) return route.abort('failed');
     const hook = state.hooks[p];
-    if (hook) { const answer = await hook(body, method); if (answer) return route.fulfill(answer); }
+    if (hook) { const answer = await hook(body, method, url); if (answer) return route.fulfill(answer); }
     switch (p) {
       case '/v1/models': return route.fulfill(json(modelsBody()));
       case '/v1/settings':
@@ -1898,6 +1898,96 @@ async function main() {
       await settle(page, 35_000);
       assert.equal(await page.evaluate(() => !document.getElementById('keyOverlay').hidden), false, 'the modal overlay is gone');
       assert.equal(await page.evaluate(() => document.getElementById('appShell').inert), false, 'and the page takes input again');
+    });
+
+    // One answer per store: staleness is decided before ok or error, and a failed read keeps the last good value.
+    await scenario('a failed prefix-cache read beside a new settings answer keeps the settings answer', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#portNum');
+      await settle(page, 500);
+      server.state.server.port = { ...server.state.server.port, file: 8080, source: 'file' };
+      let served = 0;
+      server.state.hooks['/v1/prefix-cache'] = () => (served++ < 1 ? { status: 500, contentType: 'text/plain', body: 'boom' } : null);
+      await settle(page, 10_500);
+      await settle(page, 4_500);
+      assert.ok(served >= 1, 'the failure was served');
+      await settle(page, 10_500);
+      assert.equal(await page.inputValue('#portNum'), '8080', `the server's saved port is 8080 (alert: "${(await page.textContent('#settingsAlert')).trim()}")`);
+    });
+    await scenario('a late failed settings read does not override a newer good one', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#portNum');
+      await settle(page, 500);
+      let release, polls = 0;
+      const held = new Promise((r) => { release = r; });
+      server.state.hooks['/v1/settings'] = async (body, method) => { if (method === 'GET' && polls++ === 0) { await held; return { status: 502, contentType: 'text/plain', body: 'proxy reset' }; } return null; };
+      await page.clock.runFor(10_100);
+      await page.waitForTimeout(100);
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+      await page.waitForTimeout(200);
+      release();
+      await page.waitForTimeout(200);
+      assert.equal((await page.textContent('#settingsAlert')).trim(), '', 'the newest settings answer was good');
+      assert.equal(await page.evaluate(() => document.getElementById('portCard').inert), false, 'and Settings takes input');
+    });
+    await scenario('Clear unused caches keeps the cleared table when the settings read after it fails once', { path: '/settings' }, async ({ page, server }) => {
+      await page.waitForSelector('#clearStale:not([disabled])');
+      await settle(page, 300);
+      let fail = 1, armed = false;
+      server.state.hooks['/v1/prefix-cache/clear'] = () => { armed = true; return null; };
+      server.state.hooks['/v1/settings'] = (body, method) => (method === 'GET' && armed && fail-- > 0 ? { status: 503, contentType: 'application/json', body: JSON.stringify({ error: { message: 'server is not ready' } }) } : null);
+      await page.click('#clearStale');
+      await page.click('#confirmDialog button.danger-fill');
+      await page.waitForFunction(() => /Freed 22\.1 GiB/.test(document.getElementById('toastHost').textContent));
+      await settle(page, 4_500);
+      await settle(page, 10_500);
+      assert.equal((await page.textContent('#settingsAlert')).trim(), '', 'the error has passed');
+      assert.equal(server.state.cache.namespaces.some((n) => n.stale), false, 'the server holds nothing stale');
+      assert.equal(await page.isDisabled('#clearStale'), true, `nothing stale is left to clear, yet the button offers "${await page.textContent('#clearStale')}"`);
+    });
+    await scenario('a models answer sent before a refused load does not erase its note', { path: '/models#GLM-B' }, async ({ page, server }) => {
+      await page.waitForSelector('#modelsDetail button:text-is("Load")');
+      const g = server.state.models.find((m) => m.id === 'GLM-B');
+      let releaseLoad, releaseOld, releaseNew, hold = null;
+      server.state.hooks['/v1/load-model'] = async () => { g.state = 'loading'; await new Promise((r) => { releaseLoad = r; }); g.state = 'unloaded'; return reply({ error: { message: 'out of memory: needs 61 GiB' } }, 503); };
+      server.state.hooks['/v1/models'] = async () => {
+        // The old poll answers from what the server held when it was handled: GLM-B loading.
+        if (hold === 'old') { hold = null; const snap = server.state.models.map((m) => ({ ...m })); await new Promise((r) => { releaseOld = r; }); const now = server.state.models; server.state.models = snap; setTimeout(() => { server.state.models = now; }, 0); return null; }
+        if (hold === 'new') { hold = null; await new Promise((r) => { releaseNew = r; }); }
+        return null;
+      };
+      await page.click('#modelsDetail button:text-is("Load")');
+      await page.waitForTimeout(100);
+      hold = 'old';
+      await page.clock.runFor(2100); // the busy poll goes out while GLM-B loads, and answers after the refusal
+      await page.waitForTimeout(150);
+      assert.ok(releaseOld, 'the poll is held');
+      hold = 'new';
+      releaseLoad();
+      await page.waitForTimeout(150);
+      assert.ok(releaseNew, 'the read after the refusal is held');
+      releaseOld();
+      await page.waitForTimeout(150);
+      releaseNew();
+      await page.waitForTimeout(300);
+      const note = await page.evaluate(() => document.getElementById('modelsDetail').innerText);
+      assert.match(note, /out of memory/, `the refusal is shown (detail: ${JSON.stringify(note.slice(0, 200))})`);
+    });
+    await scenario('Available opened directly names an installed pack\'s in-memory size', { path: '/downloads', setup: (s) => {
+      const pack = { repo: 'beamster/Deep-Sushi', name: 'deep', tag: '', size_bytes: 150 * GiB, tier_gb: 64, fits: true, streams_experts: true, recommended: false, installed: true, path: '/models/Deep-C', partial_bytes: null, update: null, launch: null };
+      s.state.hooks['/v1/downloads'] = () => reply({ ram_bytes: 128 * GiB, ram_gb: 128, update_check: true, catalog: 'ready', refreshing: false, dest: { path: '/models', source: 'default', locked: false, free_bytes: 900 * GiB, volume: 'Data' }, jobs: [], packs: [pack] });
+    } }, async ({ page }) => {
+      await page.waitForSelector('.dl-row');
+      await settle(page, 3000);
+      assert.match(await page.textContent('.dl-row[data-repo="beamster/Deep-Sushi"] .meta'), /96\.0 GiB in-memory size/);
+    });
+    await scenario('Reload now takes the not-in-use callout down once the model runs its saved settings', { path: '/models#Qwen-A', setup: (s) => {
+      s.state.models[0].loaded_with = { ctx_size: 32768 };
+      s.state.hooks['/v1/load-model'] = (body) => { s.state.models.find((x) => x.id === body.model).loaded_with = { ctx_size: 65536 }; return null; };
+    } }, async ({ page }) => {
+      await page.click('#modelsDetail .callout:not([hidden]) >> text=Reload now');
+      await page.waitForFunction(() => /Reloaded Qwen-A/.test(document.getElementById('toastHost').textContent));
+      await settle(page, 1000);
+      const up = await page.evaluate(() => [...document.querySelectorAll('#modelsDetail .callout')].some((c) => !c.hidden && /not in use yet/.test(c.textContent)));
+      assert.equal(up, false, 'the model runs its saved settings');
     });
 
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
