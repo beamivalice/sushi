@@ -75,7 +75,12 @@ async function open(browser, stub, { viewport = { width: 1440, height: 900 }, st
   }, storage);
   if (clock) await page.clock.install();
   await page.goto(`${stub.url}/chat`);
-  if (ready) await page.waitForSelector('#modelSelect option', { state: 'attached' });
+  if (ready) {
+    await page.waitForSelector('#modelSelect option', { state: 'attached' });
+    // The side panels open with a transition: a panel the page marks open is ready once it is shown, and a focus or a
+    // text read on a control inside it before that lands on a hidden element.
+    await page.waitForFunction(() => [['left-open', 'chatSidebar'], ['right-open', 'chatRightbar']].every(([open, id]) => !document.getElementById('chatPanel').classList.contains(open) || getComputedStyle(document.getElementById(id)).visibility === 'visible'));
+  }
   return { page, context: ctx, errors };
 }
 
