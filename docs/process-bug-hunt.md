@@ -22,7 +22,9 @@ Rules: [CLAUDE.md](../CLAUDE.md#team-process). Tests and tiers: [testsuite](test
 3. **Hunters.** Three unless the owner sets otherwise, launched together. The agents are in `.claude/agents/` (model
    and effort in each file's frontmatter); the coordinator's procedure is the `/hunt-fix` skill. Each gets its own git worktree at the head (toolchain and `lib/mlx` linked from the
    main checkout) and its own temp directory. One wave per agent: a hunter that finishes its round, or a fixer its
-   batch of findings, retires, and a fresh agent with a self-contained brief takes the next surface or batch.
+   batch of findings, retires, and a fresh agent with a self-contained brief takes the next surface or batch. The one
+   exception: a fixer chasing LOW or MED findings in one area may take further LOW or MED tickets in that area; the
+   coordinator decides which tickets go to it. A HIGH finding, or one in another area, goes to a fresh fixer.
 4. **Known list.** The brief names every defect already fixed or open, so a hunter spends its runs on new ones and
    on deeper siblings.
 5. **Report**, then **synthesis**, then the fixes, then the worktrees go.

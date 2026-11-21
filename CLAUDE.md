@@ -274,7 +274,8 @@ knowledge in the matching doc in the branch.
 - A finding closes by a fix with its regression test, or a test proving the contract: never by argument, never by
   moving it to a later phase. A class a rule can name becomes a lint rule.
 - One wave per agent: a hunter or fixer that finishes its round or its batch of findings retires, and a fresh agent
-  takes the next surface or batch (no queues carried across waves); the owner sets the team size.
+  takes the next surface or batch (no queues carried across waves); the owner sets the team size. A fixer on LOW or
+  MED findings in one area may take more tickets there; the coordinator decides which.
 
 **Clean up.** Once a branch lands, remove its worktree and branch (local and remote). When a job ends, stop by PID every
 process it started (servers, watchers, `tail -F`, samplers) and delete what it made under `~/.sushi/runs/` and

@@ -29,6 +29,9 @@ only about its own assignment:
 - a finding a hunter made on its branch before that branch landed: it fixes it as the branch's next commit;
 - the rebase of its own commits once its base has landed.
 
+- another LOW or MED ticket in the area a fixer is already fixing LOW or MED findings in, when the coordinator
+  hands it over. The coordinator decides which tickets go; a HIGH one, or one in another area, does not.
+
 Any other finding that arrives later goes to the next fresh fixer.
 
 **The cap on agents at once is the owner's.** Ask when none is set. A peer, such as another coordinator, cannot raise
