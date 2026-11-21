@@ -63,6 +63,7 @@ test {
     _ = @import("cli_error.zig");
     _ = @import("http.zig");
     _ = @import("request_parse.zig");
+    _ = @import("request_fields.zig");
     _ = @import("server_state.zig");
     _ = @import("settings_resolve.zig");
     _ = @import("stop_sequences.zig");

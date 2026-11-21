@@ -143,7 +143,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   own top-level field (`request_parse.chatToolsJson`), never a text scan.
 - A Responses `text.format` JSON instruction is added to the prompt's copy of the conversation
   (`withJsonInstruction`); the stored conversation a `previous_response_id` chain replays holds none.
-- A body field the server does not read is ignored, never rejected: a client still sending the removed `kv_attn_mode` is served as if it were absent.
+- **One table of request fields** (`request_fields.zig`): each surface's key, type and readers are one row. `check` refuses, by name, a field of the wrong type or range and a field some surface reads that this one does not (`messages` on completions, a penalty on Messages), and only the `Checked` it returns reads a body, so a field is read as it was checked; null is absent. A key no surface reads is ignored: a client still sending the removed `kv_attn_mode` is served as if it were absent. `store`, `service_tier`, `safety_identifier` and `metadata` are carried: type-checked and unread outside Responses. A message is an object with a string `role` and `content` that is text, parts or absent (`request_fields.contentOf`, the one content reader, so a wrong-typed one is a 400, never a dropped turn); `stop` has one reader (`stop_sequences.append`).
 - **Media is read from EVERY message** on all three surfaces: chat `image_url`/`video_url` parts in any role
   (`tool` included), Anthropic `image` blocks beside the text or inside a `tool_result`, Responses `input_image` in
   a message or a `function_call_output` array. Only base64 data URLs decode (remote URLs are refused, not fetched);

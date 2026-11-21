@@ -6,6 +6,7 @@ Which file under `src/` holds what, and the doc to read before changing it. A ne
 |---|---|---|
 | `main.zig` / `cli.zig` | entry, flags, subcommands (`run/pull/list/serve/launch/kld/convert`), REPL | server-lifecycle |
 | `repl_tools.zig` | `run` REPL client tools (web, confined files, images; write needs `/edit`) | server-http-apis |
+| `request_fields.zig` | the one table of request fields: key, type and the surfaces that read it; `check` and the readers (MLX-free, host tier) | server-http-apis |
 | `server_state.zig` / `http.zig` / `request_parse.zig` | the server's process globals; the HTTP transport (bind, response writers, body log, error body, JSON escape); request reading (MLX-free, host tier) | server-lifecycle |
 | `fd_limits.zig` | the open-file limit: the startup raise and its `[limits]` line, the descriptor census the accept loop logs when they run out; host tier | server-lifecycle |
 | `help.zig` / `arch/flags.zig` / `arch/packs.zig` / `arch/serve.zig` / `<arch>/<arch>_flags.zig` | `--help` assembled from the enabled archs; their flags, subcommands, launch refusals and serve hooks; the pack alias table | engine-arch-seam |

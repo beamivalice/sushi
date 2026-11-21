@@ -706,7 +706,7 @@ pub fn handleAnthropicMessages(
         }
     }
 
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(parseJsonFloatOpt(root, "think_penalty"), model_settings.think_penalty_flag, config.think_penalty_override));
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;

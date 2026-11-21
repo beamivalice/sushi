@@ -2780,3 +2780,43 @@ test "server: a non-stream reply on every surface frees every allocation of its 
         }
     }.run);
 }
+
+/// One request each surface must refuse with a 400 that names `field`.
+const FieldCase = struct { path: []const u8, body: []const u8, field: []const u8 };
+
+fn expectEachRefusedByName(cases: []const FieldCase) !void {
+    var bad: usize = 0;
+    for (cases) |c| {
+        const resp = try request("POST", c.path, c.body);
+        defer gpa.free(resp);
+        const quoted = try std.fmt.allocPrint(gpa, "'{s}'", .{c.field});
+        defer gpa.free(quoted);
+        if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, bodyOf(resp), quoted) == null) {
+            std.debug.print("not refused by name '{s}': {s} {s}\n  -> {s}\n", .{ c.field, c.path, c.body, resp[0..@min(resp.len, 160)] });
+            bad += 1;
+        }
+    }
+    if (bad > 0) return error.FieldNotRefusedByName;
+}
+
+test "server: request fields: chat and completions refuse a field of the wrong shape, or one they do not read, by name" {
+    try eachArch(2, .{}, struct {
+        const msg = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const chat = "/v1/chat/completions";
+        const comp = "/v1/completions";
+        const cases = [_]FieldCase{
+            .{ .path = chat, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"top_k\":2.5," ++ msg ++ "}", .field = "top_k" },
+            .{ .path = comp, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"top_k\":2.5,\"prompt\":\"hi\"}", .field = "top_k" },
+            .{ .path = chat, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":5}," ++ msg ++ "}", .field = "thinking" },
+            .{ .path = chat, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"stop_sequences\":[\"a\"]," ++ msg ++ "}", .field = "stop_sequences" },
+            .{ .path = comp, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"enable_thinking\":false,\"prompt\":\"hi\"}", .field = "enable_thinking" },
+            .{ .path = comp, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"tools\":[],\"prompt\":\"hi\"}", .field = "tools" },
+            .{ .path = chat, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"messages\":[{\"role\":\"system\",\"content\":5},{\"role\":\"user\",\"content\":\"hi\"}]}", .field = "messages[0].content" },
+            .{ .path = chat, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"messages\":[{\"role\":7,\"content\":\"be terse\"},{\"role\":\"user\",\"content\":\"hi\"}]}", .field = "messages[0].role" },
+            .{ .path = chat, .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"messages\":[\"hi\"]}", .field = "messages[0]" },
+        };
+        fn run() !void {
+            try expectEachRefusedByName(&cases);
+        }
+    }.run);
+}

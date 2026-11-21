@@ -9,6 +9,28 @@
 const std = @import("std");
 const log = @import("log.zig");
 
+/// Whether a request's stop field is well formed: a string or an array of strings.
+pub fn valid(v: std.json.Value) bool {
+    return switch (v) {
+        .string => true,
+        .array => |a| for (a.items) |item| {
+            if (item != .string) break false;
+        } else true,
+        else => false,
+    };
+}
+
+/// The ONE reader of a request's stop field, for every surface (`valid` has checked it): appends each non-empty
+/// stop, in the order sent. Absent or null adds none.
+pub fn append(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), v: ?std.json.Value) !void {
+    switch (v orelse return) {
+        .null => {},
+        .string => |s| if (s.len > 0) try list.append(allocator, s),
+        .array => |a| for (a.items) |item| if (item.string.len > 0) try list.append(allocator, item.string),
+        else => unreachable,
+    }
+}
+
 pub const Hit = struct { index: usize, stop: []const u8 };
 
 pub fn earliest(text: []const u8, stops: []const []const u8) ?Hit {

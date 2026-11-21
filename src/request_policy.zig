@@ -31,7 +31,6 @@ const StreamMode = generation_stream.StreamMode;
 const atomicTokenId = server.atomicTokenId;
 const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const jsonEscape = http.jsonEscape;
-const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
 const parseOnOff = server.parseOnOff;
 const parseRequestSeed = request_parse.parseRequestSeed;
 const pickStreamMode = generation_stream.pickStreamMode;
@@ -69,8 +68,8 @@ fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *cons
 
 /// The think penalty's lambda: the request's `think_penalty` > `--think-penalty` >
 /// model-settings.json > off.
-pub fn resolveThinkPenalty(root: std.json.ObjectMap, flag: ?f32, setting: ?f32) f32 {
-    if (parseJsonFloatOpt(root, "think_penalty")) |v| return v;
+pub fn resolveThinkPenalty(request: ?f32, flag: ?f32, setting: ?f32) f32 {
+    if (request) |v| return v;
     return settings_resolve.resolve(f32, flag, setting, model_settings.default_think_penalty).value;
 }
 
@@ -1217,20 +1216,15 @@ test "preserve_thinking: request > --preserve-thinking > model-settings.json > t
 }
 
 test "think penalty: request > --think-penalty > model-settings.json > off" {
-    const a = std.testing.allocator;
-    const Case = struct { body: []const u8, flag: ?f32, setting: ?f32, want: f32 };
+    const Case = struct { request: ?f32, flag: ?f32, setting: ?f32, want: f32 };
     const cases = [_]Case{
-        .{ .body = "{\"think_penalty\":0}", .flag = 2, .setting = 3, .want = 0 },
-        .{ .body = "{\"think_penalty\":1.5}", .flag = null, .setting = null, .want = 1.5 },
-        .{ .body = "{\"think_penalty\":\"2\"}", .flag = 2, .setting = 3, .want = 2 },
-        .{ .body = "{}", .flag = null, .setting = 3, .want = 3 },
-        .{ .body = "{}", .flag = null, .setting = null, .want = 0 },
+        .{ .request = 0, .flag = 2, .setting = 3, .want = 0 },
+        .{ .request = 1.5, .flag = null, .setting = null, .want = 1.5 },
+        .{ .request = null, .flag = 2, .setting = 3, .want = 2 },
+        .{ .request = null, .flag = null, .setting = 3, .want = 3 },
+        .{ .request = null, .flag = null, .setting = null, .want = 0 },
     };
-    for (cases) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.body, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(c.want, resolveThinkPenalty(parsed.value.object, c.flag, c.setting));
-    }
+    for (cases) |c| try std.testing.expectEqual(c.want, resolveThinkPenalty(c.request, c.flag, c.setting));
 }
 
 test "think penalty: arms a thinking request whose think markers are single tokens" {

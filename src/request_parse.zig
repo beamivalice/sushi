@@ -117,17 +117,6 @@ pub fn parseRequestSeed(v: ?std.json.Value) ?u64 {
 /// " (launch default)".
 pub const MAX_TOKENS_DESC_LEN: usize = 27;
 
-pub fn ignoreEosRequested(root: std.json.ObjectMap) bool {
-    return boolField(root, .ignore_eos) orelse false;
-}
-
-/// Chat refuses `ignore_eos`: past its end of turn the model writes another turn, whose think
-/// block the non-stream reply merges into the reasoning and the live stream cannot.
-pub fn chatIgnoreEosRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    if (!ignoreEosRequested(root)) return null;
-    return "'ignore_eos' is supported on /v1/completions only: a chat reply ends at its end of turn";
-}
-
 pub fn parseCancelRequestId(allocator: std.mem.Allocator, body: []const u8) ?u64 {
     if (body.len == 0) return null;
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
@@ -232,8 +221,8 @@ fn hashTextValue(v: std.json.Value) ?u64 {
     return if (n == 0) null else h.final();
 }
 
-pub fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
-    const v = root.get("n") orelse return null;
+/// A request's `n`: absent, null and 1 are served; this server returns a single choice per request.
+pub fn nChoicesFault(v: std.json.Value) ?[]const u8 {
     const n = wholeNumber(v) orelse switch (v) {
         .null => return null,
         else => return "'n' must be the integer 1: this server returns a single choice per request",
@@ -241,23 +230,6 @@ pub fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
     if (n == 1) return null;
     if (n < 1) return "'n' must be a positive integer, and this server returns a single choice per request: omit 'n' or set it to 1";
     return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
-}
-
-/// Legacy completions fields this server cannot honour: a fill-in-the-middle `suffix`, and `best_of` above 1.
-pub fn completionsFieldFault(root: std.json.ObjectMap) ?[]const u8 {
-    if (root.get("suffix")) |v| switch (v) {
-        .null => {},
-        .string => |text| if (text.len > 0) return "'suffix' is not supported: this server does not fill in the middle; omit it",
-        else => return "'suffix' is not supported: this server does not fill in the middle; omit it",
-    };
-    if (root.get("best_of")) |v| if (v != .null and wholeNumber(v) != 1) {
-        return "'best_of' must be 1: this server returns one completion per request and ranks no candidates";
-    };
-    if (root.get("logprobs")) |v| if (v != .null) {
-        const n = wholeNumber(v) orelse return "'logprobs' must be an integer from 0 to 20";
-        if (n < 0 or n > MAX_TOP_LOGPROBS) return "'logprobs' must be an integer from 0 to 20";
-    };
-    return null;
 }
 
 fn numberOf(v: std.json.Value) ?f64 {
@@ -342,7 +314,7 @@ pub const GenerationKeys = struct {
     min_p: bool = true,
 };
 
-fn fieldFault(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
+pub fn fieldFault(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buf, fmt, args) catch "a request field has an invalid value";
 }
 
@@ -410,21 +382,6 @@ pub const Logprobs = struct {
     }
 };
 
-/// Legacy completions' integer `logprobs` (null or absent: off; the range is `completionsFieldFault`'s).
-pub fn completionsLogprobs(root: std.json.ObjectMap) ?Logprobs {
-    const v = root.get("logprobs") orelse return null;
-    const n = wholeNumber(v) orelse return null;
-    return .{ .top = @intCast(@max(n, 0)) };
-}
-
-/// Chat's `logprobs: true` with its `top_logprobs` (absent or null: none; the range is `generationFieldFault`'s).
-pub fn chatLogprobs(root: std.json.ObjectMap) ?Logprobs {
-    const on = root.get("logprobs") orelse return null;
-    if (on != .bool or !on.bool) return null;
-    const top = root.get("top_logprobs") orelse return .{ .top = 0 };
-    return .{ .top = if (wholeNumber(top)) |n| @intCast(@max(n, 0)) else 0 };
-}
-
 /// The first bad value among the fields every generation surface reads the same way, as a message naming the
 /// field. A field that is absent or null is the default; a value of the wrong type or outside its range is
 /// refused, never clamped or read as absent. A `max_tokens` of 0 is an omission: the server fills the default.
@@ -468,7 +425,10 @@ pub fn generationFieldFault(buf: []u8, root: std.json.ObjectMap, keys: Generatio
 
 /// Responses `tool_choice`: auto, none, required or a function (`{"type":"function","name":...}`); null is absent.
 pub fn responsesToolChoiceFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
-    const tc = root.get("tool_choice") orelse return null;
+    return responsesToolChoiceShape(buf, root.get("tool_choice") orelse return null);
+}
+
+pub fn responsesToolChoiceShape(buf: []u8, tc: std.json.Value) ?[]const u8 {
     switch (tc) {
         .null => return null,
         .string => |s| {
@@ -479,6 +439,20 @@ pub fn responsesToolChoiceFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8
         .object => |o| return functionChoiceFault(o),
         else => return "'tool_choice' must be auto, none, required or a function object",
     }
+}
+
+/// Chat's `tool_choice`: a mode word or an object `functionChoiceFault` accepts.
+pub fn chatToolChoiceFault(tc: std.json.Value) ?[]const u8 {
+    switch (tc) {
+        .null => {},
+        .object => |o| return functionChoiceFault(o),
+        .string => |s| {
+            const ok = std.mem.eql(u8, s, "auto") or std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any");
+            if (!ok) return "'tool_choice' must be auto, none, required or a function object";
+        },
+        else => return "'tool_choice' must be auto, none, required or a function object",
+    }
+    return null;
 }
 
 /// An object `tool_choice` on chat and Responses: a form `parseToolChoice` honours, a mode (none, auto, any, required)
@@ -498,7 +472,14 @@ fn functionChoiceFault(o: std.json.ObjectMap) ?[]const u8 {
 /// Anthropic's `tool_choice` (an object typed auto, any, tool or none, `tool` naming a function) and each
 /// `tool_result.is_error` of the messages; null is absent.
 pub fn anthropicToolFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
-    if (root.get("tool_choice")) |tc| switch (tc) {
+    if (root.get("tool_choice")) |tc| if (anthropicToolChoiceFault(tc)) |m| return m;
+    const messages = root.get("messages") orelse return null;
+    if (messages != .array) return null;
+    return toolResultFault(buf, messages.array.items);
+}
+
+pub fn anthropicToolChoiceFault(tc: std.json.Value) ?[]const u8 {
+    switch (tc) {
         .null => {},
         .object => |o| {
             const t = o.get("type") orelse return "'tool_choice.type' is required: auto, any, tool or none";
@@ -514,10 +495,13 @@ pub fn anthropicToolFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
             };
         },
         else => return "'tool_choice' must be an object typed auto, any, tool or none",
-    };
-    const messages = root.get("messages") orelse return null;
-    if (messages != .array) return null;
-    for (messages.array.items, 0..) |m, mi| {
+    }
+    return null;
+}
+
+/// Each `tool_result.is_error` of a /v1/messages conversation must be a bool.
+pub fn toolResultFault(buf: []u8, items: []const std.json.Value) ?[]const u8 {
+    for (items, 0..) |m, mi| {
         if (m != .object) continue;
         const content = m.object.get("content") orelse continue;
         if (content != .array) continue;
@@ -700,32 +684,6 @@ pub fn responsesFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
     return roleFault(buf, "input", iv.array.items, &chat_mod.request_roles, true);
 }
 
-/// The first bad value among the chat-completions-only fields, as a message naming the field.
-pub fn chatFieldFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
-    if (root.get("logprobs")) |v| if (v != .null and v != .bool) return "'logprobs' must be a boolean";
-    if (root.get("messages")) |mv| if (mv == .array) if (roleFault(buf, "messages", mv.array.items, &chat_mod.request_roles, false)) |m| return m;
-    if (root.get("response_format")) |rf| switch (rf) {
-        .null => {},
-        .object => |o| {
-            const t = o.get("type") orelse return "'response_format.type' is required: text, json_object or json_schema";
-            const ok = t == .string and (std.mem.eql(u8, t.string, "text") or std.mem.eql(u8, t.string, "json_object") or std.mem.eql(u8, t.string, "json_schema"));
-            if (!ok) return "'response_format.type' must be text, json_object or json_schema";
-        },
-        else => return "'response_format' must be an object",
-    };
-    if (root.get("tools")) |tv| if (toolsFault(buf, tv, true)) |m| return m;
-    if (root.get("tool_choice")) |tc| switch (tc) {
-        .null => {},
-        .object => |o| if (functionChoiceFault(o)) |m| return m,
-        .string => |s| {
-            const ok = std.mem.eql(u8, s, "auto") or std.mem.eql(u8, s, "none") or std.mem.eql(u8, s, "required") or std.mem.eql(u8, s, "any");
-            if (!ok) return "'tool_choice' must be auto, none, required or a function object";
-        },
-        else => return "'tool_choice' must be auto, none, required or a function object",
-    };
-    return null;
-}
-
 test "generationFieldFault names the field a bad value sits in" {
     const Case = struct { body: []const u8, field: ?[]const u8 };
     const cases = [_]Case{
@@ -884,30 +842,6 @@ test "generationFieldFault: a sampler this server does not run is refused as uns
     try testing.expectEqual(@as(?[]const u8, null), generationFieldFault(&buf, none.value.object, messages));
 }
 
-test "completionsFieldFault refuses suffix and a best_of above 1 by name" {
-    const Case = struct { body: []const u8, field: ?[]const u8 };
-    const cases = [_]Case{
-        .{ .body = "{}", .field = null },
-        .{ .body = "{\"suffix\":null,\"best_of\":1}", .field = null },
-        .{ .body = "{\"suffix\":\"\",\"best_of\":1.0}", .field = null },
-        .{ .body = "{\"suffix\":\"}\"}", .field = "suffix" },
-        .{ .body = "{\"suffix\":5}", .field = "suffix" },
-        .{ .body = "{\"best_of\":3}", .field = "best_of" },
-        .{ .body = "{\"best_of\":0}", .field = "best_of" },
-        .{ .body = "{\"best_of\":\"2\"}", .field = "best_of" },
-    };
-    for (cases) |c| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        const got = completionsFieldFault(parsed.value.object);
-        if (c.field) |f| {
-            const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
-            defer testing.allocator.free(quoted);
-            try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
-        } else try testing.expectEqual(@as(?[]const u8, null), got);
-    }
-}
-
 test "parseMinP: an omitted or null min_p is off" {
     for ([_]struct { body: []const u8, want: f32 }{
         .{ .body = "{}", .want = 0 },
@@ -941,54 +875,6 @@ test "a surface's first positive token budget key wins, and a null or zero one l
         errdefer std.debug.print("\nbody: {s}\n", .{c.body});
         const got = requestedMaxTokens(parsed.value.object, c.keys);
         try testing.expectEqual(c.want, if (got) |v| wholeNumber(v) else null);
-    }
-}
-
-test "chatFieldFault refuses an unknown role, response_format type, malformed tools and tool_choice" {
-    const Case = struct { body: []const u8, field: ?[]const u8 };
-    const cases = [_]Case{
-        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"developer\"}],\"tool_choice\":\"required\"}", .field = null },
-        .{ .body = "{\"messages\":[{\"content\":\"no role\"},5],\"response_format\":null,\"tools\":null}", .field = null },
-        .{ .body = "{\"response_format\":{\"type\":\"json_schema\"},\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"a\"}}}", .field = null },
-        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a.b/c:d\",\"parameters\":{\"type\":\"object\"}}},{\"name\":\"flat\",\"parameters\":null}]}", .field = null },
-        .{ .body = "{\"messages\":[{\"role\":\"wizard\",\"content\":\"hi\"}]}", .field = "messages[0].role" },
-        .{ .body = "{\"response_format\":{\"type\":\"xml\"}}", .field = "response_format.type" },
-        .{ .body = "{\"response_format\":\"json\"}", .field = "response_format" },
-        .{ .body = "{\"tools\":\"x\"}", .field = "tools" },
-        .{ .body = "{\"tools\":[{\"type\":\"retrieval\"}]}", .field = "tools[0].type" },
-        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"description\":\"d\"}}]}", .field = "tools[0]" },
-        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\",\"parameters\":\"bad\"}}]}", .field = "tools[0].parameters" },
-        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\"}},{\"type\":\"function\",\"function\":{\"name\":\"a\"}}]}", .field = "tools[1]" },
-        .{ .body = "{\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"my tool/v1.2\"}}]}", .field = "tools[0]" },
-        .{ .body = "{\"tool_choice\":\"sometimes\"}", .field = "tool_choice" },
-        .{ .body = "{\"tool_choice\":7}", .field = "tool_choice" },
-        // An object tool_choice is a form the reader honours (a mode, a named function or tool), or it is refused by
-        // name: never read as auto. allowed_tools would be read as auto, its mode and subset dropped, so it is refused.
-        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"a\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"none\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"auto\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"any\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"required\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"a\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"allowed_tools\",\"mode\":\"required\",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"a\"}}]}}", .field = "tool_choice.type" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"tool\"}}", .field = "tool_choice.name" },
-        .{ .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"bogus\"}}", .field = "tool_choice.type" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"function\"}}", .field = "tool_choice.name" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"\"}}}", .field = "tool_choice.name" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":7}}}", .field = "tool_choice.name" },
-    };
-    for (cases) |c| {
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        var buf: [320]u8 = undefined;
-        const got = chatFieldFault(&buf, parsed.value.object);
-        errdefer std.debug.print("\nbody: {s}\ngot: {?s}\n", .{ c.body, got });
-        if (c.field) |f| {
-            const quoted = try std.fmt.allocPrint(testing.allocator, "'{s}'", .{f});
-            defer testing.allocator.free(quoted);
-            try testing.expect(std.mem.indexOf(u8, got.?, quoted) != null);
-        } else try testing.expectEqual(@as(?[]const u8, null), got);
     }
 }
 
@@ -1230,34 +1116,6 @@ test "requestCacheKey: prompt_cache_key > metadata.user_id > system prompt > ano
     ));
 }
 
-test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
-    const allocator = std.testing.allocator;
-    const cases = [_]struct { body: []const u8, rejected: bool }{
-        // Absent, explicit null, and the two spellings of "one choice" pass.
-        .{ .body = "{}", .rejected = false },
-        .{ .body = "{\"n\":null}", .rejected = false },
-        .{ .body = "{\"n\":1}", .rejected = false },
-        .{ .body = "{\"n\":1.0}", .rejected = false },
-        // Anything else is a request for multi-choice (or garbage) — reject
-        // instead of the silent one-choice no-op.
-        .{ .body = "{\"n\":2}", .rejected = true },
-        .{ .body = "{\"n\":0}", .rejected = true },
-        .{ .body = "{\"n\":\"2\"}", .rejected = true },
-    };
-    for (cases) |case| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
-        defer parsed.deinit();
-        const reason = nChoicesRejectReason(parsed.value.object);
-        try std.testing.expectEqual(case.rejected, reason != null);
-    }
-    // n=0 and n=-1 are not "more than one".
-    for ([_][]const u8{ "{\"n\":0}", "{\"n\":-1}" }) |body| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
-        defer parsed.deinit();
-        try std.testing.expect(std.mem.indexOf(u8, nChoicesRejectReason(parsed.value.object).?, "positive integer") != null);
-    }
-}
-
 test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
     const t = std.testing;
     const allocator = t.allocator;
@@ -1422,52 +1280,3 @@ test "toolResultIsError reads the flag, and disableParallelToolUse the Anthropic
     }
 }
 
-test "chat logprobs: true is on whatever top_logprobs says, 0 and absent included; only a missing true is off" {
-    const cases = [_]struct { body: []const u8, want: ?u32 }{
-        .{ .body = "{}", .want = null },
-        .{ .body = "{\"logprobs\":false,\"top_logprobs\":3}", .want = null },
-        .{ .body = "{\"top_logprobs\":3}", .want = null },
-        .{ .body = "{\"logprobs\":true}", .want = 0 },
-        .{ .body = "{\"logprobs\":true,\"top_logprobs\":null}", .want = 0 },
-        .{ .body = "{\"logprobs\":true,\"top_logprobs\":0}", .want = 0 },
-        .{ .body = "{\"logprobs\":true,\"top_logprobs\":20}", .want = 20 },
-    };
-    for (cases) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        const got = chatLogprobs(parsed.value.object);
-        try std.testing.expectEqual(c.want, if (got) |l| l.top else null);
-        // The engine reads 0 as off: a request that is on always asks it for at least one candidate.
-        if (got) |l| try std.testing.expect(l.engineN() >= 1);
-    }
-}
-
-test "logprobs of the wrong type or range is refused by name on each route, null is absent" {
-    var buf: [256]u8 = undefined;
-    const chat = [_]struct { body: []const u8, refused: bool }{
-        .{ .body = "{\"logprobs\":null}", .refused = false },
-        .{ .body = "{\"logprobs\":false}", .refused = false },
-        .{ .body = "{\"logprobs\":1}", .refused = true },
-        .{ .body = "{\"logprobs\":\"true\"}", .refused = true },
-    };
-    for (chat) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(c.refused, chatFieldFault(&buf, parsed.value.object) != null);
-    }
-    const legacy = [_]struct { body: []const u8, top: ?u32, refused: bool }{
-        .{ .body = "{}", .top = null, .refused = false },
-        .{ .body = "{\"logprobs\":null}", .top = null, .refused = false },
-        .{ .body = "{\"logprobs\":0}", .top = 0, .refused = false },
-        .{ .body = "{\"logprobs\":20}", .top = 20, .refused = false },
-        .{ .body = "{\"logprobs\":21}", .top = null, .refused = true },
-        .{ .body = "{\"logprobs\":true}", .top = null, .refused = true },
-        .{ .body = "{\"logprobs\":\"2\"}", .top = null, .refused = true },
-    };
-    for (legacy) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        try std.testing.expectEqual(c.refused, completionsFieldFault(parsed.value.object) != null);
-        if (!c.refused) try std.testing.expectEqual(c.top, if (completionsLogprobs(parsed.value.object)) |l| l.top else null);
-    }
-}

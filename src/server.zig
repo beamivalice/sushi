@@ -18,6 +18,7 @@ const log = @import("log.zig");
 const server_state = @import("server_state.zig");
 const http = @import("http.zig");
 const request_parse = @import("request_parse.zig");
+const request_fields = @import("request_fields.zig");
 const arch_flags = @import("arch/flags.zig");
 const arch_serve = @import("arch/serve.zig");
 const responses_mod = @import("responses.zig");
@@ -117,18 +118,13 @@ const countRejected = http.countRejected;
 const sendErrorResponse = http.sendErrorResponse;
 const sendMethodNotAllowed = http.sendMethodNotAllowed;
 pub const jsonEscape = http.jsonEscape;
-const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
-const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseModelFromBody = request_parse.parseModelFromBody;
 const queryModel = request_parse.queryModel;
 const messageReasoningFromObj = request_parse.messageReasoningFromObj;
-const parseRequestSeed = request_parse.parseRequestSeed;
 const MAX_TOKENS_DESC_LEN = request_parse.MAX_TOKENS_DESC_LEN;
-const chatIgnoreEosRejectReason = request_parse.chatIgnoreEosRejectReason;
 const parseCancelRequestId = request_parse.parseCancelRequestId;
 const joinedTextParts = request_parse.joinedTextParts;
 pub const requestCacheKey = request_parse.requestCacheKey;
-const nChoicesRejectReason = request_parse.nChoicesRejectReason;
 const chatTemplateKwargBool = request_parse.chatTemplateKwargBool;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
 const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
@@ -2353,8 +2349,8 @@ pub fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) Escaped
 /// ignored rather than 400'd: the request is perfectly answerable as an
 /// ordinary turn, and refusing it would break the obvious client that sets the
 /// field once for the whole session.
-fn continueFinalMessageRequested(root: std.json.ObjectMap, messages: []const chat_mod.Message) bool {
-    if (!(request_parse.boolField(root, .continue_final_message) orelse false)) return false;
+fn continueFinalMessageRequested(req: request_fields.Checked(.chat), messages: []const chat_mod.Message) bool {
+    if (!(req.flag("continue_final_message") orelse false)) return false;
     return think_tags.continuationRequested(messages);
 }
 
@@ -2390,22 +2386,15 @@ pub fn handleChatCompletions(
     }
     const root = parsed.value.object;
 
-    if (nChoicesRejectReason(root)) |reason| {
-        log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-        return;
-    }
-    if (chatIgnoreEosRejectReason(root)) |reason| {
-        log.warn("POST /v1/chat/completions -> 400 (ignore_eos)\n", .{});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-        return;
-    }
     var fault_buf: [384]u8 = undefined;
-    if (request_parse.generationFieldFault(&fault_buf, root, .{}) orelse request_parse.chatFieldFault(&fault_buf, root)) |reason| {
-        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{reason});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
-        return;
-    }
+    const req = switch (request_fields.check(.chat, &fault_buf, root)) {
+        .fault => |reason| {
+            log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{reason});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        },
+        .ok => |c| c,
+    };
 
     // The messages and the tools are read with numbers as spelled (`request_parse.parseSpelled`).
     const spelled = try request_parse.parseSpelled(allocator, body);
@@ -2442,7 +2431,7 @@ pub fn handleChatCompletions(
 
     // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
     // or <= 0 → the filled budget.
-    const requested_max_tokens = request_parse.requestedMaxTokens(root, &request_parse.chat_max_tokens);
+    const requested_max_tokens = req.requestedMaxTokens();
     const max_tokens: u32 = request_policy.resolveRequestMaxTokens(
         requested_max_tokens,
         request_policy.filledMaxTokens(config),
@@ -2450,20 +2439,20 @@ pub fn handleChatCompletions(
     // Who decided it: the log line names it, and only the client's own number is a cut to report.
     const max_tokens_origin = request_policy.maxTokensOrigin(requested_max_tokens, request_policy.launchMaxTokensDefault(), config.defaultMaxTokens());
 
-    const is_stream = request_parse.boolField(root, .stream) orelse false;
+    const is_stream = req.flag("stream") orelse false;
 
-    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
-    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
-    const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
+    const temperature = request_policy.samplingTemperature(config, req.number("temperature"));
+    const top_p = request_policy.samplingTopP(config, req.number("top_p"));
+    const top_k = request_policy.samplingTopK(config, req.topK());
 
-    const repeat_penalty = request_policy.parseRepeatPenalty(root);
+    const repeat_penalty = req.repeatPenalty();
 
-    const presence_penalty = request_policy.parseAdditivePenalty(root, "presence_penalty");
-    const frequency_penalty = request_policy.parseAdditivePenalty(root, "frequency_penalty");
+    const presence_penalty = req.additivePenalty("presence_penalty");
+    const frequency_penalty = req.additivePenalty("frequency_penalty");
 
-    const seed: ?u64 = parseRequestSeed(root.get("seed"));
+    const seed: ?u64 = req.seed();
 
-    const asked_logprobs = request_parse.chatLogprobs(root);
+    const asked_logprobs = req.logprobs();
     const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     // Extract tools JSON from request body for chat template injection
@@ -2476,7 +2465,7 @@ pub fn handleChatCompletions(
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
     // per response (the SDK sets false in strict structured-output mode).
-    const allow_parallel_tools = request_parse.boolField(root, .parallel_tool_calls) orelse true;
+    const allow_parallel_tools = req.flag("parallel_tool_calls") orelse true;
 
     defer if (tools_json) |t| allocator.free(t);
     if (has_tools) {
@@ -2488,20 +2477,9 @@ pub fn handleChatCompletions(
         }
     }
 
-    // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
     defer stop_sequences.deinit(allocator);
-    if (root.get("stop")) |stop_val| {
-        switch (stop_val) {
-            .string => |s| if (s.len > 0) try stop_sequences.append(allocator, s),
-            .array => |arr| {
-                for (arr.items) |item| {
-                    if (item == .string and item.string.len > 0) try stop_sequences.append(allocator, item.string);
-                }
-            },
-            else => {},
-        }
-    }
+    try req.stops(allocator, &stop_sequences);
 
     // Parse model name from request (use for response, fallback to config)
     const model_name_raw = if (root.get("model")) |v|
@@ -2596,7 +2574,7 @@ pub fn handleChatCompletions(
     }
 
     // Parse stream_options
-    const include_usage = request_parse.includeUsage(root);
+    const include_usage = req.includeUsage();
 
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
     // vendor `enable_thinking` bool (top-level, or nested in `chat_template_kwargs`).
@@ -2641,7 +2619,7 @@ pub fn handleChatCompletions(
     // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
     // overrides either way.
     const lm_default_enable_drafter: bool = lm.dflash != null;
-    var enable_drafter: bool = request_parse.boolField(root, .enable_drafter) orelse lm_default_enable_drafter;
+    var enable_drafter: bool = req.flag("enable_drafter") orelse lm_default_enable_drafter;
     if (enable_drafter and lm.dflash == null) {
         enable_drafter = false; // no drafter loaded; quietly fall through
     }
@@ -2654,12 +2632,12 @@ pub fn handleChatCompletions(
     // drafter caution). Priority DFlash > MTP at
     // dispatch (`requestSpecModes`). The trained head holds ~73%
     // per-draft acceptance even on fully novel content.
-    const allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
+    const allow_batch_mtp = req.flag("enable_batch_mtp") orelse true;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, req.flag("enable_mtp") orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
-    var enable_mtp: bool = request_parse.boolField(root, .enable_mtp) orelse
+    var enable_mtp: bool = req.flag("enable_mtp") orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
@@ -2699,7 +2677,7 @@ pub fn handleChatCompletions(
     // message the way /v1/messages implies it: agent frameworks legitimately
     // POST assistant-last history here and expect a fresh turn, and turning
     // that into a prefill would change what every one of them gets back.
-    const continue_final = continueFinalMessageRequested(root, messages.items);
+    const continue_final = continueFinalMessageRequested(req, messages.items);
     var tokenize_sw = io_util.Stopwatch.init(stream.io);
     const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
     var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, template_effort, continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
@@ -2783,7 +2761,7 @@ pub fn handleChatCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
-        .min_p = request_parse.parseMinP(root),
+        .min_p = req.minP(),
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .frequency_penalty = frequency_penalty,
@@ -2824,7 +2802,7 @@ pub fn handleChatCompletions(
 
     // A decode-time bound owns the budget; the surfaces then deliver the
     // whole (closed) thought instead of trimming it.
-    sampling.think_penalty = request_policy.armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, request_policy.resolveThinkPenalty(root, model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = request_policy.armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, request_policy.resolveThinkPenalty(req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
     const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
         return;
@@ -3379,19 +3357,16 @@ pub const WireMessages = struct {
 fn readOpenAiMessages(wire: *WireMessages, items: []const std.json.Value, vp: chat_mod.VisionPreproc) !void {
     const allocator = wire.allocator;
     for (items, 0..) |msg_val, raw_index| {
-        // A malformed element is skipped rather than crashing on `.object`.
-        if (msg_val != .object) continue;
-        const obj = msg_val.object;
-        const role_val = obj.get("role") orelse continue;
-        if (role_val != .string) continue;
-        const role = chat_mod.canonicalRole(role_val.string);
+        const message = try request_fields.messageOf(msg_val);
+        const obj = message.obj;
+        const role = chat_mod.canonicalRole(message.role);
 
         var read: ReadContent = .{};
-        if (obj.get("content")) |cv| switch (cv) {
-            .string => |s| read.text = s,
-            .array => |arr| read = try readContentParts(allocator, &wire.media, &wire.texts, arr.items, .openai, .{ .list = "messages", .index = raw_index }, vp),
-            else => {},
-        };
+        switch (try request_fields.contentOf(obj.get("content"))) {
+            .none => {},
+            .text => |t| read.text = t,
+            .parts => |parts| read = try readContentParts(allocator, &wire.media, &wire.texts, parts, .openai, .{ .list = "messages", .index = raw_index }, vp),
+        }
 
         var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
         if (std.mem.eql(u8, role, "assistant")) {
