@@ -157,7 +157,18 @@ pub const ToolReply = struct {
 pub fn toolReply(allocator: std.mem.Allocator, text: []const u8, tools_json: ?[]const u8, allow_parallel: bool, origin: Origin) !?ToolReply {
     const calls = (try parseToolCallsForRequest(allocator, text, tools_json, allow_parallel, origin)) orelse return null;
     const split = think_tags.splitThinkBlock(text, true, origin.opens_think);
-    return .{ .preamble = think_tags.visibleToolPreamble(split.content), .calls = calls };
+    return .{ .preamble = preambleOf(text, split.content, calls), .calls = calls };
+}
+
+/// The text the model said before its calls: `content` (the split of `text`) up to the markup the split cuts, and, when
+/// the calls are bare JSON (no markup anywhere in `text`), up to the JSON, a fence around it included, which is the
+/// call and not content.
+pub fn preambleOf(text: []const u8, content: []const u8, calls: []const tool_schema.ParsedToolCall) []const u8 {
+    var from_bare_json = calls.len > 0;
+    for (calls) |c| from_bare_json = from_bare_json and c.inferred;
+    if (!from_bare_json or think_tags.leakedToolMarkupStart(text) != null) return think_tags.visibleToolPreamble(content);
+    const at = tool_calls_mod.bareJsonCallStart(content) orelse return think_tags.visibleToolPreamble(content);
+    return think_tags.visibleToolPreamble(std.mem.trimEnd(u8, content[0..at], " \t\r\n"));
 }
 
 /// A generation as a surface got it.
@@ -1640,5 +1651,50 @@ test "r173-f-cut-think-tag: a think tag inside a cut call's value is that call's
             std.debug.print("opens_think={} [{s}] {f}: calls={d} declined={?s} content={f}\n", .{ opens, finish, std.zig.fmtString(t), if (s.reply) |r| r.calls.len else 0, if (s.declined) |d| d.name orelse "(unnamed)" else null, std.zig.fmtString(content) });
         }
     };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-bare-json-preamble: a finished bare-JSON call's own JSON is the call, never the content: the preamble is the text before it, a fence around it goes with it, and a stream holds what the whole reply cuts" {
+    const a = testing.allocator;
+    const one = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}";
+    const two = "[" ++ one ++ ", {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Osaka\"}}]";
+    const Case = struct { text: []const u8, calls: usize, preamble: []const u8 };
+    const cases = [_]Case{
+        .{ .text = one, .calls = 1, .preamble = "" },
+        .{ .text = "[" ++ one ++ "]", .calls = 1, .preamble = "" },
+        .{ .text = "Let me check.\n" ++ one, .calls = 1, .preamble = "Let me check." },
+        .{ .text = "Let me check.\n" ++ two, .calls = 2, .preamble = "Let me check." },
+        .{ .text = "```json\n" ++ one ++ "\n```", .calls = 1, .preamble = "" },
+        .{ .text = "Let me check:\n```json\n" ++ one ++ "\n```", .calls = 1, .preamble = "Let me check:" },
+        .{ .text = "Let me check:\n```json\n" ++ two ++ "\n```", .calls = 2, .preamble = "Let me check:" },
+    };
+    var bad: usize = 0;
+    for (cases) |c| {
+        const opens = false;
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = opens };
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const r = s.reply orelse {
+            bad += 1;
+            std.debug.print("no reply for {f}\n", .{std.zig.fmtString(c.text)});
+            continue;
+        };
+        if (r.calls.len != c.calls or !std.mem.eql(u8, r.preamble, c.preamble)) {
+            bad += 1;
+            std.debug.print("{f}: calls={d} preamble={f}\n", .{ std.zig.fmtString(c.text), r.calls.len, std.zig.fmtString(r.preamble) });
+        }
+        // What a stream sends as content before it holds: the split content of the longest prefix the hold released.
+        var scan: think_tags.ToolHoldScan = .{};
+        var sent: []const u8 = "";
+        for (1..c.text.len + 1) |end| {
+            if (think_tags.streamShouldBufferForToolsScan(c.text[0..end], &scan)) break;
+            if (think_tags.endsWithPartialThinkOpen(c.text[0..end])) continue;
+            sent = think_tags.splitThinkBlock(c.text[0..end], true, opens).content;
+        }
+        if (!std.mem.startsWith(u8, c.preamble, std.mem.trim(u8, sent, " \n"))) {
+            bad += 1;
+            std.debug.print("stream sent {f} before holding {f}\n", .{ std.zig.fmtString(sent), std.zig.fmtString(c.text) });
+        }
+    }
     try testing.expectEqual(@as(usize, 0), bad);
 }

@@ -932,6 +932,9 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // Raw JSON tool-call shape: starts with `{` and has `"name"` somewhere.
     if (buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) return true;
 
+    // A bare JSON call after prose, or what may turn into one.
+    if (bareJsonHold(buf, std.mem.indexOfScalar(u8, buf, '{')) != .none) return true;
+
     // Gemma 4 fully-formed canonical open.
     if (std.mem.indexOf(u8, buf, "<|tool_call") != null) return true;
 
@@ -956,6 +959,26 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     if (invokeOpenerHoldsForTools(buf)) return true;
 
     return toolTailHolds(buf);
+}
+
+const BareJsonHold = enum { none, wait, call };
+
+/// Whether `buf` holds a bare JSON call (its first `{`, at `brace`, is followed by `"name"`), or holds what may still turn
+/// into one: a `{` that may grow into `{"name"`, a trailing `[`, or a backtick run or fence line that may lead to the `{`.
+fn bareJsonHold(buf: []const u8, brace: ?usize) BareJsonHold {
+    const key = "\"name\"";
+    if (brace) |b| {
+        const after = std.mem.trimStart(u8, buf[b + 1 ..], " \t\r\n");
+        if (std.mem.startsWith(u8, after, key)) return .call;
+        return if (after.len < key.len and std.mem.startsWith(u8, key, after)) .wait else .none;
+    }
+    const tail = std.mem.trimEnd(u8, buf[buf.len -| 64 ..], " \t\r\n");
+    if (std.mem.endsWith(u8, tail, "[")) return .wait;
+    const line = tail[if (std.mem.lastIndexOfScalar(u8, tail, '\n')) |nl| nl + 1 else 0..];
+    var ticks: usize = 0;
+    while (ticks < line.len and line[ticks] == '`') ticks += 1;
+    if (ticks > 0 and (ticks == line.len or (ticks >= 3 and std.mem.indexOfAny(u8, line[ticks..], " \t`") == null))) return .wait;
+    return .none;
 }
 
 /// Trailing partial prefixes — the next streamed token could complete any
@@ -1041,6 +1064,9 @@ pub const ToolHoldScan = struct {
     func_gt: usize = 0,
     func_open: bool = false,
     invoke_from: usize = 0,
+    /// The first `{` of the text, where a bare JSON call starts, and how far it was looked for.
+    brace: ?usize = null,
+    brace_scan: usize = 0,
     /// Bytes the last call searched; test-visible.
     last_scan_span: usize = 0,
 
@@ -1051,6 +1077,19 @@ pub const ToolHoldScan = struct {
         break :blk longest - 1;
     };
 
+    fn bareJsonCall(self: *ToolHoldScan, buf: []const u8) bool {
+        if (self.brace == null) {
+            self.brace = std.mem.indexOfScalarPos(u8, buf, self.brace_scan, '{');
+            self.brace_scan = buf.len;
+        }
+        switch (bareJsonHold(buf, self.brace)) {
+            .call => return true,
+            .wait => self.pending = true,
+            .none => {},
+        }
+        return false;
+    }
+
     fn advance(self: *ToolHoldScan, buf: []const u8) void {
         self.pending = false;
         if (self.held) return;
@@ -1058,6 +1097,7 @@ pub const ToolHoldScan = struct {
         self.last_scan_span = buf.len - from;
         const win = buf[from..];
         if (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, win, "\"name\"") != null) return self.latch();
+        if (self.bareJsonCall(buf)) return self.latch();
         for (needles) |n| if (std.mem.indexOf(u8, win, n) != null) return self.latch();
 
         var scan = @max(self.tool_from, from);
@@ -2096,8 +2136,10 @@ test "streamShouldBufferForTools: false positives — <toolkit> etc." {
 test "streamShouldBufferForTools: raw JSON shape" {
     try testing.expect(streamShouldBufferForTools("{\"name\":\"shell\",\"arguments\":{}}"));
     try testing.expect(streamShouldBufferForTools("{\"name\":\"shell\""));
-    // Just `{` or JSON without `"name"` shouldn't false-trigger.
-    try testing.expect(!streamShouldBufferForTools("{"));
+    // JSON without `"name"` shouldn't false-trigger; a `{` that may still grow into `{"name"` waits, as the whole reply
+    // cuts the call's JSON from the content.
+    try testing.expect(streamShouldBufferForTools("{"));
+    try testing.expect(streamShouldBufferForTools("{\"na"));
     try testing.expect(!streamShouldBufferForTools("{\"foo\":1}"));
 }
 

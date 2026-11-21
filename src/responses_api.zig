@@ -290,10 +290,10 @@ fn shouldInjectResponsesJsonInstruction(wants_json: bool, tools_active: bool, to
 
 /// The text of the message item, or null when the reply has none: beside a call it is the text before the call,
 /// and a call that survives the two drops of the output loop (an undeclared name, non-object arguments) is one.
-fn responsesMessageText(allocator: std.mem.Allocator, tools_val: ?std.json.Value, calls: ?[]const tool_schema.ParsedToolCall, content: []const u8) ?[]const u8 {
+fn responsesMessageText(allocator: std.mem.Allocator, tools_val: ?std.json.Value, calls: ?[]const tool_schema.ParsedToolCall, text: []const u8, content: []const u8) ?[]const u8 {
     for (calls orelse return content) |tc| {
         if (!responsesToolExists(tools_val, tc.name) or !isJsonObjectString(allocator, tc.arguments)) continue;
-        const preamble = think_tags.visibleToolPreamble(content);
+        const preamble = reply_mod.preambleOf(text, content, calls.?);
         return if (preamble.len > 0) preamble else null;
     }
     return content;
@@ -1344,7 +1344,7 @@ fn handleResponsesInner(
     }
 
     // The message item carries the text before the markup beside any call, as chat does.
-    const message_item = responsesMessageText(allocator, root.get("tools"), tool_calls, visible_text);
+    const message_item = responsesMessageText(allocator, root.get("tools"), tool_calls, final_text, visible_text);
     const message_text = message_item orelse "";
 
     const reasoning_first = responsesReasoningFirst(
@@ -2403,14 +2403,14 @@ test "a Responses reply with a call carries the text before it as a message item
     const declared = [_]tool_schema.ParsedToolCall{.{ .name = "lookup", .arguments = "{\"id\":1}" }};
     const undeclared = [_]tool_schema.ParsedToolCall{.{ .name = "other", .arguments = "{}" }};
     const not_object = [_]tool_schema.ParsedToolCall{.{ .name = "lookup", .arguments = "[1]" }};
-    try testing.expectEqualStrings("I will look it up.", responsesMessageText(a, tools.value, &declared, "I will look it up.").?);
-    try testing.expect(responsesMessageText(a, tools.value, &declared, " \n") == null);
-    try testing.expect(responsesMessageText(a, tools.value, &declared, "") == null);
+    try testing.expectEqualStrings("I will look it up.", responsesMessageText(a, tools.value, &declared, "I will look it up.", "I will look it up.").?);
+    try testing.expect(responsesMessageText(a, tools.value, &declared, " \n", " \n") == null);
+    try testing.expect(responsesMessageText(a, tools.value, &declared, "", "") == null);
     // Without a surviving call the item is the reply, empty or not.
-    try testing.expectEqualStrings("", responsesMessageText(a, tools.value, null, "").?);
-    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, null, "Done.").?);
-    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, &undeclared, "Done.").?);
-    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, &not_object, "Done.").?);
+    try testing.expectEqualStrings("", responsesMessageText(a, tools.value, null, "", "").?);
+    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, null, "Done.", "Done.").?);
+    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, &undeclared, "Done.", "Done.").?);
+    try testing.expectEqualStrings("Done.", responsesMessageText(a, tools.value, &not_object, "Done.", "Done.").?);
 }
 
 test "a Responses output replayed as input renders the prompt its stored chain does, a call's preamble included" {
@@ -2422,7 +2422,7 @@ test "a Responses output replayed as input renders the prompt its stored chain d
     , .{});
     defer tools.deinit();
     const parsed = [_]tool_schema.ParsedToolCall{.{ .name = "lookup", .arguments = "{\"id\":1}" }};
-    const text = responsesMessageText(a, tools.value, &parsed, "I will look it up.").?;
+    const text = responsesMessageText(a, tools.value, &parsed, "I will look it up.", "I will look it up.").?;
     const calls = [_]chat_mod.ToolCall{.{ .id = "c1", .name = "lookup", .arguments = "{\"id\":1}" }};
     const first = [_]chat_mod.Message{.{ .role = "user", .content = "compare" }};
     try storeResponse(testing.io, a, .{ .store = &store }, "r1", "model", "completed", "{}", &first, text, "inspect it", &calls, null);

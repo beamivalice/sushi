@@ -1544,6 +1544,22 @@ fn appendBareJsonCalls(allocator: std.mem.Allocator, effective_text: []const u8,
     return null;
 }
 
+/// Where the bare JSON the text holds as a call starts (a fence line opening it included), read as `appendBareJsonCalls`
+/// reads it: the `[` that leads the first `{`, else that `{`. The text before it is what the model said; the JSON is
+/// the call, not content. Null when the text holds no `{`.
+pub fn bareJsonCallStart(text: []const u8) ?usize {
+    const brace = std.mem.indexOfScalar(u8, text, '{') orelse return null;
+    var start = brace;
+    var lead = brace;
+    while (lead > 0 and std.ascii.isWhitespace(text[lead - 1])) lead -= 1;
+    if (lead > 0 and text[lead - 1] == '[') start = lead - 1;
+    const before = std.mem.trimEnd(u8, text[0..start], " \t\r\n");
+    const line_at = if (std.mem.lastIndexOfScalar(u8, before, '\n')) |nl| nl + 1 else 0;
+    const line = std.mem.trimStart(u8, before[line_at..], " \t");
+    if (std.mem.startsWith(u8, line, "```") and std.mem.indexOfAny(u8, line[3..], " \t`{[") == null) return line_at;
+    return start;
+}
+
 /// The elements of an array that never closed, up to the one the text cut: the complete ones are appended (as
 /// `appendJsonToolCallArray` does, all or none), and the cut one's text from its `{` on is returned.
 fn appendCompleteArrayElements(allocator: std.mem.Allocator, array: []const u8, calls: *std.ArrayList(ParsedToolCall)) !?[]const u8 {

@@ -888,7 +888,7 @@ pub fn handleNonStreamingGeneration(
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
 
             // The same pre-markup text the stream flushes as a text delta.
-            const tc_preamble = visibleToolPreamble(tc_think_split.content);
+            const tc_preamble = tool_reply.preamble;
             const tc_content_esc = jsonEscapeOrEmpty(allocator, tc_preamble);
             defer if (tc_content_esc.owned) allocator.free(tc_content_esc.slice);
             const tc_content_json: []const u8 = if (tc_preamble.len > 0) tc_content_esc.slice else "null";
