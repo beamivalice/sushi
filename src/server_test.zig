@@ -7,6 +7,7 @@ const testing = std.testing;
 const mlx = @import("mlx.zig");
 const server = @import("server.zig");
 const server_state = @import("server_state.zig");
+const downloads = @import("downloads.zig");
 const model_load = @import("model_load.zig");
 const registry = @import("arch/registry.zig");
 const responses_api = @import("responses_api.zig");
@@ -2523,6 +2524,14 @@ fn deliveredBy(chat: bool, stream: bool, body: []const u8) !Delivered {
         if (choices.len > 0) try out.addChoice(chat, true, choices[0]);
     }
     return out;
+}
+
+test "server: a second serve in one process takes downloads, as the first did: its shutdown closed them, its boot opens them" {
+    for (0..2) |_| try eachArch(1, .{}, struct {
+        fn run() !void {
+            if (!downloads.serving()) return error.DownloadsStoppedByAnEarlierServe;
+        }
+    }.run);
 }
 
 test "server: logprobs list exactly the text a reply returns, streamed or not: a stop's own tokens and a cut thought are never listed" {

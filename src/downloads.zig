@@ -513,6 +513,20 @@ pub fn stop() void {
     }
 }
 
+/// A server's boot: the downloads open to it. `stop` is its shutdown; the two are the only writers of `stopping`.
+pub fn start() void {
+    lock();
+    defer unlock();
+    stopping = false;
+}
+
+/// The downloads take work: a server is serving and has not begun its shutdown.
+pub fn serving() bool {
+    lock();
+    defer unlock();
+    return !stopping;
+}
+
 // ── The answer ──────────────────────────────────────────────────────────
 
 pub const PackView = struct {
@@ -1116,6 +1130,8 @@ test "downloads: a symlinked models folder pointed at a stopped pull's copy: the
 }
 
 test "downloads: a pull reports done only once its pack is registered, so the one refresh the page makes on done lists it" {
+    // A server this process served before has stopped the downloads: this pull runs on a serving one.
+    start();
     const io = testing.io;
     const md = @import("model_discovery.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1169,6 +1185,8 @@ test "downloads: a pull reports done only once its pack is registered, so the on
 }
 
 test "downloads: a pull that finishes as the server stops registers its pack before the drain reports the registry free" {
+    // A server this process served before has stopped the downloads: this pull runs on a serving one.
+    start();
     const io = testing.io;
     const md = @import("model_discovery.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1205,11 +1223,7 @@ test "downloads: a pull that finishes as the server stops registers its pack bef
     }
     // The server stops: the request ends, and `stopServing` waits until nothing of the downloads reads the registry.
     stop();
-    defer {
-        lock();
-        stopping = false;
-        unlock();
-    }
+    defer start();
     reg.mutex.unlock(io);
     spins = 0;
     while (registryBusy()) : (spins += 1) {
@@ -1239,11 +1253,7 @@ test "downloads: a catalog refresh that starts after the server stopped reads no
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     stop();
-    defer {
-        lock();
-        stopping = false;
-        unlock();
-    }
+    defer start();
     try testing.expectError(error.ShuttingDown, catalogRoots(arena_state.allocator(), io));
     try testing.expect(!registryBusy());
 }
@@ -1260,11 +1270,7 @@ test "downloads: a pull that finishes after the server stopped registers nothing
     defer job.destroy();
     job.phase = .verifying;
     stop();
-    defer {
-        lock();
-        stopping = false;
-        unlock();
-    }
+    defer start();
     finishJob(job, true);
     try testing.expectEqual(Phase.done, job.phase);
     try testing.expect(!registryBusy());
@@ -1293,8 +1299,8 @@ test "downloads: a pull whose files finished as the server stops ends done and r
             _ = jobs.orderedRemove(i);
             break;
         };
-        stopping = false;
         unlock();
+        start();
     }
     // The server stops as the last file verifies: the files are whole, so the job is done, not stopped.
     stop();

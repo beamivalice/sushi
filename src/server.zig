@@ -786,6 +786,8 @@ pub fn serve(
     };
     if (listener) |l| server_state.listen_port = l.socket.address.ip4.port;
 
+    // `stopServing` closes the downloads; a process that serves again (the test binary does) opens them here.
+    downloads.start();
     const boots_model = !load_params.no_initial_load;
     if (boots_model) boot_gate.process.begin();
     defer if (!boot_gate.process.opened.isSet()) boot_gate.process.fail(io);
