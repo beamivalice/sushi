@@ -756,15 +756,7 @@ pub const KVCache = struct {
                 const sh = mlx.getShape(buf.array);
                 try growQuantBuf(s, buf, true, false, entry.offset, new_cap, sh[0], sh[1], sh[3], mlx.mlx_array_dtype(buf.array));
                 try mlx.check(mlx.mlx_array_eval(buf.array));
-                // The engine's pool keeps a freed buffer as a free one, which MLX's cache clear never reaches. MLX releases
-                // an evaluated graph's inputs when the GPU's command buffer completes, a moment after the eval returns, so
-                // the stream is synchronized first or the next buffer's rebuild starts beside this one's old copy and tail.
-                if (mlx.engine.isStream(s)) {
-                    mlx.engine.trim();
-                } else {
-                    try mlx.check(mlx.mlx_synchronize(s));
-                    _ = mlx.mlx_clear_cache();
-                }
+                try mlx_pages.settleGrown(s);
             }
             kv_cap_buf_grows += 1;
         }
@@ -3946,20 +3938,7 @@ fn fillGrowingLayers(cfg: *const ModelConfig, cache: *KVCache, rows: usize, s: m
     try mlx.check(mlx.mlx_eval(vec));
 }
 
-/// MLX's active bytes at the peak of `work` past what it leaves live, with MLX's pool emptied before and after.
-fn mlxPeakOver(s: mlx.mlx_stream, comptime Work: type, work: Work) !u64 {
-    try mlx.check(mlx.mlx_synchronize(s));
-    _ = mlx.mlx_clear_cache();
-    _ = mlx.mlx_reset_peak_memory();
-    try work.run();
-    try mlx.check(mlx.mlx_synchronize(s));
-    var peak: usize = 0;
-    _ = mlx.mlx_get_peak_memory(&peak);
-    _ = mlx.mlx_clear_cache();
-    var live: usize = 0;
-    _ = mlx.mlx_get_active_memory(&live);
-    return peak -| live;
-}
+const mlxPeakOver = test_support.mlxPeakOver;
 
 /// One MLX page: a buffer past it is whole pages, and a step's scalars are the few bytes beside them.
 const regrow_page_slack: u64 = mlx_pages.page;
@@ -3986,7 +3965,7 @@ test "the dearest decode regrow of a request on MLX holds beside the grown cache
         const Grow = struct {
             cache: *KVCache,
             s: mlx.mlx_stream,
-            fn run(self: @This()) !void {
+            pub fn run(self: @This()) !void {
                 try self.cache.growAhead(1, self.s);
             }
         };
@@ -4062,7 +4041,7 @@ test "the dearest decode regrow of the MTP head's cache on MLX holds beside the 
             rows: usize,
             s: mlx.mlx_stream,
             // Writes the head's layer from its stored rows to `rows`; the write grows the cache inside the graph, as the head's forward does.
-            fn run(self: @This()) !void {
+            pub fn run(self: @This()) !void {
                 const add: c_int = @intCast(self.rows - self.cache.seqLen(0));
                 if (add == 0) return;
                 var k = mlx.mlx_array_new();
@@ -4117,7 +4096,7 @@ test "the compaction of a ringed arch's sliding layers in a decode step on MLX h
             add: usize,
             s: mlx.mlx_stream,
             // Every sliding layer takes `add` rows, as one decode step's forward builds them before it is evaluated.
-            fn run(self: @This()) !void {
+            pub fn run(self: @This()) !void {
                 var li: u32 = 0;
                 while (li < self.cfg.num_hidden_layers) : (li += 1) {
                     if (self.cfg.isGlobalLayer(li)) continue;

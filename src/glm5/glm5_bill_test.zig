@@ -286,3 +286,31 @@ test "GLM's DFlash2 reserve holds no more latent or pooled rows than its request
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
 }
+
+test "a native GLM decode step's regrow, one buffer's old copy and tail, fits what the request's bill holds beyond its cache, at every prompt and reply" {
+    var cfg = try model_mod.parseConfigFromJson(std.testing.allocator, @embedFile("../fixtures/glm5_config.json"));
+    defer cfg.deinit(std.testing.allocator);
+    cfg.dflash_loaded = false;
+    // The pooled index grows a row per four tokens, so its row is a quarter of the latent buffers' widest part.
+    const pool_row: u64 = @as(u64, cfg.indexer_head_dim) * 2 / 4;
+    var short: usize = 0;
+    for ([_]u32{ 1024, 65536, 1048576 }) |ctx| {
+        cfg.pinned_context = ctx;
+        for ([_]u64{ 16, 8, 6 }) |kv_bits| {
+            const parts = glm_bill.latentPartBytes(cfg.mla_kv_lora_rank, if (kv_bits == 16) 0 else @intCast(kv_bits), 2);
+            const row = @max(std.mem.max(u64, &parts), pool_row);
+            for ([_][2]u64{ .{ 1, 4096 }, .{ 16, std.math.maxInt(u32) }, .{ 1000, 24 }, .{ 1023, 1 }, .{ 4000, 4000 }, .{ 32768, 32768 }, .{ 131072, 4096 }, .{ 500000, std.math.maxInt(u32) } }) |shape| {
+                if (shape[0] >= ctx) continue;
+                const max_tokens: u32 = @intCast(@min(shape[1], ctx - shape[0]));
+                // Old copy and zero tail make up the grown buffer whole, at most the cache's final rows.
+                const regrow = glm_bill.glmCacheRows(&cfg, shape[0], max_tokens, kv_bits) * row;
+                const beyond = glm_bill.requestBill(&cfg, shape[0], max_tokens, kv_bits, 2048, .{}).? - glm_bill.glmCacheBytes(&cfg, shape[0], max_tokens, kv_bits) - bills.slotRingBytes(&cfg, kv_bits);
+                if (regrow > beyond) {
+                    short += 1;
+                    std.debug.print("ctx {d} kv{d} {d}+{d}: regrow {d} B, bill beyond the cache and its ring {d} B\n", .{ ctx, kv_bits, shape[0], max_tokens, regrow, beyond });
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), short);
+}

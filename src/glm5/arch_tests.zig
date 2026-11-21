@@ -28,6 +28,7 @@ pub const tests = .{
     @import("glm5_dflash.zig"),
     @import("glm5_dflash_cache.zig"),
     @import("glm5_forward.zig"),
+    @import("glm5_regrow_test.zig"),
     @import("glm5_prefix.zig"),
     @import("glm5_prefix_cache_test.zig"),
     @import("glm5_generate.zig"),

@@ -156,6 +156,19 @@ pub fn grownBuffer(kept: mlx.mlx_array, shape: []const c_int, axis: usize, dtype
     return .{ .array = joined, .capacity_bytes = shapeBytes(shape, dtype), .grid = if (ring) .ring else .paged };
 }
 
+/// After a grown buffer was evaluated and its old handle freed, before the next is rebuilt. MLX releases an evaluated
+/// graph's inputs when the GPU's command buffer completes, a moment after the eval returns, so the stream is
+/// synchronized and its pool emptied, or the next rebuild starts beside this one's old copy and tail; the engine's pool
+/// keeps a freed buffer as a free one, which `trim` returns.
+pub fn settleGrown(s: mlx.mlx_stream) !void {
+    if (mlx.engine.isStream(s)) {
+        mlx.engine.trim();
+    } else {
+        try mlx.check(mlx.mlx_synchronize(s));
+        _ = mlx.mlx_clear_cache();
+    }
+}
+
 fn zeros(shape: []const c_int, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     mlx.engine.roomFor(shape, dtype);
     var made = mlx.mlx_array_new();

@@ -429,6 +429,21 @@ pub fn mlxSettledActiveBytes(s: mlx.mlx_stream) usize {
     return active;
 }
 
+/// MLX's active bytes at the peak of `work` past what it leaves live, with MLX's pool emptied before and after.
+pub fn mlxPeakOver(s: mlx.mlx_stream, comptime Work: type, work: Work) !u64 {
+    try mlx.check(mlx.mlx_synchronize(s));
+    _ = mlx.mlx_clear_cache();
+    _ = mlx.mlx_reset_peak_memory();
+    try work.run();
+    try mlx.check(mlx.mlx_synchronize(s));
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    _ = mlx.mlx_clear_cache();
+    var live: usize = 0;
+    _ = mlx.mlx_get_active_memory(&live);
+    return peak -| live;
+}
+
 pub fn qsaArraysAllEqual(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !bool {
     var eq = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(eq);

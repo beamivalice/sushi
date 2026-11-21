@@ -309,7 +309,7 @@ const Layer = struct {
         }
     }
 };
-const LayerState = struct {
+pub const LayerState = struct {
     recurrent: @import("../trunk.zig").SSMCacheEntry,
     attention: @import("glm5_attention.zig").State,
     fn init() LayerState {
@@ -669,6 +669,10 @@ pub const Model = struct {
         const staged_decode = self.expert_stream == null and ish[1] == 1 and request.decode_async;
         const staged_prefill = self.expert_stream == null and ish[1] > 1 and request.prefill_async;
         if (request.boundaries != null and (staged_decode or staged_prefill)) return error.GlmBoundaryCaptureNeedsSyncLayers;
+        // A decode step grows each MLA layer's cache before its graph is built, a buffer at a time (`State.growAhead`).
+        if (ish[1] == 1) for (self.layers, request.layers) |*layer, *state| {
+            if (layer.attn == .mla) try state.attention.growAhead(1, self.s);
+        };
         var h = try self.embedStreams(ids, embedded);
         defer _ = mlx.mlx_array_free(h);
         if (request.boundaries) |sink| try sink.append(sink.ctx, 0, h);
@@ -873,13 +877,18 @@ fn fixtureMlp(weights: *model.Weights, prefix: []const u8) !void {
 }
 
 pub fn completeFixture(weights: *model.Weights) !model.ModelConfig {
+    return completeFixtureLayers(weights, 4);
+}
+
+/// `completeFixture` with `layers` layers: the first three dense KDA, then MoE, MLA on every fourth.
+pub fn completeFixtureLayers(weights: *model.Weights, layers: u32) !model.ModelConfig {
     const a = std.testing.allocator;
     const cfg = model.ModelConfig{
         .model_type = "glm5_next",
         .weight_prefix = "model.language_model",
         .hidden_size = 128,
         .vocab_size = 4,
-        .num_hidden_layers = 4,
+        .num_hidden_layers = layers,
         .first_k_dense_replace = 3,
         .intermediate_size = 128,
         .moe_intermediate_size = 128,
@@ -919,7 +928,7 @@ pub fn completeFixture(weights: *model.Weights) !model.ModelConfig {
     }
     try fixtureTensor(weights, cfg.weight_prefix, "norm.weight", &.{128}, .bfloat16, true);
 
-    for (0..4) |i| {
+    for (0..layers) |i| {
         var buf: [128]u8 = undefined;
         const p = try std.fmt.bufPrint(&buf, "model.language_model.layers.{d}", .{i});
         for ([_][]const u8{ "hc_attn_fn", "hc_ffn_fn" }) |k| try fixtureTensor(weights, p, k, &.{ 24, 512 }, .float32, false);
@@ -928,7 +937,7 @@ pub fn completeFixture(weights: *model.Weights) !model.ModelConfig {
         for ([_][]const u8{ "input_layernorm.weight", "post_attention_layernorm.weight" }) |k| try fixtureTensor(weights, p, k, &.{128}, .bfloat16, true);
         var sb: [160]u8 = undefined;
         const ap = try std.fmt.bufPrint(&sb, "{s}.self_attn", .{p});
-        if (i < 3) {
+        if ((i + 1) % 4 != 0) {
             for ([_][]const u8{ "q_proj.weight", "k_proj.weight", "v_proj.weight", "f_a_proj.weight", "f_b_proj.weight", "g_a_proj.weight", "g_b_proj.weight", "o_proj.weight" }) |k| try fixtureTensor(weights, ap, k, &.{ 128, 128 }, .bfloat16, false);
             try fixtureTensor(weights, ap, "b_proj.weight", &.{ 1, 128 }, .bfloat16, false);
             for ([_][]const u8{ "q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight" }) |k| try fixtureTensor(weights, ap, k, &.{ 128, 1, 4 }, .bfloat16, false);
@@ -1164,8 +1173,13 @@ test "GLM MLA binds the kv bank bits once and projects with them in the bytes of
 }
 
 pub fn nonzeroDecodeFixture(weights: *model.Weights) !model.ModelConfig {
-    var cfg = try completeFixture(weights);
-    cfg.max_position_embeddings = 512;
+    return nonzeroDecodeFixtureLayers(weights, 4, 512);
+}
+
+/// `nonzeroDecodeFixture` with `layers` layers and room for `positions` rows.
+pub fn nonzeroDecodeFixtureLayers(weights: *model.Weights, layers: u32, positions: u32) !model.ModelConfig {
+    var cfg = try completeFixtureLayers(weights, layers);
+    cfg.max_position_embeddings = positions;
     var iter = weights.map.iterator();
     var seed: usize = 0;
     while (iter.next()) |entry| {
