@@ -304,12 +304,10 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `request-bool-read` flags `x == .bool` and `x != .bool` in the files that read a request body (`server`, `anthropic`,
   `completions`, `responses_api`, `http_conn`, `request_policy`, `generation_stream`): a request's bool is read by
   `request_parse.boolField`, so another type is refused by name and never read as the default.
-  `in-place-buffer` flags a fn outside `mlx_pages.zig` that makes a buffer with `mlx_zeros` and writes with
-  `mlx_slice_update`: a buffer written in place is made by `mlx_pages.inPlaceBuffer`, which refuses one off MLX's page grid.
-  `in-place-buffer` flags a fn outside `mlx_pages.zig` that makes a buffer (`mlx_zeros`, `mlx_full`, `mlx_concatenate_axis`,
-  a scope's `zeros` or `join`) and writes with `mlx_slice_update`: a buffer written in place is made by
-  `mlx_pages.inPlaceBuffer` or `grownBuffer`, which refuse one off MLX's page grid. A buffer made in one fn and written in
-  another is out of its reach (`Rows.put`, `KVCache.writeAtOffset`, DeepSeek's `Ring.write`).
+  `in-place-write` flags `mlx_slice_update` outside `mlx_pages.zig`, `src/mlx.zig` and `src/tensor/` (tests exempt), and
+  an `InPlace` built outside `mlx_pages.zig`: a buffer written in place is held as `mlx_pages.InPlace`, which records its
+  bytes when `mlx_pages` makes or `adopt`s it, and only `InPlace.write` writes it, refusing one off MLX's page grid
+  against that record (no MLX read, so a write adds no host query).
   `cache-room` flags `roomFor` outside `mlx_pages.zig` and `src/tensor/`: the constructor that makes a cache buffer takes
   the engine's room for it once, as admission bills it.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry

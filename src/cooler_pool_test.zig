@@ -4,6 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 const mlx = @import("mlx.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const model_mod = @import("model.zig");
 const arch_handle = @import("arch/handle.zig");
 const test_support = @import("test_support.zig");
@@ -1641,7 +1642,7 @@ fn oneTokenRequestHeld(comptime Q: type, cooler: bool) !void {
     while (try gen.next(a)) |_| steps += 1;
     var held: usize = 0;
     for (ld.xfm.cache.entries) |entry| if (entry.initialized) {
-        held = @max(held, @import("kv_cache.zig").KVCache.bufferCapacity(entry.keys));
+        held = @max(held, @import("kv_cache.zig").KVCache.bufferCapacity(entry.keys.array));
     };
     const st = bills.cacheStorage(c, 1, n, kv_bits, chunk, .{});
     if (held > st.rows) std.debug.print("cooler contract: cooler {}: a 1-token prompt, {d} decoded, end_tokens {d}: the cache holds {d} rows, the bill prices {d}\n", .{ cooler, steps, ld.xfm.cache.end_tokens, held, st.rows });
@@ -1715,7 +1716,7 @@ test "cooler contract: the dearest decode regrow of a request holds beside the g
         while (offset < seq + max_tokens) {
             mlx.engine.close();
             mlx.engine.trim();
-            const old_rows = KV.bufferCapacity(cache.entries[3].keys);
+            const old_rows = KV.bufferCapacity(cache.entries[3].keys.array);
             mlx.engine.resetPoolPeak(.process);
             try cache.growAhead(1, s);
             mlx.engine.close();
@@ -1727,12 +1728,12 @@ test "cooler contract: the dearest decode regrow of a request holds beside the g
             // The peak is under the bill's whole old copy and tail by the layer's four small buffers a rebuild has not yet grown.
             const last = &cache.entries[cfg.num_hidden_layers - 1];
             var later: u64 = 0;
-            for ([_]mlx.mlx_array{ last.keys_scales, last.keys_biases, last.values_scales, last.values_biases }) |buf| {
+            for ([_]mlx.mlx_array{ last.keys_scales.array, last.keys_biases.array, last.values_scales.array, last.values_biases.array }) |buf| {
                 const row = mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf) / KV.bufferCapacity(buf);
                 later += pool_class.poolBytes(KV.bufferCapacity(buf) * row) - pool_class.poolBytes(old_rows * row);
             }
             later_most = @max(later_most, later);
-            offset = @min(KV.bufferCapacity(cache.entries[3].keys), seq + max_tokens);
+            offset = @min(KV.bufferCapacity(cache.entries[3].keys.array), seq + max_tokens);
             try fillKvCache(&cfg, &cache, offset);
         }
         const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
@@ -1806,7 +1807,7 @@ test "cooler contract: the dearest decode regrow of the MTP head's cache holds b
             const peak = mlx.engine.poolPeak(.process);
             mlx.engine.trim();
             dearest = @max(dearest, peak -| (mlx.engine.poolTotal() - mlx.engine.poolFree()));
-            offset = @min(KV.bufferCapacity(cache.entries[0].keys), end);
+            offset = @min(KV.bufferCapacity(cache.entries[0].keys.array), end);
             try fillHeadCache(&cfg, &cache, offset);
         }
         const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
@@ -1844,14 +1845,16 @@ test "cooler contract: the dearest decode regrow of the QSA history holds beside
             .reserve = @import("prefill_plan.zig").reservedPrefillTokens(&cfg, seq, max_tokens, chunk),
             .end = trunk.KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(&cfg), 0),
         };
-        var pooled: [64]mlx.mlx_array = @splat(.{ .ctx = null });
+        var pooled: [64]mlx_pages.InPlace = @splat(.none);
         var pooled_view: [64]mlx.mlx_array = @splat(.{ .ctx = null });
-        var bank: [64]mlx.mlx_array = @splat(.{ .ctx = null });
+        var bank: [64]mlx_pages.InPlace = @splat(.none);
         var bank_view: [64]mlx.mlx_array = @splat(.{ .ctx = null });
         var pooled_count: [64]c_int = @splat(0);
         var bank_count: [64]c_int = @splat(0);
         defer for (0..layers) |i| {
-            for ([_]mlx.mlx_array{ pooled[i], pooled_view[i], bank[i], bank_view[i] }) |a| _ = mlx.mlx_array_free(a);
+            pooled[i].deinit();
+            bank[i].deinit();
+            for ([_]mlx.mlx_array{ pooled_view[i], bank_view[i] }) |a| _ = mlx.mlx_array_free(a);
         };
         // Every layer's history, grown to the prompt's blocks and then a block at a time (a block per `ratio` tokens).
         var blocks: usize = 0;
@@ -1872,12 +1875,12 @@ test "cooler contract: the dearest decode regrow of the QSA history holds beside
             try mlx.check(mlx.mlx_ones(&chunks[0], &[_]c_int{ 1, add, hd }, 3, .bfloat16, s));
             try mlx.check(mlx.mlx_ones(&chunks[1], &[_]c_int{ 1, 1, hd, add }, 4, .float32, s));
             const before = mlx.engine.poolTotal() - mlx.engine.poolFree();
-            const caps: usize = if (pooled[0].ctx != null) @intCast(mlx.getShape(pooled[0])[1]) else 0;
+            const caps: usize = if (pooled[0].array.ctx != null) @intCast(mlx.getShape(pooled[0].array)[1]) else 0;
             for (0..layers) |i| {
                 try trunk.capBufAppend(s, &pooled[i], &pooled_view[i], &pooled_count[i], chunks[0], 1, hold, ratio);
                 try trunk.capBufAppend(s, &bank[i], &bank_view[i], &bank_count[i], chunks[1], 3, hold, ratio);
-                _ = mlx.mlx_vector_array_append_value(vec, pooled[i]);
-                _ = mlx.mlx_vector_array_append_value(vec, bank[i]);
+                _ = mlx.mlx_vector_array_append_value(vec, pooled[i].array);
+                _ = mlx.mlx_vector_array_append_value(vec, bank[i].array);
             }
             try mlx.check(mlx.mlx_eval(vec));
             mlx.engine.close();
@@ -1886,12 +1889,12 @@ test "cooler contract: the dearest decode regrow of the QSA history holds beside
             const after = mlx.engine.poolTotal() - mlx.engine.poolFree();
             _ = before;
             // A regrow beyond the first fill: the history held its capacity and the block did not fit.
-            if (caps != 0 and @as(usize, @intCast(mlx.getShape(pooled[0])[1])) != caps) {
+            if (caps != 0 and @as(usize, @intCast(mlx.getShape(pooled[0].array)[1])) != caps) {
                 regrows += 1;
                 dearest = @max(dearest, peak -| after);
             }
             blocks = target;
-            target = @min(end_blocks, @as(usize, @intCast(mlx.getShape(pooled[0])[1])) + 1);
+            target = @min(end_blocks, @as(usize, @intCast(mlx.getShape(pooled[0].array)[1])) + 1);
             if (target == blocks) break;
         }
         const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;

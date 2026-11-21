@@ -367,7 +367,7 @@ test "GLM serving stores the latent its slot cache names and refuses kv4 by name
         }
         const stored = glm5_state.ownRequestOf(&xfm).?;
         try testing.expectEqual(bits, stored.latent_bits);
-        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(stored.layers[3].attention.latent));
+        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(stored.layers[3].attention.latent.array));
     }
     const served = glm5_state.ownRequestOf(&xfm).?;
     const ids = mlx.mlx_array_new_data(&[_]u32{0}, &[_]c_int{ 1, 1 }, 2, .uint32);
@@ -380,7 +380,7 @@ test "GLM serving stores the latent its slot cache names and refuses kv4 by name
     const plain = try xfm.forward(ids);
     defer _ = mlx.mlx_array_free(plain);
     try testing.expectEqual(@as(u8, 0), served.latent_bits);
-    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(served.layers[3].attention.latent));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(served.layers[3].attention.latent.array));
 }
 
 test "GLM serving streams EXL3 experts through eviction and the union, bit-identical to resident at BF16 and kv8 latents" {

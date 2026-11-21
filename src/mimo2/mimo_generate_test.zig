@@ -65,9 +65,9 @@ fn kvRowsEqual(x: *Trunk, y: *Trunk, layer: usize, rows: usize) !bool {
     const ex = &x.cache.entries[layer];
     const ey = &y.cache.entries[layer];
     const pairs = [_][2]mlx.mlx_array{
-        .{ ex.keys, ey.keys },                   .{ ex.values, ey.values },
-        .{ ex.keys_scales, ey.keys_scales },     .{ ex.keys_biases, ey.keys_biases },
-        .{ ex.values_scales, ey.values_scales }, .{ ex.values_biases, ey.values_biases },
+        .{ ex.keys.array, ey.keys.array },                   .{ ex.values.array, ey.values.array },
+        .{ ex.keys_scales.array, ey.keys_scales.array },     .{ ex.keys_biases.array, ey.keys_biases.array },
+        .{ ex.values_scales.array, ey.values_scales.array }, .{ ex.values_biases.array, ey.values_biases.array },
     };
     const s = x.s;
     for (pairs) |p| {

@@ -38,6 +38,7 @@ const testTrunk = @import("test_support.zig").testTrunk;
 const arch_handle = @import("arch/handle.zig");
 const sched_policy = @import("sched_policy.zig");
 const mlx = @import("mlx.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const arch_state = @import("arch/arch_state.zig");
 const model_handle = @import("model_handle.zig");
 const trunk = @import("trunk.zig");
@@ -5880,8 +5881,8 @@ test "a freed MiMo slot returns its KV to the OS, not to MLX's pool" {
         try mlx.check(mlx.mlx_arange(&kv, 0, @floatFromInt(kv_bytes / 4), 1, .float32, s));
         try mlx.check(mlx.mlx_array_eval(kv));
         _ = mlx.mlx_synchronize(s);
-        _ = mlx.mlx_array_free(done.cache.entries[0].keys);
-        done.cache.entries[0].keys = kv;
+        _ = mlx.mlx_array_free(done.cache.entries[0].keys.array);
+        done.cache.entries[0].keys = mlx_pages.InPlace.adopt(kv, .paged);
         deinitSlotsReturningPool(&.{done});
         var pooled: usize = 0;
         _ = mlx.mlx_get_cache_memory(&pooled);
@@ -6253,10 +6254,14 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     sch.current_model = &model;
 
     var cp_entries = [_]trunk.KVCacheEntry{trunk.newEmptyKVEntry()};
-    _ = mlx.mlx_zeros(&cp_entries[0].keys, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
-    defer _ = mlx.mlx_array_free(cp_entries[0].keys);
-    _ = mlx.mlx_zeros(&cp_entries[0].values, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
-    defer _ = mlx.mlx_array_free(cp_entries[0].values);
+    var cp_keys = mlx.mlx_array_new();
+    _ = mlx.mlx_zeros(&cp_keys, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
+    cp_entries[0].keys = mlx_pages.InPlace.adopt(cp_keys, .paged);
+    defer cp_entries[0].keys.deinit();
+    var cp_values = mlx.mlx_array_new();
+    _ = mlx.mlx_zeros(&cp_values, &[_]c_int{ 1, 1, 8, 4 }, 4, .bfloat16, s);
+    cp_entries[0].values = mlx_pages.InPlace.adopt(cp_values, .paged);
+    defer cp_entries[0].values.deinit();
     cp_entries[0].initialized = true;
     const cp_bytes: u64 = 2 * (8 * 4) * 2;
 

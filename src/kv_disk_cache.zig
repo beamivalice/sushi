@@ -252,7 +252,7 @@ fn mib(b: u64) f64 {
 
 /// A KV layer's buffers: keys, values and, when quantized, their scales and biases.
 fn layerArrays(e: *const trunk.KVCacheEntry) [6]mlx.mlx_array {
-    return .{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+    return .{ e.keys.array, e.values.array, e.keys_scales.array, e.keys_biases.array, e.values_scales.array, e.values_biases.array };
 }
 
 /// Bytes per token row of a `[1, H, rows, D]` buffer; 0 for an empty one.
@@ -1005,7 +1005,7 @@ pub const DiskTier = struct {
         defer _ = mlx.mlx_vector_array_free(vec);
         const kinds: []const []const u8 = if (quant.scheme == .off) &.{ "k", "v" } else &.{ "k", "v", "ks", "kb", "vs", "vb" };
         for (entries, 0..) |*en, li| {
-            const slots = [_]*mlx.mlx_array{ &en.keys, &en.values, &en.keys_scales, &en.keys_biases, &en.values_scales, &en.values_biases };
+            const slots = [_]*mlx_pages.InPlace{ &en.keys, &en.values, &en.keys_scales, &en.keys_biases, &en.values_scales, &en.values_biases };
             for (kinds, 0..) |kind, ki| {
                 const key = try std.fmt.allocPrint(self.allocator, "l{d}.{s}\x00", .{ li, kind });
                 defer self.allocator.free(key);
@@ -1015,8 +1015,8 @@ pub const DiskTier = struct {
                     if (ki == 0) break; // not a ringed layer
                     return error.DiskCacheCorruptRing;
                 }
-                _ = mlx.mlx_array_free(slots[ki].*);
-                slots[ki].* = arr;
+                slots[ki].deinit();
+                slots[ki].* = mlx_pages.InPlace.adopt(arr, .ring);
                 const shape = mlx.getShape(arr);
                 if (shape.len != 4 or shape[2] <= 0 or shape[2] > pos) return error.DiskCacheCorruptRing;
                 const rows: usize = @intCast(shape[2]);
@@ -1261,10 +1261,10 @@ pub const DiskTier = struct {
         // every chunk beside the result (twice the restored KV). Layers absent from chunk 0 stay uninitialized: the
         // GatedDeltaNet layers of a hybrid arch have no KV (their state rides the SSM checkpoints).
         const n_layers = cache.entries.len;
-        const dsts = try self.allocator.alloc(mlx.mlx_array, n_layers * kinds.len);
-        for (dsts) |*d| d.* = mlx.mlx_array_new();
+        const dsts = try self.allocator.alloc(mlx_pages.InPlace, n_layers * kinds.len);
+        for (dsts) |*d| d.* = .none;
         defer {
-            for (dsts) |d| _ = mlx.mlx_array_free(d);
+            for (dsts) |*d| d.deinit();
             self.allocator.free(dsts);
         }
         const present = try self.allocator.alloc(bool, n_layers);
@@ -1337,23 +1337,21 @@ pub const DiskTier = struct {
                     const rows = mlx.getShape(arr);
                     if (chunk_i == 0) {
                         const made = try mlx_pages.inPlaceBuffer(&.{ rows[0], rows[1], rows_held, rows[3] }, mlx.mlx_array_dtype(arr), s);
-                        _ = mlx.mlx_array_free(dst.*);
+                        dst.deinit();
                         dst.* = made;
                     }
-                    const dshape = mlx.getShape(dst.*);
+                    const dshape = mlx.getShape(dst.array);
                     if (dshape.len != 4 or dshape[0] != rows[0] or dshape[1] != rows[1] or dshape[3] != rows[3])
                         return error.DiskCacheCorruptChunk;
                     var updated = mlx.mlx_array_new();
                     const st = [_]c_int{ 0, 0, @intCast(c0), 0 };
                     const sp = [_]c_int{ rows[0], rows[1], @intCast(c0 + need), rows[3] };
-                    const sd = [_]c_int{ 1, 1, 1, 1 };
-                    const rc = mlx.mlx_slice_update(&updated, dst.*, arr, &st, 4, &sp, 4, &sd, 4, s);
-                    if (rc != 0) {
+                    const next = dst.write(&updated, arr, &st, &sp, s) catch |err| {
                         _ = mlx.mlx_array_free(updated);
-                        try mlx.check(rc);
-                    }
-                    _ = mlx.mlx_array_free(dst.*);
-                    dst.* = updated;
+                        return err;
+                    };
+                    _ = mlx.mlx_array_free(dst.array);
+                    dst.* = next;
                     _ = mlx.mlx_vector_array_append_value(chunk_arrays, updated);
                 }
             }
@@ -1370,11 +1368,11 @@ pub const DiskTier = struct {
         for (cache.entries, 0..) |*dst, li| {
             trunk.resetKVEntry(dst);
             if (!present[li]) continue;
-            const slots = [_]*mlx.mlx_array{ &dst.keys, &dst.values, &dst.keys_scales, &dst.keys_biases, &dst.values_scales, &dst.values_biases };
+            const slots = [_]*mlx_pages.InPlace{ &dst.keys, &dst.values, &dst.keys_scales, &dst.keys_biases, &dst.values_scales, &dst.values_biases };
             for (slots[0..kinds.len], dsts[li * kinds.len ..][0..kinds.len]) |slot, *filled| {
-                _ = mlx.mlx_array_free(slot.*);
+                slot.deinit();
                 slot.* = filled.*;
-                filled.* = mlx.mlx_array_new();
+                filled.* = .none;
             }
             dst.offset = limit;
             dst.initialized = true;
@@ -1979,7 +1977,7 @@ pub const DiskTier = struct {
                 log.debug("  [disk-cache] skip: layer offset {d} < kv_len {d}\n", .{ entry.offset, kv_target_u });
                 return .skipped;
             }
-            const shape = mlx.getShape(entry.keys);
+            const shape = mlx.getShape(entry.keys.array);
             if (shape.len != 4 or shape[0] != 1) {
                 log.debug("  [disk-cache] skip: non-B1 cache shape\n", .{});
                 return .skipped;
@@ -2707,13 +2705,13 @@ pub const DiskTier = struct {
         const first = list.items.len;
         for (sc.entries, 0..) |*entry, li| {
             if (!entry.initialized) continue;
-            try self.appendSpecSlice(list, prefix, li, "k", entry.keys, limit, s);
-            try self.appendSpecSlice(list, prefix, li, "v", entry.values, limit, s);
+            try self.appendSpecSlice(list, prefix, li, "k", entry.keys.array, limit, s);
+            try self.appendSpecSlice(list, prefix, li, "v", entry.values.array, limit, s);
             if (affine) {
-                try self.appendSpecSlice(list, prefix, li, "ks", entry.keys_scales, limit, s);
-                try self.appendSpecSlice(list, prefix, li, "kb", entry.keys_biases, limit, s);
-                try self.appendSpecSlice(list, prefix, li, "vs", entry.values_scales, limit, s);
-                try self.appendSpecSlice(list, prefix, li, "vb", entry.values_biases, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "ks", entry.keys_scales.array, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "kb", entry.keys_biases.array, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "vs", entry.values_scales.array, limit, s);
+                try self.appendSpecSlice(list, prefix, li, "vb", entry.values_biases.array, limit, s);
             }
         }
         for (list.items[first..]) |*t| t.rows = .{ .axis = 2, .pos0 = sc.base_pos };
@@ -2881,28 +2879,28 @@ pub const DiskTier = struct {
                 // transfer the +1 handed by _get, replacing the empty handle
                 switch (ki) {
                     0 => {
-                        _ = mlx.mlx_array_free(en.keys);
-                        en.keys = arr;
+                        _ = mlx.mlx_array_free(en.keys.array);
+                        en.keys = mlx_pages.InPlace.adopt(arr, .paged);
                     },
                     1 => {
-                        _ = mlx.mlx_array_free(en.values);
-                        en.values = arr;
+                        _ = mlx.mlx_array_free(en.values.array);
+                        en.values = mlx_pages.InPlace.adopt(arr, .paged);
                     },
                     2 => {
-                        _ = mlx.mlx_array_free(en.keys_scales);
-                        en.keys_scales = arr;
+                        _ = mlx.mlx_array_free(en.keys_scales.array);
+                        en.keys_scales = mlx_pages.InPlace.adopt(arr, .paged);
                     },
                     3 => {
-                        _ = mlx.mlx_array_free(en.keys_biases);
-                        en.keys_biases = arr;
+                        _ = mlx.mlx_array_free(en.keys_biases.array);
+                        en.keys_biases = mlx_pages.InPlace.adopt(arr, .paged);
                     },
                     4 => {
-                        _ = mlx.mlx_array_free(en.values_scales);
-                        en.values_scales = arr;
+                        _ = mlx.mlx_array_free(en.values_scales.array);
+                        en.values_scales = mlx_pages.InPlace.adopt(arr, .paged);
                     },
                     5 => {
-                        _ = mlx.mlx_array_free(en.values_biases);
-                        en.values_biases = arr;
+                        _ = mlx.mlx_array_free(en.values_biases.array);
+                        en.values_biases = mlx_pages.InPlace.adopt(arr, .paged);
                     },
                     else => unreachable,
                 }
@@ -2922,13 +2920,13 @@ pub const DiskTier = struct {
             var count: usize = 0;
             for (entries) |*en| {
                 if (!en.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(vec, en.keys);
-                _ = mlx.mlx_vector_array_append_value(vec, en.values);
+                _ = mlx.mlx_vector_array_append_value(vec, en.keys.array);
+                _ = mlx.mlx_vector_array_append_value(vec, en.values.array);
                 if (meta.quant.scheme != .off) {
-                    _ = mlx.mlx_vector_array_append_value(vec, en.keys_scales);
-                    _ = mlx.mlx_vector_array_append_value(vec, en.keys_biases);
-                    _ = mlx.mlx_vector_array_append_value(vec, en.values_scales);
-                    _ = mlx.mlx_vector_array_append_value(vec, en.values_biases);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.keys_scales.array);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.keys_biases.array);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.values_scales.array);
+                    _ = mlx.mlx_vector_array_append_value(vec, en.values_biases.array);
                 }
                 count += 1;
             }
@@ -3119,13 +3117,13 @@ pub const DiskTier = struct {
         r1: u32,
         s: mlx.mlx_stream,
     ) !void {
-        try self.appendSlice(list, li, "k", entry.keys, r0, r1, s);
-        try self.appendSlice(list, li, "v", entry.values, r0, r1, s);
+        try self.appendSlice(list, li, "k", entry.keys.array, r0, r1, s);
+        try self.appendSlice(list, li, "v", entry.values.array, r0, r1, s);
         if (config.scheme != .off) {
-            try self.appendSlice(list, li, "ks", entry.keys_scales, r0, r1, s);
-            try self.appendSlice(list, li, "kb", entry.keys_biases, r0, r1, s);
-            try self.appendSlice(list, li, "vs", entry.values_scales, r0, r1, s);
-            try self.appendSlice(list, li, "vb", entry.values_biases, r0, r1, s);
+            try self.appendSlice(list, li, "ks", entry.keys_scales.array, r0, r1, s);
+            try self.appendSlice(list, li, "kb", entry.keys_biases.array, r0, r1, s);
+            try self.appendSlice(list, li, "vs", entry.values_scales.array, r0, r1, s);
+            try self.appendSlice(list, li, "vb", entry.values_biases.array, r0, r1, s);
         }
     }
 
@@ -5101,7 +5099,7 @@ fn cacheBufValueAt(cache: *KVCache, layer: u32, pos: u32, d: u32, s: mlx.mlx_str
     const st = [_]c_int{ 0, 0, @intCast(pos), @intCast(d) };
     const sp = [_]c_int{ 1, 1, @intCast(pos + 1), @intCast(d + 1) };
     const sd = [_]c_int{ 1, 1, 1, 1 };
-    const buf = if (values) entry.values else entry.keys;
+    const buf = if (values) entry.values.array else entry.keys.array;
     try mlx.check(mlx.mlx_slice(&sliced, buf, &st, 4, &sp, 4, &sd, 4, s));
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
@@ -7235,7 +7233,7 @@ test "DiskTier: the staged encoder carries __metadata__, and refuses a value it 
 
     var list = std.ArrayList(DiskTier.NamedTensor).empty;
     defer tier.freeNamed(&list);
-    try tier.appendSlice(&list, 0, "k", cache.entries[0].keys, 0, 128, s);
+    try tier.appendSlice(&list, 0, "k", cache.entries[0].keys.array, 0, 128, s);
 
     const meta = [_]DiskTier.MetaPair{
         .{ .key = "layers", .value = "3" },
@@ -7733,12 +7731,12 @@ test "DiskTier: the staged serializer evals ONCE per chunk, byte-identically to 
     for ([_]*std.ArrayList(DiskTier.NamedTensor){ &a, &b }) |list| {
         for (cache.entries, 0..) |*e, li| {
             try testing.expect(e.initialized);
-            try tier.appendSlice(list, li, "k", e.keys, 0, 128, s);
-            try tier.appendSlice(list, li, "v", e.values, 0, 128, s);
-            try tier.appendSlice(list, li, "ks", e.keys_scales, 0, 128, s);
-            try tier.appendSlice(list, li, "kb", e.keys_biases, 0, 128, s);
-            try tier.appendSlice(list, li, "vs", e.values_scales, 0, 128, s);
-            try tier.appendSlice(list, li, "vb", e.values_biases, 0, 128, s);
+            try tier.appendSlice(list, li, "k", e.keys.array, 0, 128, s);
+            try tier.appendSlice(list, li, "v", e.values.array, 0, 128, s);
+            try tier.appendSlice(list, li, "ks", e.keys_scales.array, 0, 128, s);
+            try tier.appendSlice(list, li, "kb", e.keys_biases.array, 0, 128, s);
+            try tier.appendSlice(list, li, "vs", e.values_scales.array, 0, 128, s);
+            try tier.appendSlice(list, li, "vb", e.values_biases.array, 0, 128, s);
         }
     }
     try testing.expectEqual(@as(usize, 18), a.items.len);
@@ -9189,10 +9187,10 @@ test "DiskTier row groups: a ring file over rows an earlier one held stores only
     for (ring.entries, cache.entries) |*got, *want| {
         var rows = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(rows);
-        try sliceAxis(&rows, want.keys, 2, 500, 1300, s);
+        try sliceAxis(&rows, want.keys.array, 2, 500, 1300, s);
         var eq = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(eq);
-        try mlx.check(mlx.mlx_array_equal(&eq, rows, got.keys, false, s));
+        try mlx.check(mlx.mlx_array_equal(&eq, rows, got.keys.array, false, s));
         var same = false;
         try mlx.check(mlx.mlx_array_item_bool(&same, eq));
         try testing.expect(same);

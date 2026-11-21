@@ -694,7 +694,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
             if (!entry.initialized) continue;
             layers[i] = layer;
             old_keys[i] = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_array_set(&old_keys[i], entry.keys));
+            try mlx.check(mlx.mlx_array_set(&old_keys[i], entry.keys.array));
             break;
         }
         try testing.expect(old_keys[i].ctx != null);
@@ -717,7 +717,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
         const slot = slots[i].?;
         try testing.expectEqual(before[i], slot.off);
         try testing.expectEqual(before[i], slot.cache.entries[layers[i]].offset);
-        try Prefix.equal(old_keys[i], slot.cache.entries[layers[i]].keys, before[i], xfm.s);
+        try Prefix.equal(old_keys[i], slot.cache.entries[layers[i]].keys.array, before[i], xfm.s);
         try Prefix.state(saved_ssm[i], slot.entries, xfm.s);
         for (slot.entries) |entry| {
             try testing.expectEqual(@as(u32, 0), entry.spec_ple_len);
@@ -737,7 +737,7 @@ test "acceptance failure restores every unfinished row after verify returns" {
         const slot = slots[i].?;
         try testing.expectEqual(before[i], slot.off);
         try testing.expectEqual(before[i], slot.cache.entries[layers[i]].offset);
-        try Prefix.equal(old_keys[i], slot.cache.entries[layers[i]].keys, before[i], xfm.s);
+        try Prefix.equal(old_keys[i], slot.cache.entries[layers[i]].keys.array, before[i], xfm.s);
         try Prefix.state(saved_ssm[i], slot.entries, xfm.s);
         for (slot.entries) |entry| {
             try testing.expectEqual(@as(u32, 0), entry.spec_ple_len);

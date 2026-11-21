@@ -4,6 +4,7 @@ pub const materializedOwnedCopy = mlx_util.materializedOwnedCopy;
 const std = @import("std");
 const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const testing = std.testing;
 const kv_cache = @import("kv_cache.zig");
 const disk_format = @import("disk_format.zig");
@@ -66,15 +67,15 @@ pub const SSMCacheEntry = struct {
     /// `qsa_key_rows` rows are the history; `aux_state` stays the authority as a tight view.
     /// `qsaAppendKeys` trusts it only when `qsa_key_rows` equals the position being appended
     /// at; live sites that replace `aux_state` go through `ssmFreeQsaState`.
-    qsa_key_buf: mlx.mlx_array = .{ .ctx = null },
+    qsa_key_buf: mlx_pages.InPlace = .none,
     qsa_key_rows: c_int = 0,
     /// Pooled-bank accelerators, same discipline: `qsa_pooled_buf` is the capacity buffer
     /// `qsa_pooled` views; `qsa_score_bank` is the f32 `[B, 1, hd, nb]` score operand,
     /// a view of `qsa_score_buf`, which grows by appended columns as blocks complete.
-    qsa_pooled_buf: mlx.mlx_array = .{ .ctx = null },
+    qsa_pooled_buf: mlx_pages.InPlace = .none,
     qsa_pooled_blocks: c_int = 0,
     qsa_score_bank: mlx.mlx_array = .{ .ctx = null },
-    qsa_score_buf: mlx.mlx_array = .{ .ctx = null },
+    qsa_score_buf: mlx_pages.InPlace = .none,
     qsa_score_blocks: c_int = 0,
     /// Rows this entry's QSA history is asked to hold up front (the counterpart of
     /// `KVCache.reserve_tokens`); the pooled bank derives its own by `ratio`. 0 = none.
@@ -109,7 +110,7 @@ pub fn kvEntriesBytes(entries: []const KVCacheEntry) u64 {
     var total: u64 = 0;
     for (entries) |e| {
         if (!e.initialized or e.shared_view) continue;
-        inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+        inline for (.{ e.keys.array, e.values.array, e.keys_scales.array, e.keys_biases.array, e.values_scales.array, e.values_biases.array }) |arr| {
             total += arrayBytes(arr);
         }
     }
@@ -120,7 +121,7 @@ pub fn kvEntriesBytes(entries: []const KVCacheEntry) u64 {
 /// rows it was fed: until the next chunk reads it, or, on an entry no evaluated output reads (the MTP head's, whose
 /// prefill outputs are dropped), until the prefill ends.
 pub fn appendEvalArrays(vec: mlx.mlx_vector_array, e: *const SSMCacheEntry) void {
-    inline for (.{ e.conv_state, e.ssm_state, e.aux_state, e.qsa_pooled, e.qsa_key_buf, e.qsa_pooled_buf, e.qsa_score_bank, e.qsa_score_buf }) |arr| {
+    inline for (.{ e.conv_state, e.ssm_state, e.aux_state, e.qsa_pooled, e.qsa_key_buf.array, e.qsa_pooled_buf.array, e.qsa_score_bank, e.qsa_score_buf.array }) |arr| {
         if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
     }
 }
@@ -129,8 +130,8 @@ pub fn appendEvalArrays(vec: mlx.mlx_vector_array, e: *const SSMCacheEntry) void
 /// by its capacity buffer when it has one, never again through the view that reads it.
 pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
     return arrayBytes(e.conv_state) + arrayBytes(e.ssm_state) + qsaRawKeyBytes(e) +
-        arrayBytes(if (e.qsa_pooled_buf.ctx != null) e.qsa_pooled_buf else e.qsa_pooled) +
-        arrayBytes(if (e.qsa_score_buf.ctx != null) e.qsa_score_buf else e.qsa_score_bank);
+        arrayBytes(if (e.qsa_pooled_buf.array.ctx != null) e.qsa_pooled_buf.array else e.qsa_pooled) +
+        arrayBytes(if (e.qsa_score_buf.array.ctx != null) e.qsa_score_buf.array else e.qsa_score_bank);
 }
 
 /// Append `chunk` into a pre-grown capacity buffer along `axis` and republish `view` as the
@@ -139,7 +140,7 @@ pub fn ssmEntryBytes(e: *const SSMCacheEntry) u64 {
 /// Materialize `src` straight into a capacity buffer already `reserve` rows long: the seed
 /// half of `capBufAppend`, done once. A tight seed made the next append grow (two full passes
 /// over the prefix, ~81 ms at 393k). Byte-identical to the pair it replaces.
-pub fn seedCapBuf(s: mlx.mlx_stream, src: mlx.mlx_array, axis: usize, reserve: usize) !mlx.mlx_array {
+pub fn seedCapBuf(s: mlx.mlx_stream, src: mlx.mlx_array, axis: usize, reserve: usize) !mlx_pages.InPlace {
     const sh = mlx.getShape(src);
     const nd: usize = sh.len;
     std.debug.assert(nd <= 4 and axis < nd);
@@ -153,17 +154,16 @@ pub fn seedCapBuf(s: mlx.mlx_stream, src: mlx.mlx_array, axis: usize, reserve: u
         stop[i] = d;
     }
     shape[axis] = @intCast(pagedAxis(s, src, axis, @max(reserve, held)));
-    if (shape[axis] == sh[axis]) return materializedOwnedCopy(s, src);
+    if (shape[axis] == sh[axis]) return mlx_pages.InPlace.adopt(try materializedOwnedCopy(s, src), .paged);
     const start = [_]c_int{ 0, 0, 0, 0 };
-    const strides = [_]c_int{ 1, 1, 1, 1 };
-    const grown = try @import("mlx_pages.zig").inPlaceBuffer(shape[0..nd], mlx.mlx_array_dtype(src), s);
-    defer _ = mlx.mlx_array_free(grown);
+    var grown = try mlx_pages.inPlaceBuffer(shape[0..nd], mlx.mlx_array_dtype(src), s);
+    defer grown.deinit();
     var seeded = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(seeded);
-    try mlx.check(mlx.mlx_slice_update(&seeded, grown, src, &start, nd, &stop, nd, &strides, nd, s));
+    const kept = try grown.write(&seeded, src, start[0..nd], stop[0..nd], s);
     // Not counted in `qsa_cap_buf_allocs`: that counter means "capBufAppend had to grow".
     arch_aux.noteHistorySeed();
-    return seeded;
+    return kept;
 }
 
 /// A capacity buffer's length along `axis` on MLX: on its page grid (`mlx_pages`), so every append into it writes in
@@ -175,46 +175,45 @@ fn pagedAxis(s: mlx.mlx_stream, like: mlx.mlx_array, axis: usize, len: usize) us
     for (sh, 0..) |d, i| {
         if (i != axis) row_bytes *= @intCast(d);
     }
-    return @intCast(@import("mlx_pages.zig").pagedCount(len, row_bytes));
+    return @intCast(mlx_pages.pagedCount(len, row_bytes));
 }
 
 /// Replaces `buf`, which holds `count` rows along `axis`, by a buffer of `new_cap` rows (on MLX's page grid) that has those rows
 /// at its front: the shape and dtype of `like` (a chunk that is appended, or `buf` itself) give its other dimensions.
-pub fn growCapBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, count: c_int, axis: usize, like: mlx.mlx_array, new_cap: usize) !void {
+pub fn growCapBuf(s: mlx.mlx_stream, buf: *mlx_pages.InPlace, count: c_int, axis: usize, like: mlx.mlx_array, new_cap: usize) !void {
     const csh = mlx.getShape(like);
     const nd: usize = csh.len;
     const dtype = mlx.mlx_array_dtype(like);
     var start = [_]c_int{ 0, 0, 0, 0 };
     var stop = [_]c_int{ 0, 0, 0, 0 };
-    const strides = [_]c_int{ 1, 1, 1, 1 };
     var shape = [_]c_int{ 0, 0, 0, 0 };
     for (csh, 0..) |d, i| {
         shape[i] = d;
         stop[i] = d;
     }
     shape[axis] = @intCast(pagedAxis(s, like, axis, new_cap));
-    var grown = try @import("mlx_pages.zig").inPlaceBuffer(shape[0..nd], dtype, s);
-    errdefer _ = mlx.mlx_array_free(grown);
-    if (buf.ctx != null) {
+    var grown = try mlx_pages.inPlaceBuffer(shape[0..nd], dtype, s);
+    errdefer grown.deinit();
+    if (buf.array.ctx != null) {
         if (count > 0) {
             stop[axis] = count;
             var old = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(old);
-            try mlx.check(mlx.mlx_slice(&old, buf.*, &start, nd, &stop, nd, &strides, nd, s));
+            try mlx.check(mlx.mlx_slice(&old, buf.array, &start, nd, &stop, nd, &[_]c_int{ 1, 1, 1, 1 }, nd, s));
             var seeded = mlx.mlx_array_new();
             // Safe unscoped: on failure `grown` is still the old handle, so the two errdefers free two different arrays.
             errdefer _ = mlx.mlx_array_free(seeded);
-            try mlx.check(mlx.mlx_slice_update(&seeded, grown, old, &start, nd, &stop, nd, &strides, nd, s));
-            _ = mlx.mlx_array_free(grown);
-            grown = seeded;
+            const filled = try grown.write(&seeded, old, start[0..nd], stop[0..nd], s);
+            grown.deinit();
+            grown = filled;
         }
-        _ = mlx.mlx_array_free(buf.*);
+        buf.deinit();
     }
     buf.* = grown;
 }
 
 /// `hold` is in tokens and a row holds `ratio` of them (a pooled block holds `indexer_compress_ratio`).
-pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, hold: Hold, ratio: usize) !void {
+pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx_pages.InPlace, view: *mlx.mlx_array, count: *c_int, chunk: mlx.mlx_array, axis: usize, hold: Hold, ratio: usize) !void {
     const csh = mlx.getShape(chunk);
     const nd: usize = csh.len;
     std.debug.assert(nd <= 4 and axis < nd);
@@ -222,7 +221,7 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
     if (view.ctx != null) _ = mlx.mlx_array_free(view.*);
     view.* = .{ .ctx = null };
 
-    const cap: usize = if (buf.ctx != null) @intCast(mlx.getShape(buf.*)[axis]) else 0;
+    const cap: usize = if (buf.array.ctx != null) @intCast(mlx.getShape(buf.array)[axis]) else 0;
     const plan = qsaKeyAppendPlan(@intCast(count.*), cap, @intCast(add), hold, ratio);
     var start = [_]c_int{ 0, 0, 0, 0 };
     var stop = [_]c_int{ 0, 0, 0, 0 };
@@ -239,9 +238,9 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
     {
         var updated = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(updated);
-        try mlx.check(mlx.mlx_slice_update(&updated, buf.*, chunk, &start, nd, &stop, nd, &strides, nd, s));
-        _ = mlx.mlx_array_free(buf.*);
-        buf.* = updated;
+        const next = try buf.write(&updated, chunk, start[0..nd], stop[0..nd], s);
+        _ = mlx.mlx_array_free(buf.array);
+        buf.* = next;
     }
     count.* = @intCast(plan.new_rows);
 
@@ -251,7 +250,7 @@ pub fn capBufAppend(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array
         _ = mlx.mlx_array_free(view.*);
         view.* = .{ .ctx = null };
     }
-    try mlx.check(mlx.mlx_slice(view, buf.*, &start, nd, &stop, nd, &strides, nd, s));
+    try mlx.check(mlx.mlx_slice(view, buf.array, &start, nd, &stop, nd, &strides, nd, s));
 }
 
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
@@ -1595,17 +1594,17 @@ test "a QSA pooled bank and score bank append in place at a reservation off MLX'
             _ = mlx.mlx_array_free(chunk);
         };
         try test_support.seedMlxPool(s, c.pages * 16384, 64);
-        var buf: mlx.mlx_array = .{ .ctx = null };
+        var buf: mlx_pages.InPlace = .none;
         var view: mlx.mlx_array = .{ .ctx = null };
-        defer _ = mlx.mlx_array_free(buf);
+        defer buf.deinit();
         defer _ = mlx.mlx_array_free(view);
         var count: c_int = 0;
         var first: ?[*]const u8 = null;
         for (0..4) |step| {
             try capBufAppend(s, &buf, &view, &count, chunks[@min(step, 1)], c.axis, .{ .reserve = reserve * 4, .end = reserve * 4 }, 4);
-            try mlx.check(mlx.mlx_array_eval(buf));
+            try mlx.check(mlx.mlx_array_eval(buf.array));
             try mlx.check(mlx.mlx_synchronize(s));
-            if (step == 0) first = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf));
+            if (step == 0) first = mlx.mlx_array_data_uint8(buf.array) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf.array));
         }
     }
 }
@@ -1625,16 +1624,16 @@ test "a QSA pooled bank re-seeded at a reservation off MLX's page grid appends i
     try mlx.check(mlx.mlx_array_eval(row));
     try test_support.seedMlxPool(s, 21 * 16384, 64);
     var buf = try seedCapBuf(s, held, 1, 1274);
-    defer _ = mlx.mlx_array_free(buf);
+    defer buf.deinit();
     var view: mlx.mlx_array = .{ .ctx = null };
     defer _ = mlx.mlx_array_free(view);
     var count: c_int = 512;
     var first: ?[*]const u8 = null;
     for (0..4) |step| {
         try capBufAppend(s, &buf, &view, &count, row, 1, .{ .reserve = 1274 * 4, .end = 1274 * 4 }, 4);
-        try mlx.check(mlx.mlx_array_eval(buf));
+        try mlx.check(mlx.mlx_array_eval(buf.array));
         try mlx.check(mlx.mlx_synchronize(s));
-        if (step == 0) first = mlx.mlx_array_data_uint8(buf) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf));
+        if (step == 0) first = mlx.mlx_array_data_uint8(buf.array) else try testing.expectEqual(first, mlx.mlx_array_data_uint8(buf.array));
     }
 }
 
@@ -1650,13 +1649,13 @@ test "a short Flash-Next request's QSA pooled bank holds no more tokens' blocks 
     var chunk = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(chunk);
     try mlx.check(mlx.mlx_ones(&chunk, &[_]c_int{ 1, @divTrunc(seq, 4), 128 }, 3, .bfloat16, s));
-    var buf: mlx.mlx_array = .{ .ctx = null };
+    var buf: mlx_pages.InPlace = .none;
     var view: mlx.mlx_array = .{ .ctx = null };
-    defer _ = mlx.mlx_array_free(buf);
+    defer buf.deinit();
     defer _ = mlx.mlx_array_free(view);
     var count: c_int = 0;
     try capBufAppend(s, &buf, &view, &count, chunk, 1, .{ .end = @intCast(seq + 1) }, 4);
-    const blocks: u64 = @intCast(mlx.getShape(buf)[1]);
+    const blocks: u64 = @intCast(mlx.getShape(buf.array)[1]);
     const state_rows = @max(bills.cacheCapacityTokens(&cfg, @intCast(seq), 1, 2048, ctx, 0, null), @as(u64, @intCast(seq)));
     try testing.expect(blocks * 4 <= state_rows);
 }
@@ -1676,8 +1675,8 @@ test "a seedCapBuf copy with no reservation, resliced below its rows, appends in
     try test_support.seedMlxPool(s, 19 * 16384, 32);
     // No reservation (reserve <= held): the history's own rows.
     var buf = try seedCapBuf(s, held, 1, 0);
-    defer _ = mlx.mlx_array_free(buf);
-    try mlx.check(mlx.mlx_array_eval(buf));
+    defer buf.deinit();
+    try mlx.check(mlx.mlx_array_eval(buf.array));
     var view: mlx.mlx_array = .{ .ctx = null };
     defer _ = mlx.mlx_array_free(view);
     // A clamp (`qsaResliceToKeep`) republishes fewer rows over the same buffer.
@@ -1687,10 +1686,27 @@ test "a seedCapBuf copy with no reservation, resliced below its rows, appends in
     for (0..6) |step| {
         // The request ends at its sixth appended row.
         try capBufAppend(s, &buf, &view, &count, row, 1, .{ .end = 1070 + 6 }, 1);
-        try mlx.check(mlx.mlx_array_eval(buf));
+        try mlx.check(mlx.mlx_array_eval(buf.array));
         try mlx.check(mlx.mlx_synchronize(s));
-        const p = mlx.mlx_array_data_uint8(buf);
+        const p = mlx.mlx_array_data_uint8(buf.array);
         if (step == 0) first = p else if (p != first) moved += 1;
     }
     try testing.expectEqual(@as(usize, 0), moved);
+}
+
+test "a capacity buffer an append finds off MLX's page grid is refused, never written in place" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    // 1,100 pooled rows of 256 B are 17.2 pages, with room for the append: the capacity is this buffer's, made elsewhere.
+    var made = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&made, &[_]c_int{ 1, 1100, 128 }, 3, .bfloat16, s));
+    var buf = mlx_pages.InPlace.adopt(made, .paged);
+    defer buf.deinit();
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_ones(&row, &[_]c_int{ 1, 1, 128 }, 3, .bfloat16, s));
+    var view: mlx.mlx_array = .{ .ctx = null };
+    defer _ = mlx.mlx_array_free(view);
+    var count: c_int = 1000;
+    try testing.expectError(error.InPlaceBufferOffPageGrid, capBufAppend(s, &buf, &view, &count, row, 1, .{ .end = 1100 }, 1));
 }

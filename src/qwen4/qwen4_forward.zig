@@ -609,14 +609,14 @@ pub fn qwen4MtpStateNew(self: *Trunk) !Qwen4MtpState {
     entry.ssm_state = .{ .ctx = null };
     entry.initialized = false;
     entry.aux_state = .{ .ctx = null };
-    entry.qsa_key_buf = .{ .ctx = null };
+    entry.qsa_key_buf = .none;
     entry.qsa_key_rows = 0;
     entry.qsa_hist_rows = 0;
     entry.qsa_pooled = .{ .ctx = null };
-    entry.qsa_pooled_buf = .{ .ctx = null };
+    entry.qsa_pooled_buf = .none;
     entry.qsa_pooled_blocks = 0;
     entry.qsa_score_bank = .{ .ctx = null };
-    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_buf = .none;
     entry.qsa_score_blocks = 0;
     entry.spec_state_seq = .{ .ctx = null };
     entry.spec_replay = .{};

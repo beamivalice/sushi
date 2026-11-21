@@ -2660,8 +2660,8 @@ test "qsa score fused: no bank is built under the fused arm" {
     try testing.expect(entry.qsa_score_bank.ctx != null);
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
     entry.qsa_score_bank = .{ .ctx = null };
-    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
-    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_buf.deinit();
+    entry.qsa_score_buf = .none;
     entry.qsa_score_blocks = 0;
     qsa_score_fused_override = true;
     matrix.end();

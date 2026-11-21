@@ -9,6 +9,7 @@ const Trunk = trunk_mod.Trunk;
 const std = @import("std");
 const ssm_cache = @import("../ssm_cache.zig");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const testing = std.testing;
 const test_support = @import("../test_support.zig");
@@ -1048,7 +1049,7 @@ pub fn qsaScoreBank(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int
     const old_nb = entry.qsa_score_blocks;
     const ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);
     const hold = qwen4_qsa_state.qsaHold(entry) orelse return error.QsaHistoryUnbound;
-    if (entry.qsa_score_buf.ctx != null and old_nb > 0 and nb > old_nb and entry.qsa_pooled.ctx != null) {
+    if (entry.qsa_score_buf.array.ctx != null and old_nb > 0 and nb > old_nb and entry.qsa_pooled.ctx != null) {
         const psh = mlx.getShape(entry.qsa_pooled);
         if (psh[1] >= nb) {
             const n_new = nb - old_nb;
@@ -1074,9 +1075,9 @@ pub fn qsaScoreBank(self: *Trunk, entry: *SSMCacheEntry, batch: c_int, nb: c_int
         }
     }
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
-    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
+    entry.qsa_score_buf.deinit();
     entry.qsa_score_bank = .{ .ctx = null };
-    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_buf = .none;
     entry.qsa_score_blocks = 0;
     const cols = try qsaScoreCols(self, entry.qsa_pooled, batch, nb, idx_hd);
     defer _ = mlx.mlx_array_free(cols);
@@ -1707,14 +1708,15 @@ pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: m
         view = tmp;
     }
     if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
-    if (entry.qsa_key_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_key_buf);
+    entry.qsa_key_buf.deinit();
     entry.aux_state = .{ .ctx = null };
-    entry.qsa_key_buf = .{ .ctx = null };
+    entry.qsa_key_buf = .none;
     entry.qsa_key_rows = 0;
+    // The ring's own fixed rows, shared with `src`: a ring keeps its size off the page grid.
     entry.qsa_key_buf = if (fresh and n == rows and rows == QSA_RING_ROWS) blk: {
         var kept = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&kept, src));
-        break :blk kept;
+        break :blk mlx_pages.InPlace.adopt(kept, .ring);
     } else try seedCapBuf(s, view, 1, @intCast(QSA_RING_ROWS));
     entry.qsa_key_rows = n;
     var start = [_]c_int{ 0, 0, 0 };
@@ -1724,7 +1726,7 @@ pub fn qsaInstallRing(_: *Trunk, entry: *SSMCacheEntry, src: mlx.mlx_array, s: m
         _ = mlx.mlx_array_free(entry.aux_state);
         entry.aux_state = .{ .ctx = null };
     }
-    try mlx.check(mlx.mlx_slice(&entry.aux_state, entry.qsa_key_buf, &start, 3, &stop, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    try mlx.check(mlx.mlx_slice(&entry.aux_state, entry.qsa_key_buf.array, &start, 3, &stop, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
 }
 
 /// Append this forward's raw indexer keys `[B, S, hd]` to the layer's QSA ring and
@@ -1735,9 +1737,9 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
     const held: c_int = if (entry.aux_state.ctx != null) mlx.getShape(entry.aux_state)[1] else 0;
     const hist = qsaHistoryRows(entry);
 
-    if (!(entry.qsa_key_buf.ctx != null and hist == offset and held == entry.qsa_key_rows)) {
-        if (entry.qsa_key_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_key_buf);
-        entry.qsa_key_buf = .{ .ctx = null };
+    if (!(entry.qsa_key_buf.array.ctx != null and hist == offset and held == entry.qsa_key_rows)) {
+        entry.qsa_key_buf.deinit();
+        entry.qsa_key_buf = .none;
         entry.qsa_key_rows = 0;
         if (held > 0) {
             entry.qsa_key_buf = try seedCapBuf(s, entry.aux_state, 1, @intCast(QSA_RING_ROWS));
@@ -1747,7 +1749,7 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
 
     const ring_cap: usize = @intCast(QSA_RING_ROWS);
     // A fresh layer seeds the ring at its own rows: grown by the cache's rule it would hold a whole 256-row step.
-    if (add >= QSA_RING_ROWS or entry.qsa_key_buf.ctx == null) {
+    if (add >= QSA_RING_ROWS or entry.qsa_key_buf.array.ctx == null) {
         try qsaInstallRing(self, entry, k_raw, s, false);
     } else if (held + add <= QSA_RING_ROWS) {
         try capBufAppend(s, &entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, k_raw, 1, .{ .reserve = ring_cap, .end = ring_cap }, 1);
@@ -1782,9 +1784,9 @@ pub fn qsaAppendKeys(self: *Trunk, entry: *SSMCacheEntry, k_raw: mlx.mlx_array, 
 /// view, byte-identical to the old `concatenate`. A `nb_cached` mismatch re-seeds.
 pub fn qsaAppendPooled(self: *Trunk, entry: *SSMCacheEntry, new3: mlx.mlx_array, nb_cached: c_int) !void {
     const s = self.s;
-    if (!(entry.qsa_pooled_buf.ctx != null and entry.qsa_pooled_blocks == nb_cached)) {
-        if (entry.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled_buf);
-        entry.qsa_pooled_buf = .{ .ctx = null };
+    if (!(entry.qsa_pooled_buf.array.ctx != null and entry.qsa_pooled_blocks == nb_cached)) {
+        entry.qsa_pooled_buf.deinit();
+        entry.qsa_pooled_buf = .none;
         entry.qsa_pooled_blocks = 0;
         if (nb_cached > 0 and entry.qsa_pooled.ctx != null) {
             const seed_ratio: usize = @max(@as(usize, @intCast(entry.qsa_ratio)), 1);

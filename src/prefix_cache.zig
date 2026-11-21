@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const trunk_mod = @import("trunk.zig");
 const trunk_helpers_test = @import("trunk_helpers_test.zig");
 const model_mod = @import("model.zig");
@@ -955,13 +956,13 @@ pub const HotPrefixCache = struct {
         var total: u64 = 0;
         for (snap.entries) |e| {
             if (!e.initialized) continue;
-            total += @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
-            total += @as(u64, mlx.mlx_array_size(e.values)) * @as(u64, mlx.mlx_array_itemsize(e.values));
+            total += @as(u64, mlx.mlx_array_size(e.keys.array)) * @as(u64, mlx.mlx_array_itemsize(e.keys.array));
+            total += @as(u64, mlx.mlx_array_size(e.values.array)) * @as(u64, mlx.mlx_array_itemsize(e.values.array));
             if (snap.config.scheme != .off) {
-                total += @as(u64, mlx.mlx_array_size(e.keys_scales)) * @as(u64, mlx.mlx_array_itemsize(e.keys_scales));
-                total += @as(u64, mlx.mlx_array_size(e.keys_biases)) * @as(u64, mlx.mlx_array_itemsize(e.keys_biases));
-                total += @as(u64, mlx.mlx_array_size(e.values_scales)) * @as(u64, mlx.mlx_array_itemsize(e.values_scales));
-                total += @as(u64, mlx.mlx_array_size(e.values_biases)) * @as(u64, mlx.mlx_array_itemsize(e.values_biases));
+                total += @as(u64, mlx.mlx_array_size(e.keys_scales.array)) * @as(u64, mlx.mlx_array_itemsize(e.keys_scales.array));
+                total += @as(u64, mlx.mlx_array_size(e.keys_biases.array)) * @as(u64, mlx.mlx_array_itemsize(e.keys_biases.array));
+                total += @as(u64, mlx.mlx_array_size(e.values_scales.array)) * @as(u64, mlx.mlx_array_itemsize(e.values_scales.array));
+                total += @as(u64, mlx.mlx_array_size(e.values_biases.array)) * @as(u64, mlx.mlx_array_itemsize(e.values_biases.array));
             }
         }
         return total;
@@ -989,7 +990,7 @@ pub const HotPrefixCache = struct {
         var total: u64 = 0;
         for (snap.entries) |e| {
             if (!e.initialized or e.ringed) continue;
-            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+            inline for (.{ e.keys.array, e.values.array, e.keys_scales.array, e.keys_biases.array, e.values_scales.array, e.values_biases.array }) |arr| {
                 // A dense snapshot leaves the quant handles as empty 0-dim arrays; the ndim check makes axis 2 a fact.
                 if (arr.ctx != null and mlx.mlx_array_ndim(arr) > 2) {
                     const rows: u64 = @intCast(mlx.mlx_array_shape(arr)[2]);
@@ -1007,7 +1008,7 @@ pub const HotPrefixCache = struct {
         var total: u64 = 0;
         for (snap.entries) |e| {
             if (!e.initialized or !e.ringed) continue;
-            inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |arr| {
+            inline for (.{ e.keys.array, e.values.array, e.keys_scales.array, e.keys_biases.array, e.values_scales.array, e.values_biases.array }) |arr| {
                 if (arr.ctx != null) total += @as(u64, mlx.mlx_array_size(arr)) * @as(u64, mlx.mlx_array_itemsize(arr));
             }
         }
@@ -4560,13 +4561,13 @@ test "a hot entry holds a ringed layer's retained rows, not the ring buffer's ca
     var ring_cap: usize = 0;
     for (live.entries) |*e| {
         if (!e.initialized) continue;
-        const cap: usize = @intCast(mlx.getShape(e.keys)[2]);
+        const cap: usize = @intCast(mlx.getShape(e.keys.array)[2]);
         if (e.ringed) {
             ring_rows = e.offset;
             ring_cap = cap;
         }
         const rows: u64 = if (e.ringed) @intCast(e.offset) else @intCast(cap);
-        want_bytes += rows * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+        want_bytes += rows * (ringRowBytes(e.keys.array) + ringRowBytes(e.values.array));
     }
     try testing.expect(ring_rows > 0 and ring_rows < ring_cap);
 
@@ -4622,7 +4623,7 @@ test "a commit that records the live state for the SSD tier gives its RAM entry 
 
     // Without spare ring capacity both snapshots would share the live buffers and the test could not tell a copy.
     for (live.entries) |*l| {
-        if (l.ringed) try testing.expect(l.offset < KVCache.bufferCapacity(l.keys));
+        if (l.ringed) try testing.expect(l.offset < KVCache.bufferCapacity(l.keys.array));
     }
 
     var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
@@ -4637,8 +4638,8 @@ test "a commit that records the live state for the SSD tier gives its RAM entry 
     for (record.entries, entry.entries) |*r, *e| {
         if (!r.ringed) continue;
         ringed += 1;
-        try testing.expectEqual(mlx.mlx_array_data_uint8(r.keys), mlx.mlx_array_data_uint8(e.keys));
-        try testing.expectEqual(mlx.mlx_array_data_uint8(r.values), mlx.mlx_array_data_uint8(e.values));
+        try testing.expectEqual(mlx.mlx_array_data_uint8(r.keys.array), mlx.mlx_array_data_uint8(e.keys.array));
+        try testing.expectEqual(mlx.mlx_array_data_uint8(r.values.array), mlx.mlx_array_data_uint8(e.values.array));
     }
     try testing.expect(ringed > 0);
 }
@@ -4677,7 +4678,7 @@ test "a ringed entry restores at its prompt-end checkpoint when the next turn di
     // The bill: the window plus the backoff, per sliding layer, at the entry's KV width.
     var cp_bytes: u64 = 0;
     for (live.entries) |*e| {
-        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys.array) + ringRowBytes(e.values.array));
     }
     try testing.expectEqual(end_bytes + cp_bytes, hc.current_kv_bytes);
 
@@ -4880,8 +4881,12 @@ fn sizedRingCp(step: usize) !KVCacheSnapshot {
     var cp = try stubRingCp(step, 0);
     errdefer cp.deinit();
     const e = &cp.entries[0];
-    try mlx.check(mlx.mlx_zeros(&e.keys, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
-    try mlx.check(mlx.mlx_zeros(&e.values, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    var keys = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&keys, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    e.keys = mlx_pages.InPlace.adopt(keys, .paged);
+    var values = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&values, &[_]c_int{ 1, 1, 4, 8 }, 4, .bfloat16, mlx.gpuStream()));
+    e.values = mlx_pages.InPlace.adopt(values, .paged);
     e.initialized = true;
     return cp;
 }
@@ -5027,7 +5032,7 @@ test "a slot holding every ring restore point it may bills SLOT_RING_CHECKPOINTS
 
     var cp_bytes: u64 = 0;
     for (live.entries) |*e| {
-        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys.array) + ringRowBytes(e.values.array));
     }
     try testing.expectEqual(@as(u64, SLOT_RING_CHECKPOINTS) * cp_bytes, cps.bytes());
 }
@@ -5080,7 +5085,7 @@ test "an entry extended in place keeps its older ring checkpoints" {
 
 /// Bytes one row of `e`'s K and V bill, from their own shapes.
 fn ringEntryRowBytes(e: *const trunk_mod.KVCacheEntry) u64 {
-    return ringRowBytes(e.keys) + ringRowBytes(e.values);
+    return ringRowBytes(e.keys.array) + ringRowBytes(e.values.array);
 }
 
 /// The next turn's first write through both caches: identical views prove the restore.
@@ -5113,7 +5118,7 @@ test "an oversized ringed entry trims to its end: the ring is a constant, not a 
 
     // The global layer's buffer holds spare capacity past its rows, as a reservation does.
     var probe = try live.snapshotRetained(s);
-    const cap: u64 = @intCast(mlx.getShape(probe.entries[0].keys)[2]);
+    const cap: u64 = @intCast(mlx.getShape(probe.entries[0].keys.array)[2]);
     const rows_bytes = HotPrefixCache.snapshotBytes(&probe) - (cap - prompt) * ringEntryRowBytes(&probe.entries[0]);
     probe.deinit();
     try testing.expect(cap > prompt);
@@ -5347,7 +5352,7 @@ test "a fork entry keeps its donor's ring checkpoint, so evicting the donor stil
     end.deinit();
     var cp_bytes: u64 = 0;
     for (fork.entries) |*e| {
-        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys.array) + ringRowBytes(e.values.array));
     }
     for (hc.entries.items) |*e| {
         if (e.tokens.len == toks.len) try testing.expectEqual(end_bytes + 2 * cp_bytes, e.kv_bytes);
@@ -6998,7 +7003,7 @@ test "RAM and SSD: a flushed ringed entry keeps its newest two ring checkpoints,
     // The bill follows the storage: two checkpoints' bytes left it, and the cache total agrees.
     var cp_bytes: u64 = 0;
     for (live.entries) |*e| {
-        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys) + ringRowBytes(e.values));
+        if (e.ringed) cp_bytes += (window + model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF) * (ringRowBytes(e.keys.array) + ringRowBytes(e.values.array));
     }
     try testing.expectEqual(before - 2 * cp_bytes, hc.current_kv_bytes);
     try testing.expectEqual(hc.entries.items[0].kv_bytes, hc.current_kv_bytes);
@@ -7781,10 +7786,10 @@ pub fn pcRowBytes(snap: *const trunk_mod.KVCacheSnapshot) u64 {
     var total: u64 = 0;
     for (snap.entries) |e| {
         if (!e.initialized) continue;
-        const rows: u64 = @intCast(mlx.mlx_array_shape(e.keys)[2]);
+        const rows: u64 = @intCast(mlx.mlx_array_shape(e.keys.array)[2]);
         if (rows == 0) continue;
-        const kb = @as(u64, mlx.mlx_array_size(e.keys)) * @as(u64, mlx.mlx_array_itemsize(e.keys));
-        const vb = @as(u64, mlx.mlx_array_size(e.values)) * @as(u64, mlx.mlx_array_itemsize(e.values));
+        const kb = @as(u64, mlx.mlx_array_size(e.keys.array)) * @as(u64, mlx.mlx_array_itemsize(e.keys.array));
+        const vb = @as(u64, mlx.mlx_array_size(e.values.array)) * @as(u64, mlx.mlx_array_itemsize(e.values.array));
         total += (kb + vb) / rows;
     }
     return total;
@@ -7852,8 +7857,8 @@ test "HotPrefixCache: oversized entry trims to the longest prefix that fits (#33
         try testing.expectEqual(@as(usize, 400), d.offset);
         // Trimmed rows must be the SOURCE's rows — a slice-math bug here
         // serves a wrong prefix as a cache hit.
-        try pcExpectRowsEqual(s, d.keys, e.keys, 400);
-        try pcExpectRowsEqual(s, d.values, e.values, 400);
+        try pcExpectRowsEqual(s, d.keys.array, e.keys.array, 400);
+        try pcExpectRowsEqual(s, d.values.array, e.values.array, 400);
     }
 }
 
@@ -7875,7 +7880,7 @@ test "HotPrefixCache: trimmed entry is one-shot — a covered re-commit keeps th
     _ = try hc.commit(&src, toks[0..600], false);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expectEqual(@as(usize, 400), hc.entries.items[0].tokens.len);
-    const resident_keys_ctx = hc.entries.items[0].snapshot.entries[0].keys.ctx;
+    const resident_keys_ctx = hc.entries.items[0].snapshot.entries[0].keys.array.ctx;
 
     // Next turn: the conversation grew, the trim target did not. Re-copying
     // an identical prefix every turn would be a per-turn multi-GB memcpy.
@@ -7885,7 +7890,7 @@ test "HotPrefixCache: trimmed entry is one-shot — a covered re-commit keeps th
     _ = try hc.commit(&src2, &toks, false);
     try testing.expectEqual(@as(usize, 1), hc.entryCount());
     try testing.expectEqual(@as(usize, 400), hc.entries.items[0].tokens.len);
-    try testing.expectEqual(resident_keys_ctx, hc.entries.items[0].snapshot.entries[0].keys.ctx);
+    try testing.expectEqual(resident_keys_ctx, hc.entries.items[0].snapshot.entries[0].keys.array.ctx);
 }
 
 test "HotPrefixCache: oversized hybrid entry trims to the highest checkpoint that fits (#330)" {
@@ -8445,8 +8450,8 @@ test "evictLruToAdmit: oldest first, never the entry THIS request restored, and 
         try testFillCache(&cache, s, 8, 4096);
         // Materialize before committing: an unevaluated cache owns no Metal buffer at all.
         for (cache.entries) |*e| {
-            if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
-            if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+            if (e.keys.array.ctx != null) _ = mlx.mlx_array_eval(e.keys.array);
+            if (e.values.array.ctx != null) _ = mlx.mlx_array_eval(e.values.array);
         }
         _ = try hc.commit(&cache, toks, false);
     }
@@ -8521,8 +8526,8 @@ test "a trivial share of a whole session is a LIEN, and the admission pass gets 
     defer slot_cache.deinit();
     try testFillCache(&slot_cache, s, 8, 4096);
     for (slot_cache.entries) |*e| {
-        if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
-        if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        if (e.keys.array.ctx != null) _ = mlx.mlx_array_eval(e.keys.array);
+        if (e.values.array.ctx != null) _ = mlx.mlx_array_eval(e.values.array);
     }
     _ = try hc.commit(&slot_cache, &session, false);
     try t.expectEqual(@as(usize, 1), hc.entryCount());
@@ -8570,8 +8575,8 @@ test "a PROPORTIONATE share still restores, and is still protected" {
     defer src_cache.deinit();
     try testFillCache(&src_cache, s, 8, 4096);
     for (src_cache.entries) |*e| {
-        if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
-        if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        if (e.keys.array.ctx != null) _ = mlx.mlx_array_eval(e.keys.array);
+        if (e.values.array.ctx != null) _ = mlx.mlx_array_eval(e.values.array);
     }
     _ = try hc.commit(&src_cache, &session, false);
 
@@ -8767,8 +8772,8 @@ test "the lien weighs the share a restore DELIVERS, not the one it matched" {
     defer src.deinit();
     try testFillCache(&src, s, 8, 4096);
     for (src.entries) |*e| {
-        if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
-        if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        if (e.keys.array.ctx != null) _ = mlx.mlx_array_eval(e.keys.array);
+        if (e.values.array.ctx != null) _ = mlx.mlx_array_eval(e.values.array);
     }
     var src8 = pcBuildHybrid(s, 300.0, 700.0);
     defer pcFreeHybrid(&src8);
@@ -8842,7 +8847,7 @@ test "the admission pass weighs an eviction after the GPU work still reading the
         chain = next;
     }
     _ = mlx.mlx_vector_array_append_value(pending, chain);
-    for (src.entries) |*e| for ([_]mlx.mlx_array{ e.keys, e.values }) |buf| {
+    for (src.entries) |*e| for ([_]mlx.mlx_array{ e.keys.array, e.values.array }) |buf| {
         if (buf.ctx == null) continue;
         var total = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(total);
@@ -9804,7 +9809,7 @@ test "prefix cache: the trim's row price is the entry's own bytes divided by its
         const total = HotPrefixCache.snapshotBytes(&snap);
         try testing.expect(row_bytes > 0);
 
-        const cap: u64 = @intCast(mlx.getShape(snap.entries[0].keys)[2]);
+        const cap: u64 = @intCast(mlx.getShape(snap.entries[0].keys.array)[2]);
         try testing.expect(cap >= 104);
         try testing.expectEqual(total, row_bytes * cap);
 
@@ -9878,7 +9883,7 @@ fn testLiveBytes(s: mlx.mlx_stream) u64 {
 
 /// Bytes of one layer's key buffer (capacity, not logical rows).
 fn testKeyBufferBytes(cache: *KVCache, layer: usize) u64 {
-    const sh = mlx.getShape(cache.entries[layer].keys);
+    const sh = mlx.getShape(cache.entries[layer].keys.array);
     return @as(u64, @intCast(sh[0])) * @as(u64, @intCast(sh[1])) *
         @as(u64, @intCast(sh[2])) * @as(u64, @intCast(sh[3])) * 4; // f32
 }
@@ -9936,8 +9941,8 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         // The entry gave the buffers up: its handles are empty and it names the slot.
         const e = &hc.entries.items[0];
         try testing.expectEqual(@as(usize, 0xA11CE), e.checkout.?.slot);
-        try testing.expect(e.snapshot.entries[0].keys.ctx == null);
-        try testing.expect(e.snapshot.entries[0].values.ctx == null);
+        try testing.expect(e.snapshot.entries[0].keys.array.ctx == null);
+        try testing.expect(e.snapshot.entries[0].values.array.ctx == null);
 
         slot.evalState();
         buf_bytes = testKeyBufferBytes(&slot, 0);
@@ -9964,7 +9969,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
         try testing.expectEqual(@as(usize, 600), res.matched);
         const e = &hc.entries.items[0];
         try testing.expect(e.checkout == null);
-        try testing.expect(e.snapshot.entries[0].keys.ctx != null);
+        try testing.expect(e.snapshot.entries[0].keys.array.ctx != null);
 
         slot.evalState();
         try testing.expectEqual(buf_bytes, testKeyBufferBytes(&slot, 0));
@@ -9985,7 +9990,7 @@ test "restore by move: a full-prefix hit checks the entry out and the append don
 
 fn testReadKeyRows(cache: *KVCache, layer: usize, row: usize, out: []f32) !void {
     cache.evalState();
-    const p = mlx.mlx_array_data_float32(cache.entries[layer].keys) orelse return error.NotEvaluated;
+    const p = mlx.mlx_array_data_float32(cache.entries[layer].keys.array) orelse return error.NotEvaluated;
     for (out, 0..) |*v, i| v.* = p[row * 8 + i];
 }
 
@@ -10033,7 +10038,7 @@ test "restore by move ON DEMAND: a share that does not fit is taken over, off SS
     // Refused before it wrote: the entry comes back whole.
     hc.releaseCheckout(7, "prefill refused");
     try testing.expectEqual(@as(usize, 600), hc.entries.items[0].tokens.len);
-    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.array.ctx != null);
 
     const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 600), res.matched);
@@ -10045,7 +10050,7 @@ test "restore by move ON DEMAND: a share that does not fit is taken over, off SS
     hc.releaseCheckout(7, "prefill refused");
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
     try testing.expect(hc.entries.items[0].checkout == null);
-    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.array.ctx != null);
 }
 
 test "restore by move: a prompt that is exactly the entry, a full reuse, is taken whole, up front in SSD-first and on demand off it" {
@@ -10127,7 +10132,7 @@ test "restore by move: a partial-prefix hit keeps the refcount-share" {
     const res = try hc.lookupAndRestoreForSlot(&slot, &moe_off, null, s, &prompt, false, 0, null, null, null, 7);
     try testing.expectEqual(@as(usize, 500), res.matched);
     try testing.expect(hc.entries.items[0].checkout == null);
-    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx != null);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.array.ctx != null);
 }
 
 test "restore by move: a refusal BEFORE the append hands the entry back INTACT" {
@@ -10166,8 +10171,8 @@ test "restore by move: a refusal BEFORE the append hands the entry back INTACT" 
     const e = &hc.entries.items[0];
     try testing.expectEqual(@as(usize, 600), e.tokens.len);
     try testing.expect(e.checkout == null);
-    try testing.expect(e.snapshot.entries[0].keys.ctx != null);
-    try testing.expect(e.snapshot.entries[0].values.ctx != null);
+    try testing.expect(e.snapshot.entries[0].keys.array.ctx != null);
+    try testing.expect(e.snapshot.entries[0].values.array.ctx != null);
     try testing.expectEqual(billed_before, hc.current_kv_bytes);
     try testing.expectEqual(lru_before, e.last_used);
 
@@ -10205,7 +10210,7 @@ test "restore by move: a slot that ends without committing DROPS its checked-out
     // Admitted and about to write: the handles go over.
     hc.donateCheckout(42);
     try testing.expect(hc.entries.items[0].checkout.?.donated != null);
-    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.ctx == null);
+    try testing.expect(hc.entries.items[0].snapshot.entries[0].keys.array.ctx == null);
 
     hc.releaseCheckout(42, "cancelled");
     try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
@@ -10248,7 +10253,7 @@ test "restore by move ON DEMAND: a partial share taken over keeps the shared pre
     const e = &hc.entries.items[0];
     try testing.expect(e.checkout == null);
     try testing.expectEqualSlices(u32, &prompt, e.tokens);
-    try testing.expect(e.snapshot.entries[0].keys.ctx != null);
+    try testing.expect(e.snapshot.entries[0].keys.array.ctx != null);
     try testing.expectEqual(e.kv_bytes, hc.current_kv_bytes);
     hc.releaseCheckout(42, "finished");
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
@@ -10320,7 +10325,7 @@ test "restore by move: a commit RECLAIMS the checked-out entry with the grown bu
     const e = &hc.entries.items[0];
     try testing.expect(e.checkout == null);
     try testing.expectEqual(@as(usize, 608), e.tokens.len);
-    try testing.expect(e.snapshot.entries[0].keys.ctx != null);
+    try testing.expect(e.snapshot.entries[0].keys.array.ctx != null);
     hc.releaseCheckout(42, "finished");
     try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
 
@@ -11050,7 +11055,7 @@ test "an image turn persists its WHOLE turn to the SSD tier, image rows included
             const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, if (arm.cps != null) &ssm else null, s, &tokens, false, ask.key, ask.ms, &.{}, null, null, null, false);
             try testing.expectEqual(@as(usize, ask.want), res.matched);
             if (ask.want == 0) continue;
-            for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys, cold.entries[li].keys, ask.want);
+            for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys.array, cold.entries[li].keys.array, ask.want);
             if (arm.cps != null) try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm[0].conv_state, 0, s));
         }
     }
@@ -11197,7 +11202,7 @@ test "SSD: a record holding the request's first image restores up to the new one
     var moe: usize = 0;
     const res = try hc2.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, chainKey(&chain), first_at, &chain, null, null, null, false);
     try testing.expectEqual(second_at, res.matched);
-    for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys, cold.entries[li].keys, second_at);
+    for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys.array, cold.entries[li].keys.array, second_at);
 
     // Without the chain, the same request can only be held to the text before its first image:
     // nothing then proves the record's block is this request's.
@@ -11379,5 +11384,5 @@ test "a write-through under other pixels never extends the record that holds the
     var moe: usize = 0;
     const res = try hc.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, kb, at, &chain, null, null, null, false);
     try testing.expect(res.matched > at);
-    for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys, rows_b.entries[li].keys, res.matched);
+    for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys.array, rows_b.entries[li].keys.array, res.matched);
 }

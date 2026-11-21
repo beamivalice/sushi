@@ -29,6 +29,7 @@
 const std = @import("std");
 const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
+const mlx_pages = @import("mlx_pages.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const trunk = @import("trunk.zig");
@@ -1064,8 +1065,8 @@ pub const DflashCtx = struct {
     pub fn appendEvalArrays(self: *DflashCtx, vec: mlx.mlx_vector_array) void {
         for (self.cache.entries) |*entry| {
             if (!entry.initialized) continue;
-            _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
-            _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+            _ = mlx.mlx_vector_array_append_value(vec, entry.keys.array);
+            _ = mlx.mlx_vector_array_append_value(vec, entry.values.array);
         }
     }
 };
@@ -1770,13 +1771,15 @@ pub fn trimSlidingContext(model: *const DflashModel, ctx: *DflashCtx) !void {
     const arrays = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(arrays);
     for (ctx.cache.entries) |*entry| {
-        const keys = try ops.contiguous(try ops.slice(entry.keys, 2, @intCast(drop), @intCast(ctx.cache.step)));
-        const values = try ops.contiguous(try ops.slice(entry.values, 2, @intCast(drop), @intCast(ctx.cache.step)));
-        try mlx.check(mlx.mlx_array_set(&entry.keys, keys));
-        try mlx.check(mlx.mlx_array_set(&entry.values, values));
+        const keys = try ops.contiguous(try ops.slice(entry.keys.array, 2, @intCast(drop), @intCast(ctx.cache.step)));
+        const values = try ops.contiguous(try ops.slice(entry.values.array, 2, @intCast(drop), @intCast(ctx.cache.step)));
+        entry.keys.deinit();
+        entry.keys = try adoptCopy(keys);
+        entry.values.deinit();
+        entry.values = try adoptCopy(values);
         entry.offset = keep;
-        try mlx.check(mlx.mlx_vector_array_append_value(arrays, entry.keys));
-        try mlx.check(mlx.mlx_vector_array_append_value(arrays, entry.values));
+        try mlx.check(mlx.mlx_vector_array_append_value(arrays, entry.keys.array));
+        try mlx.check(mlx.mlx_vector_array_append_value(arrays, entry.values.array));
     }
     try mlx.check(mlx.mlx_eval(arrays));
     ctx.cache.step = keep;
@@ -1873,7 +1876,7 @@ fn tailMask(q_len: u32, ctx_len: usize, relative: usize, window: u32, s: mlx.mlx
 fn blockTailEligible(model: *const DflashModel, ctx: *const DflashCtx, noise: mlx.mlx_array) bool {
     if (!model.sliding_serving or model.layers.len != 5 or model.config.block_size != 8 or model.config.sliding_window != 2048 or ctx.cache.config.scheme != .off or ctx.cache.step < 2048 or mlx.getShape(noise)[1] != 8) return false;
     for (model.layers, ctx.cache.entries) |layer, entry| {
-        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.base != 0 or entry.offset != ctx.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return false;
+        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.base != 0 or entry.offset != ctx.cache.step or mlx.mlx_array_dtype(entry.keys.array) != .bfloat16 or mlx.mlx_array_dtype(entry.values.array) != .bfloat16) return false;
     }
     return true;
 }
@@ -1938,8 +1941,8 @@ fn forwardBlockMode(model: *const DflashModel, ctx: *DflashCtx, noise_embeds: ml
 
         const view = if (block_tail) blk: {
             const entry = &ctx.cache.entries[li];
-            const k = try tail_ops.slice(entry.keys, 2, @intCast(dropped), @intCast(ctx_len));
-            const v = try tail_ops.slice(entry.values, 2, @intCast(dropped), @intCast(ctx_len));
+            const k = try tail_ops.slice(entry.keys.array, 2, @intCast(dropped), @intCast(ctx_len));
+            const v = try tail_ops.slice(entry.values.array, 2, @intCast(dropped), @intCast(ctx_len));
             break :blk trunk.DenseKVView{ .k = try tail_ops.concat(&.{ k, bk }, 2), .v = try tail_ops.concat(&.{ v, bv }, 2), .owned = false };
         } else try ctx.cache.update(@intCast(li), bk, bv, s, 0);
 
@@ -3495,8 +3498,8 @@ test "sliding-serving DFlash2 trims physical window and preserves absolute appen
     try std.testing.expectEqual(@as(usize, 10), ctx.absLen());
     try std.testing.expectEqual(@as(usize, 3), ctx.base_pos);
     try std.testing.expectEqual(@as(u64, 224), ctx.cache.residentBytes());
-    try std.testing.expectEqual(@as(usize, 28), mlx.mlx_array_strides(ctx.cache.entries[0].keys)[1]);
-    const view = try ops.cast(ctx.cache.entries[0].keys, .float32);
+    try std.testing.expectEqual(@as(usize, 28), mlx.mlx_array_strides(ctx.cache.entries[0].keys.array)[1]);
+    const view = try ops.cast(ctx.cache.entries[0].keys.array, .float32);
     try mlx.check(mlx.mlx_array_eval(view));
     try std.testing.expectEqual(@as(f32, 12), mlx.mlx_array_data_float32(view).?[0]);
     try std.testing.expectEqual(@as(f32, 52), mlx.mlx_array_data_float32(view).?[28]);
@@ -3549,7 +3552,7 @@ test "a sliding DFlash context holds no more rows than the load bills it, and an
             try trimSlidingContext(&model, &ctx);
             const before = ctx.cache.step;
             _ = try ctx.cache.update(0, try rows(&ops, 8), try rows(&ops, 8), s, 0);
-            try std.testing.expect(KVCache.bufferCapacity(ctx.cache.entries[0].keys) <= billed);
+            try std.testing.expect(KVCache.bufferCapacity(ctx.cache.entries[0].keys.array) <= billed);
             try ctx.cache.truncate(before, s);
         }
     }
@@ -3576,8 +3579,10 @@ test "DFlash block tail engages only for the native GLM drafter" {
     const kv = mlx.mlx_array_new_data(&bits, &.{ 1, 1, 1, 1 }, 4, .bfloat16);
     defer _ = mlx.mlx_array_free(kv);
     for (ctx.cache.entries) |*entry| {
-        try mlx.check(mlx.mlx_array_set(&entry.keys, kv));
-        try mlx.check(mlx.mlx_array_set(&entry.values, kv));
+        entry.keys.deinit();
+        entry.keys = try adoptCopy(kv);
+        entry.values.deinit();
+        entry.values = try adoptCopy(kv);
         entry.initialized = true;
         entry.offset = 2048;
     }
@@ -3702,4 +3707,12 @@ test "assistantLoadBytes: a tiny assistant's bill is never under what its load k
     m.deinit();
     try testing.expect(bill.resident >= after - before);
     try testing.expect(bill.resident + bill.transient >= peak - before);
+}
+
+/// The cache entry's buffer over another handle to `a`.
+fn adoptCopy(a: mlx.mlx_array) !mlx_pages.InPlace {
+    var h = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(h);
+    try mlx.check(mlx.mlx_array_set(&h, a));
+    return mlx_pages.InPlace.adopt(h, .paged);
 }

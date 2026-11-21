@@ -1,6 +1,7 @@
 const trunk_mod = @import("../trunk.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
 const QsaHeadMarkSet = qwen4_qsa.QsaHeadMarkSet;
@@ -48,7 +49,7 @@ pub fn checkQsaCompressRatio(ratio: u32) !void {
 }
 
 pub fn qsaRawKeyBytes(e: *const SSMCacheEntry) u64 {
-    return arrayBytes(if (e.qsa_key_buf.ctx != null) e.qsa_key_buf else e.aux_state);
+    return arrayBytes(if (e.qsa_key_buf.array.ctx != null) e.qsa_key_buf.array else e.aux_state);
 }
 
 pub fn qsaLeftoverAt(aux: mlx.mlx_array, hist: c_int, pos: c_int, ratio: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -92,20 +93,20 @@ fn qsaRingTail(src: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 /// Free and null a live entry's whole QSA state: the history, its capacity buffer and the pooled bank move together.
 pub fn ssmFreeQsaState(e: *SSMCacheEntry) void {
     if (e.aux_state.ctx != null) _ = mlx.mlx_array_free(e.aux_state);
-    if (e.qsa_key_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_key_buf);
+    e.qsa_key_buf.deinit();
     if (e.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled);
-    if (e.qsa_pooled_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_pooled_buf);
+    e.qsa_pooled_buf.deinit();
     if (e.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(e.qsa_score_bank);
-    if (e.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(e.qsa_score_buf);
+    e.qsa_score_buf.deinit();
     e.aux_state = .{ .ctx = null };
-    e.qsa_key_buf = .{ .ctx = null };
+    e.qsa_key_buf = .none;
     e.qsa_key_rows = 0;
     e.qsa_hist_rows = 0;
     e.qsa_pooled = .{ .ctx = null };
-    e.qsa_pooled_buf = .{ .ctx = null };
+    e.qsa_pooled_buf = .none;
     e.qsa_pooled_blocks = 0;
     e.qsa_score_bank = .{ .ctx = null };
-    e.qsa_score_buf = .{ .ctx = null };
+    e.qsa_score_buf = .none;
     e.qsa_score_blocks = 0;
 }
 
@@ -135,8 +136,8 @@ pub var qsa_history_seeds: usize = 0;
 pub fn qsaPooledCapacity(entries: ?[]const SSMCacheEntry) usize {
     var fewest: usize = std.math.maxInt(usize);
     for (entries orelse return 0) |*e| {
-        if (e.qsa_pooled_buf.ctx == null) continue;
-        fewest = @min(fewest, @as(usize, @intCast(mlx.getShape(e.qsa_pooled_buf)[1])));
+        if (e.qsa_pooled_buf.array.ctx == null) continue;
+        fewest = @min(fewest, @as(usize, @intCast(mlx.getShape(e.qsa_pooled_buf.array)[1])));
     }
     return if (fewest == std.math.maxInt(usize)) 0 else fewest;
 }
@@ -148,35 +149,35 @@ pub fn qsaPooledCapacity(entries: ?[]const SSMCacheEntry) usize {
 pub fn growQsaHistoryAhead(entries: ?[]SSMCacheEntry, rows: usize, s: mlx.mlx_stream) !void {
     for (entries orelse return) |*e| {
         const hold = qsaHold(e) orelse continue;
-        if (e.qsa_pooled_buf.ctx == null or e.qsa_pooled.ctx == null or e.qsa_ratio <= 0) continue;
+        if (e.qsa_pooled_buf.array.ctx == null or e.qsa_pooled.ctx == null or e.qsa_ratio <= 0) continue;
         const ratio: usize = @intCast(e.qsa_ratio);
         const hist: usize = @intCast(qsaHistoryRows(e));
         const need: c_int = @intCast((hist + rows) / ratio);
         try growCapBufAhead(s, &e.qsa_pooled_buf, &e.qsa_pooled, e.qsa_pooled_blocks, 1, need, hold, ratio);
-        if (e.qsa_score_buf.ctx != null and e.qsa_score_blocks > 0) try growCapBufAhead(s, &e.qsa_score_buf, &e.qsa_score_bank, e.qsa_score_blocks, 3, need, hold, ratio);
+        if (e.qsa_score_buf.array.ctx != null and e.qsa_score_blocks > 0) try growCapBufAhead(s, &e.qsa_score_buf, &e.qsa_score_bank, e.qsa_score_blocks, 3, need, hold, ratio);
     }
 }
 
 /// One capacity buffer of `count` rows along `axis`, grown to hold `need` by the append's own plan when it does not: built,
 /// evaluated and its old copy released (a synchronized stream, the engine's pool trimmed) before the caller's next buffer.
-fn growCapBufAhead(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array, count: c_int, axis: usize, need: c_int, hold: Hold, ratio: usize) !void {
+fn growCapBufAhead(s: mlx.mlx_stream, buf: *mlx_pages.InPlace, view: *mlx.mlx_array, count: c_int, axis: usize, need: c_int, hold: Hold, ratio: usize) !void {
     if (need <= count) return;
-    const cap: usize = @intCast(mlx.getShape(buf.*)[axis]);
+    const cap: usize = @intCast(mlx.getShape(buf.array)[axis]);
     const plan = qsaKeyAppendPlan(@intCast(count), cap, @intCast(need - count), hold, ratio);
     if (plan.new_cap == cap) return;
     // The view is a slice of the old buffer, which stays alive while it does.
     if (view.ctx != null) _ = mlx.mlx_array_free(view.*);
     view.* = .{ .ctx = null };
     qsa_cap_buf_allocs += 1;
-    try @import("../ssm_cache.zig").growCapBuf(s, buf, count, axis, buf.*, plan.new_cap);
-    try mlx.check(mlx.mlx_array_eval(buf.*));
+    try @import("../ssm_cache.zig").growCapBuf(s, buf, count, axis, buf.array, plan.new_cap);
+    try mlx.check(mlx.mlx_array_eval(buf.array));
     if (mlx.engine.isStream(s)) {
         mlx.engine.trim();
     } else {
         try mlx.check(mlx.mlx_synchronize(s));
         _ = mlx.mlx_clear_cache();
     }
-    const sh = mlx.getShape(buf.*);
+    const sh = mlx.getShape(buf.array);
     var start = [_]c_int{ 0, 0, 0, 0 };
     var stop = [_]c_int{ 0, 0, 0, 0 };
     const strides = [_]c_int{ 1, 1, 1, 1 };
@@ -187,7 +188,7 @@ fn growCapBufAhead(s: mlx.mlx_stream, buf: *mlx.mlx_array, view: *mlx.mlx_array,
         _ = mlx.mlx_array_free(view.*);
         view.* = .{ .ctx = null };
     }
-    try mlx.check(mlx.mlx_slice(view, buf.*, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
+    try mlx.check(mlx.mlx_slice(view, buf.array, &start, sh.len, &stop, sh.len, &strides, sh.len, s));
 }
 
 /// Ask every live entry's QSA history to hold `tokens` rows up front (same lever as `KVCache.reserve`).
@@ -226,10 +227,10 @@ pub fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !
     // it; short of that the clamp belongs to the caller's mark path, or to its named decline.
     if (new_held < @mod(keep, @max(entry.qsa_ratio, 1))) return false;
     if (new_held > 0) {
-        const buf_ok = entry.qsa_key_buf.ctx != null and
-            mlx.getShape(entry.qsa_key_buf)[1] >= new_held;
+        const buf_ok = entry.qsa_key_buf.array.ctx != null and
+            mlx.getShape(entry.qsa_key_buf.array)[1] >= new_held;
         if (!buf_ok) return false;
-        try capBufReslice(s, entry.qsa_key_buf, &entry.aux_state, &entry.qsa_key_rows, 1, new_held);
+        try capBufReslice(s, entry.qsa_key_buf.array, &entry.aux_state, &entry.qsa_key_rows, 1, new_held);
     } else {
         if (entry.aux_state.ctx != null) _ = mlx.mlx_array_free(entry.aux_state);
         entry.aux_state = .{ .ctx = null };
@@ -237,9 +238,9 @@ pub fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !
     }
     entry.qsa_hist_rows = keep;
     const keep_blocks: c_int = @divTrunc(keep, @max(entry.qsa_ratio, 1));
-    if (entry.qsa_pooled_buf.ctx != null) {
-        if (keep_blocks > 0 and mlx.getShape(entry.qsa_pooled_buf)[1] >= keep_blocks) {
-            try capBufReslice(s, entry.qsa_pooled_buf, &entry.qsa_pooled, &entry.qsa_pooled_blocks, 1, keep_blocks);
+    if (entry.qsa_pooled_buf.array.ctx != null) {
+        if (keep_blocks > 0 and mlx.getShape(entry.qsa_pooled_buf.array)[1] >= keep_blocks) {
+            try capBufReslice(s, entry.qsa_pooled_buf.array, &entry.qsa_pooled, &entry.qsa_pooled_blocks, 1, keep_blocks);
         } else {
             if (entry.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(entry.qsa_pooled);
             entry.qsa_pooled = .{ .ctx = null };
@@ -250,8 +251,8 @@ pub fn qsaResliceToKeep(entry: *SSMCacheEntry, keep: c_int, s: mlx.mlx_stream) !
     }
     if (entry.qsa_score_bank.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_bank);
     entry.qsa_score_bank = .{ .ctx = null };
-    if (entry.qsa_score_buf.ctx != null) _ = mlx.mlx_array_free(entry.qsa_score_buf);
-    entry.qsa_score_buf = .{ .ctx = null };
+    entry.qsa_score_buf.deinit();
+    entry.qsa_score_buf = .none;
     entry.qsa_score_blocks = 0;
     return true;
 }
@@ -543,8 +544,8 @@ pub fn qsaHandoffExceedsSlack(buf_rows: c_int, keep: c_int) bool {
 
 /// The buffer a share of `src` would pin: the capacity buffer when the accelerator holds one, else the published history.
 fn qsaHandoffMustMaterialize(src: *const SSMCacheEntry, keep: c_int) bool {
-    const buf_rows: c_int = if (src.qsa_key_buf.ctx != null)
-        mlx.getShape(src.qsa_key_buf)[1]
+    const buf_rows: c_int = if (src.qsa_key_buf.array.ctx != null)
+        mlx.getShape(src.qsa_key_buf.array)[1]
     else if (src.aux_state.ctx != null)
         mlx.getShape(src.aux_state)[1]
     else
@@ -562,7 +563,7 @@ fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntr
         if (!ssmAuxIsQsaHistory(&src)) continue;
         const materialize = switch (mode) {
             .copy => true,
-            .share => qsaHandoffMustMaterialize(&src, keep) or src.qsa_pooled_buf.ctx == null,
+            .share => qsaHandoffMustMaterialize(&src, keep) or src.qsa_pooled_buf.array.ctx == null,
         };
         if (src.qsa_pooled.ctx != null) {
             if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
@@ -781,7 +782,9 @@ test "a PLE rollback leaves no freed-but-non-null QSA handle behind" {
     try mlx.check(mlx.mlx_arange(&pflat, 0.0, 8.0, 1.0, .float32, s));
     const pshape = [_]c_int{ 1, 2, 4 };
     try mlx.check(mlx.mlx_reshape(&e.qsa_pooled, pflat, &pshape, 3, s));
-    try mlx.check(mlx.mlx_reshape(&e.qsa_key_buf, pflat, &pshape, 3, s));
+    var key_buf = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&key_buf, pflat, &pshape, 3, s));
+    e.qsa_key_buf = @import("../mlx_pages.zig").InPlace.adopt(key_buf, .paged);
     e.qsa_key_rows = 2;
     e.qsa_pooled_blocks = 2;
 
@@ -793,10 +796,10 @@ test "a PLE rollback leaves no freed-but-non-null QSA handle behind" {
     try t.expectEqual(width, got[2]);
     // Every QSA handle the arm dropped is null, not dangling.
     try t.expect(e.qsa_pooled.ctx == null);
-    try t.expect(e.qsa_key_buf.ctx == null);
-    try t.expect(e.qsa_pooled_buf.ctx == null);
+    try t.expect(e.qsa_key_buf.array.ctx == null);
+    try t.expect(e.qsa_pooled_buf.array.ctx == null);
     try t.expect(e.qsa_score_bank.ctx == null);
-    try t.expect(e.qsa_score_buf.ctx == null);
+    try t.expect(e.qsa_score_buf.array.ctx == null);
     try t.expectEqual(@as(c_int, 0), e.qsa_key_rows);
     try t.expectEqual(@as(c_int, 0), e.qsa_pooled_blocks);
 }
@@ -868,13 +871,13 @@ test "ssmEntryBytes bills each QSA capacity buffer once, never the view beside i
     var e: SSMCacheEntry = .{ .conv_state = zeros.make(&.{ 1, 3, 8 }, s), .ssm_state = zeros.make(&.{ 1, 2, 4, 4 }, s), .initialized = true };
     defer _ = mlx.mlx_array_free(e.conv_state);
     defer _ = mlx.mlx_array_free(e.ssm_state);
-    e.qsa_key_buf = zeros.make(&.{ 1, 64, 16 }, s);
-    defer _ = mlx.mlx_array_free(e.qsa_key_buf);
-    e.aux_state = try zeros.rows(e.qsa_key_buf, 10, s);
+    e.qsa_key_buf = @import("../mlx_pages.zig").InPlace.adopt(zeros.make(&.{ 1, 64, 16 }, s), .paged);
+    defer _ = mlx.mlx_array_free(e.qsa_key_buf.array);
+    e.aux_state = try zeros.rows(e.qsa_key_buf.array, 10, s);
     defer _ = mlx.mlx_array_free(e.aux_state);
-    e.qsa_pooled_buf = zeros.make(&.{ 1, 32, 16 }, s);
-    defer _ = mlx.mlx_array_free(e.qsa_pooled_buf);
-    e.qsa_pooled = try zeros.rows(e.qsa_pooled_buf, 2, s);
+    e.qsa_pooled_buf = @import("../mlx_pages.zig").InPlace.adopt(zeros.make(&.{ 1, 32, 16 }, s), .paged);
+    defer _ = mlx.mlx_array_free(e.qsa_pooled_buf.array);
+    e.qsa_pooled = try zeros.rows(e.qsa_pooled_buf.array, 2, s);
     defer _ = mlx.mlx_array_free(e.qsa_pooled);
     const two: u64 = 2; // bf16
     try testing.expectEqual(two * (3 * 8 + 2 * 4 * 4 + 64 * 16 + 32 * 16), ssmEntryBytes(&e));
@@ -907,10 +910,10 @@ test "qsa raw-key ring is O(RING_ROWS) at N rows" {
     const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, n, hd }, s);
     defer _ = mlx.mlx_array_free(chunk);
     try qwen4_qsa.qsaAppendKeys(&xfm, &entry, chunk, 0);
-    try mlx.check(mlx.mlx_array_eval(entry.qsa_key_buf));
+    try mlx.check(mlx.mlx_array_eval(entry.qsa_key_buf.array));
 
     const raw = qsaRawKeyBytes(&entry);
-    const row: u64 = @as(u64, @intCast(hd)) * @as(u64, mlx.mlx_array_itemsize(entry.qsa_key_buf));
+    const row: u64 = @as(u64, @intCast(hd)) * @as(u64, mlx.mlx_array_itemsize(entry.qsa_key_buf.array));
     const ring_cap = @as(u64, @intCast(QSA_RING_ROWS)) * row;
     try t.expectEqual(ring_cap, raw);
 }
@@ -934,7 +937,7 @@ test "qsa raw-key ring: a fresh layer's first rows under the ring's size hold th
     const row = try attn256RandBf16(prng.random(), &[_]c_int{ 1, 1, hd }, s);
     defer _ = mlx.mlx_array_free(row);
     try qwen4_qsa.qsaAppendKeys(&xfm, &entry, row, 5);
-    try mlx.check(mlx.mlx_array_eval(entry.qsa_key_buf));
+    try mlx.check(mlx.mlx_array_eval(entry.qsa_key_buf.array));
     const row_bytes: u64 = @as(u64, @intCast(hd)) * 2;
     const billed = @import("../mlx_pages.zig").pagedCount(@intCast(QSA_RING_ROWS), row_bytes) * row_bytes;
     try t.expectEqual(billed, qsaRawKeyBytes(&entry));
@@ -1114,7 +1117,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
         try qwen4_qsa.qsaAppendPooled(&xfm, &entry, blocks, @divTrunc(prefix, entry.qsa_ratio));
     }
     try t.expectEqual(prefix + verify_len, entry.qsa_key_rows);
-    try t.expect(entry.qsa_key_buf.ctx != null);
+    try t.expect(entry.qsa_key_buf.array.ctx != null);
     _ = try qwen4_qsa.qsaScoreBank(&xfm, &entry, 1, @divTrunc(prefix + verify_len, entry.qsa_ratio), hd);
 
     const kept_ref = blk: {
@@ -1155,14 +1158,14 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     };
     defer _ = mlx.mlx_array_free(kept_pooled);
 
-    const buf_before = entry.qsa_key_buf.ctx;
-    const pooled_buf_before = entry.qsa_pooled_buf.ctx;
+    const buf_before = entry.qsa_key_buf.array.ctx;
+    const pooled_buf_before = entry.qsa_pooled_buf.array.ctx;
     try ssmRollbackFromCapture(&entry, accepted, @intCast(verify_len), s);
 
-    try t.expect(entry.qsa_key_buf.ctx == buf_before);
+    try t.expect(entry.qsa_key_buf.array.ctx == buf_before);
     try t.expectEqual(keep, entry.qsa_key_rows);
     try t.expectEqual(keep, mlx.getShape(entry.aux_state)[1]);
-    try t.expect(entry.qsa_pooled_buf.ctx == pooled_buf_before);
+    try t.expect(entry.qsa_pooled_buf.array.ctx == pooled_buf_before);
     try t.expectEqual(keep_blocks, entry.qsa_pooled_blocks);
     try t.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.qsa_pooled, kept_pooled, s));
     // The score bank is invalidated rather than truncated: its columns are a function of
@@ -1864,7 +1867,7 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
     try qwen4_qsa.qsaAppendPooled(&t, &live[0], blocks, 0);
     try mlx.check(mlx.mlx_array_eval(live[0].aux_state));
     try mlx.check(mlx.mlx_array_eval(live[0].qsa_pooled));
-    try testing.expectEqual(QSA_RING_ROWS, mlx.getShape(live[0].qsa_key_buf)[1]);
+    try testing.expectEqual(QSA_RING_ROWS, mlx.getShape(live[0].qsa_key_buf.array)[1]);
 
     var ref = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, @intCast(QSA_RING_ROWS), s)};
     defer ref[0].deinit(testing.allocator);
@@ -2117,7 +2120,7 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
         rows += chunk_rows;
     }
     try testing.expectEqual(QSA_RING_ROWS, mlx.getShape(entry.aux_state)[1]);
-    try testing.expect(mlx.getShape(entry.qsa_key_buf)[1] <= QSA_RING_ROWS);
+    try testing.expect(mlx.getShape(entry.qsa_key_buf.array)[1] <= QSA_RING_ROWS);
     try testing.expectEqual(@as(c_int, @intCast(total)), entry.qsa_hist_rows);
 }
 
@@ -2176,7 +2179,7 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
         defer _ = mlx.mlx_array_free(tail);
         try testing.expectEqual(mlx.getShape(tail)[1], mlx.getShape(entry.aux_state)[1]);
         try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.aux_state, tail, s));
-        try testing.expect(mlx.getShape(entry.qsa_key_buf)[1] >= mlx.getShape(entry.aux_state)[1]);
+        try testing.expect(mlx.getShape(entry.qsa_key_buf.array)[1] >= mlx.getShape(entry.aux_state)[1]);
     }
     try testing.expectEqual(QSA_RING_ROWS, mlx.getShape(entry.aux_state)[1]);
 
@@ -2274,7 +2277,7 @@ test "qsa pooled bank: capacity append equals the concat, and the f32 score oper
         try testing.expectEqual(nb, mlx.getShape(entry.qsa_pooled)[1]);
         try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(entry.qsa_pooled, reference, s));
     }
-    try testing.expect(mlx.getShape(entry.qsa_pooled_buf)[1] > nb);
+    try testing.expect(mlx.getShape(entry.qsa_pooled_buf.array)[1] > nb);
 
     const before = t.arch_state.qwen4.qsa_score_bank_builds;
     const bank = try qwen4_qsa.qsaScoreBank(&t, &entry, 1, nb, hd);
@@ -2340,7 +2343,7 @@ test "qsa score bank: incremental column append matches a from-scratch rebuild" 
         _ = try qwen4_qsa.qsaScoreBank(&t, &incr, batch, nb, hd);
     }
     try testing.expectEqual(before + 23, qwen4_qsa.qsa_score_incremental_appends);
-    try testing.expect(mlx.getShape(incr.qsa_score_buf)[3] > nb);
+    try testing.expect(mlx.getShape(incr.qsa_score_buf.array)[3] > nb);
     const bank_inc = try qwen4_qsa.qsaScoreBank(&t, &incr, batch, nb, hd);
     const bank_scratch = try qwen4_qsa.qsaScoreBank(&t, &scratch, batch, nb, hd);
     try testing.expectEqual(@as(c_int, hd), mlx.getShape(bank_inc)[2]);
@@ -2393,8 +2396,8 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
     // A restore: `aux_state` survives, the accelerator does not.
     var authority = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&authority, entry.aux_state));
-    _ = mlx.mlx_array_free(entry.qsa_key_buf);
-    entry.qsa_key_buf = .{ .ctx = null };
+    _ = mlx.mlx_array_free(entry.qsa_key_buf.array);
+    entry.qsa_key_buf = .none;
     entry.qsa_key_rows = 0;
     _ = mlx.mlx_array_free(entry.aux_state);
     entry.aux_state = authority;
@@ -2408,8 +2411,8 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
     try testing.expectEqual(@as(c_int, held + 30), entry.qsa_hist_rows);
 
     entry.qsa_reserve_rows = 0;
-    _ = mlx.mlx_array_free(entry.qsa_key_buf);
-    entry.qsa_key_buf = .{ .ctx = null };
+    _ = mlx.mlx_array_free(entry.qsa_key_buf.array);
+    entry.qsa_key_buf = .none;
     entry.qsa_key_rows = 0;
     {
         const chunk = try attn256RandBf16(rnd, &[_]c_int{ 1, 30, hd }, s);
@@ -2501,11 +2504,11 @@ test "a decode step past the QSA history's capacity holds beside the grown histo
     for (&entries) |*e| {
         e.* = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
         e.qsa_ratio = ratio;
-        e.qsa_pooled_buf = try Fill.make(&.{ 1, cap, idx_hd }, .bfloat16, s);
-        e.qsa_pooled = try Fill.view(e.qsa_pooled_buf, 1, cap, s);
+        e.qsa_pooled_buf = mlx_pages.InPlace.adopt(try Fill.make(&.{ 1, cap, idx_hd }, .bfloat16, s), .paged);
+        e.qsa_pooled = try Fill.view(e.qsa_pooled_buf.array, 1, cap, s);
         e.qsa_pooled_blocks = cap;
-        e.qsa_score_buf = try Fill.make(&.{ 1, 1, idx_hd, cap }, .float32, s);
-        e.qsa_score_bank = try Fill.view(e.qsa_score_buf, 3, cap, s);
+        e.qsa_score_buf = mlx_pages.InPlace.adopt(try Fill.make(&.{ 1, 1, idx_hd, cap }, .float32, s), .paged);
+        e.qsa_score_bank = try Fill.view(e.qsa_score_buf.array, 3, cap, s);
         e.qsa_score_blocks = cap;
         // Three tokens past the last block: the next row completes block 1,025.
         e.qsa_hist_rows = cap * ratio + 3;
@@ -2530,8 +2533,8 @@ test "a decode step past the QSA history's capacity holds beside the grown histo
         const capBufAppend = @import("../ssm_cache.zig").capBufAppend;
         try capBufAppend(s, &e.qsa_pooled_buf, &e.qsa_pooled, &e.qsa_pooled_blocks, pooled_new, 1, hold, ratio);
         try capBufAppend(s, &e.qsa_score_buf, &e.qsa_score_bank, &e.qsa_score_blocks, cols, 3, hold, ratio);
-        _ = mlx.mlx_vector_array_append_value(outs, e.qsa_pooled_buf);
-        _ = mlx.mlx_vector_array_append_value(outs, e.qsa_score_buf);
+        _ = mlx.mlx_vector_array_append_value(outs, e.qsa_pooled_buf.array);
+        _ = mlx.mlx_vector_array_append_value(outs, e.qsa_score_buf.array);
     }
     try mlx.check(mlx.mlx_eval(outs));
     try mlx.check(mlx.mlx_synchronize(s));
@@ -2541,14 +2544,14 @@ test "a decode step past the QSA history's capacity holds beside the grown histo
     var live: usize = 0;
     _ = mlx.mlx_get_active_memory(&live);
 
-    const grown: u64 = @intCast(mlx.getShape(entries[0].qsa_pooled_buf)[1]);
+    const grown: u64 = @intCast(mlx.getShape(entries[0].qsa_pooled_buf.array)[1]);
     try testing.expect(grown > cap);
     // The forward's appends found the room: one block more in every bank, written in place of the grown buffers.
     for (&entries) |*e| {
         try testing.expectEqual(cap + 1, e.qsa_pooled_blocks);
         try testing.expectEqual(cap + 1, mlx.getShape(e.qsa_pooled)[1]);
         try testing.expectEqual(cap + 1, e.qsa_score_blocks);
-        try testing.expectEqual(grown, @as(u64, @intCast(mlx.getShape(e.qsa_score_buf)[3])));
+        try testing.expectEqual(grown, @as(u64, @intCast(mlx.getShape(e.qsa_score_buf.array)[3])));
     }
     const pooled_buf: u64 = grown * idx_hd * 2;
     const score_buf: u64 = grown * idx_hd * 4;

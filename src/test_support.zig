@@ -257,9 +257,9 @@ pub fn snapshotsBitEqual(a: *const KVCacheSnapshot, b: *const KVCacheSnapshot, s
         if (!x.initialized) continue;
         if (x.base != y.base or x.offset != y.offset) return false;
         const pairs = [_][2]mlx.mlx_array{
-            .{ x.keys, y.keys },                   .{ x.values, y.values },
-            .{ x.keys_scales, y.keys_scales },     .{ x.keys_biases, y.keys_biases },
-            .{ x.values_scales, y.values_scales }, .{ x.values_biases, y.values_biases },
+            .{ x.keys.array, y.keys.array },                   .{ x.values.array, y.values.array },
+            .{ x.keys_scales.array, y.keys_scales.array },     .{ x.keys_biases.array, y.keys_biases.array },
+            .{ x.values_scales.array, y.values_scales.array }, .{ x.values_biases.array, y.values_biases.array },
         };
         for (pairs) |p| {
             if ((p[0].ctx == null) != (p[1].ctx == null)) return false;

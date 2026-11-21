@@ -262,7 +262,7 @@ fn feedKvEntry(h: *Sha256, e: *const trunk.KVCacheEntry, matched: usize, s: mlx.
     feedInt(h, e.base);
     // The storage buffers, not the views: a restore fills the buffers and a view exists only after the next append.
     const rows = @min(matched -| e.base, e.offset);
-    inline for (.{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases }) |a| {
+    inline for (.{ e.keys.array, e.values.array, e.keys_scales.array, e.keys_biases.array, e.values_scales.array, e.values_biases.array }) |a| {
         try feedRows(h, a, 2, rows, s);
     }
 }

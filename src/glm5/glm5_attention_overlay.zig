@@ -1,6 +1,7 @@
 //! Verification-only latent prefix plus at most `max_rows` ancestry rows.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const latent_store = @import("glm5_latent.zig");
 const Latent = latent_store.Latent;
@@ -193,14 +194,14 @@ test "GLM latent overlay branch outputs index state and commit match full append
             try std.testing.expectEqual(prefix + path.len, virtual.processed);
             try std.testing.expectEqual(prefix, source.processed);
             for ([_]Arr{ original.tail_keys, original.tail_gates }, [_]Arr{ virtual.tail_keys, virtual.tail_gates }) |left, right| try exact(left, right);
-            if (source.pooled.ctx != null) try std.testing.expectEqual(mlx.mlx_array_data_uint8(source.pooled), mlx.mlx_array_data_uint8(virtual.pooled)) else try std.testing.expect(virtual.pooled.ctx == null);
+            if (source.pooled.array.ctx != null) try std.testing.expectEqual(mlx.mlx_array_data_uint8(source.pooled.array), mlx.mlx_array_data_uint8(virtual.pooled.array)) else try std.testing.expect(virtual.pooled.array.ctx == null);
             const pools: c_int = @intCast(virtual.processed / 4);
             const fresh: c_int = if (virtual.pool_tail.ctx == null) 0 else mlx.getShape(virtual.pool_tail)[0];
             if (fresh > 0) {
-                const joined = if (pools == fresh) virtual.pool_tail else try ops.concat(&.{ try ops.slice(source.pooled, 0, 0, pools - fresh), virtual.pool_tail }, 0);
-                try exact(try ops.contiguous(try ops.slice(original.pooled, 0, 0, pools)), try ops.contiguous(joined));
-            } else if (pools > 0) try exact(try ops.contiguous(try ops.slice(original.pooled, 0, 0, pools)), try ops.contiguous(try ops.slice(source.pooled, 0, 0, pools)));
-            if (dtype == .bfloat16) try std.testing.expectEqual(mlx.mlx_array_data_bfloat16(source.latent), mlx.mlx_array_data_bfloat16(virtual.latent)) else try std.testing.expectEqual(mlx.mlx_array_data_float32(source.latent), mlx.mlx_array_data_float32(virtual.latent));
+                const joined = if (pools == fresh) virtual.pool_tail else try ops.concat(&.{ try ops.slice(source.pooled.array, 0, 0, pools - fresh), virtual.pool_tail }, 0);
+                try exact(try ops.contiguous(try ops.slice(original.pooled.array, 0, 0, pools)), try ops.contiguous(joined));
+            } else if (pools > 0) try exact(try ops.contiguous(try ops.slice(original.pooled.array, 0, 0, pools)), try ops.contiguous(try ops.slice(source.pooled.array, 0, 0, pools)));
+            if (dtype == .bfloat16) try std.testing.expectEqual(mlx.mlx_array_data_bfloat16(source.latent.array), mlx.mlx_array_data_bfloat16(virtual.latent.array)) else try std.testing.expectEqual(mlx.mlx_array_data_float32(source.latent.array), mlx.mlx_array_data_float32(virtual.latent.array));
             const row: c_int = @intCast(path[path.len - 1]);
             const q = try ops.slice(queries, 0, row, row + 1);
             const index_q = try ops.slice(iq, 0, row, row + 1);
@@ -253,7 +254,7 @@ fn overlayTailCase(bits: u8) !void {
             const g = try ops.take(gates, ids, 0);
             _ = try original.append(try ops.take(latents, ids, 0), k, g, ape, s);
             _ = try virtual.appendIndexOnly(try ops.take(latents, ids, 0), k, g, ape, s);
-            try std.testing.expect(virtual.latent.ctx != null and virtual.latent_scales.ctx != null);
+            try std.testing.expect(virtual.latent.array.ctx != null and virtual.latent_scales.array.ctx != null);
             const row: c_int = @intCast(path[path.len - 1]);
             const q = try ops.slice(queries, 0, row, row + 1);
             const index_q = try ops.slice(iq, 0, row, row + 1);
@@ -280,9 +281,9 @@ test "GLM overlay branch completing a pool reads a reserved pooled buffer withou
         const ape = try ops.zeros(&.{ 4, 128 }, .bfloat16);
         _ = try source.append(try normal(&ops, &.{ prefix, 64 }, .bfloat16, 61), try normal(&ops, &.{ prefix, 128 }, .bfloat16, 62), try ops.zeros(&.{ prefix, 128 }, .bfloat16), ape, s);
         // A whole-context reservation: 64 MiB of pooled keys, far past the 512 committed pools.
-        const reserved = try ops.concat(&.{ source.pooled, try ops.zeros(&.{ 262144 - mlx.getShape(source.pooled)[0], 128 }, .bfloat16) }, 0);
-        _ = mlx.mlx_array_free(source.pooled);
-        source.pooled = try ops.result(reserved);
+        const reserved = try ops.concat(&.{ source.pooled.array, try ops.zeros(&.{ 262144 - mlx.getShape(source.pooled.array)[0], 128 }, .bfloat16) }, 0);
+        _ = mlx.mlx_array_free(source.pooled.array);
+        source.pooled = mlx_pages.InPlace.adopt(try ops.result(reserved), .paged);
         try source.evaluate();
         const latents = try normal(&ops, &.{ 2, 64 }, .bfloat16, 63);
         const readable = try ops.own(try latent_store.readable(latents, bits, s));

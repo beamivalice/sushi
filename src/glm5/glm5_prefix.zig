@@ -4,6 +4,7 @@
 //! `MlaRows`, which serve every checkpoint of the entry.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const forward = @import("glm5_forward.zig");
 const restore_dump = @import("../restore_dump.zig");
 const trunk_mod = @import("../trunk.zig");
@@ -38,8 +39,8 @@ pub fn stateDigest(request: State, h: *std.crypto.hash.sha2.Sha256, s: mlx.mlx_s
         h.update(std.mem.asBytes(&std.mem.nativeToLittle(u64, a.processed)));
         try restore_dump.feedArray(h, layer.recurrent.conv_state, s);
         try restore_dump.feedArray(h, layer.recurrent.ssm_state, s);
-        for ([_]Arr{ a.latent, a.latent_scales, a.latent_biases }) |rows| try restore_dump.feedRows(h, rows, 0, a.processed, s);
-        try restore_dump.feedRows(h, a.pooled, 0, a.processed / pool_size, s);
+        for ([_]Arr{ a.latent.array, a.latent_scales.array, a.latent_biases.array }) |rows| try restore_dump.feedRows(h, rows, 0, a.processed, s);
+        try restore_dump.feedRows(h, a.pooled.array, 0, a.processed / pool_size, s);
         for ([_]Arr{ a.tail_keys, a.tail_gates, a.pool_tail }) |tail| try restore_dump.feedArray(h, tail, s);
     }
 }
@@ -99,7 +100,7 @@ pub fn rowBytesOf(request: *const forward.Request) u64 {
     for (request.layers) |*layer| {
         const st = &layer.attention;
         if (st.processed == 0) continue;
-        for ([_]Arr{ st.latent, st.latent_scales, st.latent_biases, st.pooled }, [_]*u64{ &per_row, &per_row, &per_row, &per_pool }) |a, acc| {
+        for ([_]Arr{ st.latent.array, st.latent_scales.array, st.latent_biases.array, st.pooled.array }, [_]*u64{ &per_row, &per_row, &per_row, &per_pool }) |a, acc| {
             if (a.ctx == null or mlx.mlx_array_size(a) == 0) continue;
             acc.* += @as(u64, mlx.mlx_array_size(a)) * mlx.mlx_array_itemsize(a) / @as(u64, @intCast(mlx.getShape(a)[0]));
         }
@@ -192,7 +193,7 @@ pub const MlaRows = struct {
             const st = &src.attention;
             if (st.processed == 0) continue;
             if (st.processed != request.offset or st.tail_keys.ctx == null or st.tail_gates.ctx == null) return error.InvalidGlmAttentionShape;
-            const sources = [_]Arr{ st.latent, st.latent_scales, st.latent_biases, st.pooled };
+            const sources = [_]Arr{ st.latent.array, st.latent_scales.array, st.latent_biases.array, st.pooled.array };
             const rows = [_]usize{ len, len, len, len / pool_size };
             for (sources, rows, dst.arrays()[0..4]) |source, n, field| {
                 if (source.ctx == null or n == 0) continue;
@@ -217,7 +218,7 @@ pub const MlaRows = struct {
             const st = &src.attention;
             if (st.processed == 0) continue;
             if (st.processed != request.offset) return error.InvalidGlmAttentionShape;
-            const sources = [_]Arr{ st.latent, st.latent_scales, st.latent_biases, st.pooled };
+            const sources = [_]Arr{ st.latent.array, st.latent_scales.array, st.latent_biases.array, st.pooled.array };
             const rows = [_]usize{ len, len, len, len / pool_size };
             for (sources, rows, dst.arrays()[0..4]) |source, n, field| {
                 if (source.ctx == null or n == 0) continue;
@@ -306,8 +307,15 @@ pub const MlaRows = struct {
             if (src.latent.ctx == null) continue;
             var from = src.*;
             const st = &dst.attention;
-            const fields = [_]*Arr{ &st.latent, &st.latent_scales, &st.latent_biases, &st.pooled, &st.tail_keys, &st.tail_gates };
-            for (from.arrays(), fields) |a, b| if (a.ctx != null) {
+            const rows = [_]*mlx_pages.InPlace{ &st.latent, &st.latent_scales, &st.latent_biases, &st.pooled };
+            const tails = [_]*Arr{ &st.tail_keys, &st.tail_gates };
+            for (from.arrays()[0..4], rows) |a, b| if (a.ctx != null) {
+                var shared = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(shared);
+                try mlx.check(mlx.mlx_array_set(&shared, a.*));
+                b.* = mlx_pages.InPlace.adopt(shared, .paged);
+            };
+            for (from.arrays()[4..6], tails) |a, b| if (a.ctx != null) {
                 b.* = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_array_set(b, a.*));
             };
@@ -358,13 +366,13 @@ pub fn rowsFromDisk(allocator: std.mem.Allocator, cache: *trunk_mod.KVCache, bit
     for (out.layers, 0..) |*layer, i| {
         const main = &cache.entries[2 * i];
         if (!main.initialized) continue;
-        const width: c_int = mlx.getShape(main.values)[3] * @as(c_int, pool_size);
-        layer.latent = try restoredRows(main.keys, len, &.{ @intCast(len), mlx.getShape(main.keys)[3] }, s);
-        layer.pooled = try restoredRows(main.values, len, &.{ @intCast(len / pool_size), width }, s);
+        const width: c_int = mlx.getShape(main.values.array)[3] * @as(c_int, pool_size);
+        layer.latent = try restoredRows(main.keys.array, len, &.{ @intCast(len), mlx.getShape(main.keys.array)[3] }, s);
+        layer.pooled = try restoredRows(main.values.array, len, &.{ @intCast(len / pool_size), width }, s);
         const quant = &cache.entries[2 * i + 1];
         if (quant.initialized) {
-            layer.scales = try restoredRows(quant.keys, len, &.{ @intCast(len), mlx.getShape(quant.keys)[3] }, s);
-            layer.biases = try restoredRows(quant.values, len, &.{ @intCast(len), mlx.getShape(quant.values)[3] }, s);
+            layer.scales = try restoredRows(quant.keys.array, len, &.{ @intCast(len), mlx.getShape(quant.keys.array)[3] }, s);
+            layer.biases = try restoredRows(quant.values.array, len, &.{ @intCast(len), mlx.getShape(quant.values.array)[3] }, s);
         }
         for ([_]*Arr{ &layer.tail_keys, &layer.tail_gates }) |tail| {
             tail.* = mlx.mlx_array_new();
@@ -374,10 +382,11 @@ pub fn rowsFromDisk(allocator: std.mem.Allocator, cache: *trunk_mod.KVCache, bit
     return out;
 }
 
-fn asTokenRows(dst: *Arr, src: Arr, len: usize) !void {
+fn asTokenRows(dst: *mlx_pages.InPlace, src: Arr, len: usize) !void {
     const n: usize = @intCast(mlx.mlx_array_size(src));
-    _ = mlx.mlx_array_free(dst.*);
-    dst.* = try reshaped(src, &.{ 1, 1, @intCast(len), @intCast(n / len) }, mlx.gpuStream());
+    const rows = try reshaped(src, &.{ 1, 1, @intCast(len), @intCast(n / len) }, mlx.gpuStream());
+    dst.deinit();
+    dst.* = mlx_pages.InPlace.adopt(rows, .paged);
 }
 
 /// The first `len` rows of a restored `[1, 1, rows, w]` buffer as `shape`: an SSD restore holds its rows on MLX's page
@@ -757,10 +766,10 @@ pub fn expectSameLogicalState(a: *forward.Request, b: *forward.Request) !void {
         try testing.expectEqual(p, y.attention.processed);
         if (p == 0) continue;
         const pairs = [_][2]Arr{
-            .{ x.attention.latent, y.attention.latent },
-            .{ x.attention.latent_scales, y.attention.latent_scales },
-            .{ x.attention.latent_biases, y.attention.latent_biases },
-            .{ x.attention.pooled, y.attention.pooled },
+            .{ x.attention.latent.array, y.attention.latent.array },
+            .{ x.attention.latent_scales.array, y.attention.latent_scales.array },
+            .{ x.attention.latent_biases.array, y.attention.latent_biases.array },
+            .{ x.attention.pooled.array, y.attention.pooled.array },
         };
         for (pairs, [_]usize{ p, p, p, p / pool_size }) |pair, rows| {
             try testing.expectEqual(pair[0].ctx == null, pair[1].ctx == null);

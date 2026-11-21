@@ -168,8 +168,8 @@ fn runIndexDecode(run: *report.Run) anyerror!void {
             defer alloc.free(lens_h);
             for (lens_h, 0..) |*v, i| v.* = @intCast(nb - L + i + 1);
             const lens = try sc.ints(lens_h, &.{ ci(L), 1 });
-            const codes = try sc.slice(rows.buf, 0, 0, nb);
-            const scl = try sc.slice(rows.sbuf, 0, 0, nb);
+            const codes = try sc.slice(rows.buf.array, 0, 0, nb);
+            const scl = try sc.slice(rows.sbuf.array, 0, 0, nb);
             const full = try kernels.indexScoresPacked(&sc, q, codes, scl, w, 0.01, nb - L, 1, pk.mode, pk.group);
             const mask = try model.candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
             if (mask.ctx == null) return error.KeysUnderTheCandidateBlocks;
@@ -253,7 +253,7 @@ fn runIndexPeak(run: *report.Run) anyerror!void {
             defer alloc.free(lens_h);
             for (lens_h, 0..) |*v, i| v.* = @intCast((ctx - g.L + i + 1) / g.r);
             const lens = try sc.ints(lens_h, &.{ ci(g.L), 1 });
-            try evalAll(&.{ q, w, rows.buf, rows.sbuf, lens });
+            try evalAll(&.{ q, w, rows.buf.array, rows.sbuf.array, lens });
             const a: SpanArgs = .{ .rows = &rows, .nb = nb, .q = q, .w = w, .wscale = 0.01, .p0 = ctx - g.L, .r = g.r, .k = 512, .bs = 8, .with_blocks = nb / 8 > 2048, .lens = lens };
             var c: SpanSample = .{ .gpu = gpu, .a = a, .tile = tile };
             const label = try std.fmt.allocPrint(run.a, "{s} ctx {d}", .{ g.name, ctx });
@@ -291,7 +291,7 @@ fn sampleBlock(c: *BlockSample, arm: usize) anyerror!f64 {
     const a = c.a;
     const pk = a.rows.pack.?;
     var sw = io_util.Stopwatch.init(io());
-    var scores = try kernels.indexScoresPacked(&t, a.q, try t.slice(a.rows.buf, 0, 0, a.nb), try t.slice(a.rows.sbuf, 0, 0, a.nb), a.w, a.wscale, a.p0, a.r, pk.mode, pk.group);
+    var scores = try kernels.indexScoresPacked(&t, a.q, try t.slice(a.rows.buf.array, 0, 0, a.nb), try t.slice(a.rows.sbuf.array, 0, 0, a.nb), a.w, a.wscale, a.p0, a.r, pk.mode, pk.group);
     if (arm == 1) {
         var o = mlx.mlx_array_new();
         const rep = try t.res(mlx.mlx_repeat_axis(&o, c.mask, ci(a.bs), -1, t.s), &o);
@@ -320,10 +320,10 @@ fn runIndexBlockPeak(run: *report.Run) anyerror!void {
         for (&lens_h, 0..) |*v, i| v.* = @intCast(ctx - L + i + 1);
         const lens = try sc.ints(&lens_h, &.{ L, 1 });
         const pk = rows.pack.?;
-        const full = try kernels.indexScoresPacked(&sc, q, try sc.slice(rows.buf, 0, 0, ctx), try sc.slice(rows.sbuf, 0, 0, ctx), w, 0.01, ctx - L, 1, pk.mode, pk.group);
+        const full = try kernels.indexScoresPacked(&sc, q, try sc.slice(rows.buf.array, 0, 0, ctx), try sc.slice(rows.sbuf.array, 0, 0, ctx), w, 0.01, ctx - L, 1, pk.mode, pk.group);
         const mask = try model.candidateBlocks(&sc, &fake, 0, full, lens, 8, 2048);
         if (mask.ctx == null) return error.KeysUnderTheCandidateBlocks;
-        try evalAll(&.{ q, w, rows.buf, rows.sbuf, lens, mask });
+        try evalAll(&.{ q, w, rows.buf.array, rows.sbuf.array, lens, mask });
         const a: SpanArgs = .{ .rows = &rows, .nb = ctx, .q = q, .w = w, .wscale = 0.01, .p0 = ctx - L, .r = 1, .k = 512, .bs = 8, .with_blocks = false, .lens = lens };
         var c: BlockSample = .{ .gpu = gpu, .a = a, .mask = mask };
         const label = try std.fmt.allocPrint(run.a, "ctx {d}", .{ctx});
@@ -355,17 +355,15 @@ const GrowSample = struct { gpu: mlx.mlx_stream, base: *const model.Rows, chunk:
 /// The store's rows are shared, not copied: growing frees only the copy's own handles.
 fn sampleGrow(c: *GrowSample, _: usize) anyerror!f64 {
     var rows = c.base.*;
-    rows.buf = mlx.mlx_array_new();
-    rows.sbuf = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&rows.buf, c.base.buf));
-    try mlx.check(mlx.mlx_array_set(&rows.sbuf, c.base.sbuf));
+    rows.buf = c.base.buf.share();
+    rows.sbuf = c.base.sbuf.share();
     defer rows.deinit();
     const p = Peak.begin(c.gpu);
     var t = Scope.plain(alloc, c.gpu);
     defer t.deinit();
     var sw = io_util.Stopwatch.init(io());
     try rows.append(&t, c.chunk);
-    try evalAll(&.{ rows.buf, rows.sbuf });
+    try evalAll(&.{ rows.buf.array, rows.sbuf.array });
     const ns = sw.read();
     c.peak.add(p.end());
     return @floatFromInt(ns);
@@ -386,7 +384,7 @@ fn runRowsGrowth(run: *report.Run) anyerror!void {
             const full = try sc.broadcast(try sc.expand(base, 0), &.{ ci(n / 4096), 4096, ci(g.width) });
             try rows.append(&sc, try sc.reshape(full, &.{ ci(n), ci(g.width) }));
             const chunk = try sc.slice(base, 0, 0, 2048);
-            try evalAll(&.{ rows.buf, rows.sbuf, chunk });
+            try evalAll(&.{ rows.buf.array, rows.sbuf.array, chunk });
             var c: GrowSample = .{ .gpu = gpu, .base = &rows, .chunk = chunk };
             const label = try std.fmt.allocPrint(run.a, "{s} used {d}", .{ g.name, n });
             try run.interleave(label, &c, sampleGrow);
@@ -592,7 +590,7 @@ fn runAttnEpilogue(run: *report.Run) anyerror!void {
         const freqs = try base.floats(&f, &.{32});
         const pos = try model.posArray(&base, epi_pos0, cs.c.L, 1);
         try evalAll(&.{ d.q, d.keys, d.sink, freqs, pos });
-        if (store) |r| try evalAll(&.{ d.topk, r.buf, r.sbuf });
+        if (store) |r| try evalAll(&.{ d.topk, r.buf.array, r.sbuf.array });
         var s: EpiSample = .{ .gpu = gpu, .d = d, .c = cs.c, .rows = if (store) |*r| r else null, .freqs = freqs, .pos = pos };
         const label = try std.fmt.allocPrint(run.a, "span {d} K {d}", .{ cs.c.L, cs.c.K });
         try run.interleave(label, &s, sampleEpilogue);
@@ -649,7 +647,7 @@ fn runPicksSpan(run: *report.Run) anyerror!void {
             const d = try model.attnCaseData(&base, c, 0xa77);
             var store = try model.packedStore(&base, d.comp);
             defer store.deinit();
-            try evalAll(&.{ d.q, d.keys, d.sink, d.topk, store.buf, store.sbuf });
+            try evalAll(&.{ d.q, d.keys, d.sink, d.topk, store.buf.array, store.sbuf.array });
             var s: PicksSample = .{ .gpu = gpu, .d = d, .c = c, .rows = &store };
             const label = try std.fmt.allocPrint(run.a, "span {d} rows {d}", .{ cs.L, nc });
             try run.interleave(label, &s, samplePicks);
@@ -707,7 +705,7 @@ fn samplePicksGlue(s: *PicksGlueSample, arm: usize) anyerror!f64 {
     var sc = Scope.plain(alloc, s.gpu);
     defer sc.deinit();
     const pk = s.rows.pack.?;
-    const fixed = try qat_mod.unpackPicks(&sc, s.rows.buf, s.rows.sbuf, s.topk, pk.mode, pk.group, s.rows.dtype);
+    const fixed = try qat_mod.unpackPicks(&sc, s.rows.buf.array, s.rows.sbuf.array, s.topk, pk.mode, pk.group, s.rows.dtype);
     try evalAll(&.{ fixed.rows, fixed.ids });
     var x = s.topk;
     var sw = io_util.Stopwatch.init(io());
@@ -715,7 +713,7 @@ fn samplePicksGlue(s: *PicksGlueSample, arm: usize) anyerror!f64 {
         const p: model.Picks = switch (arm) {
             0 => try model.packedPicksOps(&sc, s.rows, x),
             1 => blk: {
-                const u = try qat_mod.unpackPicks(&sc, s.rows.buf, s.rows.sbuf, x, pk.mode, pk.group, s.rows.dtype);
+                const u = try qat_mod.unpackPicks(&sc, s.rows.buf.array, s.rows.sbuf.array, x, pk.mode, pk.group, s.rows.dtype);
                 break :blk .{ .topk = u.ids, .comp_rows = u.rows };
             },
             else => .{ .topk = fixed.ids, .comp_rows = fixed.rows },
@@ -737,10 +735,10 @@ fn runPicksGlue(run: *report.Run) anyerror!void {
         const d = try model.attnCaseData(&base, c, 0xa77);
         var store = try model.packedStore(&base, d.comp);
         defer store.deinit();
-        try evalAll(&.{ d.topk, store.buf, store.sbuf });
+        try evalAll(&.{ d.topk, store.buf.array, store.sbuf.array });
         const pk = store.pack.?;
         const want = try model.packedPicksOps(&base, &store, d.topk);
-        const got = try qat_mod.unpackPicks(&base, store.buf, store.sbuf, d.topk, pk.mode, pk.group, store.dtype);
+        const got = try qat_mod.unpackPicks(&base, store.buf.array, store.sbuf.array, d.topk, pk.mode, pk.group, store.dtype);
         const wr = try sc_mod.hostF32(try base.astype(want.comp_rows, .float32));
         const gr = try sc_mod.hostF32(try base.astype(got.rows, .float32));
         const wi = try sc_mod.hostI32(want.topk);

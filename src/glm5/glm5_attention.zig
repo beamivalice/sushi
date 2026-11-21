@@ -105,35 +105,37 @@ pub const Scope = struct {
     /// `parts`: a row's bytes in each buffer that grows with `buffer` (`mlx_pages.pagedRows`). `in_place`: every
     /// buffer growing with it sits on MLX's page grid (`inPlaceRows`), so a write below its rows lands in place;
     /// otherwise the write grows it onto the grid, keeping its first `used` rows.
-    fn appendRows(self: *Scope, buffer: Arr, used: usize, chunk: Arr, parts: []const u64, in_place: bool) !Arr {
+    fn appendRows(self: *Scope, buffer: mlx_pages.InPlace, used: usize, chunk: Arr, parts: []const u64, in_place: bool) !mlx_pages.InPlace {
         const sh = mlx.getShape(chunk);
         const needed = try std.math.add(usize, used, @intCast(sh[0]));
         if (needed > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
-        const current: usize = if (buffer.ctx == null) 0 else if (in_place) @intCast(mlx.getShape(buffer)[0]) else used;
+        const current: usize = if (buffer.array.ctx == null) 0 else if (in_place) @intCast(mlx.getShape(buffer.array)[0]) else used;
         var target = buffer;
         if (needed > current) {
             const capacity: usize = @intCast(mlx_pages.pagedRows(needed, parts));
             if (capacity > std.math.maxInt(c_int)) return error.InvalidGlmAttentionShape;
             const grown = [_]c_int{ @intCast(capacity), sh[1] };
             const dtype = mlx.mlx_array_dtype(chunk);
-            target = try self.own(if (buffer.ctx == null or used == 0)
+            target = if (buffer.array.ctx == null or used == 0)
                 try mlx_pages.inPlaceBuffer(&grown, dtype, self.s)
             else
-                try mlx_pages.grownBuffer(try self.cut(buffer, 0, @intCast(used)), &grown, 0, dtype, false, self.s));
+                try mlx_pages.grownBuffer(try self.cut(buffer.array, 0, @intCast(used)), &grown, 0, dtype, false, self.s);
+            _ = try self.own(target.array);
         }
         const out = try self.slot();
-        try mlx.check(mlx.mlx_slice_update(out, target, chunk, &.{ @intCast(used), 0 }, 2, &.{ @intCast(needed), sh[1] }, 2, &.{ 1, 1 }, 2, self.s));
-        return out.*;
+        return target.write(out, chunk, &.{ @intCast(used), 0 }, &.{ @intCast(needed), sh[1] }, self.s);
+    }
+    /// A buffer a step leaves, held beyond the scope.
+    fn resultBuffer(self: *Scope, b: mlx_pages.InPlace) !mlx_pages.InPlace {
+        return b.replaced(try self.result(b.array));
     }
 };
 
 /// Whether every one of `buffers` takes a write in place: on MLX's page grid, where its pool donates the buffer. A
 /// restore binds an entry's exact rows (`MlaRows.trimmedCopy`), which sit off it.
-fn inPlaceRows(buffers: []const Arr, s: mlx.mlx_stream) bool {
+fn inPlaceRows(buffers: []const mlx_pages.InPlace, s: mlx.mlx_stream) bool {
     if (mlx.engine.isStream(s)) return true;
-    for (buffers) |b| {
-        if (b.ctx != null and !mlx_pages.onGrid(@as(u64, mlx.mlx_array_size(b)) * mlx.mlx_array_itemsize(b))) return false;
-    }
+    for (buffers) |b| if (b.array.ctx != null and !mlx_pages.onGrid(b.capacity_bytes)) return false;
     return true;
 }
 
@@ -158,10 +160,10 @@ fn compress(scope: *Scope, keys: Arr, gates: Arr, ape: Arr, ready: c_int) !Arr {
 
 pub const State = struct {
     /// BF16 rows, or kv8/kv6 u32 codes with `latent_scales` and `latent_biases` beside them.
-    latent: Arr = nil,
-    latent_scales: Arr = nil,
-    latent_biases: Arr = nil,
-    pooled: Arr = nil,
+    latent: mlx_pages.InPlace = .none,
+    latent_scales: mlx_pages.InPlace = .none,
+    latent_biases: mlx_pages.InPlace = .none,
+    pooled: mlx_pages.InPlace = .none,
     tail_keys: Arr = nil,
     tail_gates: Arr = nil,
     /// Pools an index-only append completed past `pooled`'s rows: sibling branches share the
@@ -184,22 +186,23 @@ pub const State = struct {
         self.deinit();
     }
     pub fn arrays(self: *const State) [7]Arr {
-        return .{ self.latent, self.latent_scales, self.latent_biases, self.pooled, self.tail_keys, self.tail_gates, self.pool_tail };
+        return .{ self.latent.array, self.latent_scales.array, self.latent_biases.array, self.pooled.array, self.tail_keys, self.tail_gates, self.pool_tail };
     }
     fn poolTailRows(self: *const State) usize {
         return if (self.pool_tail.ctx == null) 0 else @intCast(mlx.getShape(self.pool_tail)[0]);
     }
     fn indexKeys(self: *const State) Arr {
-        return if (self.pooled.ctx != null) self.pooled else self.pool_tail;
+        return if (self.pooled.array.ctx != null) self.pooled.array else self.pool_tail;
     }
     pub fn latentView(self: *const State) Latent {
-        return .{ .data = self.latent, .scales = self.latent_scales, .biases = self.latent_biases };
+        return .{ .data = self.latent.array, .scales = self.latent_scales.array, .biases = self.latent_biases.array };
     }
     /// A second owner of the same immutable arrays; appends replace handles, never contents.
     pub fn share(self: *const State) !State {
         var copy = State{ .processed = self.processed, .latent_bits = self.latent_bits };
         errdefer copy.deinit();
-        inline for (.{ "latent", "latent_scales", "latent_biases", "pooled", "tail_keys", "tail_gates", "pool_tail" }) |name| {
+        inline for (.{ "latent", "latent_scales", "latent_biases", "pooled" }) |name| @field(copy, name) = @field(self.*, name).share();
+        inline for (.{ "tail_keys", "tail_gates", "pool_tail" }) |name| {
             const value = @field(self.*, name);
             if (value.ctx != null) {
                 @field(copy, name) = mlx.mlx_array_new();
@@ -233,7 +236,7 @@ pub const State = struct {
             @mod(ls[1], @as(c_int, latent_store.group_size)) != 0)) return error.InvalidGlmAttentionShape;
         if (self.processed != 0 and (self.latentView().width() != ls[1] or self.latentView().dtype() != mlx.mlx_array_dtype(latent))) return error.InvalidGlmAttentionShape;
         if (self.tail_keys.ctx != null and (mlx.getShape(self.tail_keys)[1] != ks[1] or mlx.mlx_array_dtype(self.tail_keys) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
-        for ([_]Arr{ self.pooled, self.pool_tail }) |a| if (a.ctx != null and (mlx.getShape(a)[1] != ks[1] or mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
+        for ([_]Arr{ self.pooled.array, self.pool_tail }) |a| if (a.ctx != null and (mlx.getShape(a)[1] != ks[1] or mlx.mlx_array_dtype(a) != mlx.mlx_array_dtype(keys))) return error.InvalidGlmAttentionShape;
         if (store_latent and self.pool_tail.ctx != null) return error.InvalidGlmAttentionShape;
         const next = try std.math.add(usize, self.processed, @intCast(ls[0]));
         var scope = Scope{ .s = s };
@@ -261,10 +264,10 @@ pub const State = struct {
         const tail_g = try scope.copy(try scope.cut(g, ready, mlx.getShape(g)[0]));
         var new = State{ .processed = next, .latent_bits = self.latent_bits };
         errdefer new.deinit();
-        if (l.ctx != null) new.latent = try scope.result(l);
-        if (l_scales.ctx != null) new.latent_scales = try scope.result(l_scales);
-        if (l_biases.ctx != null) new.latent_biases = try scope.result(l_biases);
-        if (p.ctx != null) new.pooled = try scope.result(p);
+        if (l.array.ctx != null) new.latent = try scope.resultBuffer(l);
+        if (l_scales.array.ctx != null) new.latent_scales = try scope.resultBuffer(l_scales);
+        if (l_biases.array.ctx != null) new.latent_biases = try scope.resultBuffer(l_biases);
+        if (p.array.ctx != null) new.pooled = try scope.resultBuffer(p);
         if (pt.ctx != null) new.pool_tail = try scope.result(pt);
         new.tail_keys = try scope.result(tail_k);
         new.tail_gates = try scope.result(tail_g);
@@ -425,9 +428,9 @@ pub fn indexScores(scope: *Scope, state: *const State, index_q: Arr, weights: Ar
         const base: c_int = pools - @as(c_int, @intCast(state.poolTailRows()));
         return treeScoresTail(scope, state.indexKeys(), state.pool_tail, base, index_q, weights, offset, pools);
     }
-    if (try @import("glm5_indexpool_nax.zig").tryScores(index_q, state.pooled, weights, offset, @intCast(pools), scope.s)) |out|
+    if (try @import("glm5_indexpool_nax.zig").tryScores(index_q, state.pooled.array, weights, offset, @intCast(pools), scope.s)) |out|
         return scope.own(out);
-    return treeScores(scope, state.pooled, index_q, weights, offset, pools);
+    return treeScores(scope, state.pooled.array, index_q, weights, offset, pools);
 }
 
 fn treeScores(scope: *Scope, pooled: Arr, index_q: Arr, weights: Arr, offset: usize, pools: c_int) !Arr {
@@ -1039,7 +1042,7 @@ test "GLM IndexPool append matches scalar pooling across irregular chunks" {
         try std.testing.expectEqual(offset, state.processed);
         try state.evaluate();
         if (offset >= 4) {
-            const got = mlx.mlx_array_data_float32(state.pooled).?;
+            const got = mlx.mlx_array_data_float32(state.pooled.array).?;
             for (0..offset / 4) |p| for (0..d) |c| {
                 var sum: f64 = 0;
                 var value: f64 = 0;
@@ -1235,7 +1238,7 @@ test "GLM index score matches rounded per-head scalar math with negative weights
         const k = try scope.cast(try scope.own(array(&kv, &.{ pools, dim })), dtype);
         const q = try scope.cast(try scope.own(array(&query, &.{ rows, heads, dim })), dtype);
         const w = try scope.cast(try scope.own(array(&weight, &.{ rows, heads })), dtype);
-        const state = State{ .pooled = k, .processed = pools * 4 };
+        const state = State{ .pooled = mlx_pages.InPlace.adopt(k, .paged), .processed = pools * 4 };
         const scores = try indexScores(&scope, &state, q, w, pools * 4 - 2);
         try mlx.check(mlx.mlx_array_eval(scores));
         const got = mlx.mlx_array_data_float32(scores).?;
@@ -1342,7 +1345,7 @@ test "GLM tree index scorer equals the SIMD-sum scorer bit for bit at real magni
     defer scope.deinit();
     const calls = tree_score_calls;
     const pooled = try normal(&scope, &.{ 600, 128 }, 7, 1);
-    const state = State{ .pooled = pooled, .processed = 2400 };
+    const state = State{ .pooled = mlx_pages.InPlace.adopt(pooled, .paged), .processed = 2400 };
     _ = try indexScores(&scope, &state, try normal(&scope, &.{ 1, 32, 128 }, 8, 3), try normal(&scope, &.{ 1, 32 }, 9, 0.1), 2399);
     try std.testing.expectEqual(calls + 1, tree_score_calls);
 }
@@ -1363,10 +1366,10 @@ test "GLM verifier rows select exactly what each row selects alone, at every tai
     var rows: [cases.len]SelectRow = undefined;
     for (cases, 0..) |case, i| {
         const seed: u64 = 500 + 10 * i;
-        states[i] = .{ .pooled = pooled, .processed = case.processed };
+        states[i] = .{ .pooled = mlx_pages.InPlace.adopt(pooled, .paged), .processed = case.processed };
         if (case.tail > 0) states[i].pool_tail = try normal(&scope, &.{ @intCast(case.tail), 128 }, seed, 4);
         rows[i] = .{ .state = &states[i], .index_q = try normal(&scope, &.{ 1, 32, 128 }, seed + 1, 3), .weights = try normal(&scope, &.{ 1, 32 }, seed + 2, 0.1), .offset = case.processed - 1 };
-        if (case.processed < 2100) states[i].pooled = try scope.cut(pooled, 0, @intCast(case.processed / 4));
+        if (case.processed < 2100) states[i].pooled = mlx_pages.InPlace.adopt(try scope.cut(pooled, 0, @intCast(case.processed / 4)), .paged);
     }
     var grouped: [cases.len]Arr = undefined;
     const before = group_selects;
@@ -1485,7 +1488,7 @@ test "GLM ranked top-512 equals argpartition's stable order on ties, -inf and ca
     // Prefill tiles rank; a decode row keeps the partition.
     var scope = Scope{ .s = s };
     defer scope.deinit();
-    const state = State{ .pooled = try normal(&scope, &.{ 600, 128 }, 230, 1), .processed = 2400 };
+    const state = State{ .pooled = mlx_pages.InPlace.adopt(try normal(&scope, &.{ 600, 128 }, 230, 1), .paged), .processed = 2400 };
     const calls = rank_top_calls;
     _ = try selectChunk(&scope, &state, try normal(&scope, &.{ 16, 32, 128 }, 231, 3), try normal(&scope, &.{ 16, 32 }, 232, 0.1), 2384);
     var node = state;
@@ -1666,8 +1669,8 @@ fn appendOnceCase(bits: u8) !void {
     defer for (&twins) |*st| st.deinit();
     const kv8 = twins[0].latentView();
     try std.testing.expect(kv8.quantized() and kv8.rowMajor());
-    try std.testing.expectEqual(mlx.getShape(twins[1].latent)[0], kv8.rows());
-    try expectSameBits(try scope.own(try kv8.dense(0, n, s)), try scope.cut(twins[1].latent, 0, n));
+    try std.testing.expectEqual(mlx.getShape(twins[1].latent.array)[0], kv8.rows());
+    try expectSameBits(try scope.own(try kv8.dense(0, n, s)), try scope.cut(twins[1].latent.array, 0, n));
     var whole = try latent_store.quantize(latent, bits, s);
     defer whole.deinit();
     for ([_]Arr{ whole.q, whole.scales, whole.biases }, [_]Arr{ kv8.data, kv8.scales, kv8.biases }) |want, got| try expectSameBits(want, try scope.cut(got, 0, n));
@@ -1905,8 +1908,9 @@ test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the
     const offset = n - rows;
     var state = State{ .processed = n };
     defer state.deinit();
-    state.latent = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&state.latent, try normal(&scope, &.{ n, 512 }, 20, 1)));
+    var shared = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&shared, try normal(&scope, &.{ n, 512 }, 20, 1)));
+    state.latent = mlx_pages.InPlace.adopt(shared, .paged);
     var ids: [rows * 2051]i32 = undefined;
     for (0..rows) |r| for (0..2051) |k| {
         ids[r * 2051 + k] = if (r == rows - 1 or k % 37 == 5) -1 else @intCast(offset + r - 2050 + k);
@@ -1921,7 +1925,7 @@ test "GLM sparse prefill without NAX takes the FP32 composite, no worse than the
     const scalar = try attentionChunk(&scope, &state, q, selected, offset, 1.0 / 16.0, 1, false, null);
     const latent = try a.alloc(f32, n * 512);
     defer a.free(latent);
-    try bf16Values(state.latent, latent);
+    try bf16Values(state.latent.array, latent);
     const qv = try a.alloc(f32, rows * 64 * 512);
     defer a.free(qv);
     try bf16Values(q, qv);
@@ -1966,8 +1970,8 @@ fn restoredLatent(bits: u8, donate: bool, len: c_int, pages: c_int) !RestoredLat
     defer state.deinit();
     const exact = [_]c_int{ len, len, len, @divExact(len, 4) };
     inline for (.{ "latent", "latent_scales", "latent_biases", "pooled" }, exact) |name, rows| {
-        const from = @field(whole, name);
-        if (from.ctx != null) @field(state, name) = try @import("../mlx_util.zig").materializedOwnedCopy(s, try scope.cut(from, 0, rows));
+        const from = @field(whole, name).array;
+        if (from.ctx != null) @field(state, name) = mlx_pages.InPlace.adopt(try @import("../mlx_util.zig").materializedOwnedCopy(s, try scope.cut(from, 0, rows)), .paged);
     }
     try state.evaluate();
     // The entry keeps a handle unless the request owns the rows alone, which MLX's pool then donates.
@@ -1981,11 +1985,11 @@ fn restoredLatent(bits: u8, donate: bool, len: c_int, pages: c_int) !RestoredLat
         _ = try state.append(one, key, key, ape, s);
         try state.evaluate();
         try mlx.check(mlx.mlx_synchronize(s));
-        const at = mlx.mlx_array_data_uint8(state.latent);
+        const at = mlx.mlx_array_data_uint8(state.latent.array);
         if (bits == 0 and step > 1 and at != last) out.moved += 1;
         last = at;
     }
-    for ([_]Arr{ state.latent, state.latent_scales, state.latent_biases, state.pooled }) |a| {
+    for ([_]Arr{ state.latent.array, state.latent_scales.array, state.latent_biases.array, state.pooled.array }) |a| {
         if (a.ctx != null and !@import("../mlx_pages.zig").onGrid(@as(u64, mlx.mlx_array_size(a)) * mlx.mlx_array_itemsize(a))) out.on_grid = false;
     }
     return out;
@@ -2003,4 +2007,20 @@ test "a GLM latent restored below its exact rows grows onto MLX's page grid at i
         try std.testing.expectEqual(true, off.on_grid);
     }
     try std.testing.expectEqual(true, (try restoredLatent(latent_store.kv8_bits, false, 1100, 70)).on_grid);
+}
+
+test "a GLM latent write below the buffer's rows is refused when the buffer sits off MLX's page grid, whatever the caller says of it" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var scope: Scope = .{ .s = s };
+    defer scope.deinit();
+    // 1,100 rows of 1 KiB are 68.75 pages.
+    var made = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&made, &[_]c_int{ 1100, 512 }, 2, .bfloat16, s));
+    var latent = mlx_pages.InPlace.adopt(made, .paged);
+    defer latent.deinit();
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_ones(&row, &[_]c_int{ 1, 512 }, 2, .bfloat16, s));
+    try std.testing.expectError(error.InPlaceBufferOffPageGrid, scope.appendRows(latent, 1000, row, &.{1024}, true));
 }

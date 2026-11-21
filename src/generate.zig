@@ -1719,8 +1719,8 @@ pub const Generator = struct {
                     defer _ = mlx.mlx_vector_array_free(eval_vec);
                     for (ctx.cache.entries) |*entry| {
                         if (!entry.initialized) continue;
-                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys.array);
+                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values.array);
                     }
                     if (chunk_hidden_all.ctx != null) {
                         _ = mlx.mlx_vector_array_append_value(eval_vec, chunk_hidden_all);
@@ -4452,15 +4452,15 @@ test "a warm prefill grows its restored layers to the reservation before the fir
                     snap.releaseHandles();
                     warm.adoptRestored();
                 }
-                const ring_cap = mlx.getShape(warm.entries[1].keys)[2];
+                const ring_cap = mlx.getShape(warm.entries[1].keys.array)[2];
 
                 const reserved = try reserveRequestCapacity(&warm, cfg, seq, 32_000, 2048, 0, s);
                 try t.expect(seq <= capacity and capacity < reserved);
-                try t.expectEqual(@as(c_int, capacity), mlx.getShape(donor.entries[0].keys)[2]);
-                try t.expect(mlx.getShape(warm.entries[0].keys)[2] >= reserved);
-                try t.expect(mlx.getShape(warm.entries[0].values)[2] >= reserved);
+                try t.expectEqual(@as(c_int, capacity), mlx.getShape(donor.entries[0].keys.array)[2]);
+                try t.expect(mlx.getShape(warm.entries[0].keys.array)[2] >= reserved);
+                try t.expect(mlx.getShape(warm.entries[0].values.array)[2] >= reserved);
                 try t.expectEqual(@as(usize, @intCast(matched)), warm.entries[0].offset);
-                if (ring > 0) try t.expectEqual(ring_cap, mlx.getShape(warm.entries[1].keys)[2]);
+                if (ring > 0) try t.expectEqual(ring_cap, mlx.getShape(warm.entries[1].keys.array)[2]);
 
                 // The prefill's rows and the first decode step write in place: nothing grows.
                 const grows = KVC.kv_cap_buf_grows;

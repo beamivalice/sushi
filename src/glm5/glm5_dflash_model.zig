@@ -1,6 +1,7 @@
 //! Layerwise GLM tree verification with bounded branch-state lifetime.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const forward = @import("glm5_forward.zig");
 const base = @import("glm5_model.zig");
 const primitive = @import("glm5_next.zig");
@@ -152,8 +153,8 @@ fn mlaAttend(layer: *const forward.Mla, ops: *Ops, rows: MlaRows, from: usize, c
     const iw: c_int = @intCast(cfg.indexer_head_dim);
     const begin: c_int = @intCast(from);
     const end: c_int = begin + @as(c_int, @intCast(parents.len));
-    const latent_capacity: usize = if (state.latent.ctx != null) @intCast(mlx.getShape(state.latent)[0]) else 0;
-    const pool_capacity: usize = if (state.pooled.ctx != null) @intCast(mlx.getShape(state.pooled)[0]) else 0;
+    const latent_capacity: usize = if (state.latent.array.ctx != null) @intCast(mlx.getShape(state.latent.array)[0]) else 0;
+    const pool_capacity: usize = if (state.pooled.array.ctx != null) @intCast(mlx.getShape(state.pooled.array)[0]) else 0;
     var scratch = try @import("glm5_dflash_memory.zig").plan(state.processed, latent_capacity, pool_capacity, @intCast(width), @intCast(iw), @intCast(heads), parents.len, mlx.mlx_array_itemsize(rows.latent));
     if (native_mode) {
         const limit = @import("glm5_dflash_memory.zig").limit_bytes;
@@ -337,10 +338,7 @@ pub const Verified = struct {
             // A command buffer keeps its inputs past `mlx_eval` until it completes; drain it so the
             // pending appends hold the only references and MLX donates the buffers.
             try mlx.check(mlx.mlx_synchronize(s));
-            for (held.layers) |*layer| for ([_]*Arr{ &layer.attention.latent, &layer.attention.latent_scales, &layer.attention.latent_biases, &layer.attention.pooled }) |buffer| if (buffer.ctx != null) {
-                _ = mlx.mlx_array_free(buffer.*);
-                buffer.* = .{ .ctx = null };
-            };
+            for (held.layers) |*layer| for ([_]*mlx_pages.InPlace{ &layer.attention.latent, &layer.attention.latent_scales, &layer.attention.latent_biases, &layer.attention.pooled }) |buffer| buffer.deinit();
             try mlx.check(mlx.mlx_eval(arrays));
         } else try mlx.check(mlx.mlx_eval(arrays));
         next.offset += path.len;
@@ -668,7 +666,7 @@ fn verifierCommitCase(latent_bits: u8, prompt: usize) !void {
             const left = committed.states[last].?;
             const right = oracle.states[last].?;
             try std.testing.expectEqual(right.offset, left.offset);
-            try std.testing.expectEqual(@as(mlx.mlx_dtype, if (latent_bits == 0) .bfloat16 else .uint32), mlx.mlx_array_dtype(left.layers[3].attention.latent));
+            try std.testing.expectEqual(@as(mlx.mlx_dtype, if (latent_bits == 0) .bfloat16 else .uint32), mlx.mlx_array_dtype(left.layers[3].attention.latent.array));
             for (left.layers, right.layers) |x, y| {
                 for (x.attention.arrays(), y.attention.arrays()) |u, v| try expectArrayBits(u, v, s);
                 try expectArrayBits(x.recurrent.conv_state, y.recurrent.conv_state, s);
@@ -705,7 +703,7 @@ fn readInFlight(request: *const forward.Request, s: mlx.mlx_stream) !void {
     var ops = Ops{ .s = s };
     defer ops.deinit();
     var total = try ops.own(mlx.mlx_array_new_float(0));
-    for (request.layers) |layer| for ([_]Arr{ layer.attention.latent, layer.attention.latent_scales, layer.attention.latent_biases }) |buffer| if (buffer.ctx != null) {
+    for (request.layers) |layer| for ([_]Arr{ layer.attention.latent.array, layer.attention.latent_scales.array, layer.attention.latent_biases.array }) |buffer| if (buffer.ctx != null) {
         const sum = try ops.slot();
         try mlx.check(mlx.mlx_sum(sum, buffer, false, s));
         total = try ops.binary(.add, total, try ops.cast(sum.*, .float32));
@@ -778,8 +776,8 @@ fn consumingCommitCaseSeeded(latent_bits: u8, in_flight: bool, seed_bytes: usize
     defer expected.deinit();
     var buffers: [16][3]?[*]const u8 = @splat(@splat(null));
     var mla_layers: usize = 0;
-    for (request.layers, 0..) |layer, i| if (layer.attention.latent.ctx != null) {
-        for (&buffers[i], [_]Arr{ layer.attention.latent, layer.attention.latent_scales, layer.attention.latent_biases }) |*slot, buffer| {
+    for (request.layers, 0..) |layer, i| if (layer.attention.latent.array.ctx != null) {
+        for (&buffers[i], [_]Arr{ layer.attention.latent.array, layer.attention.latent_scales.array, layer.attention.latent_biases.array }) |*slot, buffer| {
             if (buffer.ctx != null) slot.* = mlx.mlx_array_data_uint8(buffer) else try std.testing.expect(latent_bits == 0);
         }
         mla_layers += 1;
@@ -795,7 +793,7 @@ fn consumingCommitCaseSeeded(latent_bits: u8, in_flight: bool, seed_bytes: usize
     try std.testing.expectEqual(left.offset, right.offset);
     for (left.layers, right.layers, request.layers, 0..) |x, y, released, i| {
         for (released.attention.arrays()[0..4]) |buffer| try std.testing.expect(buffer.ctx == null);
-        for (buffers[i], [_]Arr{ y.attention.latent, y.attention.latent_scales, y.attention.latent_biases }) |old, now| {
+        for (buffers[i], [_]Arr{ y.attention.latent.array, y.attention.latent_scales.array, y.attention.latent_biases.array }) |old, now| {
             if (old) |pointer| try std.testing.expectEqual(pointer, mlx.mlx_array_data_uint8(now).?);
         }
         for (x.attention.arrays(), y.attention.arrays()) |u, v| try expectArrayBits(u, v, s);

@@ -201,8 +201,9 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
   (16 KB) of the array's bytes**: a buffer appended in place whose bytes are past a page and off the page grid can
   sit in one MLX never donates, and the append copies it. Such a buffer's capacity keeps it on whole pages
   (`mlx_pages.pagedRows`: GLM's latent, the KV cache on MLX; `mlx_pages.pagedCount`: Qwen's QSA banks,
-  `ssm_cache.capBufAppend` and `seedCapBuf`). Such a buffer is made by `mlx_pages.inPlaceBuffer`, which refuses one
-  off the grid on MLX (lint `in-place-buffer`).
+  `ssm_cache.capBufAppend` and `seedCapBuf`). A holder keeps such a buffer as `mlx_pages.InPlace` (its bytes
+  recorded when made or taken), made by `inPlaceBuffer` and written only by `InPlace.write`, which refuses one off the
+  grid on MLX (lint `in-place-write`).
 
 ## Zig
 

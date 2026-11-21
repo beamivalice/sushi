@@ -55,12 +55,12 @@ pub fn kvAppendPrefill(cache: *KVCache, tokens: usize, seed: u32, s: mlx.mlx_str
 
 pub fn kvAppendOperandsEqual(a: *const KVCacheEntry, b: *const KVCacheEntry, s: mlx.mlx_stream) !void {
     try testing.expectEqual(a.offset, b.offset);
-    try testing.expect(try qsaArraysAllEqual(a.keys, b.keys, s));
-    try testing.expect(try qsaArraysAllEqual(a.values, b.values, s));
-    try testing.expect(try qsaArraysAllEqual(a.keys_scales, b.keys_scales, s));
-    try testing.expect(try qsaArraysAllEqual(a.keys_biases, b.keys_biases, s));
-    try testing.expect(try qsaArraysAllEqual(a.values_scales, b.values_scales, s));
-    try testing.expect(try qsaArraysAllEqual(a.values_biases, b.values_biases, s));
+    try testing.expect(try qsaArraysAllEqual(a.keys.array, b.keys.array, s));
+    try testing.expect(try qsaArraysAllEqual(a.values.array, b.values.array, s));
+    try testing.expect(try qsaArraysAllEqual(a.keys_scales.array, b.keys_scales.array, s));
+    try testing.expect(try qsaArraysAllEqual(a.keys_biases.array, b.keys_biases.array, s));
+    try testing.expect(try qsaArraysAllEqual(a.values_scales.array, b.values_scales.array, s));
+    try testing.expect(try qsaArraysAllEqual(a.values_biases.array, b.values_biases.array, s));
 }
 
 pub fn kvAppendDummyAttn(cache: *KVCache, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -526,7 +526,7 @@ pub fn verifyRollbackEvalStorage(entry: *const KVCacheEntry) !void {
     const vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(vec);
     inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }) |field| {
-        const value = @field(entry, field);
+        const value = @field(entry, field).array;
         if (value.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, value);
     }
     try mlx.check(mlx.mlx_eval(vec));
@@ -537,8 +537,8 @@ pub fn verifyRollbackValidPrefixEqual(a: *const KVCacheEntry, b: *const KVCacheE
     try testing.expectEqual(a.offset, b.offset);
     if (!a.initialized) return;
     inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }) |field| {
-        const av = @field(a, field);
-        const bv = @field(b, field);
+        const av = @field(a, field).array;
+        const bv = @field(b, field).array;
         try testing.expectEqual(av.ctx == null, bv.ctx == null);
         if (av.ctx != null) {
             const ash = mlx.getShape(av);

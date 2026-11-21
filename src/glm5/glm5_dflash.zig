@@ -2,6 +2,7 @@
 const std = @import("std");
 const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const forward = @import("glm5_forward.zig");
 const draft = @import("../dflash.zig");
 const tree = @import("glm5_dflash_tree.zig");
@@ -89,7 +90,7 @@ test "GLM DFlash request fork keeps rejected pool and recurrence state isolated"
     try mlx.check(mlx.mlx_array_set(&branch.layers[0].recurrent.ssm_state, try ops.zeros(&.{ 1, 1, 2, 2 }, .float32)));
     try std.testing.expectEqual(@as(usize, 3), source.layers[0].attention.processed);
     try std.testing.expectEqual(@as(usize, 4), branch.layers[0].attention.processed);
-    try std.testing.expect(source.layers[0].attention.pooled.ctx == null);
+    try std.testing.expect(source.layers[0].attention.pooled.array.ctx == null);
     try std.testing.expectEqual(@as(c_int, 3), mlx.getShape(source.layers[0].attention.tail_keys)[0]);
     try mlx.check(mlx.mlx_array_eval(source.layers[0].recurrent.ssm_state));
     try std.testing.expectEqual(@as(f32, 1), mlx.mlx_array_data_float32(source.layers[0].recurrent.ssm_state).?[0]);
@@ -203,17 +204,22 @@ fn cropCommitContext(assistant: *const draft.DflashModel, next: *draft.DflashCtx
     const cfg = &assistant.config;
     if (assistant.layers.len != 5 or cfg.block_size != 8 or cfg.sliding_window != 2048 or next.cache.config.scheme != .off or next.cache.step < 2048) return;
     for (assistant.layers, next.cache.entries) |layer, entry| {
-        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.ringed or entry.base != 0 or entry.offset != next.cache.step or mlx.mlx_array_dtype(entry.keys) != .bfloat16 or mlx.mlx_array_dtype(entry.values) != .bfloat16) return;
+        if (layer.layer_type != .sliding_attention or !entry.initialized or entry.ringed or entry.base != 0 or entry.offset != next.cache.step or mlx.mlx_array_dtype(entry.keys.array) != .bfloat16 or mlx.mlx_array_dtype(entry.values.array) != .bfloat16) return;
     }
     const keep = cfg.sliding_window - 1;
     const drop = next.cache.step - keep;
     var ops = Ops{ .s = assistant.s };
     defer ops.deinit();
     for (next.cache.entries) |*entry| {
-        const k = try ops.slice(entry.keys, 2, @intCast(drop), @intCast(next.cache.step));
-        const v = try ops.slice(entry.values, 2, @intCast(drop), @intCast(next.cache.step));
-        try mlx.check(mlx.mlx_array_set(&entry.keys, k));
-        try mlx.check(mlx.mlx_array_set(&entry.values, v));
+        const k = try ops.slice(entry.keys.array, 2, @intCast(drop), @intCast(next.cache.step));
+        const v = try ops.slice(entry.values.array, 2, @intCast(drop), @intCast(next.cache.step));
+        for ([_]struct { *mlx_pages.InPlace, mlx.mlx_array }{ .{ &entry.keys, k }, .{ &entry.values, v } }) |slot| {
+            var shared = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(shared);
+            try mlx.check(mlx.mlx_array_set(&shared, slot[1]));
+            slot[0].deinit();
+            slot[0].* = mlx_pages.InPlace.adopt(shared, .paged);
+        }
         entry.offset = keep;
     }
     next.cache.step = keep;

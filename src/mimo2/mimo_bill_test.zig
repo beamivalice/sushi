@@ -26,7 +26,7 @@ fn ringAppendHeld(seed: bool) !u64 {
         var view = try cache.update(0, arrays[if (step == 0) 0 else 2], arrays[if (step == 0) 1 else 3], s, 128);
         view.deinit();
         const e = &cache.entries[0];
-        const bufs = [_]mlx.mlx_array{ e.keys, e.values, e.keys_scales, e.keys_biases, e.values_scales, e.values_biases };
+        const bufs = [_]mlx.mlx_array{ e.keys.array, e.values.array, e.keys_scales.array, e.keys_biases.array, e.values_scales.array, e.values_biases.array };
         const vec = mlx.mlx_vector_array_new_data(&bufs, bufs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_eval(vec));

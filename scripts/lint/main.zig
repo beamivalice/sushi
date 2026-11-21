@@ -51,7 +51,7 @@ const rules = .{
     @import("error_body_literal.zig"),
     @import("conn_read_unbounded.zig"),
     @import("request_bool_read.zig"),
-    @import("in_place_buffer.zig"),
+    @import("in_place_write.zig"),
     @import("cache_room.zig"),
     @import("ceiling_raw_read.zig"),
     @import("result_field_free.zig"),

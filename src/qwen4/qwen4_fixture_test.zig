@@ -1750,7 +1750,7 @@ test "qwen4 grow to the reservation before the prefill keeps greedy logits bit-i
     }
     try grown.cache.growToReservation(s);
     for (grown.cache.entries) |*e| {
-        if (e.initialized and !e.ringed) try testing.expect(KVCache.bufferCapacity(e.keys) >= 1024);
+        if (e.initialized and !e.ringed) try testing.expect(KVCache.bufferCapacity(e.keys.array) >= 1024);
     }
 
     // A chunk to 248 rows, inside the lazy slot's 256, then decode steps past them: the lazy slot grows at step 9.
@@ -3170,13 +3170,13 @@ test "qwen4 dense rows evaluated verification replay (QWEN4_VERIFY_BENCH)" {
                     // Remove restore-only KV copies from the evaluated-forward interval.
                     for (slot.cache.entries) |*entry| {
                         if (!entry.initialized) continue;
-                        try testing.expect(mlx.getShape(entry.keys)[2] >= prefix + width);
+                        try testing.expect(mlx.getShape(entry.keys.array)[2] >= prefix + width);
                         inline for (.{ "keys", "values", "keys_scales", "keys_biases", "values_scales", "values_biases" }) |field| {
-                            const old_arr = @field(entry, field);
+                            const old_arr = @field(entry, field).array;
                             if (old_arr.ctx != null) {
                                 const own = try materializedOwnedCopy(s, old_arr);
-                                _ = mlx.mlx_array_free(old_arr);
-                                @field(entry, field) = own;
+                                @field(entry, field).deinit();
+                                @field(entry, field) = @import("../mlx_pages.zig").InPlace.adopt(own, .paged);
                             }
                         }
                         entry.shared_view = false;

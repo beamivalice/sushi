@@ -379,36 +379,44 @@ printf '%s\n' 'fn arraysStream(self: *const C) mlx.mlx_stream {' '    return sel
 printf '%s\n' 'fn other() void {' '    _ = mlx.gpuStream();' '}' > "$TMP/t/src/model.zig"
 expect_green "arraysStream's fallback, a test and a fn only tests reach, and a file outside the caches"
 
-# rule in-place-buffer
+# rule in-place-write
+tree
+printf '%s\n' 'fn put(buf: *A, x: A, s: S) !void {' '    var up = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_slice_update(&up, buf.*, x, &a, 2, &b, 2, &c, 2, s));' '    buf.* = up;' '}' > "$TMP/t/src/p.zig"
+expect_red "a write into a buffer another fn made" "src/p.zig:3:23 \[in-place-write\] put: an in-place write outside mlx_pages"
+
+tree
+printf '%s\n' 'fn mine(a: A) InPlace {' '    return InPlace{ .array = a };' '}' > "$TMP/t/src/p.zig"
+expect_red "an InPlace literal outside mlx_pages" "src/p.zig:2:12 \[in-place-write\] mine: an InPlace built outside mlx_pages"
+
+tree
+printf '%s\n' 'fn mine(a: A) Holder {' '    return .{ .array = a, .capacity_bytes = 0 };' '}' > "$TMP/t/src/p.zig"
+expect_red "a recorded capacity set outside mlx_pages" "src/p.zig:2:28 \[in-place-write\] mine: an InPlace built outside mlx_pages"
+
 tree
 printf '%s\n' 'fn grow(buf: *A, s: S) !void {' '    var z = mlx.mlx_array_new();' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, buf.*, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
-expect_red "a buffer made by mlx_zeros and written by slice_update" "src/p.zig:3:23 \[in-place-buffer\] grow: a buffer made by mlx_zeros and written by slice_update"
-
-tree
-printf '%s\n' 'fn inPlaceBuffer(s: S) !A {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '}' 'fn fill(z: A, s: S) !void {' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' \
-  'fn seed(s: S) !void {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' 'test "t" {' '    try seed(s);' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
-printf '%s\n' 'fn grow(s: S) !void {' '    try mlx.check(mlx.mlx_zeros(&z, &shape, 2, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/mlx_pages.zig"
-expect_green "zeros and a write in different fns, a test and a fn only tests reach, and mlx_pages itself"
-
-tree
-printf '%s\n' 'fn appendRows(self: *Scope, buf: A, chunk: A) !A {' '    const pad = try self.zeros(&.{ 4, 8 }, dt);' '    const t = try self.join(buf, pad);' '    try mlx.check(mlx.mlx_slice_update(&out, t, chunk, &a, 2, &b, 2, &c, 2, self.s));' '}' > "$TMP/t/src/p.zig"
-expect_red "a buffer made by a scope's zeros and join, written by slice_update" "\[in-place-buffer\] appendRows: a buffer made by zeros and written by slice_update"
-
-tree
-printf '%s\n' 'fn fill(s: S) !void {' '    try mlx.check(mlx.mlx_full(&z, &shape, 2, v, dt, s));' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
-expect_red "a buffer made by mlx_full and written by slice_update" "\[in-place-buffer\] fill: a buffer made by mlx_full and written by slice_update"
-
-tree
-printf '%s\n' 'fn grow(s: S) !void {' '    try mlx.check(mlx.mlx_concatenate_axis(&g, vec, 0, s));' '    try mlx.check(mlx.mlx_slice_update(&up, g, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
-expect_red "a buffer grown by a concatenate and written by slice_update" "\[in-place-buffer\] grow: a buffer made by mlx_concatenate_axis and written by slice_update"
+expect_red "a buffer made by mlx_zeros and written in the same fn" "src/p.zig:4:23 \[in-place-write\] grow: an in-place write outside mlx_pages"
 
 tree
 printf '%s\n' 'fn ring(sc: *Sc, row: A) !A {' '    var r = try sc.zeros(&.{ 8, 512 }, dt);' '    r = try sc.res(mlx.mlx_slice_update(&up, r, row, &a, 2, &b, 2, &c, 2, sc.s), &up);' '}' > "$TMP/t/src/p.zig"
-expect_red "a scope's zeros written by a slice_update it holds" "\[in-place-buffer\] ring: a buffer made by zeros and written by slice_update"
+expect_red "a scope's slice_update" "\[in-place-write\] ring: an in-place write outside mlx_pages"
 
 tree
-printf '%s\n' 'fn tail(self: *Scope, a: A, b: A) !A {' '    const z = try self.zeros(&.{ 4, 8 }, dt);' '    return self.join(a, try self.join(b, z));' '}' > "$TMP/t/src/p.zig"
-expect_green "a join and a zeros no slice_update writes into"
+printf '%s\n' 'const write = mlx.mlx_slice_update;' > "$TMP/t/src/p.zig"
+expect_red "the call taken as a value outside any fn" "src/p.zig:1:19 \[in-place-write\] -: an in-place write outside mlx_pages"
+
+tree
+mkdir -p "$TMP/t/src/tensor"
+printf '%s\n' 'fn fill(z: A, s: S) !void {' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' \
+  'test "t" {' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/mlx_pages.zig"
+printf '%s\n' 'pub fn mlx_slice_update(res: *A) c_int {' '    return 0;' '}' > "$TMP/t/src/tensor/route.zig"
+printf '%s\n' 'pub const mlx_slice_update = routed("mlx_slice_update", fn () c_int);' > "$TMP/t/src/mlx.zig"
+printf '%s\n' 'fn pad() void {}' 'fn seed(z: A, s: S) !void {' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' 'test "t" {' '    try seed(z, s);' \
+  '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'fn f(z: A, s: S) !void {' '    try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '}' > "$TMP/t/src/kv_test.zig"
+printf '%s\n' 'test "t" {' '    const Run = struct {' '        fn f(z: A, s: S) !void {' '            try mlx.check(mlx.mlx_slice_update(&up, z, x, &a, 2, &b, 2, &c, 2, s));' '        }' '    }.f;' '    _ = Run;' '}' > "$TMP/t/src/r.zig"
+printf '%s\n' 'fn put(buf: *Buf, x: A, s: S) !void {' '    buf.* = try buf.write(&up, x, &a, &b, s);' '    return Buf.adopt(x, .paged).array;' '}' \
+  'fn made(s: S) !mlx_pages.InPlace {' '    return try mlx_pages.inPlaceBuffer(&shape, dt, s);' '}' 'fn two(a: *Buf) [2]*mlx_pages.InPlace {' '    return [_]*mlx_pages.InPlace{ &a.x, &a.y };' '}' > "$TMP/t/src/q.zig"
+expect_green "mlx_pages, the binding, the engine, a test, a fn only tests reach, a _test file, a fn a test declares, a call of write and adopt, a return type and an array of the type"
 
 # rule cache-room
 tree

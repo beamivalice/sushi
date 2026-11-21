@@ -327,9 +327,9 @@ const Rope = struct { freqs: A };
 /// Rows appended one chunk at a time, in a buffer that grows by `rows_grow_div`'s fraction.
 pub const Rows = struct {
     /// The rows `[cap, width]` in `dtype`, or packed: E2M1 codes `[cap, width/2]` u8.
-    buf: A = none,
+    buf: mlx_pages.InPlace = .none,
     /// Packed: the scale bytes `[cap, width/group]`.
-    sbuf: A = none,
+    sbuf: mlx_pages.InPlace = .none,
     used: usize = 0,
     cap: usize = 0,
     width: usize,
@@ -340,36 +340,36 @@ pub const Rows = struct {
     const Pack = struct { mode: qat_mod.Qat, group: usize };
 
     pub fn deinit(self: *Rows) void {
-        if (self.buf.ctx != null) _ = mlx.mlx_array_free(self.buf);
-        if (self.sbuf.ctx != null) _ = mlx.mlx_array_free(self.sbuf);
+        self.buf.deinit();
+        self.sbuf.deinit();
     }
 
     /// `buf` grown to `cap` rows of `cols`, its first `used` rows kept (`cap` from `pagedCap`).
-    fn grow(buf: *A, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !void {
+    fn grow(buf: *mlx_pages.InPlace, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !void {
         var z = try mlx_pages.inPlaceBuffer(&.{ ci(cap), ci(cols) }, dt, s);
-        errdefer _ = mlx.mlx_array_free(z);
+        errdefer z.deinit();
         if (used > 0) {
             var old = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(old);
-            try mlx.check(mlx.mlx_slice(&old, buf.*, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            try mlx.check(mlx.mlx_slice(&old, buf.array, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
             var up = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(up);
-            try mlx.check(mlx.mlx_slice_update(&up, z, old, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            _ = mlx.mlx_array_free(z);
-            z = up;
+            const grown = try z.write(&up, old, &.{ 0, 0 }, &.{ ci(used), ci(cols) }, s);
+            z.deinit();
+            z = grown;
         }
-        if (buf.ctx != null) _ = mlx.mlx_array_free(buf.*);
+        buf.deinit();
         buf.* = z;
     }
 
-    fn put(buf: *A, x: A, at: usize, s: S) !void {
+    fn put(buf: *mlx_pages.InPlace, x: A, at: usize, s: S) !void {
         const n = dim(x, 0);
         const cols = dim(x, 1);
         var up = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(up);
-        try mlx.check(mlx.mlx_slice_update(&up, buf.*, x, &[_]c_int{ ci(at), 0 }, 2, &[_]c_int{ ci(at + n), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-        _ = mlx.mlx_array_free(buf.*);
-        buf.* = up;
+        const next = try buf.write(&up, x, &.{ ci(at), 0 }, &.{ ci(at + n), ci(cols) }, s);
+        _ = mlx.mlx_array_free(buf.array);
+        buf.* = next;
     }
 
     /// `count` rows on MLX's page grid for every buffer that grows with these rows (`mlx_pages`), so each append writes in
@@ -394,10 +394,10 @@ pub const Rows = struct {
         if (self.pack) |pk| {
             try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
             try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
-            try mlx.check(mlx.mlx_array_eval(self.sbuf));
+            try mlx.check(mlx.mlx_array_eval(self.sbuf.array));
         } else try grow(&self.buf, self.used, cap, self.width, self.dtype, s);
         // Written now: a grow left pending would take its buffer inside the forward that first reads it.
-        try mlx.check(mlx.mlx_array_eval(self.buf));
+        try mlx.check(mlx.mlx_array_eval(self.buf.array));
         self.cap = cap;
     }
 
@@ -405,8 +405,6 @@ pub const Rows = struct {
     fn trim(self: *Rows, s: S) !void {
         if (self.used > 0) return self.reserve(s);
         self.deinit();
-        self.buf = none;
-        self.sbuf = none;
         self.cap = 0;
     }
 
@@ -437,21 +435,21 @@ pub const Rows = struct {
 
     /// Rows [lo, hi) as values.
     fn rowsIn(self: *const Rows, sc: *Scope, lo: usize, hi: usize) !A {
-        const head = try sc.slice(self.buf, 0, lo, hi);
+        const head = try sc.slice(self.buf.array, 0, lo, hi);
         const pk = self.pack orelse return head;
-        return qat_mod.unpackFp4(sc, .{ .codes = head, .scales = try sc.slice(self.sbuf, 0, lo, hi) }, pk.mode, pk.group, self.dtype);
+        return qat_mod.unpackFp4(sc, .{ .codes = head, .scales = try sc.slice(self.sbuf.array, 0, lo, hi) }, pk.mode, pk.group, self.dtype);
     }
 
     /// Rows `idx` (flat ids below `used`) as values.
     fn gather(self: *const Rows, sc: *Scope, idx: A) !A {
-        const pk = self.pack orelse return sc.take(self.buf, idx, 0);
-        return qat_mod.unpackFp4(sc, .{ .codes = try sc.take(self.buf, idx, 0), .scales = try sc.take(self.sbuf, idx, 0) }, pk.mode, pk.group, self.dtype);
+        const pk = self.pack orelse return sc.take(self.buf.array, idx, 0);
+        return qat_mod.unpackFp4(sc, .{ .codes = try sc.take(self.buf.array, idx, 0), .scales = try sc.take(self.sbuf.array, idx, 0) }, pk.mode, pk.group, self.dtype);
     }
 };
 
 /// The window's rows by absolute position, in a ring of `cap` rows.
 const Ring = struct {
-    buf: A,
+    buf: mlx_pages.InPlace,
     cap: usize,
     width: usize,
     /// The buffer's dtype, so a launch that takes the ring reads nothing off it.
@@ -461,11 +459,11 @@ const Ring = struct {
         var z = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(z);
         try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(width) }, 2, dt, s));
-        return .{ .buf = z, .cap = cap, .width = width, .dt = dt };
+        return .{ .buf = mlx_pages.InPlace.adopt(z, .ring), .cap = cap, .width = width, .dt = dt };
     }
 
     fn deinit(self: *Ring) void {
-        _ = mlx.mlx_array_free(self.buf);
+        self.buf.deinit();
     }
 
     /// Rows for positions [p0, p0 + n); only the last `cap` survive.
@@ -482,20 +480,21 @@ const Ring = struct {
             try mlx.check(mlx.mlx_slice(&part, x, &[_]c_int{ ci(n - keep_n + done), 0 }, 2, &[_]c_int{ ci(n - keep_n + done + run), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
             var cast = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(cast);
-            try mlx.check(mlx.mlx_astype(&cast, part, mlx.mlx_array_dtype(self.buf), s));
+            try mlx.check(mlx.mlx_astype(&cast, part, mlx.mlx_array_dtype(self.buf.array), s));
             var up = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(up);
-            try mlx.check(mlx.mlx_slice_update(&up, self.buf, cast, &[_]c_int{ ci(slot), 0 }, 2, &[_]c_int{ ci(slot + run), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
-            _ = mlx.mlx_array_free(self.buf);
-            self.buf = up;
+            const next = try self.buf.write(&up, cast, &.{ ci(slot), 0 }, &.{ ci(slot + run), ci(self.width) }, s);
+            _ = mlx.mlx_array_free(self.buf.array);
+            self.buf = next;
             done += run;
         }
     }
 
     /// The ring as `write` of rows `x` at `p0` would leave it, made by another launch: `next` replaces the buffer.
     fn replace(self: *Ring, next: A) void {
-        _ = mlx.mlx_array_free(self.buf);
-        self.buf = next;
+        const kept = self.buf.replaced(next);
+        _ = mlx.mlx_array_free(self.buf.array);
+        self.buf = kept;
     }
 
     /// Rows for positions [lo, hi) in order; `hi - lo <= cap`.
@@ -503,7 +502,7 @@ const Ring = struct {
         std.debug.assert(hi - lo <= self.cap);
         var idx: [512]i32 = undefined;
         for (lo..hi, 0..) |p, k| idx[k] = @intCast(p % self.cap);
-        return sc.take(self.buf, try sc.ints(idx[0 .. hi - lo], &.{ci(hi - lo)}), 0);
+        return sc.take(self.buf.array, try sc.ints(idx[0 .. hi - lo], &.{ci(hi - lo)}), 0);
     }
 };
 
@@ -591,11 +590,11 @@ pub fn arrayBytes(a: A) u64 {
 pub fn stateBytes(st: *const State) u64 {
     var bytes: u64 = 0;
     for (st.layers) |*l| {
-        bytes += arrayBytes(l.win.buf) + arrayBytes(l.pend_kv) + arrayBytes(l.pend_gate);
-        if (l.comp) |r| bytes += arrayBytes(r.buf) + arrayBytes(r.sbuf);
-        if (l.idx_k) |r| bytes += arrayBytes(r.buf) + arrayBytes(r.sbuf);
+        bytes += arrayBytes(l.win.buf.array) + arrayBytes(l.pend_kv) + arrayBytes(l.pend_gate);
+        if (l.comp) |r| bytes += arrayBytes(r.buf.array) + arrayBytes(r.sbuf.array);
+        if (l.idx_k) |r| bytes += arrayBytes(r.buf.array) + arrayBytes(r.sbuf.array);
     }
-    for (st.ds) |r| bytes += arrayBytes(r.buf);
+    for (st.ds) |r| bytes += arrayBytes(r.buf.array);
     return bytes;
 }
 
@@ -1978,8 +1977,8 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
         idx = got.idx;
     } else if (masked and mlx.mlx_array_dtype(cand.*) == .int32) {
         const pk = rows.pack.?;
-        const keys = try sc.slice(rows.buf, 0, 0, nb);
-        const key_scales = try sc.slice(rows.sbuf, 0, 0, nb);
+        const keys = try sc.slice(rows.buf.array, 0, 0, nb);
+        const key_scales = try sc.slice(rows.sbuf.array, 0, 0, nb);
         const scores = if (indexNaxOn(m, pk, q, nb, true))
             try kernels.indexScoresGatherNax(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group, cand.*, bs)
         else
@@ -1989,8 +1988,8 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
         const packed_scan = rows.pack != null and narrowIndex(sc, m, Ls, nb);
         var scores = if (packed_scan) blk: { // [Ls, nb]
             const pk = rows.pack.?;
-            const keys = try sc.slice(rows.buf, 0, 0, nb);
-            const key_scales = try sc.slice(rows.sbuf, 0, 0, nb);
+            const keys = try sc.slice(rows.buf.array, 0, 0, nb);
+            const key_scales = try sc.slice(rows.sbuf.array, 0, 0, nb);
             break :blk if (indexNaxOn(m, pk, q, nb, false))
                 try kernels.indexScoresPackedNax(sc, q, keys, key_scales, wts, wscale, p0, r, pk.mode, pk.group)
             else
@@ -2179,7 +2178,7 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
 pub fn packedPicks(sc: *Scope, comp: *const Rows, topk: A, raw: bool) !Picks {
     if (raw) return .{ .topk = topk, .store = comp };
     const pk = comp.pack.?;
-    const u = try qat_mod.unpackPicks(sc, comp.buf, comp.sbuf, try sc.astype(topk, .int32), pk.mode, pk.group, comp.dtype);
+    const u = try qat_mod.unpackPicks(sc, comp.buf.array, comp.sbuf.array, try sc.astype(topk, .int32), pk.mode, pk.group, comp.dtype);
     return .{ .topk = u.ids, .comp_rows = u.rows };
 }
 
@@ -2303,7 +2302,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         try attnOutGrouped(sc, m, li, ly, try sc.concat(heads, 1), null)
     else
         try attnOut(sc, m, li, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, pos, true, .none, null), false, null);
-    if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf });
+    if (pf) |p| try p.mark(.attn_out, &.{ out, ls.win.buf.array });
     return out;
 }
 
@@ -2335,7 +2334,7 @@ fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usiz
     const ring_joint = joint and ls.win.dt == mlx.mlx_array_dtype(in[1]) and ls.win.width == hd and hd % 8 == 0;
     var next_ring = none;
     const rk: ?kernels.QKv = if (ring_joint) blk: {
-        const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf, ls.win.cap, ls.win.width);
+        const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf.array, ls.win.cap, ls.win.width);
         next_ring = r.ring;
         break :blk .{ .q = r.q, .kv = none };
     } else if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
@@ -2355,7 +2354,7 @@ fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usiz
     // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
     if (ring_joint) ls.win.replace(sc.out(next_ring)) else try ls.win.write(kv, p0, sc.s);
     const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
-    if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf, picks.comp_rows, picks.topk });
+    if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf.array, picks.comp_rows, picks.topk });
     if (width_probe) |t| {
         try t.put("a_q_{d}", .{li}, q);
         if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
@@ -2364,7 +2363,7 @@ fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usiz
     var rode_split: ?kernels.HcSplit = null;
     const o = try kernels.attnDecode(sc, .{
         .q = q,
-        .ring = ls.win.buf,
+        .ring = ls.win.buf.array,
         .comp = picks.comp_rows,
         .topk = picks.topk,
         .sink = ly.sink,
@@ -2455,7 +2454,7 @@ fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []con
 pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize, picks: Picks, scale: f32, out_dt: mlx.mlx_dtype, epi: ?kernels.Epilogue, nax: bool) !A {
     const rows = picks.store orelse return kernels.attnFused(sc, sink, q, keys_w, wp, window, picks.comp_rows, picks.topk, scale, out_dt, epi, nax);
     const pk = rows.pack.?;
-    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf, rows.sbuf, pk.mode, pk.group, picks.topk, scale, out_dt, epi, nax);
+    return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf.array, rows.sbuf.array, pk.mode, pk.group, picks.topk, scale, out_dt, epi, nax);
 }
 
 /// What a DSpark stage's block attends over: `keys`, its window of committed main rows, then the block's own rows.
@@ -3307,10 +3306,10 @@ fn block(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, cpre: A, p0: 
 // ── the forward ──────────────────────────────────────────────────────────
 
 fn appendStateArrays(gpa: std.mem.Allocator, ev: *std.ArrayList(A), ls: *const LState) !void {
-    try ev.append(gpa, ls.win.buf);
+    try ev.append(gpa, ls.win.buf.array);
     for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
-        if (r.buf.ctx != null) try ev.append(gpa, r.buf);
-        if (r.sbuf.ctx != null) try ev.append(gpa, r.sbuf);
+        if (r.buf.array.ctx != null) try ev.append(gpa, r.buf.array);
+        if (r.sbuf.array.ctx != null) try ev.append(gpa, r.sbuf.array);
     };
     if (ls.pend_kv.ctx != null) try ev.append(gpa, ls.pend_kv);
     if (ls.pend_gate.ctx != null) try ev.append(gpa, ls.pend_gate);
@@ -3939,6 +3938,16 @@ pub fn present(a: A) bool {
     return a.ctx != null and mlx.mlx_array_ndim(a) == 2 and mlx.mlx_array_size(a) > 0;
 }
 
+/// `shareInto` for a buffer later rows are written into: its record is read off `src`, a restore's own exact copy.
+fn shareBuf(dst: *mlx_pages.InPlace, src: A, grid: mlx_pages.Grid) !void {
+    dst.deinit();
+    if (!present(src)) return;
+    var copy = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(copy);
+    try mlx.check(mlx.mlx_array_set(&copy, src));
+    dst.* = mlx_pages.InPlace.adopt(copy, grid);
+}
+
 fn shareInto(dst: *A, src: A) !void {
     if (dst.ctx != null) _ = mlx.mlx_array_free(dst.*);
     dst.* = none;
@@ -3975,35 +3984,35 @@ fn captureInto(m: *Model, out: []Slot, share: bool) !void {
         @memset(lens, 0);
         for (st.layers, 0..) |*ls, li| {
             const of = lens[7 * li ..][0..7];
-            of[0] = rowBytes(ls.win.buf, ls.win.cap);
+            of[0] = rowBytes(ls.win.buf.array, ls.win.cap);
             of[1] = rowBytes(ls.pend_kv, rowsOf(ls.pend_kv));
             of[2] = rowBytes(ls.pend_gate, rowsOf(ls.pend_gate));
             if (!share) for ([_]?Rows{ ls.comp, ls.idx_k }, 0..) |rows, k| if (rows) |r| {
-                of[3 + 2 * k] = rowBytes(r.buf, r.used);
-                of[4 + 2 * k] = rowBytes(r.sbuf, r.used);
+                of[3 + 2 * k] = rowBytes(r.buf.array, r.used);
+                of[4 + 2 * k] = rowBytes(r.sbuf.array, r.used);
             };
         }
-        for (st.ds, 0..) |r, si| lens[7 * st.layers.len + si] = rowBytes(r.buf, r.cap);
+        for (st.ds, 0..) |r, si| lens[7 * st.layers.len + si] = rowBytes(r.buf.array, r.cap);
         mlx.engine.room(lens);
     }
     const evals = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(evals);
     for (st.layers, 0..) |*ls, li| {
         const a = &out[2 * li];
-        a[0] = try ownedRows(ls.win.buf, ls.win.cap, s);
+        a[0] = try ownedRows(ls.win.buf.array, ls.win.cap, s);
         a[1] = try ownedRows(ls.pend_kv, if (ls.pend_kv.ctx != null) dim(ls.pend_kv, 0) else 0, s);
         a[2] = try ownedRows(ls.pend_gate, if (ls.pend_gate.ctx != null) dim(ls.pend_gate, 0) else 0, s);
         const b = &out[2 * li + 1];
         if (ls.comp) |r| {
-            b[0] = try if (share) headRows(r.buf, r.used, s) else ownedRows(r.buf, r.used, s);
-            b[1] = try if (share) headRows(r.sbuf, r.used, s) else ownedRows(r.sbuf, r.used, s);
+            b[0] = try if (share) headRows(r.buf.array, r.used, s) else ownedRows(r.buf.array, r.used, s);
+            b[1] = try if (share) headRows(r.sbuf.array, r.used, s) else ownedRows(r.sbuf.array, r.used, s);
         }
         if (ls.idx_k) |r| {
-            b[2] = try if (share) headRows(r.buf, r.used, s) else ownedRows(r.buf, r.used, s);
-            b[3] = try if (share) headRows(r.sbuf, r.used, s) else ownedRows(r.sbuf, r.used, s);
+            b[2] = try if (share) headRows(r.buf.array, r.used, s) else ownedRows(r.buf.array, r.used, s);
+            b[3] = try if (share) headRows(r.sbuf.array, r.used, s) else ownedRows(r.sbuf.array, r.used, s);
         }
     }
-    for (st.ds, 0..) |r, si| out[2 * st.layers.len + si][0] = try ownedRows(r.buf, r.cap, s);
+    for (st.ds, 0..) |r, si| out[2 * st.layers.len + si][0] = try ownedRows(r.buf.array, r.cap, s);
     for (out) |sl| for (sl) |x| if (x.ctx != null) try mlx.check(mlx.mlx_vector_array_append_value(evals, x));
     try mlx.check(mlx.mlx_eval(evals));
 }
@@ -4019,8 +4028,8 @@ fn restoreRows(r: *Rows, buf: A, sbuf: A, want: usize) !void {
     const used: usize = if (present(buf)) dim(buf, 0) else 0;
     if (used != want or (r.pack != null and used > 0 and !present(sbuf))) return error.Dsv41CheckpointMismatch;
     if (used == 0) return;
-    try shareInto(&r.buf, buf);
-    try shareInto(&r.sbuf, sbuf);
+    try shareBuf(&r.buf, buf, .paged);
+    try shareBuf(&r.sbuf, sbuf, .paged);
     r.used = used;
     r.cap = used;
 }
@@ -4036,7 +4045,7 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
         const a = slots[2 * li];
         const b = slots[2 * li + 1];
         if (!present(a[0]) or dim(a[0], 0) != ls.win.cap) return error.Dsv41CheckpointMismatch;
-        try shareInto(&ls.win.buf, a[0]);
+        try shareBuf(&ls.win.buf, a[0], .ring);
         ls.win.dt = mlx.mlx_array_dtype(a[0]);
         try shareInto(&ls.pend_kv, a[1]);
         try shareInto(&ls.pend_gate, a[2]);
@@ -4047,7 +4056,7 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
     for (st.ds, 0..) |*ring, si| {
         const a = slots[2 * st.layers.len + si][0];
         if (!present(a) or dim(a, 0) != ring.cap) return error.Dsv41CheckpointMismatch;
-        try shareInto(&ring.buf, a);
+        try shareBuf(&ring.buf, a, .ring);
     }
     st.n = n;
     if (m.hash != null) {
@@ -4102,14 +4111,14 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
     st.owner = 0;
     for (st.layers, 0..) |*ls, li| {
         const a = slots[2 * li];
-        try shareInto(&ls.win.buf, a[0]);
+        try shareBuf(&ls.win.buf, a[0], .ring);
         ls.win.dt = mlx.mlx_array_dtype(a[0]);
         try shareInto(&ls.pend_kv, a[1]);
         try shareInto(&ls.pend_gate, a[2]);
         if (ls.comp) |*rows| rows.used = n / m.ratio(li);
         if (ls.idx_k) |*rows| rows.used = n / m.ratio(li);
     }
-    for (st.ds, 0..) |*ring, si| try shareInto(&ring.buf, slots[2 * st.layers.len + si][0]);
+    for (st.ds, 0..) |*ring, si| try shareBuf(&ring.buf, slots[2 * st.layers.len + si][0], .ring);
     st.n = n;
     st.main_lazy = false;
     if (m.hash != null) st.hist.shrinkRetainingCapacity(n);
@@ -4139,12 +4148,12 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
         const r = n / m.ratio(li);
         const b = &out[2 * li + 1];
         if (ls.comp) |rows| {
-            b[0] = try headRows(rows.buf, r, s);
-            b[1] = try headRows(rows.sbuf, r, s);
+            b[0] = try headRows(rows.buf.array, r, s);
+            b[1] = try headRows(rows.sbuf.array, r, s);
         }
         if (ls.idx_k) |rows| {
-            b[2] = try headRows(rows.buf, r, s);
-            b[3] = try headRows(rows.sbuf, r, s);
+            b[2] = try headRows(rows.buf.array, r, s);
+            b[3] = try headRows(rows.sbuf.array, r, s);
         }
     }
     for (st.ds, 0..) |_, si| try shareInto(&out[2 * st.layers.len + si][0], fixed[2 * st.layers.len + si][0]);
@@ -4430,7 +4439,7 @@ fn handle(x: A) A {
 const Undo = struct {
     st: *State,
     li: usize,
-    ring: A,
+    ring: mlx_pages.InPlace,
     comp_used: usize,
     idx_used: usize,
     pend_kv: A,
@@ -4444,7 +4453,7 @@ const Undo = struct {
         return .{
             .st = st,
             .li = li,
-            .ring = if (rows > 1) handle(ls.win.buf) else none,
+            .ring = if (rows > 1) ls.win.buf.share() else .none,
             .comp_used = if (ls.comp) |r| r.used else 0,
             .idx_used = if (ls.idx_k) |r| r.used else 0,
             .pend_kv = handle(ls.pend_kv),
@@ -4462,7 +4471,11 @@ const Undo = struct {
 
     fn restore(self: *Undo) void {
         const ls = &self.st.layers[self.li];
-        if (self.ring.ctx != null) give(&ls.win.buf, &self.ring);
+        if (self.ring.array.ctx != null) {
+            ls.win.buf.deinit();
+            ls.win.buf = self.ring;
+            self.ring = .none;
+        }
         if (ls.comp) |*r| r.used = self.comp_used;
         if (ls.idx_k) |*r| r.used = self.idx_used;
         give(&ls.pend_kv, &self.pend_kv);
@@ -4474,7 +4487,8 @@ const Undo = struct {
     }
 
     fn deinit(self: *Undo) void {
-        for ([_]A{ self.ring, self.pend_kv, self.pend_gate, self.verify_kv, self.verify_gate }) |a| if (a.ctx != null) {
+        self.ring.deinit();
+        for ([_]A{ self.pend_kv, self.pend_gate, self.verify_kv, self.verify_gate }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
     }
@@ -5182,7 +5196,7 @@ fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, how: Commit
     if (how == .lazy) return;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(sc.a);
-    for (st.ds) |r| try ev.append(sc.a, r.buf);
+    for (st.ds) |r| try ev.append(sc.a, r.buf.array);
     const t0 = readStart();
     defer readDone(.state, t0);
     try evalAll(ev.items);
@@ -5194,7 +5208,7 @@ fn flushMain(st: *State) !void {
     st.main_lazy = false;
     var bufs: [cfg_mod.max_targets]A = undefined;
     if (st.ds.len > bufs.len) return error.Dsv41NoDspark;
-    for (st.ds, bufs[0..st.ds.len]) |r, *b| b.* = r.buf;
+    for (st.ds, bufs[0..st.ds.len]) |r, *b| b.* = r.buf.array;
     const vec = mlx.mlx_vector_array_new_data(&bufs, st.ds.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try asyncEval(vec);
@@ -7161,7 +7175,7 @@ test "dsv41 packed picks: one kernel gives the rows and ids of the op chain byte
         ids[ids.len - 1] = @intCast(c.nc - 1);
         const topk = try sc.ints(ids, &.{ ci(c.L), ci(c.K) });
         const want = try packedPicksOps(&sc, &rows, topk);
-        const got = try qat_mod.unpackPicks(&sc, rows.buf, rows.sbuf, topk, c.mode, c.group, c.dt);
+        const got = try qat_mod.unpackPicks(&sc, rows.buf.array, rows.sbuf.array, topk, c.mode, c.group, c.dt);
         const wr = try hostBytes(&sc, want.comp_rows);
         const gr = try hostBytes(&sc, got.rows);
         const wi = try hostBytes(&sc, want.topk);
@@ -7447,8 +7461,8 @@ test "dsv41 index decode: scoring the candidate blocks' keys picks what the mask
     var rows = try streamKeys(&sc, nb, 4096, 0x4d0);
     defer rows.deinit();
     const pk = rows.pack.?;
-    const codes = try sc.slice(rows.buf, 0, 0, nb);
-    const scl = try sc.slice(rows.sbuf, 0, 0, nb);
+    const codes = try sc.slice(rows.buf.array, 0, 0, nb);
+    const scl = try sc.slice(rows.sbuf.array, 0, 0, nb);
     for ([_]usize{ 1, 2, 4, 16 }) |L| {
         const q = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32, 128 }, 0x5d0 + L), .float32);
         const w = try sc.astype(try sc_mod_randn(&sc, &.{ ci(L), 32 }, 0x6d0), .bfloat16);
@@ -8026,7 +8040,7 @@ test "dsv41 rows on MLX append in place when MLX's pool holds buffers a page pas
     try mlx.check(mlx.mlx_array_eval(big));
     try mlx.check(mlx.mlx_array_eval(one));
     try rows.append(&sc, big);
-    try mlx.check(mlx.mlx_array_eval(rows.buf));
+    try mlx.check(mlx.mlx_array_eval(rows.buf.array));
     try mlx.check(mlx.mlx_synchronize(s));
     try @import("../test_support.zig").seedMlxPool(s, 201 * 16384, 16);
     const before = rows.cap;
@@ -8035,10 +8049,10 @@ test "dsv41 rows on MLX append in place when MLX's pool holds buffers a page pas
     var moved: usize = 0;
     while (after < 5) {
         try rows.append(&sc, one);
-        try mlx.check(mlx.mlx_array_eval(rows.buf));
+        try mlx.check(mlx.mlx_array_eval(rows.buf.array));
         try mlx.check(mlx.mlx_synchronize(s));
         if (rows.cap == before) continue;
-        const p = mlx.mlx_array_data_uint8(rows.buf);
+        const p = mlx.mlx_array_data_uint8(rows.buf.array);
         if (grown_at) |g| {
             if (p != g) moved += 1;
             after += 1;
@@ -8047,4 +8061,25 @@ test "dsv41 rows on MLX append in place when MLX's pool holds buffers a page pas
     try std.testing.expectEqual(@as(usize, 0), moved);
     const asked = before + before / cfg_mod.rows_grow_div;
     try std.testing.expect((rows.cap - asked) * 1024 < mlx_pages.gridStepBytes(&.{1024}));
+}
+
+test "dsv41 rows write in place only into a buffer on MLX's page grid, whichever function made it, and a ring keeps its own rows off it" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_ones(&row, &[_]c_int{ 1, 512 }, 2, .bfloat16, s));
+    // 1,000 rows of 1 KiB are 62.5 pages: off the grid, so every write into it could copy all of it.
+    var made = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_zeros(&made, &[_]c_int{ 1000, 512 }, 2, .bfloat16, s));
+    var off = mlx_pages.InPlace.adopt(made, .paged);
+    defer off.deinit();
+    try std.testing.expectError(error.InPlaceBufferOffPageGrid, Rows.put(&off, row, 0, s));
+    var on = try mlx_pages.inPlaceBuffer(&.{ 1008, 512 }, .bfloat16, s);
+    defer on.deinit();
+    try Rows.put(&on, row, 0, s);
+    // A ring's rows are fixed: 144 rows of 1 KiB are 9 pages, 150 are 9.4.
+    var ring = try Ring.init(150, 512, .bfloat16, s);
+    defer ring.deinit();
+    try ring.write(row, 3, s);
 }

@@ -611,7 +611,7 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
             var tail: u64 = 0;
             for (cache.entries, 0..) |entry, i| if (entry.initialized) {
                 const old = caps[i];
-                const now = KV.bufferCapacity(entry.keys);
+                const now = KV.bufferCapacity(entry.keys.array);
                 if (now == old) continue;
                 // A grow is +25% (one 256-row step at least, 8192 rows at most, on the 256-row step) or exactly to the
                 // request's end, whichever is smaller.
@@ -619,7 +619,7 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
                 if (now != @min(quarter, end_rows)) std.debug.print("cooler contract: a decode's KV grew {d} -> {d} rows; +25% is {d}, the request's end {d}\n", .{ old, now, quarter, end_rows });
                 try testing.expectEqual(@min(quarter, end_rows), now);
                 if (end_rows < quarter) capped += 1;
-                for ([_]mlx.mlx_array{ entry.keys, entry.values, entry.keys_scales, entry.keys_biases, entry.values_scales, entry.values_biases }) |buf| {
+                for ([_]mlx.mlx_array{ entry.keys.array, entry.values.array, entry.keys_scales.array, entry.keys_biases.array, entry.values_scales.array, entry.values_biases.array }) |buf| {
                     if (buf.ctx == null) continue;
                     const row = mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf) / now;
                     tail += mlx.engine.poolBytes((now - old) * row);
@@ -637,7 +637,7 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
         before = Sheet.now().in_use;
         mlx.engine.resetPoolPeak(.process);
         grows_seen = KV.kv_cap_buf_grows;
-        for (cache.entries, 0..) |entry, i| caps[i] = if (entry.initialized) KV.bufferCapacity(entry.keys) else 0;
+        for (cache.entries, 0..) |entry, i| caps[i] = if (entry.initialized) KV.bufferCapacity(entry.keys.array) else 0;
     }
     // The reply grows the cache, and its last grow stops at the request's end.
     if (capped == 0) std.debug.print("cooler contract: {d} decode steps, {d} grows, none at the request's end\n", .{ steps, grows });

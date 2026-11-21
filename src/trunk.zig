@@ -2321,8 +2321,8 @@ pub const Trunk = struct {
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (self.cache.entries) |*entry| {
                 if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys.array);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values.array);
             }
             _ = mlx.mlx_eval(eval_vec);
         }
@@ -2344,8 +2344,8 @@ pub const Trunk = struct {
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (self.cache.entries) |*entry| {
                 if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys.array);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values.array);
             }
             _ = mlx.mlx_eval(eval_vec);
         }

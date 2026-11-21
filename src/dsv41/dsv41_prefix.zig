@@ -5,6 +5,7 @@
 const std = @import("std");
 const arch_handle = @import("../arch/handle.zig");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const transformer = @import("../trunk.zig");
 const model = @import("dsv41_model.zig");
 const expert_usage = @import("../expert_usage.zig");
@@ -367,12 +368,14 @@ pub fn markRows(cache: *transformer.KVCache, s: mlx.mlx_stream) !void {
     const e = &cache.entries[0];
     transformer.resetKVEntry(e);
     // A slot's cache takes the engine's KV scheme whatever the pack says, and a quantized entry owns six buffers.
-    const slots = [_]*mlx.mlx_array{ &e.keys, &e.values, &e.keys_scales, &e.keys_biases, &e.values_scales, &e.values_biases };
+    const slots = [_]*mlx_pages.InPlace{ &e.keys, &e.values, &e.keys_scales, &e.keys_biases, &e.values_scales, &e.values_biases };
     for (slots[0 .. if (cache.config.scheme == .off) 2 else 6]) |slot| {
-        _ = mlx.mlx_array_free(slot.*);
-        slot.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(slot, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, s));
-        try mlx.check(mlx.mlx_array_eval(slot.*));
+        slot.deinit();
+        var zeros = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(zeros);
+        try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, s));
+        slot.* = mlx_pages.InPlace.adopt(zeros, .paged);
+        try mlx.check(mlx.mlx_array_eval(slot.array));
     }
     e.offset = n;
     e.initialized = true;

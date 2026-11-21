@@ -1,6 +1,7 @@
 //! Lossless request-owned MLA capacity reservation before speculative cloning.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const mlx_pages = @import("../mlx_pages.zig");
 const attention = @import("glm5_attention.zig");
 const Ops = @import("glm5_model.zig").Ops;
 const Arr = mlx.mlx_array;
@@ -62,26 +63,26 @@ fn statePlan(st: *const attention.State, total: usize) !Plan {
         !std.mem.eql(c_int, ts, mlx.getShape(st.tail_gates)) or
         mlx.mlx_array_dtype(st.tail_keys) != mlx.mlx_array_dtype(st.tail_gates)) return error.InvalidGlmReserveShape;
     var pc: usize = 0;
-    if (st.pooled.ctx != null) {
-        const ps = mlx.getShape(st.pooled);
-        if (!supported(st.pooled) or ps.len != 2 or ps[0] < 0 or ps[1] != ts[1] or
-            mlx.mlx_array_dtype(st.pooled) != mlx.mlx_array_dtype(st.tail_keys)) return error.InvalidGlmReserveShape;
+    if (st.pooled.array.ctx != null) {
+        const ps = mlx.getShape(st.pooled.array);
+        if (!supported(st.pooled.array) or ps.len != 2 or ps[0] < 0 or ps[1] != ts[1] or
+            mlx.mlx_array_dtype(st.pooled.array) != mlx.mlx_array_dtype(st.tail_keys)) return error.InvalidGlmReserveShape;
         pc = @intCast(ps[0]);
     }
-    const parts = @import("glm5_bill.zig").latentPartBytes(@intCast(view.width()), st.latent_bits, mlx.mlx_array_itemsize(st.latent));
+    const parts = @import("glm5_bill.zig").latentPartBytes(@intCast(view.width()), st.latent_bits, mlx.mlx_array_itemsize(st.latent.array));
     return plan(st.processed, @intCast(view.rows()), pc, &parts, @intCast(ts[1]), mlx.mlx_array_itemsize(st.tail_keys), total);
 }
-fn grow(buffer: *Arr, rows: usize, width: c_int, dtype: mlx.mlx_dtype, stream: mlx.mlx_stream) !void {
-    const old: usize = if (buffer.ctx == null) 0 else @intCast(mlx.getShape(buffer.*)[0]);
+fn grow(buffer: *mlx_pages.InPlace, rows: usize, width: c_int, dtype: mlx.mlx_dtype, stream: mlx.mlx_stream) !void {
+    const old: usize = if (buffer.array.ctx == null) 0 else @intCast(mlx.getShape(buffer.array)[0]);
     if (rows == old) return;
     var ops = Ops{ .s = stream };
     defer ops.deinit();
     const padding = try ops.zeros(&.{ @intCast(rows - old), width }, dtype);
-    const joined = if (old == 0) padding else try ops.concat(&.{ buffer.*, padding }, 0);
+    const joined = if (old == 0) padding else try ops.concat(&.{ buffer.array, padding }, 0);
     try mlx.check(mlx.mlx_array_eval(joined));
     const result = try ops.result(joined);
-    if (buffer.ctx != null) _ = mlx.mlx_array_free(buffer.*);
-    buffer.* = result;
+    buffer.deinit();
+    buffer.* = mlx_pages.InPlace.adopt(result, .paged);
 }
 fn grown(buffer: Arr, rows: usize, stream: mlx.mlx_stream) !Arr {
     var ops = Ops{ .s = stream };
@@ -94,21 +95,21 @@ fn grown(buffer: Arr, rows: usize, stream: mlx.mlx_stream) !Arr {
 }
 /// kv8 codes, scales and biases grow together or not at all.
 fn growLatent(st: *attention.State, rows: usize, stream: mlx.mlx_stream) !void {
-    if (rows == @as(usize, @intCast(mlx.getShape(st.latent)[0]))) return;
-    const fields = [_]*Arr{ &st.latent, &st.latent_scales, &st.latent_biases };
+    if (rows == @as(usize, @intCast(mlx.getShape(st.latent.array)[0]))) return;
+    const fields = [_]*mlx_pages.InPlace{ &st.latent, &st.latent_scales, &st.latent_biases };
     var parts: [3]Arr = undefined;
     var done: usize = 0;
     errdefer for (parts[0..done]) |p| {
         _ = mlx.mlx_array_free(p);
     };
-    for (fields) |field| if (field.ctx != null) {
-        parts[done] = try grown(field.*, rows, stream);
+    for (fields) |field| if (field.array.ctx != null) {
+        parts[done] = try grown(field.array, rows, stream);
         done += 1;
     };
     var next: usize = 0;
-    for (fields) |field| if (field.ctx != null) {
-        _ = mlx.mlx_array_free(field.*);
-        field.* = parts[next];
+    for (fields) |field| if (field.array.ctx != null) {
+        field.deinit();
+        field.* = mlx_pages.InPlace.adopt(parts[next], .paged);
         next += 1;
     };
 }
@@ -172,8 +173,8 @@ fn equal(a: Arr, b: Arr, _: mlx.mlx_stream) !void {
 
 fn prefixes(a: *const attention.State, b: *const attention.State, ops: *Ops) !void {
     try std.testing.expectEqual(a.processed, b.processed);
-    try equal(try ops.slice(a.latent, 0, 0, @intCast(a.processed)), try ops.slice(b.latent, 0, 0, @intCast(b.processed)), ops.s);
-    try equal(try ops.slice(a.pooled, 0, 0, @intCast(a.processed / 4)), try ops.slice(b.pooled, 0, 0, @intCast(b.processed / 4)), ops.s);
+    try equal(try ops.slice(a.latent.array, 0, 0, @intCast(a.processed)), try ops.slice(b.latent.array, 0, 0, @intCast(b.processed)), ops.s);
+    try equal(try ops.slice(a.pooled.array, 0, 0, @intCast(a.processed / 4)), try ops.slice(b.pooled.array, 0, 0, @intCast(b.processed / 4)), ops.s);
     try equal(a.tail_keys, b.tail_keys, ops.s);
     try equal(a.tail_gates, b.tail_gates, ops.s);
 }
@@ -210,25 +211,25 @@ test "GLM reserve preserves cache bits and subsequent append and attention on BF
         try baseline.evaluate();
         const p = try statePlan(&layers[0].attention, total);
         const bill = try statesPeak(2, p);
-        const old = layers[0].attention.latent.ctx;
+        const old = layers[0].attention.latent.array.ctx;
         const tail = layers[0].attention.tail_keys.ctx;
         try std.testing.expectError(error.GlmReserveMemoryLimit, reserve(&request, total, bill - 1, stream));
-        try std.testing.expect(layers[0].attention.latent.ctx == old);
+        try std.testing.expect(layers[0].attention.latent.array.ctx == old);
         const valid = layers[1].attention.pooled;
-        layers[1].attention.pooled = try ops.result(try ops.zeros(&.{ @intCast(mlx.getShape(valid)[0]), 4 }, .int32));
+        layers[1].attention.pooled = mlx_pages.InPlace.adopt(try ops.result(try ops.zeros(&.{ @intCast(mlx.getShape(valid.array)[0]), 4 }, .int32)), .paged);
         try std.testing.expectError(error.InvalidGlmReserveShape, reserve(&request, total, bill, stream));
-        _ = mlx.mlx_array_free(layers[1].attention.pooled);
+        _ = mlx.mlx_array_free(layers[1].attention.pooled.array);
         layers[1].attention.pooled = valid;
-        try std.testing.expect(layers[0].attention.latent.ctx == old);
+        try std.testing.expect(layers[0].attention.latent.array.ctx == old);
         try std.testing.expectEqual(bill, try reserve(&request, total, bill, stream));
-        try std.testing.expectEqual(@as(c_int, @intCast(p.latent_capacity)), mlx.getShape(layers[0].attention.latent)[0]);
-        try std.testing.expectEqual(@as(c_int, @intCast(p.pool_capacity)), mlx.getShape(layers[0].attention.pooled)[0]);
+        try std.testing.expectEqual(@as(c_int, @intCast(p.latent_capacity)), mlx.getShape(layers[0].attention.latent.array)[0]);
+        try std.testing.expectEqual(@as(c_int, @intCast(p.pool_capacity)), mlx.getShape(layers[0].attention.pooled.array)[0]);
         try std.testing.expect(layers[0].attention.tail_keys.ctx == tail);
         try std.testing.expectEqual(n, request.offset);
         try prefixes(&layers[0].attention, &baseline, &ops);
-        const reserved = layers[0].attention.latent.ctx;
+        const reserved = layers[0].attention.latent.array.ctx;
         try std.testing.expectEqual(@as(usize, 0), try reserve(&request, total, 0, stream));
-        try std.testing.expect(layers[0].attention.latent.ctx == reserved);
+        try std.testing.expect(layers[0].attention.latent.array.ctx == reserved);
         const next = try ops.cast(try ops.slice(source, 0, 7, 13), dtype);
         const next_keys = try ops.slice(next, 1, 0, 4);
         const next_gates = try ops.binary(.mul, next_keys, try ops.scalar(0.5, dtype));
@@ -282,7 +283,7 @@ fn reserveQuantizedCase(bits: u8) !void {
     try std.testing.expectEqual(p.peak_bytes, try reserve(&request, total, p.peak_bytes, stream));
     const view = layers[0].attention.latentView();
     try std.testing.expect(view.rowMajor() and view.rows() == 2048);
-    for ([_]Arr{ view.data, view.scales, view.biases }, [_]Arr{ baseline.latent, baseline.latent_scales, baseline.latent_biases }) |grown_part, kept| try attention.expectSameBits(try ops.slice(grown_part, 0, 0, n), try ops.slice(kept, 0, 0, n));
+    for ([_]Arr{ view.data, view.scales, view.biases }, [_]Arr{ baseline.latent.array, baseline.latent_scales.array, baseline.latent_biases.array }) |grown_part, kept| try attention.expectSameBits(try ops.slice(grown_part, 0, 0, n), try ops.slice(kept, 0, 0, n));
     for ([_]*attention.State{ &layers[0].attention, &baseline }) |st| {
         _ = try st.append(try ops.slice(source, 0, n, n + 6), try ops.slice(keys, 0, n, n + 6), try ops.slice(keys, 0, n, n + 6), ape, stream);
         try st.evaluate();
