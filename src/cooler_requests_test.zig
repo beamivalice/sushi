@@ -411,6 +411,21 @@ test "cooler contract: Qwen grouped MTP ticks that grow their caches after a Dee
 
 /// The Qwen and DeepSeek STQ tinies loaded at once on Sushi Cooler, each served by a scheduler of its own.
 fn qwenBesideDeepSeek(comptime body: fn (qsv: *Served, dsv: *Served, qids: []const u32, dids: []const u32) anyerror!void) !void {
+    return qwenAndDeepSeekLoaded(struct {
+        fn run(qld: *Load, qdir: []const u8, dld: *Load, ddir: []const u8, qids: []const u32, dids: []const u32) !void {
+            var qsv: Served = undefined;
+            try qsv.init(qld, qdir);
+            defer qsv.deinit();
+            var dsv: Served = undefined;
+            try dsv.init(dld, ddir);
+            defer dsv.deinit();
+            try body(&qsv, &dsv, qids, dids);
+        }
+    }.run);
+}
+
+/// The Qwen and DeepSeek STQ tinies loaded at once on Sushi Cooler, for a body that serves them as it needs.
+fn qwenAndDeepSeekLoaded(comptime body: fn (qld: *Load, qdir: []const u8, dld: *Load, ddir: []const u8, qids: []const u32, dids: []const u32) anyerror!void) !void {
     try @import("test_note.zig").needArchs(&.{ "qwen4", "dsv41" });
     try mlx.requireGpu();
     const Q = ContractOf("qwen4");
@@ -433,13 +448,7 @@ fn qwenBesideDeepSeek(comptime body: fn (qsv: *Served, dsv: *Served, qids: []con
     var dld: Load = undefined;
     try dld.open(D, ddir, true);
     defer _ = dld.close();
-    var qsv: Served = undefined;
-    try qsv.init(&qld, qdir);
-    defer qsv.deinit();
-    var dsv: Served = undefined;
-    try dsv.init(&dld, ddir);
-    defer dsv.deinit();
-    try body(&qsv, &dsv, qids, dids);
+    try body(&qld, qdir, &dld, ddir, qids, dids);
 }
 
 /// What the Qwen ticks after a DeepSeek request ran under (`ticksAfterDeepSeek`).
@@ -1207,6 +1216,44 @@ test "cooler contract: a request that cannot join the planner's tick leaves the 
                 };
             }
             try testing.expectEqual(@as(u32, 0), bad);
+        }
+    }.run);
+}
+
+test "cooler contract: grouped speculative rows beside another Cooler model's request keep the planner's rounds and say their solo tokens" {
+    try qwenAndDeepSeekLoaded(struct {
+        fn run(qld: *Load, qdir: []const u8, dld: *Load, ddir: []const u8, qids: []const u32, dids: []const u32) !void {
+            var bufs: [3][300]u32 = undefined;
+            for (&bufs, 0..) |*b, r| for (b, 0..) |*t, i| {
+                t.* = qids[(i * (r + 2) + 3 * r + 7) % qids.len];
+            };
+            var dbuf: [40]u32 = undefined;
+            for (&dbuf, 0..) |*t, i| t.* = dids[(i * 5 + 2) % dids.len];
+            var qsv: Served = undefined;
+            try qsv.init(qld, qdir);
+            defer qsv.deinit();
+            var dsv: Served = undefined;
+            try dsv.init(dld, ddir);
+            defer dsv.deinit();
+            // The DeepSeek request outlasts the Qwen rows, which are long enough to calibrate and choose.
+            const set = [_]Group.Req{
+                .{ .prompt = bufs[0][0..200], .max = 200 },
+                .{ .prompt = bufs[1][0..250], .max = 210 },
+                .{ .prompt = &dbuf, .max = 400, .mtp = false, .entry = dsv.entry },
+                .{ .prompt = bufs[2][0..300], .max = 220, .at_tick = 4 },
+            };
+            var got = try Group.run(&qsv, &set);
+            defer got.deinit();
+            errdefer std.debug.print("cooler contract: beside a DeepSeek request: planner plain/prime/spec {any}\n", .{got.planner[0..4]});
+            for ([_]usize{ 0, 1, 3 }) |i| try testing.expect(got.planner[i][2] > 0);
+            const qwen = [_]Group.Req{ set[0], set[1], set[3] };
+            const qgot = Group.Out{
+                .published = .{ got.published[0], got.published[1], got.published[3], .empty, .empty, .empty, .empty, .empty },
+                .failed = .{ got.failed[0], got.failed[1], got.failed[3], null, null, null, null, null },
+            };
+            try Group.expectSolo(qld, qdir, &qwen, &qgot);
+            const dgot = Group.Out{ .published = .{ got.published[2], .empty, .empty, .empty, .empty, .empty, .empty, .empty }, .failed = .{ got.failed[2], null, null, null, null, null, null, null } };
+            try Group.expectSolo(dld, ddir, set[2..3], &dgot);
         }
     }.run);
 }

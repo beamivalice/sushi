@@ -132,7 +132,9 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   1, under 96 tokens left) rides a calibration or recovery round at width 0 while the rows that can, probe
   (`planProbe` declines only when none can); a row that cannot ride the planner's tick at all (a penalty, logprobs or
   another non-batchable verdict, M-RoPE, an `enable_batch_mtp:false` opt-out, a context the pad-waste cap leaves out)
-  decodes in the regular path while the others group (`plannerRowFits`, `plannerRows`).
+  decodes in the regular path while the others group (`plannerRowFits`, `plannerRows`). **A model's rows are a planner
+  run of their own** (`runPlannerTicks`, model order as the batched path's): a request of another model decoding in the
+  same tick, DeepSeek's included, takes none of the Qwen rows' grouping, and each model's work stays in its own turn's cap.
   A price key names a round as `observeGroupRound` records it: its proposal bit is whether the chain keeps its drafts'
   probabilities (`mtp_round.mtpKeepsDraftProbs`; a served request draws at positions and keeps none), never the draft
   temperature alone. A key no round writes leaves the planner no price, and it never drafts those rows. Four MTP streams on MCG K3

@@ -350,13 +350,12 @@ fn plannerRows(sch: *const Scheduler, active: []*Slot) usize {
     return sched_policy.takeFront(*Slot, active[0..n], &cap, PadWasteKeep.keeps);
 }
 
-/// The planner's tick for the rows of `active` that can ride it, which it moves to the front of `active`; returns
-/// how many it ticked (0: the planner declined, and every row is the regular path's).
-pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!usize {
+/// The planner's tick for the rows of `active`, all of one model, that can ride it, which it moves to the front of
+/// `active`; returns how many it ticked (0: the planner declined, and every row is the regular path's).
+fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!usize {
     if (!Planner.enabled() or active.len == 0) return 0;
     const xfm = arch_handle.trunk(active[0].model.handle orelse return 0);
     if (!arch_state.rowVerify(&xfm.arch_state) or arch_state.headCache(&xfm.arch_state) == null) return 0;
-    for (active) |slot| if (slot.model != active[0].model) return 0;
     const n = plannerRows(sch, active);
     if (n == 0 or n > Planner.MAX_ROWS) return 0;
     if (n == 1) {
@@ -364,6 +363,28 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!usize {
         if (!gen.mtp_planner_owned) return 0;
     }
     return if (try plannerTickRows(sch, active[0..n])) n else 0;
+}
+
+/// The planner's tick for each model's run of `active`, in the batched path's model order: a model's rows group
+/// among themselves, whatever another model's decode beside them. The slots a tick took go to the front of `active`;
+/// returns how many, and a failed tick fails its own model's rows and counts them taken.
+pub fn runPlannerTicks(sch: *Scheduler, active: []*Slot) usize {
+    sched_policy.sortByModel(*Slot, active);
+    var taken: usize = 0;
+    var start: usize = 0;
+    while (start < active.len) {
+        const end = sched_policy.modelRunEnd(*Slot, active, start);
+        const run = active[start..end];
+        const ticked = tryPlannerTick(sch, run) catch |e| blk: {
+            scheduler_mod.failTick(run, e, "[mtp-planner]");
+            break :blk run.len;
+        };
+        // The taken rows of this run and the rows left from the runs before it swap places.
+        std.mem.rotate(*Slot, active[taken .. start + ticked], start - taken);
+        taken += ticked;
+        start = end;
+    }
+    return taken;
 }
 
 /// One planner tick for `active`, rows that all fit and share a model.

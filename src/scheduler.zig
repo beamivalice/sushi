@@ -4275,11 +4275,7 @@ fn runSideTick(sch: *Scheduler, all: []*Slot, own: bool) anyerror!void {
             slot.planner_plain_transition = false;
             slot.planner_force_plain = false;
         };
-        const taken = mtp_tick.tryPlannerTick(sch, all) catch |e| {
-            failTick(all, e, "[mtp-planner]");
-            return;
-        };
-        active = all[taken..];
+        active = all[mtp_tick.runPlannerTicks(sch, all)..];
         // A slot the planner owns and did not take decodes plain this tick, not in a round of its own.
         for (active) |slot| if (slot.legacy_gen) |*gen| {
             if (gen.mtp_planner_owned) slot.planner_force_plain = true;

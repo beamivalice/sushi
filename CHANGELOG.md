@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Qwen3.8-Flash-Next streams keep their grouped MTP speculation while a DeepSeek-V4.1 request decodes beside them on the same server**: every Qwen stream decoded plain for as long as the other model's request ran (a 400-token DeepSeek reply cost the Qwen streams all of their rounds); each model's streams now group among themselves.
 - **Qwen3.8-Flash-Next streams that group their MTP verify keep speculating beside a request that cannot join them**: a plain request, one under 96 tokens from its budget, or one with a penalty, logprobs, an image or a much longer context stopped the speculation of every other stream in the group; the others now keep their rounds and it decodes on its own.
 - **Rescan drops a model whose folder now holds a config sushi cannot serve**: an unsupported architecture or quantization, a drafter or a half-written `config.json` left the model listed with its old architecture and size, though loading it was refused.
 - **Logprobs of a reply with a thought in the middle list the content it returned**: a non-streamed reply with content, a thought and more content listed a piece of the closing tag and missed the first content token, and a stream listed thought tokens and stray closers and missed the tokens next to a thought; the stream and the whole reply now list the same entries, and the "\n" that joins the parts has no token, so no entry lists it.
