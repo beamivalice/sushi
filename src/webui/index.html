@@ -3913,7 +3913,9 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     await withBusy(btn, "Rescanning…", async () => {
       try {
         const r = await postJson("/v1/models/rescan", {});
-        toast(r.added ? `Found ${r.added} new model${r.added === 1 ? "" : "s"}` : "No new models");
+        const n = (k, word) => `${k} ${word} model${k === 1 ? "" : "s"}`;
+        const parts = [r.added ? n(r.added, "new") : "", r.removed ? `${r.removed} removed (folder gone)` : ""].filter(Boolean);
+        toast(parts.length ? parts.join(", ") : "No changes");
         await Promise.all([modelStore.refresh(), refresh()]);
       } catch (e) { failToast("Rescan", e); }
     });

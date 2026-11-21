@@ -658,8 +658,8 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   load (the page offers the reload). `prefix_cache_disk_gb` reaches the running tiers at once (the tier re-derives its budget
   and evicts down to it) and every later load, cold loads included; the answer says "applied to the running tiers" only
   when a tier was resized, else "applies at the next model load"; 0 and removal apply at the next load. `models_dir`
-  triggers a rescan that adds the folder's models, also on a `--model`-only server, and says how many (add-only; the boot
-  discovery follows it at the next start).
+  triggers a rescan that adds the folder's models, also on a `--model`-only server, and says how many added (a rescan
+  also drops an unheld model whose folder is gone; the boot discovery follows it at the next start).
 - The page shows both in its **Models** (`/models`: a list with a detail form per model: size, load/unload, settings, a
   model's cache) and **Settings** (`/settings`: SSD cache size and use, per-namespace rows with their own Clear, the clear
   buttons, models directory, version) views. The page is served by the same build as the API, so it reads these fields

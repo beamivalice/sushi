@@ -736,6 +736,9 @@ pub const ModelRegistry = struct {
     /// are heap-allocated and owned by the registry. Iteration order isn't
     /// guaranteed; snapshot sorts by `last_used_ns` desc for stable output.
     entries: std.StringHashMap(*LoadedModel),
+    /// Entries a rescan took out of `entries` because their folder is gone. Freed only at deinit: a pointer a caller
+    /// took from `peek` (no refcount) stays valid, and `default_id` may borrow one's id.
+    retired: std.ArrayList(*LoadedModel) = .empty,
 
     /// Default model id used when a request doesn't specify `model` (or
     /// specifies the literal "sushi"). Borrowed from the corresponding
@@ -847,6 +850,11 @@ pub const ModelRegistry = struct {
             self.allocator.destroy(entry);
         }
         self.entries.deinit();
+        for (self.retired.items) |entry| {
+            entry.deinit();
+            self.allocator.destroy(entry);
+        }
+        self.retired.deinit(self.allocator);
         if (self.discovery) |*d| d.deinit();
     }
 
@@ -1017,7 +1025,7 @@ pub const ModelRegistry = struct {
     /// number of stubs added. A `--model`-only server with no
     /// settings-file models directory rescans nothing (`absorbDownload`
     /// still lists what the Downloads tab fetched).
-    pub fn rescan(self: *ModelRegistry) !u32 {
+    pub fn rescan(self: *ModelRegistry) !Rescanned {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         return self.rescanWithSettings(self.settings_path orelse model_settings.defaultPath(&path_buf));
     }
@@ -1030,7 +1038,7 @@ pub const ModelRegistry = struct {
     }
 
     pub fn absorbDownloadWithSettings(self: *ModelRegistry, settings_path: []const u8, path: []const u8) !u32 {
-        const added = try self.rescanWithSettings(settings_path);
+        const added = (try self.rescanWithSettings(settings_path)).added;
         if (self.peekByPath(path) != null) {
             self.refreshFolderFacts(path);
             return added;
@@ -1069,14 +1077,20 @@ pub const ModelRegistry = struct {
     }
 
     /// `rescan` reading the settings file at `settings_path`.
-    pub fn rescanWithSettings(self: *ModelRegistry, settings_path: []const u8) !u32 {
+    /// What a rescan changed: entries registered for new folders, and entries dropped because their folder is gone.
+    pub const Rescanned = struct { added: u32 = 0, removed: u32 = 0 };
+
+    pub fn rescanWithSettings(self: *ModelRegistry, settings_path: []const u8) !Rescanned {
         const boot_roots = if (self.discovery) |d| d.roots else &.{};
         // The settings file's models directory joins the boot roots, so a changed one is found without a restart.
         var file = model_settings.load(self.allocator, self.io, settings_path);
         defer file.deinit();
         var with_file: [9][]const u8 = undefined;
         const roots = rootsWithFileDir(&with_file, boot_roots, model_settings.launch_locks.models_dir.set, model_settings.server(&file).models_dir);
-        if (roots.len == 0) return 0;
+        self.mutex.lockUncancelable(self.io);
+        const removed = try self.retireVanishedLocked();
+        self.mutex.unlock(self.io);
+        if (roots.len == 0) return .{ .removed = removed };
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
         var added: u32 = 0;
@@ -1093,7 +1107,42 @@ pub const ModelRegistry = struct {
             stub.bytes_total = m.bytes_total;
             added += 1;
         }
-        return added;
+        return .{ .added = added, .removed = removed };
+    }
+
+    /// Takes out of `entries` every entry nothing holds (unloaded or failed, no reference) whose folder is gone from its
+    /// path: deleted, its config.json gone, or the path now leads to another folder. Whatever root, or none, listed it. A load in flight, a loaded model and a held one stay. Caller holds `mutex`.
+    fn retireVanishedLocked(self: *ModelRegistry) !u32 {
+        var gone: std.ArrayList(*LoadedModel) = .empty;
+        defer gone.deinit(self.allocator);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (e.state != .unloaded and e.state != .error_state) continue;
+            if (e.refcount.load(.seq_cst) != 0) continue;
+            if (!e.folder.eql(&e.folder)) continue; // registered without a folder: nothing to compare
+            var dir = std.Io.Dir.cwd().openDir(self.io, e.path, .{}) catch {
+                try gone.append(self.allocator, e);
+                continue;
+            };
+            // A folder without its config.json is no model any more (discovery would not list it).
+            const has_config = if (dir.statFile(self.io, "config.json", .{})) |_| true else |_| false;
+            dir.close(self.io);
+            if (!has_config) {
+                try gone.append(self.allocator, e);
+                continue;
+            }
+            // The path names another folder now (a link moved): this entry's folder is not at it.
+            const now = FolderId.of(self.io, e.path) catch continue;
+            if (!now.eql(&e.folder)) try gone.append(self.allocator, e);
+        }
+        try self.retired.ensureUnusedCapacity(self.allocator, gone.items.len);
+        for (gone.items) |e| {
+            _ = self.entries.remove(e.id);
+            self.retired.appendAssumeCapacity(e);
+            log.info("[registry] {s}: its folder is gone; dropped from the model list\n", .{e.id});
+        }
+        return @intCast(gone.items.len);
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -2734,6 +2783,48 @@ test "ModelRegistry: rescan roots: the settings file's models directory is walke
     try testing.expectEqual(@as(usize, 1), rootsWithFileDir(&buf, &boot, false, "/boot").len);
 }
 
+test "ModelRegistry: a rescan drops a model whose folder is gone, keeps one a load holds, and finds it again when it returns" {
+    try test_note.needArchs(&.{"glm5"});
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    for ([_][]const u8{ "org/kept", "org/gone", "org/held", "org/unconfigured" }) |dir| {
+        try tmp.dir.createDirPath(io, dir);
+        var cb: [64]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&cb, "{s}/config.json", .{dir}), .data = "{\"model_type\":\"glm5_next\"}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&cb, "{s}/model.safetensors", .{dir}), .data = "0123" });
+    }
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    // A held entry (a request's reference) is never dropped under it, whatever its folder does.
+    const held = reg.peek("org/held") orelse return error.TestExpectedResult;
+    _ = held.refcount.fetchAdd(1, .seq_cst);
+    defer _ = held.refcount.fetchSub(1, .seq_cst);
+
+    try tmp.dir.deleteTree(io, "org/gone");
+    try tmp.dir.deleteTree(io, "org/held");
+    try tmp.dir.deleteFile(io, "org/unconfigured/config.json");
+    try testing.expectEqual(ModelRegistry.Rescanned{ .added = 0, .removed = 2 }, try reg.rescanWithSettings(no_settings));
+    try testing.expect(reg.peek("org/gone") == null);
+    try testing.expect(reg.peek("org/unconfigured") == null);
+    try testing.expect(reg.peek("org/kept") != null);
+    try testing.expect(reg.peek("org/held") != null);
+    const listed = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(listed);
+    for (listed) |m| try testing.expect(!std.mem.eql(u8, m.id, "org/gone"));
+    try testing.expectError(error.UnknownModelId, reg.resolveEntry("org/gone"));
+
+    // The folder comes back: the next rescan lists it again.
+    try tmp.dir.createDirPath(io, "org/gone");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/gone/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/gone/model.safetensors", .data = "0123" });
+    try testing.expectEqual(ModelRegistry.Rescanned{ .added = 1, .removed = 0 }, try reg.rescanWithSettings(no_settings));
+    try testing.expect(reg.peek("org/gone") != null);
+}
+
 test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, idempotent)" {
 
     try test_note.needArchs(&.{ "mimo2", "glm5" });
@@ -2759,12 +2850,12 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     try tmp.dir.writeFile(io, .{ .sub_path = "org/second/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "org/second/model.safetensors", .data = "0123" });
 
-    try testing.expectEqual(@as(u32, 1), try reg.rescanWithSettings(no_settings));
+    try testing.expectEqual(@as(u32, 1), (try reg.rescanWithSettings(no_settings)).added);
     const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
     try testing.expectEqualStrings("mimo_v2", stub.arch_hint);
     try testing.expectEqual(LoadState.unloaded, stub.state);
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
-    try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
+    try testing.expectEqual(@as(u32, 0), (try reg.rescanWithSettings(no_settings)).added);
     try testing.expect(reg.peek("org/first") != null);
 }
 
@@ -2813,10 +2904,10 @@ test "ModelRegistry: rescan reads the settings file the registry names instead o
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
     reg.settings_path = settings;
-    try testing.expectEqual(@as(u32, 1), try reg.rescan());
+    try testing.expectEqual(@as(u32, 1), (try reg.rescan()).added);
     try testing.expect(reg.peek("org/m") != null);
     reg.settings_path = no_settings;
-    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 0), (try reg.rescan()).added);
 }
 
 test "ModelRegistry: rescan under a models root never absorbs tiny-models or dot folders" {
@@ -2837,7 +2928,7 @@ test "ModelRegistry: rescan under a models root never absorbs tiny-models or dot
     try model_discovery.writePackStub(io, tmp.dir, ".hidden/y");
     try model_discovery.writePackStub(io, tmp.dir, "org/second");
 
-    try testing.expectEqual(@as(u32, 1), try reg.rescanWithSettings(no_settings));
+    try testing.expectEqual(@as(u32, 1), (try reg.rescanWithSettings(no_settings)).added);
     try testing.expect(reg.peek("org/second") != null);
     try testing.expect(reg.peek("x") == null);
     try testing.expect(reg.peek("y") == null);
@@ -2912,7 +3003,12 @@ test "upstream bugfix: ModelRegistry: rescan clears a failed load so the complet
     // The download finishes after the failed load.
     try tmp.dir.writeFile(io, .{ .sub_path = "org/broken/model.safetensors", .data = "01234567" });
 
-    try testing.expectEqual(@as(u32, 0), try reg.rescanWithSettings(no_settings));
+    // The failed entry whose path is gone leaves the list (its folder is gone); the folder at its id's real place is
+    // found as a new stub. The old entry is not reset, it is retired as it was.
+    try testing.expectEqual(ModelRegistry.Rescanned{ .added = 1, .removed = 1 }, try reg.rescanWithSettings(no_settings));
+    const found_moved = reg.peek("org/moved") orelse return error.TestExpectedResult;
+    try testing.expect(found_moved != moved);
+    try testing.expectEqual(LoadState.unloaded, found_moved.state);
     try testing.expectEqual(LoadState.unloaded, broken.state);
     try testing.expectEqual(@as(?[]const u8, null), broken.error_name);
     try testing.expectEqual(@as(?u64, 8), broken.bytes_on_disk);

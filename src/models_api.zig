@@ -705,20 +705,20 @@ pub fn handleModelGet(allocator: std.mem.Allocator, stream: *Conn, raw_id: []con
     try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
 }
 
-/// `POST /v1/models/rescan`: re-walk the boot roots and register stubs for
-/// new dirs and clear failed loads (`ModelRegistry.rescan`). Answers `{"added":N}`.
+/// `POST /v1/models/rescan`: re-walk the boot roots, register stubs for new dirs, drop entries whose folder is gone and
+/// clear failed loads (`ModelRegistry.rescan`). Answers `{"added":N,"removed":M}`.
 pub fn handleModelsRescan(allocator: std.mem.Allocator, stream: *Conn) !void {
     const registry = server_state.global_registry orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", http.not_ready_message, 503);
         return;
     };
-    const added = registry.rescan() catch |err| {
+    const r = registry.rescan() catch |err| {
         log.warn("/v1/models/rescan failed: {s}\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "internal_error", "Model rescan failed", 500);
         return;
     };
-    if (added > 0) log.info("[registry] rescan added {d} model(s)\n", .{added});
-    const body = try std.fmt.allocPrint(allocator, "{{\"added\":{d}}}", .{added});
+    if (r.added > 0) log.info("[registry] rescan added {d} model(s)\n", .{r.added});
+    const body = try std.fmt.allocPrint(allocator, "{{\"added\":{d},\"removed\":{d}}}", .{ r.added, r.removed });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

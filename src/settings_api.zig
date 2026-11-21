@@ -1063,7 +1063,7 @@ fn modelsDirMessage(buf: []u8, rescan: anyerror!u32) []const u8 {
 
 fn applyModelsDir(sch: *@import("scheduler.zig").Scheduler, buf: []u8) []const u8 {
     if (model_settings.launch_locks.models_dir.set) return "saved; the --model-dir flag still sets the directories until a start without it";
-    return modelsDirMessage(buf, sch.registry.rescan());
+    return modelsDirMessage(buf, if (sch.registry.rescan()) |r| r.added else |e| e);
 }
 
 // ── Tests ──
