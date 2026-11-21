@@ -12,12 +12,12 @@ const slice = script.slice(start, script.indexOf('function loadVersion(', start)
 const nodes = {};
 const node = (id) => (nodes[id] ??= { id, hidden: false, textContent: '', style: {}, attrs: {}, setAttribute(k, v) { this.attrs[k] = v; } });
 const GiB = 1024 ** 3;
-let reads = 0;
+let reads = 0, lastPath = '';
 let props = {};
 const timers = [];
 const page = vm.createContext({
   $: node,
-  apiJson: async () => { reads += 1; return props; },
+  apiJson: async (path) => { reads += 1; lastPath = path; return props; },
   setTimeout: (fn, ms) => timers.push([fn, ms]),
 });
 vm.runInContext(slice, page);
@@ -47,10 +47,17 @@ assert.equal(page.prefixCacheMeter({ disk_bytes: 2 * GiB, disk_used_bytes: 3 * G
 page.renderPrefixCache({ disk_bytes: 0 });
 assert.equal(node('prefixCacheSection').hidden, true);
 
+// The meter is the chat model's: its read names the model, and with none chosen nothing is read.
+node('modelSelect').value = '';
+page.readPrefixCache();
+assert.equal(reads, 0, 'no chat model, no read');
+assert.equal(node('prefixCacheSection').hidden, true);
+node('modelSelect').value = 'Chat A/1';
 // Each turn reads /props at once and again after the server's flush.
 props = { settings: { prefix_cache: { disk_bytes: 10 * GiB, disk_used_bytes: 2 * GiB, disk_entries: 2 } } };
 page.refreshPrefixCache();
 assert.equal(reads, 1);
+assert.equal(lastPath, '/props?model=Chat%20A%2F1', 'the chat model\'s own /props');
 assert.equal(timers.length, 1);
 assert.ok(timers[0][1] >= 1000);
 timers[0][0]();

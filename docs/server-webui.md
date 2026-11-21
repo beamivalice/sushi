@@ -39,8 +39,9 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   answers, one second apart) until the model at the pack's folder is listed (never by the folder's name: a model's id may
   be `org/name`), and for an Update until its row stops offering one.
   Guard: the finished-download blocks in `tests/test_webui_downloads.cjs`.
-  The chat's prompt-cache meter reads `/props` (`readPrefixCache`, the latest read wins) when the loaded set changes
-  and after a clear, a cache-size save or a reload; `/props` has no prefix cache while nothing is loaded.
+  The chat's prompt-cache meter is the chat model's: it reads `/props?model=<id>` (`readPrefixCache`, the latest read
+  wins; bare `/props` answers for the server's default model) when the picked model or its loaded state changes
+  (`syncPrefixCache`) and after a reply, a clear, a cache-size save or a reload; with no model chosen there is no meter.
   Guards: the meter scenarios in `tests/test_webui_admin_ui.cjs`, `tests/test_webui_prefix_cache.cjs`.
   The API-key overlay is modal only while the server asks for a key: the first authorized answer from any request hides it.
 

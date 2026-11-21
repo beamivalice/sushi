@@ -1990,6 +1990,34 @@ async function main() {
       assert.equal(up, false, 'the model runs its saved settings');
     });
 
+    // /props answers for the registry's default model (Qwen-A here) unless ?model=<id> names another, and carries a prefix cache only while that model is loaded.
+    const perModelProps = (server) => {
+      const tiers = { 'Qwen-A': 41 * GiB, 'GLM-B': 3 * GiB };
+      server.state.hooks['/props'] = (body, method, url) => {
+        const m = server.state.models.find((x) => x.id === (url.searchParams.get('model') || 'Qwen-A'));
+        const cache = m?.state === 'ready' ? { prefix_cache: { disk_bytes: 100 * GiB, disk_used_bytes: tiers[m.id], disk_entries: 5 } } : {};
+        return reply({ settings: { version: '9.9.9', mtp: {}, ...cache }, memory: { available_bytes: 5e9, total_bytes: 48 * GiB }, batching: {} });
+      };
+    };
+    await scenario('the chat\'s prompt-cache meter reads the chat model\'s cache, not the default model\'s', { path: '/chat', open: { mode: 'advanced' }, setup: (s) => { perModelProps(s); s.state.models[0].state = 'unloaded'; s.state.models[1].state = 'ready'; } }, async ({ page, server }) => {
+      await page.waitForFunction(() => document.getElementById('modelSelect').value === 'GLM-B');
+      await settle(page, 3000);
+      const m = await chatMeter(page);
+      const asked = server.calls.filter((c) => c.path === '/props').map((c) => c.query || '(bare)');
+      assert.equal(m.hidden, false, `the chat is on GLM-B, loaded with a 3 GiB cache, yet the meter is hidden (reads: ${asked})`);
+      assert.match(m.usage, /3\.00 \/ 100\.0/);
+    });
+    await scenario('the chat\'s prompt-cache meter follows the model picker', { path: '/chat', open: { mode: 'advanced' }, setup: (s) => { perModelProps(s); s.state.models[1].state = 'ready'; } }, async ({ page }) => {
+      await page.waitForFunction(() => /41\.0 \/ 100\.0/.test(document.getElementById('prefixCacheUsage').textContent));
+      await page.selectOption('#modelSelect', 'GLM-B');
+      await settle(page, 500);
+      assert.match((await chatMeter(page)).usage, /3\.00 \/ 100\.0/, 'the picker is on GLM-B (3 GiB used)');
+    });
+    await scenario('the chat\'s prompt-cache meter hides while no model is chosen', { path: '/chat', open: { mode: 'advanced' }, setup: (s) => { perModelProps(s); s.state.models[0].state = 'unloaded'; } }, async ({ page, server }) => {
+      await settle(page, 3000);
+      assert.equal((await chatMeter(page)).hidden, true, 'no chat model, so no meter');
+      assert.deepEqual(server.calls.filter((c) => c.path === '/props' && c.query).map((c) => c.query), [], 'and no read for a model');
+    });
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
     console.log('Web UI admin views (browser): passed');
   } finally {

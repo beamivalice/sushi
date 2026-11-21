@@ -2001,15 +2001,23 @@ function cacheVolumeText(volume) {
   const warning = free <= 5 * 1024 ** 3 ? ' · almost full: free some disk space' : free / Number(volume.total_bytes) < 0.1 ? ' · less than 10% free' : '';
   return `${volume.name} · ${n.toFixed(unit ? 2 : 0)} ${units[unit]} free (${percent}%)${warning}`;
 }
-// The meter shows the latest /props answer: a read that lands after a newer one is dropped.
+// The meter is the chat model's: /props?model=<id> (bare /props answers for the server's default model). It shows the
+// latest read: one that lands after a newer one is dropped, and with no model chosen there is nothing to read.
 let propsSeq = 0, propsApplied = 0;
 function readPrefixCache() {
-  const mine = ++propsSeq;
-  return apiJson("/props").then((props) => {
+  const mine = ++propsSeq, id = $("modelSelect").value;
+  if (!id) { propsApplied = mine; renderPrefixCache(null); return Promise.resolve(); }
+  return apiJson(`/props?model=${encodeURIComponent(id)}`).then((props) => {
     if (mine < propsApplied) return;
     propsApplied = mine;
     renderPrefixCache(props?.settings?.prefix_cache);
   }).catch(() => {});
+}
+// The chat model, or whether it is loaded, changing (a pick, a load or unload by any tab) changes the meter.
+let meterKey = null;
+function syncPrefixCache() {
+  const id = $("modelSelect").value, key = `${id}|${selectedModel()?.state === "ready"}`;
+  if (key !== meterKey) { meterKey = key; readPrefixCache(); }
 }
 // The server flushes a turn's entry after it answers, so a second read catches the stored bytes.
 function refreshPrefixCache() {
@@ -2017,23 +2025,15 @@ function refreshPrefixCache() {
   setTimeout(readPrefixCache, 2500);
 }
 function loadVersion() {
-  const mine = ++propsSeq;
   apiJson("/props")
     .then((props) => {
       const version = props?.update?.current ?? props?.settings?.version;
       if (version) $("brandVersion").textContent = $("aboutVersion").textContent = `v${String(version).replace(/^v/, "")}`;
       showUpdate(props?.update);
       reportUpdateResult(props?.update);
-      if (mine >= propsApplied) { propsApplied = mine; renderPrefixCache(props?.settings?.prefix_cache); }
     })
     .catch(() => {});
 }
-// /props carries a prefix cache only while a model is loaded, so a load or an unload, by any tab, changes the meter.
-let readyModels = "";
-modelStore.subscribe(() => {
-  const ready = modelStore.list.filter((model) => model.state === "ready").map((model) => model.id).sort().join("|");
-  if (ready !== readyModels) { readyModels = ready; readPrefixCache(); }
-});
 
 /* ------------------------------------------------------------
    Self-update: the server offers a newer release and restarts into it
@@ -2246,6 +2246,7 @@ function renderModelOptions() {
   }
   renderEffortOptions();
   renderModelStatus();
+  syncPrefixCache();
 }
 function renderEffortOptions() {
   const select = $("effortSelect");
@@ -2341,6 +2342,7 @@ $("modelSelect").addEventListener("change", () => {
   pickedModel = $("modelSelect").value;
   renderEffortOptions();
   renderModelStatus();
+  syncPrefixCache();
 });
 $("effortSelect").addEventListener("change", () => {
   writeStore("sushi-effort", $("effortSelect").value);
