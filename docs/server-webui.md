@@ -23,6 +23,12 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
 - Status text pairs (`--info`, `--ok`, `--warn`, `--err` on their `-soft` washes) keep AA in both themes; the theme test checks all four.
 - An action that can hurt the machine asks first (`confirmAction`): skipping the memory check, turning the cache off, clearing caches.
 - A failure message belongs to one attempt: the action clears it (`adminAttempt`) before it sends, so Load, Save and Retry show only what the new attempt returned, and a refused value never blocks the next Save (`adminSaveRefused`). Guard: `tests/test_webui_admin.cjs`.
+- One refresh rule: the server's latest answer owns what the page shows. An action that moves server state (Rescan, a
+  Save, a Remove, a clear, a load) calls `invalidate`, which reads the stores it names again; no view keeps a copy of
+  an answer an action has outdated. A failed load is the server's `error` for a failed model; the page's own
+  `modelStore.failed` note exists only for a refusal, which the server keeps no record of, and goes on the next Save,
+  Remove, Rescan or restart. The model list is `/v1/models`; `/v1/settings` only adds each model's settings. Guards: the
+  load-failure, refusal-note and rescan scenarios in `tests/test_webui_admin_ui.cjs`.
 
 ## Palette
 

@@ -10,7 +10,7 @@ const slice = script.slice(script.indexOf('function adminBytes('), script.indexO
 const page = vm.createContext({});
 vm.runInContext(slice, page);
 const main = source.match(/<script>([\s\S]*?)<\/script>/)[1];
-vm.runInContext(main.slice(main.indexOf('function forgetRecoveredLoads('), main.indexOf('const modelStore = {')), page);
+vm.runInContext(main.slice(main.indexOf('function forgetAnsweredLoads('), main.indexOf('const modelStore = {')), page);
 
 const GiB = 1024 ** 3;
 assert.equal(page.adminBytes(5 * GiB), '5.00 GiB');
@@ -115,11 +115,12 @@ page.adminAttempt(failedObj, 'port');
 assert.deepEqual(JSON.parse(JSON.stringify(failedObj)), { models_dir: 'not a folder' });
 page.adminAttempt(failedObj);
 assert.deepEqual(JSON.parse(JSON.stringify(failedObj)), {});
-// A load failure this session recorded goes once the server lists the model loaded or loading, wherever it was loaded.
-const loadFailures = new Map([['a', 'out of memory'], ['b', 'bad config'], ['c', 'x']]);
-assert.equal(page.forgetRecoveredLoads(loadFailures, [{ id: 'a', state: 'ready' }, { id: 'b', state: 'error' }, { id: 'c', state: 'loading' }]), true);
-assert.deepEqual([...loadFailures], [['b', 'bad config']], 'a model that is still failed keeps its message');
-assert.equal(page.forgetRecoveredLoads(loadFailures, [{ id: 'b', state: 'unloaded' }]), false);
+// A refusal note this session recorded goes once the server answers for the model: loaded, loading or failed (its own
+// `error` is then the reason), wherever it was loaded. A model still listed unloaded keeps the note.
+const loadFailures = new Map([['a', 'out of memory'], ['b', 'bad config'], ['c', 'x'], ['d', 'no room']]);
+assert.equal(page.forgetAnsweredLoads(loadFailures, [{ id: 'a', state: 'ready' }, { id: 'b', state: 'error' }, { id: 'c', state: 'loading' }, { id: 'd', state: 'unloaded' }]), true);
+assert.deepEqual([...loadFailures], [['d', 'no room']], 'a model the server lists unloaded keeps its refusal');
+assert.equal(page.forgetAnsweredLoads(loadFailures, [{ id: 'd', state: 'unloaded' }]), false);
 // A refused Save names a setting or the form; the next Save and an edit of that value answer it, and it blocks nothing.
 const form = () => ({ texts: {}, errors: {}, refused: {}, saveError: '' });
 const shown = (P) => JSON.parse(JSON.stringify({ refused: P.refused, saveError: P.saveError, errors: P.errors }));

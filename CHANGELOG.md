@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The web UI stops saying "Load failed" once the server no longer reports it**: a Rescan, a settings Save, a removed saved value or a server restart clears a failed load's row and alert, which the page kept for the session; and a Rescan that drops a model drops its row even when `/v1/settings` fails once.
 - **A model whose folder was deleted, or lost its `config.json`, leaves the model list at the next Rescan** ([#114](https://github.com/beamivalice/sushi/issues/114)): a rescan only added before, so the deleted model stayed listed; a loaded model is never dropped, and `/v1/models/rescan` now also answers how many it removed.
 - **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that names
   no function, and a Responses `instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`,

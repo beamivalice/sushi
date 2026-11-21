@@ -1711,6 +1711,107 @@ async function main() {
       assert.match(await page.textContent(row('yarn_factor')), /Set at launch/);
     });
 
+    // One refresh rule: an action that moves server state re-reads what it moved, and every view shows the latest answer.
+    const reply = (body, status = 200) => ({ status, contentType: 'application/json', body: JSON.stringify(body) });
+    const listIds = (page) => page.evaluate(() => [...document.querySelectorAll('#modelsList .row')].map((r) => r.dataset.id));
+    const metaOfRow = (page, id) => page.evaluate((i) => document.querySelector(`#modelsList .row[data-id="${i}"] .meta`)?.textContent ?? null, id);
+    // A load that fails the way the engine stores it: the entry goes to error_state and /v1/models carries the reason.
+    const failLoadHook = (server, id) => {
+      server.state.hooks['/v1/load-model'] = (body) => {
+        const m = server.state.models.find((x) => x.id === body.model);
+        if (m.id !== id) return null;
+        m.state = 'error_state'; m.error = 'Failed to load model: ExpertCacheTooSmall';
+        return reply({ error: { message: 'Failed to load model: ExpertCacheTooSmall' } }, 500);
+      };
+    };
+    // The server forgets a stored failure on a rescan and on a settings save: the entry is unloaded again, without its error.
+    const forgetFailure = (server, id) => { const m = server.state.models.find((x) => x.id === id); m.state = 'unloaded'; delete m.error; };
+    await scenario('a rescan drops a vanished model from the list, the chat picker and the open detail', { path: '/models#GLM-B' }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      server.state.hooks['/v1/models/rescan'] = () => { server.state.models = server.state.models.filter((m) => m.id !== 'GLM-B'); return reply({ added: 0 }); };
+      await page.click('#modelsRescan');
+      await settle(page, 500);
+      assert.equal((await listIds(page)).includes('GLM-B'), false, 'the list drops the vanished model');
+      assert.equal(await page.evaluate(() => [...document.querySelectorAll('#modelSelect option')].some((o) => o.value === 'GLM-B')), false, 'the chat picker drops it');
+      assert.notEqual(await page.evaluate(() => document.querySelector('#modelsDetail h2')?.textContent ?? null), 'GLM-B', 'the detail of the vanished model goes');
+    });
+    await scenario('a rescan that clears a stored load failure clears the row\'s Load failed', { path: '/models#Qwen-A', setup: (s) => failLoadHook(s, 'GLM-B') }, async ({ page, server }) => {
+      await page.waitForSelector('#modelsList .row[data-id="GLM-B"] button');
+      await page.click('#modelsList .row[data-id="GLM-B"] button');
+      await settle(page, 500);
+      assert.match(await metaOfRow(page, 'GLM-B'), /Load failed/, 'the failure shows');
+      server.state.hooks['/v1/models/rescan'] = () => { forgetFailure(server, 'GLM-B'); return reply({ added: 0 }); };
+      await page.click('#modelsRescan');
+      await settle(page, 500);
+      const after = await metaOfRow(page, 'GLM-B');
+      assert.doesNotMatch(after, /Load failed/, `the server reports unloaded; the row reads "${after}"`);
+    });
+    await scenario('a settings save that clears a stored load failure clears the row and the detail alert', { path: '/models#GLM-B', setup: (s) => failLoadHook(s, 'GLM-B') }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('ctx_size')} input`);
+      await page.click('#modelsList .row[data-id="GLM-B"] button');
+      await settle(page, 500);
+      assert.match(await metaOfRow(page, 'GLM-B'), /Load failed/, 'the failure shows');
+      assert.match(await page.textContent('#modelsDetail'), /needs more memory for SSD streaming/);
+      server.state.hooks['/v1/settings'] = (body, method) => { if (method === 'POST') forgetFailure(server, 'GLM-B'); return null; };
+      await page.fill(`${row('ctx_size')} input`, '4096');
+      await page.click('.savebar button:text-is("Save")');
+      await settle(page, 1000);
+      const after = await metaOfRow(page, 'GLM-B');
+      assert.equal(server.count('/v1/settings', 'POST'), 1, 'the save posted');
+      assert.doesNotMatch(after, /Load failed/, `the server reports unloaded; the row reads "${after}"`);
+      assert.doesNotMatch(await page.textContent('#modelsDetail'), /needs more memory for SSD streaming/, 'the detail alert goes too');
+    });
+    // A refusal (not enough memory) leaves the entry unloaded, so only this page remembers it: it forgets it when the
+    // user changes what the refusal depends on, or the server restarts.
+    for (const [name, act] of [
+      ['a settings save', async (page) => { await page.fill(`${row('ctx_size')} input`, '4096'); await page.click('.savebar button:text-is("Save")'); }],
+      ['a rescan', async (page) => { await page.click('#modelsRescan'); }],
+    ]) {
+      await scenario(`a refused load's note goes after ${name}`, { path: '/models#GLM-B', setup: (s) => { s.state.loadFails = true; } }, async ({ page, server }) => {
+        await page.waitForSelector(`${row('ctx_size')} input`);
+        await page.click('.d-actions >> text=Load');
+        await page.waitForSelector('.detail .alert.err:not([hidden])');
+        assert.match(await metaOfRow(page, 'GLM-B'), /Load failed/, 'the refusal shows');
+        server.state.loadFails = false;
+        await act(page);
+        await settle(page, 1000);
+        assert.doesNotMatch(await metaOfRow(page, 'GLM-B'), /Load failed/, 'the note is gone');
+        assert.equal(await page.isVisible('.detail .alert.err'), false, 'and so is the alert');
+      });
+    }
+    await scenario('a refused load\'s note goes after a saved value is removed', { serverOpts: { limits: true }, path: '/models#Deep-C', open: { mode: 'advanced' }, setup: (s) => {
+      s.state.models[2].settings.preserve_thinking = keyState({ file: true, source: 'file' });
+      s.state.loadFails = true;
+    } }, async ({ page, server }) => {
+      await page.waitForSelector('.d-actions >> text=Load');
+      await page.click('.d-actions >> text=Load');
+      await page.waitForSelector('.detail .alert.err:not([hidden])');
+      server.state.loadFails = false;
+      await page.click(`${row('preserve_thinking')} button:text-is("Remove saved value")`);
+      await settle(page, 1000);
+      assert.doesNotMatch(await metaOfRow(page, 'Deep-C'), /Load failed/, 'the note is gone');
+      assert.equal(await page.isVisible('.detail .alert.err'), false, 'and so is the alert');
+    });
+    await scenario('a refused load\'s note goes once the server is back from a restart', { path: '/models#Qwen-A', setup: (s) => { s.state.loadFails = true; } }, async ({ page, server }) => {
+      await page.waitForSelector('#modelsList .row[data-id="GLM-B"] button');
+      await page.click('#modelsList .row[data-id="GLM-B"] button');
+      await settle(page, 500);
+      assert.match(await metaOfRow(page, 'GLM-B'), /Load failed/, 'the refusal shows');
+      server.state.down = true;
+      await settle(page, 6000);
+      server.state.down = false;
+      await settle(page, 6000);
+      assert.doesNotMatch(await metaOfRow(page, 'GLM-B'), /Load failed/, 'the restarted server knows no refusal');
+    });
+    await scenario('a failed /v1/settings during a rescan does not keep the vanished model in the list', { path: '/models' }, async ({ page, server }) => {
+      await page.waitForSelector('#modelsList .row[data-id="GLM-B"]');
+      server.state.hooks['/v1/models/rescan'] = () => { server.state.models = server.state.models.filter((m) => m.id !== 'GLM-B'); server.state.failSettings = 1; return reply({ added: 0 }); };
+      await page.click('#modelsRescan');
+      await settle(page, 300);
+      const ids = await listIds(page);
+      assert.equal(ids.includes('GLM-B'), false, `/v1/models dropped GLM-B; the list shows ${ids}`);
+    });
+
     if (failures.length) throw new Error(`${failures.length} admin scenario(s) failed:\n  ${failures.join('\n  ')}`);
     console.log('Web UI admin views (browser): passed');
   } finally {

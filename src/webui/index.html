@@ -1294,11 +1294,12 @@ const postJson = (path, body) => apiJson(path, { method: "POST", headers: { "Con
    Models: the one place /v1/models is read. The top bar, the chat picker, the Models tab and the dashboard
    strip subscribe; an identical answer notifies nobody, and loads and unloads run through `act`.
    ------------------------------------------------------------ */
-// Load failures this session recorded: a model the server lists loaded or loading is up, whoever loaded it, and its
-// failure is history. True when one was dropped.
-function forgetRecoveredLoads(failed, models) {
+// Load failures this session recorded: only a refusal needs one, since the server keeps no record of it and lists the
+// model unloaded. A model the server lists loaded, loading or failed has its own answer, which owns the row from then on
+// (a failure it reports is its `error`; one it no longer reports is gone). True when one was dropped.
+function forgetAnsweredLoads(failed, models) {
   let dropped = false;
-  for (const m of models) if ((m.state === "ready" || m.state === "loading") && failed.delete(m.id)) dropped = true;
+  for (const m of models) if ((m.state === "ready" || m.state === "loading" || m.state === "error") && failed.delete(m.id)) dropped = true;
   return dropped;
 }
 // The one reading of a token count, everywhere it is shown: thousands, not 1024s.
@@ -1339,8 +1340,10 @@ const modelStore = {
     }
     if (error !== this.error) changed = true;
     this.error = error;
+    // A server that was unreachable may have restarted, and a restarted server remembers no refusal.
+    if (this.online === false && online && this.failed.size) { this.failed.clear(); changed = true; }
     this.online = online;
-    if (forgetRecoveredLoads(this.failed, this.list)) changed = true;
+    if (forgetAnsweredLoads(this.failed, this.list)) changed = true;
     if (changed) this.emit();
     this.schedule();
   },
@@ -1352,6 +1355,12 @@ const modelStore = {
     this.timer = setTimeout(() => { if (chatAbort && this.view === "chat") this.schedule(); else this.refresh(); }, wait);
   },
   setView(view) { this.view = view; this.schedule(); },
+  // A refusal note is a guess that nothing it depended on changed: an action that may have changed it ends the note.
+  forgetFailures(id) {
+    const had = this.failed.size;
+    if (id === true) this.failed.clear(); else this.failed.delete(id);
+    if (this.failed.size !== had) this.emit();
+  },
   async act(id, kind) {
     if (this.pending.has(id)) return;
     this.pending.set(id, kind);
@@ -1380,6 +1389,12 @@ const modelStore = {
   },
 };
 document.addEventListener("visibilitychange", () => { if (document.hidden) clearTimeout(modelStore.timer); else modelStore.refresh(); });
+// The one way an action tells the page what it moved on the server: each store named is read again, and every view
+// renders the answer. `failures` (true, or a model id) ends the refusal note of an action that may have lifted it.
+function invalidate({ models = false, settings = false, failures = false }) {
+  if (failures) modelStore.forgetFailures(failures);
+  return Promise.all([models && modelStore.refresh(), settings && window.sushiAdmin?.refresh()]);
+}
 /* The status in the top bar: what is loaded, or why nothing is. */
 function renderServerStatus() {
   const { list, online } = modelStore;
@@ -3724,9 +3739,12 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     A.texts[kind] = body;
     return JSON.parse(body);
   }
+  // /v1/models says which models exist and /v1/settings adds each one's saved settings: a model the settings still list
+  // after the server dropped it is gone. Until /v1/models has answered, the settings stand in.
   const rowsOf = () => {
-    const byId = new Map((A.settings?.models ?? []).map((m) => [m.id, m]));
-    for (const m of modelStore.list) byId.set(m.id, { ...byId.get(m.id), ...m });
+    const saved = new Map((A.settings?.models ?? []).map((m) => [m.id, m]));
+    const byId = modelStore.text ? new Map() : saved;
+    for (const m of modelStore.list) byId.set(m.id, { ...saved.get(m.id), ...m });
     return [...byId.values()].map((m) => ({ ...m, settings: m.settings ?? {}, state: m.state === "error_state" ? "error" : m.state === "evicting" ? "unloaded" : m.state }));
   };
   const info = (id) => rowsOf().find((m) => m.id === id);
@@ -3769,7 +3787,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if ((node.dataset.msg ?? "") === (message ?? "")) return;
     node.dataset.msg = message ?? "";
     node.hidden = !message;
-    if (message) node.replaceChildren(h("span", { text: message }), ...(retry ? [h("button", { class: "btn sm", type: "button", text: "Retry", onclick: refresh })] : []));
+    node.replaceChildren(...(message ? [h("span", { text: message }), ...(retry ? [h("button", { class: "btn sm", type: "button", text: "Retry", onclick: refresh })] : [])] : []));
   }
 
   // limits[key]: { choices, max, unset: [keys], disabled, why }, present only for a constrained key.
@@ -3806,8 +3824,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // `streaming` in /v1/models means the pack can stream; it does only when it must or an SSD budget is set.
   const streamsExperts = (m) => !!(m.streaming_required || m.ssd_budget_gb);
 
-  // Why the last load failed: this session's answer, else the one /v1/models keeps for a failed model.
-  const loadError = (m) => modelStore.failed.get(m.id) || (m.state === "error" ? loadFailureText(m.error ?? "") : "");
+  // Why the last load failed: the server's own answer for a failed model, else this session's note of a refusal.
+  const loadError = (m) => m.state === "error" ? loadFailureText(m.error ?? "") : modelStore.failed.get(m.id) || "";
   const evictNote = (m) => { const others = modelStore.list.filter((x) => x.state === "ready" && x.id !== m.id).map((x) => x.id); return others.length ? `May unload ${others.join(", ")} to make room` : ""; };
   function metaOf(m) {
     const failed = loadError(m), n = savedCount(m);
@@ -3916,7 +3934,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         const n = (k, word) => `${k} ${word} model${k === 1 ? "" : "s"}`;
         const parts = [r.added ? n(r.added, "new") : "", r.removed ? `${r.removed} removed (folder gone)` : ""].filter(Boolean);
         toast(parts.length ? parts.join(", ") : "No changes");
-        await Promise.all([modelStore.refresh(), refresh()]);
+        await invalidate({ models: true, settings: true, failures: true });
       } catch (e) { failToast("Rescan", e); }
     });
   }
@@ -3934,7 +3952,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         let r;
         try { r = await postJson("/v1/settings", { server: { models_dir: path } }); } catch (e) { throw new Error(/models_dir does not exist or cannot be read/.test(String(e.message)) ? "That path is not a folder sushi can read." : adminErrorText(e)); }
         toast(typeof r.applied?.models_dir === "string" && r.applied.models_dir ? sentence(r.applied.models_dir) : path ? "Saved. Rescanning the folder." : "Back to the default folder.");
-        await Promise.all([refresh(), modelStore.refresh()]);
+        await invalidate({ models: true, settings: true, failures: true });
       },
     });
   }
@@ -4181,7 +4199,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   async function actOn(id, kind) {
     if (kind === "unload" && chatAbort && $("modelSelect").value === id && !(await confirmAction({ title: `Unload ${id}?`, body: "The reply being written will stop.", confirm: "Unload" }))) return;
     await modelStore.act(id, kind);
-    await refresh();
+    await invalidate({ settings: true });
   }
   // The page's copy of the file follows a save at once, so the form is clean before the next poll.
   function noteSaved(F, set) {
@@ -4192,15 +4210,17 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     }
   }
   async function removeSaved(F, key) {
+    let removed = false;
     await withBusy(F.sets.get(key).remove, "Removing…", async () => {
       try {
         await postJson("/v1/settings", { model: F.id, set: { [key]: null } });
+        removed = true;
         noteSaved(F, { [key]: null });
         delete per(F.id).errors[key];
         toast(`Removed the saved ${KEY[key][0].toLowerCase()}.`);
       } catch (e) { failToast("Remove", e); }
     });
-    await refresh();
+    await invalidate({ models: true, settings: true, failures: removed && F.id });
   }
   async function saveModel(F) {
     const m = info(F.id), P = per(F.id), { set } = adminChanges(F.specs, m.settings, sendable(m));
@@ -4219,7 +4239,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         shown = key ? F.sets.get(key).row : F.saveErr;
       }
     });
-    await refresh();
+    await invalidate({ models: true, settings: true, failures: !shown && F.id });
     shown?.scrollIntoView({ block: "nearest" });
   }
 
@@ -4498,7 +4518,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         toast(typeof r.applied?.effort === "string" ? sentence(r.applied.effort) : done);
       } catch (e) { E.serr = adminErrorText(e).replace(/^effort [a-z0-9_]+\./, ""); }
     });
-    await Promise.all([refresh(), modelStore.refresh()]);
+    await invalidate({ models: true, settings: true });
     // Drafts go only once the saved settings are in: a render before then would rebuild them from the old ones.
     if (saved && !A.error) { delete E.drafts[fam]; renderEffort(A.settings.effort); }
     effortPatch();
@@ -4521,15 +4541,17 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const sentence = (note) => `${note[0].toUpperCase()}${note.slice(1)}.`;
   async function saveServer(key, value, text, btn, label) {
     adminAttempt(A.serr, key);
+    let saved = false;
     await withBusy(btn, label, async () => {
       try {
         const r = await postJson("/v1/settings", { server: { [key]: value } });
         typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
         if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null; else if (key === "max_request_mb") A.requestText = null; else if (key === "wired_margin_gib") A.marginText = null;
+        saved = true;
       } catch (e) { A.serr[key] = adminErrorText(e); }
     });
-    await refresh();
+    await invalidate({ models: true, settings: true, failures: saved });
   }
   async function saveCache() {
     const v = adminControlValue(GB_SPEC, cacheIn.value);
