@@ -1009,6 +1009,33 @@ test "bare JSON cut short is declined and named, never repaired; a finished call
     try expectSameEnd(a, finished, &stops, "stop", asks[0], null, "stop", 1, .none);
 }
 
+test "a closer spelled inside a parameter value does not close the call: the generation cut there leaves it open, in every dialect" {
+    const a = testing.allocator;
+    const stops = [_][]const u8{"STOP"};
+    const ask: Ask = .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    // Each text is a write_file call whose `content` value spells a closer of its own dialect, cut right after it or a few
+    // bytes on; none of them has closed.
+    const Open = struct { text: []const u8, cut: Cut = .{ .named = "write_file" } };
+    const open = [_]Open{
+        .{ .text = "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nprint(\"</function></tool_call>\")" },
+        .{ .text = "<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nprint(\"</function>\")" },
+        .{ .text = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.md\", \"content\": \"a </tool_call> b" },
+        .{ .text = "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>a </tool_call> b" },
+        .{ .text = "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>a <tool_call|> b" },
+        .{ .text = "<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">a </\u{ff5c}DSML\u{ff5c}invoke> b" },
+        .{ .text = "<invoke name=\"write_file\">\n<parameter name=\"path\">notes.md</parameter>\n<parameter name=\"content\">a </invoke> b" },
+        .{ .text = "<function name=\"write_file\"><param name=\"content\">a </function> b" },
+        // The attribute names the tool, but the parser salvages a name from a JSON body only, so a cut body leaves it unnamed.
+        .{ .text = "<tool name=\"write_file\">{\"path\": \"notes.md\", \"content\": \"a </tool> b", .cut = .unnamed },
+        .{ .text = "<tool_request>{\"name\": \"write_file\", \"arguments\": {\"content\": \"a </tool_request> b" },
+    };
+    for (open) |call| for ([_][]const u8{ "", "Let me write it.\n" }) |lead| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(a, u8, &.{ lead, call.text });
+        defer a.free(text);
+        try expectSameEnd(a, text, &stops, finish, ask, null, finish, null, call.cut);
+    };
+}
+
 test "a declined call is named in the details field of every surface's key, and outranks a thought's note" {
     const a = testing.allocator;
     const named: Declined = .{ .name = try a.dupe(u8, "read\"file") };

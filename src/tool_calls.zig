@@ -250,9 +250,13 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
                 const exact = std.fmt.bufPrint(&exact_buf, "</{s}>", .{open_name}) catch unreachable;
                 var from: usize = 0;
                 while (std.mem.indexOfPos(u8, hay, from, exact)) |found| {
-                    // A `<parameter=…>` value may spell the wrapper's own close.
+                    // A `<parameter=…>` value or a JSON string may spell the wrapper's own close.
                     if (hermesParamSpanEnclosing(hay, found)) |past| {
                         from = past;
+                        continue;
+                    }
+                    if (jsonBodyStringOpenAt(hay, found)) {
+                        from = found + 1;
                         continue;
                     }
                     close_rel = found;
@@ -277,6 +281,10 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
                     if (word_only and j < jlimit and hay[j] == '>') {
                         if (hermesParamSpanEnclosing(hay, open_at)) |past| {
                             cpos = past;
+                            continue;
+                        }
+                        if (jsonBodyStringOpenAt(hay, open_at)) {
+                            cpos = open_at + "</tool".len;
                             continue;
                         }
                         close_rel = open_at;
@@ -2555,6 +2563,108 @@ fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
     const end = hermesValueEnd(body, gt + 1) orelse return null;
     if (end <= at) return null;
     return end + "</parameter>".len;
+}
+
+/// How a dialect writes a parameter value, so a closer spelled inside one is told from the call's own.
+pub const ValueSpans = enum {
+    /// `<tool_call>`, `<tool …>`, `<tool_request>`: the body is JSON, Hermes' function tags, or GLM's `<arg_value>`.
+    wrapper,
+    gemma,
+    dsml,
+    invoke,
+    /// `<function=…>` (Hermes) or `<function name=…>` (MiniCPM5).
+    function_tag,
+};
+
+/// Whether the closer at `at` stands inside a parameter value of the call that opens at `from`: a value opened before
+/// it has not ended, as the parser ends it (`hermesValueEnd`, `dsmlParamClose`, `argValueClose`, `miniCpm5FindCloseTag`,
+/// a JSON string's quote). A value the generation cut has no end, so it is open.
+pub fn closerInsideValue(spans: ValueSpans, text: []const u8, from: usize, at: usize) bool {
+    return switch (spans) {
+        .wrapper => blk: {
+            const gt = std.mem.indexOfScalarPos(u8, text, from, '>') orelse break :blk false;
+            if (gt >= at) break :blk false;
+            const body = std.mem.trimStart(u8, text[gt + 1 .. at], " \t\r\n");
+            if (std.mem.startsWith(u8, body, "{")) break :blk jsonBodyStringOpenAt(text[gt + 1 ..], at - (gt + 1));
+            if (std.mem.startsWith(u8, body, "<function=")) break :blk hermesValueOpenAt(text, from, at);
+            break :blk argValueOpenAt(text, from, at);
+        },
+        .gemma => std.mem.count(u8, text[from..at], "<|\"|>") % 2 == 1,
+        .dsml => dsmlValueOpenAt(text, from, at),
+        .invoke => invokeValueOpenAt(text, from, at),
+        .function_tag => if (std.mem.startsWith(u8, text[from..], "<function=")) hermesValueOpenAt(text, from, at) else miniCpm5ValueOpenAt(text, from, at),
+    };
+}
+
+/// Whether `at` falls inside a string of the JSON object `body` opens with. A model that mangles a quote (a key with no
+/// opening one) flips every string after it, so text that ends in the object's own `}` is a finished object whatever
+/// the quotes count.
+fn jsonBodyStringOpenAt(body: []const u8, at: usize) bool {
+    const trimmed = std.mem.trimStart(u8, body[0..at], " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "{")) return false;
+    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, trimmed, " \t\r\n"), "}")) return false;
+    return jsonStringOpenAt(body, at - trimmed.len, at);
+}
+
+/// Whether the JSON text from `start` leaves a string open at `at`.
+fn jsonStringOpenAt(text: []const u8, start: usize, at: usize) bool {
+    var in_string = false;
+    var escape = false;
+    for (text[start..at]) |c| {
+        if (escape) {
+            escape = false;
+        } else if (in_string) {
+            if (c == '\\') escape = true else if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+        }
+    }
+    return in_string;
+}
+
+fn hermesValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    const open = std.mem.lastIndexOf(u8, text[from..at], "<parameter=") orelse return false;
+    const gt = std.mem.indexOfScalarPos(u8, text, from + open, '>') orelse return true;
+    if (gt >= at) return true;
+    return (hermesValueEnd(text, gt + 1) orelse return true) >= at;
+}
+
+fn argValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    const open = std.mem.lastIndexOf(u8, text[from..at], "<arg_value") orelse return false;
+    const len = tagLenAt(text[from + open ..], "<arg_value") orelse return true;
+    return (argValueClose(text, from + open + len) orelse return true) >= at;
+}
+
+fn dsmlValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    var last: ?DsmlHit = null;
+    var p = from;
+    while (dsmlFind(text, p, DSML_PARAM_TAG)) |hit| : (p = hit.end) {
+        if (hit.at >= at) break;
+        last = hit;
+    }
+    const open = last orelse return false;
+    const gt = std.mem.indexOfScalarPos(u8, text, open.end, '>') orelse return true;
+    if (gt >= at) return true;
+    return (dsmlParamClose(text, gt + 1) orelse return true).at >= at;
+}
+
+fn invokeValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    const open = std.mem.lastIndexOf(u8, text[from..at], "<parameter ") orelse return false;
+    const gt = std.mem.indexOfScalarPos(u8, text, from + open, '>') orelse return true;
+    if (gt >= at) return true;
+    return (std.mem.indexOfPos(u8, text, gt + 1, "</parameter>") orelse return true) >= at;
+}
+
+fn miniCpm5ValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    var end = at;
+    const open = while (std.mem.lastIndexOf(u8, text[from..end], "<param")) |rel| {
+        const pos = from + rel;
+        if (pos + "<param".len < text.len and std.ascii.isWhitespace(text[pos + "<param".len])) break pos;
+        end = pos;
+    } else return false;
+    const gt = std.mem.indexOfScalarPos(u8, text, open, '>') orelse return true;
+    if (gt >= at) return true;
+    return (miniCpm5FindCloseTag(text, gt + 1, "</param>") orelse return true) >= at;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {

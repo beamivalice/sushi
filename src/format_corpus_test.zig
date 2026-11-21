@@ -2460,6 +2460,71 @@ test "format corpus: bare JSON cut short ships no cut call, declines it once nam
     try testing.expect(kept.declined == null);
 }
 
+/// One call in each dialect whose closer a parameter value can spell, whole: the `content` value of each carries a
+/// closer of its own dialect.
+const closer_in_value_calls = [_][]const u8{
+    "<tool_call>\n<function=get_weather>\n<parameter=city>\nprint(\"</function></tool_call>\")\n</parameter>\n</function>\n</tool_call>",
+    "<function=get_weather>\n<parameter=city>\nprint(\"</function>\")\n</parameter>\n</function>",
+    "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"a </tool_call> b\"}}\n</tool_call>",
+    "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> b</arg_value></tool_call>",
+    "<|tool_call>call:get_weather{city:<|\"|>a <tool_call|> b<|\"|>}<tool_call|>",
+    "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">a </\u{ff5c}DSML\u{ff5c}invoke> b</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+    "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">a </invoke> b</parameter>\n</invoke>\n</function_calls>",
+    "<function name=\"get_weather\"><param name=\"city\">a </function> b</param></function>",
+    "<tool name=\"get_weather\">{\"city\": \"a </tool> b\"}</tool>",
+    "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"a </tool_request> b\"}}</tool_request>",
+};
+
+test "format corpus: a closer a parameter value spells closes no call, in any dialect, at any cut" {
+    const allocator = testing.allocator;
+    for (closer_in_value_calls) |call| {
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call });
+        defer allocator.free(text);
+        const whole = try settleCut(allocator, text);
+        defer whole.deinit(allocator);
+        errdefer std.debug.print("whole call: {f}\n", .{std.zig.fmtString(text)});
+        try testing.expectEqual(@as(usize, 1), (whole.reply orelse return error.WholeCallDropped).calls.len);
+        try testing.expect(whole.declined == null);
+        var cut: usize = "Let me check.\n".len;
+        while (cut < text.len) : (cut += 1) {
+            if (text[cut] & 0xC0 == 0x80) continue;
+            const got = try settleCut(allocator, text[0..cut]);
+            defer got.deinit(allocator);
+            errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
+            try testing.expect(got.reply == null);
+            if (try tool_calls_mod.parseToolCalls(allocator, text[0..cut])) |read| {
+                defer {
+                    for (read) |c| {
+                        allocator.free(c.name);
+                        allocator.free(c.arguments);
+                    }
+                    allocator.free(read);
+                }
+                if (!read[0].inferred) try testing.expect(got.declined != null);
+            }
+        }
+    }
+}
+
+test "format corpus: a call whose last parameter lost its close is declined and named, never shipped without that parameter" {
+    const allocator = testing.allocator;
+    // The model wrote `city` and dropped the parameter's close before the call's own: a value with no end is a cut one.
+    const lost = [_][]const u8{
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</function>\n</tool_call>",
+        "<function=get_weather>\n<parameter=city>\nTokyo\n</function>",
+        "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tokyo\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+    };
+    for (lost) |call| {
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call });
+        defer allocator.free(text);
+        const got = try settleCut(allocator, text);
+        defer got.deinit(allocator);
+        errdefer std.debug.print("call: {f}\n", .{std.zig.fmtString(text)});
+        try testing.expect(got.reply == null);
+        try testing.expectEqualStrings("get_weather", (got.declined orelse return error.DeclineNotNamed).name orelse return error.DeclineNotNamed);
+    }
+}
+
 test "format corpus: a parameter VALUE never decides the call" {
     // A parameter value is arbitrary bytes. Feed each wrapper dialect a value
     // that LOOKS like call syntax — a balanced JSON object carrying its own

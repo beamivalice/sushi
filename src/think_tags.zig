@@ -548,20 +548,22 @@ const ToolMarkupFamily = struct {
     /// Spellings that begin with an opener and are another dialect's closer.
     not_openers: []const []const u8 = &.{},
     reads_as_call: ?*const fn (tail: []const u8) bool = null,
+    /// How the dialect writes a parameter value: a closer spelled inside one is the value's text, not the call's close.
+    values: tool_calls_mod.ValueSpans,
 };
 
 const hermes_closers = [_][]const u8{ "</tool_call>", "</tool_calls>", "</tool>", "</tool_request>", "</tool_requests>" };
 
 /// Every dialect `parseToolCallsAs` reads, so a call left open in any of them is found.
 const tool_markup_families = [_]ToolMarkupFamily{
-    .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"} },
-    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"} },
-    .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall },
-    .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"} },
-    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" } },
-    .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"} },
-    .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall },
-    .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall },
+    .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"}, .values = .gemma },
+    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"}, .values = .wrapper },
+    .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall, .values = .wrapper },
+    .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"}, .values = .dsml },
+    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .values = .dsml },
+    .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"}, .values = .invoke },
+    .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall, .values = .invoke },
+    .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall, .values = .function_tag },
 };
 
 /// `<tool name="x">{…`, `<tool>{"name":…` and `<tool_request>{…`: the tag's `>` opens a body that is a JSON object or Hermes' function tag.
@@ -608,8 +610,14 @@ pub fn openToolCallStart(text: []const u8) ?usize {
     return first;
 }
 
+/// Whether a closer of `f` after the opener at `from` ends the call: one a parameter value spells is the value's text.
 fn closedAfter(f: *const ToolMarkupFamily, text: []const u8, from: usize) bool {
-    for (f.closers) |c| if (std.mem.indexOfPos(u8, text, from, c) != null) return true;
+    for (f.closers) |c| {
+        var p = from;
+        while (std.mem.indexOfPos(u8, text, p, c)) |at| : (p = at + 1) {
+            if (!tool_calls_mod.closerInsideValue(f.values, text, from, at)) return true;
+        }
+    }
     return false;
 }
 
