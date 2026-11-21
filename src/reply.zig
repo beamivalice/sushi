@@ -1600,3 +1600,20 @@ test "r173-f-settle-linear: settling k whole calls and a think tag reads the tex
     for (work, bytes) |w, n| try testing.expect(w <= settle_work_per_byte * n);
     try testing.expect(work[2] <= 5 * work[1] / 2);
 }
+
+test "r173-f-settle-linear: settling k thoughts each followed by a call reads the text a bounded number of times, however many thoughts" {
+    const a = testing.allocator;
+    const unit = "<think>plan</think><tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>\n";
+    var work: [4]usize = undefined;
+    var bytes: [4]usize = undefined;
+    for ([_]usize{ 100, 200, 400, 800 }, 0..) |k, i| {
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(a);
+        for (0..k) |_| try text.appendSlice(a, unit);
+        bytes[i] = text.items.len;
+        work[i] = try settleWork(a, text.items, "stop");
+    }
+    errdefer std.debug.print("k=100/200/400/800 bytes={any} work={any}\n", .{ bytes, work });
+    for (work, bytes) |w, n| try testing.expect(w <= settle_work_per_byte * n);
+    try testing.expect(work[3] <= 5 * work[2] / 2);
+}

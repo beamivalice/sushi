@@ -155,7 +155,7 @@ pub const Opener = struct { at: usize, len: usize, family: *const Family };
 /// The first place a needle stands at or after a byte, asked for rising bytes: an answer stays valid for every byte
 /// between the one asked and the place found (or, with none found, for every later byte up to where the search looked),
 /// so a needle is searched once however many candidates ask.
-const Next = struct {
+pub const Next = struct {
     needle: []const u8,
     from: usize = 0,
     at: ?usize = null,
@@ -163,7 +163,7 @@ const Next = struct {
     to: usize = 0,
     known: bool = false,
 
-    fn find(self: *Next, text: []const u8, p: usize) ?usize {
+    pub fn find(self: *Next, text: []const u8, p: usize) ?usize {
         return self.findBefore(text, p, text.len);
     }
 
@@ -429,6 +429,7 @@ pub const Reader = struct {
     started: bool = false,
     model_ended: bool,
     scan: Scan = Scan.init(),
+    tags: think_tags.Tags = .{},
     /// The first thought opener at or after `think_from`, asked once and kept while the reading stands between the two.
     think: ?think_tags.ThinkOpen = null,
     think_from: usize = 0,
@@ -443,7 +444,7 @@ pub const Reader = struct {
     fn thinkOpen(self: *Reader) ?think_tags.ThinkOpen {
         const stale = !self.think_known or self.pos < self.think_from or (if (self.think) |t| self.pos > t.pos else false);
         if (stale) {
-            self.think = think_tags.nextThinkOpen(self.text, self.pos);
+            self.think = think_tags.nextThinkOpenIn(&self.tags, self.text, self.pos);
             self.think_from = self.pos;
             self.think_known = true;
         }
@@ -453,14 +454,14 @@ pub const Reader = struct {
     pub fn next(self: *Reader) ?Call {
         if (!self.started) {
             self.started = true;
-            if (leadingThoughtEnd(self.text, self.model_ended)) |end| self.pos = end;
+            if (leadingThoughtEnd(self.text, self.model_ended, &self.tags)) |end| self.pos = end;
         }
         while (true) {
             const opener = nextOpener(self.text, self.pos, &self.scan);
             if (self.thinkOpen()) |t| {
                 if (opener == null or t.pos < opener.?.at) {
                     const style: Style = if (t.is_think_style) .think else .channel;
-                    self.pos = if (thoughtClose(self.text, t.after, self.model_ended, style)) |c| c.pos + c.len else t.after;
+                    self.pos = if (thoughtClose(self.text, t.after, self.model_ended, style, &self.tags)) |c| c.pos + c.len else t.after;
                     continue;
                 }
             }
@@ -532,43 +533,30 @@ pub fn defects(allocator: std.mem.Allocator, text: []const u8, model_ended: bool
 
 const Style = enum { any, think, channel };
 
-/// The first tag `find` finds at or after `from` that no call's value holds: a think or channel tag inside a call is
-/// the call's payload, wherever its closer stands.
-pub fn outsideCalls(text: []const u8, from: usize, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
-    return firstOutsideCalls(text, from, true, find);
+/// The first `tag` at or after `from` that no call's value holds: a think or channel tag inside a call is the call's
+/// payload, wherever its closer stands.
+pub fn outsideCalls(text: []const u8, from: usize, tag: think_tags.Tag) ?think_tags.TagAt {
+    var tags: think_tags.Tags = .{};
+    return firstOutsideCalls(text, from, true, &tags, tag);
 }
 
 /// A thought's close at or after `from` that no call spans: a call that opens before it and ends after it holds it
 /// as payload. A call that never ends is leaked markup, not a span.
-fn thoughtClose(text: []const u8, from: usize, model_ended: bool, style: Style) ?think_tags.TagAt {
-    const think = if (style == .channel) null else firstOutsideCalls(text, from, model_ended, think_tags.rawThinkCloseAt);
-    const channel = if (style == .think) null else firstOutsideCalls(text, from, model_ended, channelCloseAt);
+fn thoughtClose(text: []const u8, from: usize, model_ended: bool, style: Style, tags: *think_tags.Tags) ?think_tags.TagAt {
+    const think = if (style == .channel) null else firstOutsideCalls(text, from, model_ended, tags, .think_close);
+    const channel = if (style == .think) null else firstOutsideCalls(text, from, model_ended, tags, .channel_close);
     const t = think orelse return channel;
     const c = channel orelse return t;
     return if (c.pos < t.pos) c else t;
 }
 
-pub fn channelThoughtAt(text: []const u8, from: usize) ?think_tags.TagAt {
-    const found = std.mem.indexOfPos(u8, text, from, "<|channel>thought");
-    charge((found orelse text.len) -| from);
-    const p = found orelse return null;
-    return .{ .pos = p, .len = "<|channel>thought".len };
-}
-
-pub fn channelCloseAt(text: []const u8, from: usize) ?think_tags.TagAt {
-    const found = std.mem.indexOfPos(u8, text, from, "<channel|>");
-    charge((found orelse text.len) -| from);
-    const p = found orelse return null;
-    return .{ .pos = p, .len = "<channel|>".len };
-}
-
-/// The first tag `find` finds at or after `from` that no call spans: a call that opens before it and ends after it holds
-/// it as payload, and so does one the text stops inside, whatever it spells.
-pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
+/// The first `tag` of `tags` (the searches of this one text) at or after `from` that no call spans: a call that opens
+/// before it and ends after it holds it as payload.
+pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, tags: *think_tags.Tags, tag: think_tags.Tag) ?think_tags.TagAt {
     var i = from;
     var q = from;
     var scan = Scan.init();
-    while (find(text, i)) |m| {
+    while (tags.find(tag, text, i)) |m| {
         while (true) {
             const c = nextCall(text, q, model_ended, &scan) orelse return m;
             if (c.start >= m.pos) return m;
@@ -588,9 +576,9 @@ pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find:
 
 /// Where the thought the text starts with ends (just past its close): a close before any opener is the template-opened
 /// thought's.
-fn leadingThoughtEnd(text: []const u8, model_ended: bool) ?usize {
-    const c = thoughtClose(text, 0, model_ended, .any) orelse return null;
-    if (think_tags.nextThinkOpen(text, 0)) |o| if (o.pos < c.pos) return null;
+fn leadingThoughtEnd(text: []const u8, model_ended: bool, tags: *think_tags.Tags) ?usize {
+    const c = thoughtClose(text, 0, model_ended, .any, tags) orelse return null;
+    if (think_tags.nextThinkOpenIn(tags, text, 0)) |o| if (o.pos < c.pos) return null;
     return c.pos + c.len;
 }
 

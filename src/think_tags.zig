@@ -24,12 +24,14 @@ const renderChatTemplate = chat.renderChatTemplate;
 /// 2026-06-19 live) — excluding it leaked the bare opener into content.
 const TrailingThinkOpen = struct { pos: usize, after: usize };
 fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
+    var tags: Tags = .{};
+    return lastUnclosedThinkOpenIn(&tags, text);
+}
+
+fn lastUnclosedThinkOpenIn(tags: *Tags, text: []const u8) ?TrailingThinkOpen {
     var from: usize = 0;
-    while (nextThinkOpen(text, from)) |o| {
-        const close = if (o.is_think_style)
-            indexOfThinkCloseTag(text, o.after)
-        else
-            tool_reading.outsideCalls(text, o.after, tool_reading.channelCloseAt);
+    while (nextThinkOpenIn(tags, text, from)) |o| {
+        const close = tool_reading.firstOutsideCalls(text, o.after, true, tags, if (o.is_think_style) .think_close else .channel_close);
         if (close) |c| {
             // This block IS closed — keep scanning past its close.
             from = c.pos + c.len;
@@ -64,23 +66,41 @@ pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
     return tagLenAt(text, "</think");
 }
 
+/// The think and channel tags a reading looks for.
+pub const Tag = enum { think_open, think_close, channel_thought, channel_close };
+
+/// The tag searches of ONE text, each kept forward (`tool_reading.Next`): a loop over a text's thoughts asks for the next
+/// tag of each kind, and a kind the text never spells is searched once, not once per thought. Never used with a second
+/// text, and its tags are asked for rising bytes.
+pub const Tags = struct {
+    next: [4]tool_reading.Next = .{
+        .{ .needle = "<think" },
+        .{ .needle = "</think" },
+        .{ .needle = "<|channel>thought" },
+        .{ .needle = "<channel|>" },
+    },
+
+    /// The first `tag` at or after `from`, whatever call it stands in; a think tag inside an inline code span is text.
+    pub fn find(self: *Tags, tag: Tag, text: []const u8, from: usize) ?TagAt {
+        const n = &self.next[@intFromEnum(tag)];
+        var i = from;
+        while (n.find(text, i)) |p| : (i = p + n.needle.len) {
+            const len = switch (tag) {
+                .think_open => thinkOpenTagLenAt(text[p..]),
+                .think_close => thinkCloseTagLenAt(text[p..]),
+                .channel_thought, .channel_close => n.needle.len,
+            } orelse continue;
+            if ((tag == .think_open or tag == .think_close) and chargedOpenCodeSpanStart(text[0..p]) != null) continue;
+            return .{ .pos = p, .len = len };
+        }
+        return null;
+    }
+};
+
 /// The first `<think>` at or after `from` outside an inline code span and outside every call's value: the one scan
 /// every surface and `normalizeEmbeddedThinkBlocks` use.
 fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
-    return tool_reading.outsideCalls(text, from, rawThinkOpenAt);
-}
-
-fn rawThinkOpenAt(text: []const u8, from: usize) ?TagAt {
-    var i = from;
-    while (true) {
-        const found = std.mem.indexOfPos(u8, text, i, "<think");
-        tool_reading.charge((found orelse text.len) -| i);
-        const p = found orelse return null;
-        if (thinkOpenTagLenAt(text[p..])) |l| {
-            if (chargedOpenCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
-        }
-        i = p + "<think".len;
-    }
+    return tool_reading.outsideCalls(text, from, .think_open);
 }
 
 /// `openCodeSpanStart`, its line read charged to the reading's work.
@@ -91,21 +111,11 @@ fn chargedOpenCodeSpanStart(text: []const u8) ?usize {
 
 /// The first `</think>` at or after `from` outside an inline code span and outside every call's value.
 pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
-    return tool_reading.outsideCalls(text, from, rawThinkCloseAt);
+    return tool_reading.outsideCalls(text, from, .think_close);
 }
 
-/// The first `</think>` at or after `from` outside an inline code span, whatever call it stands in.
-pub fn rawThinkCloseAt(text: []const u8, from: usize) ?TagAt {
-    var i = from;
-    while (true) {
-        const found = std.mem.indexOfPos(u8, text, i, "</think");
-        tool_reading.charge((found orelse text.len) -| i);
-        const p = found orelse return null;
-        if (thinkCloseTagLenAt(text[p..])) |l| {
-            if (chargedOpenCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
-        }
-        i = p + "</think".len;
-    }
+fn indexOfThinkCloseTagIn(tags: *Tags, text: []const u8, from: usize) ?TagAt {
+    return tool_reading.firstOutsideCalls(text, from, true, tags, .think_close);
 }
 
 /// Start of the inline code span still open at the end of `text`, or null. A model writing about its own
@@ -613,8 +623,9 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
 /// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
 /// above so a new arm cannot forget it.
 pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    var tags: Tags = .{};
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
-    if (tool_reading.outsideCalls(text, 0, tool_reading.channelCloseAt)) |close| {
+    if (tool_reading.firstOutsideCalls(text, 0, true, &tags, .channel_close)) |close| {
         const end = close.pos;
         const think_tag = "<|channel>thought\n";
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
@@ -636,7 +647,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         };
     }
     // Standard style: <think>...</think>
-    if (indexOfThinkCloseTag(text, 0)) |close| {
+    if (indexOfThinkCloseTagIn(&tags, text, 0)) |close| {
         const reasoning_start: usize = thinkOpenTagLenAt(text) orelse 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..close.pos], "\n ");
         const content = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
@@ -662,7 +673,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         // (Gemma 12B tail behavior): the text before the opener is the
         // answer; the dangling thought is reasoning. The raw opener tag must
         // never leak into visible content.
-        if (lastUnclosedThinkOpen(text)) |o| {
+        if (lastUnclosedThinkOpenIn(&tags, text)) |o| {
             const content = std.mem.trimEnd(u8, std.mem.trimStart(u8, text[0..o.pos], "\n "), "\n ");
             const reasoning = std.mem.trim(u8, text[o.after..], "\n ");
             return .{
@@ -699,8 +710,14 @@ pub const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
 
 /// Earliest think/thought opener at or after `from` (either tag family).
 pub fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
-    const chan = if (tool_reading.outsideCalls(text, from, tool_reading.channelThoughtAt)) |c| c.pos else null;
-    const think = indexOfThinkOpenTag(text, from);
+    var tags: Tags = .{};
+    return nextThinkOpenIn(&tags, text, from);
+}
+
+/// `nextThinkOpen` over the searches `tags` keeps for this text.
+pub fn nextThinkOpenIn(tags: *Tags, text: []const u8, from: usize) ?ThinkOpen {
+    const chan = if (tool_reading.firstOutsideCalls(text, from, true, tags, .channel_thought)) |c| c.pos else null;
+    const think = tool_reading.firstOutsideCalls(text, from, true, tags, .think_open);
     if (chan == null and think == null) return null;
     if (think == null or (chan != null and chan.? < think.?.pos)) {
         return .{ .pos = chan.?, .after = chan.? + "<|channel>thought".len, .is_think_style = false };
@@ -708,10 +725,10 @@ pub fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
     return .{ .pos = think.?.pos, .after = think.?.pos + think.?.len, .is_think_style = true };
 }
 
-/// Earliest close tag at or after `from` (either tag family).
-fn nextThinkClose(text: []const u8, from: usize) ?ThinkOpen {
-    const chan = if (tool_reading.outsideCalls(text, from, tool_reading.channelCloseAt)) |c| c.pos else null;
-    const think = indexOfThinkCloseTag(text, from);
+/// Earliest close tag at or after `from` (either tag family), over the searches `tags` keeps for this text.
+fn nextThinkCloseIn(tags: *Tags, text: []const u8, from: usize) ?ThinkOpen {
+    const chan = if (tool_reading.firstOutsideCalls(text, from, true, tags, .channel_close)) |c| c.pos else null;
+    const think = indexOfThinkCloseTagIn(tags, text, from);
     if (chan == null and think == null) return null;
     if (think == null or (chan != null and chan.? < think.?.pos)) {
         return .{ .pos = chan.?, .after = chan.? + "<channel|>".len, .is_think_style = false };
@@ -739,11 +756,12 @@ fn skipContentChannelTag(text: []const u8, start: usize) usize {
 /// a think closer inside a code span is text on both. A part that held one is copied into `owned`, which the
 /// caller frees.
 fn contentWithoutClosers(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), part: []const u8) ![]const u8 {
-    if (nextThinkClose(part, 0) == null) return part;
+    var tags: Tags = .{};
+    if (nextThinkCloseIn(&tags, part, 0) == null) return part;
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
     var pos: usize = 0;
-    while (nextThinkClose(part, pos)) |c| {
+    while (nextThinkCloseIn(&tags, part, pos)) |c| {
         try out.appendSlice(allocator, part[pos..c.pos]);
         pos = c.after;
     }
@@ -788,8 +806,9 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
     // Template-opened leading block: a close tag BEFORE any opener (Qwen
     // renders `…assistant\n<think>\n` into the prompt, so output starts
     // mid-thought and contains only the close).
-    if (nextThinkClose(text, 0)) |lc| {
-        const open_pos = if (nextThinkOpen(text, 0)) |o| o.pos else text.len;
+    var tags: Tags = .{};
+    if (nextThinkCloseIn(&tags, text, 0)) |lc| {
+        const open_pos = if (nextThinkOpenIn(&tags, text, 0)) |o| o.pos else text.len;
         if (lc.pos < open_pos) {
             try reasoning_parts.append(allocator, std.mem.trim(u8, text[0..lc.pos], "\n "));
             style_think = lc.is_think_style;
@@ -801,14 +820,11 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
     }
 
     while (true) {
-        const o = nextThinkOpen(text, pos) orelse {
+        const o = nextThinkOpenIn(&tags, text, pos) orelse {
             try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..]));
             break;
         };
-        const found: ?TagAt = if (o.is_think_style)
-            indexOfThinkCloseTag(text, o.after)
-        else
-            tool_reading.outsideCalls(text, o.after, tool_reading.channelCloseAt);
+        const found: ?TagAt = tool_reading.firstOutsideCalls(text, o.after, true, &tags, if (o.is_think_style) .think_close else .channel_close);
         const close = found orelse {
             // With no closed block the split's own unclosed arm reads the opener.
             if (closed_blocks == 0) {

@@ -4,7 +4,6 @@ const log = @import("log.zig");
 const think_tags = @import("think_tags.zig");
 const tool_reading = @import("tool_reading.zig");
 const tagLenAt = think_tags.tagLenAt;
-const indexOfThinkCloseTag = think_tags.indexOfThinkCloseTag;
 const streamShouldBufferForTools = think_tags.streamShouldBufferForTools;
 const testing = std.testing;
 const chat = @import("chat.zig");
@@ -76,9 +75,10 @@ pub fn parseToolCallsAs(allocator: std.mem.Allocator, text: []const u8, dialect:
 pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect, open_bare: *?[]u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
     var effective_text = text;
-    if (tool_reading.outsideCalls(text, 0, tool_reading.channelCloseAt)) |end| {
+    var tags: think_tags.Tags = .{};
+    if (tool_reading.firstOutsideCalls(text, 0, true, &tags, .channel_close)) |end| {
         effective_text = std.mem.trimStart(u8, text[end.pos + end.len ..], "\n ");
-    } else if (indexOfThinkCloseTag(text, 0)) |close| {
+    } else if (tool_reading.firstOutsideCalls(text, 0, true, &tags, .think_close)) |close| {
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
 
