@@ -6,12 +6,14 @@ const testing = std.testing;
 const mlx = @import("mlx.zig");
 const arch_handle = @import("arch/handle.zig");
 const arch_sched = @import("arch/sched.zig");
+const io = std.Io.Threaded.global_single_threaded.io();
 const prefill_plan = @import("prefill_plan.zig");
 const contract = @import("cooler_contract_test.zig");
 const Load = contract.Load;
 const eachArch = contract.eachArch;
 const eachFixture = contract.eachFixture;
 const greedy = contract.greedy;
+const qwenTinyServed = contract.qwenTinyServed;
 
 
 test "cooler contract: a Cooler prefill's chunks before the tail project no logits" {
@@ -97,4 +99,106 @@ fn chunkAsked(ld: *Load, ids: []const u32) !u64 {
     try mlx.check(mlx.mlx_array_eval(hidden));
     mlx.engine.close();
     return mlx.engine.poolPeak(.process) -| in0;
+}
+
+/// One launch of the prefix cache, as `main` hands it to a load.
+const CacheLaunch = struct { capacity: u32, ram: bool, disk: u64 };
+
+/// What a load's prefill took and what its bill held, from the same launch: the checkpoints a 700-token prefill took at
+/// the stride the scheduler's walk reads off the entry the launch attached (`walkCheckpointStride`), and the checkpoint
+/// term of the request's bill.
+fn checkpointsTakenAndBilled(ld: *Load, dir: []const u8, ids: []const u32, launch: CacheLaunch) !struct { taken: usize, billed: u64, walk: u32, bill_stride: u32 } {
+    const a = testing.allocator;
+    const bills = @import("bills.zig");
+    const server_state = @import("server_state.zig");
+    const registry_mod = @import("model_registry.zig");
+    const saved = .{ server_state.prefix_cache_capacity, server_state.prefix_cache_ram_enabled, server_state.prefix_cache_disk_bytes };
+    defer {
+        server_state.prefix_cache_capacity = saved[0];
+        server_state.prefix_cache_ram_enabled = saved[1];
+        server_state.prefix_cache_disk_bytes = saved[2];
+    }
+    server_state.prefix_cache_capacity = launch.capacity;
+    server_state.prefix_cache_ram_enabled = launch.ram;
+    server_state.prefix_cache_disk_bytes = launch.disk;
+
+    var reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("contract", dir, 1);
+    entry.config = &ld.config;
+    entry.handle = ld.h;
+    defer {
+        if (entry.prefix_cache) |*hc| hc.deinit();
+        entry.prefix_cache = null;
+        entry.config = null;
+        entry.handle = null;
+    }
+    // The stride `main` hands the load; no SSD tier is attached here, so a launch with one is out of this cell.
+    std.debug.assert(launch.disk == 0);
+    @import("model_load.zig").attachPrefixCache(a, io, entry, .{
+        .capacity = launch.capacity,
+        .ram_enabled = launch.ram,
+        .mem_bytes = if (launch.ram) 1 << 30 else 0,
+        .mem_resolver = null,
+        .disk_resolver = null,
+        .ssm_checkpoint_stride = @import("server.zig").effectiveSsmCheckpointStride(server_state.ssm_checkpoint_stride, launch.capacity, launch.ram, launch.disk),
+        .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
+    }, launch.disk, .load);
+
+    const walk = @import("scheduler.zig").walkCheckpointStride(entry);
+    var long: [700]u32 = undefined;
+    for (&long, 0..) |*t, i| t.* = ids[i % ids.len];
+    const turn = arch_handle.turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer arch_sched.endRequest(&ld.config);
+    var tok = @import("tokenizer.zig").Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    try ld.xfm.resetCache();
+    var gen = try @import("generate.zig").Generator.initWithOptions(io, a, ld.xfm, &tok, &long, 1, .{ .temperature = 0.0 }, &.{}, .{
+        .ssm_checkpoint_stride = walk,
+        .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
+    });
+    defer gen.deinit(a);
+    return .{
+        .taken = gen.ssm_checkpoints.items.len,
+        .billed = bills.retainedSsmCheckpointBytes(&ld.config, long.len, 0, 512),
+        .walk = walk,
+        .bill_stride = bills.launchCheckpointStride(&ld.config),
+    };
+}
+
+test "cooler contract: a hybrid prefill with the prefix cache off takes no checkpoint and its bill holds none, and with a RAM cache both hold the ones it takes" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const server_state = @import("server_state.zig");
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            const per_cp = ld.config.ssmCheckpointBytes();
+            if (per_cp == 0) return error.SkipZigTest;
+            // The launch settings the bill reads are the ones `main` handed the load.
+            const saved = .{ server_state.prefix_cache_capacity, server_state.prefix_cache_ram_enabled, server_state.prefix_cache_disk_bytes };
+            defer {
+                server_state.prefix_cache_capacity = saved[0];
+                server_state.prefix_cache_ram_enabled = saved[1];
+                server_state.prefix_cache_disk_bytes = saved[2];
+            }
+            for ([_]CacheLaunch{
+                .{ .capacity = 4, .ram = true, .disk = 0 },
+                .{ .capacity = 0, .ram = true, .disk = 0 },
+                .{ .capacity = 4, .ram = false, .disk = 0 },
+            }) |launch| {
+                const got = try checkpointsTakenAndBilled(&ld, dir, ids, launch);
+                errdefer std.debug.print("cooler contract: capacity {d} ram {} disk {d}: the walk strides {d}, took {d}, the bill strides {d} and holds {d} B of {d} B a state\n", .{ launch.capacity, launch.ram, launch.disk, got.walk, got.taken, got.bill_stride, got.billed, per_cp });
+                try testing.expectEqual(got.walk, got.bill_stride);
+                if (launch.capacity > 0 and launch.ram) {
+                    try testing.expect(got.taken > 0);
+                    try testing.expect(got.billed >= got.taken * per_cp);
+                } else {
+                    try testing.expectEqual(@as(usize, 0), got.taken);
+                    try testing.expectEqual(@as(u64, 0), got.billed);
+                }
+            }
+        }
+    }.run);
 }

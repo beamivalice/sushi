@@ -83,7 +83,7 @@ pub fn glmPrefillSchedule(seq: u64, matched: u64, cap: u32) glm5_generate.GlmCap
 
 /// GLM's twin: held from the closer to the commit beside the checkpoints the commit lists, only for a request that keeps any.
 pub fn glmThoughtPointBytes(config: *const model_mod.ModelConfig, warm: bills.WarmPrefix) u64 {
-    if (!warm.thought or bills.effectiveSsmCheckpointStride(bills.launch_state.ssm_checkpoint_stride, bills.launch_state.prefix_cache_capacity, bills.launch_state.prefix_cache_ram_enabled, bills.diskBytesFor(config)) == 0 or warm.checkpoints == 0) return 0;
+    if (!warm.thought or bills.launchCheckpointStride(config) == 0 or warm.checkpoints == 0) return 0;
     return config.ssmCheckpointBytes();
 }
 
@@ -91,7 +91,7 @@ pub fn glmThoughtPointBytes(config: *const model_mod.ModelConfig, warm: bills.Wa
 /// most `warm.checkpoints`, plus the copy taken before each thin; a released prefill holds
 /// `glm5_prefix.checkpoint_ram_held`) and the assistant window it keeps from prefill end.
 pub fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: bills.WarmPrefix) u64 {
-    if (bills.effectiveSsmCheckpointStride(bills.launch_state.ssm_checkpoint_stride, bills.launch_state.prefix_cache_capacity, bills.launch_state.prefix_cache_ram_enabled, bills.diskBytesFor(config)) == 0) return 0;
+    if (bills.launchCheckpointStride(config) == 0) return 0;
     if (warm.checkpoints == 0) return 0;
     const window: u64 = if (config.dflash_loaded) config.dflash_window_bytes else 0;
     const peak = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints).peak;
@@ -103,7 +103,7 @@ pub fn glmPrefixStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm:
 /// checkpoints, the window and the SSD writer's staged flush. Only the RAM tier copies rows, at most its
 /// budget (`HotPrefixCache.glmCommitLen`); the SSD flush reads the request's own (`glmDiskLen`).
 pub fn glmCommitStateBytes(config: *const model_mod.ModelConfig, seq: u64, warm: bills.WarmPrefix, kv_bits: u64) u64 {
-    if (bills.effectiveSsmCheckpointStride(bills.launch_state.ssm_checkpoint_stride, bills.launch_state.prefix_cache_capacity, bills.launch_state.prefix_cache_ram_enabled, bills.diskBytesFor(config)) == 0 or warm.checkpoints == 0) return 0;
+    if (bills.launchCheckpointStride(config) == 0 or warm.checkpoints == 0) return 0;
     const sched = glmPrefillSchedule(seq, warm.matched_tokens, warm.checkpoints);
     const rows = @as(u64, sched.newest) * bills.sessionBytesPerToken(config, kv_bits);
     const bound = bills.resolvedPrefixCacheMem();

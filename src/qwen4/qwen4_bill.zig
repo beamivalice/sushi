@@ -140,7 +140,7 @@ pub fn headStatePerToken(config: *const model_mod.ModelConfig) ?u64 {
 /// The checkpoint state a thinking request holds past its prefill's: the restore point behind its thought's closer, taken
 /// mid-decode and held to the commit (`generate.ThoughtPoint`).
 pub fn thoughtPoint(config: *const model_mod.ModelConfig, warm: bills.WarmPrefix) ?u64 {
-    if (!warm.thought or bills.launch_state.ssm_checkpoint_stride == 0) return 0;
+    if (!warm.thought or bills.launchCheckpointStride(config) == 0) return 0;
     return config.ssmCheckpointBytes();
 }
 

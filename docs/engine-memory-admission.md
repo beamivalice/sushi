@@ -461,7 +461,12 @@ request holds, not the ones it captures (`server.ssmResidentCap`, `ssm_cache.SSM
 | storage | held per request | why |
 |---|---:|---|
 | SSD tier up, with or without a RAM tier (the default) | 3 | a write-through prefill holds 2 (the previous newest until its file is written, and the one just taken); a request it cannot serve is thinned to 2 and holds a third while one is captured |
-| RAM only, or the tier declined (until it re-arms) | up to `--ssm-checkpoint-max` | nowhere else to restore from |
+| RAM only, or the tier declined with RAM retention on (until it re-arms) | up to `--ssm-checkpoint-max` | nowhere else to restore from |
+| no cache: `--prefix-cache-entries 0`, or RAM retention off with no SSD tier (declined included) | 0 | the prefill takes none |
+
+**A bill holds a checkpoint only where the prefill takes it**: every checkpoint term (Qwen's prefill and thought point,
+GLM's and DeepSeek's restore points) reads `bills.launchCheckpointStride`, the stride `main` hands the load, so a launch
+whose cache never attaches bills none (`launch_state.ssm_checkpoint_stride` alone stays set with the cache off).
 
 The write-through frees the older state the way GLM's does (`DiskTier.settleCheckpoints`: wait out its file, then
 `release`), so the bound is hard, not "whatever has landed". The scheduler thins a request the write-through cannot

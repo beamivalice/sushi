@@ -15,7 +15,7 @@ const prefix_cache_mod = @import("../prefix_cache.zig");
 /// the tier. Zero with no prefix cache at all.
 pub fn checkpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
     const c = config.dsv41 orelse return 0;
-    const base = bills.effectiveSsmCheckpointStride(bills.launch_state.ssm_checkpoint_stride, bills.launch_state.prefix_cache_capacity, bills.launch_state.prefix_cache_ram_enabled, bills.diskBytesFor(config));
+    const base = bills.launchCheckpointStride(config);
     const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
     if (stride == 0) return 0;
     const one = c.stateFixedBytes(config.dsparkOn()) +| seq *| c.stateBytesPerToken();

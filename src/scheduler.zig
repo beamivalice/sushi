@@ -3659,6 +3659,12 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
     slot.handover_token = t1;
 }
 
+/// The SSM checkpoint stride a request's prefill walks at: the load's, where its hot cache attached, else none (a
+/// snapshot nothing keeps is never taken). `bills.launchCheckpointStride` is the same answer from the launch's settings.
+pub fn walkCheckpointStride(model: *const model_registry_mod.LoadedModel) u32 {
+    return if (model.prefix_cache != null) model.ssm_checkpoint_stride else 0;
+}
+
 /// A request's prefill. No latch outlives it, whatever its exit: a failure is its settled error, and a latch a step it
 /// handled left fails it here, not the next request's first checkpoint.
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
@@ -3905,7 +3911,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     // and ignore the stride entirely (no-op even at stride > 0). When the
     // hot prefix cache is disabled or off, set stride to 0 to skip
     // snapshot work that would just be discarded.
-    var cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
+    var cp_stride: u32 = walkCheckpointStride(slot.model);
     var cp_max: u32 = slot.model.ssm_checkpoint_max;
 
     // Evict the hot cache to admit (#353). Here, not on the connection thread: the inference

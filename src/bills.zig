@@ -176,6 +176,13 @@ pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enable
     return stride;
 }
 
+/// The SSM checkpoint stride a model's prefill walks at under the launch's tiers, 0 when it takes none: the one
+/// reading every bill of a checkpoint (a prefill's, a thought point's, a restore point's) asks, so a bill holds
+/// checkpoints only where the walk takes them (`main` hands the load this same stride).
+pub fn launchCheckpointStride(config: *const model_mod.ModelConfig) u32 {
+    return effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, launch_state.prefix_cache_capacity, launch_state.prefix_cache_ram_enabled, diskBytesFor(config));
+}
+
 /// Percentage of the memory-derived ceiling we actually admit as context when
 /// `--ctx-size` is absent.
 ///
@@ -1591,7 +1598,7 @@ pub const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// is off or the model's hot cache never loads.
 fn legacyPrefixCacheAsk(config: *const model_mod.ModelConfig) u64 {
     if (launch_state.prefix_cache_capacity == 0 or !launch_state.prefix_cache_ram_enabled) return 0;
-    if (!prefix_cache_mod.HotPrefixCache.shouldUse(config, launch_state.ssm_checkpoint_stride > 0)) return 0;
+    if (!prefix_cache_mod.HotPrefixCache.shouldUse(config, launchCheckpointStride(config) > 0)) return 0;
     return launch_state.prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -2484,9 +2491,10 @@ pub fn reservedCacheTokens(seq: u64, max_tokens: u64, chunk: u64, ctx: u64) u64 
 /// checkpoints are already resident and merged, never re-allocated).
 pub fn retainedSsmCheckpointBytes(config: *const model_mod.ModelConfig, seq: u64, matched: u64, chunk: u64) u64 {
     const per_cp = config.ssmCheckpointBytes();
-    if (per_cp == 0 or launch_state.ssm_checkpoint_stride == 0) return 0;
+    const launch_stride = launchCheckpointStride(config);
+    if (per_cp == 0 or launch_stride == 0) return 0;
     if (archHook("retainedCheckpoints", u64, config, .{ seq, matched })) |bytes| return bytes;
-    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
+    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(launch_stride, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
     if (stride == 0) return 0;
     // Stride-aligned capture positions in `(matched, seq]` plus the always-on end-of-prompt
     // snapshot, the only capture a warm append shorter than one stride makes.
@@ -5373,7 +5381,7 @@ test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN width
         const per_cp = cfg.ssmCheckpointBytes();
         try t.expectEqual(if (f32_state) @as(u64, 115_458_048) else 58_834_944, per_cp);
 
-        const no_tier = TierGuard.pin(false, 0);
+        const no_tier = TierGuard.pin(true, 0);
         try t.expectEqual(@as(u64, 16) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
         no_tier.restore();
 
@@ -5383,9 +5391,13 @@ test "an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN width
         try t.expectEqual(@as(u64, 3) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
         // A prompt under one stride captures its prompt-end snapshot alone and bills just that.
         try t.expectEqual(per_cp, retainedSsmCheckpointBytes(&cfg, 300, 0, 512));
-        // A tier that did not come up bills as without one.
+        // A tier that did not come up bills as without one: with RAM retention off no cache attaches, so no checkpoint
+        // is taken, and with it on every one stays in RAM.
         cfg.prefix_cache_disk_declined = true;
+        try t.expectEqual(@as(u64, 0), retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
+        const declined_with_ram = TierGuard.pin(true, 20 << 30);
         try t.expectEqual(@as(u64, 16) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, 512));
+        declined_with_ram.restore();
         cfg.prefix_cache_disk_declined = false;
         ssd_only.restore();
 

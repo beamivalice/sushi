@@ -674,7 +674,7 @@ fn refusedSplits(cfg: *const model_mod.ModelConfig, named: u64, budget: u64, war
 
 test "Flash-Next: the context the auto search names at a budget is admitted at every prompt and reply split, at the width admission picks, from 1k to 600k tokens" {
     if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
-    const no_tier = bills.TierGuard.pin(false, 0);
+    const no_tier = bills.TierGuard.pin(true, 0);
     defer no_tier.restore();
     var cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
     var refused: u32 = 0;

@@ -675,7 +675,7 @@ test "qwen4ExpOomConfig does not leak qsa_score_fused_override" {
 test "the 458k prefill's two unbilled terms are billed: retained checkpoints and reserved capacity" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
@@ -1165,7 +1165,7 @@ test "memoryRefusalMessage: the 400 counts the hot cache only where the bill car
 test "the live 364k session's admission numbers reproduce, to the megabyte" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
@@ -1460,7 +1460,7 @@ test "an explicit --ctx-size boot never consults the session reserve" {
 test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
@@ -1889,7 +1889,7 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
 test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
@@ -1973,6 +1973,51 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     try t.expect((before * 5 / 4 + qsaMaskBytes(&cfg, fwd, seq)) > available);
 }
 
+test "a request bills SSM checkpoints only where its prefill takes them: no cache, no RAM tier and no SSD tier bill none" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = fixtures.qwen4ExpLive364kConfig();
+    const saved = .{ launch_state.ssm_checkpoint_stride, launch_state.ssm_checkpoint_max, launch_state.prefix_cache_capacity };
+    defer {
+        launch_state.ssm_checkpoint_stride = saved[0];
+        launch_state.ssm_checkpoint_max = saved[1];
+        launch_state.prefix_cache_capacity = saved[2];
+    }
+    launch_state.ssm_checkpoint_stride = 256;
+    launch_state.ssm_checkpoint_max = 16;
+    const per_cp = cfg.ssmCheckpointBytes();
+    const seq: u64 = 250_000;
+    const thinking = WarmPrefix{ .thought = true };
+    // Each row is a launch: the entry count, whether RAM retention is on, the SSD ask, and whether the walk takes snapshots.
+    const Launch = struct { capacity: u32, ram: bool, disk: u64, takes: bool };
+    for ([_]Launch{
+        .{ .capacity = 32, .ram = true, .disk = 0, .takes = true },
+        .{ .capacity = 32, .ram = false, .disk = 20 << 30, .takes = true },
+        .{ .capacity = 0, .ram = true, .disk = 20 << 30, .takes = false },
+        .{ .capacity = 0, .ram = false, .disk = 0, .takes = false },
+        .{ .capacity = 32, .ram = false, .disk = 0, .takes = false },
+    }) |l| {
+        launch_state.prefix_cache_capacity = l.capacity;
+        const tiers = TierGuard.pin(l.ram, l.disk);
+        defer tiers.restore();
+        // The stride `main` hands the load, which the scheduler's walk takes where the cache is attached.
+        const walk_stride = bills.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, l.capacity, l.ram, l.disk);
+        try t.expectEqual(walk_stride, bills.launchCheckpointStride(&cfg));
+        try t.expectEqual(l.takes, prefill_plan.shouldCheckpointSsmPrefill(walk_stride, true, false));
+        errdefer std.debug.print("launch capacity={d} ram={} disk={d}: walk takes={}\n", .{ l.capacity, l.ram, l.disk, l.takes });
+        const held = retainedSsmCheckpointBytes(&cfg, seq, 0, 512);
+        const terms = prefillRequestTerms(&cfg, seq, 8192, 8, 512, thinking);
+        if (l.takes) {
+            try t.expect(held >= per_cp);
+            try t.expectEqual(held +| per_cp, terms.checkpoint_bytes);
+        } else {
+            try t.expectEqual(@as(u64, 0), held);
+            try t.expectEqual(@as(u64, 0), bills.thoughtPointBytes(&cfg, thinking));
+            try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
+        }
+    }
+}
+
 test "an arch without QSA bills its requests and transients free of the QSA kernel arms" {
     if (!archBuilt("qwen4") or !archBuilt("glm5")) return error.SkipZigTest;
     const t = std.testing;
@@ -2046,7 +2091,7 @@ test "a request whose tail the chunk loop absorbs is billed at the merged forwar
 test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a reserved token costs its storage, no net" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
@@ -2203,7 +2248,7 @@ test "on Sushi Cooler a reserved request's first chunk bills no growth for the c
 test "a request refused by its bill names the bill, what is available and the largest max_tokens that fits" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     // The live session's request on an STQ pack.
     var cfg = fixtures.qwen4ExpLive364kConfig();
@@ -2391,7 +2436,7 @@ pub fn coolerFlashNext() model_mod.ModelConfig {
 test "Flash-Next on Cooler: a refusal's max_tokens and maximum context are admitted when applied, MTP on and off, the maximum at every prompt and reply split when the prompt does not fit alone" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const cfg = coolerFlashNext();
     try t.expect(@import("../cooler_side.zig").onEngine(&cfg));
@@ -2446,7 +2491,7 @@ test "Flash-Next on Cooler: a refusal's max_tokens and maximum context are admit
 test "Flash-Next on Cooler: a request's bill holds every KV and state row of its cache at the pool's size class, prompt rows as reply rows" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const cfg = coolerFlashNext();
     const kv_per_tok = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8);
@@ -2490,7 +2535,7 @@ test "Flash-Next on Cooler: a load's preflight leaves its served warm the whole 
 test "Flash-Next on Cooler: the advertised context is admitted when asked under a declared GPU limit, however little free RAM other apps leave (#110)" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     var cfg = coolerFlashNext();
     cfg.expert_streaming = true;
@@ -2552,7 +2597,7 @@ fn namedContextHolds(cfg: *const model_mod.ModelConfig, weights: u64, ws: u64, f
 
 test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, and is admitted at that length at every prompt and reply split once loaded" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
@@ -2574,7 +2619,7 @@ test "Flash-Next on Cooler: the --ctx-size a resident load refusal names loads, 
 // ceiling, so the edge the room beside the weights holds loads and is the context a refusal names.
 test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edge of the room beside the weights loads and is the one a refusal names" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
@@ -2604,7 +2649,7 @@ test "Flash-Next on Cooler: where the GPU limit binds, the --ctx-size at the edg
 test "Flash-Next on MLX: a max-context search with no cap or a large one prices two bills a probe, the prompt alone and the reservation's edge" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     var cfg = fixtures.qwen4MeasuredTestConfig();
     cfg.pinned_context = 0;
@@ -2672,7 +2717,7 @@ fn prefillHoldsReply(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, c
 
 test "Flash-Next: a request's bill less its decode regrow never falls as its prompt grows within a context, and the regrow alone falls, to nothing, where the prompt's cache already holds its reply, on Cooler and MLX, MTP on and off, across the reservation" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     const cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
     var falls: u32 = 0;
@@ -2752,7 +2797,7 @@ test "Flash-Next on Cooler: a context is priced at its dearest split, which is t
 
 test "Flash-Next: the max-context search names the largest context whose every prompt and reply split fits, on Cooler and MLX, at the reservation's edge too" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
-    const no_tier = TierGuard.pin(false, 0);
+    const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
     var cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
     var bad: u32 = 0;
