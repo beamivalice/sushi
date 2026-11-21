@@ -1105,7 +1105,7 @@ const Group = struct {
         var sv: Served = undefined;
         try sv.init(ld, dir);
         defer sv.deinit();
-        var one = [_]Req{.{ .prompt = req.prompt, .max = req.max, .mtp = false, .sampling = req.sampling, .logprobs_n = req.logprobs_n }};
+        var one = [_]Req{.{ .prompt = req.prompt, .max = req.max, .mtp = false, .sampling = req.sampling, .logprobs_n = req.logprobs_n, .mrope = req.mrope }};
         var o = try run(&sv, &one);
         defer o.deinit();
         if (o.failed[0]) |e| {
@@ -1206,11 +1206,12 @@ test "cooler contract: a request that cannot join the planner's tick leaves the 
                 const set = [_]Group.Req{ .{ .prompt = bufs[0][0..23], .max = 200 }, .{ .prompt = bufs[1][0..37], .max = 200 }, third.req };
                 var got = try Group.run(&sv, &set);
                 defer got.deinit();
+                // Every row says its solo tokens: the two that group, and the third that decodes in the regular path.
                 if (got.planner[0][2] == 0 or got.planner[1][2] == 0) {
                     std.debug.print("cooler contract: a {s} row beside: planner plain/prime/spec {any}\n", .{ third.name, got.planner[0..3] });
                     bad += 1;
                 }
-                Group.expectSolo(&ld, dir, set[0..2], &got) catch |e| {
+                Group.expectSolo(&ld, dir, &set, &got) catch |e| {
                     std.debug.print("cooler contract: a {s} row beside: {s}\n", .{ third.name, @errorName(e) });
                     bad += 1;
                 };
