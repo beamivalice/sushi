@@ -1451,3 +1451,68 @@ test "r173-f-foreign-opener: a finished call whose value spells think tags keeps
     };
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+
+test "r173-f-foreign-opener: a declined call's markup never reaches content, streamed or not" {
+    const a = testing.allocator;
+    _ = a;
+    const open = [_][]const u8{
+        "<function name=\"get_weather\"><param name=\"city\">Tok",
+        "<function=get_weather>\n<parameter=city>\nTok",
+        "<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok",
+        "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok",
+        "<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tok",
+        "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}",
+        "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nTok",
+        "<|tool_call>call:get_weather{city:<|\"|>Tok",
+        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
+    };
+    var bad: usize = 0;
+    for (open) |call| {
+        var buf: [512]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buf, "Let me check.\n{s}", .{call});
+        const content = think_tags.splitThinkBlock(text, true, false).content;
+        if (!std.mem.eql(u8, std.mem.trim(u8, content, " \n"), "Let me check.")) {
+            bad += 1;
+            std.debug.print("non-stream content leaks for {f}: {f}\n", .{ std.zig.fmtString(call), std.zig.fmtString(content) });
+        }
+        // The stream holds from the opener on: no prefix holding the opener's first byte is released.
+        var scan: think_tags.ToolHoldScan = .{};
+        const lead = "Let me check.\n".len;
+        var released_markup: ?usize = null;
+        for (lead + 1..text.len + 1) |end| {
+            if (!think_tags.streamShouldBufferForToolsScan(text[0..end], &scan) and released_markup == null) released_markup = end;
+        }
+        if (released_markup) |end| {
+            bad += 1;
+            std.debug.print("stream releases markup for {f} at prefix {f}\n", .{ std.zig.fmtString(call), std.zig.fmtString(text[lead..end]) });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: the preamble of a finished call holds no markup, in every dialect the chain reads" {
+    const a = testing.allocator;
+    const calls = [_][]const u8{
+        "<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>",
+        "<function name=\"get_weather\"><param name=\"city\">Tokyo</param></function>",
+        "<invoke name=\"get_weather\">\n<parameter name=\"city\">Tokyo</parameter>\n</invoke>",
+        "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}</tool>",
+        "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}</tool_request>",
+    };
+    var bad: usize = 0;
+    for (calls) |call| {
+        const text = try std.mem.concat(a, u8, &.{ "Let me check.\n", call });
+        defer a.free(text);
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const pre = if (s.reply) |r| r.preamble else "(no call)";
+        if (!std.mem.eql(u8, std.mem.trim(u8, pre, " \n"), "Let me check.")) {
+            bad += 1;
+            std.debug.print("preamble for {f}: {f}\n", .{ std.zig.fmtString(call[0..@min(call.len, 30)]), std.zig.fmtString(pre) });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), bad);
+}

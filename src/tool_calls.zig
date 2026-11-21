@@ -1157,7 +1157,7 @@ pub const FUNCTION_CALLS_TAG = "<function_calls>";
 
 fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), comptime d: InvokeDialect) !void {
     // An inferred dialect's opener alone is prose ("wrap it in <invoke name=\"bash\">", even naming a declared
-    // tool): a call also carries a parameter or its close, as `bareInvokeMarkupCut` demands.
+    // tool): a call also carries a parameter or its close, as the reading's cut (`tool_reading.markupStart`) demands.
     if (d.inferred and std.mem.indexOf(u8, text, d.param ++ " ") == null and std.mem.indexOf(u8, text, d.invoke_close) == null) return;
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, d.invoke)) |inv| {

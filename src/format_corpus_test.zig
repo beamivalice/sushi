@@ -1790,7 +1790,7 @@ const leak_tags = [_][]const u8{
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
-/// either. Mirrors `think_tags.tool_markup_openers` (the cut list) — kept spelled
+/// either. Mirrors `tool_reading.markupStart` (the cut) — kept spelled
 /// out here so the guard fails if the cut list is narrowed.
 const reasoning_leak_tags = [_][]const u8{
     "<｜DSML｜",
@@ -4146,6 +4146,50 @@ test "format corpus: a think tag a call's value spells is the value's text, what
             try testing.expectEqualStrings(value, std.mem.trim(u8, (parsed.value.object.get("content") orelse return error.ValueDropped).string, "\n"));
         }
         try testing.expectEqualStrings(whole.text, streamed.text);
+    };
+}
+
+test "format corpus: no call markup reaches content, finished, declined or read as prose, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    // Each text after "Let me check.\n": the cut leaves nothing of the markup in the content, whether the reading
+    // counts the opener as a call (declined or shipped) or as prose (a plain reply with the markup cut).
+    const Case = struct { text: []const u8, call: bool };
+    const cases = [_]Case{
+        .{ .text = "<function=get_weather>\n<parameter=city>\nTok", .call = true },
+        .{ .text = "<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>", .call = true },
+        .{ .text = "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}", .call = true },
+        .{ .text = "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}</tool>", .call = true },
+        .{ .text = "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok", .call = true },
+        .{ .text = "<function_calls>", .call = true },
+        .{ .text = "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok", .call = true },
+        .{ .text = "<tool_call>\nI should look first", .call = false },
+        .{ .text = "<tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok", .call = true },
+        .{ .text = "<" ++ dsml ++ "invoke name=\"get_weather\">\nno parameter here\n<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">Tok", .call = true },
+    };
+    for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", c.text });
+        defer allocator.free(text);
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer whole.deinit(allocator);
+        const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
+        defer streamed.deinit(allocator);
+        for ([_]reply_mod.Settled{ whole, streamed }) |got| {
+            const content = if (got.reply) |r| r.preamble else think_tags.splitThinkBlock(got.text, true, false).content;
+            try testing.expectEqualStrings("Let me check.", std.mem.trim(u8, content, " \n"));
+            if (!c.call) try testing.expect(got.declined == null and got.reply == null);
+        }
+        // The stream holds from the opener on: no prefix that holds its first byte is released.
+        var hold: think_tags.ToolHoldScan = .{};
+        const lead = "Let me check.\n".len;
+        for (lead + 1..text.len + 1) |end| {
+            if (!think_tags.streamShouldBufferForToolsScan(text[0..end], &hold) and text[end - 1] != '\n') {
+                // A prefix the hold lets go is plain text so far: it holds none of the markup's first byte.
+                try testing.expect(std.mem.indexOfScalar(u8, text[lead..end], '<') == null);
+            }
+        }
     };
 }
 

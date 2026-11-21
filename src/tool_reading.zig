@@ -15,6 +15,12 @@ pub const Family = struct {
     /// Spellings that begin with an opener and are another dialect's closer.
     not_openers: []const []const u8 = &.{},
     reads_as_call: ?*const fn (text: []const u8, at: usize, scan: *Scan) bool = null,
+    /// What the text after the opener must hold for the READING to open a call there, where the opener alone is markup
+    /// to cut: `I could emit <tool_call> here` is prose to a reader and leaked markup to a cut.
+    body_reads: ?*const fn (text: []const u8, at: usize, scan: *Scan) bool = null,
+    /// Instead of `reads_as_call` when cutting leaked markup: a malformed opener (a dropped attribute quote) that the
+    /// parser declined is still markup, so the cut reads looser than a call does.
+    cut_reads: ?*const fn (text: []const u8, at: usize, scan: *Scan) bool = null,
     /// How the dialect writes a parameter value: a closer spelled inside one is the value's text, not the call's close.
     values: tool_calls.ValueSpans,
     /// Holds calls of other families (`<｜DSML｜tool_calls>`, `<function_calls>`): they are read where they stand,
@@ -29,14 +35,14 @@ const hermes_closers = [_][]const u8{ "</tool_call>", "</tool_calls>", "</tool>"
 
 /// Every dialect `parseToolCallsAs` reads.
 pub const families = [_]Family{
-    .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"}, .reads_as_call = gemmaReadsAsCall, .values = .gemma },
-    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"}, .reads_as_call = wrapperReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
+    .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"}, .body_reads = gemmaReadsAsCall, .values = .gemma },
+    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"}, .body_reads = wrapperReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
     .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
     .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"}, .values = .dsml, .container = true },
-    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .reads_as_call = dsmlInvokeReadsAsCall, .values = .dsml },
+    .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .body_reads = dsmlInvokeReadsAsCall, .values = .dsml },
     .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"}, .values = .invoke, .container = true },
     .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall, .values = .invoke },
-    .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall, .values = .function_tag },
+    .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall, .cut_reads = functionCutReads, .values = .function_tag },
 };
 
 /// `<|tool_call>call:name{…`: the body starts with `call:`, or has not got that far.
@@ -96,7 +102,7 @@ fn invokeReadsAsCall(text: []const u8, at: usize, _: *Scan) bool {
     const name = tool_calls.dsmlAttr(tail[after..@min(tail.len, after + 512)], "name") orelse return false;
     if (name.len == 0) return false;
     const own = tail[after .. std.mem.indexOfPos(u8, tail, after, BARE_INVOKE.invoke) orelse tail.len];
-    return std.mem.indexOf(u8, own, BARE_INVOKE.param ++ " ") != null;
+    return std.mem.indexOf(u8, own, BARE_INVOKE.param ++ " ") != null or std.mem.indexOf(u8, own, BARE_INVOKE.invoke_close) != null;
 }
 
 /// MiniCPM5's `<function name="x">` with a `<param` after its tag, and Hermes' bare `<function=x>` with a
@@ -108,14 +114,29 @@ fn functionReadsAsCall(text: []const u8, at: usize, scan: *Scan) bool {
     if (!std.ascii.isWhitespace(text[after])) return false;
     const gt = scan.gt.find(text, after, &scan.work) orelse return false;
     const name = tool_calls.miniCpm5AttrValue(text[after..gt], "name") orelse return false;
-    return name.len > 0 and scan.param.find(text, gt + 1, &scan.work) != null;
+    return name.len > 0 and (scan.param.find(text, gt + 1, &scan.work) != null or scan.function_close.find(text, gt + 1, &scan.work) != null);
+}
+
+/// A `<function` that leaks markup: the bare `<function=` read as a call, or a MiniCPM5 `<function name=…` (a dropped
+/// quote included) with a `<param` element or a `</function>` after it; text that stops inside the opener counts.
+fn functionCutReads(text: []const u8, at: usize, scan: *Scan) bool {
+    const after = at + "<function".len;
+    if (after >= text.len) return true;
+    if (text[after] == '=') return functionReadsAsCall(text, at, scan);
+    if (!std.ascii.isWhitespace(text[after])) return false;
+    const gt = scan.gt.find(text, after, &scan.work);
+    if (std.mem.indexOf(u8, text[after .. gt orelse text.len], "name=") == null) return false;
+    return scan.param.find(text, after, &scan.work) != null or scan.function_close.find(text, after, &scan.work) != null;
 }
 
 /// Whether the text at `at`, which starts with an opener of `f`, opens a call there: no other dialect's closer, and the
 /// dialect's own reading accepts it.
 fn opensCall(f: *const Family, text: []const u8, at: usize, scan: *Scan) bool {
-    for (f.not_openers) |n| if (std.mem.startsWith(u8, text[at..], n)) return false;
-    return if (f.reads_as_call) |reads| reads(text, at, scan) else true;
+    if (scan.strict) for (f.not_openers) |n| if (std.mem.startsWith(u8, text[at..], n)) return false;
+    if (!scan.strict) if (f.cut_reads) |reads| return reads(text, at, scan);
+    if (f.reads_as_call) |reads| return reads(text, at, scan);
+    if (scan.strict) if (f.body_reads) |reads| return reads(text, at, scan);
+    return true;
 }
 
 /// A call opener found in a text.
@@ -158,11 +179,15 @@ pub const Scan = struct {
     openers: [opener_count]Next,
     parameter_eq: Next = .{ .needle = "<parameter=" },
     param: Next = .{ .needle = "<param" },
+    function_close: Next = .{ .needle = "</function>" },
     gt: Next = .{ .needle = ">" },
     dsml_invoke: Next = .{ .needle = "<｜DSML｜invoke" },
     dsml_invoke_spaced: Next = .{ .needle = "<｜DSML｜ invoke" },
     /// Bytes the searches covered; a test holds it to a multiple of the text.
     work: usize = 0,
+    /// Reading a text for calls (the default) or looking for leaked markup to cut: the cut takes an opener alone as
+    /// markup, quoted in a code span or not, whatever follows it.
+    strict: bool = true,
 
     pub fn init() Scan {
         var scan: Scan = .{ .openers = undefined };
@@ -207,7 +232,7 @@ pub fn nextOpener(text: []const u8, from: usize, scan: *Scan) ?Opener {
         }
         const i = best orelse return null;
         const at = next[i].?;
-        if (opensCall(fam[i], text, at, scan) and !scan.openAt(text, at)) return .{ .at = at, .len = scan.openers[i].needle.len, .family = fam[i] };
+        if (opensCall(fam[i], text, at, scan) and !(scan.strict and scan.openAt(text, at))) return .{ .at = at, .len = scan.openers[i].needle.len, .family = fam[i] };
         next[i] = scan.openers[i].find(text, at + 1, &scan.work);
     }
 }
@@ -447,4 +472,26 @@ pub fn isArgKeyCall(text: []const u8, call: Call) bool {
     const gt = std.mem.indexOfScalarPos(u8, text, call.start, '>') orelse return true;
     const body = std.mem.trimStart(u8, text[gt + 1 ..], " \t\r\n");
     return !(std.mem.startsWith(u8, body, "{") or std.mem.startsWith(u8, body, "<function="));
+}
+
+/// Markup no call dialect owns that is never prose: DeepSeek's DSML tags and a closer of theirs with no opener.
+pub const lone_markup = [_][]const u8{ "<｜DSML｜", "</｜DSML｜" };
+
+/// Where unparsed call markup starts in `text`: the first call opener of any family (one whose opener alone is prose
+/// counts where its own reading holds, a wrapper's opener always) or DSML markup; null with none.
+pub fn markupStart(text: []const u8) ?usize {
+    var scan = Scan.init();
+    scan.strict = false;
+    var cut: ?usize = if (nextOpener(text, 0, &scan)) |o| o.at else null;
+    for (lone_markup) |m| if (std.mem.indexOf(u8, text, m)) |p| {
+        if (cut == null or p < cut.?) cut = p;
+    };
+    return cut;
+}
+
+/// Whether `tail` is the start of an opener (or DSML markup) that more bytes may complete.
+pub fn openerMayGrow(tail: []const u8) bool {
+    for (lone_markup) |m| if (tail.len < m.len and std.mem.startsWith(u8, m, tail)) return true;
+    for (families) |f| for (f.openers) |o| if (tail.len < o.len and std.mem.startsWith(u8, o, tail)) return true;
+    return false;
 }

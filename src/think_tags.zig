@@ -342,39 +342,6 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
     return if (lt + l == text.len) l else null;
 }
 
-/// Tool-call WRAPPER openers that must never survive into text a client
-/// renders. Every entry is the opening marker of a call block, so whatever
-/// follows it is call payload, not prose — parseToolCalls has already run by
-/// the time these matter, so a marker still present means the block did not
-/// parse (a mangled opener, a bare marker with no call behind it, or a call
-/// the model emitted inside its think block, which the parser deliberately
-/// skips). The whole tail is cut rather than excised: a wrapper we could not
-/// parse has no reliable end, and shipping half of it is the same leak.
-pub const tool_markup_openers = [_][]const u8{
-    "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
-    "</｜DSML｜", // lone closers the model emits after prose with no opener
-    "<|tool_call", // Gemma 4
-    "<tool_call", // Hermes XML + the plural variants
-};
-
-/// Earliest index of Claude-style `<function_calls>` / `<invoke …>` markup, or null. Like MiniCPM5's,
-/// the opener alone is prose ("wrap it in <invoke name=…>"): a `<parameter ` or `</invoke>` must be there too.
-fn bareInvokeMarkupCut(text: []const u8) ?usize {
-    if (std.mem.indexOf(u8, text, "<parameter ") == null and
-        std.mem.indexOf(u8, text, BARE_INVOKE.invoke_close) == null) return null;
-    var cut = std.mem.indexOf(u8, text, FUNCTION_CALLS_TAG);
-    var scan: usize = 0;
-    while (std.mem.indexOfPos(u8, text, scan, BARE_INVOKE.invoke)) |p| {
-        const after = p + BARE_INVOKE.invoke.len;
-        if (after >= text.len or std.ascii.isWhitespace(text[after])) {
-            if (cut == null or p < cut.?) cut = p;
-            break;
-        }
-        scan = after;
-    }
-    return cut;
-}
-
 /// True while `buf` holds, or ends in a growing prefix of, a `<function_calls>` / `<invoke …` opener.
 fn invokeOpenerHoldsForTools(buf: []const u8) bool {
     if (std.mem.indexOf(u8, buf, FUNCTION_CALLS_TAG) != null) return true;
@@ -395,56 +362,11 @@ fn invokeTailHolds(buf: []const u8) bool {
     return false;
 }
 
-/// Earliest index of MiniCPM5 attribute-form tool markup, or null.
-/// Discriminated exactly as the streaming gate does it — `<function` followed
-/// by WHITESPACE, with a `name=` inside the opener region — so `<functional`,
-/// `<function-like>` and `<function>` prose are never cut. A malformed opener
-/// (dropped quote) still matches, which is the point: `parseToolCalls` has
-/// already run by the time this matters, so markup still present is markup that
-/// did NOT parse, and shipping it renders raw XML to the user.
-fn miniCpm5MarkupCut(text: []const u8) ?usize {
-    // The opener ALONE is not evidence of leaked markup. Prose names functions
-    // ("Document the syntax as <function name=\"shell\"> before …") and cutting
-    // there deletes the rest of the answer — the exact contradiction that let a
-    // green parser test and a green scrubber test disagree about one string.
-    // Require the same structural evidence the parser requires: a `<param`
-    // element or a `</function>` close somewhere in the text.
-    if (std.mem.indexOf(u8, text, "<param") == null and
-        std.mem.indexOf(u8, text, "</function>") == null) return null;
-    var scan: usize = 0;
-    while (std.mem.indexOfPos(u8, text, scan, "<function")) |p| {
-        const after = p + "<function".len;
-        if (after >= text.len) return p; // truncated mid-opener
-        if (!std.ascii.isWhitespace(text[after])) {
-            scan = after;
-            continue;
-        }
-        const gt_rel = std.mem.indexOfScalar(u8, text[after..], '>');
-        const region_end = if (gt_rel) |g| after + g else text.len;
-        if (std.mem.indexOf(u8, text[after..region_end], "name=") != null) return p;
-        scan = region_end;
-    }
-    return null;
-}
-
-/// Where the first unparsed tool-call marker of `text` starts; null with none.
+/// Where the first unparsed tool-call marker of `text` starts; null with none. Parsing has run by the time this
+/// matters, so markup still present did not parse: it is cut rather than shipped as text, by the same family table the
+/// reading uses (`tool_reading.markupStart`: a dialect whose opener alone is prose counts where it reads as a call).
 pub fn leakedToolMarkupStart(text: []const u8) ?usize {
-    var cut: usize = text.len;
-    for (tool_markup_openers) |m| {
-        if (std.mem.indexOf(u8, text, m)) |p| {
-            if (p < cut) cut = p;
-        }
-    }
-    // MiniCPM5 attribute form. Same reasoning, different discriminator: the
-    // dialect is `<function` + whitespace + a `name=` attribute, so prose words
-    // beginning `<function…` are left alone.
-    if (miniCpm5MarkupCut(text)) |p| {
-        if (p < cut) cut = p;
-    }
-    if (bareInvokeMarkupCut(text)) |p| {
-        if (p < cut) cut = p;
-    }
-    return if (cut == text.len) null else cut;
+    return tool_reading.markupStart(text);
 }
 
 /// Whether `unsent`, the text a stream has not sent, may still turn into markup `trimLeakedToolMarkup` cuts: it ends
@@ -453,9 +375,7 @@ fn markupPending(unsent: []const u8) bool {
     if (functionOpenerHoldsForTools(unsent) or invokeOpenerHoldsForTools(unsent)) return true;
     var i = unsent.len -| 32;
     while (i < unsent.len) : (i += 1) {
-        if (unsent[i] != '<') continue;
-        const tail = unsent[i..];
-        for (tool_markup_openers) |o| if (tail.len < o.len and std.mem.startsWith(u8, o, tail)) return true;
+        if (unsent[i] == '<' and tool_reading.openerMayGrow(unsent[i..])) return true;
     }
     return false;
 }
@@ -1066,6 +986,7 @@ fn functionOpenerHoldsForTools(buf: []const u8) bool {
         // `<function>` are not this dialect; skip and keep scanning so ordinary
         // prose keeps flowing. Gating the bare `<function=` dialect is a
         // SEPARATE problem with its own evidence — see the follow-up issue.
+        if (buf[after] == '=') return true;
         if (!std.ascii.isWhitespace(buf[after])) {
             scan = after;
             continue;
@@ -1136,6 +1057,7 @@ pub const ToolHoldScan = struct {
                 self.pending = true;
                 break;
             }
+            if (buf[after] == '=') return self.latch();
             if (!std.ascii.isWhitespace(buf[after])) {
                 scan = after;
                 self.func_from = after;
