@@ -63,10 +63,11 @@ test "cooler contract: an exact Cooler prefill bill is what each kind of layer a
                     const grew = try chunkAsked(&ld, wide);
                     const bill = bills.prefillChunkCost(&ld.config, kv_bits, width, width, .{});
                     // The margin covers the small tensors no term names, and no term may bill more than a margin it does not
-                    // hold beyond the allowance the bill names: the rows' in-flight planes, and what the f16 weight a decoded
-                    // trunk linear holds at its own matmul (`bills.trunkDecodeBilled`, NAX only) adds past the rows' peak.
+                    // hold beyond the allowance the bill names: the rows' in-flight planes, and what a layer's moments (a
+                    // decoded trunk weight at its matmul, NAX only, and the dense KV rebuild) add past the rows' peak
+                    // (`bills.forwardMomentsBilled`).
                     const allowance: u64 = (if (@hasDecl(C, "prefillAllowanceRows")) width * C.prefillAllowanceRows(&ld.config) else 0) +
-                        bills.trunkDecodeBilled(&ld.config, width);
+                        bills.forwardMomentsBilled(&ld.config, kv_bits, width, width);
                     if (grew > bill + bills.BILL_MARGIN_BYTES or bill > grew + allowance + bills.BILL_MARGIN_BYTES) std.debug.print("cooler contract: a {d}-row chunk running {any} asked {d} KB against its {d} KB bill\n", .{ width, kinds, grew >> 10, bill >> 10 });
                     try testing.expect(grew <= bill + bills.BILL_MARGIN_BYTES);
                     try testing.expect(bill <= grew + allowance + bills.BILL_MARGIN_BYTES);

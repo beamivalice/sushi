@@ -917,7 +917,7 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        trunkDecodeBilled(config, @min(chunk, @max(seq, 1))) +
+        forwardMomentsBilled(config, kv_bits, @min(chunk, @max(seq, 1)), seq) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }
@@ -962,26 +962,62 @@ pub const DECODE_REBUILD_KEYS_MAX: u64 = 4095;
 /// different K and V widths (mimo_v2: 4 heads of 192+128, against the generic
 /// 8 heads of 192 twice — 2.4x).
 pub fn kvDequantScratchBytes(config: *const model_mod.ModelConfig, seq: u64, fwd: u64) u64 {
+    if (kvRebuildRowsCap(config, fwd) == null) return 0;
+    return kvRebuildDenseBytes(config, seq, fwd);
+}
+
+/// The dense KV one layer rebuilds at a forward of `fwd` rows: its rows (`kvRebuildRowsCap`, the whole sequence where
+/// the arch names no cap) at its K and V widths.
+pub fn kvRebuildDenseBytes(config: *const model_mod.ModelConfig, seq: u64, fwd: u64) u64 {
+    const seq_rows = kvRebuildRowsCap(config, fwd) orelse std.math.maxInt(u64);
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) widest = @max(widest, kvRebuildRows(config, seq, seq_rows, li) *| config.layerKvBytes(li));
+    return widest;
+}
+
+/// The most one layer holds while it rebuilds its dense KV on Sushi Cooler: the engine's dequantize copies the packed
+/// codes, scales and biases (bf16, one per group) of the half it reads contiguous from the cache's strided slice, so K's
+/// copy sits beside K and V's beside both. A slice that fills its buffer is shared, not copied: then this is over.
+pub fn kvRebuildPeakBytes(config: *const model_mod.ModelConfig, kv_bits: u64, seq: u64, fwd: u64) u64 {
+    const seq_rows = kvRebuildRowsCap(config, fwd) orelse std.math.maxInt(u64);
+    // A bill asked at packed bits for a load configured dense prices the affine cache those bits store.
+    const kv = configuredKvQuantFor(config);
+    const group: u64 = if (kv.isQuant()) kv.group_size else trunk.KVQuantConfig.engine_default.group_size;
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        const rows = kvRebuildRows(config, seq, seq_rows, li);
+        const heads: u64 = config.layerKVHeads(li);
+        const k: u64 = config.layerHeadDim(li);
+        const v: u64 = config.layerVHeadDim(li);
+        const packed_k = heads * (k * kv_bits / 8 + k / group * 2 * 2);
+        const packed_v = heads * (v * kv_bits / 8 + v / group * 2 * 2);
+        widest = @max(widest, rows *| @max(heads * k * 2 + packed_k, heads * (k + v) * 2 + packed_v));
+    }
+    return widest;
+}
+
+/// The rows a layer of the sequence's rebuilds dense at a forward of `fwd` rows, at most; null where the arch names no
+/// cap, and every caching layer rebuilds the whole sequence.
+fn kvRebuildRowsCap(config: *const model_mod.ModelConfig, fwd: u64) ?u64 {
     // A QSA layer rebuilds only what a forward of this width cannot gather in place.
     const qsa_rows: ?u64 = archHook("denseRebuildRows", u64, config, .{fwd});
-    if (config.swaRingTokens() == 0 and qsa_rows == null) return 0;
+    if (config.swaRingTokens() == 0 and qsa_rows == null) return null;
     // A layer whose prefill attention reads the PACKED cache one dispatch at a
     // time (`transformer.fusedSdpaPrefillKv`) never rebuilds more than a
     // dispatch's keys, at `MOE_PREFILL_COEXIST` of them — the dispatches are
     // serially dependent through the softmax carry, so this is the ceiling.
     // The kill switch takes the width off `prefillHeadDimFused` and the whole
     // rebuild comes back with it. A decode rebuilds whole below the packed arms' floor.
-    const seq_rows: u64 = if (qsa_rows) |rows| rows else if (trunk.prefillHeadDimFused(config.prefillScoreHeadDim()))
+    return if (qsa_rows) |rows| rows else if (trunk.prefillHeadDimFused(config.prefillScoreHeadDim()))
         @max(MOE_PREFILL_COEXIST *| @as(u64, @intCast(trunk.PACKED_KV_SLICE_MAX)), DECODE_REBUILD_KEYS_MAX)
     else
-        seq;
-    var widest: u64 = 0;
-    var li: u32 = 0;
-    while (li < config.num_hidden_layers) : (li += 1) {
-        const rows: u64 = if (config.isKvPerTokenLayer(li)) @min(seq, seq_rows) else @min(seq, config.swaRingTokens());
-        widest = @max(widest, rows *| config.layerKvBytes(li));
-    }
-    return widest;
+        std.math.maxInt(u64);
+}
+
+fn kvRebuildRows(config: *const model_mod.ModelConfig, seq: u64, seq_rows: u64, li: u32) u64 {
+    return if (config.isKvPerTokenLayer(li)) @min(seq, seq_rows) else @min(seq, config.swaRingTokens());
 }
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
@@ -1024,10 +1060,24 @@ fn pastRowsPeak(config: *const model_mod.ModelConfig, fwd: u64, site: ?u64, byte
     return (fwd *| (site orelse rows) +| bytes) -| fwd *| rows;
 }
 
-/// What a decoded trunk weight adds to a chunk's bill: it lives only through its own linear's matmul, beside the rows
-/// that matmul holds (`coolerPrefillDecodeSiteRowBytes`).
-pub fn trunkDecodeBilled(config: *const model_mod.ModelConfig, fwd: u64) u64 {
-    return pastRowsPeak(config, fwd, archHook("coolerPrefillDecodeSiteRowBytes", u64, config, .{}), trunkDecodeScratchBytes(config, fwd));
+/// What the transients a forward holds at one moment of a layer add to a chunk's bill. A decoded trunk weight lives
+/// through its own linear's matmul, beside the rows that matmul holds (`coolerPrefillDecodeSiteRowBytes`). A
+/// full-attention layer's dense KV rebuild lives through that layer (`coolerPrefillAttnRowBytes`): beside the packed
+/// half it is dequantizing (`kvRebuildPeakBytes`), and beside o_proj's decoded weight, as o_proj runs before the view is
+/// released. On an exact Cooler bill that is the largest of these moments past the rows' peak; elsewhere the weight
+/// whole, and the rebuild in `prefillMemoryNeeded`'s terms.
+pub fn forwardMomentsBilled(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, seq: u64) u64 {
+    const weight = trunkDecodeScratchBytes(config, fwd);
+    const rows = coolerPrefillRowBytes(config);
+    if (rows == 0) return weight;
+    var top: u64 = fwd *| rows;
+    if (weight > 0) top = @max(top, fwd *| (archHook("coolerPrefillDecodeSiteRowBytes", u64, config, .{}) orelse rows) +| weight);
+    const dense = if (kv_bits >= 16) 0 else kvRebuildDenseBytes(config, seq, fwd);
+    if (dense > 0) {
+        const at_attn = fwd *| (archHook("coolerPrefillAttnRowBytes", u64, config, .{}) orelse rows);
+        top = @max(top, at_attn +| @max(kvRebuildPeakBytes(config, kv_bits, seq, fwd), dense +| weight));
+    }
+    return top -| fwd *| rows;
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -2181,7 +2231,8 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
     const scores: u64 = if (!trunk.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
-    const dequant: u64 = if (kv_bits >= 16) 0 else if (req.dequant_scratch_bytes > 0)
+    // An exact Cooler bill holds the rebuild among its forward's moments (`forwardMomentsBilled`).
+    const dequant: u64 = if (kv_bits >= 16 or req.cooler_row_bytes > 0) 0 else if (req.dequant_scratch_bytes > 0)
         req.dequant_scratch_bytes
     else
         2 * seq * kv_heads * hdim * 2;
@@ -2755,7 +2806,7 @@ pub fn requestHeldBytes(
         qsaMaskBilled(config, fwd, seq) +
         slidingBandScoreBytes(config, fwd) +
         fp8DequantScratchBytes(config, fwd) +
-        trunkDecodeBilled(config, fwd) +
+        forwardMomentsBilled(config, kv_bits, fwd, seq) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }

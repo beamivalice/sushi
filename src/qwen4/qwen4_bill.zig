@@ -103,6 +103,15 @@ pub fn coolerPrefillDecodeSiteRowBytes(config: *const model_mod.ModelConfig) ?u6
     return @max(@max(@max(r.gdn, r.attn), @max(r.ple, shared)), head) + r.trunk + r.inflight;
 }
 
+/// The rows held beside a full-attention layer's dense KV rebuild (`kv_view`, released as the layer returns): its own,
+/// the trunk's, the planes in flight and its selected blocks (`indexer_budget / ratio` a row, i32).
+pub fn coolerPrefillAttnRowBytes(config: *const model_mod.ModelConfig) ?u64 {
+    if (bills.rateGroupedPrefillBytesPerRow(config) == 0) return null;
+    const r = coolerPrefillRows(config);
+    const blocks: u64 = if (config.indexer_compress_ratio > 0) @as(u64, config.indexer_budget) / config.indexer_compress_ratio * 4 else 0;
+    return r.attn + r.trunk + r.inflight + blocks;
+}
+
 /// The rows held where a full-attention layer selects its QSA blocks: the trunk's alone.
 pub fn coolerPrefillEntryRowBytes(config: *const model_mod.ModelConfig) ?u64 {
     if (bills.rateGroupedPrefillBytesPerRow(config) == 0) return null;

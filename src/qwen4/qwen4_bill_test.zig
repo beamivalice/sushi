@@ -2084,14 +2084,86 @@ test "on Sushi Cooler a decoded trunk weight is billed beside the rows at its ow
         // A request prices its widest forward, a tail the chunk loop absorbs included.
         const fwd = bills.requestForwardRows(&cfg, seq, width, 0);
         const past_request = (fwd * at_matmul + weight) -| fwd * r.peak();
+        // A dense cache rebuilds nothing, so the weight's matmul is the one moment past the rows (the rebuild beside
+        // o_proj's weight is the next cell's).
         trunk_gemm.can_serve_for_test = false;
-        const plain = .{ bills.prefillChunkCost(&cfg, 8, width, seq, .{}), bills.requestHeldBytes(&cfg, seq, 16, 8, width, .{}) };
+        const plain = .{ bills.prefillChunkCost(&cfg, 16, width, seq, .{}), bills.requestHeldBytes(&cfg, seq, 16, 16, width, .{}) };
         trunk_gemm.can_serve_for_test = true;
-        const decoded = .{ bills.prefillChunkCost(&cfg, 8, width, seq, .{}), bills.requestHeldBytes(&cfg, seq, 16, 8, width, .{}) };
+        const decoded = .{ bills.prefillChunkCost(&cfg, 16, width, seq, .{}), bills.requestHeldBytes(&cfg, seq, 16, 16, width, .{}) };
         errdefer std.debug.print("{d} keys at {d} rows: chunk {d} -> {d} KB, request ({d} rows) {d} -> {d} KB with the decoded weight, {d} and {d} KB past the rows' peak\n", .{ seq, width, plain[0] >> 10, decoded[0] >> 10, fwd, plain[1] >> 10, decoded[1] >> 10, past >> 10, past_request >> 10 });
         try t.expectEqual(plain[0] + past, decoded[0]);
         try t.expectEqual(plain[1] + past_request, decoded[1]);
     };
+}
+
+test "on Sushi Cooler a full-attention layer's dense KV rebuild is billed beside that layer's rows, with the packed half it copies and o_proj's decoded weight, never on top of the rows' peak" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const trunk_gemm = @import("sushi_exl3").trunk_gemm;
+    var cfg = coolerFlashNext();
+    // The select's sheet is its own term; this holds the rebuild and the weight.
+    bills.qsa_off_for_test = true;
+    defer bills.qsa_off_for_test = false;
+    defer trunk_gemm.can_serve_for_test = null;
+    const r = @import("qwen4_bill.zig").coolerPrefillRows(&cfg);
+    const peak = r.peak();
+    // At a full-attention layer: its rows, the trunk's, the planes in flight and the selected blocks (i32 a row).
+    const at_attn = r.attn + r.trunk + r.inflight + cfg.indexer_budget / cfg.indexer_compress_ratio * 4;
+    try t.expect(peak > at_attn);
+    const kvh: u64 = cfg.num_key_value_heads;
+    const hd: u64 = cfg.head_dim;
+    // One layer's rebuild at `keys`, and its peak: both dense halves beside V's packed codes, scales and biases, which
+    // the engine's dequantize copies contiguous from the cache's strided slice (kv8, groups of 64, bf16 scales).
+    const Rebuild = struct {
+        fn dense(c: *const model_mod.ModelConfig, keys: u64, fwd: u64) u64 {
+            return bills.kvDequantScratchBytes(c, keys, fwd);
+        }
+        fn withCopy(c: *const model_mod.ModelConfig, keys: u64, fwd: u64, heads: u64, dim: u64) u64 {
+            const d = dense(c, keys, fwd);
+            const rows = d / (heads * 2 * dim * 2);
+            return d + rows * heads * (dim + dim / 64 * 2 * 2);
+        }
+    };
+    try t.expectEqual(hd, cfg.layerVHeadDim(cfg.num_hidden_layers - 1));
+    for ([_]u64{ 512, 1024 }) |fwd| {
+        const decoded = fwd >= @as(u64, @intCast(trunk_gemm.DECODED_MIN_ROWS));
+        if (decoded) cfg.trunk_quant = @import("sushi_exl3").format.Decode.tabled(.spec1, .w15);
+        const weight: u64 = if (decoded) trunk_gemm.DECODED_SCRATCH_BYTES else 0;
+        const site = @import("qwen4_bill.zig").coolerPrefillDecodeSiteRowBytes(&cfg).?;
+        // The largest moment: the rows' peak, the decode site with its weight, the rebuild with its copy, the rebuild
+        // with o_proj's weight.
+        const Top = struct {
+            fn at(c: *const model_mod.ModelConfig, keys: u64, w: u64, f: u64, p: u64, s_: u64, a: u64, heads: u64, dim: u64) u64 {
+                const rebuild = @max(Rebuild.withCopy(c, keys, f, heads, dim), Rebuild.dense(c, keys, f) + w);
+                return @max(@max(f * p, if (w > 0) f * s_ + w else 0), f * a + rebuild);
+            }
+        };
+        // The chunk's transient, without the cache's regrowth (`chunkGrowthBytes`), which grows with the keys too.
+        trunk_gemm.can_serve_for_test = decoded;
+        // The longest KV whose rebuild moment still sits under the rows' peak (none at 1,024 rows: o_proj's weight
+        // beside the trunk's attention rows alone is past it), and one well past it.
+        var kv_fits: u64 = 4096;
+        while (Top.at(&cfg, kv_fits + 4096, weight, fwd, peak, site, at_attn, kvh, hd) <= fwd * peak) kv_fits += 4096;
+        const kv_over = 4 * @max(kv_fits, 20_480);
+        const base = bills.prefillTransientReserveAtKv(&cfg, 8, fwd, 4096);
+        const fits = bills.prefillTransientReserveAtKv(&cfg, 8, fwd, kv_fits);
+        const over = bills.prefillTransientReserveAtKv(&cfg, 8, fwd, kv_over);
+        const top_base = Top.at(&cfg, 4096, weight, fwd, peak, site, at_attn, kvh, hd);
+        const top_over = Top.at(&cfg, kv_over, weight, fwd, peak, site, at_attn, kvh, hd);
+        trunk_gemm.can_serve_for_test = false;
+        const plain_base = bills.prefillTransientReserveAtKv(&cfg, 8, fwd, 4096);
+        const top_plain = Top.at(&cfg, 4096, 0, fwd, peak, site, at_attn, kvh, hd);
+        errdefer std.debug.print("a {d}-row chunk: rebuild {d} KB at {d} keys, {d} KB with its copy at {d}; cost {d} / {d} / {d} KB (no NAX {d}), the moments {d} / {d} KB past the rows' peak\n", .{ fwd, Rebuild.dense(&cfg, kv_fits, fwd) >> 10, kv_fits, Rebuild.withCopy(&cfg, kv_over, fwd, kvh, hd) >> 10, kv_over, base >> 10, fits >> 10, over >> 10, plain_base >> 10, (top_base - fwd * peak) >> 10, (top_over - fwd * peak) >> 10 });
+        try t.expectEqual(decoded, top_base > fwd * peak);
+        if (!decoded) {
+            // Its view is released as the attention layer returns, before the MoE or GatedDeltaNet rows are taken.
+            try t.expect(Rebuild.dense(&cfg, kv_fits, fwd) > Rebuild.dense(&cfg, 4096, fwd));
+            try t.expectEqual(base, fits);
+        }
+        try t.expectEqual(base + (top_over - top_base), over);
+        // The decoded weight is billed once, at its largest moment.
+        try t.expectEqual(plain_base + (top_base - top_plain), base);
+    }
 }
 
 test "a request whose tail the chunk loop absorbs is billed at the merged forward's rows, on Sushi Cooler and on MLX" {
@@ -2157,10 +2229,11 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expectEqual(exact, held - bills.requestHeldBytes(&cfg, seq, 8192, 8, 2048, .{}));
     // The bill is what it holds and the margin, once.
     try t.expectEqual(held + bills.BILL_MARGIN_BYTES, prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}));
-    // Turn A of the live 364k session as a Cooler load: 15,748 MB exact with the margin, its widest forward's transient
-    // from the layers' own rows (`qwen4_bill.PrefillRows`; 15,741 MB at the chunk's own 2,048 rows, 7 MB for the 255 its
-    // last forward may absorb), where its MLX load keeps the calibrated net (21,067 MB).
-    try t.expectEqual(@as(u64, 15_748), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
+    // Turn A of the live 364k session as a Cooler load: 15,684 MB exact with the margin, its widest forward's transient
+    // (2,303 rows) from the layers' own rows (`qwen4_bill.PrefillRows`), the whole-sequence KV rebuild beside an
+    // attention layer's rows with V's packed copy (`forwardMomentsBilled`), where its MLX load keeps the calibrated net
+    // (21,067 MB).
+    try t.expectEqual(@as(u64, 15_684), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
 /// The bytes a Cooler cache's buffers take from the pool at `kv_rows` of KV and `state_rows` of history: each buffer (K and
