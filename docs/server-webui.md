@@ -29,6 +29,9 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   `modelStore.failed` note exists only for a refusal, which the server keeps no record of, and goes on the next Save,
   Remove, Rescan or restart. The model list is `/v1/models`; `/v1/settings` only adds each model's settings. Guards: the
   load-failure, refusal-note and rescan scenarios in `tests/test_webui_admin_ui.cjs`.
+  A finished download is listed by the server a moment after it reports it done, so the page asks again (`landed`, six
+  answers, one second apart) until the pack's model is listed, and for an Update until its row stops offering one.
+  Guard: the finished-download blocks in `tests/test_webui_downloads.cjs`.
 
 ## Palette
 

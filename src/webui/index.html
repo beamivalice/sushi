@@ -4750,6 +4750,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
   // A downloaded pack opens in the installed list (its id is its folder's name), where it loads.
   function openInstalled(p) {
+    landed([{ dest: p.path }]);
     history.pushState(null, "", `/models#${encodeURIComponent(p.path.split("/").pop())}`);
     window.dispatchEvent(new PopStateEvent("popstate"));
   }
@@ -4844,6 +4845,19 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     for (const [repo, r] of D.rows) r.el.classList.toggle("pick", repo === D.pick);
     if (D.pick && !D.scrolled && D.rows.has(D.pick)) { D.scrolled = true; D.rows.get(D.pick).el.scrollIntoView({ block: "center" }); }
   }
+  // The server marks a download done a moment before it lists the pack: ask again, for a bounded few answers, until
+  // each finished pack's model is listed (an Update's, until its row stops offering the update).
+  const landing = new Set();
+  async function landed(jobs) {
+    const ids = jobs.map((j) => (j.dest ?? "").split("/").filter(Boolean).pop()).filter((id) => id && !landing.has(id));
+    ids.forEach((id) => landing.add(id));
+    for (let tries = 0; ids.length && tries < 6; tries++) {
+      if (tries) await new Promise((resolve) => setTimeout(resolve, 1000));
+      await invalidate({ models: true, settings: true });
+      if (ids.every((id) => modelStore.byId(id) && !modelStore.byId(id).meta?.pack_update)) break;
+    }
+    ids.forEach((id) => landing.delete(id));
+  }
   async function refreshDownloads(force) {
     clearTimeout(D.timer);
     const viewing = A.view === "downloads", near = () => viewing || (A.view === "models" && !!D.data?.jobs.some(isActive));
@@ -4852,7 +4866,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const d = await pull("downloads", force ? "/v1/downloads?refresh=1" : viewing ? "/v1/downloads" : "/v1/downloads?background=1");
       D.error = null;
       // A finished download is a new model: the Models tab and the chat's list hear of it now.
-      if (d && d.jobs.some((j) => j.phase === "done" && !D.data?.jobs.some((o) => o.repo === j.repo && o.phase === "done"))) modelStore.refresh();
+      if (d) landed(d.jobs.filter((j) => j.phase === "done" && !D.data?.jobs.some((o) => o.repo === j.repo && o.phase === "done")));
       if (d) D.data = d;
       if (D.data && (d || viewing)) markNew(D.data, viewing);
     } catch (e) { D.error = adminErrorText(e); }

@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A pack that finished downloading reaches the Models list and the chat's picker within a few seconds**: the page asked for the model list once when the download turned done, and a pack the server registered a moment later stayed missing for up to 30 s; it now asks again until the model is listed (and, for an Update, until the update badge is gone).
 - **The web UI stops saying "Load failed" once the server no longer reports it**: a Rescan, a settings Save, a removed saved value or a server restart clears a failed load's row and alert, which the page kept for the session; and a Rescan that drops a model drops its row even when `/v1/settings` fails once.
 - **A model whose folder was deleted, or lost its `config.json`, leaves the model list at the next Rescan** ([#114](https://github.com/beamivalice/sushi/issues/114)): a rescan only added before, so the deleted model stayed listed; a loaded model is never dropped, and `/v1/models/rescan` now also answers how many it removed.
 - **A request field of the wrong type is refused by name on more of the API**: a chat `tool_choice` object that names

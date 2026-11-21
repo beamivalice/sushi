@@ -42,7 +42,7 @@ function makeServer() {
     if (/^\/(chat|dashboard|models|settings|downloads)?$/.test(p)) return route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
     calls.push({ path: p, method: request.method(), body: request.postData() });
     switch (p) {
-      case '/v1/models': return route.fulfill(json({ data: state.models }));
+      case '/v1/models': state.onModels?.(); return route.fulfill(json({ data: state.models }));
       case '/props': return route.fulfill(json({ settings: { version: '9.9.9', mtp: {}, prefix_cache: {} }, memory: { available_bytes: 5e9, total_bytes: 64 * GiB }, batching: {} }));
       case '/v1/settings': return route.fulfill(json({ file: '/h/f.json', model_keys: [], applies: 'x', server: { models_dir: { default: '/d', boot_roots: ['/m'], file: null, flag: '', locked: false }, prefix_cache_disk_gb: { file: null, locked: false, effective_bytes: GiB } }, models: [] }));
       case '/metrics.json': return route.fulfill(json({ counters: {}, gauges: {}, histograms: {}, sessions: [] }));
@@ -203,6 +203,38 @@ async function main() {
       server.state.models = [{ id: 'Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw', object: 'model', state: 'unloaded', bytes_on_disk: 40 * GiB }];
       await page.waitForSelector('#modelsList [data-id="Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"]', { timeout: 4000 });
       assert.equal(await page.textContent('#modelsTabPct'), '', 'no percent once it is done');
+      await context.close();
+    }
+
+    {
+      // The server marks a download done a moment before it lists the pack: the page keeps asking until the model is there.
+      const server = makeServer();
+      const repo = PACKS[0].repo, id = repo.split('/')[1];
+      server.state.jobs = [{ repo, dest: `/m/${repo}`, phase: 'downloading', files: 12, file_index: 3, total_bytes: 40 * GiB, done_bytes: 10 * GiB, file: null, speed_bps: 1, eta_s: 9, message: null }];
+      const { page, context } = await open(browser, server, '/downloads');
+      await page.waitForSelector(`${row(repo)} .prog:not([hidden])`);
+      // The server lists the pack from its second answer after the job is done; this view polls the list every 30 s.
+      let doneAsks = 0;
+      server.state.onModels = () => { if (server.state.jobs[0].phase === 'done' && ++doneAsks >= 2) server.state.models = [{ id, object: 'model', state: 'unloaded', bytes_on_disk: 40 * GiB }]; };
+      server.state.jobs[0] = { ...server.state.jobs[0], phase: 'done', done_bytes: 40 * GiB };
+      await page.waitForFunction((i) => !!modelStore.byId(i), id, { timeout: 8000 });
+      await page.click('#modelsTabInstalled');
+      await page.waitForSelector(`#modelsList [data-id="${id}"]`);
+      await context.close();
+    }
+
+    {
+      // A finished Update: the model is listed all along, and its row stops offering the update from the second answer after done.
+      const server = makeServer();
+      const repo = PACKS[3].repo, id = 'd';
+      server.state.models = [{ id, object: 'model', state: 'unloaded', bytes_on_disk: 40 * GiB, meta: { pack_update: { current: '1.0', latest: '2.0' } } }];
+      server.state.jobs = [{ repo, dest: '/m/d', phase: 'downloading', files: 12, file_index: 3, total_bytes: 40 * GiB, done_bytes: 10 * GiB, file: null, speed_bps: 1, eta_s: 9, message: null }];
+      const { page, context } = await open(browser, server, '/downloads');
+      await page.waitForSelector(`${row(repo)} .prog:not([hidden])`);
+      let doneAsks = 0;
+      server.state.onModels = () => { if (server.state.jobs[0].phase === 'done' && ++doneAsks >= 2) server.state.models = [{ id, object: 'model', state: 'unloaded', bytes_on_disk: 40 * GiB }]; };
+      server.state.jobs[0] = { ...server.state.jobs[0], phase: 'done', done_bytes: 40 * GiB };
+      await page.waitForFunction((i) => modelStore.byId(i) && !modelStore.byId(i).meta?.pack_update, id, { timeout: 8000 });
       await context.close();
     }
 
