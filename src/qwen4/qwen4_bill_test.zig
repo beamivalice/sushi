@@ -2621,6 +2621,15 @@ test "Flash-Next on MLX: a max-context search with no cap or a large one prices 
     };
 }
 
+/// Whether some split of `ctx` (a prompt of the sweep and the reply to the context's end) bills over `budget`.
+fn someSplitOver(cfg: *const model_mod.ModelConfig, ctx: u64, budget: u64, chunk: u64, warm: WarmPrefix) bool {
+    var p: u64 = 1;
+    while (p <= ctx) : (p = nextSplitPrompt(p, ctx)) {
+        if (splitBill(cfg, ctx, p, chunk, warm) > budget) return true;
+    }
+    return false;
+}
+
 /// The bill of a request served at `ctx` whose prompt is `prompt` tokens and whose reply takes the rest of the context.
 fn splitBill(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, chunk: u64, warm: WarmPrefix) u64 {
     var probe = cfg.*;
@@ -2628,36 +2637,107 @@ fn splitBill(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, chunk: u6
     return prefillNeededAtChunk(&probe, prompt, @intCast(ctx - prompt), 8, chunk, warm);
 }
 
-/// The prompts a split sweep of `ctx` prices: every one near the context's end, the reservation and each 256-row step,
-/// a prime stride elsewhere (shorter than the QSA select sheet's steps, so a fall between two shows).
+/// The prompts a split sweep of `ctx` prices: every one near the context's end (past the longest that still regrows its
+/// cache, up to 511 rows under the end's step), the reservation and each 256-row step, a prime stride elsewhere (shorter
+/// than the QSA select sheet's steps, so a fall between two shows).
 pub fn nextSplitPrompt(p: u64, ctx: u64) u64 {
     const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
-    const near = ctx - p < 300 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252;
+    const near = ctx - p < 600 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252;
     return p + @as(u64, if (near) 1 else 53);
 }
 
-test "Flash-Next: a request's bill never falls as its prompt grows within a context, on Cooler and MLX, MTP on and off, across the reservation" {
+/// Whether the capacity a request's prefill leaves its cache already holds the reply (`KVCache.heldRows` under the hold the
+/// request binds): the cache has nothing to regrow in decode.
+fn prefillHoldsReply(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, chunk: u64, warm: WarmPrefix) bool {
+    const KV = trunk.KVCache;
+    var probe = cfg.*;
+    probe.pinned_context = @intCast(ctx);
+    const reply = ctx - prompt;
+    const hold: trunk.Hold = .{
+        .reserve = @import("../prefill_plan.zig").reservedPrefillTokens(&probe, prompt, reply, chunk),
+        .end = @max(KV.requestEnd(prompt, reply, bills.getEffectiveContextLength(&probe), bills.speculativeRowsPastEnd(&probe, warm)), prompt),
+    };
+    return KV.heldRows(0, prompt, hold, &.{}) >= hold.end;
+}
+
+test "Flash-Next: a request's bill less its decode regrow never falls as its prompt grows within a context, and the regrow alone falls, to nothing, where the prompt's cache already holds its reply, on Cooler and MLX, MTP on and off, across the reservation" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const no_tier = TierGuard.pin(false, 0);
     defer no_tier.restore();
     const cfgs = [_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4MeasuredTestConfig() };
     var falls: u32 = 0;
-    for (&cfgs, 0..) |*cfg, ci| for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048 }) |chunk| for ([_]u64{ 32_768, 40_000, 133_043, 232_471, 467_395 }) |ctx| {
+    var regrow_falls: u32 = 0;
+    for (&cfgs) |*cfg| for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048 }) |chunk| for ([_]u64{ 32_768, 40_000, 133_043, 232_471, 467_395 }) |ctx| {
         const warm: WarmPrefix = .{ .mtp_on = mtp };
         var prev: u64 = 0;
+        var prev_regrow: u64 = 0;
         var prev_p: u64 = 0;
         var p: u64 = 1;
         while (p <= ctx) : (p = nextSplitPrompt(p, ctx)) {
-            const b = splitBill(cfg, ctx, p, chunk, warm);
-            if (b < prev) {
+            var probe = cfg.*;
+            probe.pinned_context = @intCast(ctx);
+            const terms = bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm);
+            const regrow = terms.decode_regrow_bytes * terms.uplift_16ths / 16;
+            const rest = splitBill(cfg, ctx, p, chunk, warm) - regrow;
+            if (rest < prev) {
                 falls += 1;
-                if (falls < 10) std.debug.print("cfg {d} mtp {} chunk {d} ctx {d}: prompt {d} bills {d}, {d} B under prompt {d}\n", .{ ci, mtp, chunk, ctx, p, b, prev - b, prev_p });
+                if (falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B, {d} B under prompt {d}, regrow aside\n", .{ cfg.model_type, mtp, chunk, ctx, p, rest, prev - rest, prev_p });
             }
-            prev = b;
+            // The regrow falls only where the prompt's cache already holds its reply, and to nothing; it is billed exactly where it does not.
+            if (@import("../cooler_side.zig").onEngine(cfg) and (regrow == 0) != prefillHoldsReply(cfg, ctx, p, chunk, warm)) {
+                regrow_falls += 1;
+                if (regrow_falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B of regrow, its cache {s} its reply\n", .{ cfg.model_type, mtp, chunk, ctx, p, regrow, if (regrow == 0) "does not hold" else "holds" });
+            }
+            if (regrow < prev_regrow and regrow != 0) {
+                regrow_falls += 1;
+                if (regrow_falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B of regrow, under {d} B at prompt {d}, and not to nothing\n", .{ cfg.model_type, mtp, chunk, ctx, p, regrow, prev_regrow, prev_p });
+            }
+            prev = rest;
+            prev_regrow = regrow;
             prev_p = p;
         }
     };
     try std.testing.expectEqual(@as(u32, 0), falls);
+    try std.testing.expectEqual(@as(u32, 0), regrow_falls);
+}
+
+test "Flash-Next on Cooler: a context is priced at its dearest split, which is the prompt alone, the longest prompt that still regrows its cache, or the longest under the reservation, and no split is dearer" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const no_tier = TierGuard.pin(false, 0);
+    defer no_tier.restore();
+    const cfg = coolerFlashNext();
+    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
+    var wrong: u32 = 0;
+    for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048 }) |chunk| for ([_]u64{ 600, 9_000, 32_767, 32_768, 33_000, 40_000, 100_000 }) |ctx| {
+        const warm: WarmPrefix = .{ .mtp_on = mtp };
+        var probe = cfg;
+        probe.pinned_context = @intCast(ctx);
+        // Every split near the context's end and the reservation's edge, a stride elsewhere: the bill's dearest.
+        var dearest: u64 = 0;
+        var at: u64 = 0;
+        var longest_regrowing: u64 = 0;
+        var p: u64 = 1;
+        while (p <= ctx) : (p += if (ctx - p < 600 or (p + 300 > edge and p < edge + 300)) 1 else 61) {
+            const b = splitBill(&cfg, ctx, p, chunk, warm);
+            if (b > dearest) {
+                dearest = b;
+                at = p;
+            }
+            if (bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm).decode_regrow_bytes > 0) longest_regrowing = p;
+        }
+        const priced = bills.contextNeed(&probe, ctx, 8, chunk, warm);
+        // The three splits the bill changes shape at: the longest that regrows, the first that does not, the edge.
+        const candidates = [_]u64{ ctx, longest_regrowing, longest_regrowing + 1, @min(ctx, edge - 1), @min(ctx, edge) };
+        var named: u64 = 0;
+        for (candidates) |c| if (c >= 1 and c <= ctx) {
+            named = @max(named, splitBill(&cfg, ctx, c, chunk, warm));
+        };
+        if (priced != dearest or named > priced) {
+            wrong += 1;
+            std.debug.print("mtp {} chunk {d} ctx {d}: priced {d} B; the dearest split is prompt {d}, {d} B; the named splits bill {d} B\n", .{ mtp, chunk, ctx, priced, at, dearest, named });
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 0), wrong);
 }
 
 test "Flash-Next: the max-context search names the largest context whose every prompt and reply split fits, on Cooler and MLX, at the reservation's edge too" {
@@ -2684,7 +2764,7 @@ test "Flash-Next: the max-context search names the largest context whose every p
                 break;
             }
             for ([_]u64{ named + 1, named + 37, named + 256 }) |above| {
-                if (splitBill(cfg, above, above, chunk, warm) > budget or splitBill(cfg, above, @min(above, trunk.KVCache.RESERVE_MIN_TOKENS) - 1, chunk, warm) > budget) continue;
+                if (someSplitOver(cfg, above, budget, chunk, warm)) continue;
                 bad += 1;
                 if (bad < 10) std.debug.print("cfg {d} mtp {} chunk {d} budget {d}: named {d}, yet {d} fits\n", .{ ci, mtp, chunk, budget, named, above });
             }

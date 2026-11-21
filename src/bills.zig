@@ -1156,15 +1156,45 @@ pub fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64
 }
 
 /// The dearest request a context of `ctx` tokens can be asked for, over every split of it between prompt and reply: what
-/// every context the server names (advertised, admitted at load, or in a refusal) is priced at.
+/// every context the server names (advertised, admitted at load, or in a refusal) is priced at. A split's bill grows with
+/// its prompt except where its cache stops needing a decode regrow (the longest prompt that still regrows is the dearest
+/// below it, `longestRegrowingPrompt`) and where a reservation starts holding the reply, so those splits are priced beside
+/// the prompt alone: no other split is dearer.
 pub fn contextNeed(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
-    // A request's bill never falls as its prompt grows within a context, so the prompt alone is dearest. The longest
-    // prompt under the reservation is priced too, where the cache's rule changes: a guard for MiMo or any arch that
-    // reserves, whose bill could fall there.
     const alone = splitNeed(config, ctx, ctx, kv_bits, chunk, warm);
+    if (!config.reservesKvCapacity()) return alone;
     const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
-    if (!config.reservesKvCapacity() or ctx < edge) return alone;
-    return @max(alone, splitNeed(config, ctx, edge - 1, kv_bits, chunk, warm));
+    var most = alone;
+    if (ctx >= edge) most = @max(most, splitNeed(config, ctx, edge - 1, kv_bits, chunk, warm));
+    if (longestRegrowingPrompt(config, ctx, kv_bits, chunk, warm)) |p| {
+        if (p != edge - 1 or ctx < edge) most = @max(most, splitNeed(config, ctx, p, kv_bits, chunk, warm));
+    }
+    return most;
+}
+
+/// The longest prompt of a `ctx`-token context whose request still regrows its cache in decode (`decodeRegrowBytes`): a
+/// longer prompt's own capacity holds its reply, and no prompt under the reservation edge regrows past it. Null where none
+/// does. A request's capacity after its prefill never falls as its prompt grows, so one bisection finds it.
+fn longestRegrowingPrompt(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) ?u64 {
+    const Regrows = struct {
+        config: *const model_mod.ModelConfig,
+        ctx: u64,
+        kv_bits: u64,
+        chunk: u64,
+        warm: WarmPrefix,
+        fn at(self: @This(), prompt: u64) bool {
+            return decodeRegrowBytes(self.config, prompt, self.ctx - prompt, self.kv_bits, self.chunk, self.warm) > 0;
+        }
+    };
+    const r = Regrows{ .config = config, .ctx = ctx, .kv_bits = kv_bits, .chunk = chunk, .warm = warm };
+    var low: u64 = 1;
+    var high: u64 = @min(ctx -| 1, trunk.KVCache.RESERVE_MIN_TOKENS - 1);
+    if (high < low or !r.at(low)) return null;
+    while (low < high) {
+        const mid = low + (high - low + 1) / 2;
+        if (r.at(mid)) low = mid else high = mid - 1;
+    }
+    return low;
 }
 
 fn splitNeed(config: *const model_mod.ModelConfig, ctx: u64, prompt: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
@@ -2340,27 +2370,20 @@ fn widestBufferRowBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 
 /// What a decode step's regrow holds past the grown cache the request's storage prices at its last row (`cacheStorage`).
 /// The trunk's (`KVCache.growAhead`) rebuilds one buffer at a time, the kept rows joined to a zero tail of the rows it adds,
 /// so at its peak the widest buffer's old copy and that tail are alive beside the new buffer; the MTP head's rebuilds inside
-/// its forward's graph, so its whole cache's old copies and tails are. Priced at the dearest regrow of the
-/// request: its cache starts from the capacity the restore holds (`warm.capacity_tokens`, else none), the prefill grows it
-/// to the prompt (`KVCache.heldRows`, the one rule the cache grows by) and every decode row past a capacity step grows it
-/// again until the request's last row. Nothing where a reservation or a restore already holds the whole reply, on MLX and for
-/// an arch whose requests reserve no capacity.
+/// its forward's graph, so its whole cache's old copies and tails are. Old copy and tail make up the new buffer whole, so
+/// the dearest regrow of a request is its last, whatever capacity the cache grew from: a buffer of the request's final
+/// capacity (`KVCache.heldRows`, the one rule the cache grows by, from the capacity a restore holds, `warm.capacity_tokens`,
+/// else none). Nothing where the prompt's own capacity already holds the reply, as a reservation or a restore leaves it,
+/// on MLX and for an arch whose requests reserve no capacity.
 pub fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     if (!config.reservesKvCapacity() or !cooler_side.onEngine(config)) return 0;
     const KV = trunk.KVCache;
     const hold = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm));
-    const row = widestBufferRowBytes(config, kv_bits);
+    if (KV.heldRows(if (warm.matched_tokens > 0) warm.capacity_tokens else 0, seq, hold, &.{}) >= hold.end) return 0;
     // The head's cache grows inside its forward's graph, which keeps every buffer's old copy and tail beside the new.
     const head_row: u64 = if (headBilled(config, warm)) mtpHeadKvBytesPerToken(config) else 0;
-    var cap = KV.heldRows(if (warm.matched_tokens > 0) warm.capacity_tokens else 0, seq, hold, &.{});
-    var most: u64 = 0;
-    while (cap < hold.end) {
-        const grown = KV.heldRows(cap, cap + 1, hold, &.{});
-        // The two never coexist: the trunk's grows ahead of its forward, the head's inside its own.
-        for ([_]u64{ row, head_row }) |bytes| most = @max(most, pooledCacheBytes(config, cap *| bytes) +| pooledCacheBytes(config, (grown - cap) *| bytes));
-        cap = grown;
-    }
-    return most;
+    // The two never coexist: the trunk's grows ahead of its forward, the head's inside its own.
+    return pooledCacheBytes(config, KV.heldRows(0, hold.end, hold, &.{}) *| @max(widestBufferRowBytes(config, kv_bits), head_row));
 }
 
 /// On a Cooler load each cache buffer is held at its pool size class, at most a sixteenth over its bytes.
