@@ -2229,7 +2229,8 @@ function renderEffortOptions() {
   $("composerEffortName").textContent = select.value || "—";
   applyEffortBudget();
 }
-// The box takes the word's budget when the model or the word changes; a typed value holds until then.
+// The box takes the word's budget when the model or the word changes, and again when a saved cap changes it under a
+// box still holding what the page filled in (`dataset.auto`); a typed value holds until the model or the word changes.
 function applyEffortBudget() {
   const box = $("optThinkBudget");
   const model = selectedModel();
@@ -2239,9 +2240,11 @@ function applyEffortBudget() {
   // An empty box sends no budget, so the request runs under the word's own cap: say so, never "no cap" over one.
   box.placeholder = box.disabled ? "off" : budget == null ? "no cap" : `${Number(budget).toLocaleString("en-US")} (level cap)`;
   const key = `${model?.id ?? ""}|${effort}`;
-  if (box.dataset.budgetFor === key) return;
+  const filled = budget == null ? "" : String(budget);
+  if (box.dataset.budgetFor === key && (box.value !== box.dataset.auto || filled === box.dataset.auto)) return;
   box.dataset.budgetFor = key;
-  box.value = budget == null ? "" : String(budget);
+  box.dataset.auto = filled;
+  box.value = filled;
 }
 // "Default (value)" when the server reports what the model uses unset, else a bare "Default".
 function defaultWith(value) { return value == null ? "Default" : `Default (${value})`; }

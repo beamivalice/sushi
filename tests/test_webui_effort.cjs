@@ -84,9 +84,35 @@ show(models.glm);
 assert.equal(budget.value, '');
 assert.equal(budget.disabled, false, 'an uncapped word can still be capped by hand');
 
-// Every request names the selected effort, and the box's budget when it holds one.
+
+// A saved cap change reaches the box the page filled in; what was typed stays. The next request runs under the new cap.
 const request = vm.createContext({ $: (id) => ({ effortSelect: select, optThinkBudget: budget })[id] ?? { value: '' } });
 vm.runInContext(slice('function wireMessages(', 'function createStreamingView('), request);
+const capped = (cap) => ({ ...models.qwen, reasoning_effort_budgets: { low: 2048, ...(cap == null ? {} : { medium: cap }) } });
+store['sushi-effort'] = 'medium';
+show(capped(8192));
+assert.equal(budget.value, '8192', 'the box took the level cap, nothing typed');
+show(capped(4096));
+assert.equal(budget.value, '4096', 'a lowered cap replaces the value the page filled in');
+assert.equal(request.buildRequest('qwen', []).reasoning_budget_tokens, 4096, 'and the next request runs under it');
+show(capped(null));
+assert.equal(budget.value, '', 'a removed cap empties the box the page filled in');
+assert.equal('reasoning_budget_tokens' in request.buildRequest('qwen', []), false, 'the request then carries no budget');
+show(capped(6000));
+assert.equal(budget.value, '6000', 'a cap added to an uncapped word is taken by a box nobody typed in');
+budget.value = '3000';
+show(capped(5000));
+assert.equal(budget.value, '3000', 'a typed value outlives a cap change');
+assert.equal(budget.placeholder, '5,000 (level cap)', 'while the placeholder names the new cap');
+budget.value = '';
+show(capped(4000));
+assert.equal(budget.value, '', 'a box emptied by hand stays empty: the request runs under the level cap');
+show(capped(5000));
+budget.value = '5000';
+show(capped(5000));
+assert.equal(budget.value, '5000');
+
+// Every request names the selected effort, and the box's budget when it holds one.
 store['sushi-effort'] = 'default';
 show(models.mimo);
 assert.equal(request.buildRequest('mimo', []).reasoning_effort, 'on');
