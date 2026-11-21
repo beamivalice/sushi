@@ -2374,7 +2374,7 @@ pub fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tok
     var head_row: u64 = if (headBilled(config, warm)) mtpHeadKvBytesPerToken(config) else 0;
     const head_bits = archHook("headKvBits", u64, config, .{}) orelse defaultKvBits(config);
     const on_engine = cooler_side.onEngine(config);
-    var most: u64 = 0;
+    var most: u64 = ringCompactionBytes(config, kv_bits);
     var last: ?[4]u64 = null;
     var li: u32 = 0;
     while (li < config.num_hidden_layers) : (li += 1) {
@@ -2390,6 +2390,20 @@ pub fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tok
         most = @max(most, lastRegrowBytes(config, start, seq, hold, if (on_engine) &.{} else &parts, std.mem.max(u64, &parts)));
     }
     return most;
+}
+
+/// What a decode step that passes the cap of a ringed arch's sliding layers holds beside their live rings: every layer's ring
+/// grows past its cap by the cache's rule, then compacts into a fresh ring of its cap that the kept rows are copied into, in
+/// the one graph of the forward, so the old ring, the grown buffer, the fresh ring, the kept rows and the row the step appends
+/// are alive at once, less the live ring they settle to. The most MLX can hold: it frees a layer's old rings as its command buffers complete. Each
+/// step passes the cap again, so a ringed arch bills it at every prompt; zero for an arch that rings nothing.
+pub fn ringCompactionBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    const rows = config.swaRingTokens();
+    if (rows == 0) return 0;
+    const KV = trunk.KVCache;
+    // The old ring, the grown buffer (the row the step appends is in it), the fresh ring and the kept rows, and the appended row's own rows.
+    const alive = rows +| KV.nextCapacityPolicy(@intCast(rows), @intCast(rows + 1)) +| KV.ringKeep(config.sliding_window) +| 1;
+    return kvBytesPerTokenAtBits(config.swaRingBytes(), kv_bits) / rows *| alive;
 }
 
 /// A buffer of `row` bytes a row that must still grow after the prompt's prefill rebuilds, at its last regrow, a buffer of its
@@ -6248,7 +6262,7 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4802232960, 512, 1048576, 1048576, 200000, 3669110880, 512, 1048576,
+        4802232960, 512, 1048576, 1048576, 200000, 3940808280, 512, 1048576,
         1048576, 200000, 3049059800, 512, 1048576, 1048576, 200000, 3236252544,
         512, 1048576, 1048576, 200000,
     }, struct {
@@ -6269,7 +6283,7 @@ test "bill pin: loadServingBill" {
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
         0, 1, 100000, 4802232960, 1048576, 8, 512, 0,
-        1, 100000, 3937546336, 1048576, 8, 512, 0, 0,
+        1, 100000, 4209243736, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6427,7 +6441,7 @@ test "bill pin: the unnamed hot-cache ask" {
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
         2250651648, 2250651648, 36432432640, 5443498496, 1073741824, 2250651648, 1526246400, 1526246400,
-        37433413536, 4442517600, 1073741824, 1526246400, 2052183552, 2052183552, 38071504936, 3804426200,
+        37161716136, 4714215000, 1073741824, 1526246400, 2052183552, 2052183552, 38071504936, 3804426200,
         1073741824, 2052183552, 96290880, 96290880, 37224100992, 4651830144, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6582,10 +6596,10 @@ test "bill pin: prefillNeededAtChunk" {
         1220818744, 1237538616, 927666176, 1352996664, 1535335744, 1552055616, 1288805696, 1667513664,
         4598979200, 4892344960, 3701379200, 5036667520, 6443059712, 6740603392, 5545459712, 6884925952,
         5838183040, 6131548800, 4148583040, 6275871360, 7712737792, 8010281472, 6023137792, 8154604032,
-        1809406080, 1828373120, 1624913280, 1828373120, 2380062080, 2399029120, 2280160640, 2399029120,
-        2040406400, 2059373440, 1798528640, 2059373440, 2611062400, 2630029440, 2453776000, 2630029440,
-        3712812640, 3731779680, 2726812640, 3731779680, 6033032800, 6051999840, 5047032800, 6051999840,
-        5215395200, 5234362240, 3359395200, 5234362240, 7579852160, 7598819200, 5723852160, 7598819200,
+        2075205240, 2094172280, 1896610680, 2094172280, 2645861240, 2664828280, 2551858040, 2664828280,
+        2542006400, 2560973440, 2309959040, 2560973440, 3112662400, 3131629440, 2965206400, 3131629440,
+        3984510040, 4003477080, 2998510040, 4003477080, 6304730200, 6323697240, 5318730200, 6323697240,
+        5726825600, 5745792640, 3870825600, 5745792640, 8091282560, 8110249600, 6235282560, 8110249600,
         2172301720, 2172301720, 2089683520, 2356826520, 2729646720, 2729646720, 2729646720, 2914171520,
         2203677440, 2203677440, 2121102080, 2388202240, 2760733440, 2760733440, 2760733440, 2945258240,
         3083302360, 3083302360, 3083302360, 3452351960, 5349401560, 5349401560, 5349401560, 5718451160,
@@ -6603,7 +6617,7 @@ test "bill pin: prefillNeededAtChunk" {
 }
 
 test "bill pin: defaultRequestBill" {
-    try pinConfigs("defaultRequestBill", &.{ 537696256, 1108173696, 1037824640, 4385838859 }, struct {
+    try pinConfigs("defaultRequestBill", &.{ 537696256, 1619604096, 1037824640, 4385838859 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             g.add(defaultRequestBill(c));
         }
@@ -6869,7 +6883,7 @@ test "bill pin: the wire-limit sentences" {
 test "bill pin: the streamed-load fit" {
     try pinConfigs("expertStreaming", &.{
         65536, 1006731264, 4679639040, 3154214912, 1, 0, 65536, 978283392,
-        5371112800, 3125767040, 1, 0, 65536, 585941504, 5012268760, 2733425152,
+        5642810200, 3125767040, 1, 0, 65536, 585941504, 5012268760, 2733425152,
         1, 0, 65536, 64630784, 6320674816, 2212114432, 1, 0,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {

@@ -478,7 +478,7 @@ fn everyArchConfig(fx: *const fixtures.PinFx, glm_dflash: *const model_mod.Model
     return out[0..n];
 }
 
-test "a request's bill never falls as its prompt grows within a context, every served arch on each engine, MTP on and off, the SSD tier on and off" {
+test "a request's bill less its decode regrow never falls as its prompt grows within a context, and the regrow alone falls only to nothing, every served arch on each engine, MTP on and off, the SSD tier on and off" {
     var fx = try fixtures.PinFx.init();
     defer fx.deinit();
     var glm_dflash = try fixtures.glmAssistantFixture();
@@ -495,15 +495,20 @@ test "a request's bill never falls as its prompt grows within a context, every s
             var probe = c.cfg;
             probe.pinned_context = @intCast(ctx);
             var prev: u64 = 0;
+            var prev_regrow: u64 = 0;
             var p: u64 = 1;
             // Every prompt near a step a term may take (the forward widths, 256 rows, the reservation, the end).
-            while (p <= ctx) : (p += @as(u64, if (ctx - p < 300 or p < 1100 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252) 1 else 67)) {
-                const b = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm);
-                if (b < prev) {
+            while (p <= ctx) : (p += @as(u64, if (ctx - p < 600 or p < 1100 or (p + 300 > edge and p < edge + 300) or p % 256 < 3 or p % 256 > 252) 1 else 67)) {
+                const terms = bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm);
+                // A ringed arch bills its rings' compaction at every prompt, which no prompt's capacity holds: that floor is not the regrow.
+                const regrow = (terms.decode_regrow_bytes -| bills.ringCompactionBytes(&probe, 8)) * terms.uplift_16ths / 16;
+                const rest = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm) - regrow;
+                if (rest < prev or (regrow < prev_regrow and regrow != 0)) {
                     falls += 1;
-                    if (falls < 10) std.debug.print("{s} tier {} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B under the prompt before it\n", .{ c.name, tier, mtp, chunk, ctx, p, prev - b });
+                    if (falls < 10) std.debug.print("{s} tier {} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B under the prompt before it, regrow aside, or its regrow falls from {d} to {d} B\n", .{ c.name, tier, mtp, chunk, ctx, p, prev -| rest, prev_regrow, regrow });
                 }
-                prev = b;
+                prev = rest;
+                prev_regrow = regrow;
             }
         };
     }

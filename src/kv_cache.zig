@@ -349,7 +349,7 @@ pub const KVCache = struct {
     /// Rows a compaction keeps. The gap below `ringCap` is rewind headroom:
     /// a full-reuse restore clamps back a token and a prefix match lands
     /// wherever the histories diverged, and neither may fall off the ring.
-    fn ringKeep(window: u32) usize {
+    pub fn ringKeep(window: u32) usize {
         return @as(usize, window) + ModelConfig.SWA_RING_SLACK / 2;
     }
 
@@ -4004,7 +4004,8 @@ test "the dearest decode regrow of a request on MLX holds beside the grown cache
             try fillGrowingLayers(&cfg, &cache, offset, s);
         }
         const billed = terms.decode_regrow_bytes;
-        if (dearest > billed + regrow_page_slack or billed > dearest + later_most + regrow_page_slack) {
+        // A ringed arch bills its sliding rings' compaction beside, which a decode step's regrow of the global layers never meets.
+        if (dearest > billed + regrow_page_slack or billed > @max(dearest + later_most + regrow_page_slack, bills.ringCompactionBytes(&cfg, bits))) {
             over += 1;
             std.debug.print("{s} kv{d}: a {d}-token prompt + {d}: the dearest regrow holds {d} B past the grown buffers, billed {d} B\n", .{ cfg.model_type, bits, seq, max_tokens, dearest, billed });
         }
@@ -4072,5 +4073,69 @@ test "the dearest decode regrow of the MTP head's cache on MLX holds beside the 
             std.debug.print("a {d}-token prompt + {d}: the head's dearest regrow holds {d} B past its grown cache, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
         }
     };
+    try testing.expectEqual(@as(usize, 0), over);
+}
+
+test "the compaction of a ringed arch's sliding layers in a decode step on MLX holds beside the live rings no more than the request's bill carries, every layer's in one graph" {
+    try mlx.requireGpu();
+    const bills = @import("bills.zig");
+    if (!bills.archBuilt("mimo2")) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const cfg = @import("bills_fixtures_test.zig").mimoV2FlashBillConfig();
+    const cap = @as(usize, cfg.sliding_window) + ModelConfig.SWA_RING_SLACK;
+    var over: usize = 0;
+    var compactions: usize = 0;
+    for ([_]u64{ 8, 16 }) |bits| {
+        var cache = try KVCache.initWithConfig(testing.allocator, cfg.num_hidden_layers, if (bits == 16) KVQuantConfig.dense else KVQuantConfig.affine(8));
+        defer cache.deinit();
+        cache.setSwaRing(cfg.sliding_window);
+        cache.bound(1 << 20);
+        const Step = struct {
+            cache: *KVCache,
+            cfg: *const ModelConfig,
+            add: usize,
+            s: mlx.mlx_stream,
+            // Every sliding layer takes `add` rows, as one decode step's forward builds them before it is evaluated.
+            fn run(self: @This()) !void {
+                var li: u32 = 0;
+                while (li < self.cfg.num_hidden_layers) : (li += 1) {
+                    if (self.cfg.isGlobalLayer(li)) continue;
+                    var k = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(k);
+                    var v = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(v);
+                    try mlx.check(mlx.mlx_ones(&k, &[_]c_int{ 1, @intCast(self.cfg.layerKVHeads(li)), @intCast(self.add), @intCast(self.cfg.layerHeadDim(li)) }, 4, .bfloat16, self.s));
+                    try mlx.check(mlx.mlx_ones(&v, &[_]c_int{ 1, @intCast(self.cfg.layerKVHeads(li)), @intCast(self.add), @intCast(self.cfg.layerVHeadDim(li)) }, 4, .bfloat16, self.s));
+                    var view = try self.cache.update(li, k, v, self.s, @intCast(self.cfg.sliding_window));
+                    view.deinit();
+                }
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                self.cache.appendEvalArrays(vec);
+                try mlx.check(mlx.mlx_eval(vec));
+            }
+        };
+        _ = try mlxPeakOver(s, Step, .{ .cache = &cache, .cfg = &cfg, .add = cap, .s = s });
+        var dearest: u64 = 0;
+        var rows: usize = cap;
+        while (rows < cap + 3 * ModelConfig.SWA_RING_SLACK) : (rows += 1) {
+            const before = KVCache.bufferCapacity(cache.entries[1].keys);
+            const peak = try mlxPeakOver(s, Step, .{ .cache = &cache, .cfg = &cfg, .add = 1, .s = s });
+            // A step past the ring's cap compacts every sliding layer's buffers.
+            if (cache.entries[1].offset < before) {
+                compactions += 1;
+                dearest = @max(dearest, peak);
+            }
+        }
+        // Every layer's compaction in one graph is the worst MLX can hold: it frees a layer's old rings as its command buffers complete.
+        var probe = cfg;
+        probe.pinned_context = 262_144;
+        const billed = bills.prefillRequestTerms(&probe, 100, 4096, bits, 2048, .{}).decode_regrow_bytes;
+        if (dearest > billed + regrow_page_slack) {
+            over += 1;
+            std.debug.print("kv{d}: the rings' compaction holds {d} B past the live rings, billed {d} B\n", .{ bits, dearest, billed });
+        }
+    }
+    try testing.expect(compactions > 0);
     try testing.expectEqual(@as(usize, 0), over);
 }
