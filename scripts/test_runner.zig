@@ -113,6 +113,18 @@ fn isSelected(name: []const u8) bool {
     return kept;
 }
 
+/// The runner's own copy of the environment it started with, array and strings. A test's setenv or unsetenv rebuilds
+/// libc's environment and can free the array (and the strings libc made) that the start block points into, so every
+/// later read the runner and each test's Io make goes through this copy.
+fn ownedEnviron(start: std.process.Environ) std.process.Environ {
+    if (comptime std.process.Environ.Block != std.process.Environ.PosixBlock) return start;
+    const gpa = std.heap.page_allocator;
+    const from = start.block.slice;
+    const copy = gpa.allocSentinel(?[*:0]const u8, from.len, null) catch @panic("OOM");
+    for (from, copy) |entry, *out| out.* = (gpa.dupeSentinel(u8, std.mem.span(entry.?), 0) catch @panic("OOM")).ptr;
+    return .{ .block = .{ .slice = copy } };
+}
+
 /// A step that can load the Qwen cut gets `SUSHI_TEST_FIXTURE_CUT`: `1` when the build declared the cut's memory
 /// (`-Dfixture-cut=true`), `0` when not, so a `0` step that sees QWEN4_TEST_MODEL fails before its first test.
 fn refuseUndeclaredCut(environ: std.process.Environ, step: ?[]const u8) void {
@@ -192,8 +204,9 @@ const need_simple = switch (builtin.zig_backend) {
     else => false,
 };
 
-pub fn main(init: std.process.Init.Minimal) void {
+pub fn main(start: std.process.Init.Minimal) void {
     @disableInstrumentation();
+    const init: std.process.Init.Minimal = .{ .environ = ownedEnviron(start.environ), .args = start.args };
 
     if (builtin.cpu.arch.isSpirV()) {
         // SPIR-V needs an special test-runner
