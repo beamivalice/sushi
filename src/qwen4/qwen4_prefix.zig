@@ -91,12 +91,21 @@ pub fn headDigest(xfm: *trunk_mod.Trunk, h: *std.crypto.hash.sha2.Sha256, s: mlx
 }
 
 
-/// The SSD namespace of a load whose streamed router favours cached experts (`--expert-cache-bias`): the config's tag
-/// and the bias, since its states hold picks that depend on what the cache held, so no exact boot may read them. Null
-/// keeps the config's tag.
+/// The SSD namespace of a streamed load whose picks depend on what the cache held (`--expert-pick-tolerance`,
+/// `--expert-cache-bias`): the config's tag and each non-zero setting, so no exact boot reads its states. Null keeps
+/// the config's tag.
 pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, model_dir: []const u8, xfm: *trunk_mod.Trunk) !?[]u8 {
     _ = model_dir;
     const engine = xfm.expert_stream orelse return null;
-    if (!(engine.cache_bias > 0)) return null;
-    return try std.fmt.allocPrint(allocator, "{s}-cbias{x:0>8}", .{ config.cacheLayoutNamespace() orelse "", @as(u32, @bitCast(engine.cache_bias)) });
+    return layoutKey(allocator, config.cacheLayoutNamespace() orelse "", @import("../expert_stream.zig").pick_tolerance, engine.cache_bias);
+}
+
+fn layoutKey(allocator: std.mem.Allocator, tag: []const u8, pick_tolerance: f32, cache_bias: f32) !?[]u8 {
+    if (!(pick_tolerance > 0) and !(cache_bias > 0)) return null;
+    var key = std.ArrayList(u8).empty;
+    errdefer key.deinit(allocator);
+    try key.appendSlice(allocator, tag);
+    if (pick_tolerance > 0) try key.print(allocator, "-pick{x:0>8}", .{@as(u32, @bitCast(pick_tolerance))});
+    if (cache_bias > 0) try key.print(allocator, "-cbias{x:0>8}", .{@as(u32, @bitCast(cache_bias))});
+    return try key.toOwnedSlice(allocator);
 }

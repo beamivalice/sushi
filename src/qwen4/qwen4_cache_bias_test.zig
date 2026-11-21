@@ -114,3 +114,28 @@ test "qwen4 cache bias: bias 0 routes as no flag, a bias favours cached experts 
         }
     }.run);
 }
+
+test "qwen4 pick tolerance: a lossy pick keeps its states out of the exact namespace, and a tolerance and a bias do not share one (QWEN4_STQ_TINY)" {
+    try contract.qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const expert_stream = @import("../expert_stream.zig");
+            const saved = expert_stream.pick_tolerance;
+            defer expert_stream.pick_tolerance = saved;
+            expert_stream.pick_tolerance = 0.3;
+            var picked = try streamedRun(Q, dir, ids, null);
+            defer picked.deinit();
+            var both = try streamedRun(Q, dir, ids, 8);
+            defer both.deinit();
+            expert_stream.pick_tolerance = 0.2;
+            var other = try streamedRun(Q, dir, ids, null);
+            defer other.deinit();
+            expert_stream.pick_tolerance = 0;
+            var biased = try streamedRun(Q, dir, ids, 8);
+            defer biased.deinit();
+            const keys = [_]?[]u8{ picked.key, both.key, other.key, biased.key };
+            for (keys) |k| try testing.expect(k != null);
+            try testing.expect(std.mem.indexOf(u8, picked.key.?, "-pick") != null);
+            for (keys, 0..) |x, i| for (keys[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x.?, y.?));
+        }
+    }.run);
+}
