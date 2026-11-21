@@ -198,8 +198,6 @@ pub const LoadedModel = struct {
     id: []const u8,
     /// Full absolute path on disk. Allocator-owned dupe.
     path: []const u8,
-    /// The folder's identity (`FolderId`): the one thing two entries' folders are compared by.
-    folder: FolderId = .unset,
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
@@ -318,6 +316,12 @@ pub const LoadedModel = struct {
     /// Counts the claims of this entry (`tryBeginLoadLocked`): an attempt whose files read failed stores the failure
     /// only on an entry no other load claimed since it began.
     claim_gen: u64 = 0,
+
+    /// The folder `path` opens now (`FolderId`), never one kept from registration: a case rename or a retargeted link
+    /// moves what a path loads, and every comparison of folders must see the folder the load would read.
+    pub fn folderNow(self: *const LoadedModel, io: std.Io) FolderId.Error!FolderId {
+        return FolderId.of(io, self.path);
+    }
 
     /// Token → bytes table backing the JSON grammar mask, built lazily on this
     /// entry's first schema-constrained request. Its lifetime matches
@@ -728,9 +732,9 @@ pub const ModelRegistry = struct {
     /// The settings file `rescan` reads; null is `~/.sushi/model-settings.json`. Borrowed.
     settings_path: ?[]const u8 = null,
 
-    /// Set by the server: why the pack folder `folder` cannot load now (a download or update is replacing its files),
-    /// written into `buf`, or null. Called under `mutex`, so it must never take it.
-    load_gate: ?*const fn (buf: []u8, folder: *const FolderId) ?[]const u8 = null,
+    /// Set by the server: why the pack folder `folder` (the one the entry's path opens at the check) cannot load now (a
+    /// download or update is replacing its files), written into `buf`, or null. May run under `mutex`: it must never take it.
+    load_gate: ?*const fn (io: std.Io, buf: []u8, folder: *const FolderId) ?[]const u8 = null,
 
     /// Map of id → entry. Keys are borrowed from `LoadedModel.id`; entries
     /// are heap-allocated and owned by the registry. Iteration order isn't
@@ -880,7 +884,8 @@ pub const ModelRegistry = struct {
     }
 
     /// `registerStubWithMeta` for a caller that has the folder's identity. A folder has one entry: a second id or
-    /// spelling of it is `error.FolderRegistered`, never a second model over the same weights.
+    /// spelling of it is `error.FolderRegistered`, never a second model over the same weights. The identity is only
+    /// compared here; an entry keeps none, and `peekByPathLocked` derives each entry's from its path.
     fn registerStubAt(self: *ModelRegistry, id: []const u8, path: []const u8, folder: FolderId, bytes_on_disk: ?u64, arch_hint: []const u8, streaming_index_complete: bool) !*LoadedModel {
         if (self.entries.get(id) != null) return error.DuplicateId;
         if (self.peekByPathLocked(&folder) != null) return error.FolderRegistered;
@@ -898,7 +903,6 @@ pub const ModelRegistry = struct {
             .allocator = self.allocator,
             .id = id_owned,
             .path = path_owned,
-            .folder = folder,
             .bytes_on_disk = bytes_on_disk,
             .arch_hint = arch_owned,
             .streaming_index_complete = streaming_index_complete,
@@ -1009,9 +1013,14 @@ pub const ModelRegistry = struct {
         return self.peekByPathLocked(folder);
     }
 
+    /// The entry whose path opens `folder` now. Each entry's folder is derived from its path at the call, so a folder
+    /// renamed or relinked after the entry was registered is still found. Caller holds `mutex`.
     pub fn peekByPathLocked(self: *ModelRegistry, folder: *const FolderId) ?*LoadedModel {
         var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| if (entry_ptr.*.folder.eql(folder)) return entry_ptr.*;
+        while (it.next()) |entry_ptr| {
+            const now = entry_ptr.*.folderNow(self.io) catch continue;
+            if (now.eql(folder)) return entry_ptr.*;
+        }
         return null;
     }
 
@@ -1098,7 +1107,8 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         for (found.models) |m| {
             if (self.entries.get(m.id)) |e| {
-                if (e.folder.eql(&m.folder)) self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
+                const now = e.folderNow(self.io) catch continue;
+                if (now.eql(&m.folder)) self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
                 continue;
             }
             if (self.peekByPathLocked(&m.folder) != null) continue;
@@ -1110,37 +1120,60 @@ pub const ModelRegistry = struct {
         return .{ .added = added, .removed = removed };
     }
 
-    /// Takes out of `entries` every entry nothing holds (unloaded or failed, no reference) whose folder is gone from its
-    /// path: deleted, its config.json gone, or the path now leads to another folder. Whatever root, or none, listed it. A load in flight, a loaded model and a held one stay. Caller holds `mutex`.
+    /// An entry no load holds: unloaded or failed, no reference. Only such an entry is ever dropped.
+    fn unheldLocked(e: *const LoadedModel) bool {
+        return (e.state == .unloaded or e.state == .error_state) and e.refcount.load(.seq_cst) == 0;
+    }
+
+    /// Takes out of `entries` every unheld entry whose folder is gone from its path (deleted, or its config.json gone),
+    /// whatever root, or none, listed it, and every unheld entry whose path now opens the folder of another entry (a
+    /// link moved onto it): one folder has one entry. An entry whose path opens another folder, nothing else's, stays
+    /// and follows it (`FolderId` is derived from the path each time). A load in flight, a loaded model and a held one
+    /// stay. Caller holds `mutex`.
     fn retireVanishedLocked(self: *ModelRegistry) !u32 {
         var gone: std.ArrayList(*LoadedModel) = .empty;
         defer gone.deinit(self.allocator);
+        const Seen = struct { e: *LoadedModel, folder: FolderId };
+        var seen: std.ArrayList(Seen) = .empty;
+        defer seen.deinit(self.allocator);
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             const e = entry_ptr.*;
-            if (e.state != .unloaded and e.state != .error_state) continue;
-            if (e.refcount.load(.seq_cst) != 0) continue;
-            if (!e.folder.eql(&e.folder)) continue; // registered without a folder: nothing to compare
-            var dir = std.Io.Dir.cwd().openDir(self.io, e.path, .{}) catch {
-                try gone.append(self.allocator, e);
-                continue;
-            };
-            // A folder without its config.json is no model any more (discovery would not list it).
-            const has_config = if (dir.statFile(self.io, "config.json", .{})) |_| true else |_| false;
-            dir.close(self.io);
-            if (!has_config) {
-                try gone.append(self.allocator, e);
-                continue;
+            if (unheldLocked(e)) {
+                var dir = std.Io.Dir.cwd().openDir(self.io, e.path, .{}) catch {
+                    try gone.append(self.allocator, e);
+                    continue;
+                };
+                // A folder without its config.json is no model any more (discovery would not list it).
+                const has_config = if (dir.statFile(self.io, "config.json", .{})) |_| true else |_| false;
+                dir.close(self.io);
+                if (!has_config) {
+                    try gone.append(self.allocator, e);
+                    continue;
+                }
             }
-            // The path names another folder now (a link moved): this entry's folder is not at it.
-            const now = FolderId.of(self.io, e.path) catch continue;
-            if (!now.eql(&e.folder)) try gone.append(self.allocator, e);
+            try seen.append(self.allocator, .{ .e = e, .folder = e.folderNow(self.io) catch continue });
+        }
+        // Held entries first, then by id: the copy that stays does not depend on the map's order.
+        std.sort.pdq(Seen, seen.items, {}, struct {
+            fn less(_: void, a: Seen, b: Seen) bool {
+                const a_held = !unheldLocked(a.e);
+                if (a_held != !unheldLocked(b.e)) return a_held;
+                return std.mem.lessThan(u8, a.e.id, b.e.id);
+            }
+        }.less);
+        for (seen.items, 0..) |cand, i| {
+            if (!unheldLocked(cand.e)) continue;
+            for (seen.items[0..i]) |kept| if (kept.folder.eql(&cand.folder)) {
+                try gone.append(self.allocator, cand.e);
+                break;
+            };
         }
         try self.retired.ensureUnusedCapacity(self.allocator, gone.items.len);
         for (gone.items) |e| {
             _ = self.entries.remove(e.id);
             self.retired.appendAssumeCapacity(e);
-            log.info("[registry] {s}: its folder is gone; dropped from the model list\n", .{e.id});
+            log.info("[registry] {s}: its folder is gone, or another entry holds it; dropped from the model list\n", .{e.id});
         }
         return @intCast(gone.items.len);
     }
@@ -1176,7 +1209,8 @@ pub const ModelRegistry = struct {
     /// Why `entry` cannot load now (`load_gate`), or null.
     pub fn loadBlocked(self: *ModelRegistry, buf: []u8, entry: *const LoadedModel) ?[]const u8 {
         const gate = self.load_gate orelse return null;
-        return gate(buf, &entry.folder);
+        const folder = entry.folderNow(self.io) catch return std.fmt.bufPrint(buf, "The folder of {s} is not a usable path", .{entry.id}) catch "The folder of this model is not a usable path";
+        return gate(self.io, buf, &folder);
     }
 
     pub fn resolveEntry(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
@@ -3319,3 +3353,96 @@ test "ModelRegistry: register-by-path bills the shards the loader reads, as disc
     try testing.expectEqual(@as(?u64, 10), e.bytes_on_disk);
 }
 
+test "ModelRegistry: a pack folder renamed in case only is still one entry after a rescan" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "org/Pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/Pack/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    // Finder: rename Pack -> pack. APFS folds case, so both spellings are one folder (FolderId's contract).
+    try tmp.dir.rename("org/Pack", tmp.dir, "org/pack", io);
+    _ = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+fn markerGate(_: std.Io, buf: []u8, folder: *const FolderId) ?[]const u8 {
+    // downloads.loadGate's marker half, verbatim in shape: the marker is looked for in the folder the registry passes.
+    var marker: [std.fs.max_path_bytes]u8 = undefined;
+    const at = std.fmt.bufPrintSentinel(&marker, "{s}/.pull-incomplete", .{folder.bytes()}, 0) catch return null;
+    if (std.c.access(at, 0) != 0) return null;
+    return std.fmt.bufPrint(buf, "mixed", .{}) catch "mixed";
+}
+
+test "ModelRegistry: a symlinked models folder pointed elsewhere: the entry's identity is the folder its path loads" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "diskA/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "diskA/beamster/P/model.safetensors", .data = "0123" });
+    try model_discovery.writePackStub(io, tmp.dir, "diskB/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/model.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    // diskB's copy is a stopped pull: its files are mixed and the load gate must refuse it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/.pull-incomplete", .data = "" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try tmpRoot(io, tmp.dir, &rb);
+    try tmp.dir.symLink(io, "diskA", "models", .{ .is_directory = true });
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    const link_root = try std.fmt.bufPrint(&lb, "{s}/models", .{real});
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{link_root}), 2, 0, null);
+    defer reg.deinit();
+    reg.load_gate = &markerGate;
+    const e = reg.peek("beamster/P") orelse return error.TestExpectedResult;
+    // The user points the models link at another disk (or swaps the external drive behind it).
+    try tmp.dir.deleteFile(io, "models");
+    try tmp.dir.symLink(io, "diskB", "models", .{ .is_directory = true });
+    _ = try reg.rescanWithSettings(no_settings);
+    var gb: [256]u8 = undefined;
+    try testing.expect(reg.loadBlocked(&gb, e) != null);
+    // The entry follows its path to the folder it opens now: still the one entry there, with that folder's bytes.
+    try testing.expect(reg.peekByPath(e.path) == e);
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+    try testing.expectEqual(@as(?u64, 1000), e.bytes_on_disk);
+}
+
+test "ModelRegistry: after a case-only rename the entry is still the one its own path names" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "org/Pack");
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    const e = reg.peek("org/Pack") orelse return error.TestExpectedResult;
+    try tmp.dir.rename("org/Pack", tmp.dir, "org/pack", io);
+    tmp.dir.access(io, "org/Pack", .{}) catch return error.SkipZigTest;
+    try testing.expect(reg.peekByPath(e.path) == e);
+}
+
+
+test "ModelRegistry: a link moved onto another entry's folder leaves one entry for it, the held one" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "org/a", "org/b" }) |dir| {
+        try model_discovery.writePackStub(io, tmp.dir, dir);
+        var sb: [64]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors", .{dir}), .data = "0123" });
+    }
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    const b = reg.peek("org/b") orelse return error.TestExpectedResult;
+    _ = b.refcount.fetchAdd(1, .seq_cst);
+    defer _ = b.refcount.fetchSub(1, .seq_cst);
+    try tmp.dir.deleteTree(io, "org/b");
+    try tmp.dir.symLink(io, "a", "org/b", .{ .is_directory = true });
+    try testing.expectEqual(ModelRegistry.Rescanned{ .added = 0, .removed = 1 }, try reg.rescanWithSettings(no_settings));
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+    try testing.expectEqual(b, reg.peek("org/b").?);
+}

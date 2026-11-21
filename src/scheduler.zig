@@ -6465,7 +6465,7 @@ test "a cold load ended before the inference thread takes it returns its model a
         var sch_: *Scheduler = undefined;
         var failing: std.testing.FailingAllocator = undefined;
         var mode: enum { none, fail_post, claim_meanwhile } = .none;
-        fn check(_: []u8, _: *const FolderId) ?[]const u8 {
+        fn check(_: std.Io, _: []u8, _: *const FolderId) ?[]const u8 {
             const at_claim = !reg_.mutex.tryLock();
             if (!at_claim) reg_.mutex.unlock(reg_.io);
             switch (mode) {
@@ -6535,7 +6535,7 @@ test "ensureLoaded: a load whose files fail to read stores the failure only on a
     const Meanwhile = struct {
         var r: *ModelRegistry = undefined;
         var to: ?model_registry_mod.LoadState = null;
-        fn gate(_: []u8, _: *const FolderId) ?[]const u8 {
+        fn gate(_: std.Io, _: []u8, _: *const FolderId) ?[]const u8 {
             const e = r.entries.get("b").?;
             const state = to orelse return null;
             r.mutex.lockUncancelable(r.io);
@@ -6879,7 +6879,7 @@ test "an explicit load of a failed model refused at its claim keeps the stored f
     // A download into the folder starts between the gate before the files and the one at the claim.
     const Gate = struct {
         var r: *ModelRegistry = undefined;
-        fn check(_: []u8, _: *const FolderId) ?[]const u8 {
+        fn check(_: std.Io, _: []u8, _: *const FolderId) ?[]const u8 {
             const at_claim = !r.mutex.tryLock();
             if (!at_claim) r.mutex.unlock(r.io);
             return if (at_claim) "a download into this folder is running" else null;

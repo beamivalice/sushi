@@ -27,8 +27,6 @@ const Job = struct {
     repo: []u8,
     /// The pack folder it fills: an installed pack's own folder for an update.
     dest: []u8,
-    /// `dest`'s identity, what the registry's folders are compared with.
-    folder: FolderId,
     update: bool = false,
     phase: Phase = .queued,
     progress: dp.Progress = .{},
@@ -39,9 +37,9 @@ const Job = struct {
     pid: ?std.posix.pid_t = null,
     meter: dp.Meter = .{},
 
-    fn create(allocator: Allocator, io: std.Io, repo: []const u8, dest: []const u8, update: bool) !*Job {
+    fn create(allocator: Allocator, repo: []const u8, dest: []const u8, update: bool) !*Job {
         const job = try allocator.create(Job);
-        job.* = .{ .allocator = allocator, .repo = &.{}, .dest = &.{}, .folder = try FolderId.of(io, dest), .update = update };
+        job.* = .{ .allocator = allocator, .repo = &.{}, .dest = &.{}, .update = update };
         errdefer job.destroy();
         job.repo = try allocator.dupe(u8, repo);
         job.dest = try allocator.dupe(u8, dest);
@@ -255,15 +253,19 @@ fn loadedModelAtLocked(allocator: Allocator, folder: *const FolderId) Allocator.
     return try allocator.dupe(u8, e.id);
 }
 
-/// The registry's load gate: a pack folder a queued or running download or update fills cannot load, since its
-/// files are replaced one by one and a load would read some of each revision; nor can one a stopped or failed pull
-/// (this server's or `sushi pull`'s) left behind with its `.pull-incomplete` marker.
-pub fn loadGate(buf: []u8, folder: *const FolderId) ?[]const u8 {
+/// The registry's load gate on `folder`, the one the entry's path opens now: a pack folder a queued or running download
+/// or update fills cannot load, since its files are replaced one by one and a load would read some of each revision;
+/// nor can one a stopped or failed pull (this server's or `sushi pull`'s) left behind with its `.pull-incomplete`
+/// marker. A job's folder is derived from its `dest` at the check too, so neither side keeps an identity from before a
+/// rename or a relink.
+pub fn loadGate(io: std.Io, buf: []u8, folder: *const FolderId) ?[]const u8 {
     const want = folder.bytes();
     lock();
     defer unlock();
     for (jobs.items) |j| {
-        if (!j.phase.active() or !j.folder.eql(folder)) continue;
+        if (!j.phase.active()) continue;
+        const filling = FolderId.of(io, j.dest) catch continue;
+        if (!filling.eql(folder)) continue;
         return std.fmt.bufPrint(buf, "{s} is being {s} on Downloads: wait for it to finish, or stop it there, then load it", .{ j.repo, if (j.update) "updated" else "downloaded" }) catch
             "This model is being downloaded on Downloads: wait for it to finish, or stop it there, then load it";
     }
@@ -391,7 +393,7 @@ fn enqueue(io: std.Io, repo: []const u8, dest: []const u8, update: bool) !bool {
             j.destroy();
         } else i += 1;
     }
-    const job = try Job.create(gpa, io, repo, dest, update);
+    const job = try Job.create(gpa, repo, dest, update);
     errdefer job.destroy();
     try jobs.ensureUnusedCapacity(gpa, 1);
     // The thread waits on `mu` until this returns, so it finds the job; it is spawned before the append, so a failed
@@ -757,7 +759,7 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
     defer tmp.cleanup();
     var p: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(testing.io, &p);
-    const job = try Job.create(testing.allocator, testing.io, "beamster/X", p[0..n], false);
+    const job = try Job.create(testing.allocator, "beamster/X", p[0..n], false);
     defer job.destroy();
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "b.safetensors.partial", .data = "1234" });
     try testing.expect(onEvent(job, .{ .listed = .{ .files = 3, .bytes = 30, .present = 0 } }));
@@ -777,7 +779,7 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
 
 test "downloads: a pack that cannot fit is stopped once its listing is known, naming the space" {
     worker_io = testing.io;
-    const job = try Job.create(testing.allocator, testing.io, "beamster/X", "/", false);
+    const job = try Job.create(testing.allocator, "beamster/X", "/", false);
     defer job.destroy();
     // A disk already inside its reserve (a twentieth of 1 TiB): a need of any size is short, a need of 0 is not.
     const v: disk_placement.VolumeSpace = .{ .free = 20 << 30, .total = 1 << 40 };
@@ -862,7 +864,7 @@ test "downloads: with --model-dir typed with a trailing slash, a running update 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const installed = try s.installed(arena_state.allocator());
-    const job = try Job.create(testing.allocator, testing.io, cli.aliases[0].repo, installed, true);
+    const job = try Job.create(testing.allocator, cli.aliases[0].repo, installed, true);
     job.phase = .downloading;
     lock();
     jobs.append(gpa, job) catch unreachable;
@@ -948,4 +950,92 @@ test "downloads: a folder a stopped pull left, with a model loaded from it, refu
     const folder = try FolderId.of(testing.io, dest);
     const claim = claimDest(arena_state.allocator(), testing.io, cli.aliases[0].repo, dest, &folder, false);
     try testing.expectEqualStrings(e.id, claim.loaded_as orelse return error.DownloadQueuedOverALoadedModel);
+}
+// ── The download gates against a folder whose spelling or link changed after it listed ──
+
+const GateFixture = struct {
+    tmp: std.testing.TmpDir,
+    root_buf: [std.fs.max_path_bytes]u8 = undefined,
+    root: []const u8 = "",
+    reg: *@import("model_registry.zig").ModelRegistry = undefined,
+    prev: ?*@import("model_registry.zig").ModelRegistry = null,
+
+    fn deinit(s: *GateFixture) void {
+        server_state.global_registry = s.prev;
+        s.reg.deinit();
+        s.tmp.cleanup();
+    }
+};
+
+test "downloads: a loaded pack folder renamed in case only still refuses an update, and its running update still gates the load" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
+    var s: GateFixture = .{ .tmp = testing.tmpDir(.{ .iterate = true }) };
+    try md.writePackStub(io, s.tmp.dir, "beamster/Pack");
+    try s.tmp.dir.writeFile(io, .{ .sub_path = "beamster/Pack/model.safetensors", .data = "0123456789" });
+    s.root = s.root_buf[0..try s.tmp.dir.realPath(io, &s.root_buf)];
+    s.reg = try ModelRegistry.init(testing.allocator, io, try md.discoverModelsMany(io, testing.allocator, &.{s.root}), 2, 0, null);
+    s.prev = server_state.global_registry;
+    server_state.global_registry = s.reg;
+    defer s.deinit();
+    s.reg.load_gate = &loadGate;
+    const e = s.reg.peek("beamster/Pack") orelse return error.PackNotDiscovered;
+    e.state = .ready;
+    defer e.state = .unloaded;
+    // Renamed in Finder while loaded: Pack -> pack. One folder on APFS, under both spellings.
+    try s.tmp.dir.rename("beamster/Pack", s.tmp.dir, "beamster/pack", io);
+    s.tmp.dir.access(io, "beamster/Pack", .{}) catch return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const dest = try std.fmt.allocPrint(arena_state.allocator(), "{s}/beamster/pack", .{s.root});
+    const folder = try FolderId.of(io, dest);
+    // claimDest's first half (its second would start a real pull): the model in memory at the folder.
+    s.reg.mutex.lockUncancelable(io);
+    const loaded_as = try loadedModelAtLocked(arena_state.allocator(), &folder);
+    s.reg.mutex.unlock(io);
+    // The other half: a running update of that folder gates the entry's load.
+    const job = try Job.create(testing.allocator, "beamster/Pack", dest, true);
+    job.phase = .downloading;
+    lock();
+    jobs.append(gpa, job) catch unreachable;
+    unlock();
+    defer {
+        lock();
+        _ = jobs.pop();
+        unlock();
+        job.destroy();
+    }
+    var gb: [512]u8 = undefined;
+    const why = s.reg.loadBlocked(&gb, e);
+    try testing.expect(why != null);
+    try testing.expectEqualStrings(e.id, loaded_as orelse return error.UpdateQueuedOverALoadedModel);
+}
+
+test "downloads: a symlinked models folder pointed at a stopped pull's copy: the load gate sees its marker" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    const ModelRegistry = @import("model_registry.zig").ModelRegistry;
+    var s: GateFixture = .{ .tmp = testing.tmpDir(.{ .iterate = true }) };
+    try md.writePackStub(io, s.tmp.dir, "diskA/beamster/P");
+    try s.tmp.dir.writeFile(io, .{ .sub_path = "diskA/beamster/P/model.safetensors", .data = "0123" });
+    try md.writePackStub(io, s.tmp.dir, "diskB/beamster/P");
+    try s.tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/model.safetensors", .data = "01234567" });
+    try s.tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/" ++ cli.pull_marker, .data = "" });
+    s.root = s.root_buf[0..try s.tmp.dir.realPath(io, &s.root_buf)];
+    try s.tmp.dir.symLink(io, "diskA", "models", .{ .is_directory = true });
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    const link_root = try std.fmt.bufPrint(&lb, "{s}/models", .{s.root});
+    s.reg = try ModelRegistry.init(testing.allocator, io, try md.discoverModelsMany(io, testing.allocator, &.{link_root}), 2, 0, null);
+    s.prev = server_state.global_registry;
+    server_state.global_registry = s.reg;
+    defer s.deinit();
+    s.reg.load_gate = &loadGate;
+    const e = s.reg.peek("beamster/P") orelse return error.PackNotDiscovered;
+    try s.tmp.dir.deleteFile(io, "models");
+    try s.tmp.dir.symLink(io, "diskB", "models", .{ .is_directory = true });
+    _ = try s.reg.rescanWithSettings("/nonexistent/sushi-test/model-settings.json");
+    var gb: [512]u8 = undefined;
+    const why = s.reg.loadBlocked(&gb, e);
+    try testing.expect(why != null);
 }
