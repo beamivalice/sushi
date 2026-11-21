@@ -4021,12 +4021,13 @@ test "format corpus: an opener the model wrote and nothing more is a cut call: d
 
 /// The bytes the reading's searches covered over `text`, and the open call it left.
 fn readWork(text: []const u8) struct { work: usize, open: ?usize } {
+    const before = tool_reading.work;
     var reader = tool_reading.Reader.init(text, false);
     var open: ?usize = null;
     while (reader.next()) |c| if (c.end == null) {
         open = c.start;
     };
-    return .{ .work = reader.scan.work, .open = open };
+    return .{ .work = tool_reading.work - before, .open = open };
 }
 
 test "format corpus: the reading is linear in the text: quoted and prose openers cost their own bytes, however many, and the calls after them are found" {
@@ -4226,4 +4227,39 @@ test "r173-f-span-cut-call: a call cut after a stray backtick is declined and na
             try testing.expectEqualStrings("I use ` here", std.mem.trim(u8, think_tags.splitThinkBlock(got.text, true, false).content, " \n"));
         }
     };
+}
+
+test "r173-f-callend-linear: a value that spells its call's closer thousands of times is read once: the call ends where its own closer is, in work linear in the text" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const Case = struct { head: []const u8, spelled: []const u8, tail: []const u8 };
+    const cases = [_]Case{
+        .{ .head = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a\", \"content\": \"", .spelled = "</tool_call> x", .tail = "\"}}</tool_call>" },
+        .{ .head = "<|tool_call>call:write_file{path:<|\"|>a<|\"|>,content:<|\"|>", .spelled = "<tool_call|> x", .tail = "<|\"|>}<tool_call|>" },
+        .{ .head = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=content>\n", .spelled = "</function></tool_call> x", .tail = "\n</parameter>\n</function>\n</tool_call>" },
+        .{ .head = "<tool_call>write_file<arg_key>content</arg_key><arg_value>", .spelled = "</tool_call> x", .tail = "</arg_value></tool_call>" },
+        .{ .head = "<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">", .spelled = "</" ++ dsml ++ "invoke> x", .tail = "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>" },
+        .{ .head = "<invoke name=\"write_file\">\n<parameter name=\"content\">", .spelled = "</invoke> x", .tail = "</parameter>\n</invoke>" },
+        .{ .head = "<function name=\"write_file\">\n<param name=\"content\">", .spelled = "</function> x", .tail = "</param>\n</function>" },
+    };
+    for (cases) |c| {
+        var work: [2]usize = undefined;
+        for ([_]usize{ 1500, 3000 }, 0..) |k, i| {
+            var text = std.ArrayList(u8).empty;
+            defer text.deinit(allocator);
+            try text.appendSlice(allocator, c.head);
+            for (0..k) |_| try text.appendSlice(allocator, c.spelled);
+            try text.appendSlice(allocator, c.tail);
+            errdefer std.debug.print("{f} x{d}\n", .{ std.zig.fmtString(c.head), k });
+            const before = tool_reading.work;
+            var reader = tool_reading.Reader.init(text.items, false);
+            const call = reader.next() orelse return error.CallNotRead;
+            try testing.expectEqual(@as(?usize, text.items.len), call.end);
+            try testing.expect(reader.next() == null);
+            work[i] = tool_reading.work - before;
+            try testing.expect(work[i] <= 24 * text.items.len);
+        }
+        errdefer std.debug.print("{f}: work {d} then {d}\n", .{ std.zig.fmtString(c.head), work[0], work[1] });
+        try testing.expect(work[1] <= 5 * work[0] / 2);
+    }
 }

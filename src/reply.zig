@@ -1568,3 +1568,35 @@ test "r173-f-span-cut-call: a call a model backticks ships whole, and its value'
         try testing.expectEqualStrings(c.name, r.calls[0].name);
     };
 }
+
+/// What one settle of a reply may read, per byte of it: a reading pass sweeps the text once for each needle it must rule
+/// out (the next `<`, the call's closers, a think or channel tag), about five sweeps, and a settle makes about twenty-five
+/// passes (the normalize, the parse, the unfinished-call reading, the split, the decline).
+const settle_work_per_byte = 140;
+
+/// The reading work of one `settle` of `text`: every byte a reading search covered (`tool_reading.work`).
+fn settleWork(allocator: std.mem.Allocator, text: []const u8, finish: []const u8) !usize {
+    const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    const before = tool_reading.work;
+    const s = try settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+    defer s.deinit(allocator);
+    return tool_reading.work - before;
+}
+
+test "r173-f-settle-linear: settling k whole calls and a think tag reads the text a bounded number of times, however many calls" {
+    const a = testing.allocator;
+    const call = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>\n";
+    var work: [3]usize = undefined;
+    var bytes: [3]usize = undefined;
+    for ([_]usize{ 200, 400, 800 }, 0..) |k, i| {
+        var text = std.ArrayList(u8).empty;
+        defer text.deinit(a);
+        for (0..k) |_| try text.appendSlice(a, call);
+        try text.appendSlice(a, "\n<think>");
+        bytes[i] = text.items.len;
+        work[i] = try settleWork(a, text.items, "stop");
+    }
+    errdefer std.debug.print("k=200/400/800 bytes={any} work={any}\n", .{ bytes, work });
+    for (work, bytes) |w, n| try testing.expect(w <= settle_work_per_byte * n);
+    try testing.expect(work[2] <= 5 * work[1] / 2);
+}

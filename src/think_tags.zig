@@ -72,13 +72,21 @@ fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
 
 fn rawThinkOpenAt(text: []const u8, from: usize) ?TagAt {
     var i = from;
-    while (std.mem.indexOfPos(u8, text, i, "<think")) |p| {
+    while (true) {
+        const found = std.mem.indexOfPos(u8, text, i, "<think");
+        tool_reading.charge((found orelse text.len) -| i);
+        const p = found orelse return null;
         if (thinkOpenTagLenAt(text[p..])) |l| {
-            if (openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
+            if (chargedOpenCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
         }
         i = p + "<think".len;
     }
-    return null;
+}
+
+/// `openCodeSpanStart`, its line read charged to the reading's work.
+fn chargedOpenCodeSpanStart(text: []const u8) ?usize {
+    tool_reading.charge(text.len - (if (std.mem.lastIndexOfScalar(u8, text, '\n')) |nl| nl + 1 else 0));
+    return openCodeSpanStart(text);
 }
 
 /// The first `</think>` at or after `from` outside an inline code span and outside every call's value.
@@ -89,13 +97,15 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
 /// The first `</think>` at or after `from` outside an inline code span, whatever call it stands in.
 pub fn rawThinkCloseAt(text: []const u8, from: usize) ?TagAt {
     var i = from;
-    while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
+    while (true) {
+        const found = std.mem.indexOfPos(u8, text, i, "</think");
+        tool_reading.charge((found orelse text.len) -| i);
+        const p = found orelse return null;
         if (thinkCloseTagLenAt(text[p..])) |l| {
-            if (openCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
+            if (chargedOpenCodeSpanStart(text[0..p]) == null) return .{ .pos = p, .len = l };
         }
         i = p + "</think".len;
     }
-    return null;
 }
 
 /// Start of the inline code span still open at the end of `text`, or null. A model writing about its own
