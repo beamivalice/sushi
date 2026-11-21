@@ -56,8 +56,6 @@ const MropeData = server_mod.MropeData;
 const SSE_ALLOW_HEADERS_DEFAULT = http.SSE_ALLOW_HEADERS_DEFAULT;
 const TickPlayer = server_mod.TickPlayer;
 const appendRawToolDump = server_mod.appendRawToolDump;
-const buildAnthropicStreamError = anthropic.buildAnthropicStreamError;
-const buildResponsesStreamError = responses_api.buildResponsesStreamError;
 const completionShowsToken = completions.completionShowsToken;
 const completionText = completions.completionText;
 const finishDetailsField = server_mod.finishDetailsField;
@@ -134,6 +132,11 @@ pub const GenErrorWire = struct {
 
     pub fn deinit(self: GenErrorWire, allocator: std.mem.Allocator) void {
         allocator.free(self.message);
+    }
+
+    /// The answer in every dialect's frame, built by `http.ErrorEnvelope`.
+    pub fn envelope(self: GenErrorWire) http.ErrorEnvelope {
+        return .{ .status = self.code, .types = .{ .openai = self.openai_type, .anthropic = self.anthropic_type }, .message = self.message, .code = self.code };
     }
 };
 
@@ -278,17 +281,6 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
     return wire;
 }
 
-/// The terminal SSE frame for the OpenAI dialects, with a `finish_reason: "error"` choice in the surface's own chunk
-/// shape (chat's `delta`, completions' `text`) so a chunk-only client terminates.
-fn buildOpenAiStreamError(allocator: std.mem.Allocator, w: GenErrorWire, text_chunk: bool) ![]u8 {
-    const esc = try jsonEscape(allocator, w.message);
-    defer allocator.free(esc);
-    const choice = if (text_chunk) "\"text\":\"\",\"logprobs\":null" else "\"delta\":{}";
-    return std.fmt.allocPrint(allocator,
-        \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{d}}},"choices":[{{"index":0,{s},"finish_reason":"error"}}]}}
-    ++ "\n\n", .{ esc, w.openai_type, w.code, choice });
-}
-
 /// Which stream a generative surface ends with its error event.
 pub const ErrorSurface = union(enum) {
     openai,
@@ -308,19 +300,19 @@ pub fn sendGenerationError(allocator: std.mem.Allocator, stream: *Conn, err: any
 
     switch (surface) {
         .openai, .completions => {
-            const body = try buildOpenAiStreamError(allocator, w, surface == .completions);
+            const body = try w.envelope().openaiStreamFrame(allocator, surface == .completions);
             defer allocator.free(body);
             try stream.writeAllNoFlush(body);
             try stream.writeAll("data: [DONE]\n\n");
         },
         .anthropic => {
-            const body = try buildAnthropicStreamError(allocator, w);
+            const body = try w.envelope().anthropicStreamEvent(allocator);
             defer allocator.free(body);
             // Anthropic streams have no `[DONE]`; the `error` event is the terminator.
             try sendAnthropicEvent(stream, "error", body);
         },
         .responses => |seq| {
-            const body = try buildResponsesStreamError(allocator, w);
+            const body = try w.envelope().responsesStreamEvent(allocator);
             defer allocator.free(body);
             try sendResponsesEvent(allocator, stream, seq, "error", body);
             // Same gate as the success path: no `[DONE]` over the WS bridge.
@@ -2981,25 +2973,54 @@ test "a streaming fault answers with the SAME mapped error a non-streaming one d
         const quoted = try http.jsonEscape(a, GEN_OOM_MSG);
         defer a.free(quoted);
         const escaped = quoted[1 .. quoted.len - 1];
-        const body = try buildOpenAiStreamError(a, w, false);
+        const body = try w.envelope().openaiStreamFrame(a, false);
         defer a.free(body);
         try t.expect(std.mem.indexOf(u8, body, "\"type\":\"server_error\"") != null);
         try t.expect(std.mem.indexOf(u8, body, "\"code\":503") != null);
         try t.expect(std.mem.indexOf(u8, body, escaped) != null);
         try t.expect(std.mem.indexOf(u8, body, "\"finish_reason\":\"error\"") != null);
 
-        const anth = try buildAnthropicStreamError(a, w);
+        const anth = try w.envelope().anthropicStreamEvent(a);
         defer a.free(anth);
         try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"error\"") != null);
         try t.expect(std.mem.indexOf(u8, anth, "\"type\":\"api_error\"") != null);
         try t.expect(std.mem.indexOf(u8, anth, escaped) != null);
 
-        const resp = try buildResponsesStreamError(a, w);
+        const resp = try w.envelope().responsesStreamEvent(a);
         defer a.free(resp);
         try t.expect(std.mem.indexOf(u8, resp, "\"type\":\"error\"") != null);
         try t.expect(std.mem.indexOf(u8, resp, "\"code\":\"server_error\"") != null);
         try t.expect(std.mem.indexOf(u8, resp, escaped) != null);
     }
+}
+
+test "every error frame of a generation failure is the same bytes in its dialect" {
+    const a = std.testing.allocator;
+    const w: GenErrorWire = .{
+        .status_line = "503 Service Unavailable",
+        .code = 503,
+        .openai_type = "server_error",
+        .anthropic_type = "api_error",
+        .message = "He said \"hi\"\n",
+    };
+    const quoted = "\"He said \\\"hi\\\"\\n\"";
+    const chat = try w.envelope().openaiStreamFrame(a, false);
+    defer a.free(chat);
+    try std.testing.expectEqualStrings("data: {\"error\":{\"message\":" ++ quoted ++ ",\"type\":\"server_error\",\"param\":null,\"code\":503}," ++
+        "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"error\"}]}\n\n", chat);
+    const text = try w.envelope().openaiStreamFrame(a, true);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("data: {\"error\":{\"message\":" ++ quoted ++ ",\"type\":\"server_error\",\"param\":null,\"code\":503}," ++
+        "\"choices\":[{\"index\":0,\"text\":\"\",\"logprobs\":null,\"finish_reason\":\"error\"}]}\n\n", text);
+    const anth = try w.envelope().anthropicStreamEvent(a);
+    defer a.free(anth);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":" ++ quoted ++ "}}", anth);
+    const resp = try w.envelope().responsesStreamEvent(a);
+    defer a.free(resp);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"code\":\"server_error\",\"message\":" ++ quoted ++ ",\"param\":null}", resp);
+    const ws = try w.envelope().wsFrame(a);
+    defer a.free(ws);
+    try std.testing.expectEqualStrings("{\"type\":\"error\",\"status\":503,\"error\":{\"code\":\"server_error\",\"message\":" ++ quoted ++ "}}", ws);
 }
 
 test "an empty prompt refused at submit is a 400 invalid_request_error in both dialects" {

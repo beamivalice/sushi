@@ -62,10 +62,6 @@ caught-error-unsettled src/scheduler.zig:pushTokenWithLogprob a host append whil
 caught-error-unsettled src/scheduler.zig:ensureLoadedOnce a host parse of the model's files on the requesting connection thread, which must never take the inference thread's latch
 caught-error-unsettled src/scheduler.zig:runSingleDecodeTick the reasoning protocol's own errors, raised by host code; the checkErrorDecode right after reads the tick's latch
 caught-error-unsettled src/scheduler.zig:runBatchedDecodeTickInner a host append after the group's forward: a latch pending then is the group's, which runBatchedDecodeTick's checkErrorDecode reads for every row
-error-body-literal src/generation_stream.zig:buildOpenAiStreamError the chat and completions stream's terminal error chunk, built once; sendGenerationError sends it
-error-body-literal src/anthropic.zig:buildAnthropicStreamError the Messages stream's terminal error event, built once; sendGenerationError sends it
-error-body-literal src/responses_api.zig:buildResponsesStreamError the Responses stream's terminal error event, built once; sendGenerationError sends it
-error-body-literal src/http_conn.zig:anthropicEnvelope a test helper that reads a response's envelope and sends nothing
 promise-active src/kld.zig:runCompare a report of the memory a KLD run measured, no promise
 promise-active src/server.zig:sampleGauges the metrics gauges report the allocators' counters, no promise
 promise-active src/generate.zig:prefillMem the prefill-trace log line reports the counters, no promise

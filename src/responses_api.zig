@@ -22,7 +22,6 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const generation_stream = @import("generation_stream.zig");
-const GenErrorWire = generation_stream.GenErrorWire;
 const sendGenerationError = generation_stream.sendGenerationError;
 const nonStreamingViaScheduler = generation_stream.nonStreamingViaScheduler;
 const StreamingTokenStream = generation_stream.StreamingTokenStream;
@@ -127,15 +126,6 @@ pub const ResponsesTurn = struct {
     /// A finished response that would be stored goes here, the caller's to own, instead of into the store.
     kept: ?*?*responses_mod.StoredResponse = null,
 };
-
-/// The `/v1/responses` terminal `error` event payload (`sendResponsesEvent` adds `sequence_number`).
-pub fn buildResponsesStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
-    const esc = try jsonEscape(allocator, w.message);
-    defer allocator.free(esc);
-    return std.fmt.allocPrint(allocator,
-        \\{{"type":"error","code":"{s}","message":{s},"param":null}}
-    , .{ w.openai_type, esc });
-}
 
 fn responsesStoresFinish(finish_reason: []const u8, requested: bool) bool {
     if (std.mem.eql(u8, finish_reason, "client_disconnect")) return false;

@@ -1524,11 +1524,15 @@ fn wsBridgeSend(impl: *anyopaque, data: []const u8) anyerror!void {
 fn wsGenerationErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, err: anyerror) !void {
     const ws_wire = try mapGenerationError(allocator, err);
     defer ws_wire.deinit(allocator);
-    return wsSendErrorTurn(allocator, ws_conn, ws_wire.code, ws_wire.openai_type, ws_wire.message);
+    return wsSendEnvelope(allocator, ws_conn, ws_wire.envelope());
 }
 
 fn wsSendErrorTurn(allocator: std.mem.Allocator, ws_conn: *WsConnT, status: u32, code: []const u8, message: []const u8) !void {
-    const err_frame = try http.wsErrorFrame(allocator, status, code, message);
+    return wsSendEnvelope(allocator, ws_conn, http.ErrorEnvelope.refusal(status, code, message));
+}
+
+fn wsSendEnvelope(allocator: std.mem.Allocator, ws_conn: *WsConnT, envelope: http.ErrorEnvelope) !void {
+    const err_frame = try envelope.wsFrame(allocator);
     defer allocator.free(err_frame);
     try ws_conn.writeText(err_frame);
 }
@@ -2585,7 +2589,13 @@ test "a generation refusal reaches the client whole: the longest of each kind, i
 
 /// Whether `response` carries Anthropic's error envelope.
 fn anthropicEnvelope(response: []const u8) bool {
-    return std.mem.startsWith(u8, responseBody(response), "{\"type\":\"error\",\"error\":{\"type\":\"");
+    const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, responseBody(response), .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const kind = parsed.value.object.get("type") orelse return false;
+    const inner = parsed.value.object.get("error") orelse return false;
+    if (kind != .string or inner != .object or !std.mem.eql(u8, kind.string, "error")) return false;
+    return if (inner.object.get("type")) |t| t == .string else false;
 }
 
 test "an error on an Anthropic route takes Anthropic's envelope, sent by the request reader or before any registry" {

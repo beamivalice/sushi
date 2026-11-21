@@ -299,8 +299,11 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   fixture leaves unset (`draining`), so it reads an earlier test's stack and can refuse; start from `submitTestScheduler`.
   `entry-checkout` flags a write of a hot-cache entry's `checkout` (assigned, set in a literal, captured by pointer,
   written through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
-  `error-body-literal` flags a string literal that spells an error envelope (`{"error":`, `"type":"error"`) outside
-  `src/http.zig`, whose `sendError` picks the envelope by the request's API; tests and `*_test.zig` files exempt.
+  `error-body-literal` flags an error envelope spelled outside `src/http.zig` (an `error` key whose object holds a
+  `message`, or `"type":"error"` beside one; as a literal, a format, `objectField("error")` or a struct), whose
+  `ErrorEnvelope` builds every error answer by the request's API (and a literal or declared-type init of it outside
+  `http.zig` is the same hand-built body); tests and `*_test.zig` files exempt, and
+  `tests/guards/error_body_probes.txt` holds its 28 probes.
   `request-bool-read` flags `x == .bool` and `x != .bool` in the files that read a request body (`server`, `anthropic`,
   `completions`, `responses_api`, `http_conn`, `request_policy`, `generation_stream`): a request's bool is read by
   `request_parse.boolField`, so another type is refused by name and never read as the default.

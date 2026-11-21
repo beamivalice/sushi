@@ -120,11 +120,11 @@ expect_green "a bool compared in a file that reads no request, a switch prong an
 # rule error-body-literal
 tree
 printf '%s\n' 'fn f(s: *S) !void {' '    try send(s, "{\"error\":\"metrics off\"}");' '}' > "$TMP/t/src/p.zig"
-expect_red "a hand-built OpenAI error body" "src/p.zig:2:17 \[error-body-literal\] f: a hand-built error body"
+expect_red "a hand-built OpenAI error body" "src/p.zig:2:17 \[error-body-literal\] f: an error envelope spelled by hand"
 
 tree
 printf '%s\n' 'fn g(s: *S) !void {' '    try send(s,' '        \\{{"type":"error","error":{{"type":"x"}}}}' '    );' '}' > "$TMP/t/src/p.zig"
-expect_red "a hand-built Anthropic error body in a multiline literal" "src/p.zig:3:9 \[error-body-literal\] g: a hand-built error body"
+expect_red "a hand-built Anthropic error body in a multiline literal" "src/p.zig:3:9 \[error-body-literal\] g: an error envelope spelled by hand"
 
 # Each spelling of the envelope's key: spaced, a format argument, split, "type": "error", a JSON writer's field,
 # a multiline literal, a newline after the brace.
@@ -146,6 +146,18 @@ for case in "${spellings[@]}"; do
   expect_red "an error envelope spelled as in ${lines[0]%%(*}" "src/p.zig:$at \[error-body-literal\]"
 done
 
+# The hunter's 26 probes: 16 spell an envelope, 10 are near misses. A near miss may trip another rule, so each is judged
+# by this rule's own tag.
+while IFS= read -r line; do
+  case "$line" in ''|'#'*) continue ;; esac
+  IFS='|' read -r -a parts <<< "$line"
+  tree
+  printf '%s\n' "${parts[@]:2}" > "$TMP/t/src/p.zig"
+  lint
+  if grep -q '\[error-body-literal\]' "$TMP/out"; then got=R; else got=G; fi
+  [ "$got" = "${parts[0]}" ] || fail "probe ${parts[1]} is ${parts[0]} and the lint says $got"
+done < tests/guards/error_body_probes.txt
+
 tree
 printf '%s\n' 'fn g(m: []const u8, n: u32) !void {' '    _ = try std.fmt.allocPrint(alloc, ",\"{s}\":{d}", .{ "error", n });' \
   '    _ = .{ .ok = true, .@"error" = m };' '    _ = parsed.value.@"error".message;' '    _ = "{\"errors\": [], \"type\": \"error_rate\"}";' \
@@ -157,6 +169,11 @@ printf '%s\n' 'fn f(s: *S) !void {' '    try send(s, "{\"error\":\"x\"}");' '}' 
 printf '%s\n' 'fn g() []const u8 {' '    return ",\"error\":null";' '}' 'test "t" { try expect(body, "{\"error\":{\"message\":\"x\"}}"); }' > "$TMP/t/src/p.zig"
 printf '%s\n' 'fn h() []const u8 {' '    return "{\"error\":{\"message\":\"x\"}}";' '}' > "$TMP/t/src/p_test.zig"
 expect_green "the sender's own file, an error field, a test's expected body and a test file"
+
+tree
+printf '%s\n' 'fn f(m: []const u8) !void {' '    const e = http.ErrorEnvelope.of("400 Bad Request", types, m, null);' '    _ = e;' '}' \
+  'fn g(e: http.ErrorEnvelope) ErrorEnvelope {' '    return e;' '}' 'fn h() !ErrorEnvelope {' '    return ErrorEnvelope.refusal(400, "x", "y");' '}' > "$TMP/t/src/p.zig"
+expect_green "an envelope made by its constructors, taken as a parameter, and returned by a fn"
 
 # rule std-xxhash3
 tree

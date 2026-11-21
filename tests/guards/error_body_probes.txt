@@ -1,0 +1,30 @@
+# Probes of the error-body-literal lint (tests/test_lint.sh): <R|G>|<name>|<source line>|<source line>... in one file.
+# R is an error envelope spelled outside src/http.zig or an ErrorEnvelope built by hand, which the lint reports; G is a near miss it leaves alone.
+R|L1 \x22 escapes|fn f(s: *S) !void {|    try send(s, "{\x22error\x22:{\x22message\x22:\x22x\x22}}");|}
+R|L2 key from a named const, ++ joined|const key = "\"error\"";|fn f(s: *S) !void {|    try send(s, "{" ++ key ++ ":{\"message\":\"x\"}}");|}
+R|L3 key literal alone between ++|fn f(s: *S) !void {|    try send(s, "{" ++ "\"error\"" ++ ":{\"message\":\"x\"}}");|}
+R|L4 JSON writer objectField|fn f(w: *W) !void {|    try w.beginObject();|    try w.objectField("error");|    try w.beginObject();|}
+R|L5 multiline indented|fn f(s: *S) !void {|    try send(s,|        \\{|        \\    "error": {|        \\        "message": "x"|        \\    }|        \\}|    );|}
+R|L6 \u{22} escapes|fn f(s: *S) !void {|    try send(s, "{\u{22}error\u{22}:{\u{22}message\u{22}:\u{22}x\u{22}}}");|}
+R|L7 unquoted {s} placeholder with quoted key arg|fn f(m: []const u8) !void {|    _ = try std.fmt.allocPrint(alloc, "{{{s}:{{\"message\":\"{s}\"}}}}", .{ "\"error\"", m });|}
+R|L8 type error as format value|fn f(m: []const u8) !void {|    _ = try std.fmt.allocPrint(alloc, "{{\"type\":\"{s}\",\"error\":{{\"message\":\"{s}\"}}}}", .{ "error", m });|}
+R|L9 Anthropic envelope by JSON writer|fn f(w: *W, m: []const u8) !void {|    try w.write(.{ .type = "error", .@"error" = .{ .type = "api_error", .message = m } });|}
+R|L10 key with colon in a named const|const key = "\"error\":";|fn f(s: *S) !void {|    try send(s, "{" ++ key ++ "{\"message\":\"x\"}}");|}
+R|L11 key with colon as format arg|fn f(m: []const u8) !void {|    _ = try std.fmt.allocPrint(alloc, "{{{s}{{\"message\":\"{s}\"}}}}", .{ "\"error\":", m });|}
+R|L12 typed envelope struct with defaults|const Env = struct { @"error": struct { message: []const u8 = "x" } = .{} };|fn f(w: *W) !void {|    try w.write(Env{});|}
+R|L13 named struct init|const Env = struct { @"error": Inner };|fn f(w: *W, m: []const u8) !void {|    try w.write(Env{ .@"error" = .{ .message = m } });|}
+R|L14 print to a writer|fn f(w: *W, m: []const u8) !void {|    try w.print("{{ \"error\" : {{\"message\":\"{s}\"}}}}", .{m});|}
+R|L15 key built by comptime fmt|const body = std.fmt.comptimePrint("{{\"{s}\":{{\"message\":\"x\"}}}}", .{"error"});|fn f(s: *S) !void {|    try send(s, body);|}
+R|L16 tab after brace|fn f(s: *S) !void {|    try send(s, "{\t\"error\":{\"message\":\"x\"}}");|}
+R|L17 envelope struct literal outside http|const http = @import("http.zig");|fn f(m: []const u8) http.ErrorEnvelope {|    return http.ErrorEnvelope{ .status = 400, .types = .{ .openai = "x", .anthropic = "y" }, .message = m, .code = null };|}
+R|L18 declared-type envelope init|fn f(m: []const u8) !void {|    const e: ErrorEnvelope = .{ .status = 400, .types = .{ .openai = "x", .anthropic = "y" }, .message = m, .code = null };|    _ = e;|}
+G|F1 error as a value|fn f(s: *S) !void {|    try send(s, "{\"status\":\"error\",\"n\":1}");|}
+G|F2 type error_count|fn f(s: *S) !void {|    try send(s, "{\"type\":\"error_count\"}");|}
+G|F3 doc comment|/// Answers {"error":{"message":"x"}} on a bad request.|fn f(s: *S) !void {|    // {"type":"error"}|    _ = s;|}
+G|F4 a JSON schema with a property named error|fn f(s: *S) !void {|    try send(s, "{\"type\":\"object\",\"properties\":{\"error\":{\"type\":\"string\"}}}");|}
+G|F5 a stats object whose first field is error|fn f(w: *W, n: u32) !void {|    try w.write(.{ .@"error" = n, .ok = n });|}
+G|F6 a success body with error null first|fn f(s: *S) !void {|    try send(s, "{\"error\":null,\"ok\":true}");|}
+G|F7 a reader that looks for the type marker|fn isErr(body: []const u8) bool {|    return std.mem.indexOf(u8, body, "\"type\":\"error\"") != null;|}
+G|F8 a parsed envelope with a error field first|const Parsed = struct { @"error": ?struct { message: []const u8 } = null };|fn f(a: A, b: []const u8) !void {|    _ = try std.json.parseFromSlice(Parsed, a, b, .{});|}
+G|F9 log of an error kind|fn f(e: anyerror) void {|    log.warn("{{\"event\":\"error\",\"name\":\"{s}\"}}", .{@errorName(e)});|}
+G|F10 an error key in a Python snippet string|fn f(s: *S) !void {|    try send(s, "except Exception as e: print({\"error\": str(e)})");|}

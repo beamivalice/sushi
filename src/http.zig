@@ -342,49 +342,103 @@ pub fn sendErrorResponseWithHeaders(allocator: std.mem.Allocator, stream: *http_
     return sendError(allocator, stream, status, .{ .openai = err_type, .anthropic = anthropicErrorType(statusCode(status)) }, message, code, extra_headers);
 }
 
-/// An error's type in each API: OpenAI's names the case, Anthropic's the status class.
-pub const ErrorTypes = struct { openai: []const u8, anthropic: []const u8 };
-
 /// THE error sender: the connection picks the envelope, never the caller. On a Responses WebSocket an error is the
 /// turn's terminal frame; otherwise the request's API (`Conn.api`) shapes the body.
 pub fn sendError(allocator: std.mem.Allocator, stream: *http_conn.Conn, status: []const u8, types: ErrorTypes, message: []const u8, code: ?u32, extra_headers: []const u8) !void {
+    const envelope = ErrorEnvelope.of(status, types, message, code);
     if (stream.ws_mode) |bridge| {
-        const frame = try wsErrorFrame(allocator, statusCode(status), types.openai, message);
+        const frame = try envelope.wsFrame(allocator);
         defer allocator.free(frame);
         logHttpResponse(status, "application/json", frame);
         return bridge.sendText(frame);
     }
-    const escaped_msg = try jsonEscape(allocator, message);
-    defer allocator.free(escaped_msg);
-
-    var code_buf: [16]u8 = undefined;
-    const code_str = if (code) |c|
-        std.fmt.bufPrint(&code_buf, "{d}", .{c}) catch "null"
-    else
-        "null";
-
-    const body = switch (stream.api) {
-        .openai => try std.fmt.allocPrint(allocator,
-            \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
-        , .{ escaped_msg, types.openai, code_str }),
-        .anthropic => try std.fmt.allocPrint(allocator,
-            \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
-        , .{ types.anthropic, escaped_msg }),
-    };
+    const body = try envelope.body(allocator, stream.api);
     defer allocator.free(body);
     if (extra_headers.len == 0) return sendResponse(stream, status, "application/json", body);
     try sendResponseWithHeaders(stream, status, "application/json", body, extra_headers);
 }
 
-/// The terminal frame of a refused Responses WebSocket turn: a client ends the turn on `"type":"error"`.
-pub fn wsErrorFrame(allocator: std.mem.Allocator, status: u32, code: []const u8, message: []const u8) ![]u8 {
-    const esc_code = try jsonEscape(allocator, code);
-    defer allocator.free(esc_code);
-    const esc_msg = try jsonEscape(allocator, message);
-    defer allocator.free(esc_msg);
-    return std.fmt.allocPrint(allocator,
-        \\{{"type":"error","status":{d},"error":{{"code":{s},"message":{s}}}}}
-    , .{ status, esc_code, esc_msg });
+/// An error's type in each API: OpenAI's names the case, Anthropic's the status class.
+pub const ErrorTypes = struct { openai: []const u8, anthropic: []const u8 };
+
+/// One error answer, whichever API and frame carries it. The only place an error envelope is spelled (lint
+/// `error-body-literal`): every sender builds its bytes here, and each builder returns them owned. `message` is raw
+/// text, escaped as it is written.
+pub const ErrorEnvelope = struct {
+    /// The HTTP status the answer carries; a Responses WebSocket frame names it.
+    status: u32,
+    types: ErrorTypes,
+    message: []const u8,
+    /// The OpenAI body's `code`; null is written as `null`.
+    code: ?u32,
+
+    /// The answer for a status line (`NNN Reason`).
+    pub fn of(status_line: []const u8, types: ErrorTypes, message: []const u8, code: ?u32) ErrorEnvelope {
+        return .{ .status = statusCode(status_line), .types = types, .message = message, .code = code };
+    }
+
+    /// A refusal that names its status and OpenAI type; Anthropic's type is the status's class.
+    pub fn refusal(status: u32, openai_type: []const u8, message: []const u8) ErrorEnvelope {
+        return .{ .status = status, .types = .{ .openai = openai_type, .anthropic = anthropicErrorType(status) }, .message = message, .code = null };
+    }
+
+    /// The body of a non-streaming answer on the request's API.
+    pub fn body(self: ErrorEnvelope, allocator: std.mem.Allocator, api: http_conn.Api) ![]u8 {
+        const esc = try jsonEscape(allocator, self.message);
+        defer allocator.free(esc);
+        var code_buf: [16]u8 = undefined;
+        return switch (api) {
+            .openai => std.fmt.allocPrint(allocator,
+                \\{{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}}}}
+            , .{ esc, self.types.openai, codeText(&code_buf, self.code) }),
+            .anthropic => std.fmt.allocPrint(allocator,
+                \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
+            , .{ self.types.anthropic, esc }),
+        };
+    }
+
+    /// The terminal frame of a refused Responses WebSocket turn: a client ends the turn on `"type":"error"`.
+    pub fn wsFrame(self: ErrorEnvelope, allocator: std.mem.Allocator) ![]u8 {
+        const esc_code = try jsonEscape(allocator, self.types.openai);
+        defer allocator.free(esc_code);
+        const esc_msg = try jsonEscape(allocator, self.message);
+        defer allocator.free(esc_msg);
+        return std.fmt.allocPrint(allocator,
+            \\{{"type":"error","status":{d},"error":{{"code":{s},"message":{s}}}}}
+        , .{ self.status, esc_code, esc_msg });
+    }
+
+    /// The terminal SSE frame of the OpenAI dialects, with a `finish_reason: "error"` choice in the surface's own chunk
+    /// shape (chat's `delta`, completions' `text`) so a chunk-only client terminates.
+    pub fn openaiStreamFrame(self: ErrorEnvelope, allocator: std.mem.Allocator, text_chunk: bool) ![]u8 {
+        const esc = try jsonEscape(allocator, self.message);
+        defer allocator.free(esc);
+        const choice = if (text_chunk) "\"text\":\"\",\"logprobs\":null" else "\"delta\":{}";
+        var code_buf: [16]u8 = undefined;
+        return std.fmt.allocPrint(allocator,
+            \\data: {{"error":{{"message":{s},"type":"{s}","param":null,"code":{s}}},"choices":[{{"index":0,{s},"finish_reason":"error"}}]}}
+        ++ "\n\n", .{ esc, self.types.openai, codeText(&code_buf, self.code), choice });
+    }
+
+    /// The `/v1/messages` terminal `error` event payload.
+    pub fn anthropicStreamEvent(self: ErrorEnvelope, allocator: std.mem.Allocator) ![]u8 {
+        return self.body(allocator, .anthropic);
+    }
+
+    /// The `/v1/responses` terminal `error` event payload (`sendResponsesEvent` adds `sequence_number`).
+    pub fn responsesStreamEvent(self: ErrorEnvelope, allocator: std.mem.Allocator) ![]u8 {
+        const esc = try jsonEscape(allocator, self.message);
+        defer allocator.free(esc);
+        return std.fmt.allocPrint(allocator,
+            \\{{"type":"error","code":"{s}","message":{s},"param":null}}
+        , .{ self.types.openai, esc });
+    }
+};
+
+/// A code as written in a body: its number, or `null`.
+fn codeText(buf: *[16]u8, code: ?u32) []const u8 {
+    const c = code orelse return "null";
+    return std.fmt.bufPrint(buf, "{d}", .{c}) catch "null";
 }
 
 /// Anthropic's error type for a status: its API types the status class.
@@ -586,4 +640,27 @@ test "bindAddress: garbage is refused by name" {
     var buf: [512]u8 = undefined;
     try std.testing.expectEqualStrings("invalid --host 'example.com'", startupRefusal(error.InvalidHost, "example.com", 80, &buf).?);
     try std.testing.expectEqualStrings("invalid --host '999.1.2.3'", startupRefusal(error.InvalidHost, "999.1.2.3", 80, &buf).?);
+}
+
+test "an error envelope is the same bytes in every frame and API" {
+    const a = testing.allocator;
+    const e = ErrorEnvelope.of("429 Too Many Requests", .{ .openai = "rate_limit", .anthropic = "rate_limit_error" }, "slow \"down\"", 429);
+    const quoted = "\"slow \\\"down\\\"\"";
+    const openai = try e.body(a, .openai);
+    defer a.free(openai);
+    try testing.expectEqualStrings("{\"error\":{\"message\":" ++ quoted ++ ",\"type\":\"rate_limit\",\"param\":null,\"code\":429}}", openai);
+    const anthropic = try e.body(a, .anthropic);
+    defer a.free(anthropic);
+    try testing.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":" ++ quoted ++ "}}", anthropic);
+    const ws = try e.wsFrame(a);
+    defer a.free(ws);
+    try testing.expectEqualStrings("{\"type\":\"error\",\"status\":429,\"error\":{\"code\":\"rate_limit\",\"message\":" ++ quoted ++ "}}", ws);
+    // A sender that names no code writes `null`, and a refusal's Anthropic type is its status class.
+    const refused = ErrorEnvelope.refusal(404, "not_found", "gone");
+    const bare = try refused.body(a, .openai);
+    defer a.free(bare);
+    try testing.expectEqualStrings("{\"error\":{\"message\":\"gone\",\"type\":\"not_found\",\"param\":null,\"code\":null}}", bare);
+    const class = try refused.body(a, .anthropic);
+    defer a.free(class);
+    try testing.expectEqualStrings("{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"gone\"}}", class);
 }

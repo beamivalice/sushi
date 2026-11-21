@@ -304,10 +304,10 @@ before reading a completed stream and requires clean EOF.
   `http.sendError` shapes every error by it (the reader's 413, 501, 417 and bad chunk, the 401 with its Basic
   challenge and no body on HEAD, a load refusal, a 404, 405 or 400 on `/v1/messages` is Anthropic's, typed by status,
   with the status' standard reason phrase; `/metrics.json`'s 503 too). `GET /metrics`' 503 alone is plain text, by
-  decision: a Prometheus scraper reads only its status. No other file spells an error body: lint
-  `error-body-literal` finds the envelope by its key however the literal is spaced, split, formatted or built for a
-  JSON writer. A stream's error event keeps its surface's chunk shape (`ErrorSurface`: chat's `delta`, completions'
-  `text`), built once per surface.
+  decision: a Prometheus scraper reads only its status. Only `http.ErrorEnvelope` spells an error body, in every
+  frame (a body, a WebSocket turn's frame, each surface's stream event: chat's `delta`, completions' `text`); lint
+  `error-body-literal` refuses an envelope spelled in any other file however the literal is spaced, split, formatted,
+  built for a JSON writer or declared as a struct, and an `ErrorEnvelope` made by hand (`ErrorEnvelope{`, `: ErrorEnvelope = .{`); a reader declares its `error` field optional.
 - **A field the server reads is used or refused by name, never read as absent** (`request_parse.generationFieldFault`,
   one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`,
   `tool_choice` (an object is a mode `parseToolChoice` honours, none, auto, any or required, or a function or tool it names; `allowed_tools` is refused by name) and chat's boolean `logprobs`, `responsesFieldFault` the Responses

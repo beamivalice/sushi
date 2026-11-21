@@ -30,7 +30,6 @@ const responses_api = @import("responses_api.zig");
 const splitConstrainedResponse = responses_api.splitConstrainedResponse;
 const handleResponses = responses_api.handleResponses;
 const generation_stream = @import("generation_stream.zig");
-const GenErrorWire = generation_stream.GenErrorWire;
 const sendGenerationError = generation_stream.sendGenerationError;
 const nonStreamingViaScheduler = generation_stream.nonStreamingViaScheduler;
 const StreamingTokenStream = generation_stream.StreamingTokenStream;
@@ -125,16 +124,6 @@ const testWire = server_mod.testWire;
 const test_png_blue = server_mod.test_png_blue;
 const test_png_red = server_mod.test_png_red;
 const toolCallFinishReason = reply_mod.toolCallFinishReason;
-
-/// The `/v1/messages` terminal `error` event payload.
-pub fn buildAnthropicStreamError(allocator: std.mem.Allocator, w: GenErrorWire) ![]u8 {
-    const esc = try jsonEscape(allocator, w.message);
-    defer allocator.free(esc);
-    return std.fmt.allocPrint(allocator,
-        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
-    , .{ w.anthropic_type, esc });
-}
-
 
 /// Anthropic `output_config` — the 2026 spelling Claude Code sends: `effort`
 /// in place of the older `thinking` budget object, and `format` where this

@@ -571,9 +571,9 @@ fn finishUpdate(a: std.mem.Allocator, ok_note: []const u8) void {
 
 /// `error.message` of a server's JSON error body, or "".
 fn errorMessage(a: std.mem.Allocator, body: []const u8) []const u8 {
-    const E = struct { @"error": struct { message: []const u8 = "" } = .{} };
+    const E = struct { @"error": ?struct { message: []const u8 = "" } = null };
     const e = std.json.parseFromSliceLeaky(E, a, body, .{ .ignore_unknown_fields = true }) catch return "";
-    return e.@"error".message;
+    return (e.@"error" orelse return "").message;
 }
 
 fn updateViaServer(a: std.mem.Allocator, p: u16) void {
@@ -2592,4 +2592,16 @@ test "the Load button tooltip keeps a long model name whole" {
     button_row.setLoad(.{ .label = "Load", .symbol = "arrow.down.circle", .tip = tip, .closes_menu = false });
     const load = objc.msg(objc.id, objc.msg(objc.id, row, "subviews", .{}), "objectAtIndex:", .{@as(usize, 1)});
     try std.testing.expectEqualStrings(tip, testToolTip(load));
+}
+
+test "a server's error body gives its error.message, and anything else gives nothing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("no room", errorMessage(a, "{\"error\":{\"message\":\"no room\",\"type\":\"x\"}}"));
+    try std.testing.expectEqualStrings("", errorMessage(a, "{\"error\":{\"type\":\"x\"}}"));
+    try std.testing.expectEqualStrings("", errorMessage(a, "{\"error\":null}"));
+    try std.testing.expectEqualStrings("", errorMessage(a, "{\"error\":\"no room\"}"));
+    try std.testing.expectEqualStrings("", errorMessage(a, "{}"));
+    try std.testing.expectEqualStrings("", errorMessage(a, "not json"));
 }
