@@ -408,6 +408,12 @@ pub fn toolsFault(buf: []u8, tools: std.json.Value, typed: bool) ?[]const u8 {
         if (typed) if (tool.object.get("type")) |t| {
             if (t != .string or !std.mem.eql(u8, t.string, "function")) return fieldFault(buf, "'tools[{d}].type' must be \"function\"", .{i});
         };
+        // Anthropic's server tools and its own client tools (bash, text editor, computer) carry no schema this server
+        // can hand a model, and it runs none of them: only a custom tool is served.
+        if (!typed) if (tool.object.get("type")) |t| {
+            if (t != .string) return fieldFault(buf, "'tools[{d}].type' must be a string", .{i});
+            if (!std.mem.eql(u8, t.string, "custom")) return fieldFault(buf, "'tools[{d}]' is a \"{s}\" tool: this server serves custom tools only (a name, a description and an input_schema)", .{ i, t.string[0..@min(t.string.len, 64)] });
+        };
         const holder = if (tool.object.get("function")) |f| (if (f == .object) f.object else tool.object) else tool.object;
         const name = holder.get("name") orelse return fieldFault(buf, "'tools[{d}]' has no function name", .{i});
         if (name != .string or name.string.len == 0) return fieldFault(buf, "'tools[{d}]' needs a function name that is a non-empty string", .{i});

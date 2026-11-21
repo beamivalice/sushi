@@ -56,24 +56,23 @@ pub const Kind = union(enum) {
     shaped: Checker,
 };
 
-/// What a surface that does not read a row does with it.
-const Elsewhere = enum {
-    /// A 400 naming the field: a field the surface drops is never accepted in silence.
-    refused,
-    /// A field of that surface's own API that this server serves without acting on: type-checked, unread.
-    carried,
-};
-
 const Row = struct {
     key: []const u8,
     kind: Kind,
     on: []const Surface,
-    elsewhere: Elsewhere = .refused,
+    /// Surfaces that accept the field without reading it: a field of their own API that this server serves without
+    /// acting on, type-checked. Every other surface that does not read the row refuses it by name.
+    carried: []const Surface = &.{},
     /// The refusal's sentence where the surface has a better one than the generic.
     unread: ?[]const u8 = null,
 
     fn reads(r: Row, s: Surface) bool {
         for (r.on) |o| if (o == s) return true;
+        return false;
+    }
+
+    fn carries(r: Row, s: Surface) bool {
+        for (r.carried) |o| if (o == s) return true;
         return false;
     }
 };
@@ -84,6 +83,7 @@ const chat_responses = [_]Surface{ .chat, .responses };
 const chat_completions = [_]Surface{ .chat, .completions };
 const chat_messages_responses = [_]Surface{ .chat, .messages, .responses };
 
+const constraint_hint = "constrain the output with a JSON schema: response_format (chat), text.format (Responses) or output_config.format (Messages)";
 const sampler_hint = "this server samples with temperature, top_k, top_p and min_p only";
 
 pub const rows = [_]Row{
@@ -118,7 +118,7 @@ pub const rows = [_]Row{
     .{ .key = "enable_drafter", .kind = .flag, .on = &all },
     .{ .key = "enable_batch_mtp", .kind = .flag, .on = &all },
     .{ .key = "stream", .kind = .flag, .on = &all },
-    .{ .key = "stream_options", .kind = .{ .shaped = streamOptionsFault }, .on = &chat_completions },
+    .{ .key = "stream_options", .kind = .{ .shaped = streamOptionsFault }, .on = &chat_completions, .carried = &.{.responses} },
     .{ .key = "enable_thinking", .kind = .flag, .on = &chat_responses },
     .{ .key = "reasoning_budget_tokens", .kind = .{ .whole = .{ .min = std.math.minInt(i32), .max = std.math.maxInt(i32) } }, .on = &chat_responses },
     .{ .key = "reasoning_effort", .kind = .{ .shaped = anyShape }, .on = &.{.chat} },
@@ -145,11 +145,19 @@ pub const rows = [_]Row{
     .{ .key = "truncation", .kind = .{ .shaped = truncationFault }, .on = &.{.responses} },
     .{ .key = "max_tool_calls", .kind = .{ .whole = .{ .min = 0, .max = std.math.maxInt(u32) } }, .on = &.{.responses} },
     .{ .key = "background", .kind = .flag, .on = &.{.responses} },
-    .{ .key = "metadata", .kind = .{ .shaped = metadataFault }, .on = &.{ .messages, .responses }, .elsewhere = .carried },
+    .{ .key = "metadata", .kind = .{ .shaped = metadataFault }, .on = &.{ .messages, .responses }, .carried = &all },
     .{ .key = "prompt_cache_key", .kind = .text, .on = &all },
-    .{ .key = "safety_identifier", .kind = .text, .on = &.{.responses}, .elsewhere = .carried },
-    .{ .key = "store", .kind = .flag, .on = &.{.responses}, .elsewhere = .carried },
-    .{ .key = "service_tier", .kind = .text, .on = &.{.responses}, .elsewhere = .carried },
+    .{ .key = "safety_identifier", .kind = .text, .on = &.{.responses}, .carried = &all },
+    .{ .key = "store", .kind = .flag, .on = &.{.responses}, .carried = &all },
+    .{ .key = "service_tier", .kind = .text, .on = &.{.responses}, .carried = &all },
+    // Behaviour other servers give these and this one does not: refused on every surface, never dropped.
+    .{ .key = "functions", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'functions' is OpenAI's legacy tool API and is not read: send 'tools'" },
+    .{ .key = "function_call", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'function_call' is OpenAI's legacy tool API and is not read: send 'tool_choice'" },
+    .{ .key = "grammar", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'grammar' is not read: " ++ constraint_hint },
+    .{ .key = "guided_json", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'guided_json' is not read: " ++ constraint_hint },
+    .{ .key = "guided_regex", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'guided_regex' is not read: " ++ constraint_hint },
+    .{ .key = "guided_choice", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'guided_choice' is not read: " ++ constraint_hint },
+    .{ .key = "guided_grammar", .kind = .{ .shaped = anyShape }, .on = &.{}, .unread = "'guided_grammar' is not read: " ++ constraint_hint },
 };
 
 /// Whether `surface` reads `key` at all, whatever the type it reads it at.
@@ -203,14 +211,9 @@ pub fn fault(buf: []u8, surface: Surface, root: std.json.ObjectMap) ?[]const u8 
         if (v == .null) continue;
         if (!r.reads(surface)) {
             if (readsAnywhere(surface, r.key)) continue;
-            switch (r.elsewhere) {
-                .carried => {},
-                .refused => {
-                    // A compaction carries the Responses request it folds and generates nothing from the rest.
-                    if (surface == .compact) continue;
-                    return r.unread orelse fieldFault(buf, "'{s}' is not a field {s} reads: remove it", .{ r.key, surface.route() });
-                },
-            }
+            // A compaction carries the Responses request it folds and generates nothing from the rest.
+            if (surface == .compact) continue;
+            if (!r.carries(surface)) return r.unread orelse fieldFault(buf, "'{s}' is not a field {s} reads: remove it", .{ r.key, surface.route() });
         }
         if (kindFault(buf, r, surface, v)) |m| return m;
     }
@@ -807,7 +810,8 @@ test "a field a surface does not read is refused by name, never dropped" {
         .{ .surface = .chat, .body = "{\"output_config\":{}}", .field = "output_config" },
         .{ .surface = .chat, .body = "{\"ignore_eos\":true}", .field = "ignore_eos" },
         .{ .surface = .chat, .body = "{\"echo\":true}", .field = "echo" },
-        .{ .surface = .responses, .body = "{\"stream_options\":{\"include_usage\":true}}", .field = "stream_options" },
+        .{ .surface = .responses, .body = "{\"stream_options\":{\"include_usage\":true}}", .field = null },
+        .{ .surface = .responses, .body = "{\"stream_options\":\"all\"}", .field = "stream_options" },
         .{ .surface = .responses, .body = "{\"logit_bias\":{}}", .field = "logit_bias" },
         .{ .surface = .completions, .body = "{\"messages\":[]}", .field = "messages" },
         .{ .surface = .completions, .body = "{\"tools\":[]}", .field = "tools" },
@@ -1184,4 +1188,35 @@ test "repeat_penalty: 0 is unset, then off; frequency and presence are additive 
         try testing.expectEqual(c.frequency, req.additivePenalty("frequency_penalty"));
         try testing.expectEqual(c.presence, req.additivePenalty("presence_penalty"));
     }
+}
+
+test "a key that drops behaviour on every surface is refused by name, with the way to ask for it" {
+    for ([_]Surface{ .chat, .completions, .messages, .responses }) |surface| try expectCases(&.{
+        .{ .surface = surface, .body = "{\"functions\":[{\"name\":\"f\"}]}", .field = "functions" },
+        .{ .surface = surface, .body = "{\"function_call\":\"auto\"}", .field = "function_call" },
+        .{ .surface = surface, .body = "{\"grammar\":\"root ::= x\"}", .field = "grammar" },
+        .{ .surface = surface, .body = "{\"guided_json\":{}}", .field = "guided_json" },
+        .{ .surface = surface, .body = "{\"guided_regex\":\"a+\"}", .field = "guided_regex" },
+        .{ .surface = surface, .body = "{\"guided_choice\":[\"a\"]}", .field = "guided_choice" },
+        .{ .surface = surface, .body = "{\"guided_grammar\":\"x\"}", .field = "guided_grammar" },
+        .{ .surface = surface, .body = "{\"grammar\":null,\"functions\":null,\"guided_json\":null}", .field = null },
+    });
+}
+
+test "Messages serves a custom tool and refuses every other typed tool, naming its type" {
+    try expectCases(&.{
+        .{ .surface = .messages, .body = "{\"tools\":[{\"name\":\"t\",\"input_schema\":{\"type\":\"object\"}},{\"type\":\"custom\",\"name\":\"u\",\"input_schema\":{\"type\":\"object\"}}]}", .field = null },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"type\":\"web_search_20250305\",\"name\":\"web_search\"}]}", .field = "tools[0]" },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"name\":\"t\",\"input_schema\":{}},{\"type\":\"web_fetch_20250910\",\"name\":\"web_fetch\"}]}", .field = "tools[1]" },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"type\":\"code_execution_20250522\",\"name\":\"code_execution\"}]}", .field = "tools[0]" },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"type\":\"bash_20250124\",\"name\":\"bash\"}]}", .field = "tools[0]" },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"type\":\"text_editor_20250124\",\"name\":\"str_replace_editor\"}]}", .field = "tools[0]" },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"type\":\"computer_20250124\",\"name\":\"computer\",\"display_width_px\":1024}]}", .field = "tools[0]" },
+        .{ .surface = .messages, .body = "{\"tools\":[{\"type\":7,\"name\":\"t\"}]}", .field = "tools[0].type" },
+    });
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"tools\":[{\"type\":\"bash_20250124\",\"name\":\"bash\"}]}", .{});
+    defer parsed.deinit();
+    var buf: [320]u8 = undefined;
+    const why = fault(&buf, .messages, parsed.value.object).?;
+    try testing.expect(std.mem.indexOf(u8, why, "bash_20250124") != null);
 }

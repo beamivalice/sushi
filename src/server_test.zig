@@ -2922,7 +2922,6 @@ test "server: request fields: /v1/responses and its compaction refuse a field th
             .{ .path = resp, .body = head ++ "\"stop\":5,\"input\":\"hi\"}", .field = "stop" },
             .{ .path = resp, .body = head ++ "\"stop\":[\"a\",7],\"input\":\"hi\"}", .field = "stop" },
             .{ .path = resp, .body = head ++ "\"top_k\":2.5,\"input\":\"hi\"}", .field = "top_k" },
-            .{ .path = resp, .body = head ++ "\"stream_options\":{\"include_usage\":true},\"input\":\"hi\"}", .field = "stream_options" },
             .{ .path = resp, .body = head ++ "\"logit_bias\":{},\"input\":\"hi\"}", .field = "logit_bias" },
             .{ .path = resp, .body = head ++ "\"reasoning\":\"high\",\"input\":\"hi\"}", .field = "reasoning" },
             .{ .path = resp, .body = head ++ "\"text\":{\"format\":{\"type\":\"json_shema\",\"schema\":{\"type\":\"object\"}}},\"input\":\"hi\"}", .field = "text.format.type" },
@@ -3007,6 +3006,50 @@ test "server: request fields: a Responses max_tool_calls as a whole float echoes
             if (got != .integer or got.integer != 3) {
                 std.debug.print("max_tool_calls 3.0 echoed as {any}\n", .{got});
                 return error.EchoReadsAnotherWay;
+            }
+        }
+    }.run);
+}
+
+test "server: request fields: a key that silently dropped behaviour is a 400 naming it, and a custom tool and Responses stream_options are served" {
+    try eachArch(2, .{}, struct {
+        const msg = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const chat = "/v1/chat/completions";
+        const head = "{\"model\":\"tiny\",\"max_tokens\":2,";
+        const typed = [_][]const u8{ "web_search_20250305", "web_fetch_20250910", "code_execution_20250522", "bash_20250124", "text_editor_20250124", "computer_20250124" };
+        const cases = [_]FieldCase{
+            .{ .path = chat, .body = head ++ "\"functions\":[{\"name\":\"f\",\"parameters\":{\"type\":\"object\"}}]," ++ msg ++ "}", .field = "functions" },
+            .{ .path = chat, .body = head ++ "\"function_call\":\"auto\"," ++ msg ++ "}", .field = "function_call" },
+            .{ .path = chat, .body = head ++ "\"grammar\":\"root ::= x\"," ++ msg ++ "}", .field = "grammar" },
+            .{ .path = chat, .body = head ++ "\"guided_json\":{\"type\":\"object\"}," ++ msg ++ "}", .field = "guided_json" },
+            .{ .path = "/v1/completions", .body = head ++ "\"guided_regex\":\"a+\",\"prompt\":\"hi\"}", .field = "guided_regex" },
+            .{ .path = "/v1/messages", .body = head ++ "\"guided_choice\":[\"a\"]," ++ msg ++ "}", .field = "guided_choice" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"guided_grammar\":\"x\",\"input\":\"hi\"}", .field = "guided_grammar" },
+        };
+        fn run() !void {
+            try expectEachRefusedByName(&cases);
+            // A typed tool Messages cannot serve is refused with its type named, on /v1/messages and count_tokens.
+            for (typed) |t| for ([_][]const u8{ "/v1/messages", "/v1/messages/count_tokens" }) |path| {
+                var b: [512]u8 = undefined;
+                const body = try std.fmt.bufPrint(&b, "{s}\"tools\":[{{\"type\":\"{s}\",\"name\":\"x\"}}],{s}}}", .{ head, t, msg });
+                const resp = try request("POST", path, body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, bodyOf(resp), t) == null or std.mem.indexOf(u8, bodyOf(resp), "'tools[0]'") == null) {
+                    std.debug.print("typed tool {s} on {s} not refused naming its type: {s}\n", .{ t, path, resp[0..@min(resp.len, 200)] });
+                    return error.TypedToolServed;
+                }
+            };
+            const served = [_]FieldCase{
+                .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"tools\":[{\"type\":\"custom\",\"name\":\"t\",\"description\":\"d\",\"input_schema\":{\"type\":\"object\"}}]," ++ msg ++ "}", .field = "" },
+                .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"stream_options\":{\"include_obfuscation\":false},\"input\":\"hi\"}", .field = "" },
+            };
+            for (served) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) {
+                    std.debug.print("not served: {s} {s}\n  -> {s}\n", .{ c.path, c.body, resp[0..@min(resp.len, 200)] });
+                    return error.RefusedAServedField;
+                }
             }
         }
     }.run);
