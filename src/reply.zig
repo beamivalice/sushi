@@ -205,12 +205,18 @@ pub const Settled = struct {
     reply: ?ToolReply,
     /// The call the generation left open, whatever ended it.
     declined: ?Declined,
-    normalized: ?[]u8,
+    /// What `text` is when normalization rewrote the stop-cut generation.
+    normalized: ?think_tags.Normalized,
 
     pub fn deinit(self: Settled, allocator: std.mem.Allocator) void {
         if (self.reply) |r| r.deinit(allocator);
         if (self.declined) |d| d.deinit(allocator);
-        if (self.normalized) |n| allocator.free(n);
+        if (self.normalized) |n| n.deinit(allocator);
+    }
+
+    /// Where `text` got its bytes when normalization rewrote it; null when it is the generation's own text, cut at the stop.
+    pub fn provenance(self: Settled) ?[]const listed_tokens.Run {
+        return if (self.normalized) |n| n.runs else null;
     }
 };
 
@@ -229,8 +235,8 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
     };
     errdefer out.deinit(allocator);
     if (ask.normalize) {
-        out.normalized = try think_tags.normalizeEmbeddedThinkBlocks(allocator, cut.text);
-        if (out.normalized) |n| out.text = n;
+        out.normalized = try think_tags.normalizeEmbeddedThinkBlocksMapped(allocator, cut.text);
+        if (out.normalized) |n| out.text = n.text;
     }
     if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
         const model_ended = cut.stop == null and std.mem.eql(u8, gen.finish_reason, "stop");

@@ -4,6 +4,7 @@ const chat = @import("chat.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const BARE_INVOKE = tool_calls_mod.BARE_INVOKE;
 const tool_reading = @import("tool_reading.zig");
+const listed_tokens = @import("listed_tokens.zig");
 const ChatConfig = chat.ChatConfig;
 const FUNCTION_CALLS_TAG = tool_calls_mod.FUNCTION_CALLS_TAG;
 const Message = chat.Message;
@@ -194,6 +195,10 @@ pub const ContentStream = struct {
     /// Where the reply's tool markup is cut (`MarkupCut`), and the bytes it has not let go yet.
     mark: MarkupCut = .{},
     unsent: std.ArrayList(u8) = .empty,
+    /// The join that opens a part after a thought is not part of what `deliver` sends: it waits for `takeJoin`, so a surface
+    /// whose chunks carry logprobs sends it as a delta of its own.
+    join_apart: bool = false,
+    join_pending: bool = false,
 
     pub fn deinit(self: *ContentStream, allocator: std.mem.Allocator) void {
         self.held.deinit(allocator);
@@ -234,7 +239,8 @@ pub const ContentStream = struct {
         self.trimmed = tt.len - body.len;
         const text = body[0..std.mem.trimEnd(u8, body, "\n ").len];
         self.out.clearRetainingCapacity();
-        if (self.lead and self.started) try self.out.append(allocator, '\n');
+        const join = self.lead and self.started;
+        if (join and self.join_apart) self.join_pending = true else if (join) try self.out.appendSlice(allocator, listed_tokens.content_join);
         self.lead = false;
         self.started = true;
         try self.out.appendSlice(allocator, self.held.items);
@@ -248,6 +254,13 @@ pub const ContentStream = struct {
         try self.out.appendSlice(allocator, self.unsent.items[0..n]);
         self.unsent.replaceRangeAssumeCapacity(0, if (self.mark.cut) self.unsent.items.len else n, &.{});
         return if (n == 0) .hold else .{ .send = self.out.items };
+    }
+
+    /// The join to send ahead of the bytes `deliver` or `finish` is about to send, once (`join_apart`).
+    pub fn takeJoin(self: *ContentStream) ?[]const u8 {
+        if (!self.join_pending) return null;
+        self.join_pending = false;
+        return listed_tokens.content_join;
     }
 
     /// The reply ended outside a thought: the withheld whitespace ships, unless the non-stream reply trims
@@ -752,25 +765,53 @@ fn skipContentChannelTag(text: []const u8, start: usize) usize {
     return pos;
 }
 
-/// `part` with every think/thought closer cut out, as a stream drops its marker token (`ContentStream.deliver`);
-/// a think closer inside a code span is text on both. A part that held one is copied into `owned`, which the
-/// caller frees.
-fn contentWithoutClosers(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), part: []const u8) ![]const u8 {
+/// A byte range of the text a reply was generated as.
+const Span = struct { from: usize, to: usize };
+
+/// The pieces of `text[from..to]` between its think/thought closers, appended to `spans`: a stream drops a closer's marker
+/// token (`ContentStream.deliver`), and a closer inside a code span is text on both. Whether any closer was cut.
+fn spansWithoutClosers(allocator: std.mem.Allocator, spans: *std.ArrayList(Span), text: []const u8, from: usize, to: usize) !bool {
+    const part = text[from..to];
     var tags: Tags = .{};
-    if (nextThinkCloseIn(&tags, part, 0) == null) return part;
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
     var pos: usize = 0;
+    var cut = false;
     while (nextThinkCloseIn(&tags, part, pos)) |c| {
-        try out.appendSlice(allocator, part[pos..c.pos]);
+        try spans.append(allocator, .{ .from = from + pos, .to = from + c.pos });
         pos = c.after;
+        cut = true;
     }
-    try out.appendSlice(allocator, part[pos..]);
-    const kept = try out.toOwnedSlice(allocator);
-    errdefer allocator.free(kept);
-    try owned.append(allocator, kept);
-    return kept;
+    try spans.append(allocator, .{ .from = from + pos, .to = to });
+    return cut;
 }
+
+/// `spans` with "\n " trimmed from the start of the first and the end of the last byte they cover, as `std.mem.trim` reads
+/// their concatenation; spans that trim to nothing go.
+fn trimSpans(text: []const u8, spans: []Span) []Span {
+    var a: usize = 0;
+    var b = spans.len;
+    while (a < b) : (a += 1) {
+        const s = &spans[a];
+        while (s.from < s.to and (text[s.from] == '\n' or text[s.from] == ' ')) s.from += 1;
+        if (s.from < s.to) break;
+    }
+    while (b > a) : (b -= 1) {
+        const s = &spans[b - 1];
+        while (s.to > s.from and (text[s.to - 1] == '\n' or text[s.to - 1] == ' ')) s.to -= 1;
+        if (s.from < s.to) break;
+    }
+    return spans[a..b];
+}
+
+/// A reply text rewritten by `normalizeEmbeddedThinkBlocksMapped`, and where its content came from.
+pub const Normalized = struct {
+    text: []u8,
+    runs: []listed_tokens.Run,
+
+    pub fn deinit(self: Normalized, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        allocator.free(self.runs);
+    }
+};
 
 /// Merge ALL closed think/thought blocks in `text` into one leading block.
 ///
@@ -787,15 +828,22 @@ fn contentWithoutClosers(allocator: std.mem.Allocator, owned: *std.ArrayList([]u
 /// the overwhelmingly common case, zero-cost). An unclosed trailing opener is
 /// left in place for the existing trailing-strip logic.
 pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    const n = (try normalizeEmbeddedThinkBlocksMapped(allocator, text)) orelse return null;
+    allocator.free(n.runs);
+    return n.text;
+}
+
+/// `normalizeEmbeddedThinkBlocks`, with the provenance of the content it keeps: each run of the rewrite's content is a copy
+/// of bytes of `text`, or the join between two parts, so a list of the content's tokens never reads the rewrite by its offsets.
+pub fn normalizeEmbeddedThinkBlocksMapped(allocator: std.mem.Allocator, text: []const u8) !?Normalized {
     var reasoning_parts = std.ArrayList([]const u8).empty;
     defer reasoning_parts.deinit(allocator);
-    var content_parts = std.ArrayList([]const u8).empty;
-    defer content_parts.deinit(allocator);
-    var stripped = std.ArrayList([]u8).empty;
-    defer {
-        for (stripped.items) |part| allocator.free(part);
-        stripped.deinit(allocator);
-    }
+    // The pieces of every content part in order, and where each part's pieces end.
+    var spans = std.ArrayList(Span).empty;
+    defer spans.deinit(allocator);
+    var part_ends = std.ArrayList(usize).empty;
+    defer part_ends.deinit(allocator);
+    var stripped_closer = false;
 
     var style_think = false;
     var style_set = false;
@@ -821,23 +869,23 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 
     while (true) {
         const o = nextThinkOpenIn(&tags, text, pos) orelse {
-            try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..]));
+            stripped_closer = try spansWithoutClosers(allocator, &spans, text, pos, text.len) or stripped_closer;
+            try part_ends.append(allocator, spans.items.len);
             break;
         };
         const found: ?TagAt = tool_reading.firstOutsideCalls(text, o.after, true, &tags, if (o.is_think_style) .think_close else .channel_close);
         const close = found orelse {
             // With no closed block the split's own unclosed arm reads the opener.
-            if (closed_blocks == 0) {
-                try content_parts.append(allocator, text[pos..]);
-                break;
-            }
+            if (closed_blocks == 0) break;
             // A thought re-opened and cut by the end of the reply is reasoning, as a stream delivers it.
-            try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..o.pos]));
+            stripped_closer = try spansWithoutClosers(allocator, &spans, text, pos, o.pos) or stripped_closer;
+            try part_ends.append(allocator, spans.items.len);
             try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..], "\n "));
             closed_blocks += 1;
             break;
         };
-        try content_parts.append(allocator, try contentWithoutClosers(allocator, &stripped, text[pos..o.pos]));
+        stripped_closer = try spansWithoutClosers(allocator, &spans, text, pos, o.pos) or stripped_closer;
+        try part_ends.append(allocator, spans.items.len);
         try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..close.pos], "\n "));
         if (!style_set) {
             style_think = o.is_think_style;
@@ -850,10 +898,12 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 
     // Rewrite only when a closed block exists beyond the single leading one.
     if (closed_blocks == 0) return null;
-    if (closed_blocks == 1 and first_block_leading and stripped.items.len == 0) return null;
+    if (closed_blocks == 1 and first_block_leading and !stripped_closer) return null;
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    var runs = std.ArrayList(listed_tokens.Run).empty;
+    errdefer runs.deinit(allocator);
     try out.appendSlice(allocator, if (style_think) "<think>\n" else "<|channel>thought\n");
     var first = true;
     for (reasoning_parts.items) |r| {
@@ -864,14 +914,31 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
     }
     try out.appendSlice(allocator, if (style_think) "</think>\n" else "<channel|>\n");
     first = true;
-    for (content_parts.items) |c| {
-        const trimmed = std.mem.trim(u8, c, "\n ");
-        if (trimmed.len == 0) continue;
-        if (!first) try out.append(allocator, '\n');
-        try out.appendSlice(allocator, trimmed);
+    var part_from: usize = 0;
+    for (part_ends.items) |part_to| {
+        defer part_from = part_to;
+        const kept = trimSpans(text, spans.items[part_from..part_to]);
+        if (kept.len == 0) continue;
+        if (!first) {
+            try runs.append(allocator, .{ .at = out.items.len, .len = listed_tokens.content_join.len, .src = null });
+            try out.appendSlice(allocator, listed_tokens.content_join);
+        }
+        for (kept) |k| {
+            if (k.from == k.to) continue;
+            // Pieces that follow each other in the text and in the rewrite are one run.
+            if (runs.getLastOrNull()) |last| if (last.src) |src| if (src + last.len == k.from and last.at + last.len == out.items.len) {
+                runs.items[runs.items.len - 1].len += k.to - k.from;
+                try out.appendSlice(allocator, text[k.from..k.to]);
+                continue;
+            };
+            try runs.append(allocator, .{ .at = out.items.len, .len = k.to - k.from, .src = k.from });
+            try out.appendSlice(allocator, text[k.from..k.to]);
+        }
         first = false;
     }
-    return try out.toOwnedSlice(allocator);
+    const rewritten = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(rewritten);
+    return .{ .text = rewritten, .runs = try runs.toOwnedSlice(allocator) };
 }
 
 /// Streaming-only: true when the buffer TAIL is a partial prefix of a think
@@ -2679,4 +2746,23 @@ test "heldThoughtSoFar: a held thought streams only while its start cannot move"
     try testing.expectEqualStrings("plan", heldThoughtSoFar("<think>plan", false, true).?);
     try testing.expect(heldThoughtSoFar("Done. <think>plan", true, true) == null);
     try testing.expect(heldThoughtSoFar("Done. <th", true, true) == null);
+}
+
+test "normalizeEmbeddedThinkBlocksMapped: every run of the content is a copy of the generation, a join between parts is no copy" {
+    const raw = "Sure.<think>hmm</think>X</think>Y<think>q</think>\n\nDone.\n";
+    const n = (try normalizeEmbeddedThinkBlocksMapped(testing.allocator, raw)).?;
+    defer n.deinit(testing.allocator);
+    const plain = (try normalizeEmbeddedThinkBlocks(testing.allocator, raw)).?;
+    defer testing.allocator.free(plain);
+    try testing.expectEqualStrings(plain, n.text);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(testing.allocator);
+    for (n.runs) |run| {
+        const got = n.text[run.at .. run.at + run.len];
+        if (run.src) |src| try testing.expectEqualStrings(raw[src .. src + run.len], got) else try testing.expectEqualStrings(listed_tokens.content_join, got);
+        try content.appendSlice(testing.allocator, got);
+    }
+    // A closer cut from a part splits its run; the parts around the thoughts are joined.
+    try testing.expectEqualStrings("Sure.\nX" ++ "Y\nDone.", content.items);
+    try testing.expectEqualStrings(content.items, splitThinkBlock(n.text, true, false).content);
 }

@@ -5,11 +5,13 @@ const Tokenizer = tokenizer_mod.Tokenizer;
 const sampler = @import("sampler.zig");
 const server = @import("server.zig");
 const generation_stream = @import("generation_stream.zig");
-const contentTokenRange = generation_stream.contentTokenRange;
+const contentListing = generation_stream.contentListing;
 const contentLogprobsJson = generation_stream.contentLogprobsJson;
 const listed_tokens = @import("listed_tokens.zig");
 const Listing = listed_tokens.Listing;
 const Cut = listed_tokens.Cut;
+const Range = listed_tokens.Range;
+const think_tags = @import("think_tags.zig");
 const jsonEscape = server.jsonEscape;
 
 /// Streaming-side logprobs accumulator.
@@ -68,28 +70,57 @@ pub const StreamLogprobs = struct {
         self.listing.ended = self.listing.ended or ended;
     }
 
-    /// The reply's content starts at `offset` of the generation text: the token holding it lists what follows.
-    pub fn contentFrom(self: *StreamLogprobs, offset: usize) void {
-        if (self.enabled) self.listing.skipTo(offset);
-    }
-
     /// Skip the entries of text the client never receives as content.
     ///
     /// `logprobs.content` describes `message.content`, and the think gate cuts
     /// the reasoning block out of the stream — so without this the entries
     /// shipped alongside the answer were the model's *thinking*. `tail` is the
     /// gate's buffer (always a suffix of the delivered text, since it is only
-    /// ever cleared wholesale) and `content` the part of it that survives.
+    /// ever cleared wholesale) and `content` a slice of it that survives.
     pub fn skipToContent(self: *StreamLogprobs, tail: []const u8, content: []const u8) void {
         if (!self.enabled or content.len == 0) return;
         const base = @intFromPtr(tail.ptr);
         const cptr = @intFromPtr(content.ptr);
-        const off_in_tail = if (cptr >= base and cptr + content.len <= base + tail.len)
-            cptr - base
-        else
-            std.mem.indexOf(u8, tail, content) orelse return;
+        std.debug.assert(cptr >= base and cptr + content.len <= base + tail.len);
         if (self.listing.released < tail.len) return;
-        self.listing.skipTo(self.listing.released - tail.len + off_in_tail);
+        self.listing.skipTo(self.listing.released - tail.len + (cptr - base));
+    }
+
+    /// The content part being delivered ends (a thought opens or closes it): what it returned lists ahead of what follows,
+    /// and its withheld tail never does.
+    pub fn closePart(self: *StreamLogprobs) !void {
+        if (self.enabled) try self.listing.endPart(self.allocator);
+    }
+
+    /// `closePart`, and nothing released so far is content any more: a thought opens.
+    pub fn endPart(self: *StreamLogprobs) !void {
+        if (!self.enabled) return;
+        try self.listing.endPart(self.allocator);
+        self.listing.retire();
+    }
+
+    /// The content arm took the piece of the generation that starts at `at` and is `len` long, and answered `step`.
+    pub fn afterDeliver(self: *StreamLogprobs, step: think_tags.ContentStep, content: *const think_tags.ContentStream, at: usize, len: usize) !void {
+        if (!self.enabled) return;
+        if (content.trimmed > 0) self.listing.skipTo(at + content.trimmed);
+        switch (step) {
+            .marker => try self.listing.hide(self.allocator, at, at + len),
+            .hold => if (content.mark.cut) self.listing.retire(),
+            // Suppressed lead: nothing pending describes text the client received, so retire it rather than letting it
+            // ride the next chunk.
+            .drop => self.listing.retire(),
+            .send => {},
+        }
+    }
+
+    /// The reply's content is `content`, a slice of `text`, which is the last `text_len` bytes of the released generation
+    /// (`runs`: a rewrite of them, as `normalizeEmbeddedThinkBlocksMapped` made it) and ships as one chunk: it lists
+    /// through the same runs a non-stream reply reads, and nothing released before it does.
+    pub fn contentThrough(self: *StreamLogprobs, runs: ?[]const listed_tokens.Run, text: []const u8, source_len: usize, content: []const u8) !void {
+        if (!self.enabled or content.len == 0) return;
+        const at = @intFromPtr(content.ptr) - @intFromPtr(text.ptr);
+        try self.listing.returnedText(self.allocator, runs, self.listing.released -| source_len, at, at + content.len);
+        self.listing.retire();
     }
 
     /// Retire every pending entry unshipped — the turn produced no content, so
@@ -97,6 +128,12 @@ pub const StreamLogprobs = struct {
     pub fn dropPending(self: *StreamLogprobs) void {
         if (!self.enabled) return;
         self.listing.retire();
+    }
+
+    /// What a delta that lists no token carries when logprobs were asked (the join of two content parts): a list with no
+    /// entry, so a client reading `logprobs.content` always finds one. Null when they were not asked.
+    pub fn empty(self: *const StreamLogprobs) ?[]const u8 {
+        return if (self.enabled) "{\"content\":[]}" else null;
     }
 
     /// Render what a content chunk going out now describes, or null when logprobs weren't requested or
@@ -122,14 +159,15 @@ pub const StreamLogprobs = struct {
         if (self.slot) |slot| self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
         // token — hold it for the next chunk rather than shipping a half pair.
-        const r = if (content_chunk) self.listing.sent(self.entries.items.len, withheld) else self.listing.late(self.entries.items.len);
-        if (r.end <= r.start) return null;
-        const ids = self.ids.items[r.start..r.end];
-        const lps = self.entries.items[r.start..r.end];
-        const json = if (self.legacy)
-            try formatCompletionsLogprobs(self.allocator, self.tok, ids, lps, self.top, r.cut(), &self.text_offset)
-        else
-            try formatLogprobsObject(self.allocator, self.tok, ids, lps, self.top, r.cut());
+        const json = if (self.legacy) blk: {
+            const r = if (content_chunk) self.listing.sent(self.entries.items.len, withheld) else self.listing.late(self.entries.items.len);
+            if (r.end <= r.start) return null;
+            break :blk try formatCompletionsLogprobs(self.allocator, self.tok, self.ids.items[r.start..r.end], self.entries.items[r.start..r.end], self.top, r.cut(), &self.text_offset);
+        } else blk: {
+            const items = try self.listing.items(self.allocator, self.entries.items.len, content_chunk, withheld);
+            if (items.len == 0) return null;
+            break :blk try formatLogprobsObject(self.allocator, self.tok, self.ids.items, self.entries.items, self.top, items);
+        };
         self.rendered = json;
         return json;
     }
@@ -283,27 +321,30 @@ pub fn formatCompletionsLogprobs(
     , .{ toks.items, lps.items, tops.items, offs.items });
 }
 
-/// Build the full logprobs object for a non-streaming response.
+/// Build the logprobs object of a chat reply from the runs of tokens `runs` list, in order: indexes into `token_ids` and
+/// `logprobs`. The "\n" that joins content parts has no token, so no entry lists it.
 pub fn formatLogprobsObject(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
     token_ids: []const u32,
     logprobs: []const sampler.LogprobResult,
     top: u32,
-    cut: Cut,
+    runs: []const Range,
 ) ![]const u8 {
     var content_buf = std.ArrayList(u8).empty;
     defer content_buf.deinit(allocator);
 
     try content_buf.appendSlice(allocator, "[");
     const count = @min(token_ids.len, logprobs.len);
-    for (0..count) |i| {
-        if (i > 0) try content_buf.appendSlice(allocator, ",");
-        const own: Cut = .{ .head = if (i == 0) cut.head else 0, .tail = if (i + 1 == count) cut.tail else 0 };
+    var first = true;
+    for (runs) |r| for (r.start..@max(r.start, @min(r.end, count))) |i| {
+        if (!first) try content_buf.appendSlice(allocator, ",");
+        first = false;
+        const own: Cut = .{ .head = if (i == r.start) r.head else 0, .tail = if (i + 1 == r.end) r.tail else 0 };
         const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)], own);
         defer allocator.free(entry);
         try content_buf.appendSlice(allocator, entry);
-    }
+    };
     try content_buf.appendSlice(allocator, "]");
 
     return try std.fmt.allocPrint(allocator, "{{\"content\":{s}}}", .{content_buf.items});
@@ -493,7 +534,15 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     try std.testing.expectEqualStrings("é€", clean_parsed.value.object.get("token").?.string);
 }
 
-test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripped" {
+/// The one token range a `contentListing` lists, as `(start, end)`.
+fn listedRange(listing: *const Listing) struct { start: usize, end: usize } {
+    const items = listing.queued();
+    if (items.len == 0) return .{ .start = 0, .end = 0 };
+    std.debug.assert(items.len == 1);
+    return .{ .start = items[0].start, .end = items[0].end };
+}
+
+test "contentListing: logprobs cover the CONTENT, not the reasoning we stripped" {
     // `logprobs.content` is defined as the tokens of the message content, but we
     // built it from the whole generation — so on every model that thinks, entry
     // 0 was the first token of the *reasoning* and the array lined up with
@@ -517,30 +566,34 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
     const content = full[("<think>\nBecause.\n</think>").len..];
     try std.testing.expectEqualStrings("Canberra", content);
 
-    const r = contentTokenRange(allocator, &tok, &token_ids, full, content);
-    try std.testing.expectEqual(@as(usize, 3), r.start);
-    try std.testing.expectEqual(@as(usize, 5), r.end);
+    var l = try contentListing(allocator, &tok, &token_ids, full, null, content);
+    defer l.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), listedRange(&l).start);
+    try std.testing.expectEqual(@as(usize, 5), listedRange(&l).end);
 
     // Whole text as content (a model that did not think) keeps every entry.
-    const all = contentTokenRange(allocator, &tok, &token_ids, full, full);
-    try std.testing.expectEqual(@as(usize, 0), all.start);
-    try std.testing.expectEqual(@as(usize, 5), all.end);
+    var all = try contentListing(allocator, &tok, &token_ids, full, null, full);
+    defer all.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), listedRange(&all).start);
+    try std.testing.expectEqual(@as(usize, 5), listedRange(&all).end);
 
     // Empty content (a turn that was all reasoning) emits no entries rather
     // than the reasoning's.
-    const none = contentTokenRange(allocator, &tok, &token_ids, full, full[0..0]);
-    try std.testing.expectEqual(@as(usize, 0), none.start);
-    try std.testing.expectEqual(@as(usize, 0), none.end);
+    var none = try contentListing(allocator, &tok, &token_ids, full, null, full[0..0]);
+    defer none.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), none.queued().len);
 
     // A content slice we cannot locate keeps the full range: an array we can't
     // align is still better than dropping it silently.
-    const foreign = contentTokenRange(allocator, &tok, &token_ids, full, "not in there");
-    try std.testing.expectEqual(@as(usize, 0), foreign.start);
-    try std.testing.expectEqual(@as(usize, 5), foreign.end);
+    var foreign = try contentListing(allocator, &tok, &token_ids, full, null, "not in there");
+    defer foreign.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), listedRange(&foreign).start);
+    try std.testing.expectEqual(@as(usize, 5), listedRange(&foreign).end);
 
     // A token straddling the boundary belongs to content — it put bytes there.
-    const mid = contentTokenRange(allocator, &tok, &token_ids, full, full[("<think>\nBecause.\n</thi").len..]);
-    try std.testing.expectEqual(@as(usize, 2), mid.start);
+    var mid = try contentListing(allocator, &tok, &token_ids, full, null, full[("<think>\nBecause.\n</thi").len..]);
+    defer mid.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 2), listedRange(&mid).start);
 }
 
 test "contentLogprobsJson: a reply with a call lists the tokens of its content, never the call's, and `top` alternatives each" {
@@ -567,7 +620,7 @@ test "contentLogprobsJson: a reply with a call lists the tokens of its content, 
         .{ .token_logprob = -0.5, .top_logprobs = &alt },
     };
     for ([_]u32{ 0, 1 }) |top| {
-        const json = try contentLogprobsJson(allocator, &tok, &token_ids, &lps, full, full[0..10], top);
+        const json = try contentLogprobsJson(allocator, &tok, &token_ids, &lps, full, null, full[0..10], top);
         defer allocator.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
         defer parsed.deinit();
@@ -594,7 +647,7 @@ test "a token the reply returned part of lists those bytes, its logprob and alte
     // The reply returned "빵[s": the first token's space and the last token's "ection" are not its text.
     const cut: Cut = .{ .head = 1, .tail = 6 };
 
-    const chat = try formatLogprobsObject(allocator, &tok, &ids, &lps, 1, cut);
+    const chat = try formatLogprobsObject(allocator, &tok, &ids, &lps, 1, &.{.{ .start = 0, .end = 2, .head = cut.head, .tail = cut.tail }});
     defer allocator.free(chat);
     const cp = try std.json.parseFromSlice(std.json.Value, allocator, chat, .{});
     defer cp.deinit();
@@ -616,4 +669,373 @@ test "a token the reply returned part of lists those bytes, its logprob and alte
     // text_offset indexes the returned text, and the running base ends where it ends.
     try std.testing.expectEqual(@as(i64, 3), lp.value.object.get("text_offset").?.array.items[1].integer);
     try std.testing.expectEqual(@as(usize, 5), base);
+}
+
+const reply_mod = @import("reply.zig");
+const stop_seq_mod = @import("stop_sequences.zig");
+
+/// A generation as tokens: id `i + 1` decodes to `tokens[i]`, and token `i` has logprob `-(i + 1) / 10` with itself as its
+/// one alternative.
+const Generation = struct {
+    allocator: std.mem.Allocator,
+    tok: Tokenizer,
+    ids: []u32,
+    lps: []sampler.LogprobResult,
+    tops: []sampler.TokenLogprob,
+    raw: []u8,
+
+    fn init(allocator: std.mem.Allocator, tokens: []const []const u8) !Generation {
+        var tok = Tokenizer.initEmpty(allocator);
+        errdefer tok.vocab.deinit();
+        const ids = try allocator.alloc(u32, tokens.len);
+        const lps = try allocator.alloc(sampler.LogprobResult, tokens.len);
+        const tops = try allocator.alloc(sampler.TokenLogprob, tokens.len);
+        var raw = std.ArrayList(u8).empty;
+        for (tokens, 0..) |t, i| {
+            ids[i] = @intCast(i + 1);
+            try tok.id_to_token.put(ids[i], t);
+            tops[i] = .{ .token_id = ids[i], .logprob = -0.1 * @as(f32, @floatFromInt(i + 1)) };
+            lps[i] = .{ .token_logprob = tops[i].logprob, .top_logprobs = tops[i .. i + 1] };
+            try raw.appendSlice(allocator, t);
+        }
+        return .{ .allocator = allocator, .tok = tok, .ids = ids, .lps = lps, .tops = tops, .raw = try raw.toOwnedSlice(allocator) };
+    }
+
+    fn deinit(self: *Generation) void {
+        self.allocator.free(self.ids);
+        self.allocator.free(self.lps);
+        self.allocator.free(self.tops);
+        self.allocator.free(self.raw);
+        self.tok.vocab.deinit();
+        self.tok.id_to_token.deinit();
+        self.tok.merge_ranks.deinit();
+        self.tok.special_tokens.deinit();
+        self.tok.unicode_to_byte.deinit();
+    }
+};
+
+/// The entries of a `{"content":[...]}` object, each as its JSON text, appended to `out`.
+fn addEntries(allocator: std.mem.Allocator, json: []const u8, out: *std.ArrayList([]u8)) !void {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    for (parsed.value.object.get("content").?.array.items) |e| try out.append(allocator, try std.json.Stringify.valueAlloc(allocator, e, .{}));
+}
+
+fn freeEntries(allocator: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |e| allocator.free(e);
+    list.deinit(allocator);
+}
+
+/// The bytes the entries list, in order.
+fn entryBytes(allocator: std.mem.Allocator, entries: []const []u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (entries) |text| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+        defer parsed.deinit();
+        for (parsed.value.object.get("bytes").?.array.items) |b| try out.append(allocator, @intCast(b.integer));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+const weather_tools =
+    \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+;
+
+/// A non-stream reply: its content (owned; with `tools`, the text before its call) and the entries its `logprobs` lists.
+fn wholeReply(allocator: std.mem.Allocator, g: *const Generation, stops: []const []const u8, tools: ?[]const u8, entries: *std.ArrayList([]u8)) ![]u8 {
+    const ask: reply_mod.Ask = .{ .stops = stops, .normalize = true, .has_tools = tools != null, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    const settled = try reply_mod.settle(allocator, .{ .text = g.raw, .source = .whole, .finish_reason = "length", .finish_details = null }, ask);
+    defer settled.deinit(allocator);
+    const content = if (settled.reply) |r| r.preamble else think_tags.splitThinkBlock(settled.text, true, false).content;
+    const json = try contentLogprobsJson(allocator, &g.tok, g.ids, g.lps, settled.text, settled.provenance(), content, 1);
+    defer allocator.free(json);
+    try addEntries(allocator, json, entries);
+    return allocator.dupe(u8, content);
+}
+
+/// What a stream ships: the bytes of its deltas and the entries of its chunks, in order, and each delta's own bytes and the bytes its entries list.
+const Shipped = struct {
+    delta: std.ArrayList(u8) = .empty,
+    entries: std.ArrayList([]u8) = .empty,
+    deltas: std.ArrayList(Delta) = .empty,
+
+    /// `list` is whether the delta carried a `logprobs.content` list, entries or none.
+    const Delta = struct { content: []u8, listed: []u8, list: bool };
+
+    fn deinit(self: *Shipped, allocator: std.mem.Allocator) void {
+        self.delta.deinit(allocator);
+        freeEntries(allocator, &self.entries);
+        for (self.deltas.items) |d| {
+            allocator.free(d.content);
+            allocator.free(d.listed);
+        }
+        self.deltas.deinit(allocator);
+    }
+
+    fn chunk(self: *Shipped, allocator: std.mem.Allocator, bytes: []const u8, lp: ?[]const u8) !void {
+        try self.delta.appendSlice(allocator, bytes);
+        var mine: std.ArrayList([]u8) = .empty;
+        defer freeEntries(allocator, &mine);
+        if (lp) |json| try addEntries(allocator, json, &mine);
+        try self.deltas.append(allocator, .{ .content = try allocator.dupe(u8, bytes), .listed = try entryBytes(allocator, mine.items), .list = lp != null });
+        for (mine.items) |e| try self.entries.append(allocator, try allocator.dupe(u8, e));
+    }
+
+    /// A content delta as `sendContentDelta` sends it: the join that opens a part first, listing nothing.
+    fn contentDelta(self: *Shipped, allocator: std.mem.Allocator, content: *think_tags.ContentStream, lps: *StreamLogprobs, bytes: []const u8) !void {
+        if (content.takeJoin()) |join| try self.chunk(allocator, join, lps.empty());
+        try self.chunk(allocator, bytes, try lps.take(content.withheld()));
+    }
+};
+
+/// The stream of a reply with no tools, token by token as `streamChatCompletion` takes it: the gate releases text, the content arm
+/// delivers it, a thought the model opens is held and closed, and the final chunk lists what lagged.
+fn plainStream(allocator: std.mem.Allocator, g: *const Generation, stops: []const []const u8, out: *Shipped) !void {
+    var lps = StreamLogprobs{ .allocator = allocator, .tok = &g.tok, .slot = null, .enabled = true, .top = 1 };
+    defer lps.deinit();
+    var gate = stop_seq_mod.Gate{ .stops = stops };
+    defer gate.deinit(allocator);
+    var content: think_tags.ContentStream = .{ .mark = .{ .on = true }, .join_apart = true };
+    defer content.deinit(allocator);
+    var think_buf = std.ArrayList(u8).empty;
+    defer think_buf.deinit(allocator);
+    var in_think = false;
+    var thought_closed = false;
+    var i: usize = 0;
+    var tail = false;
+    while (true) : (i += 1) {
+        const piece = if (i < g.ids.len) blk: {
+            try lps.entries.append(allocator, g.lps[i]);
+            const raw = try g.tok.decode(allocator, &[_]u32{g.ids[i]});
+            defer allocator.free(raw);
+            try lps.note(g.ids[i], raw.len);
+            break :blk try gate.push(allocator, raw);
+        } else if (gate.matched == null and gate.hasHeld() and !tail) blk: {
+            tail = true;
+            break :blk try gate.finish(allocator);
+        } else break;
+        defer allocator.free(piece);
+        lps.release(gate.released, gate.matched != null or tail);
+        if (piece.len > 0) {
+            if (in_think) {
+                try think_buf.appendSlice(allocator, piece);
+                if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
+                    const content_after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n ");
+                    if (content_after.len > 0) {
+                        lps.skipToContent(think_buf.items, content_after);
+                        switch (try content.deliver(allocator, content_after)) {
+                            .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
+                            else => {},
+                        }
+                    } else lps.dropPending();
+                    think_buf.clearRetainingCapacity();
+                    in_think = false;
+                    thought_closed = true;
+                }
+            } else if (content.thoughtOpener(false, piece)) |opener| {
+                try lps.endPart();
+                content.endPart();
+                in_think = true;
+                try think_buf.appendSlice(allocator, opener);
+            } else {
+                const step = try content.deliver(allocator, piece);
+                try lps.afterDeliver(step, &content, lps.listing.released -| piece.len, piece.len);
+                switch (step) {
+                    .marker, .hold, .drop => {},
+                    .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
+                }
+            }
+        }
+        if (gate.matched != null) break;
+    }
+    const held = try content.finish(allocator, thought_closed);
+    if (held.len > 0) try out.contentDelta(allocator, &content, &lps, held);
+    try out.chunk(allocator, "", try lps.takeLate());
+}
+
+/// The stream of a reply the gate buffered to its end (a tools request): the delivered text is normalized once and its
+/// content ships as one chunk.
+fn flushStream(allocator: std.mem.Allocator, g: *const Generation, stops: []const []const u8, out: *Shipped) !void {
+    var lps = StreamLogprobs{ .allocator = allocator, .tok = &g.tok, .slot = null, .enabled = true, .top = 1 };
+    defer lps.deinit();
+    var gate = stop_seq_mod.Gate{ .stops = stops };
+    defer gate.deinit(allocator);
+    var full_text = std.ArrayList(u8).empty;
+    defer full_text.deinit(allocator);
+    var i: usize = 0;
+    var tail = false;
+    while (true) : (i += 1) {
+        const piece = if (i < g.ids.len) blk: {
+            try lps.entries.append(allocator, g.lps[i]);
+            const raw = try g.tok.decode(allocator, &[_]u32{g.ids[i]});
+            defer allocator.free(raw);
+            try lps.note(g.ids[i], raw.len);
+            break :blk try gate.push(allocator, raw);
+        } else if (gate.matched == null and gate.hasHeld() and !tail) blk: {
+            tail = true;
+            break :blk try gate.finish(allocator);
+        } else break;
+        defer allocator.free(piece);
+        lps.release(gate.released, gate.matched != null or tail);
+        try full_text.appendSlice(allocator, piece);
+        if (gate.matched != null) break;
+    }
+    const norm = try think_tags.normalizeEmbeddedThinkBlocksMapped(allocator, full_text.items);
+    defer if (norm) |n| n.deinit(allocator);
+    const text: []const u8 = if (norm) |n| n.text else full_text.items;
+    const content = think_tags.splitThinkBlock(text, true, false).content;
+    if (content.len > 0) {
+        const runs: ?[]const listed_tokens.Run = if (norm) |n| n.runs else null;
+        const content_at = @intFromPtr(content.ptr) - @intFromPtr(text.ptr);
+        var shipped: usize = 0;
+        for (runs orelse &.{}) |run| {
+            if (run.src != null or run.at < content_at + shipped or run.at + run.len > content_at + content.len) continue;
+            const piece = content[shipped .. run.at - content_at];
+            if (piece.len > 0) {
+                try lps.contentThrough(runs, text, full_text.items.len, piece);
+                try out.chunk(allocator, piece, try lps.take(0));
+            }
+            try out.chunk(allocator, listed_tokens.content_join, lps.empty());
+            shipped = run.at - content_at + run.len;
+        }
+        const last = content[shipped..];
+        if (last.len > 0) {
+            try lps.contentThrough(runs, text, full_text.items.len, last);
+            try out.chunk(allocator, last, try lps.take(0));
+        }
+    } else lps.dropPending();
+    try out.chunk(allocator, "", try lps.takeLate());
+}
+
+const Scenario = struct {
+    name: []const u8,
+    tokens: []const []const u8,
+    stops: []const []const u8 = &.{},
+    /// The `token` of each entry the reply lists: a token cut at the reply's edge lists what it returned.
+    listed: []const []const u8,
+    /// Where in the content the joins no token carries lie, each one "\n" that no entry lists.
+    joins: []const usize,
+    /// No token of the reply holds bytes past the delta that ships them (a trimmed tail or a stop inside a token lists after
+    /// them): each delta lists exactly its own bytes.
+    aligned: bool = true,
+    /// The think style the per-token stream follows: a channel thought opened after content is the whole reply's to read.
+    plain: bool = true,
+};
+
+const scenarios = [_]Scenario{
+    .{ .name = "content, a thought, content", .tokens = &.{ "Sure.", "<think>", "hmm", "</think>", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 } },
+    .{ .name = "whitespace around the thought, inside tokens", .tokens = &.{ "Sure.\n", "<think>", "hmm", "</think>", "\nDone.\n" }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 }, .aligned = false },
+    .{ .name = "whitespace tokens around the thought", .tokens = &.{ "Sure.", "\n\n", "<think>", "hmm", "</think>", "\n\n", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 } },
+    .{ .name = "a stop inside the second part", .tokens = &.{ "Sure.", "<think>", "hmm", "</think>", "Do", "ne. ST", "OP x" }, .stops = &.{"STOP"}, .listed = &.{ "Sure.", "Do", "ne." }, .joins = &.{ 5 }, .aligned = false },
+    .{ .name = "a stray closer inside a part", .tokens = &.{ "Sure.", "<think>", "hmm", "</think>", "X", "</think>", "Y" }, .listed = &.{ "Sure.", "X", "Y" }, .joins = &.{ 5 } },
+    .{ .name = "two thoughts", .tokens = &.{ "A", "<think>", "p", "</think>", "B", "<think>", "q", "</think>", "C" }, .listed = &.{ "A", "B", "C" }, .joins = &.{ 1, 3 } },
+    .{ .name = "the channel style", .tokens = &.{ "Sure.", "<|channel>thought\n", "hmm", "<channel|>", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 }, .plain = false },
+};
+
+test "a reply with a thought in the middle lists exactly the bytes its tokens returned, no entry for the join of its parts, streamed or not" {
+    const allocator = std.testing.allocator;
+    var bad: usize = 0;
+    for (scenarios) |s| {
+        var g = try Generation.init(allocator, s.tokens);
+        defer g.deinit();
+        var whole: std.ArrayList([]u8) = .empty;
+        defer freeEntries(allocator, &whole);
+        const content = try wholeReply(allocator, &g, s.stops, null, &whole);
+        defer allocator.free(content);
+        const listed = try entryBytes(allocator, whole.items);
+        defer allocator.free(listed);
+        if (whole.items.len != s.listed.len) {
+            std.debug.print("{s}: the whole reply lists {d} entries, want {d}\n", .{ s.name, whole.items.len, s.listed.len });
+            bad += 1;
+        } else for (whole.items, s.listed) |entry, want| {
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, entry, .{});
+            defer parsed.deinit();
+            const token = parsed.value.object.get("token").?.string;
+            // Every entry is a token's: a number logprob, whatever the client's schema reads it as.
+            const lp = parsed.value.object.get("logprob").?;
+            const alts = parsed.value.object.get("top_logprobs").?.array.items.len;
+            if (!std.mem.eql(u8, token, want) or lp != .float or alts != 1) {
+                std.debug.print("{s}: entry {f}, want token {f}\n", .{ s.name, std.zig.fmtString(entry), std.zig.fmtString(want) });
+                bad += 1;
+            }
+        }
+        // The listed bytes are the content less exactly its joins, each a "\n" at the position the cell names.
+        var less_joins = std.ArrayList(u8).empty;
+        defer less_joins.deinit(allocator);
+        var at: usize = 0;
+        for (s.joins) |p| {
+            if (p >= content.len or content[p] != '\n') {
+                std.debug.print("{s}: no join at {d} of {f}\n", .{ s.name, p, std.zig.fmtString(content) });
+                bad += 1;
+                continue;
+            }
+            try less_joins.appendSlice(allocator, content[at..p]);
+            at = p + 1;
+        }
+        try less_joins.appendSlice(allocator, content[at..]);
+        if (!std.mem.eql(u8, less_joins.items, listed)) {
+            std.debug.print("{s}: whole reply returns {f}, lists {f}, want {f}\n", .{ s.name, std.zig.fmtString(content), std.zig.fmtString(listed), std.zig.fmtString(less_joins.items) });
+            bad += 1;
+        }
+        const arms = [_]struct { name: []const u8, run: *const fn (std.mem.Allocator, *const Generation, []const []const u8, *Shipped) anyerror!void }{
+            .{ .name = "per token", .run = plainStream },
+            .{ .name = "buffered", .run = flushStream },
+        };
+        for (arms) |arm| {
+            if (!s.plain and arm.run == plainStream) continue;
+            var got: Shipped = .{};
+            defer got.deinit(allocator);
+            try arm.run(allocator, &g, s.stops, &got);
+            // Every join ships as a delta of its own that lists nothing; the other deltas list their own bytes.
+            var join_deltas: usize = 0;
+            for (got.deltas.items) |d| {
+                const is_join = std.mem.eql(u8, d.content, listed_tokens.content_join) and d.listed.len == 0;
+                if (is_join) join_deltas += 1;
+                // The join's list is an empty list, never null: a client reading `logprobs.content` finds one.
+                if (is_join and !d.list) {
+                    std.debug.print("{s}, {s}: the join delta carries no logprobs.content list\n", .{ s.name, arm.name });
+                    bad += 1;
+                }
+                if (s.aligned and !is_join and !std.mem.eql(u8, d.content, d.listed)) {
+                    std.debug.print("{s}, {s}: a delta returns {f}, lists {f}\n", .{ s.name, arm.name, std.zig.fmtString(d.content), std.zig.fmtString(d.listed) });
+                    bad += 1;
+                }
+            }
+            if (join_deltas != s.joins.len) {
+                std.debug.print("{s}, {s}: {d} deltas are exactly a join, want {d}\n", .{ s.name, arm.name, join_deltas, s.joins.len });
+                bad += 1;
+            }
+            if (!std.mem.eql(u8, got.delta.items, content)) {
+                std.debug.print("{s}, {s}: the stream returns {f}, the whole reply {f}\n", .{ s.name, arm.name, std.zig.fmtString(got.delta.items), std.zig.fmtString(content) });
+                bad += 1;
+            }
+            const same = got.entries.items.len == whole.items.len and for (got.entries.items, whole.items) |a, b| {
+                if (!std.mem.eql(u8, a, b)) break false;
+            } else true;
+            if (!same) {
+                std.debug.print("{s}, {s}: the stream lists {d} entries, the whole reply {d}\n", .{ s.name, arm.name, got.entries.items.len, whole.items.len });
+                for (got.entries.items) |e| std.debug.print("  stream {s}\n", .{e});
+                for (whole.items) |e| std.debug.print("  whole  {s}\n", .{e});
+                bad += 1;
+            }
+        }
+    }
+    if (bad > 0) return error.ListedWhatWasNotReturned;
+}
+
+test "a reply with a call lists its preamble through the same runs: the join of its parts has no entry" {
+    const allocator = std.testing.allocator;
+    const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
+    var g = try Generation.init(allocator, &.{ "Sure.", "<think>", "hmm", "</think>", "Done.\n", call });
+    defer g.deinit();
+    var entries: std.ArrayList([]u8) = .empty;
+    defer freeEntries(allocator, &entries);
+    const preamble = try wholeReply(allocator, &g, &.{}, weather_tools, &entries);
+    defer allocator.free(preamble);
+    try std.testing.expectEqualStrings("Sure.\nDone.", preamble);
+    const listed = try entryBytes(allocator, entries.items);
+    defer allocator.free(listed);
+    try std.testing.expectEqualStrings("Sure.Done.", listed);
+    try std.testing.expectEqual(@as(usize, 2), entries.items.len);
 }

@@ -1,8 +1,13 @@
 //! Which of a generation's tokens a reply lists logprobs for: the tokens whose bytes the reply returned. A stream
 //! drains this as its text goes out and a non-stream reply reads it once; both ask `Listing`, so a stop's own tokens
 //! and a thought the reply does not ship are listed on neither. A token the reply returned only part of (a stop or a
-//! trimmed lead inside it) is listed with just those bytes: `head` and `tail` are what its entry drops.
+//! trimmed lead inside it) is listed with just those bytes: `head` and `tail` are what its entry drops. A reply's text
+//! can hold bytes no token produced (the "\n" that joins its content parts around a thought): no entry lists them, so
+//! the listed bytes join to the returned content less exactly those joins.
 const std = @import("std");
+
+/// The bytes that join two content parts of a reply around a thought (`think_tags.normalizeEmbeddedThinkBlocks`, `ContentStream`).
+pub const content_join = "\n";
 
 /// Tokens `start..end` (indexes into the generation); `head` bytes of the first and `tail` bytes of the last are not
 /// returned text.
@@ -20,6 +25,11 @@ pub const Range = struct {
 /// What a rendered list drops from its first token's start and its last token's end.
 pub const Cut = struct { head: usize = 0, tail: usize = 0 };
 
+/// Where a rewritten reply text got its content bytes (`think_tags.Normalized`): runs of the text in order, each copied from
+/// the generation at `src`, or, with no `src`, a join no token carries and no entry lists. A byte outside every run is not content (the
+/// rewrite's framing and the thoughts it gathered), and a list of the text's content never reaches one.
+pub const Run = struct { at: usize, len: usize, src: ?usize };
+
 pub const Listing = struct {
     /// Where each noted token starts, in bytes of the generation text as the reply sees it (hidden tokens are
     /// noted with length 0).
@@ -36,9 +46,21 @@ pub const Listing = struct {
     emitted: usize = 0,
     /// Bytes of that token the reply's content starts after.
     head: usize = 0,
+    /// Parts of the list already decided, in order, ahead of the tokens still being drained: a content part that ended.
+    /// A stream drains them first (`items`); a non-stream reply reads them once (`queued`).
+    queue: std.ArrayList(Range) = .empty,
+    /// Raw bytes the reply drops from the middle of its content (a stray think closer): a token wholly inside lists nothing.
+    holes: std.ArrayList(Hole) = .empty,
+    /// What `items` returned last.
+    out: std.ArrayList(Range) = .empty,
+
+    const Hole = struct { from: usize, to: usize };
 
     pub fn deinit(self: *Listing, allocator: std.mem.Allocator) void {
         self.starts.deinit(allocator);
+        self.queue.deinit(allocator);
+        self.holes.deinit(allocator);
+        self.out.deinit(allocator);
     }
 
     pub fn note(self: *Listing, allocator: std.mem.Allocator, len: usize) !void {
@@ -52,6 +74,99 @@ pub const Listing = struct {
         if (from >= to) return .{ .start = start, .end = start };
         const end = @max(start, self.firstStartingAtOrAfter(to));
         return self.cut(.{ .start = start, .end = end, .head = self.headOf(start, from) }, to);
+    }
+
+    /// The reply returned the generation's bytes `from..to`: they list after what is already queued.
+    pub fn returned(self: *Listing, allocator: std.mem.Allocator, from: usize, to: usize) !void {
+        try self.queueRange(allocator, self.touching(from, to));
+    }
+
+    /// The reply returned the bytes `from..to` of its text. `runs` says where a rewrite of the generation got them (null: the
+    /// text is the generation's own); `base` is the generation offset the text, or the bytes `runs` copy from, starts at.
+    pub fn returnedText(self: *Listing, allocator: std.mem.Allocator, runs: ?[]const Run, base: usize, from: usize, to: usize) !void {
+        const rs = runs orelse return self.returned(allocator, base + from, base + to);
+        for (rs) |run| {
+            const lo = @max(from, run.at);
+            const hi = @min(to, run.at + run.len);
+            if (lo >= hi) continue;
+            // A join has no token and no entry.
+            if (run.src) |src| try self.returned(allocator, base + src + (lo - run.at), base + src + (hi - run.at));
+        }
+    }
+
+    /// What the reply returned so far, in order (`returned`).
+    pub fn queued(self: *const Listing) []const Range {
+        return self.queue.items;
+    }
+
+    /// The content part being drained ends where its last sent byte does: what it returned lists, ahead of whatever follows,
+    /// and the bytes it withheld (a trimmed tail) and the thought opening after it never do.
+    pub fn endPart(self: *Listing, allocator: std.mem.Allocator) !void {
+        const was = self.ended;
+        self.ended = true;
+        const r = self.drain(self.starts.items.len);
+        self.ended = was;
+        try self.queueRange(allocator, r);
+    }
+
+    /// The reply drops the raw bytes `from..to` from its content: a token wholly inside lists nothing.
+    pub fn hide(self: *Listing, allocator: std.mem.Allocator, from: usize, to: usize) !void {
+        if (from < to) try self.holes.append(allocator, .{ .from = from, .to = to });
+    }
+
+    fn hidden(self: *const Listing, token: usize) bool {
+        const from = self.starts.items[token];
+        const to = self.end_of(token);
+        for (self.holes.items) |h| if (h.from <= from and to <= h.to) return true;
+        return false;
+    }
+
+    /// `r` into `dest` as the runs of tokens a hole does not cut out of it.
+    fn splitHoles(self: *const Listing, allocator: std.mem.Allocator, r: Range, dest: *std.ArrayList(Range)) !void {
+        if (r.end <= r.start) return;
+        var from = r.start;
+        for (r.start..r.end + 1) |i| {
+            if (i < r.end and !self.hidden(i)) continue;
+            if (i > from) try dest.append(allocator, .{
+                .start = from,
+                .end = i,
+                .head = if (from == r.start) r.head else 0,
+                .tail = if (i == r.end) r.tail else 0,
+            });
+            from = i + 1;
+        }
+    }
+
+    fn queueRange(self: *Listing, allocator: std.mem.Allocator, r: Range) !void {
+        try self.splitHoles(allocator, r, &self.queue);
+    }
+
+    /// The runs of tokens a chat chunk going out now lists, in order, valid until the next call: the parts decided since the last chunk
+    /// whose entries have landed (`published`), then, once they all have, the tokens of the content being drained
+    /// (`sent` for a content chunk carrying all released bytes but the last `withheld`, `late` for one with none).
+    pub fn items(self: *Listing, allocator: std.mem.Allocator, published: usize, content_chunk: bool, withheld: usize) ![]const Range {
+        self.out.clearRetainingCapacity();
+        var n: usize = 0;
+        while (n < self.queue.items.len) : (n += 1) {
+            if (self.queue.items[n].end > published) break;
+            try self.out.append(allocator, self.queue.items[n]);
+        }
+        self.queue.replaceRangeAssumeCapacity(0, n, &.{});
+        if (content_chunk) self.content_to = self.released -| withheld;
+        if (self.queue.items.len == 0) try self.splitHoles(allocator, self.drain(published), &self.out);
+        self.pruneHoles();
+        return self.out.items;
+    }
+
+    fn pruneHoles(self: *Listing) void {
+        const keep_from = if (self.emitted < self.starts.items.len) self.starts.items[self.emitted] else self.total;
+        var n: usize = 0;
+        for (self.holes.items) |h| {
+            if (h.to <= keep_from) continue;
+            self.holes.items[n] = h;
+            n += 1;
+        }
+        self.holes.items.len = n;
     }
 
     /// The generation's own text from `from` is the reply's content: tokens wholly before it are never listed, and
@@ -221,4 +336,52 @@ test "a trailing run the content arm withholds and a trimmed reply never ships i
     const last = l.late(1);
     try testing.expectEqual(@as(usize, 1), last.end - last.start);
     try testing.expectEqual(@as(usize, 1), last.tail);
+}
+
+test "a part that ends lists its returned bytes ahead of the part after, the withheld tail and a thought never" {
+    var l: Listing = .{};
+    defer l.deinit(testing.allocator);
+    // "Sure.\n" (the "\n" withheld), "<think>", "hmm", "</think>", "Done.": 6 + 7 + 3 + 8 + 5 bytes.
+    try noteAll(&l, &.{ 6, 7, 3, 8, 5 });
+    l.released = 6;
+    _ = l.sent(1, 1);
+    l.released = 13;
+    try l.endPart(testing.allocator);
+    l.retire();
+    l.released = 24;
+    l.retire();
+    l.released = 29;
+    const items = try l.items(testing.allocator, 5, true, 0);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(usize, 0), items[0].start);
+    try testing.expectEqual(@as(usize, 1), items[0].end);
+    try testing.expectEqual(@as(usize, 1), items[0].tail);
+    try testing.expectEqual(@as(usize, 4), items[1].start);
+    try testing.expectEqual(@as(usize, 5), items[1].end);
+}
+
+test "a token wholly inside a hole lists nothing, the tokens around it list as runs with the cuts at the ends" {
+    var l: Listing = .{};
+    defer l.deinit(testing.allocator);
+    try noteAll(&l, &.{ 3, 8, 4 });
+    try l.hide(testing.allocator, 3, 11);
+    l.released = 15;
+    const items = try l.items(testing.allocator, 3, true, 0);
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(usize, 1), items[0].end);
+    try testing.expectEqual(@as(usize, 2), items[1].start);
+}
+
+test "a text rewritten by runs lists its content through them: a join lists nothing, a run of the generation its tokens" {
+    var l: Listing = .{};
+    defer l.deinit(testing.allocator);
+    // "Sure." "<think>" "hmm" "</think>" "Done." as the rewrite "<think>\nhmm</think>\nSure.\nDone.".
+    try noteAll(&l, &.{ 5, 7, 3, 8, 5 });
+    const runs = [_]Run{ .{ .at = 20, .len = 5, .src = 0 }, .{ .at = 25, .len = 1, .src = null }, .{ .at = 26, .len = 5, .src = 23 } };
+    try l.returnedText(testing.allocator, &runs, 0, 20, 31);
+    const items = l.queued();
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(usize, 0), items[0].start);
+    try testing.expectEqual(@as(usize, 1), items[0].end);
+    try testing.expectEqual(@as(usize, 4), items[1].start);
 }
