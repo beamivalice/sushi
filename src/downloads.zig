@@ -415,8 +415,10 @@ fn finishJob(job: *Job, ok: bool) void {
         unlock();
         return;
     }
-    // A Stop answered before this point took effect: the pull's files are complete, but the job ends as stopped.
-    if (job.cancel.load(.monotonic)) {
+    // A user's Stop answered before this point took effect: the files are complete, but the job ends as stopped. A
+    // server stop sets the same flag, yet the files finished: the job is done and records its revision, and only the
+    // registry absorb is skipped (the next boot's discovery lists the pack).
+    if (job.cancel.load(.monotonic) and !stopping) {
         job.phase = .cancelled;
         job.setMessage("");
         unlock();
@@ -1265,6 +1267,42 @@ test "downloads: a pull that finishes after the server stopped registers nothing
     }
     finishJob(job, true);
     try testing.expectEqual(Phase.done, job.phase);
+    try testing.expect(!registryBusy());
+    try testing.expectEqual(@as(usize, 0), reg.entries.count());
+}
+
+test "downloads: a pull whose files finished as the server stops ends done and records its revision, registering nothing" {
+    const io = testing.io;
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    const dest = "/nonexistent/sushi-test/beamster/Finished";
+    const job = try Job.create(testing.allocator, "beamster/Finished", dest, true);
+    defer job.destroy();
+    job.phase = .verifying;
+    pack_update.record(dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Finished" } });
+    lock();
+    try jobs.append(gpa, job);
+    unlock();
+    defer {
+        lock();
+        for (jobs.items, 0..) |j, i| if (j == job) {
+            _ = jobs.orderedRemove(i);
+            break;
+        };
+        stopping = false;
+        unlock();
+    }
+    // The server stops as the last file verifies: the files are whole, so the job is done, not stopped.
+    stop();
+    finishJob(job, true);
+    try testing.expectEqual(Phase.done, job.phase);
+    const row = try pack_update.rowFragment(testing.allocator, dest);
+    defer testing.allocator.free(row);
+    try testing.expectEqualStrings("", row);
     try testing.expect(!registryBusy());
     try testing.expectEqual(@as(usize, 0), reg.entries.count());
 }
