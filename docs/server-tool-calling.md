@@ -49,8 +49,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   call, which it sends first (it buffers them to the end otherwise). Rules:
   - Only the first call, and only while no finished call stands before it: the end decides whether a finished call ships
     at all (a stop cut, a repetition loop, `parallel_tool_calls: false`), and a client cannot take one back. While the
-    opened call is open its beats continue through the calls after it; a first call that finished before any beat leaves
-    the later calls with comments (`ping`).
+    opened call is open its beats continue through the calls after it. Known gap: a short call followed by a long call
+    beats with comments (`ping` on Messages), since the short one finished before any beat.
   - The name is never one the finished call lacks (a corpus pin cuts every dialect's calls at every byte); when the
     reply's first call is another tool's, the opened call stays as sent and the reply's calls follow it
     (`Progress.settle`, `at`). A bare JSON call names itself by its arguments, so it never opens early.
