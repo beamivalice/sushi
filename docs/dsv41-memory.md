@@ -134,34 +134,41 @@ source and an index owner (the tiny's 2, the release's 14). L is the chunk's row
 
 The data-dependent maxima are the bill's: a streamed route reads each rate group from its cache pool and its spill
 pool, so it bills `2 x rate_groups` pools (`ModelConfig.expert_rate_groups`, the pack's widest layer; above 6 pools the
-combined chain), and a ratio-r compressor bills `r - 1` pending rows. A resident load's route reads one pool a group:
-its bill carries the spill pools it never makes. Decode forwards keep their scores term and `forward_held_bytes`.
+combined chain), and a ratio-r compressor bills `r - 1` pending rows. A resident plan's cache holds every expert, so its
+route reads one pool a group and bills `rate_groups` (`Config.spill_pools`: the expert plan sets it, `adoptPlan`, and the
+load sets it from its own engine plan, which the trunk's and the caller's configs take). Decode forwards keep their scores term and `forward_held_bytes`.
 The expand and Engram arms are the priced model's (`Config.wide_arms`): two loads, or a load under
 `SUSHI_DSV41_COMPOSED`, each bill their own, and the load hands its arms to the trunk's and the server's configs.
 A config that bills a load's forwards takes the load's arms through `model_load.initTrunk`; one left at the parse's guess
 under-bills a load whose probe serves the expand chain by 68 B a hidden channel a row (136 MB at 8,192 rows of the tiny).
 
-Measured (`dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the spill pools its route did not
-take`, DSV41_STQ_TINY and DSV41_TINY at 512 to 8192 rows, one row in, all experts cached; the pair-major tiny is left out: tile order is fixed at the slab fill, never in the forward pool): the shape sum at the pools taken sits over the
+Measured (`dsv41 engine: a wide forward's in-use peak is its cap's shape sum, a resident load's cap pricing no spill
+pool`, DSV41_STQ_TINY and DSV41_TINY at 512 to 8192 rows, one row in, all experts cached; the pair-major tiny is left out: tile order is fixed at the slab fill, never in the forward pool): the shape sum at the pools taken sits over the
 in-use peak by 10 pages on the STQ tinies (9 at 512 rows) and 1 page on DSV41_TINY (3 at 512): page-sized tables and
 constants a route reuses. On a non-NAX GPU (M1 Max) the expand's chain, at the attention's expand and at the layer's last
 expand, keeps every tiny inside its bill at every width: the STQ tiny was 46.2 MB in use against 40.5 MB billed at 512
 rows, DSV41_TINY about 600 B a row over (its routed chain is smaller than the last expand's chain); DSV41_TINY now sits
-108 KB under at 512 rows and 536 KB under at 8,192. The STQ tiny's sum at 8192 rows is 637.5 MB at six pools, 75.5 MB of them the three spill
-pools its cached route never makes.
+108 KB under at 512 rows and 536 KB under at 8,192. The STQ tiny's sum at 8192 rows is 358.4 MB at six pools and 282.9 MB at the three its
+resident route makes (the cap bills the latter); the release's sums are in the table below.
 
-| release (STQ-1.75bpw, 10 pools) rows | shape sum, GB | new cap at seq = rows, GB | old cap, GB |
+| release (STQ-1.75bpw) rows | shape sum, streamed (10 pools), GB | shape sum, resident (5 pools), GB | resident cap at seq = rows, GB |
 |---|---|---|---|
-| 363 | 0.751 | 1.020 | 1.290 |
-| 2,048 | 4.081 | 4.350 (4.443 at 225k) | 5.431 (5.523 at 225k) |
-| 4,096 | 8.161 | 8.431 | 10.465 |
-| 8,192 | 16.314 | 16.586 | 20.533 |
+| 363 | 0.500 | 0.433 | 0.702 |
+| 2,048 | 2.696 | 2.327 | 2.597 |
+| 4,096 | 5.391 | 4.653 | 4.923 |
+| 8,192 | 10.775 | 9.299 | 9.571 |
 
-The release checkpoint itself (FP4 experts, FP8 trunk) on Sushi Cooler: 2.718 GB at 2,048 rows, cap 2.987 GB.
+(Streamed caps at seq = rows: 0.769, 2.966, 5.662 and 11.047 GB; `dsv41_config` pins both sums.)
+
+Measured on the M5 Ultra, the release pack resident, one 8,192-row chunk (2026-11-21): the engine's pool held 10.247 GB
+under a bill of 10.288 GB at ten pools, and 8.872 GB under 8.913 GB at the five a resident route makes, the same eight
+tokens; the in-use peak was 7.78 GB. Held sits 41 MB under the bill on both arms.
+
+The release checkpoint itself (FP4 experts, FP8 trunk) on Sushi Cooler: 1.333 GB of shapes at 2,048 rows (pinned).
 
 **MLX keeps the measured row term** (`Config.mlxForwardCap`, the 480 B a channel below): MLX's graph holds what its
-evaluation order keeps, and the recorded MLX peaks sit above the engine's shape sum (2,048 rows: 4.57 GiB against 4.11
-GB).
+evaluation order keeps, and the recorded MLX peaks sit above the engine's shape sum (2,048 rows: 4.57 GiB against the
+engine sum's 2.70 GB).
 
 Measured peaks of MLX's own bytes, imported weights left out and the state's rows in (the reading then counted what
 was resident at the phase's start; it now counts only what the phase adds past it) (`SUSHI_TRANSIENT_PEAK=1`,
@@ -192,7 +199,7 @@ cap carries 603 B.
 | decode or verify block | 9k / 225k / 1M | 0.55 / 0.71 / 1.33 | 0.40 / 0.53 / 1.03 |
 | image encode | any | unchanged: the bill already covered the measured peak by a quarter | |
 
-Those are MLX's; on a Cooler load (the shape sum) a 2048-row chunk needs 4.35 / 4.44 / 4.78 GB at 2k / 225k / 1M.
+Those are MLX's; on a Cooler load (the shape sum) a 2048-row chunk needs 2.97 / 3.06 / 3.38 GB at 2k / 225k / 1M streamed, 2.60 / 2.69 / 3.01 GB resident.
 
 On a Cooler load (an STQ pack, [engine-own-forward](engine-own-forward.md#memory)) the request
 bill is the state and one forward's cap: the engine's pool is that cap (its free buffers are inside it), a prefill chunk

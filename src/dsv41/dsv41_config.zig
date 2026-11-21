@@ -158,6 +158,11 @@ pub const Config = struct {
     /// The most rate groups one layer's routed experts span in an STQ pack (`ModelConfig.expert_rate_groups`, set
     /// once the pack's layout is read); 1 for an ungrouped pack.
     rate_groups: u8 = 1,
+    /// Whether a routed chain can read a spill pool beside each rate group's cache pool (`Ragged.initSplit`): a streamed
+    /// plan's route does when an expert misses the cache; a resident plan's cache holds every expert, so its route makes
+    /// none. The shape sum bills the pools the route makes. True until the plan says resident (`adoptPlan`, and the load's
+    /// own plan, `dsv41_serving.initDsv41`).
+    spill_pools: bool = true,
     /// The wide forward's arms the shape sum bills (`dsv41_wide_bytes`): what the parse predicts for this GPU until
     /// the load records its own (`dsv41_model.setFused`). Null only for a config no parse made.
     wide_arms: ?WideArms = null,
@@ -708,6 +713,30 @@ test "dsv41 forward cap: a wide forward's row term is the shape sum of its wides
         const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
         errdefer std.debug.print("{d} rows: shape sum {d}\n", .{ k.rows, got });
         try testing.expectEqual(k.shapes, got);
+    }
+}
+
+test "dsv41 forward cap: a resident plan's route makes no spill pool, so its wide forward bills the cache pools alone, never past the streamed worst case" {
+    var tiny = try parseText(stq_tiny_config);
+    tiny.rate_groups = 3;
+    var rel_stq = try releaseStqForTest();
+    const Case = struct { c: *Config, rows: u64, shapes: u64 };
+    for ([_]Case{
+        .{ .c = &tiny, .rows = 512, .shapes = 20_267_008 },
+        .{ .c = &tiny, .rows = 8192, .shapes = 282_918_912 },
+        .{ .c = &rel_stq, .rows = 363, .shapes = 433_356_800 },
+        .{ .c = &rel_stq, .rows = 2048, .shapes = 2_327_232_512 },
+        .{ .c = &rel_stq, .rows = 4096, .shapes = 4_653_219_840 },
+        .{ .c = &rel_stq, .rows = 8192, .shapes = 9_298_886_656 },
+    }) |k| {
+        k.c.spill_pools = true;
+        const streamed = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
+        k.c.spill_pools = false;
+        const got = k.c.forwardCap(k.rows, k.rows) - k.c.growthBytes(k.rows) - BILL_MARGIN_BYTES;
+        errdefer std.debug.print("{d} rows: resident shape sum {d}, streamed {d}\n", .{ k.rows, got, streamed });
+        try testing.expectEqual(k.shapes, got);
+        try testing.expectEqual(wide_bytes.bytesAt(k.c, k.rows, k.rows, k.c.rate_groups), got);
+        try testing.expect(got < streamed);
     }
 }
 

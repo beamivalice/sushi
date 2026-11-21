@@ -33,8 +33,9 @@ const Tally = struct {
 /// The most the pool holds in use over one wide forward of `rows` rows ending at position `seq`, past what was in
 /// use when it began: the widest layer's peak.
 pub fn bytes(c: *const Config, rows: u64, seq: u64) u64 {
-    // A streamed route reads each rate group from its cache pool and its spill pool: the routing worst case.
-    return bytesAt(c, rows, seq, 2 * @as(u64, c.rate_groups));
+    // A streamed route reads each rate group from its cache pool and its spill pool: the routing worst case. A resident
+    // plan's route reads the cache pools alone.
+    return bytesAt(c, rows, seq, (if (c.spill_pools) @as(u64, 2) else 1) * @as(u64, c.rate_groups));
 }
 
 /// `bytes` with the routed chain of STQ experts over `pools` pools.

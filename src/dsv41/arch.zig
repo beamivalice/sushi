@@ -123,9 +123,17 @@ pub fn adoptLayout(config: *Config) void {
     if (config.dsv41) |*c| c.rate_groups = config.expert_rate_groups;
 }
 
+/// The pools a routed chain makes follow the expert plan: a resident plan holds every expert in the cache, so no route spills.
+pub fn adoptPlan(config: *Config) void {
+    if (config.dsv41) |*c| c.spill_pools = !config.expert_resident;
+}
+
 /// The wide forward's arms the load recorded (`dsv41_model.setFused`), which admission prices.
 pub fn adoptLoaded(config: *Config, loaded: *const Config) void {
-    if (config.dsv41) |*c| c.wide_arms = loaded.dsv41.?.wide_arms;
+    if (config.dsv41) |*c| {
+        c.wide_arms = loaded.dsv41.?.wide_arms;
+        c.spill_pools = loaded.dsv41.?.spill_pools;
+    }
 }
 pub const parseConfig = config_file.parseFamily;
 

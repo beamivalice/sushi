@@ -6534,7 +6534,7 @@ test "dsv41 serving: a load hands the wide arms it serves to the config the call
     try testing.expectEqual(served, fx.config.dsv41.?.wide_arms.?);
 }
 
-test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the spill pools its route did not take, under, at and past one router tile; between two 2,048-row chunks the pool holds no more than the request's billed state, its rows' growth and a page an array (DSV41_STQ_TINY, DSV41_TINY)" {
+test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum, a resident load's cap pricing no spill pool, under, at and past one router tile; between two 2,048-row chunks the pool holds no more than the request's billed state, its rows' growth and a page an array (DSV41_STQ_TINY, DSV41_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const wide_bytes = @import("dsv41_wide_bytes.zig");
@@ -6573,13 +6573,18 @@ test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum less the
                 const peak = mlx.engine.poolPeak(.process) - in0 - pool_class.poolBytes(4 * w);
                 const seq = 1 + w;
                 const cap = c.forwardCap(w, seq);
-                // The routing worst case the cap bills that this route, every expert cached, did not take: the spill pools.
-                const spill = if (c.expert_dec != null) wide_bytes.bytes(c, w, seq) - wide_bytes.bytesAt(c, w, seq, c.rate_groups) else 0;
+                // Every expert is cached, so the plan is resident and its route makes no spill pool for the cap to bill; the
+                // load hands that to the trunk's config and the caller's, which the server bills from.
+                if (c.expert_dec != null) {
+                    try testing.expect(!c.spill_pools);
+                    try testing.expect(!fx.xfm.config.dsv41.?.spill_pools);
+                    try testing.expect(!fx.config.dsv41.?.spill_pools);
+                }
                 // The context term: a grow's slack and its copy, which a chunk at the start of a request does not make.
                 const growth = cap - wide_bytes.bytes(c, w, seq) - dsv41_config.BILL_MARGIN_BYTES;
-                errdefer std.debug.print("{s} {d} rows: peak {d}, cap {d} (shape sum {d}, spill pools {d}, growth {d})\n", .{ env, w, peak, cap, wide_bytes.bytes(c, w, seq), spill, growth });
+                errdefer std.debug.print("{s} {d} rows: peak {d}, cap {d} (shape sum {d}, growth {d})\n", .{ env, w, peak, cap, wide_bytes.bytes(c, w, seq), growth });
                 try testing.expect(peak <= cap - dsv41_config.BILL_MARGIN_BYTES);
-                try testing.expect(cap <= peak + spill + growth + dsv41_config.BILL_MARGIN_BYTES + pages_over);
+                try testing.expect(cap <= peak + growth + dsv41_config.BILL_MARGIN_BYTES + pages_over);
             }
         }
 

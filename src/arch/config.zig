@@ -278,6 +278,14 @@ pub fn adoptLayout(config: *model.ModelConfig) void {
     }
 }
 
+/// What the arch changes once the expert plan is known (`expert_resident` and the cache the plan made).
+pub fn adoptPlan(config: *model.ModelConfig) void {
+    const tag = tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| if (@hasDecl(registry.Mod(t), "adoptPlan")) registry.Mod(t).adoptPlan(config),
+    }
+}
+
 /// What the arch's load decided that its bills read, from the loaded trunk's config onto `config`, the caller's copy.
 pub fn adoptLoaded(config: *model.ModelConfig, loaded: *const model.ModelConfig) void {
     const tag = tagOf(config) orelse return;

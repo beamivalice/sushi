@@ -59,7 +59,10 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     if (dsv41_borrow.keepsScales(&config) and !engine.plan.resident) try engine.keepScales();
     var plan = beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
-    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, config.dsv41.?, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop, .on_engine = own_decode });
+    // The pools a route makes follow the plan this load runs under, whatever the config said before it.
+    var own_cfg = config.dsv41.?;
+    own_cfg.spill_pools = !engine.plan.resident;
+    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, own_cfg, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop, .on_engine = own_decode });
     errdefer if (mdl_mine) |m| m.deinit();
     const mdl = mdl_mine.?;
     dsv41_model.logMemory(mdl);
@@ -85,6 +88,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     var shell = try initModuleShell(allocator, config, model_stream);
     // The trunk's bills price the arms this load serves; `arch_config.adoptLoaded` hands them to the caller's config.
     shell.config.dsv41.?.wide_arms = mdl.cfg.wide_arms;
+    shell.config.dsv41.?.spill_pools = mdl.cfg.spill_pools;
     // The shell frees what it has been given: the experts' stream from its making, the model and the engine below.
     errdefer {
         shell.arch_state.dsv41.deinit(allocator);

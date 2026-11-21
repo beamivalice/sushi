@@ -1012,6 +1012,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_layout = plan.layout;
     config.expert_streaming = true;
     config.expert_resident = plan.cache.resident;
+    arch_config.adoptPlan(config);
     config.expert_cache_bytes = plan.cache.cache_bytes;
     config.expert_ssd_budget_bytes = if (plan.resolved.ledger != null) budget_bytes else 0;
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
