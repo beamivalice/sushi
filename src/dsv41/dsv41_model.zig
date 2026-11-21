@@ -3650,6 +3650,35 @@ fn warmOwnFills(m: *Model, t1: u32) !void {
     }
 }
 
+/// The kernels a lent layer's wide route makes and a forward over resident pools does not: a prefill that does not fit
+/// the free memory lends decoder pools, and a lent layer reads through the union workspace, so its router is the plain
+/// split launch (a resident layer's maps slots in the launch) and its gate and up planes are combined at the expert
+/// width. Each pipeline is keyed by template values and dtypes, never by rows, so one row of zeros makes the request's:
+/// no forward runs, no pool is lent and nothing is read.
+pub fn warmLentRoutes(m: *Model) !void {
+    const c = &m.cfg;
+    const was = ownBegin(m);
+    defer ownEnd(m, was);
+    var sc = m.scope();
+    defer sc.deinit();
+    if (fusedOn(&sc, m) and c.experts <= 1024) {
+        // A router launch is keyed by its pick count; layers of one count share it.
+        var seen: u64 = 0;
+        for (m.layers[0..c.layers]) |*ly| {
+            if (ly.top_k >= 64 or seen & (@as(u64, 1) << @intCast(ly.top_k)) != 0) continue;
+            seen |= @as(u64, 1) << @intCast(ly.top_k);
+            const hc: c_int = @intCast(c.hc_mult);
+            const logits = try sc.zeros(&.{ 1, ci(c.experts) }, .float32);
+            const bias = try sc.zeros(&.{ 1, ci(c.experts) }, .float32);
+            const z = try sc.zeros(&.{ 1, (2 + hc) * hc }, .float32);
+            const eps = try kernels.hcEps(&sc, c.eps, c.hc_eps);
+            const rs = try kernels.routeSplit(&sc, logits, bias, ly.top_k, c.norm_topk and ly.top_k > 1, c.route_scale, z, c.hc_mult, c.hc_iters, eps);
+            try mlx.check(mlx.mlx_array_eval(rs.routes.idx));
+        }
+    }
+    try exl3.rate_groups.warmCombine(m.s, ci(c.moe_inter));
+}
+
 /// The engine's decode kernels of the block indexer, which a request reaches only where its context holds more
 /// candidate blocks than a query keeps (past 16k tokens on the release pack). The load runs them at a context it can
 /// afford by keeping fewer blocks: the count is no kernel's template value, so the pipelines are the request's.

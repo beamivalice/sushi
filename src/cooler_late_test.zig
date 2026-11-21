@@ -316,3 +316,86 @@ test "cooler contract: after a Cooler load's served warm, the release bench's fi
         }
     }.run);
 }
+
+/// A box whose free memory is `base` plus what the decoder pools gave back: a prefill chunk that does not fit it
+/// releases pools until it does (the lend `dsv41_borrow.beforeForward` makes).
+const LendProbe = struct {
+    var engine: ?*@import("expert_stream.zig").Engine = null;
+    var base: u64 = 0;
+    /// The most pools out on loan at one read.
+    var most: usize = 0;
+
+    fn headroom(_: *const @import("model.zig").ModelConfig) @import("bills.zig").Headroom {
+        const e = engine.?;
+        var lent: u64 = 0;
+        var out: usize = 0;
+        for (e.borrow_from..e.layers.len) |li| {
+            lent += e.lentBytes(@intCast(li));
+            out += @intFromBool(e.isBorrowed(@intCast(li)));
+        }
+        most = @max(most, out);
+        return .{ .live = base + lent };
+    }
+};
+
+/// A prompt whose chunks after the first need more than the free memory holds, so its decoder pools are lent, through
+/// the scheduler; the pools released and the kernels compiled late. Null where the load lends nothing.
+fn lendingPrefill(ld: *Load, dir: []const u8, ids: []const u32) !?struct { released: usize, late: u64 } {
+    const borrow = @import("dsv41/dsv41_borrow.zig");
+    const xfm = arch_handle.trunk(ld.h);
+    const engine = xfm.expert_stream orelse return null;
+    if (engine.borrow_from >= engine.layers.len) return null;
+    const m = @import("dsv41/dsv41_state.zig").modelOf(xfm).?;
+    ld.config.pinned_prefill_chunk = 2048;
+    const need = borrow.prefillNeed(&m.cfg, @import("cooler_side.zig").onEngine(&ld.config), 2048, 4096);
+    LendProbe.engine = engine;
+    defer LendProbe.engine = null;
+    LendProbe.most = 0;
+    LendProbe.base = need - engine.poolBytes(@intCast(engine.layers.len - 1)) / 2;
+    borrow.headroom_fn = &LendProbe.headroom;
+    defer borrow.headroom_fn = null;
+    // Three chunks and the held-back span: the first fits, the second and third release pools.
+    const prompt = try testing.allocator.alloc(u32, 3 * 2048 + @import("prefill_plan.zig").SSM_SNAPSHOT_BACKOFF + 1);
+    defer testing.allocator.free(prompt);
+    for (prompt, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+    var sv: Served = undefined;
+    try sv.init(ld, dir);
+    defer sv.deinit();
+    const late = mlx.engine.latePipelines();
+    mlx.engine.late_names.clear();
+    var from: u32 = 0;
+    var got = try sv.requestWith(prompt, 4, .{ .temperature = 0 }, false, &from);
+    got.deinit(testing.allocator);
+    return .{ .released = LendProbe.most, .late = mlx.engine.latePipelines() - late };
+}
+
+test "cooler contract: after a Cooler load's warm, and after one whose served warm its manifest skipped, a prefill that lends decoder pools compiles no kernel" {
+    try eachTinyFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            if (comptime C != @import("dsv41/arch.zig").cooler_contract) return error.SkipZigTest;
+            const shared = @import("arch/cooler_pipelines.zig");
+            const cooler_warm = @import("cooler_warm.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            mlx.engine.pipeline_registry.resetForTest();
+            // The second load is a new process as far as its manifest goes: the pipelines the first made stay made in
+            // this one, so what it shows is that the manifest's trust skips the served warm and the lend still compiles
+            // nothing.
+            for (0..2) |load| {
+                if (load == 1) mlx.engine.pipeline_registry.resetForTest();
+                const runs = cooler_warm.runs_for_test;
+                var ld: Load = undefined;
+                try ld.open(C, dir, true);
+                defer _ = ld.close();
+                try testing.expectEqual(@as(u32, if (load == 0) 1 else 0), cooler_warm.runs_for_test - runs);
+                const r = (try lendingPrefill(&ld, dir, ids)) orelse return error.SkipZigTest;
+                errdefer std.debug.print("cooler contract: load {d}: a prefill that lent {d} pools compiled:\n{s}", .{ load, r.released, mlx.engine.late_names.text() });
+                try testing.expect(r.released > 0);
+                try testing.expectEqual(@as(u64, 0), r.late);
+            }
+        }
+    }.run);
+}

@@ -177,6 +177,11 @@ fn warmForwards(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqSt
         var clock = expert_stream_mod.Clock.init();
         try warmWide(self, mdl, stq, width);
         log.info("[dsv41] wide kernels warmed in {d} ms\n", .{clock.lap() / std.time.ns_per_ms});
+        // A prefill that lends decoder pools takes a route no forward over resident pools does (`warmLentRoutes`).
+        if (stq) |st| if (st.engine.borrow_from < st.engine.layers.len) {
+            try dsv41_model.warmLentRoutes(mdl);
+            log.info("[dsv41] lent-route kernels made in {d} ms\n", .{clock.lap() / std.time.ns_per_ms});
+        };
     }
 }
 

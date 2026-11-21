@@ -1857,6 +1857,23 @@ fn combine(s: mlx.mlx_stream, planes: []const mlx.mlx_array, sorted: mlx.mlx_arr
     }
 }
 
+/// Makes the combine kernel's pipeline for planes of `dim` columns on one row of zeros: the kernel is keyed by `dim` and
+/// the dispatch's position in a chain, never by rows, so a warm need not run a prefill chain to have it.
+pub fn warmCombine(s: mlx.mlx_stream, dim: c_int) !void {
+    var plane = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(plane);
+    try mlx.check(mlx.mlx_zeros(&plane, &[_]c_int{ 1, dim }, 2, .float16, s));
+    var eids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eids);
+    try mlx.check(mlx.mlx_zeros(&eids, &[_]c_int{1}, 1, .uint32, s));
+    var meta = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(meta);
+    try mlx.check(mlx.mlx_zeros(&meta, &[_]c_int{8}, 1, .uint32, s));
+    const y = try combine(s, &.{ plane, plane }, eids, meta);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+}
+
 /// The gate and up GEMM planes of each pool of a prefill chain (`moePrefillEarly`), for a caller that starts a group's
 /// GEMMs as soon as its experts land. The caller frees them.
 pub const EarlyPlanes = struct {

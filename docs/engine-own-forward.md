@@ -604,6 +604,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   restore point copies a layer's open pooling group, which holds no row where the layer's ratio divides the position,
   so `warmOwnCapture` takes the point where the warm forwards left the state and one row on. Taken once "where the
   warm left it", the copy of the ratio-4 layers' pending rows was made or not by the row count of the warm before it.
+- **A route only a lent pool takes is made ahead, never lent** (`dsv41_model.warmLentRoutes`, after `warmWide`): a prefill that does not fit the free memory lends decoder pools, and a lent layer reads through the union workspace, so its plain router launch and the combine of its gate and up planes at the expert width are kernels no forward over resident pools makes. A pipeline is keyed by template values and dtypes, so one row of zeros makes the request's with no forward, no pool lent and no read; the manifest records them with the warm's.
 - **The sampled verdict is warmed** (`dsv41_serving.warmSampledVerdict`, after `warmKernels`): `sampledDraws`, the
   function a round calls, runs on the engine's stream over zero logits of `[1, w, vocab]` f32 for every verify width
   with a suppress mask. The draw is one kernel (`sampler_draw`) whose temperature, top-k and top-p are inputs and whose
