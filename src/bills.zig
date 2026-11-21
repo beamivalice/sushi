@@ -2100,6 +2100,9 @@ pub const PrefillRequestTerms = struct {
     /// reservation before it, GROWS the cache. Zero when nothing grows, and on every arch that
     /// does not reserve its capacity.
     grow_coexist_bytes: u64 = 0,
+    /// What a decode step's regrow holds beside the grown cache at its peak (`decodeRegrowBytes`), read from the capacity the
+    /// restore holds: Sushi Cooler, where a request does not reserve its whole reply.
+    decode_regrow_bytes: u64 = 0,
     qsa_ring_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
     /// The DFlash2 assistant's window and capture rows (`dflashRequestBytes`).
@@ -2150,12 +2153,12 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // the route off: ~0 at chunk 8192 where the envelope already dominates.
     const dq_weights: u64 = if (fwd >= trunk.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + runtime_floor;
+        req.grow_coexist_bytes + req.decode_regrow_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + runtime_floor;
     // The one place a budget is argued about: every term, so `--log-level debug` on a live box
     // names what a chunk's bill is made of instead of leaving it to be re-derived by hand.
-    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} gross={d}\n", .{
+    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} gross={d}\n", .{
         seq, fwd, kv_bytes, req.reserved_kv_bytes, req.state_bytes, req.checkpoint_bytes,
-        req.grow_coexist_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
+        req.grow_coexist_bytes, req.decode_regrow_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
         scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, gross,
     });
     // The one place a warm turn's resident rows leave the bill, inside the net.
@@ -2290,23 +2293,67 @@ pub fn statePerTokenBilled(config: *const model_mod.ModelConfig) u64 {
 /// the QSA history, which grows on the policy alone in pooled rows. What the bill and the commit count.
 pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64, paged_bits: ?u64) u64 {
     const KV = trunk.KVCache;
-    const end = @max(KV.requestEnd(seq, max_tokens, ctx, past_end), seq);
-    const reserves = config.reservesKvCapacity();
-    const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
-    const hold: trunk.Hold = .{ .reserve = if (long > 0) long else if (reserves and seq > chunk) seq else 0, .end = end };
+    const hold = requestHold(config, seq, max_tokens, chunk, ctx, past_end);
     // The QSA history grows in pooled rows of `indexer_compress_ratio` tokens (`qsaKeyAppendPlan`).
     const ratio: u64 = @max(config.indexer_compress_ratio, 1);
-    const kv_bits = paged_bits orelse return KV.heldRows(0, (end +| ratio - 1) / ratio, hold.per(ratio), &.{}) *| ratio;
-    if (cooler_side.onEngine(config)) return KV.heldRows(0, end, hold, &.{});
-    var most: u64 = KV.heldRows(0, end, hold, &.{});
+    const kv_bits = paged_bits orelse return KV.heldRows(0, (hold.end +| ratio - 1) / ratio, hold.per(ratio), &.{}) *| ratio;
+    if (cooler_side.onEngine(config)) return KV.heldRows(0, hold.end, hold, &.{});
+    var most: u64 = KV.heldRows(0, hold.end, hold, &.{});
     var li: u32 = 0;
     while (li < config.num_hidden_layers) : (li += 1) {
         if (!config.isGlobalLayer(li)) continue;
-        const k: u64 = @as(u64, config.layerKVHeads(li)) * config.layerHeadDim(li) * 2;
-        const v: u64 = @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li) * 2;
-        // Codes, then the BF16 scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
-        const parts: [4]u64 = if (kv_bits >= 16) .{ k, v, 0, 0 } else .{ k * kv_bits / 16, v * kv_bits / 16, k / 64, v / 64 };
-        most = @max(most, KV.heldRows(0, end, hold, &parts));
+        most = @max(most, KV.heldRows(0, hold.end, hold, &layerBufferRowBytes(config, li, kv_bits)));
+    }
+    return most;
+}
+
+/// What the request asks of its cache's growth: its reservation (a long prompt's prompt, reply and a chunk; a shorter one
+/// of several chunks its own length) and its last row. The one hold `cacheCapacityTokens` and `decodeRegrowBytes` price.
+fn requestHold(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64) trunk.Hold {
+    const reserves = config.reservesKvCapacity();
+    const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
+    return .{
+        .reserve = if (long > 0) long else if (reserves and seq > chunk) seq else 0,
+        .end = @max(trunk.KVCache.requestEnd(seq, max_tokens, ctx, past_end), seq),
+    };
+}
+
+/// The bytes one row takes in each buffer of attention layer `li`'s cache, at `kv_bits`: K and V (codes), then the BF16
+/// scales and biases of each group of 64 (`kvBytesPerTokenAtBits`).
+fn layerBufferRowBytes(config: *const model_mod.ModelConfig, li: u32, kv_bits: u64) [4]u64 {
+    const k: u64 = @as(u64, config.layerKVHeads(li)) * config.layerHeadDim(li) * 2;
+    const v: u64 = @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li) * 2;
+    return if (kv_bits >= 16) .{ k, v, 0, 0 } else .{ k * kv_bits / 16, v * kv_bits / 16, k / 64, v / 64 };
+}
+
+/// One row of the widest single buffer any layer's cache holds: the buffer a regrow rebuilds beside its old copy.
+fn widestBufferRowBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (!config.isKvPerTokenLayer(li)) continue;
+        for (layerBufferRowBytes(config, li, kv_bits)) |row| widest = @max(widest, row);
+    }
+    return widest;
+}
+
+/// What a decode step's regrow (`KVCache.growAhead`) holds past the grown cache the request's storage prices at its last
+/// row (`cacheStorage`): it rebuilds one buffer at a time, the kept rows joined to a zero tail of the rows it adds, so at
+/// its peak the widest buffer's old copy and that tail are alive beside the new buffer. Priced at the dearest regrow of the
+/// request: its cache starts from the capacity the restore holds (`warm.capacity_tokens`, else none), the prefill grows it
+/// to the prompt (`KVCache.heldRows`, the one rule the cache grows by) and every decode row past a capacity step grows it
+/// again until the request's last row. Nothing where a reservation already holds the whole reply, and on MLX.
+fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
+    if (!cooler_side.onEngine(config)) return 0;
+    const KV = trunk.KVCache;
+    const hold = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm));
+    const row = widestBufferRowBytes(config, kv_bits);
+    var cap = KV.heldRows(if (warm.matched_tokens > 0) warm.capacity_tokens else 0, seq, hold, &.{});
+    var most: u64 = 0;
+    while (cap < hold.end) {
+        const grown = KV.heldRows(cap, cap + 1, hold, &.{});
+        most = @max(most, pooledCacheBytes(config, cap *| row) +| pooledCacheBytes(config, (grown - cap) *| row));
+        cap = grown;
     }
     return most;
 }
@@ -2337,6 +2384,8 @@ pub const CacheStorage = struct {
     /// The out-of-cache history (`statePerTokenBilled`) and, where the head is billed, the head's.
     state: u64,
     head_kv: u64,
+    /// What a decode regrow of the KV holds past the cache at its last row (`decodeRegrowBytes`).
+    regrow: u64,
 };
 
 pub fn cacheStorage(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) CacheStorage {
@@ -2354,6 +2403,7 @@ pub fn cacheStorage(config: *const model_mod.ModelConfig, seq: u64, max_tokens: 
         .kv = pooledCacheBytes(config, rows *| kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits)),
         .state = pooledCacheBytes(config, state_rows *| (statePerTokenBilled(config) +| head_state)),
         .head_kv = if (head) pooledCacheBytes(config, head_rows *| mtpHeadKvBytesPerToken(config)) else 0,
+        .regrow = decodeRegrowBytes(config, seq, max_tokens, kv_bits, chunk, warm),
     };
 }
 
@@ -2361,7 +2411,7 @@ pub fn cacheStorage(config: *const model_mod.ModelConfig, seq: u64, max_tokens: 
 /// prices it (`cacheStorage`), the MTP head's where the request runs it, drained as the cache becomes resident.
 pub fn cacheCommitBytes(config: *const model_mod.ModelConfig, prompt_len: u64, max_tokens: u64, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
     const st = cacheStorage(config, prompt_len, max_tokens, kv_bits, chunk, .{ .mtp_on = mtp_on });
-    return st.kv +| st.state +| st.head_kv;
+    return st.kv +| st.state +| st.head_kv +| st.regrow;
 }
 
 /// Tokens of cache capacity a request reserves at admission (prompt + generation + one chunk
@@ -2463,6 +2513,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk) +| thoughtPointBytes(config, warm),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
+        .decode_regrow_bytes = storage.regrow,
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
         .mtp_head_kv_bytes = storage.head_kv,
         .dflash_bytes = dflashRequestBytes(config, requestForwardRows(config, seq, chunk, warm.matched_tokens)),
