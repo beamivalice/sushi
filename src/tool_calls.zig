@@ -1513,6 +1513,14 @@ fn appendBareJsonCalls(allocator: std.mem.Allocator, effective_text: []const u8,
             array_probe = std.mem.trim(u8, array_probe[nl + 1 ..], " \t\n\r");
         }
     }
+    // Prose before the array: an array of objects starts at the `[` that leads the first `{`.
+    if (array_probe.len == 0 or array_probe[0] != '[') {
+        if (std.mem.indexOfScalar(u8, trimmed, '{')) |brace| {
+            var lead = brace;
+            while (lead > 0 and std.ascii.isWhitespace(trimmed[lead - 1])) lead -= 1;
+            if (lead > 0 and trimmed[lead - 1] == '[') array_probe = trimmed[lead - 1 ..];
+        }
+    }
     var array_cut: ?[]const u8 = null;
     if (array_probe.len > 0 and array_probe[0] == '[') {
         if (balancedJsonArray(array_probe)) |arr_body| {

@@ -1007,7 +1007,7 @@ test "bare JSON cut short is declined and named, never repaired; a finished call
             const mid = try std.mem.concat(a, u8, &.{ lead, "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tok" });
             defer a.free(mid);
             try expectSameEnd(a, mid, &stops, finish, ask, null, finish, null, named);
-            // An array (it leads the text: prose before it reads the first object only) whose second element is cut
+            // An array whose second element is cut
             // ships the complete first and declines the second.
             const arr = try std.mem.concat(a, u8, &.{ "[", first, ",{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Osa" });
             defer a.free(arr);
@@ -1521,4 +1521,25 @@ test "r173-f-foreign-opener: the preamble of a finished call holds no markup, in
         }
     }
     try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-array-after-prose: a bare JSON array of calls after prose ships every complete element, a cut one is declined and named, streamed or not" {
+    const a = testing.allocator;
+    const first = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}";
+    const second = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Osaka\"}}";
+    const asks = [_]Ask{
+        .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = true },
+    };
+    for (asks) |ask| for ([_][]const u8{ "Let me check.\n", "Let me check:\n```json\n" }) |lead| for ([_][]const u8{ "stop", "length", "cancelled" }) |finish| {
+        const whole = try std.mem.concat(a, u8, &.{ lead, "[", first, ",", second, "]" });
+        defer a.free(whole);
+        try expectSameEnd(a, whole, &.{}, finish, ask, null, finish, 2, .none);
+        const cut = try std.mem.concat(a, u8, &.{ lead, "[", first, ",{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Osa" });
+        defer a.free(cut);
+        try expectSameEnd(a, cut, &.{}, finish, ask, null, finish, 1, .{ .named = "get_weather" });
+        const unclosed = try std.mem.concat(a, u8, &.{ lead, "[", first, ",", second });
+        defer a.free(unclosed);
+        try expectSameEnd(a, unclosed, &.{}, finish, ask, null, finish, 2, .none);
+    };
 }
