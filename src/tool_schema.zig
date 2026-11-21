@@ -1942,6 +1942,19 @@ test "parseToolCalls: Claude-style bare <invoke> markup is an inferred call" {
 }
 
 
+test "parseToolCalls invoke: a value that spells </invoke> keeps the call whole, a cut inside one ships no fragment" {
+    const allocator = testing.allocator;
+    const whole = "<invoke name=\"write\"><parameter name=\"code\">print(\"</invoke>\")</parameter><parameter name=\"n\">2</parameter></invoke>";
+    const calls = (try parseToolCalls(allocator, whole)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("{\"code\":\"print(\\\"</invoke>\\\")\",\"n\":\"2\"}", calls[0].arguments);
+    // The generation stopped inside the value: the value has no end, so the call keeps NAME and no fragment.
+    const cut = (try parseToolCalls(allocator, "<invoke name=\"write\"><parameter name=\"code\">print(\"</invoke>\")")).?;
+    defer freeParsedCalls(cut);
+    try testing.expectEqualStrings("{}", cut[0].arguments);
+}
+
 test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)" {
     // A 4 KB edit call that hit EOS inside a string value. The object never
     // balances, so the balanced-snap arm declines; without a name salvage the

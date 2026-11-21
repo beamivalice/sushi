@@ -2525,6 +2525,93 @@ test "format corpus: a call whose last parameter lost its close is declined and 
     }
 }
 
+test "format corpus: a closer a parameter value spells ships the whole value in every dialect" {
+    const allocator = testing.allocator;
+    const want = [_][]const u8{
+        "print(\"</function></tool_call>\")",
+        "print(\"</function>\")",
+        "a </tool_call> b",
+        "a </tool_call> b",
+        "a <tool_call|> b",
+        "a </\u{ff5c}DSML\u{ff5c}invoke> b",
+        "a </invoke> b",
+        "a </function> b",
+        "a </tool> b",
+        "a </tool_request> b",
+    };
+    comptime std.debug.assert(want.len == closer_in_value_calls.len);
+    for (closer_in_value_calls, want) |call, value| {
+        errdefer std.debug.print("\ncall: {f}\n", .{std.zig.fmtString(call)});
+        const calls = (try tool_calls_mod.parseToolCalls(allocator, call)) orelse return error.WholeCallDropped;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        const got = parsed.value.object.get("city") orelse return error.ValueDropped;
+        // Hermes frames a value with one newline per side; the rest are verbatim.
+        try testing.expectEqualStrings(value, std.mem.trim(u8, got.string, "\n"));
+    }
+}
+
+test "format corpus: a closer a parameter value spells in an invoke dialect ships every argument byte for byte" {
+    // The call ends at its closer OUTSIDE a value: a value that spells `</invoke>` (or the wrapper's close) is the
+    // model's own text, and the parameter after it is still the model's own.
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const Shape = struct { pre: []const u8, mid: []const u8, post: []const u8 };
+    const shapes = [_]Shape{
+        .{
+            .pre = "<invoke name=\"write\">\n<parameter name=\"code\">",
+            .mid = "</parameter>\n<parameter name=\"path\">",
+            .post = "</parameter>\n</invoke>",
+        },
+        .{
+            .pre = "<function_calls>\n<invoke name=\"write\">\n<parameter name=\"code\">",
+            .mid = "</parameter>\n<parameter name=\"path\">",
+            .post = "</parameter>\n</invoke>\n</function_calls>",
+        },
+        .{
+            .pre = "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write\">\n<" ++ dsml ++ "parameter name=\"code\" string=\"true\">",
+            .mid = "</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">",
+            .post = "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls>",
+        },
+    };
+    const values = [_][]const u8{
+        "print(\"</invoke>\")",
+        "a </invoke> b",
+        "x</invoke>\n</function_calls>\ny",
+        "a </" ++ dsml ++ "invoke> b </" ++ dsml ++ "tool_calls> c",
+    };
+    for (shapes) |shape| {
+        for (values) |value| {
+            const raw = try std.mem.concat(allocator, u8, &.{ shape.pre, value, shape.mid, "a.txt", shape.post });
+            defer allocator.free(raw);
+            errdefer std.debug.print("\nraw: {f}\n", .{std.zig.fmtString(raw)});
+            const calls = (try tool_calls_mod.parseToolCalls(allocator, raw)) orelse return error.WholeCallDropped;
+            defer {
+                for (calls) |tc| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
+                allocator.free(calls);
+            }
+            try testing.expectEqual(@as(usize, 1), calls.len);
+            try testing.expectEqualStrings("write", calls[0].name);
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+            defer parsed.deinit();
+            try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+            try testing.expectEqualStrings(value, (parsed.value.object.get("code") orelse return error.CodeDropped).string);
+            try testing.expectEqualStrings("a.txt", (parsed.value.object.get("path") orelse return error.PathDropped).string);
+        }
+    }
+}
+
 test "format corpus: a parameter VALUE never decides the call" {
     // A parameter value is arbitrary bytes. Feed each wrapper dialect a value
     // that LOOKS like call syntax — a balanced JSON object carrying its own

@@ -451,7 +451,7 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
         while (search_pos < effective_text.len) {
             const tag_start = std.mem.indexOf(u8, effective_text[search_pos..], "<|tool_call>") orelse break;
             const content_start = search_pos + tag_start + "<|tool_call>".len;
-            const tag_end_opt = std.mem.indexOf(u8, effective_text[content_start..], "<tool_call|>");
+            const tag_end_opt = gemmaCloserOutsideValue(effective_text, content_start);
             const content = if (tag_end_opt) |tag_end|
                 std.mem.trim(u8, effective_text[content_start .. content_start + tag_end], " \t\n\r")
             else
@@ -1193,10 +1193,10 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
                     continue;
                 }
             }
-            const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
-            args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
-            pos = if (body_end < body_all.len)
-                after_tag + te + 1 + body_end + d.invoke_close.len
+            const closer = invokeCloserOutsideValue(body_all, d);
+            args_json = try invokeParamsToJson(allocator, body_all[0 .. closer orelse body_all.len], d);
+            pos = if (closer) |c|
+                after_tag + te + 1 + c + d.invoke_close.len
             else
                 text.len; // truncated body — completed params already salvaged
         } else {
@@ -1210,6 +1210,55 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
     }
 }
 
+/// One `<parameter name="k">` of an invoke body: where its value starts and where it ends, with no end when the text
+/// stops inside the value.
+const InvokeParam = struct { open: usize, name: []const u8, vstart: usize, vend: ?usize };
+
+/// The next parameter of `body` from `from`, null when none is left or its open tag was cut. A value runs to the first
+/// parameter close, the one rule the parser, the call's end and the open-call finder all read.
+fn nextInvokeParam(body: []const u8, from: usize, d: InvokeDialect) ?InvokeParam {
+    var pos = from;
+    while (std.mem.indexOfPos(u8, body, pos, d.param)) |p| {
+        const after = p + d.param.len;
+        const seg = body[after..];
+        const te = std.mem.indexOfScalar(u8, seg, '>') orelse return null; // truncated open tag
+        const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
+            pos = after;
+            continue;
+        };
+        const vstart = after + te + 1;
+        const vend = if (std.mem.indexOf(u8, body[vstart..], d.param_close)) |rel| vstart + rel else null;
+        return .{ .open = p, .name = pname, .vstart = vstart, .vend = vend };
+    }
+    return null;
+}
+
+/// Where the call whose body is `body` ends: its first `invoke_close` outside every parameter value. A value that
+/// spells the closer is the model's text, so the call ends after it; null when the text stops before the closer, inside
+/// a value included.
+fn invokeCloserOutsideValue(body: []const u8, d: InvokeDialect) ?usize {
+    var pos: usize = 0;
+    while (true) {
+        const closer = std.mem.indexOfPos(u8, body, pos, d.invoke_close);
+        const param = nextInvokeParam(body, pos, d) orelse return closer;
+        if (closer) |c| if (c < param.open) return c;
+        const vend = param.vend orelse return null;
+        pos = vend + d.param_close.len;
+    }
+}
+
+/// Whether `at` falls inside a parameter value of the invoke text from `from`.
+fn invokeValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    var pos = from;
+    while (nextInvokeParam(text, pos, BARE_INVOKE)) |param| {
+        if (param.open >= at) return false;
+        const vend = param.vend orelse return true;
+        if (at < vend) return true;
+        pos = vend + BARE_INVOKE.param_close.len;
+    }
+    return false;
+}
+
 /// Assemble `<parameter name="k">v</parameter>` runs into a JSON
 /// object string of raw string values, exact bytes. Keys are escaped + deduped
 /// (last wins) via ObjectMap+Stringify, so emitted arguments are ALWAYS valid
@@ -1221,22 +1270,12 @@ fn invokeParamsToJson(allocator: std.mem.Allocator, body: []const u8, comptime d
     var map: std.json.ObjectMap = .empty;
     var pos: usize = 0;
     var found = false;
-    while (std.mem.indexOfPos(u8, body, pos, d.param)) |p| {
-        const after = p + d.param.len;
-        const seg = body[after..];
-        const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
-        const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
-            pos = after;
-            continue;
-        };
-        const vstart = after + te + 1;
-        // The value runs to the CONFIRMED closing tag — rich values with
-        // newlines/quotes/`<` survive; no close by end of text = fragment,
-        // dropped.
-        const vend_rel = std.mem.indexOf(u8, body[vstart..], d.param_close) orelse break;
-        try map.put(aa, pname, .{ .string = body[vstart .. vstart + vend_rel] });
+    // No close by end of text = fragment, dropped.
+    while (nextInvokeParam(body, pos, d)) |param| {
+        const vend = param.vend orelse break;
+        try map.put(aa, param.name, .{ .string = body[param.vstart..vend] });
         found = true;
-        pos = vstart + vend_rel + d.param_close.len;
+        pos = vend + d.param_close.len;
     }
     if (!found) return null;
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
@@ -2589,11 +2628,28 @@ pub fn closerInsideValue(spans: ValueSpans, text: []const u8, from: usize, at: u
             if (std.mem.startsWith(u8, body, "<function=")) break :blk hermesValueOpenAt(text, from, at);
             break :blk argValueOpenAt(text, from, at);
         },
-        .gemma => std.mem.count(u8, text[from..at], "<|\"|>") % 2 == 1,
+        .gemma => gemmaStringOpenAt(text[from..at]),
         .dsml => dsmlValueOpenAt(text, from, at),
         .invoke => invokeValueOpenAt(text, from, at),
         .function_tag => if (std.mem.startsWith(u8, text[from..], "<function=")) hermesValueOpenAt(text, from, at) else miniCpm5ValueOpenAt(text, from, at),
     };
+}
+
+/// Whether `before`, a Gemma call's text up to a closer, leaves a `<|"|>` string open. Text that ends in the arguments'
+/// own `}` is a finished call whatever the delimiters count: a model that drops one delimiter flips every string after it.
+fn gemmaStringOpenAt(before: []const u8) bool {
+    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, before, " \t\r\n"), "}")) return false;
+    return std.mem.count(u8, before, "<|\"|>") % 2 == 1;
+}
+
+/// Where the Gemma call whose body starts at `from` ends, relative to `from`: its first `<tool_call|>` outside every
+/// `<|"|>` string, the one rule `closerInsideValue` reads. Null when the text stops before it.
+fn gemmaCloserOutsideValue(text: []const u8, from: usize) ?usize {
+    var p = from;
+    while (std.mem.indexOfPos(u8, text, p, "<tool_call|>")) |at| : (p = at + 1) {
+        if (!closerInsideValue(.gemma, text, from, at)) return at - from;
+    }
+    return null;
 }
 
 /// Whether `at` falls inside a string of the JSON object `body` opens with. A model that mangles a quote (a key with no
@@ -2648,23 +2704,43 @@ fn dsmlValueOpenAt(text: []const u8, from: usize, at: usize) bool {
     return (dsmlParamClose(text, gt + 1) orelse return true).at >= at;
 }
 
-fn invokeValueOpenAt(text: []const u8, from: usize, at: usize) bool {
-    const open = std.mem.lastIndexOf(u8, text[from..at], "<parameter ") orelse return false;
-    const gt = std.mem.indexOfScalarPos(u8, text, from + open, '>') orelse return true;
-    if (gt >= at) return true;
-    return (std.mem.indexOfPos(u8, text, gt + 1, "</parameter>") orelse return true) >= at;
+fn miniCpm5ValueOpenAt(text: []const u8, from: usize, at: usize) bool {
+    const gt = std.mem.indexOfScalarPos(u8, text, from, '>') orelse return false;
+    if (gt >= at) return false;
+    return at < (miniCpm5CallClose(text, gt + 1) orelse return true);
 }
 
-fn miniCpm5ValueOpenAt(text: []const u8, from: usize, at: usize) bool {
-    var end = at;
-    const open = while (std.mem.lastIndexOf(u8, text[from..end], "<param")) |rel| {
-        const pos = from + rel;
-        if (pos + "<param".len < text.len and std.ascii.isWhitespace(text[pos + "<param".len])) break pos;
-        end = pos;
-    } else return false;
-    const gt = std.mem.indexOfScalarPos(u8, text, open, '>') orelse return true;
-    if (gt >= at) return true;
-    return (miniCpm5FindCloseTag(text, gt + 1, "</param>") orelse return true) >= at;
+/// Where the MiniCPM5 call whose body starts at `from` ends: its first `</function>` outside every `<param>` value
+/// (a value runs to its `</param>`, CDATA skipped), the one rule `closerInsideValue` reads. Null when the text stops
+/// before it, inside a value included.
+fn miniCpm5CallClose(text: []const u8, from: usize) ?usize {
+    var i = from;
+    while (true) {
+        const close = miniCpm5FindCloseTag(text, i, "</function>");
+        const open = miniCpm5NextParamValue(text, i) orelse return close;
+        if (close) |c| if (c < open.tag) return c;
+        const end = miniCpm5FindCloseTag(text, open.vstart, "</param>") orelse return null;
+        i = end + "</param>".len;
+    }
+}
+
+/// The next `<param name=…>` of `text` from `from`: where its tag opens and where its value starts.
+fn miniCpm5NextParamValue(text: []const u8, from: usize) ?struct { tag: usize, vstart: usize } {
+    var pscan = from;
+    while (std.mem.indexOfPos(u8, text, pscan, "<param")) |pp| {
+        const p_after = pp + "<param".len;
+        if (p_after >= text.len or !std.ascii.isWhitespace(text[p_after])) {
+            pscan = p_after;
+            continue;
+        }
+        const gt = std.mem.indexOfScalarPos(u8, text, p_after, '>') orelse return null;
+        if (miniCpm5AttrValue(text[p_after..gt], "name") == null) {
+            pscan = gt + 1;
+            continue;
+        }
+        return .{ .tag = pp, .vstart = gt + 1 };
+    }
+    return null;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
@@ -2839,7 +2915,7 @@ fn parseMiniCpm5ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls:
         }
 
         const body_start = tag_end + 1;
-        const close_pos = miniCpm5FindCloseTag(text, body_start, "</function>");
+        const close_pos = miniCpm5CallClose(text, body_start);
         const body_end = if (close_pos) |cp| cp else text.len;
         const body = text[body_start..body_end];
 
@@ -2847,21 +2923,10 @@ fn parseMiniCpm5ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls:
         defer args_map.deinit(allocator);
 
         var pscan: usize = 0;
-        while (std.mem.indexOfPos(u8, body, pscan, "<param")) |pp| {
-            const p_after = pp + "<param".len;
-            if (p_after >= body.len or !std.ascii.isWhitespace(body[p_after])) {
-                pscan = p_after;
-                continue;
-            }
-            const p_tag_end = std.mem.indexOfScalarPos(u8, body, p_after, '>') orelse break;
-            const p_open_tag = body[p_after..p_tag_end];
-            const p_name = miniCpm5AttrValue(p_open_tag, "name") orelse {
-                pscan = p_tag_end + 1;
-                continue;
-            };
-            const p_val_start = p_tag_end + 1;
-            const p_close_pos = miniCpm5FindCloseTag(body, p_val_start, "</param>") orelse break;
-            const value = miniCpm5ParamValue(body[p_val_start..p_close_pos]);
+        while (miniCpm5NextParamValue(body, pscan)) |param| {
+            const p_name = miniCpm5AttrValue(body[param.tag + "<param".len .. param.vstart - 1], "name").?;
+            const p_close_pos = miniCpm5FindCloseTag(body, param.vstart, "</param>") orelse break;
+            const value = miniCpm5ParamValue(body[param.vstart..p_close_pos]);
 
             if (p_name.len > 0 and args_map.getEntry(p_name) == null) {
                 try args_map.put(allocator, p_name, .{ .string = value });
