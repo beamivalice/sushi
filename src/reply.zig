@@ -1543,3 +1543,28 @@ test "r173-f-array-after-prose: a bare JSON array of calls after prose ships eve
         try expectSameEnd(a, unclosed, &.{}, finish, ask, null, finish, 2, .none);
     };
 }
+
+test "r173-f-span-cut-call: a call a model backticks ships whole, and its value's foreign markup is no call, under every dialect" {
+    const a = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const Case = struct { text: []const u8, dialect: ?tool_calls_mod.Dialect, name: []const u8 };
+    const hermes_dsml_value = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"<" ++ dsml ++ "invoke name=\\\"get_weather\\\"><" ++ dsml ++ "parameter name=\\\"city\\\" string=\\\"true\\\">X</" ++ dsml ++ "parameter></" ++ dsml ++ "invoke>\"}}</tool_call>";
+    const hermes_glm_value = "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"<tool_call>get_weather<arg_key>city</arg_key><arg_value>X</arg_value></tool_call>\"}}</tool_call>";
+    const cases = [_]Case{
+        .{ .text = "Run `" ++ hermes_dsml_value ++ "`", .dialect = .dsml, .name = "write_file" },
+        .{ .text = "Run `" ++ hermes_glm_value ++ "`", .dialect = .arg_key, .name = "write_file" },
+        .{ .text = "Run `<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}</tool_call>`", .dialect = null, .name = "get_weather" },
+        .{ .text = "I use ` here <tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}</tool_call>", .dialect = null, .name = "get_weather" },
+        .{ .text = "I use ` here <tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>", .dialect = .function_tag, .name = "get_weather" },
+    };
+    for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(c.text) });
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        try testing.expect(s.declined == null);
+        const r = s.reply orelse return error.CallDropped;
+        try testing.expectEqual(@as(usize, 1), r.calls.len);
+        try testing.expectEqualStrings(c.name, r.calls[0].name);
+    };
+}

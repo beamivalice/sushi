@@ -170,12 +170,9 @@ const opener_count = blk: {
     break :blk n;
 };
 
-/// What reading one text keeps forward, so the read is linear in the text: whether an inline code span is open at a
-/// byte, and where each opener spelling and each needle an opener's reading looks for next stands.
+/// What reading one text keeps forward, so the read is linear in the text: where each opener spelling and each needle
+/// an opener's reading looks for next stands, and which inline code span a byte falls in.
 pub const Scan = struct {
-    fed: usize = 0,
-    started: bool = false,
-    state: think_tags.CodeSpan = .{},
     openers: [opener_count]Next,
     parameter_eq: Next = .{ .needle = "<parameter=" },
     param: Next = .{ .needle = "<param" },
@@ -183,6 +180,13 @@ pub const Scan = struct {
     gt: Next = .{ .needle = ">" },
     dsml_invoke: Next = .{ .needle = "<｜DSML｜invoke" },
     dsml_invoke_spaced: Next = .{ .needle = "<｜DSML｜ invoke" },
+    tick: Next = .{ .needle = "`" },
+    newline: Next = .{ .needle = "\n" },
+    /// Where the span reading stands: the first byte after the last pair it settled, and the first pair at or after it.
+    cursor: usize = 0,
+    pair: ?Pair = null,
+    pair_known: bool = false,
+    spans_started: bool = false,
     /// Bytes the searches covered; a test holds it to a multiple of the text.
     work: usize = 0,
     /// Reading a text for calls (the default) or looking for leaked markup to cut: the cut takes an opener alone as
@@ -199,21 +203,58 @@ pub const Scan = struct {
         return scan;
     }
 
-    fn openAt(self: *Scan, text: []const u8, at: usize) bool {
-        // A span ends with its line, so a text is read from the line of the first byte asked.
-        if (at < self.fed or !self.started) {
-            self.fed = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
-            self.state = .{};
-            self.started = true;
+    /// Whether the byte at `at` stands inside an inline code span of its line, asked for rising bytes. Runs of one or
+    /// two backticks pair up in order along the line (three or more are a fence and pair with nothing); a run no later
+    /// run pairs with is a literal backtick and hides nothing.
+    fn quoted(self: *Scan, text: []const u8, at: usize) bool {
+        if (!self.spans_started or at < self.cursor) {
+            self.cursor = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
+            self.work += at - self.cursor;
+            self.pair_known = false;
+            self.spans_started = true;
         }
-        self.state.feed(text[self.fed..at]);
-        self.fed = at;
-        return self.state.openStart() != null;
+        while (true) {
+            const eol = self.newline.find(text, self.cursor, &self.work) orelse text.len;
+            if (eol < at) {
+                self.cursor = eol + 1;
+                self.pair_known = false;
+                continue;
+            }
+            if (!self.pair_known) {
+                self.pair = self.findPair(text, eol);
+                self.pair_known = true;
+            }
+            const p = self.pair orelse return false;
+            if (at < p.open) return false;
+            if (at < p.close) return true;
+            self.cursor = p.end;
+            self.pair_known = false;
+        }
+    }
+
+    fn findPair(self: *Scan, text: []const u8, eol: usize) ?Pair {
+        const open = self.tickRun(text, self.cursor, eol) orelse return null;
+        const close = self.tickRun(text, open.at + open.len, eol) orelse return null;
+        return .{ .open = open.at, .close = close.at, .end = close.at + close.len };
+    }
+
+    /// The first run of one or two backticks in `[from, eol)`.
+    fn tickRun(self: *Scan, text: []const u8, from: usize, eol: usize) ?struct { at: usize, len: usize } {
+        var p = from;
+        while (self.tick.find(text, p, &self.work)) |t| {
+            if (t >= eol) return null;
+            var len: usize = 1;
+            while (t + len < text.len and text[t + len] == '`') len += 1;
+            if (len < 3) return .{ .at = t, .len = len };
+            p = t + len;
+        }
+        return null;
     }
 };
 
-/// The first call opener at or after `from`. An opener inside an inline code span is text: a model explaining its
-/// format quotes it.
+const Pair = struct { open: usize, close: usize, end: usize };
+
+/// The first call opener at or after `from`.
 pub fn nextOpener(text: []const u8, from: usize, scan: *Scan) ?Opener {
     var fam: [opener_count]*const Family = undefined;
     var k: usize = 0;
@@ -232,7 +273,7 @@ pub fn nextOpener(text: []const u8, from: usize, scan: *Scan) ?Opener {
         }
         const i = best orelse return null;
         const at = next[i].?;
-        if (opensCall(fam[i], text, at, scan) and !(scan.strict and scan.openAt(text, at))) return .{ .at = at, .len = scan.openers[i].needle.len, .family = fam[i] };
+        if (opensCall(fam[i], text, at, scan)) return .{ .at = at, .len = scan.openers[i].needle.len, .family = fam[i] };
         next[i] = scan.openers[i].find(text, at + 1, &scan.work);
     }
 }
@@ -320,7 +361,7 @@ fn bodyIsFunction(text: []const u8, at: usize) bool {
 
 /// A call of the text and where it ends (null: the text stops inside it).
 /// `lost`: the call lost the close of its last value, so it ends where the next call opens.
-pub const Call = struct { start: usize, end: ?usize, lost: bool = false, family: *const Family };
+pub const Call = struct { start: usize, open_len: usize, end: ?usize, lost: bool = false, family: *const Family };
 
 /// The calls of a text, in order, outside every thought that closed. A thought still open at the end of the text
 /// holds calls as the rest of the text does; the one the prompt opened ends at its first close.
@@ -350,20 +391,48 @@ pub const Reader = struct {
                 }
             }
             const o = opener orelse return null;
-            const end = callEnd(o.family, self.text, o.at, self.model_ended);
-            if (o.family.container) {
-                const inner = nextOpener(self.text, o.at + o.len, &self.scan);
-                const whole = end != null or self.model_ended;
-                if (inner != null and whole and (end == null or inner.?.at < end.?.at)) {
-                    self.pos = o.at + o.len;
-                    continue;
-                }
+            switch (readAt(self.text, o, self.model_ended, &self.scan)) {
+                .call => |c| {
+                    self.pos = c.end orelse self.text.len;
+                    return c;
+                },
+                .enter => self.pos = o.at + o.len,
+                .mention => self.pos = o.at + o.len,
             }
-            self.pos = if (end) |e| e.at else self.text.len;
-            return .{ .start = o.at, .end = if (end) |e| e.at else null, .lost = if (end) |e| e.lost else false, .family = o.family };
         }
     }
 };
+
+const Step = union(enum) {
+    call: Call,
+    /// A container with calls inside: they are read where they stand.
+    enter,
+    /// An opener quoted in an inline code span that no closer follows: a model explaining its format, not a call.
+    mention,
+};
+
+/// What the opener `o` starts, read as the parser reads it. Only an unfinished call quoted in a code span is a mention:
+/// a call that ends is a call wherever it is written.
+fn readAt(text: []const u8, o: Opener, model_ended: bool, scan: *Scan) Step {
+    const end = callEnd(o.family, text, o.at, model_ended);
+    if (o.family.container) {
+        const inner = nextOpener(text, o.at + o.len, scan);
+        const whole = end != null or model_ended;
+        if (inner != null and whole and (end == null or inner.?.at < end.?.at)) return .enter;
+    }
+    if (end == null and scan.strict and scan.quoted(text, o.at)) return .mention;
+    return .{ .call = .{ .start = o.at, .open_len = o.len, .end = if (end) |e| e.at else null, .lost = if (end) |e| e.lost else false, .family = o.family } };
+}
+
+/// The first call of the text at or after `from`, read as `Reader` reads it but with no thought skipped.
+fn nextCall(text: []const u8, from: usize, model_ended: bool, scan: *Scan) ?Call {
+    var pos = from;
+    while (nextOpener(text, pos, scan)) |o| switch (readAt(text, o, model_ended, scan)) {
+        .call => |c| return c,
+        .enter, .mention => pos = o.at + o.len,
+    };
+    return null;
+}
 
 /// Where the call the text leaves open starts: the first call that has no end. Null when the text stops outside one.
 pub fn openCallStart(text: []const u8, model_ended: bool) ?usize {
@@ -415,24 +484,26 @@ pub fn channelCloseAt(text: []const u8, from: usize) ?think_tags.TagAt {
     return .{ .pos = p, .len = "<channel|>".len };
 }
 
+/// The first tag `find` finds at or after `from` that no call spans: a call that opens before it and ends after it holds
+/// it as payload, and so does one the text stops inside, whatever it spells.
 pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, find: *const fn ([]const u8, usize) ?think_tags.TagAt) ?think_tags.TagAt {
     var i = from;
+    var q = from;
     var scan = Scan.init();
-    outer: while (find(text, i)) |m| {
-        var q = i;
-        while (nextOpener(text, q, &scan)) |o| {
-            if (o.at >= m.pos) break;
-            const end = (callEnd(o.family, text, o.at, model_ended) orelse {
-                q = o.at + o.len;
+    while (find(text, i)) |m| {
+        while (true) {
+            const c = nextCall(text, q, model_ended, &scan) orelse return m;
+            if (c.start >= m.pos) return m;
+            const end = c.end orelse {
+                q = c.start + c.open_len;
                 continue;
-            }).at;
+            };
+            q = end;
             if (end > m.pos) {
                 i = end;
-                continue :outer;
+                break;
             }
-            q = end;
         }
-        return m;
     }
     return null;
 }

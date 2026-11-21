@@ -4193,3 +4193,37 @@ test "format corpus: no call markup reaches content, finished, declined or read 
     };
 }
 
+
+test "r173-f-span-cut-call: a call cut after a stray backtick is declined and named exactly as without the backtick, every dialect, at stop, length and cancel, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const bodies = [_][]const u8{
+        "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
+        "<tool_call>\n<function=get_weather>\n<parameter=city>\nTok",
+        "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
+        "<|tool_call>call:get_weather{city:<|\"|>Tok",
+        "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">Tok",
+        "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok",
+        "<function name=\"get_weather\">\n<param name=\"city\">Tok",
+        "<tool name=\"get_weather\">{\"arguments\": {\"city\": \"Tok",
+    };
+    for (bodies) |body| for ([_][]const u8{ "stop", "length", "cancelled" }) |finish| {
+        const stray = try std.mem.concat(allocator, u8, &.{ "I use ` here ", body });
+        defer allocator.free(stray);
+        const plain = try std.mem.concat(allocator, u8, &.{ "I use  here ", body });
+        defer allocator.free(plain);
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(stray) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const want = try reply_mod.settle(allocator, .{ .text = plain, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer want.deinit(allocator);
+        try testing.expect(want.reply == null);
+        const want_name = (want.declined orelse return error.TwinNotDeclined).name orelse return error.TwinNotNamed;
+        for ([_]stop_sequences.Source{ .whole, .{ .gated = null } }) |source| {
+            const got = try reply_mod.settle(allocator, .{ .text = stray, .source = source, .finish_reason = finish, .finish_details = null }, ask);
+            defer got.deinit(allocator);
+            try testing.expect(got.reply == null);
+            try testing.expectEqualStrings(want_name, (got.declined orelse return error.StrayNotDeclined).name orelse return error.StrayNotNamed);
+            try testing.expectEqualStrings("I use ` here", std.mem.trim(u8, think_tags.splitThinkBlock(got.text, true, false).content, " \n"));
+        }
+    };
+}
