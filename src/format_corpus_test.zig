@@ -4083,3 +4083,35 @@ test "format corpus: a string value that ends in a brace right before a spelled 
         try testing.expect(open.reply != null);
     }
 }
+
+test "format corpus: a call whose value spells another call's markup is read as the one call, under every served dialect" {
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const value = "wrap: <tool_call>x</tool_call> and <" ++ dsml ++ "invoke name=\"y\"> and <tool_call>z<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> done";
+    const json_value = "wrap: <tool_call>x</tool_call> and <" ++ dsml ++ "invoke name=\\\"y\\\"> and <tool_call>z<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> done";
+    // GLM ends a value at the first </arg_value> the call's close follows, so its value cannot spell that pair.
+    const glm_value = "wrap: <tool_call>x</tool_call> and <" ++ dsml ++ "invoke name=\"y\"> done";
+    const calls = [_][]const u8{
+        "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"" ++ json_value ++ "\"}}\n</tool_call>",
+        "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>",
+        "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ glm_value ++ "</arg_value></tool_call>",
+        "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">a.md</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">" ++ value ++ "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls>",
+    };
+    for (calls, 0..) |call, k| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .arg_key, .dsml }) |dialect| {
+        const want = if (k == 2) glm_value else value;
+        errdefer std.debug.print("[{?s}] {f}\n", .{ if (dialect) |d| @tagName(d) else null, std.zig.fmtString(call) });
+        const read = (try tool_calls_mod.parseToolCallsAs(allocator, call, dialect)) orelse return error.WholeCallDropped;
+        defer {
+            for (read) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(read);
+        }
+        try testing.expectEqual(@as(usize, 1), read.len);
+        try testing.expectEqualStrings("write_file", read[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, read[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(want, std.mem.trim(u8, (parsed.value.object.get("content") orelse return error.ValueDropped).string, "\n"));
+    };
+}

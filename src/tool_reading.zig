@@ -381,3 +381,32 @@ fn leadingThoughtEnd(text: []const u8, model_ended: bool) ?usize {
     if (think_tags.nextThinkOpen(text, 0)) |o| if (o.pos < c.pos) return null;
     return c.pos + c.len;
 }
+
+/// `text` with every call the reading finds that `keep` does not accept blanked to spaces (the bytes keep their
+/// places), or null when nothing is blanked: a family's parser then reads only its own calls, and a value that spells
+/// another family's markup never decides the call. The caller frees the copy.
+pub fn maskedExcept(allocator: std.mem.Allocator, text: []const u8, keep: *const fn (text: []const u8, call: Call) bool) !?[]u8 {
+    var out: ?[]u8 = null;
+    errdefer if (out) |o| allocator.free(o);
+    var reader = Reader.init(text, true);
+    while (reader.next()) |c| {
+        if (keep(text, c)) continue;
+        if (out == null) out = try allocator.dupe(u8, text);
+        @memset(out.?[c.start .. c.end orelse text.len], ' ');
+    }
+    return out;
+}
+
+/// A call of DeepSeek's DSML dialect.
+pub fn isDsmlCall(_: []const u8, call: Call) bool {
+    return call.family.values == .dsml;
+}
+
+/// A call of GLM's `<tool_call>NAME<arg_key>…` dialect: a bare `<tool_call>` whose body is neither JSON nor a
+/// `<function=` tag.
+pub fn isArgKeyCall(text: []const u8, call: Call) bool {
+    if (call.family != &families[1]) return false;
+    const gt = std.mem.indexOfScalarPos(u8, text, call.start, '>') orelse return true;
+    const body = std.mem.trimStart(u8, text[gt + 1 ..], " \t\r\n");
+    return !(std.mem.startsWith(u8, body, "{") or std.mem.startsWith(u8, body, "<function="));
+}

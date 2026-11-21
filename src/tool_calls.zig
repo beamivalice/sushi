@@ -2,6 +2,7 @@ const std = @import("std");
 const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const think_tags = @import("think_tags.zig");
+const tool_reading = @import("tool_reading.zig");
 const tagLenAt = think_tags.tagLenAt;
 const indexOfThinkCloseTag = think_tags.indexOfThinkCloseTag;
 const streamShouldBufferForTools = think_tags.streamShouldBufferForTools;
@@ -580,7 +581,10 @@ fn parseTaggedFamilies(allocator: std.mem.Allocator, text: []const u8, calls: *s
     const dsml_first = dialect != .arg_key;
     for ([_]bool{ dsml_first, !dsml_first }) |dsml| {
         if (dialect != null and calls.items.len > 0) return;
-        if (dsml) try parseDsmlToolCalls(allocator, text, calls) else try parseArgKeyToolCalls(allocator, text, calls);
+        // A family reads only its own calls: another family's markup in a value is payload.
+        const own = try tool_reading.maskedExcept(allocator, text, if (dsml) tool_reading.isDsmlCall else tool_reading.isArgKeyCall);
+        defer if (own) |o| allocator.free(o);
+        if (dsml) try parseDsmlToolCalls(allocator, own orelse text, calls) else try parseArgKeyToolCalls(allocator, own orelse text, calls);
         dropUnnamedCalls(allocator, calls);
     }
 }

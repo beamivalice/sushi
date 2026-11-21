@@ -1303,3 +1303,119 @@ test "r173-f-foreign-opener: Hermes JSON: a string value ending in a brace right
     }
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+
+test "r173-f-foreign-opener: a finished call whose value spells its own dialect's opener ships whole" {
+    const a = testing.allocator;
+    const Case = struct { dialect: ?tool_calls_mod.Dialect, text: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .dialect = null, .text = "<tool_call>{\"name\":\"write_file\",\"arguments\":{\"path\":\"a.md\",\"content\":\"see <tool_call> tag\"}}</tool_call>", .want = "see <tool_call> tag" },
+        .{ .dialect = null, .text = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"wrap: <tool_call>x</tool_call> done\"}}\n</tool_call>", .want = "wrap: <tool_call>x</tool_call> done" },
+        .{ .dialect = .function_tag, .text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\nsee <tool_call> tag\n</parameter>\n</function>\n</tool_call>", .want = "see <tool_call> tag" },
+        .{ .dialect = .function_tag, .text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\nuse <function=x> then\n</parameter>\n</function>\n</tool_call>", .want = "use <function=x> then" },
+        .{ .dialect = .arg_key, .text = "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see <tool_call> tag</arg_value></tool_call>", .want = "see <tool_call> tag" },
+        .{ .dialect = .dsml, .text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">a.md</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">see <\u{ff5c}DSML\u{ff5c}invoke name=\"y\"> tag</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>", .want = "see <\u{ff5c}DSML\u{ff5c}invoke name=\"y\"> tag" },
+        .{ .dialect = null, .text = "<|tool_call>call:write_file{path:<|\"|>a.md<|\"|>,content:<|\"|>see <|tool_call> tag<|\"|>}<tool_call|>", .want = "see <|tool_call> tag" },
+    };
+    var bad: usize = 0;
+    for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        var got: []const u8 = "(no call)";
+        var parsed: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed) |p| p.deinit();
+        if (s.reply) |r| {
+            parsed = try std.json.parseFromSlice(std.json.Value, a, r.calls[0].arguments, .{});
+            got = if (parsed.?.value.object.get("content")) |v| v.string else r.calls[0].arguments;
+        }
+        if (s.declined != null or !std.mem.eql(u8, got, c.want)) {
+            bad += 1;
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+            std.debug.print("own {f} [{s}]: content {f} declined={?s}\n", .{ std.zig.fmtString(c.text[0..@min(40, c.text.len)]), finish, std.zig.fmtString(got), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: a finished Hermes JSON call whose string spells the closer keeps its arguments, under every served dialect" {
+    const a = testing.allocator;
+    const texts = [_][]const u8{
+        "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"end </tool_call> here\"}}\n</tool_call>",
+        "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"wrap: <tool_call>x</tool_call> done\"}}\n</tool_call>",
+    };
+    var bad: usize = 0;
+    for (texts) |text| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .arg_key, .dsml }) |dialect| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.eql(u8, r.calls[0].name, "write_file") and std.mem.indexOf(u8, r.calls[0].arguments, "here") != null or std.mem.indexOf(u8, r.calls[0].arguments, "done") != null else false;
+        if (!ok or s.declined != null) {
+            bad += 1;
+            std.debug.print("hermes-closer {s} {f}: declined={?s}\n", .{ if (dialect) |d| @tagName(d) else "null", std.zig.fmtString(text[40..@min(text.len, 110)]), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: a finished arg_key call whose value spells a whole call of its own dialect keeps its arguments" {
+    const a = testing.allocator;
+    const texts = [_][]const u8{
+        "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>wrap: <tool_call>x</tool_call> done</arg_value></tool_call>",
+        "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>end </tool_call> done</arg_value></tool_call>",
+    };
+    var bad: usize = 0;
+    for (texts) |text| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.eql(u8, r.calls[0].name, "write_file") and std.mem.indexOf(u8, r.calls[0].arguments, "done") != null else false;
+        if (!ok or s.declined != null) {
+            bad += 1;
+            std.debug.print("glm [{s}] {f}: declined={?s}\n", .{ finish, std.zig.fmtString(text[80..]), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: a finished function-tag call whose value spells its closers keeps every argument" {
+    const a = testing.allocator;
+    const values = [_][]const u8{ "print(\"</tool_call>\")", "print(\"</function>\")", "print(\"</function></tool_call>\")" };
+    var bad: usize = 0;
+    for (values) |v| for ([_]?tool_calls_mod.Dialect{ .function_tag, null }) |dialect| {
+        const text = try std.mem.concat(a, u8, &.{ "<tool_call>\n<function=write_file>\n<parameter=content>\n", v, "\n</parameter>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>" });
+        defer a.free(text);
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer s.deinit(a);
+        const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.indexOf(u8, r.calls[0].arguments, "a.py") != null else false;
+        if (!ok or s.declined != null) {
+            bad += 1;
+            std.debug.print("qwen-closer {s} {s}: declined={?s}\n", .{ if (dialect) |d| @tagName(d) else "null", v, if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
+
+test "r173-f-foreign-opener: DSML: a finished call whose value spells its closers keeps every argument" {
+    const a = testing.allocator;
+    const values = [_][]const u8{ "a </\u{ff5c}DSML\u{ff5c}invoke></\u{ff5c}DSML\u{ff5c}tool_calls> b", "a </\u{ff5c}DSML\u{ff5c}tool_calls> b", "<\u{ff5c}DSML\u{ff5c}tool_calls> b" };
+    var bad: usize = 0;
+    for (values) |v| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(a, u8, &.{ "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">", v, "</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">a.py</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>" });
+        defer a.free(text);
+        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .dsml, .opens_think = false };
+        const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer s.deinit(a);
+        const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.indexOf(u8, r.calls[0].arguments, "a.py") != null else false;
+        if (!ok or s.declined != null) {
+            bad += 1;
+            std.debug.print("dsml-closer [{s}] {f}: declined={?s}\n", .{ finish, std.zig.fmtString(v), if (s.declined) |d| d.name orelse "(unnamed)" else null });
+            if (s.reply) |r| for (r.calls) |cc| std.debug.print("  call {s} {s}\n", .{ cc.name, cc.arguments });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
+}
