@@ -1024,16 +1024,12 @@ pub const ModelRegistry = struct {
         return null;
     }
 
-    /// Re-run discovery over the roots the server booted with and absorb NEW
-    /// dirs as `.unloaded` stubs (`POST /v1/models/rescan` — the Model
-    /// Browser downloads models while the server runs, and a boot-only scan
-    /// can't see them). Add-only: an id or path already registered wins
-    /// (first-wins, like boot) and live entries are never re-pointed or
-    /// removed. An entry no load holds, at the same path, takes the folder's facts again
-    /// (a pull that finished), and a failed load there becomes retryable. Returns the
-    /// number of stubs added. A `--model`-only server with no
-    /// settings-file models directory rescans nothing (`absorbDownload`
-    /// still lists what the Downloads tab fetched).
+    /// Re-run discovery over the roots the server booted with and reconcile the registry with what it found
+    /// (`POST /v1/models/rescan`: the Model Browser downloads models while the server runs, and a boot-only scan
+    /// can't see them): new folders become `.unloaded` stubs, an entry no load holds takes its folder's facts again
+    /// (a pull that finished; a failed load there becomes retryable), and one whose folder is gone is dropped
+    /// (`reconcileLocked`). A held or loaded entry is never changed. A `--model`-only server with no settings-file
+    /// models directory rescans nothing (`absorbDownload` still lists what the Downloads tab fetched).
     pub fn rescan(self: *ModelRegistry) !Rescanned {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         return self.rescanWithSettings(self.settings_path orelse model_settings.defaultPath(&path_buf));
@@ -1086,7 +1082,8 @@ pub const ModelRegistry = struct {
     }
 
     /// `rescan` reading the settings file at `settings_path`.
-    /// What a rescan changed: entries registered for new folders, and entries dropped because their folder is gone.
+    /// What a rescan changed: entries registered for new folders, and entries dropped (their folder is gone, or another
+    /// entry has it).
     pub const Rescanned = struct { added: u32 = 0, removed: u32 = 0 };
 
     pub fn rescanWithSettings(self: *ModelRegistry, settings_path: []const u8) !Rescanned {
@@ -1096,22 +1093,26 @@ pub const ModelRegistry = struct {
         defer file.deinit();
         var with_file: [9][]const u8 = undefined;
         const roots = rootsWithFileDir(&with_file, boot_roots, model_settings.launch_locks.models_dir.set, model_settings.server(&file).models_dir);
-        self.mutex.lockUncancelable(self.io);
-        const removed = try self.retireVanishedLocked();
-        self.mutex.unlock(self.io);
-        if (roots.len == 0) return .{ .removed = removed };
-        var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
-        defer found.deinit();
-        var added: u32 = 0;
+        var found: ?model_discovery.DiscoveryResult = if (roots.len == 0) null else try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
+        defer if (found) |*f| f.deinit();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (found.models) |m| {
-            if (self.entries.get(m.id)) |e| {
-                const now = e.folderNow(self.io) catch continue;
-                if (now.eql(&m.folder)) self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
+        return self.reconcileLocked(if (found) |f| f.models else &.{});
+    }
+
+    /// The inventory against the disk, in one pass under `mutex`: drops what is gone (`retireVanishedLocked`), then
+    /// joins each folder discovery found to the entry whose path opens it, whatever id registered that entry, and
+    /// refreshes it (`refreshFactsLocked`); a folder no entry opens is added under its discovery id, unless that id
+    /// names another folder's entry (first wins, as at boot).
+    fn reconcileLocked(self: *ModelRegistry, found: []const model_discovery.DiscoveredModel) !Rescanned {
+        const removed = try self.retireVanishedLocked();
+        var added: u32 = 0;
+        for (found) |m| {
+            if (self.peekByPathLocked(&m.folder)) |e| {
+                self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
                 continue;
             }
-            if (self.peekByPathLocked(&m.folder) != null) continue;
+            if (self.entries.get(m.id) != null) continue;
             const stub = try self.registerStubAt(m.id, m.path, m.folder, m.bytes_on_disk, m.model_type, m.streaming_index_complete);
             stub.bytes_linked = m.bytes_linked;
             stub.bytes_total = m.bytes_total;
@@ -3445,4 +3446,88 @@ test "ModelRegistry: a link moved onto another entry's folder leaves one entry f
     try testing.expectEqual(ModelRegistry.Rescanned{ .added = 0, .removed = 1 }, try reg.rescanWithSettings(no_settings));
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
     try testing.expectEqual(b, reg.peek("org/b").?);
+}
+
+test "ModelRegistry: a pack registered by path outside every root is dropped once its folder is deleted" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "dl/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dl/beamster/P/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    _ = try reg.absorbDownloadWithSettings(no_settings, try std.fmt.bufPrint(&pb, "{s}/dl/beamster/P", .{root}));
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
+    try tmp.dir.deleteTree(io, "dl/beamster/P");
+    _ = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(usize, 0), reg.entries.count());
+}
+
+
+test "ModelRegistry: a listed pack whose config.json is gone is no longer listed after a rescan" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    try tmp.dir.deleteFile(io, "beamster/P/config.json");
+    _ = try reg.rescanWithSettings(no_settings);
+    try testing.expect(reg.peek("beamster/P") == null);
+}
+
+
+test "ModelRegistry: two roots hold one id; the first copy deleted, the second is the one listed" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "r1/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "r1/beamster/P/model.safetensors", .data = "0123" });
+    try model_discovery.writePackStub(io, tmp.dir, "r2/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "r2/beamster/P/model.safetensors", .data = "01234567" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const r1 = try std.fmt.bufPrint(&b1, "{s}/r1", .{root});
+    const r2 = try std.fmt.bufPrint(&b2, "{s}/r2", .{root});
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{ r1, r2 }), 2, 0, null);
+    defer reg.deinit();
+    try tmp.dir.deleteTree(io, "r1/beamster/P");
+    _ = try reg.rescanWithSettings(no_settings);
+    const e = reg.peek("beamster/P") orelse return error.SecondCopyNotListed;
+    var want: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "{s}/beamster/P", .{r2}), e.path);
+}
+
+
+test "ModelRegistry: a rescan refreshes the facts of the entry at a walked folder, whatever id registered it" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "models/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/beamster/P/model-00001.safetensors", .data = "0123456789" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const settings_json = try std.fmt.allocPrint(testing.allocator, "{{\"server\":{{\"models_dir\":\"{s}/models\"}}}}", .{root});
+    defer testing.allocator.free(settings_json);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data = settings_json });
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    const settings = try std.fmt.bufPrint(&sb, "{s}/model-settings.json", .{root});
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    // The app loads the pack by path while `sushi pull` is still writing it: listed as "P" with its partial bytes.
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const e = reg.peek(try reg.registerByPath(io, try std.fmt.bufPrint(&pb, "{s}/models/beamster/P", .{root}))) orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 10), e.bytes_on_disk);
+    // The pull finishes; the user presses Rescan (POST /v1/models/rescan) over the models folder that holds it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/beamster/P/model-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    _ = try reg.rescanWithSettings(settings);
+    try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
 }
