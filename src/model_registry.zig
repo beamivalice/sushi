@@ -670,7 +670,10 @@ pub const LoadAttempt = struct {
     }
 
     /// Claims the entry, the caller holding `mutex`. An explicit retry's stored failure is kept until `posted`.
-    pub fn claimLocked(self: *LoadAttempt) void {
+    /// `error.EntryRetired` when a rescan retired the entry since the caller resolved it: the registry lists another
+    /// (or none) under its id, and a load of this one would be resident beyond every walk of the list.
+    pub fn claimLocked(self: *LoadAttempt) error{EntryRetired}!void {
+        if (!self.registry.listsLocked(self.entry)) return error.EntryRetired;
         if (self.entry.state == .error_state) {
             self.kept_name = self.entry.error_name;
             self.entry.error_name = null;
@@ -1290,6 +1293,11 @@ pub const ModelRegistry = struct {
     /// `peek` for a caller that already holds `mutex` and must read the
     /// entry's `state` and its retained CPU state without the two drifting
     /// apart. Caller holds `mutex`.
+    /// Whether `e` is the entry the registry lists under its id (a retired one is not). Caller holds `mutex`.
+    pub fn listsLocked(self: *ModelRegistry, e: *const LoadedModel) bool {
+        return self.entries.get(e.id) == e;
+    }
+
     pub fn peekLocked(self: *ModelRegistry, id: []const u8) ?*LoadedModel {
         return self.entries.get(id);
     }
@@ -2443,7 +2451,7 @@ test "ModelRegistry: a refused load is unloaded, any other failure is stored, an
     inline for (refusals ++ [_][]const u8{ "FileNotFound", "LoadFailed", "Exl3ShardStampMismatch" }) |name| {
         var attempt = reg.beginAttempt(stub);
         reg.mutex.lockUncancelable(reg.io);
-        attempt.claimLocked();
+        try attempt.claimLocked();
         reg.mutex.unlock(reg.io);
         attempt.outcome = .{ .failed = @field(anyerror, name) };
         attempt.end();
@@ -2508,7 +2516,7 @@ test "ModelRegistry: a setting that reaches loading saved while the model loads 
         for ([_]bool{ true, false }) |saved| {
             var attempt = reg.beginAttempt(e);
             reg.mutex.lockUncancelable(reg.io);
-            attempt.claimLocked();
+            try attempt.claimLocked();
             reg.mutex.unlock(reg.io);
             if (saved) if (e == one) reg.forgetLoadFailure(e) else reg.forgetLoadFailures();
             attempt.outcome = .{ .failed = error.FileNotFound };
@@ -3729,4 +3737,34 @@ test "ModelRegistry: a probe lands only on an entry that still has the path stri
     try reg.applyProbedLocked(e, e.path, read);
     try testing.expectEqual(@as(?u64, 99), e.bytes_on_disk);
     try testing.expectEqualStrings("beta_arch", e.archHint());
+}
+
+test "a load claims only an entry the registry still lists: one a rescan retired since it was resolved is refused" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "org/a", "org/b" }) |dir| {
+        try model_discovery.writePackStub(io, tmp.dir, dir);
+        var sb: [64]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors", .{dir}), .data = "0123" });
+    }
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    // Scheduler.ensureLoaded's slow path resolves, then preloads outside the mutex.
+    const b = try reg.resolveEntry("org/b");
+    // Meanwhile org/b becomes a link onto org/a's folder and a rescan retires the unheld entry: one folder, one entry.
+    try tmp.dir.deleteTree(io, "org/b");
+    try tmp.dir.symLink(io, "a", "org/b", .{ .is_directory = true });
+    _ = try reg.rescanWithSettings(no_settings);
+    var attempt = reg.beginAttempt(b);
+    defer attempt.end();
+    {
+        reg.mutex.lockUncancelable(io);
+        defer reg.mutex.unlock(io);
+        try testing.expectError(error.EntryRetired, attempt.claimLocked());
+    }
+    try testing.expectEqual(LoadState.unloaded, b.state);
+    try testing.expectEqual(@as(u64, 0), reg.current_resident_bytes);
 }

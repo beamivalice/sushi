@@ -59,7 +59,7 @@ array-unowned-across-try src/ubench_shared.zig:runTrunkPrefill a bench setup tha
 array-unowned-across-try src/exl3_ubench/ubench.zig:runTrunkRows a bench setup that fails ends the ubench process, which holds no pool beyond it
 array-unowned-across-try src/exl3_ubench/ubench.zig:runTrunkLaunches a bench setup that fails ends the ubench process, which holds no pool beyond it
 caught-error-unsettled src/scheduler.zig:pushTokenWithLogprob a host append while a tick publishes: a latch pending then is the forward's, which the tick's checkErrorDecode reads
-caught-error-unsettled src/scheduler.zig:ensureLoadedWith a host parse of the model's files on the requesting connection thread, which must never take the inference thread's latch
+caught-error-unsettled src/scheduler.zig:ensureLoadedOnce a host parse of the model's files on the requesting connection thread, which must never take the inference thread's latch
 caught-error-unsettled src/scheduler.zig:runSingleDecodeTick the reasoning protocol's own errors, raised by host code; the checkErrorDecode right after reads the tick's latch
 caught-error-unsettled src/scheduler.zig:runBatchedDecodeTickInner a host append after the group's forward: a latch pending then is the group's, which runBatchedDecodeTick's checkErrorDecode reads for every row
 error-body-literal src/generation_stream.zig:buildOpenAiStreamError the chat and completions stream's terminal error chunk, built once; sendGenerationError sends it

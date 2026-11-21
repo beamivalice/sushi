@@ -1747,6 +1747,18 @@ pub const Scheduler = struct {
     }
 
     fn ensureLoadedWith(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool, report: ?*LoadReport) !*LoadedModel {
+        // A rescan can retire the entry this load resolved before it claims it: resolve again, and find the entry the
+        // registry lists under that id now (a folder moved back) or none.
+        var tries: u8 = 0;
+        while (true) : (tries += 1) {
+            return self.ensureLoadedOnce(id_or_empty, retry_failed, report) catch |err| switch (err) {
+                error.EntryRetired => if (tries < 3) continue else error.UnknownModelId,
+                else => err,
+            };
+        }
+    }
+
+    fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8, retry_failed: bool, report: ?*LoadReport) !*LoadedModel {
         var unread: LoadReport = .{};
         const rep = report orelse &unread;
         rep.* = .{};
@@ -1888,7 +1900,7 @@ pub const Scheduler = struct {
             // Checked again under the mutex a download start holds while it enqueues, so the two never overlap.
             if (self.registry.loadBlocked(&gate_buf, entry) != null) return error.PackDownloading;
 
-            attempt.claimLocked();
+            try attempt.claimLocked();
 
             // Estimate post-load bytes (`gateEstimateBytes`).
             const estimated: u64 = streaming_gate_bytes orelse model_load.gateEstimateBytes(entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
