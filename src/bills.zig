@@ -917,7 +917,7 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        trunkDecodeScratchBytes(config, @min(chunk, @max(seq, 1))) +
+        trunkDecodeBilled(config, @min(chunk, @max(seq, 1))) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }
@@ -1013,10 +1013,21 @@ fn qsaMaskBilled(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64 {
 /// What `bytes` held where a chunk holds only the trunk's rows (a full-attention layer's entry, the head's readout
 /// past the last layer) adds to its bill: on an exact Cooler bill, only what they hold past the rows' peak.
 pub fn atTrunkRows(config: *const model_mod.ModelConfig, fwd: u64, bytes: u64) u64 {
+    return pastRowsPeak(config, fwd, archHook("coolerPrefillEntryRowBytes", u64, config, .{}), bytes);
+}
+
+/// What `bytes` held beside `site` bytes a row adds to a chunk's bill: on an exact Cooler bill, only what that moment
+/// holds past the rows' peak; an arch that names no site holds them at the peak.
+fn pastRowsPeak(config: *const model_mod.ModelConfig, fwd: u64, site: ?u64, bytes: u64) u64 {
     const rows = coolerPrefillRowBytes(config);
-    if (rows == 0) return bytes;
-    const entry = archHook("coolerPrefillEntryRowBytes", u64, config, .{}) orelse rows;
-    return (fwd *| entry +| bytes) -| fwd *| rows;
+    if (rows == 0 or bytes == 0) return bytes;
+    return (fwd *| (site orelse rows) +| bytes) -| fwd *| rows;
+}
+
+/// What a decoded trunk weight adds to a chunk's bill: it lives only through its own linear's matmul, beside the rows
+/// that matmul holds (`coolerPrefillDecodeSiteRowBytes`).
+pub fn trunkDecodeBilled(config: *const model_mod.ModelConfig, fwd: u64) u64 {
+    return pastRowsPeak(config, fwd, archHook("coolerPrefillDecodeSiteRowBytes", u64, config, .{}), trunkDecodeScratchBytes(config, fwd));
 }
 
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
@@ -2744,7 +2755,7 @@ pub fn requestHeldBytes(
         qsaMaskBilled(config, fwd, seq) +
         slidingBandScoreBytes(config, fwd) +
         fp8DequantScratchBytes(config, fwd) +
-        trunkDecodeScratchBytes(config, fwd) +
+        trunkDecodeBilled(config, fwd) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }

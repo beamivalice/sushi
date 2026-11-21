@@ -89,6 +89,20 @@ pub fn coolerPrefillRowBytes(config: *const model_mod.ModelConfig) ?u64 {
     return coolerPrefillRows(config).peak();
 }
 
+/// The most rows a trellis trunk linear's matmul holds beside its decoded weight (`bills.trunkDecodeScratchBytes`): its
+/// own layer kind's (attention, GatedDeltaNet, PLE) or a MoE layer's shared expert's, whose gate, up and SwiGLU planes
+/// and output sit beside the router's f32 logits, ids and scores and the routed sum but never the routed planes; in the
+/// MTP head, past its four stream-wide rows.
+pub fn coolerPrefillDecodeSiteRowBytes(config: *const model_mod.ModelConfig) ?u64 {
+    if (bills.rateGroupedPrefillBytesPerRow(config) == 0) return null;
+    const r = coolerPrefillRows(config);
+    const hidden: u64 = config.hidden_size;
+    const top_k: u64 = @max(config.num_experts_per_tok, 1);
+    const shared = 3 * @as(u64, config.shared_expert_intermediate_size) * 2 + 2 * hidden * 2 + @as(u64, config.num_experts) * 4 + top_k * 8;
+    const head = if (bills.mtpHeadDefaultOn(config)) 4 * @as(u64, config.hc_count) * hidden * 2 + @max(r.attn, shared) else 0;
+    return @max(@max(@max(r.gdn, r.attn), @max(r.ple, shared)), head) + r.trunk + r.inflight;
+}
+
 /// The rows held where a full-attention layer selects its QSA blocks: the trunk's alone.
 pub fn coolerPrefillEntryRowBytes(config: *const model_mod.ModelConfig) ?u64 {
     if (bills.rateGroupedPrefillBytesPerRow(config) == 0) return null;

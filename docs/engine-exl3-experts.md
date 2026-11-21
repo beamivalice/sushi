@@ -359,7 +359,8 @@ or from 1024 rows the decoded path below.
   (K >= 3 max(M, N), or max(M, N) <= 1024 with K > 2 max(M, N); mlx 0.32.3). That changes the order, so
   `denseOrderMatches` keeps those shapes on the sorted GEMM, as it does the lm_head (`DECODED_MAX_WEIGHTS`) and rows under
   1024, where the decode pass does not pay. The f16 bank and the previous one MLX's cache may hold are billed
-  (`trunkDecodeScratchBytes`, 128 MB). An MLX bump re-runs these tests.
+  (`trunkDecodeScratchBytes`, 128 MB; on an exact Cooler bill beside its matmul's rows, `trunkDecodeBilled`). An MLX
+  bump re-runs these tests.
   - `sushi-ubench run shared.exl3_trunk_prefill --rungs k=6`, 5481a90e, GPU lock, QUIET, fans max, AC, `taskpolicy -a`, 7 rounds
     x 4 steps, us a call at 4096 rows. Columns: sorted / decoded / affine-8 `quantized_matmul` / dense bf16 ceiling.
 

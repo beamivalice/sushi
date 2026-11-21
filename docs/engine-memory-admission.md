@@ -376,9 +376,11 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   Beside them, every linear layer's state replaced beside the old until its pass runs (`ssmCheckpointBytes`). The QSA
   block select runs at an attention layer's entry beside the trunk's rows alone, so it adds only what that moment holds
   past the rows' peak; on the engine it is `rows·nb·4·(2·n_idx + 1) + fwd·min(nb, 512)·4` (measured to 16 KB at 8,192
-  rows). A trellis trunk's decoded weight is billed only where the GPU runs the NAX GEMM that takes it. The contract
+  rows). A trellis trunk's decoded weight is billed only where the GPU runs the NAX GEMM that takes it, and, as it lives
+  only through its own linear's matmul, as what it holds there past the rows' peak (`trunkDecodeBilled`, at the rows
+  `coolerPrefillDecodeSiteRowBytes` names). The contract
   cell `an exact Cooler prefill bill is what each kind of layer asks...` holds each kind's cost within one
-  `BILL_MARGIN_BYTES` of what it asks, either way past the in-flight plane and the decoded trunk weight it names (held at
+  `BILL_MARGIN_BYTES` of what it asks, either way past the in-flight plane and what the decoded trunk weight adds (held at
   its own matmul, never at a chunk's peak: the stq4 cut's 8,192-row attention chunk asks 1,933,856 KB with and without
   NAX, r-46), on tiny and both cuts at 512, 2,048
   and 8,192 rows: the small tensors

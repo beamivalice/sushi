@@ -2058,6 +2058,42 @@ test "the adaptive width prices a candidate as the forward the loop runs at it, 
     try t.expect(got < 1024);
 }
 
+test "on Sushi Cooler a decoded trunk weight is billed beside the rows at its own matmul, never on top of the rows' peak" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const trunk_gemm = @import("sushi_exl3").trunk_gemm;
+    var cfg = coolerFlashNext();
+    cfg.trunk_quant = @import("sushi_exl3").format.Decode.tabled(.spec1, .w15);
+    defer trunk_gemm.can_serve_for_test = null;
+    const r = @import("qwen4_bill.zig").coolerPrefillRows(&cfg);
+    const weight = trunk_gemm.DECODED_SCRATCH_BYTES;
+    // The most a decoded linear's matmul holds beside its weight, with the trunk's rows and the planes in flight: its
+    // own kind's rows (attention, GatedDeltaNet, PLE), or at a shared expert its three planes and output, the router's
+    // f32 logits, ids and scores and the routed sum, never a MoE layer's routed planes; the MTP head adds its stream rows.
+    const hidden: u64 = cfg.hidden_size;
+    const shared = 3 * @as(u64, cfg.shared_expert_intermediate_size) * 2 + 2 * hidden * 2 + @as(u64, cfg.num_experts) * 4 + @as(u64, cfg.num_experts_per_tok) * 8;
+    try t.expect(bills.mtpHeadDefaultOn(&cfg));
+    const head = 4 * @as(u64, cfg.hc_count) * hidden * 2 + @max(r.attn, shared);
+    const at_matmul = r.trunk + r.inflight + @max(@max(@max(r.attn, r.gdn), @max(r.ple, shared)), head);
+    const min: u64 = @intCast(trunk_gemm.DECODED_MIN_ROWS);
+    for ([_]u64{ 8_705, 78_337 }) |seq| for ([_]u64{ min, 4096 }) |width| {
+        // Past the rows' peak the weight adds only what its matmul holds over it: some at the decoded path's narrowest
+        // width here, none at 4096 rows.
+        const past = (width * at_matmul + weight) -| width * r.peak();
+        try t.expect((width == min) == (past > 0));
+        // A request prices its widest forward, a tail the chunk loop absorbs included.
+        const fwd = bills.requestForwardRows(&cfg, seq, width, 0);
+        const past_request = (fwd * at_matmul + weight) -| fwd * r.peak();
+        trunk_gemm.can_serve_for_test = false;
+        const plain = .{ bills.prefillChunkCost(&cfg, 8, width, seq, .{}), bills.requestHeldBytes(&cfg, seq, 16, 8, width, .{}) };
+        trunk_gemm.can_serve_for_test = true;
+        const decoded = .{ bills.prefillChunkCost(&cfg, 8, width, seq, .{}), bills.requestHeldBytes(&cfg, seq, 16, 8, width, .{}) };
+        errdefer std.debug.print("{d} keys at {d} rows: chunk {d} -> {d} KB, request ({d} rows) {d} -> {d} KB with the decoded weight, {d} and {d} KB past the rows' peak\n", .{ seq, width, plain[0] >> 10, decoded[0] >> 10, fwd, plain[1] >> 10, decoded[1] >> 10, past >> 10, past_request >> 10 });
+        try t.expectEqual(plain[0] + past, decoded[0]);
+        try t.expectEqual(plain[1] + past_request, decoded[1]);
+    };
+}
+
 test "a request whose tail the chunk loop absorbs is billed at the merged forward's rows, on Sushi Cooler and on MLX" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
