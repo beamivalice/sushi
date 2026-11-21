@@ -89,6 +89,7 @@ cooler contract: a DeepSeek request restored from a tier makes no store grow, fr
 cooler contract: a DeepSeek request whose row stores are made at its last row gives the tokens of one whose stores grow by the policy
 cooler contract: a DeepSeek request's first forward finds its whole state made: the stores and the window rings
 cooler contract: a DeepSeek request's row stores are made at its last row before its first chunk, and no chunk grows one
+cooler contract: a DeepSeek wide forward's pool growth, the buffers its pass pins included, stays within its cap
 cooler contract: a Qwen prompt that re-renders an earlier reply restores from that turn's own point, written when the held points pass the cap
 cooler contract: a Qwen request reaching generate as one token holds no more cache rows than its bill, on Cooler and on MLX
 cooler contract: a held Qwen restore point another conversation pushes out of RAM is written, not dropped, and restores

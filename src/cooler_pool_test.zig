@@ -2170,3 +2170,27 @@ test "cooler contract: a DeepSeek request's first forward finds its whole state 
         }
     }.run);
 }
+
+test "cooler contract: a DeepSeek wide forward's pool growth, the buffers its pass pins included, stays within its cap" {
+    try servedOn("dsv41", dsv41_tinies, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            const c = ld.config.dsv41.?;
+            for ([_]usize{ 64, 512, 2048 }) |w| {
+                const prompt = try a.alloc(u32, w);
+                defer a.free(prompt);
+                for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+                const grew = try D.forwardHeld(a, ld.xfm, prompt, w + 1);
+                const cap = c.forwardCap(w, w);
+                const shape = cap - @import("dsv41/dsv41_config.zig").BILL_MARGIN_BYTES;
+                errdefer std.debug.print("cooler contract: {d} rows: in use {d} B, held {d} B, shape sum {d} B, cap {d} B\n", .{ w, grew.in_use, grew.held, shape, cap });
+                try testing.expect(grew.in_use <= shape);
+                // The pool counts the buffers a pass frees and keeps pinned until it ends: past the shape sum, inside the margin.
+                try testing.expect(grew.held <= cap);
+            }
+        }
+    }.run);
+}

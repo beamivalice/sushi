@@ -136,6 +136,8 @@ source and an index owner (the tiny's 2, the release's 14). L is the chunk's row
 | routed chain, STQ combined (`moePrefillFrom`, more than 6 pools) | the shared expert as ops (gate, up, eight f32 `[L,I]`, down), sort, prep `[n,D]` twice, gate and up combined and the SwiGLU `[n,I]`, a down plane per pool and their combine `[n,D]` |
 | routed chain, FP4 (`moeWide`) | the shared expert as ops, six `[n]` index arrays, the gathered rows `[n,D]`, gate, up, SwiGLU `[n,I]`, down `[n,D]`, the sum `[L,D]` |
 
+The shape sum is the in-use peak. The pool's held bytes (what Metal counts and the cap's limit reads) pass it by what a pass frees and keeps pinned until it ends: 1.4 to 6.3 MB on the STQ tiny at 64 to 2048 rows, the 5 to 31 MiB seen past a release prefill's shape sum. The cap installs the shape sum and the bill's one margin, so that growth is inside it, and `a wide forward's pool growth ... stays within its cap` holds it.
+
 The data-dependent maxima are the bill's: a streamed route reads each rate group from its cache pool and its spill
 pool, so it bills `2 x rate_groups` pools (`ModelConfig.expert_rate_groups`, the pack's widest layer; above 6 pools the
 combined chain), and a ratio-r compressor bills `r - 1` pending rows. A resident plan's cache holds every expert, so its

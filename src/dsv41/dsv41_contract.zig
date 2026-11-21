@@ -156,6 +156,29 @@ pub fn bindMade(xfm: *Trunk, end: usize) !struct { made: u64, rings: u64 } {
     return .{ .made = (s1.pool_bytes - s1.pool_free) - (s0.pool_bytes - s0.pool_free), .rings = rings };
 }
 
+/// What one forward of `ids` grows the pool by over a request bound to its last row `end`: the in-use bytes at their
+/// fullest, and the bytes the pool held at their fullest, which count the buffers a pass frees and still pins.
+pub fn forwardHeld(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, end: usize) !struct { in_use: u64, held: u64 } {
+    const trunk_mod = @import("../trunk.zig");
+    const m = dsv41_state.modelOf(xfm).?;
+    var cache = try trunk_mod.KVCache.initWithConfig(a, m.cfg.layers, @import("../kv_quant.zig").KVQuantConfig.dense);
+    defer cache.deinit();
+    var offset: usize = 0;
+    var ctx = xfm.defaultCtx();
+    ctx.cache = &cache;
+    ctx.moe_seq_offset = &offset;
+    try xfm.resetCache();
+    try @import("dsv41_prefix.zig").bindRows(xfm, &ctx, end);
+    mlx.engine.close();
+    const s0 = mlx.engine.stats();
+    const in0 = s0.pool_bytes - s0.pool_free;
+    const held0 = s0.pool_bytes;
+    mlx.engine.resetPoolPeak(.process);
+    const ids_bytes = pool_class.poolBytes(4 * ids.len);
+    _ = mlx.mlx_array_free(try forwardIds(xfm, &ctx, ids));
+    return .{ .in_use = mlx.engine.poolPeak(.process) - in0 - ids_bytes, .held = mlx.engine.poolHeldPeak(.process) - held0 };
+}
+
 /// What a restored request makes in the pool: `ids[0..at]` are prefilled and captured as a restore point, the state is
 /// dropped, and the point is restored and the request bound to its last row `end` as `Generator` does. The pool's in-use
 /// bytes at their fullest over the restore and the bind, past those in use before them (the point's own arrays among
