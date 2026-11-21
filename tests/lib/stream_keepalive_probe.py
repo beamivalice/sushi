@@ -94,7 +94,10 @@ sock.close()
 elapsed = time.time() - t0
 text = raw.decode("utf-8", "replace")
 
-beats = text.count(": keepalive") + text.count("event: ping")
+# A chat stream that is writing a named call beats with a `tool_calls` fragment that adds no bytes
+# (`"arguments":""`), an event for clients that count events, not comments.
+progress_events = text.count('"arguments":""') if SURFACE == "chat" else 0
+beats = text.count(": keepalive") + text.count("event: ping") + progress_events
 print(f"elapsed={elapsed:.1f}s bytes={len(raw)} max_gap={max_gap:.1f}s "
       f"(at t={max_gap_at:.1f}s) keepalives={beats}")
 
@@ -113,6 +116,10 @@ if max_gap > MAX_GAP_S:
 # 2. The heartbeat actually fired.
 if beats == 0:
     failures.append("no keepalive/ping observed on the stream")
+
+# 2b. A chat stream shows the call before it is whole: its opening, `arguments` empty, then the arguments once.
+if SURFACE == "chat" and progress_events == 0:
+    failures.append("no tool_calls progress event: a client that counts events saw nothing while the call was written")
 
 # 3. The tool call survived the injected bytes: name intact, args valid JSON.
 args = None

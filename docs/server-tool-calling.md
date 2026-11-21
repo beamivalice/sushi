@@ -38,8 +38,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - Template input `chat.templateMessages`: role "tool" native, a call's `arguments` the client's JSON object (`{}` for
   anything else), every string valid UTF-8 (U+FFFD for a bad sequence, as `appendJsonString` writes). Streaming: full args in ONE SSE delta, thinking → `reasoning_content`.
 - **A call's id comes from `io_util.callId`, on every surface** (`call_`, Anthropic `toolu_`): random digits beside a per-process count, never a clock tick, so two requests in one millisecond or one restart apart never share an id.
-- Buffered calls may exceed a client's inter-event progress deadline even while SSE keepalives arrive. The omp launcher
-  disables that deadline only for its Sushi provider; argument truncation and loop-stop rules remain unchanged.
+- **A chat stream that buffers a call shows it before it is whole** (`tool_progress.zig`): SSE comments are no event to a
+  client that counts parsed events (pi-ai: only non-empty text or reasoning, or any `tool_calls` entry). Once the first
+  call's name is read and declared (`reply.pendingCallName`, the parse `declinedCall` names a cut call by; no finished call
+  before it), each due keepalive (5 s of byte silence) is the call's opening (`index`, `id`, `type`, `name`,
+  `arguments: ""`), then `arguments: ""` fragments; the end adds the whole arguments to that id. The name
+  is never one the finished call lacks (`deliver` refuses a renamed call; a corpus pin cuts every dialect's call at every byte).
+  A call left unfinished after its opening stays at `arguments: ""` under a finish that is never `tool_calls`, with `tool_call_cut`
+  (`Progress.cutEnding`). Anthropic's `ping` is an event already; Responses and a call that is not first beat with comments.
 - **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion
   never worsens conformance; a parsed NAME never contains `<|`; no tag leaks. Harness:
   `src/tool_traffic_replay_test.zig` over `src/fixtures/tool_traffic.jsonl`.

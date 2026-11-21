@@ -4263,3 +4263,42 @@ test "r173-f-callend-linear: a value that spells its call's closer thousands of 
         try testing.expect(work[1] <= 5 * work[0] / 2);
     }
 }
+
+/// A tools array that declares `name` and every strict prefix of it, so a name read before it is whole is declared too.
+fn prefixTools(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.append(allocator, '[');
+    for (1..name.len + 1) |n| {
+        if (n > 1) try out.append(allocator, ',');
+        try out.print(allocator, "{{\"type\":\"function\",\"function\":{{\"name\":\"{s}\",\"parameters\":{{\"type\":\"object\",\"properties\":{{\"city\":{{\"type\":\"string\"}}}}}}}}}}", .{name[0..n]});
+    }
+    try out.append(allocator, ']');
+    return out.toOwnedSlice(allocator);
+}
+
+test "format corpus: a call named while it is written keeps that name to its end, in every dialect, at every cut" {
+    const allocator = testing.allocator;
+    const tools = try prefixTools(allocator, "get_weather");
+    defer allocator.free(tools);
+    for (dialect_calls) |call| {
+        const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call });
+        defer allocator.free(text);
+        var named: usize = 0;
+        var cut: usize = 0;
+        while (cut <= text.len) : (cut += 1) {
+            if (cut < text.len and text[cut] & 0xC0 == 0x80) continue;
+            const got = try reply_mod.pendingCallName(allocator, text[0..cut], .{ .dialect = null }, tools);
+            defer if (got) |g| allocator.free(g);
+            errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
+            if (got) |name| {
+                try testing.expectEqualStrings("get_weather", name);
+                named += 1;
+            }
+            // The whole call is a call, never a pending one.
+            if (cut == text.len) try testing.expect(got == null);
+        }
+        errdefer std.debug.print("never named: {f}\n", .{std.zig.fmtString(text)});
+        try testing.expect(named > 0);
+    }
+}

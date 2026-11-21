@@ -206,10 +206,12 @@ answers while the weights load:
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
-  byte-silence. SSE comments keep the transport alive but do not count as model progress for every client.
+  byte-silence. SSE comments keep the transport alive but are no event to a client that counts parsed events.
   While a stream waits in the queue behind another request, the comment reads `: queued behind N
   request(s); running G of M tokens (~S s at R tok/s)` (G/M: the running request's generated tokens and max); an
   Anthropic stream gets it before each `ping`.
+  A chat stream buffering a named tool call beats with `tool_calls` fragments instead, which add no bytes to the
+  arguments ([server-tool-calling](server-tool-calling.md#the-pipeline)).
   `sushi launch omp` sets the Sushi provider's `compat.streamIdleTimeoutMs: 0` so buffered calls can finish;
   explicit omp timeout settings, environment overrides and per-call options still take precedence (verified with
   omp 18.3.0). Non-loopback `--url` targets also have a separate first-event deadline: omp's

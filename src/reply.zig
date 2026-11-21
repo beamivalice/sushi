@@ -287,6 +287,24 @@ fn declinedBareCall(allocator: std.mem.Allocator, text: []const u8, origin: Orig
     return .{ .name = name };
 }
 
+/// The tool the first call of `text` names while the model is still writing it, owned, or null: the text holds no
+/// finished call, its first unfinished call has a name, and the request declares that name. A client is told this
+/// name before the call is whole, so it is one the finished call keeps (`declinedCall` reads the same parse).
+pub fn pendingCallName(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?[]u8 {
+    const tools = tools_json orelse return null;
+    if (try toolReply(allocator, text, tools_json, true, origin)) |done| {
+        done.deinit(allocator);
+        return null;
+    }
+    const open = (try declinedCall(allocator, text, origin, tools_json)) orelse return null;
+    const name = open.name orelse return null;
+    if (!tool_schema.toolNameIsDeclared(allocator, tools, name)) {
+        allocator.free(name);
+        return null;
+    }
+    return name;
+}
+
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
 /// bare-JSON inference, then coerce the arguments to the schema the request
 /// declared. Every surface must go through this — a site that calls

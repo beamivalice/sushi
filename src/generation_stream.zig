@@ -44,6 +44,7 @@ const Stopwatch = io_util.Stopwatch;
 const nextCompletionId = io_util.nextCompletionId;
 const server_mod = @import("server.zig");
 const reply_mod = @import("reply.zig");
+const tool_progress = @import("tool_progress.zig");
 const server_state = @import("server_state.zig");
 const arch_packs = @import("arch/packs.zig");
 const anthropic = @import("anthropic.zig");
@@ -1596,6 +1597,9 @@ pub fn handleStreamingGeneration(
     // A model that opens the block itself is picked up by `saw_think_open`.
     var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
     const gated_stream = has_tools;
+    // The call the stream opens to the client while it is still being written (`tool_progress`).
+    var tool_stream: tool_progress.Progress = .{};
+    defer tool_stream.deinit(allocator);
     // The `finish_details` field naming a call the reply declined, set where the end is settled.
     var declined_field: []const u8 = "";
     defer allocator.free(declined_field);
@@ -1970,7 +1974,14 @@ pub fn handleStreamingGeneration(
         // one-shot whole-file `write_file`). Tokens flowing is not bytes
         // flowing — without this the client's idle-body timeout kills the
         // stream mid-generation.
-        beatStreamKeepalive(stream, .sse_comment) catch {
+        const beaten = if (gated_stream and stream.keepaliveDue())
+            beatToolCall(allocator, stream, chat_id, model_name, &tool_stream, text_buf.items, .{
+                .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?),
+                .opens_think = opens_think and !think_closed,
+            }, tools_json)
+        else
+            beatStreamKeepalive(stream, .sse_comment);
+        beaten catch {
             log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
             ts.slot.?.cancel();
             client_gone = true;
@@ -2072,18 +2083,17 @@ pub fn handleStreamingGeneration(
 
             // Emit tool call deltas in OpenAI streaming format
             for (tool_calls, 0..) |tc, i| {
-                const tc_id = try io_util.callId(stream.io, allocator, "call");
-                defer allocator.free(tc_id);
-
-                // Escape the full arguments string for embedding in JSON
-                // Strip outer quotes from jsonEscape result (it wraps in "...")
-                // First delta: name + id + full arguments (clients accumulate these)
-                const first_delta = try formatChatStreamToolCall(allocator, i, tc_id, tc.name, tc.arguments);
+                // A call the stream opened early gets its arguments whole; any other is delivered whole.
+                const first_delta = try tool_stream.deliver(allocator, stream.io, i, tc);
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = null });
             }
             finish_reason = toolCallFinishReason(finish_reason);
         } else {
+            if (tool_stream.opened) |o| {
+                log.info("  [tool-stream] the call \"{s}\" opened to the client was left unfinished; it ends under a finish that is not tool_calls\n", .{o.name});
+                if (tool_stream.cutEnding()) |ending| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = ending }, null, null, null, .{ .logprobs_json = null });
+            }
             // No tool calls found — flush buffered tokens, splitting thinking
             // from content. Runs regardless of the request's thinking flag:
             // reasoning the model produced ships as reasoning_content, and
@@ -2709,21 +2719,6 @@ pub fn formatPerfBracket(
     return s catch buf[0..0];
 }
 
-fn quotedJsonInner(escaped: []const u8) []const u8 {
-    if (escaped.len >= 2 and escaped[0] == '"' and escaped[escaped.len - 1] == '"') return escaped[1 .. escaped.len - 1];
-    return escaped;
-}
-
-fn formatChatStreamToolCall(allocator: std.mem.Allocator, index: usize, id: []const u8, name: []const u8, arguments: []const u8) ![]u8 {
-    const escaped_name = try jsonEscape(allocator, name);
-    defer allocator.free(escaped_name);
-    const escaped_args = try jsonEscape(allocator, arguments);
-    defer allocator.free(escaped_args);
-    return std.fmt.allocPrint(allocator,
-        \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
-    , .{ index, id, quotedJsonInner(escaped_name), quotedJsonInner(escaped_args) });
-}
-
 /// The `logprobs` object of a non-streamed reply: the entries of the tokens whose bytes are `content`, a slice of `text`.
 /// `runs` says where a rewrite of the generation got its bytes (`reply.Settled.provenance`); null: `text` is the generation's own.
 pub fn contentLogprobsJson(
@@ -2823,6 +2818,28 @@ pub fn beatStreamKeepalive(stream: *Conn, style: KeepaliveStyle) !void {
     stream.heartbeat.noteWrite(nowMsMonotonic(stream.io));
 }
 
+/// The keepalive of a stream that is buffering tool markup: while a call is being written, a data chunk that adds no
+/// bytes to it (`tool_progress`), so a client that counts events, not comments, sees the stream move.
+fn beatToolCall(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    chat_id: i64,
+    model_name: []const u8,
+    progress: *tool_progress.Progress,
+    buffered: []const u8,
+    origin: reply_mod.Origin,
+    tools_json: ?[]const u8,
+) !void {
+    // A WebSocket has liveness of its own, and its frames are not a stream a client times.
+    if (stream.ws_mode == null) {
+        if (try progress.beat(allocator, stream.io, buffered, origin, tools_json)) |delta| {
+            defer allocator.free(delta);
+            return sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = delta }, null, null, null, .{ .logprobs_json = null });
+        }
+    }
+    try beatStreamKeepalive(stream, .sse_comment);
+}
+
 test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to emitting everything" {
     const ids = [_]u32{ 1, 2, 3, 4, 5 };
     // No cut → untouched (identity for every non-loop response).
@@ -2835,18 +2852,6 @@ test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to em
     // must emit everything rather than slice out of bounds.
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 5));
     try std.testing.expectEqualSlices(u32, &ids, loopTrimmedIds(&ids, 99));
-}
-
-test "chat stream tool-call delta escapes the function name" {
-    const a = std.testing.allocator;
-    const delta = try formatChatStreamToolCall(a, 0, "call_1", "say\"hi", "{\"x\":1}");
-    defer a.free(delta);
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, delta, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .array);
-    const fn_obj = parsed.value.array.items[0].object.get("function").?.object;
-    try std.testing.expectEqualStrings("say\"hi", fn_obj.get("name").?.string);
-    try std.testing.expectEqualStrings("{\"x\":1}", fn_obj.get("arguments").?.string);
 }
 
 test "a tool-call reply delivers the budget-capped thought" {
