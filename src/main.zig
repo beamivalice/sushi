@@ -1446,7 +1446,7 @@ fn runHeadlessServe(
         .id = "",
         .path = "",
         .bytes_on_disk = null,
-        .arch_hint = "",
+        .arch_hint = .static(""),
         .config = null,
         .weights = null,
         .handle = null,

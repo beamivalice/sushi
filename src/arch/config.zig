@@ -204,6 +204,15 @@ pub fn discovers(model_type: []const u8) bool {
     return false;
 }
 
+/// `model_type` as the enabled arch that discovers it spells it, a slice of that arch's own constant: static, never
+/// allocated or freed, so a holder keeps it across anything. Null when no enabled arch discovers it.
+pub fn discoveredType(model_type: []const u8) ?[]const u8 {
+    inline for (comptime std.enums.values(Tag)) |tag| {
+        inline for (registry.Mod(tag).discovery_types) |t| if (std.mem.eql(u8, t, model_type)) return t;
+    }
+    return null;
+}
+
 /// The facts of the arch that serves `model_type`; null when no enabled arch does.
 pub fn factsOfType(model_type: []const u8) ?Facts {
     const tag = registry.ofModelType(model_type) orelse return null;

@@ -51,7 +51,7 @@ fn isSupportedQuantMode(mode: []const u8) bool {
 /// Outcome of reading a candidate's config.json. Discovery treats any
 /// non-`.supported` result as "skip this directory."
 const ConfigPeek = union(enum) {
-    supported: []const u8, // owned dupe of model_type
+    supported: []const u8, // static (`arch_config.discoveredType`)
     unsupported_arch: []const u8, // owned dupe of model_type
     unsupported_quant: []const u8, // owned dupe of quantization.mode
     /// Declares the DFlash config contract — a spec-decode sidecar whatever
@@ -88,10 +88,10 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     if (dflash.isDflashConfigJson(root)) return .drafter;
     const mt_val = root.get("model_type") orelse return .missing_or_unparseable;
     if (mt_val != .string) return .missing_or_unparseable;
-    if (!isSupportedModelType(mt_val.string)) {
+    const supported = arch_config.discoveredType(mt_val.string) orelse {
         const dup = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable;
         return .{ .unsupported_arch = dup };
-    }
+    };
     // Quantization gate: if a model declares a `quantization.mode`, accept
     // only the schemes the loader supports. Models without a quantization
     // block (bf16 / unquantized) pass through.
@@ -105,7 +105,7 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
             }
         }
     }
-    return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+    return .{ .supported = supported };
 }
 
 /// The set of shard basenames in `model.safetensors.index.json`'s `weight_map`,
@@ -336,10 +336,7 @@ pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []c
             break :blk .unsupported;
         },
         .drafter => .drafter,
-        .supported => |mt| blk: {
-            defer allocator.free(mt);
-            break :blk modelKindFromType(mt);
-        },
+        .supported => |mt| modelKindFromType(mt),
     };
 }
 
@@ -358,8 +355,7 @@ pub const DiscoveredModel = struct {
     /// Every regular file in the folder (the n-gram table included), symlinks at their target's size; null if empty.
     bytes_total: ?u64 = null,
     /// `model_type` peeked from config.json (e.g. "qwen4_exp"), so registry stubs
-    /// can advertise arch-derived capabilities before a cold load. Empty
-    /// when unknown.
+    /// can advertise arch-derived capabilities before a cold load. Static, never freed.
     model_type: []const u8 = "",
     streaming_index_complete: bool = false,
 };
@@ -377,7 +373,6 @@ pub const DiscoveryResult = struct {
         for (self.models) |*m| {
             self.allocator.free(m.id);
             self.allocator.free(m.path);
-            if (m.model_type.len > 0) self.allocator.free(m.model_type);
         }
         self.allocator.free(self.models);
         if (self.roots.len > 0) {
@@ -445,7 +440,6 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         for (merged.items) |*m| {
             allocator.free(m.id);
             allocator.free(m.path);
-            if (m.model_type.len > 0) allocator.free(m.model_type);
         }
         merged.deinit(allocator);
     }
@@ -474,7 +468,6 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
                 log.warn("[discovery] {s}: already found (same id or folder) in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
                 allocator.free(m.id);
                 allocator.free(m.path);
-                if (m.model_type.len > 0) allocator.free(m.model_type);
                 continue;
             }
             try merged.append(allocator, m);
@@ -507,7 +500,6 @@ pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io
         for (found.items) |*m| {
             allocator.free(m.id);
             allocator.free(m.path);
-            if (m.model_type.len > 0) allocator.free(m.model_type);
         }
         found.deinit(allocator);
     }
@@ -584,11 +576,9 @@ fn tryAddModel(
                 log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model\n", .{name});
                 return true;
             },
-            .supported => |mt| mt, // ownership moves to the DiscoveredModel
+            .supported => |mt| mt,
         };
     };
-    errdefer if (model_type.len > 0) allocator.free(model_type);
-
     const weights = weightBytes(io, sub);
 
     const id = if (id_prefix.len > 0)
@@ -623,7 +613,7 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
 }
 
 pub const ProbeResult = struct {
-    /// Owned dupe of the supported model_type.
+    /// The supported model_type, static.
     model_type: []const u8,
     /// Sum of *.safetensors bytes; null if the scan failed.
     bytes_on_disk: ?u64,
@@ -714,8 +704,6 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
         .drafter => return error.UnsupportedArch,
         .supported => |mt| mt,
     };
-    errdefer allocator.free(model_type);
-
     var sub = dir.openDir(io, base, .{ .iterate = true }) catch return .{ .model_type = model_type, .bytes_on_disk = null };
     defer sub.close(io);
     const weights = weightBytes(io, sub);
@@ -1301,7 +1289,6 @@ test "discovery counts shard bytes that come through symlinks leaving the pack" 
     defer pack_dir.close(io);
     const pack_len = try pack_dir.realPath(io, &pack_buf);
     const probe = try probeModelDir(io, allocator, pack_buf[0..pack_len]);
-    defer allocator.free(probe.model_type);
     try testing.expectEqual(@as(u64, 16), probe.bytes_linked);
 }
 
@@ -1337,7 +1324,6 @@ test "bytes_total counts every regular file of the pack, a symlink at its target
     defer pack_dir.close(io);
     const pack_len = try pack_dir.realPath(io, &pack_buf);
     const probe = try probeModelDir(io, allocator, pack_buf[0..pack_len]);
-    defer allocator.free(probe.model_type);
     try testing.expectEqual(@as(?u64, 4), probe.bytes_on_disk);
     try testing.expectEqual(@as(?u64, want), probe.bytes_total);
 }

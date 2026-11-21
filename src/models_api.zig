@@ -157,7 +157,7 @@ test "an unloaded qwen4 stub is text-only only when the checkpoint must stream" 
         .id = "stub",
         .path = path,
         .bytes_on_disk = 0,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = .static("qwen4_exp"),
         .config = null,
         .weights = null,
         .handle = null,
@@ -209,7 +209,7 @@ test "a model row carries bytes_linked and bytes_total beside bytes_on_disk, loa
         .bytes_on_disk = 100,
         .bytes_linked = 40,
         .bytes_total = 150,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = .static("qwen4_exp"),
         .config = null,
         .weights = null,
         .handle = null,
@@ -267,7 +267,7 @@ test "a quantized pack loaded resident advertises no streaming, the same pack st
         .id = "resident",
         .path = path_buf[0..path_len],
         .bytes_on_disk = 0,
-        .arch_hint = "example_arch",
+        .arch_hint = .static("example_arch"),
         .config = &cfg,
         .weights = null,
         .handle = null,
@@ -516,14 +516,14 @@ pub fn renderModelEntry(
     const sm = model_discovery.readStubMeta(io, allocator, entry.path);
     const streaming_geometry = sm.found and sm.hidden_size > 0 and sm.num_hidden_layers > 0 and
         sm.num_experts > 0 and sm.num_experts_per_tok > 0 and sm.moe_intermediate_size > 0;
-    const streaming_precheck = expert_quant.isExpertStreamingArch(entry.arch_hint) and streaming_geometry;
+    const streaming_precheck = expert_quant.isExpertStreamingArch(entry.archHint()) and streaming_geometry;
     const streaming_candidate = streamingStubMarker(
-        entry.arch_hint,
+        entry.archHint(),
         streaming_geometry,
         streaming_precheck and entry.streaming_index_complete,
     );
     const streaming_required = streamingRequiredMarker(
-        entry.arch_hint,
+        entry.archHint(),
         sm.quant_bits,
         sm.quantized_experts,
         streaming_geometry,
@@ -567,7 +567,7 @@ pub fn renderModelEntry(
         break :blk try b.toOwnedSlice(allocator);
     };
     defer allocator.free(caps_part);
-    const efforts_part = try reasoningEffortsJson(allocator, &.{ .model_type = entry.arch_hint, .gen_enable_thinking = sm.enable_thinking });
+    const efforts_part = try reasoningEffortsJson(allocator, &.{ .model_type = entry.archHint(), .gen_enable_thinking = sm.enable_thinking });
     defer allocator.free(efforts_part);
 
     const mods_part: []const u8 = if (streaming_required)
@@ -581,8 +581,8 @@ pub fn renderModelEntry(
     else
         "";
 
-    const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
-        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":{f},", .{json_text.Str{ .s = entry.arch_hint }});
+    const arch_part: []const u8 = if (entry.archHint().len > 0) blk: {
+        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":{f},", .{json_text.Str{ .s = entry.archHint() }});
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
@@ -1020,7 +1020,7 @@ test "a video-capable vision model advertises video beside image, loaded or not"
             .id = "m",
             .path = path,
             .bytes_on_disk = 0,
-            .arch_hint = "qwen4_exp",
+            .arch_hint = .static("qwen4_exp"),
             .config = &cfg,
             .weights = null,
             .handle = null,
@@ -1275,7 +1275,7 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
     try chat_cfg.compile();
     defer chat_cfg.dropCompiled();
     const Case = struct { arch: []const u8, gen: []const u8, want: []const u8 };
-    for ([_]Case{
+    inline for ([_]Case{
         .{ .arch = "qwen4_exp", .gen = "{}", .want = ",\"reasoning_efforts\":[\"off\",\"low\",\"medium\",\"xhigh\"],\"reasoning_effort_budgets\":{\"low\":2048,\"medium\":8192},\"reasoning_effort_values\":{\"low\":\"low\",\"medium\":\"medium\",\"xhigh\":\"xhigh\"},\"default_reasoning_effort\":\"medium\"" },
         .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":true}}", .want = ",\"default_reasoning_effort\":\"medium\"" },
         .{ .arch = "qwen4_exp", .gen = "{\"default_chat_template_kwargs\":{\"enable_thinking\":false}}", .want = ",\"default_reasoning_effort\":\"off\"" },
@@ -1293,7 +1293,7 @@ test "/v1/models rows, loaded or not, name each model's effort words and the one
             .id = "m",
             .path = path,
             .bytes_on_disk = 0,
-            .arch_hint = c.arch,
+            .arch_hint = .static(c.arch),
             .config = &cfg,
             .weights = null,
             .handle = null,
@@ -1338,7 +1338,7 @@ test "/v1/models rows stay valid JSON for a model id and error name with a quote
         .id = hostile,
         .path = path,
         .bytes_on_disk = 0,
-        .arch_hint = "example_arch",
+        .arch_hint = .static("example_arch"),
         .config = &cfg,
         .weights = null,
         .handle = null,
@@ -1401,7 +1401,7 @@ test "/props stays valid JSON when a settings label carries a quote, a backslash
     try t.expectEqualStrings(hostile, settings.get("vision").?.object.get("source").?.string);
 }
 
-fn testQuantizationModelRow(model_type: []const u8, k: ?u8, expected: []const u8, loaded: bool) !void {
+fn testQuantizationModelRow(comptime model_type: []const u8, k: ?u8, expected: []const u8, loaded: bool) !void {
     const t = std.testing;
     const io = t.io;
     var tmp = t.tmpDir(.{});
@@ -1426,7 +1426,7 @@ fn testQuantizationModelRow(model_type: []const u8, k: ?u8, expected: []const u8
         .id = "test-pack",
         .path = path,
         .bytes_on_disk = 0,
-        .arch_hint = model_type,
+        .arch_hint = .static(model_type),
         .config = null,
         .weights = null,
         .handle = null,
@@ -1488,7 +1488,7 @@ fn testStqLabel(trunk_k: ?u8, expected: []const u8) !void {
         .id = "test-pack",
         .path = path,
         .bytes_on_disk = 0,
-        .arch_hint = "qwen4_exp",
+        .arch_hint = .static("qwen4_exp"),
         .config = null,
         .weights = null,
         .handle = null,
@@ -1530,7 +1530,7 @@ test "models row: meta.pack_update appears only for a pack with a newer publishe
         .id = "test-pack",
         .path = "/pack-update-test/ready-row",
         .bytes_on_disk = 0,
-        .arch_hint = "example_arch",
+        .arch_hint = .static("example_arch"),
         .config = &cfg,
         .weights = null,
         .handle = null,

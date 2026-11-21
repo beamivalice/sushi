@@ -637,7 +637,7 @@ fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void 
 /// An entry's row from what the registry holds; the caller holds its lock.
 fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
     var row: ModelRow = .{ .id = e.id, .path = e.path, .state = stateName(e.state), .bytes = e.bytes_on_disk, .index_complete = e.streaming_index_complete };
-    row.fit.arch = e.arch_hint;
+    row.fit.arch = e.archHint();
     if (e.state == .ready and e.config != null) {
         const c = e.config.?;
         row.fit = arch_flags.settingsFit(c);

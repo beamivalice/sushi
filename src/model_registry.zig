@@ -187,6 +187,27 @@ pub const DiskStats = struct {
     }
 };
 
+/// An entry's arch hint: one atomic pointer to an immutable string header, so a reader without the registry's mutex
+/// sees the old string or the new one whole (a slice is two words and could tear). The headers the registry makes live
+/// in its arena (`internArch`) until it is freed; a header made by `static` is a comptime constant.
+pub const ArchHint = struct {
+    ref: std.atomic.Value(*const []const u8) = .init(&none),
+
+    const none: []const u8 = "";
+
+    /// For a hand-built entry (a test): the hint is `s`, held by the program for good.
+    pub fn static(comptime s: []const u8) ArchHint {
+        const Header = struct {
+            const text: []const u8 = s;
+        };
+        return .{ .ref = .init(&Header.text) };
+    }
+
+    pub fn get(self: *const ArchHint) []const u8 {
+        return self.ref.load(.acquire).*;
+    }
+};
+
 pub const LoadedModel = struct {
     allocator: std.mem.Allocator,
 
@@ -205,10 +226,10 @@ pub const LoadedModel = struct {
     bytes_linked: u64 = 0,
     /// Every regular file in the pack folder; see `DiscoveredModel.bytes_total`.
     bytes_total: ?u64 = null,
-    /// `model_type` peeked from config.json at discovery time (allocator-
-    /// owned dupe; empty when unknown). Lets /v1/models advertise
-    /// arch-derived capabilities while the entry is still an `.unloaded` stub.
-    arch_hint: []const u8,
+    /// `model_type` peeked from config.json (empty when unknown). Lets /v1/models advertise arch-derived capabilities
+    /// while the entry is still an `.unloaded` stub. Read through `archHint`: a refresh replaces it while a reader
+    /// that does not hold `mutex` may be reading, and the registry keeps every string it ever held until it is freed.
+    arch_hint: ArchHint,
     streaming_index_complete: bool = false,
 
     // ── Mlx-allocating state. Non-null iff state == .ready (or transitioning
@@ -316,6 +337,11 @@ pub const LoadedModel = struct {
     /// Counts the claims of this entry (`tryBeginLoadLocked`): an attempt whose files read failed stores the failure
     /// only on an entry no other load claimed since it began.
     claim_gen: u64 = 0,
+
+    /// The arch hint as a static string; the one way to read it.
+    pub fn archHint(self: *const LoadedModel) []const u8 {
+        return self.arch_hint.get();
+    }
 
     /// The folder `path` opens now (`FolderId`), never one kept from registration: a case rename or a retargeted link
     /// moves what a path loads, and every comparison of folders must see the folder the load would read.
@@ -437,7 +463,6 @@ pub const LoadedModel = struct {
         }
         if (self.error_name) |n| self.allocator.free(n);
         if (self.drafter_path.len > 0) self.allocator.free(self.drafter_path);
-        if (self.arch_hint.len > 0) self.allocator.free(self.arch_hint);
         self.allocator.free(self.id);
         self.allocator.free(self.path);
     }
@@ -740,6 +765,10 @@ pub const ModelRegistry = struct {
     /// are heap-allocated and owned by the registry. Iteration order isn't
     /// guaranteed; snapshot sorts by `last_used_ns` desc for stable output.
     entries: std.StringHashMap(*LoadedModel),
+    /// The arch strings entries have held, one header per distinct string (`internArch`), kept until the registry is freed
+    /// so a reader that took an old `ArchHint` never sees freed memory.
+    arch_names: std.heap.ArenaAllocator,
+    arch_interned: std.StringHashMapUnmanaged(*const []const u8) = .empty,
     /// Entries a rescan took out of `entries` because their folder is gone. Freed only at deinit: a pointer a caller
     /// took from `peek` (no refcount) stays valid, and `default_id` may borrow one's id.
     retired: std.ArrayList(*LoadedModel) = .empty,
@@ -810,6 +839,7 @@ pub const ModelRegistry = struct {
             .io = io,
             .discovery = discovery,
             .entries = std.StringHashMap(*LoadedModel).init(allocator),
+            .arch_names = .init(allocator),
             .default_id = "",
             .max_resident_models = if (max_resident_models == 0) 1 else max_resident_models,
             .max_resident_mem = max_resident_mem,
@@ -859,7 +889,20 @@ pub const ModelRegistry = struct {
             self.allocator.destroy(entry);
         }
         self.retired.deinit(self.allocator);
+        self.arch_names.deinit();
         if (self.discovery) |*d| d.deinit();
+    }
+
+    /// The header of arch string `s`, made once per distinct string. Caller holds `mutex` (or is the single boot thread).
+    fn internArch(self: *ModelRegistry, s: []const u8) std.mem.Allocator.Error!*const []const u8 {
+        if (s.len == 0) return &ArchHint.none;
+        if (self.arch_interned.get(s)) |header| return header;
+        const arena = self.arch_names.allocator();
+        const text = try arena.dupe(u8, s);
+        const header = try arena.create([]const u8);
+        header.* = text;
+        try self.arch_interned.put(arena, text, header);
+        return header;
     }
 
     /// Insert an `.unloaded` stub for a model. Returns the heap-allocated
@@ -896,15 +939,13 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(id_owned);
         const path_owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_owned);
-        const arch_owned: []const u8 = if (arch_hint.len > 0) try self.allocator.dupe(u8, arch_hint) else "";
-        errdefer if (arch_owned.len > 0) self.allocator.free(arch_owned);
 
         stub.* = .{
             .allocator = self.allocator,
             .id = id_owned,
             .path = path_owned,
             .bytes_on_disk = bytes_on_disk,
-            .arch_hint = arch_owned,
+            .arch_hint = .{ .ref = .init(try self.internArch(arch_hint)) },
             .streaming_index_complete = streaming_index_complete,
             .config = null,
             .weights = null,
@@ -948,7 +989,6 @@ pub const ModelRegistry = struct {
         if (self.peekByFolder(&folder)) |existing| return existing.id;
 
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
-        defer self.allocator.free(probe.model_type);
         const streaming_index_complete = expert_quant.isExpertStreamingArch(probe.model_type) and
             model_discovery.streamingIndexComplete(io, self.allocator, trimmed) != null;
 
@@ -1055,26 +1095,28 @@ pub const ModelRegistry = struct {
     /// The folder of a registered entry as it is now, for a folder a download finished in that no walked root holds.
     fn refreshFolderFacts(self: *ModelRegistry, path: []const u8) void {
         const probe = model_discovery.probeModelDir(self.io, self.allocator, path) catch return;
-        defer self.allocator.free(probe.model_type);
         const streaming = expert_quant.isExpertStreamingArch(probe.model_type) and
             model_discovery.streamingIndexComplete(self.io, self.allocator, path) != null;
         const folder = FolderId.of(self.io, path) catch return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const e = self.peekByPathLocked(&folder) orelse return;
-        self.refreshFactsLocked(e, probe.bytes_on_disk, probe.bytes_linked, probe.bytes_total, streaming);
+        self.refreshFactsLocked(e, probe.model_type, probe.bytes_on_disk, probe.bytes_linked, probe.bytes_total, streaming) catch |err|
+            log.warn("[registry] {s}: facts not refreshed: {s}\n", .{ e.id, @errorName(err) });
     }
 
     /// An entry no load holds takes the folder's facts as discovery read them now: a pack listed while its pull was
-    /// partial would otherwise bill its partial bytes for good. A failed load becomes retryable. `arch_hint` stays:
-    /// it is read without the lock, and `config.json` lands before any shard. Caller holds `mutex`.
-    fn refreshFactsLocked(self: *ModelRegistry, e: *LoadedModel, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool) void {
+    /// partial would otherwise bill its partial bytes for good, and a folder replaced by another arch's pack would keep
+    /// the old arch. A failed load becomes retryable. Caller holds `mutex`.
+    fn refreshFactsLocked(self: *ModelRegistry, e: *LoadedModel, arch_hint: []const u8, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool) !void {
+        const arch_header = try self.internArch(arch_hint);
         switch (e.state) {
             .unloaded => {},
             // As a settings save does: an attempt reading the files meanwhile stores no failure over it.
             .error_state => self.forgetLoadFailureLocked(e),
             else => return,
         }
+        e.arch_hint.ref.store(arch_header, .release);
         e.bytes_on_disk = bytes_on_disk;
         e.bytes_linked = bytes_linked;
         e.bytes_total = bytes_total;
@@ -1109,7 +1151,7 @@ pub const ModelRegistry = struct {
         var added: u32 = 0;
         for (found) |m| {
             if (self.peekByPathLocked(&m.folder)) |e| {
-                self.refreshFactsLocked(e, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
+                try self.refreshFactsLocked(e, m.model_type, m.bytes_on_disk, m.bytes_linked, m.bytes_total, m.streaming_index_complete);
                 continue;
             }
             if (self.entries.get(m.id) != null) continue;
@@ -1872,10 +1914,10 @@ test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
     const hinted = try reg.registerStubWithArch("q4", "/path/to/q4", 64, "qwen4_exp");
-    try testing.expectEqualStrings("qwen4_exp", hinted.arch_hint);
+    try testing.expectEqualStrings("qwen4_exp", hinted.archHint());
     // Plain registerStub keeps an empty hint (no arch known).
     const plain = try reg.registerStub("foo", "/path/to/foo", 1024);
-    try testing.expectEqualStrings("", plain.arch_hint);
+    try testing.expectEqualStrings("", plain.archHint());
 }
 
 test "ModelRegistry: streaming discovery verdict is cached on the stub" {
@@ -2887,7 +2929,7 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
 
     try testing.expectEqual(@as(u32, 1), (try reg.rescanWithSettings(no_settings)).added);
     const stub = reg.peek("org/second") orelse return error.TestExpectedResult;
-    try testing.expectEqualStrings("mimo_v2", stub.arch_hint);
+    try testing.expectEqualStrings("mimo_v2", stub.archHint());
     try testing.expectEqual(LoadState.unloaded, stub.state);
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), (try reg.rescanWithSettings(no_settings)).added);
@@ -2914,7 +2956,7 @@ test "ModelRegistry: a --model-only server lists the pack it downloaded outside 
     var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
     defer reg.deinit();
     try testing.expectEqual(@as(u32, 1), try reg.absorbDownloadWithSettings(no_settings, got));
-    try testing.expectEqualStrings("qwen4_exp", (reg.peekByPath(got) orelse return error.TestExpectedResult).arch_hint);
+    try testing.expectEqualStrings("qwen4_exp", (reg.peekByPath(got) orelse return error.TestExpectedResult).archHint());
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
     try testing.expectEqual(@as(u32, 0), try reg.absorbDownloadWithSettings(no_settings, got));
 }
@@ -3530,4 +3572,51 @@ test "ModelRegistry: a rescan refreshes the facts of the entry at a walked folde
     try tmp.dir.writeFile(io, .{ .sub_path = "models/beamster/P/model-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
     _ = try reg.rescanWithSettings(settings);
     try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
+}
+
+test "ModelRegistry: a folder replaced by a pack of another arch lists the new arch after a rescan" {
+    const types = @import("arch/registry.zig").served_model_types;
+    if (types.len < 2) return error.SkipZigTest;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var cfg: [128]u8 = undefined;
+    try tmp.dir.createDirPath(io, "beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/config.json", .data = try std.fmt.bufPrint(&cfg, "{{\"model_type\":\"{s}\"}}", .{types[0]}) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
+    defer reg.deinit();
+    const e = reg.peek("beamster/P") orelse return error.TestExpectedResult;
+    // The folder now holds another pack (deleted in Finder, another one copied in under the same name).
+    var other: []const u8 = types[1];
+    for (types) |t| if (!std.mem.eql(u8, t, types[0])) {
+        other = t;
+        break;
+    };
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/config.json", .data = try std.fmt.bufPrint(&cfg, "{{\"model_type\":\"{s}\"}}", .{other}) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model.safetensors", .data = "01234567" });
+    _ = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(?u64, 8), e.bytes_on_disk);
+    try testing.expectEqualStrings(other, e.archHint());
+}
+
+
+test "ModelRegistry: an arch string the registry holds is its own copy: a caller's buffer, and a hint read before a refresh, stay whole" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    var name: [10]u8 = undefined;
+    @memcpy(&name, "alpha_arch");
+    const a = try reg.registerStubWithArch("a", "/a", 1, &name);
+    const b = try reg.registerStubWithArch("b", "/b", 1, &name);
+    @memset(&name, 'x');
+    const before = a.archHint();
+    try testing.expectEqualStrings("alpha_arch", before);
+    try testing.expectEqual(before.ptr, b.archHint().ptr);
+    reg.mutex.lockUncancelable(testing.io);
+    try reg.refreshFactsLocked(a, "beta_arch", 1, 0, null, false);
+    reg.mutex.unlock(testing.io);
+    try testing.expectEqualStrings("beta_arch", a.archHint());
+    try testing.expectEqualStrings("alpha_arch", before);
 }
