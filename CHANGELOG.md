@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A Stop sent as a download finishes answers what happened**: it said stopped while the job went on to report done with its pack registered; it is now refused as too late (409) once the pack is being registered, and a Stop that landed before that ends the job stopped.
 - **A server stopped while a download was finishing no longer risks a crash at exit**: the download's thread could still be registering the finished pack in the model list that shutdown was freeing, and the catalog refresh read the same list; shutdown now waits for them, or ends without freeing it.
 - **The web UI's API-key box closes by itself once the server stops asking for a key** (a server restarted without `--api-key`): it stayed modal over a page that was answering again.
 - **A thinking-effort cap saved on Settings reaches the chat's Thinking budget box**: the box kept the cap it had filled in and the next request ran under the old one; it now takes the new cap (or empties when the cap is removed) unless you typed a value over it.

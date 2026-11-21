@@ -33,6 +33,8 @@ const Job = struct {
     progress: dp.Progress = .{},
     message: []u8 = &.{},
     cancel: std.atomic.Value(bool) = .init(false),
+    /// The pull succeeded and the pack is being registered: a Stop is too late, since the job then ends `done`.
+    registering: bool = false,
     /// The curl of the file in flight, unreaped while set (`cli.waitExitedUnreaped`), so a SIGTERM never hits another
     /// process.
     pid: ?std.posix.pid_t = null,
@@ -413,6 +415,14 @@ fn finishJob(job: *Job, ok: bool) void {
         unlock();
         return;
     }
+    // A Stop answered before this point took effect: the pull's files are complete, but the job ends as stopped.
+    if (job.cancel.load(.monotonic)) {
+        job.phase = .cancelled;
+        job.setMessage("");
+        unlock();
+        return;
+    }
+    job.registering = true;
     // The pack is now the published revision: its row drops the update without asking Hugging Face again.
     for (cat_entries) |*e| if (std.ascii.eqlIgnoreCase(e.repo, job.repo)) {
         e.update = null;
@@ -467,21 +477,25 @@ fn enqueue(io: std.Io, repo: []const u8, dest: []const u8, update: bool) !bool {
     return true;
 }
 
-/// Stops a running download (its partials stay) or drops a queued one. False when `repo` has neither.
-fn cancel(repo: []const u8) bool {
+const CancelAnswer = enum { stopped, none, too_late };
+
+/// Stops a running download (its partials stay) or drops a queued one. `none` when `repo` has neither; `too_late` for
+/// a pull that finished and is being registered, which ends `done` whatever is asked.
+fn cancel(repo: []const u8) CancelAnswer {
     lock();
     defer unlock();
     for (jobs.items) |j| {
         if (!std.ascii.eqlIgnoreCase(j.repo, repo) or !j.phase.active()) continue;
+        if (j.registering) return .too_late;
         if (j.phase == .queued) {
             j.phase = .cancelled;
         } else {
             j.cancel.store(true, .monotonic);
             if (j.pid) |pid| _ = std.c.kill(pid, .TERM);
         }
-        return true;
+        return .stopped;
     }
-    return false;
+    return .none;
 }
 
 /// Server shutdown: no curl outlives the server, nothing queued starts, nothing new is queued and no downloads
@@ -740,8 +754,11 @@ pub fn handleCancel(allocator: Allocator, stream: *http_conn.Conn, body: []const
     defer arena_state.deinit();
     const repo = bodyRepo(arena_state.allocator(), body) orelse
         return http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Send {\"repo\":\"beamster/<repo>\"}", 400);
-    if (!cancel(repo)) return http.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No download of that pack is queued or running", 404);
-    try http.sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
+    switch (cancel(repo)) {
+        .none => return http.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "No download of that pack is queued or running", 404),
+        .too_late => return http.sendErrorResponse(allocator, stream, "409 Conflict", "download_finishing", "That download has finished and its pack is being registered: it cannot be stopped now", 409),
+        .stopped => try http.sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}"),
+    }
 }
 
 const testing = std.testing;
@@ -1249,5 +1266,73 @@ test "downloads: a pull that finishes after the server stopped registers nothing
     finishJob(job, true);
     try testing.expectEqual(Phase.done, job.phase);
     try testing.expect(!registryBusy());
+    try testing.expectEqual(@as(usize, 0), reg.entries.count());
+}
+
+test "downloads: a Stop sent while the finished pull's pack is being registered is refused as too late, not answered stopped" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try md.writePackStub(io, tmp.dir, "beamster/Late");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Late/model.safetensors", .data = "0123456789" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const dest = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Late", .{rb[0..try tmp.dir.realPath(io, &rb)]});
+    defer testing.allocator.free(dest);
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    const job = try Job.create(testing.allocator, "beamster/Late", dest, false);
+    job.phase = .verifying;
+    lock();
+    try jobs.append(gpa, job);
+    unlock();
+    defer {
+        lock();
+        _ = jobs.pop();
+        unlock();
+        job.destroy();
+    }
+    reg.mutex.lockUncancelable(io);
+    const finisher = try std.Thread.spawn(.{}, struct {
+        fn run(j: *Job) void {
+            finishJob(j, true);
+        }
+    }.run, .{job});
+    var spins: usize = 0;
+    while (reg.mutex.state.load(.monotonic) != .contended) : (spins += 1) {
+        if (spins == 200_000_000) {
+            reg.mutex.unlock(io);
+            finisher.join();
+            return error.FinisherNeverWaited;
+        }
+        std.Thread.yield() catch {};
+    }
+    const answer = cancel("beamster/Late");
+    reg.mutex.unlock(io);
+    finisher.join();
+    // The pack is registered and the job done: the Stop must not have answered that it stopped it.
+    try testing.expectEqual(Phase.done, job.phase);
+    try testing.expect(reg.peekByPath(dest) != null);
+    try testing.expectEqual(CancelAnswer.too_late, answer);
+}
+
+test "downloads: a Stop that lands as the last file verifies ends the job stopped, with its pack not registered" {
+    const io = testing.io;
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.settings_path = "/nonexistent/sushi-test/model-settings.json";
+    const prev = server_state.global_registry;
+    server_state.global_registry = reg;
+    defer server_state.global_registry = prev;
+    const job = try Job.create(testing.allocator, "beamster/Never", "/nonexistent/sushi-test/beamster/Never", false);
+    defer job.destroy();
+    job.phase = .verifying;
+    job.cancel.store(true, .monotonic);
+    finishJob(job, true);
+    try testing.expectEqual(Phase.cancelled, job.phase);
     try testing.expectEqual(@as(usize, 0), reg.entries.count());
 }
