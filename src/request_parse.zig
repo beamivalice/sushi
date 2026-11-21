@@ -469,15 +469,7 @@ fn functionChoiceFault(o: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
-/// Anthropic's `tool_choice` (an object typed auto, any, tool or none, `tool` naming a function) and each
-/// `tool_result.is_error` of the messages; null is absent.
-pub fn anthropicToolFault(buf: []u8, root: std.json.ObjectMap) ?[]const u8 {
-    if (root.get("tool_choice")) |tc| if (anthropicToolChoiceFault(tc)) |m| return m;
-    const messages = root.get("messages") orelse return null;
-    if (messages != .array) return null;
-    return toolResultFault(buf, messages.array.items);
-}
-
+/// Anthropic's `tool_choice`: an object typed auto, any, tool or none, `tool` naming a function.
 pub fn anthropicToolChoiceFault(tc: std.json.Value) ?[]const u8 {
     switch (tc) {
         .null => {},
@@ -507,6 +499,12 @@ pub fn toolResultFault(buf: []u8, items: []const std.json.Value) ?[]const u8 {
         if (content != .array) continue;
         for (content.array.items, 0..) |block, bi| {
             if (block != .object) continue;
+            const kind = block.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "tool_result")) continue;
+            if (block.object.get("content")) |c| switch (c) {
+                .null, .string, .array => {},
+                else => return fieldFault(buf, "'messages[{d}].content[{d}].content' must be a string or an array of content parts", .{ mi, bi }),
+            };
             const flag = block.object.get("is_error") orelse continue;
             if (flag != .null and flag != .bool) {
                 return fieldFault(buf, "'messages[{d}].content[{d}].is_error' must be true or false", .{ mi, bi });
@@ -1225,30 +1223,6 @@ test "responsesToolChoiceFault refuses a tool_choice this server cannot honour, 
         .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":7}}", .field = "tool_choice.name" },
     };
     for (cases) |c| try expectFault(responsesToolChoiceFault, c.body, c.field);
-}
-
-test "anthropicToolFault refuses a tool_choice type it does not serve and a tool_result flag that is no bool, by name" {
-    const Case = struct { body: []const u8, field: ?[]const u8 };
-    const cases = [_]Case{
-        .{ .body = "{}", .field = null },
-        .{ .body = "{\"tool_choice\":null}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"auto\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"any\",\"disable_parallel_tool_use\":true}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"none\"}}", .field = null },
-        .{ .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"f\",\"disable_parallel_tool_use\":false}}", .field = null },
-        .{ .body = "{\"tool_choice\":\"auto\"}", .field = "tool_choice" },
-        .{ .body = "{\"tool_choice\":5}", .field = "tool_choice" },
-        .{ .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"bogus\"}}", .field = "tool_choice.type" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"f\"}}", .field = "tool_choice.type" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"tool\"}}", .field = "tool_choice.name" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"\"}}", .field = "tool_choice.name" },
-        .{ .body = "{\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":\"yes\"}}", .field = "tool_choice.disable_parallel_tool_use" },
-        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":true}]}]}", .field = null },
-        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":null}]}]}", .field = null },
-        .{ .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":\"yes\"}]}]}", .field = "messages[0].content[0].is_error" },
-    };
-    for (cases) |c| try expectFault(anthropicToolFault, c.body, c.field);
 }
 
 fn expectFault(check: *const fn ([]u8, std.json.ObjectMap) ?[]const u8, body: []const u8, field: ?[]const u8) !void {

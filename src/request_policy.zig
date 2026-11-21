@@ -4,6 +4,7 @@ const arch_chat = @import("arch/chat.zig");
 const arch_handle = @import("arch/handle.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
+const request_fields = @import("request_fields.zig");
 const http = @import("http.zig");
 const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -485,28 +486,27 @@ pub fn chatThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, conf
 
 /// `/v1/messages`: a `thinking` object decides, OR'd with `output_config.effort` (`effort_cfg`); `budget_tokens`
 /// outranks the word's cap.
-pub fn anthropicThinking(root: std.json.ObjectMap, effort_cfg: ?ReasoningEffort, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot) Thinking {
-    const think_obj: ?std.json.ObjectMap = if (root.get("thinking")) |v| (if (v == .object) v.object else null) else null;
+pub fn anthropicThinking(req: request_fields.Checked(.messages), effort_cfg: ?ReasoningEffort, config: *const model_mod.ModelConfig, snap: *const effort_mod.Snapshot) Thinking {
+    const asked = req.thinking();
     var t: Thinking = .{
-        .enable = if (root.get("thinking") == null) config.defaultEnableThinkingIn(snap) else false,
+        .enable = if (asked == null) config.defaultEnableThinkingIn(snap) else false,
         .budget = model_mod.defaultThinkBudgetIn(config, snap),
         .template = model_mod.defaultTemplateEffortIn(config, snap),
     };
     var budget_explicit = false;
     var disabled = false;
-    if (think_obj) |o| {
-        const kind = if (o.get("type")) |v| (if (v == .string) v.string else "") else "";
-        if (std.mem.eql(u8, kind, "enabled") or std.mem.eql(u8, kind, "adaptive")) t.enable = true;
-        disabled = std.mem.eql(u8, kind, "disabled");
-        if (o.get("budget_tokens")) |bt| if (bt == .integer) {
-            t.budget = std.math.cast(i32, bt.integer) orelse t.budget;
+    if (asked) |a| {
+        t.enable = a.kind != .disabled;
+        disabled = a.kind == .disabled;
+        if (a.budget_tokens) |b| {
+            t.budget = b;
             budget_explicit = true;
-        };
+        }
     }
     if (effort_cfg) |cfg| {
         t.template = cfg.sends;
         if (!budget_explicit) t.budget = cfg.budget;
-        t.enable = if (root.get("thinking") == null) cfg.enable else (t.enable or cfg.enable);
+        t.enable = if (asked == null) cfg.enable else (t.enable or cfg.enable);
     }
     holdOffDefault(&t, config, snap, effort_cfg != null, budget_explicit, disabled);
     return t;
@@ -1252,15 +1252,11 @@ test "--preserve-thinking takes on or off" {
 test "a request renders with its own preserve_thinking and leaves the model's config alone" {
     const a = std.testing.allocator;
     var model_config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"chat_template_kwargs\":{\"preserve_thinking\":false}}", .{});
-    defer parsed.deinit();
-    const per_request = renderConfigFor(&model_config, parsed.value.object, null, true);
+    const per_request = renderConfigFor(&model_config, false, null, true);
     try std.testing.expectEqual(@as(?bool, false), per_request.preserve_thinking);
     try std.testing.expectEqual(@as(?bool, null), model_config.preserve_thinking);
-    const empty = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
-    defer empty.deinit();
-    try std.testing.expectEqual(@as(?bool, true), renderConfigFor(&model_config, empty.value.object, null, true).preserve_thinking);
-    try std.testing.expectEqual(@as(?bool, false), renderConfigFor(&model_config, empty.value.object, false, true).preserve_thinking);
+    try std.testing.expectEqual(@as(?bool, true), renderConfigFor(&model_config, null, null, true).preserve_thinking);
+    try std.testing.expectEqual(@as(?bool, false), renderConfigFor(&model_config, null, false, true).preserve_thinking);
 }
 
 test "format corpus: one-shot thinking reaches served templates and effort budgets" {
@@ -1571,7 +1567,12 @@ fn surfaceThinking(a: std.mem.Allocator, surface: OffSurface, config: *const mod
         .chat => return chatThinking(root, try parseReasoningEffort(root, false, table), config, &snap),
         .anthropic => {
             const word: ?[]const u8 = if (root.get("output_config")) |oc| (if (oc.object.get("effort")) |e| e.string else null) else null;
-            return anthropicThinking(root, if (word) |w| try reasoningEffortFromWord(w, false, table) else null, config, &snap);
+            var fb: [128]u8 = undefined;
+            const req = switch (request_fields.check(.messages, &fb, root)) {
+                .ok => |c| c,
+                .fault => return error.RequestRefused,
+            };
+            return anthropicThinking(req, if (word) |w| try reasoningEffortFromWord(w, false, table) else null, config, &snap);
         },
         .responses => {
             var rc = responses_mod.parseReasoning(root.get("reasoning"));

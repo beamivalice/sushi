@@ -1,6 +1,7 @@
 const std = @import("std");
 const arch_fx = @import("arch_fixtures_test.zig");
 const request_parse = @import("request_parse.zig");
+const request_fields = @import("request_fields.zig");
 const http = @import("http.zig");
 const json_text = @import("json_text.zig");
 const trunk = @import("trunk.zig");
@@ -106,10 +107,7 @@ const jsonEscape = http.jsonEscape;
 const logHttpBody = http.logHttpBody;
 const mtpCapable = server_mod.mtpCapable;
 const nativeMeasuredMoeHead = server_mod.nativeMeasuredMoeHead;
-const parseJsonFloatOpt = request_parse.parseJsonFloatOpt;
-const parseJsonTopKOpt = request_parse.parseJsonTopKOpt;
 const parseKvQuantOverride = request_parse.parseKvQuantOverride;
-const parseRequestSeed = request_parse.parseRequestSeed;
 const promptOpensThink = server_mod.promptOpensThink;
 const readAllFromPair = server_mod.readAllFromPair;
 const readContentParts = server_mod.readContentParts;
@@ -243,14 +241,14 @@ fn readAnthropicConversation(wire: *WireMessages, system: ?std.json.Value, items
     // Array form JOINS every text block — Claude Code sends 2+ (identity + the
     // instructions block), and first-wins dropped everything after the first.
     if (system) |sys_val| {
-        const sys_text: []const u8 = switch (sys_val) {
-            .string => |s| s,
-            .array => |arr| blk: {
-                const joined = try joinedTextParts(allocator, arr.items);
+        const sys_text: []const u8 = switch (try request_fields.contentOf(sys_val)) {
+            .none => "",
+            .text => |t| t,
+            .parts => |parts| blk: {
+                const joined = try joinedTextParts(allocator, parts);
                 if (joined.owned) try wire.texts.append(allocator, joined.text);
                 break :blk joined.text;
             },
-            else => "",
         };
         if (sys_text.len > 0) {
             try wire.push(.{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
@@ -282,32 +280,30 @@ fn markToolError(wire: *WireMessages, result: *ReadContent) !void {
 pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value, vp: chat_mod.VisionPreproc) !void {
     const allocator = wire.allocator;
     for (items, 0..) |msg_val, raw_index| {
-        if (msg_val != .object) continue;
-        const msg_obj = msg_val.object;
-        const role_val = msg_obj.get("role") orelse continue;
-        if (role_val != .string) continue;
-        const role = role_val.string;
-        const content_val = msg_obj.get("content");
+        const message = try request_fields.messageOf(msg_val);
+        const role = message.role;
+        const body = try request_fields.contentOf(message.obj.get("content"));
         const pos: WirePos = .{ .list = "messages", .index = raw_index };
 
         if (std.mem.eql(u8, role, "user")) {
-            if (content_val) |cv| switch (cv) {
-                .string => |s| {
+            switch (body) {
+                .none => {},
+                .text => |s| {
                     try wire.push(.{ .role = "user", .content = s });
                 },
-                .array => |arr| {
-                    for (arr.items) |block| {
+                .parts => |parts| {
+                    for (parts) |block| {
                         if (block != .object) continue;
                         const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
                         if (!std.mem.eql(u8, btype, "tool_result")) continue;
 
                         const tool_use_id = if (block.object.get("tool_use_id")) |v| (if (v == .string) v.string else "") else "";
                         var result: ReadContent = .{};
-                        if (block.object.get("content")) |rc| switch (rc) {
-                            .string => |s| result.text = s,
-                            .array => |result_arr| result = try readContentParts(allocator, &wire.media, &wire.texts, result_arr.items, .anthropic, pos, vp),
-                            else => {},
-                        };
+                        switch (try request_fields.contentOf(block.object.get("content"))) {
+                            .none => {},
+                            .text => |t| result.text = t,
+                            .parts => |result_parts| result = try readContentParts(allocator, &wire.media, &wire.texts, result_parts, .anthropic, pos, vp),
+                        }
                         if (request_parse.toolResultIsError(block.object)) try markToolError(wire, &result);
                         try wire.push(.{
                             .role = "tool",
@@ -318,7 +314,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                         });
                     }
 
-                    const read = try readContentParts(allocator, &wire.media, &wire.texts, arr.items, .anthropic, pos, vp);
+                    const read = try readContentParts(allocator, &wire.media, &wire.texts, parts, .anthropic, pos, vp);
                     if (read.text.len > 0 or read.images != null) {
                         try wire.push(.{
                             .role = "user",
@@ -328,14 +324,14 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                         });
                     }
                 },
-                else => {},
-            };
+            }
         } else if (std.mem.eql(u8, role, "assistant")) {
-            if (content_val) |cv| switch (cv) {
-                .string => |s| {
+            switch (body) {
+                .none => {},
+                .text => |s| {
                     try wire.push(.{ .role = "assistant", .content = s });
                 },
-                .array => |arr| {
+                .parts => |parts| {
                     // Extract text, tool_use and thinking blocks
                     var text_content: chat_mod.TextJoin = .{};
                     defer text_content.deinit(allocator);
@@ -343,7 +339,7 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                     defer think_content.deinit(allocator);
                     var tcs = std.ArrayList(chat_mod.ToolCall).empty;
 
-                    for (arr.items) |block| {
+                    for (parts) |block| {
                         if (block != .object) continue;
                         const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
 
@@ -390,19 +386,18 @@ pub fn readAnthropicMessages(wire: *WireMessages, items: []const std.json.Value,
                     const msg_reasoning: ?[]const u8 = if (thought.text.len > 0) thought.text else null;
                     try wire.push(.{ .role = "assistant", .content = content.text, .tool_calls = msg_tool_calls, .reasoning_content = msg_reasoning });
                 },
-                else => {},
-            };
+            }
         } else if (std.mem.eql(u8, role, "system")) {
             // Claude Code puts SessionStart hook output here; dropping it is silent context loss.
-            const sys_text: []const u8 = if (content_val) |cv| switch (cv) {
-                .string => |s| s,
-                .array => |arr| blk: {
-                    const joined = try joinedTextParts(allocator, arr.items);
+            const sys_text: []const u8 = switch (body) {
+                .none => "",
+                .text => |t| t,
+                .parts => |parts| blk: {
+                    const joined = try joinedTextParts(allocator, parts);
                     if (joined.owned) try wire.texts.append(allocator, joined.text);
                     break :blk joined.text;
                 },
-                else => "",
-            } else "";
+            };
             if (sys_text.len > 0) {
                 try wire.push(.{ .role = "system", .content = sys_text });
             }
@@ -543,40 +538,27 @@ pub fn handleAnthropicMessages(
     const spelled = try request_parse.parseSpelled(allocator, body);
     defer spelled.deinit();
 
-    var fault_buf: [384]u8 = undefined;
-    const field_fault = request_parse.generationFieldFault(&fault_buf, root, .{ .max_tokens = &.{"max_tokens"}, .stop = "stop_sequences", .min_p = false }) orelse
-        if (root.get("tools")) |tv| request_parse.toolsFault(&fault_buf, tv, false) else null;
-    if (field_fault) |reason| {
-        log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});
-        try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
-        return;
-    }
+    const req = (try checkedMessagesBody(allocator, stream, root, "/v1/messages")) orelse return;
 
     // The Anthropic API requires max_tokens; an omitted one takes the filled budget like every surface.
-    const max_tokens: u32 = resolveRequestMaxTokens(root.get("max_tokens"), request_policy.filledMaxTokens(config));
-    const max_tokens_origin = maxTokensOrigin(root.get("max_tokens"), launchMaxTokensDefault(), config.defaultMaxTokens());
+    const requested_max_tokens = req.requestedMaxTokens();
+    const max_tokens: u32 = resolveRequestMaxTokens(requested_max_tokens, request_policy.filledMaxTokens(config));
+    const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault(), config.defaultMaxTokens());
 
     // Sampling parameters. Omitted fields resolve through CLI flags and the
     // model's generation_config.json — Claude Code omits ALL of them, and the
     // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
     // intended envelope (model card wants top_k=20, top_p=0.95).
-    const temperature = request_policy.samplingTemperature(config, parseJsonFloatOpt(root, "temperature"));
-    const top_p = request_policy.samplingTopP(config, parseJsonFloatOpt(root, "top_p"));
-    const top_k = request_policy.samplingTopK(config, parseJsonTopKOpt(root, "top_k"));
-    const seed: ?u64 = parseRequestSeed(root.get("seed"));
+    const temperature = request_policy.samplingTemperature(config, req.number("temperature"));
+    const top_p = request_policy.samplingTopP(config, req.number("top_p"));
+    const top_k = request_policy.samplingTopK(config, req.topK());
+    const seed: ?u64 = req.seed();
 
-    // Stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
     defer stop_sequences.deinit(allocator);
-    if (root.get("stop_sequences")) |stop_val| {
-        if (stop_val == .array) {
-            for (stop_val.array.items) |item| {
-                if (item == .string and item.string.len > 0) try stop_sequences.append(allocator, item.string);
-            }
-        }
-    }
+    try req.stops(allocator, &stop_sequences);
 
-    const is_stream = request_parse.boolField(root, .stream) orelse false;
+    const is_stream = req.flag("stream") orelse false;
     const model_name_raw = if (root.get("model")) |v| (if (v == .string) v.string else servedModelId(lm, config)) else servedModelId(lm, config);
     const model_name = try json_text.innerAlloc(allocator, model_name_raw);
     defer allocator.free(model_name);
@@ -586,18 +568,18 @@ pub fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const lm_default_enable_drafter: bool = lm.dflash != null;
-    var enable_drafter: bool = request_parse.boolField(root, .enable_drafter) orelse lm_default_enable_drafter;
+    var enable_drafter: bool = req.flag("enable_drafter") orelse lm_default_enable_drafter;
     if (enable_drafter and lm.dflash == null) enable_drafter = false;
-    const allow_batch_mtp = request_parse.boolField(root, .enable_batch_mtp) orelse true;
-    var enable_mtp: bool = request_parse.boolField(root, .enable_mtp) orelse
+    const allow_batch_mtp = req.flag("enable_batch_mtp") orelse true;
+    var enable_mtp: bool = req.flag("enable_mtp") orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     var prompt: AnthropicPrompt = .{ .wire = WireMessages.init(allocator) };
     defer prompt.deinit();
     defer clearEffortNotice(stream);
-    if (!try renderAnthropicPrompt(allocator, stream, lm, root, spelled.value.object, .messages, &prompt)) return;
-    if (expert_stream_mod.mtpRefusal(config.expert_streaming, request_parse.boolField(root, .enable_mtp) orelse false, lm.mtp != null)) |why| {
+    if (!try renderAnthropicPrompt(allocator, stream, lm, req, spelled.value.object, .messages, &prompt)) return;
+    if (expert_stream_mod.mtpRefusal(config.expert_streaming, req.flag("enable_mtp") orelse false, lm.mtp != null)) |why| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
         return;
     }
@@ -706,7 +688,7 @@ pub fn handleAnthropicMessages(
         }
     }
 
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(parseJsonFloatOpt(root, "think_penalty"), model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -747,6 +729,20 @@ pub fn handleAnthropicMessages(
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     }
+}
+
+/// The fields of a /v1/messages body, checked (`request_fields`); null once the 400 is sent. count_tokens takes the
+/// same body and runs the same checks.
+fn checkedMessagesBody(allocator: std.mem.Allocator, stream: *Conn, root: std.json.ObjectMap, route: []const u8) !?request_fields.Checked(.messages) {
+    var fault_buf: [384]u8 = undefined;
+    return switch (request_fields.check(.messages, &fault_buf, root)) {
+        .fault => |reason| {
+            log.warn("POST {s} -> 400 ({s})\n", .{ route, reason });
+            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+            return null;
+        },
+        .ok => |c| c,
+    };
 }
 
 /// A /v1/messages body as a JSON object; null once the 400 is sent.
@@ -815,17 +811,12 @@ const AnthropicRoute = enum {
 
 /// Renders `root` into `p` exactly as /v1/messages prefills it; false once a 400 is sent. The conversation and the tools
 /// are read from `spelled` (`request_parse.parseSpelled`), which outlives `p`.
-fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, root: std.json.ObjectMap, spelled: std.json.ObjectMap, route: AnthropicRoute, p: *AnthropicPrompt) !bool {
+fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, req: request_fields.Checked(.messages), spelled: std.json.ObjectMap, route: AnthropicRoute, p: *AnthropicPrompt) !bool {
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
 
-    var fault_buf: [320]u8 = undefined;
-    if (request_parse.anthropicToolFault(&fault_buf, root) orelse request_parse.anthropicFieldFault(&fault_buf, root)) |reason| {
-        log.warn("POST {s} -> 400 ({s})\n", .{ route.path(), reason });
-        try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
-        return false;
-    }
+    const root = req.root;
     const messages_val = spelled.get("messages") orelse {
         try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
         return false;
@@ -904,7 +895,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
         effort_cfg = cfg;
     }
     // An absent `thinking` object takes the arch default; a present one decides (`request_policy.anthropicThinking`).
-    const thinking = request_policy.anthropicThinking(root, effort_cfg, config, &effort_snap);
+    const thinking = request_policy.anthropicThinking(req, effort_cfg, config, &effort_snap);
     var enable_thinking = thinking.enable;
     const reasoning_budget = thinking.budget;
     const effort_word = thinking.template;
@@ -955,7 +946,7 @@ fn renderAnthropicPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *Loade
     // The `thinking` budget object carries no effort string, but
     // `output_config.effort` does — templates that read the word (dsv4,
     // qwen3.8) get it; requests without one still render their default.
-    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    const render_config = renderConfigFor(chat_config, req.templateKwarg("preserve_thinking"), model_settings.preserve_thinking_flag, config.preserve_thinking_override);
     p.ids = (if (route == .messages)
         cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, effective_tools_json, p.tool_choice_instruction, enable_thinking, effort_word, p.continue_final)
     else
@@ -1014,7 +1005,8 @@ pub fn handleAnthropicCountTokens(allocator: std.mem.Allocator, stream: *Conn, b
     var prompt: AnthropicPrompt = .{ .wire = WireMessages.init(allocator) };
     defer prompt.deinit();
     defer clearEffortNotice(stream);
-    if (!try renderAnthropicPrompt(allocator, stream, lm, parsed.value.object, spelled.value.object, .count_tokens, &prompt)) return;
+    const req = (try checkedMessagesBody(allocator, stream, parsed.value.object, "/v1/messages/count_tokens")) orelse return;
+    if (!try renderAnthropicPrompt(allocator, stream, lm, req, spelled.value.object, .count_tokens, &prompt)) return;
 
     var input_tokens = prompt.ids.len;
     var flat = try flattenMedia(allocator, prompt.wire.messages.items);
@@ -2575,13 +2567,18 @@ test "count_tokens: both routes render a body to the same prompt, schema, tools,
         defer parsed.deinit();
         const spelled = try request_parse.parseSpelled(t.allocator, body);
         defer spelled.deinit();
+        var fault_buf: [256]u8 = undefined;
+        const req = switch (request_fields.check(.messages, &fault_buf, parsed.value.object)) {
+            .ok => |c| c,
+            .fault => return error.RequestRefused,
+        };
         var served: AnthropicPrompt = .{ .wire = WireMessages.init(t.allocator) };
         defer served.deinit();
-        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, spelled.value.object, .messages, &served));
+        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, req, spelled.value.object, .messages, &served));
         clearEffortNotice(&conn);
         var counted: AnthropicPrompt = .{ .wire = WireMessages.init(t.allocator) };
         defer counted.deinit();
-        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, parsed.value.object, spelled.value.object, .count_tokens, &counted));
+        try t.expect(try renderAnthropicPrompt(t.allocator, &conn, &f.lm, req, spelled.value.object, .count_tokens, &counted));
         clearEffortNotice(&conn);
         try t.expect(served.ids.len > 0);
         try t.expectEqualSlices(u32, served.ids, counted.ids);

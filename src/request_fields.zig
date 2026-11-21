@@ -347,6 +347,22 @@ pub fn Checked(comptime surface: Surface) type {
             return if (v == .bool) v.bool else null;
         }
 
+        /// Anthropic's `thinking` object; null when absent or null.
+        pub fn thinking(self: Self) ?AnthropicThinking {
+            comptime _ = rowFor(surface, "thinking");
+            const v = self.root.get("thinking") orelse return null;
+            if (v == .null) return null;
+            if (v != .object) unreachable;
+            const t = v.object.get("type") orelse unreachable;
+            if (t != .string) unreachable;
+            const kind = std.meta.stringToEnum(ThinkingKind, t.string) orelse unreachable;
+            const budget: ?i32 = if (v.object.get("budget_tokens")) |b| switch (b) {
+                .integer => |i| std.math.cast(i32, i) orelse unreachable,
+                else => null,
+            } else null;
+            return .{ .kind = kind, .budget_tokens = budget };
+        }
+
         /// The thinking switch the client set: top-level `enable_thinking`, else the vLLM `chat_template_kwargs` one.
         pub fn enableThinking(self: Self) ?bool {
             return self.flag("enable_thinking") orelse self.templateKwarg("enable_thinking");
@@ -392,6 +408,9 @@ fn wholeValue(v: std.json.Value) ?i64 {
         else => wholeNumber(v) orelse unreachable,
     };
 }
+
+pub const ThinkingKind = enum { enabled, disabled, adaptive };
+pub const AnthropicThinking = struct { kind: ThinkingKind, budget_tokens: ?i32 };
 
 pub fn CheckResult(comptime surface: Surface) type {
     return union(enum) { fault: []const u8, ok: Checked(surface) };
@@ -993,6 +1012,29 @@ test "contentOf reads text, parts or nothing, and refuses any other type" {
     try testing.expect(try contentOf(null) == .none);
     try testing.expectError(error.ContentWrongType, contentOf(items[3]));
     try testing.expectError(error.ContentWrongType, contentOf(items[4]));
+}
+
+test "Messages refuses a tool_choice type it does not serve, and a tool_result flag or content that is no bool or text, by name" {
+    try expectCases(&.{
+        .{ .surface = .messages, .body = "{}", .field = null },
+        .{ .surface = .messages, .body = "{\"tool_choice\":null}", .field = null },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"auto\"}}", .field = null },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"any\",\"disable_parallel_tool_use\":true}}", .field = null },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"none\"}}", .field = null },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"f\",\"disable_parallel_tool_use\":false}}", .field = null },
+        .{ .surface = .messages, .body = "{\"tool_choice\":\"auto\"}", .field = "tool_choice" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":5}", .field = "tool_choice" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{}}", .field = "tool_choice.type" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"bogus\"}}", .field = "tool_choice.type" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"function\",\"name\":\"f\"}}", .field = "tool_choice.type" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"tool\"}}", .field = "tool_choice.name" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"tool\",\"name\":\"\"}}", .field = "tool_choice.name" },
+        .{ .surface = .messages, .body = "{\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":\"yes\"}}", .field = "tool_choice.disable_parallel_tool_use" },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":true}]}]}", .field = null },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":null}]}]}", .field = null },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":\"yes\"}]}]}", .field = "messages[0].content[0].is_error" },
+        .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":5}]}]}", .field = "messages[0].content[0].content" },
+    });
 }
 
 test "chat logprobs: true is on whatever top_logprobs says, 0 and absent included; only a missing true is off" {

@@ -2820,3 +2820,96 @@ test "server: request fields: chat and completions refuse a field of the wrong s
         }
     }.run);
 }
+
+/// The Anthropic non-stream reply's joined text blocks and its stop_reason.
+fn anthropicTextAndReason(resp: []const u8, out_reason: *[64]u8) ![]u8 {
+    const p = try parseBody(bodyOf(resp));
+    defer p.deinit();
+    var text: std.ArrayList(u8) = .empty;
+    errdefer text.deinit(gpa);
+    if (p.value.object.get("content")) |c| if (c == .array) for (c.array.items) |b| {
+        const t = b.object.get("type") orelse continue;
+        if (t == .string and std.mem.eql(u8, t.string, "text")) try text.appendSlice(gpa, b.object.get("text").?.string);
+    };
+    const r = if (p.value.object.get("stop_reason")) |v| (if (v == .string) v.string else "") else "";
+    @memset(out_reason, 0);
+    @memcpy(out_reason[0..@min(r.len, 64)], r[0..@min(r.len, 64)]);
+    return text.toOwnedSlice(gpa);
+}
+
+test "server: request fields: /v1/messages refuses a field it does not read or of the wrong shape, by name, and count_tokens runs the same checks" {
+    try eachArch(2, .{}, struct {
+        const msg = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const path = "/v1/messages";
+        const head = "{\"model\":\"tiny\",\"max_tokens\":2,";
+        const cases = [_]FieldCase{
+            .{ .path = path, .body = head ++ "\"presence_penalty\":1," ++ msg ++ "}", .field = "presence_penalty" },
+            .{ .path = path, .body = head ++ "\"frequency_penalty\":1," ++ msg ++ "}", .field = "frequency_penalty" },
+            .{ .path = path, .body = head ++ "\"repeat_penalty\":1.1," ++ msg ++ "}", .field = "repeat_penalty" },
+            .{ .path = path, .body = head ++ "\"enable_thinking\":true," ++ msg ++ "}", .field = "enable_thinking" },
+            .{ .path = path, .body = head ++ "\"reasoning_budget_tokens\":64," ++ msg ++ "}", .field = "reasoning_budget_tokens" },
+            .{ .path = path, .body = head ++ "\"top_logprobs\":3," ++ msg ++ "}", .field = "top_logprobs" },
+            .{ .path = path, .body = head ++ "\"parallel_tool_calls\":false," ++ msg ++ "}", .field = "parallel_tool_calls" },
+            .{ .path = path, .body = head ++ "\"continue_final_message\":true," ++ msg ++ "}", .field = "continue_final_message" },
+            .{ .path = path, .body = head ++ "\"stream_options\":{\"include_usage\":true}," ++ msg ++ "}", .field = "stream_options" },
+            .{ .path = path, .body = head ++ "\"top_k\":2.5," ++ msg ++ "}", .field = "top_k" },
+            .{ .path = path, .body = head ++ "\"stop_sequences\":5," ++ msg ++ "}", .field = "stop_sequences" },
+            .{ .path = path, .body = head ++ "\"thinking\":\"enabled\"," ++ msg ++ "}", .field = "thinking" },
+            .{ .path = path, .body = head ++ "\"thinking\":{\"type\":\"on\"}," ++ msg ++ "}", .field = "thinking.type" },
+            .{ .path = path, .body = head ++ "\"system\":{\"type\":\"text\",\"text\":\"be terse\"}," ++ msg ++ "}", .field = "system" },
+            .{ .path = path, .body = head ++ "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":5},{\"role\":\"user\",\"content\":\"again\"}]}", .field = "messages[1].content" },
+            .{ .path = path, .body = head ++ "\"messages\":[{\"role\":7,\"content\":\"hi\"}]}", .field = "messages[0].role" },
+            // count_tokens answers what /v1/messages answers for the same body.
+            .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"presence_penalty\":1," ++ msg ++ "}", .field = "presence_penalty" },
+            .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"tools\":[{\"name\":\"my tool\",\"input_schema\":{\"type\":\"object\"}}]," ++ msg ++ "}", .field = "tools[0]" },
+            .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"tools\":[{\"name\":\"t\",\"input_schema\":{\"type\":\"object\"}},{\"name\":\"t\",\"input_schema\":{\"type\":\"object\"}}]," ++ msg ++ "}", .field = "tools[1]" },
+            .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"tools\":{\"name\":\"t\"}," ++ msg ++ "}", .field = "tools" },
+            .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":\"many\"}," ++ msg ++ "}", .field = "thinking.budget_tokens" },
+            .{ .path = "/v1/messages/count_tokens", .body = head ++ "\"top_k\":2.5," ++ msg ++ "}", .field = "top_k" },
+        };
+        fn run() !void {
+            try expectEachRefusedByName(&cases);
+        }
+    }.run);
+}
+
+test "server: request fields: /v1/messages reads stop_sequences as a string as it reads the array form" {
+    try eachArch(2, .{}, struct {
+        fn run() !void {
+            const base = try request("POST", "/v1/messages", "{\"model\":\"tiny\",\"max_tokens\":16,\"temperature\":0,\"thinking\":{\"type\":\"disabled\"},\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+            defer gpa.free(base);
+            var reason: [64]u8 = undefined;
+            const text = try anthropicTextAndReason(base, &reason);
+            defer gpa.free(text);
+            // Two printable, JSON-safe bytes that start after the reply's first.
+            var at: usize = 1;
+            const cut: []const u8 = while (at + 2 <= text.len) : (at += 1) {
+                const w = text[at .. at + 2];
+                if (for (w) |c| {
+                    if (c < 0x21 or c > 0x7e or c == '"' or c == '\\') break false;
+                } else true) break w;
+            } else {
+                std.debug.print("no two printable bytes to stop at in {s} [{s}]\n", .{ text, base[0..@min(base.len, 600)] });
+                return error.Inconclusive;
+            };
+            var b1: [512]u8 = undefined;
+            var b2: [512]u8 = undefined;
+            const arr = try std.fmt.bufPrint(&b1, "{{\"model\":\"tiny\",\"max_tokens\":16,\"temperature\":0,\"thinking\":{{\"type\":\"disabled\"}},\"stop_sequences\":[\"{s}\"],\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}", .{cut});
+            const str = try std.fmt.bufPrint(&b2, "{{\"model\":\"tiny\",\"max_tokens\":16,\"temperature\":0,\"thinking\":{{\"type\":\"disabled\"}},\"stop_sequences\":\"{s}\",\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]}}", .{cut});
+            const ra = try request("POST", "/v1/messages", arr);
+            defer gpa.free(ra);
+            const rs = try request("POST", "/v1/messages", str);
+            defer gpa.free(rs);
+            var r1: [64]u8 = undefined;
+            var r2: [64]u8 = undefined;
+            const ta = try anthropicTextAndReason(ra, &r1);
+            defer gpa.free(ta);
+            const ts = try anthropicTextAndReason(rs, &r2);
+            defer gpa.free(ts);
+            if (!std.mem.eql(u8, ta, ts) or !std.mem.eql(u8, &r1, &r2) or !std.mem.eql(u8, std.mem.sliceTo(&r1, 0), "stop_sequence")) {
+                std.debug.print("stop_sequences \"{s}\": array -> {s} [{s}]; string -> {s} [{s}]\n", .{ cut, ta, std.mem.sliceTo(&r1, 0), ts, std.mem.sliceTo(&r2, 0) });
+                return error.StringStopReadAsAbsent;
+            }
+        }
+    }.run);
+}

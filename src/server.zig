@@ -2679,7 +2679,7 @@ pub fn handleChatCompletions(
     // that into a prefill would change what every one of them gets back.
     const continue_final = continueFinalMessageRequested(req, messages.items);
     var tokenize_sw = io_util.Stopwatch.init(stream.io);
-    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    const render_config = renderConfigFor(chat_config, req.templateKwarg("preserve_thinking"), model_settings.preserve_thinking_flag, config.preserve_thinking_override);
     var prompt_ids_raw = cachedFormatChat(allocator, stream.io, lm, tok, &render_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, template_effort, continue_final) catch |err| return generation_stream.sendGenerationError(allocator, stream, err, .openai);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
@@ -3190,9 +3190,9 @@ test "an unknown endpoint is a 404 that never reaches model resolution" {
 
 
 /// The model's chat config as this request renders it.
-pub fn renderConfigFor(chat_config: *const chat_mod.ChatConfig, root: std.json.ObjectMap, flag: ?bool, setting: ?bool) chat_mod.ChatConfig {
+pub fn renderConfigFor(chat_config: *const chat_mod.ChatConfig, request_preserve: ?bool, flag: ?bool, setting: ?bool) chat_mod.ChatConfig {
     var cfg = chat_config.*;
-    cfg.preserve_thinking = request_policy.resolvePreserveThinking(chatTemplateKwargBool(root, "preserve_thinking"), flag, setting);
+    cfg.preserve_thinking = request_policy.resolvePreserveThinking(request_preserve, flag, setting);
     return cfg;
 }
 

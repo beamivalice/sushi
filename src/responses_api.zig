@@ -742,7 +742,7 @@ fn handleResponsesInner(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    const render_config = renderConfigFor(chat_config, root, model_settings.preserve_thinking_flag, config.preserve_thinking_override);
+    const render_config = renderConfigFor(chat_config, request_parse.chatTemplateKwargBool(root, "preserve_thinking"), model_settings.preserve_thinking_flag, config.preserve_thinking_override);
     var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, &render_config, prompt_messages, active_tools_json, active_tool_choice_instruction, enable_thinking, template_effort, false);
     var schema_proto: rp_mod.Protocol = undefined;
     var schema_proto_active = false;
