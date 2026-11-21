@@ -242,7 +242,7 @@ pub fn batchedForward(
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
     const tag = tagOfModel(xfm) orelse return error.NoBatchedKernel;
-    enterJoinedRows(xfm, ctxs, null);
+    enterJoinedRows(xfm);
     return switch (tag) {
         inline else => |t| if (comptime has(t, "batchedForward"))
             S(t).batchedForward(sch, allocator, xfm, batch, next_tokens, ctxs, rope_offsets, arm, hidden_rows)
@@ -251,18 +251,9 @@ pub fn batchedForward(
     };
 }
 
-/// A joined forward over `ctxs` begins (`arch_cooler.enterJoined`): one row a request, or each request's `token_rows`.
-pub fn enterJoinedRows(xfm: *Trunk, ctxs: []const *ForwardCtx, token_rows: ?[]const mlx.mlx_array) void {
-    const cooler = @import("cooler.zig");
-    if (!cooler.joinedLifts(&xfm.config, &xfm.cooler_budget)) return;
-    var rows: u64 = 0;
-    var seq: u64 = 0;
-    for (ctxs, 0..) |c, i| {
-        const n: u64 = if (token_rows) |r| @intCast(mlx.mlx_array_size(r[i])) else 1;
-        rows += n;
-        seq = @max(seq, @as(u64, c.cache.kvLenForBatching()) + n);
-    }
-    cooler.enterJoined(&xfm.config, &xfm.cooler_budget, rows, seq);
+/// A joined forward of the model of `xfm` begins (`arch_cooler.enterJoined`).
+pub fn enterJoinedRows(xfm: *Trunk) void {
+    @import("cooler.zig").enterJoined(&xfm.config, &xfm.cooler_budget);
 }
 
 /// Whether the arch runs joined decode rows outside a scheduler (`rowsForward`); one whose rows need a request's
@@ -278,7 +269,7 @@ pub fn hasRowsForward(xfm: *const Trunk) bool {
 /// them for `arm`, for an arch with `hasRowsForward`.
 pub fn rowsForward(xfm: *Trunk, next_tokens: []const u32, ctxs: []const *ForwardCtx, rope_offsets: []const u32, arm: BatchArm, hidden_rows: ?*?[]mlx.mlx_array) ![]mlx.mlx_array {
     const tag = tagOfModel(xfm) orelse return error.NoBatchedKernel;
-    enterJoinedRows(xfm, ctxs, null);
+    enterJoinedRows(xfm);
     return switch (tag) {
         inline else => |t| if (comptime has(t, "rowsForward")) S(t).rowsForward(xfm, next_tokens, ctxs, rope_offsets, arm, hidden_rows) else error.NoBatchedKernel,
     };

@@ -308,11 +308,11 @@ test "cooler contract: a wide forward's cap is its own model's to lift: another 
     {
         const turn = mlx.engine.turnToModel(true, &b);
         defer turn.end();
-        cooler.enterJoined(&config, &b, 2, 64);
+        cooler.enterJoined(&config, &b);
     }
     const turn = mlx.engine.turnToModel(true, &a);
     defer turn.end();
-    cooler.enterJoined(&config, &a, 2, 64);
+    cooler.enterJoined(&config, &a);
     try testing.expectEqual(@as(?u64, null), capInForce());
 }
 

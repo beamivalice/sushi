@@ -84,6 +84,75 @@ test "cooler contract: a decode after a long Cooler prefill grows the engine's p
     }.run);
 }
 
+test "cooler contract: a decode after a wide forward that left free buffers of sizes it never asks for grows the engine's pool by no more than its forward's cap" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const ld = try heldLoad(C, dir);
+            const cooler = @import("arch/cooler.zig");
+            // An arch that installs its own hard caps refuses a buffer past them; its decode cap has its own cells.
+            if (cooler.ownsCaps(&ld.config)) {
+                @import("test_note.zig").notePartSkipped("an arch with its own pool caps");
+                return error.SkipZigTest;
+            }
+            const a = testing.allocator;
+            const wide_rows: usize = 2048;
+            const wide = try a.alloc(u32, wide_rows);
+            defer a.free(wide);
+            for (wide, 0..) |*t, i| t.* = ids[i % ids.len];
+            const turn = arch_handle.turnFor(ld.h, &ld.config);
+            defer turn.end();
+            defer arch_sched.endRequest(&ld.config);
+            try ld.xfm.resetCache();
+            ld.xfm.bindOwnRows(wide_rows + 1);
+            const cap = cooler.forwardCap(&ld.config, 1, wide_rows + 1);
+            {
+                const arr = mlx.mlx_array_new_data(@ptrCast(wide.ptr), &[_]c_int{ 1, wide_rows }, 2, .int32);
+                defer _ = mlx.mlx_array_free(arr);
+                var ctx = ld.xfm.defaultCtx();
+                ctx.skip_lm_head = true;
+                const out = try @import("model_handle.zig").forwardWith(ld.xfm, &ctx, arr);
+                defer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_array_eval(out));
+            }
+            // The wide forward's leftovers, and then some: a decode asks buffers far smaller than these, so none of
+            // them serves it and what stays free past the lift sits on top of its own asks.
+            {
+                const parked_each: usize = 1 << 20;
+                const n = cap / parked_each + 2;
+                const held = try a.alloc(mlx.mlx_array, n);
+                defer a.free(held);
+                var made: usize = 0;
+                defer for (held[0..made]) |h| {
+                    _ = mlx.mlx_array_free(h);
+                };
+                while (made < n) : (made += 1) {
+                    held[made] = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_zeros(&held[made], &[_]c_int{parked_each / 4}, 1, .float32, ld.xfm.s));
+                    try mlx.check(mlx.mlx_array_eval(held[made]));
+                }
+            }
+            {
+                const one = mlx.mlx_array_new_data(@ptrCast(wide.ptr), &[_]c_int{ 1, 1 }, 2, .int32);
+                defer _ = mlx.mlx_array_free(one);
+                var ctx = ld.xfm.defaultCtx();
+                // The decode forward begins: its model's wide cap is lifted and the free buffers past its cap go.
+                // The window opens after that, so it holds the forward's own asks over what the lift left parked.
+                _ = cooler.enterForward(&ld.config, &ctx, one, ld.xfm, false);
+                mlx.engine.close();
+                const in0 = Sheet.now().in_use;
+                mlx.engine.resetPoolPeak(.process);
+                const out = try @import("model_handle.zig").forwardWith(ld.xfm, &ctx, one);
+                defer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_array_eval(out));
+                mlx.engine.close();
+                const grew = mlx.engine.poolHeldPeak(.process) -| in0;
+                if (grew > cap) std.debug.print("cooler contract: a decode forward after a {d}-row one grew the pool {d} KB over its {d} KB cap\n", .{ wide_rows, grew >> 10, cap >> 10 });
+                try testing.expect(grew <= cap);
+            }
+        }
+    }.run);
+}
+
 test "cooler contract: a served cold prefill past the reservation floor, whose first chunk grows the request's whole reserved cache, runs under its chunks' caps" {
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {

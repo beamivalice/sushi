@@ -527,9 +527,11 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **Maps are the engine's inside its scope** (`route.zig`: names to arrays, names to strings, the iterator): a map
   made under `engine.enter` is tagged like a vector, every call that takes one follows it, and a name it lacks
   answers 2 with no error latched, as mlx-c does. The SSD tier's readers hand tensors around in them.
-- **One seam owns the pool for every Cooler arch** (`arch/cooler.zig`): the first decode forward after a prefill trims
-  the free buffers to its transient bill (`bills.prefillTransientReserveAtKv` at a verify block's rows), a request's
-  end trims them to the arch's resting cap, and an unload, and the last Cooler hold's end, leave the pool empty.
+- **One seam owns the pool for every Cooler arch** (`arch/cooler.zig`): the first decode forward after a prefill
+  leaves at most the cap's margin of free buffers (the forward's own asks, which a parked buffer of another size does
+  not serve, come on top of them, so the transient bill `bills.prefillTransientReserveAtKv` at a verify block's rows
+  plus the margin holds), a request's end trims them to the arch's resting cap, and an unload, and the last Cooler
+  hold's end, leave the pool empty.
 - **The shared bill trims and never caps.** As a hard cap it refused a Qwen verify after a 10k prefill on the
   release pack (762 MB in use, a 1290 MB limit): buffers an open pass binds outlive their tensors, which no bill term
   counts. A hard cap needs a measured forward cap, as DeepSeek's.

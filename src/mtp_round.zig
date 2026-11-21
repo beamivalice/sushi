@@ -694,7 +694,7 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
     var ctxs: [@import("sched_policy.zig").MAX_BATCH_GROUP]*ForwardCtx = undefined;
     if (gens.len > ctxs.len) return error.BatchTooWide;
     for (gens, ctxs[0..gens.len]) |g, *c| c.* = &g.ctx;
-    @import("arch/sched.zig").enterJoinedRows(gens[0].xfm, ctxs[0..gens.len], null);
+    @import("arch/sched.zig").enterJoinedRows(gens[0].xfm);
     try gens[0].mtp.?.buildBatchedChains(gens, chains, from, to);
 }
 
