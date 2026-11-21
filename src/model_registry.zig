@@ -1092,17 +1092,46 @@ pub const ModelRegistry = struct {
         return added + 1;
     }
 
-    /// The folder of a registered entry as it is now, for a folder a download finished in that no walked root holds.
+    /// After a download into `path`: the entry at that folder takes the folder's facts as they are now.
     fn refreshFolderFacts(self: *ModelRegistry, path: []const u8) void {
-        const probe = model_discovery.probeModelDir(self.io, self.allocator, path) catch return;
+        if (self.peekByPath(path)) |e| self.refreshEntryFacts(e);
+    }
+
+    /// What a probe of one folder read: the arguments of `refreshFactsLocked`.
+    const Probed = struct { model_type: []const u8, bytes_on_disk: ?u64, bytes_linked: u64, bytes_total: ?u64, streaming_index_complete: bool };
+
+    fn probeFacts(self: *ModelRegistry, path: []const u8) ?Probed {
+        const probe = model_discovery.probeModelDir(self.io, self.allocator, path) catch return null;
         const streaming = expert_quant.isExpertStreamingArch(probe.model_type) and
             model_discovery.streamingIndexComplete(self.io, self.allocator, path) != null;
-        const folder = FolderId.of(self.io, path) catch return;
+        return .{ .model_type = probe.model_type, .bytes_on_disk = probe.bytes_on_disk, .bytes_linked = probe.bytes_linked, .bytes_total = probe.bytes_total, .streaming_index_complete = streaming };
+    }
+
+    /// `e` takes the facts of the folder its own path opens, for an entry no walked root lists, which no discovery
+    /// refreshes. The probe reads a copy of the path outside the mutex (a streaming pack's index opens stores), and its
+    /// result lands only on an entry that still has that path and no load.
+    fn refreshEntryFacts(self: *ModelRegistry, e: *LoadedModel) void {
+        self.mutex.lockUncancelable(self.io);
+        const at = e.path;
+        const copy = self.allocator.dupe(u8, at) catch {
+            self.mutex.unlock(self.io);
+            return;
+        };
+        self.mutex.unlock(self.io);
+        defer self.allocator.free(copy);
+        const probed = self.probeFacts(copy) orelse return;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        const e = self.peekByPathLocked(&folder) orelse return;
-        self.refreshFactsLocked(e, probe.model_type, probe.bytes_on_disk, probe.bytes_linked, probe.bytes_total, streaming) catch |err|
+        self.applyProbedLocked(e, at, probed) catch |err|
             log.warn("[registry] {s}: facts not refreshed: {s}\n", .{ e.id, @errorName(err) });
+    }
+
+    /// `probed`, read from a copy of the path `read_from` (the entry's own string when the probe began), is the entry's
+    /// facts only if that is still the entry's path string; `refreshFactsLocked` then drops it for an entry a load
+    /// holds. Caller holds `mutex`.
+    fn applyProbedLocked(self: *ModelRegistry, e: *LoadedModel, read_from: []const u8, probed: Probed) !void {
+        if (e.path.ptr != read_from.ptr or e.path.len != read_from.len) return;
+        try self.refreshFactsLocked(e, probed.model_type, probed.bytes_on_disk, probed.bytes_linked, probed.bytes_total, probed.streaming_index_complete);
     }
 
     /// An entry no load holds takes the folder's facts as discovery read them now: a pack listed while its pull was
@@ -1137,9 +1166,31 @@ pub const ModelRegistry = struct {
         const roots = rootsWithFileDir(&with_file, boot_roots, model_settings.launch_locks.models_dir.set, model_settings.server(&file).models_dir);
         var found: ?model_discovery.DiscoveryResult = if (roots.len == 0) null else try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer if (found) |*f| f.deinit();
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        return self.reconcileLocked(if (found) |f| f.models else &.{});
+        var unlisted: std.ArrayList(*LoadedModel) = .empty;
+        defer unlisted.deinit(self.allocator);
+        const result = blk: {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const models = if (found) |f| f.models else &.{};
+            const done = try self.reconcileLocked(models);
+            try self.collectUnlistedLocked(models, &unlisted);
+            break :blk done;
+        };
+        for (unlisted.items) |e| self.refreshEntryFacts(e);
+        return result;
+    }
+
+    /// The unheld entries whose folder no found folder is: no root lists them (registered by path, or `--model`), so
+    /// discovery gave them no facts. Caller holds `mutex`.
+    fn collectUnlistedLocked(self: *ModelRegistry, found: []const model_discovery.DiscoveredModel, out: *std.ArrayList(*LoadedModel)) !void {
+        var it = self.entries.valueIterator();
+        entries: while (it.next()) |entry_ptr| {
+            const e = entry_ptr.*;
+            if (!unheldLocked(e)) continue;
+            const now = e.folderNow(self.io) catch continue;
+            for (found) |m| if (m.folder.eql(&now)) continue :entries;
+            try out.append(self.allocator, e);
+        }
     }
 
     /// The inventory against the disk, in one pass under `mutex`: drops what is gone (`retireVanishedLocked`), then
@@ -3619,4 +3670,63 @@ test "ModelRegistry: an arch string the registry holds is its own copy: a caller
     reg.mutex.unlock(testing.io);
     try testing.expectEqualStrings("beta_arch", a.archHint());
     try testing.expectEqualStrings("alpha_arch", before);
+}
+
+test "ModelRegistry: a rescan refreshes an entry registered by path outside every root when its folder is replaced by a bigger pack" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "dl/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "dl/beamster/P/model.safetensors", .data = "0123" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const e = reg.peek(try reg.registerByPath(io, try std.fmt.bufPrint(&pb, "{s}/dl/beamster/P", .{root}))) orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 4), e.bytes_on_disk);
+    try tmp.dir.writeFile(io, .{ .sub_path = "dl/beamster/P/model.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    _ = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(?u64, 1000), e.bytes_on_disk);
+}
+
+test "ModelRegistry: a rescan refreshes an entry registered by path outside every root when its link is retargeted to a bigger pack" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try model_discovery.writePackStub(io, tmp.dir, "diskA/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "diskA/beamster/P/model.safetensors", .data = "0123" });
+    try model_discovery.writePackStub(io, tmp.dir, "diskB/beamster/P");
+    try tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/model.safetensors", .data = &@as([1000]u8, @splat('x')) });
+    try tmp.dir.symLink(io, "diskA", "models", .{ .is_directory = true });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmpRoot(io, tmp.dir, &rb);
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const e = reg.peek(try reg.registerByPath(io, try std.fmt.bufPrint(&pb, "{s}/models/beamster/P", .{root}))) orelse return error.TestExpectedResult;
+    try testing.expectEqual(@as(?u64, 4), e.bytes_on_disk);
+    try tmp.dir.deleteFile(io, "models");
+    try tmp.dir.symLink(io, "diskB", "models", .{ .is_directory = true });
+    _ = try reg.rescanWithSettings(no_settings);
+    try testing.expectEqual(@as(?u64, 1000), e.bytes_on_disk);
+}
+
+test "ModelRegistry: a probe lands only on an entry that still has the path string it read and no load" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("a", "/a", 1, "alpha_arch");
+    const read: ModelRegistry.Probed = .{ .model_type = "beta_arch", .bytes_on_disk = 99, .bytes_linked = 0, .bytes_total = null, .streaming_index_complete = false };
+    reg.mutex.lockUncancelable(testing.io);
+    defer reg.mutex.unlock(testing.io);
+    try reg.applyProbedLocked(e, "/old/a", read);
+    try testing.expectEqual(@as(?u64, 1), e.bytes_on_disk);
+    try testing.expectEqualStrings("alpha_arch", e.archHint());
+    e.state = .loading;
+    try reg.applyProbedLocked(e, e.path, read);
+    try testing.expectEqual(@as(?u64, 1), e.bytes_on_disk);
+    e.state = .unloaded;
+    try reg.applyProbedLocked(e, e.path, read);
+    try testing.expectEqual(@as(?u64, 99), e.bytes_on_disk);
+    try testing.expectEqualStrings("beta_arch", e.archHint());
 }
