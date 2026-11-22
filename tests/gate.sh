@@ -240,22 +240,19 @@ import datetime, json, os, re
 
 env = os.environ
 line = env["GATE_SUMMARY"]
-steps_part, _, tests_part = line.partition(";")
+steps_part = line.partition(";")[0]
 build = {"line": line}
 m = re.search(r"(\d+)/(\d+) steps succeeded", steps_part)
 if m:
     build["steps_succeeded"], build["steps_total"] = int(m[1]), int(m[2])
-m = re.search(r"(\d+)/(\d+) tests passed", tests_part)
-if m:
-    build["tests_passed"], build["tests_total"] = int(m[1]), int(m[2])
-for n, kind in re.findall(r"(\d+) (\w+)", tests_part.split("passed", 1)[-1]):
-    build[kind] = int(n)
 
 minutes = {}
 for kv in env["GATE_STEPS"].split():
     name, secs = kv.split("=")
     minutes[name] = round(int(secs) / 60, 1)
 
+# The test counts come from the per-test log, which holds the reused steps' lines too: zig's own summary counts only
+# the run steps it made.
 times = []
 with open(env["GATE_TIMES"], encoding="utf-8") as f:
     for row in f:
@@ -263,9 +260,14 @@ with open(env["GATE_TIMES"], encoding="utf-8") as f:
         if status != "DONE":
             times.append({"ms": int(ms), "test": test, "step": step, "status": status})
 times.sort(key=lambda t: -t["ms"])
+tally = {k: sum(t["status"] == k for t in times) for k in ("PASS", "SKIP", "FAIL")}
+build["tests_passed"], build["tests_total"] = tally["PASS"], len(times)
+for kind, key in (("skipped", "SKIP"), ("failed", "FAIL")):
+    if tally[key]:
+        build[kind] = tally[key]
 
 finished = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-counts = f"{build.get('tests_passed', '?')}/{build.get('tests_total', '?')} tests passed"
+counts = f"{build['tests_passed']}/{build['tests_total']} tests passed"
 extra = ", ".join(f"{build[k]} {k}" for k in build if k not in ("line", "steps_succeeded", "steps_total", "tests_passed", "tests_total"))
 record = {
     "sha": env["GATE_SHA"],

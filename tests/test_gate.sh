@@ -96,10 +96,14 @@ if [ "$step" = test ]; then
   log=; skip=" "
   for a in "$@"; do case "$a" in -Dtest-log=*) log=${a#-Dtest-log=} ;; -Dtest-skip-step=*) skip+="${a#-Dtest-skip-step=} " ;; esac; done
   t=2026-11-19T07:13:02.000Z
+  # Like zig, the summary counts only the run steps this invocation made, and has no tests part when it made none.
+  p=0; sk=0
   if [ "$skip" = "${skip/ test-host /}" ]; then
+    p=$((p + 1))
     printf '%s\ttest-host\tPASS\t12\tfirst: a test\n%s\ttest-host\tDONE\t12\t1 pass, 0 skip, 0 fail\n' $t $t >> "$log"
   fi
   if [ "$skip" = "${skip/ test-rest /}" ]; then
+    p=$((p + 1)); sk=$((sk + 1))
     printf '%s\ttest-rest\tPASS\t345\tsecond: "quoted" test\n%s\ttest-rest\tSKIP\t0\tthird: a skip\n' $t $t >> "$log"
     if [ "${STUB_FAIL:-}" = a-test ]; then
       printf '%s\ttest-rest\tFAIL\t7\tfourth: a failure\n' $t >> "$log"
@@ -108,7 +112,8 @@ if [ "$step" = test ]; then
     printf '%s\ttest-rest\tDONE\t352\t1 pass, 1 skip, 0 fail\n' $t >> "$log"
   fi
   [ "${STUB_FAIL:-}" = a-test ] && exit 1
-  echo "Build Summary: 22/22 steps succeeded; 939/1001 tests passed (62 skipped)"
+  if [ $((p + sk)) -eq 0 ]; then echo "Build Summary: 22/22 steps succeeded"
+  else echo "Build Summary: 22/22 steps succeeded; $p/$((p + sk)) tests passed ($sk skipped)"; fi
 fi
 exit 0
 EOF
@@ -154,9 +159,9 @@ ok "lib/mlx sits beside the gate's zig cache, where a cached test binary's rpath
 ok "  and none for another commit" "$([ -e "$GATE_DIR/$SHA2.json" ] && echo yes || echo no)" "no"
 ok "the record holds the sha" "$(field "$REC" sha)" "$SHA1"
 ok "the record holds the toolchain" "$(field "$REC" zig)" "0.17.1"
-ok "the record holds the tests passed" "$(field "$REC" build_summary.tests_passed)" "939"
-ok "  the tests total" "$(field "$REC" build_summary.tests_total)" "1001"
-ok "  the skips" "$(field "$REC" build_summary.skipped)" "62"
+ok "the record holds the tests passed" "$(field "$REC" build_summary.tests_passed)" "2"
+ok "  the tests total" "$(field "$REC" build_summary.tests_total)" "3"
+ok "  the skips" "$(field "$REC" build_summary.skipped)" "1"
 ok "  the steps succeeded" "$(field "$REC" build_summary.steps_succeeded)" "22"
 for s in lint guards ubench test; do
   ok "the record holds $s's minutes" "$(field "$REC" minutes.$s > /dev/null && echo yes || echo no)" "yes"
@@ -175,7 +180,7 @@ has "the test step runs under the M5 row's 72 GiB" "$(grep '^zig test ' "$CALLS"
 has "the gate names its budget" "$OUT" "test budget 72 GiB (hw.memsize 128 GiB)"
 has "the test step declares the Qwen cut that the fixture envs name" "$(grep '^zig test ' "$CALLS")" "-Dfixture-cut=true"
 ok "  and keeps zig's default job count on the M5 row" "$(grep '^zig test ' "$CALLS" | grep -c -- ' -j')" "0"
-has "the record holds a summary line" "$(field "$REC" summary)" "939/1001"
+has "the record holds a summary line" "$(field "$REC" summary)" "2/3 tests passed"
 ZIGS="$(grep '^zig ' "$CALLS" | cut -d' ' -f2 | tr '\n' ' ')"
 ok "lint, then ubench, then the test binaries and plan, then the test step" "$(grep -E '^zig ' "$CALLS" | cut -d' ' -f1-2 | tr '\n' ',')" "zig lint,zig ubench,zig test-build,zig test,"
 has "  the binaries and plan built with the test step's flags" "$(grep '^zig test-build ' "$CALLS")" "args=build test-build test-plan -Doptimize=ReleaseFast"
@@ -281,10 +286,16 @@ ok "  with their prior lines in its log" "$(grep -c $'\ttest-rest\t' "$GATE_DIR/
 ok "  the record names the gate it reused" "$(field "$GATE_DIR/$SHA3.json" reused.from)" "$PRIOR"
 ok "  and the steps" "$(field "$GATE_DIR/$SHA3.json" reused.steps.1)" "test-rest"
 has "  and says so" "$OUT" "gate: reused from $PRIOR: test-host test-rest"
+CREC="$GATE_DIR/$SHA3.json"
+ok "  the record counts the reused tests, zig having run none" "$(field "$CREC" summary | grep -c '2/3 tests passed (1 skipped)')" "1"
+ok "  the passes" "$(field "$CREC" build_summary.tests_passed)" "2"
+ok "  the total" "$(field "$CREC" build_summary.tests_total)" "3"
+ok "  the skips" "$(field "$CREC" build_summary.skipped)" "1"
 ok "  lint and the guards still run" "$(grep -c -E '^(zig lint|guards) ' "$CALLS")" "2"
 gate STUB_BIN_REST="rest v2" -- --continue "$PRIOR" HEAD
 ok "a step whose binary changed runs again" "$(skips)" "test-host,"
 ok "  and the record lists only the reused one" "$(field "$GATE_DIR/$SHA3.json" reused.steps.1 > /dev/null && echo two || echo one)" "one"
+ok "  and counts the rerun step's tests with the reused one's" "$(field "$GATE_DIR/$SHA3.json" summary | grep -c '2/3 tests passed (1 skipped)')" "1"
 gate STUB_FAIL=a-test -- HEAD
 echo 'pub const a = 2;' > "$REPO/src/a.zig"
 g -C "$REPO" commit -qam "another zig-only change"

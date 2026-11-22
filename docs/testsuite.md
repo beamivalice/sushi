@@ -432,7 +432,7 @@ worktree is `~/.sushi/runs/gate/worktree` for every gate, since a binary holds i
 holds (`worktree.pid`) refuses the gate, one a stopped gate left is removed with a line saying so.
 Its zig builds share a persistent local cache, `~/.sushi/runs/gate/zig-cache` (`--cache-dir`), so a fresh worktree is
 not a cold build; remove it after a toolchain or SDK change, as a checkout's `.zig-cache`.
-Green writes `~/.sushi/runs/gate/<sha>.json` (sha, time, Zig version, the Build Summary counts, each step's minutes,
+Green writes `~/.sushi/runs/gate/<sha>.json` (sha, time, Zig version, the step counts of the Build Summary, the test counts of the per-test log (a `--continue` run's zig counts only the steps it ran), each step's minutes,
 every test's ms, step and status from the log, `<sha>.logs/tests.tsv`); a failed step names itself and writes none.
 `./release.sh` dispatches only with a record for origin's main head and passes its sha; `release.yml` starts only
 from a dispatch and refuses a release run that builds any other commit (a `dry_run` packaging check needs none). The runner keeps only what a clean checkout alone proves: the build from the pins,
