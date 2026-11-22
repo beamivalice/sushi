@@ -35,6 +35,7 @@ const ssmRollbackFromCapture = trunk_mod.ssmRollbackFromCapture;
 const ssmSnapshot = trunk_mod.ssmSnapshot;
 const ssmSnapshotDeinit = trunk_mod.ssmSnapshotDeinit;
 const truncatePooled = trunk_mod.truncatePooled;
+const keptPooledBlocks = trunk_mod.keptPooledBlocks;
 
 comptime {
     // A partial-accept rollback re-slices the ring to `keep`, so the ring must still hold a
@@ -535,7 +536,13 @@ pub fn handoffQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEnt
     return attachQsaHistoryToLatestMode(cps, live, s, .share);
 }
 
-pub const QsaAttachMode = enum { copy, share };
+/// The commit boundary of an entry that stays: like `handoffQsaHistoryToLatest`, but the checkpoint pins no slack, so the
+/// entry holds the rows it is billed for. A history whose capacity buffer holds more than the checkpoint's blocks is copied.
+pub fn commitQsaHistoryToLatest(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream) !void {
+    return attachQsaHistoryToLatestMode(cps, live, s, .keep);
+}
+
+pub const QsaAttachMode = enum { copy, share, keep };
 
 /// Does sharing `buf_rows` rows of capacity for a `keep`-row snap pin more slack than `QSA_HANDOFF_MAX_SLACK_ROWS`?
 pub fn qsaHandoffExceedsSlack(buf_rows: c_int, keep: c_int) bool {
@@ -553,6 +560,12 @@ fn qsaHandoffMustMaterialize(src: *const SSMCacheEntry, keep: c_int) bool {
     return qsaHandoffExceedsSlack(buf_rows, keep);
 }
 
+/// Does the pooled bank's capacity buffer hold blocks past the ones a `keep`-row checkpoint keeps?
+fn qsaPooledBufferHoldsPast(src: *const SSMCacheEntry, keep: c_int) bool {
+    if (src.qsa_pooled_buf.array.ctx == null) return false;
+    return mlx.getShape(src.qsa_pooled_buf.array)[1] > keptPooledBlocks(keep, src.qsa_ratio);
+}
+
 fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream, mode: QsaAttachMode) !void {
     if (cps.len == 0) return;
     const cp = &cps[cps.len - 1];
@@ -564,16 +577,19 @@ fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntr
         const materialize = switch (mode) {
             .copy => true,
             .share => qsaHandoffMustMaterialize(&src, keep) or src.qsa_pooled_buf.array.ctx == null,
+            .keep => qsaPooledBufferHoldsPast(&src, keep) or src.qsa_pooled_buf.array.ctx == null,
         };
         if (src.qsa_pooled.ctx != null) {
             if (dst.qsa_pooled.ctx != null) _ = mlx.mlx_array_free(dst.qsa_pooled);
-            if (materialize) {
-                dst.qsa_pooled = try materializedOwnedCopy(s, src.qsa_pooled);
-            } else {
-                dst.qsa_pooled = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
+            // Cut to the checkpoint's blocks first: a copy then holds only those, never the whole live bank beside them.
+            dst.qsa_pooled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&dst.qsa_pooled, src.qsa_pooled));
+            try truncatePooled(&dst.qsa_pooled, keep, src.qsa_ratio, s, false);
+            if (materialize and dst.qsa_pooled.ctx != null) {
+                const own = try materializedOwnedCopy(s, dst.qsa_pooled);
+                _ = mlx.mlx_array_free(dst.qsa_pooled);
+                dst.qsa_pooled = own;
             }
-            try truncatePooled(&dst.qsa_pooled, keep, src.qsa_ratio, s, materialize);
         }
         dst.qsa_ratio = src.qsa_ratio;
         copied += 1;

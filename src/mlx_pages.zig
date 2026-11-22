@@ -156,6 +156,15 @@ pub fn grownBuffer(kept: mlx.mlx_array, shape: []const c_int, axis: usize, dtype
     return .{ .array = joined, .capacity_bytes = shapeBytes(shape, dtype), .grid = if (ring) .ring else .paged };
 }
 
+/// A buffer of exactly `kept`'s rows: one copy of them into a buffer of its own, no zero tail (a cache cut to the rows it
+/// holds, `KVCache.shrinkToRows`). The caller owns the result.
+pub fn cutBuffer(kept: mlx.mlx_array, s: mlx.mlx_stream) !InPlace {
+    const shape = mlx.getShape(kept);
+    const dtype = mlx.mlx_array_dtype(kept);
+    mlx.engine.roomFor(shape, dtype);
+    return .{ .array = try mlx_util.materializedOwnedCopy(s, kept), .capacity_bytes = shapeBytes(shape, dtype), .grid = .paged };
+}
+
 /// After a grown buffer was evaluated and its old handle freed, before the next is rebuilt. MLX releases an evaluated
 /// graph's inputs when the GPU's command buffer completes, a moment after the eval returns, so the stream is
 /// synchronized and its pool emptied, or the next rebuild starts beside this one's old copy and tail; the engine's pool
@@ -221,3 +230,4 @@ test "a buffer made on MLX's page grid takes every append in place while MLX's p
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const core = @import("tensor/core.zig");
+const mlx_util = @import("mlx_util.zig");

@@ -2229,11 +2229,11 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expectEqual(held + bills.BILL_MARGIN_BYTES, prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}));
     const whole_rebuild = qsaWholeRebuildGuard();
     defer whole_rebuild.deinit();
-    // Turn A of the live 364k session as a Cooler load, the packed arms off: 16,346 MB exact with the margin, the decode
+    // Turn A of the live 364k session as a Cooler load, the packed arms off: 16,314 MB exact with the margin, the decode
     // step's whole-sequence KV rebuild at the context's last key (`forwardMomentsBilled` at one row) beside an attention
     // layer's rows, past its widest forward's transient (2,303 rows, `qwen4_bill.PrefillRows`) at the prompt; its MLX load
     // keeps the calibrated net (21,067 MB).
-    try t.expectEqual(@as(u64, 16_346), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
+    try t.expectEqual(@as(u64, 16_314), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
 /// The bytes a Cooler cache's buffers take from the pool at `kv_rows` of KV and `state_rows` of history: each buffer (K and
@@ -2295,34 +2295,40 @@ test "on Sushi Cooler a chunk part-way through a prompt bills the cache growth t
     }
 }
 
-test "on Sushi Cooler a restore's admission commit holds the decode regrow its bill holds: none where the restored cache holds the reply, the cold term where it does not" {
+test "a restore's admission commit holds the transient its bill holds at the request's end: on Sushi Cooler its commit's trim copy at every restored capacity, on MLX the decode regrow, none where the restored cache holds the reply" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
-    const cfg = coolerFlashNext();
-    const chunk: u64 = cfg.prefillStartWidth();
     const seq: u64 = 4000;
     const max_tokens: u32 = 4096;
-    const stored = bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false);
-    const cold = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{}).decode_regrow_bytes;
-    try t.expect(cold > 0);
-    // Restored capacities below the request's last row (its regrow is the cold one) and at or past it (the cache holds the reply).
-    for ([_]struct { capacity: u64, regrow: u64 }{ .{ .capacity = 4096, .regrow = cold }, .{ .capacity = 6144, .regrow = cold }, .{ .capacity = 8192, .regrow = 0 }, .{ .capacity = 9000, .regrow = 0 } }) |c| {
-        const warm: WarmPrefix = .{ .matched_tokens = 3000, .capacity_tokens = c.capacity, .will_donate = true };
-        const bill = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, warm).decode_regrow_bytes;
-        const commit = bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, warm);
-        errdefer std.debug.print("a restore holding {d} rows: its bill holds a {d} B regrow, its commit {d} B of {d} B stored\n", .{ c.capacity, bill, commit -| stored, stored });
-        try t.expectEqual(c.regrow, bill);
-        try t.expectEqual(stored + bill, commit);
+    for ([_]model_mod.ModelConfig{ coolerFlashNext(), fixtures.qwen4ExpLive364kConfig() }) |cfg| {
+        const cooler = @import("../cooler_side.zig").onEngine(&cfg);
+        const chunk: u64 = cfg.prefillStartWidth();
+        const stored = bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false);
+        const cold = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{}).decode_regrow_bytes;
+        // The cache the engine reserves at its last row regrows in no decode; MLX's under the floor does.
+        try t.expectEqual(!cooler, cold > 0);
+        const trim = bills.commitTrimBytes(&cfg, seq, max_tokens, 8, chunk, .{});
+        try t.expectEqual(cooler, trim > 0);
+        // Restored capacities below the request's last row (MLX: its regrow is the cold one) and at or past it.
+        for ([_]struct { capacity: u64, regrow: u64 }{ .{ .capacity = 4096, .regrow = cold }, .{ .capacity = 6144, .regrow = cold }, .{ .capacity = 8192, .regrow = 0 }, .{ .capacity = 9000, .regrow = 0 } }) |c| {
+            const warm: WarmPrefix = .{ .matched_tokens = 3000, .capacity_tokens = c.capacity, .will_donate = true };
+            const bill = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, warm).decode_regrow_bytes;
+            const commit = bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, warm);
+            errdefer std.debug.print("{s}, a restore holding {d} rows: its bill holds a {d} B regrow, its commit {d} B of {d} B stored\n", .{ if (cooler) "Cooler" else "MLX", c.capacity, bill, commit -| stored, stored });
+            try t.expectEqual(c.regrow, bill);
+            try t.expectEqual(stored + @max(bill, trim), commit);
+        }
+        // A cold request commits the transient too, and admission re-prices a restore's commit where it does not move the width.
+        const held_term = @max(cold, trim);
+        try t.expectEqual(stored + held_term, bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, .{}));
+        const same = slot_admission.postEvictionPrefillChunk(@intCast(chunk), @intCast(chunk));
+        const held: WarmPrefix = .{ .matched_tokens = 3000, .capacity_tokens = 9000, .will_donate = true };
+        try t.expectEqual(stored + held_term, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + held_term, same, .{}));
+        try t.expectEqual(stored + trim, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + held_term, same, held));
     }
-    // A cold request commits the term too, and admission re-prices a restore's commit where it does not move the width.
-    try t.expectEqual(stored + cold, bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, .{}));
-    const same = slot_admission.postEvictionPrefillChunk(@intCast(chunk), @intCast(chunk));
-    const held: WarmPrefix = .{ .matched_tokens = 3000, .capacity_tokens = 9000, .will_donate = true };
-    try t.expectEqual(stored + cold, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + cold, same, .{}));
-    try t.expectEqual(stored, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + cold, same, held));
 }
 
-test "on Sushi Cooler a request's bill is its larger phase, the prefill chunk's or the decode regrow's, never their sum" {
+test "on Sushi Cooler a request's bill is its larger phase, the prefill chunk's or the decode's commit trim, never their sum" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const cfg = coolerFlashNext();
@@ -2330,32 +2336,32 @@ test "on Sushi Cooler a request's bill is its larger phase, the prefill chunk's 
     const seq: u64 = 4096;
     for ([_]bool{ false, true }) |mtp| {
         const terms = prefillRequestTerms(&cfg, seq, 4096, 8, chunk, .{ .mtp_on = mtp });
-        const regrow = terms.decode_regrow_bytes;
-        try t.expect(regrow > 0);
+        const trim = terms.commit_trim_bytes;
+        try t.expect(trim > 0);
         const at = struct {
             fn bill(c: *const model_mod.ModelConfig, sq: u64, ck: u64, tm: PrefillRequestTerms, r: u64) u64 {
                 var with = tm;
-                with.decode_regrow_bytes = r;
+                with.commit_trim_bytes = r;
                 return oomBillFor(c, sq, ck, with);
             }
         }.bill;
-        // The regrow is a few MB beside a chunk's transient: the prefill phase holds more, so the request bills it alone.
-        errdefer std.debug.print("MTP {}: a {d} B regrow moves the bill {d} B -> {d} B\n", .{ mtp, regrow, at(&cfg, seq, chunk, terms, 0), at(&cfg, seq, chunk, terms, regrow) });
-        try t.expectEqual(at(&cfg, seq, chunk, terms, 0), at(&cfg, seq, chunk, terms, regrow));
-        // Past what the prefill holds the regrow's phase wins, and the bill climbs a byte a byte: the crossover is where the
-        // two phases are equal, and the request's own regrow lies under it.
+        // The trim copy is a few MB beside a chunk's transient: the prefill phase holds more, so the request bills it alone.
+        errdefer std.debug.print("MTP {}: a {d} B trim copy moves the bill {d} B -> {d} B\n", .{ mtp, trim, at(&cfg, seq, chunk, terms, 0), at(&cfg, seq, chunk, terms, trim) });
+        try t.expectEqual(at(&cfg, seq, chunk, terms, 0), at(&cfg, seq, chunk, terms, trim));
+        // Past what the prefill holds the decode's phase wins, and the bill climbs a byte a byte: the crossover is where the
+        // two phases are equal, and the request's own trim copy lies under it.
         const huge: u64 = 1 << 40;
         const common = at(&cfg, seq, chunk, terms, huge) - huge;
         const prefill_phase = at(&cfg, seq, chunk, terms, 0);
         try t.expect(common < prefill_phase);
         const cross = prefill_phase - common;
-        try t.expect(regrow < cross);
+        try t.expect(trim < cross);
         try t.expectEqual(prefill_phase, at(&cfg, seq, chunk, terms, cross));
         try t.expectEqual(prefill_phase + 1, at(&cfg, seq, chunk, terms, cross + 1));
     }
 }
 
-test "on Sushi Cooler a request's admission commit is its decode phase's cache part, its storage and its regrow, and carries none of the prefill chunk's transient the bill's larger phase holds" {
+test "on Sushi Cooler a request's admission commit is its decode phase's cache part, its storage and its commit trim, and carries none of the prefill chunk's transient the bill's larger phase holds" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const cfg = coolerFlashNext();
@@ -2365,13 +2371,14 @@ test "on Sushi Cooler a request's admission commit is its decode phase's cache p
     for ([_]u64{ 512, 2048, 4096 }) |chunk| {
         const terms = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{});
         const phases = bills.requestPhasesFor(&cfg, seq, max_tokens, 8, chunk, .{});
-        // The prefill phase is the bill, and the regrow is only the decode phase's.
-        try t.expect(terms.decode_regrow_bytes > 0);
+        // The prefill phase is the bill, and the trim copy is only the decode phase's; nothing regrows.
+        try t.expect(terms.commit_trim_bytes > 0);
+        try t.expectEqual(@as(u64, 0), terms.decode_regrow_bytes);
         try t.expect(phases.prefill > phases.decode);
         const got = bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, .{});
-        errdefer std.debug.print("a {d}-row chunk: commit {d} B, storage {d} B, regrow {d} B\n", .{ chunk, got, bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false), terms.decode_regrow_bytes });
-        try t.expectEqual(bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false) + terms.decode_regrow_bytes, got);
-        // No prompt under the reservation reserves a chunk: the commit does not follow the width the prefill transient does.
+        errdefer std.debug.print("a {d}-row chunk: commit {d} B, storage {d} B, trim {d} B\n", .{ chunk, got, bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false), terms.commit_trim_bytes });
+        try t.expectEqual(bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false) + terms.commit_trim_bytes, got);
+        // The commit does not follow the width the prefill transient does: the request reserves its last row at any width.
         if (commit) |c| try t.expectEqual(c, got) else commit = got;
     }
 }
@@ -2394,7 +2401,7 @@ test "on Sushi Cooler a speculative request's decode phase holds its round's den
         const common = req.seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + terms.reserved_kv_bytes + terms.state_bytes + terms.checkpoint_bytes +
             terms.qsa_ring_bytes + terms.mtp_head_kv_bytes + terms.dflash_bytes;
         errdefer std.debug.print("a {d}-token prompt + {d}: decode phase {d} B, the round {d} B and its rebuild {d} B beside {d} B held\n", .{ req.seq, req.n, phases.decode, terms.round_bytes, rebuild, common });
-        try t.expectEqual(common + @max(terms.decode_regrow_bytes, terms.round_bytes + rebuild), phases.decode);
+        try t.expectEqual(common + @max(terms.commit_trim_bytes, terms.round_bytes + rebuild), phases.decode);
     }
 }
 
@@ -2411,7 +2418,7 @@ test "on Sushi Cooler a reserved request's first chunk bills no growth for the c
         // The cache the request holds when its first chunk is asked: empty, bound to the request's reservation and last row.
         const chunk: u64 = 2048;
         const hold: trunk.Hold = .{
-            .reserve = prefill_plan.reservedPrefillTokens(&cfg, seq, max_tokens, chunk),
+            .reserve = prefill_plan.reservedPrefillTokens(&cfg, seq, max_tokens, chunk, 0),
             .end = trunk.KVCache.requestEnd(seq, max_tokens, ctx, 0),
         };
         try t.expect(hold.reserve > seq);
@@ -2885,7 +2892,7 @@ fn prefillHoldsReply(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, c
     probe.pinned_context = @intCast(ctx);
     const reply = ctx - prompt;
     const hold: trunk.Hold = .{
-        .reserve = @import("../prefill_plan.zig").reservedPrefillTokens(&probe, prompt, reply, chunk),
+        .reserve = @import("../prefill_plan.zig").reservedPrefillTokens(&probe, prompt, reply, chunk, bills.speculativeRowsPastEnd(&probe, warm)),
         .end = @max(KV.requestEnd(prompt, reply, bills.getEffectiveContextLength(&probe), bills.speculativeRowsPastEnd(&probe, warm)), prompt),
     };
     // On MLX a buffer's rows sit on its page grid: the codes and the scale rows of K and V at kv8, K and V dense for the head.
@@ -2920,11 +2927,16 @@ test "Flash-Next: a request's prefill phase and its decode phase less the decode
             const terms = bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm);
             const phases = bills.requestPhasesFor(&probe, p, @intCast(ctx - p), 8, chunk, warm);
             const regrow = terms.decode_regrow_bytes * terms.uplift_16ths / 16;
-            // What the decode phase holds past the terms both phases hold: the larger of the regrow and a round.
-            const common = phases.decode - @max(terms.decode_regrow_bytes, terms.round_bytes) * terms.uplift_16ths / 16;
+            // What the decode phase holds past the terms both phases hold: the larger of the regrow, the commit's trim copy and a round.
+            const common = phases.decode - @max(@max(terms.decode_regrow_bytes, terms.commit_trim_bytes), terms.round_bytes) * terms.uplift_16ths / 16;
             if (phases.prefill < prev_prefill or common < prev_common) {
                 falls += 1;
                 if (falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B in the prefill and {d} B beside the decode transient, {d} and {d} B at prompt {d}\n", .{ cfg.model_type, mtp, chunk, ctx, p, phases.prefill, common, prev_prefill, prev_common, prev_p });
+            }
+            // A Cooler request reserves its last row, so no prompt regrows in decode.
+            if (@import("../cooler_side.zig").onEngine(cfg) and regrow != 0) {
+                regrow_falls += 1;
+                if (regrow_falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B of regrow on Cooler\n", .{ cfg.model_type, mtp, chunk, ctx, p, regrow });
             }
             // The regrow falls only where the prompt's cache already holds its reply, and to nothing; it is billed exactly where it does not.
             if ((regrow == 0) != prefillHoldsReply(cfg, ctx, p, chunk, warm)) {
@@ -3036,4 +3048,33 @@ test "a layer's QSA history buffer, grown ahead of a decode forward one at a tim
             try t.expect(cfg.qsaScoreBankBytesPerToken() / layers <= widest_kv);
         }
     }
+}
+
+test "on Sushi Cooler a request's bill never falls as its prompt grows a row at fixed context and max_tokens, across the old reservation edge and every chunk width's steps, MTP on and off" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const no_tier = TierGuard.pin(true, 0);
+    defer no_tier.restore();
+    const cfg = coolerFlashNext();
+    const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
+    const ctx: u64 = 98_304;
+    var falls: u32 = 0;
+    for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048, 4096 }) |chunk| for ([_]u32{ 64, 4096, 65_536 }) |max_tokens| {
+        const warm: WarmPrefix = .{ .mtp_on = mtp };
+        var probe = cfg;
+        probe.pinned_context = @intCast(ctx);
+        var prev: u64 = 0;
+        var prev_p: u64 = 0;
+        var p: u64 = 1;
+        // Every row near the old edge and the context's end, each chunk width's and each cache step's boundary, a prime stride elsewhere.
+        while (p <= ctx) : (p += if ((p + 300 > edge and p < edge + 300) or ctx - p < 600 or p % chunk < 3 or p % chunk > chunk - 3 or p % 256 < 3 or p % 256 > 252) @as(u64, 1) else 53) {
+            const b = prefillNeededAtChunk(&probe, p, max_tokens, 8, chunk, warm);
+            if (b < prev) {
+                falls += 1;
+                if (falls < 10) std.debug.print("mtp {} chunk {d} max_tokens {d}: prompt {d} bills {d} B, under {d} B at prompt {d}\n", .{ mtp, chunk, max_tokens, p, b, prev, prev_p });
+            }
+            prev = b;
+            prev_p = p;
+        }
+    };
+    try std.testing.expectEqual(@as(u32, 0), falls);
 }

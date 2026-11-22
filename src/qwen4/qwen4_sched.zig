@@ -118,13 +118,13 @@ pub fn tickClass(slot: *const Slot) sched.TickClass {
     return if (mtpGroupable(slot)) .mtp_group else .none;
 }
 
-/// The newest checkpoint takes the slot's live QSA indexer history as a view of the capacity buffer (the slot is
-/// torn down right after). A failure commits the entry history-less, which a QSA arch treats as a miss.
+/// The newest checkpoint takes the slot's live QSA indexer history as its own rows (`commitQsaHistoryToLatest`: a view
+/// of the slot's buffer only where it holds no more). A failure commits the entry history-less, which a QSA arch treats as a miss.
 pub fn handoffHistory(slot: *Slot, cps: []trunk_mod.SSMCheckpoint) void {
     if (qsa_state.checkpointHasQsaPooled(&cps[cps.len - 1])) return;
     const ents = slot.ssm_entries orelse return;
     const xf = arch_handle.trunk(slot.model.handle orelse return);
-    qsa_state.handoffQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
+    qsa_state.commitQsaHistoryToLatest(cps, ents, xf.s) catch |err| {
         log.warn("[hot-cache] QSA history handoff failed: {s} — committing without it\n", .{@errorName(err)});
     };
 }

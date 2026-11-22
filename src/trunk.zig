@@ -255,6 +255,7 @@ pub const ssmSnapshotDeinit = ssm_cache.ssmSnapshotDeinit;
 pub const ssmUnbindAll = ssm_cache.ssmUnbindAll;
 pub const ssmUnbindEntries = ssm_cache.ssmUnbindEntries;
 pub const truncatePooled = ssm_cache.truncatePooled;
+pub const keptPooledBlocks = ssm_cache.keptPooledBlocks;
 pub const verifyQmmNaxAvailable = nax_gate.verifyQmmNaxAvailable;
 pub const verifyQmmEnabled = verify_qmm.verifyQmmEnabled;
 pub const vqmmLaneFor = verify_qmm.vqmmLaneFor;

@@ -274,9 +274,9 @@ test "cooler contract: a Cooler prefill hands each chunk's free buffers back, so
     return error.SkipZigTest;
 }
 
-test "cooler contract: a decode past its cache's capacity grows it a buffer at a time, holding no more than the new rows past its growth" {
+test "cooler contract: a cache cut to its rows at a request's end holds one buffer's copy past itself, as its bill prices, and gives the reservation back" {
     const Q = ContractOf("qwen4");
-    if (comptime @hasDecl(Q, "prompt")) return decodeGrowsInPlace(Q);
+    if (comptime @hasDecl(Q, "prompt")) return commitCutHoldsOneBuffer(Q);
     return error.SkipZigTest;
 }
 
@@ -565,7 +565,7 @@ fn prefillHandsChunksBack(comptime Q: type) !void {
     try testing.expect(free_after[1] <= free_after[0] + std.math.ceilPowerOfTwoAssert(usize, long.len * @sizeOf(u32)));
 }
 
-fn decodeGrowsInPlace(comptime Q: type) !void {
+fn commitCutHoldsOneBuffer(comptime Q: type) !void {
     try mlx.requireGpu();
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -575,7 +575,7 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     const ld = try heldLoad(Q, dir);
-    // A prompt below the reservation's threshold takes no reservation, so decode grows the cache by its +25% steps.
+    const bills = @import("bills.zig");
     const len: usize = 4097;
     const n: u32 = 3072;
     const long = try a.alloc(u32, len);
@@ -589,60 +589,43 @@ fn decodeGrowsInPlace(comptime Q: type) !void {
     try ld.xfm.resetCache();
     var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, long, n, .{ .temperature = 0.0 }, &.{}, .{});
     defer gen.deinit(a);
+    // The reply is stopped a hundred tokens in: the request reserved its last row (the prompt and all 3,072 asked).
+    for (0..100) |_| _ = try gen.next(a);
     const KV = @import("kv_cache.zig").KVCache;
     const cache = &ld.xfm.cache;
-    var caps: [64]usize = undefined;
-    std.debug.assert(cache.entries.len <= caps.len);
-    var steps: usize = 0;
-    var grows: usize = 0;
-    var capped: usize = 0;
-    // Each step's start: what is in use, and the step's own peak over it before a grow (its scratch).
-    var before: u64 = 0;
-    var scratch: u64 = 0;
-    var grows_seen: usize = 0;
-    while (try gen.next(a)) |_| {
-        steps += 1;
-        const peak = mlx.engine.poolHeldPeak(.process) -| before;
-        if (steps > 1 and KV.kv_cap_buf_grows > grows_seen) {
-            const grew = Sheet.now().in_use -| before;
-            // The request's last row bounds every grow (`requestEnd`): the prompt and the whole reply.
-            try testing.expect(cache.end_tokens >= len + n);
-            const end_rows = std.mem.alignForward(usize, cache.end_tokens, 256);
-            var tail: u64 = 0;
-            for (cache.entries, 0..) |entry, i| if (entry.initialized) {
-                const old = caps[i];
-                const now = KV.bufferCapacity(entry.keys.array);
-                if (now == old) continue;
-                // A grow is +25% (one 256-row step at least, 8192 rows at most, on the 256-row step) or exactly to the
-                // request's end, whichever is smaller.
-                const quarter = std.mem.alignForward(usize, old + @min(@max(old / 4, 256), 8192), 256);
-                if (now != @min(quarter, end_rows)) std.debug.print("cooler contract: a decode's KV grew {d} -> {d} rows; +25% is {d}, the request's end {d}\n", .{ old, now, quarter, end_rows });
-                try testing.expectEqual(@min(quarter, end_rows), now);
-                if (end_rows < quarter) capped += 1;
-                for ([_]mlx.mlx_array{ entry.keys.array, entry.values.array, entry.keys_scales.array, entry.keys_biases.array, entry.values_scales.array, entry.values_biases.array }) |buf| {
-                    if (buf.ctx == null) continue;
-                    const row = mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf) / now;
-                    tail += mlx.engine.poolBytes((now - old) * row);
-                }
-            };
-            grows += 1;
-            // What the grow held past the decode's scratch and the growth itself: the zero tails of the buffers it
-            // grew, which one pass may hold together. A grow that built a zeros buffer of the whole capacity first held
-            // that buffer once more.
-            const transient = peak -| scratch -| grew;
-            if (transient > tail) std.debug.print("cooler contract: a decode's KV grow at step {d} held {d} KB past its growth and scratch, over its {d} KB of new rows\n", .{ steps, transient >> 10, tail >> 10 });
-            try testing.expect(transient <= tail);
-        } else if (steps > 1) scratch = peak;
-        // From the first token on: the prefill's own transients are its bill's.
-        before = Sheet.now().in_use;
-        mlx.engine.resetPoolPeak(.process);
-        grows_seen = KV.kv_cap_buf_grows;
-        for (cache.entries, 0..) |entry, i| caps[i] = if (entry.initialized) KV.bufferCapacity(entry.keys.array) else 0;
-    }
-    // The reply grows the cache, and its last grow stops at the request's end.
-    if (capped == 0) std.debug.print("cooler contract: {d} decode steps, {d} grows, none at the request's end\n", .{ steps, grows });
-    try testing.expect(grows > 0);
-    try testing.expect(capped > 0);
+    try testing.expect(cache.end_tokens >= len + n);
+    var slack: u64 = 0;
+    for (cache.entries) |entry| if (entry.initialized) {
+        slack = @max(slack, KV.bufferCapacity(entry.keys.array) - entry.offset);
+    };
+    try testing.expect(slack > 0);
+    mlx.engine.close();
+    mlx.engine.trim();
+    const before = mlx.engine.poolTotal() - mlx.engine.poolFree();
+    mlx.engine.resetPoolPeak(.process);
+    try cache.shrinkToRows(mlx.engine.stream());
+    mlx.engine.close();
+    const over = mlx.engine.poolPeak(.process) -| before;
+    mlx.engine.trim();
+    const after = mlx.engine.poolTotal() - mlx.engine.poolFree();
+    // Every buffer holds its rows, and the cut held beside the cache the one widest buffer of those rows.
+    var widest: u64 = 0;
+    for (cache.entries) |entry| if (entry.initialized) {
+        try testing.expectEqual(entry.offset, KV.bufferCapacity(entry.keys.array));
+        for ([_]mlx.mlx_array{ entry.keys.array, entry.values.array, entry.keys_scales.array, entry.keys_biases.array, entry.values_scales.array, entry.values_biases.array }) |buf| {
+            if (buf.ctx != null) widest = @max(widest, mlx.engine.poolBytes(mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf)));
+        }
+    };
+    const freed = before -| after;
+    const kv = bills.configuredKvQuantFor(&ld.config);
+    // Billed for the request as the engine bound it, in a context that holds it.
+    var wide = ld.config;
+    wide.pinned_context = 1 << 20;
+    const billed = bills.commitTrimBytes(&wide, len, n, if (kv.scheme == .off) 16 else kv.bits, wide.prefillStartWidth(), .{});
+    errdefer std.debug.print("cooler contract: a cache cut to its rows held {d} B past itself, its widest buffer is {d} B, billed {d} B; the cut gave {d} B back\n", .{ over, widest, billed, freed });
+    try testing.expectEqual(widest, over);
+    try testing.expect(over <= billed);
+    try testing.expect(freed > 0);
 }
 
 /// One greedy request under a thinking bound, ticked in the scheduler's order (`loopGuardTick` before every tick,

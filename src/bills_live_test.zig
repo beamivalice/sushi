@@ -720,7 +720,7 @@ test "a 64 GB Mac at a declared 59,000 MB serves the 2.75 pack at kv8 to 262,144
         cooler.quant_bits = 0;
         const chunk: u32 = @intCast(bill.chunk);
         const hold: trunk.Hold = .{
-            .reserve = @import("prefill_plan.zig").reservedPrefillTokens(&cooler, 124_000, 32_000, chunk),
+            .reserve = @import("prefill_plan.zig").reservedPrefillTokens(&cooler, 124_000, 32_000, chunk, 0),
             .end = trunk.KVCache.requestEnd(124_000, 32_000, advertised, 0),
         };
         var st_ungrown: mtp_plan.AdaptiveWidthState = .{};

@@ -57,11 +57,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-prefix-cache](engi
 
 - Affine scales and biases retain the quantizer's activation dtype at allocation and growth; dense reconstruction returns that same dtype, so f16 attention does not widen through bf16 K/V.
 
-- KV growth is PROPORTIONAL (`nextCapacity` +25%, capped 8192). Past 32k a request reserves its whole cache up front
-  (`KVCache.reservedTokens`: prompt, `min(max_tokens, ctx - prompt)` and a chunk), so its decode never grows it; a
-  ringed arch reserves always (`ModelConfig.reservesKvCapacity`). A shorter prompt of
-  several chunks reserves its own length (`prefill_plan.reservedPrefillTokens`, as the bill floors it), so its prefill
-  grows each layer's buffers once, not once a chunk.
+- KV growth is PROPORTIONAL (`nextCapacity` +25%, capped 8192). **On Sushi Cooler every request reserves its last row up
+  front** (`prefill_plan.reservedPrefillTokens`: `KVCache.requestEnd`, the prompt, `min(max_tokens, ctx - prompt)` and the
+  speculative rows past it, whatever the prompt, no chunk of slack), so its decode never grows a buffer, and a commit
+  cuts the cache to the rows it holds (`KVCache.shrinkToRows`, so a hot-cache entry bills its rows, not its reservation).
+  On MLX a prompt past 32k reserves its whole cache up front (`KVCache.reservedTokens`: prompt, `min(max_tokens, ctx -
+  prompt)` and a chunk), so its decode never grows it; a ringed arch reserves always (`ModelConfig.reservesKvCapacity`). A
+  shorter prompt of several chunks reserves its own length (`prefill_plan.reservedPrefillTokens`, as the bill floors it), so
+  its prefill grows each layer's buffers once, not once a chunk.
 - On MLX a grown layer's capacity is on MLX's page grid (`KVCache.heldRows`, `mlx_pages`): every buffer past a
   16 KB page is whole pages, or MLX's pool can hand it a buffer it never donates and each append copies. At 2 heads of
   256, kv8, past 1,024 rows the cache steps by 1,024 (16 B scale rows); the bill pages the same (`cacheCapacityTokens`).

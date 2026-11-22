@@ -4,7 +4,6 @@
 const std = @import("std");
 const testing = std.testing;
 const mlx = @import("mlx.zig");
-const mlx_pages = @import("mlx_pages.zig");
 const model_mod = @import("model.zig");
 const arch_handle = @import("arch/handle.zig");
 const test_support = @import("test_support.zig");
@@ -86,7 +85,7 @@ test "cooler contract: a Cooler prefill chunk, the widest on the load's first re
                 const prompt = long[0 .. pin + 1];
                 const width = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, prompt.len, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pin);
                 // The request's own hold on the cache's growth, which a chunk at the prompt's end regrows from full.
-                const hold: @import("kv_cache.zig").Hold = .{ .reserve = prefill_plan.reservedPrefillTokens(&ld.config, prompt.len, 1, width), .end = prompt.len + 1 };
+                const hold: @import("kv_cache.zig").Hold = .{ .reserve = prefill_plan.reservedPrefillTokens(&ld.config, prompt.len, 1, width, 0), .end = prompt.len + 1 };
                 const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
                 // A reserved request's cache is its admission commit's, which this request, never admitted, does not carry.
                 const commit: u64 = if (hold.reserve > 0) bills.cacheCommitBytes(&ld.config, prompt.len, 1, bits, width, false) else 0;
@@ -707,6 +706,261 @@ test "cooler contract: a Cooler request's bill is its larger phase, the prefill'
         }
     };
     try testing.expectEqual(@as(usize, 0), over);
+}
+
+test "cooler contract: a Cooler request reserves its last row before its first chunk writes and its decode grows no buffer, plain and speculative, a short prompt included" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    if (!fixtureChosen(selection(), "QWEN4_STQ_TINY")) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const a = testing.allocator;
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    const bills = @import("bills.zig");
+    const KV = @import("kv_cache.zig").KVCache;
+    const c = &ld.config;
+    const kv = bills.configuredKvQuantFor(c);
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    var over: usize = 0;
+    for ([_]bool{ false, true }) |spec| for ([_]struct { len: usize, n: u32 }{ .{ .len = 40, .n = 1200 }, .{ .len = 1000, .n = 1500 }, .{ .len = 3000, .n = 64 } }) |req| {
+        const prompt = try a.alloc(u32, req.len);
+        defer a.free(prompt);
+        for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+        const warm: bills.WarmPrefix = .{ .mtp_on = spec };
+        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+        const billed = bills.cacheCapacityTokens(c, req.len, req.n, chunk, bills.getEffectiveContextLength(c), bills.speculativeRowsPastEnd(c, warm), kv_bits);
+        const turn = arch_handle.turnFor(ld.h, c);
+        defer turn.end();
+        defer arch_sched.endRequest(c);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, req.n, .{ .temperature = 0.0 }, &.{}, if (spec) Q.specOptions(ld.xfm, 0) else .{});
+        defer gen.deinit(a);
+        // Prefill is done: the cache holds the request's last row, and the bill prices no regrow past it.
+        const held = ld.xfm.cache.residentCapacityTokens();
+        const head_held: usize = if (spec) Q.headCacheTokens(ld.xfm) else 0;
+        const grows = KV.kv_cap_buf_grows;
+        const state_held = Q.stateHeldBytes(ld.xfm);
+        if (spec) {
+            while (try gen.nextMtp(a)) |r| a.free(r.tokens);
+        } else {
+            while (try gen.next(a) != null) {}
+        }
+        const head_after: usize = if (spec) Q.headCacheTokens(ld.xfm) else 0;
+        if (held != billed or ld.xfm.cache.residentCapacityTokens() != held or head_after != head_held or KV.kv_cap_buf_grows != grows or Q.stateHeldBytes(ld.xfm) > state_held or bills.prefillRequestTerms(c, req.len, req.n, kv_bits, chunk, warm).decode_regrow_bytes != 0) {
+            over += 1;
+            std.debug.print("cooler contract: a {d}-token prompt + {d} (MTP {}): {d} rows after its prefill against {d} billed, {d} after its decode, {d} buffer grows in the decode, the head {d} -> {d}, the history and head state {d} -> {d} B, regrow billed {d} B\n", .{ req.len, req.n, spec, held, billed, ld.xfm.cache.residentCapacityTokens(), KV.kv_cap_buf_grows - grows, head_held, head_after, state_held, Q.stateHeldBytes(ld.xfm), bills.prefillRequestTerms(c, req.len, req.n, kv_bits, chunk, warm).decode_regrow_bytes });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), over);
+}
+
+test "cooler contract: a commit hands its checkpoint the QSA history's own rows, the copy it holds is what the bill prices, and the slot's reservation is not pinned" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    if (!fixtureChosen(selection(), "QWEN4_STQ_TINY")) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const a = testing.allocator;
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    const bills = @import("bills.zig");
+    const qsa_state = @import("qwen4/qwen4_qsa_state.zig");
+    const c = &ld.config;
+    const kv = bills.configuredKvQuantFor(c);
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    for ([_]bool{ false, true }) |spec| for ([_]struct { len: usize, n: u32 }{ .{ .len = 1000, .n = 6000 }, .{ .len = 3000, .n = 64 } }) |req| {
+        const prompt = try a.alloc(u32, req.len);
+        defer a.free(prompt);
+        for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+        const warm: bills.WarmPrefix = .{ .mtp_on = spec };
+        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+        var wide = c.*;
+        wide.pinned_context = 1 << 20;
+        const turn = arch_handle.turnFor(ld.h, c);
+        defer turn.end();
+        defer arch_sched.endRequest(c);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var opts = if (spec) Q.specOptions(ld.xfm, 0) else Generator.InitOptions{};
+        opts.ssm_checkpoint_stride = 256;
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, req.n, .{ .temperature = 0.0 }, &.{}, opts);
+        defer gen.deinit(a);
+        try testing.expect(gen.ssm_checkpoints.items.len > 0);
+        const cp = &gen.ssm_checkpoints.items[gen.ssm_checkpoints.items.len - 1];
+        const live = gen.ctx.ssm_entries.?;
+        mlx.engine.close();
+        mlx.engine.trim();
+        const before = mlx.engine.poolTotal() - mlx.engine.poolFree();
+        mlx.engine.resetPoolPeak(.process);
+        try qsa_state.commitQsaHistoryToLatest(gen.ssm_checkpoints.items, live, ld.xfm.s);
+        mlx.engine.close();
+        const copied = mlx.engine.poolPeak(.process) -| before;
+        const priced = bills.commitQsaCopyBytes(&wide, cp.pos);
+        const terms = bills.prefillRequestTerms(&wide, req.len, req.n, kv_bits, chunk, warm);
+        errdefer std.debug.print("cooler contract: a {d}-token prompt + {d} (MTP {}): the handoff at {d} rows held {d} B past the slot, priced {d} B, the commit term {d} B\n", .{ req.len, req.n, spec, cp.pos, copied, priced, terms.commit_trim_bytes });
+        try testing.expect(priced > 0);
+        // The bill prices each bank at its size class's sixteenth over its bytes, which a page-rounded buffer stays under.
+        try testing.expect(copied <= priced and priced - copied <= copied / 16);
+        try testing.expect(copied <= terms.commit_trim_bytes);
+        // What the checkpoint keeps is those buffers alone: the slot's reservation goes with the slot.
+        const kept = mlx.engine.poolTotal() - mlx.engine.poolFree() -| before;
+        try testing.expectEqual(copied, kept);
+    };
+}
+
+/// One served request that stops on `stop` after its prompt, asked for `n` tokens: it reserved its whole reply and used
+/// none of it. Its entry is committed to the RAM tier, the SSD record flushed.
+fn stoppedAfterPrompt(sv: *Served, prompt: []const u32, n: u32, stop: u32, mtp: bool) !void {
+    const sch = &sv.sch;
+    const scheduler = Served.scheduler;
+    const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
+    const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{stop}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
+    defer {
+        sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    _ = sch.pending.orderedRemove(0);
+    try scheduler.runPrefill(sch, slot);
+    if (!scheduler.postPrefillTerminal(sch, slot)) {
+        try sch.decoding.append(testing.allocator, slot);
+        var one = [_]*scheduler.Slot{slot};
+        while (slot.joinsTick()) try scheduler.runDecodeTick(sch, &one);
+        scheduler.cullDecoding(sch);
+    }
+    if (slot.error_code) |e| {
+        std.debug.print("cooler contract: the served request failed ({s})\n", .{e});
+        return error.RequestFailed;
+    }
+    const hc = &sv.entry.prefix_cache.?;
+    hc.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
+    hc.disk.?.drainWriter();
+}
+
+test "cooler contract: a request that stops far short of its reserved reply commits the rows it holds, so its RAM entry keeps those rows' bytes whatever it reserved and the pool takes the reservation back, plain and speculative" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            const KV = @import("kv_cache.zig").KVCache;
+            const prefix_cache = @import("prefix_cache.zig");
+            const prompt = try a.alloc(u32, 1000);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+            // The token the model says after this prompt stops the request at once.
+            var stop: u32 = 0;
+            {
+                var probe: Served = undefined;
+                try probe.init(&ld, dir);
+                defer probe.deinit();
+                var f: u32 = 0;
+                var said = try probe.request(prompt, 1, &f);
+                defer said.deinit(a);
+                stop = said.items[0];
+            }
+            for ([_]bool{ false, true }) |mtp| {
+                // The same request asking for 16 tokens and for 6,000: the entry it commits is the same.
+                var kept: [2]u64 = undefined;
+                var bytes: [2]u64 = undefined;
+                for ([_]u32{ 16, 6000 }, 0..) |n, k| {
+                    var sv: Served = undefined;
+                    try sv.initTiers(&ld, dir, 1 << 30);
+                    defer sv.deinit();
+                    mlx.engine.close();
+                    mlx.engine.trim();
+                    const before = mlx.engine.poolTotal() - mlx.engine.poolFree();
+                    try stoppedAfterPrompt(&sv, prompt, n, stop, mtp);
+                    mlx.engine.close();
+                    mlx.engine.trim();
+                    kept[k] = mlx.engine.poolTotal() - mlx.engine.poolFree() -| before;
+                    const hc = &sv.entry.prefix_cache.?;
+                    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+                    const e = &hc.entries.items[0];
+                    bytes[k] = hc.residentBytes();
+                    // Every buffer of the entry holds the rows it used, and no more.
+                    var slack: usize = 0;
+                    for (e.snapshot.entries) |*l| {
+                        if (l.initialized and !l.ringed and KV.bufferCapacity(l.keys.array) != l.offset) slack += 1;
+                    }
+                    if (e.mtp) |*m| for (m.snapshot.entries) |*l| {
+                        if (l.initialized and !l.ringed and KV.bufferCapacity(l.keys.array) != l.offset) slack += 1;
+                    };
+                    errdefer std.debug.print("cooler contract: MTP {} asking {d} tokens: {d} buffers of the entry hold more than their rows; its KV is {d} B, the entry bills {d} B, the pool holds {d} B beyond the load\n", .{ mtp, n, slack, prefix_cache.HotPrefixCache.snapshotBytes(&e.snapshot), bytes[k], kept[k] });
+                    try testing.expectEqual(@as(usize, 0), slack);
+                }
+                // The pool holds the entry and no more whatever the request asked: the QSA history a checkpoint keeps is its
+                // rows' own copy, not a view that pins the slot's reservation.
+                errdefer std.debug.print("cooler contract: MTP {}: asking 16 tokens the entry bills {d} B and the pool holds {d} B, asking 6,000 {d} B and {d} B\n", .{ mtp, bytes[0], kept[0], bytes[1], kept[1] });
+                try testing.expectEqual(bytes[0], bytes[1]);
+                try testing.expectEqual(kept[0], kept[1]);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a prefill cancelled between two chunks commits the rows it forwarded and no reservation, as a finished request does" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            const KV = @import("kv_cache.zig").KVCache;
+            const prompt = try a.alloc(u32, 20000);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[(i * 7 + i / ids.len) % ids.len];
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            const scheduler = Served.scheduler;
+            const sch = &sv.sch;
+            const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 6000 });
+            defer {
+                sch.complete(slot);
+                for (sch.cleanup_queue.items) |s| s.deinit();
+                sch.cleanup_queue.clearRetainingCapacity();
+            }
+            _ = sch.pending.orderedRemove(0);
+            scheduler.cancel_after_chunks_for_test = 1;
+            defer scheduler.cancel_after_chunks_for_test = null;
+            try testing.expectError(error.Cancelled, scheduler.runPrefill(sch, slot));
+            scheduler.commitCancelledAtCleanup(sch, slot, scheduler.commitSlotIfApplicable);
+            const hc = &sv.entry.prefix_cache.?;
+            hc.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+            const e = &hc.entries.items[0];
+            var rows: usize = 0;
+            var slack: usize = 0;
+            for (e.snapshot.entries) |*l| {
+                if (!l.initialized or l.ringed) continue;
+                rows = @max(rows, @as(usize, @intCast(l.offset)));
+                if (KV.bufferCapacity(l.keys.array) != l.offset) slack += 1;
+            }
+            errdefer std.debug.print("cooler contract: the entry a prefill cancelled after {d} of 20000 rows committed holds {d} rows, {d} of its buffers hold more than their rows\n", .{ slot.prefill_computed, rows, slack });
+            try testing.expect(rows > 0 and rows < prompt.len);
+            try testing.expectEqual(@as(usize, slot.prefill_computed), rows);
+            try testing.expectEqual(@as(usize, 0), slack);
+        }
+    }.run);
 }
 
 test "cooler contract: a speculative request whose reply ends at a cache step grows its KV and its draft head's KV no further than the rows its bill prices" {
@@ -1901,256 +2155,6 @@ test "cooler contract: a Qwen request reaching generate as one token holds no mo
     if (comptime !@hasDecl(Q, "prompt")) return error.SkipZigTest;
     try oneTokenRequestHeld(Q, true);
     try oneTokenRequestHeld(Q, false);
-}
-
-/// Writes every attention layer of the Flash-Next cache on the engine from its stored rows to `rows`, kv8.
-fn fillKvCache(cfg: *const model_mod.ModelConfig, cache: *@import("kv_cache.zig").KVCache, rows: usize) !void {
-    const s = mlx.engine.stream();
-    var li: u32 = 0;
-    while (li < cfg.num_hidden_layers) : (li += 1) {
-        if (cfg.isLinearLayer(li)) continue;
-        const add: c_int = @intCast(rows - cache.seqLen(li));
-        if (add == 0) continue;
-        var k = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(k);
-        var v = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(v);
-        try mlx.check(mlx.mlx_ones(&k, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(li)), add, @intCast(cfg.layerHeadDim(li)) }, 4, .bfloat16, s));
-        try mlx.check(mlx.mlx_ones(&v, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(li)), add, @intCast(cfg.layerVHeadDim(li)) }, 4, .bfloat16, s));
-        var view = try cache.update(li, k, v, s, 0);
-        view.deinit();
-    }
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    cache.appendEvalArrays(vec);
-    try mlx.check(mlx.mlx_eval(vec));
-}
-
-/// A Flash-Next cache on the engine holding `rows` rows of every attention layer at kv8, bound as the engine binds the
-/// request of `seq` tokens and `max_tokens` reply (`generate.reserveRequestCapacity`).
-fn heldKvCache(cfg: *const model_mod.ModelConfig, rows: usize, seq: u64, max_tokens: u64) !@import("kv_cache.zig").KVCache {
-    var cache = try @import("kv_cache.zig").KVCache.initWithConfig(testing.allocator, cfg.num_hidden_layers, @import("kv_quant.zig").KVQuantConfig.affine(8));
-    errdefer cache.deinit();
-    _ = try @import("generate.zig").reserveRequestCapacity(&cache, cfg, seq, max_tokens, cfg.prefillStartWidth(), 0, mlx.engine.stream());
-    try fillKvCache(cfg, &cache, rows);
-    return cache;
-}
-
-test "cooler contract: the dearest decode regrow of a request holds beside the grown cache no more than the request's bill carries beyond it, at every prompt and reply" {
-    const KV = @import("kv_cache.zig").KVCache;
-    const bills = @import("bills.zig");
-    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    const pool_class = @import("tensor/pool_class.zig");
-    const cfg = @import("qwen4/qwen4_bill_test.zig").coolerFlashNext();
-    const chunk: u64 = cfg.prefillStartWidth();
-    const s = mlx.engine.stream();
-    var over: usize = 0;
-    // A reply that ends at the first capacity step and one that outlives several, below the long-prompt reservation
-    // (`RESERVE_MIN_TOKENS`), which holds the whole reply.
-    for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
-        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{});
-        var cache = try heldKvCache(&cfg, seq, seq, max_tokens);
-        defer cache.deinit();
-        // The request's decode: every row past a capacity step regrows the cache, as `growAhead` does ahead of the forward.
-        var offset: usize = seq;
-        var dearest: u64 = 0;
-        var later_most: u64 = 0;
-        while (offset < seq + max_tokens) {
-            mlx.engine.close();
-            mlx.engine.trim();
-            const old_rows = KV.bufferCapacity(cache.entries[3].keys.array);
-            mlx.engine.resetPoolPeak(.process);
-            try cache.growAhead(1, s);
-            mlx.engine.close();
-            const peak = mlx.engine.poolPeak(.process);
-            mlx.engine.trim();
-            // What the grown cache settles at is the request's storage at its last row (`cacheStorage`); the regrow's peak
-            // is what it holds past that, which the bill carries as `decode_regrow_bytes`.
-            dearest = @max(dearest, peak -| (mlx.engine.poolTotal() - mlx.engine.poolFree()));
-            // The peak is under the bill's whole old copy and tail by the layer's four small buffers a rebuild has not yet grown.
-            const last = &cache.entries[cfg.num_hidden_layers - 1];
-            var later: u64 = 0;
-            for ([_]mlx.mlx_array{ last.keys_scales.array, last.keys_biases.array, last.values_scales.array, last.values_biases.array }) |buf| {
-                const row = mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf) / KV.bufferCapacity(buf);
-                later += pool_class.poolBytes(KV.bufferCapacity(buf) * row) - pool_class.poolBytes(old_rows * row);
-            }
-            later_most = @max(later_most, later);
-            offset = @min(KV.bufferCapacity(cache.entries[3].keys.array), seq + max_tokens);
-            try fillKvCache(&cfg, &cache, offset);
-        }
-        const billed = terms.decode_regrow_bytes;
-        if (dearest > billed or billed > dearest + later_most + billed / 16) {
-            over += 1;
-            std.debug.print("cooler contract: a {d}-token prompt + {d}: the dearest regrow holds {d} B past the grown buffers, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
-        }
-    };
-    try testing.expectEqual(@as(usize, 0), over);
-}
-
-/// The MTP head's one-layer cache on the engine (its own scheme, `qwen4MtpHeadKvConfig`) holding `rows` rows, bound as the
-/// engine binds the head for the request of `seq` tokens and `max_tokens` reply (`DraftCache.reserve`).
-fn heldHeadCache(cfg: *const model_mod.ModelConfig, rows: usize, seq: u64, max_tokens: u64) !@import("kv_cache.zig").KVCache {
-    const KV = @import("kv_cache.zig");
-    const bills = @import("bills.zig");
-    var cache = try KV.KVCache.initWithConfig(testing.allocator, 1, @import("qwen4/qwen4_forward.zig").qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(cfg)));
-    errdefer cache.deinit();
-    cache.reserve(@intCast(@import("prefill_plan.zig").reservedPrefillTokens(cfg, seq, max_tokens, cfg.prefillStartWidth())));
-    cache.bound(@intCast(KV.KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(cfg), bills.speculativeRowsPastEnd(cfg, .{ .mtp_on = true }))));
-    try fillHeadCache(cfg, &cache, rows);
-    return cache;
-}
-
-/// Writes the head's layer from its stored rows to `rows`; the write grows the cache inside the graph, as the head's forward does.
-fn fillHeadCache(cfg: *const model_mod.ModelConfig, cache: *@import("kv_cache.zig").KVCache, rows: usize) !void {
-    const s = mlx.engine.stream();
-    const add: c_int = @intCast(rows - cache.seqLen(0));
-    if (add == 0) return;
-    var k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k);
-    var v = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v);
-    try mlx.check(mlx.mlx_ones(&k, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(3)), add, @intCast(cfg.layerHeadDim(3)) }, 4, .bfloat16, s));
-    try mlx.check(mlx.mlx_ones(&v, &[_]c_int{ 1, @intCast(cfg.layerKVHeads(3)), add, @intCast(cfg.layerVHeadDim(3)) }, 4, .bfloat16, s));
-    var view = try cache.update(0, k, v, s, 0);
-    view.deinit();
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    cache.appendEvalArrays(vec);
-    try mlx.check(mlx.mlx_eval(vec));
-}
-
-test "cooler contract: the dearest decode regrow of the MTP head's cache holds beside the grown cache no more than the request's bill carries beyond it, at every prompt and reply" {
-    const KV = @import("kv_cache.zig").KVCache;
-    const bills = @import("bills.zig");
-    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    const cfg = @import("qwen4/qwen4_bill_test.zig").coolerFlashNext();
-    // The head's own scheme is dense unless the kv-quant lever is on: its buffers are K and V alone.
-    if (@import("qwen4/qwen4_forward.zig").qwen4MtpHeadKvConfig(bills.configuredKvQuantFor(&cfg)).scheme != .off) return error.SkipZigTest;
-    const chunk: u64 = cfg.prefillStartWidth();
-    var over: usize = 0;
-    for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
-        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{ .mtp_on = true });
-        var cache = try heldHeadCache(&cfg, seq, seq, max_tokens);
-        defer cache.deinit();
-        const end = seq + max_tokens + bills.speculativeRowsPastEnd(&cfg, .{ .mtp_on = true });
-        // The head's decode: a row past a capacity step regrows its cache inside the forward's graph.
-        var dearest: u64 = 0;
-        var offset: usize = seq;
-        while (offset < end) {
-            mlx.engine.close();
-            mlx.engine.trim();
-            mlx.engine.resetPoolPeak(.process);
-            try fillHeadCache(&cfg, &cache, offset + 1);
-            mlx.engine.close();
-            const peak = mlx.engine.poolPeak(.process);
-            mlx.engine.trim();
-            dearest = @max(dearest, peak -| (mlx.engine.poolTotal() - mlx.engine.poolFree()));
-            offset = @min(KV.bufferCapacity(cache.entries[0].keys.array), end);
-            try fillHeadCache(&cfg, &cache, offset);
-        }
-        const billed = terms.decode_regrow_bytes;
-        // The peak is the cache's old copies and zero tails whole, which the bill prices at a sixteenth over their size classes.
-        if (dearest > billed or billed > dearest + billed / 16) {
-            over += 1;
-            std.debug.print("cooler contract: a {d}-token prompt + {d}: the head's dearest regrow holds {d} B past its grown cache, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
-        }
-    };
-    try testing.expectEqual(@as(usize, 0), over);
-}
-
-test "cooler contract: the dearest decode regrow of the QSA history holds beside the grown history no more than the request's bill carries beyond it, every layer's regrow in one graph" {
-    const bills = @import("bills.zig");
-    if (!bills.archBuilt("qwen4")) return error.SkipZigTest;
-    try mlx.requireGpu();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer test_support.restoreEngine(was);
-    // The unfused score bank is the history's dearest layout: its f32 columns grow beside the pooled keys.
-    @import("qwen4/qwen4_qsa_select.zig").qsa_score_fused_override = false;
-    defer @import("qwen4/qwen4_qsa_select.zig").qsa_score_fused_override = null;
-    const trunk = @import("trunk.zig");
-    const cfg = @import("qwen4/qwen4_bill_test.zig").coolerFlashNext();
-    const chunk: u64 = cfg.prefillStartWidth();
-    const s = mlx.engine.stream();
-    const layers: usize = cfg.attnCacheLayerCount();
-    const hd: c_int = @intCast(cfg.indexer_head_dim);
-    const ratio: usize = cfg.indexer_compress_ratio;
-    var over: usize = 0;
-    var regrows: usize = 0;
-    for ([_]u64{ 4096, 8192 }) |seq| for ([_]u64{ 1, 4096 }) |max_tokens| {
-        const terms = bills.prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{});
-        const hold: trunk.Hold = .{
-            .reserve = @import("prefill_plan.zig").reservedPrefillTokens(&cfg, seq, max_tokens, chunk),
-            .end = trunk.KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(&cfg), 0),
-        };
-        var pooled: [64]mlx_pages.InPlace = @splat(.none);
-        var pooled_view: [64]mlx.mlx_array = @splat(.{ .ctx = null });
-        var bank: [64]mlx_pages.InPlace = @splat(.none);
-        var bank_view: [64]mlx.mlx_array = @splat(.{ .ctx = null });
-        var pooled_count: [64]c_int = @splat(0);
-        var bank_count: [64]c_int = @splat(0);
-        defer for (0..layers) |i| {
-            pooled[i].deinit();
-            bank[i].deinit();
-            for ([_]mlx.mlx_array{ pooled_view[i], bank_view[i] }) |a| _ = mlx.mlx_array_free(a);
-        };
-        // Every layer's history, grown to the prompt's blocks and then a block at a time (a block per `ratio` tokens).
-        var blocks: usize = 0;
-        var dearest: u64 = 0;
-        const end_blocks = (hold.end + ratio - 1) / ratio;
-        var target: usize = (seq + ratio - 1) / ratio;
-        while (blocks < end_blocks) {
-            const add: c_int = @intCast(target - blocks);
-            mlx.engine.close();
-            mlx.engine.trim();
-            mlx.engine.resetPoolPeak(.process);
-            const vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(vec);
-            var chunks: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
-            defer for (chunks) |c| {
-                _ = mlx.mlx_array_free(c);
-            };
-            try mlx.check(mlx.mlx_ones(&chunks[0], &[_]c_int{ 1, add, hd }, 3, .bfloat16, s));
-            try mlx.check(mlx.mlx_ones(&chunks[1], &[_]c_int{ 1, 1, hd, add }, 4, .float32, s));
-            const before = mlx.engine.poolTotal() - mlx.engine.poolFree();
-            const caps: usize = if (pooled[0].array.ctx != null) @intCast(mlx.getShape(pooled[0].array)[1]) else 0;
-            for (0..layers) |i| {
-                try trunk.capBufAppend(s, &pooled[i], &pooled_view[i], &pooled_count[i], chunks[0], 1, hold, ratio);
-                try trunk.capBufAppend(s, &bank[i], &bank_view[i], &bank_count[i], chunks[1], 3, hold, ratio);
-                _ = mlx.mlx_vector_array_append_value(vec, pooled[i].array);
-                _ = mlx.mlx_vector_array_append_value(vec, bank[i].array);
-            }
-            try mlx.check(mlx.mlx_eval(vec));
-            mlx.engine.close();
-            const peak = mlx.engine.poolPeak(.process);
-            mlx.engine.trim();
-            const after = mlx.engine.poolTotal() - mlx.engine.poolFree();
-            _ = before;
-            // A regrow beyond the first fill: the history held its capacity and the block did not fit.
-            if (caps != 0 and @as(usize, @intCast(mlx.getShape(pooled[0].array)[1])) != caps) {
-                regrows += 1;
-                dearest = @max(dearest, peak -| after);
-            }
-            blocks = target;
-            target = @min(end_blocks, @as(usize, @intCast(mlx.getShape(pooled[0].array)[1])) + 1);
-            if (target == blocks) break;
-        }
-        const billed = terms.decode_regrow_bytes;
-        if (dearest > billed) {
-            over += 1;
-            std.debug.print("cooler contract: a {d}-token prompt + {d}: the history's dearest regrow holds {d} B past its grown buffers, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
-        }
-    };
-    try testing.expect(regrows > 0);
-    try testing.expectEqual(@as(usize, 0), over);
 }
 
 const dsv41_tinies: []const [:0]const u8 = &.{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" };

@@ -742,6 +742,44 @@ pub const KVCache = struct {
         }
     }
 
+    /// Cut every owned, non-ringed layer to the rows it holds (capacity == rows), for a cache about to be committed to the hot
+    /// cache: a request reserves its last row (`reservedTokens`, `prefill_plan.reservedPrefillTokens`), and a hot-cache entry bills
+    /// the capacity of its buffers (`prefix_cache.snapshotBytes`). A buffer at a time, each evaluated and its old copy released
+    /// before the next, so the copy beside the cache is the widest buffer's rows (`bills.commitTrimBytes`). A shared restore's
+    /// buffers are the entry's, not this cache's to cut.
+    pub fn shrinkToRows(self: *KVCache, s: mlx.mlx_stream) !void {
+        const n: usize = if (self.config.scheme == .off) 2 else 6;
+        for (self.entries) |*entry| {
+            if (!entry.initialized or entry.ringed or entry.shared_view or entry.offset == 0) continue;
+            if (bufferCapacity(entry.keys.array) <= entry.offset) continue;
+            const views = [_]*mlx.mlx_array{ &entry.key_view, &entry.value_view, &entry.key_scales_view, &entry.key_biases_view, &entry.value_scales_view, &entry.value_biases_view };
+            for (views) |view| {
+                _ = mlx.mlx_array_free(view.*);
+                view.* = mlx.mlx_array_new();
+            }
+            const bufs = [_]*mlx_pages.InPlace{ &entry.keys, &entry.values, &entry.keys_scales, &entry.keys_biases, &entry.values_scales, &entry.values_biases };
+            for (bufs[0..n]) |buf| {
+                try cutBuf(s, buf, entry.offset);
+                try mlx.check(mlx.mlx_array_eval(buf.array));
+                try mlx_pages.settleGrown(s);
+            }
+        }
+    }
+
+    /// Replace `buf` with a copy of its first `rows` rows; the slice that names them is released on return, with the old buffer.
+    fn cutBuf(s: mlx.mlx_stream, buf: *mlx_pages.InPlace, rows: usize) !void {
+        const sh = mlx.getShape(buf.array);
+        const start = [_]c_int{ 0, 0, 0, 0 };
+        const stop = [_]c_int{ sh[0], sh[1], @intCast(rows), sh[3] };
+        const strides = [_]c_int{ 1, 1, 1, 1 };
+        var kept = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kept);
+        try mlx.check(mlx.mlx_slice(&kept, buf.array, &start, 4, &stop, 4, &strides, 4, s));
+        const cut = try mlx_pages.cutBuffer(kept, s);
+        buf.deinit();
+        buf.* = cut;
+    }
+
     /// Grow every initialized, unshared, non-ringed layer whose next `rows` would pass its capacity, one layer per
     /// eval, before a forward builds. Left to the forward, a decode step past the capacity grew every layer inside its
     /// lazy graph, each old buffer alive beside its new one until the step ran: the whole cache twice, unbilled.
@@ -4041,7 +4079,7 @@ test "the dearest decode regrow of the MTP head's cache on MLX holds beside the 
         const end = KVCache.requestEnd(seq, max_tokens, bills.getEffectiveContextLength(&cfg), bills.speculativeRowsPastEnd(&cfg, .{ .mtp_on = true }));
         var cache = try KVCache.initWithConfig(testing.allocator, 1, KVQuantConfig.dense);
         defer cache.deinit();
-        cache.reserve(@intCast(@import("prefill_plan.zig").reservedPrefillTokens(&cfg, seq, max_tokens, chunk)));
+        cache.reserve(@intCast(@import("prefill_plan.zig").reservedPrefillTokens(&cfg, seq, max_tokens, chunk, 0)));
         cache.bound(@intCast(end));
         const Fill = struct {
             cache: *KVCache,

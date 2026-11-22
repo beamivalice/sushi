@@ -235,14 +235,14 @@ test "reservedPrefillTokens: the KV capacity reservation is qwen4_exp-only; ever
     const KVC = trunk.KVCache;
     try t.expectEqual(
         KVC.reservedTokens(seq, max_tokens, chunk, 1_048_576),
-        reservedPrefillTokens(&qwen4, seq, max_tokens, chunk),
+        reservedPrefillTokens(&qwen4, seq, max_tokens, chunk, 0),
     );
-    try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk) > seq);
+    try t.expect(reservedPrefillTokens(&qwen4, seq, max_tokens, chunk, 0) > seq);
 
     // Every other arch: zero, which leaves `KVCache.heldRows` the policy alone.
     for ([_][]const u8{ "glm5_next", "deepseek_v41", "not_a_served_arch" }) |mt| {
         var cfg = model_mod.ModelConfig{ .model_type = mt, .max_position_embeddings = 262_144 };
-        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk));
+        try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&cfg, seq, max_tokens, chunk, 0));
     }
 
     var cache = try KVC.init(t.allocator, 4);

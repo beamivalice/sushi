@@ -453,7 +453,7 @@ fn capturePrefillCheckpoint(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *con
 /// layers to the reservation before the prefill's first chunk writes (`KVCache.growToReservation`). Returns the
 /// reserved tokens.
 pub fn reserveRequestCapacity(cache: *KVCache, config: *const model_mod.ModelConfig, total_ctx: u64, max_tokens: u64, chunk: u64, past_end: u64, s: mlx.mlx_stream) !u64 {
-    const reserved = prefill_plan.reservedPrefillTokens(config, total_ctx, max_tokens, chunk);
+    const reserved = prefill_plan.reservedPrefillTokens(config, total_ctx, max_tokens, chunk, past_end);
     cache.reserve(@intCast(reserved));
     cache.bound(@intCast(KVCache.requestEnd(total_ctx, max_tokens, total_ctx +| max_tokens, past_end)));
     try cache.growToReservation(s);
@@ -1591,7 +1591,7 @@ pub const Generator = struct {
                             sink.forwarded = ssm_cp_offset + pos;
                             if (ssm_checkpoints.items.len > 0) {
                                 if (ctx.ssm_entries) |ents| {
-                                    prefix_arch.aux.handoffQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
+                                    prefix_arch.aux.commitQsaHistoryToLatest(ssm_checkpoints.items, ents, xfm.s) catch {};
                                 }
                                 if (ssm_checkpoints.toOwnedSlice(allocator)) |owned| {
                                     sink.checkpoints = owned;

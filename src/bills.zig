@@ -1224,13 +1224,14 @@ pub fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64
 }
 
 /// The dearest request a context of `ctx` tokens can be asked for, over every split of it between prompt and reply: what
-/// every context the server names (advertised, admitted at load, or in a refusal) is priced at. A split's bill grows with
-/// its prompt except where its cache stops needing a decode regrow (the longest prompt that still regrows is the dearest
-/// below it, `longestRegrowingPrompt`) and where a reservation starts holding the reply, so those splits are priced beside
-/// the prompt alone: no other split is dearer.
+/// every context the server names (advertised, admitted at load, or in a refusal) is priced at. On Sushi Cooler a split's
+/// bill never falls as its prompt grows (the cache holds the request's last row from its first chunk, so nothing regrows in
+/// decode), and the prompt alone is the dearest. On MLX it grows with its prompt except where its cache stops needing a decode
+/// regrow (the longest prompt that still regrows is the dearest below it, `longestRegrowingPrompt`) and where a reservation
+/// starts holding the reply, so those splits are priced beside the prompt alone: no other split is dearer.
 pub fn contextNeed(config: *const model_mod.ModelConfig, ctx: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     const alone = splitNeed(config, ctx, ctx, kv_bits, chunk, warm);
-    if (!config.reservesKvCapacity()) return alone;
+    if (!config.reservesKvCapacity() or cooler_side.onEngine(config)) return alone;
     const edge = trunk.KVCache.RESERVE_MIN_TOKENS;
     var most = alone;
     if (ctx >= edge) most = @max(most, splitNeed(config, ctx, edge - 1, kv_bits, chunk, warm));
@@ -2205,8 +2206,11 @@ pub const PrefillRequestTerms = struct {
     /// does not reserve its capacity.
     grow_coexist_bytes: u64 = 0,
     /// The decode phase's. What a decode step's regrow holds beside the grown cache at its peak (`decodeRegrowBytes`), read
-    /// from the capacity the restore holds: Sushi Cooler, where a request does not reserve its whole reply.
+    /// from the capacity the restore holds: MLX, where a request under the reservation floor does not reserve its whole reply.
     decode_regrow_bytes: u64 = 0,
+    /// The decode phase's. What the request's commit holds beside its cache when it cuts every buffer to the rows it used
+    /// (`commitTrimBytes`): Sushi Cooler.
+    commit_trim_bytes: u64 = 0,
     /// Both phases.
     qsa_ring_bytes: u64 = 0,
     /// Both phases.
@@ -2265,7 +2269,8 @@ pub const PhaseExtras = struct {
 /// (`kv`, `reserved_kv_bytes`), the out-of-cache state, the SSM checkpoints, the QSA rings, the MTP head's cache, DFlash2's
 /// window and MLX's runtime floor. The prefill phase adds what a chunk holds: its forward's envelope, the score sheet,
 /// the dense KV rebuild, the dequantized GEMM weights and the old cache buffers a warm grow holds (`grow_coexist_bytes`).
-/// The decode phase adds the larger of the cache's regrow (`decode_regrow_bytes`) and a decode forward: a speculative
+/// The decode phase adds the larger of the cache's regrow (`decode_regrow_bytes`, MLX) or its commit's trim copy
+/// (`commit_trim_bytes`, Sushi Cooler) and a decode forward: a speculative
 /// round's transient (`round_bytes`) or a one-row envelope, with the forward-width terms (`forwardWidthBytes`, the dense KV
 /// rebuild among them) at the request's last key. The trunk's regrow finishes before the step's forward is built and the
 /// head's runs in the draft that precedes the verify, so neither holds the other's buffers.
@@ -2313,15 +2318,15 @@ pub fn requestPhases(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim:
     const phases: RequestPhases = .{
         .prefill = (common + chunk_transient -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.prefill + extra.both,
         .decode = @max(
-            (common + req.decode_regrow_bytes -| req.shared_resident_bytes) * req.uplift_16ths / 16,
+            (common + @max(req.decode_regrow_bytes, req.commit_trim_bytes) -| req.shared_resident_bytes) * req.uplift_16ths / 16,
             (common + decode_forward -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.decode,
         ) + extra.both,
     };
     // The one place a budget is argued about: every term, so `--log-level debug` on a live box
     // names what a chunk's bill is made of instead of leaving it to be re-derived by hand.
-    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} round={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} extra={d}/{d}+{d} | prefill phase={d} decode phase={d} won={s}\n", .{
+    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} trim={d} round={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} extra={d}/{d}+{d} | prefill phase={d} decode phase={d} won={s}\n", .{
         seq, fwd, kv_bytes, req.reserved_kv_bytes, req.state_bytes, req.checkpoint_bytes,
-        req.grow_coexist_bytes, req.decode_regrow_bytes, req.round_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
+        req.grow_coexist_bytes, req.decode_regrow_bytes, req.commit_trim_bytes, req.round_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
         scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, extra.prefill, extra.decode, extra.both,
         phases.prefill, phases.decode, if (phases.decodeWins()) "decode" else "prefill",
     });
@@ -2476,14 +2481,17 @@ pub fn cacheCapacityTokens(config: *const model_mod.ModelConfig, seq: u64, max_t
     return most;
 }
 
-/// What the request asks of its cache's growth: its reservation (a long prompt's prompt, reply and a chunk; a shorter one
-/// of several chunks its own length) and its last row. The one hold `cacheCapacityTokens` and `decodeRegrowBytes` price.
+/// What the request asks of its cache's growth: its reservation and its last row. On Sushi Cooler the reservation is the
+/// last row (`prefill_plan.reservedPrefillTokens`), whatever the prompt; on MLX a long prompt's prompt, reply and a chunk,
+/// a shorter one of several chunks its own length. The one hold `cacheCapacityTokens` and `decodeRegrowBytes` price.
 fn requestHold(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, chunk: u64, ctx: u64, past_end: u64) trunk.Hold {
     const reserves = config.reservesKvCapacity();
+    const end = @max(trunk.KVCache.requestEnd(seq, max_tokens, ctx, past_end), seq);
+    if (reserves and cooler_side.onEngine(config)) return .{ .reserve = end, .end = end };
     const long = if (reserves) reservedCacheTokens(seq, max_tokens, chunk, ctx) else 0;
     return .{
         .reserve = if (long > 0) long else if (reserves and seq > chunk) seq else 0,
-        .end = @max(trunk.KVCache.requestEnd(seq, max_tokens, ctx, past_end), seq),
+        .end = end,
     };
 }
 
@@ -2529,6 +2537,39 @@ pub fn decodeRegrowBytes(config: *const model_mod.ModelConfig, seq: u64, max_tok
         most = @max(most, lastRegrowBytes(config, start, seq, hold, if (on_engine) &.{} else &parts, std.mem.max(u64, &parts)));
     }
     return most;
+}
+
+/// What a Sushi Cooler request's commit holds past the state it has, at its dearest copy. The cut of its cache
+/// (`KVCache.shrinkToRows`) rebuilds a buffer at a time, its old copy released before the next, so the most alive is the widest
+/// buffer's copy, at most a row short of the request's capacity (a buffer already at its rows is not copied); the trunk's
+/// buffers and then the MTP head's never coexist. The QSA history's handoff (`commitQsaHistoryToLatest`) comes after the cut
+/// and copies the pooled banks of every layer at once, at the most rows a checkpoint can keep (`commitQsaCopyBytes`).
+/// Nothing on MLX, which commits the capacity it holds.
+pub fn commitTrimBytes(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
+    if (!config.reservesKvCapacity() or !cooler_side.onEngine(config)) return 0;
+    const hold = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm));
+    const rows = trunk.KVCache.heldRows(0, hold.end, hold, &.{}) -| 1;
+    const head_bits = archHook("headKvBits", u64, config, .{}) orelse defaultKvBits(config);
+    var head = headBilled(config, warm);
+    var widest: u64 = 0;
+    var li: u32 = 0;
+    while (li < config.num_hidden_layers) : (li += 1) {
+        if (!config.isKvPerTokenLayer(li)) continue;
+        widest = @max(widest, std.mem.max(u64, &layerBufferRowBytes(config, li, kv_bits)));
+        if (head) {
+            widest = @max(widest, std.mem.max(u64, &layerBufferRowBytes(config, li, head_bits)));
+            head = false;
+        }
+    }
+    return @max(pooledCacheBytes(config, rows *| widest), commitQsaCopyBytes(config, hold.end));
+}
+
+/// The pooled QSA banks a commit copies into its checkpoint for a history of `keep_rows` rows (the blocks
+/// `ssm_cache.truncatePooled` keeps), a bank per layer, each at the pool's size class. Zero where the arch keeps no such history.
+pub fn commitQsaCopyBytes(config: *const model_mod.ModelConfig, keep_rows: u64) u64 {
+    if (config.qsaHistoryBytesPerToken() == 0) return 0;
+    const blocks: u64 = @intCast(trunk.keptPooledBlocks(@intCast(keep_rows), @intCast(@max(config.indexer_compress_ratio, 1))));
+    return @as(u64, config.attnCacheLayerCount()) *| pooledCacheBytes(config, blocks *| config.qsaPooledRowBytes());
 }
 
 /// What a decode step that passes the cap of a ringed arch's sliding layers holds beside their live rings: every layer's ring
@@ -2712,6 +2753,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, reserved, kv_per_tok),
         .decode_regrow_bytes = storage.regrow,
+        .commit_trim_bytes = commitTrimBytes(config, seq, max_tokens, kv_bits, chunk, warm),
         .qsa_ring_bytes = slotRingBytes(config, kv_bits) +| head_qsa_ring,
         .mtp_head_kv_bytes = storage.head_kv,
         .dflash_bytes = dflashRequestBytes(config, requestForwardRows(config, seq, chunk, warm.matched_tokens)),
@@ -3563,7 +3605,8 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
 pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     const stored = archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, chunk, warm.mtp_on }) orelse return 0;
     // The decode regrow (`decodeRegrowBytes`) starts from the capacity a restore holds, which the arch's hook is not given.
-    return stored +| decodeRegrowBytes(config, prompt_len, max_tokens, kv_bits, chunk, warm);
+    // A request's end holds either the regrow's transient (MLX) or its commit's trim copy (Sushi Cooler), never both.
+    return stored +| @max(decodeRegrowBytes(config, prompt_len, max_tokens, kv_bits, chunk, warm), commitTrimBytes(config, prompt_len, max_tokens, kv_bits, chunk, warm));
 }
 
 /// The inference thread's refusal, quoting the numbers it compared.
@@ -5778,8 +5821,8 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
 
     // The allocator side: the prefill loop asks for the whole request's capacity
     // before the first chunk writes, so no buffer grows mid-prefill.
-    try t.expect(prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk) > seq);
-    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, 1024, 2048, chunk));
+    try t.expect(prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk, 0) > seq);
+    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, 1024, 2048, chunk, 0));
 
     // The bill side: headroom and the per-slot ring, nothing else acquired.
     const terms = prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{});
@@ -5811,7 +5854,7 @@ test "a ringed arch reserves its KV capacity once and bills the ring it holds" {
     plain.model_type = "not_a_served_arch";
     try t.expect(!plain.reservesKvCapacity());
     try t.expectEqual(PrefillRequestTerms{}, prefillRequestTerms(&plain, seq, 2048, 8, chunk, .{}));
-    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&plain, seq, 2048, chunk));
+    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&plain, seq, 2048, chunk, 0));
 }
 
 test "a prompt of several chunks under the long-prompt threshold reserves its own length (one grow, as a reserved cache takes), and is billed the cache its reply grows it to" {
@@ -5821,14 +5864,14 @@ test "a prompt of several chunks under the long-prompt threshold reserves its ow
     try t.expect(cfg.reservesKvCapacity());
     const chunk: u64 = 1024;
     for ([_]u64{ 1025, 5000, 32767 }) |seq| {
-        try t.expectEqual(seq, prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk));
+        try t.expectEqual(seq, prefill_plan.reservedPrefillTokens(&cfg, seq, 2048, chunk, 0));
         // The reply grows the cache past the prompt by the +25% policy, each grow billed.
         const cap = cacheCapacityTokens(&cfg, seq, 2048, chunk, getEffectiveContextLength(&cfg), 0, 8);
         try t.expect(cap >= seq + 2048);
         try t.expectEqual((cap - seq) * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8), prefillRequestTerms(&cfg, seq, 2048, 8, chunk, .{}).reserved_kv_bytes);
     }
     // One chunk grows once either way: nothing reserved.
-    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, chunk, 2048, chunk));
+    try t.expectEqual(@as(u64, 0), prefill_plan.reservedPrefillTokens(&cfg, chunk, 2048, chunk, 0));
 }
 
 test "mimo_v2 prefill bill: fusing qk 192 drops the global and the band score sheets" {

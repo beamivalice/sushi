@@ -4,6 +4,7 @@ const settings_resolve = @import("settings_resolve.zig");
 const trunk = @import("trunk.zig");
 const attn_kernels = @import("attn_kernels.zig");
 const model_mod = @import("model.zig");
+const cooler_side = @import("cooler_side.zig");
 const SSMCheckpoint = trunk.SSMCheckpoint;
 const testing = std.testing;
 
@@ -374,15 +375,19 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 
 /// Tokens of KV capacity this prefill reserves up front (#353): removes the grow transient a
 /// long prefill pays, at the price of allocating generation headroom early. Gated on
-/// `longCtxGated`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
-/// `server.prefillRequestTerms` bills it.
+/// `reservesKvCapacity`; every other arch keeps proportional growth (`reserve_tokens` stays 0).
+/// `bills.requestHold` prices it. Sushi Cooler reserves the request's last row, the one `reserveRequestCapacity` binds
+/// (`KVCache.requestEnd`: `max_tokens` is the reply the context leaves), whatever the prompt, so no buffer grows after
+/// the first chunk; MLX keeps `KVCache.reservedTokens`.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
     max_tokens: u64,
     chunk: u64,
+    past_end: u64,
 ) u64 {
     if (!config.reservesKvCapacity()) return 0;
+    if (cooler_side.onEngine(config)) return trunk.KVCache.requestEnd(seq, max_tokens, seq +| max_tokens, past_end);
     const long = trunk.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings);
     // A shorter prompt of several chunks reserves its own length, which its prefill fills anyway and the bill
     // already floors at: else every chunk regrows each attention layer's buffers (a zero fill and a copy).

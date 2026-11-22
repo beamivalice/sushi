@@ -734,9 +734,13 @@ pub const ModelConfig = struct {
     pub fn qsaHistoryBytesPerToken(self: *const ModelConfig) u64 {
         if (self.indexer_budget == 0 or self.indexer_head_dim == 0) return 0;
         const n = @as(u64, self.attnCacheLayerCount());
-        const hd = @as(u64, self.indexer_head_dim);
         const ratio = @max(@as(u64, self.indexer_compress_ratio), 1);
-        return n * hd * 2 / ratio;
+        return n * self.qsaPooledRowBytes() / ratio;
+    }
+
+    /// One row of a layer's pooled indexer bank (one block of `indexer_compress_ratio` tokens), bf16.
+    pub fn qsaPooledRowBytes(self: *const ModelConfig) u64 {
+        return @as(u64, self.indexer_head_dim) * 2;
     }
 
     /// The raw indexer keys every live slot holds: `QSA_RING_ROWS` rows per

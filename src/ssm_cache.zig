@@ -903,13 +903,18 @@ pub fn ssmLiveAux(e: *const SSMCacheEntry) mlx.mlx_array {
     return e.aux_state;
 }
 
+/// The blocks of a pooled bank a history cut to `keep_rows` still completes.
+pub fn keptPooledBlocks(keep_rows: c_int, ratio: c_int) c_int {
+    return @divTrunc(keep_rows, ratio);
+}
+
 /// Keep the pooled-key rows that are still complete blocks of a key history
 /// truncated to `keep_rows` (the block size is implied by the two shapes).
 /// Cut the pooled bank to the blocks `keep_rows` completes. `materialize` = a fresh buffer; false = a slice view.
 pub fn truncatePooled(pooled: *mlx.mlx_array, keep_rows: c_int, ratio: c_int, s: mlx.mlx_stream, materialize: bool) !void {
     if (pooled.ctx == null) return;
     const ps = mlx.getShape(pooled.*);
-    const keep_blocks: c_int = @divTrunc(keep_rows, ratio);
+    const keep_blocks = keptPooledBlocks(keep_rows, ratio);
     if (keep_blocks >= ps[1]) return;
     if (keep_blocks <= 0) {
         _ = mlx.mlx_array_free(pooled.*);

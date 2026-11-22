@@ -239,6 +239,7 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   chunk inodes and equal QSA segment hashes below it, and has no point as high there. An heir keeps points only past
   where it diverged, so once the oldest record went, a client that changed an early image (the newest-24-images
   window) found no point below it and prefilled about 300k tokens cold.
+- **A Sushi Cooler commit holds the rows a request used, not its reservation**: the slot's cache (and the MTP head's history) is cut to its rows before the commit snapshots it (`KVCache.shrinkToRows`, from `scheduler.shrinkForCommit`), because `snapshotBytes` bills buffer capacity and a request reserves its last row; the copy is one buffer at a time and billed (`bills.commitTrimBytes`).
 - An oversized candidate is TRIMMED to the longest restorable prefix that fits (`trimLenForBudget`,
   `KVCacheSnapshot.trimmedCopy` is a REAL copy); a QSA trim bills the bank on the final retained checkpoint.
 - **A ringed candidate trims only where it restores** (`ringTrimLen`): its end, dropping the reservation's spare

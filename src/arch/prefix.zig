@@ -452,6 +452,7 @@ pub const aux = firstWith("aux") orelse struct {
     pub fn applyQsaHistoryAt(_: []ssm_cache.SSMCacheEntry, _: *const ssm_cache.SSMCheckpoint, _: usize, _: mlx.mlx_stream, _: bool) !void {}
     pub fn attachQsaHistoryToLatest(_: []ssm_cache.SSMCheckpoint, _: []const ssm_cache.SSMCacheEntry, _: mlx.mlx_stream) !void {}
     pub fn handoffQsaHistoryToLatest(_: []ssm_cache.SSMCheckpoint, _: []const ssm_cache.SSMCacheEntry, _: mlx.mlx_stream) !void {}
+    pub fn commitQsaHistoryToLatest(_: []ssm_cache.SSMCheckpoint, _: []const ssm_cache.SSMCacheEntry, _: mlx.mlx_stream) !void {}
     pub fn sliceQsaHistoryOntoCheckpoint(_: *ssm_cache.SSMCheckpoint, _: *const ssm_cache.SSMCheckpoint, _: usize, _: mlx.mlx_stream) !void {}
     pub fn keepOnlyLatestQsaHistory(_: []ssm_cache.SSMCheckpoint) void {}
     pub fn dropQsaHistory(_: *ssm_cache.SSMCheckpoint) void {}

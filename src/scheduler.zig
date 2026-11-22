@@ -3123,6 +3123,19 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
+/// Whether the slot's model runs on Sushi Cooler, where a request reserved its last row.
+fn coolerSlot(slot: *const Slot) bool {
+    const config = slot.model.config orelse return false;
+    return @import("cooler_side.zig").onEngine(config);
+}
+
+/// A Sushi Cooler request reserved its last row, and a hot-cache entry bills the capacity of its buffers: the cache is cut
+/// to the rows it holds before it is committed (`KVCache.shrinkToRows`, priced by `bills.commitTrimBytes`).
+fn shrinkForCommit(slot: *Slot) !void {
+    if (!coolerSlot(slot)) return;
+    try slot.cache.shrinkToRows(arch_handle.trunk(slot.model.handle.?).s);
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -3158,6 +3171,10 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
     sched.prepareCommit(slot) catch |err| {
         log.warn("[hot-cache] {s} failed: {s} — not committed\n", .{ sched.prepareCommitLabel(slot), mlx.settledErrorName(err) });
+        return;
+    };
+    shrinkForCommit(slot) catch |err| {
+        log.warn("[hot-cache] cutting the cache to its rows failed: {s} — not committed\n", .{mlx.settledErrorName(err)});
         return;
     };
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
@@ -3218,6 +3235,10 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         if (committed == 0) break :blk null;
         mc.truncate(committed, arch_handle.trunk(slot.model.handle.?).s) catch |err| {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{mlx.settledErrorName(err)});
+            break :blk null;
+        };
+        if (coolerSlot(slot)) if (mc.kv()) |head_kv| head_kv.shrinkToRows(arch_handle.trunk(slot.model.handle.?).s) catch |err| {
+            log.warn("[hot-cache] cutting the mtp history to its rows failed: {s} — not committed\n", .{mlx.settledErrorName(err)});
             break :blk null;
         };
         // An in-checkpoint head commits its own half beside the KV.
@@ -3297,6 +3318,10 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     };
     const cps: ?[]trunk.SSMCheckpoint = if (salvage.checkpoints.len > 0) salvage.checkpoints else null;
     sched.prepareCommit(slot) catch return;
+    shrinkForCommit(slot) catch |err| {
+        log.warn("[hot-cache] cutting the cache to its rows failed: {s} — not committed\n", .{mlx.settledErrorName(err)});
+        return;
+    };
     // Pass the media boundary RAW: when the cancelled prefill forwarded less
     // than the media position, the cache re-keys the pure-text entry to the
     // null vision key (a kept pixel key with no boundary is the
@@ -3406,7 +3431,11 @@ const InterleaveCtx = struct {
     chunk_sw: io_util.Stopwatch,
     decode_ns: u64 = 0,
     ticks: u32 = 0,
+    chunks_seen: u32 = 0,
 };
+
+/// Test builds: the slot being prefilled is cancelled once this many of its chunks have run, so the cancel lands between two chunks.
+pub var cancel_after_chunks_for_test: ?u32 = null;
 
 /// SSD-first write-through: persist each completed prefill chunk as the prefill produces it,
 /// so a cancelled or killed prefill leaves a restorable chunk-aligned prefix. Armed only with
@@ -3550,6 +3579,10 @@ fn waitPassesOut(io: std.Io, mu: *std.Io.Mutex, in_pass: *std.atomic.Value(u32))
 
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    ic.chunks_seen += 1;
+    if (comptime @import("builtin").is_test) if (cancel_after_chunks_for_test) |n| {
+        if (ic.chunks_seen == n) ic.slot.cancelled.store(true, .release);
+    };
     if (ic.ticks == 0) {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
