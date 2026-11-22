@@ -1260,70 +1260,6 @@ structural item left: tiling the rate-group, PLE or head rows inside a chunk wou
 boot-per-arm measurement ([measurement](process-measurement.md)).
 
 
-## M1 Max 64 GB: what a long-context tool call's prefill actually costs (2026-11-20)
-
-A report of "prefill drops to half as the context grows, and decode swings from crawling to fast from tool call to
-tool call" on the served STQ 2.75bpw pack. Measured against a live 1.7.0 server, `~/.sushi/serve-max.sh`'s recipe
-(kv8, `--qwen-gdn 16`, MTP depth pinned 2..2, `--ctx-size 250000 --max-tokens 32000 --prefix-cache-disk 40GB
---prefix-cache-entries 4 --max-concurrent 4`), cold prompts of random words on `/v1/completions`, `timings` per
-request plus the server log's restore/queue lines. The box is shared with the reporting agent, so cells carry
-contention where noted; nothing here is one-boot-per-arm.
-
-**Cold prefill compute is barely context-dependent.** 4,026 tokens 315.5 tok/s, 16,986 304.0, 34,430 270.1
-(-14% with 8.5x the context; the chunk stayed 4096 and no `[prefill] width` step fired below 150k). The
-mirror of the M5 Max profile (a 4096-row chunk 1,931 ms at 20k, 2,116 at 127k, +9.6%).
-
-**What collapses is the per-turn work around the prefill**: for a 150k-token session each tool call pays a prefix
-restore and an admission wait, and a request's reported `prompt_per_second` divides only the NEW tokens by
-`prompt_ms`, so both land in it.
-
-- Restore, quiet box: 0.74-0.90 s at 159k tokens (4.7-6.0 ms per 1k), 0.12 s at 14k. Linear, and 8-15x the
-  cas-layer fix's 65 ms per 32.7k read on the same class of path ([cas-restore-read](#cas-restore-read)).
-- Restore, contended: 2.4-4.6 s at the same 150-170k prefixes (20-28 ms per 1k). Identical prefixes read 815 ms
-  and 3,336 ms apart: the restore is inference-thread work and waits behind whatever that thread is doing.
-- Admission wait: a held request starts only when memory frees, and a live 150k-token request holds its KV plus
-  its chunk. The current boot logged `[queue] started after 86.5 s` (a 154,957-token prompt) and `303.1 s`
-  (`[admission] held: 154957 tokens need ~5477MB, ~6180MB available beside live requests`).
-- Per-turn at 150k: restore 0.7-0.9 s + prefill 0.3-0.6 s + decode. Reported prefill falls from ~250 tok/s at
-  30k to 8-60 tok/s at 150k+, which is the restore and the wait, not the prefill.
-
-**Per-token decode is flat with context.** The MTP cost table's own w2 samples: 22.8 ms/token at 16-32k, 24.6 at
-128-256k; `one_ms_tok` 24-32 ms at every band. Solo decode 33.3 tok/s median (p10 30.1, p90 39.4, n=98 requests
-with under 15% idle) - the 1.3x spread is acceptance (`per_draft_pct` 62-82%), not context. Under contention the
-same requests read 16.7-19.8 tok/s, and `[spec-stats]` reports `max_gap_ms` up to 13.1 s: a decoder waits for
-another request's whole prefill chunk, then gets its owed ticks in one burst at the boundary (the share never
-narrows a chunk, [server-lifecycle](server-lifecycle.md)).
-
-**Where the bill goes (measured, not derived).** `--log-level debug` now prints `[bill] prefill seq=… fwd=… kv=…
-gross=…` from `prefillMemoryNeeded`, so the terms are read instead of re-derived. Served recipe, STQ 2.75bpw, one
-in-process `sushi bench --code-only --rungs 32k,128k`:
-
-| bill | seq | fwd | envelope | dq-GEMM | dequant | KV | state | ckpt | MTP KV | gross |
-|---|---|---|---|---|---|---|---|---|---|---|
-| one chunk | 4,096 | 4,096 | **1,522 MB** | 103 MB | 8 MB | 0 | 0 | 0 | 0 | **1,630 MB** |
-| request | 155k, cold | 4,096 | 1,522 MB | 103 MB | ~500 MB | 1,900 MB | 410 MB | **898 MB** | 260 MB | ~5,500 MB |
-
-- The chunk is 93% the Cooler rows: 389 KB/row, the peak over kinds being the MTP head's row (274 KB, where
-  `--mtp` runs it over the chunk), the PLE's 195 KB, the rate-grouped MoE's 192 KB, the GDN's 90 KB and the
-  attention layer's 75 KB, plus the trunk's 46 KB and the down GEMM's 64 KB in flight. It does not grow with kv.
-- The request's 5552 MB is what `[admission] held: 154957 tokens need ~5477MB` compared: KV at 12,288 B/token,
-  the linear state at 2.7 KB/token, the MTP head's KV, the packed-cache dequant, the chunk, and 256 MB margin.
-- **Correction to the step-down line above**: the `cost(2048 rows) = 3851 MB` log line came from an MLX-side boot
-  (its envelope is `3 × MLP` plus the 512 MB floor and the mask billed at 5/4), not from the served Cooler engine.
-  On Cooler the same chunk bills 1,630 MB and the width stays 4096 at 155k. Read `[bill]` before blaming a width.
-- Two such requests do not fit in the ~11 GB the box can reach (48.0 GB of weights wired of 64 GB, 3-5 GB
-  reclaimable), so one waits for the other to FINISH - the 86-303 s `[queue]` waits.
-
-Levers, and what each costs: `--ssm-checkpoint-max` (16 -> 4 drops the 898 MB of retained checkpoints a cold
-155k prefill holds to 224 MB (measured, arm B: `ckpt=235339776`), and the tier's stored restore points are untouched - the request bill, and with it
-the serialization, is what moves; launcher 2026-11-20); `--prefill-decode-share` (0.25 -> 0.5 halves a decoder's
-wait during another request's prefill at the same cost to that prefill); `--max-tokens` (32000 -> 8192 removes 24k
-tokens of KV reservation per request, ~0.3 GB); a session kept under ~110k tokens (bills 40% smaller, restore ~0.6 s,
-two requests coexist); `--prefix-cache-mem` (a RAM entry rebinds instead of rehydrating, but it holds the same bytes
-resident, which this box does not have spare). The chunk itself - 93% Cooler rows at 389 KB/row - is the only
-structural item left: tiling the rate-group, PLE or head rows inside a chunk would shrink it, and it needs a
-boot-per-arm measurement ([measurement](process-measurement.md)).
-
 ## M1 Max 64 GB: the depth-2 pin survives 1.7, and a decoder waits a whole chunk (2026-11-20)
 
 The same pack and recipe as the section above, re-measured with a hill-climb harness instead of single-boot A/B
@@ -1425,3 +1361,35 @@ Two measurement rules this campaign learned the hard way, worth keeping next to 
   absolute ms are not.
 - **A served cell is void when a same-window greedy control also moved.** The earlier 25.8 tok/s "sampled collapse"
   and 189 tok/s "chunk-2048 prefill" were both that: their temp-0 controls read 25 and 270 in the same window.
+
+## M1 Max 64 GB: the kernel budget of a verify round, and what the ceiling is made of (2026-11-22)
+
+Hardware: `applegpu_g13s`, 32-core GPU, no MPP. Pack: Sushi-STQ-2.75bpw (spec1 w15, kv8), MTP pinned at depth 2.
+Measured with the engine's own switches, no profiler: `SUSHI_LAYER_CAP=24` against 48 (a graph ablation, so nothing
+is instrumented), the forward meter (`SUSHI_DECODE_FWD_UBENCH`), `shared.exl3_trunk_launches` and
+`shared.exl3_grouped_decode` arms interleaved in one process, and static AGX from `metal-profile`.
+
+Per layer, from the layer-cap slope: **565 us at one row, 947 us at three, 1299 at four**; the intercept (embed, PLE,
+lm_head, final norm) is 3.1 / 5.6 ms. The 3-row verify forward is 51 ms of GPU:
+
+| block | per layer | per forward | the bound it sits on |
+|---|---:|---:|---|
+| MoE experts, rate-grouped prepared chain (5 launches) | ~306 us | 14.7 ms | the issue rate |
+| trunk linears (7 launches) | ~240-272 us | 12-13 ms | 1.85-1.9x its own streaming floor |
+| residual: attention core, GDN verify, fused HC read, router, norms | ~390 us | ~18 ms | 3.1 us of each launch is ramp |
+| fixed: embed, PLE, lm_head, final norm | — | 5.6 ms | lm_head at 354 GB/s |
+
+- **The expert chain is at the machine's issue rate, not the byte roof.** 147M weight-rows a layer at ~2.8
+  instructions a weight reads 306 us at ~1 instruction a lane-cycle (1024 lanes, 1.295 GHz). Static AGX on the pair
+  GEMV: 634 instructions, 47 live GPRs, 100% occupancy, no `stack_load`/`stack_store`/`StackAdjust`, SCIB 57% / F32
+  20%; the 64-bit window shift is already a `breif` with the window mask folded in.
+- **The trunk at verify width is work-bound, not byte-bound**: `gdn_qkvz` reads 162.6 us against an 87.8 us streaming
+  floor (193 GB/s of a measured ~310) at 3 rows, and 110.7 against 88.5 at one. The decode amortizes over the rows,
+  the per-row FMA does not.
+- **A launch costs 3.1 us of GPU time**, ramp included: `SUSHI_DISPATCH_PROBE=8` (eight injected elementwise kernels a
+  MoE layer, +384 a forward) moved GPU busy 50.31 -> 51.51 ms. The 1779-dispatch forward therefore carries ~5.5 ms of
+  launch cost, ~3.7 ms of it outside the MoE and trunk lines.
+- The memory ceiling (111 tok/s at 3.2 GB/token) would need ~3.4x fewer instructions a weight. That is the matrix-unit
+  route (M1 has `simdgroup_matrix`, no MPP, and a 3-row fragment is 3/8 filled) or a lower-bit format; both change
+  output and neither is attempted here. The served c1 of 45.2-46.2 tok/s is within ~2% of what this algorithm's issue
+  rate allows on this GPU.
