@@ -7,6 +7,7 @@ const qwen4_exp = @import("qwen4_exp.zig");
 const qwen4_qsa_attn = @import("qwen4_qsa_attn.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const qwen4_gdn = @import("qwen4_gdn.zig");
+const attn_kernels = @import("../attn_kernels.zig");
 
 // Hooks: bills.zig reaches these through the arch's `bill` declaration; a hook returns null where it has no say.
 
@@ -76,7 +77,7 @@ pub fn coolerPrefillRows(config: *const model_mod.ModelConfig) PrefillRows {
         .attn = 2 * query * 2 + 4 * query * 2 + 2 * @as(u64, config.head_dim) * 2,
         .moe = bills.rateGroupedPrefillBytesPerRow(config),
         .ple = if (config.ple_layer_idx >= 0) 9 * stream + hidden * 2 + @as(u64, config.ple_embed_dim) * 2 else 0,
-        .mtp = if (bills.mtpHeadDefaultOn(config)) bills.rateGroupedPrefillBytesPerRow(config) + 4 * stream else 0,
+        .mtp = if (bills.mtpHeadDefaultOn(config)) bills.rateGroupedPrefillBytesPerRow(config) + headStreamRowBytes(config) else 0,
         .trunk = stream + 5 * hidden * 2,
         .inflight = @as(u64, @max(config.num_experts_per_tok, 1)) * (hidden + @as(u64, config.moe_intermediate_size)) * 2,
     };
@@ -99,7 +100,7 @@ pub fn coolerPrefillDecodeSiteRowBytes(config: *const model_mod.ModelConfig) ?u6
     const hidden: u64 = config.hidden_size;
     const top_k: u64 = @max(config.num_experts_per_tok, 1);
     const shared = 3 * @as(u64, config.shared_expert_intermediate_size) * 2 + 2 * hidden * 2 + @as(u64, config.num_experts) * 4 + top_k * 8;
-    const head = if (bills.mtpHeadDefaultOn(config)) 4 * @as(u64, config.hc_count) * hidden * 2 + @max(r.attn, shared) else 0;
+    const head = if (bills.mtpHeadDefaultOn(config)) headStreamRowBytes(config) + @max(r.attn, shared) else 0;
     return @max(@max(@max(r.gdn, r.attn), @max(r.ple, shared)), head) + r.trunk + r.inflight;
 }
 
@@ -110,6 +111,38 @@ pub fn coolerPrefillAttnRowBytes(config: *const model_mod.ModelConfig) ?u64 {
     const r = coolerPrefillRows(config);
     const blocks: u64 = if (config.indexer_compress_ratio > 0) @as(u64, config.indexer_budget) / config.indexer_compress_ratio * 4 else 0;
     return r.attn + r.trunk + r.inflight + blocks;
+}
+
+/// The rows held beside the MTP head's attention layer's dense KV rebuild, for a forward of `fwd` rows over `keys`. The head
+/// attends under the bool mask (the trunk gathers its selected blocks): the layer's rows at their dearest moment
+/// (`attnKernelRowBytes`), the trunk's, the planes in flight and the head's four stream-wide rows. Null where no head runs.
+pub fn coolerPrefillHeadAttnRowBytes(config: *const model_mod.ModelConfig, fwd: u64, keys: u64) ?u64 {
+    if (bills.rateGroupedPrefillBytesPerRow(config) == 0 or !bills.mtpHeadDefaultOn(config)) return null;
+    const r = coolerPrefillRows(config);
+    return attnKernelRowBytes(config, fwd, keys) + r.trunk + r.inflight + headStreamRowBytes(config);
+}
+
+/// What the head's attention layer holds a row while its fused causal attention runs (`attn_kernels.attnPdDispatch`): the gated
+/// query projection, the key and value projections and the roped query and key, the rope's angle rows, and the kernel's
+/// output. The keys split into dispatches of `fused256KvChunkLen`, the f32 accumulator carried from one to the next: a
+/// first or last dispatch holds one of them (the last beside its bf16 output), a middle one the accumulator it reads and
+/// the one it writes.
+fn attnKernelRowBytes(config: *const model_mod.ModelConfig, fwd: u64, keys: u64) u64 {
+    const heads: u64 = config.num_attention_heads;
+    const hd: u64 = config.head_dim;
+    const query = heads * hd * 2;
+    const kv = @as(u64, config.num_key_value_heads) * hd * 2;
+    const chunk: u64 = @intCast(attn_kernels.fused256KvChunkLen(1, @intCast(heads), @intCast(fwd), @intCast(keys), attn_kernels.fused256DispatchBudget(.simd)));
+    const dispatches = (keys + chunk - 1) / @max(chunk, 1);
+    const f32_plane = heads * hd * 4;
+    const out: u64 = if (dispatches >= 3) 2 * f32_plane else if (dispatches == 2) f32_plane + query else query;
+    return 2 * query + 3 * kv + query + out + 2 * hd * 2;
+}
+
+/// The MTP head's four stream-wide rows (its history row, its projection, the gated mix and the hc write), held through
+/// its forward's layers.
+fn headStreamRowBytes(config: *const model_mod.ModelConfig) u64 {
+    return 4 * @as(u64, config.hc_count) * config.hidden_size * 2;
 }
 
 /// The rows held where a full-attention layer selects its QSA blocks: the trunk's alone.

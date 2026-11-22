@@ -381,7 +381,13 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   moments past the rows' peak (`forwardMomentsBilled`): the weight beside its matmul's rows
   (`coolerPrefillDecodeSiteRowBytes`), the rebuild beside the attention rows (`coolerPrefillAttnRowBytes`) with the
   packed half the engine's dequantize copies contiguous (`kvRebuildPeakBytes`, 38 MB of codes at 78k keys, kv8), and
-  the rebuild beside o_proj's decoded weight, which runs before the view is released. The contract
+  the rebuild beside o_proj's decoded weight, which runs before the view is released. The MTP head's own attention layer
+  is one more moment, billed where the request runs the head (`coolerPrefillHeadAttnRowBytes`): it attends under the
+  bool mask of its selection (a byte a row and key) over a dense cache, and its fused attention carries the f32
+  accumulator between key dispatches (`fused256KvChunkLen`), the one it reads beside the one it writes from the third
+  dispatch on, so its rows exceed the trunk's (which gathers its blocks) once rows x keys pass about 20.8M (4,564 rows
+  on the tiny pack's one 8,192-row chunk), and the head's four stream-wide rows sit beside them. The load's sizer prices
+  the trunk's chunk alone. The contract
   cell `an exact Cooler prefill bill is what each kind of layer asks...` holds each kind's cost within one
   `BILL_MARGIN_BYTES` of what it asks, either way past the in-flight plane and what those moments add (the weight held at
   its own matmul, never at a chunk's peak: the stq4 cut's 8,192-row attention chunk asks 1,933,856 KB with and without

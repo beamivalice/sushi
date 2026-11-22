@@ -625,8 +625,9 @@ test "cooler contract: a Cooler request's bill is its larger phase, the prefill'
         last_kv = @intCast(li);
     };
     var over: usize = 0;
-    // A reply that regrows the cache from a prompt under the reservation, a short prompt, and a long one with a short reply.
-    for ([_]bool{ false, true }) |spec| for ([_]struct { len: usize, n: u32 }{ .{ .len = 1000, .n = 1500 }, .{ .len = 40, .n = 1200 }, .{ .len = 3000, .n = 64 } }) |req| {
+    // A reply that regrows the cache from a prompt under the reservation, a short prompt, a long one with a short reply, and one so
+    // long that the MTP head's attention layer, under its selection's mask, is the pool's fullest moment.
+    for ([_]bool{ false, true }) |spec| for ([_]struct { len: usize, n: u32 }{ .{ .len = 1000, .n = 1500 }, .{ .len = 40, .n = 1200 }, .{ .len = 3000, .n = 64 }, .{ .len = 6000, .n = 64 } }) |req| {
         const prompt = try a.alloc(u32, req.len);
         defer a.free(prompt);
         for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];

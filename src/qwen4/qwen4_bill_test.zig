@@ -2395,7 +2395,7 @@ test "on Sushi Cooler a speculative request's decode phase holds its round's den
         const phases = bills.requestPhasesFor(&cfg, req.seq, req.n, 8, chunk, warm);
         const kv_end = trunk.KVCache.requestEnd(req.seq, req.n, getEffectiveContextLength(&cfg), bills.speculativeRowsPastEnd(&cfg, warm));
         // What a verify block holds past its rows at the layer that rebuilds the dense KV, at the request's last keys.
-        const rebuild = bills.forwardMomentsBilled(&cfg, 8, rows, kv_end);
+        const rebuild = bills.forwardMomentsBilled(&cfg, 8, rows, kv_end, true);
         try t.expect(rebuild > 0);
         try t.expect(terms.round_bytes > 0);
         const common = req.seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + terms.reserved_kv_bytes + terms.state_bytes + terms.checkpoint_bytes +

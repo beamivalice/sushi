@@ -917,7 +917,8 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        forwardMomentsBilled(config, kv_bits, @min(chunk, @max(seq, 1)), seq) +
+        // The load's sizer prices the trunk's chunk alone, whatever requests later run the head.
+        forwardMomentsBilled(config, kv_bits, @min(chunk, @max(seq, 1)), seq, false) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }
@@ -1065,8 +1066,9 @@ fn pastRowsPeak(config: *const model_mod.ModelConfig, fwd: u64, site: ?u64, byte
 /// full-attention layer's dense KV rebuild lives through that layer (`coolerPrefillAttnRowBytes`): beside the packed
 /// half it is dequantizing (`kvRebuildPeakBytes`), and beside o_proj's decoded weight, as o_proj runs before the view is
 /// released. On an exact Cooler bill that is the largest of these moments past the rows' peak; elsewhere the weight
-/// whole, and the rebuild in `prefillMemoryNeeded`'s terms.
-pub fn forwardMomentsBilled(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, seq: u64) u64 {
+/// whole, and the rebuild in `prefillMemoryNeeded`'s terms. `head`: the request runs the MTP head, whose own attention layer
+/// is one more such moment (`coolerPrefillHeadAttnRowBytes`).
+pub fn forwardMomentsBilled(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, seq: u64, head: bool) u64 {
     const weight = trunkDecodeScratchBytes(config, fwd);
     const rows = coolerPrefillRowBytes(config);
     if (rows == 0) return weight;
@@ -1076,6 +1078,15 @@ pub fn forwardMomentsBilled(config: *const model_mod.ModelConfig, kv_bits: u64, 
     if (dense > 0) {
         const at_attn = fwd *| (archHook("coolerPrefillAttnRowBytes", u64, config, .{}) orelse rows);
         top = @max(top, at_attn +| @max(kvRebuildPeakBytes(config, kv_bits, seq, fwd), dense +| weight));
+    }
+    // The MTP head's attention layer attends under the bool mask of its selection (a byte a row and key), over its own cache,
+    // which rebuilds nothing where it is dense.
+    if (head) {
+        if (archHook("coolerPrefillHeadAttnRowBytes", u64, config, .{ fwd, seq })) |head_row| {
+            const head_bits = archHook("headKvBits", u64, config, .{}) orelse defaultKvBits(config);
+            const rebuild = if (head_bits >= 16) 0 else @max(kvRebuildPeakBytes(config, head_bits, seq, fwd), kvRebuildDenseBytes(config, seq, fwd) +| weight);
+            top = @max(top, fwd *| head_row +| fwd *| seq +| rebuild);
+        }
     }
     return top -| fwd *| rows;
 }
@@ -2939,9 +2950,9 @@ pub fn requestPhasesFor(
     // A decode forward: the verify block's rows where the request speculates, else one.
     const rows = decodeForwardRows(config, warm);
     return requestPhases(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, fwd, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), terms, .{
-        .prefill = forwardWidthBytes(config, kv_bits, fwd, seq),
+        .prefill = forwardWidthBytes(config, kv_bits, fwd, seq, headBilled(config, warm)),
         // The round's own mask is in `round_bytes`.
-        .decode = forwardWidthBytes(config, kv_bits, rows, terms.decode_keys) -| (if (terms.round_bytes > 0) qsaMaskBilled(config, rows, terms.decode_keys) else 0),
+        .decode = forwardWidthBytes(config, kv_bits, rows, terms.decode_keys, headBilled(config, warm)) -| (if (terms.round_bytes > 0) qsaMaskBilled(config, rows, terms.decode_keys) else 0),
         .both = (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
             cadenceInflightBytes(mlx_mb_per_buffer),
     });
@@ -2950,11 +2961,11 @@ pub fn requestPhasesFor(
 /// What a forward of `fwd` rows over `keys` holds past `prefillMemoryNeeded`'s terms: the QSA select's mask, a ringed arch's
 /// band sheet, the FP8 and trellis weight copies and the forward's moments (the dense KV rebuild among them on Cooler).
 /// The prefill chunk and the decode step are priced by it alike.
-fn forwardWidthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, keys: u64) u64 {
+fn forwardWidthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, keys: u64, head: bool) u64 {
     return qsaMaskBilled(config, fwd, keys) +
         slidingBandScoreBytes(config, fwd) +
         fp8DequantScratchBytes(config, fwd) +
-        forwardMomentsBilled(config, kv_bits, fwd, keys);
+        forwardMomentsBilled(config, kv_bits, fwd, keys, head);
 }
 
 /// The rows a decode step's forward carries: a speculative round's verify block, else one.
