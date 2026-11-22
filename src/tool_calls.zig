@@ -280,8 +280,8 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
                         from = past;
                         continue;
                     }
-                    if (jsonBodyStringOpenAt(hay, found)) {
-                        from = found + 1;
+                    if (jsonBodyStringEnd(hay, found)) |past| {
+                        from = @min(past, hay.len);
                         continue;
                     }
                     close_rel = found;
@@ -308,8 +308,8 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
                             cpos = past;
                             continue;
                         }
-                        if (jsonBodyStringOpenAt(hay, open_at)) {
-                            cpos = open_at + "</tool".len;
+                        if (jsonBodyStringEnd(hay, open_at)) |past| {
+                            cpos = @min(past, hay.len);
                             continue;
                         }
                         close_rel = open_at;
@@ -2670,13 +2670,6 @@ pub const ValueSpans = enum {
 /// The end of a value that never ends: the text stops inside it.
 pub const never = std.math.maxInt(usize);
 
-/// Whether the closer at `at` stands inside a parameter value of the call that opens at `from`: a value opened before
-/// it has not ended, as the parser ends it (`hermesValueEnd`, `dsmlParamClose`, `argValueClose`, `miniCpm5FindCloseTag`,
-/// a JSON string's quote). A value the generation cut has no end, so it is open.
-pub fn closerInsideValue(spans: ValueSpans, text: []const u8, from: usize, at: usize) bool {
-    return closerValueEnd(spans, text, from, at) != null;
-}
-
 /// Where the value the closer at `at` stands inside ends (`never` when the text stops inside it), or null when the closer
 /// is outside every value. Every closer before that end stands inside the same value, so a reader asks once per value.
 pub fn closerValueEnd(spans: ValueSpans, text: []const u8, from: usize, at: usize) ?usize {
@@ -2696,41 +2689,50 @@ pub fn closerValueEnd(spans: ValueSpans, text: []const u8, from: usize, at: usiz
     };
 }
 
-/// Whether the closer at `at` of the Gemma call that starts at `from` stands in a `<|"|>` string. A model that drops one
-/// delimiter flips every string after it, so arguments that end in their own `}` with no delimiter after the closer
-/// are a finished call; a value that spells `}` before a closer is told by the delimiter that still follows it.
+/// Where the `<|"|>` string the closer at `at` of the Gemma call that starts at `from` stands in ends (`never` when the text
+/// stops inside it), or null when it stands in none. Judged from the bytes before `at` only. A model that drops one
+/// delimiter flips every string after it, so arguments whose braces close before the closer are a finished call.
 fn gemmaStringEnd(text: []const u8, from: usize, at: usize) ?usize {
     const before = text[from..at];
     if (std.mem.count(u8, before, "<|\"|>") % 2 == 0) return null;
-    const ends_arguments = std.mem.endsWith(u8, std.mem.trimEnd(u8, before, " \t\r\n"), "}");
-    const next = std.mem.indexOfPos(u8, text, at, "<|\"|>");
-    return if (ends_arguments and next == null) null else next orelse never;
+    if (bracesCloseObject(std.mem.trim(u8, before, " \t\r\n"))) return null;
+    return std.mem.indexOfPos(u8, text, at, "<|\"|>") orelse never;
 }
 
 /// Where the Gemma call whose body starts at `from` ends, relative to `from`: its first `<tool_call|>` outside every
-/// `<|"|>` string, the one rule `closerInsideValue` reads. Null when the text stops before it.
+/// `<|"|>` string, the one rule `closerValueEnd` reads. Null when the text stops before it.
 fn gemmaCloserOutsideValue(text: []const u8, from: usize) ?usize {
     var p = from;
-    while (std.mem.indexOfPos(u8, text, p, "<tool_call|>")) |at| : (p = at + 1) {
-        if (!closerInsideValue(.gemma, text, from, at)) return at - from;
+    while (std.mem.indexOfPos(u8, text, p, "<tool_call|>")) |at| {
+        p = @min(closerValueEnd(.gemma, text, from, at) orelse return at - from, text.len);
     }
     return null;
 }
 
-/// Whether `at` falls inside a string of the JSON object `body` opens with. A model that mangles a quote (a key with no
-/// opening one) flips every string after it, so text that ends in the object's own `}` with no quote after `at` is a
-/// finished object whatever the quotes count; a string that spells `}` before a closer is told by the quote that follows.
-fn jsonBodyStringOpenAt(body: []const u8, at: usize) bool {
-    return jsonBodyStringEnd(body, at) != null;
-}
-
-/// Where the string `at` falls in ends (just past its closing quote; `never` for a string the text stops inside), or
-/// null when `at` is in none.
+/// Where the string of the JSON object `body` opens with that `at` falls in ends (just past its closing quote; `never` for
+/// a string the text stops inside), or null when `at` is in none. Judged from the bytes before `at` only, so a longer text
+/// never turns an end into a value: a model that mangles a quote flips every string after it, so text before `at` that is
+/// the object's own closed braces is a finished object whatever the quotes count (`bracesCloseObject`).
 fn jsonBodyStringEnd(body: []const u8, at: usize) ?usize {
     const trimmed = std.mem.trimStart(u8, body[0..at], " \t\r\n");
     if (!std.mem.startsWith(u8, trimmed, "{")) return null;
-    if (std.mem.endsWith(u8, std.mem.trimEnd(u8, trimmed, " \t\r\n"), "}") and std.mem.indexOfScalarPos(u8, body, at, '"') == null) return null;
-    return jsonStringEnd(body, at - trimmed.len, at);
+    const end = jsonStringEnd(body, at - trimmed.len, at) orelse return null;
+    return if (bracesCloseObject(std.mem.trimEnd(u8, trimmed, " \t\r\n"))) null else end;
+}
+
+/// Whether `text` counts braces, whatever the quotes say, down to the first object's own `}` at its very end.
+fn bracesCloseObject(text: []const u8) bool {
+    var depth: usize = 0;
+    for (text, 0..) |c, i| switch (c) {
+        '{' => depth += 1,
+        '}' => {
+            if (depth == 0) return false;
+            depth -= 1;
+            if (depth == 0) return i + 1 == text.len;
+        },
+        else => {},
+    };
+    return false;
 }
 
 /// Where the JSON string the text from `start` leaves open at `at` ends, or null when none is open there.
@@ -5761,4 +5763,65 @@ test "chat: an added token's text in a user, system or tool message is text on t
         defer a.free(ids);
         try testing.expectEqual(@as(usize, 0), countId(ids, id));
     }
+}
+
+test "r174-f-closer-monotone: a closer judged outside every value stays outside as the text grows, in every dialect's value reader" {
+    // A thought a stream latched at one length must be the one the whole reply reads: a verdict that later bytes flip is not a verdict.
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    // `grammar`: the family ends a value by the parameter close the call's closers follow, a lookahead its docs name, so a close
+    // right after the closers makes them the value's own bytes.
+    const Probe = struct { name: []const u8, spans: ValueSpans, text: []const u8, from: usize = 0, grammar: bool = false };
+    const probes = [_]Probe{
+        .{ .name = "json mangled quote", .spans = .wrapper, .text = "<tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v}}</tool_call> done</think>answer \"q" },
+        .{ .name = "json whole", .spans = .wrapper, .text = "<tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v\"}}</tool_call> after \"x\"" },
+        .{ .name = "json value spells }", .spans = .wrapper, .text = "<tool_call>{\"name\":\"w\",\"arguments\":{\"c\":\"x = {}</tool_call> y\"}}</tool_call> z \"q" },
+        .{ .name = "json value spells its closer", .spans = .wrapper, .text = "<tool_call>{\"name\":\"w\",\"arguments\":{\"c\":\"a </tool_call> b\"}}</tool_call> z \"q" },
+        .{ .name = "gemma whole", .spans = .gemma, .from = 12, .text = "<|tool_call>call:w{c:<|\"|>a<|\"|>}<tool_call|> t <|\"|>" },
+        .{ .name = "gemma mangled delimiter", .spans = .gemma, .from = 12, .text = "<|tool_call>call:w{c:a<|\"|>}<tool_call|> x<|\"|>" },
+        .{ .name = "gemma value spells }", .spans = .gemma, .from = 12, .text = "<|tool_call>call:w{c:<|\"|>f() {}<tool_call|> tail<|\"|>}<tool_call|> u<|\"|>" },
+        .{ .name = "hermes whole", .spans = .wrapper, .text = "<tool_call>\n<function=f>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call>\nthen </parameter>" },
+        .{ .name = "hermes value spells its closer", .spans = .wrapper, .text = "<tool_call>\n<function=f>\n<parameter=k>\na </tool_call> b\n</parameter>\n</function>\n</tool_call> then </parameter>" },
+        .{ .name = "arg_value whole", .spans = .wrapper, .text = "<tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call> x </arg_value>" },
+        .{ .name = "arg_value value spells its closer", .spans = .wrapper, .text = "<tool_call>f<arg_key>k</arg_key><arg_value>a </tool_call> b</arg_value></tool_call> x </arg_value>" },
+        .{ .name = "dsml whole", .spans = .dsml, .text = "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"f\">\n<" ++ dsml ++ "parameter name=\"k\" string=\"true\">v</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls> t </" ++ dsml ++ "parameter>" },
+        .{ .name = "dsml value spells its closer", .spans = .dsml, .text = "<" ++ dsml ++ "invoke name=\"f\"><" ++ dsml ++ "parameter name=\"k\" string=\"true\">a </" ++ dsml ++ "invoke> b</" ++ dsml ++ "parameter></" ++ dsml ++ "invoke> t </" ++ dsml ++ "parameter>" },
+        .{ .name = "invoke whole", .spans = .invoke, .text = "<function_calls>\n<invoke name=\"f\">\n<parameter name=\"k\">v</parameter>\n</invoke>\n</function_calls> t </parameter>" },
+        .{ .name = "invoke value spells its closer", .spans = .invoke, .text = "<invoke name=\"f\"><parameter name=\"k\">a </invoke> b</parameter></invoke> t </parameter>" },
+        .{ .name = "function_tag hermes", .spans = .function_tag, .text = "<function=f>\n<parameter=k>\nv\n</parameter>\n</function> t </parameter>" },
+        .{ .name = "function_tag minicpm5", .spans = .function_tag, .text = "<function name=\"f\"><param name=\"k\">v</param></function> t </param>" },
+        // A parameter close right after the call's own closers.
+        .{ .name = "hermes close follows the closers", .spans = .wrapper, .text = "<tool_call>\n<function=f>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call></parameter>", .grammar = true },
+        .{ .name = "arg_value close follows the closers", .spans = .wrapper, .text = "<tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call></arg_value>", .grammar = true },
+        .{ .name = "dsml close follows the closers", .spans = .dsml, .text = "<" ++ dsml ++ "invoke name=\"f\"><" ++ dsml ++ "parameter name=\"k\" string=\"true\">v</" ++ dsml ++ "parameter></" ++ dsml ++ "invoke></" ++ dsml ++ "parameter>", .grammar = true },
+        .{ .name = "invoke close follows the closers", .spans = .invoke, .text = "<invoke name=\"f\"><parameter name=\"k\">v</parameter></invoke></parameter>" },
+        .{ .name = "function_tag hermes close follows the closers", .spans = .function_tag, .text = "<function=f>\n<parameter=k>\nv\n</parameter>\n</function></parameter>", .grammar = true },
+        .{ .name = "function_tag minicpm5 close follows the closer", .spans = .function_tag, .text = "<function name=\"f\"><param name=\"k\">v</param></function></param>" },
+        .{ .name = "function_tag minicpm5 value spells its closer", .spans = .function_tag, .text = "<function name=\"f\"><param name=\"k\">a </function> b</param></function> t </param>" },
+    };
+    const closers = [_][]const u8{ "</tool_call>", "</tool>", "</function>", "<tool_call|>", "</invoke>", "</" ++ dsml ++ "invoke>", "</" ++ dsml ++ "tool_calls>" };
+    var bad: usize = 0;
+    for (probes) |p| for (closers) |c| {
+        var from: usize = 0;
+        while (std.mem.indexOfPos(u8, p.text, from, c)) |at| : (from = at + 1) {
+            var outside_at: ?usize = null;
+            var flipped = false;
+            for (at + c.len..p.text.len + 1) |n| {
+                const outside = closerValueEnd(p.spans, p.text[0..n], p.from, at) == null;
+                if (outside and outside_at == null) outside_at = n;
+                if (outside_at) |first| if (!outside and !flipped) {
+                    flipped = true;
+                    if (!p.grammar) {
+                        bad += 1;
+                        std.debug.print("{s}: the closer at {d} is outside at length {d} and inside at {d}\n", .{ p.name, at, first, n });
+                    }
+                };
+            }
+            // A grammar probe holds closers the family's own lookahead turns into value bytes: only those flip.
+            if (p.grammar and outside_at != null and !flipped) {
+                bad += 1;
+                std.debug.print("{s}: the closer at {d} no longer reads as the value's own bytes once the close follows\n", .{ p.name, at });
+            }
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), bad);
 }

@@ -4475,3 +4475,40 @@ test "format corpus: every tool a Responses client declares is served to the mod
         try testing.expectEqual(want, listed.value.array.items.len);
     }
 }
+
+test "r174-f-closer-monotone: a thought that spells a mangled call's closer reads the same at every length, so a stream and the whole reply split it alike" {
+    // A closer is judged by the bytes before it: a quote appended after `</think>` no longer flips the call's end back.
+    const allocator = testing.allocator;
+    const raw = "plan <tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v}}</tool_call> done</think>answer \"q";
+    const want = think_tags.splitThinkBlock(raw, true, true);
+    // The think closer is one token, as every served tokenizer spells it: the boundaries land at 66, 74 and 83 (the quote that flipped it).
+    for ([_]usize{ 1, 2, 7, 1000 }) |step| {
+        const tokens = try tokensOf(allocator, raw, &.{"</think>"}, step);
+        defer allocator.free(tokens);
+        errdefer std.debug.print("\nstep {d}, whole: {?s} | {s}\n", .{ step, want.reasoning_content, want.content });
+        try expectStreamMatchesReply(allocator, raw, tokens, true);
+    }
+    // No prefix is split earlier than the whole reply splits.
+    var scan: think_tags.ThinkScan = .{};
+    for (0..raw.len + 1) |n| {
+        const got = think_tags.streamThinkGateScan(raw[0..n], true, false, true, &scan);
+        if (got != .split_think) continue;
+        errdefer std.debug.print("\nprefix {d} splits; the whole reply's close: {any}\n", .{ n, think_tags.indexOfThinkCloseTag(raw, 0) });
+        try testing.expectEqual(think_tags.indexOfThinkCloseTag(raw, 0).?.pos, think_tags.indexOfThinkCloseTag(raw[0..n], 0).?.pos);
+    }
+}
+
+test "r174-f-closer-monotone: a string value that spells braces before a closer is a finished call only when they close the object" {
+    // `x = {}` leaves the object open, so the closer stays the value's. `}}` closes both objects, which is all the bytes
+    // before the closer can say of a dropped quote; a later quote never rereads it.
+    const open_value = "<tool_call>{\"name\":\"w\",\"arguments\":{\"c\":\"x = {}</tool_call> y</think>\"}}</tool_call>";
+    const closed_value = "<tool_call>{\"name\":\"w\",\"arguments\":{\"c\":\"}}</tool_call> y</think>\"}}</tool_call>";
+    try testing.expectEqual(@as(?think_tags.TagAt, null), think_tags.indexOfThinkCloseTag(open_value, 0));
+    const read = think_tags.indexOfThinkCloseTag(closed_value, 0) orelse return error.CloseNotRead;
+    try testing.expectEqual(std.mem.indexOf(u8, closed_value, "</think>").?, read.pos);
+    // The same at every length of the text that holds the closer.
+    for (std.mem.indexOf(u8, closed_value, "</tool_call>").? + "</tool_call>".len..closed_value.len + 1) |n| {
+        const got = think_tags.indexOfThinkCloseTag(closed_value[0..n], 0);
+        try testing.expectEqual(n >= read.pos + read.len, got != null);
+    }
+}
