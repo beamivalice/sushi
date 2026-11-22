@@ -160,11 +160,10 @@ fn parseCompletionPrompt(allocator: std.mem.Allocator, v: ?std.json.Value, vocab
     }
 }
 
-/// Prompt-token logprobs are not computed, so an echo would hand lm-eval an empty sum it
-/// reads as perplexity 1; refused by name instead.
+/// The prompt is not echoed back and there are no token probabilities to give for it: refused by name, never dropped.
 fn echoRejectReason(req: request_fields.Checked(.completions)) ?[]const u8 {
     if (!(req.flag("echo") orelse false)) return null;
-    return "'echo' is not supported: the prompt is not echoed and its tokens carry no logprobs";
+    return "'echo' is not supported: the prompt is not echoed";
 }
 
 pub fn handleCompletions(
@@ -201,8 +200,8 @@ pub fn handleCompletions(
         .ok => |c| c,
     };
 
-    // Legacy completions' `logprobs` is an INTEGER (alternatives per token), not chat's bool + `top_logprobs`.
-    const asked_logprobs = req.logprobs();
+    // Logprobs are refused at the request check: none is ever asked.
+    const asked_logprobs: ?request_parse.Logprobs = null;
     const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     if (echoRejectReason(req)) |reason| {

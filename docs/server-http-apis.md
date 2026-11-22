@@ -286,6 +286,7 @@ before reading a completed stream and requires clean EOF.
   | `min_p` | chat, completions, Responses (a Messages request carrying it is a 400: Anthropic has no such field) | served, 0..1, 0 or omitted off; no launch flag or model default | 4: keeps p ≥ `min_p` × the top p |
   | `typical_p`, `tfs_z` | all | accepted only at 1 | not run |
   | `top_a`, `mirostat`, `dry_multiplier`, `xtc_probability` | all | accepted only at 0 | not run |
+  | `logprobs`, `top_logprobs`, Responses `include: ["message.output_text.logprobs"]` | chat, completions, Responses | accepted only at the value that turns them off (chat `logprobs` false, `top_logprobs` 0, null); any other value is a 400 naming the field, and so is a legacy completion's integer `logprobs` at any value, 0 included | not served |
   | `suffix` | completions | null or `""` only; fill-in-the-middle is a 400 | |
   | `best_of` | completions | 1 only | |
   | `service_tier` | all | accepted and ignored: a billing hint with no meaning on a local server (Responses echoes it, escaped like every request string its hand-built envelope carries) | |

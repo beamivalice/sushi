@@ -35,6 +35,10 @@ pub const Surface = enum {
 const Range = struct { min: f64, max: f64 };
 const Checker = *const fn (buf: []u8, s: Surface, v: std.json.Value) ?[]const u8;
 
+/// The value that turns an unserved feature off: `false` for a flag, `0` for a count, or none (any value asks for it;
+/// only absent or null is off).
+pub const Off = enum { flag, count, absent };
+
 pub const Kind = union(enum) {
     /// A finite number in the range, never clamped.
     number: Range,
@@ -50,6 +54,9 @@ pub const Kind = union(enum) {
     seed,
     /// A sampler other servers run and this one does not: accepted only at the value that turns it off.
     sampler_off: f64,
+    /// A feature this server does not serve: accepted only at the value that turns it off (null is absent), and an
+    /// `absent` one never.
+    not_served: Off,
     /// `n`: the single choice this server returns.
     one_choice,
     /// A value with a shape of its own, checked by the named function.
@@ -111,9 +118,10 @@ pub const rows = [_]Row{
     .{ .key = "kv_quant", .kind = .{ .shaped = kvQuantFault }, .on = &all },
     .{ .key = "n", .kind = .one_choice, .on = &all },
     .{ .key = "logit_bias", .kind = .{ .shaped = anyShape }, .on = &chat_completions },
-    .{ .key = "logprobs", .kind = .flag, .on = &.{.chat} },
-    .{ .key = "logprobs", .kind = .{ .whole = .{ .min = 0, .max = request_parse.MAX_TOP_LOGPROBS } }, .on = &.{.completions} },
-    .{ .key = "top_logprobs", .kind = .{ .whole = .{ .min = 0, .max = request_parse.MAX_TOP_LOGPROBS } }, .on = &chat_responses },
+    .{ .key = "logprobs", .kind = .{ .not_served = .flag }, .on = &.{.chat} },
+    .{ .key = "logprobs", .kind = .{ .not_served = .absent }, .on = &.{.completions} },
+    .{ .key = "top_logprobs", .kind = .{ .not_served = .count }, .on = &chat_responses },
+    .{ .key = "include", .kind = .{ .shaped = includeFault }, .on = &.{.responses} },
     .{ .key = "enable_mtp", .kind = .flag, .on = &all },
     .{ .key = "enable_drafter", .kind = .flag, .on = &all },
     .{ .key = "enable_batch_mtp", .kind = .flag, .on = &all },
@@ -196,6 +204,18 @@ fn kindFault(buf: []u8, r: Row, s: Surface, v: std.json.Value) ?[]const u8 {
         .seed => if (wholeNumber(v) == null) return "'seed' must be an integer that fits in 64 bits; a negative one means unseeded",
         .sampler_off => |off| if (numberOf(v) != off) {
             return fieldFault(buf, "'{s}' is not supported: " ++ sampler_hint ++ "; omit it or send {d}", .{ r.key, off });
+        },
+        .not_served => |off| {
+            const is_off = switch (off) {
+                .flag => v == .bool and !v.bool,
+                .count => numberOf(v) == 0,
+                .absent => false,
+            };
+            if (!is_off) return switch (off) {
+                .flag => fieldFault(buf, "'{s}' is not supported: this server returns no token probabilities; omit it or send false", .{r.key}),
+                .count => fieldFault(buf, "'{s}' is not supported: this server returns no token probabilities; omit it or send 0", .{r.key}),
+                .absent => fieldFault(buf, "'{s}' is not supported: this server returns no token probabilities; omit it", .{r.key}),
+            };
         },
         .one_choice => if (request_parse.nChoicesFault(v)) |m| return m,
         .shaped => |checker| return checker(buf, s, v),
@@ -388,22 +408,6 @@ pub fn Checked(comptime surface: Surface) type {
             return @intCast(n);
         }
 
-        /// What a request asks of logprobs when it asks (`request_parse.Logprobs`): chat's `logprobs: true` with its
-        /// `top_logprobs`, legacy completions' integer `logprobs`.
-        pub fn logprobs(self: Self) ?request_parse.Logprobs {
-            switch (surface) {
-                .chat => {
-                    if (!(self.flag("logprobs") orelse false)) return null;
-                    const top = self.whole("top_logprobs") orelse 0;
-                    return .{ .top = @intCast(top) };
-                },
-                .completions => {
-                    const n = wholeValue(self.root.get("logprobs") orelse return null) orelse return null;
-                    return .{ .top = @intCast(n) };
-                },
-                else => @compileError(@tagName(surface) ++ " reads no logprobs"),
-            }
-        }
     };
 }
 
@@ -513,6 +517,17 @@ fn formatTypeFault(path: []const u8, o: std.json.ObjectMap) ?[]const u8 {
 fn responseFormatFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
     if (v != .object) return "'response_format' must be an object";
     return formatTypeFault("response_format", v.object);
+}
+
+/// `include` asks for extra output; the one entry this server cannot give is the output text's token probabilities.
+fn includeFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
+    if (v != .array) return null;
+    for (v.array.items) |entry| {
+        if (entry == .string and std.mem.eql(u8, entry.string, "message.output_text.logprobs")) {
+            return "'include' is not supported with 'message.output_text.logprobs': this server returns no token probabilities; remove that entry";
+        }
+    }
+    return null;
 }
 
 fn textFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
@@ -675,8 +690,8 @@ test "a scalar field of the wrong type or range is refused by name, on the surfa
         .{ .body = "{\"max_tokens\":7,\"temperature\":0,\"top_p\":1,\"top_k\":40,\"seed\":-1,\"stop\":[\"a\"],\"kv_quant\":\"off\"}", .field = null },
         .{ .body = "{\"max_tokens\":7.0,\"seed\":5.0,\"top_k\":40.0,\"max_completion_tokens\":null,\"kv_quant\":16,\"top_p\":1.0}", .field = null },
         .{ .body = "{\"max_tokens\":0}", .field = null },
-        .{ .body = "{\"temperature\":2,\"top_p\":0,\"top_k\":1000,\"presence_penalty\":-2,\"frequency_penalty\":2,\"repeat_penalty\":10,\"top_logprobs\":20,\"seed\":-5}", .field = null },
-        .{ .surface = .responses, .body = "{\"max_output_tokens\":0,\"top_logprobs\":20}", .field = null },
+        .{ .body = "{\"temperature\":2,\"top_p\":0,\"top_k\":1000,\"presence_penalty\":-2,\"frequency_penalty\":2,\"repeat_penalty\":10,\"seed\":-5}", .field = null },
+        .{ .surface = .responses, .body = "{\"max_output_tokens\":0}", .field = null },
         .{ .body = "{\"stop\":null,\"temperature\":null,\"top_k\":null,\"top_logprobs\":null}", .field = null },
         .{ .body = "{\"temperature\":-1}", .field = "temperature" },
         .{ .body = "{\"temperature\":100}", .field = "temperature" },
@@ -691,10 +706,6 @@ test "a scalar field of the wrong type or range is refused by name, on the surfa
         .{ .body = "{\"frequency_penalty\":-2.5}", .field = "frequency_penalty" },
         .{ .body = "{\"repeat_penalty\":11}", .field = "repeat_penalty" },
         .{ .body = "{\"repetition_penalty\":-1}", .field = "repetition_penalty" },
-        .{ .body = "{\"top_logprobs\":50}", .field = "top_logprobs" },
-        .{ .body = "{\"top_logprobs\":-1}", .field = "top_logprobs" },
-        .{ .body = "{\"top_logprobs\":\"5\"}", .field = "top_logprobs" },
-        .{ .body = "{\"top_logprobs\":2.5}", .field = "top_logprobs" },
         .{ .body = "{\"seed\":9223372036854775808}", .field = "seed" },
         .{ .body = "{\"max_tokens\":-1}", .field = "max_tokens" },
         .{ .body = "{\"max_completion_tokens\":-5}", .field = "max_completion_tokens" },
@@ -837,19 +848,36 @@ test "a field a surface does not read is refused by name, never dropped" {
     });
 }
 
-test "logprobs of the wrong type or range is refused by name on each route, null is absent" {
+test "logprobs are refused by name on every surface that read them, accepted only at the value that turns them off" {
     try expectCases(&.{
-        .{ .body = "{\"logprobs\":null}", .field = null },
-        .{ .body = "{\"logprobs\":false}", .field = null },
-        .{ .body = "{\"logprobs\":1}", .field = "logprobs" },
-        .{ .body = "{\"logprobs\":\"true\"}", .field = "logprobs" },
+        // Chat: `logprobs` is off at false, `top_logprobs` at 0; null is absent.
+        .{ .surface = .chat, .body = "{\"logprobs\":false,\"top_logprobs\":0}", .field = null },
+        .{ .surface = .chat, .body = "{\"logprobs\":null,\"top_logprobs\":null}", .field = null },
+        .{ .surface = .chat, .body = "{\"logprobs\":true}", .field = "logprobs" },
+        .{ .surface = .chat, .body = "{\"logprobs\":true,\"top_logprobs\":3}", .field = "logprobs" },
+        .{ .surface = .chat, .body = "{\"logprobs\":1}", .field = "logprobs" },
+        .{ .surface = .chat, .body = "{\"logprobs\":\"true\"}", .field = "logprobs" },
+        .{ .surface = .chat, .body = "{\"top_logprobs\":3}", .field = "top_logprobs" },
+        .{ .surface = .chat, .body = "{\"logprobs\":false,\"top_logprobs\":3}", .field = "top_logprobs" },
+        .{ .surface = .chat, .body = "{\"top_logprobs\":\"0\"}", .field = "top_logprobs" },
+        // Legacy completions: any integer asks, 0 included (the sampled token's logprob, no alternatives); only absent or null is off.
         .{ .surface = .completions, .body = "{}", .field = null },
-        .{ .surface = .completions, .body = "{\"logprobs\":0}", .field = null },
-        .{ .surface = .completions, .body = "{\"logprobs\":20}", .field = null },
-        .{ .surface = .completions, .body = "{\"logprobs\":21}", .field = "logprobs" },
+        .{ .surface = .completions, .body = "{\"logprobs\":null}", .field = null },
+        .{ .surface = .completions, .body = "{\"logprobs\":0}", .field = "logprobs" },
+        .{ .surface = .completions, .body = "{\"logprobs\":1}", .field = "logprobs" },
+        .{ .surface = .completions, .body = "{\"logprobs\":20}", .field = "logprobs" },
         .{ .surface = .completions, .body = "{\"logprobs\":true}", .field = "logprobs" },
         .{ .surface = .completions, .body = "{\"logprobs\":\"2\"}", .field = "logprobs" },
+        // Responses: `top_logprobs` is off at 0, and the output-text logprobs entry of `include` is refused.
+        .{ .surface = .responses, .body = "{\"top_logprobs\":0}", .field = null },
+        .{ .surface = .responses, .body = "{\"top_logprobs\":5}", .field = "top_logprobs" },
+        .{ .surface = .responses, .body = "{\"include\":[\"message.output_text.logprobs\"]}", .field = "include" },
+        .{ .surface = .responses, .body = "{\"include\":[\"reasoning.encrypted_content\",\"message.output_text.logprobs\"]}", .field = "include" },
+        .{ .surface = .responses, .body = "{\"include\":[\"reasoning.encrypted_content\"]}", .field = null },
+        .{ .surface = .responses, .body = "{\"include\":[]}", .field = null },
+        // Messages never read either field.
         .{ .surface = .messages, .body = "{\"logprobs\":true}", .field = "logprobs" },
+        .{ .surface = .messages, .body = "{\"top_logprobs\":3}", .field = "top_logprobs" },
     });
 }
 
@@ -993,7 +1021,7 @@ test "kv_quant, metadata and the tools of Messages and Responses are checked whe
 }
 
 test "the readers give the values the check accepted" {
-    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"top_k\":40.0,\"temperature\":1,\"seed\":-3,\"repetition_penalty\":1.25,\"stop\":[\"a\",\"\",\"b\"],\"max_completion_tokens\":0,\"max_tokens\":9,\"logprobs\":true,\"top_logprobs\":3,\"stream_options\":{\"include_usage\":true},\"reasoning_budget_tokens\":-1}", .{});
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"top_k\":40.0,\"temperature\":1,\"seed\":-3,\"repetition_penalty\":1.25,\"stop\":[\"a\",\"\",\"b\"],\"max_completion_tokens\":0,\"max_tokens\":9,\"stream_options\":{\"include_usage\":true},\"reasoning_budget_tokens\":-1}", .{});
     defer parsed.deinit();
     var buf: [256]u8 = undefined;
     const req = switch (check(.chat, &buf, parsed.value.object)) {
@@ -1013,17 +1041,15 @@ test "the readers give the values the check accepted" {
     try req.stops(testing.allocator, &stops);
     try testing.expectEqual(@as(usize, 2), stops.items.len);
     try testing.expectEqual(@as(i64, 9), wholeNumber(req.requestedMaxTokens().?).?);
-    try testing.expectEqual(@as(u32, 3), req.logprobs().?.top);
     try testing.expect(req.includeUsage());
     try testing.expectEqual(@as(?i32, -1), req.reasoningBudget());
 
-    var responses = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tool_calls\":3.0,\"truncation\":\"auto\",\"service_tier\":\"flex\",\"top_logprobs\":2}", .{});
+    var responses = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tool_calls\":3.0,\"truncation\":\"auto\",\"service_tier\":\"flex\"}", .{});
     defer responses.deinit();
     const resp = check(.responses, &buf, responses.value.object).ok;
     try testing.expectEqual(@as(?i64, 3), resp.whole("max_tool_calls"));
     try testing.expectEqualStrings("auto", resp.truncation());
     try testing.expectEqualStrings("flex", resp.text("service_tier").?);
-    try testing.expectEqual(@as(?i64, 2), resp.whole("top_logprobs"));
 }
 
 test "contentOf reads text, parts or nothing, and refuses any other type" {
@@ -1059,43 +1085,6 @@ test "Messages refuses a tool_choice type it does not serve, and a tool_result f
         .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":\"x\",\"is_error\":\"yes\"}]}]}", .field = "messages[0].content[0].is_error" },
         .{ .surface = .messages, .body = "{\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t\",\"content\":5}]}]}", .field = "messages[0].content[0].content" },
     });
-}
-
-test "chat logprobs: true is on whatever top_logprobs says, 0 and absent included; only a missing true is off" {
-    const cases = [_]struct { body: []const u8, want: ?u32 }{
-        .{ .body = "{}", .want = null },
-        .{ .body = "{\"logprobs\":false,\"top_logprobs\":3}", .want = null },
-        .{ .body = "{\"top_logprobs\":3}", .want = null },
-        .{ .body = "{\"logprobs\":true}", .want = 0 },
-        .{ .body = "{\"logprobs\":true,\"top_logprobs\":null}", .want = 0 },
-        .{ .body = "{\"logprobs\":true,\"top_logprobs\":0}", .want = 0 },
-        .{ .body = "{\"logprobs\":true,\"top_logprobs\":20}", .want = 20 },
-    };
-    for (cases) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        var buf: [128]u8 = undefined;
-        const req = check(.chat, &buf, parsed.value.object).ok;
-        const got = req.logprobs();
-        try testing.expectEqual(c.want, if (got) |l| l.top else null);
-        // The engine reads 0 as off: a request that is on always asks it for at least one candidate.
-        if (got) |l| try testing.expect(l.engineN() >= 1);
-    }
-}
-
-test "legacy completions' integer logprobs reads as the alternatives asked, 0 included" {
-    for ([_]struct { body: []const u8, top: ?u32 }{
-        .{ .body = "{}", .top = null },
-        .{ .body = "{\"logprobs\":null}", .top = null },
-        .{ .body = "{\"logprobs\":0}", .top = 0 },
-        .{ .body = "{\"logprobs\":20}", .top = 20 },
-    }) |c| {
-        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, c.body, .{});
-        defer parsed.deinit();
-        var buf: [128]u8 = undefined;
-        const got = check(.completions, &buf, parsed.value.object).ok.logprobs();
-        try testing.expectEqual(c.top, if (got) |l| l.top else null);
-    }
 }
 
 test "a surface's first positive token budget key wins, and a null or zero one leaves the next in force" {

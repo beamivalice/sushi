@@ -537,7 +537,7 @@ fn handleResponsesInner(
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
-    const top_logprobs_echo: u32 = if (req.whole("top_logprobs")) |n| @intCast(n) else 0;
+    const top_logprobs_echo: u32 = 0;
     const max_tool_calls_echo: ?u32 = if (req.whole("max_tool_calls")) |n| @intCast(n) else null;
     const truncation_echo: []const u8 = req.truncation();
     const parallel_tool_calls_echo = req.flag("parallel_tool_calls") orelse true;

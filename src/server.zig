@@ -2451,7 +2451,8 @@ pub fn handleChatCompletions(
 
     const seed: ?u64 = req.seed();
 
-    const asked_logprobs = req.logprobs();
+    // Logprobs are refused at the request check: none is ever asked.
+    const asked_logprobs: ?request_parse.Logprobs = null;
     const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     // Extract tools JSON from request body for chat template injection

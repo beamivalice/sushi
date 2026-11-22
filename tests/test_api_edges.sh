@@ -77,7 +77,7 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"
 # a value the sampler cannot honour as given is refused naming the field, never clamped
 for f in 'temperature|"temperature":-1' 'temperature|"temperature":100' 'top_p|"top_p":2' 'top_k|"top_k":-3' 'top_k|"top_k":5000' \
          'seed|"seed":9223372036854775808' 'max_tokens|"max_tokens":-5' 'presence_penalty|"presence_penalty":3' \
-         'repeat_penalty|"repeat_penalty":-1' 'top_logprobs|"logprobs":true,"top_logprobs":50' 'think_penalty|"think_penalty":99' \
+         'repeat_penalty|"repeat_penalty":-1' 'logprobs|"logprobs":true' 'top_logprobs|"top_logprobs":3' 'think_penalty|"think_penalty":99' \
          'min_p|"min_p":1.5' 'typical_p|"typical_p":0.9' 'tfs_z|"tfs_z":0.95' 'top_a|"top_a":0.1' 'mirostat|"mirostat":2' \
          'dry_multiplier|"dry_multiplier":0.8' 'xtc_probability|"xtc_probability":0.5'; do
     key=${f%%|*}; field=${f#*|}
@@ -94,8 +94,8 @@ for f in '"max_tokens":0' '"temperature":2,"top_p":0,"top_k":1000' '"logit_bias"
 done
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":5,\"temperature\":5,\"messages\":[$U]}"
 expect_status 400 "messages: temperature 5 is refused"
-req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"logprobs\":99}"
-expect_status 400 "completions: logprobs 99 is refused"
+req POST /v1/completions "{\"model\":\"m\",\"prompt\":\"$N hi\",\"max_tokens\":5,\"logprobs\":1}"
+expect_status 400 "completions: logprobs 1 is refused"
 req POST /v1/responses '{"model":"m","max_output_tokens":-3,"input":"hi"}'
 expect_status 400 "responses: negative max_output_tokens is refused"
 # a field the server cannot honour is a 400 that names it, never ignored
