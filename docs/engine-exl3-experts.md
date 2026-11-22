@@ -139,11 +139,17 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   ([perf-baselines](qwen4-perf.md#m2max-64gb)).
 - **Decode**: four dispatches per MoE layer — pair prepare, split-K pair GEMV with f32 inner planes, fused mid+down
   GEMV, f32 finish reduce (`moeSwigluFused`; top-k ≤ 32, named refusal above). On MiMo geometry the SwiGLU mid is
-  prepared once per (row, expert) (`preparedMidOn`, disabled for Qwen; like `gpuWindowPrefillOn` it keys on geometry,
-  never on the rate), and the pair input too, in its own dispatch (`pairPrepare`): five dispatches. A pair
+  prepared once per (row, expert) (`preparedMidOn`; like `gpuWindowPrefillOn` it keys on geometry, never on the rate),
+  and the pair input too, in its own dispatch (`pairPrepare`): five dispatches. A pair
   threadgroup would otherwise re-derive its K span of x (64 times per slot). Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
   chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
   (`Exl3MtpRowsExceedDecode`).
+  - **The generation-13 (M1) row takes the same five-dispatch chain on the Flash-Next geometry** (2026-11-22,
+    `applegpu_g13s`, the served STQ 2.75 pack's spec1 w15, `shared.exl3_grouped_decode`, flash geometry, stq36, 7
+    rounds interleaved, arms byte-identical): prepared/fused **0.885 at 3 rows, 0.881 at 4, 1.008 at 1** (one row
+    never prepares its pair). The Hadamard prepare is ALU on a SIMD-only GPU, and the self-preparing kernels pay it
+    per output-tile threadgroup — 20 groups a slot for the pair, 80 for the mid — so on M1 the prepare dispatches cost
+    less than the repeated ALU. Later generations are unmeasured and keep the geometry's own rule.
 - **The prepared pair input is stored in GEMV lane order** (`LANE_ORDER_SLOT`: each 16-row tile keeps rows 2q,
   2q+1, 2q+8, 2q+9 at 4q..4q+3), so a lane reads its four as one half4 (`laneQuadReads`). Same values in the same
   order: the pair planes kept the self-preparing kernel's bytes when proven. The same layout for the prepared middle measured no
