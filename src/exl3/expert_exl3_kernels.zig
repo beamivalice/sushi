@@ -8419,7 +8419,8 @@ test "exl3 grouped decode timing arms all engage and keep the served chain's byt
         setDecodeParams(.mul1);
         clearGroupArm();
     }
-    for ([_]usize{ 1, 2, 4, 8 }) |rows| {
+    // 9 rows is the widest verify block the MTP head's uniform chain admits on M1 (`preparedMidOn`'s row).
+    for ([_]usize{ 1, 2, 4, 8, 9 }) |rows| {
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
         defer arena.deinit();
         const alloc = arena.allocator();

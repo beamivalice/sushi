@@ -1666,7 +1666,9 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
     const downs = classesOf(rb, true, &dc);
     logEngaged(.decode, rb, pair.len, downs.len);
     const prepared = preparedOn(rb);
-    const group = if (prepared and groupedOn(rb)) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
+    // A non-null `group_force` is a test or bench ASKING for grouping (its own doc says so): it overrides the
+    // geometry row, which production leaves to `groupedOn`. Without it the policy stands.
+    const group = if (prepared and (groupedOn(rb) or group_force != null)) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
     if (group > 0) kernels.logGroupedEngaged(group);
     const inner = if (prepared) blk: {
         const prep = try kernels.pairPrepare(s, x, rb.suh[0], rb.suh[1], slots, rb.hidden, @intCast(mlx.mlx_array_size(slots)), topk);
@@ -2955,7 +2957,9 @@ test "exl3 rate groups: verify rows grouped by expert write the per-slot chain's
                 var c0 = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(c0);
                 const want = try bytesOf(s, one, &c0);
-                for ([_]?c_int{ null, 2, 4, 8, 16 }) |arm| {
+                // Every bucket through the seam: the policy's own row (`groupedOn`) groups DeepSeek's geometry only,
+                // and this fixture's 512/256 is the reference arm above (`group_force = 0`).
+                for ([_]?c_int{ 2, 4, 8, 16 }) |arm| {
                     group_force = arm;
                     kernels.grouped_widest = 0;
                     const y = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
