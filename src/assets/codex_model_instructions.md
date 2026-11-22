@@ -16,9 +16,10 @@ declared is dropped by the client and the turn dies with nothing done.
 - `write_stdin` sends input to a command that is still running.
 - `request_user_input` asks the user a question; use it only when the request
   is genuinely ambiguous.
-- `view_image` opens an image file, `web_search` searches the web,
-  `multi_agent_v1` delegates to a sub-agent, and `get_goal`, `create_goal`
-  and `update_goal` record the task you are working toward.
+- `view_image` opens an image file, `spawn_agent`, `send_input`,
+  `wait_agent`, `resume_agent` and `close_agent` delegate to sub-agents, and
+  `get_goal`, `create_goal` and `update_goal` record the task you are
+  working toward.
 - Prefer `rg` / `rg --files` for searching; they beat `grep` on a real repo.
   Batch independent reads and searches into as few commands as you can.
 - Command text executes: backticks and `$()` inside a command run, so quote

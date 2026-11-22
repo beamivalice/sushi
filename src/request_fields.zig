@@ -526,7 +526,11 @@ fn textFault(_: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
 }
 
 fn toolsShape(buf: []u8, s: Surface, v: std.json.Value) ?[]const u8 {
-    return request_parse.toolsFault(buf, v, s != .messages);
+    return request_parse.toolsFault(buf, v, switch (s) {
+        .messages => .messages,
+        .responses => .responses,
+        else => .chat,
+    });
 }
 
 fn toolChoiceFault(buf: []u8, s: Surface, v: std.json.Value) ?[]const u8 {
@@ -1204,6 +1208,51 @@ test "a key that drops behaviour on every surface is refused by name, with the w
         .{ .surface = surface, .body = "{\"guided_grammar\":\"x\"}", .field = "guided_grammar" },
         .{ .surface = surface, .body = "{\"grammar\":null,\"functions\":null,\"guided_json\":null}", .field = null },
     });
+}
+
+/// codex-cli 0.154's `tools` (a captured request, trimmed to one member): a function, a namespace, a hosted web_search.
+const codex_function = "{\"type\":\"function\",\"name\":\"exec_command\",\"description\":\"Runs a command.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}},\"required\":[\"cmd\"],\"additionalProperties\":false}}";
+const codex_namespace = "{\"type\":\"namespace\",\"name\":\"multi_agent_v1\",\"description\":\"Tools for spawning and managing sub-agents.\",\"tools\":[{\"type\":\"function\",\"name\":\"close_agent\",\"description\":\"Close an agent.\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"}},\"required\":[\"target\"],\"additionalProperties\":false}}]}";
+const codex_web_search = "{\"type\":\"web_search\",\"external_web_access\":false}";
+
+test "Responses serves a namespace of function tools and refuses a malformed one by name" {
+    try expectCases(&.{
+        .{ .surface = .responses, .body = "{\"tools\":[" ++ codex_function ++ "," ++ codex_namespace ++ "]}", .field = null },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\"}]}", .field = "tools[0].tools" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":{}}]}", .field = "tools[0].tools" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[]}]}", .field = "tools[0].tools" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"tools\":[{\"type\":\"function\",\"name\":\"a\"}]}]}", .field = "tools[0].name" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"\",\"tools\":[{\"type\":\"function\",\"name\":\"a\"}]}]}", .field = "tools[0].name" },
+        .{ .surface = .responses, .body = "{\"tools\":[" ++ codex_function ++ ",{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"function\",\"name\":\"a\"},7]}]}", .field = "tools[1].tools[1]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"custom\",\"name\":\"a\"}]}]}", .field = "tools[0].tools[0]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"namespace\",\"name\":\"in\",\"tools\":[]}]}]}", .field = "tools[0].tools[0]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"function\"}]}]}", .field = "tools[0].tools[0]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"function\",\"name\":\"a\",\"parameters\":\"bad\"}]}]}", .field = "tools[0].tools[0].parameters" },
+        // One name is one tool: the model is shown the members beside the top-level functions.
+        .{ .surface = .responses, .body = "{\"tools\":[" ++ codex_function ++ ",{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"function\",\"name\":\"exec_command\"}]}]}", .field = "tools[1].tools[0]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"ns\",\"tools\":[{\"type\":\"function\",\"name\":\"a\"}]},{\"type\":\"function\",\"name\":\"a\"}]}", .field = "tools[1]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"namespace\",\"name\":\"one\",\"tools\":[{\"type\":\"function\",\"name\":\"a\"}]},{\"type\":\"namespace\",\"name\":\"two\",\"tools\":[{\"type\":\"function\",\"name\":\"a\"}]}]}", .field = "tools[1].tools[0]" },
+        // Namespaces are a Responses tool: chat and Anthropic refuse one as they refuse any other type.
+        .{ .surface = .chat, .body = "{\"tools\":[" ++ codex_namespace ++ "]}", .field = "tools[0].type" },
+        .{ .surface = .messages, .body = "{\"tools\":[" ++ codex_namespace ++ "]}", .field = "tools[0]" },
+    });
+}
+
+test "Responses refuses a hosted web_search, naming the tool and the client setting that turns it off" {
+    const body = "{\"tools\":[" ++ codex_function ++ "," ++ codex_namespace ++ "," ++ codex_web_search ++ "]}";
+    try expectCases(&.{
+        .{ .surface = .responses, .body = body, .field = "tools[2]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"web_search_preview\"}]}", .field = "tools[0]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":\"file_search\"}]}", .field = "tools[0]" },
+        .{ .surface = .responses, .body = "{\"tools\":[{\"type\":7}]}", .field = "tools[0].type" },
+    });
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    var buf: [480]u8 = undefined;
+    const why = fault(&buf, .responses, parsed.value.object).?;
+    try testing.expect(std.mem.indexOf(u8, why, "\"web_search\"") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "web_search = \"disabled\"") != null);
+    try testing.expect(std.mem.indexOf(u8, why, "config.toml") != null);
 }
 
 test "Messages serves a custom tool and refuses every other typed tool, naming its type" {

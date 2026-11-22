@@ -69,7 +69,7 @@ promise-active src/models_api.zig:handleProps /props reports the active bytes as
 promise-active src/models_api.zig:handlePropsNoModel /props reports the active bytes as MLX and the engine count them, no promise
 promise-active src/expert_stream.zig:lentReading measures the lent term itself, on the reading admission subtracts it from
 promise-active src/model_load.zig:doLoadOnInferenceThread the load's decode profile measures what its forwards allocate, no promise
-request-bool-read src/responses_api.zig:renderResponsesToolsEcho echoes a tool's `strict` as null for another type; it reads nothing the request acts on
+request-bool-read src/responses_api.zig:appendFunctionToolEcho echoes a tool's `strict` as null for another type; it reads nothing the request acts on
 request-bool-read src/server.zig:handleWebTools refuses a non-bool browse, vision and write by name before reading them
 request-bool-read src/server.zig:handleLoadModelStrict refuses a non-bool default by name before reading it
 ceiling-raw-read src/main.zig:settleDeviceReads asks the device once before any load so a load asks MLX nothing; it reads no ceiling

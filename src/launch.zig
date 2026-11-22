@@ -527,7 +527,8 @@ pub const codex_instructions = @embedFile("assets/codex_model_instructions.md");
 /// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
 /// variant), pointing at our /v1/responses. Keyless: no `env_key` and
 /// `requires_openai_auth` unset means codex skips login; the loopback server
-/// ignores keys anyway.
+/// ignores keys anyway. `web_search = "disabled"` keeps the hosted web_search tool out of its
+/// requests, which the server refuses.
 pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, budget: Budget, instructions_path: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator,
         \\# written by sushi — dedicated CODEX_HOME, regenerated at each launch.
@@ -535,6 +536,7 @@ pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model
         \\model_provider = "sushi"
         \\model_context_window = {d}
         \\model_instructions_file = "{f}"
+        \\web_search = "disabled"
         \\
         \\[model_providers.sushi]
         \\name = "sushi (local)"
@@ -1196,6 +1198,13 @@ test "codex config: responses wire API, keyless, context at the root" {
     try t.expect(std.mem.indexOf(u8, toml, "base_url = \"http://127.0.0.1:12345/v1\"") != null);
     try t.expect(std.mem.indexOf(u8, toml, "env_key") == null);
     try t.expect(std.mem.indexOf(u8, toml, "\nmodel_instructions_file = \"/h/o\\\"me/.sushi/codex/model-instructions.md\"\n") != null);
+}
+
+test "codex config turns its hosted web search off, at the root where codex reads it" {
+    const toml = try codexConfigToml(t.allocator, "http://127.0.0.1:12345", "m1", .{ .context = 90112, .output = 22528 }, "/x");
+    defer t.allocator.free(toml);
+    const key = std.mem.indexOf(u8, toml, "\nweb_search = \"disabled\"\n") orelse return error.WebSearchNotDisabled;
+    try t.expect(key < std.mem.indexOf(u8, toml, "\n[model_providers.sushi]").?);
 }
 
 test "codex instructions file is the embedded asset and names no undeclared tool" {

@@ -2128,6 +2128,36 @@ test "server: a chat object tool_choice naming no function, and a Responses fiel
     }.run);
 }
 
+test "server: /v1/responses serves Codex's namespace tool, echoes it, and refuses its hosted web_search naming the setting" {
+    try eachArch(2, .{}, struct {
+        const function = "{\"type\":\"function\",\"name\":\"exec_command\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}}}}";
+        const namespace = "{\"type\":\"namespace\",\"name\":\"multi_agent_v1\",\"description\":\"Sub-agents.\",\"tools\":[{\"type\":\"function\",\"name\":\"close_agent\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"target\":{\"type\":\"string\"}}}}]}";
+        // tool_choice none keeps the tools out of the prompt, which a tiny context cannot hold; the request still reads them.
+        const head = "{\"model\":\"tiny\",\"max_output_tokens\":2,\"temperature\":0,\"input\":\"hi\",\"tool_choice\":\"none\",\"tools\":[" ++ function ++ "," ++ namespace;
+        fn run() !void {
+            const served = try request("POST", "/v1/responses", head ++ "]}");
+            defer gpa.free(served);
+            if (!std.mem.startsWith(u8, served, "HTTP/1.1 200")) {
+                std.debug.print("namespace refused: {s}\n", .{served[0..@min(served.len, 400)]});
+                return error.NamespaceNotServed;
+            }
+            const p = try parseBody(bodyOf(served));
+            defer p.deinit();
+            const echoed = p.value.object.get("tools").?.array.items;
+            try testing.expectEqual(@as(usize, 2), echoed.len);
+            try testing.expectEqualStrings("namespace", echoed[1].object.get("type").?.string);
+
+            const refused = try request("POST", "/v1/responses", head ++ ",{\"type\":\"web_search\",\"external_web_access\":false}]}");
+            defer gpa.free(refused);
+            const body = bodyOf(refused);
+            if (!std.mem.startsWith(u8, refused, "HTTP/1.1 400") or std.mem.indexOf(u8, body, "'tools[2]'") == null or std.mem.indexOf(u8, body, "web_search = \\\"disabled\\\"") == null) {
+                std.debug.print("web_search not refused by name: {s}\n", .{refused[0..@min(refused.len, 400)]});
+                return error.WebSearchNotRefused;
+            }
+        }
+    }.run);
+}
+
 test "server: h21 a request field of the wrong type is refused by name, never read as absent" {
     try eachArch(4, .{}, struct {
         const Case = struct { path: []const u8, body: []const u8, field: []const u8 };

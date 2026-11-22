@@ -231,17 +231,12 @@ pub fn handleResponsesDelete(allocator: std.mem.Allocator, stream: *Conn, id: []
 }
 
 fn responsesToolExists(tools_val: ?std.json.Value, name: []const u8) bool {
-    const v = tools_val orelse return false;
-    if (v != .array) return false;
-    for (v.array.items) |tool_val| {
-        if (tool_val != .object) continue;
-        const tool = tool_val.object;
-        const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
-        if (!std.mem.eql(u8, t, "function")) continue;
-        const tool_name = if (tool.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
-        if (std.mem.eql(u8, tool_name, name)) return true;
-    }
-    return false;
+    return request_parse.findResponsesFunction(tools_val, name) != null;
+}
+
+/// The namespace a call to `name` is made in, null for a top-level function.
+fn responsesCallNamespace(tools_val: ?std.json.Value, name: []const u8) ?[]const u8 {
+    return (request_parse.findResponsesFunction(tools_val, name) orelse return null).namespace;
 }
 
 fn buildResponsesJsonInstruction(allocator: std.mem.Allocator, schema_val: ?std.json.Value, tools_active: bool) ![]const u8 {
@@ -1112,7 +1107,7 @@ fn handleResponsesInner(
                 }, raw_buf.items, .{
                     .dialect = try chat_mod.callDialect(allocator, chat_config),
                     .opens_think = promptOpensThink(allocator, tok, prompt_ids),
-                }, active_tools_json)
+                }, active_tools_json, root.get("tools"))
             else
                 beatStreamKeepalive(stream, .sse_comment);
             beaten catch {
@@ -1412,11 +1407,12 @@ fn handleResponsesInner(
             return err;
         };
         if (emitted > 0) try out_buf.append(allocator, ',');
-        try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
+        const item: responses_mod.CallItem = .{ .id = fc_id, .call_id = call_id, .name = tc.name, .namespace = responsesCallNamespace(root.get("tools"), tc.name), .arguments = tc.arguments };
+        try responses_mod.appendFunctionCallItem(allocator, &out_buf, item);
         emitted += 1;
         if (is_stream) switch (owed) {
-            .arguments => try emitResponsesFunctionCallRest(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments),
-            .whole => try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, fc_id, call_id, tc.name, tc.arguments),
+            .arguments => try emitResponsesFunctionCallRest(allocator, stream, seq_num, output_index, item),
+            .whole => try emitResponsesFunctionCallEvents(allocator, stream, seq_num, output_index, item),
         };
         output_index += 1;
     }
@@ -1498,6 +1494,58 @@ fn handleResponsesInner(
 // metadata, etc.). These helpers re-render those values from the parsed
 // request JSON in the exact shape the schema demands. Caller owns the result.
 
+/// One function tool as the envelope echoes it.
+fn appendFunctionToolEcho(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), tool: std.json.ObjectMap) !void {
+    // Accept both flat (Responses API) and nested-under-"function" (chat-completions) shapes.
+    var fn_obj_opt: ?std.json.ObjectMap = null;
+    if (tool.get("function")) |fv| if (fv == .object) {
+        fn_obj_opt = fv.object;
+    };
+
+    const name_v: ?std.json.Value = tool.get("name") orelse if (fn_obj_opt) |fo| fo.get("name") else null;
+    const desc_v: ?std.json.Value = tool.get("description") orelse if (fn_obj_opt) |fo| fo.get("description") else null;
+    const params_v: ?std.json.Value = tool.get("parameters") orelse if (fn_obj_opt) |fo| fo.get("parameters") else null;
+    const strict_v: ?std.json.Value = tool.get("strict") orelse if (fn_obj_opt) |fo| fo.get("strict") else null;
+
+    try buf.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
+    if (name_v) |nv| if (nv == .string) {
+        const e = try jsonEscape(allocator, nv.string);
+        defer allocator.free(e);
+        try buf.appendSlice(allocator, e);
+    } else {
+        try buf.appendSlice(allocator, "\"\"");
+    } else {
+        try buf.appendSlice(allocator, "\"\"");
+    }
+    try buf.appendSlice(allocator, ",\"description\":");
+    if (desc_v) |dv| if (dv == .string) {
+        const e = try jsonEscape(allocator, dv.string);
+        defer allocator.free(e);
+        try buf.appendSlice(allocator, e);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"parameters\":");
+    if (params_v) |pv| if (pv == .object) {
+        try json_text.appendValue(allocator, buf, pv);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"strict\":");
+    if (strict_v) |sv| if (sv == .bool) {
+        try buf.appendSlice(allocator, if (sv.bool) "true" else "false");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.append(allocator, '}');
+}
+
 fn renderResponsesToolsEcho(allocator: std.mem.Allocator, tools_val: ?std.json.Value) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -1508,62 +1556,47 @@ fn renderResponsesToolsEcho(allocator: std.mem.Allocator, tools_val: ?std.json.V
             if (tool_val != .object) continue;
             const tool = tool_val.object;
             const t = if (tool.get("type")) |x| (if (x == .string) x.string else "") else "";
-            if (!std.mem.eql(u8, t, "function")) continue;
-
-            // Accept both flat (Responses API) and nested-under-"function" (chat-completions) shapes.
-            var fn_obj_opt: ?std.json.ObjectMap = null;
-            if (tool.get("function")) |fv| if (fv == .object) {
-                fn_obj_opt = fv.object;
-            };
-
-            const name_v: ?std.json.Value = tool.get("name") orelse if (fn_obj_opt) |fo| fo.get("name") else null;
-            const desc_v: ?std.json.Value = tool.get("description") orelse if (fn_obj_opt) |fo| fo.get("description") else null;
-            const params_v: ?std.json.Value = tool.get("parameters") orelse if (fn_obj_opt) |fo| fo.get("parameters") else null;
-            const strict_v: ?std.json.Value = tool.get("strict") orelse if (fn_obj_opt) |fo| fo.get("strict") else null;
-
-            if (emitted > 0) try buf.append(allocator, ',');
-            emitted += 1;
-            try buf.appendSlice(allocator, "{\"type\":\"function\",\"name\":");
-            if (name_v) |nv| if (nv == .string) {
-                const e = try jsonEscape(allocator, nv.string);
-                defer allocator.free(e);
-                try buf.appendSlice(allocator, e);
-            } else {
-                try buf.appendSlice(allocator, "\"\"");
-            } else {
-                try buf.appendSlice(allocator, "\"\"");
+            if (std.mem.eql(u8, t, "function")) {
+                if (emitted > 0) try buf.append(allocator, ',');
+                emitted += 1;
+                try appendFunctionToolEcho(allocator, &buf, tool);
+            } else if (std.mem.eql(u8, t, "namespace")) {
+                if (emitted > 0) try buf.append(allocator, ',');
+                emitted += 1;
+                try appendNamespaceToolEcho(allocator, &buf, tool);
             }
-            try buf.appendSlice(allocator, ",\"description\":");
-            if (desc_v) |dv| if (dv == .string) {
-                const e = try jsonEscape(allocator, dv.string);
-                defer allocator.free(e);
-                try buf.appendSlice(allocator, e);
-            } else {
-                try buf.appendSlice(allocator, "null");
-            } else {
-                try buf.appendSlice(allocator, "null");
-            }
-            try buf.appendSlice(allocator, ",\"parameters\":");
-            if (params_v) |pv| if (pv == .object) {
-                try json_text.appendValue(allocator, &buf, pv);
-            } else {
-                try buf.appendSlice(allocator, "null");
-            } else {
-                try buf.appendSlice(allocator, "null");
-            }
-            try buf.appendSlice(allocator, ",\"strict\":");
-            if (strict_v) |sv| if (sv == .bool) {
-                try buf.appendSlice(allocator, if (sv.bool) "true" else "false");
-            } else {
-                try buf.appendSlice(allocator, "null");
-            } else {
-                try buf.appendSlice(allocator, "null");
-            }
-            try buf.append(allocator, '}');
         }
     };
     try buf.append(allocator, ']');
     return try buf.toOwnedSlice(allocator);
+}
+
+/// A namespace tool as the envelope echoes it: its name, description and member functions.
+fn appendNamespaceToolEcho(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), ns: std.json.ObjectMap) !void {
+    try buf.appendSlice(allocator, "{\"type\":\"namespace\",\"name\":");
+    try appendEscapedString(allocator, buf, ns.get("name"));
+    try buf.appendSlice(allocator, ",\"description\":");
+    try appendEscapedString(allocator, buf, ns.get("description"));
+    try buf.appendSlice(allocator, ",\"tools\":[");
+    var first = true;
+    if (ns.get("tools")) |members| if (members == .array) for (members.array.items) |m| {
+        if (m != .object) continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try appendFunctionToolEcho(allocator, buf, m.object);
+    };
+    try buf.appendSlice(allocator, "]}");
+}
+
+/// A JSON string for a string value, `null` for anything else.
+fn appendEscapedString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), v: ?std.json.Value) !void {
+    const text = if (v) |x| (if (x == .string) x.string else null) else null;
+    const e = try jsonEscape(allocator, text orelse {
+        try buf.appendSlice(allocator, "null");
+        return;
+    });
+    defer allocator.free(e);
+    try buf.appendSlice(allocator, e);
 }
 
 fn renderResponsesToolChoiceEcho(allocator: std.mem.Allocator, tc_val: ?std.json.Value) ![]const u8 {
@@ -2043,6 +2076,7 @@ fn beatFunctionCall(
     buffered: []const u8,
     origin: reply_mod.Origin,
     tools_json: ?[]const u8,
+    request_tools: ?std.json.Value,
 ) !void {
     // A WebSocket has liveness of its own.
     if (stream.ws_mode == null) {
@@ -2060,7 +2094,7 @@ fn beatFunctionCall(
                 live.call_item_index.* = live.live_output_index.* + @intFromBool(live.message_started.*);
                 live.call_item_id.* = try responses_mod.makeId(stream.io, allocator, "fc");
                 const o = progress.opened.?;
-                try emitResponsesFunctionCallAdded(allocator, stream, seq, live.call_item_index.*, live.call_item_id.*.?, o.id, o.name);
+                try emitResponsesFunctionCallAdded(allocator, stream, seq, live.call_item_index.*, .{ .id = live.call_item_id.*.?, .call_id = o.id, .name = o.name, .namespace = responsesCallNamespace(request_tools, o.name), .arguments = "" });
             }
             try emitResponsesFunctionCallDelta(allocator, stream, seq, live.call_item_index.*, live.call_item_id.*.?, "");
             return;
@@ -2071,41 +2105,27 @@ fn beatFunctionCall(
 
 /// Emit the SSE event sequence for a function_call output item: output_item.added,
 /// function_call_arguments.delta (single full-args delta), .done, output_item.done.
-fn emitResponsesFunctionCallEvents(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-    seq: *u64,
-    output_index: u32,
-    fc_id: []const u8,
-    call_id: []const u8,
-    name: []const u8,
-    arguments_json: []const u8,
-) !void {
-    try emitResponsesFunctionCallAdded(allocator, stream, seq, output_index, fc_id, call_id, name);
-    try emitResponsesFunctionCallRest(allocator, stream, seq, output_index, fc_id, call_id, name, arguments_json);
+fn emitResponsesFunctionCallEvents(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, output_index: u32, call: responses_mod.CallItem) !void {
+    try emitResponsesFunctionCallAdded(allocator, stream, seq, output_index, call);
+    try emitResponsesFunctionCallRest(allocator, stream, seq, output_index, call);
+}
+
+/// A `response.output_item.added`/`.done` event carrying the call as its item.
+fn sendResponsesCallItemEvent(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, event: []const u8, output_index: u32, call: responses_mod.CallItem) !void {
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try buf.print(allocator, "{{\"type\":\"{s}\",\"output_index\":{d},\"item\":", .{ event, output_index });
+    try responses_mod.appendFunctionCallItem(allocator, &buf, call);
+    try buf.append(allocator, '}');
+    try sendResponsesEvent(allocator, stream, seq, event, buf.items);
 }
 
 /// The function_call item opening: `output_item.added` with its arguments empty.
-fn emitResponsesFunctionCallAdded(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-    seq: *u64,
-    output_index: u32,
-    fc_id: []const u8,
-    call_id: []const u8,
-    name: []const u8,
-) !void {
-    const esc_id = try jsonEscape(allocator, fc_id);
-    defer allocator.free(esc_id);
-    const esc_call = try jsonEscape(allocator, call_id);
-    defer allocator.free(esc_call);
-    const esc_name = try jsonEscape(allocator, name);
-    defer allocator.free(esc_name);
-    const item_added = try std.fmt.allocPrint(allocator,
-        \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":"","status":"in_progress"}}}}
-    , .{ output_index, esc_id, esc_call, esc_name });
-    defer allocator.free(item_added);
-    try sendResponsesEvent(allocator, stream, seq, "response.output_item.added", item_added);
+fn emitResponsesFunctionCallAdded(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, output_index: u32, call: responses_mod.CallItem) !void {
+    var opened = call;
+    opened.arguments = "";
+    opened.status = "in_progress";
+    try sendResponsesCallItemEvent(allocator, stream, seq, "response.output_item.added", output_index, opened);
 }
 
 /// A `function_call_arguments.delta` of the item (empty: nothing added to its arguments, which a client still counts
@@ -2123,25 +2143,12 @@ fn emitResponsesFunctionCallDelta(allocator: std.mem.Allocator, stream: *Conn, s
 }
 
 /// What an opened function_call item still owes: its arguments as one delta, then `.done` and `output_item.done`.
-fn emitResponsesFunctionCallRest(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-    seq: *u64,
-    output_index: u32,
-    fc_id: []const u8,
-    call_id: []const u8,
-    name: []const u8,
-    arguments_json: []const u8,
-) !void {
-    const esc_id = try jsonEscape(allocator, fc_id);
+fn emitResponsesFunctionCallRest(allocator: std.mem.Allocator, stream: *Conn, seq: *u64, output_index: u32, call: responses_mod.CallItem) !void {
+    const esc_id = try jsonEscape(allocator, call.id);
     defer allocator.free(esc_id);
-    const esc_call = try jsonEscape(allocator, call_id);
-    defer allocator.free(esc_call);
-    const esc_name = try jsonEscape(allocator, name);
-    defer allocator.free(esc_name);
-    const esc_args = try jsonEscape(allocator, arguments_json);
+    const esc_args = try jsonEscape(allocator, call.arguments);
     defer allocator.free(esc_args);
-    try emitResponsesFunctionCallDelta(allocator, stream, seq, output_index, fc_id, arguments_json);
+    try emitResponsesFunctionCallDelta(allocator, stream, seq, output_index, call.id, call.arguments);
     {
         const done = try std.fmt.allocPrint(allocator,
             \\{{"type":"response.function_call_arguments.done","item_id":{s},"output_index":{d},"arguments":{s}}}
@@ -2149,13 +2156,7 @@ fn emitResponsesFunctionCallRest(
         defer allocator.free(done);
         try sendResponsesEvent(allocator, stream, seq, "response.function_call_arguments.done", done);
     }
-    {
-        const item_done = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":{s},"status":"completed"}}}}
-        , .{ output_index, esc_id, esc_call, esc_name, esc_args });
-        defer allocator.free(item_done);
-        try sendResponsesEvent(allocator, stream, seq, "response.output_item.done", item_done);
-    }
+    try sendResponsesCallItemEvent(allocator, stream, seq, "response.output_item.done", output_index, call);
 }
 
 /// Emit output_item.added (type=message) + content_part.added.
@@ -2357,6 +2358,104 @@ test "responsesToolExists validates Responses function tool names" {
 
     try testing.expect(responsesToolExists(parsed.value, "smartSearch"));
     try testing.expect(!responsesToolExists(parsed.value, "cruise_cards"));
+}
+
+const namespaced_tools =
+    \\[{"type":"function","name":"exec_command","parameters":{"type":"object"}},
+    \\ {"type":"namespace","name":"multi_agent_v1","description":"Sub-agents.","tools":[{"type":"function","name":"close_agent","parameters":{"type":"object","properties":{"target":{"type":"string"}}}}]}]
+;
+
+test "a call to a namespace member names its namespace; a top-level call and an undeclared name name none" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, namespaced_tools, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("multi_agent_v1", responsesCallNamespace(parsed.value, "close_agent").?);
+    try testing.expectEqual(@as(?[]const u8, null), responsesCallNamespace(parsed.value, "exec_command"));
+    try testing.expectEqual(@as(?[]const u8, null), responsesCallNamespace(parsed.value, "spawn_agent"));
+    try testing.expect(responsesToolExists(parsed.value, "close_agent"));
+    try testing.expect(!responsesToolExists(parsed.value, "spawn_agent"));
+}
+
+test "a namespaced call is the same item on the stream as in the envelope, opened and done" {
+    const a = testing.allocator;
+    var wire: http_conn.TestWire = undefined;
+    try wire.init();
+    defer wire.deinit();
+    var seq: u64 = 0;
+    const call: responses_mod.CallItem = .{ .id = "fc_1", .call_id = "call_1", .name = "close_agent", .namespace = "multi_agent_v1", .arguments = "{\"target\":\"a\"}" };
+    try emitResponsesFunctionCallEvents(a, &wire.conn, &seq, 3, call);
+    var buf: [4096]u8 = undefined;
+    const raw = wire.read(&buf);
+
+    var envelope = std.ArrayList(u8).empty;
+    defer envelope.deinit(a);
+    try responses_mod.appendFunctionCallItem(a, &envelope, call);
+    const done = try std.fmt.allocPrint(a, "\"type\":\"response.output_item.done\",\"output_index\":3,\"item\":{s},\"sequence_number\":", .{envelope.items});
+    defer a.free(done);
+    try testing.expect(std.mem.indexOf(u8, raw, done) != null);
+
+    // The opening carries the namespace too, with its arguments empty.
+    const opened = "\"type\":\"response.output_item.added\",\"output_index\":3,\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"close_agent\",\"namespace\":\"multi_agent_v1\",\"arguments\":\"\",\"status\":\"in_progress\"},\"sequence_number\":";
+    try testing.expect(std.mem.indexOf(u8, raw, opened) != null);
+}
+
+test "a call opened early on a keepalive names its namespace" {
+    const a = testing.allocator;
+    var wire: http_conn.TestWire = undefined;
+    try wire.init();
+    defer wire.deinit();
+    var progress: tool_progress.Progress = .{};
+    defer progress.deinit(a);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, namespaced_tools, .{});
+    defer parsed.deinit();
+    const flat = try responses_mod.buildToolsJson(a, parsed.value.array);
+    defer a.free(flat);
+    var seq: u64 = 0;
+    var reasoning_id: ?[]u8 = null;
+    var reasoning_index: u32 = 0;
+    var reasoning_started = false;
+    var message_id: ?[]u8 = null;
+    defer if (message_id) |id| a.free(id);
+    var message_index: u32 = 0;
+    var message_started = false;
+    var live_output_index: u32 = 0;
+    var join: think_tags.ThoughtJoin = .{};
+    var call_item_id: ?[]u8 = null;
+    defer if (call_item_id) |id| a.free(id);
+    var call_item_index: u32 = 0;
+    const live: LiveItems = .{
+        .reasoning_id = &reasoning_id,
+        .reasoning_index = &reasoning_index,
+        .reasoning_started = &reasoning_started,
+        .message_id = &message_id,
+        .message_index = &message_index,
+        .message_started = &message_started,
+        .live_output_index = &live_output_index,
+        .join = &join,
+        .call_item_id = &call_item_id,
+        .call_item_index = &call_item_index,
+    };
+    const writing = "<tool_call>\n<function=close_agent>\n<parameter=target>\nagent-1\n";
+    try beatFunctionCall(a, &wire.conn, &seq, &progress, live, writing, .{ .dialect = null }, flat, parsed.value);
+    var buf: [4096]u8 = undefined;
+    const raw = wire.read(&buf);
+    try testing.expect(std.mem.indexOf(u8, raw, "\"type\":\"function_call\",\"id\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, raw, "\"name\":\"close_agent\",\"namespace\":\"multi_agent_v1\",\"arguments\":\"\",\"status\":\"in_progress\"") != null);
+}
+
+test "the response echoes a namespace tool with its member functions" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, namespaced_tools, .{});
+    defer parsed.deinit();
+    const echo = try renderResponsesToolsEcho(testing.allocator, parsed.value);
+    defer testing.allocator.free(echo);
+    const got = try std.json.parseFromSlice(std.json.Value, testing.allocator, echo, .{});
+    defer got.deinit();
+    const items = got.value.array.items;
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqualStrings("namespace", items[1].object.get("type").?.string);
+    try testing.expectEqualStrings("multi_agent_v1", items[1].object.get("name").?.string);
+    const members = items[1].object.get("tools").?.array.items;
+    try testing.expectEqual(@as(usize, 1), members.len);
+    try testing.expectEqualStrings("close_agent", members[0].object.get("name").?.string);
 }
 
 test "buildResponsesJsonInstruction scopes schema prompt when tools are active" {
@@ -2657,7 +2756,7 @@ test "tool stream: a Responses call that buffers for 23 s sends its item and a f
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;
-        try beatFunctionCall(a, &wire.conn, &seq, &progress, live, buffered.items, .{ .dialect = null }, tools);
+        try beatFunctionCall(a, &wire.conn, &seq, &progress, live, buffered.items, .{ .dialect = null }, tools, null);
     }
     var buf: [16384]u8 = undefined;
     const raw = wire.read(&buf);
@@ -2674,7 +2773,7 @@ test "tool stream: a Responses call that buffers for 23 s sends its item and a f
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, raw, "output_item.done"));
 
     // The end completes that item: its arguments in one delta, then the done events, and no second `added`.
-    try emitResponsesFunctionCallRest(a, &wire.conn, &seq, call_item_index, call_item_id.?, progress.opened.?.id, "write_file", "{\"path\":\"report.md\"}");
+    try emitResponsesFunctionCallRest(a, &wire.conn, &seq, call_item_index, .{ .id = call_item_id.?, .call_id = progress.opened.?.id, .name = "write_file", .arguments = "{\"path\":\"report.md\"}" });
     const rest = wire.read(&buf);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, rest, "response.output_item.added"));
     try std.testing.expect(std.mem.indexOf(u8, rest, "\"output_index\":2,\"delta\":\"{\\\"path\\\":\\\"report.md\\\"}\"") != null);

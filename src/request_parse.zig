@@ -398,36 +398,175 @@ fn toolNameCarriable(name: []const u8) bool {
     return true;
 }
 
-/// The first malformed entry of a `tools` array (OpenAI chat, flat Responses and Anthropic shapes alike), as a
-/// message naming it. `typed` also requires an OpenAI/Responses `type` of "function" where one is given.
-pub fn toolsFault(buf: []u8, tools: std.json.Value, typed: bool) ?[]const u8 {
+/// The surfaces that carry a `tools` array, which differ in the tool types they serve.
+pub const ToolsShape = enum {
+    /// OpenAI chat and completions: function tools.
+    chat,
+    /// OpenAI Responses: function tools and `namespace` tools of function tools.
+    responses,
+    /// Anthropic Messages: custom tools.
+    messages,
+};
+
+fn toolType(tool: std.json.ObjectMap) ?[]const u8 {
+    const t = tool.get("type") orelse return null;
+    return if (t == .string) t.string else null;
+}
+
+/// The name a tool declares, where `function` nests it (chat) or the tool itself holds it.
+fn declaredName(tool: std.json.ObjectMap) ?[]const u8 {
+    const holder = if (tool.get("function")) |f| (if (f == .object) f.object else tool) else tool;
+    const n = holder.get("name") orelse return null;
+    return if (n == .string) n.string else null;
+}
+
+/// Whether an entry of `items` before `upto`, or a member of the namespace `members` before `member_upto`, declares `name`.
+fn nameDeclaredBefore(items: []const std.json.Value, upto: usize, members: []const std.json.Value, member_upto: usize, name: []const u8) bool {
+    for (items[0..upto]) |prev| {
+        if (prev != .object) continue;
+        if (toolType(prev.object)) |t| if (std.mem.eql(u8, t, "namespace")) {
+            const inner = prev.object.get("tools") orelse continue;
+            if (inner != .array) continue;
+            for (inner.array.items) |m| {
+                if (m != .object) continue;
+                if (declaredName(m.object)) |n| if (std.mem.eql(u8, n, name)) return true;
+            }
+            continue;
+        };
+        if (declaredName(prev.object)) |n| if (std.mem.eql(u8, n, name)) return true;
+    }
+    for (members[0..member_upto]) |m| {
+        if (m != .object) continue;
+        if (declaredName(m.object)) |n| if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
+}
+
+/// Where a function tool sits, for the repeats it checks: the `tools` entries before it, and the members of its
+/// namespace before it (none for a top-level tool).
+const Siblings = struct {
+    items: []const std.json.Value,
+    upto: usize,
+    members: []const std.json.Value = &.{},
+    member_upto: usize = 0,
+};
+
+/// A function tool's own faults: a name the model can call, once, and a schema that is an object. `path` names the
+/// entry (`tools[2]` or `tools[2].tools[0]`); a member holds its name flat, a top-level tool may nest it in `function`.
+fn functionFault(buf: []u8, path: []const u8, tool: std.json.ObjectMap, nested_ok: bool, sib: Siblings) ?[]const u8 {
+    const holder = if (nested_ok) (if (tool.get("function")) |f| (if (f == .object) f.object else tool) else tool) else tool;
+    const name = holder.get("name") orelse return fieldFault(buf, "'{s}' has no function name", .{path});
+    if (name != .string or name.string.len == 0) return fieldFault(buf, "'{s}' needs a function name that is a non-empty string", .{path});
+    if (!toolNameCarriable(name.string)) return fieldFault(buf, "'{s}' names the function \"{s}\", which the model cannot call: a name holds no whitespace, quote or angle bracket and is at most 128 bytes", .{ path, name.string[0..@min(name.string.len, 64)] });
+    if (nameDeclaredBefore(sib.items, sib.upto, sib.members, sib.member_upto, name.string)) return fieldFault(buf, "'{s}' repeats the function name \"{s}\"", .{ path, name.string[0..@min(name.string.len, 64)] });
+    for ([_][]const u8{ "parameters", "input_schema" }) |pk| {
+        const p = holder.get(pk) orelse continue;
+        if (p != .object and p != .null) return fieldFault(buf, "'{s}.{s}' must be a JSON schema object", .{ path, pk });
+    }
+    return null;
+}
+
+/// A `namespace` tool's faults: a name, and a non-empty `tools` array of function tools, each served under its own
+/// name. A member of another type is refused, as a top-level tool of that type is.
+fn namespaceFault(buf: []u8, i: usize, ns: std.json.ObjectMap, items: []const std.json.Value) ?[]const u8 {
+    const name = ns.get("name") orelse return fieldFault(buf, "'tools[{d}].name' is required: a namespace tool is named", .{i});
+    if (name != .string or name.string.len == 0) return fieldFault(buf, "'tools[{d}].name' must be a non-empty string", .{i});
+    const members = ns.get("tools") orelse return fieldFault(buf, "'tools[{d}].tools' is required: the namespace \"{s}\" holds an array of function tools", .{ i, name.string[0..@min(name.string.len, 64)] });
+    if (members != .array or members.array.items.len == 0) return fieldFault(buf, "'tools[{d}].tools' must be a non-empty array of function tools (the namespace \"{s}\")", .{ i, name.string[0..@min(name.string.len, 64)] });
+    for (members.array.items, 0..) |m, j| {
+        var path_buf: [48]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "tools[{d}].tools[{d}]", .{ i, j }) catch "tools";
+        if (m != .object) return fieldFault(buf, "'{s}' must be an object", .{path});
+        const t = toolType(m.object) orelse return fieldFault(buf, "'{s}.type' must be \"function\": a namespace serves function tools only", .{path});
+        if (!std.mem.eql(u8, t, "function")) return fieldFault(buf, "'{s}' is a \"{s}\" tool: a namespace serves function tools only", .{ path, t[0..@min(t.len, 64)] });
+        if (functionFault(buf, path, m.object, false, .{ .items = items, .upto = i, .members = members.array.items, .member_upto = j })) |why| return why;
+    }
+    return null;
+}
+
+/// A Responses tool this server does not run, as a message naming it. A hosted web search is the one a client can
+/// switch off, so its message says how for Codex.
+fn hostedToolFault(buf: []u8, i: usize, t: []const u8) []const u8 {
+    const shown = t[0..@min(t.len, 64)];
+    if (std.mem.startsWith(u8, t, "web_search")) return fieldFault(buf, "'tools[{d}]' is a \"{s}\" tool: this server runs no hosted web search; turn it off in the client (Codex: web_search = \"disabled\" in config.toml)", .{ i, shown });
+    return fieldFault(buf, "'tools[{d}]' is a \"{s}\" tool: this server serves function tools, and namespaces of function tools, only", .{ i, shown });
+}
+
+/// The first malformed entry of a `tools` array, as a message naming it.
+pub fn toolsFault(buf: []u8, tools: std.json.Value, shape: ToolsShape) ?[]const u8 {
     if (tools == .null) return null;
     if (tools != .array) return "'tools' must be an array";
     for (tools.array.items, 0..) |tool, i| {
         if (tool != .object) return fieldFault(buf, "'tools[{d}]' must be an object", .{i});
-        if (typed) if (tool.object.get("type")) |t| {
-            if (t != .string or !std.mem.eql(u8, t.string, "function")) return fieldFault(buf, "'tools[{d}].type' must be \"function\"", .{i});
+        var path_buf: [24]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "tools[{d}]", .{i}) catch "tools";
+        if (tool.object.get("type")) |t| switch (shape) {
+            .chat => if (t != .string or !std.mem.eql(u8, t.string, "function")) return fieldFault(buf, "'tools[{d}].type' must be \"function\"", .{i}),
+            .responses => {
+                if (t != .string) return fieldFault(buf, "'tools[{d}].type' must be a string", .{i});
+                if (std.mem.eql(u8, t.string, "namespace")) {
+                    if (namespaceFault(buf, i, tool.object, tools.array.items)) |why| return why;
+                    continue;
+                }
+                if (!std.mem.eql(u8, t.string, "function")) return hostedToolFault(buf, i, t.string);
+            },
+            // Anthropic's server tools and its own client tools (bash, text editor, computer) carry no schema this
+            // server can hand a model, and it runs none of them: only a custom tool is served.
+            .messages => {
+                if (t != .string) return fieldFault(buf, "'tools[{d}].type' must be a string", .{i});
+                if (!std.mem.eql(u8, t.string, "custom")) return fieldFault(buf, "'tools[{d}]' is a \"{s}\" tool: this server serves custom tools only (a name, a description and an input_schema)", .{ i, t.string[0..@min(t.string.len, 64)] });
+            },
         };
-        // Anthropic's server tools and its own client tools (bash, text editor, computer) carry no schema this server
-        // can hand a model, and it runs none of them: only a custom tool is served.
-        if (!typed) if (tool.object.get("type")) |t| {
-            if (t != .string) return fieldFault(buf, "'tools[{d}].type' must be a string", .{i});
-            if (!std.mem.eql(u8, t.string, "custom")) return fieldFault(buf, "'tools[{d}]' is a \"{s}\" tool: this server serves custom tools only (a name, a description and an input_schema)", .{ i, t.string[0..@min(t.string.len, 64)] });
-        };
-        const holder = if (tool.object.get("function")) |f| (if (f == .object) f.object else tool.object) else tool.object;
-        const name = holder.get("name") orelse return fieldFault(buf, "'tools[{d}]' has no function name", .{i});
-        if (name != .string or name.string.len == 0) return fieldFault(buf, "'tools[{d}]' needs a function name that is a non-empty string", .{i});
-        if (!toolNameCarriable(name.string)) return fieldFault(buf, "'tools[{d}]' names the function \"{s}\", which the model cannot call: a name holds no whitespace, quote or angle bracket and is at most 128 bytes", .{ i, name.string[0..@min(name.string.len, 64)] });
-        for (tools.array.items[0..i]) |prev| {
-            if (prev != .object) continue;
-            const ph = if (prev.object.get("function")) |f| (if (f == .object) f.object else prev.object) else prev.object;
-            const pn = ph.get("name") orelse continue;
-            if (pn == .string and std.mem.eql(u8, pn.string, name.string)) return fieldFault(buf, "'tools[{d}]' repeats the function name \"{s}\"", .{ i, name.string[0..@min(name.string.len, 64)] });
+        if (functionFault(buf, path, tool.object, true, .{ .items = tools.array.items, .upto = i })) |why| return why;
+    }
+    return null;
+}
+
+/// One function a Responses `tools` array offers the model: a top-level function tool, or a member of a `namespace`
+/// tool, which a call to it names back as `namespace`.
+pub const ResponsesFunction = struct { tool: std.json.ObjectMap, namespace: ?[]const u8 };
+
+/// The functions of a Responses `tools` array in declaration order, namespace members flattened in place. A tool of
+/// another type yields nothing: `toolsFault` refuses it before a request is served.
+pub const ResponsesFunctions = struct {
+    tools: []const std.json.Value,
+    at: usize = 0,
+    member: usize = 0,
+
+    pub fn next(self: *ResponsesFunctions) ?ResponsesFunction {
+        while (self.at < self.tools.len) {
+            const tool = self.tools[self.at];
+            const t = if (tool == .object) toolType(tool.object) orelse "" else "";
+            if (std.mem.eql(u8, t, "function")) {
+                self.at += 1;
+                return .{ .tool = tool.object, .namespace = null };
+            }
+            if (std.mem.eql(u8, t, "namespace")) {
+                const members = tool.object.get("tools") orelse .null;
+                const ns_name = tool.object.get("name") orelse .null;
+                if (members == .array and ns_name == .string) while (self.member < members.array.items.len) {
+                    const m = members.array.items[self.member];
+                    self.member += 1;
+                    if (m == .object and std.mem.eql(u8, toolType(m.object) orelse "", "function")) return .{ .tool = m.object, .namespace = ns_name.string };
+                };
+            }
+            self.at += 1;
+            self.member = 0;
         }
-        for ([_][]const u8{ "parameters", "input_schema" }) |pk| {
-            const p = holder.get(pk) orelse continue;
-            if (p != .object and p != .null) return fieldFault(buf, "'tools[{d}].{s}' must be a JSON schema object", .{ i, pk });
-        }
+        return null;
+    }
+};
+
+pub fn responsesFunctions(tools: std.json.Value) ResponsesFunctions {
+    return .{ .tools = if (tools == .array) tools.array.items else &.{} };
+}
+
+/// The function a Responses `tools` array declares under `name`, or null.
+pub fn findResponsesFunction(tools: ?std.json.Value, name: []const u8) ?ResponsesFunction {
+    var it = responsesFunctions(tools orelse return null);
+    while (it.next()) |f| {
+        const n = f.tool.get("name") orelse continue;
+        if (n == .string and std.mem.eql(u8, n.string, name)) return f;
     }
     return null;
 }

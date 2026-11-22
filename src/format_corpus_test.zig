@@ -46,6 +46,8 @@ const tool_schema = @import("tool_schema.zig");
 const stop_sequences = @import("stop_sequences.zig");
 const reply_mod = @import("reply.zig");
 const tool_reading = @import("tool_reading.zig");
+const request_fields = @import("request_fields.zig");
+const responses_mod = @import("responses.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
     const Worker = struct {
@@ -4324,4 +4326,69 @@ test "format corpus: a call named while it is written keeps that name to its end
         try testing.expect(after_first > 0);
     }
     try testing.expect(two_calls >= 6);
+}
+
+/// The `tools` arrays Responses clients sent, as recorded: every entry is served to the model or the request is refused
+/// naming it. A tool that is neither is dropped without a word, and a client that needs it fails later, unexplained.
+const client_tool_arrays = [_]struct { client: []const u8, tools: []const u8, refused: ?[]const u8 }{
+    // codex-cli 0.154 with its default web search: refused at the web_search entry.
+    .{ .client = "codex 0.154", .refused = "tools[3]", .tools = 
+    \\[{"type":"function","name":"exec_command","description":"Runs a command in a PTY.","strict":false,"parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"],"additionalProperties":false}},
+    \\ {"type":"namespace","name":"multi_agent_v1","description":"Tools for spawning and managing sub-agents.","tools":[
+    \\   {"type":"function","name":"close_agent","description":"Close an agent.","strict":false,"parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}},
+    \\   {"type":"function","name":"spawn_agent","description":"Spawn an agent.","strict":false,"parameters":{"type":"object","properties":{"message":{"type":"string"}},"additionalProperties":false}}]},
+    \\ {"type":"function","name":"get_goal","description":"Get the goal.","strict":false,"parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false}},
+    \\ {"type":"web_search","external_web_access":false}]
+    },
+    // The same request under the config `sushi launch codex` writes (web_search = "disabled").
+    .{ .client = "codex 0.154, web_search disabled", .refused = null, .tools = 
+    \\[{"type":"function","name":"exec_command","description":"Runs a command in a PTY.","strict":false,"parameters":{"type":"object","properties":{"cmd":{"type":"string"}},"required":["cmd"],"additionalProperties":false}},
+    \\ {"type":"namespace","name":"multi_agent_v1","description":"Tools for spawning and managing sub-agents.","tools":[
+    \\   {"type":"function","name":"close_agent","description":"Close an agent.","strict":false,"parameters":{"type":"object","properties":{"target":{"type":"string"}},"required":["target"],"additionalProperties":false}},
+    \\   {"type":"function","name":"spawn_agent","description":"Spawn an agent.","strict":false,"parameters":{"type":"object","properties":{"message":{"type":"string"}},"additionalProperties":false}}]},
+    \\ {"type":"function","name":"get_goal","description":"Get the goal.","strict":false,"parameters":{"type":"object","properties":{},"required":[],"additionalProperties":false}}]
+    },
+    .{ .client = "flat function tools", .refused = null, .tools = 
+    \\[{"type":"function","name":"get_weather","description":"Weather.","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}]
+    },
+    // A freeform tool is not a function: refused at its entry.
+    .{ .client = "codex freeform apply_patch", .refused = "tools[1]", .tools = 
+    \\[{"type":"function","name":"exec_command","parameters":{"type":"object"}},
+    \\ {"type":"custom","name":"apply_patch","description":"Patch.","format":{"type":"grammar","syntax":"lark","definition":"start: x"}}]
+    },
+};
+
+test "format corpus: every tool a Responses client declares is served to the model or refused by name, never dropped" {
+    const allocator = testing.allocator;
+    for (client_tool_arrays) |c| {
+        errdefer std.debug.print("client: {s}\n", .{c.client});
+        const body = try std.fmt.allocPrint(allocator, "{{\"tools\":{s}}}", .{c.tools});
+        defer allocator.free(body);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        var buf: [384]u8 = undefined;
+        const why = request_fields.fault(&buf, .responses, parsed.value.object);
+        if (c.refused) |entry| {
+            const quoted = try std.fmt.allocPrint(allocator, "'{s}'", .{entry});
+            defer allocator.free(quoted);
+            errdefer std.debug.print("refusal: {?s}\n", .{why});
+            try testing.expect(std.mem.indexOf(u8, why orelse return error.NotRefused, quoted) != null);
+            continue;
+        }
+        try testing.expectEqual(@as(?[]const u8, null), why);
+        const declared = parsed.value.object.get("tools").?.array;
+        var want: usize = 0;
+        for (declared.items) |tool| {
+            const kind = tool.object.get("type").?.string;
+            if (std.mem.eql(u8, kind, "function")) want += 1 else {
+                try testing.expectEqualStrings("namespace", kind);
+                want += tool.object.get("tools").?.array.items.len;
+            }
+        }
+        const served = try responses_mod.buildToolsJson(allocator, declared);
+        defer allocator.free(served);
+        var listed = try std.json.parseFromSlice(std.json.Value, allocator, served, .{});
+        defer listed.deinit();
+        try testing.expectEqual(want, listed.value.array.items.len);
+    }
 }

@@ -7,6 +7,7 @@
 const arch_fx = @import("arch_fixtures_test.zig");
 const std = @import("std");
 const request_fields = @import("request_fields.zig");
+const request_parse = @import("request_parse.zig");
 const json_text = @import("json_text.zig");
 const chat_mod = @import("chat.zig");
 
@@ -168,19 +169,17 @@ pub fn inputContainsFunctionCallOutput(input_val: std.json.Value) bool {
 
 /// Re-shape Responses tools (`{type:"function", name, parameters, description}`)
 /// into the nested OpenAI form (`{type:"function", function:{name, parameters,
-/// description}}`) that `chat_mod.formatChat` expects. Returns owned JSON.
+/// description}}`) that `chat_mod.formatChat` expects. A `namespace` tool's member functions are
+/// listed in place under their own names; the reply names the namespace back (`appendFunctionCallItem`).
+/// The caller has run `request_parse.toolsFault`, which refuses every other tool type. Returns owned JSON.
 pub fn buildToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     try buf.append(allocator, '[');
     var emitted: usize = 0;
-    for (tools_array.items) |tool_val| {
-        if (tool_val != .object) continue;
-        const tool = tool_val.object;
-        // Only function tools are supported locally (web_search/file_search/computer_use are not)
-        const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
-        if (!std.mem.eql(u8, t, "function")) continue;
-
+    var it = request_parse.responsesFunctions(.{ .array = tools_array });
+    while (it.next()) |f| {
+        const tool = f.tool;
         if (emitted > 0) try buf.append(allocator, ',');
         emitted += 1;
         const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
@@ -241,31 +240,40 @@ pub fn appendReasoningItem(
     try buf.appendSlice(allocator, "}]}");
 }
 
-pub fn appendFunctionCallItem(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    item_id: []const u8,
+/// A `function_call` output item. `namespace` is set for a call to a member of a `namespace` tool, which the client
+/// routes by (namespace, name).
+pub const CallItem = struct {
+    id: []const u8,
     call_id: []const u8,
     name: []const u8,
-    arguments_json: []const u8,
-) !void {
-    const esc_id = try jsonEscape(allocator, item_id);
-    defer allocator.free(esc_id);
-    const esc_call = try jsonEscape(allocator, call_id);
-    defer allocator.free(esc_call);
-    const esc_name = try jsonEscape(allocator, name);
-    defer allocator.free(esc_name);
-    const esc_args = try jsonEscape(allocator, arguments_json);
-    defer allocator.free(esc_args);
+    namespace: ?[]const u8 = null,
+    arguments: []const u8,
+    status: []const u8 = "completed",
+};
+
+fn appendEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
+    const esc = try jsonEscape(allocator, text);
+    defer allocator.free(esc);
+    try buf.appendSlice(allocator, esc);
+}
+
+/// The item as the envelope's `output` and a stream's `output_item.done` carry it: one writer, so the two agree.
+pub fn appendFunctionCallItem(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), item: CallItem) !void {
     try buf.appendSlice(allocator, "{\"type\":\"function_call\",\"id\":");
-    try buf.appendSlice(allocator, esc_id);
+    try appendEscaped(allocator, buf, item.id);
     try buf.appendSlice(allocator, ",\"call_id\":");
-    try buf.appendSlice(allocator, esc_call);
+    try appendEscaped(allocator, buf, item.call_id);
     try buf.appendSlice(allocator, ",\"name\":");
-    try buf.appendSlice(allocator, esc_name);
+    try appendEscaped(allocator, buf, item.name);
+    if (item.namespace) |ns| {
+        try buf.appendSlice(allocator, ",\"namespace\":");
+        try appendEscaped(allocator, buf, ns);
+    }
     try buf.appendSlice(allocator, ",\"arguments\":");
-    try buf.appendSlice(allocator, esc_args);
-    try buf.appendSlice(allocator, ",\"status\":\"completed\"}");
+    try appendEscaped(allocator, buf, item.arguments);
+    try buf.appendSlice(allocator, ",\"status\":\"");
+    try buf.appendSlice(allocator, item.status);
+    try buf.appendSlice(allocator, "\"}");
 }
 
 // ─── input-item parser ────────────────────────────────────────────────────
@@ -932,6 +940,44 @@ test "buildToolsJson nests Responses-shape into OpenAI-shape" {
     try testing.expect(std.mem.indexOf(u8, out, "\"parameters\":{") != null);
     // Make sure top-level "type" wraps it
     try testing.expect(std.mem.startsWith(u8, out, "[{\"type\":\"function\""));
+}
+
+const codex_tools =
+    \\[{"type":"function","name":"exec_command","description":"Runs a command.","strict":false,"parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+    \\ {"type":"namespace","name":"multi_agent_v1","description":"Tools for spawning and managing sub-agents.","tools":[
+    \\   {"type":"function","name":"close_agent","description":"Close an agent.","strict":false,"parameters":{"type":"object","properties":{"target":{"type":"string"}}}},
+    \\   {"type":"function","name":"spawn_agent","description":"Spawn one.","strict":false,"parameters":{"type":"object","properties":{}}}]},
+    \\ {"type":"function","name":"view_image","description":"View.","strict":false,"parameters":{"type":"object","properties":{}}}]
+;
+
+test "buildToolsJson lists a namespace's member functions in place, each under its own name" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, codex_tools, .{});
+    defer parsed.deinit();
+    const out = try buildToolsJson(testing.allocator, parsed.value.array);
+    defer testing.allocator.free(out);
+    const listed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer listed.deinit();
+    const want = [_][]const u8{ "exec_command", "close_agent", "spawn_agent", "view_image" };
+    try testing.expectEqual(want.len, listed.value.array.items.len);
+    for (want, listed.value.array.items) |name, tool| {
+        try testing.expectEqualStrings("function", tool.object.get("type").?.string);
+        try testing.expectEqualStrings(name, tool.object.get("function").?.object.get("name").?.string);
+    }
+    try testing.expect(std.mem.indexOf(u8, out, "multi_agent_v1") == null);
+}
+
+test "a call item names the namespace of a member function, and no namespace for a top-level one" {
+    const a = testing.allocator;
+    const cases = [_]struct { namespace: ?[]const u8, want: []const u8 }{
+        .{ .namespace = "multi_agent_v1", .want = "{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"close_agent\",\"namespace\":\"multi_agent_v1\",\"arguments\":\"{\\\"target\\\":\\\"a\\\"}\",\"status\":\"completed\"}" },
+        .{ .namespace = null, .want = "{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"close_agent\",\"arguments\":\"{\\\"target\\\":\\\"a\\\"}\",\"status\":\"completed\"}" },
+    };
+    for (cases) |c| {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(a);
+        try appendFunctionCallItem(a, &buf, .{ .id = "fc_1", .call_id = "call_1", .name = "close_agent", .namespace = c.namespace, .arguments = "{\"target\":\"a\"}" });
+        try testing.expectEqualStrings(c.want, buf.items);
+    }
 }
 
 test "buildToolsJson skips non-function tools" {
