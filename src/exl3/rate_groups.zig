@@ -1601,10 +1601,18 @@ fn gatedFold(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, inds: mlx.m
     return out;
 }
 
-/// Whether a decode chain prepares its inputs once per slot, at DeepSeek's geometry: a threadgroup of the fused chain
-/// otherwise re-derives its slice of the input and of the SwiGLU mid, which the two extra dispatches cost less than.
+/// Whether a decode chain prepares its inputs once per slot: a threadgroup of the fused chain otherwise
+/// re-derives its slice of the input and of the SwiGLU mid, which the two extra dispatches cost less than.
+/// DeepSeek's geometry was the first row; `shared.exl3_grouped_decode` measures the same 10 % at Flash-Next's
+/// (stq36/stq42, rows 3: fused 361/375 us against prep 321/337), the planes byte-identical either way.
 fn preparedOn(rb: *const Ragged) bool {
     if (prepared_force) |v| return v;
+    return (rb.hidden == 5120 and rb.inter == 2304) or (rb.hidden == 2560 and rb.inter == 640);
+}
+
+/// Member grouping (two slots' rows per threadgroup) is DeepSeek's: at Flash-Next's width the
+/// bench's pairs arm only wins with a carry, and its zero-carry rung is behind fused.
+fn groupedOn(rb: *const Ragged) bool {
     return rb.hidden == 5120 and rb.inter == 2304;
 }
 
@@ -1658,7 +1666,7 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
     const downs = classesOf(rb, true, &dc);
     logEngaged(.decode, rb, pair.len, downs.len);
     const prepared = preparedOn(rb);
-    const group = if (prepared) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
+    const group = if (prepared and groupedOn(rb)) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
     if (group > 0) kernels.logGroupedEngaged(group);
     const inner = if (prepared) blk: {
         const prep = try kernels.pairPrepare(s, x, rb.suh[0], rb.suh[1], slots, rb.hidden, @intCast(mlx.mlx_array_size(slots)), topk);

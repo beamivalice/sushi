@@ -14,6 +14,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 Every bill, admission, context and chunk function is in `src/bills.zig`, which links no MLX and runs in
 `zig build test-host`; `gpu_mem.zig` holds the live GPU readers, so a host test that would read the device panics
 instead of guessing. An arch's own terms are in `src/<arch>/<arch>_bill.zig` ([engine-arch-seam](engine-arch-seam.md)).
+`--log-level debug` prints every term of the bill it last computed (`[bill] prefill seq=… fwd=… envelope=… gross=…`,
+from `prefillMemoryNeeded`): read a bill's composition off a live boot instead of re-deriving it, the way
+[qwen4-perf](qwen4-perf.md#m1-max-64-gb-what-a-long-context-tool-calls-prefill-actually-costs-2026-11-20) did.
 `bills.zig` reads the launch vars `main.zig` writes through `launch_state` (an alias of `server_state.zig`, the process
 globals' file); `requestBillsMtpHead` stays in `server.zig`. The `bill pin:` tests hold every
 bill function's output on the committed fixture configs of all served packs: a bill change moves a pin, on purpose.
