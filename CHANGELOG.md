@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **The debug log no longer reports a tool call as dropped while the model is still writing it**: a stream's keepalive re-read the growing call and wrote "tool markup parsed to no call" for each read (22 lines in one Claude Code run, every call delivered). Only the final read writes the line now, and it names the cut call's own start, its length and the calls parsed before it.
 - **`sushi launch aider` is gone**: aider is not an agent sushi supports, so the launcher now refuses it as an unknown agent and no longer writes `~/.sushi/aider/`.
 - **The `[admission]` line names the decoder-pool bytes a DeepSeek prefill borrows**: `lendable` sits beside `needed`, so a resident prefill's hold, which is more than `needed` by design, can be checked against `needed + lendable` from the log.
 - **A DeepSeek-V4.1 row store whose grow fails inside MLX no longer keeps a part at a size its capacity disagrees with**: the codes grew before the scales, so a failure at the scales (or at a trim after a truncate) left the codes at the new size and the capacity at the old one, which under-billed the store or let a later append write past the codes' end; every part is now built before any old one is freed.

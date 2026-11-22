@@ -375,8 +375,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **A stream with no tools cuts the markup where the non-stream reply does** (`think_tags.MarkupCut`, in
   `ContentStream` and the thought arms): text that may open markup waits, text before an opener goes, nothing follows
   it. A request with tools parses the markup instead, so the cut is off there.
-- A reply whose tool markup parsed to no call ends its turn as a plain `stop` with the markup cut: the log names it
-  (`[tool-parse]`, written by `parseToolCallsForRequest`, the bytes cut and where they start).
+- A reply whose tool markup was cut (parsed to no call, or a call left open) ends without it: the log names it
+  (`[tool-parse] tool markup cut`, written once by the final read in `parseToolCallsForRequest`: the CUT call's own
+  start, its length, and how many calls parsed before it, `reply.unparsedOf`). A read of a buffer still growing
+  (`pendingCall`, which a stream's keepalive repeats) holds `tool_calls.PartialRead` and writes no `[tool-parse]` note (every site goes through `tool_calls.note`); any other line it raises still writes.
 - Whether a prompt ends inside a think block is a property of the RENDERED BYTES (`promptOpensThink`), never ANDed
   with `enable_thinking`; `in_think_block` seeds from `prompt_opened_think` ALONE at every stream site; a model can
   open its OWN block (`modelThinkOpener`).

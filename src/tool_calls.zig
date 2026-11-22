@@ -9,6 +9,30 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const tool_schema = @import("tool_schema.zig");
 const Message = chat.Message;
+
+/// Set around a read of the text of a generation that is still running (`reply.pendingCall`, which a stream's keepalive
+/// repeats on the growing buffer): the final read writes each `[tool-parse]` note once, so the partial one writes none.
+/// Only these notes wait; every other line a read raises still writes.
+threadlocal var partial_read_depth: u32 = 0;
+
+pub const PartialRead = struct {
+    pub fn begin() PartialRead {
+        partial_read_depth += 1;
+        return .{};
+    }
+
+    pub fn end(self: PartialRead) void {
+        _ = self;
+        partial_read_depth -= 1;
+    }
+};
+
+/// A `[tool-parse]` line: what the parse chain did to the text it read.
+pub fn note(level: log.Level, comptime fmt: []const u8, args: anytype) void {
+    if (partial_read_depth > 0) return;
+    log.atLevel(level, fmt, args);
+}
+
 const ParsedToolCall = tool_schema.ParsedToolCall;
 const ReplayCase = chat.ReplayCase;
 const ToolCall = chat.ToolCall;
@@ -470,7 +494,7 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
             if (parseGemma4ToolCall(allocator, content, tag_end_opt == null)) |tc| {
                 try calls.append(allocator, tc);
             } else {
-                log.info("  [tool-parse] Gemma4 parse FAILED for: {s}\n", .{content[0..@min(content.len, 200)]});
+                note(.info, "  [tool-parse] Gemma4 parse FAILED for: {s}\n", .{content[0..@min(content.len, 200)]});
             }
         }
     }
@@ -545,7 +569,7 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
             }
             allocator.free(repaired);
         }
-        log.info("  [tool-parse] unrepairable args for '{s}' → empty object (never ship invalid JSON)\n", .{tc.name});
+        note(.info, "  [tool-parse] unrepairable args for '{s}' → empty object (never ship invalid JSON)\n", .{tc.name});
         const empty = try allocator.dupe(u8, "{}");
         allocator.free(tc.arguments);
         tc.arguments = empty;
@@ -2013,7 +2037,7 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
         if (looseRepairToolCallJson(allocator, text)) |repaired| {
             defer allocator.free(repaired);
             if (tool_schema.parseArgs(allocator, repaired)) |reparsed| {
-                log.info("  [tool-parse] loose-repair recovered mangled tool-call JSON (raw control bytes / unescaped quotes)\n", .{});
+                note(.info, "  [tool-parse] loose-repair recovered mangled tool-call JSON (raw control bytes / unescaped quotes)\n", .{});
                 break :blk reparsed;
             } else |_| {}
         }
@@ -2217,7 +2241,7 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8, input_
             if (reparsed.value == .object) {
                 const name_owned = allocator.dupe(u8, name) catch return null;
                 keep = true;
-                log.info("  [tool-parse] loose-repair recovered mangled Gemma 4 tool-call JSON\n", .{});
+                note(.info, "  [tool-parse] loose-repair recovered mangled Gemma 4 tool-call JSON\n", .{});
                 return .{ .name = name_owned, .arguments = repaired };
             }
         } else |_| {}
@@ -2226,7 +2250,7 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8, input_
     // Convert Gemma 4 custom format to JSON:
     // {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>} → {"key":"value","key2":"value2"}
     const json = convertGemma4ArgsToJson(allocator, args_str, input_truncated) orelse {
-        log.info("  [tool-parse] convertGemma4ArgsToJson FAILED for: {s}\n", .{args_str[0..@min(args_str.len, 200)]});
+        note(.info, "  [tool-parse] convertGemma4ArgsToJson FAILED for: {s}\n", .{args_str[0..@min(args_str.len, 200)]});
         return null;
     };
     return .{

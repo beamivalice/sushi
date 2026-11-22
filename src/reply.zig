@@ -311,12 +311,48 @@ pub const Pending = struct {
     }
 };
 
+/// The tool markup a reply cuts without a call: where the cut call starts, how long it runs, and how many calls parsed
+/// before it.
+pub const Unparsed = struct { start: usize, len: usize, parsed_before: usize };
+
+/// The first cut call of `text` (the first of `defects`, else the markup of a text that parsed to no call), with the
+/// calls the text before it parsed to.
+pub fn unparsedOf(allocator: std.mem.Allocator, text: []const u8, origin: Origin, defects: []const tool_reading.Defect) !?Unparsed {
+    const start, const end = if (defects.len > 0)
+        .{ defects[0].start, defects[0].end }
+    else if (think_tags.leakedToolMarkupStart(text)) |at|
+        .{ at, text.len }
+    else
+        return null;
+    var parsed_before: usize = 0;
+    if (try tool_calls_mod.parseToolCallsAs(allocator, text[0..start], origin.dialect)) |before| {
+        parsed_before = before.len;
+        for (before) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(before);
+    }
+    return .{ .start = start, .len = end - start, .parsed_before = parsed_before };
+}
+
+/// A reply whose tool markup was cut goes out as text without it and its turn ends as a plain stop, or names the cut:
+/// this line is the log's one trace of why. Only a final read writes it.
+fn noteUnparsed(text: []const u8, cut: Unparsed) void {
+    var quoted: [512]u8 = undefined;
+    const n = log.appendQuoted(&quoted, 0, text[cut.start..], 96);
+    tool_calls_mod.note(.info, "[tool-parse] tool markup cut from the reply: the call at byte {d} runs {d} bytes, {d} call(s) parsed before it, {s}\n", .{ cut.start, cut.len, cut.parsed_before, quoted[0..n] });
+}
+
 /// The call `text` is still writing, or null: its first unfinished call is marked up, has a name, and the request
 /// declares it. A client is told this name, and the calls before it, before the generation ends, so they are the ones
 /// the finished text holds (`unfinishedCall` reads the same parse). A bare JSON call has no markup to start from and
 /// names itself only by its arguments, so it is never pending.
 pub fn pendingCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Pending {
     const tools = tools_json orelse return null;
+    // A read of a buffer that grows: the final read of the text writes the `[tool-parse]` notes, this one none.
+    const partial = tool_calls_mod.PartialRead.begin();
+    defer partial.end();
     const defects = try tool_reading.defects(allocator, text, origin.model_ended);
     defer allocator.free(defects);
     if (defects.len == 0) return null;
@@ -358,7 +394,6 @@ pub fn parseToolCallsForRequest(
     defer rest.deinit(allocator);
     var body = text;
     if (defects.len > 0) {
-        tool_schema.noteUnparsedToolMarkup(text);
         var at: usize = 0;
         for (defects) |d| {
             try rest.appendSlice(allocator, text[at..d.start]);
@@ -367,11 +402,15 @@ pub fn parseToolCallsForRequest(
         try rest.appendSlice(allocator, text[at..]);
         body = rest.items;
     }
-    return tool_schema.parseForRequest(allocator, body, tools_json, .{
+    const calls = try tool_schema.parseForRequest(allocator, body, tools_json, .{
         .allow_parallel = allow_parallel,
         .autocorrect = server_state.g_tool_autocorrect,
         .dialect = origin.dialect,
     });
+    if (defects.len > 0 or calls == null) {
+        if (try unparsedOf(allocator, text, origin, defects)) |cut| noteUnparsed(text, cut);
+    }
+    return calls;
 }
 
 test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
@@ -550,7 +589,81 @@ test "parseToolCallsForRequest: tool markup that parses to no call leaves one lo
     defer allocator.free(logged);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, logged, "[tool-parse]"));
     try std.testing.expect(std.mem.indexOf(u8, logged, "inv\u{793c}oke name=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, logged, "from byte 22,") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logged, "call at byte 22 runs 175 bytes, 0 call(s) parsed") != null);
+}
+
+const two_calls_second_open = "\n\nfirst.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>\n" ++
+    "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/a\n</parameter>\n<parameter=content>\nhalf";
+
+test "unparsedOf: a buffer whose first call parsed and whose second did not names the second call's own start, its length and the one call before it" {
+    const allocator = testing.allocator;
+    const defects = try tool_reading.defects(allocator, two_calls_second_open, false);
+    defer allocator.free(defects);
+    const got = (try unparsedOf(allocator, two_calls_second_open, .{ .dialect = null }, defects)) orelse return error.NoCut;
+    const second = std.mem.lastIndexOf(u8, two_calls_second_open, "<tool_call>").?;
+    try testing.expectEqual(second, got.start);
+    try testing.expectEqual(two_calls_second_open.len - second, got.len);
+    try testing.expectEqual(@as(usize, 1), got.parsed_before);
+}
+
+/// The log a read of `text` writes (debug level), through the chokepoint (a final read) or `pendingCall` (the partial
+/// read a stream's keepalive repeats). The caller frees the result.
+fn logOfRead(allocator: std.mem.Allocator, partial: bool, text: []const u8, tools: []const u8) ![]u8 {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(root);
+    const log_path = try std.fmt.allocPrint(allocator, "{s}/s.log", .{root});
+    defer allocator.free(log_path);
+    const was_debug = log.isDebug();
+    log.setLevel(.debug);
+    defer log.setLevel(if (was_debug) .debug else .info);
+    try log.openFile(log_path, 0);
+    errdefer log.closeFile();
+    if (partial) {
+        if (try pendingCall(allocator, text, .{ .dialect = null }, tools)) |p| p.deinit(allocator);
+    } else {
+        const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null });
+        if (calls) |cs| {
+            for (cs) |c| {
+                allocator.free(c.name);
+                allocator.free(c.arguments);
+            }
+            allocator.free(cs);
+        }
+    }
+    log.closeFile();
+    return tmp.dir.readFileAlloc(io, "s.log", allocator, .limited(1 << 16));
+}
+
+test "a partial read of a growing call (pendingCall) writes no [tool-parse] line; the final read of the same text writes one" {
+    const allocator = testing.allocator;
+    const partial = try logOfRead(allocator, true, two_calls_second_open, test_tools);
+    defer allocator.free(partial);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, partial, "[tool-parse]"));
+    const final = try logOfRead(allocator, false, two_calls_second_open, test_tools);
+    defer allocator.free(final);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, final, "[tool-parse]"));
+}
+
+// A finished call whose array argument is no JSON, even repaired, writes a `[tool-autocorrect]` line, which is no tool-parse note.
+const mangled_array_tools =
+    \\[{"type":"function","function":{"name":"take","parameters":{"type":"object","properties":{"items":{"type":"array"}},"required":["items"]}}},
+    \\{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+;
+const mangled_then_open = "\n\n<tool_call>\n<function=take>\n<parameter=items>\n[undefined]\n</parameter>\n</function>\n</tool_call>\n" ++
+    "<tool_call>\n<function=write_file>\n<parameter=path>\n/tmp/a";
+
+test "a line that is no tool-parse note still writes during a partial read" {
+    const allocator = testing.allocator;
+    const final = try logOfRead(allocator, false, mangled_then_open, mangled_array_tools);
+    defer allocator.free(final);
+    try testing.expect(std.mem.indexOf(u8, final, "[tool-autocorrect]") != null);
+    const partial = try logOfRead(allocator, true, mangled_then_open, mangled_array_tools);
+    defer allocator.free(partial);
+    try testing.expect(std.mem.indexOf(u8, partial, "[tool-autocorrect]") != null);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, partial, "[tool-parse]"));
 }
 
 test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses" {

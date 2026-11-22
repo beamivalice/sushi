@@ -440,7 +440,7 @@ pub fn coerceToolArgsToSchema(
         if (!changed) continue;
 
         const rewritten = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch continue;
-        log.info("  [tool-parse] coerced {s} arguments to the declared schema types\n", .{call.name});
+        tool_calls_mod.note(.info, "  [tool-parse] coerced {s} arguments to the declared schema types\n", .{call.name});
         allocator.free(call.arguments);
         call.arguments = rewritten;
     }
@@ -593,7 +593,7 @@ pub fn hoistMisplacedRequiredParams(
                 _ = buriedParamIn(e.value_ptr, name, want, true);
             }
             try parsed.value.object.put(parsed.arena.allocator(), name, found.?);
-            log.info("  [tool-parse] hoisted misplaced required arg '{s}' to the top level for {s}\n", .{ name, call.name });
+            tool_calls_mod.note(.info, "  [tool-parse] hoisted misplaced required arg '{s}' to the top level for {s}\n", .{ name, call.name });
             changed = true;
         }
         if (!changed) continue;
@@ -648,7 +648,7 @@ pub fn filterInferredBySchema(
             calls[kept] = tc;
             kept += 1;
         } else {
-            log.warn("  [tool-parse] dropped inferred raw-JSON call '{s}' — name not among the request's tools (data object, not a call)\n", .{tc.name});
+            tool_calls_mod.note(.warn, "  [tool-parse] dropped inferred raw-JSON call '{s}' — name not among the request's tools (data object, not a call)\n", .{tc.name});
             allocator.free(tc.name);
             allocator.free(tc.arguments);
         }
@@ -752,7 +752,7 @@ pub fn inferBareJsonToolCalls(allocator: std.mem.Allocator, text: []const u8, to
     const name_owned = try allocator.dupe(u8, name);
     errdefer allocator.free(name_owned);
     calls[0] = .{ .name = name_owned, .arguments = try allocator.dupe(u8, obj_slice) };
-    log.info("  [tool-parse] inferred bare-args call to '{s}' via unique schema match\n", .{name});
+    tool_calls_mod.note(.info, "  [tool-parse] inferred bare-args call to '{s}' via unique schema match\n", .{name});
     return calls;
 }
 
@@ -780,10 +780,7 @@ pub fn parseForRequest(allocator: std.mem.Allocator, text: []const u8, tools_jso
         if (tools_json) |tj| parsed_calls = try filterInferredBySchema(allocator, c, tj);
     }
     var calls = parsed_calls orelse
-        (if (tools_json) |tj| try inferBareJsonToolCalls(allocator, text, tj) else null) orelse {
-        noteUnparsedToolMarkup(text);
-        return null;
-    };
+        (if (tools_json) |tj| try inferBareJsonToolCalls(allocator, text, tj) else null) orelse return null;
     if (!opts.allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
         for (calls[1..]) |tc| {
@@ -804,15 +801,6 @@ pub fn parseForRequest(allocator: std.mem.Allocator, text: []const u8, tools_jso
         }
     }
     return calls;
-}
-
-/// A reply whose tool markup gave no call goes out as text with the markup cut, and its turn ends as a plain stop:
-/// this line is the log's one trace of why.
-pub fn noteUnparsedToolMarkup(text: []const u8) void {
-    const at = think_tags.leakedToolMarkupStart(text) orelse return;
-    var quoted: [512]u8 = undefined;
-    const n = log.appendQuoted(&quoted, 0, text[at..], 96);
-    log.info("[tool-parse] tool markup parsed to no call and is cut from the reply: {d} bytes from byte {d}, {s}\n", .{ text.len - at, at, quoted[0..n] });
 }
 
 test "inferBareJsonToolCalls maps bare-args fenced JSON to the unique matching tool (Claude Code capture)" {
