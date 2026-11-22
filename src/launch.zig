@@ -102,7 +102,6 @@ pub const AgentKind = enum {
     dsh,
     codex,
     hermes,
-    aider,
     zcode,
     grok,
 
@@ -115,7 +114,7 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, dsh, codex, hermes, aider, zcode, grok";
+    pub const names = "claude, pi, omp, opencode, dsh, codex, hermes, zcode, grok";
 };
 
 pub const zcodeConfigJson = @import("zcode_launch.zig").configJson;
@@ -587,29 +586,6 @@ pub fn hermesEnvFile(allocator: std.mem.Allocator, base_url: []const u8) ![]u8 {
     , .{base_url});
 }
 
-/// aider model metadata (litellm's registry format) — the real context
-/// window for every openai/<id> model.
-pub fn aiderMetadataJson(allocator: std.mem.Allocator, entries: []const Entry) ![]u8 {
-    var out = std.ArrayList(u8).empty;
-    errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, "{\n");
-    for (entries, 0..) |e, i| {
-        try out.print(allocator,
-            \\{s}  "openai/{f}": {{
-            \\    "max_input_tokens": {d},
-            \\    "max_output_tokens": {d},
-            \\    "max_tokens": {d},
-            \\    "input_cost_per_token": 0,
-            \\    "output_cost_per_token": 0,
-            \\    "litellm_provider": "openai",
-            \\    "mode": "chat"
-            \\  }}
-        , .{ if (i == 0) "" else ",\n", esc(e.id), e.budget.context, e.budget.output, e.budget.output });
-    }
-    try out.appendSlice(allocator, "\n}\n");
-    return out.toOwnedSlice(allocator);
-}
-
 // ── Launch script assembly ──────────────────────────────────────────────
 
 /// Shell-quote one extra passthrough arg (single quotes, '\'' escape).
@@ -664,10 +640,6 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
     defer allocator.free(q_model);
     const q_sushi_model = try quotedAlloc(allocator, "sushi/", model, "");
     defer allocator.free(q_sushi_model);
-    const q_openai_model = try quotedAlloc(allocator, "openai/", model, "");
-    defer allocator.free(q_openai_model);
-    const q_api_base = try quotedAlloc(allocator, "", base_url, "/v1");
-    defer allocator.free(q_api_base);
     const q_config = try quotedAlloc(allocator, "", opencode_config orelse "", "");
     defer allocator.free(q_config);
     switch (kind) {
@@ -768,13 +740,6 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\if ! command -v zcode >/dev/null 2>&1; then echo "zcode is not installed: build or install ZCode (https://github.com/zai-org/ZCode)" >&2; exit 127; fi
                 \\zcode
             );
-        },
-        .aider => {
-            try out.print(allocator,
-                \\export OPENAI_API_BASE={s}
-                \\export OPENAI_API_KEY=sushi
-                \\aider --model {s} --weak-model {s} --model-metadata-file ~/.sushi/aider/model-metadata.json
-            , .{ q_api_base, q_openai_model, q_openai_model });
         },
     }
     try appendExtras(&out, allocator, extras);
@@ -964,11 +929,6 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             const json = try zcodeConfigJson(allocator, base_url, model, entries);
             defer allocator.free(json);
             try writeAgentFile(allocator, io, "zcode", "provider_config.json", json);
-        },
-        .aider => {
-            const json = try aiderMetadataJson(allocator, entries);
-            defer allocator.free(json);
-            try writeAgentFile(allocator, io, "aider", "model-metadata.json", json);
         },
     }
 }
@@ -1393,19 +1353,6 @@ test "opencode config: limit.output is the compaction reserve" {
     try t.expectEqualStrings("sushi/m1", p1.value.object.get("model").?.string);
 }
 
-test "aider metadata: litellm keys per openai/<id> entry" {
-    const entries = [_]Entry{
-        .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true },
-    };
-    const json = try aiderMetadataJson(t.allocator, &entries);
-    defer t.allocator.free(json);
-    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
-    defer parsed.deinit();
-    const row = parsed.value.object.get("openai/m1").?.object;
-    try t.expectEqual(@as(i64, 4096), row.get("max_input_tokens").?.integer);
-    try t.expectEqual(@as(i64, 1024), row.get("max_output_tokens").?.integer);
-}
-
 test "launch args: passthrough after --, unknown agent named, url trailing slash trimmed" {
     const parsed = try parseLaunchArgs(&.{ "codex", "--url", "http://x:1/", "--print", "--", "resume", "-a" });
     try t.expectEqual(AgentKind.codex, parsed.kind);
@@ -1645,6 +1592,12 @@ test "grok names" {
     try t.expect(std.mem.indexOf(u8, AgentKind.names, "grok") != null);
 }
 
+test "aider is not a supported agent: launch refuses it by name and never lists it" {
+    try t.expect(AgentKind.fromName("aider") == null);
+    try t.expect(std.mem.indexOf(u8, AgentKind.names, "aider") == null);
+    try t.expectError(error.UnknownAgent, parseLaunchArgs(&.{"aider"}));
+}
+
 test "grok compaction threshold leaves the compaction reserve free" {
     try t.expectEqual(@as(u64, 98), grokCompactPercent(1048576));
     try t.expectEqual(@as(u64, 75), grokCompactPercent(24576));
@@ -1729,14 +1682,6 @@ test "script: a model id with spaces, quotes, ; and $() stays one shell word in 
     defer t.allocator.free(omp);
     try t.expect(std.mem.indexOf(u8, omp, "\nomp --model 'sushi/x'\\''; touch PWNED #$(id)\"\\'\n") != null);
 
-    const aider = try scriptFor(t.allocator, .aider, "http://x:1", hostile_id, b, null, &.{});
-    defer t.allocator.free(aider);
-    const oai = "'openai/x'\\''; touch PWNED #$(id)\"\\'";
-    try t.expect(std.mem.indexOf(u8, aider, "\naider --model " ++ oai ++ " --weak-model " ++ oai ++ " --model-metadata-file") != null);
-
-    const hostile_url = try scriptFor(t.allocator, .aider, "http://h'; touch PWNED #", "m1", b, null, &.{});
-    defer t.allocator.free(hostile_url);
-    try t.expect(std.mem.indexOf(u8, hostile_url, "export OPENAI_API_BASE='http://h'\\''; touch PWNED #/v1'\n") != null);
     const claude_url = try scriptFor(t.allocator, .claude, "http://h'; touch PWNED #", "m1", b, null, &.{});
     defer t.allocator.free(claude_url);
     try t.expect(std.mem.indexOf(u8, claude_url, "export ANTHROPIC_BASE_URL='http://h'\\''; touch PWNED #'\n") != null);
@@ -1764,12 +1709,6 @@ test "config writers escape ids and urls so hostile ones stay data" {
     defer pi_parsed.deinit();
     const pi_models = pi_parsed.value.object.get("providers").?.object.get("sushi").?.object.get("models").?.array.items;
     try t.expectEqualStrings(id, pi_models[0].object.get("id").?.string);
-
-    const aider = try aiderMetadataJson(t.allocator, &entries);
-    defer t.allocator.free(aider);
-    const aider_parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, aider, .{});
-    defer aider_parsed.deinit();
-    try t.expect(aider_parsed.value.object.get("openai/" ++ id) != null);
 
     const codex = try codexConfigToml(t.allocator, "http://h:1", id, FALLBACK_BUDGET, "/x");
     defer t.allocator.free(codex);

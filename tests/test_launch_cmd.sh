@@ -36,7 +36,7 @@ run_test() {
 
 # ── [1] unknown agent ──
 OUT=$(sushi_cli launch not-an-agent 2>&1)
-if [ $? -ne 0 ] && echo "$OUT" | grep -q "claude" && echo "$OUT" | grep -q "aider"; then
+if [ $? -ne 0 ] && echo "$OUT" | grep -q "claude" && echo "$OUT" | grep -q "grok" && ! echo "$OUT" | grep -q "aider"; then
     run_test "unknown agent errors naming the choices" PASS
 else
     run_test "unknown agent errors naming the choices" FAIL "$OUT"

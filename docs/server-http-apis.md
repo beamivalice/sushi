@@ -900,7 +900,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
 
 ## Agent launcher (`sushi launch <agent>`)
 
-- `src/launch.zig` (claude/pi/omp/opencode/dsh/codex/hermes/aider/zcode/grok): reads `/v1/models`, writes agent configs into
+- `src/launch.zig` (claude/pi/omp/opencode/dsh/codex/hermes/zcode/grok): reads `/v1/models`, writes agent configs into
   `~/.sushi/<agent>/`. Launcher env: `ANTHROPIC_BASE_URL` + dummy keys + `ANTHROPIC_DEFAULT_*_MODEL=sushi`.
 - Every model id and URL in the zsh script is one single-quoted word (`appendQuoted`) and every config writer escapes
   them for its format (JSON/TOML/YAML `Esc`): ids come from folder names or a `--url` server, so never interpolate bare.
