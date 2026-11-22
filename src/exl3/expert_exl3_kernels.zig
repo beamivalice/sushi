@@ -5913,6 +5913,20 @@ test "exl3 n40 decode BF16 rows no worse than composite against f32 truth" {
 
 var prepared_mid_force: ?bool = null;
 
+/// A SIMD-only GPU pays the Hadamard prepare as ALU, and the self-preparing kernels re-derive it in every
+/// output-tile group; this row reads the planes a slot's prepare dispatches wrote instead. Seam: forces it.
+var m1_prepare_force: ?bool = null;
+
+fn m1PrepareRow() bool {
+    if (m1_prepare_force) |v| return v;
+    return device.current().generation == 13;
+}
+
+/// The M1 family only: a later generation is unmeasured and keeps the geometry's own rule.
+fn preparedMidRow(rows: c_int) bool {
+    return rows >= 2 and m1PrepareRow();
+}
+
 test "exl3 n40 prepared mid adds one dispatch and preserves BF16 f32 truth" {
     prepared_mid_force = true;
     defer prepared_mid_force = null;
@@ -6522,15 +6536,26 @@ fn downGemvPreparedMid(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, 
 
 fn preparedMidOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int, rows: c_int, dtype: mlx.mlx_dtype) bool {
     if (prepared_mid_force) |v| return v;
-    return hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8 and rows >= 1 and rows <= 8 and dtype == .bfloat16;
+    if (dtype != .bfloat16) return false;
+    if (hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8 and rows >= 1 and rows <= 8) return true;
+    return hidden == 2560 and inter == 640 and experts == 512 and topk == 10 and rows <= 8 and preparedMidRow(rows);
 }
 
-test "exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes qwen and unmeasured widths" {
+test "exl3 prepared mid keys on MiMo geometry, never on the rate, and adds the M1 row only under its seam" {
     try std.testing.expect(preparedMidOn(4096, 2048, 256, 8, 1, .bfloat16));
     try std.testing.expect(preparedMidOn(4096, 2048, 256, 8, 8, .bfloat16));
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 9, .bfloat16));
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 1, .float16));
+    m1_prepare_force = false;
+    defer m1_prepare_force = null;
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 3, .bfloat16));
+    m1_prepare_force = true;
+    try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 2, .bfloat16));
+    try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 8, .bfloat16));
     try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 1, .bfloat16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 9, .bfloat16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 3, .float16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 16, 10, 3, .bfloat16));
 }
 
 fn n48FunnelCase(cb: exl3.Codebook, rows: usize, seed: u64, decode: bool, prepared: ?bool) !void {

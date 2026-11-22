@@ -1171,6 +1171,7 @@ const GROUP_RATES = [_]GroupRate{
     .{ .name = "mcg64", .n = 64, .dec = MCG_W15 },
     .{ .name = "stq36", .n = 36, .dec = kernels.SPEC1_W15 },
     .{ .name = "stq42", .n = 42, .dec = kernels.SPEC1_W15 },
+    .{ .name = "stq64", .n = 64, .dec = kernels.SPEC1_W15 },
 };
 
 pub const grouped_decode: report.Bench = .{
