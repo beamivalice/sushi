@@ -6821,6 +6821,25 @@ test "exl3 n40 decode BF16 rows no worse than composite against f32 truth" {
 
 var prepared_mid_force: ?bool = null;
 
+/// The M1-family row for the prepared chain (2026-11-22, `applegpu_g13s`, the served STQ 2.75 pack's
+/// spec1 w15): on a SIMD-only GPU the Hadamard prepare is ALU, not free. The self-preparing pair
+/// re-derives its K span in each of a slot's 20 output-tile groups, and `DOWN_FUSED_SOURCE`
+/// re-derives the mid once per output tile (80 a slot); preparing each once per slot in its own
+/// dispatch measures 0.885 of the fused chain at 3 rows and 0.881 at 4 (`shared.exl3_grouped_decode`,
+/// flash geometry, stq36, 7 rounds interleaved, same-chain bytes). One row never prepares its pair.
+/// Test and microbench seam: forces the row on or off.
+var m1_prepare_force: ?bool = null;
+
+fn m1PrepareRow() bool {
+    if (m1_prepare_force) |v| return v;
+    return device.current().generation == 13;
+}
+
+/// The M1 family only: a later generation is unmeasured and keeps the geometry's own rule.
+fn preparedMidRow(rows: c_int) bool {
+    return rows >= 2 and m1PrepareRow();
+}
+
 test "exl3 n40 prepared mid adds one dispatch and preserves BF16 f32 truth" {
     prepared_mid_force = true;
     defer prepared_mid_force = null;
@@ -7432,15 +7451,26 @@ fn downGemvPreparedMid(s: mlx.mlx_stream, ig: mlx.mlx_array, iu: mlx.mlx_array, 
 
 fn preparedMidOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int, rows: c_int, dtype: mlx.mlx_dtype) bool {
     if (prepared_mid_force) |v| return v;
-    return hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8 and rows >= 1 and rows <= 8 and dtype == .bfloat16;
+    if (dtype != .bfloat16) return false;
+    if (hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8 and rows >= 1 and rows <= 8) return true;
+    return hidden == 2560 and inter == 640 and experts == 512 and topk == 10 and rows <= 8 and preparedMidRow(rows);
 }
 
-test "exl3 prepared mid keys on MiMo geometry, never on the rate, and excludes qwen and unmeasured widths" {
+test "exl3 prepared mid keys on MiMo geometry, never on the rate, and adds the M1 row only under its seam" {
     try std.testing.expect(preparedMidOn(4096, 2048, 256, 8, 1, .bfloat16));
     try std.testing.expect(preparedMidOn(4096, 2048, 256, 8, 8, .bfloat16));
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 9, .bfloat16));
     try std.testing.expect(!preparedMidOn(4096, 2048, 256, 8, 1, .float16));
+    m1_prepare_force = false;
+    defer m1_prepare_force = null;
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 3, .bfloat16));
+    m1_prepare_force = true;
+    try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 2, .bfloat16));
+    try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 8, .bfloat16));
     try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 1, .bfloat16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 9, .bfloat16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 3, .float16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 16, 10, 3, .bfloat16));
 }
 
 fn n48FunnelCase(cb: exl3.Codebook, rows: usize, seed: u64, decode: bool, prepared: ?bool) !void {
