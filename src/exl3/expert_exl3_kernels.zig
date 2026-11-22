@@ -7458,7 +7458,7 @@ fn preparedMidOn(hidden: c_int, inter: c_int, experts: c_int, topk: c_int, rows:
     if (prepared_mid_force) |v| return v;
     if (dtype != .bfloat16) return false;
     if (hidden == 4096 and inter == 2048 and experts > 0 and experts <= 256 and topk == 8 and rows >= 1 and rows <= 8) return true;
-    return hidden == 2560 and inter == 640 and experts == 512 and topk == 10 and rows <= 8 and preparedMidRow(rows);
+    return hidden == 2560 and inter == 640 and experts == 512 and topk == 10 and rows <= 9 and preparedMidRow(rows);
 }
 
 test "exl3 prepared mid keys on MiMo geometry, never on the rate, and adds the M1 row only under its seam" {
@@ -7472,8 +7472,9 @@ test "exl3 prepared mid keys on MiMo geometry, never on the rate, and adds the M
     m1_prepare_force = true;
     try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 2, .bfloat16));
     try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 8, .bfloat16));
+    try std.testing.expect(preparedMidOn(2560, 640, 512, 10, 9, .bfloat16));
     try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 1, .bfloat16));
-    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 9, .bfloat16));
+    try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 10, .bfloat16));
     try std.testing.expect(!preparedMidOn(2560, 640, 512, 10, 3, .float16));
     try std.testing.expect(!preparedMidOn(2560, 640, 16, 10, 3, .bfloat16));
 }
