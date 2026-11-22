@@ -11,6 +11,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **`sushi launch aider` is gone**: aider is not an agent sushi supports, so the launcher now refuses it as an unknown agent and no longer writes `~/.sushi/aider/`.
 - **The `[admission]` line names the decoder-pool bytes a DeepSeek prefill borrows**: `lendable` sits beside `needed`, so a resident prefill's hold, which is more than `needed` by design, can be checked against `needed + lendable` from the log.
 - **A DeepSeek-V4.1 row store whose grow fails inside MLX no longer keeps a part at a size its capacity disagrees with**: the codes grew before the scales, so a failure at the scales (or at a trim after a truncate) left the codes at the new size and the capacity at the old one, which under-billed the store or let a later append write past the codes' end; every part is now built before any old one is freed.
+- **A thought with one stray backtick before its close is no longer swallowed whole**: `<think>use the ` key</think>answer` returned its whole text as reasoning and an empty answer, because the lone backtick opened a code span to the end of the line; a span now opens only where its closing backtick follows on the line, on every surface, stream or not.
 
 ## v1.7.3 — Claude Code and tool calls that hold, requests checked end to end
 

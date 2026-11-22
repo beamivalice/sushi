@@ -402,11 +402,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`think_tags.settledReasoning` on the tools path, `think_tags.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
-- **A think tag inside an inline code span is text** (`openCodeSpanStart`, read by `indexOfThinkCloseTag` and
-  `indexOfThinkOpenTag`, the ONE scan every surface and `normalizeEmbeddedThinkBlocks` use): a model explaining
-  its format writes `` `<think>x</think>` `` into a thought or an answer. The verdict reads only the bytes BEFORE the
-  tag, so a stream never revises it; `openThoughtFlush` therefore keeps an open span in the buffer. A span ends with
-  its line and three backticks are a fence. Tags quoted any other way (plain or double quotes) are still structure.
+- **A think tag inside an inline code span is text** (`tool_reading.Spans`, read by `Tags.find` for `indexOfThinkCloseTag`
+  and `indexOfThinkOpenTag`, the ONE scan every surface and `normalizeEmbeddedThinkBlocks` use): a model explaining
+  its format writes `` `<think>x</think>` `` into a thought or an answer. A span opens only where its closing run follows
+  on the line (a backtick nothing pairs with is literal, as when reading calls), so a stream cannot judge a tag after
+  an unpaired backtick from the bytes before it: `Tags.complete` is false there, the tag waits for the closing run or the
+  line's end (`ThinkScan.unresolved`, `ContentStream.ready`, `think_tags.thoughtClose`), and the reply's end reads it as
+  the whole reply does. `openThoughtFlush` keeps an open span in the buffer. A span ends with its line and three
+  backticks are a fence. Tags quoted any other way (plain or double quotes) are still structure.
 - **A thought the length limit cuts ends on what its split delivers** (`think_tags.cutThoughtDelta`): a lone opener is
   structure, and a thinking block or reasoning item opens at its first delta, so an empty thought streams none.
 - **A token that opens an assistant turn ends the reply** (`ModelConfig.turn_opener`, merged into the eos ids at load
@@ -417,8 +420,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`isChannelMarkerToken`), so `normalizeEmbeddedThinkBlocks` cuts closers out of the content between and after blocks
   (`contentWithoutClosers`; a closer inside a code span is text) and `trimTrailingThinkClosers` keeps the tail.
   `<think>t</think>391</think>391` is content `391391` stream and non-stream.
-- **Every stream's content arm is `think_tags.ContentStream`**: a think tag token inside an open code span is text
-  (`CodeSpan`, the `openCodeSpanStart` reading kept as bytes arrive); a `<think>` outside one re-opens a thought,
+- **Every stream's content arm is `think_tags.ContentStream`**: a think tag token inside a code span is text
+  (`CodeSpan` parity plus the bytes to the closing run, which `arrive`/`ready` queue the tokens behind it for); a `<think>` outside one re-opens a thought,
   which streams as reasoning joined by `\n\n` (`ThoughtJoin`) while the content parts around it are trimmed and
   joined by `\n`, as `normalizeEmbeddedThinkBlocks` merges them. Whitespace waits only as whole tokens.
   A re-opened thought cut by the end of the reply is reasoning on both sides. Anthropic gives a thought after

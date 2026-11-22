@@ -1026,7 +1026,7 @@ fn handleResponsesInner(
         var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
         defer if (delivery) |*d| d.deinit(allocator);
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-        var content: think_tags.ContentStream = .{ .mark = .{ .on = !active_has_tools } };
+        var content: think_tags.ContentStream = .{ .mark = .{ .on = !active_has_tools }, .opens_thoughts = !active_has_tools };
         defer content.deinit(allocator);
         var thought_mark: think_tags.MarkupCut = .{ .on = !active_has_tools };
         var join: think_tags.ThoughtJoin = .{};
@@ -1035,14 +1035,21 @@ fn handleResponsesInner(
         var thought_shipped = false; // this thought has streamed a delta (`think_tags.openThoughtFlush`)
         var skipped_think_open = false;
         var live_output_index: u32 = 0;
+        // The reply ended: one more turn, with no token, reads what the arms held for bytes that decide it (`think_tags.ContentStream.ready`).
+        var reply_over = false;
 
         while (true) {
-            // A stop cut resolved on the previous token ends the turn here.
-            if (stopped) break;
-            const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            const arms_wait = !active_has_tools and delivery == null and (content.waiting() or (in_think_block and think_buf.items.len > 0));
+            // A stop cut resolved on the previous token ends the turn here, once the arms have read what they held.
+            if (reply_over or (stopped and !arms_wait)) break;
+            if (stopped) reply_over = true;
+            const token_id: u32 = if (reply_over) 0 else switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
                 .done => if (stop_gate.hasHeld()) flush: {
                     tail_flush = true;
+                    break :flush 0;
+                } else if (arms_wait) flush: {
+                    reply_over = true;
                     break :flush 0;
                 } else break,
                 .idle => {
@@ -1070,7 +1077,7 @@ fn handleResponsesInner(
                 client_gone = true;
                 break;
             }
-            const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+            const token_text = if (reply_over) try allocator.alloc(u8, 0) else if (tail_flush) try stop_gate.finish(allocator) else blk: {
                 try token_ids_buf.append(allocator, token_id);
                 const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
                 defer allocator.free(raw_decoded);
@@ -1081,10 +1088,7 @@ fn handleResponsesInner(
 
             stopped = stop_gate.matched != null;
             if (stopped) ts.slot.?.stop_hit.store(true, .release);
-            if (token_text.len == 0) {
-                if (stopped) break;
-                continue;
-            }
+            if (token_text.len == 0 and !reply_over) continue;
 
             try raw_buf.appendSlice(allocator, token_text);
 
@@ -1127,8 +1131,35 @@ fn handleResponsesInner(
                 continue;
             }
 
+            // A think block the MODEL opens, first or after content: seeded like a template-injected one, and holds the tokens
+            // that followed its opener while the content arm waited on the tag.
+            // The thought holds the token already when it opened here: it took the tokens that followed its opener.
+            var think_has_token = false;
+            if (!in_think_block) {
+                if (token_text.len > 0) try content.arrive(allocator, token_text, 0);
+                while (try content.ready(allocator, channel_armed, reply_over)) |r| switch (r) {
+                    .opens => |opener| {
+                        content.endPart();
+                        channel_armed = false;
+                        in_think_block = true;
+                        skipped_think_open = false;
+                        try think_buf.appendSlice(allocator, opener);
+                        const rest = content.takeWaiting();
+                        try think_buf.appendSlice(allocator, rest.bytes);
+                        think_has_token = true;
+                        break;
+                    },
+                    .step => |st| {
+                        channel_armed = st.step == .marker and !content.started and std.mem.eql(u8, st.text, "<|channel>");
+                        switch (st.step) {
+                            .send => |bytes| try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, bytes),
+                            else => {},
+                        }
+                    },
+                };
+            }
             if (in_think_block) {
-                try think_buf.appendSlice(allocator, token_text);
+                if (!think_has_token) try think_buf.appendSlice(allocator, token_text);
 
                 // Skip a literal think opener if the template did not pre-inject one.
                 if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
@@ -1156,17 +1187,8 @@ fn handleResponsesInner(
                 }
 
                 // Detect close tag (</think> or <channel|>).
-                const tp = if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |t| t.pos else null;
-                const cp = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-                const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
-                    if (tp == null and cp == null) break :blk null;
-                    if (tp == null) break :blk .{ .pos = cp.?, .tag = "<channel|>" };
-                    if (cp == null) break :blk .{ .pos = tp.?, .tag = "</think>" };
-                    if (tp.? <= cp.?) break :blk .{ .pos = tp.?, .tag = "</think>" };
-                    break :blk .{ .pos = cp.?, .tag = "<channel|>" };
-                };
-
-                if (close_match) |m| {
+                // A think close that waits on a backtick's partner is no close yet; the reply's end settles it.
+                if (think_tags.thoughtClose(think_buf.items, reply_over)) |m| {
                     const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                     const before = closed[0..thought_mark.final(closed)];
                     thought_shipped = false;
@@ -1174,7 +1196,7 @@ fn handleResponsesInner(
                     join.close();
                     if (streamed_reasoning_started and !streamed_message_started) live_output_index += 1;
 
-                    const after = m.pos + m.tag.len;
+                    const after = m.pos + m.len;
                     var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                     if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
                         content_after = content_after[11..];
@@ -1204,23 +1226,6 @@ fn handleResponsesInner(
                         try think_buf.appendSlice(allocator, remaining);
                         allocator.free(remaining);
                     }
-                }
-            } else {
-                // A think block the MODEL opens, first or after content: seeded like a template-injected one.
-                // Checked before the marker skip, which would swallow a bare `<think>`.
-                if (content.thoughtOpener(channel_armed, token_text)) |opener| {
-                    content.endPart();
-                    channel_armed = false;
-                    in_think_block = true;
-                    skipped_think_open = false;
-                    try think_buf.appendSlice(allocator, opener);
-                    continue;
-                }
-                const step = try content.deliver(allocator, token_text);
-                channel_armed = step == .marker and !content.started and std.mem.eql(u8, token_text, "<|channel>");
-                switch (step) {
-                    .send => |bytes| try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, bytes),
-                    else => {},
                 }
             }
         }

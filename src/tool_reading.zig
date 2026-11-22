@@ -236,13 +236,7 @@ pub const Scan = struct {
     gt: Next = .{ .needle = ">" },
     dsml_invoke: Next = .{ .needle = "<｜DSML｜invoke" },
     dsml_invoke_spaced: Next = .{ .needle = "<｜DSML｜ invoke" },
-    tick: Next = .{ .needle = "`" },
-    newline: Next = .{ .needle = "\n" },
-    /// Where the span reading stands: the first byte after the last pair it settled, and the first pair at or after it.
-    cursor: usize = 0,
-    pair: ?Pair = null,
-    pair_known: bool = false,
-    spans_started: bool = false,
+    spans: Spans = .{},
     /// Reading a text for calls (the default) or looking for leaked markup to cut: the cut takes an opener alone as
     /// markup, quoted in a code span or not, whatever follows it.
     strict: bool = true,
@@ -258,43 +252,82 @@ pub const Scan = struct {
         unreachable;
     }
 
-    /// Whether the byte at `at` stands inside an inline code span of its line, asked for rising bytes. Runs of one or
-    /// two backticks pair up in order along the line (three or more are a fence and pair with nothing); a run no later
-    /// run pairs with is a literal backtick and hides nothing.
     fn quoted(self: *Scan, text: []const u8, at: usize) bool {
-        if (!self.spans_started or at < self.cursor) {
+        return self.spans.read(text, at, true) == .inside;
+    }
+};
+
+/// Where a byte stands against the inline code spans of its line.
+pub const Quote = enum {
+    outside,
+    inside,
+    /// A backtick no run has paired yet opens before the byte and the text may still grow: the next bytes decide.
+    unresolved,
+};
+
+/// The inline code spans of one text, asked for rising bytes and kept forward. Runs of one or two backticks pair up in
+/// order along the line (three or more are a fence and pair with nothing); a run no later run pairs with is a literal
+/// backtick and hides nothing, so a byte is inside a span only where the closing run follows on its line.
+pub const Spans = struct {
+    tick: Next = .{ .needle = "`" },
+    newline: Next = .{ .needle = "\n" },
+    /// Where the reading stands: the first byte after the last pair it settled, and the first pair at or after it.
+    cursor: usize = 0,
+    found: Found = .none,
+    found_known: bool = false,
+    started: bool = false,
+
+    const Found = union(enum) {
+        none,
+        /// An opening run with no closing run on the line yet.
+        stray: usize,
+        pair: Pair,
+    };
+
+    /// Where the byte at `at` stands. `complete`: no bytes follow the text; otherwise they may, so a byte after an
+    /// opening run that no closing run follows on the text so far is `.unresolved`, never judged on bytes to come. A
+    /// text that grows needs a new `Spans` for each look.
+    pub fn read(self: *Spans, text: []const u8, at: usize, complete: bool) Quote {
+        if (!self.started or at < self.cursor) {
             self.cursor = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
             charge(at - self.cursor);
-            self.pair_known = false;
-            self.spans_started = true;
+            self.found_known = false;
+            self.started = true;
         }
         while (true) {
             const eol = self.newline.find(text, self.cursor) orelse text.len;
             if (eol < at) {
                 self.cursor = eol + 1;
-                self.pair_known = false;
+                self.found_known = false;
                 continue;
             }
-            if (!self.pair_known) {
-                self.pair = self.findPair(text, eol);
-                self.pair_known = true;
+            if (!self.found_known) {
+                self.found = self.findPair(text, eol);
+                self.found_known = true;
             }
-            const p = self.pair orelse return false;
-            if (at < p.open) return false;
-            if (at < p.close) return true;
-            self.cursor = p.end;
-            self.pair_known = false;
+            const open_line = !complete and eol == text.len;
+            switch (self.found) {
+                .none => return .outside,
+                .stray => |open| return if (open_line and at > open) .unresolved else .outside,
+                .pair => |p| {
+                    if (at < p.open) return .outside;
+                    // A closing run at the end of the text may still grow into a fence.
+                    if (at < p.close) return if (open_line and p.end == text.len) .unresolved else .inside;
+                    self.cursor = p.end;
+                    self.found_known = false;
+                },
+            }
         }
     }
 
-    fn findPair(self: *Scan, text: []const u8, eol: usize) ?Pair {
-        const open = self.tickRun(text, self.cursor, eol) orelse return null;
-        const close = self.tickRun(text, open.at + open.len, eol) orelse return null;
-        return .{ .open = open.at, .close = close.at, .end = close.at + close.len };
+    fn findPair(self: *Spans, text: []const u8, eol: usize) Found {
+        const open = self.tickRun(text, self.cursor, eol) orelse return .none;
+        const close = self.tickRun(text, open.at + open.len, eol) orelse return .{ .stray = open.at };
+        return .{ .pair = .{ .open = open.at, .close = close.at, .end = close.at + close.len } };
     }
 
     /// The first run of one or two backticks in `[from, eol)`.
-    fn tickRun(self: *Scan, text: []const u8, from: usize, eol: usize) ?struct { at: usize, len: usize } {
+    fn tickRun(self: *Spans, text: []const u8, from: usize, eol: usize) ?struct { at: usize, len: usize } {
         var p = from;
         while (self.tick.find(text, p)) |t| {
             if (t >= eol) return null;

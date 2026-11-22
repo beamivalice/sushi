@@ -804,8 +804,13 @@ fn plainStream(allocator: std.mem.Allocator, g: *const Generation, stops: []cons
     var thought_closed = false;
     var i: usize = 0;
     var tail = false;
+    // The reply ended: one more turn, with no piece, reads what the arms held for bytes that decide it.
+    var over = false;
     while (true) : (i += 1) {
-        const piece = if (i < g.ids.len) blk: {
+        const arms_wait = content.waiting() or (in_think and think_buf.items.len > 0);
+        if (over or (gate.matched != null and !arms_wait)) break;
+        if (gate.matched != null) over = true;
+        const piece: []const u8 = if (over) "" else if (i < g.ids.len) blk: {
             try lps.entries.append(allocator, g.lps[i]);
             const raw = try g.tok.decode(allocator, &[_]u32{g.ids[i]});
             defer allocator.free(raw);
@@ -814,40 +819,51 @@ fn plainStream(allocator: std.mem.Allocator, g: *const Generation, stops: []cons
         } else if (gate.matched == null and gate.hasHeld() and !tail) blk: {
             tail = true;
             break :blk try gate.finish(allocator);
+        } else if (arms_wait) blk: {
+            over = true;
+            break :blk "";
         } else break;
         defer allocator.free(piece);
         lps.release(gate.released, gate.matched != null or tail);
-        if (piece.len > 0) {
-            if (in_think) {
-                try think_buf.appendSlice(allocator, piece);
-                if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
-                    const content_after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n ");
-                    if (content_after.len > 0) {
-                        lps.skipToContent(think_buf.items, content_after);
-                        switch (try content.deliver(allocator, content_after)) {
-                            .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
-                            else => {},
-                        }
-                    } else lps.dropPending();
-                    think_buf.clearRetainingCapacity();
-                    in_think = false;
-                    thought_closed = true;
-                }
-            } else if (content.thoughtOpener(false, piece)) |opener| {
-                try lps.endPart();
-                content.endPart();
-                in_think = true;
-                try think_buf.appendSlice(allocator, opener);
-            } else {
-                const step = try content.deliver(allocator, piece);
-                try lps.afterDeliver(step, &content, lps.listing.released -| piece.len, piece.len);
-                switch (step) {
-                    .marker, .hold, .drop => {},
-                    .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
-                }
+        if (piece.len == 0 and !over) continue;
+        var think_has_token = false;
+        if (!in_think) {
+            if (piece.len > 0) try content.arrive(allocator, piece, lps.listing.released -| piece.len);
+            while (try content.ready(allocator, false, over)) |r| switch (r) {
+                .opens => |opener| {
+                    try lps.endPart();
+                    content.endPart();
+                    in_think = true;
+                    try think_buf.appendSlice(allocator, opener);
+                    try think_buf.appendSlice(allocator, content.takeWaiting().bytes);
+                    think_has_token = true;
+                    break;
+                },
+                .step => |st| {
+                    try lps.afterDeliver(st.step, &content, st.at, st.text.len);
+                    switch (st.step) {
+                        .marker, .hold, .drop => {},
+                        .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
+                    }
+                },
+            };
+        }
+        if (in_think) {
+            if (!think_has_token) try think_buf.appendSlice(allocator, piece);
+            if (think_tags.thoughtClose(think_buf.items, over)) |close| {
+                const content_after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n ");
+                if (content_after.len > 0) {
+                    lps.skipToContent(think_buf.items, content_after);
+                    switch (try content.deliver(allocator, content_after)) {
+                        .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
+                        else => {},
+                    }
+                } else lps.dropPending();
+                think_buf.clearRetainingCapacity();
+                in_think = false;
+                thought_closed = true;
             }
         }
-        if (gate.matched != null) break;
     }
     const held = try content.finish(allocator, thought_closed);
     if (held.len > 0) try out.contentDelta(allocator, &content, &lps, held);
@@ -929,6 +945,8 @@ const scenarios = [_]Scenario{
     .{ .name = "whitespace tokens around the thought", .tokens = &.{ "Sure.", "\n\n", "<think>", "hmm", "</think>", "\n\n", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 } },
     .{ .name = "a stop inside the second part", .tokens = &.{ "Sure.", "<think>", "hmm", "</think>", "Do", "ne. ST", "OP x" }, .stops = &.{"STOP"}, .listed = &.{ "Sure.", "Do", "ne." }, .joins = &.{ 5 }, .aligned = false },
     .{ .name = "a stray closer inside a part", .tokens = &.{ "Sure.", "<think>", "hmm", "</think>", "X", "</think>", "Y" }, .listed = &.{ "Sure.", "X", "Y" }, .joins = &.{ 5 } },
+    .{ .name = "a closer after a stray backtick waits for the line's end", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>", " here" }, .listed = &.{ "Use `", " here" }, .joins = &.{} },
+    .{ .name = "a closer a closing backtick follows is text", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>", "` here" }, .listed = &.{ "Use `", "</think>", "` here" }, .joins = &.{} },
     .{ .name = "two thoughts", .tokens = &.{ "A", "<think>", "p", "</think>", "B", "<think>", "q", "</think>", "C" }, .listed = &.{ "A", "B", "C" }, .joins = &.{ 1, 3 } },
     .{ .name = "the channel style", .tokens = &.{ "Sure.", "<|channel>thought\n", "hmm", "<channel|>", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 }, .plain = false },
 };

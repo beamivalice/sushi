@@ -1383,7 +1383,7 @@ fn handleAnthropicStreaming(
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
-    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream } };
+    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream }, .opens_thoughts = !gated_stream };
     defer content.deinit(allocator);
     var thought_mark: think_tags.MarkupCut = .{ .on = !gated_stream };
     var join: think_tags.ThoughtJoin = .{};
@@ -1419,15 +1419,22 @@ fn handleAnthropicStreaming(
     var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences };
     defer stop_gate.deinit(allocator);
     var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
+    // The reply ended: one more turn, with no token, reads what the arms held for bytes that decide it (`think_tags.ContentStream.ready`).
+    var reply_over = false;
     var client_gone = false;
 
     while (true) {
-        // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        const arms_wait = !gated_stream and delivery == null and (content.waiting() or (in_think_block and think_buf.items.len > 0));
+        // A stop cut resolved on the previous token ends the turn here, once the arms have read what they held.
+        if (reply_over or (stopped and !arms_wait)) break;
+        if (stopped) reply_over = true;
+        const token_id: u32 = if (reply_over) 0 else switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
             .done => if (stop_gate.hasHeld()) flush: {
                 tail_flush = true;
+                break :flush 0;
+            } else if (arms_wait) flush: {
+                reply_over = true;
                 break :flush 0;
             } else break,
             .idle => {
@@ -1457,7 +1464,7 @@ fn handleAnthropicStreaming(
         }
         // The gate remembers WHICH stop matched (reported as stop_reason "stop_sequence" + the
         // echoed `stop_sequence` field in message_delta).
-        const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
+        const token_text = if (reply_over) try allocator.alloc(u8, 0) else if (tail_flush) try stop_gate.finish(allocator) else blk: {
             const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
             if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
@@ -1465,9 +1472,8 @@ fn handleAnthropicStreaming(
         };
         stopped = stop_gate.matched != null;
         if (stopped) ts.slot.?.stop_hit.store(true, .release);
-        if (token_text.len == 0) {
+        if (token_text.len == 0 and !reply_over) {
             allocator.free(token_text);
-            if (stopped) break;
             continue;
         }
 
@@ -1482,6 +1488,9 @@ fn handleAnthropicStreaming(
             try beatStreamKeepalive(stream, .anthropic_ping);
             continue;
         }
+        defer if (!gated_stream) allocator.free(token_text);
+        // The thought holds the token already when it opened here: it took the tokens that followed its opener.
+        var think_has_token = false;
 
         if (gated_stream) {
             // Buffer for tool detection. Detection rules live in
@@ -1548,24 +1557,58 @@ fn handleAnthropicStreaming(
                     .flush_text => {
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
-                            switch (try content.deliver(allocator, tt)) {
+                            try content.arrive(allocator, tt, 0);
+                        }
+                        // The gate flushes no think tag that waits on a backtick's partner: what it flushed is read as it stands.
+                        while (try content.ready(allocator, false, true)) |r| switch (r) {
+                            .opens => unreachable,
+                            .step => |st| switch (st.step) {
                                 .send => |bytes| try emitAnthropicText(allocator, stream, block_index, &text_block_open, bytes),
                                 else => {},
-                            }
-                        }
+                            },
+                        };
                         token_texts.clearRetainingCapacity();
                         text_delivered = text_buf.items.len;
                         thought_scan.reset();
                     },
                 }
             }
-        } else if (in_think_block) {
+        }
+
+        // A think block the MODEL opens, first or after content: seeded like a template-injected one, and holds the tokens
+        // that followed its opener while the content arm waited on the tag.
+        if (!gated_stream and !in_think_block) {
+            if (token_text.len > 0) try content.arrive(allocator, token_text, 0);
+            while (try content.ready(allocator, channel_armed, reply_over)) |r| switch (r) {
+                .opens => |opener| {
+                    content.endPart();
+                    channel_armed = false;
+                    in_think_block = true;
+                    skipped_think_open = false;
+                    try think_buf.appendSlice(allocator, opener);
+                    const rest = content.takeWaiting();
+                    try think_buf.appendSlice(allocator, rest.bytes);
+                    think_tokens += @intCast(rest.tokens);
+                    think_has_token = true;
+                    break;
+                },
+                .step => |st| {
+                    channel_armed = st.step == .marker and !content.started and std.mem.eql(u8, st.text, "<|channel>");
+                    switch (st.step) {
+                        .send => |bytes| try emitAnthropicText(allocator, stream, block_index, &text_block_open, bytes),
+                        else => {},
+                    }
+                },
+            };
+        }
+        if (!gated_stream and in_think_block) {
             // Thinking block handling. Also covers thinking-off +
             // template-opened (LFM2.5 class): the block streams as thinking
             // deltas instead of being paid for and dropped.
-            defer allocator.free(token_text);
-            try think_buf.appendSlice(allocator, token_text);
-            think_tokens += 1;
+            if (!think_has_token) {
+                try think_buf.appendSlice(allocator, token_text);
+                think_tokens += @intFromBool(token_text.len > 0);
+            }
 
             if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
                 if (think_tags.thinkOpenTagLenAt(think_buf.items)) |olen| {
@@ -1606,17 +1649,8 @@ fn handleAnthropicStreaming(
             }
 
             // Check for the close tag — accept whichever appears first.
-            const think_match = think_tags.indexOfThinkCloseTag(think_buf.items, 0);
-            const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
-                if (think_match == null and channel_pos == null) break :blk null;
-                if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
-                if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
-                if (think_match.?.pos <= channel_pos.?) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
-                break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
-            };
-
-            if (close_match) |m| {
+            // A think close that waits on a backtick's partner is no close yet; the reply's end settles it.
+            if (think_tags.thoughtClose(think_buf.items, reply_over)) |m| {
                 const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 const last = closed[0..thought_mark.final(closed)];
                 thought_shipped = false;
@@ -1653,25 +1687,6 @@ fn handleAnthropicStreaming(
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
                 }
-            }
-        } else {
-            // Regular content token
-            defer allocator.free(token_text);
-            // A think block the MODEL opens, first or after content: seeded like a template-injected one.
-            // Checked before the marker skip, which would swallow a bare `<think>`.
-            if (content.thoughtOpener(channel_armed, token_text)) |opener| {
-                content.endPart();
-                channel_armed = false;
-                in_think_block = true;
-                skipped_think_open = false;
-                try think_buf.appendSlice(allocator, opener);
-                continue;
-            }
-            const step = try content.deliver(allocator, token_text);
-            channel_armed = step == .marker and !content.started and std.mem.eql(u8, token_text, "<|channel>");
-            switch (step) {
-                .send => |bytes| try emitAnthropicText(allocator, stream, block_index, &text_block_open, bytes),
-                else => {},
             }
         }
 

@@ -3250,9 +3250,10 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var pending = std.ArrayList(u8).empty;
     defer pending.deinit(allocator);
     var shipped = false;
-    for (raw[body_from .. close_at + "</think>".len]) |byte| {
+    const body = raw[body_from .. close_at + "</think>".len];
+    for (body, 1..) |byte, n| {
         try pending.append(allocator, byte);
-        if (think_tags.indexOfThinkCloseTag(pending.items, 0)) |close| {
+        if (think_tags.thoughtClose(pending.items, n == body.len)) |close| {
             try plain.appendSlice(allocator, think_tags.closedThoughtDelta(pending.items[0..close.pos], shipped));
             break;
         }
@@ -3327,20 +3328,33 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
     var in_think = opened;
     var skipped = false;
     var shipped = false;
-    for (tokens) |tt| {
+    // One pass per token, and one more with none once the reply ends: what the arms held for bytes that decide it is read as it stands.
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const over = i >= tokens.len;
+        if (i > tokens.len or (over and !(content.waiting() or (in_think and think_buf.items.len > 0)))) break;
+        const tt = if (over) "" else tokens[i];
+        var think_has_token = false;
         if (!in_think) {
-            if (content.thoughtOpener(false, tt)) |opener| {
-                content.endPart();
-                in_think = true;
-                skipped = false;
-                try think_buf.appendSlice(allocator, opener);
-            } else switch (try content.deliver(allocator, tt)) {
-                .send => |bytes| try out.appendSlice(allocator, bytes),
-                else => {},
-            }
-            continue;
+            if (tt.len > 0) try content.arrive(allocator, tt, 0);
+            while (try content.ready(allocator, false, over)) |r| switch (r) {
+                .opens => |opener| {
+                    content.endPart();
+                    in_think = true;
+                    skipped = false;
+                    try think_buf.appendSlice(allocator, opener);
+                    try think_buf.appendSlice(allocator, content.takeWaiting().bytes);
+                    think_has_token = true;
+                    break;
+                },
+                .step => |st| switch (st.step) {
+                    .send => |bytes| try out.appendSlice(allocator, bytes),
+                    else => {},
+                },
+            };
         }
-        try think_buf.appendSlice(allocator, tt);
+        if (!in_think) continue;
+        if (!think_has_token) try think_buf.appendSlice(allocator, tt);
         if (!skipped and (think_buf.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(think_buf.items))) {
             skipped = true;
             if (think_tags.thinkOpenTagLenAt(think_buf.items)) |l| {
@@ -3352,7 +3366,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
             }
         }
         if (!skipped) continue;
-        if (think_tags.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
+        if (think_tags.thoughtClose(think_buf.items, over)) |close| {
             const closed = think_tags.closedThoughtDelta(think_buf.items[0..close.pos], shipped);
             try appendReasoning(allocator, &reasoning, &join, closed[0..thought_mark.final(closed)]);
             join.close();
@@ -3478,7 +3492,7 @@ test "format corpus: a closer in content after the thought is dropped on the str
         .{ .raw = "<think>t</think>Write `<think>` first", .tokens = &.{ "<think>", "t", "</think>", "Write `", "<think>", "` first" }, .opened = false, .content = "Write `<think>` first" },
         .{ .raw = "<think>t</think>Use `</think>` here", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</", "think>", "` here" }, .opened = false, .content = "Use `</think>` here" },
         .{ .raw = "<think>t</think>Use `x` </think>here", .tokens = &.{ "<think>", "t", "</think>", "Use `x` ", "</think>", "here" }, .opened = false, .content = "Use `x` here" },
-        .{ .raw = "<think>t</think>Use `</think>", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>" }, .opened = false, .content = "Use `</think>" },
+        .{ .raw = "<think>t</think>Use `</think>", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>" }, .opened = false, .content = "Use `" },
     };
     for (cases) |c| {
         const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
@@ -3552,6 +3566,42 @@ test "format corpus: a think tag anywhere in content is the same bytes on the st
         for (0..tail.len) |i| try tokens.append(allocator, tail[i..][0..1]);
         try expectStreamMatchesReply(allocator, raw.items, tokens.items, false);
     };
+}
+
+test "r173-f-stray-backtick: a backtick no later backtick pairs with hides no think tag from the stream either" {
+    // The stream waits at a tag that follows an unresolved backtick until the line ends or a closer arrives, and then
+    // reads it as the non-stream reply does. Tokens put the backtick and the tag apart, and split a thought's closer.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, opened: bool, reasoning: []const u8, content: []const u8, in_content: bool = false };
+    const cases = [_]Case{
+        .{ .raw = "<think>use the ` key</think>answer", .opened = false, .reasoning = "use the ` key", .content = "answer" },
+        .{ .raw = "use the ` key</think>answer", .opened = true, .reasoning = "use the ` key", .content = "answer" },
+        .{ .raw = "<think>use the ` key</think>answer\nmore", .opened = false, .reasoning = "use the ` key", .content = "answer\nmore" },
+        .{ .raw = "<think>use the ` key</think>", .opened = false, .reasoning = "use the ` key", .content = "" },
+        .{ .raw = "use the ` key\n</think>answer", .opened = true, .reasoning = "use the ` key", .content = "answer" },
+        .{ .raw = "a `</think>` b</think>c", .opened = true, .reasoning = "a `</think>` b", .content = "c" },
+        .{ .raw = "a ` b </think> c ` d</think>e", .opened = true, .reasoning = "a ` b </think> c ` d", .content = "e" },
+        // Content: a closer is dropped and a thought opens after a stray backtick, as without it.
+        .{ .raw = "<think>t</think>Use ` then</think>done", .opened = false, .reasoning = "t", .content = "Use ` thendone", .in_content = true },
+        .{ .raw = "<think>t</think>Use ` then <think>u</think>B", .opened = false, .reasoning = "t\n\nu", .content = "Use ` then\nB", .in_content = true },
+        .{ .raw = "<think>t</think>Use ` then <think>u` v</think>B", .opened = false, .reasoning = "t", .content = "Use ` then <think>u` vB", .in_content = true },
+        .{ .raw = "<think>t</think>Use ` then <think>u", .opened = false, .reasoning = "t\n\nu", .content = "Use ` then", .in_content = true },
+    };
+    for (cases) |c| {
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        defer if (norm) |n| allocator.free(n);
+        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        errdefer std.debug.print("\nraw: {f}\nnon-stream: {?s} | {s}\n", .{ std.zig.fmtString(c.raw), split.reasoning_content, split.content });
+        try testing.expectEqualStrings(c.reasoning, split.reasoning_content orelse "");
+        try testing.expectEqualStrings(c.content, split.content);
+        // A tag the content arm reads is one token, as every served tokenizer spells it.
+        const specials = [_][]const []const u8{ &.{"<think>"}, &.{ "<think>", "</think>" } };
+        for (specials[@intFromBool(c.in_content)..]) |sp| for ([_]usize{ 1, 2, 3, 5, 1000 }) |step| {
+            const tokens = try tokensOf(allocator, c.raw, sp, step);
+            defer allocator.free(tokens);
+            try expectStreamMatchesReply(allocator, c.raw, tokens, c.opened);
+        };
+    }
 }
 
 /// Streams `raw` cut by the length limit after `cut` bytes, the way each stream
