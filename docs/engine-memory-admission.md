@@ -387,7 +387,15 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   accumulator between key dispatches (`fused256KvChunkLen`), the one it reads beside the one it writes from the third
   dispatch on, so its rows exceed the trunk's (which gathers its blocks) once rows x keys pass about 20.8M (4,564 rows
   on the tiny pack's one 8,192-row chunk), and the head's four stream-wide rows sit beside them. The load's sizer prices
-  the trunk's chunk alone. The contract
+  the moment wherever the load runs the head (`mtpHeadDefaultOn`), as its width ladder, the chunk cost and the pool's forward cap
+  (`arch/cooler.forwardCap`) all read it: the cell `the load's sizer reserves at a width...` holds the reserve over what a
+  request's bill holds at that width. The pool then parks free buffers up to that cap, so the pool cell holds a request's
+  whole held bytes under the bill of the request as the load sizes it (the head on), and its in-use peak under its own. The
+  envelope over-bills every moment by the SSM checkpoint turnover (added to all, though one linear layer holds it) and bills
+  the rope's angle rows at 1,024 B a row against 256 B measured: 34 to 47 MB over the real peak at the head's moment on the
+  tiny pack, as the trunk's own. The carry model takes the simd arm's 250M dispatch budget
+  (`FUSED256_DEFAULT_DISPATCH_BUDGET`) because the masked arm never takes NAX (`attnPdNaxServes` is false under a mask);
+  a masked NAX arm would need its own budget read. The contract
   cell `an exact Cooler prefill bill is what each kind of layer asks...` holds each kind's cost within one
   `BILL_MARGIN_BYTES` of what it asks, either way past the in-flight plane and what those moments add (the weight held at
   its own matmul, never at a chunk's peak: the stq4 cut's 8,192-row attention chunk asks 1,933,856 KB with and without

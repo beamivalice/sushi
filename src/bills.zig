@@ -917,8 +917,7 @@ pub fn prefillTransientReserveAtKv(
     ) + qsaMaskBilled(config, @min(chunk, @max(seq, 1)), seq) +
         slidingBandScoreBytes(config, @min(chunk, @max(seq, 1))) +
         fp8DequantScratchBytes(config, @min(chunk, @max(seq, 1))) +
-        // The load's sizer prices the trunk's chunk alone, whatever requests later run the head.
-        forwardMomentsBilled(config, kv_bits, @min(chunk, @max(seq, 1)), seq, false) +
+        forwardMomentsBilled(config, kv_bits, @min(chunk, @max(seq, 1)), seq, mtpHeadDefaultOn(config)) +
         (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
         cadenceInflightBytes(mlx_mb_per_buffer);
 }

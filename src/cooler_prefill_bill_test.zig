@@ -64,10 +64,10 @@ test "cooler contract: an exact Cooler prefill bill is what each kind of layer a
                     const bill = bills.prefillChunkCost(&ld.config, kv_bits, width, width, .{});
                     // The margin covers the small tensors no term names, and no term may bill more than a margin it does not
                     // hold beyond the allowance the bill names: the rows' in-flight planes, and what a layer's moments (a
-                    // decoded trunk weight at its matmul, NAX only, and the dense KV rebuild) add past the rows' peak
-                    // (`bills.forwardMomentsBilled`).
+                    // decoded trunk weight at its matmul, NAX only, the dense KV rebuild, and the MTP head's attention layer where the load
+                    // runs the head) add past the rows' peak (`bills.forwardMomentsBilled`).
                     const allowance: u64 = (if (@hasDecl(C, "prefillAllowanceRows")) width * C.prefillAllowanceRows(&ld.config) else 0) +
-                        bills.forwardMomentsBilled(&ld.config, kv_bits, width, width, false);
+                        bills.forwardMomentsBilled(&ld.config, kv_bits, width, width, bills.mtpHeadDefaultOn(&ld.config));
                     if (grew > bill + bills.BILL_MARGIN_BYTES or bill > grew + allowance + bills.BILL_MARGIN_BYTES) std.debug.print("cooler contract: a {d}-row chunk running {any} asked {d} KB against its {d} KB bill\n", .{ width, kinds, grew >> 10, bill >> 10 });
                     try testing.expect(grew <= bill + bills.BILL_MARGIN_BYTES);
                     try testing.expect(bill <= grew + allowance + bills.BILL_MARGIN_BYTES);
@@ -199,6 +199,39 @@ test "cooler contract: a hybrid prefill with the prefix cache off takes no check
                     try testing.expectEqual(@as(u64, 0), got.billed);
                 }
             }
+        }
+    }.run);
+}
+
+test "cooler contract: the load's sizer reserves at a width what a request's bill holds at that width, the MTP head's attention moment included" {
+    try qwenTinyServed(struct {
+        fn run(comptime Q: type, dir: []const u8, _: []const u32) !void {
+            const bills = @import("bills.zig");
+            var ld: Load = undefined;
+            try ld.open(Q, dir, true);
+            defer _ = ld.close();
+            // A load that runs the head: the sizer prices every width for it.
+            if (!bills.mtpHeadDefaultOn(&ld.config)) return error.SkipZigTest;
+            const kv = bills.configuredKvQuantFor(&ld.config);
+            const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+            var wide = ld.config;
+            wide.pinned_context = 1 << 20;
+            var over: usize = 0;
+            for ([_]u64{ 2048, 4096, 6000, 8192 }) |width| {
+                const warm: bills.WarmPrefix = .{ .mtp_on = true };
+                const terms = bills.prefillRequestTerms(&wide, width, 64, kv_bits, width, warm);
+                const phases = bills.requestPhasesFor(&wide, width, 64, kv_bits, width, warm);
+                // What the request holds through its prefill, past the chunk's own forward.
+                const held = width * bills.kvBytesPerTokenAtBits(wide.kvBytesPerToken(), kv_bits) + terms.reserved_kv_bytes + terms.state_bytes +
+                    terms.checkpoint_bytes + terms.qsa_ring_bytes + terms.mtp_head_kv_bytes + terms.dflash_bytes;
+                const transient = phases.prefill - held;
+                const reserve = bills.prefillTransientReserveAtKv(&wide, kv_bits, width, width);
+                if (transient > reserve) {
+                    over += 1;
+                    std.debug.print("cooler contract: a {d}-row chunk's request transient is {d} B against the sizer's reserve of {d} B\n", .{ width, transient, reserve });
+                }
+            }
+            try testing.expectEqual(@as(usize, 0), over);
         }
     }.run);
 }

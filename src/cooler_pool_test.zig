@@ -310,7 +310,9 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8, spec: bool) !void {
     const kv = bills.configuredKvQuantFor(c);
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
     const chunk = @import("prefill_plan.zig").requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
-    const bill = bills.prefillNeededAtChunk(c, len, n, kv_bits, chunk, .{ .mtp_on = spec });
+    // The pool parks free buffers up to the cap of the load's sizing, which prices the head where the load runs it: a request's
+    // held bytes are under the bill of the request as the load sizes it.
+    const bill = bills.prefillNeededAtChunk(c, len, n, kv_bits, chunk, .{ .mtp_on = spec or bills.mtpHeadDefaultOn(c) });
     const turn = arch_handle.turnFor(ld.h, c);
     defer turn.end();
     defer arch_sched.endRequest(c);
@@ -597,7 +599,7 @@ test "cooler contract: a cold prompt admitted at its 512-row bill holds no more 
     try testing.expect(held <= bill);
 }
 
-test "cooler contract: a Cooler request's bill is its larger phase, the prefill's or the decode's, the pool holds each within the bill's margin, and the dearest regrow of the load's own cache is the term, plain and speculative" {
+test "cooler contract: a Cooler request's bill is its larger phase, the prefill's or the decode's, the pool holds each in use under its bill and in all within the load's sized bill and the margin, and the dearest regrow of the load's own cache is the term, plain and speculative" {
     const Q = ContractOf("qwen4");
     if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
     try mlx.requireGpu();
@@ -625,6 +627,24 @@ test "cooler contract: a Cooler request's bill is its larger phase, the prefill'
         last_kv = @intCast(li);
     };
     var over: usize = 0;
+    // A request of each mode first, so that every shape below is measured as a request after the load's first: the size classes
+    // and tables a process's first request makes once are made here, and the pool is emptied of what they leave free.
+    for ([_]bool{ false, true }) |spec| {
+        const prompt = try a.alloc(u32, 40);
+        defer a.free(prompt);
+        for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+        const turn = arch_handle.turnFor(ld.h, c);
+        defer turn.end();
+        defer arch_sched.endRequest(c);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, 8, .{ .temperature = 0.0 }, &.{}, if (spec) Q.specOptions(ld.xfm, 0) else .{});
+        defer gen.deinit(a);
+        if (spec) {
+            while (try gen.nextMtp(a)) |r| a.free(r.tokens);
+        } else while (try gen.next(a) != null) {}
+    }
     // A reply that regrows the cache from a prompt under the reservation, a short prompt, a long one with a short reply, and one so
     // long that the MTP head's attention layer, under its selection's mask, is the pool's fullest moment.
     for ([_]bool{ false, true }) |spec| for ([_]struct { len: usize, n: u32 }{ .{ .len = 1000, .n = 1500 }, .{ .len = 40, .n = 1200 }, .{ .len = 3000, .n = 64 }, .{ .len = 6000, .n = 64 } }) |req| {
@@ -694,9 +714,11 @@ test "cooler contract: a Cooler request's bill is its larger phase, the prefill'
         mlx.engine.close();
         decode_peak = @max(decode_peak, mlx.engine.poolHeldPeak(.process) -| held0);
         decode_inuse = @max(decode_inuse, mlx.engine.poolPeak(.process) -| held0);
-        // Each phase's peak in use is under its own bill, and the pool holds the buffers it has freed beside them, up to
-        // the bill's one margin: the request needs the larger of the two phases, not their sum.
-        if (prefill_inuse > phases.prefill or decode_inuse > phases.decode or prefill_peak > phases.prefill + bills.BILL_MARGIN_BYTES or decode_peak > phases.decode + bills.BILL_MARGIN_BYTES) {
+        // Each phase's peak in use is under its own bill. The pool holds the buffers it has freed beside them up to the cap of the
+        // load's sizing (`arch/cooler.forwardCap`: the sizer's reserve, which prices the head where the load runs it, and the one
+        // margin), so the whole is held under the bill of the request as the load sizes it, the head on where the load runs it.
+        const sized = bills.requestPhasesFor(c, req.len, req.n, kv_bits, chunk, .{ .mtp_on = spec or bills.mtpHeadDefaultOn(c) });
+        if (prefill_inuse > phases.prefill or decode_inuse > phases.decode or prefill_peak > sized.prefill + bills.BILL_MARGIN_BYTES or decode_peak > sized.decode + bills.BILL_MARGIN_BYTES) {
             over += 1;
             std.debug.print("cooler contract: a {d}-token prompt + {d} (MTP {}): the pool had {d} B in use ({d} B held) in the prefill against {d} B, {d} B in use ({d} B held) in the decode against {d} B\n", .{ req.len, req.n, spec, prefill_inuse, prefill_peak, phases.prefill, decode_inuse, decode_peak, phases.decode });
         }
