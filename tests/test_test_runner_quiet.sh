@@ -136,6 +136,11 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{ .root_source_file = b.path("by_hand.zig"), .target = target }),
         .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .server },
     }));
+    b.installArtifact(b.addTest(.{
+        .name = "eof",
+        .root_module = b.createModule(.{ .root_source_file = b.path("eof.zig"), .target = target }),
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .server },
+    }));
     if (b.option([]const u8, "select", "")) |select| {
         const run_select = b.addRunArtifact(b.addTest(.{
             .root_module = b.createModule(.{ .root_source_file = b.path("select.zig"), .target = target }),
@@ -160,6 +165,18 @@ test "skips" {
 }
 test "fails" {
     try std.testing.expect(false);
+}
+EOF
+cat >"$TMP/scratch/eof.zig" <<'EOF'
+const std = @import("std");
+test "a pipe end its parent closed is not held by the test process" {
+    const seen = std.c.getenv("EOF_SEEN") orelse return error.NoMarker;
+    var tries: u32 = 0;
+    while (tries < 100) : (tries += 1) {
+        if (std.c.access(seen, 0) == 0) return;
+        std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+    return error.PipeEndHeld;
 }
 EOF
 (cd "$TMP/scratch" && "$ZIG" build "-Dlog=$TMP/scratch.tsv" >"$TMP/out" 2>&1)
@@ -228,6 +245,23 @@ got=$(cut -f3,5 "$TMP/by-hand-select.tsv" 2>/dev/null | tr '\t' '|' | tr '\n' ';
 want="PASS|by_hand.test.passes;SKIP|by_hand.test.skips;DONE|1 pass, 1 skip, 0 fail;"
 if [ $BY_HAND_RC -ne 0 ] || [ "$got" != "$want" ]; then
   echo "  FAIL: a binary run by hand under SUSHI_TEST_SELECT should run and log only [$want], got [$got] (exit $BY_HAND_RC)"
+  FAIL=1
+fi
+
+# The build runner starts steps from several threads, and on this host a pipe's CLOEXEC is a second call after pipe(),
+# so a process can inherit another step's pipe: that step's stdout then reaches EOF only when this process ends, and the
+# build runner kills the step as "failed to respond for 1m". A process the runner starts holds only stdio: here a pipe's
+# write end is handed to the binary, the parent closes its own copy, and the reader of the pipe must see EOF while the
+# binary still runs. The binary's one test waits for the reader to say so, and fails if it never does.
+mkfifo "$TMP/pipe"
+(cat <"$TMP/pipe" >/dev/null; touch "$TMP/eof-seen") &
+exec 100>"$TMP/pipe"
+EOF_SEEN="$TMP/eof-seen" "$TMP/scratch/zig-out/bin/eof" >"$TMP/eof.out" 2>&1 &
+EOF_PID=$!
+exec 100>&-
+if ! wait "$EOF_PID"; then
+  echo "  FAIL: a test process kept the write end of a pipe its parent had closed, so the pipe's reader never saw EOF"
+  sed 's/^/    | /' "$TMP/eof.out" | head -20
   FAIL=1
 fi
 

@@ -106,6 +106,12 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   The slow tests: `sort -t$'\t' -k4,4rn <file> | head`.
   `SUSHI_TEST_SELECT` (one name prefix a line, `!<prefix>` drops) makes the runner run only the tests it selects, so
   several run steps can share one binary; one that selects nothing fails, naming its step.
+- **A test process owns only stdio**: the runner closes every other inherited descriptor first (the build runner's
+  progress pipe, `ZIG_PROGRESS`, excepted). The build runner spawns steps from several threads and macOS sets a pipe's
+  CLOEXEC in a second call, so a step can inherit another's stdout write end; that step's EOF then waits for this
+  process to end, and the build fails it "test runner failed to respond for 1m" with no test failed (the window runs
+  while no test is active). A Cooler binary's start and exit outside a test take about 10 ms, measured beside
+  two other Cooler binaries: a silent minute there is not slow work.
 - **An env set at the invocation reaches every test**: a run step gets only its own variables (`SUSHI_TEST_STEP`,
   `SUSHI_TEST_SELECT`, `SUSHI_TEST_FIXTURE_CUT`, `SUSHI_TEST_LOG`, the step's `SUSHI_PREFIX_FS`, `QWEN_PREPROCESS_FIXTURE`) as
   `--env=NAME=VALUE` arguments, never through `run.setEnvironmentVariable`, which snapshots the build's whole environment

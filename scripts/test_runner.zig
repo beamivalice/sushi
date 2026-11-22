@@ -127,6 +127,20 @@ fn ownedEnviron(start: std.process.Environ) std.process.Environ {
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn getdtablesize() c_int;
+extern "c" fn close(fd: c_int) c_int;
+
+/// Closes every descriptor past stdio except the progress pipe the build runner passes on purpose (`ZIG_PROGRESS`).
+/// The build runner starts steps from several threads, and a pipe's CLOEXEC is a second call after `pipe()` on macOS,
+/// so a process can inherit another step's pipe; that step's stdout then reaches EOF only when this process ends, and
+/// the build runner kills it as unresponsive. The runner opens nothing before this.
+fn closeInheritedFds() void {
+    const progress: c_int = if (std.c.getenv("ZIG_PROGRESS")) |v| std.fmt.parseInt(c_int, std.mem.span(v), 10) catch -1 else -1;
+    var fd: c_int = 3;
+    while (fd < getdtablesize()) : (fd += 1) {
+        if (fd != progress) _ = close(fd);
+    }
+}
 
 /// The run step's own variables arrive as `--env=NAME=VALUE`, not in the environment the build runner hands the process:
 /// a run step's environment is a snapshot taken at configure, and a cached configure replays it, so a variable set at
@@ -234,6 +248,7 @@ pub fn main(start: std.process.Init.Minimal) void {
         return mainSimple() catch |err| panic("test failure: {t}", .{err});
     }
 
+    closeInheritedFds();
     const args = start.args.toSlice(std.heap.page_allocator) catch |err| panic("unable to parse command line args: {t}", .{err});
     applyStepEnv(args[1..]);
     const init: std.process.Init.Minimal = .{ .environ = ownedEnviron(start.environ), .args = start.args };
