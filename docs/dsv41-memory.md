@@ -215,7 +215,7 @@ decode pool (1 GiB on the MLX route) is not billed. The ledger's pool line of a 
 between requests, about 0.26 GB (`arch_config.expertPoolBytes`, the arch's own answer for the config).
 - **The caps belong to a side** (`dsv41_borrow`): a request's end or a forward of a model on MLX moves MLX's caps
   only, a Cooler model's the engine's budget only, so one model's request end never takes the other's room
-  (`after a model on MLX beside it served and ended a request, the Cooler's next request of any kind has the engine's room`).
+  (`a Cooler model beside a model on MLX, in phases`, its pool-room phase).
 - **A restore reserves the rows' slack** (`Rows.reserve`): the first step after a restore from a point someone keeps
   copied every layer's rows (1,441,792 bytes on the tiny fixture against 163,840 cold); it now takes 196,608 and does
   not grow with the context.

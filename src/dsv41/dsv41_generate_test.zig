@@ -1901,98 +1901,6 @@ test "dsv41 engine: a Cooler load holds the engine's scope from its load to its 
     try testing.expect(!mlx.engine.active and !mlx.engine.holding());
 }
 
-test "dsv41 engine: beside a resident Cooler model, a model on MLX loads, runs and unloads inside its own turn, and the Cooler's hold is as it was after (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    var cooler: EngineFixture = undefined;
-    try cooler.open(dir);
-    defer cooler.deinit();
-    var buf: [24]u32 = undefined;
-    const ids = cooler.prompt(&buf);
-    const a = testing.allocator;
-    // The caps as `serve` installs them, so each model's hooks move what is theirs.
-    const ram_cap = dsv41_borrow.pool_ram_cap;
-    dsv41_borrow.pool_ram_cap = 8 << 30;
-    defer {
-        dsv41_borrow.pool_ram_cap = ram_cap;
-        mlx.engine.budget(std.math.maxInt(u64)) catch {};
-    }
-    {
-        // A request of the Cooler's first: its pool holds free buffers the other model's hooks must leave alone.
-        var first = try shortPrefillBytes(a, &cooler.xfm, ids, 16, 8, 2);
-        first.deinit(a);
-        dsv41_borrow.endRequestMlx(&cooler.config);
-    }
-    const free_before = mlx.engine.poolFree();
-    try testing.expect(free_before > 0);
-    {
-        // The scheduler turns to the other model for each of its jobs: its load, its requests, its unload.
-        const turn = mlx.engine.turnTo(false);
-        defer turn.end();
-        try testing.expect(!mlx.engine.active);
-        var on_mlx: EngineFixture = undefined;
-        try on_mlx.openMlx(dir);
-        defer on_mlx.deinit();
-        try testing.expect(!mlx.engine.isStream(on_mlx.xfm.s));
-        // MLX's allocator answers for itself while its model works: a model's weights are in it.
-        var held_by_mlx: usize = 0;
-        try mlx.check(mlx.mlx_get_active_memory(&held_by_mlx));
-        try testing.expect(held_by_mlx > 0);
-        var bytes = try shortPrefillBytes(a, &on_mlx.xfm, ids, 16, 8, 2);
-        bytes.deinit(a);
-        dsv41_borrow.endRequestMlx(&on_mlx.config);
-        dsv41_borrow.unloadModelMlx(&on_mlx.config);
-    }
-    // Back in the Cooler's turn: its scope holds, its pool is as it left it, and its forward asks MLX nothing.
-    try testing.expect(mlx.engine.active and mlx.engine.holding());
-    try testing.expect(mlx.engine.poolFree() >= free_before);
-    const turn = mlx.engine.turnTo(true);
-    defer turn.end();
-    var census = try Census.begin();
-    errdefer census.names.deinit(a);
-    var got = try shortPrefillBytes(a, &cooler.xfm, ids, 16, 8, 2);
-    defer got.deinit(a);
-    try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try census.end("the Cooler's forwards after another model's turn"));
-}
-
-test "dsv41 engine: a Cooler load beside a model on MLX leaves MLX a wired limit less the mappings the engine wraps, from that model's next turn (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const max_rec = mlx.maxRecommendedWorkingSet();
-    if (max_rec == 0) return error.SkipZigTest;
-    var on_mlx: EngineFixture = undefined;
-    try on_mlx.openMlx(dir);
-    defer on_mlx.deinit();
-    var orig: usize = 0;
-    try mlx.check(mlx.mlx_set_wired_limit(&orig, 0));
-    try mlx.check(mlx.mlx_set_wired_limit(&orig, orig));
-    defer {
-        const t = mlx.engine.turnTo(false);
-        var unused: usize = 0;
-        _ = mlx.mlx_set_wired_limit(&unused, orig);
-        t.end();
-    }
-    // The policy as the load job of the model on MLX applies it.
-    const alone = mlx.applyWiredPolicy() orelse return error.SkipZigTest;
-    var cooler: EngineFixture = undefined;
-    try cooler.open(dir);
-    defer cooler.deinit();
-    // The Cooler's load job applies it under its hold: nothing is set now.
-    try testing.expectEqual(@as(?usize, null), mlx.applyWiredPolicy());
-    const mapped: usize = @intCast(mlx.engine.mappedTotal());
-    try testing.expect(mapped > 0);
-    var now: usize = 0;
-    {
-        const t = mlx.engine.turnTo(false);
-        defer t.end();
-        // Read by setting it: the call hands back the limit it replaces, which then goes back.
-        try mlx.check(mlx.mlx_set_wired_limit(&now, alone));
-        var unused: usize = 0;
-        try mlx.check(mlx.mlx_set_wired_limit(&unused, now));
-    }
-    try testing.expectEqual(max_rec - mapped, now);
-}
-
 /// A load or an unload as the scheduler runs it (`model_load.JobTurn`).
 const LoadJob = struct {
     turn: mlx.engine.Turn,
@@ -2010,65 +1918,264 @@ const LoadJob = struct {
     }
 };
 
-test "dsv41 engine: a Cooler model and a model on MLX loaded beside it each serve their own bytes, the Cooler asks MLX nothing, and its unload first leaves the other serving (DSV41_STQ_TINY)" {
+test "dsv41 engine: a Cooler model beside a model on MLX, in phases: the wired limit, each side's own turn and bytes, the pool's room after the other's request, the idle flush, and either one's unload leaving the other serving (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     const a = testing.allocator;
+    const io = testing.io;
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer test_support.restoreEngine(was_enabled);
-    defer mlx.engine.budget(std.math.maxInt(u64)) catch {};
-    var buf: [24]u32 = undefined;
+    const ram_cap = dsv41_borrow.pool_ram_cap;
+    defer {
+        dsv41_borrow.pool_ram_cap = ram_cap;
+        mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    }
+    const max_rec = mlx.maxRecommendedWorkingSet();
+    if (max_rec == 0) return error.SkipZigTest;
+    var orig: usize = 0;
+    try mlx.check(mlx.mlx_set_wired_limit(&orig, 0));
+    try mlx.check(mlx.mlx_set_wired_limit(&orig, orig));
+    defer {
+        const t = mlx.engine.turnTo(false);
+        var unused: usize = 0;
+        _ = mlx.mlx_set_wired_limit(&unused, orig);
+        t.end();
+    }
+    // The policy as a model on MLX's load job applies it with no engine held.
+    const alone = mlx.applyWiredPolicy() orelse return error.SkipZigTest;
     // The server's unload hook runs on a config that outlives the model: the Cooler's, which names its side.
     var kept = try model_mod.parseConfig(std.Io.Threaded.global_single_threaded.io(), a, dir);
     defer kept.deinit(a);
     kept.cooler_for_test = true;
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var ids_own: [24]u32 = undefined;
+    var ids_run: [48]u32 = undefined;
+    var ids_tier: [600]u32 = undefined;
+
+    // Phase load: the Cooler's load job holds the engine's scope; the policy it applies under that hold sets nothing now.
     var cooler: EngineFixture = undefined;
+    var cooler_up = false;
+    defer if (cooler_up) cooler.deinit();
     {
         const job = LoadJob.begin(true);
         defer job.end();
         try cooler.open(dir);
+        cooler_up = true;
     }
-    // Each side's own bytes are the reference: the Cooler's before the other model loads, the other model's beside it,
-    // which it must still give after the Cooler's unload.
+    try testing.expectEqual(@as(?usize, null), mlx.applyWiredPolicy());
+    const mapped: usize = @intCast(mlx.engine.mappedTotal());
+    try testing.expect(mapped > 0);
+
+    // Each side's own bytes are the reference: the Cooler's before the model on MLX loads, the other's beside it.
     var want_own = blk: {
         const turn = mlx.engine.turnTo(true);
         defer turn.end();
-        break :blk try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&buf), 16, 8, 2);
+        break :blk try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&ids_own), 16, 8, 2);
     };
     defer want_own.deinit(a);
+    // The Cooler's first request, as served: its end leaves free buffers in the pool the other model's hooks must leave alone.
+    {
+        const caps = ServedCaps.install();
+        defer caps.restore();
+        try runRequest(&cooler, &tok, cooler.prompt(&ids_run)[0..40], .{ .temperature = 0.0 }, .{}, 6, null, null);
+        dsv41_borrow.endRequestMlx(&cooler.config);
+    }
+    dsv41_borrow.pool_ram_cap = 8 << 30;
+    {
+        var first = try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&ids_own), 16, 8, 2);
+        first.deinit(a);
+        dsv41_borrow.endRequestMlx(&cooler.config);
+    }
+    const free_before = mlx.engine.poolFree();
+    try testing.expect(free_before > 0);
+
+    // Phase turn and wired limit: a model on MLX loads, runs and ends its request inside its own turn, and that turn's
+    // wired limit is the working set less the mappings the engine wraps.
     var on_mlx: EngineFixture = undefined;
+    var mlx_up = false;
+    defer {
+        if (mlx_up) {
+            const turn = mlx.engine.turnTo(false);
+            defer turn.end();
+            on_mlx.deinit();
+        }
+    }
+    var want_mlx: std.ArrayList(u8) = .empty;
+    defer want_mlx.deinit(a);
     {
         const job = LoadJob.begin(false);
         defer job.end();
+        try testing.expect(!mlx.engine.active);
         try on_mlx.openMlx(dir);
+        mlx_up = true;
+        try testing.expect(!mlx.engine.active);
+        try testing.expect(!mlx.engine.isStream(on_mlx.xfm.s));
+        // Read by setting it: the call hands back the limit it replaces, which then goes back.
+        var now: usize = 0;
+        try mlx.check(mlx.mlx_set_wired_limit(&now, alone));
+        var unused: usize = 0;
+        try mlx.check(mlx.mlx_set_wired_limit(&unused, now));
+        try testing.expectEqual(max_rec - mapped, now);
+        // MLX's allocator answers for itself while its model works: a model's weights are in it.
+        var held_by_mlx: usize = 0;
+        try mlx.check(mlx.mlx_get_active_memory(&held_by_mlx));
+        try testing.expect(held_by_mlx > 0);
+        var ids: [24]u32 = undefined;
+        want_mlx = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
+        dsv41_borrow.endRequestMlx(&on_mlx.config);
     }
-    var want_mlx = blk: {
-        const turn = mlx.engine.turnTo(false);
-        defer turn.end();
-        break :blk try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&buf), 16, 8, 2);
-    };
-    defer want_mlx.deinit(a);
+    // Back in the Cooler's turn: its scope holds, its pool is as it left it, and its forwards ask MLX nothing.
+    try testing.expect(mlx.engine.active and mlx.engine.holding());
+    try testing.expect(mlx.engine.poolFree() >= free_before);
     {
-        // The configs the other model launched are in the caches both share: the Cooler's request drops some.
         const turn = mlx.engine.turnTo(true);
         defer turn.end();
         var census = try Census.begin();
         errdefer census.names.deinit(a);
-        var got = try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&buf), 16, 8, 2);
+        var got = try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&ids_own), 16, 8, 2);
+        defer got.deinit(a);
+        try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try census.end("the Cooler's forwards after another model's turn"));
+    }
+    mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    dsv41_borrow.pool_ram_cap = ram_cap;
+
+    // Phase own bytes: the configs the model on MLX launched are in the caches both share, and the Cooler's request drops some.
+    {
+        const turn = mlx.engine.turnTo(true);
+        defer turn.end();
+        var census = try Census.begin();
+        errdefer census.names.deinit(a);
+        var got = try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&ids_own), 16, 8, 2);
         defer got.deinit(a);
         try testing.expectEqualSlices(u8, want_own.items, got.items);
         try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try census.end("the Cooler's request beside a model on MLX"));
+    }
+
+    // Phase pool room: after the other model's request and its end, a serial request and a DSpark one each have the
+    // engine's room (any kind fails on a budget another model's request end lowered).
+    {
+        const caps = ServedCaps.install();
+        defer caps.restore();
+        const greedy: SamplingParams = .{ .temperature = 0.0 };
+        const Variant = struct { sampling: SamplingParams, opts: Generator.InitOptions };
+        const variants = [_]Variant{
+            .{ .sampling = greedy, .opts = .{} },
+            .{ .sampling = greedy, .opts = .{ .dspark_enabled = true } },
+        };
+        for (variants) |v| {
+            {
+                // The other model's request and its end, in its own turn as the scheduler runs them.
+                const turn = mlx.engine.turnTo(false);
+                defer turn.end();
+                var ids: [24]u32 = undefined;
+                var bytes = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
+                bytes.deinit(a);
+                dsv41_borrow.endRequestMlx(&on_mlx.config);
+            }
+            const turn = mlx.engine.turnTo(true);
+            defer turn.end();
+            try runRequest(&cooler, &tok, cooler.prompt(&ids_run)[0..40], v.sampling, v.opts, 6, null, null);
+            dsv41_borrow.endRequestMlx(&cooler.config);
+            try testing.expect(!mlx.errorPending());
+        }
+    }
+
+    // Phase idle flush: the Cooler's live restore points reach the SSD tier at an idle flush, the model on MLX having
+    // served in between or not.
+    {
+        const caps = ServedCaps.install();
+        defer caps.restore();
+        const m = cooler.model();
+        const prompt = cooler.prompt(&ids_tier);
+        const point = 512;
+        for ([_]bool{ false, true }) |other_served| {
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            var path_buf: [512]u8 = undefined;
+            const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+            var hc = try coolerTier(&cooler, base);
+            defer hc.deinit();
+            {
+                // The Cooler's request: a prefill to the point, which it keeps live, then its end.
+                const turn = mlx.engine.turnTo(true);
+                defer turn.end();
+                try cooler.xfm.resetCache();
+                var ctx = cooler.xfm.defaultCtx();
+                _ = dsv41_borrow.enterForward(point, point, &cooler.config, &cooler.config.dsv41.?, ServedCaps.ops);
+                _ = mlx.mlx_array_free(try forwardIds(&cooler.xfm, &ctx, prompt[0..point]));
+                ctx.cache.step = point;
+                var cp = try dsv41_prefix.capture(a, m, point);
+                defer cp.deinit(a);
+                try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, null);
+                try testing.expect(try dsv41_prefix.publishLiveDsv41(&hc, m, prompt[0..point], false, .{}, ctx.cache.config));
+                dsv41_borrow.endRequestMlx(&cooler.config);
+            }
+            if (other_served) {
+                const turn = mlx.engine.turnTo(false);
+                defer turn.end();
+                var ids: [24]u32 = undefined;
+                var bytes = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
+                bytes.deinit(a);
+                dsv41_borrow.endRequestMlx(&on_mlx.config);
+            }
+            const turn = mlx.engine.turnTo(true);
+            defer turn.end();
+            dsv41_prefix.flushLiveDsv41(&hc, m, "idle");
+            hc.disk.?.drainWriter();
+            try testing.expect(!mlx.errorPending());
+            try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+            try testing.expect(!dsv41_prefix.liveOf(&hc).unflushed(&hc.disk.?));
+            try runRequest(&cooler, &tok, prompt[0..40], .{ .temperature = 0.0 }, .{}, 4, null, null);
+        }
+    }
+
+    // Phase the model on MLX's unload: inside its own turn, the Cooler's hold is as it was after, its pool keeps its
+    // free buffers and its forwards ask MLX nothing.
+    dsv41_borrow.pool_ram_cap = 8 << 30;
+    const free_pre = mlx.engine.poolFree();
+    {
+        const turn = mlx.engine.turnTo(false);
+        defer turn.end();
+        dsv41_borrow.endRequestMlx(&on_mlx.config);
+        dsv41_borrow.unloadModelMlx(&on_mlx.config);
+        on_mlx.deinit();
+        mlx_up = false;
+    }
+    try testing.expect(mlx.engine.active and mlx.engine.holding());
+    try testing.expect(mlx.engine.poolFree() >= free_pre);
+    {
+        const turn = mlx.engine.turnTo(true);
+        defer turn.end();
+        var census = try Census.begin();
+        errdefer census.names.deinit(a);
+        var got = try shortPrefillBytes(a, &cooler.xfm, cooler.prompt(&ids_own), 16, 8, 2);
+        defer got.deinit(a);
+        try testing.expectEqual(Asked{ .calls = 0, .ops = 0 }, try census.end("the Cooler's forwards after the other model's unload"));
+    }
+    mlx.engine.budget(std.math.maxInt(u64)) catch {};
+    dsv41_borrow.pool_ram_cap = ram_cap;
+
+    // Phase the Cooler's unload: it leaves the model on MLX (a load of its own beside it, as the unload above ended the
+    // first) serving its own bytes.
+    {
+        const job = LoadJob.begin(false);
+        defer job.end();
+        try on_mlx.openMlx(dir);
+        mlx_up = true;
     }
     {
         const job = LoadJob.begin(true);
         defer job.end();
         cooler.deinit();
+        cooler_up = false;
         dsv41_borrow.unloadModelMlx(&kept);
     }
     try testing.expect(!mlx.engine.holding() and !mlx.engine.active and !mlx.engine.mlx_at_rest.on.load(.acquire));
     {
-        var got = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&buf), 16, 8, 2);
+        var ids: [24]u32 = undefined;
+        var got = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
         defer got.deinit(a);
         try testing.expectEqualSlices(u8, want_mlx.items, got.items);
     }
@@ -2076,6 +2183,7 @@ test "dsv41 engine: a Cooler model and a model on MLX loaded beside it each serv
     defer job.end();
     dsv41_borrow.unloadModelMlx(&on_mlx.config);
     on_mlx.deinit();
+    mlx_up = false;
 }
 
 test "dsv41 engine: each row of a verify, at every width the model accepts, is the bits of the serial step at its position, an image id the model emitted among them or not (DSV41_STQ_TINY)" {
@@ -5440,125 +5548,6 @@ const ServedCaps = struct {
     fn clear() void {}
     const ops: dsv41_borrow.PoolOps = .{ .set_limit = &ignore, .clear = &clear, .set_transient = &ignore, .set_own = &setOwn, .restore_ram = &ignore };
 };
-
-test "dsv41 engine: after a model on MLX beside it served and ended a request, the Cooler's next request of any kind has the engine's room (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const caps = ServedCaps.install();
-    defer caps.restore();
-    var cooler: EngineFixture = undefined;
-    try cooler.open(dir);
-    defer cooler.deinit();
-    var tok = Tokenizer.initEmpty(a);
-    defer tok.deinit();
-    var buf: [48]u32 = undefined;
-    const prompt = cooler.prompt(&buf)[0..40];
-    const greedy: SamplingParams = .{ .temperature = 0.0 };
-    try runRequest(&cooler, &tok, prompt, greedy, .{}, 6, null, null);
-    dsv41_borrow.endRequestMlx(&cooler.config);
-    var on_mlx: EngineFixture = undefined;
-    {
-        const turn = mlx.engine.turnTo(false);
-        defer turn.end();
-        try on_mlx.openMlx(dir);
-    }
-    defer {
-        const turn = mlx.engine.turnTo(false);
-        on_mlx.deinit();
-        turn.end();
-    }
-    const Variant = struct { sampling: SamplingParams, opts: Generator.InitOptions };
-    // A serial request and a DSpark one: any kind fails on a budget another model's request end lowered.
-    const variants = [_]Variant{
-        .{ .sampling = greedy, .opts = .{} },
-        .{ .sampling = greedy, .opts = .{ .dspark_enabled = true } },
-    };
-    for (variants) |v| {
-        {
-            // The other model's request and its end, in its own turn as the scheduler runs them.
-            const turn = mlx.engine.turnTo(false);
-            defer turn.end();
-            var ids: [24]u32 = undefined;
-            var bytes = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
-            bytes.deinit(a);
-            dsv41_borrow.endRequestMlx(&on_mlx.config);
-        }
-        const turn = mlx.engine.turnTo(true);
-        defer turn.end();
-        try runRequest(&cooler, &tok, prompt, v.sampling, v.opts, 6, null, null);
-        dsv41_borrow.endRequestMlx(&cooler.config);
-        try testing.expect(!mlx.errorPending());
-    }
-}
-
-test "dsv41 engine: the Cooler's live restore points reach the SSD tier at an idle flush, a model on MLX having served in between or not (DSV41_STQ_TINY)" {
-    try mlx.requireGpu();
-    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const io = testing.io;
-    const caps = ServedCaps.install();
-    defer caps.restore();
-    var cooler: EngineFixture = undefined;
-    try cooler.open(dir);
-    defer cooler.deinit();
-    const m = cooler.model();
-    var on_mlx: EngineFixture = undefined;
-    {
-        const turn = mlx.engine.turnTo(false);
-        defer turn.end();
-        try on_mlx.openMlx(dir);
-    }
-    defer {
-        const turn = mlx.engine.turnTo(false);
-        on_mlx.deinit();
-        turn.end();
-    }
-    var tok = Tokenizer.initEmpty(a);
-    defer tok.deinit();
-    var buf: [600]u32 = undefined;
-    const prompt = cooler.prompt(&buf);
-    const point = 512;
-    for ([_]bool{ false, true }) |other_served| {
-        var tmp = testing.tmpDir(.{ .iterate = true });
-        defer tmp.cleanup();
-        var path_buf: [512]u8 = undefined;
-        const base = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-        var hc = try coolerTier(&cooler, base);
-        defer hc.deinit();
-        {
-            // The Cooler's request: a prefill to the point, which it keeps live, then its end.
-            const turn = mlx.engine.turnTo(true);
-            defer turn.end();
-            try cooler.xfm.resetCache();
-            var ctx = cooler.xfm.defaultCtx();
-            _ = dsv41_borrow.enterForward(point, point, &cooler.config, &cooler.config.dsv41.?, ServedCaps.ops);
-            _ = mlx.mlx_array_free(try forwardIds(&cooler.xfm, &ctx, prompt[0..point]));
-            ctx.cache.step = point;
-            var cp = try dsv41_prefix.capture(a, m, point);
-            defer cp.deinit(a);
-            try dsv41_prefix.liveOf(&hc).keep(a, m, &cp, null);
-            try testing.expect(try dsv41_prefix.publishLiveDsv41(&hc, m, prompt[0..point], false, .{}, ctx.cache.config));
-            dsv41_borrow.endRequestMlx(&cooler.config);
-        }
-        if (other_served) {
-            const turn = mlx.engine.turnTo(false);
-            defer turn.end();
-            var ids: [24]u32 = undefined;
-            var bytes = try shortPrefillBytes(a, &on_mlx.xfm, on_mlx.prompt(&ids), 16, 8, 2);
-            bytes.deinit(a);
-            dsv41_borrow.endRequestMlx(&on_mlx.config);
-        }
-        const turn = mlx.engine.turnTo(true);
-        defer turn.end();
-        dsv41_prefix.flushLiveDsv41(&hc, m, "idle");
-        hc.disk.?.drainWriter();
-        try testing.expect(!mlx.errorPending());
-        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
-        try testing.expect(!dsv41_prefix.liveOf(&hc).unflushed(&hc.disk.?));
-        try runRequest(&cooler, &tok, prompt[0..40], .{ .temperature = 0.0 }, .{}, 4, null, null);
-    }
-}
 
 /// `shortPrefillBytes` with a greedy token fed back: a `lead`-row prefill, `k` rows, `steps` steps, each one's logits
 /// and token. `spoil` writes that byte over the pool's free buffers before every forward.

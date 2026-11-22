@@ -374,6 +374,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   sync times, so the round count, and every call per round, changes from request to request with the same tokens.
 - One function, many inputs: one table-driven test, one row per case.
 - One fixture or pack load per process, shared by the tests that read it.
+- A scenario that needs two models loaded beside each other (a Cooler load and one on MLX) is one test in phases on one
+  load pair; a phase gets its own load only when it ends a model, or reads a state only a fresh load has.
 - No sleeps to wait for a thread. Use a hook or a counter. Any wait is bounded and under 100 ms.
 - A served test that waits on another request bounds what it claims (the request is not held: its model is claimed
   soon after the step it waited on), never a wall clock that holds a reload: every load runs its served warm.
