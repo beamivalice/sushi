@@ -144,12 +144,14 @@ Moved to [glm5-clamped-experts](glm5-clamped-experts.md).
   threadgroup would otherwise re-derive its K span of x (64 times per slot). Rows ≤ `DECODE_ROWS_MAX` or verify rows take this
   chain; wider takes `moePrefill`. The MTP head's MoE rows ride the decode chain and refuse wider
   (`Exl3MtpRowsExceedDecode`).
-  - **The generation-13 (M1) row takes the same five-dispatch chain on the Flash-Next geometry** (2026-11-22,
-    `applegpu_g13s`, the served STQ 2.75 pack's spec1 w15, `shared.exl3_grouped_decode`, flash geometry, stq36, 7
-    rounds interleaved, arms byte-identical): prepared/fused **0.885 at 3 rows, 0.881 at 4, 1.008 at 1** (one row
-    never prepares its pair). The Hadamard prepare is ALU on a SIMD-only GPU, and the self-preparing kernels pay it
-    per output-tile threadgroup — 20 groups a slot for the pair, 80 for the mid — so on M1 the prepare dispatches cost
-    less than the repeated ALU. Later generations are unmeasured and keep the geometry's own rule.
+  - **The generation-13 (M1) row takes the same five-dispatch chain on the Flash-Next geometry, at every verify width
+    including the 9-row lookup** (2026-11-22, `applegpu_g13s`, the pack's own rate stq64 spec1 w15,
+    `shared.exl3_grouped_decode`, flash geometry, 7 rounds interleaved, arms byte-identical): prepared/fused **0.863
+    at 3 rows, 0.858 at 4, 0.847 at 8, 0.846 at 9**, and 0.999 at 1 (one row never prepares its pair; the prepared
+    and bucket-2 pair arms read 0.806 at 9 rows, so the grouping stays at 2). The Hadamard prepare is ALU on a
+    SIMD-only GPU, and the self-preparing kernels pay it per output-tile threadgroup — 20 groups a slot for the pair,
+    80 for the mid — so on M1 the prepare dispatches cost less than the repeated ALU. Later generations are
+    unmeasured and keep the geometry's own rule.
 - **The prepared pair input is stored in GEMV lane order** (`LANE_ORDER_SLOT`: each 16-row tile keeps rows 2q,
   2q+1, 2q+8, 2q+9 at 4q..4q+3), so a lane reads its four as one half4 (`laneQuadReads`). Same values in the same
   order: the pair planes kept the self-preparing kernel's bytes when proven. The same layout for the prepared middle measured no
