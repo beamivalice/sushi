@@ -72,7 +72,8 @@ chk() {
 }
 
 # One request, normalized: ask <chat|messages|responses> <0|1 stream> <json body>. Prints one JSON object with
-# http, finish, content, reasoning, calls[{name,args}], usage (chat) or text/thinking (messages; responses: text and reasoned).
+# http, finish, content, reasoning, calls[{name,args}], usage (chat) or text/thinking (messages; responses: text, reasoning
+# (the reasoning items' summary text) and reasoned).
 HELPER=$(cat <<'PY'
 import json, sys, urllib.error, urllib.request
 
@@ -110,6 +111,7 @@ elif mode == "responses":
     d = json.load(resp)
     out.update(finish=d.get("status"), usage=d.get("usage") or {},
                reasoned=any(it.get("type") == "reasoning" for it in d.get("output", [])),
+               reasoning="".join(p.get("text", "") for it in d.get("output", []) if it.get("type") == "reasoning" for p in it.get("summary") or []),
                text="".join(c.get("text", "") for it in d.get("output", []) if it.get("type") == "message" for c in it.get("content", [])))
 elif mode == "chat" and not stream:
     d = json.load(resp)
@@ -225,6 +227,11 @@ chk_clean() {
     check "$1" "$(no_leak "$(jget "$R" "r['$2']")" && echo 1 || echo 0)"
 }
 
+# A reply the cap cut may hold answer text after a thought that closed, so "no text" is not the claim; the claim is
+# that none of the thought rides in the text: no think tag, and no line of 20 or more characters of the reasoning.
+# Use as: chk "..." "r['finish']!='incomplete' or $NO_REASONING_IN_TEXT(r['reasoning'], r['text'])"
+NO_REASONING_IN_TEXT="(lambda reasoning, text: 'think>' not in text and not any(len(l.strip())>=20 and l.strip() in text for l in reasoning.splitlines()))"
+
 # ntok <text>: the token count of the server's own tokenizer
 ntok() {
     python3 -I -c 'import json, sys, urllib.request
@@ -320,13 +327,13 @@ chk_clean "8. /v1/messages stream: no control-tag leak in deltas" text
 
 if [ "$THINKS" = 1 ]; then
     # ── 9. /v1/messages: truncated thinking lands in the thinking block ──
-    R=$(ask messages 0 "{\"model\":\"x\",\"max_tokens\":120,\"messages\":[$PROMPT],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4000}}")
-    chk "9. /v1/messages: truncated thinking not in the text block" "r['finish']!='max_tokens' or not r['text']"
+    R=$(ask messages 0 "{\"model\":\"x\",\"max_tokens\":120,\"temperature\":0,\"messages\":[$PROMPT],\"thinking\":{\"type\":\"enabled\",\"budget_tokens\":4000}}")
+    chk "9. /v1/messages: truncated thinking not in the text block" "r['finish']!='max_tokens' or $NO_REASONING_IN_TEXT(r['thinking'], r['text'])"
     chk "9. /v1/messages: thinking block non-empty" "r['thinking']"
 
     # ── 10. /v1/responses: truncated thinking is no message text, and usage reports the reasoning ──
-    R=$(ask responses 0 "{\"model\":\"x\",\"input\":\"$SUSHI_NONCE What is 17*23? Be brief.\",\"max_output_tokens\":120,\"reasoning\":{\"effort\":\"low\"}}")
-    chk "10. /v1/responses: truncated thinking not in message text" "r['finish']!='incomplete' or not r['text']"
+    R=$(ask responses 0 "{\"model\":\"x\",\"input\":\"$SUSHI_NONCE What is 17*23? Be brief.\",\"max_output_tokens\":120,\"temperature\":0,\"reasoning\":{\"effort\":\"low\"}}")
+    chk "10. /v1/responses: truncated thinking not in message text" "r['finish']!='incomplete' or $NO_REASONING_IN_TEXT(r['reasoning'], r['text'])"
     chk "10. /v1/responses: usage reasoning_tokens > 0 exactly when the output holds a reasoning item" "(r['usage'].get('output_tokens_details',{}).get('reasoning_tokens',0)>0)==r['reasoned']"
 
     # ── 11. Stream + thinking, truncated: deltas split, nothing in content ──
