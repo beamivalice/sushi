@@ -1183,7 +1183,7 @@ pub const grouped_decode: report.Bench = .{
     .axes = &.{
         .{ .name = "geometry", .values = &.{ "flash", "deepseek" }, .numeric = false },
         .{ .name = "rate", .values = &.{ "mcg32", "mcg40", "mcg48", "mcg64", "stq36", "stq42", "stq64" }, .numeric = false },
-        .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "6", "8" } },
+        .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "6", "8", "9" } },
         .{ .name = "carry", .values = &.{ "0", "0.5" }, .numeric = false },
     },
     .arms = &kernels.GROUP_ARMS,

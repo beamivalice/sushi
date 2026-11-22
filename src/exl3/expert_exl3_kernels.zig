@@ -2733,6 +2733,10 @@ pub fn moeSwigluFusedWithShared(
     const topk = @divExact(nslots, rows);
     const inter = tsh[2] * 16;
     const prepared = preparedMidOn(hidden, inter, tsh[0], topk, rows, out_dtype) and mlx.mlx_array_dtype(x) == .bfloat16;
+    if (rows >= 2 and prep_chain_reports < 4) {
+        prep_chain_reports += 1;
+        log.info("[exl3-decode] prepared chain {s} rows={d} hidden={d} inter={d} experts={d} topk={d} dtype={s}\n", .{ if (prepared) "engaged" else "declined", rows, hidden, inter, tsh[0], topk, @tagName(mlx.mlx_array_dtype(x)) });
+    }
     const group = decodeGroupFor(prepared, rows, nslots);
     // A one-row pair keeps preparing its own K span: the extra prepare dispatch costs it more than it saves.
     const inners = if (prepared and rows >= 2 and !pair_selfprep_for_test) blk: {
@@ -5912,6 +5916,7 @@ test "exl3 n40 decode BF16 rows no worse than composite against f32 truth" {
 }
 
 var prepared_mid_force: ?bool = null;
+var prep_chain_reports: u8 = 0;
 
 /// A SIMD-only GPU pays the Hadamard prepare as ALU, and the self-preparing kernels re-derive it in every
 /// output-tile group; this row reads the planes a slot's prepare dispatches wrote instead. Seam: forces it.
