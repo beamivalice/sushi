@@ -10,6 +10,11 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 
 ## Decode kernels
 
+- **A launch also costs GPU time, not only host time** (M1 Max, 2026-11-22): `SUSHI_DISPATCH_PROBE=8` (eight
+  injected elementwise kernels a MoE layer, +384 dispatches a forward) moved a 3-row verify forward's GPU busy
+  50.31 -> 51.51 ms, i.e. **3.1 us a launch including ramp**; a 1779-dispatch forward therefore carries ~5.5 ms of
+  launch cost, and the ~1203 dispatches outside the MoE and trunk lines ~3.7 ms. Price a fusion against that, but
+  only where the fused work is free: the repeated-staging rule below still wins over fusion.
 - **Fold a small step into a small kernel, never into a heavy kernel's input staging.** A dependent dispatch costs 3.4
   to 4.4 us, but work folded into the staging of a kernel with many threadgroups runs again in each of them and sits
   on its critical path: about 1.1 us a staging iteration on DeepSeek's `wo_b`, +2.2 us at one row and +12.3 us at

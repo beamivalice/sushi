@@ -1679,7 +1679,8 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
     const downs = classesOf(rb, true, &dc);
     logEngaged(.decode, rb, pair.len, downs.len);
     const prepared = preparedOn(rb);
-    const group = if (prepared and groupedOn(rb)) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
+    // A non-null `group_force` is a test or bench asking for grouping: it overrides the geometry policy.
+    const group = if (prepared and (groupedOn(rb) or group_force != null)) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
     if (group > 0) kernels.logGroupedEngaged(group);
     const inner = if (prepared) blk: {
         const prep = try kernels.pairPrepare(s, x, rb.suh[0], rb.suh[1], slots, rb.hidden, @intCast(mlx.mlx_array_size(slots)), topk);
@@ -2923,7 +2924,9 @@ test "exl3 rate groups: verify rows grouped by expert write the per-slot chain's
             var c0 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(c0);
             const want = try bytesOf(s, one, &c0);
-            group_force = null;
+            // The seam asks for the default bucket: this branch gates member grouping by geometry
+            // (`groupedOn`), and a non-null force is the request its own doc describes.
+            group_force = kernels.GROUP_BUCKETS[0];
             kernels.grouped_widest = 0;
             const y = try moeDecodeClamped(s, f.x, &f.rb, f.slots, f.scores, f.topk(), .float32, null, null, limit);
             defer _ = mlx.mlx_array_free(y);
