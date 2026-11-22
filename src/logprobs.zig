@@ -1055,6 +1055,25 @@ test "a reply with a thought in the middle lists exactly the bytes its tokens re
     if (bad > 0) return error.ListedWhatWasNotReturned;
 }
 
+test "every content a reply lists is a slice of the text it is listed against: a bare-JSON call's preamble and a thought-free reply too" {
+    const allocator = std.testing.allocator;
+    const call = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}";
+    for ([_][]const []const u8{
+        &.{ "Let me check.\n", call },
+        &.{ "Let me check:\n```json\n", call, "\n```" },
+        &.{ "<think>", "hmm", "</think>", "Let me check.\n", call },
+    }) |tokens| {
+        var g = try Generation.init(allocator, tokens);
+        defer g.deinit();
+        var entries: std.ArrayList([]u8) = .empty;
+        defer freeEntries(allocator, &entries);
+        const preamble = try wholeReply(allocator, &g, &.{}, weather_tools, &entries);
+        defer allocator.free(preamble);
+        try std.testing.expect(std.mem.startsWith(u8, preamble, "Let me check"));
+        try std.testing.expect(entries.items.len >= 1);
+    }
+}
+
 test "a constrained reply lists the tokens its content was copied from, never the ones a search for its bytes finds" {
     // The reasoning holds the payload's own bytes: finding the content in the generation lists the thought's token.
     const allocator = std.testing.allocator;
