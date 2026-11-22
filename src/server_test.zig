@@ -85,7 +85,7 @@ const decode_limit_ms: i64 = 30_000;
 fn ready() !void {
     const fd = try connect();
     defer _ = std.c.close(fd);
-    readLimit(fd, load_limit_ms / 1000);
+    try readLimit(fd, load_limit_ms / 1000);
     try send(fd, "POST", "/v1/load-model", "{\"model\":\"tiny\"}");
     const answer = try readUntil(fd, null);
     defer gpa.free(answer);
@@ -164,7 +164,7 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
         break :blk withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body);
     }) catch |e| {
         if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ x.name, @errorName(e) });
-        if (e == error.ReadTimedOut) std.debug.print("  {s}\n", .{waitedOn()});
+        if (e == error.ReadTimedOut or e == error.FdPastWireTable) std.debug.print("  {s}\n", .{waitedOn()});
         return e;
     };
 }
@@ -286,7 +286,7 @@ fn connect() !std.posix.fd_t {
     const small: c_int = 2048;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
-    track(sv[1], scenario_limit_ms);
+    try track(sv[1], scenario_limit_ms);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
@@ -308,18 +308,28 @@ const Wire = struct {
     asked_len: usize = 0,
 };
 var wires: [4096]Wire = @splat(.{});
+
+/// The connection state of client end `fd`; a descriptor past the table is a named failure, never an index.
+fn wireOf(fd: std.posix.fd_t) !*Wire {
+    if (fd < 0 or fd >= wires.len) {
+        const note = std.fmt.bufPrint(&timed_out_on, "client fd {d} is outside the {d} connections the client tracks", .{ fd, wires.len }) catch timed_out_on[0..0];
+        timed_out_len = note.len;
+        return error.FdPastWireTable;
+    }
+    return &wires[@intCast(fd)];
+}
 /// The arch a scenario serves, and what the last read that timed out was waiting on (`waitedOn`).
 var serving_arch: []const u8 = "";
 var timed_out_on: [600]u8 = undefined;
 var timed_out_len: usize = 0;
 
 /// A new connection's client end `fd`: a read of it waits at most `limit_ms`.
-fn track(fd: std.posix.fd_t, limit_ms: i64) void {
-    wires[@intCast(fd)] = .{ .limit_ms = limit_ms };
+fn track(fd: std.posix.fd_t, limit_ms: i64) !void {
+    (try wireOf(fd)).* = .{ .limit_ms = limit_ms };
 }
 
-fn noteAsked(fd: std.posix.fd_t, what: []const u8) void {
-    const w = &wires[@intCast(fd)];
+fn noteAsked(fd: std.posix.fd_t, what: []const u8) !void {
+    const w = try wireOf(fd);
     if (w.asked_len > 0) return;
     w.asked_len = @min(what.len, w.asked.len);
     @memcpy(w.asked[0..w.asked_len], what[0..w.asked_len]);
@@ -328,7 +338,7 @@ fn noteAsked(fd: std.posix.fd_t, what: []const u8) void {
 /// One read of `fd`: its bytes (0 at the server's close), waited for in slices up to the connection's limit. `have` is
 /// what the caller received so far. A wait past the limit is `error.ReadTimedOut`, and `waitedOn` says what it waited on.
 fn readSome(fd: std.posix.fd_t, buf: []u8, have: []const u8) !usize {
-    const w = &wires[@intCast(fd)];
+    const w = try wireOf(fd);
     const t0 = nowMsMonotonic(io);
     while (true) {
         var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
@@ -347,13 +357,13 @@ fn readSome(fd: std.posix.fd_t, buf: []u8, have: []const u8) !usize {
     return @intCast(n);
 }
 
-/// What the last timed-out read waited on, for the failure that carries `error.ReadTimedOut`.
+/// What the last timed-out read waited on, or the descriptor `wireOf` refused, for the failure that carries the error.
 fn waitedOn() []const u8 {
     return timed_out_on[0..timed_out_len];
 }
 
 fn sendAll(fd: std.posix.fd_t, bytes: []const u8) !void {
-    noteAsked(fd, bytes);
+    try noteAsked(fd, bytes);
     var off: usize = 0;
     while (off < bytes.len) {
         const n = std.c.write(fd, bytes[off..].ptr, bytes.len - off);
@@ -364,7 +374,7 @@ fn sendAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 
 fn send(fd: std.posix.fd_t, method: []const u8, path: []const u8, body: []const u8) !void {
     var ab: [200]u8 = undefined;
-    noteAsked(fd, std.fmt.bufPrint(&ab, "{s} {s} {s}", .{ method, path, body }) catch ab[0..]);
+    try noteAsked(fd, std.fmt.bufPrint(&ab, "{s} {s} {s}", .{ method, path, body }) catch ab[0..]);
     var hb: [256]u8 = undefined;
     try sendAll(fd, try std.fmt.bufPrint(&hb, "{s} {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{ method, path, body.len }));
     try sendAll(fd, body);
@@ -409,7 +419,7 @@ test "server test client: a read past its limit fails naming the request, the by
     var sv: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(sv[1]);
-    track(sv[1], 150);
+    try track(sv[1], 150);
     try send(sv[1], "POST", "/v1/chat/completions", "{\"model\":\"tiny\"}");
     // The peer takes the request, so closing it later is a close and not a reset of unread bytes.
     var sink: [512]u8 = undefined;
@@ -429,6 +439,12 @@ test "server test client: a read past its limit fails naming the request, the by
     const rest = try readUntil(sv[1], null);
     defer gpa.free(rest);
     try testing.expectEqualStrings("{}", rest);
+}
+
+test "server test client: a descriptor past the table of connections it tracks is refused by name, never indexed" {
+    try testing.expectError(error.FdPastWireTable, readLimit(wires.len, 1));
+    try testing.expectError(error.FdPastWireTable, track(-1, 1));
+    try testing.expect(std.mem.indexOf(u8, waitedOn(), "fd -1") != null);
 }
 
 fn request(method: []const u8, path: []const u8, body: []const u8) ![]u8 {
@@ -1582,8 +1598,8 @@ test "server: a WebSocket upgrade the server cannot complete is answered 400, ne
 }
 
 /// A read on `fd` that waits past `sec` fails instead of blocking.
-fn readLimit(fd: std.posix.fd_t, sec: i64) void {
-    wires[@intCast(fd)].limit_ms = sec * 1000;
+fn readLimit(fd: std.posix.fd_t, sec: i64) !void {
+    (try wireOf(fd)).limit_ms = sec * 1000;
 }
 
 test "server: a shutdown closes a WebSocket idle between turns with 1001 and an idle connection at once, and serve runs its teardown" {
@@ -1597,8 +1613,8 @@ test "server: a shutdown closes a WebSocket idle between turns with 1001 and an 
             const idle = try connect();
             defer _ = std.c.close(idle);
             // Well under the request read limit (30 s) and the drain bound (35 s) that bounded these waits before.
-            readLimit(ws, 10);
-            readLimit(idle, 10);
+            try readLimit(ws, 10);
+            try readLimit(idle, 10);
             server.requestShutdown();
             if (try wsReadCloseCode(ws) != 1001) return error.NotGoingAway;
             var b: [64]u8 = undefined;
@@ -1765,7 +1781,7 @@ fn connectWide() !std.posix.fd_t {
     const wide: c_int = 256 * 1024;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
-    track(sv[1], scenario_limit_ms);
+    try track(sv[1], scenario_limit_ms);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
@@ -2023,7 +2039,7 @@ fn connectReceiveWide() !std.posix.fd_t {
     const wide: c_int = 256 * 1024;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
-    track(sv[1], 10_000);
+    try track(sv[1], 10_000);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
@@ -2104,7 +2120,7 @@ test "server: a shutdown while a body trickles, a chunked upload waits and a fra
             const a3 = try wsConnect();
             defer _ = std.c.close(a3);
             try sendAll(a3, &.{ 0x81, 0x80 | 20, 0, 0, 0, 0, '{', '"' });
-            for ([_]std.posix.fd_t{ a1, a2, a3 }) |fd| readLimit(fd, 5);
+            for ([_]std.posix.fd_t{ a1, a2, a3 }) |fd| try readLimit(fd, 5);
             pause(200);
             server.requestShutdown();
             for ([_]std.posix.fd_t{ a1, a2 }, [_][]const u8{ "trickled body", "waiting chunked upload" }) |fd, what| {
@@ -2131,7 +2147,7 @@ test "server: a Content-Length body read past the reader's buffer, then stalled,
         fn run() !void {
             const fd = try connectReceiveWide();
             defer _ = std.c.close(fd);
-            readLimit(fd, 5);
+            try readLimit(fd, 5);
             var req: std.ArrayList(u8) = .empty;
             defer req.deinit(gpa);
             try req.appendSlice(gpa, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\n\r\n{\"model\":\"tiny\",\"user\":\"");
@@ -2422,7 +2438,7 @@ fn askedBeforeServed(path: []const u8, body: []const u8) ![]u8 {
     var sv: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(sv[1]);
-    track(sv[1], 30_000);
+    try track(sv[1], 30_000);
     try send(sv[1], "POST", path, body);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return readUntil(sv[1], null);
@@ -2540,7 +2556,7 @@ fn modelState(id: []const u8) @import("model_registry.zig").LoadState {
 fn rawExchange(bytes: []const u8) ![]u8 {
     const fd = try connect();
     defer _ = std.c.close(fd);
-    readLimit(fd, 30);
+    try readLimit(fd, 30);
     try sendAll(fd, bytes);
     return readUntil(fd, null);
 }
@@ -2600,7 +2616,7 @@ test "server: a ping sent in the same write as the WebSocket upgrade gets its po
         fn run() !void {
             const fd = try connect();
             defer _ = std.c.close(fd);
-            readLimit(fd, 5);
+            try readLimit(fd, 5);
             try sendAll(fd, "GET /v1/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n" ++ [_]u8{ 0x89, 0x80 | 2, 0, 0, 0, 0, 'h', 'i' });
             const head = try readUntil(fd, "\r\n\r\n");
             defer gpa.free(head);
