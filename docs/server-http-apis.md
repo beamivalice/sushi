@@ -38,6 +38,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   (merge, parse, resolve, the served store) and the section names (`effort.Family`) the settings file keys them by.
 - qwen4_exp (built-in): off, low (2048), medium (8192), xhigh (uncapped); the template reads the word (`sends` takes
   low|medium|xhigh, which the template accepts); `high` and `max` fold to `xhigh`; `minimal` still 400.
+- **A template can ask for less thinking than the table's `cap` allows, and that is all it can do.** A box-local
+  template that lowers `reasoning_effort` for one request shape (e.g. `tools` present) shortens the *instruction*;
+  the decode-time bound stays the word's `cap` from the served table, so a `medium` request carrying tools still logs
+  `reasoning budget 8192: enforced in-stream` while its prompt says "keep thinking brief" (verified on an M1 Max,
+  2026-11-20). A real ceiling for a request class would be a row the table can pick per shape, which it cannot today:
+  the word resolves before tools are known. Read `sends` and `cap` as one row for a reason — setting one alone moves
+  the answer's length only as far as the model obeys.
 - deepseek_v41 (built-in): off, low 50, medium 62, high 75, xhigh 87, max 100 on the encoder's 1-100 scale (`sends`
   takes any whole number 1-100; 50, 75 and 100 reach the encoder as its own words, `chat.scaleEffortFor`); no caps.
 - glm5_next (built-in): low, high, max (uncapped, a prompt instruction; `sends` takes low|high|max); `medium` folds to
