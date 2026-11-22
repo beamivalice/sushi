@@ -138,6 +138,9 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
   branch on the model's choice.
 - **A test exists to catch an error a change can make.** A parity test against another engine goes once the new one
   is proven; no check repeats over fixtures, lengths or arms on one code path.
+- **No unreliable test**: a test whose verdict varies run to run on the same tree is made deterministic (a fixed seed,
+  a bounded wait, a structural reading) or removed, naming what still covers it; never rerun until green. No blanket
+  long wait: a read waits for its own measured work, a model load once, and a timeout names what it waited for.
 
 ## Releases and packs
 
@@ -145,6 +148,9 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 2.4bpw, DeepSeek STQ 1.75bpw). Deferred repo work goes to `docs/private/future.md`, never agent memory.
 - A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
   owner-approved card.
+- **Pair-major only** ([tile order](docs/pack-format.md#tile-order)): every pack we make, convert, re-quantize or repack
+  stores its routed experts pair-major, and every serving and streaming path we add or change reads them so; legacy
+  Qwen3.8-Flash-Next STQ packs are the one exemption.
 - **Adding a pack** (pair-major: [tile order](docs/pack-format.md#tile-order)) updates, in the same landing, its
   `packs` row in `src/<arch>/arch.zig` (`Alias.tier_gb`, `recommend_gb`), the tier table and recommended launch in
   `docs/usage.md`, and the README pack line.
@@ -264,6 +270,9 @@ landing's subset, the full suite at a series' end, `tests/gate.sh` on the commit
 
 **Workers.** Report progress and blockers to the coordinator; commit per step; don't push or merge unless told; put new
 knowledge in the matching doc in the branch.
+
+**Agent memory.** Nothing is saved to agent memory unless the owner says so: a rule goes in this file, knowledge in
+`docs/`, deferred work in `docs/private/future.md`.
 
 **Bug hunt** ([process-bug-hunt](docs/process-bug-hunt.md)). New code is closed by a hunt before its phase is called done.
 - Three hunters unless the owner sets otherwise, one surface each, each in its own worktree at the head, write and
