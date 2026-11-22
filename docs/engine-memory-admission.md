@@ -557,7 +557,7 @@ in for the booted pack's bytes).
 
 - The generation bill uses the request's concrete `max_tokens` (the client's, else the filled default, never the
   rest of the window), cut to what the window leaves ([server-http-apis](server-http-apis.md)).
-- One `[admission] needed=… available=… reclaimable=… width=… verdict=…` line per decision.
+- One `[admission] needed=… lendable=… available=… reclaimable=… width=… verdict=…` line per decision.
 - An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
   below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
   the bill and the scheduler, `prefill_plan.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed

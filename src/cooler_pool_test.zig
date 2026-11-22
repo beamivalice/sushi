@@ -2194,3 +2194,29 @@ test "cooler contract: a DeepSeek wide forward's pool growth, the buffers its pa
         }
     }.run);
 }
+
+test "cooler contract: a DeepSeek prefill holds no more than the needed and the lendable its admission bill names" {
+    try servedOn("dsv41", &.{"DSV41_STQ_TINY"}, struct {
+        fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const bills = @import("bills.zig");
+            var ld: Load = undefined;
+            try ld.open(D, dir, true);
+            defer _ = ld.close();
+            // Wide enough that the prefill's cap, not the decode forward's, is the term the bill nets the lendable from.
+            const rows: usize = 8192;
+            const prompt = try a.alloc(u32, rows);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+            const bill = bills.prefillAdmissionBill(&ld.config, null, rows, 1, null, false, null, .{});
+            // A forward the headroom holds takes its whole cap from the pool; the bill nets out only what the pools lend.
+            mlx.engine.close();
+            mlx.engine.trim();
+            const grew = try D.forwardHeld(a, ld.xfm, prompt, rows + 1);
+            errdefer std.debug.print("cooler contract: a {d}-row prefill held {d} B; its bill needs {d} B and names {d} B lendable (the load lends {d} B)\n", .{ rows, grew.footprint, bill.needed, bill.lendable, bills.lendableBytes(&ld.config) });
+            try testing.expect(bill.lendable > 0);
+            try testing.expectEqual(bills.lendableBytes(&ld.config), bill.lendable);
+            try testing.expect(grew.footprint <= bill.needed +| bill.lendable);
+        }
+    }.run);
+}

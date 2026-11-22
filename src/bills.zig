@@ -2722,6 +2722,9 @@ pub const AdmissionBill = struct {
     chunk: u64 = 0,
     /// A published pack of the model is smaller (`ModelConfig.smaller_pack`), which a refusal may offer.
     smaller_pack: bool = false,
+    /// What `needed` nets out because the prefill takes it from the decoder pools (`lendableBytes`): a resident prefill
+    /// holds up to `needed + lendable`, which the admission line names beside `needed`.
+    lendable: u64 = 0,
 
     pub fn fits(self: AdmissionBill) bool {
         return self.needed <= self.available;
@@ -3349,9 +3352,9 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, model: ?*model
 /// the single `needed > available` refusal stands. The publishers stay on every arch.
 pub fn creditedAdmissionBill(config: *const model_mod.ModelConfig, needed: u64, available: u64, evictable: u64, reclaimable: u64, chunk: u64) AdmissionBill {
     if (!config.admissionEvictsHotCache()) {
-        return .{ .needed = needed, .available = available, .chunk = chunk, .smaller_pack = config.smaller_pack };
+        return .{ .needed = needed, .available = available, .chunk = chunk, .smaller_pack = config.smaller_pack, .lendable = lendableBytes(config) };
     }
-    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk, .smaller_pack = config.smaller_pack };
+    return .{ .needed = needed, .available = available, .evictable = evictable, .reclaimable = reclaimable, .chunk = chunk, .smaller_pack = config.smaller_pack, .lendable = lendableBytes(config) };
 }
 
 /// Bytes of the resident hot cache this prompt pins: residency less what an eviction can prove
@@ -3412,8 +3415,9 @@ pub fn logAdmissionDecision(bill: AdmissionBill) void {
     const level = admissionLogLevel(bill.needed, bill.available, firstRequestAfterLoad());
     if (!log.enabled(level)) return;
     const mb = 1024 * 1024;
-    log.atLevel(level, "[admission] needed={d} MB available={d} MB reclaimable={d} MB width={d} verdict={s}\n", .{
+    log.atLevel(level, "[admission] needed={d} MB lendable={d} MB available={d} MB reclaimable={d} MB width={d} verdict={s}\n", .{
         bill.needed / mb,
+        bill.lendable / mb,
         bill.available / mb,
         bill.evictionCredit() / mb,
         bill.chunk,
