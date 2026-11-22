@@ -1188,7 +1188,7 @@ fn handleResponsesInner(
 
                 // Detect close tag (</think> or <channel|>).
                 // A think close that waits on a backtick's partner is no close yet; the reply's end settles it.
-                if (think_tags.thoughtClose(think_buf.items, reply_over)) |m| {
+                if (thought_mark.thoughtClose(think_buf.items, reply_over)) |m| {
                     const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                     const before = closed[0..thought_mark.final(closed)];
                     thought_shipped = false;
@@ -1216,12 +1216,12 @@ fn handleResponsesInner(
                     const flush = think_tags.openThoughtFlush(think_buf.items, thought_shipped);
                     const ship = thought_mark.sendable(think_buf.items[flush.skip..][0..flush.ship]);
                     const safe_len = flush.skip + ship;
-                    if (safe_len > 0 or thought_mark.cut) {
+                    if (safe_len > 0) {
                         if (ship > 0) {
                             try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_buf.items[flush.skip..safe_len]);
                             thought_shipped = true;
                         }
-                        const remaining = try allocator.dupe(u8, if (thought_mark.cut) "" else think_buf.items[safe_len..]);
+                        const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                         think_buf.clearRetainingCapacity();
                         try think_buf.appendSlice(allocator, remaining);
                         allocator.free(remaining);

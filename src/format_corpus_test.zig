@@ -3373,7 +3373,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
             }
         }
         if (!skipped) continue;
-        if (think_tags.thoughtClose(think_buf.items, over)) |close| {
+        if (thought_mark.thoughtClose(think_buf.items, over)) |close| {
             const closed = think_tags.closedThoughtDelta(think_buf.items[0..close.pos], shipped);
             try appendReasoning(allocator, &reasoning, &join, closed[0..thought_mark.final(closed)]);
             join.close();
@@ -3392,7 +3392,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         const delta = think_buf.items[flush.skip..][0..ship];
         try appendReasoning(allocator, &reasoning, &join, delta);
         if (delta.len > 0) shipped = true;
-        const keep = if (thought_mark.cut) 0 else think_buf.items.len - flush.skip - ship;
+        const keep = think_buf.items.len - flush.skip - ship;
         std.mem.copyForwards(u8, think_buf.items[0..keep], think_buf.items[flush.skip + ship ..][0..keep]);
         think_buf.shrinkRetainingCapacity(keep);
     }
@@ -4510,5 +4510,103 @@ test "r174-f-closer-monotone: a string value that spells braces before a closer 
     for (std.mem.indexOf(u8, closed_value, "</tool_call>").? + "</tool_call>".len..closed_value.len + 1) |n| {
         const got = think_tags.indexOfThinkCloseTag(closed_value[0..n], 0);
         try testing.expectEqual(n >= read.pos + read.len, got != null);
+    }
+}
+
+/// A thought that holds a call whose parameter close after the closer turns the call's closers into the value's own bytes:
+/// the whole reply reads the call as open to its end, so the answer after `</think>` is payload. A stream without tools,
+/// split at the close and at the end, must read the same: the tag dialects end a value by what follows its close.
+fn expectHeldThoughtMatchesReply(raw: []const u8) !void {
+    const allocator = testing.allocator;
+    const want = think_tags.splitThinkBlock(raw, true, true);
+    errdefer std.debug.print("\nraw: {f}\nwhole: {?s} | {s}\n", .{ std.zig.fmtString(raw), want.reasoning_content, want.content });
+    // The cell holds a flip: the call's own closers end it at the close, and the reply's last bytes undo that.
+    try testing.expectEqualStrings("", want.content);
+    const closer_at = std.mem.indexOf(u8, raw, "</think>").?;
+    const specials = [_][]const []const u8{ &.{"</think>"}, &.{ "</think>", raw[closer_at + "</think>".len ..] } };
+    for (specials) |sp| for ([_]usize{ 1, 3, 1000 }) |step| {
+        const tokens = try tokensOf(allocator, raw, sp, step);
+        defer allocator.free(tokens);
+        try expectStreamMatchesReply(allocator, raw, tokens, true);
+    };
+}
+
+test "r174-f-closer-hold: Hermes: a thought that holds a call reads its close at the reply's end, so a stream without tools splits it as the whole reply does" {
+    try expectHeldThoughtMatchesReply("plan <tool_call>\n<function=f>\n<parameter=k>\nv </parameter> junk\n</function>\n</tool_call> done</think>answer </parameter>");
+}
+
+test "r174-f-closer-hold: arg_value: a thought that holds a call reads its close at the reply's end, so a stream without tools splits it as the whole reply does" {
+    try expectHeldThoughtMatchesReply("plan <tool_call>f<arg_key>k</arg_key><arg_value>v </arg_value> junk</tool_call> done</think>answer </arg_value>");
+}
+
+test "r174-f-closer-hold: DSML: a thought that holds a call reads its close at the reply's end, so a stream without tools splits it as the whole reply does" {
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    try expectHeldThoughtMatchesReply("plan <" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"f\">\n<" ++ dsml ++ "parameter name=\"k\" string=\"true\">v </" ++ dsml ++ "parameter> junk\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls> done</think>answer </" ++ dsml ++ "parameter>");
+}
+
+/// What a tools-declared stream sends at each token of a template-opened reply, through the `think_tags` steps all three
+/// surfaces' gated arm takes: the hold, the thought's gate and its split. `[i r:..]` is reasoning, `[i c:..]` content.
+fn toolsArmDeltas(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const tokens = try tokensOf(allocator, raw, &.{ "</think>", "<tool_call>", "</tool_call>" }, 1);
+    defer allocator.free(tokens);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var delivered: usize = 0;
+    var streamed: usize = 0;
+    var closed = false;
+    var hold: think_tags.ToolHoldScan = .{};
+    var gate: think_tags.ThinkScan = .{};
+    var thought: think_tags.ThoughtScan = .{};
+    for (tokens, 0..) |tok, i| {
+        try buf.appendSlice(allocator, tok);
+        const undelivered = buf.items[delivered..];
+        if (think_tags.streamShouldBufferForToolsScan(buf.items, &hold)) continue;
+        switch (think_tags.streamThinkGateScan(buf.items, true, closed, true, &gate)) {
+            .hold_thinking => if (think_tags.heldThoughtSoFarScan(undelivered, true, closed, &hold, &thought)) |settled| {
+                if (think_tags.unstreamedReasoning(settled, streamed)) |fresh| {
+                    try out.print(allocator, "[{d} r:{s}]", .{ i, fresh });
+                    streamed = settled.len;
+                }
+            },
+            .split_think => {
+                const split = think_tags.splitThinkBlock(undelivered, true, true);
+                if (split.reasoning_content) |rc| if (think_tags.unstreamedReasoning(rc, streamed)) |fresh| try out.print(allocator, "[{d} r:{s}]", .{ i, fresh });
+                if (split.content.len > 0) try out.print(allocator, "[{d} c:{s}]", .{ i, split.content });
+                buf.clearRetainingCapacity();
+                delivered = 0;
+                streamed = 0;
+                gate.reset();
+                hold = .{};
+                thought.reset();
+                closed = true;
+            },
+            .flush_text => {
+                try out.print(allocator, "[{d} c:{s}]", .{ i, undelivered });
+                delivered = buf.items.len;
+                thought.reset();
+            },
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "r174-f-closer-hold: a tools stream's reasoning and content deltas are the same with the no-tools hold as before it" {
+    // Tools requests read the thought through the gate's `ThinkScan`, never `thoughtClose`: a thought that holds a call
+    // opener sends nothing until the reply ends, and a thought with none streams and splits as it always did.
+    const allocator = testing.allocator;
+    const Case = struct { raw: []const u8, deltas: []const u8 };
+    const cases = [_]Case{
+        .{ .raw = "plan <tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v\"}}</tool_call> done</think>answer", .deltas = "[0 r:p][1 r:l][2 r:a][3 r:n]" },
+        .{ .raw = "plan <tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v}}</tool_call> done</think>answer \"q", .deltas = "[0 r:p][1 r:l][2 r:a][3 r:n]" },
+        .{ .raw = "plan\nmore</think>answer here", .deltas = "[0 r:p][1 r:l][2 r:a][3 r:n][5 r:\nm][6 r:o][7 r:r][8 r:e][10 c:a][11 c:n][12 c:s][13 c:w][14 c:e][15 c:r][16 c: ][17 c:h][18 c:e][19 c:r][20 c:e]" },
+        .{ .raw = "plan</think>ans <tool_call>f<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>", .deltas = "[0 r:p][1 r:l][2 r:a][3 r:n][5 c:a][6 c:n][7 c:s][8 c: ]" },
+    };
+    for (cases) |c| {
+        const got = try toolsArmDeltas(allocator, c.raw);
+        defer allocator.free(got);
+        errdefer std.debug.print("\nraw: {f}\ndeltas: {f}\n", .{ std.zig.fmtString(c.raw), std.zig.fmtString(got) });
+        try testing.expectEqualStrings(c.deltas, got);
     }
 }

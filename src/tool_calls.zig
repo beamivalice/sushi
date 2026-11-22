@@ -5768,8 +5768,8 @@ test "chat: an added token's text in a user, system or tool message is text on t
 test "r174-f-closer-monotone: a closer judged outside every value stays outside as the text grows, in every dialect's value reader" {
     // A thought a stream latched at one length must be the one the whole reply reads: a verdict that later bytes flip is not a verdict.
     const dsml = "\u{ff5c}DSML\u{ff5c}";
-    // `grammar`: the family ends a value by the parameter close the call's closers follow, a lookahead its docs name, so a close
-    // right after the closers makes them the value's own bytes.
+    // `grammar`: the tag dialects keep their documented lookahead (a close right after the closers makes them the value's
+    // own bytes), so those closers flip; the stream holds a thought that holds such a call to the reply's end instead.
     const Probe = struct { name: []const u8, spans: ValueSpans, text: []const u8, from: usize = 0, grammar: bool = false };
     const probes = [_]Probe{
         .{ .name = "json mangled quote", .spans = .wrapper, .text = "<tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v}}</tool_call> done</think>answer \"q" },

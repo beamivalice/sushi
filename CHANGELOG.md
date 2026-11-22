@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A stream with no tools declared holds a thought that writes call markup until the reply ends**: the whole reply reads such a thought's close by the call's own value end, which a later byte can flip, so its reasoning after the call and the answer after `</think>` arrive at the reply's end instead of as they come.
 - **The debug log no longer reports a tool call as dropped while the model is still writing it**: a stream's keepalive re-read the growing call and wrote "tool markup parsed to no call" for each read (22 lines in one Claude Code run, every call delivered). Only the final read writes the line now, and it names the cut call's own start, its length and the calls parsed before it.
 - **Current Codex runs on sushi again**: `/v1/responses` serves a `namespace` tool (Codex's `multi_agent_v1`) by offering its member functions to the model and returning a call to one with its `namespace`, a malformed namespace is a 400 naming it, a hosted `web_search` is a 400 naming the tool and Codex's `web_search = "disabled"` setting, and `sushi launch codex` writes that setting.
 - **A thought that holds a call with a mangled quote splits the same on a stream as on the whole reply**: `plan <tool_call>{"name":"f","arguments":{"k":"v}}</tool_call> done</think>answer "q` read the thought's close while it streamed and lost it when the answer's own quote arrived; a call's end is now judged from the bytes before its closer, never from a quote after it.

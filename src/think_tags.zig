@@ -133,6 +133,14 @@ pub const ThoughtClose = struct { pos: usize, len: usize, is_channel: bool };
 /// unless `complete` a think close after a backtick that no closing run pairs yet is no close yet: the same text read as
 /// the whole reply says where the thought ends.
 pub fn thoughtClose(buf: []const u8, complete: bool) ?ThoughtClose {
+    const close = thoughtCloseIn(buf, complete) orelse return null;
+    // A call before the close may take it as payload once more bytes arrive (a tag dialect ends a value by what follows
+    // its close), so only the reply's end settles a close that stands after a call opener.
+    if (!complete) if (leakedToolMarkupStart(buf)) |opener| if (opener < close.pos) return null;
+    return close;
+}
+
+fn thoughtCloseIn(buf: []const u8, complete: bool) ?ThoughtClose {
     var tags: Tags = .{ .complete = complete };
     const think = tool_reading.firstOutsideCalls(buf, 0, true, &tags, .think_close);
     const channel = std.mem.indexOf(u8, buf, "<channel|>");
@@ -533,9 +541,12 @@ fn markupPending(unsent: []const u8) bool {
     return false;
 }
 
+const closeOfThought = thoughtClose;
+
 /// Where a stream stops sending so the reply ends where `trimLeakedToolMarkup` ends it: text that may open tool
-/// markup waits, text before an opener goes, and once one opened nothing more does. Off by default: a request
-/// with tools parses the markup instead.
+/// markup waits, text before an opener goes, and once one opened nothing more does. A thought that holds an opener keeps
+/// its text and reads its close once, at the reply's end (`thoughtClose`). Off by default: a request with tools parses
+/// the markup instead.
 pub const MarkupCut = struct {
     on: bool = false,
     cut: bool = false,
@@ -549,6 +560,12 @@ pub const MarkupCut = struct {
             return std.mem.trimEnd(u8, unsent[0..at], "\n\r\t ").len;
         }
         return if (markupPending(unsent)) 0 else unsent.len;
+    }
+
+    /// The close of the thought `buf` holds, not before the reply's end once a call opener cut it.
+    pub fn thoughtClose(self: *const MarkupCut, buf: []const u8, over: bool) ?ThoughtClose {
+        if (self.cut and !over) return null;
+        return closeOfThought(buf, over);
     }
 
     /// How many leading bytes of `unsent` go when no more text follows.
