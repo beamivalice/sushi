@@ -549,21 +549,21 @@ pub fn qsaHandoffExceedsSlack(buf_rows: c_int, keep: c_int) bool {
     return buf_rows - keep > QSA_HANDOFF_MAX_SLACK_ROWS;
 }
 
-/// The buffer a share of `src` would pin: the capacity buffer when the accelerator holds one, else the published history.
+/// Tokens the pooled bank's capacity buffer holds: the buffer a view of the bank pins. Zero where the bank has no capacity
+/// buffer, which a handoff never shares.
+fn qsaPooledCapacityRows(src: *const SSMCacheEntry) c_int {
+    if (src.qsa_pooled_buf.array.ctx == null) return 0;
+    return mlx.getShape(src.qsa_pooled_buf.array)[1] * @max(src.qsa_ratio, 1);
+}
+
+/// Does a lend of `src`'s bank as a view pin more slack past `keep` rows than `QSA_HANDOFF_MAX_SLACK_ROWS`?
 fn qsaHandoffMustMaterialize(src: *const SSMCacheEntry, keep: c_int) bool {
-    const buf_rows: c_int = if (src.qsa_key_buf.array.ctx != null)
-        mlx.getShape(src.qsa_key_buf.array)[1]
-    else if (src.aux_state.ctx != null)
-        mlx.getShape(src.aux_state)[1]
-    else
-        0;
-    return qsaHandoffExceedsSlack(buf_rows, keep);
+    return qsaHandoffExceedsSlack(qsaPooledCapacityRows(src), keep);
 }
 
 /// Does the pooled bank's capacity buffer hold blocks past the ones a `keep`-row checkpoint keeps?
 fn qsaPooledBufferHoldsPast(src: *const SSMCacheEntry, keep: c_int) bool {
-    if (src.qsa_pooled_buf.array.ctx == null) return false;
-    return mlx.getShape(src.qsa_pooled_buf.array)[1] > keptPooledBlocks(keep, src.qsa_ratio);
+    return qsaPooledCapacityRows(src) > keptPooledBlocks(keep, src.qsa_ratio) * @max(src.qsa_ratio, 1);
 }
 
 fn attachQsaHistoryToLatestMode(cps: []SSMCheckpoint, live: []const SSMCacheEntry, s: mlx.mlx_stream, mode: QsaAttachMode) !void {
@@ -2575,4 +2575,95 @@ test "a decode step past the QSA history's capacity holds beside the grown histo
     const held = @as(u64, peak) -| live;
     errdefer std.debug.print("the history's growth holds {d} B past the grown history, one layer's widest buffer is {d} B\n", .{ held, one_layer });
     try testing.expect(held <= one_layer + @import("../mlx_pages.zig").page);
+}
+
+/// Bytes the MLX allocator holds in use after a synchronize.
+fn activeBytes(s: mlx.mlx_stream) usize {
+    _ = mlx.mlx_synchronize(s);
+    var bytes: usize = 0;
+    _ = mlx.mlx_get_active_memory(&bytes);
+    return bytes;
+}
+
+/// A live entry whose pooled bank was appended `rows` blocks into a capacity buffer reserved for `reserve` tokens.
+fn reservedLiveEntry(t: *Trunk, rnd: std.Random, hd: c_int, rows: c_int, reserve: usize, s: mlx.mlx_stream) !SSMCacheEntry {
+    var live: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true, .qsa_reserve_rows = reserve, .qsa_end_rows = reserve };
+    errdefer ssmFreeQsaState(&live);
+    const keys = try attn256RandBf16(rnd, &[_]c_int{ 1, QSA_RING_ROWS, hd }, s);
+    defer _ = mlx.mlx_array_free(keys);
+    try qwen4_qsa.qsaAppendKeys(t, &live, keys, 0);
+    const blocks = try attn256RandBf16(rnd, &[_]c_int{ 1, rows, hd }, s);
+    defer _ = mlx.mlx_array_free(blocks);
+    try qwen4_qsa.qsaAppendPooled(t, &live, blocks, 0);
+    try mlx.check(mlx.mlx_array_eval(live.aux_state));
+    try mlx.check(mlx.mlx_array_eval(live.qsa_pooled));
+    return live;
+}
+
+test "a handoff over a bank reserved far past the checkpoint copies the checkpoint's rows and does not pin the reservation, lent or committed" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var t: Trunk = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    const hd: c_int = 16;
+    var prng = std.Random.DefaultPrng.init(0x7E5E_12ED);
+    const rnd = prng.random();
+    // A reservation four slack bars past the 256 rows the checkpoint keeps.
+    const reserve: usize = 4 * @as(usize, @intCast(QSA_HANDOFF_MAX_SLACK_ROWS));
+    for ([_]bool{ true, false }) |commit| {
+        const none = activeBytes(s);
+        var live = [_]SSMCacheEntry{try reservedLiveEntry(&t, rnd, hd, QSA_RING_ROWS / 4, reserve, s)};
+        var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, @intCast(QSA_RING_ROWS), s)};
+        defer cps[0].deinit(testing.allocator);
+        try testing.expect(mlx.getShape(live[0].qsa_pooled_buf.array)[1] > 2 * @as(c_int, QSA_HANDOFF_MAX_SLACK_ROWS) / 4);
+        if (commit) try commitQsaHistoryToLatest(&cps, &live, s) else try handoffQsaHistoryToLatest(&cps, &live, s);
+        try mlx.check(mlx.mlx_array_eval(cps[0].layers[0].qsa_pooled));
+        // The slot goes; the checkpoint holds the bank's own rows, not the reservation behind them.
+        ssmFreeQsaState(&live[0]);
+        const held = activeBytes(s) -| none;
+        errdefer std.debug.print("handoff (commit {}): after the slot went the checkpoint pins {d} B for {d} B of rows\n", .{ commit, held, ssmCheckpointBytes(&cps[0]) });
+        try testing.expect(held <= ssmCheckpointBytes(&cps[0]) + 16 * 1024);
+    }
+}
+
+test "commitQsaHistoryToLatest takes the slot's buffer as a view where it holds no more than the checkpoint keeps, and a cut copy past it" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    var t: Trunk = undefined;
+    t.s = s;
+    t.allocator = testing.allocator;
+    const hd: c_int = 16;
+    var prng = std.Random.DefaultPrng.init(0xC0DE_51AC);
+    const rnd = prng.random();
+    // A 256-block bank in a buffer of exactly 256 blocks (the cache's smallest step).
+    const blocks: c_int = 256;
+    // The checkpoint at the bank's last block: a view of the slot's buffer, no allocation.
+    {
+        var live = [_]SSMCacheEntry{try reservedLiveEntry(&t, rnd, hd, blocks, 4 * @as(usize, @intCast(blocks)), s)};
+        defer ssmFreeQsaState(&live[0]);
+        try testing.expectEqual(blocks, mlx.getShape(live[0].qsa_pooled_buf.array)[1]);
+        var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, @intCast(4 * blocks), s)};
+        defer cps[0].deinit(testing.allocator);
+        const before = activeBytes(s);
+        try commitQsaHistoryToLatest(&cps, &live, s);
+        try testing.expect(activeBytes(s) <= before);
+        try testing.expectEqual(blocks, mlx.getShape(cps[0].layers[0].qsa_pooled)[1]);
+    }
+    // A checkpoint a block short of it: a copy of the kept rows, equal to the copy arm's.
+    {
+        var live = [_]SSMCacheEntry{try reservedLiveEntry(&t, rnd, hd, blocks, 4 * @as(usize, @intCast(blocks)), s)};
+        defer ssmFreeQsaState(&live[0]);
+        var ref = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, @intCast(4 * blocks - 4), s)};
+        defer ref[0].deinit(testing.allocator);
+        try attachQsaHistoryToLatest(&ref, &live, s);
+        var cps = [_]SSMCheckpoint{try captureSsmCheckpoint(testing.allocator, &live, @intCast(4 * blocks - 4), s)};
+        defer cps[0].deinit(testing.allocator);
+        const before = activeBytes(s);
+        try commitQsaHistoryToLatest(&cps, &live, s);
+        try mlx.check(mlx.mlx_array_eval(cps[0].layers[0].qsa_pooled));
+        try testing.expect(activeBytes(s) > before);
+        try testing.expectEqual(blocks - 1, mlx.getShape(cps[0].layers[0].qsa_pooled)[1]);
+        try testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(cps[0].layers[0].qsa_pooled, ref[0].layers[0].qsa_pooled, s));
+    }
 }

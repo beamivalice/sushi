@@ -79,7 +79,10 @@ separate M-RoPE guard.
 
 ## Indexer history
 
-- ONE copy per (slot ∪ entry); the newest snap VIEWS the live buffer at commit (`handoffQsaHistoryToLatest`); none
+- ONE copy per (slot ∪ entry); the newest snap holds the history's own rows at commit (`commitQsaHistoryToLatest`: a view of the
+  live buffer only where it holds no more blocks than the snap keeps, else a cut copy; a lend for a write,
+  `handoffQsaHistoryToLatest`, views it while the bank's capacity buffer leaves under `QSA_HANDOFF_MAX_SLACK_ROWS` past the
+  snap, and copies past that); none
   after restore = MISS; the f32 score bank is billed; raw keys are a 32-row ring billed once per slot
   (`qsaRingBytes`), held at those rows from a fresh layer's first append (`qsaInstallRing`), never grown by the cache's
   256-row step.
