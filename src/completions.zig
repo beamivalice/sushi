@@ -356,9 +356,9 @@ pub fn completeIds(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const 
     sampling.think_penalty = requestThinkPenalty(allocator, lm, req, ids);
     const spec_request = requestSpec(config, req, lm.dflash != null, lm.mtp != null, nativeMeasuredMoeHead(lm));
     const enable_mtp = admitMtpForCtx(spec_request.mtp, ids.len);
-    const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
+    const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
 
-    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, true, ids.len, effective_ctx), sampling, requestEosSlice(config, req), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, 0, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true }, null);
+    return nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, ids, ids, clampMaxTokens(max_tokens, true, ids.len, effective_ctx), sampling, requestEosSlice(config, req), 0, false, false, spec.use_drafter, spec.use_mtp, spec_request.allow_batch_mtp, getTimeoutNs(), null, &.{}, requestCacheKey(root), .{}, parseKvQuantOverride(root), null, .{ .stops = &.{}, .completion_skip_special = true }, null);
 }
 
 fn handleNonStreamingCompletion(
