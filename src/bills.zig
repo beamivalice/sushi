@@ -3523,7 +3523,9 @@ pub fn prefillBillNumbersNow(config: *const model_mod.ModelConfig, prompt_len: u
 /// Bytes the bill prices for a request's cache that it allocates AFTER admission. A native GLM
 /// MLA cache grows row by row (a DFlash2 request reserves it after prefill); a Qwen or MiMo
 /// request takes its reserved capacity at its first grow, so it is resident before the next admission. `chunk` is the
-/// width the request is admitted and reserved at.
+/// width the request is admitted and reserved at. It is the decode phase's cache part, never a bill: the storage still
+/// to come and the regrow's transient, which a later admission leaves free beside its own `needed` (its larger phase)
+/// because the regrow lands while that request is resident. The prefill chunk's transient is not in it.
 pub fn admissionCommitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_tokens: u32, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     const stored = archHook("commitBytes", u64, config, .{ prompt_len, max_tokens, kv_bits, chunk, warm.mtp_on }) orelse return 0;
     // The decode regrow (`decodeRegrowBytes`) starts from the capacity a restore holds, which the arch's hook is not given.

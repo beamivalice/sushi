@@ -2355,6 +2355,27 @@ test "on Sushi Cooler a request's bill is its larger phase, the prefill chunk's 
     }
 }
 
+test "on Sushi Cooler a request's admission commit is its decode phase's cache part, its storage and its regrow, and carries none of the prefill chunk's transient the bill's larger phase holds" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = coolerFlashNext();
+    const seq: u64 = 4096;
+    const max_tokens: u32 = 4096;
+    var commit: ?u64 = null;
+    for ([_]u64{ 512, 2048, 4096 }) |chunk| {
+        const terms = prefillRequestTerms(&cfg, seq, max_tokens, 8, chunk, .{});
+        const phases = bills.requestPhasesFor(&cfg, seq, max_tokens, 8, chunk, .{});
+        // The prefill phase is the bill, and the regrow is only the decode phase's.
+        try t.expect(terms.decode_regrow_bytes > 0);
+        try t.expect(phases.prefill > phases.decode);
+        const got = bills.admissionCommitBytes(&cfg, seq, max_tokens, 8, chunk, .{});
+        errdefer std.debug.print("a {d}-row chunk: commit {d} B, storage {d} B, regrow {d} B\n", .{ chunk, got, bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false), terms.decode_regrow_bytes });
+        try t.expectEqual(bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false) + terms.decode_regrow_bytes, got);
+        // No prompt under the reservation reserves a chunk: the commit does not follow the width the prefill transient does.
+        if (commit) |c| try t.expectEqual(c, got) else commit = got;
+    }
+}
+
 test "on Sushi Cooler a reserved request's first chunk bills no growth for the cache its admission commit already holds, so its width holds at every long prompt" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
