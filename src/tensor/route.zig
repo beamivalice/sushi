@@ -733,6 +733,7 @@ pub fn sealed() bool {
 }
 
 pub const matrixUnits = @import("matmul.zig").matrixUnits;
+pub const tf32Units = @import("matmul.zig").tf32Units;
 
 pub const pipeline_cache = @import("pipeline_cache.zig");
 pub const stock_kernels = stock;

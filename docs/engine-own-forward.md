@@ -778,6 +778,8 @@ rebuilds one.
 - **In a test the engine takes TF32 from what MLX does, not from the environment** (`matmul.mlxTf32`): MLX reads
   `MLX_ENABLE_TF32` once per process, and in a full `zig build test` it ends up off while the variable is unset, so
   the two matmul and DSpark byte tests failed by rounding only there. A server reads the variable as MLX does.
+  A pin or bound that holds on the TF32 tiles keys on `mlx.engine.tf32Units()` (matrix units and TF32 on), never on
+  `matrixUnits()`: with `MLX_ENABLE_TF32=0` those boxes run f32 products exactly.
 - **A request's wall time is compared on both sides, not only its tok/s**: the decode clock stops at the last token,
   so a wait at the request's end (0.6 s here) showed in no bench column, only in the time to the last stream chunk.
 - **A cleanup is checked by the full suite**: a filter compiles only the tests it names, and a type removed as

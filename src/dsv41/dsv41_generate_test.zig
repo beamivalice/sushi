@@ -4493,9 +4493,9 @@ test "dsv41 engine: the MLX route's ids are pinned, and a seeded request gives t
         .{ .sampling = seeded, .rounds = true, .ids = .{ 116, 250, 45, 140, 74, 163, 10, 167, 27, 239, 132, 31 } },
         .{ .sampling = .{ .temperature = 0.0 }, .rounds = false, .ids = .{ 116, 250, 208, 14, 139, 226, 6, 223, 159, 221, 109, 193 } },
     };
-    // The pins are the matrix-unit arm's bytes; another arm's stock tiles sum in another order, so it keeps the claim
-    // that follows and none of the values.
-    const pinned = @import("sushi_exl3").device.current().has(.matrix_g17);
+    // The pins are the TF32-on matrix-unit arm's bytes (the trunk linears' f16 input meets a TF32 twin there); another
+    // arm's tiles sum in another order, so it keeps the claim that follows and none of the values.
+    const pinned = mlx.engine.tf32Units();
     var seeded_ids: [2][12]u32 = undefined;
     for (cases, 0..) |c, i| {
         var ids: std.ArrayList(u32) = .empty;

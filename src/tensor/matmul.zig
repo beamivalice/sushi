@@ -49,6 +49,12 @@ pub fn matrixUnits() bool {
     return (gpu() catch return false).nax;
 }
 
+/// Whether MLX's f32 products run on the matrix units' TF32 tiles: the arm a byte pin or a twin bound made there holds on.
+pub fn tf32Units() bool {
+    const g = gpu() catch return false;
+    return g.nax and g.tf32;
+}
+
 /// Whether MLX takes an f32 product on the NAX tiles, by what a product of its own gives: those keep 10 mantissa bits
 /// of an operand, so 1 + 2^-12 multiplies as 1. Tests only: MLX keeps its first reading of `MLX_ENABLE_TF32` for the
 /// process, so a test that changes the variable around an MLX product leaves MLX on a value the environment no
