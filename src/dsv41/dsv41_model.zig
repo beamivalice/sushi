@@ -351,8 +351,9 @@ pub const Rows = struct {
         self.sbuf.deinit();
     }
 
-    /// `buf` grown to `cap` rows of `cols`, its first `used` rows kept (`cap` from `pagedCap`).
-    fn grow(buf: *mlx_pages.InPlace, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !void {
+    /// A new buffer of `cap` rows of `cols` (`cap` from `pagedCap`) holding `buf`'s first `used` rows; `buf` is left as it
+    /// was, so `growTo` builds every part before it frees any old one.
+    fn grown(buf: mlx_pages.InPlace, used: usize, cap: usize, cols: usize, dt: mlx.mlx_dtype, s: S) !mlx_pages.InPlace {
         var z = try mlx_pages.inPlaceBuffer(&.{ ci(cap), ci(cols) }, dt, s);
         errdefer z.deinit();
         if (used > 0) {
@@ -361,12 +362,40 @@ pub const Rows = struct {
             try mlx.check(mlx.mlx_slice(&old, buf.array, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(used), ci(cols) }, 2, &[_]c_int{ 1, 1 }, 2, s));
             var up = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(up);
-            const grown = try z.write(&up, old, &.{ 0, 0 }, &.{ ci(used), ci(cols) }, s);
+            const next = try z.write(&up, old, &.{ 0, 0 }, &.{ ci(used), ci(cols) }, s);
             z.deinit();
-            z = grown;
+            z = next;
         }
-        buf.deinit();
-        buf.* = z;
+        return z;
+    }
+
+    /// Every part made `cap` rows long with the rows held kept, all or none: each part's new buffer is built (and, with
+    /// `written`, evaluated) before any old one is freed, so a failure at any part frees what was built and leaves every
+    /// part and `cap` as they were, never a part and `cap` that disagree.
+    fn growTo(self: *Rows, cap: usize, s: S, written: bool) !void {
+        const Shape = struct { cols: usize, dtype: mlx.mlx_dtype };
+        const olds = [2]*mlx_pages.InPlace{ &self.buf, &self.sbuf };
+        var shapes: [2]Shape = undefined;
+        var n: usize = 1;
+        shapes[0] = .{ .cols = self.width, .dtype = self.dtype };
+        if (self.pack) |pk| {
+            n = 2;
+            shapes = .{ .{ .cols = self.width / 2, .dtype = .uint8 }, .{ .cols = self.width / pk.group, .dtype = .uint8 } };
+        }
+        var next: [2]mlx_pages.InPlace = @splat(.none);
+        errdefer for (&next) |*b| b.deinit();
+        for (olds[0..n], shapes[0..n], next[0..n]) |old, sh, *dst| dst.* = try grown(old.*, self.used, cap, sh.cols, sh.dtype, s);
+        if (written) {
+            // A grow left pending would take its buffer inside the forward that first reads it.
+            var i = n;
+            while (i > 0) : (i -= 1) try mlx.check(mlx.mlx_array_eval(next[i - 1].array));
+        }
+        for (olds[0..n], next[0..n]) |old, *z| {
+            old.deinit();
+            old.* = z.*;
+            z.* = .none;
+        }
+        self.cap = cap;
     }
 
     fn put(buf: *mlx_pages.InPlace, x: A, at: usize, s: S) !void {
@@ -408,16 +437,9 @@ pub const Rows = struct {
         if (cap != self.cap) try self.regrow(cap, s);
     }
 
-    /// The buffers made `cap` rows long with the rows held kept.
+    /// The buffers made `cap` rows long with the rows held kept, written now.
     fn regrow(self: *Rows, cap: usize, s: S) !void {
-        if (self.pack) |pk| {
-            try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
-            try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
-            try mlx.check(mlx.mlx_array_eval(self.sbuf.array));
-        } else try grow(&self.buf, self.used, cap, self.width, self.dtype, s);
-        // Written now: a grow left pending would take its buffer inside the forward that first reads it.
-        try mlx.check(mlx.mlx_array_eval(self.buf.array));
-        self.cap = cap;
+        try self.growTo(cap, s, true);
     }
 
     /// The buffer cut back to the rows it holds with `reserve`'s slack, or gone when it holds none.
@@ -434,11 +456,7 @@ pub const Rows = struct {
         if (self.used + n > self.cap) {
             store_grows += 1;
             const cap = self.pagedCap(cfg_mod.grownRows(self.cap, self.used, n, self.goal), s);
-            if (self.pack) |pk| {
-                try grow(&self.buf, self.used, cap, self.width / 2, .uint8, s);
-                try grow(&self.sbuf, self.used, cap, self.width / pk.group, .uint8, s);
-            } else try grow(&self.buf, self.used, cap, self.width, self.dtype, s);
-            self.cap = cap;
+            try self.growTo(cap, s, false);
         }
         if (self.pack) |pk| {
             const p = try qat_mod.packFp4(sc, try sc.astype(x, self.dtype), pk.mode, pk.group);
@@ -8145,4 +8163,85 @@ test "dsv41 rows write in place only into a buffer on MLX's page grid, whichever
     var ring = try Ring.init(150, 512, .bfloat16, s);
     defer ring.deinit();
     try ring.write(row, 3, s);
+}
+
+/// A packed store of two parts (codes `[cap, 16]`, scales `[cap, 2]`) holding `used` rows of `codes`/`scales`, on `s`.
+fn twoPartStore(cap: usize, used: usize, codes: []const u8, scales: []const u8, s: S) !Rows {
+    var rows = Rows{ .width = 32, .dtype = .bfloat16, .pack = .{ .mode = .fp4_e4m3, .group = 16 } };
+    errdefer rows.deinit();
+    try rows.regrow(cap, s);
+    const c = try mlx.newData(codes.ptr, &[_]c_int{ ci(used), 16 }, .uint8);
+    defer _ = mlx.mlx_array_free(c);
+    const sc_ = try mlx.newData(scales.ptr, &[_]c_int{ ci(used), 2 }, .uint8);
+    defer _ = mlx.mlx_array_free(sc_);
+    try Rows.put(&rows.buf, c, 0, s);
+    try Rows.put(&rows.sbuf, sc_, 0, s);
+    rows.used = used;
+    return rows;
+}
+
+/// Every part of `rows` is `rows.cap` rows long, and its first `rows.used` rows are `codes` and `scales`.
+fn expectPartsAgree(rows: *const Rows, codes: []const u8, scales: []const u8, s: S) !void {
+    for ([_]mlx_pages.InPlace{ rows.buf, rows.sbuf }, [_][]const u8{ codes, scales }, [_]c_int{ 16, 2 }) |part, want, cols| {
+        try std.testing.expectEqual(ci(rows.cap), mlx.getShape(part.array)[0]);
+        var head = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(head);
+        try mlx.check(mlx.mlx_slice(&head, part.array, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(rows.used), cols }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_contiguous(&flat, head, false, s));
+        try mlx.check(mlx.mlx_array_eval(flat));
+        const got = mlx.mlx_array_data_uint8(flat) orelse return error.HostRead;
+        try std.testing.expectEqualSlices(u8, want[0 .. rows.used * @as(usize, @intCast(cols))], got[0 .. rows.used * @as(usize, @intCast(cols))]);
+    }
+}
+
+test "dsv41 rows: a grow that fails at any MLX call leaves both parts, the rows and the cap as they were, upward and down, and frees what it built" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var codes: [128 * 16]u8 = undefined;
+    for (&codes, 0..) |*v, i| v.* = @intCast((i % 251) + 1);
+    var scales: [128 * 2]u8 = undefined;
+    for (&scales, 0..) |*v, i| v.* = @intCast((i % 241) + 1);
+    const settled = @import("../test_support.zig").mlxSettledActiveBytes;
+
+    // Upward: 64 rows in a store of 64, regrown to 128 as a reserve or bind does (written now) and as an append does
+    // (left pending). Down: 10 rows in a store of 128, trimmed to `reserve`'s 64.
+    const Case = struct { cap: usize, used: usize, to: usize, trim: bool, written: bool = true, min_calls: usize };
+    const cases = [_]Case{
+        .{ .cap = 64, .used = 64, .to = 128, .trim = false, .min_calls = 8 },
+        .{ .cap = 64, .used = 64, .to = 128, .trim = false, .written = false, .min_calls = 6 },
+        .{ .cap = 128, .used = 10, .to = 64, .trim = true, .min_calls = 8 },
+    };
+    for (cases) |c| {
+        const base = settled(s);
+        var calls: usize = 0;
+        var k: u64 = 1;
+        while (true) : (k += 1) {
+            var rows = try twoPartStore(c.cap, c.used, &codes, &scales, s);
+            defer rows.deinit();
+            mlx.fault.arm(k);
+            const res = if (c.trim) rows.trim(s) else rows.growTo(c.to, s, c.written);
+            const fired = mlx.fault.didFire();
+            mlx.fault.disarm();
+            if (!fired) {
+                try res;
+                try std.testing.expectEqual(c.to, rows.cap);
+                try expectPartsAgree(&rows, &codes, &scales, s);
+                break;
+            }
+            calls += 1;
+            try std.testing.expectError(error.MlxError, res);
+            try std.testing.expectEqual(c.cap, rows.cap);
+            try std.testing.expectEqual(c.used, rows.used);
+            try expectPartsAgree(&rows, &codes, &scales, s);
+            // The store is still one a grow takes: the same grow, unarmed, lands every part at once.
+            try if (c.trim) rows.trim(s) else rows.growTo(c.to, s, c.written);
+            try std.testing.expectEqual(c.to, rows.cap);
+            try expectPartsAgree(&rows, &codes, &scales, s);
+        }
+        // Each part makes a buffer, slices its rows and writes them, and a written grow evaluates each part.
+        try std.testing.expect(calls >= c.min_calls);
+        try std.testing.expectEqual(base, settled(s));
+    }
 }

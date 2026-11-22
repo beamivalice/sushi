@@ -110,6 +110,7 @@ tensors a decode forward holds (`forward_held_bytes`) and the 256 MiB the bill's
 term is multiplied. A last chunk absorbs a tail, so a chunk bills `chunk + 511` rows (`chunkCap`).
 On MLX the row stores grow on MLX's page grid (`Rows.pagedCap`), so each append writes in place, and the MLX caps add
 the grid's step of every store (`rowsGridBytes`, 1.6 MiB on the release).
+A store's grow builds every part's new buffer before it frees any old one (`Rows.growTo`), so a failed MLX call leaves each part and `cap` as they were.
 The request bill (`dsv41_bill.requestBill`) takes the larger of the chunk's cap and the decode cap at the reply's end
 (`seq + max_tokens + 17`, where the last verify runs), and on Sushi Cooler the cap less its margin: `bills.billMargin`
 adds the one margin, which a cap taken whole billed twice (512 MB, not 256).
