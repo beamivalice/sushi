@@ -58,9 +58,41 @@ const Poison = struct {
 
 fn clientMain() void {
     defer server.requestShutdown();
+    if (loads_first) ready() catch |e| {
+        failed = e;
+        return;
+    };
     scenario() catch |e| {
         failed = e;
     };
+}
+
+/// Whether the scenario in hand has its model loaded before it starts (`Needs.cold` is off), and how long its reads wait:
+/// a scenario that loads a model inside its requests (a cold first load, or a second model) waits for that load too.
+var loads_first = true;
+var scenario_limit_ms: i64 = read_limit_ms;
+
+/// How long a model's load may take, waited for once by `ready` and by a scenario that loads inside its requests
+/// (`Needs.loads`). The M1 Max loads DeepSeek's tiny in 3.5 to 7.7 s, in 15 to 19 s with three builds running (a run with a
+/// 20 s limit timed out nine loads), and Qwen's in 13.7 to 17.3 s, once 30.9 s, in a 24-minute run beside other builds.
+const load_limit_ms: i64 = 60_000;
+
+/// How long a read may wait in a scenario whose own work is a long decode (`Needs.decodes`): the cell that waits out a
+/// 2000-token request read it for 6.9 s on Qwen's tiny; this is four times that.
+const decode_limit_ms: i64 = 30_000;
+
+/// The one wait for a load that is not a request's: `tiny` loaded, so the first request of a scenario meets a resident model.
+fn ready() !void {
+    const fd = try connect();
+    defer _ = std.c.close(fd);
+    readLimit(fd, load_limit_ms / 1000);
+    try send(fd, "POST", "/v1/load-model", "{\"model\":\"tiny\"}");
+    const answer = try readUntil(fd, null);
+    defer gpa.free(answer);
+    if (!std.mem.startsWith(u8, answer, "HTTP/1.1 200")) {
+        std.debug.print("the load of tiny that readies a scenario answered: {s}\n", .{answer[0..@min(answer.len, 300)]});
+        return error.ReadyLoadRefused;
+    }
 }
 
 fn startClient() anyerror!std.Thread {
@@ -84,6 +116,13 @@ const Needs = struct {
     max_resident: u32 = 2,
     /// Serve on a real listener (an ephemeral port) with the client started by `on_ready`, so `acceptLoop` runs.
     listener: bool = false,
+    /// The scenario meets the model unloaded: its first load is what it tests, or it asks none (`ready` is skipped).
+    cold: bool = false,
+    /// The scenario loads a model inside its requests (a reload after an unload, a second model, its first load), so its
+    /// reads wait for a load (`load_limit_ms`).
+    loads: bool = false,
+    /// The scenario waits out a request that decodes thousands of tokens, so its reads wait for that (`decode_limit_ms`).
+    decodes: bool = false,
 };
 
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
@@ -120,8 +159,12 @@ fn eachArch(max_concurrent: u32, needs: Needs, body: *const fn () anyerror!void)
     var any = false;
     for (archs) |a| any = any or a != null;
     if (!any) return error.SkipZigTest;
-    for (&archs) |*a| if (a.*) |*x| withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body) catch |e| {
+    for (&archs) |*a| if (a.*) |*x| (blk: {
+        serving_arch = x.name;
+        break :blk withServer(&x.tmp, x.ssd_budget_gb, max_concurrent, needs, body);
+    }) catch |e| {
         if (e != error.SkipZigTest) std.debug.print("server test on {s}: {s}\n", .{ x.name, @errorName(e) });
+        if (e == error.ReadTimedOut) std.debug.print("  {s}\n", .{waitedOn()});
         return e;
     };
 }
@@ -209,6 +252,8 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
     };
     gpa = a;
     scenario = body;
+    loads_first = !needs.cold;
+    scenario_limit_ms = if (needs.cold or needs.loads or needs.tiny2) load_limit_ms else if (needs.decodes) decode_limit_ms else read_limit_ms;
     failed = null;
     const prev_max = server_state.max_concurrent;
     server_state.max_concurrent = max_concurrent;
@@ -241,15 +286,74 @@ fn connect() !std.posix.fd_t {
     const small: c_int = 2048;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
-    // A read that waits past this fails the test instead of hanging it; it budgets a cold first load, whose kernel
-    // compiles alone can pass half a minute on a loaded box.
-    const limit: std.posix.timeval = .{ .sec = 120, .usec = 0 };
-    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit), @sizeOf(std.posix.timeval));
+    track(sv[1], scenario_limit_ms);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
 
+/// How long a read may wait for its own work: a request on a resident tiny. The longest such read of this file on the M1 Max
+/// with other builds running was 527 ms on DeepSeek's tiny (a 16-token `/v1/messages`, three runs) and 989 ms on Qwen's (a
+/// 1-token chat, one run); loads ran 2.5 times slower at load average 7, which puts that near 2.5 s. GLM's tiny is not on this
+/// box: a box that has it measures again. A load is no part of it (`load_limit_ms`).
+const read_limit_ms: i64 = 10_000;
+
+/// How often a waiting read looks at its socket again. A wake the kernel loses (an EOF on a unix socketpair, seen with
+/// small buffers) then costs one slice, as the server's own waits do (`Conn.awaitReadable`).
+const read_slice_ms: i64 = 100;
+
+/// What the client knows of one connection, by its fd: how long a read may wait, and the request it sent.
+const Wire = struct {
+    limit_ms: i64 = read_limit_ms,
+    asked: [200]u8 = undefined,
+    asked_len: usize = 0,
+};
+var wires: [4096]Wire = @splat(.{});
+/// The arch a scenario serves, and what the last read that timed out was waiting on (`waitedOn`).
+var serving_arch: []const u8 = "";
+var timed_out_on: [600]u8 = undefined;
+var timed_out_len: usize = 0;
+
+/// A new connection's client end `fd`: a read of it waits at most `limit_ms`.
+fn track(fd: std.posix.fd_t, limit_ms: i64) void {
+    wires[@intCast(fd)] = .{ .limit_ms = limit_ms };
+}
+
+fn noteAsked(fd: std.posix.fd_t, what: []const u8) void {
+    const w = &wires[@intCast(fd)];
+    if (w.asked_len > 0) return;
+    w.asked_len = @min(what.len, w.asked.len);
+    @memcpy(w.asked[0..w.asked_len], what[0..w.asked_len]);
+}
+
+/// One read of `fd`: its bytes (0 at the server's close), waited for in slices up to the connection's limit. `have` is
+/// what the caller received so far. A wait past the limit is `error.ReadTimedOut`, and `waitedOn` says what it waited on.
+fn readSome(fd: std.posix.fd_t, buf: []u8, have: []const u8) !usize {
+    const w = &wires[@intCast(fd)];
+    const t0 = nowMsMonotonic(io);
+    while (true) {
+        var pfd = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready_fds = std.posix.poll(&pfd, @intCast(read_slice_ms)) catch return error.ReadFailed;
+        if (ready_fds > 0) break;
+        const waited = nowMsMonotonic(io) - t0;
+        if (waited < w.limit_ms) continue;
+        const tail = have[have.len -| 160..];
+        const note = std.fmt.bufPrint(&timed_out_on, "no byte for {d} ms on {s}: waiting on {s}; {d} bytes received so far, ending {f}", .{ waited, serving_arch, w.asked[0..w.asked_len], have.len, std.zig.fmtString(tail) }) catch timed_out_on[0..0];
+        timed_out_len = note.len;
+        return error.ReadTimedOut;
+    }
+    // The socket is readable: this read returns at once, with bytes or the close.
+    const n = std.c.read(fd, buf.ptr, buf.len);
+    if (n < 0) return error.ReadFailed;
+    return @intCast(n);
+}
+
+/// What the last timed-out read waited on, for the failure that carries `error.ReadTimedOut`.
+fn waitedOn() []const u8 {
+    return timed_out_on[0..timed_out_len];
+}
+
 fn sendAll(fd: std.posix.fd_t, bytes: []const u8) !void {
+    noteAsked(fd, bytes);
     var off: usize = 0;
     while (off < bytes.len) {
         const n = std.c.write(fd, bytes[off..].ptr, bytes.len - off);
@@ -259,6 +363,8 @@ fn sendAll(fd: std.posix.fd_t, bytes: []const u8) !void {
 }
 
 fn send(fd: std.posix.fd_t, method: []const u8, path: []const u8, body: []const u8) !void {
+    var ab: [200]u8 = undefined;
+    noteAsked(fd, std.fmt.bufPrint(&ab, "{s} {s} {s}", .{ method, path, body }) catch ab[0..]);
     var hb: [256]u8 = undefined;
     try sendAll(fd, try std.fmt.bufPrint(&hb, "{s} {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{ method, path, body.len }));
     try sendAll(fd, body);
@@ -270,10 +376,9 @@ fn readUntil(fd: std.posix.fd_t, needle: ?[]const u8) ![]u8 {
     errdefer out.deinit(gpa);
     var buf: [16 * 1024]u8 = undefined;
     while (needle == null or std.mem.indexOf(u8, out.items, needle.?) == null) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = try readSome(fd, &buf, out.items);
         if (n == 0) break;
-        if (n < 0) return if (std.posix.errno(n) == .AGAIN) error.ReadTimedOut else error.ReadFailed;
-        try out.appendSlice(gpa, buf[0..@intCast(n)]);
+        try out.appendSlice(gpa, buf[0..n]);
     }
     return out.toOwnedSlice(gpa);
 }
@@ -289,23 +394,35 @@ fn readUntilResponsesTerminal(fd: std.posix.fd_t) ![]u8 {
     errdefer out.deinit(gpa);
     var buf: [16 * 1024]u8 = undefined;
     while (!hasResponsesTerminal(out.items)) {
-        const n = std.c.read(fd, &buf, buf.len);
+        const n = try readSome(fd, &buf, out.items);
         if (n == 0) break;
-        if (n < 0) return if (std.posix.errno(n) == .AGAIN) error.ReadTimedOut else error.ReadFailed;
-        try out.appendSlice(gpa, buf[0..@intCast(n)]);
+        try out.appendSlice(gpa, buf[0..n]);
     }
     return out.toOwnedSlice(gpa);
 }
 
-test "server test client: a read past its limit fails by name, never as a short answer" {
+test "server test client: a read past its limit fails naming the request, the bytes received and the arch, never as a short answer" {
     gpa = testing.allocator;
+    const arch_was = serving_arch;
+    defer serving_arch = arch_was;
+    serving_arch = "some-arch";
     var sv: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(sv[1]);
-    const limit: std.posix.timeval = .{ .sec = 0, .usec = 50_000 };
-    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit), @sizeOf(std.posix.timeval));
+    track(sv[1], 150);
+    try send(sv[1], "POST", "/v1/chat/completions", "{\"model\":\"tiny\"}");
+    // The peer takes the request, so closing it later is a close and not a reset of unread bytes.
+    var sink: [512]u8 = undefined;
+    try testing.expect(std.c.read(sv[0], &sink, sink.len) > 0);
     try sendAll(sv[0], "HTTP/1.1 200 OK\r\n");
     try testing.expectError(error.ReadTimedOut, readUntil(sv[1], "\r\n\r\n"));
+    const note = waitedOn();
+    for ([_][]const u8{ "some-arch", "POST /v1/chat/completions {\"model\":\"tiny\"}", "17 bytes received so far", "HTTP/1.1 200 OK" }) |part| {
+        if (std.mem.indexOf(u8, note, part) == null) {
+            std.debug.print("the timed-out read's note lacks {s}: {s}\n", .{ part, note });
+            return error.WaitNotNamed;
+        }
+    }
     // A peer that closes ends the read with what it sent.
     try sendAll(sv[0], "{}");
     _ = std.c.close(sv[0]);
@@ -536,7 +653,7 @@ test "server: a shutdown with the submit queue full ends the request waiting for
 }
 
 test "server: a request whose connection thread reads it after the shutdown was asked is answered with the shutdown error" {
-    try eachArch(1, .{}, struct {
+    try eachArch(1, .{ .loads = true }, struct {
         fn run() !void {
             // The flag is up before the connection exists, so its thread's first read finds the shutdown with the
             // whole request already in the socket, as a thread the box scheduled late does.
@@ -622,7 +739,7 @@ test "server: a client that stops reading its stream gives up its model, so an u
     const was = http_conn.send_limit_ms;
     http_conn.send_limit_ms = 200;
     defer http_conn.send_limit_ms = was;
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .loads = true }, struct {
         fn run() !void {
             const got = try behindAStalledReader(120_000);
             defer for (got) |g| gpa.free(g);
@@ -636,7 +753,7 @@ test "server: an unload whose model stays held past its drain bound is refused b
     const was = scheduler_mod.Scheduler.unload_drain_ms;
     scheduler_mod.Scheduler.unload_drain_ms = 200;
     defer scheduler_mod.Scheduler.unload_drain_ms = was;
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .loads = true }, struct {
         fn run() !void {
             const got = try behindAStalledReader(120_000);
             defer for (got) |g| gpa.free(g);
@@ -650,7 +767,7 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
     const was = http_conn.send_limit_ms;
     http_conn.send_limit_ms = 3000;
     defer http_conn.send_limit_ms = was;
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .loads = true }, struct {
         var asked: [3]Asked = undefined;
         fn allDone() bool {
             for (asked) |q| if (!q.done.load(.acquire)) return false;
@@ -912,7 +1029,7 @@ test "server: a load that fails after a setting saved during it answers its own 
     const Scenario = struct {
         var failed: u32 = 0;
     };
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .cold = true }, struct {
         fn run() !void {
             const sch = server_state.global_scheduler.?;
             LoadBodyHold.held.store(false, .release);
@@ -1038,9 +1155,9 @@ fn wsReadFrameOf(fd: std.posix.fd_t) !struct { opcode: u4, payload: []u8 } {
 fn readExact(fd: std.posix.fd_t, out: []u8) !void {
     var got: usize = 0;
     while (got < out.len) {
-        const n = std.c.read(fd, out[got..].ptr, out.len - got);
-        if (n <= 0) return error.ConnectionEnded;
-        got += @intCast(n);
+        const n = try readSome(fd, out[got..], out[0..got]);
+        if (n == 0) return error.ConnectionEnded;
+        got += n;
     }
 }
 
@@ -1116,7 +1233,7 @@ fn bodyOf(resp: []const u8) []const u8 {
 }
 
 test "server: an error on an Anthropic route takes Anthropic's envelope and status line, whichever check sent it" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .cold = true }, struct {
         /// `status` is the head's status line, or its start.
         const Case = struct { name: []const u8, method: []const u8 = "POST", path: []const u8, body: []const u8, status: []const u8, anthropic: bool = true };
         const messages = "{\"model\":\"tiny\",\"max_tokens\":4,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
@@ -1379,7 +1496,7 @@ fn errorMessage(resp: []const u8) ![]u8 {
 }
 
 test "server: every request to a model whose load is refused for memory gets the whole refusal, re-read, as a named 503" {
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .cold = true }, struct {
         fn run() !void {
             try setWiredFloor(64 << 20);
             defer clearWiredFloor();
@@ -1466,8 +1583,7 @@ test "server: a WebSocket upgrade the server cannot complete is answered 400, ne
 
 /// A read on `fd` that waits past `sec` fails instead of blocking.
 fn readLimit(fd: std.posix.fd_t, sec: i64) void {
-    const limit: std.posix.timeval = .{ .sec = @intCast(sec), .usec = 0 };
-    _ = std.c.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&limit), @sizeOf(std.posix.timeval));
+    wires[@intCast(fd)].limit_ms = sec * 1000;
 }
 
 test "server: a shutdown closes a WebSocket idle between turns with 1001 and an idle connection at once, and serve runs its teardown" {
@@ -1486,7 +1602,7 @@ test "server: a shutdown closes a WebSocket idle between turns with 1001 and an 
             server.requestShutdown();
             if (try wsReadCloseCode(ws) != 1001) return error.NotGoingAway;
             var b: [64]u8 = undefined;
-            if (std.c.read(idle, &b, b.len) != 0) return error.IdleConnectionOutlivesShutdown;
+            if (try readSome(idle, &b, &.{}) != 0) return error.IdleConnectionOutlivesShutdown;
             // serve returns `ConnectionsOutliveShutdown` when a connection thread outlives the drain.
         }
     }.run);
@@ -1496,7 +1612,7 @@ test "server: a WebSocket idle between turns does not hold its model against an 
     const was = scheduler_mod.Scheduler.unload_drain_ms;
     scheduler_mod.Scheduler.unload_drain_ms = 2000;
     defer scheduler_mod.Scheduler.unload_drain_ms = was;
-    try eachArch(4, .{}, struct {
+    try eachArch(4, .{ .loads = true }, struct {
         fn run() !void {
             const ws = try wsConnect();
             defer _ = std.c.close(ws);
@@ -1649,7 +1765,7 @@ fn connectWide() !std.posix.fd_t {
     const wide: c_int = 256 * 1024;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
-    readLimit(sv[1], 120);
+    track(sv[1], scenario_limit_ms);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
@@ -1907,7 +2023,7 @@ fn connectReceiveWide() !std.posix.fd_t {
     const wide: c_int = 256 * 1024;
     _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
     _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&wide), @sizeOf(c_int));
-    readLimit(sv[1], 10);
+    track(sv[1], 10_000);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return sv[1];
 }
@@ -2306,7 +2422,7 @@ fn askedBeforeServed(path: []const u8, body: []const u8) ![]u8 {
     var sv: [2]std.posix.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv) != 0) return error.SocketPairFailed;
     defer _ = std.c.close(sv[1]);
-    readLimit(sv[1], 30);
+    track(sv[1], 30_000);
     try send(sv[1], "POST", path, body);
     server.spawnConnection(gpa, io, .{ .socket = .{ .handle = sv[0], .address = .{ .ip4 = .loopback(0) } } });
     return readUntil(sv[1], null);
@@ -2716,7 +2832,7 @@ const waiting_ids = [_]u32{ 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 11
 const waiting_body = "{\"model\":\"tiny\",\"prompt\":[101,102,103,104,105,106,107,108,109,110,111,112,113,114,115,116],\"max_tokens\":8,\"temperature\":0,\"ignore_eos\":true,\"enable_mtp\":false}";
 
 test "server: a request that fits once the running one finishes waits for it and is answered, and one that never fits is refused at once" {
-    try eachArch(4, .{ .long_replies = true }, struct {
+    try eachArch(4, .{ .long_replies = true, .decodes = true }, struct {
         fn run() !void {
             defer clearWiredFloor();
             var running = Background{ .path = "/v1/completions", .body = running_body };

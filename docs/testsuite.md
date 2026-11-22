@@ -364,6 +364,11 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
   to the test's model-settings.json): a box under 96 GB has no RAM-tier default, and its cells would test a refusal.
   A cell that needs a request to stand still (queued, or between two tokens) holds the inference thread in a
   blocker's prefill (`PrefillHold`), never a wall-clock race against the tiny's decode.
+  The harness owns the waits ([CLAUDE.md](../CLAUDE.md#testing--tdd-is-mandatory)): `ready` loads the model before a
+  scenario's requests; a cell whose subject is a load, that serves a second model or that reloads declares it
+  (`Needs.cold`, `Needs.tiny2`, `Needs.loads`) and its reads wait for that load, and one that waits out a long decode says
+  so (`Needs.decodes`). A read that outlasts its limit fails naming the request, the bytes received and the arch. Reads
+  wait in poll slices, as the server's own do: a blocking `read` on a socketpair lost an EOF.
 - Integration scripts in `tests/` cover only what HTTP shows and a unit test cannot reach.
 
 ## How a test is built
