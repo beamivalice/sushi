@@ -296,6 +296,12 @@ prompt, one boot per arm. At S=1 the default 16 splits launch exactly 32 threadg
   `--max-concurrent 4` is the right cap on this GPU.
 - Greedy text diverges with the split count (the merge order changes, as at every nsplit); these cells are rates, not
   a byte gate. BK stays 16: the BK=8 seam fails the kernel's launch check on 1.7.0 (MlxError), so it is not an arm.
+- **The split count is flat at the verify width (2026-11-22, same meter, S=3, 12 dependent layers, median of 7):**
+  kv 4096 nsplit 16/32/64 read 307.5 / 310.2 / 311.5 us a call, kv 32768 320.4 / 318.4 / 323.1, and 8 splits is
+  worse at both (506.8 / 528.9 — the split pass stops filling the GPU). So the one-row row (64 splits) stands for the
+  MTP round's 3-row verify: the `S=3 nsplit=64 tgs=384` launch is not the cost, and a per-width split row is not a
+  lever. A boot-to-boot reading of -0.9 ms of GPU busy at 3 rows for 16 splits did not survive this meter (it is
+  4 us a layer) — that arm was reverted (`nsplit=64` kept).
 
 ## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
 

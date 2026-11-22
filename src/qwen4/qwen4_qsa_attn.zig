@@ -2597,7 +2597,9 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
     const rnd = prng.random();
     defer qsa_attn_simdgroups_override = null;
     defer qsa_attn_nsplit_override = null;
-    const splits = [_]c_int{ QSA_ATTN_NSPLIT_DEFAULT, QSA_ATTN_NSPLIT_M1_MAX };
+    // S=3, the MTP round's verify width: the split count is flat there (docs/qwen4-perf.md#qsa).
+    const bench_seq: c_int = 3;
+    const splits = [_]c_int{ 8, QSA_ATTN_NSPLIT_DEFAULT, 32, QSA_ATTN_NSPLIT_M1_MAX };
     const sgs = [_]c_int{ 2, 16 };
     for ([_]c_int{ 4096, 32768 }) |kv| {
         var caches: [layers]KVCache = undefined;
@@ -2616,11 +2618,11 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
             views[i] = try qsaAttnCacheFixture(ta, s, k, v, kv, kv - 1, kv_quant.KVQuantConfig.affine(8), &caches[i]);
             built += 1;
         }
-        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, 1, kv, 512, ratio);
+        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, bench_seq, kv, 512, ratio);
         defer ta.free(blocks_host);
-        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, 1, 512 }, 3, .int32);
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, bench_seq, 512 }, 3, .int32);
         defer _ = mlx.mlx_array_free(blocks);
-        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, bench_seq, 256 }, s);
         defer _ = mlx.mlx_array_free(q0);
         var us: [splits.len][sgs.len][reps]f64 = undefined;
         for (0..reps + 1) |rep| for (splits, 0..) |nsplit, ni| for (sgs, 0..) |sg, ai| {
@@ -2641,7 +2643,7 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
         };
         for (splits, 0..) |nsplit, ni| for (sgs, 0..) |sg, ai| {
             std.mem.sort(f64, &us[ni][ai], {}, std.sort.asc(f64));
-            std.debug.print("[qsa-attn-ubench] kv={d} nsplit={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, nsplit, sg, us[ni][ai][reps / 2], reps });
+            std.debug.print("[qsa-attn-ubench] kv={d} S={d} nsplit={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, bench_seq, nsplit, sg, us[ni][ai][reps / 2], reps });
         };
     }
 }
