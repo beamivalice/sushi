@@ -1150,7 +1150,7 @@ fn handleResponsesInner(
                         break;
                     },
                     .step => |st| {
-                        channel_armed = st.step == .marker and !content.started and std.mem.eql(u8, st.text, "<|channel>");
+                        channel_armed = st.step == .marker and std.mem.eql(u8, st.text, "<|channel>");
                         switch (st.step) {
                             .send => |bytes| try emitResponsesMessage(allocator, stream, seq_num, &streamed_message_id, &streamed_message_index, &streamed_message_started, live_output_index, bytes),
                             else => {},

@@ -964,7 +964,11 @@ pub fn handleNonStreamingGeneration(
     var logprobs_json: []const u8 = "null";
     var logprobs_allocated = false;
     if (result.logprobs) |lps| {
-        logprobs_json = try contentLogprobsJson(allocator, tok, result.token_ids, lps, final_text, settled.provenance(), content_text, if (asked_logprobs) |l| l.top else 0);
+        const top: u32 = if (asked_logprobs) |l| l.top else 0;
+        logprobs_json = if (routed) |*d|
+            try constrainedLogprobsJson(allocator, tok, result.token_ids, lps, d, top)
+        else
+            try contentLogprobsJson(allocator, tok, result.token_ids, lps, final_text, settled.provenance(), content_text, top);
         logprobs_allocated = true;
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
@@ -1861,7 +1865,7 @@ pub fn handleStreamingGeneration(
                 },
                 .step => |st| {
                     try lps.afterDeliver(st.step, &content, st.at, st.text.len);
-                    channel_armed = st.step == .marker and !content.started and std.mem.eql(u8, st.text, "<|channel>");
+                    channel_armed = st.step == .marker and std.mem.eql(u8, st.text, "<|channel>");
                     switch (st.step) {
                         .marker, .hold, .drop => {},
                         .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, bytes),
@@ -2743,7 +2747,21 @@ pub fn contentLogprobsJson(
     const n = @min(token_ids.len, lps.len);
     var listing = try contentListing(allocator, tok, token_ids[0..n], text, runs, content);
     defer listing.deinit(allocator);
-    return formatLogprobsObject(allocator, tok, token_ids[0..n], lps[0..n], top, listing.queued());
+    return formatLogprobsObject(allocator, tok, token_ids[0..n], lps[0..n], top, listing.queued(), listing.gaps.items);
+}
+
+/// The `logprobs` object of a constrained reply, whose content is the delivery's own copy of the generation's bytes from
+/// `content_at` on: it lists through that map, never by finding the copy in the text.
+pub fn constrainedLogprobsJson(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    token_ids: []const u32,
+    lps: []const sampler.LogprobResult,
+    d: *const rp_mod.Delivery,
+    top: u32,
+) ![]const u8 {
+    const run = [_]listed_tokens.Run{.{ .at = 0, .len = d.content.items.len, .src = d.content_at orelse 0 }};
+    return contentLogprobsJson(allocator, tok, token_ids, lps, d.content.items, &run, d.content.items, top);
 }
 
 /// Which of the generated tokens survive into `message.content`, as a `Listing` whose `queued` list is the entries in order.
@@ -2751,9 +2769,9 @@ pub fn contentLogprobsJson(
 /// OpenAI defines `logprobs.content` as the tokens of the message CONTENT, but the generation also carries the reasoning
 /// block, any leaked tool markup and a loop-trimmed tail, all cut before the text reaches the client; the content can also
 /// hold bytes no token produced, the join of its parts around a thought. `content` is a slice of `text` (the split helpers
-/// return raw slices, so its offset is exact pointer arithmetic) and `runs` maps `text` to the generation. A content that is
-/// not a slice of `text` (a constrained reply's own copy) is found by its bytes, and when it is not there either every
-/// token lists: an array we cannot align is still better than none.
+/// return raw slices, so its offset is exact pointer arithmetic) and `runs` maps `text` to the generation. A reply whose
+/// content is a copy (a constrained reply's) names the copy as `text` and says where it came from in `runs`; a content
+/// that is no slice of `text` is refused, never found by its bytes.
 pub fn contentListing(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
@@ -2772,13 +2790,8 @@ pub fn contentListing(
     }
     const base = @intFromPtr(text.ptr);
     const cptr = @intFromPtr(content.ptr);
-    const from = if (cptr >= base and cptr + content.len <= base + text.len)
-        cptr - base
-    else
-        std.mem.indexOf(u8, text, content) orelse {
-            try listing.returned(allocator, 0, listing.total);
-            return listing;
-        };
+    if (cptr < base or cptr + content.len > base + text.len) return error.ContentIsNotTheReplyText;
+    const from = cptr - base;
     try listing.returnedText(allocator, runs, 0, from, from + content.len);
     return listing;
 }

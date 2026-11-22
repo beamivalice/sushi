@@ -764,6 +764,8 @@ pub const Delivery = struct {
     raw_bytes: usize = 0,
     consumed_bytes: usize = 0,
     payload_byte: ?usize = null,
+    /// Where in the fed bytes the first content byte stands: `content` is a copy of the bytes from here on.
+    content_at: ?usize = null,
     opener_cursor: usize = 0,
     opened: bool,
     pending: [MAX_MARKER_BYTES]u8 = undefined,
@@ -812,6 +814,7 @@ pub const Delivery = struct {
             if (is_content) {
                 try self.flushPending(allocator);
                 if (!self.content_started and (b == ' ' or b == '\n')) continue;
+                if (!self.content_started) self.content_at = self.consumed_bytes - 1;
                 self.content_started = true;
                 try self.content.append(allocator, b);
                 continue;

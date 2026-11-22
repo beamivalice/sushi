@@ -25,6 +25,10 @@ pub const Range = struct {
 /// What a rendered list drops from its first token's start and its last token's end.
 pub const Cut = struct { head: usize = 0, tail: usize = 0 };
 
+/// Bytes `len` long at `at` inside the token `token` that the reply cut out of its content (a think closer between two
+/// returned runs of one token): the token lists once, without them.
+pub const Gap = struct { token: usize, at: usize, len: usize };
+
 /// Where a rewritten reply text got its content bytes (`think_tags.Normalized`): runs of the text in order, each copied from
 /// the generation at `src`, or, with no `src`, a join no token carries and no entry lists. A byte outside every run is not content (the
 /// rewrite's framing and the thoughts it gathered), and a list of the text's content never reaches one.
@@ -51,6 +55,10 @@ pub const Listing = struct {
     queue: std.ArrayList(Range) = .empty,
     /// Raw bytes the reply drops from the middle of its content (a stray think closer): a token wholly inside lists nothing.
     holes: std.ArrayList(Hole) = .empty,
+    /// The bytes inside a token the reply returned on both sides of, in order (`returned`).
+    gaps: std.ArrayList(Gap) = .empty,
+    /// Where the last returned bytes ended.
+    returned_to: usize = 0,
     /// What `items` returned last.
     out: std.ArrayList(Range) = .empty,
 
@@ -60,6 +68,7 @@ pub const Listing = struct {
         self.starts.deinit(allocator);
         self.queue.deinit(allocator);
         self.holes.deinit(allocator);
+        self.gaps.deinit(allocator);
         self.out.deinit(allocator);
     }
 
@@ -76,9 +85,34 @@ pub const Listing = struct {
         return self.cut(.{ .start = start, .end = end, .head = self.headOf(start, from) }, to);
     }
 
-    /// The reply returned the generation's bytes `from..to`: they list after what is already queued.
+    /// The reply returned the generation's bytes `from..to`: they list after what is already queued. A token the bytes
+    /// before them also touched is listed once, with what lies between cut out (`gaps`).
     pub fn returned(self: *Listing, allocator: std.mem.Allocator, from: usize, to: usize) !void {
-        try self.queueRange(allocator, self.touching(from, to));
+        var r = self.touching(from, to);
+        defer self.returned_to = to;
+        if (r.end <= r.start or self.queue.items.len == 0) return self.queueRange(allocator, r);
+        const last = &self.queue.items[self.queue.items.len - 1];
+        const shared = last.end > last.start and last.end - 1 == r.start and self.returned_to <= from and self.returned_to > self.starts.items[r.start];
+        if (!shared) return self.queueRange(allocator, r);
+        const token_at = self.starts.items[r.start];
+        if (from > self.returned_to) try self.gaps.append(allocator, .{ .token = r.start, .at = self.returned_to - token_at, .len = from - self.returned_to });
+        if (r.end == r.start + 1) {
+            last.tail = r.tail;
+            return;
+        }
+        last.tail = 0;
+        r.start += 1;
+        r.head = 0;
+        try self.queueRange(allocator, r);
+    }
+
+    /// The gaps inside token `token`, in order, of the `gaps` a listing found.
+    pub fn gapsOf(gaps: []const Gap, token: usize) []const Gap {
+        var from: usize = 0;
+        while (from < gaps.len and gaps[from].token < token) from += 1;
+        var to = from;
+        while (to < gaps.len and gaps[to].token == token) to += 1;
+        return gaps[from..to];
     }
 
     /// The reply returned the bytes `from..to` of its text. `runs` says where a rewrite of the generation got them (null: the
@@ -322,6 +356,22 @@ test "a lead and a stop inside one token list that token with both cuts, and a t
     // Nothing of the token is returned: it is not listed.
     const gone = l.touching(5, 5);
     try testing.expectEqual(@as(usize, 0), gone.end - gone.start);
+}
+
+test "a token the reply returned on both sides of cut bytes lists once, with the cut bytes as its gap" {
+    var l: Listing = .{};
+    defer l.deinit(testing.allocator);
+    try noteAll(&l, &.{ 2, 10, 1 });
+    try l.returned(testing.allocator, 0, 3);
+    try l.returned(testing.allocator, 7, 12);
+    try testing.expectEqual(@as(usize, 1), l.queued().len);
+    try testing.expectEqual(@as(usize, 2), l.queued()[0].end);
+    try testing.expectEqual(@as(usize, 0), l.queued()[0].tail);
+    try testing.expectEqual(@as(usize, 1), l.gaps.items.len);
+    try testing.expectEqual(Gap{ .token = 1, .at = 1, .len = 4 }, l.gaps.items[0]);
+    // Bytes that continue into the next token do not share the first.
+    try l.returned(testing.allocator, 12, 13);
+    try testing.expectEqual(@as(usize, 2), l.queued().len);
 }
 
 test "a trailing run the content arm withholds and a trimmed reply never ships is not listed" {

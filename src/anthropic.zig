@@ -1593,7 +1593,7 @@ fn handleAnthropicStreaming(
                     break;
                 },
                 .step => |st| {
-                    channel_armed = st.step == .marker and !content.started and std.mem.eql(u8, st.text, "<|channel>");
+                    channel_armed = st.step == .marker and std.mem.eql(u8, st.text, "<|channel>");
                     switch (st.step) {
                         .send => |bytes| try emitAnthropicText(allocator, stream, block_index, &text_block_open, bytes),
                         else => {},

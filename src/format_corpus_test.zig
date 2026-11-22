@@ -3328,6 +3328,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
     var in_think = opened;
     var skipped = false;
     var shipped = false;
+    var channel_armed = false;
     // One pass per token, and one more with none once the reply ends: what the arms held for bytes that decide it is read as it stands.
     var i: usize = 0;
     while (true) : (i += 1) {
@@ -3337,9 +3338,10 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         var think_has_token = false;
         if (!in_think) {
             if (tt.len > 0) try content.arrive(allocator, tt, 0);
-            while (try content.ready(allocator, false, over)) |r| switch (r) {
+            while (try content.ready(allocator, channel_armed, over)) |r| switch (r) {
                 .opens => |opener| {
                     content.endPart();
+                    channel_armed = false;
                     in_think = true;
                     skipped = false;
                     try think_buf.appendSlice(allocator, opener);
@@ -3347,9 +3349,12 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
                     think_has_token = true;
                     break;
                 },
-                .step => |st| switch (st.step) {
-                    .send => |bytes| try out.appendSlice(allocator, bytes),
-                    else => {},
+                .step => |st| {
+                    channel_armed = st.step == .marker and std.mem.eql(u8, st.text, "<|channel>");
+                    switch (st.step) {
+                        .send => |bytes| try out.appendSlice(allocator, bytes),
+                        else => {},
+                    }
                 },
             };
         }
@@ -3357,7 +3362,9 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         if (!think_has_token) try think_buf.appendSlice(allocator, tt);
         if (!skipped and (think_buf.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(think_buf.items))) {
             skipped = true;
-            if (think_tags.thinkOpenTagLenAt(think_buf.items)) |l| {
+            const opener_len = think_tags.thinkOpenTagLenAt(think_buf.items) orelse
+                (if (std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) "<|channel>thought".len else null);
+            if (opener_len) |l| {
                 var skip = l;
                 while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                 const rest = think_buf.items.len - skip;
@@ -3601,6 +3608,32 @@ test "r173-f-stray-backtick: a backtick no later backtick pairs with hides no th
             defer allocator.free(tokens);
             try expectStreamMatchesReply(allocator, c.raw, tokens, c.opened);
         };
+    }
+}
+
+test "r174-f-stream-channel-midreply: a Gemma thought opened after content is reasoning on the stream and the non-stream reply alike" {
+    // `<|channel>` then `thought` open the thought, whether or not content went out before: the stream armed the pair
+    // only before the first content byte, so "thought" streamed as content after `Sure.`.
+    const allocator = testing.allocator;
+    const Case = struct { tokens: []const []const u8, opened: bool, reasoning: []const u8, content: []const u8 };
+    const cases = [_]Case{
+        .{ .tokens = &.{ "<|channel>", "thought", "\nhmm", "<channel|>", "Done." }, .opened = false, .reasoning = "hmm", .content = "Done." },
+        .{ .tokens = &.{ "Sure.", "<|channel>", "thought", "\nhmm", "<channel|>", "Done." }, .opened = false, .reasoning = "hmm", .content = "Sure.\nDone." },
+        .{ .tokens = &.{ "Sure.", "<|channel>", "thought", "\n", "hmm", "<channel|>", "\n", "<|channel>", "\n", "Done." }, .opened = false, .reasoning = "hmm", .content = "Sure.\nDone." },
+        .{ .tokens = &.{ "Sure.", "<|channel>", "thought", "\nhmm" }, .opened = false, .reasoning = "hmm", .content = "Sure." },
+        .{ .tokens = &.{ "<think>", "t", "</think>", "A", "<|channel>", "thought", "\nu", "<channel|>", "B" }, .opened = false, .reasoning = "t\n\nu", .content = "A\nB" },
+    };
+    for (cases) |c| {
+        var raw = std.ArrayList(u8).empty;
+        defer raw.deinit(allocator);
+        for (c.tokens) |t| try raw.appendSlice(allocator, t);
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, raw.items);
+        defer if (norm) |n| allocator.free(n);
+        const split = think_tags.splitThinkBlock(norm orelse raw.items, true, c.opened);
+        errdefer std.debug.print("\nraw: {f}\nnon-stream: {?s} | {s}\n", .{ std.zig.fmtString(raw.items), split.reasoning_content, split.content });
+        try testing.expectEqualStrings(c.reasoning, split.reasoning_content orelse "");
+        try testing.expectEqualStrings(c.content, split.content);
+        try expectStreamMatchesReply(allocator, raw.items, c.tokens, c.opened);
     }
 }
 

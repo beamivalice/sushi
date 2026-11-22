@@ -10,6 +10,7 @@ const contentLogprobsJson = generation_stream.contentLogprobsJson;
 const listed_tokens = @import("listed_tokens.zig");
 const Listing = listed_tokens.Listing;
 const Cut = listed_tokens.Cut;
+const Gap = listed_tokens.Gap;
 const Range = listed_tokens.Range;
 const think_tags = @import("think_tags.zig");
 const jsonEscape = server.jsonEscape;
@@ -166,7 +167,7 @@ pub const StreamLogprobs = struct {
         } else blk: {
             const items = try self.listing.items(self.allocator, self.entries.items.len, content_chunk, withheld);
             if (items.len == 0) return null;
-            break :blk try formatLogprobsObject(self.allocator, self.tok, self.ids.items, self.entries.items, self.top, items);
+            break :blk try formatLogprobsObject(self.allocator, self.tok, self.ids.items, self.entries.items, self.top, items, self.listing.gaps.items);
         };
         self.rendered = json;
         return json;
@@ -184,13 +185,23 @@ fn formatTokenLogprob(
     logprob: f32,
     top_logprobs: []const sampler.TokenLogprob,
     cut: Cut,
+    gaps: []const Gap,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
     const whole = try tok.decode(allocator, &[_]u32{token_id});
     defer allocator.free(whole);
-    const token_text = whole[@min(cut.head, whole.len)..whole.len -| cut.tail];
+    const returned = whole[@min(cut.head, whole.len)..whole.len -| cut.tail];
+    // The bytes the reply cut out from inside the token are no part of what it lists.
+    var kept = std.ArrayList(u8).empty;
+    defer kept.deinit(allocator);
+    for (returned, @min(cut.head, whole.len)..) |b, at| {
+        var cut_out = false;
+        for (gaps) |g| cut_out = cut_out or (at >= g.at and at < g.at + g.len);
+        if (!cut_out) try kept.append(allocator, b);
+    }
+    const token_text = if (gaps.len == 0) returned else kept.items;
 
     const escaped_token = try jsonEscape(allocator, token_text);
     defer allocator.free(escaped_token);
@@ -330,6 +341,7 @@ pub fn formatLogprobsObject(
     logprobs: []const sampler.LogprobResult,
     top: u32,
     runs: []const Range,
+    gaps: []const Gap,
 ) ![]const u8 {
     var content_buf = std.ArrayList(u8).empty;
     defer content_buf.deinit(allocator);
@@ -341,7 +353,7 @@ pub fn formatLogprobsObject(
         if (!first) try content_buf.appendSlice(allocator, ",");
         first = false;
         const own: Cut = .{ .head = if (i == r.start) r.head else 0, .tail = if (i + 1 == r.end) r.tail else 0 };
-        const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)], own);
+        const entry = try formatTokenLogprob(allocator, tok, token_ids[i], logprobs[i].token_logprob, logprobs[i].top_logprobs[0..@min(top, logprobs[i].top_logprobs.len)], own, Listing.gapsOf(gaps, i));
         defer allocator.free(entry);
         try content_buf.appendSlice(allocator, entry);
     };
@@ -491,7 +503,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
     const token_ids = [_]u32{1};
 
     // Chat shape.
-    const chat_json = try formatTokenLogprob(allocator, &tok, 2, -9.0, &t0, .{});
+    const chat_json = try formatTokenLogprob(allocator, &tok, 2, -9.0, &t0, .{}, &.{});
     defer allocator.free(chat_json);
     try std.testing.expect(std.unicode.utf8ValidateSlice(chat_json));
     const chat_parsed = try std.json.parseFromSlice(std.json.Value, allocator, chat_json, .{});
@@ -527,7 +539,7 @@ test "logprobs token strings are valid UTF-8 — a split multi-byte token can't 
 
     // Valid UTF-8 is untouched, including multi-byte that arrives whole.
     try tok.id_to_token.put(5, "é€");
-    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]sampler.TokenLogprob{}, .{});
+    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]sampler.TokenLogprob{}, .{}, &.{});
     defer allocator.free(clean);
     const clean_parsed = try std.json.parseFromSlice(std.json.Value, allocator, clean, .{});
     defer clean_parsed.deinit();
@@ -583,12 +595,8 @@ test "contentListing: logprobs cover the CONTENT, not the reasoning we stripped"
     defer none.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 0), none.queued().len);
 
-    // A content slice we cannot locate keeps the full range: an array we can't
-    // align is still better than dropping it silently.
-    var foreign = try contentListing(allocator, &tok, &token_ids, full, null, "not in there");
-    defer foreign.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 0), listedRange(&foreign).start);
-    try std.testing.expectEqual(@as(usize, 5), listedRange(&foreign).end);
+    // A content that is no slice of the text is refused: it is never found by its bytes.
+    try std.testing.expectError(error.ContentIsNotTheReplyText, contentListing(allocator, &tok, &token_ids, full, null, "not in there"));
 
     // A token straddling the boundary belongs to content — it put bytes there.
     var mid = try contentListing(allocator, &tok, &token_ids, full, null, full[("<think>\nBecause.\n</thi").len..]);
@@ -647,7 +655,7 @@ test "a token the reply returned part of lists those bytes, its logprob and alte
     // The reply returned "빵[s": the first token's space and the last token's "ection" are not its text.
     const cut: Cut = .{ .head = 1, .tail = 6 };
 
-    const chat = try formatLogprobsObject(allocator, &tok, &ids, &lps, 1, &.{.{ .start = 0, .end = 2, .head = cut.head, .tail = cut.tail }});
+    const chat = try formatLogprobsObject(allocator, &tok, &ids, &lps, 1, &.{.{ .start = 0, .end = 2, .head = cut.head, .tail = cut.tail }}, &.{});
     defer allocator.free(chat);
     const cp = try std.json.parseFromSlice(std.json.Value, allocator, chat, .{});
     defer cp.deinit();
@@ -802,6 +810,7 @@ fn plainStream(allocator: std.mem.Allocator, g: *const Generation, stops: []cons
     defer think_buf.deinit(allocator);
     var in_think = false;
     var thought_closed = false;
+    var channel_armed = false;
     var i: usize = 0;
     var tail = false;
     // The reply ended: one more turn, with no piece, reads what the arms held for bytes that decide it.
@@ -829,10 +838,11 @@ fn plainStream(allocator: std.mem.Allocator, g: *const Generation, stops: []cons
         var think_has_token = false;
         if (!in_think) {
             if (piece.len > 0) try content.arrive(allocator, piece, lps.listing.released -| piece.len);
-            while (try content.ready(allocator, false, over)) |r| switch (r) {
+            while (try content.ready(allocator, channel_armed, over)) |r| switch (r) {
                 .opens => |opener| {
                     try lps.endPart();
                     content.endPart();
+                    channel_armed = false;
                     in_think = true;
                     try think_buf.appendSlice(allocator, opener);
                     try think_buf.appendSlice(allocator, content.takeWaiting().bytes);
@@ -841,6 +851,7 @@ fn plainStream(allocator: std.mem.Allocator, g: *const Generation, stops: []cons
                 },
                 .step => |st| {
                     try lps.afterDeliver(st.step, &content, st.at, st.text.len);
+                    channel_armed = st.step == .marker and std.mem.eql(u8, st.text, "<|channel>");
                     switch (st.step) {
                         .marker, .hold, .drop => {},
                         .send => |bytes| try out.contentDelta(allocator, &content, &lps, bytes),
@@ -948,6 +959,8 @@ const scenarios = [_]Scenario{
     .{ .name = "a closer after a stray backtick waits for the line's end", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>", " here" }, .listed = &.{ "Use `", " here" }, .joins = &.{} },
     .{ .name = "a closer a closing backtick follows is text", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>", "` here" }, .listed = &.{ "Use `", "</think>", "` here" }, .joins = &.{} },
     .{ .name = "two thoughts", .tokens = &.{ "A", "<think>", "p", "</think>", "B", "<think>", "q", "</think>", "C" }, .listed = &.{ "A", "B", "C" }, .joins = &.{ 1, 3 } },
+    .{ .name = "a channel thought after content, its two tokens", .tokens = &.{ "Sure.", "<|channel>", "thought", "\nhmm", "<channel|>", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{5} },
+    .{ .name = "a closer inside one token, bytes returned on both sides", .tokens = &.{ "<think>", "t", "</think>", "a", "b</think>c", "d" }, .listed = &.{ "a", "bc", "d" }, .joins = &.{}, .plain = false },
     .{ .name = "the channel style", .tokens = &.{ "Sure.", "<|channel>thought\n", "hmm", "<channel|>", "Done." }, .listed = &.{ "Sure.", "Done." }, .joins = &.{ 5 }, .plain = false },
 };
 
@@ -1040,6 +1053,33 @@ test "a reply with a thought in the middle lists exactly the bytes its tokens re
         }
     }
     if (bad > 0) return error.ListedWhatWasNotReturned;
+}
+
+test "a constrained reply lists the tokens its content was copied from, never the ones a search for its bytes finds" {
+    // The reasoning holds the payload's own bytes: finding the content in the generation lists the thought's token.
+    const allocator = std.testing.allocator;
+    const rp = @import("reasoning_protocol.zig");
+    var g = try Generation.init(allocator, &.{ "<think>", "{\"a\":1}", "</think>", " ", "{\"a\":1}" });
+    defer g.deinit();
+    var proto = rp.Protocol{ .kind = .bare_think };
+    try std.testing.expect(proto.setOpener("<think>"));
+    try std.testing.expect(proto.setCloser("</think>"));
+    var d = rp.Delivery.init(&proto);
+    defer d.deinit(allocator);
+    d.payload_byte = "<think>{\"a\":1}</think>".len;
+    try d.feed(allocator, g.raw);
+    try d.finish(allocator);
+    try std.testing.expectEqualStrings("{\"a\":1}", d.content.items);
+    const json = try generation_stream.constrainedLogprobsJson(allocator, &g.tok, g.ids, g.lps, &d, 1);
+    defer allocator.free(json);
+    var entries: std.ArrayList([]u8) = .empty;
+    defer freeEntries(allocator, &entries);
+    try addEntries(allocator, json, &entries);
+    // Token 5 (index 4) holds the payload; the space before it is not content.
+    try std.testing.expectEqual(@as(usize, 1), entries.items.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, entries.items[0], .{});
+    defer parsed.deinit();
+    try std.testing.expectApproxEqAbs(@as(f64, -0.5), parsed.value.object.get("logprob").?.float, 1e-6);
 }
 
 test "a reply with a call lists its preamble through the same runs: the join of its parts has no entry" {
