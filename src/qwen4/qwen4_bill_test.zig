@@ -2322,6 +2322,39 @@ test "on Sushi Cooler a restore's admission commit holds the decode regrow its b
     try t.expectEqual(stored, slot_admission.growthCommitAt(&cfg, seq, max_tokens, 8, stored + cold, same, held));
 }
 
+test "on Sushi Cooler a request's bill is its larger phase, the prefill chunk's or the decode regrow's, never their sum" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = coolerFlashNext();
+    const chunk: u64 = cfg.prefillStartWidth();
+    const seq: u64 = 4096;
+    for ([_]bool{ false, true }) |mtp| {
+        const terms = prefillRequestTerms(&cfg, seq, 4096, 8, chunk, .{ .mtp_on = mtp });
+        const regrow = terms.decode_regrow_bytes;
+        try t.expect(regrow > 0);
+        const at = struct {
+            fn bill(c: *const model_mod.ModelConfig, sq: u64, ck: u64, tm: PrefillRequestTerms, r: u64) u64 {
+                var with = tm;
+                with.decode_regrow_bytes = r;
+                return oomBillFor(c, sq, ck, with);
+            }
+        }.bill;
+        // The regrow is a few MB beside a chunk's transient: the prefill phase holds more, so the request bills it alone.
+        errdefer std.debug.print("MTP {}: a {d} B regrow moves the bill {d} B -> {d} B\n", .{ mtp, regrow, at(&cfg, seq, chunk, terms, 0), at(&cfg, seq, chunk, terms, regrow) });
+        try t.expectEqual(at(&cfg, seq, chunk, terms, 0), at(&cfg, seq, chunk, terms, regrow));
+        // Past what the prefill holds the regrow's phase wins, and the bill climbs a byte a byte: the crossover is where the
+        // two phases are equal, and the request's own regrow lies under it.
+        const huge: u64 = 1 << 40;
+        const common = at(&cfg, seq, chunk, terms, huge) - huge;
+        const prefill_phase = at(&cfg, seq, chunk, terms, 0);
+        try t.expect(common < prefill_phase);
+        const cross = prefill_phase - common;
+        try t.expect(regrow < cross);
+        try t.expectEqual(prefill_phase, at(&cfg, seq, chunk, terms, cross));
+        try t.expectEqual(prefill_phase + 1, at(&cfg, seq, chunk, terms, cross + 1));
+    }
+}
+
 test "on Sushi Cooler a reserved request's first chunk bills no growth for the cache its admission commit already holds, so its width holds at every long prompt" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
@@ -2824,7 +2857,7 @@ fn prefillHoldsReply(cfg: *const model_mod.ModelConfig, ctx: u64, prompt: u64, c
     return !warm.mtp_on or KV.heldRows(0, prompt, hold, if (on_engine) &.{} else &dense) >= hold.end;
 }
 
-test "Flash-Next: a request's bill less its decode regrow never falls as its prompt grows within a context, and the regrow alone falls, to nothing, where the prompt's cache already holds its reply, on Cooler and MLX, MTP on and off, across the reservation" {
+test "Flash-Next: a request's prefill phase and its decode phase less the decode transient never fall as its prompt grows within a context, and the regrow alone falls, to nothing, where the prompt's cache already holds its reply, on Cooler and MLX, MTP on and off, across the reservation" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
@@ -2833,7 +2866,8 @@ test "Flash-Next: a request's bill less its decode regrow never falls as its pro
     var regrow_falls: u32 = 0;
     for (&cfgs) |*cfg| for ([_]bool{ false, true }) |mtp| for ([_]u64{ 512, 2048 }) |chunk| for ([_]u64{ 32_768, 40_000, 133_043, 232_471, 467_395 }) |ctx| {
         const warm: WarmPrefix = .{ .mtp_on = mtp };
-        var prev: u64 = 0;
+        var prev_prefill: u64 = 0;
+        var prev_common: u64 = 0;
         var prev_regrow: u64 = 0;
         var prev_p: u64 = 0;
         var p: u64 = 1;
@@ -2841,11 +2875,13 @@ test "Flash-Next: a request's bill less its decode regrow never falls as its pro
             var probe = cfg.*;
             probe.pinned_context = @intCast(ctx);
             const terms = bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm);
+            const phases = bills.requestPhasesFor(&probe, p, @intCast(ctx - p), 8, chunk, warm);
             const regrow = terms.decode_regrow_bytes * terms.uplift_16ths / 16;
-            const rest = splitBill(cfg, ctx, p, chunk, warm) - regrow;
-            if (rest < prev) {
+            // What the decode phase holds past the terms both phases hold: the larger of the regrow and a round.
+            const common = phases.decode - @max(terms.decode_regrow_bytes, terms.round_bytes) * terms.uplift_16ths / 16;
+            if (phases.prefill < prev_prefill or common < prev_common) {
                 falls += 1;
-                if (falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B, {d} B under prompt {d}, regrow aside\n", .{ cfg.model_type, mtp, chunk, ctx, p, rest, prev - rest, prev_p });
+                if (falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B in the prefill and {d} B beside the decode transient, {d} and {d} B at prompt {d}\n", .{ cfg.model_type, mtp, chunk, ctx, p, phases.prefill, common, prev_prefill, prev_common, prev_p });
             }
             // The regrow falls only where the prompt's cache already holds its reply, and to nothing; it is billed exactly where it does not.
             if ((regrow == 0) != prefillHoldsReply(cfg, ctx, p, chunk, warm)) {
@@ -2856,7 +2892,8 @@ test "Flash-Next: a request's bill less its decode regrow never falls as its pro
                 regrow_falls += 1;
                 if (regrow_falls < 10) std.debug.print("{s} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B of regrow, under {d} B at prompt {d}, and not to nothing\n", .{ cfg.model_type, mtp, chunk, ctx, p, regrow, prev_regrow, prev_p });
             }
-            prev = rest;
+            prev_prefill = phases.prefill;
+            prev_common = common;
             prev_regrow = regrow;
             prev_p = p;
         }

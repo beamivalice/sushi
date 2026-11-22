@@ -1312,7 +1312,11 @@ fn contextFits(config: *const model_mod.ModelConfig, ctx: u32, kv_bits: u64, bud
 /// Whether a refusal can name the max_tokens and the context that fit: the resident Sushi EXL3 bill, or an arch's own
 /// request bill (`requestBill`), each priced by `prefillNeededAtChunk` at any prompt and reply.
 fn refusalNamesFigures(config: *const model_mod.ModelConfig) bool {
-    if (model_mod.usesSushiQuantMemoryBill(config)) return true;
+    return model_mod.usesSushiQuantMemoryBill(config) or archBillsRequest(config);
+}
+
+/// Whether the arch prices its own request (`requestBill`): its bill is not the generic one's two phases (`requestPhasesFor`).
+pub fn archBillsRequest(config: *const model_mod.ModelConfig) bool {
     const claimed = arch_spec.of(config) orelse return false;
     return switch (claimed) {
         inline else => |_, tag| @hasDecl(arch_registry.Mod(tag).bill, "requestBill"),
@@ -2182,28 +2186,32 @@ fn oldBuffersInEvalWindow(config: *const model_mod.ModelConfig, tokens: u64, spa
     return tokens *| kv_per_tok / attn *| window;
 }
 
-/// Per-request bytes that scale with the prompt rather than the chunk.
+/// Per-request bytes that scale with the prompt rather than the chunk. Each says the phase that holds it
+/// (`requestPhases`): both, the prefill chunk's alone, or the decode step's alone.
 pub const PrefillRequestTerms = struct {
-    /// Cache capacity reserved at admission beyond `seq * kv_per_tok`: the generation headroom
+    /// Both phases. Cache capacity reserved at admission beyond `seq * kv_per_tok`: the generation headroom
     /// plus a chunk of slack, so no buffer grows during the prefill (#353).
     reserved_kv_bytes: u64 = 0,
-    /// Per-request state the arch keeps outside the KV cache (the qwen4_exp QSA indexer history), at its reserved size.
+    /// Both phases. Per-request state the arch keeps outside the KV cache (the qwen4_exp QSA indexer history), at its reserved size.
     state_bytes: u64 = 0,
-    /// SSM checkpoints the prefill is still holding when it reaches its last chunk.
+    /// Both phases (the checkpoints go to the prefix cache with the request's end). SSM checkpoints the prefill is still
+    /// holding when it reaches its last chunk.
     checkpoint_bytes: u64 = 0,
     /// Bytes of the KV terms above already resident in the buffer the restore handed this slot
     /// (`WarmPrefix`). KV only; subtracted once, in `prefillMemoryNeeded`.
     shared_resident_bytes: u64 = 0,
-    /// Old KV buffers that coexist with the new ones while a warm append, or the grow to the
+    /// The prefill phase's. Old KV buffers that coexist with the new ones while a warm append, or the grow to the
     /// reservation before it, GROWS the cache. Zero when nothing grows, and on every arch that
     /// does not reserve its capacity.
     grow_coexist_bytes: u64 = 0,
-    /// What a decode step's regrow holds beside the grown cache at its peak (`decodeRegrowBytes`), read from the capacity the
-    /// restore holds: Sushi Cooler, where a request does not reserve its whole reply.
+    /// The decode phase's. What a decode step's regrow holds beside the grown cache at its peak (`decodeRegrowBytes`), read
+    /// from the capacity the restore holds: Sushi Cooler, where a request does not reserve its whole reply.
     decode_regrow_bytes: u64 = 0,
+    /// Both phases.
     qsa_ring_bytes: u64 = 0,
+    /// Both phases.
     mtp_head_kv_bytes: u64 = 0,
-    /// The DFlash2 assistant's window and capture rows (`dflashRequestBytes`).
+    /// Both phases. The DFlash2 assistant's window and capture rows (`dflashRequestBytes`).
     dflash_bytes: u64 = 0,
     /// The bill's net over the summed terms, in sixteenths (20 = the historical quarter; 16, none, on Sushi Cooler).
     uplift_16ths: u64 = 20,
@@ -2212,17 +2220,49 @@ pub const PrefillRequestTerms = struct {
     /// `2 · seq · kv_heads · hdim · 2` below, which is exact for every arch
     /// whose caching layers share one head count and one width.
     dequant_scratch_bytes: u64 = 0,
-    /// Sushi Cooler: the bytes each forward row holds at the chunk's peak, from the arch's own buffers
+    /// Prefill phase. Sushi Cooler: the bytes each forward row holds at the chunk's peak, from the arch's own buffers
     /// (`coolerPrefillRowBytes`). Nonzero replaces the fitted envelope and MLX's runtime floor.
     cooler_row_bytes: u64 = 0,
     /// Beside them, the recurrent states a chunk replaces (`ModelConfig.ssmCheckpointBytes`).
     cooler_turnover_bytes: u64 = 0,
-    /// A speculative round's transient (`roundTransientBytes`): the request's transient is the larger of its prefill
-    /// chunk's and its round's.
+    /// The decode phase's. A speculative round's transient (`roundTransientBytes`): the phase's transient is the larger
+    /// of the cache's regrow and the round.
     round_bytes: u64 = 0,
 };
 
-pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
+/// What a request holds at the peak of each of its two phases, each phase's bytes whole (the terms both hold included).
+/// The prefill never coexists with a decode regrow or round: the chunk's buffers are freed before the first decode step,
+/// which grows the cache ahead of its forward (`KVCache.growAhead`). The request needs the larger of the two.
+pub const RequestPhases = struct {
+    prefill: u64,
+    decode: u64,
+
+    pub fn peak(self: RequestPhases) u64 {
+        return @max(self.prefill, self.decode);
+    }
+
+    /// The decode phase is the dearer one (a tie is the prefill's).
+    pub fn decodeWins(self: RequestPhases) bool {
+        return self.decode > self.prefill;
+    }
+};
+
+/// Bytes added to a request's phases after the net (`PrefillRequestTerms.uplift_16ths`): what the forward-width terms
+/// `requestHeldBytes` prices past `prefillMemoryNeeded` hold in the prefill chunk alone, and what both phases hold.
+pub const PhaseExtras = struct {
+    prefill: u64 = 0,
+    both: u64 = 0,
+};
+
+/// The request's bill by phase, the one owner of the split. Held through both phases: the cache at its last row
+/// (`kv`, `reserved_kv_bytes`), the out-of-cache state, the SSM checkpoints, the QSA rings, the MTP head's cache, DFlash2's
+/// window and MLX's runtime floor. The prefill phase adds what a chunk holds: its forward's envelope, the score sheet,
+/// the dense KV rebuild, the dequantized GEMM weights and the old cache buffers a warm grow holds (`grow_coexist_bytes`).
+/// The decode phase adds the largest of the cache's regrow (`decode_regrow_bytes`), a speculative round's transient
+/// (`round_bytes`) and a one-row forward's envelope: the trunk's regrow finishes before the step's forward is built and the
+/// head's runs in the draft that precedes the verify, so none holds another's buffers. A decode step's dense KV rebuild is
+/// below the packed arms' floor (`DECODE_REBUILD_KEYS_MAX` keys) and no phase prices it apart from the chunk's.
+pub fn requestPhases(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms, extra: PhaseExtras) RequestPhases {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
     // scales with min(chunk, seq) — billing the raw chunk cap rejected a
@@ -2236,7 +2276,8 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
         req.dequant_scratch_bytes
     else
         2 * seq * kv_heads * hdim * 2;
-    const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
+    const mlp_row: u64 = 8 * @max(hidden, ffn) * 2;
+    const mlp: u64 = fwd * mlp_row;
     // The MLP envelope alone is not the whole per-token working set: an arch
     // with its own prefill streams (linear-attention layers, MoE gather-sort
     // expansion — `prefillStreamBytesPerToken`) adds to it. Floored at the
@@ -2244,24 +2285,39 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // figure is conservative on plain attention archs and would be a 33%
     // UNDER-bill on a GatedDeltaNet hybrid.
     // An exact Cooler forward's rows, and each linear layer's state replaced beside the old until its pass has run.
-    const envelope: u64 = if (req.cooler_row_bytes > 0) @max(fwd * req.cooler_row_bytes + req.cooler_turnover_bytes, req.round_bytes) else @max(3 * mlp, mlp + fwd * stream_per_tok);
+    const envelope: u64 = if (req.cooler_row_bytes > 0) fwd * req.cooler_row_bytes + req.cooler_turnover_bytes else @max(3 * mlp, mlp + fwd * stream_per_tok);
     const runtime_floor: u64 = if (req.cooler_row_bytes > 0) 0 else PREFILL_RUNTIME_FLOOR_BYTES;
     // The dequant+GEMM prefill route (verify_moe.prefillDqGemm) materializes
     // a bf16 copy of the weight it is about to multiply plus its transpose,
     // and only at forwards wide enough to take that route. Measured against
     // the route off: ~0 at chunk 8192 where the envelope already dominates.
     const dq_weights: u64 = if (fwd >= trunk.PREFILL_DQ_GEMM_MIN_M) dequant_weights else 0;
-    const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.decode_regrow_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + scores + dequant + envelope + dq_weights + runtime_floor;
+    // A decode step is a forward of one row (a round's verify is `round_bytes`).
+    const decode_envelope: u64 = if (req.cooler_row_bytes > 0) req.cooler_row_bytes + req.cooler_turnover_bytes else @max(3 * mlp_row, mlp_row + stream_per_tok);
+    const common: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
+        req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + runtime_floor;
+    const chunk_transient: u64 = req.grow_coexist_bytes + scores + dequant + envelope + dq_weights;
+    const decode_transient: u64 = @max(@max(req.decode_regrow_bytes, req.round_bytes), decode_envelope);
+    // The one place a warm turn's resident rows leave the bill, inside the net.
+    const phases: RequestPhases = .{
+        .prefill = (common + chunk_transient -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.prefill + extra.both,
+        .decode = (common + decode_transient -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.both,
+    };
     // The one place a budget is argued about: every term, so `--log-level debug` on a live box
     // names what a chunk's bill is made of instead of leaving it to be re-derived by hand.
-    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} gross={d}\n", .{
+    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} round={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} extra={d}+{d} | prefill phase={d} decode phase={d} won={s}\n", .{
         seq, fwd, kv_bytes, req.reserved_kv_bytes, req.state_bytes, req.checkpoint_bytes,
-        req.grow_coexist_bytes, req.decode_regrow_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
-        scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, gross,
+        req.grow_coexist_bytes, req.decode_regrow_bytes, req.round_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
+        scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, extra.prefill, extra.both,
+        phases.prefill, phases.decode, if (phases.decodeWins()) "decode" else "prefill",
     });
-    // The one place a warm turn's resident rows leave the bill, inside the net.
-    return (gross -| req.shared_resident_bytes) * req.uplift_16ths / 16;
+    return phases;
+}
+
+/// A request's bill: the larger of its two phases (`requestPhases`), with nothing past the forward-width terms
+/// `requestHeldBytes` adds.
+pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
+    return requestPhases(seq, heads, kv_heads, kv_per_tok, hdim, score_hdim, hidden, ffn, kv_bits, chunk, attn_keys, stream_per_tok, dequant_weights, req, .{}).peak();
 }
 
 /// Per-TOKEN bytes of prefill working set that live OUTSIDE the MLP envelope,
@@ -2798,6 +2854,21 @@ pub fn requestHeldBytes(
     warm: WarmPrefix,
 ) u64 {
     if (archHook("requestBill", u64, config, .{ seq, max_tokens, kv_bits, chunk, warm })) |bill| return bill;
+    return requestPhasesFor(config, seq, max_tokens, kv_bits, chunk, warm).peak();
+}
+
+/// The generic request bill by phase (`requestPhases`), the one every reader of the bill takes its figure from. The
+/// forward-width terms past `prefillMemoryNeeded` (the QSA select's mask, a ringed arch's band sheet, the FP8 and trellis
+/// weight copies, the forward's moments) are the chunk's alone: a decode step is one row, which holds none of them. The
+/// streamed experts' fill and the in-flight buffers of the eval cadence are held by every forward.
+pub fn requestPhasesFor(
+    config: *const model_mod.ModelConfig,
+    seq: u64,
+    max_tokens: u32,
+    kv_bits: u64,
+    chunk: u64,
+    warm: WarmPrefix,
+) RequestPhases {
     const heads: u64 = config.num_attention_heads;
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
@@ -2805,13 +2876,14 @@ pub fn requestHeldBytes(
     const ffn: u64 = prefillFfnWidth(config);
     // The forward terms price the widest forward; the reservation keeps the chunk.
     const fwd = requestForwardRows(config, seq, chunk, warm.matched_tokens);
-    return prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, fwd, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm)) +
-        qsaMaskBilled(config, fwd, seq) +
-        slidingBandScoreBytes(config, fwd) +
-        fp8DequantScratchBytes(config, fwd) +
-        forwardMomentsBilled(config, kv_bits, fwd, seq) +
-        (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
-        cadenceInflightBytes(mlx_mb_per_buffer);
+    return requestPhases(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, fwd, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm), .{
+        .prefill = qsaMaskBilled(config, fwd, seq) +
+            slidingBandScoreBytes(config, fwd) +
+            fp8DequantScratchBytes(config, fwd) +
+            forwardMomentsBilled(config, kv_bits, fwd, seq),
+        .both = (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
+            cadenceInflightBytes(mlx_mb_per_buffer),
+    });
 }
 
 /// The widest forward a request of `seq` tokens, `matched` of them restored, runs at `chunk` (`prefill_plan.widestForward`:
@@ -6343,7 +6415,7 @@ test "bill pin: sushiContextBytesAt and the max-context search" {
     defer launch_state.server_config.max_context_size = saved;
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigs("maxSushiContext", &.{
-        4802232960, 512, 1048576, 1048576, 200000, 3940808280, 512, 1048576,
+        4802232960, 512, 1048576, 1048576, 200000, 3669110880, 512, 1048576,
         1048576, 200000, 3049059800, 512, 1048576, 1048576, 200000, 3195170789,
         512, 1048576, 1048576, 200000,
     }, struct {
@@ -6364,7 +6436,7 @@ test "bill pin: loadServingBill" {
     launch_state.server_config.max_context_size = 100_000;
     try pinConfigsRagged("loadServingBill", &.{
         0, 1, 100000, 4802232960, 1048576, 8, 512, 0,
-        1, 100000, 4209243736, 1048576, 8, 512, 0, 0,
+        1, 100000, 3937546336, 1048576, 8, 512, 0, 0,
         0, 0,
     }, .{ 7, 7, 2, 2 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6522,7 +6594,7 @@ test "bill pin: the unnamed hot-cache ask" {
 test "bill pin: oneSessionEntryBytes and oneSessionFor" {
     try pinConfigs("oneSession", &.{
         2250651648, 2250651648, 36432432640, 5443498496, 1073741824, 2250651648, 1526246400, 1526246400,
-        37161716136, 4714215000, 1073741824, 1526246400, 2052183552, 2052183552, 38071504936, 3804426200,
+        37433413536, 4442517600, 1073741824, 1526246400, 2052183552, 2052183552, 38071504936, 3804426200,
         1073741824, 2052183552, 96290880, 96290880, 37265182747, 4610748389, 1073741824, 96290880,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
@@ -6673,14 +6745,14 @@ test "bill pin: growCoexistBytes and the eval-window terms" {
 
 test "bill pin: prefillNeededAtChunk" {
     try pinConfigs("prefillNeededAtChunk", &.{
-        1161262904, 1180604216, 929714176, 1296062264, 1475779904, 1495121216, 1290853696, 1610579264,
-        1220818744, 1237538616, 927666176, 1352996664, 1535335744, 1552055616, 1288805696, 1667513664,
+        1158641464, 1170118456, 929714176, 1285576504, 1473158464, 1484635456, 1290853696, 1600093504,
+        1215575864, 1227052856, 927666176, 1342510904, 1530092864, 1541569856, 1288805696, 1657027904,
         4598979200, 4892344960, 3701379200, 5036667520, 6443059712, 6740603392, 5545459712, 6884925952,
         5838183040, 6131548800, 4148583040, 6275871360, 7712737792, 8010281472, 6023137792, 8154604032,
-        2075205240, 2094172280, 1896610680, 2094172280, 2645861240, 2664828280, 2551858040, 2664828280,
-        2542006400, 2560973440, 2309959040, 2560973440, 3112662400, 3131629440, 2965206400, 3131629440,
-        3984510040, 4003477080, 2998510040, 4003477080, 6304730200, 6323697240, 5318730200, 6323697240,
-        5726825600, 5745792640, 3870825600, 5745792640, 8091282560, 8110249600, 6235282560, 8110249600,
+        1803507840, 1822474880, 1624913280, 1822474880, 2374163840, 2393130880, 2280160640, 2393130880,
+        2030576000, 2049543040, 1798528640, 2049543040, 2601232000, 2620199040, 2453776000, 2620199040,
+        3712812640, 3731779680, 2726812640, 3731779680, 6033032800, 6051999840, 5047032800, 6051999840,
+        5215395200, 5234362240, 3359395200, 5234362240, 7579852160, 7598819200, 5723852160, 7598819200,
         2172301720, 2172301720, 2089683520, 2356826520, 2729646720, 2729646720, 2729646720, 2914171520,
         2203677440, 2203677440, 2121102080, 2388202240, 2760733440, 2760733440, 2760733440, 2945258240,
         3083302360, 3083302360, 3083302360, 3452351960, 5349401560, 5349401560, 5349401560, 5718451160,
@@ -6698,7 +6770,7 @@ test "bill pin: prefillNeededAtChunk" {
 }
 
 test "bill pin: defaultRequestBill" {
-    try pinConfigs("defaultRequestBill", &.{ 537696256, 1619604096, 1037824640, 3974850117 }, struct {
+    try pinConfigs("defaultRequestBill", &.{ 537696256, 1618195840, 1037824640, 3974850117 }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {
             g.add(defaultRequestBill(c));
         }
@@ -6964,7 +7036,7 @@ test "bill pin: the wire-limit sentences" {
 test "bill pin: the streamed-load fit" {
     try pinConfigs("expertStreaming", &.{
         65536, 1006731264, 4679639040, 3154214912, 1, 0, 65536, 978283392,
-        5642810200, 3125767040, 1, 0, 65536, 585941504, 5012268760, 2733425152,
+        5371112800, 3125767040, 1, 0, 65536, 585941504, 5012268760, 2733425152,
         1, 0, 65536, 64630784, 6293757765, 2212114432, 1, 0,
     }, struct {
         fn run(c: *const PinCfg, g: *PinGot) void {

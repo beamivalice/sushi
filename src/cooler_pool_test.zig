@@ -598,6 +598,117 @@ test "cooler contract: a cold prompt admitted at its 512-row bill holds no more 
     try testing.expect(held <= bill);
 }
 
+test "cooler contract: a Cooler request's bill is its larger phase, the prefill's or the decode's, the pool holds each within the bill's margin, and the dearest regrow of the load's own cache is the term, plain and speculative" {
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    if (!fixtureChosen(selection(), "QWEN4_STQ_TINY")) return error.SkipZigTest;
+    const dir = std.mem.span(std.c.getenv("QWEN4_STQ_TINY") orelse return error.SkipZigTest);
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const a = testing.allocator;
+    const ids = try Q.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(Q, dir, true);
+    defer _ = ld.close();
+    const bills = @import("bills.zig");
+    const KV = @import("kv_cache.zig").KVCache;
+    const pool_class = @import("tensor/pool_class.zig");
+    const s = mlx.engine.stream();
+    const c = &ld.config;
+    const kv = bills.configuredKvQuantFor(c);
+    const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    // The last layer that caches rows: the four small buffers it has not yet grown are what a rebuild's peak leaves.
+    var last_kv: u32 = 0;
+    for (0..c.num_hidden_layers) |li| if (c.isKvPerTokenLayer(@intCast(li))) {
+        last_kv = @intCast(li);
+    };
+    var over: usize = 0;
+    // A reply that regrows the cache from a prompt under the reservation, a short prompt, and a long one with a short reply.
+    for ([_]bool{ false, true }) |spec| for ([_]struct { len: usize, n: u32 }{ .{ .len = 1000, .n = 1500 }, .{ .len = 40, .n = 1200 }, .{ .len = 3000, .n = 64 } }) |req| {
+        const prompt = try a.alloc(u32, req.len);
+        defer a.free(prompt);
+        for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
+        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+        const warm: bills.WarmPrefix = .{ .mtp_on = spec };
+        const phases = bills.requestPhasesFor(c, req.len, req.n, kv_bits, chunk, warm);
+        const terms = bills.prefillRequestTerms(c, req.len, req.n, kv_bits, chunk, warm);
+        try testing.expectEqual(phases.peak(), bills.requestHeldBytes(c, req.len, req.n, kv_bits, chunk, warm));
+        const turn = arch_handle.turnFor(ld.h, c);
+        defer turn.end();
+        defer arch_sched.endRequest(c);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        mlx.engine.close();
+        mlx.engine.trim();
+        const held0 = mlx.engine.poolTotal();
+        mlx.engine.resetPoolPeak(.process);
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, req.n, .{ .temperature = 0.0 }, &.{}, if (spec) Q.specOptions(ld.xfm, 0) else .{});
+        defer gen.deinit(a);
+        mlx.engine.close();
+        const prefill_peak = mlx.engine.poolHeldPeak(.process) -| held0;
+        const prefill_inuse = mlx.engine.poolPeak(.process) -| held0;
+        mlx.engine.resetPoolPeak(.process);
+        // The decode: a plain request regrows its cache ahead of each step as the forward does (`growAhead`), here beforehand so
+        // that the regrow's peak past the grown cache is read alone, beside what the step's own forward holds.
+        var dearest: u64 = 0;
+        var events: usize = 0;
+        var later_most: u64 = 0;
+        var decode_peak: u64 = 0;
+        var decode_inuse: u64 = 0;
+        if (spec) {
+            while (try gen.nextMtp(a)) |r| a.free(r.tokens);
+            mlx.engine.close();
+            decode_peak = mlx.engine.poolHeldPeak(.process) -| held0;
+            decode_inuse = mlx.engine.poolPeak(.process) -| held0;
+        } else while (true) {
+            const cache = &ld.xfm.cache;
+            const entry = &cache.entries[last_kv];
+            const old_rows = KV.bufferCapacity(entry.keys.array);
+            const full = entry.offset + 1 > old_rows;
+            mlx.engine.close();
+            const before = mlx.engine.poolHeldPeak(.process);
+            decode_peak = @max(decode_peak, before -| held0);
+            decode_inuse = @max(decode_inuse, mlx.engine.poolPeak(.process) -| held0);
+            if (full) {
+                mlx.engine.trim();
+                mlx.engine.resetPoolPeak(.process);
+                try cache.growAhead(1, s);
+                mlx.engine.close();
+                const peak = mlx.engine.poolPeak(.process);
+                mlx.engine.trim();
+                dearest = @max(dearest, peak -| (mlx.engine.poolTotal() - mlx.engine.poolFree()));
+                var later: u64 = 0;
+                for ([_]mlx.mlx_array{ entry.keys_scales.array, entry.keys_biases.array, entry.values_scales.array, entry.values_biases.array }) |buf| {
+                    const row = mlx.mlx_array_size(buf) * mlx.mlx_array_itemsize(buf) / KV.bufferCapacity(buf);
+                    later += pool_class.poolBytes(KV.bufferCapacity(buf) * row) - pool_class.poolBytes(old_rows * row);
+                }
+                later_most = @max(later_most, later);
+                events += 1;
+            }
+            if (try gen.next(a) == null) break;
+        }
+        mlx.engine.close();
+        decode_peak = @max(decode_peak, mlx.engine.poolHeldPeak(.process) -| held0);
+        decode_inuse = @max(decode_inuse, mlx.engine.poolPeak(.process) -| held0);
+        // Each phase's peak in use is under its own bill, and the pool holds the buffers it has freed beside them, up to
+        // the bill's one margin: the request needs the larger of the two phases, not their sum.
+        if (prefill_inuse > phases.prefill or decode_inuse > phases.decode or prefill_peak > phases.prefill + bills.BILL_MARGIN_BYTES or decode_peak > phases.decode + bills.BILL_MARGIN_BYTES) {
+            over += 1;
+            std.debug.print("cooler contract: a {d}-token prompt + {d} (MTP {}): the pool had {d} B in use ({d} B held) in the prefill against {d} B, {d} B in use ({d} B held) in the decode against {d} B\n", .{ req.len, req.n, spec, prefill_inuse, prefill_peak, phases.prefill, decode_inuse, decode_peak, phases.decode });
+        }
+        // The dearest regrow the load's own cache makes is the term, to the buffers a rebuild has not yet grown and the size-class sixteenth.
+        if (!spec and (((events > 0) != (terms.decode_regrow_bytes > 0)) or dearest > terms.decode_regrow_bytes or terms.decode_regrow_bytes > dearest + later_most + terms.decode_regrow_bytes / 16)) {
+            over += 1;
+            std.debug.print("cooler contract: a {d}-token prompt + {d}: {d} regrows, the dearest holds {d} B past the grown cache, billed {d} B\n", .{ req.len, req.n, events, dearest, terms.decode_regrow_bytes });
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), over);
+}
+
 test "cooler contract: a speculative request whose reply ends at a cache step grows its KV and its draft head's KV no further than the rows its bill prices" {
     const Q = ContractOf("qwen4");
     if (comptime !@hasDecl(Q, "specOptions")) return error.SkipZigTest;
@@ -1871,7 +1982,7 @@ test "cooler contract: the dearest decode regrow of a request holds beside the g
             offset = @min(KV.bufferCapacity(cache.entries[3].keys.array), seq + max_tokens);
             try fillKvCache(&cfg, &cache, offset);
         }
-        const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
+        const billed = terms.decode_regrow_bytes;
         if (dearest > billed or billed > dearest + later_most + billed / 16) {
             over += 1;
             std.debug.print("cooler contract: a {d}-token prompt + {d}: the dearest regrow holds {d} B past the grown buffers, billed {d} B\n", .{ seq, max_tokens, dearest, billed });
@@ -1945,7 +2056,7 @@ test "cooler contract: the dearest decode regrow of the MTP head's cache holds b
             offset = @min(KV.bufferCapacity(cache.entries[0].keys.array), end);
             try fillHeadCache(&cfg, &cache, offset);
         }
-        const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
+        const billed = terms.decode_regrow_bytes;
         // The peak is the cache's old copies and zero tails whole, which the bill prices at a sixteenth over their size classes.
         if (dearest > billed or billed > dearest + billed / 16) {
             over += 1;
@@ -2032,7 +2143,7 @@ test "cooler contract: the dearest decode regrow of the QSA history holds beside
             target = @min(end_blocks, @as(usize, @intCast(mlx.getShape(pooled[0].array)[1])) + 1);
             if (target == blocks) break;
         }
-        const billed = terms.grow_coexist_bytes + terms.decode_regrow_bytes;
+        const billed = terms.decode_regrow_bytes;
         if (dearest > billed) {
             over += 1;
             std.debug.print("cooler contract: a {d}-token prompt + {d}: the history's dearest regrow holds {d} B past its grown buffers, billed {d} B\n", .{ seq, max_tokens, dearest, billed });

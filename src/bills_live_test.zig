@@ -478,7 +478,7 @@ fn everyArchConfig(fx: *const fixtures.PinFx, glm_dflash: *const model_mod.Model
     return out[0..n];
 }
 
-test "a request's bill less its decode regrow never falls as its prompt grows within a context, and the regrow alone falls only to nothing, every served arch on each engine, MTP on and off, the SSD tier on and off" {
+test "a request's prefill phase and its decode phase less the decode transient never fall as its prompt grows within a context, and the regrow alone falls only to nothing, every served arch on each engine, MTP on and off, the SSD tier on and off" {
     var fx = try fixtures.PinFx.init();
     defer fx.deinit();
     var glm_dflash = try fixtures.glmAssistantFixture();
@@ -494,7 +494,8 @@ test "a request's bill less its decode regrow never falls as its prompt grows wi
             const warm: bills.WarmPrefix = .{ .mtp_on = mtp };
             var probe = c.cfg;
             probe.pinned_context = @intCast(ctx);
-            var prev: u64 = 0;
+            var prev_prefill: u64 = 0;
+            var prev_common: u64 = 0;
             var prev_regrow: u64 = 0;
             var p: u64 = 1;
             // Every prompt near a step a term may take (the forward widths, 256 rows, the reservation, the end).
@@ -502,12 +503,21 @@ test "a request's bill less its decode regrow never falls as its prompt grows wi
                 const terms = bills.prefillRequestTerms(&probe, p, ctx - p, 8, chunk, warm);
                 // A ringed arch bills its rings' compaction at every prompt, which no prompt's capacity holds: that floor is not the regrow.
                 const regrow = (terms.decode_regrow_bytes -| bills.ringCompactionBytes(&probe, 8)) * terms.uplift_16ths / 16;
-                const rest = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm) - regrow;
-                if (rest < prev or (regrow < prev_regrow and regrow != 0)) {
-                    falls += 1;
-                    if (falls < 10) std.debug.print("{s} tier {} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B under the prompt before it, regrow aside, or its regrow falls from {d} to {d} B\n", .{ c.name, tier, mtp, chunk, ctx, p, prev -| rest, prev_regrow, regrow });
+                // An arch that prices its own request has one bill, and no regrow.
+                var prefill: u64 = bills.prefillNeededAtChunk(&probe, p, @intCast(ctx - p), 8, chunk, warm);
+                var common = prefill;
+                if (!bills.archBillsRequest(&probe)) {
+                    const phases = bills.requestPhasesFor(&probe, p, @intCast(ctx - p), 8, chunk, warm);
+                    prefill = phases.prefill;
+                    // What the decode phase holds past the terms both phases hold: the larger of the regrow and a round.
+                    common = phases.decode - @max(terms.decode_regrow_bytes, terms.round_bytes) * terms.uplift_16ths / 16;
                 }
-                prev = rest;
+                if (prefill < prev_prefill or common < prev_common or (regrow < prev_regrow and regrow != 0)) {
+                    falls += 1;
+                    if (falls < 10) std.debug.print("{s} tier {} mtp {} chunk {d} ctx {d}: prompt {d} bills {d} B in the prefill and {d} B beside the decode transient, {d} and {d} B at the prompt before it, or its regrow falls from {d} to {d} B\n", .{ c.name, tier, mtp, chunk, ctx, p, prefill, common, prev_prefill, prev_common, prev_regrow, regrow });
+                }
+                prev_prefill = prefill;
+                prev_common = common;
                 prev_regrow = regrow;
             }
         };
