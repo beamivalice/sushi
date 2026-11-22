@@ -2225,6 +2225,12 @@ pub const PrefillRequestTerms = struct {
     cooler_row_bytes: u64 = 0,
     /// Beside them, the recurrent states a chunk replaces (`ModelConfig.ssmCheckpointBytes`).
     cooler_turnover_bytes: u64 = 0,
+    /// The decode phase's. The request's last key, which a decode step's dense KV rebuild reads up to.
+    decode_keys: u64 = 0,
+    /// The decode phase's. The dense rebuild of a packed cache one decode forward makes (`decodeForwardRows` wide), priced
+    /// as the prefill's is (`kvDequantScratchBytes`); zero = the generic rebuild of the keys below
+    /// `DECODE_REBUILD_KEYS_MAX`. Nothing on an exact Cooler bill: its forward moments hold it.
+    decode_dequant_scratch_bytes: u64 = 0,
     /// The decode phase's. A speculative round's transient (`roundTransientBytes`): the phase's transient is the larger
     /// of the cache's regrow and the round.
     round_bytes: u64 = 0,
@@ -2251,6 +2257,7 @@ pub const RequestPhases = struct {
 /// `requestHeldBytes` prices past `prefillMemoryNeeded` hold in the prefill chunk alone, and what both phases hold.
 pub const PhaseExtras = struct {
     prefill: u64 = 0,
+    decode: u64 = 0,
     both: u64 = 0,
 };
 
@@ -2258,10 +2265,10 @@ pub const PhaseExtras = struct {
 /// (`kv`, `reserved_kv_bytes`), the out-of-cache state, the SSM checkpoints, the QSA rings, the MTP head's cache, DFlash2's
 /// window and MLX's runtime floor. The prefill phase adds what a chunk holds: its forward's envelope, the score sheet,
 /// the dense KV rebuild, the dequantized GEMM weights and the old cache buffers a warm grow holds (`grow_coexist_bytes`).
-/// The decode phase adds the largest of the cache's regrow (`decode_regrow_bytes`), a speculative round's transient
-/// (`round_bytes`) and a one-row forward's envelope: the trunk's regrow finishes before the step's forward is built and the
-/// head's runs in the draft that precedes the verify, so none holds another's buffers. A decode step's dense KV rebuild is
-/// below the packed arms' floor (`DECODE_REBUILD_KEYS_MAX` keys) and no phase prices it apart from the chunk's.
+/// The decode phase adds the larger of the cache's regrow (`decode_regrow_bytes`) and a decode forward: a speculative
+/// round's transient (`round_bytes`) or a one-row envelope, with the forward-width terms (`forwardWidthBytes`, the dense KV
+/// rebuild among them) at the request's last key. The trunk's regrow finishes before the step's forward is built and the
+/// head's runs in the draft that precedes the verify, so neither holds the other's buffers.
 pub fn requestPhases(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms, extra: PhaseExtras) RequestPhases {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
@@ -2297,18 +2304,25 @@ pub fn requestPhases(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim:
     const common: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
         req.qsa_ring_bytes + req.mtp_head_kv_bytes + req.dflash_bytes + runtime_floor;
     const chunk_transient: u64 = req.grow_coexist_bytes + scores + dequant + envelope + dq_weights;
-    const decode_transient: u64 = @max(@max(req.decode_regrow_bytes, req.round_bytes), decode_envelope);
+    const decode_dequant: u64 = if (kv_bits >= 16 or req.cooler_row_bytes > 0) 0 else if (req.decode_dequant_scratch_bytes > 0)
+        req.decode_dequant_scratch_bytes
+    else
+        2 * @min(req.decode_keys, DECODE_REBUILD_KEYS_MAX) * kv_heads * hdim * 2;
+    const decode_forward: u64 = @max(req.round_bytes, decode_envelope) + decode_dequant;
     // The one place a warm turn's resident rows leave the bill, inside the net.
     const phases: RequestPhases = .{
         .prefill = (common + chunk_transient -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.prefill + extra.both,
-        .decode = (common + decode_transient -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.both,
+        .decode = @max(
+            (common + req.decode_regrow_bytes -| req.shared_resident_bytes) * req.uplift_16ths / 16,
+            (common + decode_forward -| req.shared_resident_bytes) * req.uplift_16ths / 16 + extra.decode,
+        ) + extra.both,
     };
     // The one place a budget is argued about: every term, so `--log-level debug` on a live box
     // names what a chunk's bill is made of instead of leaving it to be re-derived by hand.
-    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} round={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} extra={d}+{d} | prefill phase={d} decode phase={d} won={s}\n", .{
+    if (log.enabled(.debug)) log.debug("[bill] prefill seq={d} fwd={d} kv={d} reserved={d} state={d} ckpt={d} coexist={d} regrow={d} round={d} ring={d} mtpkv={d} dflash={d} scores={d} dequant={d} envelope={d} dq={d} floor={d} shared={d} extra={d}/{d}+{d} | prefill phase={d} decode phase={d} won={s}\n", .{
         seq, fwd, kv_bytes, req.reserved_kv_bytes, req.state_bytes, req.checkpoint_bytes,
         req.grow_coexist_bytes, req.decode_regrow_bytes, req.round_bytes, req.qsa_ring_bytes, req.mtp_head_kv_bytes, req.dflash_bytes,
-        scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, extra.prefill, extra.both,
+        scores, dequant, envelope, dq_weights, runtime_floor, req.shared_resident_bytes, extra.prefill, extra.decode, extra.both,
         phases.prefill, phases.decode, if (phases.decodeWins()) "decode" else "prefill",
     });
     return phases;
@@ -2687,6 +2701,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     // Rows the restore hands over without allocating another copy. KV only: the history is
     // privatised on restore (`seedCapBuf`), so crediting it cancelled the one-copy bill outright.
     const credited = warm.creditedRows(reserved);
+    const decode_keys = requestHold(config, seq, max_tokens, chunk, getEffectiveContextLength(config), speculativeRowsPastEnd(config, warm)).end;
     return .{
         // The pool holds each layer's whole cache at its size class, the prompt's rows with the reply's: this prices
         // it whole, less the prompt's raw rows `prefillMemoryNeeded` bills.
@@ -2704,6 +2719,8 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .uplift_16ths = billUplift16ths(config, seq),
         .cooler_row_bytes = coolerPrefillRowBytes(config),
         .cooler_turnover_bytes = config.ssmCheckpointBytes(),
+        .decode_keys = decode_keys,
+        .decode_dequant_scratch_bytes = kvDequantScratchBytes(config, decode_keys, decodeForwardRows(config, warm)),
         .round_bytes = if (speculativeRowsPastEnd(config, warm) > 0) roundTransientBytes(config, seq +| max_tokens +| speculativeRowsPastEnd(config, warm)) else 0,
     };
 }
@@ -2876,14 +2893,31 @@ pub fn requestPhasesFor(
     const ffn: u64 = prefillFfnWidth(config);
     // The forward terms price the widest forward; the reservation keeps the chunk.
     const fwd = requestForwardRows(config, seq, chunk, warm.matched_tokens);
-    return requestPhases(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, fwd, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm), .{
-        .prefill = qsaMaskBilled(config, fwd, seq) +
-            slidingBandScoreBytes(config, fwd) +
-            fp8DequantScratchBytes(config, fwd) +
-            forwardMomentsBilled(config, kv_bits, fwd, seq),
+    const terms = prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm);
+    // A decode forward: the verify block's rows where the request speculates, else one.
+    const rows = decodeForwardRows(config, warm);
+    return requestPhases(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, fwd, config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), terms, .{
+        .prefill = forwardWidthBytes(config, kv_bits, fwd, seq),
+        // The round's own mask is in `round_bytes`.
+        .decode = forwardWidthBytes(config, kv_bits, rows, terms.decode_keys) -| (if (terms.round_bytes > 0) qsaMaskBilled(config, rows, terms.decode_keys) else 0),
         .both = (if (config.expert_streaming) config.expert_fill_peak_bytes else 0) +
             cadenceInflightBytes(mlx_mb_per_buffer),
     });
+}
+
+/// What a forward of `fwd` rows over `keys` holds past `prefillMemoryNeeded`'s terms: the QSA select's mask, a ringed arch's
+/// band sheet, the FP8 and trellis weight copies and the forward's moments (the dense KV rebuild among them on Cooler).
+/// The prefill chunk and the decode step are priced by it alike.
+fn forwardWidthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, keys: u64) u64 {
+    return qsaMaskBilled(config, fwd, keys) +
+        slidingBandScoreBytes(config, fwd) +
+        fp8DequantScratchBytes(config, fwd) +
+        forwardMomentsBilled(config, kv_bits, fwd, keys);
+}
+
+/// The rows a decode step's forward carries: a speculative round's verify block, else one.
+fn decodeForwardRows(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64 {
+    return if (speculativeRowsPastEnd(config, warm) > 0) ROUND_ROWS else 1;
 }
 
 /// The widest forward a request of `seq` tokens, `matched` of them restored, runs at `chunk` (`prefill_plan.widestForward`:

@@ -2201,8 +2201,6 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     const t = std.testing;
     const no_tier = TierGuard.pin(true, 0);
     defer no_tier.restore();
-    const whole_rebuild = qsaWholeRebuildGuard();
-    defer whole_rebuild.deinit();
     qwen4_qsa_select.qsa_score_fused_override = false;
     defer qwen4_qsa_select.qsa_score_fused_override = null;
     // The live session's request on an STQ pack, which Sushi Cooler runs.
@@ -2229,11 +2227,13 @@ test "on Sushi Cooler a bill is the exact bytes held plus one named margin: a re
     try t.expectEqual(exact, held - bills.requestHeldBytes(&cfg, seq, 8192, 8, 2048, .{}));
     // The bill is what it holds and the margin, once.
     try t.expectEqual(held + bills.BILL_MARGIN_BYTES, prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}));
-    // Turn A of the live 364k session as a Cooler load: 15,684 MB exact with the margin, its widest forward's transient
-    // (2,303 rows) from the layers' own rows (`qwen4_bill.PrefillRows`), the whole-sequence KV rebuild beside an
-    // attention layer's rows with V's packed copy (`forwardMomentsBilled`), where its MLX load keeps the calibrated net
-    // (21,067 MB).
-    try t.expectEqual(@as(u64, 15_684), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
+    const whole_rebuild = qsaWholeRebuildGuard();
+    defer whole_rebuild.deinit();
+    // Turn A of the live 364k session as a Cooler load, the packed arms off: 16,346 MB exact with the margin, the decode
+    // step's whole-sequence KV rebuild at the context's last key (`forwardMomentsBilled` at one row) beside an attention
+    // layer's rows, past its widest forward's transient (2,303 rows, `qwen4_bill.PrefillRows`) at the prompt; its MLX load
+    // keeps the calibrated net (21,067 MB).
+    try t.expectEqual(@as(u64, 16_346), prefillNeededAtChunk(&cfg, seq, 421_923, 8, 2048, .{}) >> 20);
 }
 
 /// The bytes a Cooler cache's buffers take from the pool at `kv_rows` of KV and `state_rows` of history: each buffer (K and
@@ -2373,6 +2373,28 @@ test "on Sushi Cooler a request's admission commit is its decode phase's cache p
         try t.expectEqual(bills.cacheCommitBytes(&cfg, seq, max_tokens, 8, chunk, false) + terms.decode_regrow_bytes, got);
         // No prompt under the reservation reserves a chunk: the commit does not follow the width the prefill transient does.
         if (commit) |c| try t.expectEqual(c, got) else commit = got;
+    }
+}
+
+test "on Sushi Cooler a speculative request's decode phase holds its round's dense KV rebuild beside the round, a short prompt with a long reply included" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = coolerFlashNext();
+    const chunk: u64 = cfg.prefillStartWidth();
+    const rows: u64 = @import("../sampler_draw.zig").max_rows;
+    for ([_]struct { seq: u64, n: u32 }{ .{ .seq = 40, .n = 1200 }, .{ .seq = 2000, .n = 4096 } }) |req| {
+        const warm: WarmPrefix = .{ .mtp_on = true };
+        const terms = prefillRequestTerms(&cfg, req.seq, req.n, 8, chunk, warm);
+        const phases = bills.requestPhasesFor(&cfg, req.seq, req.n, 8, chunk, warm);
+        const kv_end = trunk.KVCache.requestEnd(req.seq, req.n, getEffectiveContextLength(&cfg), bills.speculativeRowsPastEnd(&cfg, warm));
+        // What a verify block holds past its rows at the layer that rebuilds the dense KV, at the request's last keys.
+        const rebuild = bills.forwardMomentsBilled(&cfg, 8, rows, kv_end);
+        try t.expect(rebuild > 0);
+        try t.expect(terms.round_bytes > 0);
+        const common = req.seq * kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), 8) + terms.reserved_kv_bytes + terms.state_bytes + terms.checkpoint_bytes +
+            terms.qsa_ring_bytes + terms.mtp_head_kv_bytes + terms.dflash_bytes;
+        errdefer std.debug.print("a {d}-token prompt + {d}: decode phase {d} B, the round {d} B and its rebuild {d} B beside {d} B held\n", .{ req.seq, req.n, phases.decode, terms.round_bytes, rebuild, common });
+        try t.expectEqual(common + @max(terms.decode_regrow_bytes, terms.round_bytes + rebuild), phases.decode);
     }
 }
 
