@@ -12,10 +12,16 @@ scripts that may). Read everything instead: `grep -c PAT >/dev/null`, `sed -n 1p
 the file. tests/guards/pipefail-early-exit.allow holds `<file>:<line> <reason>` for one deliberate hit (a writer
 that is finite and small); an entry that matches nothing, or has no reason, fails. --all ignores the pipefail
 condition and lists every hit.
+
+not-executable: a script under tests/ or scripts/ that starts with a shebang is an entry point the docs and skills run
+bare (`tests/gate.sh`), so its committed mode is 100755 (`git update-index --chmod=+x`): a fresh checkout follows the
+index, not the disk. An untracked script (or a root that is no git repo) is judged by its disk mode. A sourced file is
+exempt by its `# sushi-test: tier=lib` header, and one with no shebang is never run directly.
 """
 import argparse
 import os
 import re
+import subprocess
 import sys
 
 ALLOW = "tests/guards/pipefail-early-exit.allow"
@@ -229,6 +235,26 @@ def shell_files(root):
                     yield os.path.relpath(os.path.join(dp, f), root)
 
 
+def index_modes(root):
+    """{path: git mode} of the tracked files under the scanned dirs; empty when root is no git repo."""
+    p = subprocess.run(["git", "-C", root, "ls-files", "-s", "--", *SCAN_DIRS], capture_output=True, text=True)
+    return {row.partition("\t")[2]: row.split()[0] for row in p.stdout.splitlines()} if p.returncode == 0 else {}
+
+
+def not_executable(root):
+    """The scripts that start with a shebang, are not sourced libs and are not executable: by the index for a tracked
+    file, by the disk for any other."""
+    modes = index_modes(root)
+    for rel in shell_files(root):
+        path = os.path.join(root, rel)
+        with open(path, errors="replace") as f:
+            head = f.read(512)
+        if not head.startswith("#!") or "sushi-test: tier=lib" in head:
+            continue
+        if (modes[rel] != "100755") if rel in modes else not os.access(path, os.X_OK):
+            yield rel
+
+
 def read_allow(root):
     path = os.path.join(root, ALLOW)
     allow = {}
@@ -263,6 +289,10 @@ def check(root, everything):
         elif not reason:
             fail += 1
             print(f"pipefail-early-exit: {ALLOW}: entry {key} has no reason", file=sys.stderr)
+    for rel in not_executable(root):
+        fail += 1
+        print(f"not-executable: {rel}: starts with a shebang but is not executable (index mode, else disk), so a bare run is refused; "
+              f"git update-index --chmod=+x {rel}", file=sys.stderr)
     return 1 if fail else 0
 
 

@@ -225,6 +225,9 @@ and commit the allowlist diff with it. `python3 tests/suite_guards.py` alone che
   fail with 141 although the reader succeeded. Read it all (`grep -c PAT >/dev/null`, `sed -n 1,3p`) or give it the
   file. A deliberate hit (a finite, small writer) goes in `tests/guards/pipefail-early-exit.allow` as
   `<file>:<line> <reason>`; an entry that matches nothing fails.
+  The same tool refuses a script under `tests/` or `scripts/` that starts with a shebang and is not committed as 100755
+  (a bare `tests/gate.sh` fails `permission denied`; a tracked file is read from the index, an untracked one from the
+  disk); a sourced file carries `tier=lib` instead.
 - **The seam is enforced by the type system, not a guard.** `tests/test_arch_drop.sh` compiles the engine without each
   arch and with each arch alone, so shared code that imports one fails to build ([engine-arch-seam](engine-arch-seam.md)).
 

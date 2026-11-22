@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # sushi-test: tier=hermetic
 """Guard for tests/shell_guards.py: each pipefail-early-exit form fails on a planted script in a scratch tree, the near
-misses pass, the allowlist excuses one hit and rejects a stale or reasonless entry, and the repo passes. Stdlib only;
+misses pass, the allowlist excuses one hit and rejects a stale or reasonless entry, a script with a shebang and no x bit
+fails (by the index mode for a tracked one), and the repo passes. Stdlib only;
 a passing run prints nothing.
 
     python3 tests/test_shell_guards.py
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -82,6 +84,7 @@ def put(root, rel, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         f.write(text)
+    os.chmod(path, 0o755 if text.startswith("#!") else 0o644)
 
 
 def expect(cond, what, out=""):
@@ -143,14 +146,64 @@ def allowlist(root):
     os.remove(os.path.join(root, "tests/test_probe.sh"))
 
 
+def modes(root):
+    probe = os.path.join(root, "tests/test_probe.sh")
+    body = "#!/bin/bash\n# sushi-test: tier=hermetic\ntrue\n"
+    put(root, "tests/test_probe.sh", body)
+    os.chmod(probe, 0o644)
+    rc, out = run(root)
+    expect(rc == 1 and "not-executable: tests/test_probe.sh" in out, "red: a shebang script without the x bit fails", out)
+    os.chmod(probe, 0o755)
+    rc, out = run(root)
+    expect(rc == 0 and out == "", "green: the same script executable passes silently", out)
+    put(root, "scripts/tool.sh", "#!/bin/bash\ntrue\n")
+    os.chmod(os.path.join(root, "scripts/tool.sh"), 0o644)
+    rc, out = run(root)
+    expect(rc == 1 and "not-executable: scripts/tool.sh" in out, "red: scripts/ is checked too", out)
+    os.remove(os.path.join(root, "scripts/tool.sh"))
+    for what, rel, text in (
+        ("a sourced lib that keeps a shebang", "tests/lib/helper.sh", "#!/bin/bash\n# sushi-test: tier=lib\ntrue\n"),
+        ("a sourced file with no shebang", "tests/helper.sh", "# sushi-test: tier=lib\ntrue\n"),
+    ):
+        put(root, rel, text)
+        os.chmod(os.path.join(root, rel), 0o644)
+        rc, out = run(root)
+        expect(rc == 0 and out == "", f"green: {what} needs no x bit", out)
+        os.remove(os.path.join(root, rel))
+    os.remove(probe)
+
+
+def committed_mode(root):
+    """A tracked script is judged by the index: +x on the disk with 100644 committed is a fresh checkout's failure."""
+    def git(*a):
+        subprocess.run(["git", "-C", root, "-c", "user.name=t", "-c", "user.email=t@t", *a], check=True, capture_output=True)
+
+    git("init", "-q")
+    probe = os.path.join(root, "tests/test_probe.sh")
+    put(root, "tests/test_probe.sh", "#!/bin/bash\n# sushi-test: tier=hermetic\ntrue\n")
+    os.chmod(probe, 0o644)
+    git("add", "tests/test_probe.sh")
+    os.chmod(probe, 0o755)
+    rc, out = run(root)
+    expect(rc == 1 and "not-executable: tests/test_probe.sh" in out, "red: +x on the disk and 100644 in the index fails", out)
+    git("update-index", "--chmod=+x", "tests/test_probe.sh")
+    os.chmod(probe, 0o644)
+    rc, out = run(root)
+    expect(rc == 0 and out == "", "green: 100755 in the index passes whatever the disk says", out)
+    shutil.rmtree(os.path.join(root, ".git"))
+    os.remove(probe)
+
+
 def main():
     with tempfile.TemporaryDirectory() as root:
         forms(root)
         reported_line(root)
         scope(root)
         allowlist(root)
+        modes(root)
+        committed_mode(root)
     rc, out = run(os.path.dirname(HERE))
-    expect(rc == 0, "the repo passes the pipefail-early-exit guard (use grep -c ... >/dev/null)", out)
+    expect(rc == 0, "the repo passes the shell guards (pipefail-early-exit: grep -c ... >/dev/null; not-executable: chmod +x)", out)
 
 
 main()
