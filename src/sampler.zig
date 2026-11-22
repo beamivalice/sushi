@@ -4,8 +4,6 @@ const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
-const token_mask = @import("token_mask.zig");
-const io_util = @import("io_util.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const think_penalty = @import("think_penalty.zig");
@@ -26,21 +24,8 @@ const mtp_policy = @import("mtp_policy.zig");
 const CallForce = generate.CallForce;
 const Constraint = generate.Constraint;
 const Generator = generate.Generator;
-const SchemaConstraint = generate.SchemaConstraint;
 const tokenArray = generate.tokenArray;
 const verifyArgmax = generate.verifyArgmax;
-
-/// Per-token logprob info (OpenAI format).
-pub const TokenLogprob = struct {
-    token_id: u32,
-    logprob: f32,
-};
-
-/// Logprob result for a single generated token.
-pub const LogprobResult = struct {
-    token_logprob: f32, // logprob of the chosen token
-    top_logprobs: []TokenLogprob, // top N alternatives (caller must free)
-};
 
 pub fn isGreedyTemperature(temperature: f32) bool {
     return temperature < 0.01;
@@ -80,9 +65,7 @@ pub const SamplingParams = struct {
     /// OWNED by the Trunk (`suppress_mask`), non-owning here; wired by
     /// `Generator.initWithOptions` so every sampling path inherits it.
     /// Applied by both samplers and both stochastic-verify filters, fully
-    /// lazy (`mlx_where` + -inf, no host sync); logprobs deliberately keep
-    /// reading the RAW logits — the field reports the model, the mask is
-    /// sampling policy. Null = no suppression (kill switch, no-template
+    /// lazy (`mlx_where` + -inf, no host sync). Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
     /// Overthinking-marker penalty; the Generator's copy tracks the span over its committed ids.
@@ -90,15 +73,14 @@ pub const SamplingParams = struct {
 };
 
 /// Whether a request consumes only each position's argmax: greedy (or top-1), no logit-moving
-/// penalty, no logprobs, no grammar or forced call choosing among ids. Only then may a
+/// penalty, no grammar or forced call choosing among ids. Only then may a
 /// forward serve pruned or shortlisted logits.
-pub fn argmaxOnlyRequest(sampling: SamplingParams, logprobs_n: u32) bool {
+pub fn argmaxOnlyRequest(sampling: SamplingParams) bool {
     return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
         !penaltyActive(sampling) and
         !sampling.think_penalty.active() and
         sampling.constraint == null and
-        sampling.call_force == null and
-        logprobs_n == 0;
+        sampling.call_force == null;
 }
 
 /// Build the `[vocab]` bool suppression mask (true = never sample) on the
@@ -1092,7 +1074,6 @@ pub fn seedKey(sampling: SamplingParams) mlx.mlx_array {
 
 pub const SampleResult = struct {
     token_id: u32,
-    logprob_result: ?LogprobResult = null,
 };
 
 /// A host-decided think penalty for one sample: lower the `mask` ids by `lambda`.
@@ -1100,8 +1081,7 @@ pub const MarkerShift = struct { mask: ?mlx.mlx_array, state: ThinkPenalty };
 
 /// Sample a token from the last position's logits.
 /// temperature < 0.01 (`isGreedyTemperature`): greedy argmax. Otherwise: scale logits, apply top_p, and sample.
-/// If logprobs_n > 0, also computes logprobs for the sampled token and top N alternatives.
-pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: ?[]const u32, logprobs_n: u32, marker_shift: ?MarkerShift, s: mlx.mlx_stream) !SampleResult {
+pub fn sampleToken(logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: ?[]const u32, marker_shift: ?MarkerShift, s: mlx.mlx_stream) !SampleResult {
     const host = mlx.engine.enter(s);
     defer host.end();
     const shape = mlx.getShape(logits);
@@ -1130,9 +1110,7 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
     var current = last_logits;
 
     // Reserved-token suppression — before any other transform, so the greedy
-    // arm below can't draw a suppressed id. `logprobs_logits` stays
-    // `last_logits`: the reported distribution is the MODEL's, so under
-    // suppression rank 1 may legitimately differ from the chosen token.
+    // arm below can't draw a suppressed id.
     var suppressed = mlx.mlx_array_new();
     var suppressed_owned = false;
     defer if (suppressed_owned) {
@@ -1170,12 +1148,7 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
 
     // Greedy if temperature is ~0
     if (isGreedyTemperature(sampling.temperature)) {
-        const token_id = try argmax(current, s);
-        var logprob_result: ?LogprobResult = null;
-        if (logprobs_n > 0) {
-            logprob_result = try computeLogprobs(allocator, last_logits, token_id, logprobs_n, s);
-        }
-        return .{ .token_id = token_id, .logprob_result = logprob_result };
+        return .{ .token_id = try argmax(current, s) };
     }
 
     // Scale logits by 1/temperature
@@ -1193,12 +1166,6 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
         current = scaled;
         scaled_owned = true;
     }
-
-    // Logprobs report the MODEL's distribution, so they read the position's raw
-    // logits — not `current`, which by here carries the client's temperature
-    // (and any penalty) and would make the same token's logprob move with a
-    // sampling knob.
-    const logprobs_logits = last_logits;
 
     // Top-k and top-p in one pass, then min-p
     var filtered = mlx.mlx_array_new();
@@ -1227,194 +1194,7 @@ pub fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling
     var val: i32 = 0;
     try mlx.check(mlx.mlx_array_item_int32(&val, sampled));
 
-    const token_id: u32 = @intCast(val);
-
-    // Compute logprobs after sampling (we now know the token_id)
-    var logprob_result: ?LogprobResult = null;
-    if (logprobs_n > 0) {
-        logprob_result = try computeLogprobs(allocator, logprobs_logits, token_id, logprobs_n, s);
-    }
-
-    return .{ .token_id = token_id, .logprob_result = logprob_result };
-}
-
-/// Logprobs for the FIRST generated token, taken from the prefill's
-/// final-position logits — the one distribution the decode loop never sees.
-/// `chosen` is the id the lazy sampler actually drew, so the reported
-/// `token_logprob` belongs to the token that was really emitted (re-sampling
-/// here would disagree with it at any temperature above 0).
-pub fn firstTokenLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen: u32, logprobs_n: u32, s: mlx.mlx_stream) !?LogprobResult {
-    if (logprobs_n == 0) return null;
-    const host = mlx.engine.enter(s);
-    defer host.end();
-    const shape = mlx.getShape(logits);
-    if (shape.len != 3) return null;
-    var last = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(last);
-    const sq_shape = [_]c_int{ 1, shape[2] };
-    if (shape[1] == 1) {
-        try mlx.check(mlx.mlx_reshape(&last, logits, &sq_shape, 2, s));
-    } else {
-        const start = [_]c_int{ 0, shape[1] - 1, 0 };
-        const stop = [_]c_int{ 1, shape[1], shape[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        var sliced = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sliced);
-        try mlx.check(mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, s));
-        try mlx.check(mlx.mlx_reshape(&last, sliced, &sq_shape, 2, s));
-    }
-    return try computeLogprobs(allocator, last, chosen, logprobs_n, s);
-}
-
-/// Compute log-probabilities from logits. Returns the logprob of the chosen token
-/// and the top N alternatives with their token IDs and logprobs.
-///
-/// `logits` are the MODEL's logits for the position — before temperature,
-/// penalties and top-k/top-p — so the reported distribution is the model's, as
-/// OpenAI's is. Reading them after temperature made every value move with a
-/// knob the client set (and at temp 0 the distribution SATURATES, so most
-/// entries report exactly 0.0).
-///
-/// Ids travel WITH their values through `mlx_argpartition_axis` + a gather.
-/// Recovering them afterwards by scanning the vocab for float equality — what
-/// this did — is ambiguous the moment two logits tie, which under the
-/// saturation above is everywhere: rank 1 was measured to be the chosen token
-/// in 0 of 5 positions on a trivial greedy prompt.
-pub fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
-    if (mlx.engine.isStream(s)) return hostLogprobs(allocator, logits, chosen_token, top_n, s);
-    // log_softmax in f32: `log(softmax(x))` in bf16 lands on bf16's grid (0.125 apart
-    // between -16 and -32), and f16 underflows to -inf.
-    var logits32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logits32);
-    try mlx.check(mlx.mlx_astype(&logits32, logits, .float32, s));
-    var lse = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lse);
-    try mlx.check(mlx.mlx_logsumexp_axis(&lse, logits32, -1, true, s));
-    var log_probs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(log_probs);
-    try mlx.check(mlx.mlx_subtract(&log_probs, logits32, lse, s));
-
-    const lp_shape = mlx.getShape(log_probs);
-    const rank = lp_shape.len;
-    const vocab_size: usize = @intCast(lp_shape[rank - 1]);
-    const k: usize = @min(@as(usize, @min(top_n, 20)), vocab_size);
-
-    // Top-k INDICES, carried alongside their values. Negating turns "k largest"
-    // into the "k smallest" that argpartition puts in the leading slots.
-    var neg = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(neg);
-    try mlx.check(mlx.mlx_negative(&neg, log_probs, s));
-
-    var part_idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(part_idx);
-    try mlx.check(mlx.mlx_argpartition_axis(&part_idx, neg, @intCast(if (k == 0) 0 else k - 1), -1, s));
-
-    var start_buf: [8]c_int = @splat(0);
-    var stop_buf: [8]c_int = @splat(1);
-    var stride_buf: [8]c_int = @splat(1);
-    for (0..rank) |i| stop_buf[i] = lp_shape[i];
-    stop_buf[rank - 1] = @intCast(k);
-
-    var idx_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(idx_k);
-    try mlx.check(mlx.mlx_slice(&idx_k, part_idx, &start_buf, rank, &stop_buf, rank, &stride_buf, rank, s));
-
-    var vals_raw = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vals_raw);
-    try mlx.check(mlx.mlx_take_axis(&vals_raw, log_probs, idx_k, @intCast(rank - 1), s));
-
-    var vals_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(vals_k);
-    try mlx.check(mlx.mlx_astype(&vals_k, vals_raw, .float32, s));
-
-    var ids_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids_k);
-    try mlx.check(mlx.mlx_astype(&ids_k, idx_k, .int32, s));
-
-    try mlx.check(mlx.mlx_array_eval(log_probs));
-    try mlx.check(mlx.mlx_array_eval(vals_k));
-    try mlx.check(mlx.mlx_array_eval(ids_k));
-
-    // Read the logprob of the chosen token from the full array
-    const lp_data = mlx.mlx_array_data_float32(log_probs);
-    const chosen_logprob: f32 = if (lp_data) |ptr|
-        (if (chosen_token < vocab_size) ptr[chosen_token] else -100.0)
-    else
-        -100.0;
-
-    const val_ptr = mlx.mlx_array_data_float32(vals_k);
-    const id_ptr = mlx.mlx_array_data_int32(ids_k);
-
-    var top_logprobs = try allocator.alloc(TokenLogprob, k);
-    errdefer allocator.free(top_logprobs);
-    var filled: usize = 0;
-    if (val_ptr) |vp| {
-        if (id_ptr) |ip| {
-            for (0..k) |i| {
-                const tid = ip[i];
-                if (tid < 0 or @as(usize, @intCast(tid)) >= vocab_size) continue;
-                top_logprobs[filled] = .{ .token_id = @intCast(tid), .logprob = vp[i] };
-                filled += 1;
-            }
-        }
-    }
-    // argpartition leaves the winners UNORDERED; ties break on the lower id so
-    // the ranking is deterministic run to run.
-    std.mem.sort(TokenLogprob, top_logprobs[0..filled], {}, struct {
-        fn lt(_: void, a: TokenLogprob, b: TokenLogprob) bool {
-            if (a.logprob != b.logprob) return a.logprob > b.logprob;
-            return a.token_id < b.token_id;
-        }
-    }.lt);
-
-    if (filled < top_logprobs.len) {
-        top_logprobs = allocator.realloc(top_logprobs, filled) catch top_logprobs;
-    }
-
-    return .{
-        .token_logprob = chosen_logprob,
-        .top_logprobs = top_logprobs,
-    };
-}
-
-/// `computeLogprobs` on the engine's stream: the engine has no logsumexp or argpartition, and a row is one vocabulary
-/// of floats, so the row is read back once and ranked on the host. Values may differ from MLX's in the last bits;
-/// ranks break ties on the lower id.
-fn hostLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_token: u32, top_n: u32, s: mlx.mlx_stream) !LogprobResult {
-    const host = mlx.engine.enter(s);
-    defer host.end();
-    var wide = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(wide);
-    try mlx.check(mlx.mlx_astype(&wide, logits, .float32, s));
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_contiguous(&flat, wide, false, s));
-    try mlx.check(mlx.mlx_array_eval(flat));
-    const shape = mlx.getShape(flat);
-    const vocab: usize = @intCast(shape[shape.len - 1]);
-    const all = mlx.mlx_array_data_float32(flat) orelse return error.MlxArrayDataNull;
-    const row = all[0..mlx.mlx_array_size(flat)][mlx.mlx_array_size(flat) - vocab ..];
-    var peak: f32 = -std.math.inf(f32);
-    for (row) |x| peak = @max(peak, x);
-    var total: f64 = 0;
-    for (row) |x| total += @exp(@as(f64, x) - peak);
-    const lse: f64 = @as(f64, peak) + @log(total);
-
-    const k: usize = @min(@as(usize, @min(top_n, 20)), vocab);
-    const top = try allocator.alloc(TokenLogprob, k);
-    errdefer allocator.free(top);
-    var filled: usize = 0;
-    if (k > 0) for (row, 0..) |x, id| {
-        // Ids arrive ascending, so a value equal to the last kept one ranks below it.
-        if (filled == k and x <= top[k - 1].logprob) continue;
-        var at = if (filled < k) filled else k - 1;
-        while (at > 0 and x > top[at - 1].logprob) : (at -= 1) top[at] = top[at - 1];
-        top[at] = .{ .token_id = @intCast(id), .logprob = x };
-        if (filled < k) filled += 1;
-    };
-    for (top[0..filled]) |*t| t.logprob = @floatCast(@as(f64, t.logprob) - lse);
-    const chosen: f32 = if (chosen_token < vocab) @floatCast(@as(f64, row[chosen_token]) - lse) else -100.0;
-    return .{ .token_logprob = chosen, .top_logprobs = if (filled < k) try allocator.realloc(top, filled) else top };
+    return .{ .token_id = @intCast(val) };
 }
 
 /// Apply a grammar token mask to logits. `mask[i]==true` keeps `logits[i]`,
@@ -1901,8 +1681,8 @@ test "a repeat penalty of 0 or below is off" {
     try testing.expect(!penaltyActive(.{ .repeat_penalty = 0 }));
     try testing.expect(!penaltyActive(.{ .repeat_penalty = -1.5 }));
     try testing.expect(penaltyActive(.{ .repeat_penalty = 0, .presence_penalty = 0.3 }));
-    try testing.expect(!argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 1.1 }, 0));
-    try testing.expect(argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 0 }, 0));
+    try testing.expect(!argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 1.1 }));
+    try testing.expect(argmaxOnlyRequest(.{ .temperature = 0, .repeat_penalty = 0 }));
 }
 
 test "a constrained penalised step picks what sampleToken picks on the same masked logits, penalised once" {
@@ -1926,7 +1706,7 @@ test "a constrained penalised step picks what sampleToken picks on the same mask
         try applyGrammarMask(a, &masked, logits, &allowed, s);
         const sampling = SamplingParams{ .temperature = 0, .presence_penalty = 0.5 };
         const generated = [_]u32{ 0, 3 };
-        const sync = try sampleToken(a, masked, sampling, &generated, 0, null, s);
+        const sync = try sampleToken(masked, sampling, &generated, null, s);
         const lazy = try penalizedSampleLazy(std.heap.page_allocator, masked, sampling, &generated, s);
         defer _ = mlx.mlx_array_free(lazy);
         const got = try samplerTestReadFlat(a, lazy, 1, s);
@@ -2087,7 +1867,7 @@ test "the serial and lazy samplers count every occurrence under frequency_penalt
         .{ .sampling = .{ .temperature = 0, .frequency_penalty = 0.1 }, .want = 1 },
         .{ .sampling = .{ .temperature = 0, .presence_penalty = 0.1 }, .want = 0 },
     }) |c| {
-        const sync = try sampleToken(a, logits, c.sampling, &generated, 0, null, s);
+        const sync = try sampleToken(logits, c.sampling, &generated, null, s);
         const lazy = try penalizedSampleLazy(std.heap.page_allocator, logits, c.sampling, &generated, s);
         defer _ = mlx.mlx_array_free(lazy);
         const got = try samplerTestReadFlat(a, lazy, 1, s);
@@ -2121,7 +1901,6 @@ test "applyPenalties combined penalties" {
 }
 
 test "sampleToken greedy selects argmax" {
-    const allocator = testing.allocator;
     const s = mlx.gpuStream();
 
     // Create logits [1, 1, 5] — 5 vocab entries, token at index 3 has highest
@@ -2131,12 +1910,11 @@ test "sampleToken greedy selects argmax" {
     defer _ = mlx.mlx_array_free(logits);
 
     const params = SamplingParams{ .temperature = 0.0 };
-    const result = try sampleToken(allocator, logits, params, null, 0, null, s);
+    const result = try sampleToken(logits, params, null, null, s);
     try testing.expectEqual(@as(u32, 3), result.token_id);
 }
 
 test "sampleToken with temperature produces valid token" {
-    const allocator = testing.allocator;
     const s = mlx.gpuStream();
 
     const data = [_]f32{ 1.0, 2.0, 3.0 };
@@ -2145,7 +1923,7 @@ test "sampleToken with temperature produces valid token" {
     defer _ = mlx.mlx_array_free(logits);
 
     const params = SamplingParams{ .temperature = 0.5 };
-    const result = try sampleToken(allocator, logits, params, null, 0, null, s);
+    const result = try sampleToken(logits, params, null, null, s);
     // Token should be in valid range
     try testing.expect(result.token_id < 3);
 }
@@ -2310,7 +2088,7 @@ test "min_p: MLX's densities, the host sampler and the lazy sampler keep the rul
         var params = base;
         params.seed = 9;
         for (0..48) |_| {
-            const sync = try sampleToken(a, logits, params, null, 0, null, s);
+            const sync = try sampleToken(logits, params, null, null, s);
             try testing.expect(kept[sync.token_id]);
             try testing.expect(kept[try evalLazyToken(try sampleTokenLazy(logits, params, s))]);
             params.draw +%= 1;
@@ -2378,7 +2156,6 @@ test "batched seeded draws keep per-row keys" {
 }
 
 test "sampleToken from prefill logits (seq_len > 1)" {
-    const allocator = testing.allocator;
     const s = mlx.gpuStream();
 
     // [1, 3, 4] — 3 positions, 4 vocab, should take last position
@@ -2392,7 +2169,7 @@ test "sampleToken from prefill logits (seq_len > 1)" {
     defer _ = mlx.mlx_array_free(logits);
 
     const params = SamplingParams{ .temperature = 0.0 };
-    const result = try sampleToken(allocator, logits, params, null, 0, null, s);
+    const result = try sampleToken(logits, params, null, null, s);
     try testing.expectEqual(@as(u32, 0), result.token_id); // pos 2, index 0 = 9.0
 }
 
@@ -3090,7 +2867,7 @@ test "sampler: on the engine a sampled step, the sync sampler and a block's rows
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         try testing.expectEqual(rule.id, mlx.mlx_array_data_uint32(lazy).?[0]);
-        try testing.expectEqual(rule.id, (try sampleToken(a, step, sampling, null, 0, null, s)).token_id);
+        try testing.expectEqual(rule.id, (try sampleToken(step, sampling, null, null, s)).token_id);
     }
 
     const block = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{ n, V }, 2, .float32);
@@ -3118,13 +2895,9 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     // model-lifetime suppression mask. Contract pinned here: with the mask,
     // neither sampler can return a suppressed id on any of its paths (greedy
     // fast path, greedy general, categorical, sync sampleToken); with a null
-    // mask the same logits DO pick it (red-on-revert); and logprobs keep
-    // reporting the MODEL's raw distribution — the suppressed id still ranks
-    // where the model put it, because the field reports the model while the
-    // mask is sampling policy.
+    // mask the same logits DO pick it (red-on-revert).
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    const allocator = testing.allocator;
 
     const V: usize = 8;
     const mask = try buildSuppressMask(&[_]u32{3}, 0, V, s);
@@ -3149,13 +2922,9 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     const masked_t1 = SamplingParams{ .temperature = 1.0, .suppress_mask = mask };
     try testing.expectEqual(@as(u32, 5), try evalLazyToken(try sampleTokenLazy(logits3, masked_t1, s)));
 
-    // Sync sampler (logprobs/penalty path): same policy, and the reported
-    // distribution stays the model's own — rank 1 is the SUPPRESSED id.
-    const r = try sampleToken(allocator, logits3, masked_sp, null, 2, null, s);
-    const lp = r.logprob_result orelse return error.NoLogprobs;
-    defer allocator.free(lp.top_logprobs);
+    // Sync sampler (the penalty path): the same policy.
+    const r = try sampleToken(logits3, masked_sp, null, null, s);
     try testing.expectEqual(@as(u32, 5), r.token_id);
-    try testing.expectEqual(@as(u32, 3), lp.top_logprobs[0].token_id);
 
     // Stochastic-verify filters: a suppressed draft's acceptance probability
     // must be exactly 0 (always rejected), and the residual it corrects from
@@ -3164,86 +2933,6 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     defer _ = mlx.mlx_array_free(probs);
     try testing.expectEqual(@as(f32, 0.0), try probAt(probs, 3, s));
     try testing.expect(try probAt(probs, 5, s) > 0.99);
-}
-
-test "computeLogprobs: bf16 logits report the exact log-probability" {
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    const raw = [_]f32{ 5, 5, 5, -20 };
-    const a32 = mlx.mlx_array_new_data(&raw, &[_]c_int{ 1, 4 }, 2, .float32);
-    defer _ = mlx.mlx_array_free(a32);
-    var a16 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a16);
-    try mlx.check(mlx.mlx_astype(&a16, a32, .bfloat16, s));
-    const r = try computeLogprobs(testing.allocator, a16, 3, 4, s);
-    defer testing.allocator.free(r.top_logprobs);
-    // -26.0986; the bf16 grid reads -26.125 there.
-    try testing.expectApproxEqAbs(-20.0 - (5.0 + @log(@as(f32, 3.0))), r.token_logprob, 1e-3);
-}
-
-test "computeLogprobs: rank 1 is the argmax and ranks descend, under a tie-saturated distribution" {
-    // The producer used to recover token ids by scanning the whole vocab for
-    // FLOAT EQUALITY with each `mlx_topk` value. Ties make that ambiguous, and
-    // at temp 0 the post-temperature distribution saturates so ties are
-    // everywhere — measured 0/5 positions where rank 1 was the chosen token on
-    // a trivial prompt. The observable contract: with greedy sampling the
-    // chosen token IS the argmax, so rank 1 must equal it.
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    const allocator = testing.allocator;
-
-    // Six exactly-tied entries, then a strict runner-up and a strict max.
-    const data = [_]f32{ 1, 1, 1, 1, 1, 1, 2, 3 };
-    const shape = [_]c_int{ 1, 8 };
-    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(logits);
-
-    const chosen: u32 = 7; // argmax
-    const r = try computeLogprobs(allocator, logits, chosen, 3, s);
-    defer allocator.free(r.top_logprobs);
-
-    try testing.expectEqual(@as(usize, 3), r.top_logprobs.len);
-    try testing.expectEqual(chosen, r.top_logprobs[0].token_id);
-    try testing.expectEqual(@as(u32, 6), r.top_logprobs[1].token_id);
-    try testing.expect(r.top_logprobs[2].token_id < 6);
-    // Strictly descending, and ids distinct.
-    try testing.expect(r.top_logprobs[0].logprob > r.top_logprobs[1].logprob);
-    try testing.expect(r.top_logprobs[1].logprob > r.top_logprobs[2].logprob);
-    try testing.expect(r.top_logprobs[0].token_id != r.top_logprobs[1].token_id);
-    try testing.expect(r.top_logprobs[1].token_id != r.top_logprobs[2].token_id);
-    // The chosen token's own logprob must agree with its rank-1 entry.
-    try testing.expectApproxEqAbs(r.top_logprobs[0].logprob, r.token_logprob, 1e-6);
-}
-
-test "sampleToken: reported logprobs are the model's, not the client's temperature" {
-    // Same prompt, same chosen token, three temperatures used to report three
-    // different logprobs (-0.2129 / -0.0607 / -2.1566 at 0 / 0.6 / 2.0). The
-    // value belongs to the model, so it must not move with a sampling knob.
-    try mlx.requireGpu();
-    const s = mlx.gpuStream();
-    const allocator = testing.allocator;
-
-    const data = [_]f32{ 0, 1, 2, 3 };
-    const shape = [_]c_int{ 1, 1, 4 };
-    const logits = mlx.mlx_array_new_data(&data, &shape, 3, .float32);
-    defer _ = mlx.mlx_array_free(logits);
-
-    // log_softmax([0,1,2,3])[3], computed independently.
-    var denom: f64 = 0;
-    for (data) |v| denom += @exp(@as(f64, v));
-    const expect_top: f32 = @floatCast(3.0 - @log(denom));
-
-    const temps = [_]f32{ 0.0, 0.6, 2.0 };
-    for (temps) |t| {
-        const sp = SamplingParams{ .temperature = t, .seed = 7 };
-        const r = try sampleToken(allocator, logits, sp, null, 2, null, s);
-        const lp = r.logprob_result orelse return error.NoLogprobs;
-        defer allocator.free(lp.top_logprobs);
-        try testing.expectEqual(@as(usize, 2), lp.top_logprobs.len);
-        try testing.expectEqual(@as(u32, 3), lp.top_logprobs[0].token_id);
-        try testing.expectEqual(@as(u32, 2), lp.top_logprobs[1].token_id);
-        try testing.expectApproxEqAbs(expect_top, lp.top_logprobs[0].logprob, 1e-5);
-    }
 }
 
 /// Deterministic Gaussian logits (Box-Muller over an xorshift stream): diffuse
@@ -3768,75 +3457,18 @@ test "serial and MTP agree at the greedy temperature cutoff" {
     }
 }
 
-test "upstream bugfix: constrained logprobs describe the returned token before masking" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const s = mlx.gpuStream();
-    // Each call is the final allowed token, so no model forward is needed. The step still reads the trunk's arch
-    // and think mask, so none of it is left undefined.
-    var cache = try @import("kv_cache.zig").KVCache.init(a, 0);
-    defer cache.deinit();
-    var xfm = std.mem.zeroInit(Trunk, .{ .s = s, .allocator = a, .cache = cache });
-    var bytes = try token_mask.TokenBytes.init(std.heap.ArenaAllocator.init(a), &.{ null, "true", "false", "invalid" }, null);
-    defer bytes.deinit();
-    const parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"type\":\"boolean\"}", .{});
-    defer parsed.deinit();
-    var gen = Generator{
-        .opts = .{},
-        .xfm = &xfm,
-        .ctx = undefined,
-        .tok = undefined,
-        .next_token_id = 0,
-        .step = 0,
-        .max_tokens = 1,
-        .sampling = .{ .temperature = 0 },
-        .prompt_tokens = 0,
-        .completion_tokens = 0,
-        .finish_reason = "length",
-        .done = false,
-        .eos_token_ids = &.{},
-        .generated_ids = .empty,
-        .timeout_ns = 0,
-        .timer = io_util.Stopwatch.init(testing.io),
-        .last_hidden = .{ .ctx = null },
-        .has_last_hidden = false,
-        .logprobs_n = 4,
-    };
-    defer gen.generated_ids.deinit(a);
-    defer if (gen.last_logprob) |lp| a.free(lp.top_logprobs);
-    defer gen.dropPending();
-    for ([_][4]f32{ .{ 0, 2, 1, 4 }, .{ 0, 1, 3, 5 } }, [_]u32{ 1, 2 }) |values, want| {
-        var sc: SchemaConstraint = undefined;
-        try sc.initFromValue(a, parsed.value, &bytes);
-        defer sc.deinit();
-        gen.sampling.constraint = &sc.constraint;
-        gen.max_tokens = gen.step + 1;
-        gen.done = false;
-        gen.pending = .{ .logits = mlx.mlx_array_new_data(&values, &.{ 1, 1, 4 }, 3, .float32) };
-        const expected = try computeLogprobs(a, gen.pending.?.logits, want, 4, s);
-        defer a.free(expected.top_logprobs);
-        try testing.expectEqual(@as(?u32, want), try gen.nextConstrained(a));
-        const got = gen.last_logprob orelse return error.NoLogprobs;
-        try testing.expectApproxEqAbs(expected.token_logprob, got.token_logprob, 1e-6);
-        try testing.expectEqual(@as(u32, 3), got.top_logprobs[0].token_id);
-        try testing.expectEqual(@as(?u32, null), try gen.nextConstrained(a));
-    }
-    try testing.expectEqualSlices(u32, &.{ 1, 2 }, gen.generated_ids.items);
-}
-
 test "argmax-only requests: greedy with nothing that reads past the argmax" {
     const greedy: SamplingParams = .{ .temperature = 0.0 };
-    try std.testing.expect(argmaxOnlyRequest(greedy, 0));
-    try std.testing.expect(argmaxOnlyRequest(.{ .temperature = 0.8, .top_k = 1 }, 0));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.7 }, 0));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }, 0));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .presence_penalty = 0.5 }, 0));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .think_penalty = .{ .lambda = 1 } }, 0));
-    try std.testing.expect(!argmaxOnlyRequest(greedy, 5));
+    try std.testing.expect(argmaxOnlyRequest(greedy));
+    try std.testing.expect(argmaxOnlyRequest(.{ .temperature = 0.8, .top_k = 1 }));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.7 }));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .presence_penalty = 0.5 }));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .think_penalty = .{ .lambda = 1 } }));
     var cf: CallForce = undefined;
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }));
     var c: Constraint = undefined;
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .constraint = &c }, 0));
+    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .constraint = &c }));
 }
 
 test "a lazy penalty allocation failure fails the request instead of sampling unpenalized" {
@@ -3855,13 +3487,13 @@ test "logit bias CPU: rewards and penalties require the full head while zero sta
     for ([_]f32{ -2, 2 }) |delta| {
         const entries = [_]logit_bias.Bias{.{ .id = 1, .delta = delta }};
         const sampling = SamplingParams{ .temperature = 0, .think_penalty = .{ .biases = &entries } };
-        try t.expect(!argmaxOnlyRequest(sampling, 0));
+        try t.expect(!argmaxOnlyRequest(sampling));
         var from_file = sampling;
         from_file.think_penalty.biases = &.{};
         from_file.think_penalty.file_biases = &entries;
-        try t.expect(!argmaxOnlyRequest(from_file, 0));
+        try t.expect(!argmaxOnlyRequest(from_file));
     }
     const zero = [_]logit_bias.Bias{.{ .id = 1, .delta = 0 }};
-    try t.expect(argmaxOnlyRequest(.{ .temperature = 0, .think_penalty = .{ .biases = &zero } }, 0));
-    try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }, 0));
+    try t.expect(argmaxOnlyRequest(.{ .temperature = 0, .think_penalty = .{ .biases = &zero } }));
+    try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }));
 }

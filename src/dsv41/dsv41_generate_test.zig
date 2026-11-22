@@ -172,10 +172,6 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
         try testing.expectEqual(@as(usize, want), list.items.len);
         for (list.items, 0..) |t, i| try testing.expect(std.mem.indexOfScalar(u32, list.items[0..i], t) == null);
     }
-    var logprob_req = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 4, .{ .temperature = 0.8 }, &.{}, .{ .dspark_enabled = true, .logprobs_n = 2 });
-    defer logprob_req.deinit(a);
-    try testing.expect(!logprob_req.dspark);
-    try testing.expectError(error.SpecDecodeUnsupported, logprob_req.nextDspark(a));
 
     // One verified row of a sampled request draws its pending token from the filtered row, not a placeholder.
     var single: std.ArrayList(u32) = .empty;
@@ -769,7 +765,7 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     try testing.expect(active <= baseline + 64 * 1024);
 }
 
-test "dsv41 generator: serial decode serves sampling, penalties and logprobs, one request after another (DSV41_TINY)" {
+test "dsv41 generator: serial decode serves sampling and penalties, one request after another (DSV41_TINY)" {
     try mlx.requireGpu();
     const dsv41_model = @import("dsv41_model.zig");
     const dir = try dsv41_model.fixtureDir();
@@ -794,29 +790,20 @@ test "dsv41 generator: serial decode serves sampling, penalties and logprobs, on
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     const prompt = ids[0..30];
-    const cases = [_]struct { sampling: SamplingParams, logprobs: u32, want: u32 = 12 }{
-        .{ .sampling = .{ .temperature = 0.8, .top_p = 0.9, .top_k = 20, .seed = 5 }, .logprobs = 0 },
-        .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 5 }, .logprobs = 0 },
-        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 0, .want = CACHE_CLEAR_INTERVAL + 8 },
-        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3, .want = CACHE_CLEAR_INTERVAL + 8 },
+    const cases = [_]struct { sampling: SamplingParams, want: u32 = 12 }{
+        .{ .sampling = .{ .temperature = 0.8, .top_p = 0.9, .top_k = 20, .seed = 5 } },
+        .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 5 } },
+        .{ .sampling = .{ .temperature = 0.0 }, .want = CACHE_CLEAR_INTERVAL + 8 },
+        .{ .sampling = .{ .temperature = 0.0, .presence_penalty = 0.5 }, .want = CACHE_CLEAR_INTERVAL + 8 },
     };
     for (cases) |c| {
         var runs: [2]std.ArrayList(u32) = .{ .empty, .empty };
         defer for (&runs) |*r| r.deinit(a);
         for (&runs) |*out| {
             try xfm.resetCache();
-            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, c.want, c.sampling, &.{}, .{ .skip_lazy_preforward = true, .logprobs_n = c.logprobs });
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, c.want, c.sampling, &.{}, .{ .skip_lazy_preforward = true });
             defer gen.deinit(a);
-            gen.logprobs_n = c.logprobs;
-            while (try gen.next(a)) |t| {
-                try out.append(a, t);
-                if (c.logprobs > 0) {
-                    const lp = gen.last_logprob orelse return error.MissingLogprobs;
-                    try testing.expectEqual(@as(usize, c.logprobs), lp.top_logprobs.len);
-                    try testing.expectEqual(t, lp.top_logprobs[0].token_id);
-                    try testing.expectEqual(lp.top_logprobs[0].logprob, lp.token_logprob);
-                }
-            }
+            while (try gen.next(a)) |t| try out.append(a, t);
             if (c.want > CACHE_CLEAR_INTERVAL) try testing.expect(gen.last_cache_clear_step > 0);
         }
         try testing.expectEqual(@as(usize, c.want), runs[0].items.len);
@@ -1049,10 +1036,9 @@ test "dsv41 generator: a one-row decode that hands its logits back unevaluated a
     // A request that reads the logits themselves keeps the evaluated head.
     const kept = m.heads_deferred;
     try xfm.resetCache();
-    var lp = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 8, .{ .temperature = 0.0 }, &.{}, .{ .logprobs_n = 3 });
-    defer lp.deinit(a);
-    lp.logprobs_n = 3;
-    while (try lp.next(a)) |_| {}
+    var penalised = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 8, .{ .temperature = 0.0, .presence_penalty = 0.5 }, &.{}, .{});
+    defer penalised.deinit(a);
+    while (try penalised.next(a)) |_| {}
     try testing.expectEqual(kept, m.heads_deferred);
 }
 
@@ -1439,9 +1425,10 @@ fn censusOf(dir: []const u8, work: *[9]u64, throwaway: bool) ![9]Asked {
     // Once through everything first: the expert cache, the pools and the pipelines are a load's, not a request's.
     const greedy: SamplingParams = .{ .temperature = 0.0 };
     const seeded: SamplingParams = .{ .temperature = 0.8, .top_p = 0.95, .seed = 5 };
+    const penalized: SamplingParams = .{ .temperature = 0.0, .presence_penalty = 0.5 };
     try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
     try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
-    try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
+    try Request.run(&fx, &tok, prompt, penalized, .{ .skip_lazy_preforward = true });
 
     c = try Census.begin();
     try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
@@ -1454,8 +1441,8 @@ fn censusOf(dir: []const u8, work: *[9]u64, throwaway: bool) ![9]Asked {
     work[1] = c.dispatched;
 
     c = try Census.begin();
-    try Request.run(&fx, &tok, prompt, greedy, .{ .skip_lazy_preforward = true, .logprobs_n = 3 });
-    asked[2] = try c.end("serial steps with logprobs");
+    try Request.run(&fx, &tok, prompt, penalized, .{ .skip_lazy_preforward = true });
+    asked[2] = try c.end("serial steps with a penalty");
     work[2] = c.dispatched;
 
     try fx.xfm.resetCache();
@@ -3147,7 +3134,7 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
         try testing.expectEqual(late, mlx.engine.latePipelines());
     };
     // The serial tick, the first token and a round with penalties launch no pipeline the warm did not make.
-    const serial = [_]struct { sampling: SamplingParams, logprobs: u32 = 0, masked: bool = false }{
+    const serial = [_]struct { sampling: SamplingParams, masked: bool = false }{
         .{ .sampling = .{ .temperature = 0.0 } },
         .{ .sampling = .{ .temperature = 0.0 }, .masked = true },
         .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 }, .masked = true },
@@ -3155,14 +3142,12 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
         .{ .sampling = .{ .temperature = 0.8, .top_p = 0.9 } },
         .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.2, .seed = 7 } },
         .{ .sampling = .{ .temperature = 0.0, .presence_penalty = 0.5, .frequency_penalty = 0.3 } },
-        .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7, .repeat_penalty = 1.2, .presence_penalty = 0.5 }, .logprobs = 3 },
-        .{ .sampling = .{ .temperature = 0.0 }, .logprobs = 3 },
+        .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7, .repeat_penalty = 1.2, .presence_penalty = 0.5 } },
     };
     for (serial) |c| for ([_]bool{ true, false }) |skip_lazy| {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 12, c.sampling, &.{}, .{ .skip_lazy_preforward = skip_lazy, .logprobs_n = c.logprobs });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 12, c.sampling, &.{}, .{ .skip_lazy_preforward = skip_lazy });
         defer gen.deinit(a);
-        gen.logprobs_n = c.logprobs;
         if (c.masked) gen.sampling.suppress_mask = mask;
         while (try gen.next(a)) |_| {}
         try testing.expectEqual(late, mlx.engine.latePipelines());
@@ -3363,14 +3348,13 @@ test "dsv41 generator: a thinking bound that fires mid-round cuts it at the seri
     }
 }
 
-test "dspark eligibility: sampled, penalized and thinking-bound requests draft, logprobs do not" {
-    try testing.expect(dsparkEligible(.{ .temperature = 0.0 }, 0));
-    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .top_p = 0.9, .top_k = 40 }, 0));
-    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .repeat_penalty = 1.1 }, 0));
-    try testing.expect(dsparkEligible(.{ .temperature = 0.0, .presence_penalty = 0.5 }, 0));
-    try testing.expect(!dsparkEligible(.{ .temperature = 1.0 }, 3));
+test "dspark eligibility: sampled, penalized and thinking-bound requests draft" {
+    try testing.expect(dsparkEligible(.{ .temperature = 0.0 }));
+    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .top_p = 0.9, .top_k = 40 }));
+    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .repeat_penalty = 1.1 }));
+    try testing.expect(dsparkEligible(.{ .temperature = 0.0, .presence_penalty = 0.5 }));
     var bound = ThinkBound{ .budget = 10, .opener_id = null, .closer_id = 1, .forced = &.{}, .in_think = true };
-    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .think_bound = &bound }, 0));
+    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .think_bound = &bound }));
 }
 
 test "dsv41 generator: a chat prompt's snapshot sits before its last assistant opener, and a restore there runs the two-row tail to the cold tokens (DSV41_TINY)" {
@@ -4305,7 +4289,7 @@ fn opsOver(gen: *Generator, a: std.mem.Allocator, want: usize) !u64 {
     return mlx.engine.mlx_ops - before;
 }
 
-test "dsv41 engine: a request's first token and every serial step put no op on MLX, greedy, seeded, penalized, with logprobs or a mask (DSV41_STQ_TINY)" {
+test "dsv41 engine: a request's first token and every serial step put no op on MLX, greedy, seeded, penalized or with a mask (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
@@ -4324,17 +4308,14 @@ test "dsv41 engine: a request's first token and every serial step put no op on M
     const mask = mlx.mlx_array_new_data(flags.ptr, &[_]c_int{@intCast(m.cfg.vocab)}, 1, .bool_);
     defer _ = mlx.mlx_array_free(mask);
     const filtered: SamplingParams = .{ .temperature = 0.8, .top_p = 0.9, .top_k = 20, .seed = 5 };
-    const cases = [_]struct { sampling: SamplingParams, logprobs: u32 = 0, masked: bool = false, opts: Generator.InitOptions = .{} }{
+    const cases = [_]struct { sampling: SamplingParams, masked: bool = false, opts: Generator.InitOptions = .{} }{
         .{ .sampling = .{ .temperature = 0.0 } },
         .{ .sampling = .{ .temperature = 0.0 }, .masked = true },
         .{ .sampling = filtered, .opts = .{ .skip_lazy_preforward = true }, .masked = true },
         .{ .sampling = .{ .temperature = 0.8 } },
         .{ .sampling = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .seed = 5 }, .opts = .{ .skip_lazy_preforward = true } },
-        .{ .sampling = filtered, .logprobs = 3, .opts = .{ .skip_lazy_preforward = true } },
     };
     for (cases) |c| {
-        var opts = c.opts;
-        opts.logprobs_n = c.logprobs;
         // The first token: the prefill is MLX's, what it is sampled and read with is not.
         {
             try fx.xfm.resetCache();
@@ -4351,16 +4332,11 @@ test "dsv41 engine: a request's first token and every serial step put no op on M
             try mlx.check(mlx.mlx_array_eval(lazy));
             var first: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first, lazy));
-            if (c.logprobs > 0) {
-                const lp = (try sampler.firstTokenLogprobs(a, lg, @intCast(first), c.logprobs, fx.xfm.outStream())).?;
-                a.free(lp.top_logprobs);
-            }
             try testing.expectEqual(before, mlx.engine.mlx_ops);
         }
         try fx.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 12, c.sampling, &.{}, opts);
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 12, c.sampling, &.{}, c.opts);
         defer gen.deinit(a);
-        gen.logprobs_n = c.logprobs;
         if (c.masked) gen.sampling.suppress_mask = mask;
         _ = try opsOver(&gen, a, 2);
         try testing.expectEqual(@as(u64, 0), try opsOver(&gen, a, 8));
@@ -4414,7 +4390,7 @@ test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit b
 }
 
 /// One request on the engine through `mode`, its ids.
-const Mode = enum { serial, serial_lazy, serial_logprobs, rows1, rows3, sweep, adaptive };
+const Mode = enum { serial, serial_lazy, rows1, rows3, sweep, adaptive };
 
 fn engineIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32, sampling: SamplingParams, mode: Mode, out: *std.ArrayList(u32)) !void {
     const a = testing.allocator;
@@ -4423,17 +4399,12 @@ fn engineIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32
     const opts: Generator.InitOptions = switch (mode) {
         .serial => .{ .skip_lazy_preforward = true },
         .serial_lazy => .{},
-        .serial_logprobs => .{ .skip_lazy_preforward = true, .logprobs_n = 3 },
         else => .{ .dspark_enabled = true },
     };
     var gen = try Generator.initWithOptions(io, a, &fx.xfm, tok, prompt, want, sampling, &.{}, opts);
     defer gen.deinit(a);
     switch (mode) {
         .serial, .serial_lazy => while (try gen.next(a)) |t| try out.append(a, t),
-        .serial_logprobs => {
-            gen.logprobs_n = 3;
-            while (try gen.next(a)) |t| try out.append(a, t);
-        },
         else => {
             gen.dspark_diag = switch (mode) {
                 .rows1 => .{ .rows = 1 },
@@ -4529,7 +4500,7 @@ test "dsv41 engine: a seeded request gives the same tokens, the first one includ
     // A one-row decode and a one-row verify differ in the last bits of their logits, so a serial request and a round
     // request are two texts of one seed; each is the same at every mix of its own kind. The first token is one function's.
     // Every round mix is held to the serial text in `a request gives one text serial and in rounds of any width`.
-    const groups = [_][]const Mode{ &.{ .serial, .serial_lazy, .serial_logprobs }, &.{.rows1} };
+    const groups = [_][]const Mode{ &.{ .serial, .serial_lazy }, &.{.rows1} };
     for ([_]SamplingParams{ seeded, penalized }) |sampling| {
         var first: ?u32 = null;
         for (groups) |modes| {
@@ -5603,7 +5574,7 @@ test "dsv41 engine: forwards and requests give the same bytes whatever the pool'
     const prompt = ids[0..30];
     const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 };
     const penalized: SamplingParams = .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .frequency_penalty = 0.3, .seed = 9 };
-    for ([_]Mode{ .serial, .serial_logprobs, .sweep }) |mode| for ([_]SamplingParams{ seeded, .{ .temperature = 0 }, penalized }) |sampling| {
+    for ([_]Mode{ .serial, .sweep }) |mode| for ([_]SamplingParams{ seeded, .{ .temperature = 0 }, penalized }) |sampling| {
         var clean: std.ArrayList(u32) = .empty;
         defer clean.deinit(a);
         try engineIds(&fx, &tok, prompt, 24, sampling, mode, &clean);

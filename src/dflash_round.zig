@@ -43,7 +43,7 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     if (self.done) return null;
     std.debug.assert(self.dflash != null);
     std.debug.assert(self.dflash_ctx != null or self.spec_disabled_runtime);
-    if (mtp_plan.specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+    if (mtp_plan.specDecodeUnsupported(self.sampling)) return error.SpecDecodeUnsupported;
 
     if (self.completion_tokens >= self.max_tokens) {
         self.done = true;

@@ -1086,8 +1086,8 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     std.debug.assert(self.has_last_hidden);
     if (group_planner.enabled() and self.mtp_planner_owned and self.mtp_hidden_stale) return error.MtpHiddenStale;
     // Release-enforced guard (issue #97): the MTP path cannot honor a
-    // grammar constraint or logprobs (compiled-out asserts before).
-    if (mtp_plan.mtpUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+    // grammar constraint (compiled-out asserts before).
+    if (mtp_plan.mtpUnsupported(self.sampling)) return error.SpecDecodeUnsupported;
 
     // `--max-mtp-ctx`, checked at the top of the round against prompt + generated. Sticky
     // (context only grows), routed through the same `spec_disabled_runtime` fallback.

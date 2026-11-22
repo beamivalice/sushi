@@ -326,9 +326,9 @@ pub fn supportsDflash(model: *Trunk) bool {
 }
 
 /// Whether the loaded arch runs DFlash2 rounds on its own model for this request's sampling; false for an arch with none.
-pub fn nativeDflashEligible(xfm: *const Trunk, sampling: anytype, logprobs_n: u32) bool {
+pub fn nativeDflashEligible(xfm: *const Trunk, sampling: anytype) bool {
     switch (xfm.arch) {
-        inline else => |t| return if (comptime @hasDecl(registry.Mod(t).drafter, "nativeEligible")) registry.Mod(t).drafter.nativeEligible(xfm, sampling, logprobs_n) else false,
+        inline else => |t| return if (comptime @hasDecl(registry.Mod(t).drafter, "nativeEligible")) registry.Mod(t).drafter.nativeEligible(xfm, sampling) else false,
     }
 }
 

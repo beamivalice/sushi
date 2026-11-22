@@ -824,8 +824,8 @@ expect_green "Conn's own reads, a reader with arguments, read_state.err, a test,
 
 # rule result-field-free
 tree
-printf '%s\n' 'const A = struct { fn free(a: A, x: []u32) void { _ = a; _ = x; } };' 'const R = struct { token_ids: []u32, logprobs: []u32 };' \
-  'fn f(a: A, r: R) void {' '    defer a.free(r.token_ids);' '    defer a.free(r.logprobs);' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'const A = struct { fn free(a: A, x: []u32) void { _ = a; _ = x; } };' 'const R = struct { token_ids: []u32, text: []u32 };' \
+  'fn f(a: A, r: R) void {' '    defer a.free(r.token_ids);' '}' > "$TMP/t/src/p.zig"
 expect_red "a result's token_ids freed by hand" "src/p.zig:4:13 \[result-field-free\] f: 'token_ids' freed by hand"
 
 tree

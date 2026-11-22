@@ -1024,7 +1024,6 @@ const Group = struct {
         sampling: SamplingParams = .{ .temperature = 0 },
         /// Submitted once this many ticks have run (0: before the first).
         at_tick: u32 = 0,
-        logprobs_n: u32 = 0,
         /// An M-RoPE table of text positions, as a request with an image builds (the row's tokens are not compared).
         mrope: bool = false,
         /// Another model's entry on the same scheduler; null: the served one.
@@ -1071,7 +1070,7 @@ const Group = struct {
                     };
                     table = t;
                 }
-                const slot = try sch.submit(.{ .model = entry, .prompt_ids = r.prompt, .sampling = r.sampling, .eos_token_ids = &.{}, .max_tokens = r.max, .enable_mtp = r.mtp, .mtp = if (r.mtp) head else null, .logprobs_n = r.logprobs_n, .mrope_pos = table, .mrope_total = r.prompt.len });
+                const slot = try sch.submit(.{ .model = entry, .prompt_ids = r.prompt, .sampling = r.sampling, .eos_token_ids = &.{}, .max_tokens = r.max, .enable_mtp = r.mtp, .mtp = if (r.mtp) head else null, .mrope_pos = table, .mrope_total = r.prompt.len });
                 slots[made] = slot;
                 _ = sch.pending.orderedRemove(0);
                 try scheduler.runPrefill(sch, slot);
@@ -1105,7 +1104,7 @@ const Group = struct {
         var sv: Served = undefined;
         try sv.init(ld, dir);
         defer sv.deinit();
-        var one = [_]Req{.{ .prompt = req.prompt, .max = req.max, .mtp = false, .sampling = req.sampling, .logprobs_n = req.logprobs_n, .mrope = req.mrope }};
+        var one = [_]Req{.{ .prompt = req.prompt, .max = req.max, .mtp = false, .sampling = req.sampling, .mrope = req.mrope }};
         var o = try run(&sv, &one);
         defer o.deinit();
         if (o.failed[0]) |e| {
@@ -1190,11 +1189,10 @@ test "cooler contract: a request that cannot join the planner's tick leaves the 
                 t.* = ids[(i * (r + 3) + 5 * r + 1) % ids.len];
             };
             // Each third row has a reason of its own to decode outside the planner: a penalty its plain tick does not
-            // sample, logprobs it does not return, a position table it does not read, a context so much longer than
+            // sample, a position table it does not read, a context so much longer than
             // its neighbours' that padding them to it wastes the verify.
             const thirds = [_]struct { name: []const u8, req: Group.Req }{
                 .{ .name = "penalty", .req = .{ .prompt = bufs[2][0..51], .max = 120, .sampling = .{ .temperature = 0, .presence_penalty = 0.5 } } },
-                .{ .name = "logprobs", .req = .{ .prompt = bufs[2][0..51], .max = 120, .mtp = false, .logprobs_n = 3 } },
                 .{ .name = "mrope", .req = .{ .prompt = bufs[2][0..51], .max = 120, .mrope = true } },
                 .{ .name = "pad waste", .req = .{ .prompt = bufs[2][0..650], .max = 120 } },
             };

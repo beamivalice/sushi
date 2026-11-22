@@ -29,7 +29,6 @@ test {
     _ = @import("tool_reading.zig");
     _ = @import("reply.zig");
     _ = @import("tool_progress.zig");
-    _ = @import("listed_tokens.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("template_oracle_test.zig");
     _ = @import("template/template.zig");

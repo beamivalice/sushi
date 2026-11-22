@@ -63,7 +63,7 @@ fn mtpCrowdable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!slot.enable_mtp or gen.mtp == null or gen.mtp_cache == null or !gen.has_last_hidden) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
+    if (slot.sampling.constraint != null or sampler.penaltyActive(slot.sampling)) return false;
     const t = arch_handle.trunk(slot.model.handle orelse return false);
     if (!mimo_forward.supportsBatchedMimoDecode(t)) return false;
     return sched_policy.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;

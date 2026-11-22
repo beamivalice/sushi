@@ -1,7 +1,7 @@
 # Server: HTTP APIs, streaming, sampling and constrained output
 
 What each HTTP surface promises its clients: the OpenAI chat/completions/Responses and Anthropic Messages contracts,
-streaming and usage chunks, logprobs, seeds and sampling, reasoning budgets and constrained JSON, plus the agent
+streaming and usage chunks, seeds and sampling, reasoning budgets and constrained JSON, plus the agent
 launcher. Read this before touching `src/server.zig`, `src/http.zig`, `src/request_parse.zig`, `src/http_conn.zig`, `src/anthropic.zig`, `src/responses_api.zig`, `src/completions.zig`, `src/generation_stream.zig`, `src/request_policy.zig`, `src/responses.zig`, `src/launch.zig` or the sampler.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](server-tool-calling.md),
@@ -176,8 +176,7 @@ answers while the weights load:
 - Chat usage reports `completion_tokens_details.reasoning_tokens` by tokenizing concatenated delivered reasoning; streaming includes it only with `stream_options.include_usage`.
 
 - **A stream and a non-stream answer are the SAME BYTES**; whitespace is the one thing a stream may withhold: a
-  leading run of a content part, inside its first token too (`streamContentLead`, `ContentStream`; a logprobs entry lists only
-  the bytes returned, on both), and a token's trailing whitespace until text follows (`ContentStream`). The held
+  leading run of a content part, inside its first token too (`streamContentLead`, `ContentStream`), and a token's trailing whitespace until text follows (`ContentStream`). The held
   tail ships at the end of the reply unless the non-stream reply trims it: after a closed thought, or before tool
   markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a thought cut to a token budget after the fact ends on a whole character (`reasoningWithinBudget` drops the half a token cut); a tool-call reply, streamed or not,
   carries the pre-markup text (`visibleToolPreamble`; Responses lists it as a message item ahead of its `function_call`s,
@@ -221,7 +220,7 @@ answers while the weights load:
   `providers.streamFirstEventTimeoutSeconds` controls it, with zero allowing unlimited initial buffering.
   `--timeout` remains a token-progress STALL timeout (`degenerate.StallClock`).
 - **NO string built from model bytes is guaranteed UTF-8**: sanitizing lives INSIDE the escaper (`chat.utf8Next`
-  under every `jsonEscape`/`appendJsonString`); logprobs `bytes` keeps the exact bytes. Hand-written error text is
+  under every `jsonEscape`/`appendJsonString`); Hand-written error text is
   escaped at the SINK.
 - **A refusal's text reaches the client whole, on every surface and the WebSocket**: `mapGenerationError`,
   `loadRefusalMessage` and `memoryContextRefusalMessage` allocate their message, never a caller's fixed buffer with a
@@ -239,9 +238,9 @@ Ported from [mlx-serve #673](https://github.com/ddalcu/mlx-serve/pull/673). Sock
 length-framed responses and shutdown; `tests/test_responses_streaming.sh` also waits past the TCP FIN timeout
 before reading a completed stream and requires clean EOF.
 
-## Seeds, logprobs, sampling
+## Seeds, sampling
 
-- **A `GenerationResult` owns its text, token ids and logprobs together**: every receiver frees it with `deinit`, never a field at a time (lint `result-field-free`).
+- **A `GenerationResult` owns its text and token ids together**: every receiver frees it with `deinit`, never a field at a time (lint `result-field-free`).
 - **A `seed` binds EVERY sampler with a fresh key PER DRAW** (`sampler.seedKey`).
 - <a id="sampled-draw"></a>**On Sushi Cooler a sampled token is one kernel's draw** (`sampler_draw.zig`,
   `sampler.engineDraws`), a serial step's, a DSpark row's and an MTP verify row's alike. Its rule, which `hostDraw`
@@ -255,24 +254,9 @@ before reading a completed stream and requires clean EOF.
   of the rule.
   Joined rows of several requests under one sampler draw in one call, each row under its own request's root and draw
   index (`sampler.sampleRowsLazy`): a draw on the engine never takes a shared or absent key, which it refuses (#106).
-- Logprobs are the MODEL's distribution (pre-temperature), ids travel WITH values, entry belongs to the RETURNED
-  token (one-token delay); `logprobs.content` describes `message.content` (`contentTokenRange`); streaming logprobs
-  are a SIBLING of `delta` shipped EXACTLY once against a high-water mark. logprobs>0 + grammar disable spec.
-- **Logprobs list exactly the tokens whose bytes the reply returns**, chat and legacy completions, streamed or not
-  (`listed_tokens.Listing`): a stop's own tokens (the stop gate's `released` bytes) and a thought the reply does not ship
-  are never listed, and a chunk with no content (the final one) lists only what sent content left behind. A tool call's tokens
-  are never listed either: a streamed call chunk carries no logprobs, and a non-streamed reply with calls lists its preamble, `null` without one.
-  A token a stop or a trimmed lead cut into is listed with only the bytes the reply returned (`token`, `bytes`, `text_offset`), its
-  `logprob` the whole token's and its alternatives untrimmed; a stream lists a token once all its bytes have shipped (a stop's hold-back and the content arm's withheld trailing whitespace
-  included), and the token a stop or a trimmed tail ends on at the end of the reply. `Listing` owns the cut (`Range.head`/`tail`) and stream and non-stream list the same entries.
-  Content may hold a "\n" joining two content parts around a thought; no token carries it, so no logprobs entry lists it (a `logprob: null` entry would fail the strictly typed clients that read the field as a number), and the listed `bytes` join to the returned content less exactly those joins. A stream ships the join as a content delta of its own (`logprobs.content` an empty list when logprobs were asked, no logprobs field otherwise), ahead of the next part's delta, so a delta's entries are the tokens of its own bytes.
-  Stream and non-stream both list through `reply.Settled.provenance` (`think_tags.normalizeEmbeddedThinkBlocksMapped`: each content run's source range in the generation, or the join), never the rewritten text's offsets. Legacy completions return the raw continuation (no thought, no join), so `text_offset` indexes the returned text. Messages and Responses list no logprobs. A constrained reply's content is the delivery's copy, so it lists through its one run (`Delivery.content_at`, `constrainedLogprobsJson`) and a content that is no slice of the text is refused, never searched for; a token with returned bytes on both sides of cut bytes (a closer inside it) lists once, without them (`Listing.gaps`). A channel thought opens after content as before it (the `<|channel>` marker arms the next `thought` token wherever it lands).
-- **`logprobs: true` (chat) or an integer `logprobs` (legacy) turns logprobs on, whatever the alternatives count**: `top_logprobs`
-  absent or 0 lists the sampled token with an empty alternatives list (`request_parse.Logprobs`; the engine ranks at least one
-  candidate, `engineN`, and the reply lists `top` of them).
-- Logprobs are `logits - logsumexp` in f32 (`sampler.computeLogprobs`): `log(softmax)` in bf16 lands on bf16's grid, 0.125
-  apart between -16 and -32. On DeepSeek on Sushi Cooler the engine has no logsumexp or argpartition, so the row is read
-  back once and ranked on the host (f64 sum): ids and order are MLX's (ties by the lower id), values may differ in the last bits.
+- **Logprobs are not served**: `logprobs`, `top_logprobs` and Responses' `include` of `message.output_text.logprobs` are refused
+  (the sampling-fields table below), so no decode path computes, carries or lists one, and a reply's `logprobs` is `null`. A
+  stream's chat chunks carry no `logprobs` key, the legacy completions' chunks carry `"logprobs":null` as OpenAI's do.
 - Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded.
 - <a id="sampling-fields"></a>**The sampling fields, in the order they apply** (llama.cpp's default chain, with
   temperature first as vLLM does, so min-p reads probabilities after temperature). A field another server reads that
@@ -312,14 +296,13 @@ before reading a completed stream and requires clean EOF.
   built for a JSON writer or declared as a struct, and an `ErrorEnvelope` made by hand (`ErrorEnvelope{`, `: ErrorEnvelope = .{`); a reader declares its `error` field optional.
 - **A field the server reads is used or refused by name, never read as absent** (`request_parse.generationFieldFault`,
   one check for chat, completions, Messages and Responses; `chatFieldFault` adds roles, `response_format.type`, `tools`,
-  `tool_choice` (an object is a mode `parseToolChoice` honours, none, auto, any or required, or a function or tool it names; `allowed_tools` is refused by name) and chat's boolean `logprobs`, `responsesFieldFault` the Responses
+  `tool_choice` (an object is a mode `parseToolChoice` honours, none, auto, any or required, or a function or tool it names; `allowed_tools` is refused by name) and chat's `logprobs` (refused unless false), `responsesFieldFault` the Responses
   strings (`instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`), `truncation` (auto or
-  disabled) and `max_tool_calls` (on `/v1/responses/compact` too; the envelope echoes the whole number accepted, `3.0` as 3), `completionsFieldFault` the legacy integer `logprobs`): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
-  float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties and `top_logprobs` take a number; `stop` a string or
+  disabled) and `max_tool_calls` (on `/v1/responses/compact` too; the envelope echoes the whole number accepted, `3.0` as 3), `completionsFieldFault` the legacy integer `logprobs`, refused at any value): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
+  float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties take a number; `stop` a string or
   strings; `kv_quant` `off|0|4|6|8|16`; every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000
-  (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `top_logprobs`
-  and the legacy `logprobs` 0..20, `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
+  (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
   and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),
   `reasoning_budget_tokens` and `thinking.budget_tokens` 32-bit integers. A `max_tokens` past what
   the window leaves after the prompt is the one value that is cut, not refused (clients such as Claude Code send 64000 on
@@ -338,7 +321,7 @@ before reading a completed stream and requires clean EOF.
   `top_p` 0 is GREEDY (`sampler.applyTopP` floors at `floatMin(f32)`).
 - Min-p is the one filter that cuts by VALUE (`sampler.applyMinP`, compared in f32): its definition keeps every id
   tied with the threshold, so `min_p` 1 keeps every id tied at the top.
-- A sampler never draws a RESERVED special or PADDING row (`Tokenizer.bindTemplate` derives the set, `sampler.installSuppressMask` applies it; logprobs stay RAW).
+- A sampler never draws a RESERVED special or PADDING row (`Tokenizer.bindTemplate` derives the set, `sampler.installSuppressMask` applies it).
 - **A non-streaming `/v1/completions` reply carries the chat reply's `timings`** (`prompt_n`, `cached_n`, `prompt_ms`, `predicted_ms`; `prompt_ms` includes the prefix restore); `sushi bench` reads it.
 - **A text `/v1/completions` prompt is encoded raw, plus the model's own opening id** (`ModelConfig.textPromptBosId`: DeepSeek's BOS, which its chat template writes literally; its base model answers EOS at once without it). Other families add none, and Qwen's config "BOS" is `<|endoftext|>`.
 - **`ignore_eos: true`** (vLLM's field) decodes a `/v1/completions` request past EOS to `max_tokens`
@@ -346,7 +329,7 @@ before reading a completed stream and requires clean EOF.
   (`completionShowsToken`, vLLM's default `skip_special_tokens`). Chat refuses it with a named 400
   (`chatIgnoreEosRejectReason`): past its end of turn the model writes another turn, and that turn's think block is
   merged into the reasoning by the non-stream reply (`normalizeEmbeddedThinkBlocks`) but not by the live stream.
-- **A repeat/presence/frequency penalty samples on the synchronous serial path** (`samplesSync`, like logprobs): no DFlash or
+- **A repeat/presence/frequency penalty samples on the synchronous serial path** (`samplesSync`): no DFlash or
   drafter path (`mtp_plan.draftsRefused`), no batched tick (`.penalty`), never the lazy pipeline, which never applied it.
   MTP does run: each verify row carries the penalty ([engine-mtp](engine-mtp.md#spec-verify-invariant)).
   A penalty-mask allocation failure fails the request instead of sampling without its penalty. Chat and
@@ -357,7 +340,7 @@ before reading a completed stream and requires clean EOF.
   while the thought is open every single-token spelling of the paper's markers (bare or space-led, lower or capital)
   loses λ; a split spelling is skipped (its first piece starts other words). The paper penalises everywhere; we stop
   at the closer. Every sampled position, serial or verify row, is shifted by its own prefix (`thinkShifted`,
-  `thinkShiftRows`), so greedy MTP keeps serial's bytes; logprobs stay RAW.
+  `thinkShiftRows`), so greedy MTP keeps serial's bytes.
 
 
 ## Experimental logit bias
@@ -386,7 +369,7 @@ The load line reports the file, entry count, expanded ids and skipped spellings.
 `/v1/chat/completions` and `/v1/completions` accept OpenAI `logit_bias`, a map such as `{"1234":-2}`. These deltas
 apply to all positions and add to file entries and the optional think-penalty preset. Invalid ids, nonnumeric or
 out-of-range biases return 400; `null` and `[]` mean no bias. `think_penalty: 0` disables the preset only; file and request biases still apply.
-Overlapping entries add. Sampling uses shifted logits; returned logprobs remain raw.
+Overlapping entries add. Sampling uses shifted logits.
 
 Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
 head, including positive rewards. Serial, MTP, prompt-lookup and GLM DFlash2 rows apply the same prefix-dependent
@@ -449,14 +432,13 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
 
 ## Constrained JSON
 
-- Constrained generation reports each returned token against its raw logits before the grammar mask, including forced choices; those logprobs have no one-token delay.
 
 - The payload offset is AUTHORITATIVE (`reasoning_protocol.Delivery`, all surfaces, stream + non-stream).
 - The grammar mask never walks the whole vocabulary (`token_mask.buildMask`); every grammar state has a legal byte;
   no whitespace OUTSIDE the root value, the model's OWN layout inside (`MAX_FREE_WS` 16).
 - A root number ends only at EOS, so it is complete once terminable; the empty-mask disable in `nextConstrainedToken`
   is the logged last resort (a new dead end gets a schema in the `no reachable grammar state is a dead end` test).
-- DeepSeek's DSpark verifies each row under that row's mask (`row_grammar.zig`), before and after the reasoning close; logprobs and forced calls still disable spec.
+- DeepSeek's DSpark verifies each row under that row's mask (`row_grammar.zig`), before and after the reasoning close; forced calls still disable spec.
 - Every schema-mask surface uses ONE thinking policy (`schemaMasksThinking`); tools present = no mask. Per-model
   grammar table lives on `LoadedModel`.
 - The parser owns what the grammar enforces (`json_schema.parseExplained`): it refuses by name a schema no value can

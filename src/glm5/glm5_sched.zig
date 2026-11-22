@@ -135,7 +135,7 @@ pub fn writeThrough(
 }
 
 pub fn nativeDflashArmed(slot: *const Slot) bool {
-    return rows_tick.glmNativeDflashArmed(true, slot.enable_drafter, slot.dflash != null, slot.sampling, slot.logprobs_n);
+    return rows_tick.glmNativeDflashArmed(true, slot.enable_drafter, slot.dflash != null, slot.sampling);
 }
 
 pub fn thoughtGrid(gen: *const Generator) ?u32 {

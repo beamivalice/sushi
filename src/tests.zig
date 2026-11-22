@@ -55,7 +55,6 @@ test {
     _ = @import("request_media.zig");
     _ = @import("request_policy.zig");
     _ = @import("models_api.zig");
-    _ = @import("logprobs.zig");
     _ = @import("model.zig");
     _ = @import("owned_weights.zig");
     _ = @import("cooler_contract_test.zig");

@@ -310,7 +310,7 @@ fn plannerRowFits(sch: *const Scheduler, slot: *Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     // M-RoPE positions are a table the grouped rows do not read.
     if (arch_state.mropeOf(&gen.ctx.arch_ctx) != null) return false;
-    // Logprobs, a grammar, a forced call, a head release still to land: a slot that is neither a plain batchable row
+    // A grammar, a forced call, a head release still to land: a slot that is neither a plain batchable row
     // nor an MTP row the planner groups.
     const why = sch.batchVerdict(slot);
     return why == .ok or (why == .spec_active and slotMtpGroupable(slot));

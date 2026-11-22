@@ -13,7 +13,7 @@
 # nospec (enable_mtp and enable_drafter false). GLM serves an affine8 MLA latent with DFlash2 and no MTP: it refuses
 # kv4 by name, and kv8 is its default, so its cells are default, off and nospec. DeepSeek has no KV cache and streams its experts, so its
 # cells are default and nospec. GLM has no thinking-off mode: it asks reasoning_effort low and skips "thinking off".
-# Per cell: chat non-stream/stream, thinking on/off, tools, json_schema, logprobs, max_tokens cap, ignore_eos
+# Per cell: chat non-stream/stream, thinking on/off, tools, json_schema, logprobs refused, max_tokens cap, ignore_eos
 # (completions: stream == non-stream; chat: 400), 2-way concurrency, /v1/completions (an empty prompt 400s),
 # /v1/messages (both modes), /v1/responses (both modes), /v1/models, /metrics.json. Prefix-cache reuse has its own
 # live tests (test_prefix_cache_ssd_default.sh, test_prefix_cache_mem.sh).
@@ -145,7 +145,7 @@ print(json.dumps({"c":c,"rc":rc}))' 2>/dev/null)
     c=$(echo "$r" | J 'd["choices"][0]["message"]["content"]')
     check "json_schema: content parses with both keys" "$(echo "$c" | py 'import sys,json;d=json.load(sys.stdin);assert "name" in d and "age" in d' && echo 0 || echo 1)" "${c:0:120}"
 
-    # 6. max_tokens cap, then logprobs (entries describe message.content, so they need a finished answer)
+    # 6. max_tokens cap, then logprobs refused
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":5,\"temperature\":0}")
     # A model that finishes under the cap (Spark: "Blue") reports stop; the invariant is the cap.
     fr=$(echo "$r" | J 'd["choices"][0]["finish_reason"]')
@@ -168,11 +168,9 @@ print(repr(t))' 2>/dev/null)
     check "ignore_eos: completion stream == non-stream bytes" "$([[ -n "$c" && "$c" == "$rc" ]] && echo 0 || echo 1)" "ns=${c:0:120} st=${rc:0:120}"
     r=$(status /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"ignore_eos\":true}")
     check "ignore_eos: chat refuses it with a 400" "$([[ "$r" == 400 ]] && echo 0 || echo 1)" "status=$r"
-    r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":600,\"temperature\":0,\"logprobs\":true,\"top_logprobs\":2,\"enable_thinking\":false}")
-    c=$(echo "$r" | J 'd["choices"][0]["message"]["content"] or ""')
-    if [[ -z "$c" ]]; then skip "logprobs: entries with top_logprobs" "no content to describe"
-    else
-    check "logprobs: entries with top_logprobs" "$([[ "$(echo "$r" | J 'len(d["choices"][0]["logprobs"]["content"][0]["top_logprobs"])')" == 2 ]] && echo 0 || echo 1)" "$(echo "$r" | J 'str(d["choices"][0].get("logprobs"))[:120]')"; fi
+    # logprobs are not served: a request that asks is a 400 naming the field.
+    r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"logprobs\":true,\"top_logprobs\":2}")
+    check "logprobs: refused with a 400 naming the field" "$([[ "$(echo "$r" | J 'd["error"]["message"]')" == *"'logprobs'"* ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 200)"
 
     # 7. concurrency: two at once
     post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Count from one to twenty in words.\"}],\"max_tokens\":600,\"temperature\":0}" > "$WORK/c1.json" &

@@ -107,7 +107,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
 - Qwen3.8-Flash-Next's DFlash2 drafter verifies through the same forward, per-position capture and `ssmRollbackFromCapture`
   (GDN, PLE and QSA state), so the invariant above holds for it unchanged; a drafter named with `--drafter` outranks the head (MTP is the default)
   ([qwen4-arch](qwen4-arch.md#dflash2)).
-- logprobs>0, grammar and a forced call disable spec (DeepSeek's DSpark drafts under a grammar, [dsv41-arch](dsv41-arch.md#dspark-grammar)); DFlash and the drafter also refuse a penalty. A request that
+- A grammar and a forced call disable spec (DeepSeek's DSpark drafts under a grammar, [dsv41-arch](dsv41-arch.md#dspark-grammar)); DFlash and the drafter also refuse a penalty. A request that
   asked for MTP and runs without it logs `mtp=disabled (<reason>)`.
 
 ## Cost and acceptance
@@ -130,7 +130,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   tick do rounds stay solo, two interleave and three or more go plain (`mtpRoundsStaySolo`).
   **One row never takes the group's speculation with it**: a row that cannot probe (a plain request, a thought room of
   1, under 96 tokens left) rides a calibration or recovery round at width 0 while the rows that can, probe
-  (`planProbe` declines only when none can); a row that cannot ride the planner's tick at all (a penalty, logprobs or
+  (`planProbe` declines only when none can); a row that cannot ride the planner's tick at all (a penalty or
   another non-batchable verdict, M-RoPE, an `enable_batch_mtp:false` opt-out, a context the pad-waste cap leaves out)
   decodes in the regular path while the others group (`plannerRowFits`, `plannerRows`). **A model's rows are a planner
   run of their own** (`runPlannerTicks`, model order as the batched path's): a request of another model decoding in the
@@ -144,7 +144,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   (`mimo2_shortlist.readout` through `arch_state.headShortlist`, up to 16 argmax-only rows, serial ticks and verify rows alike): the coarse top-32 per row,
   re-scored through the full head (the same qmv, so each value is the full readout's), every other id -inf. The copy
   exists with MTP or without, so MTP == serial holds by construction. Gate `sampler.argmaxOnlyRequest` (greedy or
-  top-1; no penalty, logprobs, grammar, forced call); `kld` reads the full head. Not certified: a full argmax
+  top-1; no penalty, grammar, forced call); `kld` reads the full head. Not certified: a full argmax
   outside the top-32 changes the token; `SUSHI_LMHEAD_SHORTLIST_AUDIT=1` counts such rows, `SUSHI_LMHEAD_FULL=1`
   reads the full head ([perf-baselines](mimo2-perf.md#mimo-lmhead-shortlist)).
 - **Drafts shortlist on a coarse lm_head copy and re-score exactly** from the MIXER output

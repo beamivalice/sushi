@@ -631,7 +631,7 @@ pub fn handleAnthropicMessages(
     const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, max_tokens_origin == .client, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{}, 0);
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{});
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, true, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -700,7 +700,7 @@ pub fn handleAnthropicMessages(
         .has_tools = has_tools,
         .allow_parallel = prompt.allow_parallel_tools,
         .tool_choice = if (has_tools) prompt.tool_choice else .auto,
-        .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, false, sampling.constraint != null),
+        .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, sampling.constraint != null),
     };
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = req_media.deferred;
@@ -1063,12 +1063,11 @@ fn handleAnthropicNonStreaming(
 
     // Speculative decoding dispatch — same `requestSpecModes` as
     // chat-completions (DFlash > MTP).
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
-    // Anthropic responses never carry logprobs (the API doesn't expose
-    // them). Vision-bearing requests transfer ownership of `ve_local` into
+    // Vision-bearing requests transfer ownership of `ve_local` into
     // the slot.
     const slot_ve: ?*vision_queue.DeferredMedia = blk: {
         const v = ve_local;
@@ -1079,7 +1078,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, 0, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
     defer result.deinit(allocator);
 
     // The stop that ended the generation (Anthropic reports it as stop_reason "stop_sequence" + the echoed
@@ -1284,10 +1283,10 @@ fn handleAnthropicStreaming(
     // Pick speculative-decoding mode (regular / drafter / MTP). The token-
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, 0);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
-    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, 0);
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| server_state.global_scheduler.?.complete(s);
@@ -1314,7 +1313,6 @@ fn handleAnthropicStreaming(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .logprobs_n = 0,
         .deferred_media = slot_ve_anth,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
@@ -1557,7 +1555,7 @@ fn handleAnthropicStreaming(
                     .flush_text => {
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
-                            try content.arrive(allocator, tt, 0);
+                            try content.arrive(allocator, tt);
                         }
                         // The gate flushes no think tag that waits on a backtick's partner: what it flushed is read as it stands.
                         while (try content.ready(allocator, false, true)) |r| switch (r) {
@@ -1578,7 +1576,7 @@ fn handleAnthropicStreaming(
         // A think block the MODEL opens, first or after content: seeded like a template-injected one, and holds the tokens
         // that followed its opener while the content arm waited on the tag.
         if (!gated_stream and !in_think_block) {
-            if (token_text.len > 0) try content.arrive(allocator, token_text, 0);
+            if (token_text.len > 0) try content.arrive(allocator, token_text);
             while (try content.ready(allocator, channel_armed, reply_over)) |r| switch (r) {
                 .opens => |opener| {
                     content.endPart();

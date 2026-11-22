@@ -851,7 +851,6 @@ pub const MixedTick = struct {
         n: u32,
         sampling: SamplingParams = .{ .temperature = 0.0 },
         mtp: bool = false,
-        logprobs: u32 = 0,
         /// Decode ticks after its admission at which its client leaves; null: it runs to its end.
         cancel_at: ?u32 = null,
 
@@ -909,7 +908,7 @@ pub const MixedTick = struct {
         for (specs, 0..) |sp, i| {
             if (i > 0) tick(sch);
             const head = if (sp.mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
-            slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = sp.prompt, .sampling = sp.sampling, .eos_token_ids = &.{}, .max_tokens = sp.n, .enable_mtp = sp.mtp, .mtp = head, .logprobs_n = sp.logprobs });
+            slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = sp.prompt, .sampling = sp.sampling, .eos_token_ids = &.{}, .max_tokens = sp.n, .enable_mtp = sp.mtp, .mtp = head });
             made += 1;
             for (sch.pending.items, 0..) |p, k| if (p == slots[i]) {
                 _ = sch.pending.orderedRemove(k);

@@ -84,7 +84,7 @@ pub const rows_company_min: usize = 3;
 pub fn tickClass(slot: *const Slot) sched.TickClass {
     const gen = if (slot.legacy_gen) |*g| g else return .none;
     if (!gen.dspark or gen.done) return .none;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or @import("../sampler.zig").penaltyActive(slot.sampling)) return .none;
+    if (slot.sampling.constraint != null or @import("../sampler.zig").penaltyActive(slot.sampling)) return .none;
     return if (modelBatches(arch_handle.trunk(slot.model.handle orelse return .none))) .rows_company else .none;
 }
 

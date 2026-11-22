@@ -537,7 +537,6 @@ fn handleResponsesInner(
 
     // ── echo fields (parsed but not consumed by generation; round-tripped
     // back into the response envelope to satisfy the OpenAI Responses schema) ──
-    const top_logprobs_echo: u32 = 0;
     const max_tool_calls_echo: ?u32 = if (req.whole("max_tool_calls")) |n| @intCast(n) else null;
     const truncation_echo: []const u8 = req.truncation();
     const parallel_tool_calls_echo = req.flag("parallel_tool_calls") orelse true;
@@ -779,7 +778,7 @@ fn handleResponsesInner(
     if (enable_drafter_resp and lm.dflash == null) enable_drafter_resp = false;
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, 0);
+    const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty });
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     // ── sampling ──
@@ -869,7 +868,6 @@ fn handleResponsesInner(
         .top_p = top_p,
         .presence_penalty = presence_penalty,
         .frequency_penalty = frequency_penalty,
-        .top_logprobs = top_logprobs_echo,
         .parallel_tool_calls = parallel_tool_calls_echo,
         .background = background_echo,
         .max_output_tokens = req_max_output_tokens,
@@ -955,15 +953,15 @@ fn handleResponsesInner(
         .has_tools = active_has_tools,
         .allow_parallel = parallel_tool_calls_echo,
         .tool_choice = if (active_has_tools) tool_choice else .auto,
-        .kept = generation_stream.ThoughtResume.keptFor(false, req_media.chain.len > 0, false, sampling.constraint != null),
+        .kept = generation_stream.ThoughtResume.keptFor(false, req_media.chain.len > 0, sampling.constraint != null),
     };
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling, 0);
+        const stream_mode = pickStreamMode(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling);
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
-        noteMtpRefused(enable_mtp_resp, lm.mtp != null, sampling, 0);
+        noteMtpRefused(enable_mtp_resp, lm.mtp != null, sampling);
 
         var slot_handle: ?*scheduler_mod.Slot = null;
         defer if (slot_handle) |s| server_state.global_scheduler.?.complete(s);
@@ -999,7 +997,6 @@ fn handleResponsesInner(
             .mrope_pos = slot_mrope_resp.pos,
             .mrope_total = slot_mrope_resp.total,
             .mrope_delta = slot_mrope_resp.delta,
-            .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         };
         slot_handle = try sch.submit(params);
@@ -1136,7 +1133,7 @@ fn handleResponsesInner(
             // The thought holds the token already when it opened here: it took the tokens that followed its opener.
             var think_has_token = false;
             if (!in_think_block) {
-                if (token_text.len > 0) try content.arrive(allocator, token_text, 0);
+                if (token_text.len > 0) try content.arrive(allocator, token_text);
                 while (try content.ready(allocator, channel_armed, reply_over)) |r| switch (r) {
                     .opens => |opener| {
                         content.endPart();
@@ -1271,7 +1268,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > drafter) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling, 0);
+        const spec = requestSpecModes(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, sampling);
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         // Transfer vision ownership into the slot.
@@ -1280,7 +1277,7 @@ fn handleResponsesInner(
         const slot_mrope_ns = req_media.mrope;
         req_media.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, 0, kv_quant_override, stream, .{ .stops = stop_sequences.items }, &thought);
+        result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, req_media.chain, cache_key, slot_mrope_ns, kv_quant_override, stream, .{ .stops = stop_sequences.items }, &thought);
     }
     defer result.deinit(allocator);
 

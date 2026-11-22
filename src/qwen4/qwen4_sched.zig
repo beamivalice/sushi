@@ -108,7 +108,7 @@ pub fn mtpGroupable(slot: *const Slot) bool {
     if (gen.mtp.?.moduleOwned()) return false;
     if (gen.spec_disabled_runtime or gen.mtp_serial_left > 0 or gen.mtp_serial_exit != .none) return false;
     if (gen.ctx.ssm_entries == null) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0) return false;
+    if (slot.sampling.constraint != null) return false;
     const t = arch_handle.trunk(slot.model.handle orelse return false);
     if (!qwen4_forward.supportsBatchedGdnDecode(t)) return false;
     return sched_policy.specTickMode(slot.enable_mtp, true, slot.enable_drafter, gen.dflash != null) == .mtp;

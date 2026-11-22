@@ -2,9 +2,9 @@
 # sushi-test: tier=live boot=exact
 # repeat_penalty / presence_penalty reach the default decode path (one boot, MTP on by default).
 #
-#   1. APPLIED: a penalised request answers the same bytes as with `logprobs` on, whose synchronous
-#      path always applied the penalty (before the fix the pipelined sampler and every MTP verify
-#      dropped it); and the penalty changes the answer on at least one of the two penalties.
+#   1. APPLIED: a penalised request answers the same bytes as with no MTP and no drafter, whose
+#      synchronous path always applied the penalty (before the fix the pipelined sampler and every MTP
+#      verify dropped it); and the penalty changes the answer on at least one of the two penalties.
 #   2. MTP == SERIAL: the penalised request gives the same bytes with enable_mtp true and false, and
 #      it ENGAGES MTP (a new `[spec-stats] mode=mtp` line with attempts > 0), so the equality is not
 #      two serial runs.
@@ -69,10 +69,10 @@ pen_serial = plain(presence_penalty=2.0, enable_mtp=False)
 pen_stream = streamed(presence_penalty=2.0)
 rep_mtp = plain(repeat_penalty=1.5)
 rep_serial = plain(repeat_penalty=1.5, enable_mtp=False)
-if pen_mtp != plain(presence_penalty=2.0, logprobs=True, top_logprobs=1):
-    fails.append("presence_penalty: default path != the logprobs path, which applies it")
-if rep_mtp != plain(repeat_penalty=1.5, logprobs=True, top_logprobs=1):
-    fails.append("repeat_penalty: default path != the logprobs path, which applies it")
+if pen_mtp != plain(presence_penalty=2.0, enable_mtp=False, enable_drafter=False):
+    fails.append("presence_penalty: default path != the synchronous serial path, which applies it")
+if rep_mtp != plain(repeat_penalty=1.5, enable_mtp=False, enable_drafter=False):
+    fails.append("repeat_penalty: default path != the synchronous serial path, which applies it")
 if pen_mtp == free and rep_mtp == free:
     fails.append("neither penalty changed the answer: the prompt no longer exercises them")
 if pen_mtp != pen_serial:

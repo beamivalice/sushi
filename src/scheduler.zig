@@ -144,7 +144,6 @@ pub const SubmitParams = struct {
     mrope_pos: ?[]const i32 = null,
     mrope_total: usize = 0,
     mrope_delta: i32 = 0,
-    logprobs_n: u32 = 0,
     /// Wave 1.A: per-request override of the process-default KV-cache quant
     /// scheme. When non-null, this slot's KVCache is constructed with this
     /// config instead of `Scheduler.kv_quant`. Lets one server host a
@@ -352,7 +351,6 @@ pub const Slot = struct {
     mtp: ?Drafter,
     mtp_depth: u32,
     cached_tokens: u32,
-    logprobs_n: u32,
     serial_reason_logged: bool = false,
     memory_hold_logged: bool = false,
     /// The `[queue]` line was logged for this pending slot (inference thread, `queue_mu`).
@@ -480,11 +478,6 @@ pub const Slot = struct {
     /// pad-only flag: set by inference thread when the entire generation was
     /// token id 0. Server-level cache invalidation reads this after complete.
     was_pad_only: bool,
-    /// Phase A5: per-token logprobs accumulated by the inference thread when
-    /// `logprobs_n > 0`. The conn thread takes ownership via
-    /// `nonStreamingViaScheduler` (or equivalent) at completion; if the
-    /// caller doesn't consume, `Slot.deinit` frees the contents.
-    logprobs_buf: std.ArrayList(sampler.LogprobResult),
 
     /// Initialize but do NOT take ownership of caches — those are allocated
     /// inside `init` from the slot's allocator.
@@ -586,7 +579,6 @@ pub const Slot = struct {
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
             .cached_tokens = params.cached_tokens,
-            .logprobs_n = params.logprobs_n,
             .state = .pending_prefill,
             .out_mu = .init,
             .out_cond = .init,
@@ -613,7 +605,6 @@ pub const Slot = struct {
             .decode_ns = 0,
             .generated_ids = null,
             .was_pad_only = true,
-            .logprobs_buf = .empty,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -668,11 +659,6 @@ pub const Slot = struct {
             if (code.ptr != static_error_name.ptr) self.allocator.free(code);
         }
         if (self.generated_ids) |g| self.allocator.free(g);
-        // Free any logprobs the conn thread didn't claim. After
-        // `nonStreamingViaScheduler` calls `toOwnedSlice`, items.len becomes
-        // 0 so this is a no-op on the success path.
-        for (self.logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
-        self.logprobs_buf.deinit(self.allocator);
         self.out_buf.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -694,11 +680,6 @@ pub const Slot = struct {
         return .{ .token_index = at, .byte_offset = self.constraint_payload_offset.load(.acquire) };
     }
 
-    /// Inference thread: enqueue a generated token for the consumer.
-    fn pushToken(self: *Slot, t: u32) void {
-        self.pushTokenWithLogprob(t, null);
-    }
-
     /// True once, for the first token published after the handover when it is t1 again.
     fn takeHandoverEcho(self: *Slot, t: u32) bool {
         const h = self.handover_token orelse return false;
@@ -708,63 +689,14 @@ pub const Slot = struct {
         return false;
     }
 
-    /// Publish one token and, when the request asked for logprobs, the entry
-    /// describing it — in ONE critical section.
-    ///
-    /// Both must move under `out_mu` together. The streaming path reads entry
-    /// i as soon as it is handed token i, so an append outside the lock races
-    /// the reader two ways: the entry may not be visible yet (a silently
-    /// missing trailing logprob), and a concurrent grow reallocates the
-    /// backing array under a reader mid-copy. Non-streaming consumes the whole
-    /// buffer at completion and is blind to both, which is why the streaming
-    /// gap survived: it is invisible to output-equality tests AND to llmprobe,
-    /// which probes logprobs non-streaming only.
-    pub fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?sampler.LogprobResult) void {
+    /// Inference thread: enqueue a generated token for the consumer.
+    pub fn pushToken(self: *Slot, t: u32) void {
         if (self.takeHandoverEcho(t)) return;
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
-        if (lp) |entry| {
-            // Degrade to error like the token append below — and do NOT return:
-            // the broadcast at the bottom is what wakes a reader blocked on the
-            // condvar, so an early exit here trades an OOM for a hang.
-            self.logprobs_buf.append(self.allocator, entry) catch |err| self.latchErrorLocked(@errorName(err));
-        }
         self.out_buf.append(self.allocator, t) catch |err| self.latchErrorLocked(@errorName(err));
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
-    }
-
-    /// Connection thread: copy logprob entries produced since `cursor` into
-    /// `out`, returning the new cursor. Under `out_mu`, so it cannot observe a
-    /// half-written entry or a reallocating buffer.
-    ///
-    /// The COPY is shallow and that is deliberate: each entry's `top_logprobs`
-    /// is its own allocation, stable for the life of the slot, and owned by
-    /// the slot (`Slot.deinit` frees it). The caller borrows and must not free
-    /// — only the ArrayList's backing array is at risk from a concurrent grow,
-    /// and that is exactly what the lock covers.
-    pub fn copyLogprobsFrom(
-        self: *Slot,
-        allocator: std.mem.Allocator,
-        cursor: usize,
-        out: *std.ArrayList(sampler.LogprobResult),
-    ) !usize {
-        self.out_mu.lockUncancelable(self.io);
-        defer self.out_mu.unlock(self.io);
-        const items = self.logprobs_buf.items;
-        if (cursor >= items.len) return cursor;
-        try out.appendSlice(allocator, items[cursor..]);
-        return items.len;
-    }
-
-    /// Connection thread: take ownership of the first `limit` logprob entries. A slot cancelled
-    /// mid-decode may hold entries for tokens the caller never read; those are freed here.
-    pub fn takeLogprobs(self: *Slot, limit: usize) ?[]sampler.LogprobResult {
-        self.out_mu.lockUncancelable(self.io);
-        defer self.out_mu.unlock(self.io);
-        while (self.logprobs_buf.items.len > limit) self.allocator.free(self.logprobs_buf.pop().?.top_logprobs);
-        if (self.logprobs_buf.items.len == 0) return null;
-        return self.logprobs_buf.toOwnedSlice(self.allocator) catch null;
     }
 
     /// The tick loop still drives this slot: not cancelled, finished or errored.
@@ -2202,7 +2134,6 @@ pub const Scheduler = struct {
             .release_pending = slotReleasePending(slot),
             .grammar = slot.sampling.constraint != null,
             .forced_call_pending = if (slot.sampling.call_force) |cf| cf.pending() else false,
-            .logprobs = slot.logprobs_n > 0,
             .penalty = sampler.penaltyActive(slot.sampling),
             .model_batches = if (slot.model.handle) |h| sched.modelBatches(arch_handle.trunk(h)) else null,
         });
@@ -3681,14 +3612,13 @@ fn endPrefillPass(sch: *Scheduler, slot: *Slot) void {
 
 /// t1 is on the host once an MTP prefill ends; the first round would only stream it after its
 /// verify. An EOS t1 stays with the round, which ends the answer the usual way.
-fn handoverToken(mtp: bool, completion_tokens: u32, done: bool, logprobs_n: u32, t1: u32, eos: []const u32) ?u32 {
-    // The swallowed round echo would also drop t1's logprob entry.
-    if (!mtp or completion_tokens != 0 or done or logprobs_n > 0 or generate_mod.isEosId(t1, eos)) return null;
+fn handoverToken(mtp: bool, completion_tokens: u32, done: bool, t1: u32, eos: []const u32) ?u32 {
+    if (!mtp or completion_tokens != 0 or done or generate_mod.isEosId(t1, eos)) return null;
     return t1;
 }
 
 fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
-    const t1 = handoverToken(gen.mtp != null, gen.completion_tokens, gen.done, slot.logprobs_n, gen.next_token_id, slot.eos_token_ids) orelse return;
+    const t1 = handoverToken(gen.mtp != null, gen.completion_tokens, gen.done, gen.next_token_id, slot.eos_token_ids) orelse return;
     slot.pushToken(t1);
     slot.handover_token = t1;
 }
@@ -4189,17 +4119,12 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                 null,
             // The install above is process-wide, so it is not the arch gate.
             .adaptive_chunk_width = slot_admission.adaptiveChunkWidthFor(width_ctx.cfg),
-            // Init's argmax-only gate must see logprobs BEFORE the split-
-            // prefill final-token forward runs — a post-init field write is
-            // too late for the certified lm_head prune.
-            .logprobs_n = slot.logprobs_n,
         },
     );
     slot.cache.ring_marks = &.{};
     slot.ring_cps.keepCompleteMarks(&slot.cache);
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
-    gen.logprobs_n = slot.logprobs_n;
 
     slot.legacy_gen = gen;
     sched.armThoughtPoint(slot, &slot.legacy_gen.?, write_through_on and cp_stride > 0);
@@ -4854,25 +4779,13 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
         plannerOutputClock(slot, gen);
     }
     const t = tok_opt.?;
-    // Phase A5: capture per-token logprob. `gen.last_logprob` ownership
-    // transfers into slot.logprobs_buf (gen sets the field, we null it here).
-    // Published in the SAME critical section as the token so a streaming
-    // reader that has been handed token i can read entry i — see
-    // `pushTokenWithLogprob`.
-    var lp_take: ?sampler.LogprobResult = null;
-    if (slot.logprobs_n > 0) {
-        if (gen.last_logprob) |lp| {
-            lp_take = lp;
-            gen.last_logprob = null;
-        }
-    }
     // Publish the reasoning→payload boundary (if this is the token that
     // carries it) BEFORE the token itself, so a streaming reader handed token
     // i already sees its span.
     if (gen.takeConstraintSpan()) |span| {
         slot.publishConstraintSpan(span.token_index, span.byte_offset);
     }
-    slot.pushTokenWithLogprob(t, lp_take);
+    slot.pushToken(t);
     if (t != 0) slot.was_pad_only = false;
     slot.completion_tokens = gen.completion_tokens;
     if (tick_on) {
@@ -5591,8 +5504,9 @@ test "single MTP slot reaches the round entry through runDecodeTick, and its ref
     gen.has_last_hidden = true;
     gen.dflash = null;
     gen.done = false;
-    gen.sampling = .{};
-    gen.logprobs_n = 1;
+    // A forced tool call is a request a draft round cannot honour: the round entry refuses it.
+    var forced = generate_mod.CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
+    gen.sampling = .{ .call_force = &forced };
     var slot: Slot = undefined;
     slot.io = testing.io;
     slot.allocator = testing.allocator;
@@ -6108,12 +6022,11 @@ test "decode share: cancelled prefill stops its hosted ticks before touching the
 
 test "MTP handover: t1 streams at the prefill handover unless it ends the answer or nothing speculates" {
     const eos = [_]u32{ 2, 7 };
-    try testing.expectEqual(@as(?u32, 42), handoverToken(true, 0, false, 0, 42, &eos));
-    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, false, 0, 7, &eos));
-    try testing.expectEqual(@as(?u32, null), handoverToken(false, 0, false, 0, 42, &eos));
-    try testing.expectEqual(@as(?u32, null), handoverToken(true, 1, false, 0, 42, &eos));
-    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, true, 0, 42, &eos));
-    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, false, 5, 42, &eos));
+    try testing.expectEqual(@as(?u32, 42), handoverToken(true, 0, false, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, false, 7, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(false, 0, false, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 1, false, 42, &eos));
+    try testing.expectEqual(@as(?u32, null), handoverToken(true, 0, true, 42, &eos));
 }
 
 test "MTP handover: the first block's echo of the streamed t1 is swallowed once, anything else is published" {

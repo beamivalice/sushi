@@ -31,8 +31,8 @@ pub const Resume = union(enum) {
 /// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
 /// rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the request
 /// decodes serially.
-pub fn eligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
-    return !mtp_plan.mtpUnsupported(sampling, logprobs_n);
+pub fn eligible(sampling: sampler.SamplingParams) bool {
+    return !mtp_plan.mtpUnsupported(sampling);
 }
 
 /// Verify ms: `plain_ms` for the one-row step and `step_ms` for each row added to it (the decode kernels and the routed

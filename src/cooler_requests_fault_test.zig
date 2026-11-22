@@ -186,8 +186,8 @@ const UnitShape = enum { alone, company };
 fn unitFaultCell(comptime shape: UnitShape) fn (comptime type, []const u8, []const u32) anyerror!void {
     return struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
-            // A drafting request rides the joined rows in company on an arch that says so; it asks its logprobs to tick
-            // alone, which no joined round takes.
+            // A drafting request rides the joined rows in company on an arch that says so; it carries a penalty, which
+            // ticks alone: no joined round takes it.
             const rides_rows = comptime @hasDecl(C, "drafting_rides_rows") and C.drafting_rides_rows;
             if (shape == .company and !rides_rows) return error.SkipZigTest;
             const a = testing.allocator;
@@ -229,7 +229,7 @@ fn unitFaultCell(comptime shape: UnitShape) fn (comptime type, []const u8, []con
                 var slots: [reqs.len]*scheduler.Slot = undefined;
                 for (&slots, reqs, 0..) |*slot, req, r| {
                     const head = if (req.drafting) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
-                    slot.* = try sch.submit(.{ .model = sv.entry, .prompt_ids = &prompts[r], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = req.drafting, .mtp = head, .logprobs_n = @intFromBool(req.own_unit and rides_rows) });
+                    slot.* = try sch.submit(.{ .model = sv.entry, .prompt_ids = &prompts[r], .sampling = .{ .temperature = 0.0, .presence_penalty = if (req.own_unit and rides_rows) 0.5 else 0 }, .eos_token_ids = &.{}, .max_tokens = 24, .enable_mtp = req.drafting, .mtp = head });
                     for (sch.pending.items, 0..) |p, i| if (p == slot.*) {
                         _ = sch.pending.orderedRemove(i);
                         break;

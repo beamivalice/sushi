@@ -88,7 +88,7 @@ pub const ForwardCtx = struct {
     skip_lm_head: bool = false,
     /// Set by the Generator when this request consumes ONLY the argmax of
     /// the logits (greedy or top-1 sampling, no logit-modifying penalties,
-    /// no per-token logprobs, no grammar mask). Gates the certified lm_head
+    /// no grammar mask). Gates the certified lm_head
     /// prune, whose output row is bit-identical at every candidate slot and
     /// certified-below-the-winner elsewhere — exactly enough for an argmax,
     /// not for a tail distribution. Default false = dense path everywhere.

@@ -2120,7 +2120,7 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *http_conn.Conn
 }
 
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
-/// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
+/// batch decode at all? Per-slot arms (spec, grammar) come later.
 pub fn batchVerdictFor(entry: *const LoadedModel) sched_policy.BatchVerdict {
     const exclusive = if (entry.handle) |h| arch_handle.ownsModuleDecodeState(h) else false;
     return batchVerdictOf(entry.config, exclusive);
@@ -2451,10 +2451,6 @@ pub fn handleChatCompletions(
 
     const seed: ?u64 = req.seed();
 
-    // Logprobs are refused at the request check: none is ever asked.
-    const asked_logprobs: ?request_parse.Logprobs = null;
-    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
-
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
     var has_tools = request_parse.toolsDeclared(root);
@@ -2610,7 +2606,6 @@ pub fn handleChatCompletions(
     // Parse enable_drafter: per-request override of the --drafter default.
     // Auto-disabled when:
     //   - the server didn't load a drafter (`default_drafter == null`)
-    //   - logprobs are requested (drafter doesn't expose realized log-probs)
     //   - hybrid SSM architecture (the drafter would hit the SSM-state issue on
     //     the verify forward).
     // Tools do NOT disable the drafter.
@@ -2622,10 +2617,6 @@ pub fn handleChatCompletions(
     var enable_drafter: bool = req.flag("enable_drafter") orelse lm_default_enable_drafter;
     if (enable_drafter and lm.dflash == null) {
         enable_drafter = false; // no drafter loaded; quietly fall through
-    }
-    if (enable_drafter and logprobs_n > 0) {
-        log.info("  drafter=disabled (logprobs requested)\n", .{});
-        enable_drafter = false;
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
     // sidecar only loads when it binds to this trunk; MoE mirrors the
@@ -2640,10 +2631,6 @@ pub fn handleChatCompletions(
     var enable_mtp: bool = req.flag("enable_mtp") orelse
         defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
-    if (enable_mtp and logprobs_n > 0) {
-        log.info("  mtp=disabled (logprobs requested)\n", .{});
-        enable_mtp = false;
-    }
     if (enable_drafter) {
         log.info("  drafter=enabled (block_size={d})\n", .{lm.drafter_block_size});
     }
@@ -2747,7 +2734,7 @@ pub fn handleChatCompletions(
     const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, max_tokens_origin == .client, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty }, logprobs_n);
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty });
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -2834,7 +2821,7 @@ pub fn handleChatCompletions(
         .has_tools = has_tools,
         .allow_parallel = allow_parallel_tools,
         .tool_choice = if (has_tools) tool_choice else .auto,
-        .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, asked_logprobs != null, sampling.constraint != null),
+        .kept = generation_stream.ThoughtResume.keptFor(continue_final, req_media.chain.len > 0, sampling.constraint != null),
     };
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
@@ -2843,13 +2830,13 @@ pub fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
+        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, asked_logprobs, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
+        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -2894,9 +2881,8 @@ pub fn requestBillsMtpHead(
     dflash_loaded: bool,
     mtp_loaded: bool,
     sampling: sampler.SamplingParams,
-    logprobs_n: u32,
 ) bool {
-    return generation_stream.requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n).use_mtp;
+    return generation_stream.requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling).use_mtp;
 }
 
 test "the bill prices the MTP head only for a request that runs it: a DFlash2 request never builds the head's cache" {
@@ -2908,18 +2894,18 @@ test "the bill prices the MTP head only for a request that runs it: a DFlash2 re
     server_state.server_config.default_force_mtp = false;
     const plain = sampler.SamplingParams{};
     // A loaded drafter outranks the head; `enable_drafter:false` hands the request back to it.
-    try t.expect(!requestBillsMtpHead(true, true, true, true, plain, 0));
-    try t.expect(requestBillsMtpHead(false, true, true, true, plain, 0));
+    try t.expect(!requestBillsMtpHead(true, true, true, true, plain));
+    try t.expect(requestBillsMtpHead(false, true, true, true, plain));
     // A penalty keeps the drafter off, so the head runs.
-    try t.expect(requestBillsMtpHead(true, true, true, true, .{ .presence_penalty = 1.5 }, 0));
-    try t.expect(requestBillsMtpHead(true, true, false, true, plain, 0));
-    try t.expect(!requestBillsMtpHead(true, false, false, true, plain, 0));
+    try t.expect(requestBillsMtpHead(true, true, true, true, .{ .presence_penalty = 1.5 }));
+    try t.expect(requestBillsMtpHead(true, true, false, true, plain));
+    try t.expect(!requestBillsMtpHead(true, false, false, true, plain));
     var cfg = fixtures.qwen4ExpOomConfig();
     cfg.mtp_override = null;
     cfg.dflash_loaded = true;
     const seq: u64 = 100_000;
-    const dflash = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(true, true, true, true, plain, 0) });
-    const head = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(false, true, true, true, plain, 0) });
+    const dflash = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(true, true, true, true, plain) });
+    const head = prefillRequestTerms(&cfg, seq, 4096, 8, 4096, .{ .mtp_on = requestBillsMtpHead(false, true, true, true, plain) });
     try t.expectEqual(@as(u64, 0), dflash.mtp_head_kv_bytes);
     try t.expect(head.mtp_head_kv_bytes > 0);
     try t.expect(head.state_bytes > dflash.state_bytes);
@@ -4066,7 +4052,7 @@ pub const TickPlayer = struct {
     pub fn run(self: *TickPlayer) void {
         const io = self.slot.io;
         var i: u32 = 0;
-        while (i < self.n) : (i += 1) self.slot.pushTokenWithLogprob(i + 1, null);
+        while (i < self.n) : (i += 1) self.slot.pushToken(i + 1);
         std.Io.sleep(io, .fromMilliseconds(self.gap_ms), .real) catch {};
         i = 0;
         while (i < self.n) : (i += 1) {

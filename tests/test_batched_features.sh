@@ -5,7 +5,7 @@
 # beside the others in the same tick. Six requests with different contracts
 # fire at once on a batching arch and each must keep ITS OWN: the tool call
 # carries its own planted code, the schema request parses, the thinking
-# request splits, logprobs describe content, the stop request cuts, and the
+# request splits, the penalised request answers on the serial path, the stop request cuts, and the
 # short/long caps finish by their own max_tokens. The log must show the group
 # actually formed (`[batched] ... engaged (slots=N)`, N >= 2) or the run
 # proves nothing.
@@ -40,7 +40,7 @@ echo "=== burst: six contracts in one group ==="
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Save a note with tag $CODE and text 'batched'. Use the save_note tool now.\"}],\"tools\":$TOOLS,\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/tools.sse" & P1=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Describe an owl.\"}],\"response_format\":$SCHEMA,\"max_tokens\":80,\"temperature\":0}" > "$WORK/schema.json" & P2=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N What is 12*12? Answer briefly.\"}],\"enable_thinking\":true,\"stream\":true,\"max_tokens\":400,\"temperature\":0}" > "$WORK/think.sse" & P3=$!
-post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"logprobs\":true,\"top_logprobs\":3,$LP_THINK,\"max_tokens\":$LP_MAX,\"temperature\":0}" > "$WORK/logprobs.json" & P4=$!
+post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"presence_penalty\":0.5,$LP_THINK,\"max_tokens\":$LP_MAX,\"temperature\":0}" > "$WORK/penalty.json" & P4=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$N Count from one to twenty in words, comma separated.\"}],\"stop\":[\"seven\"],\"stream\":true,\"max_tokens\":200,\"temperature\":0}" > "$WORK/stop.sse" & P5=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"max_tokens\":5,\"temperature\":0.7}" > "$WORK/cap5.json" & P6=$!
 post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$LONG\"}],\"max_tokens\":300,\"temperature\":0}" > "$WORK/cap300.json" & P7=$!
@@ -94,12 +94,12 @@ assert r, "no reasoning"
 assert "<think>" not in c and "</think>" not in c and "</think>" not in r, "tag leak"
 EOF
 
-# logprobs (non-stream): entries exist and rank 1 is the chosen token
-python3 - "$WORK/logprobs.json" <<'EOF' && ok "logprobs: entries describe content, rank 1 == chosen" || bad "logprobs: in the group" "$(head -c 200 "$WORK/logprobs.json")"
+# penalised (non-stream): the serial-path slot beside the batched ones answers with content
+python3 - "$WORK/penalty.json" <<'EOF' && ok "penalty: a serial-path slot in the group answers its own content" || bad "penalty: in the group" "$(head -c 200 "$WORK/penalty.json")"
 import sys,json
-d=json.load(open(sys.argv[1])); ch=d["choices"][0]; lp=ch["logprobs"]["content"]
-assert len(lp)>0 and all(e["top_logprobs"][0]["token"]==e["token"] for e in lp)
-assert "".join(e["token"] for e in lp).strip()==ch["message"]["content"].strip()
+d=json.load(open(sys.argv[1])); ch=d["choices"][0]
+assert ch["message"]["content"].strip(), "no content"
+assert ch["finish_reason"] in ("stop","length"), ch["finish_reason"]
 EOF
 
 # stop (stream): content excludes the stop, finish stop

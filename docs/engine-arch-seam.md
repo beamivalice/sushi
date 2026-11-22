@@ -93,7 +93,7 @@ without it. An arch added later joins the list in the landing that adds it.
   `checkpointMax` (the restore points a request keeps in memory) and, for the arch whose slots keep a request beside the
   KV, `captureRequest`, `restorableAt` and the prefill grid (`requestCheckpointStride`, `requestCaptureStride`,
   `requestCaptureBackoff`, `requestChunkEnd`), which `generate.zig` reaches through `arch_state.requestOf`. The `drafter`
-  module: `nativeEligible(xfm, sampling, logprobs_n)` / `reserveNative` (rounds the arch runs on its own model) and
+  module: `nativeEligible(xfm, sampling)` / `reserveNative` (rounds the arch runs on its own model) and
   `inDirCacheValid` (a drafter folder the engine derived from the model directory is intact). A shared helper
   that two archs once borrowed from one is named by capability and lives in `src/` (`mlx_ops.zig`: the eager-graph `Ops`).
 - **The seam guard** (`arch_state.zig`, at compile time) covers `Trunk`, `ForwardCtx` and `Slot` only, not `Generator`,

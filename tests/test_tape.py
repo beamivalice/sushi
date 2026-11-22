@@ -18,9 +18,7 @@ spec.loader.exec_module(tape)
 
 
 def chat(tokens, text=None):
-    return {"choices": [{"message": {"content": text or "".join(tokens)}, "finish_reason": "length",
-                         "logprobs": {"content": [{"token": t, "logprob": -0.5, "top_logprobs": [{"token": t, "logprob": -0.5}]}
-                                                  for t in tokens]}}],
+    return {"choices": [{"message": {"content": text or "".join(tokens)}, "finish_reason": "length"}],
             "usage": {"completion_tokens": len(tokens), "prompt_tokens": 7, "prompt_tokens_details": {"cached_tokens": 0}}}
 
 
@@ -32,15 +30,15 @@ class Tape(unittest.TestCase):
     def test_equal_entries_agree(self):
         self.assertIsNone(tape.compare_case("serial", entry(), entry()))
 
-    def test_changed_logprob_row_names_the_position(self):
-        got = entry()
-        got["response"]["positions"][1]["h"] = "0" * 16
-        self.assertIn("serial position 1", tape.compare_case("serial", entry(), got))
-
-    def test_changed_token_names_both_tokens(self):
+    def test_changed_text_names_the_character(self):
         d = tape.compare_case("serial", entry(), entry(("a", "z", "c")))
-        self.assertIn("position 1", d)
-        self.assertIn("'b' vs 'z'", d)
+        self.assertIn("char 1", d)
+        self.assertIn("'abc' vs 'azc'", d)
+
+    def test_a_tape_recorded_with_logprob_rows_still_compares(self):
+        old = entry()
+        old["response"]["positions"] = [{"t": "a", "h": "0" * 16}]
+        self.assertIsNone(tape.compare_case("serial", old, entry()))
 
     def test_log_timing_is_not_a_difference_but_a_restore_is(self):
         a = entry(log=["[hot-cache] restored in 12 ms, 3.5 GB/s", "[prefix] reused 5 of 9 prompt tokens from SSD"])
@@ -107,7 +105,7 @@ class Tape(unittest.TestCase):
         self.assertIn("no restore from SSD", tape.ssd_verdict(ref, {**ref, "reused": None}))
         self.assertIn("no restore from SSD", tape.ssd_verdict(ref, {**ref, "reused": [96, 100, "the live state"]}))
         self.assertIn("reused [64, 100, 'SSD'] vs [96, 100, 'SSD']", tape.ssd_verdict(ref, {**ref, "reused": [64, 100, "SSD"]}))
-        self.assertIn("position 1", tape.ssd_verdict(ref, {**ref, "response": entry(("a", "z", "c"))["response"]}))
+        self.assertIn("char 1", tape.ssd_verdict(ref, {**ref, "response": entry(("a", "z", "c"))["response"]}))
 
     def test_cache_file_diff_and_reused_line(self):
         self.assertEqual(tape.cache_file_diff({"a": "1", "b": "2", "c": "3"}, {"a": "1", "b": "9", "d": "4"}),

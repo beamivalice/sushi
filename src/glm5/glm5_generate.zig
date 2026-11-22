@@ -106,8 +106,8 @@ pub const DflashGateWindow = dflash_policy.DflashGateWindow;
 pub const dflashSerialPrice = dflash_policy.dflashSerialPrice;
 
 /// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
-pub fn glmDflashEligible(sampling: sampler.SamplingParams, logprobs_n: u32) bool {
-    return !mtp_plan.specDecodeUnsupported(sampling, logprobs_n) and sampling.think_bound == null;
+pub fn glmDflashEligible(sampling: sampler.SamplingParams) bool {
+    return !mtp_plan.specDecodeUnsupported(sampling) and sampling.think_bound == null;
 }
 
 /// A verbatim-copy round: `pending` and the context's next three tokens as a chain, when the copy
@@ -282,7 +282,7 @@ pub fn glmPenalty(self: *Generator) ?@import("glm5_dflash_model.zig").Penalty {
 /// A DFlash2 GLM round may run: not done, no stop due.
 pub fn glmRoundReady(self: *Generator) !bool {
     if (self.done or try self.checkStop()) return false;
-    if (!glmDflashEligible(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+    if (!glmDflashEligible(self.sampling)) return error.SpecDecodeUnsupported;
     if (glm5_state.requestOf(&self.ctx) == null) return error.GlmRequestMissing;
     const target = glm5_state.modelOf(self.xfm).?;
     target.s = self.xfm.s;
@@ -374,32 +374,27 @@ pub fn glmRoundEnd(self: *Generator, allocator: std.mem.Allocator, proposal: *co
 }
 
 test "a repeat or presence penalty keeps DFlash and the drafter off and samples on the synchronous path" {
-    try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 0.5 }, 0));
-    try testing.expect(specDecodeUnsupported(.{ .repeat_penalty = 1.1 }, 0));
+    try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 0.5 }));
+    try testing.expect(specDecodeUnsupported(.{ .repeat_penalty = 1.1 }));
     try testing.expect(draftsRefused(.{ .presence_penalty = 0.5 }));
     try testing.expect(!draftsRefused(.{}));
     var g: Generator = undefined;
-    g.logprobs_n = 0;
     g.sampling = .{ .presence_penalty = 0.5 };
     try testing.expect(g.samplesSync());
     g.sampling = .{ .repeat_penalty = 1.2 };
     try testing.expect(g.samplesSync());
     g.sampling = .{};
     try testing.expect(!g.samplesSync());
-    g.logprobs_n = 2;
-    try testing.expect(g.samplesSync());
 }
 
 test "a penalty keeps DFlash and the drafter off but not MTP" {
-    try testing.expect(!mtpUnsupported(.{ .presence_penalty = 1.5 }, 0));
-    try testing.expect(!mtpUnsupported(.{ .repeat_penalty = 1.1, .presence_penalty = 0.5 }, 0));
-    try testing.expect(mtpUnsupported(.{ .presence_penalty = 1.5 }, 2));
+    try testing.expect(!mtpUnsupported(.{ .presence_penalty = 1.5 }));
+    try testing.expect(!mtpUnsupported(.{ .repeat_penalty = 1.1, .presence_penalty = 0.5 }));
     var cf = CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
-    try testing.expect(mtpUnsupported(.{ .call_force = &cf, .presence_penalty = 1.5 }, 0));
-    try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 1.5 }, 0));
-    try testing.expect(mtpRefusal(.{ .presence_penalty = 1.5 }, 0) == null);
-    try testing.expectEqualStrings("logprobs requested", mtpRefusal(.{}, 1).?);
-    try testing.expectEqualStrings("forced tool call", mtpRefusal(.{ .call_force = &cf }, 0).?);
+    try testing.expect(mtpUnsupported(.{ .call_force = &cf, .presence_penalty = 1.5 }));
+    try testing.expect(specDecodeUnsupported(.{ .presence_penalty = 1.5 }));
+    try testing.expect(mtpRefusal(.{ .presence_penalty = 1.5 }) == null);
+    try testing.expectEqualStrings("forced tool call", mtpRefusal(.{ .call_force = &cf }).?);
 }
 
 test "Generator.dflashGateShouldDisable: a serial price decides by ms per token, the ladder break-even decides without one" {
@@ -542,15 +537,14 @@ test "a GLM lookup chain needs a long verbatim match and the budget for all four
 }
 
 test "GLM serving DFlash2 arms only requests the native verifier can reproduce" {
-    try testing.expect(glmDflashEligible(.{ .temperature = 0 }, 0));
-    try testing.expect(glmDflashEligible(.{ .temperature = 1, .top_k = 1 }, 0));
-    try testing.expect(glmDflashEligible(.{ .temperature = 1 }, 0));
-    try testing.expect(!glmDflashEligible(.{ .temperature = 0 }, 1));
-    try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 0 }));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1, .top_k = 1 }));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1 }));
+    try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }));
     const ban = [_]logit_bias.Bias{.{ .id = 7, .delta = -100 }};
-    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .biases = &ban } }, 0));
-    try testing.expect(glmDflashEligible(.{ .temperature = 1, .think_penalty = .{ .file_biases = &ban } }, 0));
-    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1, .closer_id = 3, .phase = .inside } }, 0));
+    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .biases = &ban } }));
+    try testing.expect(glmDflashEligible(.{ .temperature = 1, .think_penalty = .{ .file_biases = &ban } }));
+    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1, .closer_id = 3, .phase = .inside } }));
 }
 
 test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {

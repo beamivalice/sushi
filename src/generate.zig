@@ -387,8 +387,6 @@ pub const GenerationResult = struct {
     /// is what was actually run through the model this turn, so `prefill_tps`
     /// reflects real compute rather than an inflated full-prompt rate.
     cached_tokens: u32 = 0,
-    /// Per-token logprobs, each with its own `top_logprobs` slice.
-    logprobs: ?[]sampler.LogprobResult = null,
     /// Non-null only when the degenerate-tail guard cut this generation:
     /// the `finish_details.type` value emitted beside `finish_reason`
     /// ("stop" for loop cuts — see `slot_outcome.loopStopReason`).
@@ -407,14 +405,10 @@ pub const GenerationResult = struct {
     /// carries the match), a non-stream text still holds the stop (`stop_sequences.cut`).
     stop_source: stop_seq_mod.Source = .whole,
 
-    /// Frees everything the result owns, allocated by `allocator`: `text`, `token_ids` and `logprobs`.
+    /// Frees everything the result owns, allocated by `allocator`: `text` and `token_ids`.
     pub fn deinit(self: GenerationResult, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
         allocator.free(self.token_ids);
-        if (self.logprobs) |lps| {
-            for (lps) |lp| allocator.free(lp.top_logprobs);
-            allocator.free(lps);
-        }
     }
 };
 
@@ -524,20 +518,6 @@ pub const Generator = struct {
     timeout_ns: u64, // 0 = no timeout; measures SILENCE, not total time (see StallClock)
     stall: degenerate.StallClock = .{},
     timer: io_util.Stopwatch,
-    logprobs_n: u32 = 0, // 0 = disabled, >0 = number of top_logprobs to return
-    last_logprob: ?sampler.LogprobResult = null, // logprob result for the most recently returned token
-    /// Logprobs for the token the NEXT `next()` call will return.
-    ///
-    /// The decode loop returns `next_token_id` and, in the same call, forwards
-    /// it to sample its successor — so the result `sampleToken` hands back
-    /// describes the token AFTER the one being returned. Publishing it as
-    /// `last_logprob` there shifted the whole array by one: the caller zips
-    /// token_ids with logprobs by index, so at temp 0 every entry reported the
-    /// distribution of the token that FOLLOWED it (a one-token "OK" reply came
-    /// back with `<|role_end|>` at rank 1). Seeded at init with t1's own
-    /// distribution — t1 is sampled from the prefill's final forward, which
-    /// this loop never sees.
-    pending_logprob: ?sampler.LogprobResult = null,
     /// The decode pipeline's lookahead, owned here and freed by `deinit` whatever state a failed step left.
     pending: ?Pending = null,
 
@@ -1203,13 +1183,6 @@ pub const Generator = struct {
         /// cache commit from them. Null keeps the old drop-everything
         /// behaviour.
         cancelled_checkpoint_sink: ?*CancelledCheckpointSink = null,
-        /// Per-token logprobs count for this request (0 = disabled). Callers
-        /// that set `Generator.logprobs_n` after init must ALSO pass it here:
-        /// init's split-prefill final-token forward is a single-row dispatch,
-        /// and the certified lm_head prune may only engage when the request
-        /// consumes nothing but the argmax — a logprobs request reads the
-        /// full logit row, which the pruned head does not produce.
-        logprobs_n: u32 = 0,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -1308,7 +1281,7 @@ pub const Generator = struct {
         errdefer sampling.think_penalty.deinitPrepared();
         if (mlx.engine.isStream(xfm.outStream())) sampling.draw_root = try drawRoot(io, sampling.seed);
         var options = options_in;
-        const native_dflash = options.dflash_enabled and options.dflash != null and drafter.nativeDflashEligible(xfm, sampling, options.logprobs_n);
+        const native_dflash = options.dflash_enabled and options.dflash != null and drafter.nativeDflashEligible(xfm, sampling);
         if (arch_state.runsOwnModel(&xfm.arch_state)) {
             options.mtp_enabled = false;
             options.dflash_enabled = native_dflash;
@@ -1324,7 +1297,7 @@ pub const Generator = struct {
         // lm_head gate: the certified prune and MiMo's coarse shortlist serve
         // the ARGMAX, not the tail distribution, so they engage only when this
         // request consumes nothing else (`argmaxOnlyRequest`).
-        ctx.argmax_only = sampler.argmaxOnlyRequest(sampling, options.logprobs_n);
+        ctx.argmax_only = sampler.argmaxOnlyRequest(sampling);
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -2079,7 +2052,7 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
-                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling, options.logprobs_n),
+                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling),
                 .dspark_diag = arch_dspark.dsparkDiag(),
                 .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
             };
@@ -2196,16 +2169,11 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
-            // t1's own distribution comes from the prefill's final forward and
-            // is invisible to the decode loop — read it here or the first
-            // returned token has no logprobs and the array shifts by one.
-            const first_lp = try sampler.firstTokenLogprobs(allocator, logits, @intCast(first_val), options.logprobs_n, xfm.outStream());
             _ = mlx.mlx_array_free(logits);
             held = .{ .ctx = null };
 
             var gen = Generator{
                 .opts = round_opts,
-                .pending_logprob = first_lp,
                 .xfm = xfm,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
@@ -2231,7 +2199,7 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
-                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling, options.logprobs_n),
+                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling),
                 .dspark_diag = arch_dspark.dsparkDiag(),
                 .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
             };
@@ -2261,16 +2229,11 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_array_eval(lazy_token));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
-        // See the skip_lazy_preforward branch: t1's distribution lives only in
-        // the prefill's own output, so it is read here, against the id that was
-        // actually drawn.
-        const first_lp = try sampler.firstTokenLogprobs(allocator, logits, @intCast(val), options.logprobs_n, xfm.outStream());
         _ = mlx.mlx_array_free(logits);
         held = .{ .ctx = null };
 
         var gen = Generator{
             .opts = round_opts,
-            .pending_logprob = first_lp,
             .xfm = xfm,
             .model_has_mtp = options.model_has_mtp,
             .ctx = ctx,
@@ -2323,7 +2286,7 @@ pub const Generator = struct {
     /// with no clear ratchets the process footprint while `active_bytes` stays
     /// flat: the reporter's process reached 81 GB with the panel reading 19.6.
     /// A `-mtp` checkpoint on a dense trunk defaults straight onto one of them.
-    /// The serial-decode test asserts the clock advances on the plain and logprob paths.
+    /// The serial-decode test asserts the clock advances on the plain and sampled-sync paths.
     pub fn advanceStep(self: *Generator, n: u32) void {
         self.completion_tokens += n;
         self.step += n;
@@ -2467,12 +2430,6 @@ pub const Generator = struct {
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         self.sampling.think_penalty.deinitPrepared();
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
-        if (self.last_logprob) |*lp| {
-            allocator.free(lp.top_logprobs);
-        }
-        if (self.pending_logprob) |*lp| {
-            allocator.free(lp.top_logprobs);
-        }
         self.dropPending();
         self.dspark_masks.deinit(allocator);
         if (self.has_last_hidden) {
@@ -2617,7 +2574,7 @@ pub const Generator = struct {
 
     /// This slot samples on the synchronous serial path (`sampleToken`), never the lazy pipeline.
     pub fn samplesSync(self: *const Generator) bool {
-        return self.logprobs_n > 0 or sampler.penaltyActive(self.sampling);
+        return sampler.penaltyActive(self.sampling);
     }
 
     /// What precedes a sampled position beyond the committed `generated_ids`.
@@ -3352,7 +3309,7 @@ pub const Generator = struct {
             return token;
         }
 
-        // ── Phase 2: Slow path (first token, last token, logprobs, or pipeline miss) ──
+        // ── Phase 2: Slow path (first token, last token, or pipeline miss) ──
         const t_res = tick_prof.mark();
         try self.resolvePendingToken();
         tick_prof.add(.resolve, t_res);
@@ -3374,13 +3331,13 @@ pub const Generator = struct {
             break :blk out;
         };
 
-        // Logprobs and penalties: fully synchronous
+        // Penalties: fully synchronous
         if (self.samplesSync()) {
             defer _ = mlx.mlx_array_free(step_logits);
             const t_sample = tick_prof.mark();
             const result: sampler.SampleResult = switch (self.forcedNext()) {
-                .sample => try sampler.sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.markerShiftCommitted(), self.xfm.outStream()),
-                .force => |id| .{ .token_id = id, .logprob_result = try sampler.firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.outStream()) },
+                .sample => try sampler.sampleToken(step_logits, self.sampling, self.generated_ids.items, self.markerShiftCommitted(), self.xfm.outStream()),
+                .force => |id| .{ .token_id = id },
                 .choose => |ids| blk: {
                     const lazy = try self.sampleAmong(allocator, step_logits, ids);
                     defer _ = mlx.mlx_array_free(lazy);
@@ -3388,17 +3345,12 @@ pub const Generator = struct {
                     var v: i32 = 0;
                     try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
                     const id: u32 = @intCast(v);
-                    break :blk .{ .token_id = id, .logprob_result = try sampler.firstTokenLogprobs(allocator, step_logits, id, self.logprobs_n, self.xfm.outStream()) };
+                    break :blk .{ .token_id = id };
                 },
             };
             tick_prof.add(.sample, t_sample);
             self.sampling.draw +%= 1;
             self.next_token_id = result.token_id;
-            // `result` belongs to the token we just SAMPLED, which the next
-            // call returns; `token` is carrying the previous round's result.
-            if (self.last_logprob) |*lp| allocator.free(lp.top_logprobs);
-            self.last_logprob = self.pending_logprob;
-            self.pending_logprob = result.logprob_result;
             if (self.step < self.max_tokens) self.startAsyncForward(result.token_id);
             return token;
         }
@@ -3691,21 +3643,6 @@ pub const Generator = struct {
     /// grammar by the sampled token's bytes, and pre-launches the next forward
     /// pass to overlap with the next mask build.
     pub fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
-        if (self.logprobs_n == 0 or self.pending == null) return self.nextConstrainedToken(allocator);
-        // A constrained token belongs to these raw logits, before the grammar mask.
-        var logits = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(logits);
-        try mlx.check(mlx.mlx_array_set(&logits, self.pending.?.logits));
-        const token = (try self.nextConstrainedToken(allocator)) orelse return null;
-        const lp = try sampler.computeLogprobs(allocator, logits, token, self.logprobs_n, self.xfm.outStream());
-        if (self.last_logprob) |old| allocator.free(old.top_logprobs);
-        self.pending_logprob = lp;
-        self.last_logprob = self.pending_logprob;
-        self.pending_logprob = null;
-        return token;
-    }
-
-    fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (self.pending == null) {
             self.done = true;
             return null;
@@ -3887,7 +3824,7 @@ pub const Generator = struct {
         return false;
     }
 
-    /// Legacy sync forward for logprobs path.
+    /// Starts the forward of `token_id` while the host samples on.
     fn startAsyncForward(self: *Generator, token_id: u32) void {
         const tok_i32: i32 = @intCast(token_id);
         const tok_shape = [_]c_int{ 1, 1 };
@@ -4005,15 +3942,10 @@ pub fn generate(
     sampling: sampler.SamplingParams,
     eos_token_ids: []const u32,
     timeout_ns: u64,
-    logprobs_n: u32,
 ) !GenerationResult {
     var timer = io_util.Stopwatch.init(io);
-    // logprobs_n rides InitOptions so init's argmax-only gate sees it (a
-    // post-init field write would let the split-prefill final-token forward
-    // engage the pruned lm_head on a logprobs request).
-    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .logprobs_n = logprobs_n });
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{});
     gen.timeout_ns = timeout_ns;
-    gen.logprobs_n = logprobs_n;
     defer gen.deinit(allocator);
 
     const prefill_ns = timer.read();
@@ -4030,23 +3962,9 @@ pub fn generate(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
-    var logprob_results = std.ArrayList(sampler.LogprobResult).empty;
-    defer {
-        if (logprobs_n == 0) {
-            for (logprob_results.items) |*lp| allocator.free(lp.top_logprobs);
-            logprob_results.deinit(allocator);
-        }
-    }
-
     timer.reset();
     while (try gen.next(allocator)) |token_id| {
         try output_ids.append(allocator, token_id);
-        if (logprobs_n > 0) {
-            if (gen.last_logprob) |lp| {
-                try logprob_results.append(allocator, lp);
-                gen.last_logprob = null; // Transfer ownership
-            }
-        }
     }
 
     const decode_ns = timer.read();
@@ -4072,7 +3990,6 @@ pub fn generate(
         .finish_reason = gen.finish_reason,
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
-        .logprobs = if (logprobs_n > 0) try logprob_results.toOwnedSlice(allocator) else null,
     };
 }
 
@@ -4101,12 +4018,10 @@ test "GenerationResult fields" {
         .finish_reason = "stop",
         .prefill_tps = 100.0,
         .decode_tps = 35.0,
-        .logprobs = null,
     };
     try testing.expectEqual(@as(u32, 10), result.prompt_tokens);
     try testing.expectEqual(@as(u32, 3), result.completion_tokens);
     try testing.expectEqualStrings("stop", result.finish_reason);
-    try testing.expect(result.logprobs == null);
 }
 
 test "tokensPerSec basic and zero-time" {

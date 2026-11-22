@@ -207,7 +207,7 @@ route and the MLX arm still build the bank at prepare time.
   is `mlx.libraryAnchor()`, never a wrapper's address. A request on each tiny fixture makes no call into mlx-c
   (the contract's `a Cooler load's request and unload ask nothing of MLX`).
 - **A Cooler load, its requests and its unload ask nothing of MLX, pinned phase by phase** (the census test in
-  `dsv41_generate_test.zig`: the load, a greedy and a seeded request in rounds, serial steps with logprobs, a restore
+  `dsv41_generate_test.zig`: the load, a greedy and a seeded request in rounds, serial steps with a penalty, a restore
   point captured and restored, a step after it, an image prompt, the unload; the SSD tier has its own test, with the
   restored state compared byte for byte). Every row is zero calls, and a change that adds one fails it.
   `SUSHI_DSV41_CENSUS_TRACE=1` prints a phase's calls by entry point. The free of an empty handle is no call
@@ -613,7 +613,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   only template values are the vocabulary and the logits' dtype, so one setting warms every request's filters; a seeded
   request differs only in its root.
 - **The serial sampler is warmed** (`warmSerialSampler`, with the sampled verdict): a first-token or serial draw,
-  sampled and greedy, with and without the suppress mask, the three penalty mixes with logprobs, a grammar mask,
+  sampled and greedy, with and without the suppress mask, the three penalty mixes, a grammar mask,
   and a verify block of every width under the penalties, the thinking penalty with and without a bias, and a row mask.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.

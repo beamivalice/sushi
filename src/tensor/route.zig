@@ -6510,57 +6510,6 @@ test "the penalties and the think penalty on the engine's stream give MLX's byte
     try expectSame(Chain.think(.before, true), &.{ logits, counts, think_ids, mask });
 }
 
-test "logprobs on the engine's stream rank as MLX's do and agree to the last bits: the chosen token, the top ids, a tie, a wide row" {
-    try mlx.requireGpu();
-    const sampler = @import("../sampler.zig");
-    const was = enabled;
-    enabled = true;
-    defer enabled = was;
-    const gpu = mlx.gpuStream();
-    defer _ = mlx.mlx_stream_free(gpu);
-    const vocab = 129280;
-    var values = ramp(f32, vocab, 14, -7);
-    // Two equal leaders (the lower id ranks first), and a leader far above the rest.
-    values[900] = 9.5;
-    values[77] = 9.5;
-    values[128000] = 11;
-    const f32_row = hostArray(f32, &values, &.{ 1, vocab }, .float32);
-    defer _ = mlx.mlx_array_free(f32_row);
-    const f32_3d = hostArray(f32, &values, &.{ 1, 1, vocab }, .float32);
-    defer _ = mlx.mlx_array_free(f32_3d);
-    const bf16_row = try castByMlx(f32_row, .bfloat16);
-    defer _ = mlx.mlx_array_free(bf16_row);
-    for ([_]A{ f32_row, f32_3d, bf16_row }) |logits| for ([_]u32{ 128000, 900, 5, vocab + 3 }) |chosen| {
-        const want = try sampler.computeLogprobs(t_std.allocator, logits, chosen, 5, gpu);
-        defer t_std.allocator.free(want.top_logprobs);
-        const got = try sampler.computeLogprobs(t_std.allocator, logits, chosen, 5, core.stream());
-        defer t_std.allocator.free(got.top_logprobs);
-        try t_std.expectEqual(want.top_logprobs.len, got.top_logprobs.len);
-        try t_std.expectApproxEqAbs(want.token_logprob, got.token_logprob, 1e-4);
-        // A bf16 row ties wherever its fifth place is, and MLX's partition breaks that tie arbitrarily: the leaders only.
-        const compared = if (logits.ctx == bf16_row.ctx) 3 else want.top_logprobs.len;
-        for (want.top_logprobs[0..compared], got.top_logprobs[0..compared]) |w, g| {
-            try t_std.expectEqual(w.token_id, g.token_id);
-            try t_std.expectApproxEqAbs(w.logprob, g.logprob, 1e-4);
-        }
-    };
-    // Past twenty the list stops at twenty; a row of two ids gives two.
-    const big = try sampler.computeLogprobs(t_std.allocator, f32_row, 0, 99, core.stream());
-    defer t_std.allocator.free(big.top_logprobs);
-    try t_std.expectEqual(@as(usize, 20), big.top_logprobs.len);
-    const two = hostArray(f32, &[_]f32{ 1, 3 }, &.{ 1, 2 }, .float32);
-    defer _ = mlx.mlx_array_free(two);
-    const short = try sampler.computeLogprobs(t_std.allocator, two, 0, 5, core.stream());
-    defer t_std.allocator.free(short.top_logprobs);
-    try t_std.expectEqual(@as(usize, 2), short.top_logprobs.len);
-    try t_std.expectEqual(@as(u32, 1), short.top_logprobs[0].token_id);
-    // The engine's stream reads the row once and puts no op on MLX.
-    const before = mlx_ops;
-    const once = try sampler.computeLogprobs(t_std.allocator, f32_row, 128000, 5, core.stream());
-    defer t_std.allocator.free(once.top_logprobs);
-    try t_std.expectEqual(before, mlx_ops);
-}
-
 /// `expectSame` for a table of cases: a failing one is named on stderr and counted, so one run shows them all.
 var named_failures: usize = 0;
 fn expectNamed(name: []const u8, comptime build: anytype, inputs: []const A) !void {

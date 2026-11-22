@@ -27,12 +27,6 @@ const Conn = http_conn.Conn;
 const sendSseHeaders = http_conn.sendSseHeaders;
 const request_policy = @import("request_policy.zig");
 const withEffortNoticeJson = request_policy.withEffortNoticeJson;
-const logprobs = @import("logprobs.zig");
-const listed_tokens = @import("listed_tokens.zig");
-const request_parse = @import("request_parse.zig");
-const StreamLogprobs = logprobs.StreamLogprobs;
-const formatLogprobsObject = logprobs.formatLogprobsObject;
-const Listing = listed_tokens.Listing;
 const io_util = @import("io_util.zig");
 const mtp_plan = @import("mtp_plan.zig");
 const sampler = @import("sampler.zig");
@@ -394,10 +388,9 @@ pub const ThoughtResume = struct {
     kept: ?reply_mod.ThoughtKept = null,
 
     /// What a request that cannot be continued is kept for, or null when it can be.
-    pub fn keptFor(continue_final: bool, images: bool, asked_logprobs: bool, constrained: bool) ?reply_mod.ThoughtKept {
+    pub fn keptFor(continue_final: bool, images: bool, constrained: bool) ?reply_mod.ThoughtKept {
         if (continue_final) return .continuation_request;
         if (images) return .images;
-        if (asked_logprobs) return .logprobs;
         if (constrained) return .json_schema;
         return null;
     }
@@ -563,7 +556,6 @@ pub fn nonStreamingViaScheduler(
     media_chain: []const prefix_cache_mod.MediaSpan,
     cache_key: u64,
     mrope: MropeData,
-    logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?trunk.KVQuantConfig,
     /// When non-null, the peer socket is probed on idle wakeups during the
@@ -599,7 +591,6 @@ pub fn nonStreamingViaScheduler(
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
-        .logprobs_n = logprobs_n,
         .kv_quant_config = kv_quant_override,
     };
     const slot = try sch.submit(params);
@@ -683,11 +674,6 @@ pub fn nonStreamingViaScheduler(
         }
     }
 
-    // Phase A5: take ownership of the slot's accumulated logprobs. After
-    // `toOwnedSlice` the slot's list is empty, so `Slot.deinit` doesn't try
-    // to free what we just transferred to the caller.
-    const logprobs_slice: ?[]sampler.LogprobResult = slot.takeLogprobs(if (returned) token_ids.len else std.math.maxInt(usize));
-
     return .{
         .text = text,
         .token_ids = token_ids,
@@ -699,7 +685,6 @@ pub fn nonStreamingViaScheduler(
         .prefill_ns = prefill_ns,
         .decode_ns = decode_ns,
         .cached_tokens = slot.cached_tokens,
-        .logprobs = logprobs_slice,
         .finish_details = details,
         .constraint_payload_byte = constraint_payload_byte,
         .restore_ns = slot.restore_ns,
@@ -714,20 +699,18 @@ pub fn nonStreamingViaScheduler(
 /// UNREParsed. A standalone re-scan of the payload would read marker text
 /// inside JSON string data ("the close delimiter") as protocol structure and
 /// truncate valid JSON. Without a boundary the existing parser applies.
-/// A chat stream's content delta, with the join that opens a part after a thought sent ahead of it as a delta of its own
-/// that lists nothing, as an empty list when logprobs were asked: no token carries it.
-fn sendContentDelta(allocator: std.mem.Allocator, stream: *Conn, chat_id: i64, model_name: []const u8, content: *think_tags.ContentStream, lps: *StreamLogprobs, bytes: []const u8) !void {
-    if (content.takeJoin()) |join| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = join }, null, null, null, .{ .logprobs_json = lps.empty() });
-    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null, .{ .logprobs_json = try lps.take(content.withheld()) });
+/// A chat stream's content delta.
+fn sendContentDelta(allocator: std.mem.Allocator, stream: *Conn, chat_id: i64, model_name: []const u8, bytes: []const u8) !void {
+    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = bytes }, null, null, null);
 }
 
-fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: i64, model: []const u8, lps: *StreamLogprobs, d: *rp_mod.Delivery) !void {
+fn emitConstrainedChat(a: std.mem.Allocator, stream: *Conn, id: i64, model: []const u8, d: *rp_mod.Delivery) !void {
     if (d.reasoning.items.len > 0) {
-        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null, .{ .logprobs_json = null });
+        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = null, .reasoning_content = d.reasoning.items }, null, null, null);
     }
     if (d.content.items.len > 0) {
-        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = d.content.items }, null, null, null, .{ .logprobs_json = try lps.take(0) });
-    } else lps.dropPending();
+        try sendSSEChunk(a, stream, id, model, .{ .role = null, .content = d.content.items }, null, null, null);
+    }
 }
 
 pub fn handleNonStreamingGeneration(
@@ -748,7 +731,6 @@ pub fn handleNonStreamingGeneration(
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
-    asked_logprobs: ?request_parse.Logprobs,
     enable_thinking: bool,
     reasoning_budget: i32,
     enable_drafter: bool,
@@ -765,7 +747,6 @@ pub fn handleNonStreamingGeneration(
     tokenize_ns: u64,
     thought: ?*const ThoughtResume,
 ) !void {
-    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     // Phase A8: this handler owns the vision array on entry; ownership
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
     // it). Nulled before transfer so the early-return defer is a no-op.
@@ -775,12 +756,11 @@ pub fn handleNonStreamingGeneration(
     var timer = Stopwatch.init(stream.io);
 
     // Speculative-decoding dispatch (priority: DFlash > MTP > regular).
-    //   1. Drafter wins if loaded AND requested AND no logprobs (drafter
-    //      cannot expose realized log-probs from the draft side).
-    //   2. PLD next if requested AND no logprobs AND no grammar constraint
+    //   1. Drafter wins if loaded AND requested.
+    //   2. PLD next if requested AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
@@ -791,7 +771,7 @@ pub fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media_chain, cache_key, mrope, kv_quant_override, stream, .{ .stops = stop_sequences }, thought);
     defer result.deinit(allocator);
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
@@ -894,15 +874,6 @@ pub fn handleNonStreamingGeneration(
             defer if (tc_content_esc.owned) allocator.free(tc_content_esc.slice);
             const tc_content_json: []const u8 = if (tc_preamble.len > 0) tc_content_esc.slice else "null";
 
-            // `logprobs.content` lists the message's content, never a call's tokens: null when there is no content.
-            var tc_logprobs_json: []const u8 = "null";
-            var tc_logprobs_owned = false;
-            defer if (tc_logprobs_owned) allocator.free(tc_logprobs_json);
-            if (result.logprobs) |lps| if (tc_preamble.len > 0) {
-                tc_logprobs_json = try contentLogprobsJson(allocator, tok, result.token_ids, lps, final_text, settled.provenance(), tc_preamble, if (asked_logprobs) |l| l.top else 0);
-                tc_logprobs_owned = true;
-            };
-
             const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
             const tc_timings_field = if (tc_timings.len > 0)
@@ -920,7 +891,7 @@ pub fn handleNonStreamingGeneration(
             defer allocator.free(tc_finish_details);
             // finish_reason always carries finish_details beside it.
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"logprobs":null,"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
             , .{
                 nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
                 nowSecs(stream.io),
@@ -928,7 +899,6 @@ pub fn handleNonStreamingGeneration(
                 tc_content_json,
                 tc_reasoning_json,
                 tc_buf.items,
-                tc_logprobs_json,
                 toolCallFinishReason(finish_reason),
                 tc_finish_details,
                 tc_usage_obj,
@@ -957,21 +927,6 @@ pub fn handleNonStreamingGeneration(
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
     const escaped_text = escaped.slice;
     defer if (escaped.owned) allocator.free(escaped.slice);
-
-    // Build logprobs JSON if requested. The array describes `message.content`,
-    // so it stops at the tokens that survived the think split — see
-    // `contentListing`.
-    var logprobs_json: []const u8 = "null";
-    var logprobs_allocated = false;
-    if (result.logprobs) |lps| {
-        const top: u32 = if (asked_logprobs) |l| l.top else 0;
-        logprobs_json = if (routed) |*d|
-            try constrainedLogprobsJson(allocator, tok, result.token_ids, lps, d, top)
-        else
-            try contentLogprobsJson(allocator, tok, result.token_ids, lps, final_text, settled.provenance(), content_text, top);
-        logprobs_allocated = true;
-    }
-    defer if (logprobs_allocated) allocator.free(logprobs_json);
 
     // Build reasoning_content whenever reasoning exists — delivery does not
     // key on the request's thinking flag.
@@ -1003,14 +958,13 @@ pub fn handleNonStreamingGeneration(
     defer allocator.free(finish_details);
     // finish_reason always carries finish_details beside it.
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":null,"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{
         nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
         model_name,
         escaped_text,
         reasoning_json,
-        logprobs_json,
         finish_reason,
         finish_details,
         usage_obj,
@@ -1357,7 +1311,7 @@ pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool };
 /// `sched_policy.specInitWiring`. A loaded DFlash sidecar is an explicit choice
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
-/// false` hand the round back to MTP. logprobs and a grammar constraint disable every mode; a repeat or presence
+/// false` hand the round back to MTP. A grammar constraint disables every mode; a repeat or presence
 /// penalty disables only the sidecar and the drafter, since MTP shifts its verify rows for it.
 pub fn requestSpecModes(
     enable_drafter: bool,
@@ -1365,9 +1319,8 @@ pub fn requestSpecModes(
     dflash_loaded: bool,
     mtp_loaded: bool,
     sampling: sampler.SamplingParams,
-    logprobs_n: u32,
 ) RequestSpec {
-    const spec_ok = !mtp_plan.mtpUnsupported(sampling, logprobs_n);
+    const spec_ok = !mtp_plan.mtpUnsupported(sampling);
     const sidecar = spec_ok and !sampler.penaltyActive(sampling) and enable_drafter and dflash_loaded;
     const use_dflash = sidecar and dflash_loaded;
     const use_mtp = !use_dflash and spec_ok and enable_mtp and mtp_loaded;
@@ -1379,9 +1332,9 @@ pub fn requestSpecModes(
 }
 
 /// A request that asked for MTP and runs without it says why; the boot line says MTP is on.
-pub fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: sampler.SamplingParams, logprobs_n: u32) void {
+pub fn noteMtpRefused(enable_mtp: bool, mtp_loaded: bool, sampling: sampler.SamplingParams) void {
     if (!enable_mtp or !mtp_loaded) return;
-    if (mtp_plan.mtpRefusal(sampling, logprobs_n)) |why| log.info("  mtp=disabled ({s})\n", .{why});
+    if (mtp_plan.mtpRefusal(sampling)) |why| log.info("  mtp=disabled ({s})\n", .{why});
 }
 
 pub fn pickStreamMode(
@@ -1390,9 +1343,8 @@ pub fn pickStreamMode(
     dflash_loaded: bool,
     mtp_loaded: bool,
     sampling: sampler.SamplingParams,
-    logprobs_n: u32,
 ) StreamMode {
-    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling, logprobs_n);
+    const r = requestSpecModes(enable_drafter, enable_mtp, dflash_loaded, mtp_loaded, sampling);
     if (r.use_mtp) return .mtp;
     if (r.use_drafter) return .drafter;
     return .regular;
@@ -1401,26 +1353,24 @@ pub fn pickStreamMode(
 test "requestSpecModes: a loaded DFlash sidecar outranks the checkpoint's MTP head" {
     const plain = sampler.SamplingParams{};
     // dflash + mtp both loaded and enabled -> dflash rides the drafter arm.
-    var r = requestSpecModes(true, true, true, true, plain, 0);
+    var r = requestSpecModes(true, true, true, true, plain);
     try std.testing.expect(r.use_drafter and !r.use_mtp);
-    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, plain, 0));
+    try std.testing.expectEqual(StreamMode.drafter, pickStreamMode(true, true, true, true, plain));
     // No sidecar loaded -> MTP keeps its rank.
-    r = requestSpecModes(true, true, false, true, plain, 0);
+    r = requestSpecModes(true, true, false, true, plain);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, plain, 0));
+    try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, false, true, plain));
     // enable_drafter:false hands the round back to MTP.
-    r = requestSpecModes(false, true, true, true, plain, 0);
+    r = requestSpecModes(false, true, true, true, plain);
     try std.testing.expect(r.use_mtp and !r.use_drafter);
-    // logprobs / grammar disable every spec mode, dflash included.
-    r = requestSpecModes(true, true, true, true, plain, 3);
-    try std.testing.expect(!r.use_mtp and !r.use_drafter);
+    // A grammar disables every spec mode, dflash included.
     var dummy: generate_mod.Constraint = .{ .grammar = undefined, .token_bytes = undefined, .mask_buf = &.{} };
-    r = requestSpecModes(true, true, true, true, .{ .constraint = &dummy }, 0);
+    r = requestSpecModes(true, true, true, true, .{ .constraint = &dummy });
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
     // Nothing loaded -> regular decode.
-    r = requestSpecModes(true, true, false, false, plain, 0);
+    r = requestSpecModes(true, true, false, false, plain);
     try std.testing.expect(!r.use_mtp and !r.use_drafter);
-    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, plain, 0));
+    try std.testing.expectEqual(StreamMode.regular, pickStreamMode(true, true, false, false, plain));
 }
 
 pub fn handleStreamingGeneration(
@@ -1442,7 +1392,6 @@ pub fn handleStreamingGeneration(
     /// false = client set parallel_tool_calls:false (Anthropic:
     /// tool_choice.disable_parallel_tool_use) — at most one call per response.
     allow_parallel_tools: bool,
-    asked_logprobs: ?request_parse.Logprobs,
     enable_thinking: bool,
     reasoning_budget: i32,
     enable_drafter: bool,
@@ -1461,7 +1410,6 @@ pub fn handleStreamingGeneration(
     tokenize_ns: u64,
     thought: ?*const ThoughtResume,
 ) !void {
-    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     // Vision array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer so
     // the early-return defer is a no-op.
@@ -1486,10 +1434,10 @@ pub fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
-    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling);
 
     // Scheduler's inference thread runs prefill + per-tick decode (regular
     // / PLD / drafter) and pushes generated tokens into the slot's output
@@ -1520,7 +1468,6 @@ pub fn handleStreamingGeneration(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .logprobs_n = logprobs_n,
         .deferred_media = slot_ve_s,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
@@ -1538,21 +1485,8 @@ pub fn handleStreamingGeneration(
     // Send SSE headers (no Content-Length — we stream until done)
     try sendSseHeaders(stream, "chat.completions", SSE_ALLOW_HEADERS_DEFAULT);
 
-    // Logprobs ride the chunks beside their deltas. Requesting them already
-    // forced this stream off every speculative path (see `pickStreamMode`), so
-    // the cost is paid whether or not they are delivered — dropping them was
-    // the worst of both.
-    var lps = StreamLogprobs{
-        .allocator = allocator,
-        .tok = tok,
-        .slot = slot_handle,
-        .enabled = asked_logprobs != null,
-        .top = if (asked_logprobs) |l| l.top else 0,
-    };
-    defer lps.deinit();
-
     // First chunk: role announcement
-    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null, null, .{ .logprobs_json = try lps.take(0) });
+    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null, null);
 
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
@@ -1611,7 +1545,7 @@ pub fn handleStreamingGeneration(
     defer if (delivery) |*d| d.deinit(allocator);
     var think_closed = false; // a complete think block was already split+emitted this stream
     // The content arm delivers the non-stream content bytes (think_tags.ContentStream).
-    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream }, .join_apart = true, .opens_thoughts = !gated_stream };
+    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream }, .opens_thoughts = !gated_stream };
     defer content.deinit(allocator);
     var thought_mark: think_tags.MarkupCut = .{ .on = !gated_stream };
     var join: think_tags.ThoughtJoin = .{};
@@ -1686,11 +1620,9 @@ pub fn handleStreamingGeneration(
         const token_text = if (reply_over) try allocator.alloc(u8, 0) else if (tail_flush) try stop_gate.finish(allocator) else blk: {
             const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
-            try lps.note(token_id, raw_decoded.len);
             if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
         };
-        lps.release(stop_gate.released, tail_flush or stop_gate.matched != null);
         stopped = stop_gate.matched != null;
         if (stopped) ts.slot.?.stop_hit.store(true, .release);
         if (token_text.len == 0 and !reply_over) {
@@ -1707,7 +1639,7 @@ pub fn handleStreamingGeneration(
             defer allocator.free(token_text);
             try d.feed(allocator, token_text);
             if (include_usage) try delivered_reasoning.appendSlice(allocator, d.reasoning.items);
-            try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
+            try emitConstrainedChat(allocator, stream, chat_id, model_name, d);
             try beatStreamKeepalive(stream, .sse_comment);
             continue;
         }
@@ -1776,15 +1708,6 @@ pub fn handleStreamingGeneration(
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
                         const split = think_tags.splitThinkBlock(undelivered, true, opens_think);
-                        // The thought's tokens never reach the client, so their
-                        // entries must not ride the content chunk below — the
-                        // reasoning emitters above deliberately do not drain.
-                        // Empty content means the block closed with nothing
-                        // after it: everything buffered so far was reasoning,
-                        // and leaving it pending hands it to the NEXT chunk
-                        // (measured: 42 entries on a 1-char delta).
-                        try lps.closePart();
-                        if (split.content.len > 0) lps.skipToContent(undelivered, split.content) else lps.dropPending();
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
@@ -1810,27 +1733,22 @@ pub fn handleStreamingGeneration(
                         reasoning_streamed = 0;
                         content.endPart();
                         if (split.content.len > 0) switch (try content.deliver(allocator, split.content)) {
-                            .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, bytes),
+                            .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, bytes),
                             else => {},
                         };
                     },
                     .flush_text => {
-                        // The pieces end at the gate's `released`: each one's offset in the generation follows.
-                        var piece_at = lps.listing.released;
-                        for (token_texts.items) |tt| piece_at -|= tt.len;
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
-                            try content.arrive(allocator, tt, piece_at);
-                            piece_at += tt.len;
+                            try content.arrive(allocator, tt);
                         }
                         // The gate flushes no think tag that waits on a backtick's partner: what it flushed is read as it stands.
                         while (try content.ready(allocator, false, true)) |r| switch (r) {
                             .opens => unreachable,
                             .step => |st| {
-                                try lps.afterDeliver(st.step, &content, st.at, st.text.len);
                                 switch (st.step) {
                                     .marker, .hold, .drop => {},
-                                    .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, bytes),
+                                    .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, bytes),
                                 }
                             },
                         };
@@ -1846,11 +1764,10 @@ pub fn handleStreamingGeneration(
         // A think block the MODEL opens, first or after content: seeded like a template-injected one, and holds the tokens
         // that followed its opener while the content arm waited on the tag.
         if (!gated_stream and !in_think_block) {
-            if (token_text.len > 0) try content.arrive(allocator, token_text, lps.listing.released -| token_text.len);
+            if (token_text.len > 0) try content.arrive(allocator, token_text);
             while (try content.ready(allocator, channel_armed, reply_over)) |r| switch (r) {
                 .opens => |opener| {
                     // The opener and any whitespace held before it never reach content.
-                    try lps.endPart();
                     content.endPart();
                     channel_armed = false;
                     in_think_block = true;
@@ -1864,11 +1781,10 @@ pub fn handleStreamingGeneration(
                     break;
                 },
                 .step => |st| {
-                    try lps.afterDeliver(st.step, &content, st.at, st.text.len);
                     channel_armed = st.step == .marker and std.mem.eql(u8, st.text, "<|channel>");
                     switch (st.step) {
                         .marker, .hold, .drop => {},
-                        .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, bytes),
+                        .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, bytes),
                     }
                 },
             };
@@ -1952,15 +1868,10 @@ pub fn handleStreamingGeneration(
                 }
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
-                    // The reasoning above this point never reaches the client,
-                    // so its entries stop here rather than riding the answer.
-                    lps.skipToContent(think_buf.items, content_after);
                     switch (try content.deliver(allocator, content_after)) {
-                        .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, bytes),
+                        .send => |bytes| try sendContentDelta(allocator, stream, chat_id, model_name, bytes),
                         else => {},
                     }
-                } else {
-                    lps.dropPending();
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
@@ -2007,7 +1918,7 @@ pub fn handleStreamingGeneration(
             d.clearOutput();
             try d.finish(allocator);
             if (include_usage) try delivered_reasoning.appendSlice(allocator, d.reasoning.items);
-            try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
+            try emitConstrainedChat(allocator, stream, chat_id, model_name, d);
         }
     }
 
@@ -2015,7 +1926,7 @@ pub fn handleStreamingGeneration(
     // thought, or before tool markup (a tools request decides below).
     if (!client_gone and !gated_stream) {
         const held = try content.finish(allocator, join.closed);
-        if (held.len > 0) try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, held);
+        if (held.len > 0) try sendContentDelta(allocator, stream, chat_id, model_name, held);
     }
 
     // Flush any remaining think buffer
@@ -2036,7 +1947,7 @@ pub fn handleStreamingGeneration(
             const vis_tail = lead[0..content.mark.final(lead)];
             if (vis_tail.len > 0) {
                 content.started = true;
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null, .{ .logprobs_json = try lps.take(0) });
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = vis_tail }, null, null, null);
             }
         }
     }
@@ -2100,7 +2011,7 @@ pub fn handleStreamingGeneration(
                 // A call that went out early owes its arguments (or nothing); any other is delivered whole.
                 const first_delta = try tool_progress.chatEnd(allocator, stream.io, &tool_stream, i, tc);
                 defer allocator.free(first_delta);
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = null });
+                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null);
             }
             try endCutCall(allocator, stream, chat_id, model_name, &tool_stream);
             finish_reason = toolCallFinishReason(finish_reason);
@@ -2121,12 +2032,12 @@ pub fn handleStreamingGeneration(
                 for (token_texts.items) |t| {
                     try full_text.appendSlice(allocator, t);
                 }
-                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocksMapped(allocator, full_text.items);
-                defer if (flush_norm) |n| n.deinit(allocator);
-                const flush_text: []const u8 = if (flush_norm) |n| n.text else full_text.items;
+                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
+                defer if (flush_norm) |n| allocator.free(n);
+                const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 const held = try content.finish(allocator, join.closed and think_split.content.len == 0);
-                if (held.len > 0) try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, held);
+                if (held.len > 0) try sendContentDelta(allocator, stream, chat_id, model_name, held);
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (think_tags.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -2134,33 +2045,7 @@ pub fn handleStreamingGeneration(
                     defer if (capped.owned) allocator.free(capped.text);
                     try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, capped.text);
                 }
-                if (think_split.content.len > 0) {
-                    // `full_text` is a true suffix of the generation, which `flush_text` may rewrite:
-                    // the content lists through the rewrite's provenance.
-                    // The content ships in deltas split at the rewrite's joins, each join a delta of its own that lists nothing.
-                    const runs: ?[]const listed_tokens.Run = if (flush_norm) |n| n.runs else null;
-                    const content_at = @intFromPtr(think_split.content.ptr) - @intFromPtr(flush_text.ptr);
-                    var shipped: usize = 0;
-                    for (runs orelse &.{}) |run| {
-                        if (run.src != null or run.at < content_at + shipped or run.at + run.len > content_at + think_split.content.len) continue;
-                        const piece = think_split.content[shipped .. run.at - content_at];
-                        if (piece.len > 0) {
-                            try lps.contentThrough(runs, flush_text, full_text.items.len, piece);
-                            try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, piece);
-                        }
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = listed_tokens.content_join }, null, null, null, .{ .logprobs_json = lps.empty() });
-                        shipped = run.at - content_at + run.len;
-                    }
-                    const last = think_split.content[shipped..];
-                    if (last.len > 0) {
-                        try lps.contentThrough(runs, flush_text, full_text.items.len, last);
-                        try sendContentDelta(allocator, stream, chat_id, model_name, &content, &lps, last);
-                    }
-                } else {
-                    // All reasoning, no content: those entries describe text the
-                    // client never received.
-                    lps.dropPending();
-                }
+                if (think_split.content.len > 0) try sendContentDelta(allocator, stream, chat_id, model_name, think_split.content);
             }
         }
     }
@@ -2168,7 +2053,7 @@ pub fn handleStreamingGeneration(
     const total_prompt = ts.prompt_tokens;
     if (!client_gone) {
         // Final chunk with finish_reason
-        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details, .declined_field = if (declined_field.len > 0) declined_field else null }, null, null, .{ .logprobs_json = try lps.takeLate() });
+        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish_reason, .details = ts.finish_details, .declined_field = if (declined_field.len > 0) declined_field else null }, null, null);
 
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
@@ -2208,15 +2093,6 @@ const DeltaFields = struct {
     tool_calls_json: ?[]const u8 = null,
 };
 
-/// Per-choice fields that sit BESIDE `delta`, not inside it. Defaulted so a
-/// call site that has nothing to add passes `.{}` — every existing emitter
-/// keeps its exact bytes, which is what makes this additive.
-const ChunkExtras = struct {
-    /// Already-rendered `{"content":[…]}` from `formatLogprobsObject`, or null
-    /// to omit the key entirely.
-    logprobs_json: ?[]const u8,
-};
-
 /// How a stream ended: the wire `finish_reason` plus, when the
 /// degenerate-tail guard cut it, the sibling cause (`finishDetailsField`).
 const Finish = struct {
@@ -2234,8 +2110,8 @@ fn sendReasoning(allocator: std.mem.Allocator, stream: *Conn, chat_id: i64, mode
         try u.appendSlice(allocator, sep);
         try u.appendSlice(allocator, delta);
     }
-    if (sep.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = sep }, null, null, null, .{ .logprobs_json = null });
-    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = delta }, null, null, null, .{ .logprobs_json = null });
+    if (sep.len > 0) try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = sep }, null, null, null);
+    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = delta }, null, null, null);
 }
 
 fn sendSSEChunk(
@@ -2250,7 +2126,6 @@ fn sendSSEChunk(
     finish: ?Finish,
     usage_json: ?[]const u8,
     timings_json: ?[]const u8,
-    extras: ChunkExtras,
 ) !void {
     // Build the delta JSON object
     var delta_buf = std.ArrayList(u8).empty;
@@ -2300,16 +2175,6 @@ fn sendSSEChunk(
         "null";
     const fd_str = if (finish) |f| (f.declined_field orelse finishDetailsField(f.reason, f.details)) else "";
 
-    // `logprobs` is a sibling of `delta` on the choice, not a field inside it.
-    // Emitted only when the request asked; OpenAI's own chunk shape carries
-    // `"logprobs":null` otherwise, which is what the empty case renders.
-    var lp_buf = std.ArrayList(u8).empty;
-    defer lp_buf.deinit(allocator);
-    if (extras.logprobs_json) |lp| {
-        try lp_buf.appendSlice(allocator, ",\"logprobs\":");
-        try lp_buf.appendSlice(allocator, lp);
-    }
-
     // Build usage field
     const usage_str = if (usage_json) |u| u else "null";
 
@@ -2325,8 +2190,8 @@ fn sendSSEChunk(
     // Build the full SSE chunk
     // finish_reason always carries finish_details beside it.
     const chunk = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"delta":{s},"finish_reason":{s}{s}{s}}}],"usage":{s}{s}}}
-    , .{ chat_id, nowSecs(stream.io), model_name, delta_buf.items, fr_str, fd_str, lp_buf.items, usage_str, timings_tail_buf.items });
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"delta":{s},"finish_reason":{s}{s}}}],"usage":{s}{s}}}
+    , .{ chat_id, nowSecs(stream.io), model_name, delta_buf.items, fr_str, fd_str, usage_str, timings_tail_buf.items });
     defer allocator.free(chunk);
 
     const shipped = if (finish != null) try withEffortNoticeJson(allocator, chunk, stream.effort_notice_json) else try allocator.dupe(u8, chunk);
@@ -2340,7 +2205,7 @@ fn sendSSEChunk(
 
 /// The `stream_options.include_usage` chunk: OpenAI's shape is an EMPTY
 /// `choices` array beside the usage object — no delta, no finish_reason, no
-/// logprobs (all per-choice fields; the final chunk already carried them).
+/// (all per-choice fields; the final chunk already carried them).
 fn sendSSEUsageChunk(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -2732,70 +2597,6 @@ pub fn formatPerfBracket(
     return s catch buf[0..0];
 }
 
-/// The `logprobs` object of a non-streamed reply: the entries of the tokens whose bytes are `content`, a slice of `text`.
-/// `runs` says where a rewrite of the generation got its bytes (`reply.Settled.provenance`); null: `text` is the generation's own.
-pub fn contentLogprobsJson(
-    allocator: std.mem.Allocator,
-    tok: *const Tokenizer,
-    token_ids: []const u32,
-    lps: []const sampler.LogprobResult,
-    text: []const u8,
-    runs: ?[]const listed_tokens.Run,
-    content: []const u8,
-    top: u32,
-) ![]const u8 {
-    const n = @min(token_ids.len, lps.len);
-    var listing = try contentListing(allocator, tok, token_ids[0..n], text, runs, content);
-    defer listing.deinit(allocator);
-    return formatLogprobsObject(allocator, tok, token_ids[0..n], lps[0..n], top, listing.queued(), listing.gaps.items);
-}
-
-/// The `logprobs` object of a constrained reply, whose content is the delivery's own copy of the generation's bytes from
-/// `content_at` on: it lists through that map, never by finding the copy in the text.
-pub fn constrainedLogprobsJson(
-    allocator: std.mem.Allocator,
-    tok: *const Tokenizer,
-    token_ids: []const u32,
-    lps: []const sampler.LogprobResult,
-    d: *const rp_mod.Delivery,
-    top: u32,
-) ![]const u8 {
-    const run = [_]listed_tokens.Run{.{ .at = 0, .len = d.content.items.len, .src = d.content_at orelse 0 }};
-    return contentLogprobsJson(allocator, tok, token_ids, lps, d.content.items, &run, d.content.items, top);
-}
-
-/// Which of the generated tokens survive into `message.content`, as a `Listing` whose `queued` list is the entries in order.
-///
-/// OpenAI defines `logprobs.content` as the tokens of the message CONTENT, but the generation also carries the reasoning
-/// block, any leaked tool markup and a loop-trimmed tail, all cut before the text reaches the client; the content can also
-/// hold bytes no token produced, the join of its parts around a thought. `content` is a slice of `text` (the split helpers
-/// return raw slices, so its offset is exact pointer arithmetic) and `runs` maps `text` to the generation. A reply whose
-/// content is a copy (a constrained reply's) names the copy as `text` and says where it came from in `runs`; a content
-/// that is no slice of `text` is refused, never found by its bytes.
-pub fn contentListing(
-    allocator: std.mem.Allocator,
-    tok: *const Tokenizer,
-    token_ids: []const u32,
-    text: []const u8,
-    runs: ?[]const listed_tokens.Run,
-    content: []const u8,
-) !Listing {
-    var listing: Listing = .{};
-    errdefer listing.deinit(allocator);
-    if (content.len == 0) return listing;
-    for (token_ids) |id| {
-        const decoded = try tok.decode(allocator, &[_]u32{id});
-        defer allocator.free(decoded);
-        try listing.note(allocator, decoded.len);
-    }
-    const base = @intFromPtr(text.ptr);
-    const cptr = @intFromPtr(content.ptr);
-    if (cptr < base or cptr + content.len > base + text.len) return error.ContentIsNotTheReplyText;
-    const from = cptr - base;
-    try listing.returnedText(allocator, runs, 0, from, from + content.len);
-    return listing;
-}
-
 /// SSE comment keepalive for the OpenAI-style streaming surfaces. Comments
 /// are SSE-spec-legal and skipped by every SSE parser. No-op on the
 /// WebSocket transport — a raw comment line would corrupt WS framing, and
@@ -2857,7 +2658,7 @@ fn beatToolCall(
         if (try progress.beat(allocator, stream.io, buffered, origin, tools_json, .{})) |beat| {
             const delta = try tool_progress.chatBeat(allocator, progress, beat);
             defer allocator.free(delta);
-            return sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = delta }, null, null, null, .{ .logprobs_json = null });
+            return sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = delta }, null, null, null);
         }
     }
     try beatStreamKeepalive(stream, .sse_comment);
@@ -2868,7 +2669,7 @@ fn beatToolCall(
 fn endCutCall(allocator: std.mem.Allocator, stream: *Conn, chat_id: i64, model_name: []const u8, progress: *const tool_progress.Progress) !void {
     const open = progress.cut() orelse return;
     log.info("  [tool-stream] the call \"{s}\" sent to the client was left unfinished; it ends under a finish that is not tool_calls\n", .{open.name});
-    if (progress.cutEnding()) |ending| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = ending }, null, null, null, .{ .logprobs_json = null });
+    if (progress.cutEnding()) |ending| try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = ending }, null, null, null);
 }
 
 test "loopTrimmedIds: the degenerate span is cut, and a bad index degrades to emitting everything" {
@@ -3134,7 +2935,6 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     slot.out_event = .unset;
     slot.out_buf = .empty;
     defer slot.out_buf.deinit(a);
-    slot.logprobs_buf = .empty;
     slot.out_idx = 0;
     slot.handover_token = null;
     slot.cancelled = .init(false);
@@ -3176,7 +2976,6 @@ test "a streamed stop reports the tokens it delivered, not the speculative block
     slot.out_event = .unset;
     slot.out_buf = .empty;
     defer slot.out_buf.deinit(a);
-    slot.logprobs_buf = .empty;
     slot.out_idx = 0;
     slot.handover_token = null;
     slot.cancelled = .init(false);
@@ -3234,7 +3033,6 @@ test "a reply the cancel API ends mid-decode says cancelled and counts the token
         slot.out_event = .unset;
         slot.out_buf = .empty;
         defer slot.out_buf.deinit(a);
-        slot.logprobs_buf = .empty;
         slot.out_idx = 0;
         slot.handover_token = null;
         slot.cancelled = .init(false);
@@ -3251,7 +3049,7 @@ test "a reply the cancel API ends mid-decode says cancelled and counts the token
         slot.prefill_ns = 0;
         slot.decode_ns = 0;
         slot.in_pass = .init(1);
-        for (0..3) |i| slot.pushTokenWithLogprob(@intCast(i + 1), null);
+        for (0..3) |i| slot.pushToken(@intCast(i + 1));
         // POST /v1/slots/cancel, from another connection, while a pass holds the slot.
         slot.cancel();
         var pass = LatePass{ .slot = &slot };
@@ -3437,7 +3235,7 @@ test "a stream's final chunk names the call its reply declined, ahead of a thoug
         defer _ = std.c.close(sv[1]);
         var conn: Conn = undefined;
         Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
-        try sendSSEChunk(a, &conn, 1, "m", .{ .role = null, .content = null }, c.finish, null, null, .{ .logprobs_json = null });
+        try sendSSEChunk(a, &conn, 1, "m", .{ .role = null, .content = null }, c.finish, null, null);
         _ = std.posix.system.shutdown(sv[1], std.posix.SHUT.WR);
         conn.close();
         var buf: [4096]u8 = undefined;

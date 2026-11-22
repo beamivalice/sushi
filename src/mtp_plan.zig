@@ -218,9 +218,8 @@ pub fn cutMtpRound(drafts: []const u32, accepted: u32, pending: u32, keep: usize
 }
 
 /// A speculative decode step (DFlash / MTP) cannot honor a grammar
-/// constraint — the drafts bypass the per-token grammar mask — nor per-token
-/// logprobs, which the draft path never captures. The scheduler and server
-/// already select a spec mode only when both are absent, but `nextDflash` /
+/// constraint — the drafts bypass the per-token grammar mask. The scheduler and server
+/// already select a spec mode only when it is absent, but `nextDflash` /
 /// `nextMtp` only *documented* that with `std.debug.assert`,
 /// which compiles out in the ReleaseFast build users actually run (issue #97).
 /// A future dispatch bug that let a constrained request reach a spec step would
@@ -228,19 +227,18 @@ pub fn cutMtpRound(drafts: []const u32, accepted: u32, pending: u32, keep: usize
 /// stream silently off-schema output as a normal 200. So the spec steps gate on
 /// this real, release-enforced check and return `error.SpecDecodeUnsupported`
 /// instead of asserting.
-pub fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
-    return draftsRefused(sampling) or logprobs_n != 0;
+pub fn specDecodeUnsupported(sampling: SamplingParams) bool {
+    return draftsRefused(sampling);
 }
 
 /// MTP rounds shift every verify row for a repeat, presence or frequency penalty (`penaltyShiftRows`), so
 /// only what a draft run cannot honour keeps them off.
-pub fn mtpUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
-    return mtpRefusal(sampling, logprobs_n) != null;
+pub fn mtpUnsupported(sampling: SamplingParams) bool {
+    return mtpRefusal(sampling) != null;
 }
 
 /// Why a request runs without MTP, for the log; null when MTP may run.
-pub fn mtpRefusal(sampling: SamplingParams, logprobs_n: u32) ?[]const u8 {
-    if (logprobs_n != 0) return "logprobs requested";
+pub fn mtpRefusal(sampling: SamplingParams) ?[]const u8 {
     if (sampling.constraint) |c| if (!c.rowsDraftable()) return "grammar-constrained output";
     if (sampling.call_force != null) return "forced tool call";
     return null;
@@ -294,26 +292,23 @@ test "capAcceptedForTokenBudget keeps speculative commits inside max_tokens" {
     try std.testing.expectEqual(@as(u32, 0), capAcceptedForTokenBudget(15, 401, 400));
 }
 
-test "specDecodeUnsupported: release-enforced guard for spec + constraint/logprobs (issue #97)" {
-    // Speculative decode (drafter/MTP) cannot honor a grammar constraint or
-    // per-token logprobs. nextDflash/nextMtp only asserted this, which
+test "specDecodeUnsupported: release-enforced guard for spec + constraint (issue #97)" {
+    // Speculative decode (drafter/MTP) cannot honor a grammar constraint.
+    // nextDflash/nextMtp only asserted this, which
     // compiles out in ReleaseFast (issue #97) — this is the real check they now
     // use to fail loud instead of streaming silently off-schema output.
-    try testing.expect(!specDecodeUnsupported(.{}, 0)); // plain sampling → spec OK
-    try testing.expect(specDecodeUnsupported(.{}, 1)); // any logprobs → not OK
-    try testing.expect(specDecodeUnsupported(.{}, 5));
+    try testing.expect(!specDecodeUnsupported(.{})); // plain sampling → spec OK
     // A grammar constraint present → not OK. The guard only null-checks the
     // pointer (never dereferences), so a dummy address is sufficient here.
     var dummy: Constraint = undefined;
-    try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 0));
-    try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 3));
+    try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }));
 }
 
 test "specDecodeUnsupported: a forced tool call keeps every draft path off" {
     // Drafts are accepted in runs, so no draft path can hand the position after
     // the think closer to the forced call.
     var cf = CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
-    try testing.expect(specDecodeUnsupported(.{ .call_force = &cf }, 0));
+    try testing.expect(specDecodeUnsupported(.{ .call_force = &cf }));
 }
 
 test "ThinkBound: counts only tokens inside the think block and fires at the budget" {
@@ -515,20 +510,19 @@ test "MTP depth bounds: the windowed controller never leaves min..max and never 
 
 test "mtpRefusal: a constraint speculates only where the drafter verifies rows under masks, and never through a channel header" {
     var c = Constraint{ .grammar = undefined, .token_bytes = undefined, .mask_buf = &.{} };
-    try testing.expectEqualStrings("grammar-constrained output", mtpRefusal(.{ .constraint = &c }, 0).?);
+    try testing.expectEqualStrings("grammar-constrained output", mtpRefusal(.{ .constraint = &c }).?);
     c.row_masks = true;
-    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) == null);
-    try testing.expect(dsparkEligible(.{ .constraint = &c }, 0));
-    try testing.expectEqualStrings("logprobs requested", mtpRefusal(.{ .constraint = &c }, 2).?);
+    try testing.expect(mtpRefusal(.{ .constraint = &c }) == null);
+    try testing.expect(dsparkEligible(.{ .constraint = &c }));
     var proto = rp_mod.Protocol{ .kind = .bare_think };
     c.proto = &proto;
     c.pstate = .{ .phase = .reasoning };
-    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) == null);
+    try testing.expect(mtpRefusal(.{ .constraint = &c }) == null);
     c.pstate = .{ .phase = .choice };
-    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) != null);
+    try testing.expect(mtpRefusal(.{ .constraint = &c }) != null);
     c.pstate = .{ .phase = .reasoning };
     proto.header_len = 1;
-    try testing.expect(mtpRefusal(.{ .constraint = &c }, 0) != null);
+    try testing.expect(mtpRefusal(.{ .constraint = &c }) != null);
 }
 
 test "thoughtRound: a round ends on the closer or the grid position at or below it, and a short thought or a passed grid takes no point" {

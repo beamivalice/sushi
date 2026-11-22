@@ -3337,7 +3337,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         const tt = if (over) "" else tokens[i];
         var think_has_token = false;
         if (!in_think) {
-            if (tt.len > 0) try content.arrive(allocator, tt, 0);
+            if (tt.len > 0) try content.arrive(allocator, tt);
             while (try content.ready(allocator, channel_armed, over)) |r| switch (r) {
                 .opens => |opener| {
                     content.endPart();

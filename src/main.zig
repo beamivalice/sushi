@@ -1350,7 +1350,7 @@ fn runCli(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0);
             defer result.deinit(allocator);
 
             try stdout_w.writeAll("==========\n");

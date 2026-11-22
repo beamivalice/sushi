@@ -305,12 +305,10 @@ Licensed under the MIT License, the license and copyright of this project's LICE
 
 Ported after the 2026-09-17 detach; each site names its upstream pull request:
 
-  * SSD accounting (`src/kv_disk_cache.zig`), rescan retry
-    (`src/model_registry.zig`), and constrained-output logprobs
-    (`src/generate.zig`), from mlx-serve #601, #550 and #552 by
+  * SSD accounting (`src/kv_disk_cache.zig`) and rescan retry
+    (`src/model_registry.zig`), from mlx-serve #601 and #550 by
     @brandondyal. Modifications: SSD deltas retain sushi's
-    ring files and transactional metadata publication; logprob regressions
-    use synthetic logits and the existing HTTP integration suite.
+    ring files and transactional metadata publication.
   * Affine KV activation dtype preservation (`src/trunk.zig` and
     `src/kv_quant.zig`), from mlx-serve #553 by Jason Titus (@jasontitus).
     Modifications: cache writes use sushi's shared batched/solo chunk path;

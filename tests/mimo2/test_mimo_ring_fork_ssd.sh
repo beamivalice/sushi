@@ -10,8 +10,8 @@
 #     the next main turn restores from the side entry in RAM. The unrelated request's own lookup
 #     declines at the ring clamp and must not promote the entry it declined on.
 #  2. The SSD tier persists ringed entries as chunks plus ring files (manifest v9).
-#  3. After a restart the same main turn restores from the SSD tier, and its logprobs match the
-#     RAM-restored run within 0.5 nats up to any flip; a turn diverging at the reminder then restores
+#  3. After a restart the same main turn restores from the SSD tier, and its reply starts as the
+#     RAM-restored run's does (the bytes they share, printed); a turn diverging at the reminder then restores
 #     too (from either tier).
 #  4. Both main turn 2 restores land past the reply: at the message start the side request's
 #     prefill marked (a ring file at that position after the restart), not at turn 1's prompt end.
@@ -65,10 +65,11 @@ main1() { jq -nc --arg q "$Q1" '{messages:[{role:"user",content:$q}],max_tokens:
 # The conversation so far (the main reply as content only, as a client sends it back) plus one user turn.
 after() {
     jq -nc --arg q "$Q1" --arg r "$REPLY" --arg u "$1" --argjson n "$2" \
-        '{messages:[{role:"user",content:$q},{role:"assistant",content:$r},{role:"user",content:$u}],max_tokens:$n,temperature:0,stream:false,logprobs:true,top_logprobs:1}'
+        '{messages:[{role:"user",content:$q},{role:"assistant",content:$r},{role:"user",content:$u}],max_tokens:$n,temperature:0,stream:false}'
 }
 title() { jq -nc --arg q "$TITLE" '{messages:[{role:"user",content:$q}],max_tokens:32,temperature:0,stream:false}'; }
 field() { echo "$1" | jq -r "$2"; }
+text() { echo "$1" | jq -r '(.choices[0].message.reasoning_content // "") + "\u0001" + (.choices[0].message.content // "")'; }
 count() { boot_log | grep -c "$1"; }
 
 EC=0
@@ -128,20 +129,14 @@ M2D=$(ask "$(after "$Q2" 300)") || { echo "fail: main turn 2 after restart"; boo
 [ "$(field "$M2D" .timings.cached_n)" -gt 0 ] || fail "main turn 2 after restart cold-prefilled"
 [ "$(field "$M2D" .timings.cached_n)" -gt "$P1" ] || fail "main turn 2 after restart restored at or below turn 1's prompt end"
 echo "main turn 2 (SSD): cached_n=$(field "$M2D" .timings.cached_n) prompt_ms=$(field "$M2D" .timings.prompt_ms)"
-DRIFT=$(python3 - "$M2" "$M2D" <<'PY'
-import json, sys
-a, b = (json.loads(x)["choices"][0]["logprobs"]["content"] for x in sys.argv[1:3])
-n = 0
-worst = 0.0
-while n < min(len(a), len(b)) and a[n]["token"] == b[n]["token"]:
-    worst = max(worst, abs(a[n]["logprob"] - b[n]["logprob"]))
-    n += 1
-print(f"{n} {len(a)} {worst:.4f}")
+read -r AGREE TOTAL <<< "$(python3 - "$(text "$M2")" "$(text "$M2D")" <<'PY'
+import os, sys
+a, b = sys.argv[1:3]
+print(f"{len(os.path.commonprefix([a, b]))} {len(a)}")
 PY
-)
-read -r AGREE TOTAL WORST <<< "$DRIFT"
-echo "main turn 2 RAM vs SSD restore: tokens agree for $AGREE of $TOTAL; max |dlogprob| over them $WORST nats"
-python3 -c "import sys; sys.exit(0 if float('$WORST') <= 0.5 else 1)" || fail "SSD-restored logprobs drift past 0.5 nats"
+)"
+echo "main turn 2 RAM vs SSD restore: the replies share $AGREE of $TOTAL bytes"
+[ "$AGREE" -gt 0 ] || fail "the SSD-restored reply shares no bytes with the RAM-restored one"
 
 DISK1=$(count '\[disk-cache\] restored .*ring@')
 M3=$(ask "$(after "$Q3" 64)") || { echo "fail: main turn 3"; boot_log | tail -20; exit 1; }

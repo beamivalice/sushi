@@ -85,7 +85,6 @@ test "MiMo crowded MTP takes an eligible slot" {
     slot.enable_mtp = true;
     slot.enable_drafter = false;
     slot.sampling = .{};
-    slot.logprobs_n = 0;
     try testing.expect(slotMimoMtpCrowdable(&slot));
 }
 
@@ -108,7 +107,6 @@ test "a penalised MTP slot never joins a plain batched tick, which samples no pe
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
     slot.enable_drafter = false;
-    slot.logprobs_n = 0;
     slot.sampling = .{ .presence_penalty = 1.5 };
     try testing.expect(!slotMimoMtpCrowdable(&slot));
     var plain: Slot = slot;

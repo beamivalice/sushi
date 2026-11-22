@@ -41,10 +41,6 @@ const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
 const maxTokensOrigin = request_policy.maxTokensOrigin;
 const describeMaxTokens = request_policy.describeMaxTokens;
 const clampMaxTokens = request_policy.clampMaxTokens;
-const logprobs = @import("logprobs.zig");
-const listed_tokens = @import("listed_tokens.zig");
-const StreamLogprobs = logprobs.StreamLogprobs;
-const formatCompletionsLogprobs = logprobs.formatCompletionsLogprobs;
 const io_util = @import("io_util.zig");
 const sampler = @import("sampler.zig");
 const nowSecs = io_util.nowSecs;
@@ -97,22 +93,6 @@ pub fn completionText(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: 
     defer shown.deinit(allocator);
     for (ids) |id| if (completionShowsToken(tok, id, true)) try shown.append(allocator, id);
     return tok.decode(allocator, shown.items);
-}
-
-/// The tokens of `ids` that put a byte into the first `text_len` bytes of the completion's text.
-fn listedBy(allocator: std.mem.Allocator, tok: *const Tokenizer, ids: []const u32, skip_special: bool, text_len: usize) !listed_tokens.Range {
-    var listing: listed_tokens.Listing = .{};
-    defer listing.deinit(allocator);
-    for (ids) |id| {
-        if (!completionShowsToken(tok, id, skip_special)) {
-            try listing.note(allocator, 0);
-            continue;
-        }
-        const text = try tok.decode(allocator, &[_]u32{id});
-        defer allocator.free(text);
-        try listing.note(allocator, text.len);
-    }
-    return listing.touching(0, text_len);
 }
 
 fn withTextPromptBos(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u32) ![]u32 {
@@ -199,10 +179,6 @@ pub fn handleCompletions(
         },
         .ok => |c| c,
     };
-
-    // Logprobs are refused at the request check: none is ever asked.
-    const asked_logprobs: ?request_parse.Logprobs = null;
-    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
 
     if (echoRejectReason(req)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
@@ -298,7 +274,7 @@ pub fn handleCompletions(
     const effective_max_tokens = request_policy.clampMaxTokensFor(stream, max_tokens, max_tokens_origin == .client, prompt_ids.len, effective_ctx);
 
     // Check if attention computation would exceed GPU memory.
-    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = sampling.repeat_penalty, .presence_penalty = sampling.presence_penalty, .frequency_penalty = sampling.frequency_penalty }, logprobs_n);
+    const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = sampling.repeat_penalty, .presence_penalty = sampling.presence_penalty, .frequency_penalty = sampling.frequency_penalty });
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, false, bill_head)) return;
 
     const eos_slice = requestEosSlice(config, req);
@@ -311,12 +287,12 @@ pub fn handleCompletions(
     sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, asked_logprobs, cache_key, kv_quant_override) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, cache_key, kv_quant_override) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .completions) catch {};
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, enable_drafter, enable_mtp, allow_batch_mtp, asked_logprobs, cache_key, kv_quant_override) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, enable_drafter, enable_mtp, allow_batch_mtp, cache_key, kv_quant_override) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .completions) catch {};
         };
@@ -400,22 +376,18 @@ fn handleNonStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    asked_logprobs: ?request_parse.Logprobs,
     cache_key: u64,
     kv_quant_override: ?trunk.KVQuantConfig,
 ) !void {
-    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     var timer = Stopwatch.init(stream.io);
 
     // Spec dispatch: `requestSpecModes` (DFlash > MTP).
-    // logprobs needs every step's own distribution, so it disables speculation
-    // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
+    const spec = requestSpecModes(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special }, null);
+    const result = try nonStreamingViaScheduler(allocator, server_state.global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, kv_quant_override, stream, .{ .stops = stop_sequences, .completion_skip_special = skip_special }, null);
     defer result.deinit(allocator);
 
     // Text completion is a raw continuation: FIM clients rely on exact
@@ -441,30 +413,17 @@ fn handleNonStreamingCompletion(
     const escaped_text = escaped.slice;
     defer if (escaped.owned) allocator.free(escaped.slice);
 
-    // `null` unless the request asked: OpenAI omits the field's content rather
-    // than shipping an empty object that reads as "no alternatives exist".
-    var lp_offset_base: usize = 0;
-    const lp_json: []const u8 = if (asked_logprobs != null and result.logprobs != null) lp: {
-        // The tokens whose bytes the text kept: a stop's own tokens are cut from the text, and from the list.
-        const lps = result.logprobs.?;
-        const n = @min(result.token_ids.len, lps.len);
-        const r = try listedBy(allocator, tok, result.token_ids[0..n], skip_special, final_text.len);
-        break :lp try formatCompletionsLogprobs(allocator, tok, result.token_ids[r.start..r.end], lps[r.start..r.end], asked_logprobs.?.top, r.cut(), &lp_offset_base);
-    } else "null";
-    defer if (!std.mem.eql(u8, lp_json, "null")) allocator.free(lp_json);
-
     const timings_field = try completionTimingsField(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
     defer allocator.free(timings_field);
 
     // finish_reason always carries finish_details beside it.
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
+        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":null,"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
     , .{
         nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
         model_name,
         escaped_text,
-        lp_json,
         finish_reason,
         finishDetailsField(finish_reason, result.finish_details),
         result.prompt_tokens,
@@ -501,19 +460,17 @@ fn handleStreamingCompletion(
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
-    asked_logprobs: ?request_parse.Logprobs,
     cache_key: u64,
     kv_quant_override: ?trunk.KVQuantConfig,
 ) !void {
-    const logprobs_n: u32 = if (asked_logprobs) |l| l.engineN() else 0;
     const cmpl_id = nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io));
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling, logprobs_n);
+    const stream_mode = pickStreamMode(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
-    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling, logprobs_n);
+    noteMtpRefused(enable_mtp, mtpCapable(lm), sampling);
 
     var slot_handle: ?*scheduler_mod.Slot = null;
     defer if (slot_handle) |s| server_state.global_scheduler.?.complete(s);
@@ -537,24 +494,11 @@ fn handleStreamingCompletion(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
-        .logprobs_n = logprobs_n,
         .cache_key = cache_key,
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
-    // Legacy completions carries logprobs as four parallel arrays whose
-    // `text_offset` indexes the whole completion, so the collector renders
-    // the legacy shape and keeps the running offset across chunks.
-    var lps = StreamLogprobs{
-        .allocator = allocator,
-        .tok = tok,
-        .slot = slot_handle,
-        .enabled = asked_logprobs != null,
-        .top = if (asked_logprobs) |l| l.top else 0,
-        .legacy = true,
-    };
-    defer lps.deinit();
     defer ts.deinit(allocator);
 
     // SSE headers
@@ -602,15 +546,12 @@ fn handleStreamingCompletion(
         }
         const token_text = if (tail_flush) try stop_gate.finish(allocator) else blk: {
             if (!completionShowsToken(tok, token_id, skip_special)) {
-                try lps.note(token_id, 0);
                 continue;
             }
             const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id});
             defer allocator.free(raw_decoded_c);
-            try lps.note(token_id, raw_decoded_c.len);
             break :blk try stop_gate.push(allocator, raw_decoded_c);
         };
-        lps.release(stop_gate.released, tail_flush or stop_gate.matched != null);
         defer allocator.free(token_text);
 
         stopped = stop_gate.matched != null;
@@ -622,12 +563,10 @@ fn handleStreamingCompletion(
 
         const escaped = try jsonEscape(allocator, token_text);
         defer allocator.free(escaped);
-        // Legacy `logprobs` is a sibling of `text` on the choice. OpenAI sends
-        // `null` on a chunk that has none, never an absent key.
-        const lp_field = (try lps.take(0)) orelse "null";
+        // OpenAI sends `"logprobs":null` on every chunk, never an absent key.
         const chunk = try std.fmt.allocPrint(allocator,
-            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":{s},"finish_reason":null}}]}}
-        , .{ cmpl_id, created_ts, model_name, escaped, lp_field });
+            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":null,"finish_reason":null}}]}}
+        , .{ cmpl_id, created_ts, model_name, escaped });
         defer allocator.free(chunk);
 
         logHttpSseData(chunk);
@@ -643,11 +582,10 @@ fn handleStreamingCompletion(
     const total_prompt = ts.prompt_tokens;
 
     if (!client_gone) {
-        const final_lp = (try lps.takeLate()) orelse "null";
         // finish_reason always carries finish_details beside it.
         const final_chunk = try std.fmt.allocPrint(allocator,
-            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":"","logprobs":{s},"finish_reason":"{s}"{s}}}]}}
-        , .{ cmpl_id, created_ts, model_name, final_lp, finish_reason, finishDetailsField(finish_reason, ts.finish_details) });
+            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":"","logprobs":null,"finish_reason":"{s}"{s}}}]}}
+        , .{ cmpl_id, created_ts, model_name, finish_reason, finishDetailsField(finish_reason, ts.finish_details) });
         defer allocator.free(final_chunk);
 
         logHttpSseData(final_chunk);

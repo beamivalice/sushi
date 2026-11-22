@@ -215,20 +215,6 @@ pub fn fieldFault(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8
     return std.fmt.bufPrint(buf, fmt, args) catch "a request field has an invalid value";
 }
 
-pub const MAX_TOP_LOGPROBS: i64 = 20;
-
-/// What a request asks of logprobs when it asks: `top` alternatives beside each sampled token's own logprob, 0 for
-/// the sampled token alone. Null, where a request carries one, is off: `top` 0 is not.
-pub const Logprobs = struct {
-    top: u32,
-
-    /// The engine's per-step count, which reads 0 as off: a request for the sampled token alone still ranks one
-    /// candidate, and the reply lists `top` of them.
-    pub fn engineN(self: Logprobs) u32 {
-        return @max(self.top, 1);
-    }
-};
-
 pub fn responsesToolChoiceShape(buf: []u8, tc: std.json.Value) ?[]const u8 {
     switch (tc) {
         .null => return null,

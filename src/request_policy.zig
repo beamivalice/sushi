@@ -557,16 +557,13 @@ test "requestSpecModes: a repeat, presence or frequency penalty keeps the sideca
     const frequency = sampler.SamplingParams{ .frequency_penalty = 0.5 };
     for ([_]sampler.SamplingParams{ presence, repeat, frequency }) |sampling| {
         // A loaded sidecar cannot take the request, so the round falls to MTP.
-        var r = requestSpecModes(true, true, true, true, sampling, 0);
+        var r = requestSpecModes(true, true, true, true, sampling);
         try std.testing.expect(r.use_mtp and !r.use_drafter);
-        try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, sampling, 0));
-        r = requestSpecModes(true, true, false, true, sampling, 0);
+        try std.testing.expectEqual(StreamMode.mtp, pickStreamMode(true, true, true, true, sampling));
+        r = requestSpecModes(true, true, false, true, sampling);
         try std.testing.expect(r.use_mtp and !r.use_drafter);
         // Without MTP the penalty leaves the sidecar nothing to run.
-        r = requestSpecModes(true, false, true, false, sampling, 0);
-        try std.testing.expect(!r.use_mtp and !r.use_drafter);
-        // logprobs still beat it.
-        r = requestSpecModes(true, true, false, true, sampling, 2);
+        r = requestSpecModes(true, false, true, false, sampling);
         try std.testing.expect(!r.use_mtp and !r.use_drafter);
     }
 }

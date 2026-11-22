@@ -145,9 +145,8 @@ pub fn glmNativeDflashArmed(
     enable_drafter: bool,
     has_dflash: bool,
     sampling: SamplingParams,
-    logprobs_n: u32,
 ) bool {
-    return is_glm5 and enable_drafter and has_dflash and glm5_generate.glmDflashEligible(sampling, logprobs_n);
+    return is_glm5 and enable_drafter and has_dflash and glm5_generate.glmDflashEligible(sampling);
 }
 
 /// Step costs of a grouped GLM forward in ms (rows ubench, glm5-arch#concurrency): fixed, per
@@ -185,7 +184,7 @@ pub fn glmTreeNodes(slots: usize, rate: f32, cost: GlmRowCost) usize {
 pub fn slotGlmRowable(slot: *const Slot) bool {
     const gen = if (slot.legacy_gen) |*g| g else return false;
     if (!gen.native_dflash or gen.dflash_ctx == null or gen.done) return false;
-    if (slot.sampling.constraint != null or slot.logprobs_n > 0 or sampler.penaltyActive(slot.sampling)) return false;
+    if (slot.sampling.constraint != null or sampler.penaltyActive(slot.sampling)) return false;
     const t = arch_handle.trunk(slot.model.handle orelse return false);
     return glm5_state.supportsBatchedRows(t);
 }
@@ -337,24 +336,23 @@ test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM sl
     try expectOutcomes(&m, 0, 1, 0, 0);
 }
 
-test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained/penalised/logprobs/budgeted-thinking/disabled ones do not" {
+test "glmNativeDflashArmed: eligible greedy/sampled requests arm it, constrained/penalised/budgeted-thinking/disabled ones do not" {
     const t = testing;
-    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 0));
-    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 1 }, 0));
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }));
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 1 }));
     // tool_choice "none" bans the call opener; the verifier honours the bias.
     const none_ban = [_]@import("../logit_bias.zig").Bias{.{ .id = 5, .delta = -100 }};
-    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_penalty = .{ .biases = &none_ban } }, 0));
+    try t.expect(glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_penalty = .{ .biases = &none_ban } }));
 
-    try t.expect(!glmNativeDflashArmed(false, true, true, .{ .temperature = 0 }, 0));
-    try t.expect(!glmNativeDflashArmed(true, false, true, .{ .temperature = 0 }, 0));
-    try t.expect(!glmNativeDflashArmed(true, true, false, .{ .temperature = 0 }, 0));
+    try t.expect(!glmNativeDflashArmed(false, true, true, .{ .temperature = 0 }));
+    try t.expect(!glmNativeDflashArmed(true, false, true, .{ .temperature = 0 }));
+    try t.expect(!glmNativeDflashArmed(true, true, false, .{ .temperature = 0 }));
 
     var constraint: generate_mod.Constraint = undefined;
-    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .constraint = &constraint }, 0));
-    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .presence_penalty = 1 }, 0));
-    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0 }, 1));
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .constraint = &constraint }));
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .presence_penalty = 1 }));
     var think_bound: mtp_plan.ThinkBound = undefined;
-    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_bound = &think_bound }, 0));
+    try t.expect(!glmNativeDflashArmed(true, true, true, .{ .temperature = 0, .think_bound = &think_bound }));
 }
 
 test "the four-row planner gives spare rows to drafts only while they beat the group's rows" {

@@ -695,7 +695,7 @@ expert, so only the logits' direction is held (`dsv41 fused`).
 ## DSpark
 
 The release's drafter: three sliding-window stages (`mtp.0..2`, window 128, rope theta 10000 and no YaRN, 128 routed
-experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries logprobs or a forced call
+experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries a forced call
 (`dsv41_dspark.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
 ([below](#dspark-grammar)). A repeat or
 presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
@@ -994,7 +994,7 @@ ms queued, 122 to 126 ms waiting. The gain is the wait a layer saves, about 6 ms
 not wait for its embedding, and queues the head from the last layer's queued sum before settling it (a rebuild builds the
 head again), so the GPU's only idle points are the logits read and the host's sampling. A pipelined one-row greedy
 decode (`ForwardCtx.lazy_logits`, set by the Generator when the request reads only the argmax) takes the logits back
-unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); logprobs, penalties, grammar and every
+unevaluated, so the sampler's argmax rides the head's wait (`Model.heads_deferred`); penalties, grammar and every
 wider pass keep the waited head. A DSpark verify defers its head the same way (`verify` sets `defer_head`: the round's
 verdict is a value built on the logits), and neither it nor `finishVerify` waits on anything else: the stage-window rows
 `v.mh` and a rolled-back open group stay lazy for the next pass's layer evaluation, so the argmax is the round's only
@@ -1340,7 +1340,7 @@ one-row step and sum in another order. Each row therefore splits its own `min(K,
 its own `attnSplits` count, and the rows of a round that take different counts run as separate launches (only a round straddling a
 split step makes more than one). The real-pack probe (`SUSHI_DSV41_REAL_PACK`, `testsuite.md`) compares every verify row with its
 one-row round layer by layer. Where there is no NAX the arms are the same and nothing changes. A serial step of a load
-that has a drafter (a request with logprobs, the rounds a stop switch turns plain) is a round of one row by another
+that has a drafter (the rounds a stop switch turns plain) is a round of one row by another
 road and takes the round's arm (`Model.arm(.step)`), so a token's logits do not depend on which of the
 two fed it; it pays the exact arm's one-row cost (41.6 against 46.8 tok/s on a serial-only request, STQ 1.75bpw).
 `--no-mtp` has no drafter and no rounds: its serial step keeps the SIMD one-row arm, so its text can part from a

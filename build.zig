@@ -506,7 +506,7 @@ const test_domains = [_]TestDomain{
     } },
     .{ .name = "generate", .files = &.{
         "arm_trial",     "degenerate",   "dflash",             "forward_diag", "generate",       "hc_prefill",   "kv_cache",
-        "kv_quant",      "logprobs",     "mtp",                "mtp_plan",     "mtp_policy",     "mtp_round",    "mtp_tick",
+        "kv_quant",      "mtp",                "mtp_plan",         "mtp_policy",     "mtp_round",    "mtp_tick",
         "prefill_plan",  "restore_dump", "sampler",            "scheduler",    "slot_admission", "slot_outcome", "ssm_cache",
         "think_penalty", "trunk",        "trunk_helpers_test", "trunk_stq",
     } },

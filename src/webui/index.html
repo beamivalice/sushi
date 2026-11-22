@@ -5308,7 +5308,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   }
 
   // The server's reasons a request decoded alone, in words.
-  const SERIAL_REASON = { spec_active: 'Speculative decoding', head_release_pending: 'Draft head still busy', grammar: 'Structured output (JSON)', forced_call: 'Forced tool call', logprobs: 'Token probabilities asked',
+  const SERIAL_REASON = { spec_active: 'Speculative decoding', head_release_pending: 'Draft head still busy', grammar: 'Structured output (JSON)', forced_call: 'Forced tool call',
     penalty: 'Repetition penalty', arch: 'Model cannot share a pass', pad_waste: 'Too uneven to share', row_cap: 'Shared pass full', exclusive: 'Model runs one at a time' };
   // Horizontal bars with the exact value beside each. rows: [label, value, text, colour var, tip]. The rows are one Tab stop.
   function bars(id, rows, none, full) {

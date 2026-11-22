@@ -1,5 +1,5 @@
-//! Rule `result-field-free`: a `.free(x.token_ids)` or `.free(x.logprobs)` call. A `GenerationResult` owns its text,
-//! token ids and logprobs together and releases them with `deinit`; freeing a field by hand leaves the others behind.
+//! Rule `result-field-free`: a `.free(x.token_ids)` call. A `GenerationResult` owns its text and token ids together
+//! and releases them with `deinit`; freeing a field by hand leaves the other behind.
 //! Token scan of the parsed file, no Sema: the field names stand for the type.
 const std = @import("std");
 const Ast = std.zig.Ast;
@@ -8,7 +8,7 @@ const rule = @import("rule.zig");
 pub const name = "result-field-free";
 pub const reason = "a GenerationResult owns its fields together: release it with deinit, never one field at a time";
 
-const fields = [_][]const u8{ "token_ids", "logprobs" };
+const fields = [_][]const u8{"token_ids"};
 
 pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !void {
     var owners: ?std.ArrayList(rule.Owner) = null;

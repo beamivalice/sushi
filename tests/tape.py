@@ -13,7 +13,7 @@
                 every prompts/*/logits.f32 and the token lists.
   serving tape  HTTP against `--serve` under a throwaway HOME: serial, batched, speculative (pinned depth), hot-prefix
                 restore, SSD restore across a restart, image, long prompt, streamed experts, thinking multi-turn.
-                Each case stores the response (text, finish_reason, usage, a digest of every logprob row) and the
+                Each case stores the response (text, finish_reason, usage) and the
                 engine log tags that were identical across the recording runs. A case is in the tape only if all
                 --runs recordings agree byte for byte; otherwise it is stored as `unstable` and checked by an
                 invariant. `check` runs each case once and names the first differing case and position.
@@ -132,10 +132,6 @@ def document(sections):
     return "\n\n".join(f"Section {i + 1}. {PARA[i % len(PARA)]}" for i in range(sections))
 
 
-def digest(obj):
-    return hashlib.sha256(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
-
-
 # ---------------------------------------------------------------- records and comparison
 
 def response_record(resp):
@@ -149,13 +145,6 @@ def response_record(resp):
     cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens")
     if cached is not None:
         rec["cached_tokens"] = cached
-    lp = ch.get("logprobs")
-    if lp and "content" in lp:
-        rec["positions"] = [{"t": e["token"], "h": digest([e["token"], e["logprob"], e.get("top_logprobs")])}
-                            for e in lp["content"]]
-    elif lp and lp.get("tokens"):
-        rec["positions"] = [{"t": t, "h": digest([t, a, list(m.items())])}
-                            for t, a, m in zip(lp["tokens"], lp["token_logprobs"], lp["top_logprobs"])]
     return rec
 
 
@@ -179,17 +168,9 @@ def log_lines(seg):
 def first_diff(a, b, path):
     """The first difference between two records as one line naming where, or None."""
     if isinstance(a, dict) and isinstance(b, dict):
-        pa, pb = a.get("positions"), b.get("positions")
-        if pa is not None or pb is not None:
-            pa, pb = pa or [], pb or []
-            for i, (x, y) in enumerate(zip(pa, pb)):
-                if x != y:
-                    return f"{path} position {i}: token {x['t']!r} vs {y['t']!r}" + ("" if x["t"] != y["t"] else " (same token, logprob row differs)")
-            if len(pa) != len(pb):
-                return f"{path} position {min(len(pa), len(pb))}: {len(pa)} positions vs {len(pb)}"
         for k in sorted(set(a) | set(b)):
             if k == "positions":
-                continue
+                continue  # a tape recorded when the server still returned logprobs
             if k not in a or k not in b:
                 return f"{path}.{k}: present in one tape only"
             d = first_diff(a[k], b[k], f"{path}.{k}")
@@ -277,17 +258,17 @@ class Replay:
         seg, self.mark = text[self.mark:], len(text)
         return seg
 
-    def chat(self, messages, n, lp=True, think=None):
+    def chat(self, messages, n, serial=True, think=None):
         body = {"model": "sushi", "messages": messages, "max_tokens": n, "temperature": 0, "seed": 1, "stream": False,
                 **(self.think if think is None else think)}
-        if lp:
-            body.update(logprobs=True, top_logprobs=5)
+        if serial:
+            body.update(self.SPEC_OFF)
         return post(self.s.base, "/v1/chat/completions", body)
 
-    def raw(self, prompt, n, lp=True):
+    def raw(self, prompt, n, serial=True):
         body = {"model": "sushi", "prompt": prompt, "max_tokens": n, "temperature": 0, "seed": 1, "ignore_eos": True}
-        if lp:
-            body["logprobs"] = 5
+        if serial:
+            body.update(self.SPEC_OFF)
         return post(self.s.base, "/v1/completions", body)
 
     def barrier(self, bodies):
@@ -361,7 +342,7 @@ class Replay:
 
     def case_spec(self, k):
         self.slice()
-        out = [self.chat(self.user(p), 256, lp=False) for p in PROMPTS[:2]]
+        out = [self.chat(self.user(p), 256, serial=False) for p in PROMPTS[:2]]
         seg = self.wait_log(r"\[spec-stats\] mode=")
         if "[spec-stats] mode=" not in seg:
             raise AssertionError(f"speculation never engaged; log {self.s.log}")
@@ -404,14 +385,14 @@ class Replay:
     SPEC_OFF = {"enable_mtp": False, "enable_drafter": False}
 
     def q_serial(self):
-        """Logprobs request: speculation is off for it by design, so this is the serial decode."""
+        """Speculation is off on the request, so this is the serial decode."""
         self.slice()
         out = [self.chat(self.user(p), 96) for p in PROMPTS[:2]]
         return self.result(out, self.slice(), prompts=PROMPTS[:2])
 
     def q_spec(self):
         self.slice()
-        out = self.chat(self.user(PROMPTS[2]), 128, lp=False)
+        out = self.chat(self.user(PROMPTS[2]), 128, serial=False)
         seg = self.wait_log(r"\[spec-stats\] mode=")
         if "[spec-stats] mode=" not in seg:
             raise AssertionError(f"speculation never engaged; log {self.s.log}")

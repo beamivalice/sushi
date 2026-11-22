@@ -21,7 +21,7 @@
 #      at the depth-3 default even on creative temp-0 content where the
 #      chained per_draft_pct legitimately dilutes to ~25%.
 #   2. EQUIVALENCE — full output bytes must match at temp=0.
-#      Every divergence fails, with the serial top-two gap reported.
+#      Every divergence fails, with the first differing byte reported.
 #   3. PROMPT LOOKUP — a copy task (return a file with one rename) runs
 #      lookup rounds (`lookup=R/..` with R > 0) and still matches the
 #      serial bytes (the same boot with `enable_mtp:false` on the request), stream and non-stream; `--no-mtp-lookup` runs none
@@ -273,36 +273,14 @@ lookup_rounds_max() { # largest lookup round count on any [spec-stats] line of t
     grep -o 'lookup=[0-9]*/' "$LOG" | tr -dc '0-9\n' | sort -n | tail -1
 }
 
-# Every mismatch fails and reports its serial top-two gap.
-tie_gap_at_divergence() { # $1 expected-file, $2 actual-file → prints gap or "none"
-    python3 - "$1" "$2" "$PORT" "$MAX_TOKENS" "$PROMPT" "${GAP_EXTRA:-}" <<'PYEOF'
-import json, sys, urllib.request
-expf, actf, port, max_tokens, prompt = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
-extra = json.loads(sys.argv[6]) if sys.argv[6] else {}
-exp = open(expf).read()
-act = open(actf).read()
+# Every mismatch fails and reports the byte it first differs at.
+first_difference() { # $1 expected-file, $2 actual-file → prints the byte index
+    python3 - "$1" "$2" <<'PYEOF'
+import sys
+exp = open(sys.argv[1], "rb").read()
+act = open(sys.argv[2], "rb").read()
 n = min(len(exp), len(act))
-i = next((k for k in range(n) if exp[k] != act[k]), n)
-body = {"model": "default", "stream": False, "temperature": 0, "max_tokens": max_tokens,
-        "enable_mtp": False, "logprobs": True, "top_logprobs": 2,
-        "messages": [{"role": "user", "content": prompt}]}
-body.update(extra)
-req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
-                             data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-resp = json.load(urllib.request.urlopen(req, timeout=600))
-entries = (resp["choices"][0].get("logprobs") or {}).get("content") or []
-pos = 0
-for e in entries:
-    tok = e.get("token") or ""
-    if pos + len(tok) > i:
-        tops = e.get("top_logprobs") or []
-        if len(tops) >= 2:
-            print(f"{abs(tops[0]['logprob'] - tops[1]['logprob']):.4f}")
-        else:
-            print("none")
-        sys.exit(0)
-    pos += len(tok)
-print("none")
+print(next((k for k in range(n) if exp[k] != act[k]), n))
 PYEOF
 }
 
@@ -321,9 +299,7 @@ check() { # $1 name, $2 expected-prefix-file, $3 actual-file, $4 expected new mt
         ENGAGE_BASE=$stats
     fi
     if ! cmp -s "$expf" "$actf"; then
-        local gap
-        gap=$(tie_gap_at_divergence "$expf" "$actf")
-        echo "FAIL [$name]: full output bytes differ from no-mtp baseline (top-2 gap at divergence: ${gap:-unreadable})"
+        echo "FAIL [$name]: full output bytes differ from no-mtp baseline (first difference at byte $(first_difference "$expf" "$actf"))"
         python3 - "$expf" "$actf" <<'PYBYTES'
 import pathlib, sys
 for label, path in zip(("expected", "actual"), sys.argv[1:]):
@@ -370,11 +346,9 @@ check "chat stream" "$ARTIFACTS/mtp_base_chat.txt" "$ARTIFACTS/mtp_on_chat_strea
 messages_nonstream > "$ARTIFACTS/mtp_on_msg.txt"
 check "messages non-stream" "$ARTIFACTS/mtp_base_msg.txt" "$ARTIFACTS/mtp_on_msg.txt" yes
 copy_request false > "$ARTIFACTS/mtp_on_copy.txt"
-PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
-    check "copy non-stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy.txt" yes
+check "copy non-stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy.txt" yes
 copy_request true > "$ARTIFACTS/mtp_on_copy_stream.txt"
-PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
-    check "copy stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy_stream.txt" yes
+check "copy stream (lookup on)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_on_copy_stream.txt" yes
 LOOKUP_ROUNDS=$(lookup_rounds_max)
 if [ "${LOOKUP_ROUNDS:-0}" -gt 0 ] && grep -q "\[mtp\] prompt-lookup drafts engaged" "$LOG"; then
     echo "PASS [prompt lookup engages on the copy task] (lookup rounds=$LOOKUP_ROUNDS)"; PASS=$((PASS+1))
@@ -461,8 +435,7 @@ if [ -n "$EXPECT_AUTO_DEPTH" ]; then
 fi
 ENGAGE_BASE=$(grep -c "\[spec-stats\] mode=mtp" "$LOG")
 copy_request false > "$ARTIFACTS/mtp_nolookup_copy.txt"
-PROMPT="$COPY_PROMPT" MAX_TOKENS=$COPY_MAX_TOKENS GAP_EXTRA='{"enable_thinking":false}' \
-    check "copy non-stream (lookup off)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_nolookup_copy.txt" yes
+check "copy non-stream (lookup off)" "$ARTIFACTS/mtp_base_copy.txt" "$ARTIFACTS/mtp_nolookup_copy.txt" yes
 if [ "$(lookup_rounds_max)" = "0" ] && ! grep -q "prompt-lookup drafts engaged" "$LOG"; then
     echo "PASS [--no-mtp-lookup runs no lookup round]"; PASS=$((PASS+1))
 else

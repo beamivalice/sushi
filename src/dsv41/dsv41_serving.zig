@@ -377,8 +377,7 @@ pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
             const drawn = try sampler.penalizedSampleLazy(a, logits, sampling, &seen, s);
             defer _ = mlx.mlx_array_free(drawn);
             try mlx.check(mlx.mlx_array_eval(drawn));
-            const tick = try sampler.sampleToken(a, logits, sampling, &seen, 3, null, s);
-            a.free(tick.logprob_result.?.top_logprobs);
+            _ = try sampler.sampleToken(logits, sampling, &seen, null, s);
         }
     }
     const grammar = try a.alloc(bool, mdl.cfg.vocab);

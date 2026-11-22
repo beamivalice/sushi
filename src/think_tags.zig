@@ -4,7 +4,6 @@ const chat = @import("chat.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const BARE_INVOKE = tool_calls_mod.BARE_INVOKE;
 const tool_reading = @import("tool_reading.zig");
-const listed_tokens = @import("listed_tokens.zig");
 const ChatConfig = chat.ChatConfig;
 const FUNCTION_CALLS_TAG = tool_calls_mod.FUNCTION_CALLS_TAG;
 const Message = chat.Message;
@@ -200,7 +199,7 @@ pub const CodeSpan = struct {
 pub const ContentStep = union(enum) {
     /// A control marker no stream shows.
     marker,
-    /// Whitespace leading a content part: never shown, so its logprobs entries retire.
+    /// Whitespace leading a content part: never shown.
     drop,
     /// Whitespace at the content's tail: withheld until text follows or the reply ends.
     hold,
@@ -219,17 +218,11 @@ pub const ContentStream = struct {
     started: bool = false,
     /// The current part has sent nothing yet.
     lead: bool = true,
-    /// Bytes `deliver` cut from the start of its last input: a part's leading whitespace never ships.
-    trimmed: usize = 0,
     held: std.ArrayList(u8) = .empty,
     out: std.ArrayList(u8) = .empty,
     /// Where the reply's tool markup is cut (`MarkupCut`), and the bytes it has not let go yet.
     mark: MarkupCut = .{},
     unsent: std.ArrayList(u8) = .empty,
-    /// The join that opens a part after a thought is not part of what `deliver` sends: it waits for `takeJoin`, so a surface
-    /// whose chunks carry logprobs sends it as a delta of its own.
-    join_apart: bool = false,
-    join_pending: bool = false,
     /// Tokens `arrive` took that `ready` has not acted on: from a think tag a backtick that nothing has paired yet may quote,
     /// to the byte that decides it. `head` is where the first one starts.
     queue: std.ArrayList(u8) = .empty,
@@ -243,7 +236,7 @@ pub const ContentStream = struct {
     look_run: usize = 0,
     look_for: ?usize = null,
 
-    const Queued = struct { len: usize, at: usize };
+    const Queued = struct { len: usize };
 
     pub fn deinit(self: *ContentStream, allocator: std.mem.Allocator) void {
         self.held.deinit(allocator);
@@ -257,14 +250,14 @@ pub const ContentStream = struct {
     pub const Ready = union(enum) {
         /// A thought opens here: `takeWaiting` is every later token still queued, which the thought holds.
         opens: []const u8,
-        step: struct { step: ContentStep, text: []const u8, at: usize },
+        step: struct { step: ContentStep, text: []const u8 },
     };
 
-    /// The content arm takes a token of the generation that starts at `at`. Whether it opens a thought, closes one or is text
+    /// The content arm takes a token of the generation. Whether it opens a thought, closes one or is text
     /// can depend on bytes to come (`ready`), so a token is acted on only through `ready`.
-    pub fn arrive(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8, at: usize) !void {
+    pub fn arrive(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8) !void {
         try self.queue.appendSlice(allocator, tt);
-        try self.queued.append(allocator, .{ .len = tt.len, .at = at });
+        try self.queued.append(allocator, .{ .len = tt.len });
     }
 
     /// The next queued token acted on, or null when none is left or the first waits: a think tag after a backtick that no
@@ -285,7 +278,7 @@ pub const ContentStream = struct {
         self.head_token += 1;
         self.look_for = null;
         if (self.opens_thoughts and !quoted) if (modelThinkOpener(channel_armed, text)) |opener| return .{ .opens = opener };
-        return .{ .step = .{ .step = try self.deliverAs(allocator, text, quoted), .text = text, .at = tok.at } };
+        return .{ .step = .{ .step = try self.deliverAs(allocator, text, quoted), .text = text } };
     }
 
     /// Whether the first queued token is a think tag that reads as text; null while the bytes that decide it have not arrived.
@@ -342,11 +335,6 @@ pub const ContentStream = struct {
         self.span = .{};
     }
 
-    /// Bytes the arm has taken but not sent: a tail whitespace run, markup that may still be cut and the queued tokens.
-    pub fn withheld(self: *const ContentStream) usize {
-        return self.held.items.len + self.unsent.items.len + self.queue.items.len - self.head;
-    }
-
     /// The content a thought's close token carried: text, never a tag token. `.send` is valid until the next call.
     pub fn deliver(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8) !ContentStep {
         return self.deliverAs(allocator, tt, self.span.openStart() != null);
@@ -354,7 +342,6 @@ pub const ContentStream = struct {
 
     /// `tt` is a token the reply spells (`quoted`: a think tag among them is text).
     fn deliverAs(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8, quoted: bool) !ContentStep {
-        self.trimmed = 0;
         const think_tag = std.mem.eql(u8, tt, BARE_THINK_OPENER) or std.mem.eql(u8, tt, BARE_THINK_CLOSER);
         if (isChannelMarkerToken(tt) and !(think_tag and quoted)) return .marker;
         self.span.feed(tt);
@@ -364,11 +351,10 @@ pub const ContentStream = struct {
             return .hold;
         }
         const body = if (self.lead) std.mem.trimStart(u8, tt, "\n ") else tt;
-        self.trimmed = tt.len - body.len;
         const text = body[0..std.mem.trimEnd(u8, body, "\n ").len];
         self.out.clearRetainingCapacity();
         const join = self.lead and self.started;
-        if (join and self.join_apart) self.join_pending = true else if (join) try self.out.appendSlice(allocator, listed_tokens.content_join);
+        if (join) try self.out.appendSlice(allocator, content_join);
         self.lead = false;
         self.started = true;
         try self.out.appendSlice(allocator, self.held.items);
@@ -382,13 +368,6 @@ pub const ContentStream = struct {
         try self.out.appendSlice(allocator, self.unsent.items[0..n]);
         self.unsent.replaceRangeAssumeCapacity(0, if (self.mark.cut) self.unsent.items.len else n, &.{});
         return if (n == 0) .hold else .{ .send = self.out.items };
-    }
-
-    /// The join to send ahead of the bytes `deliver` or `finish` is about to send, once (`join_apart`).
-    pub fn takeJoin(self: *ContentStream) ?[]const u8 {
-        if (!self.join_pending) return null;
-        self.join_pending = false;
-        return listed_tokens.content_join;
     }
 
     /// The reply ended outside a thought: the withheld whitespace ships, unless the non-stream reply trims
@@ -938,16 +917,8 @@ fn trimSpans(text: []const u8, spans: []Span) []Span {
     return spans[a..b];
 }
 
-/// A reply text rewritten by `normalizeEmbeddedThinkBlocksMapped`, and where its content came from.
-pub const Normalized = struct {
-    text: []u8,
-    runs: []listed_tokens.Run,
-
-    pub fn deinit(self: Normalized, allocator: std.mem.Allocator) void {
-        allocator.free(self.text);
-        allocator.free(self.runs);
-    }
-};
+/// The bytes that join two content parts of a reply around a thought (`normalizeEmbeddedThinkBlocks`, `ContentStream`).
+pub const content_join = "\n";
 
 /// Merge ALL closed think/thought blocks in `text` into one leading block.
 ///
@@ -964,14 +935,6 @@ pub const Normalized = struct {
 /// the overwhelmingly common case, zero-cost). An unclosed trailing opener is
 /// left in place for the existing trailing-strip logic.
 pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
-    const n = (try normalizeEmbeddedThinkBlocksMapped(allocator, text)) orelse return null;
-    allocator.free(n.runs);
-    return n.text;
-}
-
-/// `normalizeEmbeddedThinkBlocks`, with the provenance of the content it keeps: each run of the rewrite's content is a copy
-/// of bytes of `text`, or the join between two parts, so a list of the content's tokens never reads the rewrite by its offsets.
-pub fn normalizeEmbeddedThinkBlocksMapped(allocator: std.mem.Allocator, text: []const u8) !?Normalized {
     var reasoning_parts = std.ArrayList([]const u8).empty;
     defer reasoning_parts.deinit(allocator);
     // The pieces of every content part in order, and where each part's pieces end.
@@ -1038,8 +1001,6 @@ pub fn normalizeEmbeddedThinkBlocksMapped(allocator: std.mem.Allocator, text: []
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    var runs = std.ArrayList(listed_tokens.Run).empty;
-    errdefer runs.deinit(allocator);
     try out.appendSlice(allocator, if (style_think) "<think>\n" else "<|channel>thought\n");
     var first = true;
     for (reasoning_parts.items) |r| {
@@ -1055,26 +1016,14 @@ pub fn normalizeEmbeddedThinkBlocksMapped(allocator: std.mem.Allocator, text: []
         defer part_from = part_to;
         const kept = trimSpans(text, spans.items[part_from..part_to]);
         if (kept.len == 0) continue;
-        if (!first) {
-            try runs.append(allocator, .{ .at = out.items.len, .len = listed_tokens.content_join.len, .src = null });
-            try out.appendSlice(allocator, listed_tokens.content_join);
-        }
+        if (!first) try out.appendSlice(allocator, content_join);
         for (kept) |k| {
             if (k.from == k.to) continue;
-            // Pieces that follow each other in the text and in the rewrite are one run.
-            if (runs.getLastOrNull()) |last| if (last.src) |src| if (src + last.len == k.from and last.at + last.len == out.items.len) {
-                runs.items[runs.items.len - 1].len += k.to - k.from;
-                try out.appendSlice(allocator, text[k.from..k.to]);
-                continue;
-            };
-            try runs.append(allocator, .{ .at = out.items.len, .len = k.to - k.from, .src = k.from });
             try out.appendSlice(allocator, text[k.from..k.to]);
         }
         first = false;
     }
-    const rewritten = try out.toOwnedSlice(allocator);
-    errdefer allocator.free(rewritten);
-    return .{ .text = rewritten, .runs = try runs.toOwnedSlice(allocator) };
+    return try out.toOwnedSlice(allocator);
 }
 
 /// Streaming-only: true when the buffer TAIL is a partial prefix of a think
@@ -1710,8 +1659,7 @@ pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, sa
 /// Leading whitespace is the ONE thing a stream can still withhold: nothing
 /// visible has been sent yet, so this is a suppression, never a retraction.
 ///
-/// It cuts the leading whitespace of a chunk, inside a token too; a logprobs entry lists only the bytes that
-/// ship (`ContentStream.trimmed`, `Listing.skipTo`).
+/// It cuts the leading whitespace of a chunk, inside a token too.
 ///
 /// `content_started` must flip on the first NON-EMPTY emission, so a suppressed
 /// whitespace token leaves the next one still eligible.
@@ -1872,23 +1820,23 @@ test "ContentStream: a think tag after a backtick waits for its closing backtick
     const allocator = testing.allocator;
     var content = ContentStream{};
     defer content.deinit(allocator);
-    try content.arrive(allocator, BARE_THINK_CLOSER, 0);
+    try content.arrive(allocator, BARE_THINK_CLOSER);
     try testing.expect((try content.ready(allocator, false, false)).?.step.step == .marker);
-    try content.arrive(allocator, "say `", 0);
+    try content.arrive(allocator, "say `");
     try testing.expectEqualStrings("say `", (try content.ready(allocator, false, false)).?.step.step.send);
     // The closing backtick arrives: the tag between is text.
-    try content.arrive(allocator, BARE_THINK_CLOSER, 0);
+    try content.arrive(allocator, BARE_THINK_CLOSER);
     try testing.expect(try content.ready(allocator, false, false) == null);
     try testing.expect(content.waiting());
-    try content.arrive(allocator, "` done", 0);
+    try content.arrive(allocator, "` done");
     try testing.expectEqualStrings(BARE_THINK_CLOSER, (try content.ready(allocator, false, false)).?.step.step.send);
     try testing.expectEqualStrings("` done", (try content.ready(allocator, false, false)).?.step.step.send);
     try testing.expect(try content.ready(allocator, false, false) == null);
     // A stray backtick: the line's end makes the tag structure, and the opener after it opens a thought.
-    try content.arrive(allocator, " a `", 0);
+    try content.arrive(allocator, " a `");
     try testing.expectEqualStrings(" a `", (try content.ready(allocator, false, false)).?.step.step.send);
-    try content.arrive(allocator, BARE_THINK_OPENER, 0);
-    try content.arrive(allocator, "plan\n", 0);
+    try content.arrive(allocator, BARE_THINK_OPENER);
+    try content.arrive(allocator, "plan\n");
     try testing.expectEqualStrings(BARE_THINK_OPENER, (try content.ready(allocator, false, false)).?.opens);
     const rest = content.takeWaiting();
     try testing.expectEqualStrings("plan\n", rest.bytes);
@@ -1900,17 +1848,17 @@ test "ContentStream: a tag that waits when the reply ends is read as the whole r
     const allocator = testing.allocator;
     var content = ContentStream{};
     defer content.deinit(allocator);
-    try content.arrive(allocator, "say `", 0);
+    try content.arrive(allocator, "say `");
     _ = try content.ready(allocator, false, false);
-    try content.arrive(allocator, BARE_THINK_CLOSER, 0);
-    try content.arrive(allocator, "x", 0);
+    try content.arrive(allocator, BARE_THINK_CLOSER);
+    try content.arrive(allocator, "x");
     try testing.expect(try content.ready(allocator, false, false) == null);
     try testing.expect((try content.ready(allocator, false, true)).?.step.step == .marker);
     try testing.expectEqualStrings("x", (try content.ready(allocator, false, true)).?.step.step.send);
     // A tag a stream's thought arm opens never reaches this arm's marker.
     var tools = ContentStream{ .opens_thoughts = false };
     defer tools.deinit(allocator);
-    try tools.arrive(allocator, BARE_THINK_OPENER, 0);
+    try tools.arrive(allocator, BARE_THINK_OPENER);
     try testing.expect((try tools.ready(allocator, false, false)).?.step.step == .marker);
 }
 
@@ -3004,21 +2952,9 @@ test "heldThoughtSoFar: a held thought streams only while its start cannot move"
     try testing.expect(heldThoughtSoFar("Done. <th", true, true) == null);
 }
 
-test "normalizeEmbeddedThinkBlocksMapped: every run of the content is a copy of the generation, a join between parts is no copy" {
+test "normalizeEmbeddedThinkBlocks: a closer cut from a part splits it, and the parts around the thoughts are joined" {
     const raw = "Sure.<think>hmm</think>X</think>Y<think>q</think>\n\nDone.\n";
-    const n = (try normalizeEmbeddedThinkBlocksMapped(testing.allocator, raw)).?;
-    defer n.deinit(testing.allocator);
     const plain = (try normalizeEmbeddedThinkBlocks(testing.allocator, raw)).?;
     defer testing.allocator.free(plain);
-    try testing.expectEqualStrings(plain, n.text);
-    var content = std.ArrayList(u8).empty;
-    defer content.deinit(testing.allocator);
-    for (n.runs) |run| {
-        const got = n.text[run.at .. run.at + run.len];
-        if (run.src) |src| try testing.expectEqualStrings(raw[src .. src + run.len], got) else try testing.expectEqualStrings(listed_tokens.content_join, got);
-        try content.appendSlice(testing.allocator, got);
-    }
-    // A closer cut from a part splits its run; the parts around the thoughts are joined.
-    try testing.expectEqualStrings("Sure.\nX" ++ "Y\nDone.", content.items);
-    try testing.expectEqualStrings(content.items, splitThinkBlock(n.text, true, false).content);
+    try testing.expectEqualStrings("Sure.\nX" ++ "Y\nDone.", splitThinkBlock(plain, true, false).content);
 }

@@ -506,12 +506,13 @@ test "cooler contract: a pool refusal in one request of a mixed tick fails that 
                 for (p[i], 0..) |*t, k| t.* = ids[(k * (7 + 2 * i) + i + 2) % ids.len];
             }
             const seeded: SamplingParams = .{ .temperature = 0.8, .top_k = 20, .seed = 5 };
+            const penalised: SamplingParams = .{ .temperature = 0.0, .presence_penalty = 0.5 };
             var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
             defer seen.deinit(testing.allocator);
-            // A logprobs request decodes serially and two speculative ones run their own rounds: three forwards a tick.
-            try MixedTick.faultSweep(Q, &sv, &.{ .{ .prompt = p[0], .n = 10, .logprobs = 2 }, .{ .prompt = p[1], .n = 10, .mtp = true }, .{ .prompt = p[2], .n = 10, .mtp = true, .sampling = seeded } }, &seen);
+            // A penalised request decodes serially and two speculative ones run their own rounds: three forwards a tick.
+            try MixedTick.faultSweep(Q, &sv, &.{ .{ .prompt = p[0], .n = 10, .sampling = penalised }, .{ .prompt = p[1], .n = 10, .mtp = true }, .{ .prompt = p[2], .n = 10, .mtp = true, .sampling = seeded } }, &seen);
             // One of them leaves after two ticks: the sites its commit and drain between the others' ticks add.
-            try MixedTick.faultSweep(Q, &sv, &.{ .{ .prompt = p[0], .n = 12, .logprobs = 2 }, .{ .prompt = p[1], .n = 12, .mtp = true, .cancel_at = 2 }, .{ .prompt = p[2], .n = 12, .mtp = true, .sampling = seeded } }, &seen);
+            try MixedTick.faultSweep(Q, &sv, &.{ .{ .prompt = p[0], .n = 12, .sampling = penalised }, .{ .prompt = p[1], .n = 12, .mtp = true, .cancel_at = 2 }, .{ .prompt = p[2], .n = 12, .mtp = true, .sampling = seeded } }, &seen);
         }
     }.run);
 }

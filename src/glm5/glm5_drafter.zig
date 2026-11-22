@@ -30,8 +30,8 @@ pub const inDirCacheValid = @import("glm5_dflash_cache.zig").cacheValid;
 pub const shipped_subdir = @import("glm5_dflash_cache.zig").shipped_subdir;
 
 /// The native model runs the rounds when it is loaded and the sampling allows speculation.
-pub fn nativeEligible(xfm: *const @import("../trunk.zig").Trunk, sampling: anytype, logprobs_n: u32) bool {
-    return @import("glm5_state.zig").modelOf(xfm) != null and rounds.glmDflashEligible(sampling, logprobs_n);
+pub fn nativeEligible(xfm: *const @import("../trunk.zig").Trunk, sampling: anytype) bool {
+    return @import("glm5_state.zig").modelOf(xfm) != null and rounds.glmDflashEligible(sampling);
 }
 
 pub const reserveNative = rounds.reserveGlmDflash;

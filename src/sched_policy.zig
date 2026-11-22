@@ -43,7 +43,6 @@ pub const BatchVerdict = enum {
     head_release_pending,
     grammar,
     forced_call,
-    logprobs,
     penalty,
     arch,
     pad_waste,
@@ -62,7 +61,6 @@ pub const BatchFacts = struct {
     grammar: bool,
     /// A forced call decides its own successor, and the batched tick samples every slot's.
     forced_call_pending: bool,
-    logprobs: bool,
     penalty: bool,
     /// The transformer's batching answer, never a config compare; null when the slot has no transformer.
     model_batches: ?bool,
@@ -74,7 +72,6 @@ pub fn batchVerdictOf(f: BatchFacts) BatchVerdict {
     if (f.release_pending) return .head_release_pending;
     if (f.grammar) return .grammar;
     if (f.forced_call_pending) return .forced_call;
-    if (f.logprobs) return .logprobs;
     if (f.penalty) return .penalty;
     return if (f.model_batches orelse false) .ok else .arch;
 }
@@ -437,7 +434,6 @@ test "batchVerdictOf: the first reason in the gate's order wins, and a model wit
         .release_pending = false,
         .grammar = false,
         .forced_call_pending = false,
-        .logprobs = false,
         .penalty = false,
         .model_batches = true,
     };
@@ -454,7 +450,6 @@ test "batchVerdictOf: the first reason in the gate's order wins, and a model wit
         .{ .field = "release_pending", .why = .head_release_pending },
         .{ .field = "grammar", .why = .grammar },
         .{ .field = "forced_call_pending", .why = .forced_call },
-        .{ .field = "logprobs", .why = .logprobs },
         .{ .field = "penalty", .why = .penalty },
     };
     var all = base;
@@ -480,7 +475,7 @@ test "bucketOf: a plain slot batches, a speculating one by its class, and a full
     try testing.expectEqual(TickBucket.mtp, bucketOf(.spec_active, .mtp_group, empty));
     try testing.expectEqual(TickBucket.rows, bucketOf(.spec_active, .rows_company, empty));
     try testing.expectEqual(TickBucket.serial, bucketOf(.spec_active, .none, empty));
-    inline for (.{ .grammar, .logprobs, .penalty, .arch, .forced_call, .head_release_pending }) |why| {
+    inline for (.{ .grammar, .penalty, .arch, .forced_call, .head_release_pending }) |why| {
         try testing.expectEqual(TickBucket.serial, bucketOf(why, .none, empty));
     }
 

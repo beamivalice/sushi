@@ -9,8 +9,8 @@
 #   [2] the first FIRST_N_TOKENS tokens of a long greedy recital match (past them an INT4 near-tie may flip, see
 #       docs/engine-kv-cache.md "Byte stability");
 #   [3] two genuinely concurrent streams (batch != 1, where the fused QK-norm+RoPE gates differ) each match the
-#       serial answer, byte for byte on a per-row trunk, for FIRST_N_TOKENS with near-ties acquitted otherwise;
-#   [4] /props and /v1/models report batching, and a logprobs slot beside a batched one names its serial reason;
+#       serial answer, byte for byte on a per-row trunk, for FIRST_N_TOKENS otherwise;
+#   [4] /props and /v1/models report batching, and a penalised slot beside a batched one names its serial reason;
 #   [5] the batched kernel under kv-quant (the default kv8) leaves the server alive with no MLX error: it once read
 #       the packed quantized words raw and killed the server on the first concurrent decode.
 # --no-mtp: an MTP slot runs speculative rounds and never reaches the plain batched tick under test.
@@ -129,42 +129,32 @@ PYEOF
             fail "per-row concurrent stream is not the serial answer: $verdict"
         fi
         if [ "$verdict" != "OK" ]; then
-            # A batch of >= 2 is not bit-identical to serial (B=2 tiles accumulate in a different order). Acquit a
-            # divergence whose serial top-2 gap is a near-tie (<= 0.15 nats, the MTP equivalence bar).
-            idx=$(echo "$verdict" | sed -n 's/DIFF at index \([0-9]*\):.*/\1/p')
-            gap=$(python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=True; d['top_logprobs']=2; print(json.dumps(d))" "$LONG_PAYLOAD" | post |
-                python3 -c "
-import sys,json
-c=json.load(sys.stdin)['choices'][0]['logprobs']['content']; i=int(sys.argv[1])
-t=c[i]['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],4))" "$idx" 2> /dev/null || echo 99)
-            if python3 -c "import sys; sys.exit(0 if float('$gap') <= 0.15 else 1)"; then
-                echo -e "  ${YELLOW}near-tie${NC} $verdict acquitted: serial top-2 gap at index $idx = $gap nats"
-            else
-                fail "[3] N=2 concurrent stream diverged from serial: $verdict (serial top-2 gap $gap nats)"
-            fi
+            # A batch of >= 2 is not bit-identical to serial (B=2 tiles accumulate in a different order), and the
+            # server returns no probabilities to acquit a near-tie flip by: a divergence inside the compared window fails.
+            fail "[3] N=2 concurrent stream diverged from serial: $verdict"
         fi
     done
     if [ "$ROW_EXACT" = 1 ]; then
         echo -e "${GREEN}PASS${NC} [3] both concurrent streams are the serial answer byte for byte (per-row batch >= 2)"
     else
-        echo -e "${GREEN}PASS${NC} [3] both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2; near-ties acquitted)"
+        echo -e "${GREEN}PASS${NC} [3] both concurrent streams match serial for ${FIRST_N_TOKENS} tokens (batch >= 2)"
     fi
 fi
 
 # What a user reads without the log: /props and /v1/models say the loaded model batches, and a slot that cannot
-# (logprobs) names its reason once beside live company.
+# (a penalty) names its reason once beside live company.
 curl -s "$SUSHI_URL/props" | grep -q '"batching":{"supported":true' || fail "[4] /props does not report batching.supported=true"
 curl -s "$SUSHI_URL/v1/models" | grep -q '"batched_decode":true' || fail "[4] /v1/models row lacks batched_decode:true"
 OFF=$(wc -c < "$SUSHI_LOG" | tr -d ' ')
-python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['logprobs']=True; d['top_logprobs']=1; print(json.dumps(d))" "$LONG_PAYLOAD" | post > /dev/null &
+python3 -c "import json,sys; d=json.loads(sys.argv[1]); d['presence_penalty']=0.5; print(json.dumps(d))" "$LONG_PAYLOAD" | post > /dev/null &
 LA=$!
 echo "$LONG_PAYLOAD" | post > /dev/null &
 LB=$!
 wait $LA; wait $LB
-if tail -c +$((OFF + 1)) "$SUSHI_LOG" | grep -q "\[batched\] slot serial: logprobs"; then
-    echo -e "${GREEN}PASS${NC} [4] a logprobs slot beside a batched one names its serial reason"
+if tail -c +$((OFF + 1)) "$SUSHI_LOG" | grep -q "\[batched\] slot serial: penalty"; then
+    echo -e "${GREEN}PASS${NC} [4] a penalised slot beside a batched one names its serial reason"
 else
-    echo -e "  ${YELLOW}NOT RUN${NC} the logprobs request never overlapped a live slot (no serial-reason line)"
+    echo -e "  ${YELLOW}NOT RUN${NC} the penalised request never overlapped a live slot (no serial-reason line)"
 fi
 
 curl -sf "$SUSHI_URL/health" > /dev/null || fail "[5] server died under the batched kernel at kv8"

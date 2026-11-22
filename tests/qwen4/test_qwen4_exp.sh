@@ -17,26 +17,20 @@ trap 'rm -rf "$T"' EXIT
 # per-request lines (spec-stats, QsaHistoryGap) are counted over this script's own slice.
 slice_count() { sushi_log_since | grep -c "$1"; }
 pass=0; fail=0
-# Tie-aware equivalence (test_mtp_equivalence.sh bar): prints 1 when `other`
-# equals the serial greedy answer for body `$1`, or first diverges at a token
-# whose serial top-2 gap is <= 0.15 nats.
-same_or_tie() {
+# Equivalence: prints 1 when `other` equals the serial greedy answer for body `$1` over the first 100 characters
+# (the whole answer when it is shorter). The server gives no probabilities to acquit a near-tie flip by, so a
+# divergence inside that window fails.
+same_as_serial() {
   local body="$1" other="$2"
-  local lp; lp=$(echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); d['logprobs']=True; d['top_logprobs']=2; d['enable_mtp']=False; print(json.dumps(d))")
-  curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$lp" | python3 -c "
-import sys,json; d=json.load(sys.stdin); other=sys.argv[1]; acc=''; ok=1
-for n,e in enumerate(d['choices'][0]['logprobs']['content'][:30]):
-    if not other.startswith((acc+e['token']).lstrip()):  # content is lead-trimmed, tokens are not
-        t=e['top_logprobs']; gap=(t[0]['logprob']-t[1]['logprob']) if len(t)>1 else 99
-        print('  diverged at token %d, serial top-2 gap %.3f nats' % (n, gap), file=sys.stderr)
-        ok=1 if gap <= 0.15 else 0; break
-    acc+=e['token']
-print(ok)" "$other"
+  local serial; serial=$(echo "$body" | python3 -c "import sys,json; d=json.load(sys.stdin); d['enable_mtp']=False; print(json.dumps(d))")
+  curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$serial" | python3 -c "
+import sys,json; d=json.load(sys.stdin); other=sys.argv[1]; want=d['choices'][0]['message']['content']
+print(1 if want[:100] == other[:100] else 0)" "$other"
 }
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
 # The exact boot pins depth 3 (every MTP round verifies 4 rows, so [5b] exercises the array-mask row split:
 # S >= 3 at gqa 12 is MLX's unfused fallback), batches four slots for [8]-[10] and keeps the prefix cache off,
-# so the serial reruns those arms compare against never restore (hybrid restore class 0.14-0.30 nats > the near-tie bar).
+# so the serial reruns those arms compare against never restore (a hybrid restore moves ties).
 echo "[1] architecture + n-gram table"
 arch=$(curl -s "$U/v1/models" | python3 -c "import sys,json; print(json.load(sys.stdin)['data'][0]['meta'].get('architecture',''))")
 check "architecture" "$arch" "qwen4_exp"
@@ -79,20 +73,7 @@ echo "[6] MTP head: engagement + greedy equivalence"
 base=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"'"$N"' Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 mtp=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"'"$N"' Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":true}' | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])")
 check "mtp engaged" "$(slice_count 'spec-stats\] mode=mtp' | sed 's/^[1-9][0-9]*$/1/')" "1"
-if [ "${mtp:0:60}" = "${base:0:60}" ]; then check "mtp == serial (first 60 chars)" 1 1; else
-  # Tie-aware acquittal (test_mtp_equivalence.sh): a verify width moves ties, a
-  # plumbing bug diverges at a confident position. Serial top-2 gap at the first
-  # divergent token must be <= 0.15 nats.
-  gap=$(curl -s -m 600 "$U/v1/chat/completions" -H 'content-type: application/json' -d '{"messages":[{"role":"user","content":"'"$N"' Write a limerick about a cat."}],"max_tokens":80,"temperature":0,"enable_thinking":false,"enable_mtp":false,"logprobs":true,"top_logprobs":2}' | python3 -c "
-import sys,json; d=json.load(sys.stdin); mtp=sys.argv[1]; acc=''
-for e in d['choices'][0]['logprobs']['content']:
-    if not mtp.startswith(acc+e['token']):
-        t=e['top_logprobs']; print(round(t[0]['logprob']-t[1]['logprob'],3) if len(t)>1 else 99); break
-    acc+=e['token']
-else: print(0)" "$mtp")
-  echo "  mtp diverged; serial top-2 gap at the first divergent token: $gap nats"
-  check "mtp == serial or near-tie divergence (gap <= 0.15)" "$(python3 -c "print(1 if float('${gap:-99}')<=0.15 else 0)")" "1"
-fi
+check "mtp == serial (first 60 chars)" "$([ "${mtp:0:60}" = "${base:0:60}" ] && echo 1 || echo 0)" "1"
 apr=$(sushi_log_since | grep 'spec-stats\] mode=mtp' | tail -1 | sed -E 's/.*avg_per_round=([0-9.]+).*/\1/')
 echo "  avg accepted per round: $apr"
 check "acceptance floor 0.5/round" "$(python3 -c "print(1 if float('${apr:-0}')>=0.5 else 0)")" "1"
@@ -120,8 +101,8 @@ tb=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][
 echo "  A: $(echo "$ta" | tr '\n' ' ' | cut -c1-70)"
 echo "  B: $(echo "$tb" | tr '\n' ' ' | cut -c1-70)"
 check "batched decode engaged (slots=2)" "$g8" "2"
-check "A == serial (30 tokens, tie-aware)" "$(same_or_tie "$pa" "$ta")" "1"
-check "B == serial (30 tokens, tie-aware)" "$(same_or_tie "$pb" "$tb")" "1"
+check "A == serial (first 100 characters)" "$(same_as_serial "$pa" "$ta")" "1"
+check "B == serial (first 100 characters)" "$(same_as_serial "$pb" "$tb")" "1"
 echo "[9] two concurrent long prompts: batched decode under the QSA mask"
 mk_long() { python3 -c "
 import json,sys
@@ -141,8 +122,8 @@ echo "  A: $(echo "$ta" | tr '\n' ' ' | cut -c1-60)  B: $(echo "$tb" | tr '\n' '
 check "needle A" "$(echo "$ta" | grep -c 'HERON-77')" "1"
 check "needle B" "$(echo "$tb" | grep -c 'OTTER-31')" "1"
 check "batched decode engaged again past the budget" "$g9" "2"
-check "A == serial (tie-aware)" "$(same_or_tie "$la9" "$ta")" "1"
-check "B == serial (tie-aware)" "$(same_or_tie "$lb9" "$tb")" "1"
+check "A == serial " "$(same_as_serial "$la9" "$ta")" "1"
+check "B == serial " "$(same_as_serial "$lb9" "$tb")" "1"
 echo "[10] an MTP slot stays exclusive while a plain slot decodes beside it"
 nm0=$(slice_count 'spec-stats\] mode=mtp')
 pm='{"messages":[{"role":"user","content":"'"$N"' List ten European capitals with one fact each."}],"max_tokens":200,"temperature":0,"enable_thinking":false,"enable_mtp":true}'
@@ -157,8 +138,8 @@ tm=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][
 tp=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['choices'][0]['message']['content'])" "$T/10p")
 echo "  mtp: $(echo "$tm" | tr '\n' ' ' | cut -c1-60)  plain: $(echo "$tp" | tr '\n' ' ' | cut -c1-60)"
 check "exactly one more mtp engagement" "$(python3 -c "print($(slice_count 'spec-stats\] mode=mtp') - $nm0)")" "1"
-check "mtp answer == serial (tie-aware)" "$(same_or_tie "$pm" "$tm")" "1"
-check "plain answer == serial (tie-aware)" "$(same_or_tie "$pp" "$tp")" "1"
+check "mtp answer == serial " "$(same_as_serial "$pm" "$tm")" "1"
+check "plain answer == serial " "$(same_as_serial "$pp" "$tp")" "1"
 # The head is module-owned; anything that hands it between slots risks `QsaHistoryGap`.
 check "no QSA history gap anywhere in the run" "$(slice_count 'QsaHistoryGap')" "0"
 # If the adaptive switch fired, the release is a one-shot per request.

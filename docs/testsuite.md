@@ -28,6 +28,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   timed something keeps its exactness half.
 - A test of code no served path reaches. Dead code goes with its tests in the same commit.
 - An assertion that a model must think, answer or call a tool. Assert the invariant, branch on the model's choice.
+- A verdict that varies run to run on the same tree ([CLAUDE.md](../CLAUDE.md#testing--tdd-is-mandatory)). A verdict on a
+  model's text takes fixed tokens through the stream and whole-reply mirrors (`format_corpus_test.zig`).
 - A second copy of a check another test already makes on the same input with as strong an assertion.
 - A parity test between two engines (Sushi Cooler against MLX, a kernel against its replaced kernel) once the new
   one is proven: it proves a fact, then repeats it on every run and catches nothing. It goes in the landing that
@@ -265,7 +267,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   its caller's stream ([engine-prefix-cache](engine-prefix-cache.md)). `response-store-field` flags
   the Responses store's map or LRU (`by_id`, `recency`) touched outside `responses.zig`: a record is held through
   `acquire`/`release`.
-  `result-field-free` flags `.free(x.token_ids)` and `.free(x.logprobs)`: a `GenerationResult` is released with `deinit`.
+  `result-field-free` flags `.free(x.token_ids)`: a `GenerationResult` is released with `deinit`.
   `template-runtime-safety` flags a fn under `src/template/` whose body does not open with `@setRuntimeSafety(true)`,
   and any `@setRuntimeSafety(false)` there: the engine reads pack text, and in ReleaseFast only that keeps its bounds
   and overflow checks. It covers the engine's own code, not the std functions it calls (those run unchecked); that is
