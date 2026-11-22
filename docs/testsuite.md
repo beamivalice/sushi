@@ -429,7 +429,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
 | a broad area | `-Dmodel=` (above); a narrow check names its tests with `-Dtest-filter=`, which stays parallel |
 | docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
-| a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `python3 tests/suite_guards.py` and the touched area's scripts |
+| a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `zig build -Doptimize=ReleaseFast` (code only the binary reaches, such as the in-process bench, is analysed by no test binary), `python3 tests/suite_guards.py` and the touched area's scripts |
 | the end of a series of landings (shared files, `build.zig`, `mlx.zig`, several areas stacked) | `zig build test` with the tiny-fixture envs set |
 | a version bump (release step 1) | `tests/gate.sh` on the pushed bump commit (below) |
 | an architecture joins the family, or one is dropped for real | `tests/test_arch_drop.sh` (the only time it runs) |
