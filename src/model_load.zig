@@ -3041,7 +3041,12 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig,
             @import("sushi_exl3").trunk_gemm.enabled = if (arm) |a| a else true
         else
             exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
+        var engine0 = mlx.engine.stats();
         for (0..n + 1) |iter| {
+            if (iter == 1) {
+                mlx.engine.resetKernelProfile();
+                engine0 = mlx.engine.stats();
+            }
             xfm.resetCache() catch return;
             xfm.bindOwnRows(rows);
             var ctx = xfm.defaultCtx();
@@ -3068,6 +3073,19 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig,
             if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
             @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0, first_ms,
         });
+        const engine1 = mlx.engine.stats();
+        if (engine1.dispatches > engine0.dispatches) {
+            const chunks: f64 = @floatFromInt(n);
+            log.info("[prefill-ubench] engine: {d:.1} dispatches, {d:.1} barriers, {d:.1} command buffers, {d:.1} waits, {d:.3} ms GPU busy, {d:.3} ms idle between passes per chunk\n", .{
+                @as(f64, @floatFromInt(engine1.dispatches - engine0.dispatches)) / chunks,
+                @as(f64, @floatFromInt(engine1.barriers - engine0.barriers)) / chunks,
+                @as(f64, @floatFromInt(engine1.submits - engine0.submits)) / chunks,
+                @as(f64, @floatFromInt(engine1.waits - engine0.waits)) / chunks,
+                @as(f64, @floatFromInt(engine1.gpu_busy_ns - engine0.gpu_busy_ns)) / 1e6 / chunks,
+                @as(f64, @floatFromInt(engine1.gpu_gap_ns - engine0.gpu_gap_ns)) / 1e6 / chunks,
+            });
+            mlx.engine.logKernelProfile(chunks);
+        }
     }
 }
 

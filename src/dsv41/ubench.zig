@@ -56,6 +56,7 @@ const Range = struct {
     }
 
     fn metrics(r: Range, run: *report.Run, arm: []const u8, name: []const u8) !void {
+        if (!run.hasArm(arm)) return;
         const lo = try std.fmt.allocPrint(run.a, "{s} min", .{name});
         const hi = try std.fmt.allocPrint(run.a, "{s} max", .{name});
         try run.metric(arm, lo, "MB", mb(r.lo));
@@ -604,19 +605,19 @@ fn runAttnEpilogue(run: *report.Run) anyerror!void {
 pub const picks_span: report.Bench = .{
     .name = "dsv41.picks_span",
     .scope = .dsv41,
-    .what = "one prefill span's compressed picks and fused attention at the release geometry: the picked rows unpacked and gathered first, against the kernel decoding them from the packed store, on the SIMD or the matrix units (NAX GPUs); MLX peak beyond the inputs",
+    .what = "one prefill span's compressed picks and fused attention at the release geometry: the picked rows unpacked and gathered first, against the kernel reading packed rows or pre-unpacked values, on the SIMD or the matrix units (NAX GPUs); MLX peak beyond the inputs",
     .unit = .ms,
     .steps = 1,
     .axes = &.{
         .{ .name = "span", .values = &.{ "256k512", "128k512" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "8192", "262144" } },
     },
-    .arms = &.{ "gather", "packed", "packed_nax" },
+    .arms = &.{ "gather", "packed", "packed_nax", "unpacked_nax" },
     .ref = "gather",
     .run = runPicksSpan,
 };
 
-const PicksSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: *const model.Rows, peak: [3]Range = @splat(.{}) };
+const PicksSample = struct { gpu: mlx.mlx_stream, d: model.AttnData, c: model.AttnCase, rows: *const model.Rows, unpacked: mlx.mlx_array, peak: [4]Range = @splat(.{}) };
 
 fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
     const scale = 1.0 / @sqrt(@as(f32, 512));
@@ -624,9 +625,12 @@ fn samplePicks(s: *PicksSample, arm: usize) anyerror!f64 {
     defer sc.deinit();
     const p = Peak.begin(s.gpu);
     var sw = io_util.Stopwatch.init(io());
-    const nax = arm == 2;
+    const nax = arm >= 2;
     if (nax and !kernels.attnNaxFits(s.c.H, s.c.hd)) return error.NaxUnavailable;
-    const picks = try model.packedPicks(&sc, s.rows, s.d.topk, arm >= 1);
+    const picks: model.Picks = if (arm == 3)
+        .{ .topk = s.d.topk, .comp_rows = s.unpacked }
+    else
+        try model.packedPicks(&sc, s.rows, s.d.topk, arm >= 1);
     const y = try model.fusedHeads(&sc, s.d.sink, s.d.q, s.d.keys, s.c.wp, s.c.window, picks, scale, .bfloat16, null, nax);
     try mlx.check(mlx.mlx_array_eval(y));
     const ns = sw.read();
@@ -648,12 +652,18 @@ fn runPicksSpan(run: *report.Run) anyerror!void {
             var store = try model.packedStore(&base, d.comp);
             defer store.deinit();
             try evalAll(&.{ d.q, d.keys, d.sink, d.topk, store.buf.array, store.sbuf.array });
-            var s: PicksSample = .{ .gpu = gpu, .d = d, .c = c, .rows = &store };
+            const unpacked = if (run.hasArm("unpacked_nax")) blk: {
+                const values = try store.rows(&base, nc);
+                try mlx.check(mlx.mlx_array_eval(values));
+                break :blk values;
+            } else mlx.mlx_array{ .ctx = null };
+            var s: PicksSample = .{ .gpu = gpu, .d = d, .c = c, .rows = &store, .unpacked = unpacked };
             const label = try std.fmt.allocPrint(run.a, "span {d} rows {d}", .{ cs.L, nc });
             try run.interleave(label, &s, samplePicks);
             try s.peak[0].metrics(run, "gather", "peak");
             try s.peak[1].metrics(run, "packed", "peak");
             try s.peak[2].metrics(run, "packed_nax", "peak");
+            try s.peak[3].metrics(run, "unpacked_nax", "peak");
         }
     }
 }

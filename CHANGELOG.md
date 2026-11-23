@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek prefill runs about 1% faster with 3,960 fewer GPU dispatches per 8,192-token chunk**: fused prefill attention no longer builds a separate causal mask it computes inside the kernel.
 - **Nine to sixteen DeepSeek requests decoding together now each get the same text they would alone**: past 8 joined rows the attention input took separate launches whose sums ran in another order than a request's solo step, so its tokens could drift from what it generates alone.
 - **A fully resident DeepSeek load serves several requests at once up to 14% faster**: the joined rows share one vocabulary head and wait, and up to 16 tensor parts join in one dispatch (M5 Ultra, 2.7bpw: 108 to 124 tok/s at 8 requests, 117 to 134 at 16).
 - **`sushi pull deepseek-v4.1-flash:2.7bpw`**: DeepSeek-V4.1-Flash STQ 2.7bpw (400 GB, KLD 0.0607 against the 1.75bpw pack's 0.1525) is listed by `sushi pull`, `sushi list` and the web page, and recommended on 256 GB Macs; the bare name still pulls 1.75bpw.

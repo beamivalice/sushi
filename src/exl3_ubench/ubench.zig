@@ -229,9 +229,11 @@ fn runExperts(run: *report.Run) anyerror!void {
                 for (xh) |*v| v.* = @truncate(@as(u32, @bitCast((rnd.float(f32) * 2 - 1) * 0.5)) >> 16);
                 const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), @intCast(HIDDEN) }, 2, .bfloat16);
                 defer _ = mlx.mlx_array_free(x0);
-                var scv: [256 * 6]f32 = undefined;
-                for (&scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
-                const scores = mlx.mlx_array_new_data(&scv, &[_]c_int{@intCast(rows * lay.topk)}, 1, .float32);
+                const score_count = rows * lay.topk;
+                const scv = try std.heap.page_allocator.alloc(f32, @max(256 * 6, score_count));
+                defer std.heap.page_allocator.free(scv);
+                for (scv) |*v| v.* = 0.05 + rnd.float(f32) * 0.2;
+                const scores = mlx.mlx_array_new_data(scv.ptr, &[_]c_int{@intCast(score_count)}, 1, .float32);
                 defer _ = mlx.mlx_array_free(scores);
                 const c: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = rows > kernels.DECODE_ROWS_MAX };
                 const label = try std.fmt.allocPrint(run.a, "{s} rows {d} {s}", .{ lay.key, rows, mode_text });

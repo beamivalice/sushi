@@ -2315,10 +2315,6 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         parts[np] = try ssc.slice(kv, 0, if (lo > p0) lo - p0 else 0, b);
         np += 1;
         const keys_w = try ssc.concat(parts[0..np], 0);
-        const kpos = try ssc.add(try ssc.reshape(try ssc.arange(0, wk), &.{ 1, ci(wk) }), try ssc.i(ci(lo)));
-        const qpos = try ssc.add(try ssc.reshape(try ssc.arange(0, Ls), &.{ ci(Ls), 1 }), try ssc.i(ci(p0 + a)));
-        const band = try ssc.op2(mlx.mlx_logical_and, try ssc.op2(mlx.mlx_less_equal, kpos, qpos), try ssc.op2(mlx.mlx_greater, kpos, try ssc.sub(qpos, try ssc.i(ci(window)))));
-
         const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
         if (pf) |p| try p.mark(.indexer, &.{ keys_w, picks.comp_rows, picks.topk });
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
@@ -2326,8 +2322,13 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act, if (fold) kernels.Epilogue{ .freqs = rope, .rd = rd, .pos0 = p0 + a, .qat = m.qat_on, .og = c.o_groups } else null, m.attn_nax and kernels.attnNaxFits(H, hd))
         else if (m.attn_f16 and fus and (m.act == .bfloat16 or m.act == .float16) and wk + K <= kernels.attn_softmax_max_cols)
             try kernels.attnWide(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
-        else
-            try attnCore(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, band, picks.comp_rows, picks.topk, scale, m.act);
+        else blk: {
+            // Only this fallback reads the band: the fused and wide arms build it in the kernel.
+            const kpos = try ssc.add(try ssc.reshape(try ssc.arange(0, wk), &.{ 1, ci(wk) }), try ssc.i(ci(lo)));
+            const qpos = try ssc.add(try ssc.reshape(try ssc.arange(0, Ls), &.{ ci(Ls), 1 }), try ssc.i(ci(p0 + a)));
+            const band = try ssc.op2(mlx.mlx_logical_and, try ssc.op2(mlx.mlx_less_equal, kpos, qpos), try ssc.op2(mlx.mlx_greater, kpos, try ssc.sub(qpos, try ssc.i(ci(window)))));
+            break :blk try attnCore(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, band, picks.comp_rows, picks.topk, scale, m.act);
+        };
         heads[si] = try sc.keep(ssc.out(head));
         if (L > NARROW_ROWS) try submit(heads[si]);
         if (pf) |p| try p.mark(.core, &.{heads[si]});
@@ -8330,4 +8331,40 @@ test "dsv41 rows: nine through sixteen joined queries and KV inputs keep their s
             }
         }
     }
+}
+
+test "dsv41 fused prefill attention spans issue no standalone causal band" {
+    try mlx.requireGpu();
+    const dir = try epiFixtureDir();
+    const core = @import("../tensor/core.zig");
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const m = try tinyModel(dir, .{ .on_engine = true, .experts = false }, s);
+    defer m.deinit();
+    var st = try newState(m);
+    defer st.deinit();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    var sh = try Shared.init(testing.allocator, 2);
+    defer sh.deinit(testing.allocator);
+    const h = try sc.zeros(&.{ 32, ci(m.cfg.dim) }, m.act);
+
+    try core.sync();
+    const old_prof = core.kernel_prof_hook;
+    core.kernel_prof_hook = true;
+    defer core.kernel_prof_hook = old_prof;
+    core.resetKernelProfile();
+    defer core.resetKernelProfile();
+    _ = try attention(&sc, m, &st, 0, h, 0, &sh, 16, null);
+    try core.sync();
+    var spans: u64 = 0;
+    var masks: u64 = 0;
+    for (core.kernelProfile()) |k| {
+        if (std.mem.indexOf(u8, k.name, "dsv41_attn_fused") != null or std.mem.indexOf(u8, k.name, "dsv41_attn_nax") != null) spans += k.dispatches;
+        if (std.mem.indexOf(u8, k.name, "bin_logical_and") != null) masks += k.dispatches;
+    }
+    try testing.expectEqual(@as(u64, 2), spans);
+    try testing.expectEqual(@as(u64, 0), masks);
 }

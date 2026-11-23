@@ -560,6 +560,27 @@ then the shared head and the 16-part concatenate, then the wide-row correction; 
   ~4.7% only when every pick is in the hot group): two stays. Reusing unpacked attention keys across rows: -480
   dispatches at 16 rows, 100.3 against 99.9 ms.
 
+**Where an 8,192-row prefill chunk goes** (2.7bpw resident, code / prose, GPU ms a chunk from single-dispatch
+profiles, base `b891db78`): routed experts n40 550 / 607, n48 144 / 124, n56 129 / 104, shared expert 127 / 128, trunk
+linears 514 / 517, attention 428 / 430; GPU busy 2,386 / 2,406 ms. Routed, trunk and attention are ~74% of it; the K2.5
+group carries 69% of the encoder's routed assignments. Prose's 21 ms more GPU time is not why it prefills slower: its
+first pass touches ~172,200 distinct Engram rows a table against ~97,600 for code, and its Engram stage takes 941 against
+466 ms.
+- Fused prefill attention without the standalone causal band (the kernel builds it): -3,960 dispatches a 8,192-row chunk
+  on both packs, the same bytes (8cat KLD 0.060666116; two 16,415-token prompts equal in every continuation id and all
+  67 MB of saved state). Prefill meter, A B B A one resident load an arm, ms: 2.7bpw code 2,048 700.7 / 700.3 against
+  693.9 / 698.3; code 8,192 2,555.2 / 2,469.9 against 2,467.2 / 2,509.8; 1.75bpw prose 8,192 2,466.9 / 2,474.2 against
+  2,438.1 / 2,444.8 (about 1%).
+- Ruled out: one command buffer a chunk (907-919 to 312-314 buffers, 2,634.7 to 2,920.1 ms on 8k prose: the idle
+  between passes grew), an asynchronous CED hand-off (2,473 to 2,504 ms), a PAIR1 reader over two independent windows
+  (7.22 to 8.73 ms at 256 rows), a transposed tile grid, a SIMD expert-boundary scan (-0.7% routed, slower K5 trunk),
+  attention inputs unpacked ahead (0.989x / 1.000x), and sorted, unsorted or mapped Engram reads for cold rows (all
+  1.08-1.09 s for 49,152 rows).
+- Open: parking the Engram consumer on a completion event instead of a spin (caller CPU 156 ms to 4 us in a 150 ms
+  wait) is held: the 1.75bpw served prose ladder read 1.7-4.8 GB more cold Engram pages on its loads in both orders and
+  ran ~20% slower, unexplained. The same binary's cold first 4k code prompt read 1,472 and 2,698 tok/s on two loads
+  (764 MB against 61 MB read in the chunk).
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh
