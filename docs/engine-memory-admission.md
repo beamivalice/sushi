@@ -83,7 +83,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   streamed load on a quiet 32 GB box saw 27,936 MiB of ceiling where its requests saw 26,976, and proved an 86k context
   each request then refused.
 - **A load's served warm forwards at the widest width a served request takes** (`widestServedRung`, shared with the
-  load line): the arch's start width (DeepSeek's 2048) or `--prefill-chunk`, never the global default. The warm took the
+  load line): the arch's start width (DeepSeek's 8192) or `--prefill-chunk`, never the global default. The warm took the
   generic 8192 on DeepSeek, a width no DeepSeek request forwards at, and at `--ssd-budget-gb 108` it reset the Mac.
 - **Every runtime ceiling is the wired limit alone, as on 1.6.0** (`currentGpuMemoryCeiling`, #110): under a declared
   `iogpu.wired_limit_mb` the limit less the unplanned margin, whatever free RAM other apps leave; with none declared,
@@ -326,7 +326,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next, deepseek_v41) prefills every
-  request from its start width (`prefillStartWidth`: 4096, 2048, 2048, 2048; an explicit `--prefill-chunk` sets it instead). Each
+  request from its start width (`prefillStartWidth`: 4096, 2048, 2048, 8192; an explicit `--prefill-chunk` sets it instead). Each
   chunk boundary steps down a rung, never up again, only where the next chunk's cost no longer fits the live
   headroom beside the KV (`adaptivePrefillWidth`). Admission bills the request's top at the widest rung whose whole
   bill fits (`chooseRequestPrefillChunk`), so a long prompt is never under-billed; the load-time pin is only the
