@@ -1183,7 +1183,9 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   The warm runs one `.rows` forward at every width the load joins (`warmOwnRows`, 2 to `maxJoinedRows`): past 8 rows
   an exact, wide forward's pipelines carry its row count, and without DSpark's verify rounds no other warm runs one.
   The joined rows' head is one vocabulary projection and one wait for all of them, and the engine joins up to 16
-  parts in one concatenate dispatch.
+  parts in one concatenate dispatch. The attention input (`wq_a`, `wkv` and a ratio-1 compressor's `wkv`, `attnQuery`)
+  takes its stacked one-launch projection up to `maxJoinedRows` on a joined forward, the launch a solo step takes:
+  separate launches past 8 rows sum in another order, and 9 to 16 joined rows differed from solo before 1.7.4.
 - **A load that joins rows keeps a state per request and parks none** (`serves_rows`): a slot's first forward makes
   its request's state, and a forward runs it only for its own span (`bind`, `unbindRows`). Off a forward a hook reads a
   state only where it lends one (`lend`, `lendFor`: the restore through `restoreTarget`/`restoreEnd`, a write-through,

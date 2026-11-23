@@ -2264,7 +2264,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
 
     const fus = fusedOn(sc, m);
     const pf = prof(m, L);
-    const in = try attnQuery(sc, m, ly, h);
+    const in = try attnQuery(sc, m, ly, h, exl3.project_rows.PROJECT_ROWS_MAX);
     if (pf) |p| try p.mark(.attn_in, &in);
     const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
@@ -2454,7 +2454,7 @@ fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []con
     const c = &m.cfg;
     const ly = &m.layers[li];
     const n = segs.len;
-    const in = try attnQuery(sc, m, ly, h);
+    const in = try attnQuery(sc, m, ly, h, m.maxJoinedRows());
     const q_all = try sc.reshape(try ly.wq_b.apply(sc, in[0]), &.{ ci(L), ci(c.heads), ci(c.head_dim) });
     const os = try sc.a.alloc(A, n);
     defer sc.a.free(os);
@@ -2505,20 +2505,19 @@ pub const DsKeys = struct { keys: A, band: A = none, pos: A = none };
 
 /// The attention input's projections: wq_a, wkv and (none past the stacked bank) a ratio-1 compressor's wkv, from one
 /// launch at decode widths.
-fn attnIn(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
-    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.project_rows.PROJECT_ROWS_MAX) {
+fn attnIn(sc: *Scope, ly: *const Layer, h: A, max_rows: usize) ![3]A {
+    if (ly.in_shared) |sh| if (dim(h, 0) <= max_rows) {
         var outs: [3]A = .{ none, none, none };
         try sharedApply(sc, sh, ly.wq_a.stq.?.dec, h, outs[0..sh.count]);
         return outs;
     };
-    _ = m;
     return .{ try ly.wq_a.apply(sc, h), try ly.wkv.apply(sc, h), none };
 }
 
 /// `attnIn` with its first output through `q_norm`: the query's low-rank row, normed. At decode widths the stacked
 /// launch's finish norms it, one dispatch for the two.
-fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
-    if (ly.in_shared) |sh| if (dim(h, 0) <= exl3.project_rows.PROJECT_ROWS_MAX) {
+fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A, max_rows: usize) ![3]A {
+    if (ly.in_shared) |sh| if (dim(h, 0) <= max_rows) {
         var outs: [3]A = .{ none, none, none };
         const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = try kernels.hcEps(sc, m.cfg.eps, m.cfg.hc_eps), .cols = sh.cols[1] };
         if (try exl3.linear.linearSharedNormed(sc.s, h, sh, ly.wq_a.stq.?.dec, outs[0..sh.count], .{ .rows = sc.rows }, norm)) {
@@ -2529,7 +2528,7 @@ fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A) ![3]A {
             return outs;
         }
     };
-    var in = try attnIn(sc, m, ly, h);
+    var in = try attnIn(sc, ly, h, max_rows);
     in[0] = try sc.rms(in[0], ly.q_norm, m.cfg.eps);
     return in;
 }
@@ -2543,7 +2542,7 @@ fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0:
     const hd = c.head_dim;
     const rope = m.rope_plain.freqs;
     const pos = if (ds.pos.ctx != null) ds.pos else try posArray(sc, p0, B, 1);
-    const in = try attnQuery(sc, m, ly, h);
+    const in = try attnQuery(sc, m, ly, h, exl3.project_rows.PROJECT_ROWS_MAX);
     const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
     const q = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(B), ci(c.heads), ci(hd) }), rope, pos, false, .none, null);
@@ -8280,5 +8279,55 @@ test "dsv41 rows: a grow that fails at any MLX call leaves both parts, the rows 
         // Each part makes a buffer, slices its rows and writes them, and a written grow evaluates each part.
         try std.testing.expect(calls >= c.min_calls);
         try std.testing.expectEqual(base, settled(s));
+    }
+}
+
+test "dsv41 rows: nine through sixteen joined queries and KV inputs keep their solo stacked K5 projections at release shape" {
+    try mlx.requireGpu();
+    if (!exl3.kernels.gemmNaxOn()) return error.SkipZigTest;
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    sc.rows = .{ .exact = true, .wide = true };
+    var rnd = std.Random.DefaultPrng.init(0x451a);
+    var q = try exl3.synth.makeBank(rnd.random(), 5120, 1280, .{ 80, 80, 80 }, 1, 0.02, 1);
+    defer exl3.synth.freeBank(&q);
+    var kv = try exl3.synth.makeBank(rnd.random(), 5120, 512, .{ 80, 80, 80 }, 1, 0.02, 1);
+    defer exl3.synth.freeBank(&kv);
+    const dec = exl3.format.Decode.tabled(.spec1, .w15);
+    var ly: Layer = undefined;
+    ly.wq_a = .{ .w = none, .stq = .{ .p = q.gate, .dec = dec } };
+    ly.wkv = .{ .w = none, .stq = .{ .p = kv.gate, .dec = dec } };
+    ly.in_shared = .{ .count = 2, .cols = .{ 0, 1280, 1792, 1792, 1792 }, .p = .{
+        .trellis = try sc.contiguous(try sc.concat(&.{ q.gate.trellis, kv.gate.trellis }, 2)),
+        .suh = try sc.concat(&.{ q.gate.suh, kv.gate.suh }, 0),
+        .svh = try sc.concat(&.{ q.gate.svh, kv.gate.svh }, 1),
+    } };
+    ly.q_norm = try sc.astype(try kernels.randn(&sc, &.{1280}, .float32, 7142, 1), .bfloat16);
+    var m: Model = undefined;
+    m.cfg = .{ .eps = 1e-6 };
+    const x = try sc.astype(try kernels.randn(&sc, &.{ 16, 5120 }, .float32, 7141, 2), .bfloat16);
+    const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = try kernels.hcEps(&sc, m.cfg.eps, m.cfg.hc_eps), .cols = 1280 };
+    var joined: [8][3]A = undefined;
+    for (&joined, 9..) |*result, width| {
+        result.* = try attnQuery(&sc, &m, &ly, try sc.slice(x, 0, 0, width), m.maxJoinedRows());
+    }
+    for (0..16) |row| {
+        var solo: [2]A = .{ none, none };
+        const input = try sc.slice(x, 0, row, row + 1);
+        try testing.expect(try exl3.linear.linearSharedNormed(sc.s, input, ly.in_shared.?, dec, &solo, .{ .rows = .{ .exact = true } }, norm));
+        defer for (solo) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (solo, 0..) |want, projection| {
+            const expected = try hostRows(&sc, want);
+            defer testing.allocator.free(expected);
+            for (joined, 9..) |result, width| {
+                if (row >= width) continue;
+                const actual = try hostRows(&sc, try sc.slice(result[projection], 0, row, row + 1));
+                defer testing.allocator.free(actual);
+                errdefer std.debug.print("joined width {d}, row {d}, projection {d}\n", .{ width, row, projection });
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+            }
+        }
     }
 }
