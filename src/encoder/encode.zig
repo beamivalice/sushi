@@ -6,8 +6,16 @@ pub const tile_len = format.TILE_VALUES;
 
 pub const Error = error{ RateUnsupported, WindowTooNarrow, WindowUnsupported, ShapeMismatch, CodebookUnsupported } || std.mem.Allocator.Error;
 
-/// The codebooks the encoder searches.
+/// The codebooks the encoder searches: MCG and MUL1 by their closed-form decode, and the tabled
+/// hash-mask codebooks (SPEC1, STD1) through their table's row for the rate, one codeword at a time.
 pub fn searchable(codebook: format.Codebook) bool {
+    return searchableClosedForm(codebook) or codebook.tabledHashMask();
+}
+
+/// The codebooks a search can spell as an expression: MCG and MUL1. The tabled codebooks read their
+/// value from a table row instead, so the call sites that emit code (the converter's pack stamp and the
+/// Metal search's kernel) stay off them — only the scalar encoder, which reads the same table, takes them.
+pub fn searchableClosedForm(codebook: format.Codebook) bool {
     return codebook == .mcg or codebook == .mul1;
 }
 
@@ -149,8 +157,16 @@ pub const Encoder = struct {
         self.stride = @as(usize, 1) << (w - kmin);
         self.table = try allocator.alloc(f32, @as(usize, 1) << w);
         errdefer allocator.free(self.table);
-        for (self.table, 0..) |*v, cw| {
-            v.* = format.f16BitsToF32(format.decodeCodeword(@intCast(cw), dec.codebook));
+        // A tabled codebook decodes a window through its table's (multiplier, mask) row — the same
+        // function `decodeHashMask` the kernels use — so the search scores exactly what the pack decodes.
+        // A rate the table has no row for is not searchable; say so instead of scoring zeros.
+        if (dec.codebook.tabledHashMask()) {
+            const hm = dec.hashMask(rate) orelse return error.CodebookUnsupported;
+            for (self.table, 0..) |*v, cw| v.* = format.f16BitsToF32(format.decodeHashMask(@truncate(cw), hm));
+        } else {
+            for (self.table, 0..) |*v, cw| {
+                v.* = format.f16BitsToF32(format.decodeCodeword(@intCast(cw), dec.codebook));
+            }
         }
         self.costs[0] = try allocator.alloc(f16, self.stride);
         errdefer allocator.free(self.costs[0]);
@@ -310,6 +326,8 @@ test "encode: every code the search writes decodes to the values it scored" {
         .{ .dec = .{ .codebook = .mul1, .window = .w12 }, .n = 44 },
         .{ .dec = .{ .codebook = .mul1, .window = .w15 }, .n = 48 },
         .{ .dec = .{ .codebook = .mul1, .window = .w16 }, .n = 64 },
+        .{ .dec = format.Decode.tabled(.spec1, .w15), .n = 96 },
+        .{ .dec = format.Decode.tabled(.std1, .w15), .n = 64 },
     };
     var prng = std.Random.DefaultPrng.init(7);
     for (cases) |c| {
@@ -317,7 +335,7 @@ test "encode: every code the search writes decodes to the values it scored" {
         var enc = try Encoder.init(t.allocator, rate, c.dec);
         defer enc.deinit();
         var tile: [tile_len]f32 = undefined;
-        var packed_out: [64]u16 = undefined;
+        var packed_out: [format.Rate.max_n]u16 = undefined;
         for (0..3) |_| {
             testTile(&prng, &tile);
             var recon: [tile_len]f32 = undefined;
@@ -488,6 +506,8 @@ test "encode: a rate or window the trellis cannot carry is refused" {
     try t.expectError(error.RateUnsupported, Encoder.init(t.allocator, .{ .n = 41 }, .mcg));
     try t.expectError(error.RateUnsupported, Encoder.init(t.allocator, .{ .n = 8 }, .mcg));
     try t.expectError(error.WindowUnsupported, Encoder.init(t.allocator, .{ .n = 128 }, .{ .codebook = .mcg, .window = .w8 }));
+    // A tabled codebook is searchable only at a rate its table has a row for: STd1 ends at n 64.
+    try t.expectError(error.CodebookUnsupported, Encoder.init(t.allocator, .{ .n = 96 }, format.Decode.tabled(.std1, .w15)));
 }
 
 test "encode: a short packed slice or a window outside 12..16 is refused" {
