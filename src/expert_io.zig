@@ -1742,7 +1742,7 @@ fn fileIndex(allocator: std.mem.Allocator, files: *std.ArrayList(std.c.fd_t), fd
 
 extern "c" fn proc_pid_rusage(pid: c_int, flavor: c_int, buffer: *anyopaque) c_int;
 
-fn processDiskBytesRead() u64 {
+pub fn processDiskBytesRead() u64 {
     var buf: [1024]u8 align(8) = @splat(0);
     if (proc_pid_rusage(std.c.getpid(), 2, @ptrCast(&buf)) != 0) return 0;
     return std.mem.readInt(u64, buf[144..152], .little);

@@ -605,6 +605,27 @@ round. Mean ms a round, base -> final, then the final's draft / verify / rollbac
   one-row forward), fours sharing a weight walk (1.75bpw eight-row forward 36.23 -> 43.75 ms), the stages' attention
   fused with its epilogue and pairing routed slots in expert prep (both under the bar).
 
+**Prefill against this GPU's roof** (8,192-row chunk, resident, both packs; roof: a dense bf16 projection at 104.9
+TFLOP/s and a streaming read at 768 GB/s, `sushi-ubench`; base `578b0279`): fraction of roof, 1.75bpw / 2.7bpw.
+
+| family | fraction of roof |
+|---|---|
+| routed experts | n24 82.7%, n26 77.9%, n32 76.6%, n40 71.4% / n40 84.2%, n48 74.8%, n56 69.7% |
+| shared expert, trunk linears | 89.3%, 90.2% / 88.1%, 89.0% |
+| attention | 40.7% / 40.6% |
+| indexer | 19.4% / 17.4% |
+| Engram GPU, hyper-connections, router | 89.1%, 82.0%, 48.2% / 84.7%, 81.8%, 47.8% |
+
+- The Engram reader on 4 threads until a read reaches the SSD, and the GPU warm window opened at load (fast bench,
+  `tests/bench.sh --rungs 4k,8k`, prefill tok/s, page cache primed alike before each launch; base `578b0279` binary
+  `3d9206c36aaff585`, final binary `b60afc574664acea`): 1.75bpw code 2,809 / 2,697 -> 2,846 / 2,792, prose 2,326 /
+  2,237 -> 2,733 / 2,688; 2.7bpw code 1,432 / 2,720 -> 2,872 / 2,798 (the 4k cell is the first prompt after idle),
+  prose 2,251 / 2,253 -> 2,716 / 2,743. Fully cached 8k resets move little (1.75bpw code 2,428.9 -> 2,434.0 ms, prose
+  2,454.3 -> 2,435.3); a first prose reset 3,012 -> 2,586 ms (1.75bpw), 3,095 -> 2,692 (2.7bpw). Same bytes: 8cat KLD
+  0.152457202 / 0.060666116, two 16,415-token prompts equal on each pack.
+- Ruled out: twice the attention span (-35 ms GPU, but more idle: 2,459 -> 2,488 ms wall); parking the Engram consumer
+  on an event (round 1's loss was cold pages; with pages primed it ties, and a reverse-order residual stays unexplained).
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh

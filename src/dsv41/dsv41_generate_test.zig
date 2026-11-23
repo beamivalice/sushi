@@ -1625,7 +1625,7 @@ test "dsv41 serving: a model another model's load evicts writes its live restore
     sch.io = io;
     sch.allocator = a;
     var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = base, .evict_entries = &victims };
-    @import("../model_load.zig").runLoadRequest(&sch, &req);
+    try testing.expect(!@import("../model_load.zig").runLoadRequest(&sch, &req));
     try testing.expectEqualStrings("ArchitectureUnsupported", req.outcome.errorName().?);
     try testing.expectEqual(registry_mod.LoadState.unloaded, victim.state);
     try testing.expect(victim.handle == null);

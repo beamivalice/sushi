@@ -2549,7 +2549,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     // decode tick (`worked`).
     var warm_since: ?io_util.Stopwatch = null;
     var warm_ticks: u32 = 0;
-    var worked = false;
+    // A model that just loaded opens the warm window, as a finished request does: idle, the pack's wired pages go.
+    var worked = !params.no_initial_load;
     var active: std.ArrayList(*Slot) = .empty;
     defer active.deinit(sch.allocator);
     while (!sch.shutdown.load(.acquire)) {
@@ -2605,7 +2606,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             defer turn.end();
             for (orphan_vision[0..orphan_vision_n]) |ve| vision_queue.freeVisionArray(ve);
         }
-        if (load_req) |req| model_load.runLoadRequest(sch, req);
+        if (load_req) |req| worked = model_load.runLoadRequest(sch, req) or worked;
         if (unload_req) |req| model_load.runUnloadRequest(sch, req);
         if (clear_req) |req| {
             prefix_cache_admin.runClear(sch.io, req);

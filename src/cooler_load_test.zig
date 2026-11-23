@@ -741,7 +741,7 @@ test "cooler contract: a resident load beside buffers already past a declared wi
     // Past the preflight the first checked MLX call is the weights': failing it ends an admitted load before it needs a
     // tokenizer.
     mlx.fault.arm(1);
-    model_load.runLoadRequest(&sch, &req);
+    try testing.expect(!model_load.runLoadRequest(&sch, &req));
     const admitted = mlx.fault.didFire();
     mlx.fault.disarm();
     if (admitted) {
@@ -839,7 +839,7 @@ fn evictMlxModel(new_on_engine: bool) !usize {
     scheduler_mod.load_serving_bill = &PreflightSawMlx.bill;
     PreflightSawMlx.mlx_cache = null;
     var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = dir, .evict_entries = &victims };
-    model_load.runLoadRequest(&sch, &req);
+    try testing.expect(!model_load.runLoadRequest(&sch, &req));
     mlx.fault.disarm();
     var msg: [300]u8 = undefined;
     _ = mlx.takeError(&msg);

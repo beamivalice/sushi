@@ -79,7 +79,10 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   the next pass takes them when its row ids are the same, else reads its own. A batch of 256 rows or more (`ADVISE_BELOW`) is
   `pread` without `F_RDADVISE`; a narrower one (a decode token's 24 rows, a verify) is advised first. A read takes one thread per 16 rows, up to 64
   (`readParts`): on the release table a cold batch of random rows reads 29% sooner at 64 threads than at 16 and no sooner past that
-  (3,072 rows 17.2 to 12.3 ms, 49,152 rows 254 to 180 ms; `2877a95e`, the read pattern replayed on the layer-1 table, arms interleaved). The n-gram hash and the compressed-vocabulary map
+  (3,072 rows 17.2 to 12.3 ms, 49,152 rows 254 to 180 ms; `2877a95e`, the read pattern replayed on the layer-1 table, arms interleaved).
+  A batch of 4,096 rows or more (`WIDE_READ_ROWS`, a prefill chunk's) reads on 4 threads while the pages are cached and
+  widens to `readParts` at the first physical read (`readWide`): 172,203 cached prose rows took 167 ms and 0.67 CPU s on
+  4 threads against 605 ms and 17.8 CPU s on 64, while 4.66 GB cold took 5.54 s on 4 against 1.55 s on 64. The n-gram hash and the compressed-vocabulary map
   are the reference's (`engram.py`); the map ships embedded (`src/dsv41/fixtures/dsv41_engram_token_map.bin`) and a pack's own
   `engram_token_map.json` outranks it. `tests/dsv41/dump_dsv41_token_map.py --check` re-derives it from `tokenizer.json`.
 - **Forward** (`src/dsv41/dsv41_model.zig`): bf16 activations, f32 where the reference is f32 (head, compressor, hyper-connection

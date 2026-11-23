@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek prose prompts prefill 17-22% faster and the first prompt after a load up to twice as fast**: Engram rows already in the page cache are read on 4 threads instead of 64 (25x less CPU), widening only when a read reaches the SSD, and the GPU warm window now opens when a model loads, so an idle server keeps the pack wired.
 - **DeepSeek decodes with DSpark up to 8% faster on both STQ packs**: a verify forward decodes each shared-expert weight once for several of its rows (M5 Ultra fast bench: 2.7bpw code 120 to 128 / 159 to 162 tok/s at 4k / 8k, 1.75bpw code 140 to 149 / 148 to 160).
 - **A long DeepSeek reply with DSpark is now exactly what serial decoding gives**: a verify of 9 to 16 rows took the attention input in separate launches, so an adaptive stream could part from serial decode thousands of tokens in (token 8,293 of an 8k code reply).
 - **DeepSeek prefill runs about 1% faster with 3,960 fewer GPU dispatches per 8,192-token chunk**: fused prefill attention no longer builds a separate causal mask it computes inside the kernel.

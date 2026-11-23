@@ -436,8 +436,10 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **The first GPU submission after about a second of idle waits 0.6-1.0 s before any work runs** (M5 Max, MiMo
   2.3bpw, ~90 GB resident, measured on e2d5be76; even a one-element op pays it, and a tick every 2 s does not prevent
   it; [perf-baselines](mimo2-perf.md#mimo-ttft-idle)). For `--gpu-warm-secs` (default 60, 0 = off) after its
-  last prefill or decode tick, the parked inference thread runs one synced element-op every 500 ms (`gpuWarmTick`),
-  never while work is queued; an unload closes the window. Output is unchanged. Under a Sushi Cooler load the tick
+  last prefill or decode tick, and after a model load, the parked inference thread runs one synced element-op every 500 ms (`gpuWarmTick`),
+  never while work is queued; an unload closes the window. Output is unchanged. Without the window after a load a DeepSeek
+  pack's wired pages fell away while the server sat idle (~197 GB on 2.7bpw on the M5 Ultra), and the first 4k code
+  prompt read 1,086 tok/s against 2,779 with it (1.75bpw 1,419 against 2,764; zero physical reads in both). Under a Sushi Cooler load the tick
   passes the engine's queue alone ([engine-own-forward](engine-own-forward.md)).
 - `Slot.deinit` runs on conn threads: it stores marks, the inference thread frees.
 - **A `submit` that fails after its slot is built hands the slot to the inference thread** (`Scheduler.abandoned`, an

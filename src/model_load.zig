@@ -2845,7 +2845,7 @@ fn dropViewsOf(sch: *Scheduler, entry: *LoadedModel) void {
     if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
 }
 
-pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
+pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) bool {
     const job = JobTurn.begin(null, req.config);
     defer job.end();
     // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
@@ -2884,7 +2884,7 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     const had_error = mlx.errorPending();
     doLoadOnInferenceThread(sch, req) catch |err| {
         failLoadRequest(sch, req, err, had_error);
-        return;
+        return false;
     };
 
     log.info("[registry] model id={s} ready ({d:.2} GB resident)\n", .{
@@ -2895,6 +2895,7 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // (MTP head / drafter / vision land after the mid-load apply).
     logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, .ok);
+    return true;
 }
 
 fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror, had_error: bool) void {

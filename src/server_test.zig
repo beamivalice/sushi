@@ -3100,3 +3100,15 @@ test "server: /v1/messages reads a system message inside messages into the promp
         }
     }.run);
 }
+
+test "server: the loaded model stays on the GPU before its first request" {
+    const metal = @import("metal.zig");
+    const before = metal.touches;
+    try eachArch(1, .{}, struct {
+        fn body() anyerror!void {
+            try std.Io.sleep(io, .fromNanoseconds(3 * @import("sched_policy.zig").GPU_WARM_TICK_NS), .awake);
+        }
+    }.body);
+    errdefer std.debug.print("GPU touches across load and idle: {d}\n", .{metal.touches - before});
+    try testing.expect(metal.touches > before);
+}

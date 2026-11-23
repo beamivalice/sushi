@@ -375,16 +375,9 @@ pub const Table = struct {
         const n = if (only) |o| o.len else ids.len;
         if (self.rows_read) |c| _ = c.fetchAdd(n, .monotonic);
         var job: Job = .{ .t = self, .ids = ids, .only = only, .w = w, .s = sc };
-        const parts = readParts(n);
-        if (parts > 1) {
-            var threads: [PAR_THREADS]?std.Thread = @splat(null);
-            for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
-            var failed = !job.run(0, parts);
-            for (threads[1..parts], 1..) |t, k| {
-                if (t) |th| th.join() else failed = !job.run(k, parts) or failed;
-            }
-            if (failed or job.bad.load(.acquire)) return error.EngramRead;
-        } else if (n > 0 and !job.run(0, 1)) return error.EngramRead;
+        if (n == 0) return;
+        if (n >= WIDE_READ_ROWS and builtin.os.tag.isDarwin()) return job.readWide(n, expert_io.processDiskBytesRead);
+        return job.readRange(0, n, readParts(n));
     }
 
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (the caller frees).
@@ -434,19 +427,51 @@ pub const Table = struct {
         s: []u8,
         bad: std.atomic.Value(bool) = .init(false),
 
-        fn runVoid(self: *Job, first: usize, stride: usize) void {
-            _ = self.run(first, stride);
+        /// Page-cached rows read fastest on a few threads (64 preads spend ~25x the CPU for the same rows); a batch that
+        /// reaches the SSD needs the queue depth, so the first sign of a physical read widens the rest to `readParts`.
+        fn readWide(self: *Job, n: usize, comptime diskBytes: fn () u64) !void {
+            const cached_readers = 4;
+            var start: usize = 0;
+            var end: usize = 256;
+            var previous = diskBytes();
+            while (true) {
+                try self.readRange(start, end, @min(end - start, cached_readers));
+                if (end == n) return;
+                const current = diskBytes();
+                if (current > previous) return self.readRange(end, n, readParts(n - end));
+                previous = current;
+                start = end;
+                end = @min(n, start + WIDE_READ_ROWS);
+            }
+        }
+
+        fn readRange(self: *Job, start: usize, end: usize, parts: usize) !void {
+            if (comptime builtin.is_test) peak_readers_for_test = @max(peak_readers_for_test, parts);
+            if (parts == 1) {
+                if (!self.run(start, 1, end)) return error.EngramRead;
+                return;
+            }
+            var threads: [PAR_THREADS]?std.Thread = @splat(null);
+            for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, runVoid, .{ self, start + k, parts, end }) catch null;
+            var failed = !self.run(start, parts, end);
+            for (threads[1..parts], 1..) |t, k| {
+                if (t) |th| th.join() else failed = !self.run(start + k, parts, end) or failed;
+            }
+            if (failed or self.bad.load(.acquire)) return error.EngramRead;
+        }
+
+        fn runVoid(self: *Job, first: usize, stride: usize, end: usize) void {
+            _ = self.run(first, stride, end);
         }
 
         /// Every `stride`-th row from `first`, asked of the kernel first.
-        fn run(self: *Job, first: usize, stride: usize) bool {
+        fn run(self: *Job, first: usize, stride: usize, end: usize) bool {
             const t = self.t;
             const wl = t.head_dim;
             const sl = t.sdim;
             t.advise(self.ids, self.only, first, stride);
-            const n = if (self.only) |o| o.len else self.ids.len;
             var j = first;
-            while (j < n) : (j += stride) {
+            while (j < end) : (j += stride) {
                 const i = if (self.only) |o| o[j] else j;
                 const r: u64 = self.ids[i];
                 if (r >= t.rows or
@@ -733,8 +758,10 @@ pub const Prefetch = struct {
     }
 };
 
+const WIDE_READ_ROWS = 4096;
 const PAR_ROWS_PER_THREAD = 16;
 const PAR_THREADS = 64;
+threadlocal var peak_readers_for_test: usize = 0;
 /// Rows of one read from which it is not advised: its threads' preads already queue deep enough.
 const ADVISE_BELOW = 256;
 
@@ -1267,4 +1294,42 @@ test "dsv41 engram: row reuse by cache capacity over a token file (SUSHI_DSV41_E
         const rate = [2]f64{ @as(f64, @floatFromInt(pair[0].hits)) / @as(f64, @floatFromInt(pair[0].hits + pair[0].misses)), @as(f64, @floatFromInt(pair[1].hits)) / @as(f64, @floatFromInt(pair[1].hits + pair[1].misses)) };
         std.debug.print("[engram-reuse] {d} docs, {d} rows a table ({d:.0} MB a table at 272 B a row): hit layer 1 {d:.3}, layer 14 {d:.3}\n", .{ d, cap, @as(f64, @floatFromInt(RowCache.bytesFor(cap, 256, 8))) / 1e6, rate[0], rate[1] });
     }
+}
+
+test "dsv41 engram reads a page-cached wide shard without fanning out to the SSD queue depth" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const rows = 8193;
+    try writePatternShard(io, td.dir, rows);
+    var buf: [512]u8 = undefined;
+    var table = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 1, rows, 64);
+    defer table.close();
+    var ids: [rows]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(rows - 1 - i);
+    const primed = try table.read(testing.allocator, &ids);
+    primed.deinit(testing.allocator);
+    peak_readers_for_test = 0;
+    const raw = try table.read(testing.allocator, &ids);
+    defer raw.deinit(testing.allocator);
+    try expectPatternRows(raw, &ids);
+    try testing.expectEqual(@as(usize, 4), peak_readers_for_test);
+
+    const MixedPages = struct {
+        threadlocal var samples: usize = 0;
+
+        fn bytes() u64 {
+            samples += 1;
+            return if (samples >= 3) 16384 else 0;
+        }
+    };
+    @memset(raw.w, 0);
+    @memset(raw.s, 0);
+    MixedPages.samples = 0;
+    var job: Table.Job = .{ .t = &table, .ids = &ids, .w = raw.w, .s = raw.s };
+    try job.readWide(ids.len, MixedPages.bytes);
+    try testing.expectEqual(@as(usize, 64), peak_readers_for_test);
+    try testing.expectEqual(@as(usize, 3), MixedPages.samples);
+    try expectPatternRows(raw, &ids);
 }
