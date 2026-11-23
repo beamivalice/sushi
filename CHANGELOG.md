@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi pull deepseek-v4.1-flash:2.7bpw`**: DeepSeek-V4.1-Flash STQ 2.7bpw (400 GB, KLD 0.0607 against the 1.75bpw pack's 0.1525) is listed by `sushi pull`, `sushi list` and the web page, and recommended on 256 GB Macs; the bare name still pulls 1.75bpw.
 - **DeepSeek-V4.1-Flash STQ 2.7bpw decodes 13-20% faster on an M5 Ultra**: its K3.5 routed experts and K5 trunk read their weights with fewer loads at the same output, and on the Ultra the K5 trunk splits its sums its own way, which moves the pack's KLD from 0.06114 to 0.06067.
 - **Logprobs are no longer served**: a request that asks for them (`logprobs`, `top_logprobs`, a legacy completion's integer `logprobs`, or a Responses `include` of `message.output_text.logprobs`) is refused with a 400 naming the field; chat `logprobs: false`, `top_logprobs: 0` and null still pass; a legacy completion's integer `logprobs` is refused at any value, 0 included.
 - **A stream with no tools declared holds a thought that writes call markup until the reply ends**: the whole reply reads such a thought's close by the call's own value end, which a later byte can flip, so its reasoning after the call and the answer after `</think>` arrive at the reply's end instead of as they come.

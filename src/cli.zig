@@ -2265,6 +2265,10 @@ test "list recommends one pack per family from the tier table" {
     try testing.expectEqualStrings("2.4bpw", recommendedAlias("glm-5.3-flash", 128).?.tag);
     try testing.expect(recommendedAlias("deepseek-v4.1-flash", 95) == null);
     try testing.expectEqualStrings("1.75bpw", recommendedAlias("deepseek-v4.1-flash", 96).?.tag);
+    try testing.expectEqualStrings("1.75bpw", recommendedAlias("deepseek-v4.1-flash", 255).?.tag);
+    try testing.expectEqualStrings("2.7bpw", recommendedAlias("deepseek-v4.1-flash", 256).?.tag);
+    try testing.expectEqualStrings("beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", resolveShortName("deepseek-v4.1-flash").?.repo);
+    try testing.expectEqualStrings("beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", resolveShortName("deepseek-v4.1-flash:2.7bpw").?.repo);
 }
 
 test "pull warns only below the documented tier, naming --ssd-budget-gb" {

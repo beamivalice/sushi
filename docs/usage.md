@@ -54,6 +54,7 @@ it may still run streamed ([Choosing a pack and streaming](usage-streaming.md)),
 | GLM-5.3-Flash-Sushi-2.4bpw | 128 GB | 128 GB |
 | MiMo-V2.6-Flash-Sushi-2.3bpw | 128 GB | 128 GB |
 | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 96 GB (experts streamed) | 96 GB |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw | 256 GB (experts resident) | 256 GB |
 
 Sizes are the whole download; a Qwen pack's n-gram table and DeepSeek's 189 GiB of Engram tables stay on the SSD and are
 never loaded. Offline, `sushi list` shows only the models on disk.
@@ -167,6 +168,14 @@ sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-
 
 On a 128 GB Mac the 108 default needs the GPU limit raised (`sudo sysctl iogpu.wired_limit_mb=125000
 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000`, the limit the heading names); without it the default is 96, and it steps down further, saying so, when the Mac's limits cannot hold it.
+
+**256 GB Macs, DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw**: KLD 0.0611 against 0.1525 for the 1.75bpw pack, and every
+routed expert resident at the RAM default (no SSD reads, no limit to raise).
+
+```bash
+sushi pull deepseek-v4.1-flash:2.7bpw
+sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw
+```
 
 DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
 authors recommend; `--ctx-size` and `--max-tokens` still override them.

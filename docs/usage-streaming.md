@@ -13,6 +13,7 @@ at each context see [README, Memory](../README.md#memory).
 | 64 GB | **Qwen Sushi-STQ-2.75bpw** | Qwen Sushi-4bpw, streamed: closer to the original model, about half the speed |
 | 96 GB | Qwen Sushi-4bpw, GLM Sushi-2bpw, DeepSeek (streamed) | |
 | 128 GB | any pack; GLM Sushi-2.4bpw and DeepSeek are the largest | |
+| 256 GB | **DeepSeek Sushi-STQ-2.7bpw**, every expert resident | DeepSeek Sushi-STQ-1.75bpw: smaller, lower quality |
 
 A pack that fits in memory is always the faster choice. Stream only when you want a pack that does not fit and you
 accept that it runs slower.

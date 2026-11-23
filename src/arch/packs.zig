@@ -110,6 +110,7 @@ test "the alias table lists every arch's packs, in the arch gate's order, with t
         .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .is_default = false, .tier_gb = 96, .recommend_gb = 96, .streams = false, .flags = "" },
         .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .streams = false, .flags = "" },
         .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams = true, .flags = "" },
+        .{ .name = "deepseek-v4.1-flash", .tag = "2.7bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", .is_default = false, .tier_gb = 256, .recommend_gb = 256, .streams = true, .flags = "" },
     };
     try std.testing.expectEqual(rows.len, aliases.len);
     for (rows, aliases) |want, got| {
