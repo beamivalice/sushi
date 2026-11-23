@@ -2264,7 +2264,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
 
     const fus = fusedOn(sc, m);
     const pf = prof(m, L);
-    const in = try attnQuery(sc, m, ly, h, exl3.project_rows.PROJECT_ROWS_MAX);
+    const in = try attnQuery(sc, m, ly, h, @intCast(exl3.project_rows.rowsMax(sc.rows)));
     if (pf) |p| try p.mark(.attn_in, &in);
     const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
@@ -5359,13 +5359,17 @@ pub fn draft(m: *Model, t1: u32, with_heads: bool) !Draft {
 /// the windows of committed main rows, the trunk head over the last stage's norm, then the Markov bigram bias chained
 /// token to token.
 pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+    return draftMeasured(m, t1, heads_wanted, null);
+}
+
+pub fn draftMeasured(m: *Model, t1: u32, heads_wanted: Heads, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
     transient_peak.begin();
     defer transient_peak.end(.draft, m.cfg.dspark.block, null);
-    const out = try draftPass(m, t1, heads_wanted);
+    const out = try draftPass(m, t1, heads_wanted, meter);
     return out;
 }
 
-fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
+fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
     const gpa = m.gpa;
     const saved_profile = m.profile;
     m.profile = null;
@@ -5393,9 +5397,17 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
         const out = try block(&sc, m, st, c.layers + si, x, pre, n, &dummy, SPAN, .{ .keys = keys }, &.{});
         x = try sc.keep(out.x);
         pre = try sc.keep(out.pre);
+        if (meter) |timing| {
+            if (timing.fence_draft) try evalAll(&.{ x, pre });
+            timing.mark(.stage);
+        }
     }
     const hout = try hcCollapse(&sc, x, pre); // [B, dim]
     const logits = try m.head.apply(&sc, try sc.astype(try sc.rms(hout, ds.norm, c.eps), .float32)); // [B, vocab] f32
+    if (meter) |timing| {
+        if (timing.fence_draft) try evalAll(&.{logits});
+        timing.mark(.head);
+    }
     var cur = try sc.reshape(try sc.i(@intCast(t1)), &.{1});
     var picks: [cfg_mod.max_block]A = undefined;
     var rows: [cfg_mod.max_block]A = undefined;
@@ -5421,7 +5433,10 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     const all = try sc.concat(picks[0..B], 0);
     const heads = if (with_heads) try sc.concat(rows[0..B], 0) else all;
     const conf = if (with_conf) try sc.reshape(try sc.concat(confs[0..B], 0), &.{ci(B)}) else all;
+    const timed_pick = if (meter) |timing| timing.fence_draft else false;
+    if (meter) |timing| if (!timed_pick) timing.mark(.markov);
     try evalAll(&.{ all, heads, conf });
+    if (meter) |timing| if (timed_pick) timing.mark(.markov);
     var out: Draft = .{ .gpa = gpa, .ids = &.{}, .logits = &.{}, .conf = &.{} };
     errdefer out.deinit();
     out.ids = try gpa.alloc(u32, B + 1);
@@ -8312,6 +8327,36 @@ test "dsv41 rows: nine through sixteen joined queries and KV inputs keep their s
     for (&joined, 9..) |*result, width| {
         result.* = try attnQuery(&sc, &m, &ly, try sc.slice(x, 0, 0, width), m.maxJoinedRows());
     }
+    const Capture = struct {
+        fn query(ctx: *anyopaque, _: usize, kind: TapKind, value: A) !void {
+            if (kind != .q_lora) return error.UnexpectedTap;
+            const dst: *A = @ptrCast(@alignCast(ctx));
+            dst.* = handle(value);
+            return error.QueryCaptured;
+        }
+        fn unexpected(_: *anyopaque, _: usize, _: A, _: A) !void {
+            return error.UnexpectedTap;
+        }
+    };
+    var layer_states: [1]LState = undefined;
+    var state: State = .{ .gpa = testing.allocator, .layers = &layer_states };
+    var shared = try Shared.init(testing.allocator, 1);
+    defer shared.deinit(testing.allocator);
+    var layers = [_]Layer{ly};
+    m.layers = &layers;
+    m.profile = null;
+    m.rope_plain = .{ .freqs = none };
+    m.fused = true;
+    m.dspark_exact = true;
+    sc.rows = m.rowsOf(.verify);
+    var verified: [8]A = undefined;
+    for (&verified, 9..) |*result, width| {
+        var capture = none;
+        m.tap = .{ .ctx = &capture, .input = Capture.query, .routes = Capture.unexpected, .expert_act = Capture.unexpected };
+        try testing.expectError(error.QueryCaptured, attention(&sc, &m, &state, 0, try sc.slice(x, 0, 0, width), 0, &shared, width, null));
+        result.* = try sc.keep(capture);
+    }
+    m.tap = null;
     for (0..16) |row| {
         var solo: [2]A = .{ none, none };
         const input = try sc.slice(x, 0, row, row + 1);
@@ -8328,6 +8373,11 @@ test "dsv41 rows: nine through sixteen joined queries and KV inputs keep their s
                 defer testing.allocator.free(actual);
                 errdefer std.debug.print("joined width {d}, row {d}, projection {d}\n", .{ width, row, projection });
                 try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+                if (projection == 0) {
+                    const query = try hostRows(&sc, try sc.slice(verified[width - 9], 0, row, row + 1));
+                    defer testing.allocator.free(query);
+                    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(query));
+                }
             }
         }
     }

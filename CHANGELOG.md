@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek decodes with DSpark up to 8% faster on both STQ packs**: a verify forward decodes each shared-expert weight once for several of its rows (M5 Ultra fast bench: 2.7bpw code 120 to 128 / 159 to 162 tok/s at 4k / 8k, 1.75bpw code 140 to 149 / 148 to 160).
+- **A long DeepSeek reply with DSpark is now exactly what serial decoding gives**: a verify of 9 to 16 rows took the attention input in separate launches, so an adaptive stream could part from serial decode thousands of tokens in (token 8,293 of an 8k code reply).
 - **DeepSeek prefill runs about 1% faster with 3,960 fewer GPU dispatches per 8,192-token chunk**: fused prefill attention no longer builds a separate causal mask it computes inside the kernel.
 - **Nine to sixteen DeepSeek requests decoding together now each get the same text they would alone**: past 8 joined rows the attention input took separate launches whose sums ran in another order than a request's solo step, so its tokens could drift from what it generates alone.
 - **A fully resident DeepSeek load serves several requests at once up to 14% faster**: the joined rows share one vocabulary head and wait, and up to 16 tensor parts join in one dispatch (M5 Ultra, 2.7bpw: 108 to 124 tok/s at 8 requests, 117 to 134 at 16).

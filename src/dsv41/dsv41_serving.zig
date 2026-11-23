@@ -586,6 +586,10 @@ pub fn forwardRows(self: *Trunk, segs: []const dsv41_model.Seg) !mlx.mlx_array {
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
 pub fn dsv41DraftImpl(self: *Trunk, ctx: *ForwardCtx, t1: u32) !dsv41_model.Draft {
+    return dsv41DraftMeasured(self, ctx, t1, null);
+}
+
+pub fn dsv41DraftMeasured(self: *Trunk, ctx: *ForwardCtx, t1: u32, meter: ?*@import("round_meter.zig").RoundMeter) !dsv41_model.Draft {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
     const scope = try dsv41_model.enterForward(m, dsv41_state.requestOf(ctx));
     defer scope.endForward();
@@ -594,7 +598,7 @@ pub fn dsv41DraftImpl(self: *Trunk, ctx: *ForwardCtx, t1: u32) !dsv41_model.Draf
     defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
     mlx.engine.phase(2);
     defer mlx.engine.phase(0);
-    return dsv41_model.draftHeads(m, t1, .conf);
+    return dsv41_model.draftMeasured(m, t1, .conf, meter);
 }
 
 /// Advances the request by `ids` (`[t1, drafts...]`) as a chunk `dsv41Finish` trims; the logits of every row,

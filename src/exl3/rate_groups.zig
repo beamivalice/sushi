@@ -864,7 +864,7 @@ const FuseKey = struct {
     dec: exl3.Decode,
     sdec: exl3.Decode,
     sn: u32,
-    one_row: bool,
+    coop: bool,
     b_first: bool,
 };
 
@@ -951,6 +951,15 @@ fn routedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
 fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fuse.Part {
     const rows = k.rows;
     const n: c_int = @intCast(k.sn);
+    const grouped_rows = k.coop and rows > 1;
+    const tile_pairs = k.coop and rows == 1;
+    // Rows a shared-expert weight walk serves at once: threes fit the narrow verify widths, pairs the wide copies
+    // (fours slowed an eight-row forward); every row keeps its one-row bytes.
+    const span: c_int = switch (rows) {
+        3, 5, 6 => 3,
+        else => 2,
+    };
+    const groups = if (grouped_rows) @divTrunc(rows + span - 1, span) else rows;
     const pair_tiles = @divExact(k.inter, 16);
     const down_tiles = @divExact(k.hidden, 16);
     switch (k.stage) {
@@ -961,8 +970,8 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
             .outs = &.{ "yg", "yu" },
         },
         .pair => return .{
-            .launch = .{ .tgs = .{ if (k.one_row) @divExact(pair_tiles, 2) else pair_tiles, rows, 2 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", k.hidden }, .{ "ODIM", k.inter }, .{ "NHW", n } }), .outs = try outs2(alloc, try halfOut(alloc, rows, k.inter), try halfOut(alloc, rows, k.inter)) },
-            .body = if (k.one_row) kernels.ONE_ROW_PAIR_SOURCE else kernels.LANE_PAIR_SOURCE,
+            .launch = .{ .tgs = .{ if (tile_pairs) @divExact(pair_tiles, 2) else pair_tiles, groups, 2 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", k.hidden }, .{ "ODIM", k.inter }, .{ "NHW", n }, .{ "ROWS", rows }, .{ "SHARED_ROWS", span } }), .outs = try outs2(alloc, try halfOut(alloc, rows, k.inter), try halfOut(alloc, rows, k.inter)) },
+            .body = if (grouped_rows) kernels.SHARED_ROWS_PAIR_SOURCE else if (tile_pairs) kernels.ONE_ROW_PAIR_SOURCE else kernels.LANE_PAIR_SOURCE,
             .ins = &.{ "xg", "xu", "tg", "tu", "slots" },
             .outs = &.{ "yg", "yu" },
             .header = header_text,
@@ -974,8 +983,8 @@ fn sharedPart(alloc: std.mem.Allocator, k: FuseKey, header_text: []const u8) !fu
             .outs = &.{"yd"},
         },
         .down => return .{
-            .launch = .{ .tgs = .{ if (k.one_row) @divExact(down_tiles, 2) else down_tiles, rows, 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", k.inter }, .{ "ODIM", k.hidden }, .{ "NHW", n } }), .outs = try outs1(alloc, try halfOut(alloc, rows, k.hidden)) },
-            .body = if (k.one_row) kernels.ONE_ROW_COOP_SOURCE else kernels.DOWN_LANE_COOP_SOURCE,
+            .launch = .{ .tgs = .{ if (tile_pairs) @divExact(down_tiles, 2) else down_tiles, groups, 1 }, .threads = 128, .ints = try intArgs(alloc, .{ .{ "IDIM", k.inter }, .{ "ODIM", k.hidden }, .{ "NHW", n }, .{ "ROWS", rows }, .{ "SHARED_ROWS", span } }), .outs = try outs1(alloc, try halfOut(alloc, rows, k.hidden)) },
+            .body = if (grouped_rows) kernels.SHARED_ROWS_COOP_SOURCE else if (tile_pairs) kernels.ONE_ROW_COOP_SOURCE else kernels.DOWN_LANE_COOP_SOURCE,
             .ins = &.{ "x", "trellis", "slots" },
             .outs = &.{"y"},
             .header = header_text,
@@ -1010,7 +1019,7 @@ fn buildStage(gpa: std.mem.Allocator, k: FuseKey) !FusedStage {
         try name.print(alloc, "_g{d}", .{k.group});
     }
     if (k.stage == .mid) try name.print(alloc, "_clamp{d}", .{k.limit});
-    if (k.one_row) try name.appendSlice(alloc, "_one");
+    if (k.coop) try name.appendSlice(alloc, if (k.rows == 1) "_one" else "_shared_rows");
     if (k.tile_major) try name.appendSlice(alloc, "_tm");
     try name.append(alloc, 0);
     var slot: ?mlx.mlx_fast_metal_kernel = null;
@@ -1226,10 +1235,10 @@ fn reduceFused(s: mlx.mlx_stream, down: mlx.mlx_array, rb: *const Ragged, slots:
 }
 
 /// The shared expert's lane-arm shapes at this bank, or null where its own chain would run another arm.
-fn sharedRate(se: SharedExpert, rb: *const Ragged, rows: usize) ?struct { n: u32, one_row_pair: bool, one_row_down: bool } {
+fn sharedRate(se: SharedExpert, rb: *const Ragged, rows: usize) ?struct { n: u32, coop_pair: bool, coop_down: bool } {
     if (!se.dec.codebook.servesLaneFastPaths() or rows < 1 or rows > kernels.DECODE_ROWS_MAX) return null;
     const lane = if (se.lane) |l| (if (l.fits(rb)) l.* else return null) else SharedLane.read(se.bank, rb) orelse return null;
-    return .{ .n = lane.n, .one_row_pair = rows == 1 and lane.pair_coop, .one_row_down = rows == 1 and lane.down_coop };
+    return .{ .n = lane.n, .coop_pair = lane.pair_coop, .coop_down = lane.down_coop };
 }
 
 /// `moeDecodeClamped` over the prepared chain with the shared expert `se` (bf16 `x`) riding its launches: the routed
@@ -1299,7 +1308,7 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
         .dec = kernels.activeDecode(),
         .sdec = se.dec,
         .sn = sr.n,
-        .one_row = false,
+        .coop = false,
         .b_first = fused_shared_first,
     };
     const zeros = try zeroSlots(@intCast(rows));
@@ -1319,7 +1328,7 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     key.funnel = pair_layout.funnel;
     @memcpy(key.classes[0..pair.len], pair);
     key.class_count = pair.len;
-    key.one_row = sr.one_row_pair;
+    key.coop = sr.coop_pair;
     const pair_ov = try applyStage(s, try stageFor(key), &.{ prep, rb.trellis[0], rb.trellis[1], slots, rb.meta }, &.{ sxg, sxu, se.bank.gate.trellis, se.bank.up.trellis, zeros }, 4);
     defer _ = mlx.mlx_vector_array_free(pair_ov);
     const ig = try getOut(pair_ov, 0);
@@ -1338,7 +1347,7 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     key.classes = std.mem.zeroes([max_groups]RateClass);
     key.class_count = 0;
     key.limit = limit;
-    key.one_row = false;
+    key.coop = false;
     const mid_ov = try applyStage(s, try stageFor(key), &.{ ig, iu, rb.svh[0], rb.svh[1], rb.suh[2], slots }, &.{ sig, siu, se.bank.gate.svh, se.bank.up.svh, se.bank.down.suh, zeros }, 2);
     defer _ = mlx.mlx_vector_array_free(mid_ov);
     const middle = try getOut(mid_ov, 0);
@@ -1354,7 +1363,7 @@ pub fn moeDecodeClampedSharedFusedKeep(s: mlx.mlx_stream, x: mlx.mlx_array, rb: 
     key.limit = 0;
     @memcpy(key.classes[0..downs.len], downs);
     key.class_count = downs.len;
-    key.one_row = sr.one_row_down;
+    key.coop = sr.coop_down;
     const down_ov = try applyStage(s, try stageFor(key), &.{ middle, rb.trellis[2], slots, rb.meta }, &.{ smid, se.bank.down.trellis, zeros }, 2);
     defer _ = mlx.mlx_vector_array_free(down_ov);
     const down = try getOut(down_ov, 0);
@@ -1979,7 +1988,6 @@ fn groupedGemm(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, pi: usize
     defer planes.deinit();
     return combinedPlane(s, &planes, sorted, rb);
 }
-
 
 /// The planes of `groupedGemm` combined into one, the single plane as it is.
 fn combinedPlane(s: mlx.mlx_stream, planes: *GroupPlanes, sorted: mlx.mlx_array, rb: *const Ragged) !mlx.mlx_array {
@@ -3528,10 +3536,62 @@ test "exl3 rate groups: a fused stage's build keeps none of what it allocated: t
         .dec = kernels.activeDecode(),
         .sdec = kernels.activeDecode(),
         .sn = 2,
-        .one_row = false,
+        .coop = false,
         .b_first = false,
     };
     const built = try buildStage(std.testing.allocator, key);
     _ = mlx.mlx_fast_metal_kernel_free(built.kernel);
     _ = mlx.mlx_fast_metal_kernel_config_free(built.cfg);
+}
+
+test "exl3 rate groups: adjacent shared rows use one weight walk and match independent expert projections" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setDecodeParams(.mul1);
+    defer {
+        prepared_force = null;
+        fused_shared_first = false;
+    }
+    prepared_force = true;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f = try sharedLayer(a, s, 512, 256, &.{.{ 40, 40, 40 }}, &.{12}, 3, 0x941);
+    defer f.deinit();
+    var prng = std.Random.DefaultPrng.init(0x578);
+    for ([_]u32{ 64, 80 }) |n| {
+        var se: SharedExpert = .{ .bank = try sharedBankAt(prng.random(), 512, 256, n, .{ 0.0126, 1.03, 0.0083, 1.009 }), .dec = exl3.Decode.tabled(.spec1, .w15) };
+        defer freeBank(&se.bank);
+        for ([_]usize{ 2, 3, 4, 5, 6, 7, 8, 9, 16 }) |rows| {
+            try f.redraw(a, rows, 400, null, 0x941 + rows);
+            try sharedFusedCase(t.allocator, s, &f, se, 0x941 + rows);
+            const sr = sharedRate(se, &f.rb, rows).?;
+            for ([_]FuseStage{ .pair, .down }) |stage| {
+                const k: FuseKey = .{
+                    .stage = stage,
+                    .nslots = @intCast(rows * 3),
+                    .rows = @intCast(rows),
+                    .topk = 3,
+                    .hidden = 512,
+                    .inter = 256,
+                    .group = 0,
+                    .tiles = 0,
+                    .funnel = false,
+                    .tile_major = false,
+                    .limit = 10,
+                    .classes = std.mem.zeroes([max_groups]RateClass),
+                    .class_count = 0,
+                    .dec = kernels.activeDecode(),
+                    .sdec = se.dec,
+                    .sn = n,
+                    .coop = if (stage == .pair) sr.coop_pair else sr.coop_down,
+                    .b_first = false,
+                };
+                const shape = (try sharedPart(a, k, "")).launch.tgs;
+                const span: usize = if (rows == 3 or rows == 5 or rows == 6) 3 else 2;
+                try t.expectEqual(@as(c_int, @intCast((rows + span - 1) / span)), shape[1]);
+            }
+        }
+    }
 }

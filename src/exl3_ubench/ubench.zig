@@ -45,7 +45,7 @@ pub const LAYOUTS = [_]Layout{
     .{ .key = "M30", .name = "M30 56:136 48:86 40:162", .topk = 6, .groups = &.{
         .{ .n = .{ 56, 56, 56 }, .experts = 136 }, .{ .n = .{ 48, 48, 48 }, .experts = 86 }, .{ .n = .{ 40, 40, 40 }, .experts = 162 },
     } },
-    .{ .key = "Mstage", .name = "Mstage n40 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 40, 40, 40 }, .experts = 384 }} },
+    .{ .key = "Mstage", .name = "Mstage n40 x128 top3", .topk = 3, .groups = &.{.{ .n = .{ 40, 40, 40 }, .experts = 128 }} },
     // One rate over all 384 experts at top-6: a rate's chain per byte, beside the others.
     .{ .key = "R32", .name = "R32 n32 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 32, 32, 32 }, .experts = 384 }} },
     .{ .key = "R40", .name = "R40 n40 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 40, 40, 40 }, .experts = 384 }} },
@@ -137,7 +137,7 @@ pub const dsv41_experts: report.Bench = .{
         .{ .name = "mode", .values = &.{ "uniform", "highest", "lowest", "shared" }, .numeric = false },
     },
     // chain: as served (prepared, rows paired); ungrouped: prepared, one threadgroup a slot; plain: the unprepared chain.
-    .arms = &.{ "chain", "ungrouped", "plain", "fused", "fused_ungrouped" },
+    .arms = &.{ "chain", "ungrouped", "plain", "fused", "fused_ungrouped", "shared_per_row" },
     .ref = "chain",
     .opts = &.{
         .{ .name = "splits", .help = "the pair GEMV's k splits (2 as served): one value a run" },
@@ -150,13 +150,22 @@ const Sample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, fused: Ctx
 
 /// Nanoseconds of one call: the chain less the link floor measured beside it.
 fn sampleChain(smp: Sample, arm: usize) anyerror!f64 {
-    rate_groups.group_force = if (arm == 1 or arm == 4) 0 else if (arm == 3) smp.group else null;
+    rate_groups.group_force = if (arm == 1 or arm == 4) 0 else if (arm == 3 or arm == 5) smp.group else null;
     rate_groups.prepared_force = if (arm == 2) false else null;
     defer {
         rate_groups.group_force = null;
         rate_groups.prepared_force = null;
     }
-    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, if (arm >= 3) smp.fused else smp.c, step);
+    var ctx = if (arm >= 3) smp.fused else smp.c;
+    var lane: rate_groups.SharedLane = undefined;
+    if (arm == 5 and ctx.rows > 1) {
+        const shared = &ctx.shared.?;
+        lane = rate_groups.SharedLane.read(shared.bank, ctx.rb) orelse return error.SharedFuseDeclined;
+        lane.pair_coop = false;
+        lane.down_coop = false;
+        shared.lane = &lane;
+    }
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, ctx, step);
     const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
     return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
 }
@@ -189,17 +198,17 @@ fn runExperts(run: *report.Run) anyerror!void {
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_eval(vec));
         for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
-        const fused = run.hasArm("fused") or run.hasArm("fused_ungrouped");
+        const fused = run.hasArm("fused") or run.hasArm("fused_ungrouped") or run.hasArm("shared_per_row");
         const shared_n: u32 = if (lay.key[0] == 'L' or std.mem.eql(u8, lay.key, "stage")) 64 else 80;
         var shared_prng = std.Random.DefaultPrng.init(0xd54f);
         var shared = if (fused) try bench.makeBank(shared_prng.random(), HIDDEN, INTER, @splat(shared_n), 1, 0.02, 0.9) else null;
         defer if (shared) |*b| bench.freeBank(b);
         var tiled = if (fused) try rate_groups.tileMajorCopy(s, &rb) else null;
         defer if (tiled) |*r| r.deinit();
-        const is_stage = lay.groups.len == 1;
+        const is_stage = std.mem.eql(u8, lay.key, "stage") or std.mem.eql(u8, lay.key, "Mstage");
         for (run.axis("rows")) |rows_text| {
             const rows = try std.fmt.parseInt(usize, rows_text, 10);
-            if (rows == 256 and is_stage and lay.key[0] != 'R') continue;
+            if (rows == 256 and is_stage) continue;
             var stream = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(stream);
             var post = mlx.mlx_array_new();
@@ -207,7 +216,7 @@ fn runExperts(run: *report.Run) anyerror!void {
             var comb = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(comb);
             const r: c_int = @intCast(rows);
-            const expand: ?rate_groups.StreamExpand = if (fused and rows <= kernels.DECODE_ROWS_MAX) blk: {
+            const expand: ?rate_groups.StreamExpand = if (fused and !is_stage and rows <= kernels.DECODE_ROWS_MAX) blk: {
                 try mlx.check(mlx.mlx_ones(&stream, &.{ r, 4, HIDDEN }, 3, .bfloat16, s));
                 try mlx.check(mlx.mlx_ones(&post, &.{ r, 4 }, 2, .float32, s));
                 try mlx.check(mlx.mlx_ones(&comb, &.{ r, 4, 4 }, 3, .float32, s));
@@ -215,7 +224,7 @@ fn runExperts(run: *report.Run) anyerror!void {
             } else null;
             for (run.axis("mode")) |mode_text| {
                 const mode = modeNamed(mode_text);
-                if (is_stage and mode != .uniform) continue;
+                if (lay.groups.len == 1 and mode != .uniform) continue;
                 if (mode == .shared and (rows > 6 or rows == 1)) continue;
                 if (rows <= 6 and rows != 1 and (mode == .highest or mode == .lowest)) continue;
                 if (rows == 256 and mode != .uniform) continue;
@@ -244,7 +253,7 @@ fn runExperts(run: *report.Run) anyerror!void {
                     fc.expand = expand;
                 }
                 try run.interleave(label, Sample{ .s = s, .x0 = x0, .c = c, .fused = fc, .group = group, .steps = run.steps(if (c.prefill) 4 else 16) }, sampleChain);
-                for ([_][]const u8{ "chain", "fused", "fused_ungrouped" }) |arm| {
+                for ([_][]const u8{ "chain", "fused", "fused_ungrouped", "shared_per_row" }) |arm| {
                     if (!run.hasArm(arm)) continue;
                     const shared_bytes = HIDDEN * INTER * 3 / 128 * shared_n;
                     const read = bytes + if (!std.mem.eql(u8, arm, "chain")) @as(f64, @floatFromInt(shared_bytes)) else 0;

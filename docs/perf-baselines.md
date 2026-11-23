@@ -581,6 +581,30 @@ first pass touches ~172,200 distinct Engram rows a table against ~97,600 for cod
   ran ~20% slower, unexplained. The same binary's cold first 4k code prompt read 1,472 and 2,698 tok/s on two loads
   (764 MB against 61 MB read in the chunk).
 
+**A DSpark round on both STQ packs** (served rounds, per-round meter `round_meter.zig` under `SUSHI_DSPARK_DIAG`, base
+`985a354b`, final the shared-row verify below; M5 Ultra, resident, A B B A one load an arm): verify is nearly the whole
+round. Mean ms a round, base -> final, then the final's draft / verify / rollback / gap and accepted drafts a round:
+
+| pack, request | round | draft | verify | rollback | gap | accepted |
+|---|---|---:|---:|---:|---:|---:|
+| 2.7 code 4k | 31.34 -> 29.52 | 2.53 | 26.89 | 0.05 | 0.26 | 2.71 |
+| 2.7 code 8k | 39.15 -> 35.46 | 1.48 | 33.85 | 0.06 | 0.29 | 4.69 |
+| 2.7 prose 4k | 18.09 -> 17.93 | 1.45 | 16.46 | 0.01 | 0.09 | 0.17 |
+| 2.7 prose 8k | 24.10 -> 22.97 | 2.60 | 20.33 | 0.05 | 0.25 | 0.97 |
+| 1.75 code 4k | 33.65 -> 31.59 | 1.73 | 29.76 | 0.05 | 0.25 | 3.66 |
+| 1.75 code 8k | 35.76 -> 33.75 | 1.47 | 32.16 | 0.06 | 0.27 | 4.33 |
+| 1.75 prose 4k | 16.63 -> 16.60 | 1.13 | 15.47 | 0.01 | 0.08 | 0.12 |
+| 1.75 prose 8k | 23.09 -> 22.09 | 2.58 | 19.46 | 0.05 | 0.23 | 0.86 |
+
+- Shared-expert weights decoded once for several verify rows (threes at 3, 5 and 6 rows, pairs elsewhere; the same bytes
+  a row): six-row forward 33.67 -> 31.26 ms (2.7bpw), 32.34 -> 30.26 (1.75bpw); fast bench decode, tok/s, code 4k / 8k
+  and prose 4k / 8k: 2.7bpw 128.0 / 162.2, 66.0 / 86.6; 1.75bpw 149.1 / 160.0, 68.3 / 84.3 (1.75bpw code was 140.2 /
+  148.0). Both 8cat KLDs unchanged (0.060666116, 0.152457202); all eight code and prose histories equal serial decode.
+- With diagnostic fences a staged draft is three stages of ~0.75 ms, the head ~0.69 ms and the Markov pick ~0.61 ms.
+- Ruled out: one engine pass for router and layer work (82 -> 9 command buffers, +71 barriers, 15.59 -> 16.23 ms a
+  one-row forward), fours sharing a weight walk (1.75bpw eight-row forward 36.23 -> 43.75 ms), the stages' attention
+  fused with its epilogue and pairing routed slots in expert prep (both under the bar).
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh

@@ -4016,8 +4016,7 @@ const WidthProbe = struct {
     }
 
     /// Row `row` of `a` (axis 0) as host f32.
-    fn rowF32(a: std.mem.Allocator, x: A, row: usize) ![]f32 {
-        const s = mlx.gpuStream();
+    fn rowF32(a: std.mem.Allocator, s: mlx.mlx_stream, x: A, row: usize) ![]f32 {
         const sh = mlx.getShape(x);
         var start: [8]c_int = @splat(0);
         var stop: [8]c_int = undefined;
@@ -4037,7 +4036,7 @@ const WidthProbe = struct {
     }
 
     /// Counts the elements of row `row` of `wide` that differ from row 0 of `narrow`; reports each name that differs.
-    fn diffRow(a: std.mem.Allocator, wide: *const dsv41_model.Trace, narrow: *const dsv41_model.Trace, row: usize, verbose: bool) !usize {
+    fn diffRow(a: std.mem.Allocator, s: mlx.mlx_stream, wide: *const dsv41_model.Trace, narrow: *const dsv41_model.Trace, row: usize, verbose: bool) !usize {
         var differing: usize = 0;
         var seen: std.StringHashMapUnmanaged(void) = .empty;
         defer seen.deinit(a);
@@ -4046,9 +4045,9 @@ const WidthProbe = struct {
             try seen.put(a, it.name, {});
             const w = last(wide, it.name).?;
             const n = last(narrow, it.name) orelse continue;
-            const wr = try rowF32(a, w, row);
+            const wr = try rowF32(a, s, w, row);
             defer a.free(wr);
-            const nr = try rowF32(a, n, 0);
+            const nr = try rowF32(a, s, n, 0);
             defer a.free(nr);
             if (std.mem.startsWith(u8, it.name, "a_topk")) {
                 // A wider block carries more picks, -1 past the row's own; packed picks index rows gathered per call,
@@ -4081,11 +4080,14 @@ const WidthProbe = struct {
     }
 
     fn at(a: std.mem.Allocator, xfm: *Trunk, prompt: []const u32, cont: []const u32, W: usize, verbose: bool) !usize {
+        @setRuntimeSafety(true);
+        if (W == 0 or W > dsv41_max_verify_rows or cont.len <= W) return error.BadProbeWidth;
+        defer dsv41_model.width_probe = null;
         const m = dsv41_state.modelOf(xfm).?;
         // One-row rounds, each traced.
         dsv41_model.resetState(m);
         _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
-        var narrow: [16]dsv41_model.Trace = undefined;
+        var narrow: [dsv41_max_verify_rows + 1]dsv41_model.Trace = undefined;
         for (&narrow) |*t| t.* = .{ .gpa = a };
         defer for (&narrow) |*t| t.deinit();
         for (0..W + 1) |i| {
@@ -4114,28 +4116,29 @@ const WidthProbe = struct {
             _ = mlx.mlx_array_free(try forward(xfm, cont[W .. W + 1], false));
             try dsv41_model.finishVerify(m, 0);
         }
+        const kept = @min(2, W);
         var bad: usize = 0;
-        for (0..W) |r| bad += try diffRow(a, &wide, &narrow[r], r, verbose);
+        for (0..W) |r| bad += try diffRow(a, m.s, &wide, &narrow[r], r, verbose);
         if (verbose) std.debug.print("  -- the one-row round after the wide verify\n", .{});
-        bad += try diffRow(a, &after, &narrow[W], 0, verbose);
+        bad += try diffRow(a, m.s, &after, &narrow[W], 0, verbose);
 
         // A W-row verify that keeps two rows (its drafts after the first are wrong), then one-row rounds over the rest.
         dsv41_model.resetState(m);
         _ = mlx.mlx_array_free(try forward(xfm, prompt, true));
         {
-            var ids: [16]u32 = undefined;
+            var ids: [dsv41_max_verify_rows]u32 = undefined;
             @memcpy(ids[0..W], cont[0..W]);
-            for (2..W) |k| ids[k] = (cont[k] + 7) % 1000 + 1000;
+            for (kept..W) |k| ids[k] = (cont[k] + 1) % @as(u32, @intCast(m.cfg.vocab));
             var t: dsv41_model.Trace = .{ .gpa = a };
             defer t.deinit();
             dsv41_model.width_probe = &t;
             _ = mlx.mlx_array_free(try forward(xfm, ids[0..W], false));
             dsv41_model.width_probe = null;
-            try dsv41_model.finishVerify(m, 1);
+            try dsv41_model.finishVerify(m, kept - 1);
             if (verbose) std.debug.print("  -- rejected verify: kept rows\n", .{});
-            for (0..2) |r| bad += try diffRow(a, &t, &narrow[r], r, verbose);
+            for (0..kept) |r| bad += try diffRow(a, m.s, &t, &narrow[r], r, verbose);
         }
-        for (2..W + 1) |i| {
+        for (kept..W + 1) |i| {
             var t: dsv41_model.Trace = .{ .gpa = a };
             defer t.deinit();
             dsv41_model.width_probe = &t;
@@ -4143,7 +4146,7 @@ const WidthProbe = struct {
             dsv41_model.width_probe = null;
             try dsv41_model.finishVerify(m, 0);
             if (verbose) std.debug.print("  -- one-row round {d} after the rollback\n", .{i});
-            bad += try diffRow(a, &t, &narrow[i], 0, verbose);
+            bad += try diffRow(a, m.s, &t, &narrow[i], 0, verbose);
         }
 
         // One-row rounds with a draft pass before each, as a drafted round runs it.
@@ -4159,7 +4162,7 @@ const WidthProbe = struct {
             dsv41_model.width_probe = null;
             try dsv41_model.finishVerify(m, 0);
             if (verbose) std.debug.print("  -- one-row round {d} behind a draft\n", .{i});
-            bad += try diffRow(a, &t, &narrow[i], 0, verbose);
+            bad += try diffRow(a, m.s, &t, &narrow[i], 0, verbose);
         }
         return bad;
     }
@@ -4201,7 +4204,7 @@ test "dsv41 DSpark: on the real pack each row of a wide verify is the bits of it
     var bad: usize = 0;
     while (at_it.next()) |at_s| {
         const P = try std.fmt.parseInt(usize, at_s, 10);
-        if (P + W + 1 > all.len) return error.ProbeTextTooShort;
+        if (P >= all.len or W >= all.len - P) return error.ProbeTextTooShort;
         if (verbose) std.debug.print("== context {d}, width {d}\n", .{ P, W });
         bad += try WidthProbe.at(a, &xfm, all[0..P], all[P..], W, verbose);
     }
@@ -6641,4 +6644,65 @@ test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum, a resid
         ran = true;
     }
     if (!ran) return error.SkipZigTest;
+}
+
+test "dsv41 engine: the round meter accounts for the served dispatches and waits on a plain and a staged round (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, fx.prompt(&buf)[0..40], 32, .{ .temperature = 0 }, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    for ([_]u8{ 1, 3, 3 }, [_]bool{ false, false, true }) |width, fence| {
+        gen.dspark_diag = .{ .rows = width };
+        var meter = dsv41_dspark.RoundMeter.init(io);
+        meter.fence_draft = fence;
+        const before = mlx.engine.stats();
+        const result = (try dsv41_dspark.measuredRound(&gen, a, &meter)).?;
+        defer a.free(result.tokens);
+        const after = mlx.engine.stats();
+        var dispatches: u64 = 0;
+        var waits: u64 = 0;
+        for (meter.parts) |part| {
+            dispatches += part.dispatches;
+            waits += part.waits;
+        }
+        try testing.expectEqual(after.dispatches - before.dispatches, dispatches);
+        try testing.expectEqual(after.waits - before.waits, waits);
+        try testing.expect(meter.part(.verify).dispatches > 0);
+        try testing.expect(meter.part(.verdict).waits > 0);
+        try testing.expectEqual(if (width == 1) @as(u32, 0) else fx.model().cfg.n_mtp, meter.part(.stage).calls);
+        try testing.expectEqual(width > 1, meter.part(.markov).dispatches > 0);
+        if (fence) {
+            try testing.expectEqual(fx.model().cfg.n_mtp, meter.part(.stage).waits);
+            try testing.expectEqual(@as(u64, 1), meter.part(.head).waits);
+            try testing.expectEqual(@as(u64, 1), meter.part(.markov).waits);
+        } else if (width > 1) {
+            try testing.expectEqual(@as(u64, 0), meter.part(.stage).waits + meter.part(.head).waits + meter.part(.markov).waits);
+            try testing.expectEqual(@as(u64, 1), meter.part(.draft_read).waits);
+        }
+        try testing.expectEqual(@as(u32, 1), meter.part(.finish).calls);
+    }
+}
+
+test "dsv41 DSpark: the widest verify probe also traces the following serial row (DSV41_STQ_TINY)" {
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    try mlx.requireGpu();
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const w = dsv41_max_verify_rows;
+    var cont: [w + 1]u32 = undefined;
+    for (&cont, 0..) |*id, i| id.* = fx.ids[i % fx.ids.len];
+    try std.testing.expectEqual(@as(usize, 0), try WidthProbe.at(std.testing.allocator, &fx.xfm, fx.ids[0..8], &cont, w, false));
+    try std.testing.expectEqual(@as(usize, 0), try WidthProbe.at(std.testing.allocator, &fx.xfm, fx.ids[0..8], &cont, 1, false));
+    for ([_]usize{ 0, w + 1 }) |invalid| {
+        try std.testing.expectError(error.BadProbeWidth, WidthProbe.at(std.testing.allocator, &fx.xfm, fx.ids[0..8], &cont, invalid, false));
+    }
 }

@@ -1185,7 +1185,10 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   The joined rows' head is one vocabulary projection and one wait for all of them, and the engine joins up to 16
   parts in one concatenate dispatch. The attention input (`wq_a`, `wkv` and a ratio-1 compressor's `wkv`, `attnQuery`)
   takes its stacked one-launch projection up to `maxJoinedRows` on a joined forward, the launch a solo step takes:
-  separate launches past 8 rows sum in another order, and 9 to 16 joined rows differed from solo before 1.7.4.
+  separate launches past 8 rows sum in another order, and 9 to 16 joined rows differed from solo before 1.7.4. A
+  single request's DSpark verify takes the same projection up to its widest copy round (16 rows), so an adaptive
+  stream equals serial decode there too (before 1.7.4 it parted at token 8,293 of an 8k code reply on 2.7bpw, 8,303 on
+  1.75bpw).
 - **A load that joins rows keeps a state per request and parks none** (`serves_rows`): a slot's first forward makes
   its request's state, and a forward runs it only for its own span (`bind`, `unbindRows`). Off a forward a hook reads a
   state only where it lends one (`lend`, `lendFor`: the restore through `restoreTarget`/`restoreEnd`, a write-through,

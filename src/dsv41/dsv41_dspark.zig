@@ -106,6 +106,14 @@ pub const dsparkEligible = dspark_rows.eligible;
 /// `[t1, drafts]` reads it through the trunk, and the longest prefix of drafts the trunk's own argmax agrees with
 /// stays, with the trunk's token after it pending. The model cuts its state back to the kept rows.
 pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+    if (dsparkDiag() == .off) return measuredRound(self, allocator, null);
+    var meter = RoundMeter.init(self.timer.io);
+    return measuredRound(self, allocator, &meter);
+}
+
+pub const RoundMeter = @import("round_meter.zig").RoundMeter;
+
+pub fn measuredRound(self: *Generator, allocator: std.mem.Allocator, meter: ?*RoundMeter) !?DrafterStepResult {
     if (self.done) return null;
     if (!self.dspark) return error.SpecDecodeUnsupported;
     if (self.completion_tokens >= self.max_tokens) {
@@ -157,11 +165,13 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     var block: ?@import("dsv41_model.zig").Draft = null;
     defer if (block) |*b| b.deinit();
     var block_len: usize = 1 + copied;
+    if (meter) |m| m.mark(.entry);
     if (copied == 0 and (forced == null or forced.? > 1)) {
-        block = try dsv41_serving.dsv41DraftImpl(xfm, &self.ctx, t1);
+        block = try dsv41_serving.dsv41DraftMeasured(xfm, &self.ctx, t1, meter);
         block_len = block.?.ids.len;
         @memcpy(ids_buf[0..block_len], block.?.ids);
         @memcpy(conf_buf[0 .. block_len - 1], block.?.conf);
+        if (meter) |m| m.mark(.draft_read);
     }
     const draft_ns = timer.read();
     timer.reset();
@@ -183,9 +193,11 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         rows_masked = planned.masked;
         self.dspark_stats.mask_ns += mask_timer.read();
     }
+    if (meter) |m| m.mark(.plan);
     const ctx_before = self.ctx.cache.step;
     var logits = try dsv41_serving.dsv41VerifyImpl(xfm, &self.ctx, ids_buf[0..rows]);
     defer _ = mlx.mlx_array_free(logits);
+    if (meter) |m| m.mark(.verify);
     if (self.sampling.think_penalty.active() or sampler.penaltyActive(self.sampling)) {
         var row_ids: [dsv41_max_drafts + 1]i32 = undefined;
         if (rows > row_ids.len) return error.SpecDecodeUnsupported;
@@ -213,8 +225,10 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         accepted = verdict.accepted;
         pending = verdict.pending;
     }
+    if (meter) |m| m.mark(.verdict);
     try dsv41_serving.dsv41FinishImpl(xfm, &self.ctx, accepted);
     const verify_ns = timer.read();
+    if (meter) |m| m.mark(.finish);
 
     const n_commit: usize = 1 + accepted;
     const tokens = try allocator.dupe(u32, ids_buf[0..n_commit]);
@@ -248,6 +262,10 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
             self.dspark_copy_backoff.observeStage(n_commit, ms(draft_ns + verify_ns));
             if (block == null) policy.observePlain(ms(verify_ns)) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, ms(draft_ns), ms(verify_ns));
         }
+    }
+    if (meter) |m| {
+        m.mark(.publish);
+        if (dsparkDiag() != .off) m.report(ctx_before, rows, accepted, if (copied > 0) "copy" else if (block != null) "stage" else "plain");
     }
     if (dsparkDiag() != .off) log.info("  [dspark-round] ctx={d} rows={d} accepted={d} draft_ms={d:.1} verify_ms={d:.1} gate={s} conf={any}\n", .{
         ctx_before,
