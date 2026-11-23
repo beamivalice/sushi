@@ -72,7 +72,7 @@ fn planFor(rate: format.Rate, dec: format.Decode, max_threads: u32) Error!Plan {
     if (rate.n % 2 != 0 or rate.n < 24 or rate.n > format.Rate.max_n) return error.RateUnsupported;
     const w: u32 = dec.window.bits();
     if (w < 12 or w > 16) return error.WindowUnsupported;
-    if (!encode.searchable(dec.codebook)) return error.CodebookUnsupported;
+    if (!encode.searchableClosedForm(dec.codebook)) return error.CodebookUnsupported;
     const period: usize = 16 / std.math.gcd(@as(u32, 16), rate.n);
     var pattern: [8]u32 = undefined;
     var kmin: u32 = 32;

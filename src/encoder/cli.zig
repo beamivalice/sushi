@@ -100,7 +100,7 @@ pub const USAGE =
 fn parseCodec(text: []const u8) ?format.Codebook {
     if (!std.mem.startsWith(u8, text, "exl3-")) return null;
     const cb = format.Codebook.fromName(text["exl3-".len..]) orelse return null;
-    return if (encode.searchable(cb)) cb else null;
+    return if (encode.searchableClosedForm(cb)) cb else null;
 }
 
 fn parseExpertsN(text: []const u8) ?u32 {
