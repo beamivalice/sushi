@@ -13,7 +13,7 @@ const kernels = @import("dsv41_kernels.zig");
 const model = @import("dsv41_model.zig");
 const exl3_ubench = @import("sushi_exl3_ubench").ubench;
 
-pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, markov_chain, reduce_expand, settle_redo };
+pub const benches = [_]report.Bench{ index_decode, index_peak, index_block_peak, rows_growth, attn_span, attn_decode, picks_span, attn_epilogue, picks_glue, topk, hc_expand, hc_expand_decode, hc_stages, launch_fusions, markov_chain, reduce_expand, settle_redo, @import("ubench_joined.zig").bench };
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;

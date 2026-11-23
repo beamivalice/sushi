@@ -2278,27 +2278,27 @@ test "an engine concatenate of two to four parts is one dispatch with MLX's byte
     }
 }
 
-test "an engine concatenate of three and four parts, as a verify's sdpa groups, is one dispatch with MLX's bytes" {
+test "an engine concatenate of three to sixteen unequal parts is one dispatch with MLX's bytes" {
     try mlx.requireGpu();
     const was = enabled;
     enabled = true;
     defer enabled = was;
     const gpu = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(gpu);
-    const vals = ramp(u16, 512, 13, 1);
-    for ([_]usize{ 3, 4 }) |count| for ([_]c_int{ 0, 1, 2 }) |axis| {
+    const vals = ramp(u16, 2048, 13, 1);
+    for (3..17) |count| for ([_]c_int{ 0, 1, 2 }) |axis| {
         const ax: usize = @intCast(axis);
-        var shapes: [4][3]c_int = undefined;
+        var shapes: [16][3]c_int = undefined;
         var total: usize = 0;
         for (0..count) |i| {
             shapes[i] = .{ 2, 3, 4 };
             shapes[i][ax] = @intCast(i + 1);
             total += @intCast(shapes[i][0] * shapes[i][1] * shapes[i][2]);
         }
-        var bytes: [2][256]u16 = undefined;
+        var bytes: [2][2048]u16 = undefined;
         var dispatched: u64 = 0;
         for ([_]S{ gpu, core.stream() }, 0..) |s, arm| {
-            var parts: [4]A = undefined;
+            var parts: [16]A = undefined;
             var off: usize = 0;
             for (0..count) |i| {
                 const n: usize = @intCast(shapes[i][0] * shapes[i][1] * shapes[i][2]);

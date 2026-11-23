@@ -451,7 +451,7 @@ fn generalSource(comptime tag: []const u8, comptime expr: []const u8, comptime w
 pub fn makeCopiesAhead() Error!void {
     inline for (.{ Dtype.bfloat16, Dtype.float16, Dtype.float32, Dtype.int32, Dtype.uint32, Dtype.uint8 }) |d| {
         _ = try pipelineFor("copy_v0", comptime flatSource("copy", "x", 1, 0), &.{d}, d);
-        inline for (2..5) |k| _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ d, d }, d);
+        inline for (concat_widths) |k| _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ d, d }, d);
     }
 }
 
@@ -818,7 +818,7 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
     const out = try core.fresh(dtype, shape[0..first.ndim]);
     errdefer core.release(out);
     if (out.size() == 0) return out;
-    var joinable = parts.len >= 2 and parts.len <= 4 and out.size() <= std.math.maxInt(u32);
+    var joinable = parts.len >= 2 and parts.len <= 16 and out.size() <= std.math.maxInt(u32);
     for (parts) |part| joinable = joinable and part.dtype == dtype and part.rowContiguous();
     if (joinable) {
         // Two to four row-contiguous parts in one dispatch: each element copied from the part its axis position falls in.
@@ -826,23 +826,32 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
         for (first.dims()[axis + 1 ..]) |d| inner *= @intCast(d);
         // Until the seal, a dtype's first concatenate makes every part count's kernel: a verify's joins take the count
         // its row groups have, which the warm's widths do not all reach.
-        if (!core.sealed) inline for (2..5) |k| {
+        if (!core.sealed) inline for (concat_widths) |k| {
             _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype);
         };
-        const pipeline = switch (parts.len) {
-            inline 2, 3, 4 => |k| try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype),
+        const width = switch (parts.len) {
+            2...4 => parts.len,
+            5...8 => 8,
+            else => 16,
+        };
+        const pipeline = switch (width) {
+            inline 2, 3, 4, 8, 16 => |k| try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype),
             else => unreachable,
         };
         const p = try core.pass();
         p.pipeline(pipeline);
-        for (parts, 0..) |part, i| core.bind(p, part, i);
-        core.bindOut(p, out, parts.len);
-        var extents: [4]u32 = @splat(0);
-        for (parts, 0..) |part, i| extents[i] = @intCast(part.shape[axis]);
+        var extents: [16]u32 = @splat(0);
+        for (parts, 0..) |part, i| {
+            core.bind(p, part, i);
+            extents[i] = @intCast(part.shape[axis]);
+        }
+        // The pipeline is built for 8 or 16 parts: the slots past `parts.len` hold zero rows, bound to any buffer.
+        for (parts.len..width) |i| core.bind(p, first, i);
+        core.bindOut(p, out, width);
         const n: u32 = @intCast(out.size());
-        p.constant(inner, parts.len + 1);
-        p.bytes(std.mem.sliceAsBytes(&extents), parts.len + 2);
-        p.constant(n, parts.len + 3);
+        p.constant(inner, width + 1);
+        p.bytes(std.mem.sliceAsBytes(extents[0..width]), width + 2);
+        p.constant(n, width + 3);
         core.dispatch(p, .{ .x = n }, .{ .x = @min(n, 256) });
         return out;
     }
@@ -861,10 +870,12 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
     return out;
 }
 
+const concat_widths = [_]usize{ 2, 3, 4, 8, 16 };
+
 /// The kernel joining `k` row-contiguous parts along one axis: `inner` elements after the axis, each part's extent
 /// along it in `ext`.
 fn concatSource(comptime k: usize) []const u8 {
-    const names = [_][]const u8{ "a", "b", "c", "d" };
+    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "p8", "p9", "p10", "p11", "p12", "p13", "p14", "p15" };
     comptime var src: []const u8 = std.fmt.comptimePrint("[[kernel]] void sushi_concat{d}(\n", .{k});
     inline for (0..k) |i| src = src ++ std.fmt.comptimePrint("  const device $0* {s} [[buffer({d})]],\n", .{ names[i], i });
     src = src ++ std.fmt.comptimePrint(

@@ -5435,6 +5435,52 @@ test "dsv41 engine: requests joined as rows of one decode forward each get the b
     }
 }
 
+test "dsv41 engine: the widest joined head keeps every request's solo logits and next step (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const dsv = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    fx.model().serves_rows = true;
+    const n = fx.model().maxJoinedRows();
+    var prompt_buf: [64]u32 = undefined;
+    const tokens = fx.prompt(&prompt_buf);
+    var solo: [16]dsv.Request = @splat(.{});
+    defer for (&solo) |*r| r.deinit();
+    var joined: [16]dsv.Request = @splat(.{});
+    defer for (&joined) |*r| r.deinit();
+    var ids: [16]u32 = undefined;
+    var segs: [16]dsv.Seg = undefined;
+    for (0..n) |i| {
+        const prompt = tokens[i .. i + 5 + i % 3];
+        _ = mlx.mlx_array_free(try forwardOn(&fx, &solo[i], prompt));
+        _ = mlx.mlx_array_free(try forwardOn(&fx, &joined[i], prompt));
+        ids[i] = tokens[n + i];
+        segs[n - 1 - i] = .{ .request = &joined[i], .ids = ids[i .. i + 1] };
+    }
+    for (0..2) |_| {
+        const reads = dsv.readsAt(.head);
+        const rows = try dsv41_serving.forwardRows(&fx.xfm, segs[0..n]);
+        defer _ = mlx.mlx_array_free(rows);
+        try testing.expectEqual(@as(u64, 1), dsv.readsAt(.head) - reads);
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(testing.allocator);
+        try logitBytes(testing.allocator, &got, rows);
+        const stride = @divExact(got.items.len, n);
+        for (0..n) |i| {
+            const one = try forwardOn(&fx, &solo[i], ids[i .. i + 1]);
+            defer _ = mlx.mlx_array_free(one);
+            var want: std.ArrayList(u8) = .empty;
+            defer want.deinit(testing.allocator);
+            try logitBytes(testing.allocator, &want, one);
+            try testing.expectEqualSlices(u8, want.items, got.items[(n - 1 - i) * stride ..][0..stride]);
+            try testing.expectEqual(solo[i].position(), joined[i].position());
+            ids[i] = try argmaxHost(&fx.xfm, one);
+        }
+    }
+}
+
 test "dsv41 engine: a joined decode forward copies a request's rows out only at layers that take its own input (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);

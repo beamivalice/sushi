@@ -139,15 +139,18 @@ pub const dsv41_experts: report.Bench = .{
     // chain: as served (prepared, rows paired); ungrouped: prepared, one threadgroup a slot; plain: the unprepared chain.
     .arms = &.{ "chain", "ungrouped", "plain", "fused", "fused_ungrouped" },
     .ref = "chain",
-    .opts = &.{.{ .name = "splits", .help = "the pair GEMV's k splits (2 as served): one value a run" }},
+    .opts = &.{
+        .{ .name = "splits", .help = "the pair GEMV's k splits (2 as served): one value a run" },
+        .{ .name = "group", .help = "member bucket of the fused decode arm (0, 2, 4, 8 or 16)" },
+    },
     .run = runExperts,
 };
 
-const Sample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, fused: Ctx, steps: usize };
+const Sample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, fused: Ctx, group: ?c_int, steps: usize };
 
 /// Nanoseconds of one call: the chain less the link floor measured beside it.
 fn sampleChain(smp: Sample, arm: usize) anyerror!f64 {
-    rate_groups.group_force = if (arm == 1 or arm == 4) 0 else null;
+    rate_groups.group_force = if (arm == 1 or arm == 4) 0 else if (arm == 3) smp.group else null;
     rate_groups.prepared_force = if (arm == 2) false else null;
     defer {
         rate_groups.group_force = null;
@@ -170,6 +173,11 @@ fn runExperts(run: *report.Run) anyerror!void {
     kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
     if (run.opt("splits")) |v| kernels.setPairSplitsForTest(std.fmt.parseInt(u32, v, 10) catch return error.BadOpt);
     defer kernels.setPairSplitsForTest(null);
+    const group: ?c_int = if (run.opt("group")) |v| blk: {
+        const g = std.fmt.parseInt(c_int, v, 10) catch return error.BadOpt;
+        if (!run.hasArm("fused") or (g != 0 and std.mem.indexOfScalar(c_int, &kernels.GROUP_BUCKETS, g) == null)) return error.BadOpt;
+        break :blk g;
+    } else null;
     for (LAYOUTS) |lay| {
         if (!listed(run.axis("layout"), lay.key)) continue;
         var banks: [8]root.Bank = undefined;
@@ -233,7 +241,7 @@ fn runExperts(run: *report.Run) anyerror!void {
                     fc.rb = &tiled.?;
                     fc.expand = expand;
                 }
-                try run.interleave(label, Sample{ .s = s, .x0 = x0, .c = c, .fused = fc, .steps = run.steps(if (c.prefill) 4 else 16) }, sampleChain);
+                try run.interleave(label, Sample{ .s = s, .x0 = x0, .c = c, .fused = fc, .group = group, .steps = run.steps(if (c.prefill) 4 else 16) }, sampleChain);
                 for ([_][]const u8{ "chain", "fused", "fused_ungrouped" }) |arm| {
                     if (!run.hasArm(arm)) continue;
                     const shared_bytes = HIDDEN * INTER * 3 / 128 * shared_n;
@@ -1746,7 +1754,7 @@ fn trunkStep(t: Trunk, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!m
     switch (t.arm) {
         0, 1, 2, 6 => {
             const served = t.rows <= @as(usize, @intCast(project_rows.PROJECT_ROWS_MAX));
-            const opts: root.linear.Opts = .{ .rows = .{ .exact = t.arm == 1 } };
+            const opts: root.linear.Opts = .{ .rows = .{ .exact = t.arm == 1, .wide = t.arm == 1 } };
             root.linear.force_arm = if (t.arm == 2 and served) .gemv else if (t.arm == 6 and served) .rows else null;
             project_rows.nax_force = if (t.arm == 6) false else null;
             defer {

@@ -542,6 +542,24 @@ quiet, `taskpolicy -a`, GPU lock; A = main `7592f365` plus the bench rungs (bina
   at M5), parallel gate and up, one raw word per routed lane with shuffles (+6 / +31 us), the K5 shared expert's lane
   by shuffle (+6 us at three rows), and two K5 tiles read ahead at the Ultra's split (`wo_b` 32.0 to 37.5 us).
 
+**Joined rows on the 2.7bpw pack** (resident, decode meter 100 forwards at 4,096 keys a request, HTTP: a mixed-prompt
+wave of greedy 96-token completions, DSpark off; base `47fc70d1` (main of the day plus the single-request series),
+then the shared head and the 16-part concatenate, then the wide-row correction; M5 Ultra, `taskpolicy -a`, GPU lock):
+
+| requests | ms a step: base / head+concat / corrected | tok/s: base / head+concat / corrected |
+|---:|---|---|
+| 2 | 22.41 / 21.58 / 21.76 | 79.7 / 81.6 / 81.7 |
+| 4 | 34.95 / 32.37 / 32.36 | 101.8 / 106.8 / 106.7 |
+| 8 | 64.24 / 54.01 / 54.45 | 108.4 / 124.6 / 123.5 |
+| 16 | 119.73 / 101.63 / 99.94 | 117.2 / 132.9 / 133.9 |
+
+- At 16 rows the base and the head+concat arms had 16 of 16 rows differ from solo (13 of 16 completions); the
+  corrected arm matched every one of 8,273,920 logit bytes and all 16 completions. Dispatches at 16 rows: 8,666 to
+  5,968 a step. Single-request decode unchanged (fast bench code 120.4 / 159.1, prose 64.8 / 82.6 tok/s at 4k / 8k).
+- Ruled out: expert buckets of four (`dsv41.experts --arms fused`, 16 uniform rows: +5.6% on M5, +6.1% on M30; it saves
+  ~4.7% only when every pick is in the hot group): two stays. Reusing unpacked attention keys across rows: -480
+  dispatches at 16 rows, 100.3 against 99.9 ms.
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh

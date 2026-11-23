@@ -4787,7 +4787,10 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
 /// The pass's logits (f32; `[1, vocab]` for the last position or `[L, vocab]` for every one; the caller frees);
 /// the state now covers the chunk.
 pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
-    const c = &m.cfg;
+    return finishPassHead(m, p, want, try preparePassHead(m, p, want));
+}
+
+fn preparePassHead(m: *Model, p: *Pass, want: Want) !A {
     const L = p.ids.len;
     // The head is queued before the host checks the last layer, so the GPU goes from that layer to the logits; a miss
     // there builds the head again from the exact stream.
@@ -4800,6 +4803,13 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         _ = mlx.mlx_array_free(res);
         res = none;
     }
+    try advancePass(m, p);
+    return res;
+}
+
+fn advancePass(m: *Model, p: *Pass) !void {
+    const c = &m.cfg;
+    const L = p.ids.len;
     reportEngramWait(m, L);
     p.st.n = p.p0 + L;
     if (p.st.ds.len > 0) {
@@ -4811,6 +4821,15 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
             v.mh = msc.out(main_rows);
         } else try commitMain(&msc, m, p.st, main_rows, p.p0, if (L > exl3.kernels.DECODE_ROWS_MAX) .wait else .lazy);
     }
+}
+
+fn finishPassHead(m: *Model, p: *Pass, want: Want, queued: A) !A {
+    const c = &m.cfg;
+    const L = p.ids.len;
+    var res = queued;
+    errdefer if (res.ctx != null) {
+        _ = mlx.mlx_array_free(res);
+    };
     if (m.tap) |t| {
         var tsc = m.scope();
         defer tsc.deinit();
@@ -4830,12 +4849,16 @@ pub fn finishPass(m: *Model, p: *Pass, want: Want) !A {
         reportReads(L);
         return res;
     }
+    try waitHead(m, res, L);
+    return res;
+}
+
+fn waitHead(m: *Model, logits: A, rows: usize) !void {
     const t0 = readStart();
     defer readDone(.head, t0);
-    try mlx.check(mlx.mlx_array_eval(res));
+    try mlx.check(mlx.mlx_array_eval(logits));
     try pipeDrain(m);
-    reportReads(L);
-    return res;
+    reportReads(rows);
 }
 
 fn headLogits(m: *Model, p: *const Pass, want: Want) !A {
@@ -4844,8 +4867,12 @@ fn headLogits(m: *Model, p: *const Pass, want: Want) !A {
     defer sc.deinit();
     const xs = if (want == .last) try sc.slice(p.x, 0, L - 1, L) else p.x;
     const ps = if (want == .last) try sc.slice(p.cpre, 0, L - 1, L) else p.cpre;
-    const hn = try sc.rms(try hcCollapse(&sc, xs, ps), m.norm, m.cfg.eps);
-    return sc.out(try m.head.apply(&sc, try sc.astype(hn, .float32)));
+    return sc.out(try projectHead(&sc, m, xs, ps));
+}
+
+fn projectHead(sc: *Scope, m: *Model, xs: A, ps: A) !A {
+    const hn = try sc.rms(try hcCollapse(sc, xs, ps), m.norm, m.cfg.eps);
+    return m.head.apply(sc, try sc.astype(hn, .float32));
 }
 
 /// `headLogits`, submitted.
@@ -4918,6 +4945,16 @@ pub fn extendRows(m: *Model, segs: []const Seg) !A {
     var rows: JoinedRows = .{};
     defer rows.deinit();
     for (0..m.cfg.layers) |li| try buildLayerRows(m, passes, &joined, li, &rows);
+    // One vocabulary projection and one wait for every joined row; a tap, trace or profile keeps each pass's own head.
+    if (m.head.stq != null and m.tap == null and m.trace == null and m.profile == null and width_probe == null) {
+        var sc = m.scope();
+        defer sc.deinit();
+        for (passes) |*p| try advancePass(m, p);
+        const out = try projectHead(&sc, m, rows.x, rows.pre);
+        try waitHead(m, out, n);
+        transient_peak.end(.decode, n, null);
+        return sc.out(out);
+    }
     try rows.split(m, passes);
     const heads = try gpa.alloc(A, n);
     defer gpa.free(heads);

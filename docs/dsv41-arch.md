@@ -1182,6 +1182,8 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   and width-exact ones (`Config.widthExactLayout`, `Model.widthExact`): the release's FP8/FP4 layout serves one row.
   The warm runs one `.rows` forward at every width the load joins (`warmOwnRows`, 2 to `maxJoinedRows`): past 8 rows
   an exact, wide forward's pipelines carry its row count, and without DSpark's verify rounds no other warm runs one.
+  The joined rows' head is one vocabulary projection and one wait for all of them, and the engine joins up to 16
+  parts in one concatenate dispatch.
 - **A load that joins rows keeps a state per request and parks none** (`serves_rows`): a slot's first forward makes
   its request's state, and a forward runs it only for its own span (`bind`, `unbindRows`). Off a forward a hook reads a
   state only where it lends one (`lend`, `lendFor`: the restore through `restoreTarget`/`restoreEnd`, a write-through,
