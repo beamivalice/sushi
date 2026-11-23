@@ -549,8 +549,44 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\  const half2 p3 = exl3_pairh(uint2((hi.x >> s4) & 0xffffu, hi.x & 0xffffu));
     \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
     \\}
+    \\static inline uint nax_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
+    \\template<uint N>
+    \\static inline half2 nax_k5_pair(uint bits) {
+    \\  return exl3_pairh(uint2(bits >> 5u, bits) & uint2(0xffffu));
+    \\}
+    \\// A K5 lane's four codeword pairs lie in four adjacent words, funneled once at the lane's offset;
+    \\// word 0's predecessor is the tile's last word, as the trellis wraps.
+    \\template<uint N>
+    \\static inline nfrag nax_k5_frag(const device uint *words, uint lane) {
+    \\  const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+    \\  const uint word = (5u * group) >> 1u;
+    \\  const uint shift = 26u - 16u * (group & 1u) - 10u * ((lane >> 3u) & 1u);
+    \\  const uint prev = words[word == 0u ? N / 2u - 1u : word - 1u];
+    \\  const uint x = words[word], y = words[word + 1u], z = words[word + 2u];
+    \\  const uint a = nax_funnel(x, prev, shift);
+    \\  const uint b = nax_funnel(y, x, shift);
+    \\  const uint c = nax_funnel(z, y, shift);
+    \\  const half2 p0 = nax_k5_pair<N>((a << 4u) | (b >> 28u));
+    \\  const half2 p1 = nax_k5_pair<N>((a << 24u) | (b >> 8u));
+    \\  const half2 p2 = nax_k5_pair<N>((b << 12u) | (c >> 20u));
+    \\  const half2 p3 = nax_k5_pair<N>(c);
+    \\  return nfrag(p0.x, p0.y, p2.x, p2.y, p1.x, p1.y, p3.x, p3.y);
+    \\}
     \\template<uint N>
     \\static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
+    \\  // A PAIR1 lane's four odd codewords at K2.5 to K3.5 lie in three adjacent words, each read once.
+    \\  if constexpr (EXL3_LANE_FIRST == 1u && (N == 40u || N == 48u || N == 56u)) {
+    \\    constexpr uint P = N / 8u;
+    \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+    \\    const uint end = group * N + P * (7u + ((lane >> 3u) & 1u));
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint prev = words[last - 1u];
+    \\    const uint lo = nax_funnel(words[last], prev, s);
+    \\    const uint hi = nax_funnel(prev, words[last == 1u ? N / 2u - 1u : last - 2u], s);
+    \\    return nax_quads<N>(nax_funnel(lo, hi, 4u * P), lo, 0u, 2u * P, 0u);
+    \\  }
+    \\  if constexpr (N == 80u) return nax_k5_frag<N>(words, lane);
     \\  if (N == 64u) return nax_wfrag(words, lane);
     \\  constexpr uint W = N / 2u;
     \\  const uint end = 8u * N * (lane >> 4u) + N * (lane & 7u) + (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u)) * ((lane >> 3u) & 1u) + nax_end(N, 0u, 5u);
@@ -3167,6 +3203,11 @@ fn indexedParity(rate: exl3.Rate, in_dim: usize, out_dim: usize, e: usize, topk:
     try reportGemmParity(try indexedParityStats(rate, in_dim, out_dim, e, topk, seed, dec, .none));
 }
 
+test "exl3 K3.5 cooperative indexed GEMV matches host tile decode, its lanes that need a third word among them" {
+    try indexedParity(.{ .n = 56 }, 256, 256, 4, 6, 5601, PAIR1_W16);
+    try indexedParity(.{ .n = 56 }, 256, 256, 4, 6, 5602, .{ .codebook = .mcg, .window = .w12 });
+}
+
 test "exl3 K3 cooperative indexed GEMV matches host MUL1 tile decode" {
     try indexedParity(exl3.Rate.fromK(3), 128, 128, 4, 10, 17, .mul1);
 }
@@ -5535,7 +5576,7 @@ pub fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
     defer _ = mlx.mlx_array_free(svh_a);
     const slots = try host_side.made(mlx.mlx_array_new_data(zeros.ptr, &[_]c_int{@intCast(c.rows)}, 1, .uint32));
     defer _ = mlx.mlx_array_free(slots);
-    const geom = c.geom orelse project_rows.rowsGeometry(@intCast(c.in_dim), @intCast(c.out_dim), @intCast(c.rows), 1, .{});
+    const geom = c.geom orelse project_rows.rowsGeometry(@intCast(c.in_dim), @intCast(c.out_dim), @intCast(c.rows), 1, @intCast(nh), .{});
     const got_a = try project_rows.projectRowsWith(s, x_a, tr3, suh_a, svh_a, geom, if (c.mutant_rows) try rowsMutantKernel(geom) else try project_rows.rowsKernel(geom), null);
     defer _ = mlx.mlx_array_free(got_a);
     const comp_a = try projectIndexed(s, x_a, tr4, suh_a, svh_a, slots);
@@ -6722,6 +6763,10 @@ test "exl3 GLM serves PAIR1 on its lane fast paths with the staged chain's bytes
     for ([_]u32{ 24, 36, 40 }) |n| for ([_]usize{ 1, 3, 4 }) |rows| try laneChainBytesMatch(n, PAIR1_W16, rows, 6200 + rows);
 }
 
+test "exl3 PAIR1 lane chains at n48 and n56 keep the staged chain's bytes, the third-word lanes of n56 among them" {
+    for ([_]u32{ 48, 56 }) |n| for ([_]usize{ 1, 3 }) |rows| try laneChainBytesMatch(n, PAIR1_W16, rows, 6300 + n + rows);
+}
+
 test "exl3 GLM serves spec1 and std1 on its lane fast paths with the staged chain's bytes" {
     for ([_]exl3.Decode{ SPEC1_W15, STD1_W15 }) |dec| for ([_]usize{ 1, 3, 4 }) |rows| try laneChainBytesMatch(36, dec, rows, 6200 + rows);
 }
@@ -7385,7 +7430,7 @@ test "exl3 clamped routing takes the lane kernels and preserves staged bytes at 
     defer setDecodeParams(.{ .codebook = .mul1, .window = .w16 });
     var random = std.Random.DefaultPrng.init(89031);
     const rnd = random.random();
-    for ([_]c_int{ 16, 36, 42, 64, 128 }) |n| {
+    for ([_]c_int{ 16, 36, 42, 56, 64, 128 }) |n| {
         const bits = try a.alloc(u16, experts * 16 * 16 * @as(usize, @intCast(n)));
         defer a.free(bits);
         for (bits) |*v| v.* = rnd.int(u16);

@@ -509,6 +509,39 @@ large share alone.
   rounds; the chain already reads its banks at 0.6 to 0.9 of the memory roofline. A one-row token is bound by its reads,
   not by the codebook's arithmetic.
 
+<a id="m5u-stq27"></a>
+**DeepSeek STQ 2.7bpw at its own rates: the K3.5 routed lane, the K5 trunk fragment, the Ultra's K5 split** (decode
+meter 100 forwards at 4,096 keys, S=1,3, plus seven cold 2,048-token code prefills; A B B A, one resident load an arm,
+quiet, `taskpolicy -a`, GPU lock; A = main `7592f365` plus the bench rungs (binary SHA-256 `e9678d74`), B = the change
+(`ebc5f0fe`); both arms carried the conditional third word ruled out below, which left the forward unchanged; KLD on
+8cat-cooler-v1 to first EOS, `MLX_ENABLE_TF32=0`, 7,784 positions):
+
+| | A | B | change |
+|---|---|---|---:|
+| one-row forward, ms | 18.300 / 18.274 | 15.657 / 15.640 | -14.4% |
+| three-row forward, ms | 26.423 / 26.446 | 23.600 / 23.623 | -10.7% |
+| 2,048-token code prefill, ms | 759.62 / 755.72 | 693.67 / 693.85 | -8.4% |
+| KLD (top-1) | 0.061141880 (93.58%) | 0.060666116 (93.72%) | |
+
+- The steps, each on the one before, one-row / three-row: the K3.5 lane taking the bits under its window from the
+  preceding lane by shuffle -1.0 / -1.1% (byte-exact); the K5 trunk fragment from four adjacent words -10.5 / -6.5%
+  (byte-exact); the Ultra's K5 split -4.0 / -3.3% (the KLD move above, owner-approved). The PAIR1 prefill fragment
+  from three words alone took the cold prefill -3.3% at the same bytes.
+- Micro (`dsv41.experts --arms fused`, uniform, rows 1, quiet, B): K2.5 130.8, K3 139.2, K3.5 150.8, K4 153.3 us; on A
+  K3.5 read 168.9 against K4's 166.2. K5 trunk at one row, exact NAX: `wq_b` 45.5 to 30.3, `wo_a` 38.9 to 27.1, `wo_b`
+  62.0 to 32.4 us. Routed prefill at 256 rows, R40 / R48 / R56: 8.57 / 8.74 / 9.04 to 7.06 / 7.25 / 7.54 ms (the
+  1.75bpw pack's K2.5 groups take the same reader).
+- Fast bench (`tests/bench.sh` protocol, `--rungs 4k,8k`, DSpark, a private prefix cache a load, GPU 1620 MHz), A / B
+  both loads: code decode 4k 104.9, 107.2 / 120.2, 120.2; 8k 131.7, 132.3 / 158.6, 159.1; prose decode 4k 55.7, 56.7 /
+  64.7, 65.6; 8k 72.4, 73.5 / 82.5, 82.5. Prefill code 8k 2,348, 2,507 / 2,637, 2,730; prose 4k 1,737, 2,170 / 2,262,
+  2,189; 8k 1,829, 2,075 / 2,216, 2,252. Code 4k prefill is one cold prompt a load and read 1,017 to 2,432 on A alone.
+- Ruled out: the third word loaded only by the lanes whose bits need it (1 in 8 at n56). On A the 2.7 forward did not
+  move (quiet, 18.188 / 18.323 against 18.577 / 18.284 ms), and the decode chain read 2-5% slower against n48 at three
+  rows at n52 to n80 (`shared.exl3_decode_chain`, contended, two rounds an arm): the every-lane load stays.
+- Ruled out (B, `dsv41.experts`): pair k-splits 4 against 2 (+10 us at three rows), ungrouped three-row verify (+37 us
+  at M5), parallel gate and up, one raw word per routed lane with shuffles (+6 / +31 us), the K5 shared expert's lane
+  by shuffle (+6 us at three rows), and two K5 tiles read ahead at the Ultra's split (`wo_b` 32.0 to 37.5 us).
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh

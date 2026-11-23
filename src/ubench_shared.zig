@@ -180,6 +180,8 @@ fn runLaunch(run: *report.Run) anyerror!void {
 const TrunkShape = struct { name: []const u8, out: usize, in: usize, group: c_int };
 
 const TRUNK_SHAPES = [_]TrunkShape{
+    .{ .name = "wq_b", .out = 32768, .in = 1280, .group = 64 },
+    .{ .name = "wo_b", .out = 5120, .in = 8192, .group = 64 },
     .{ .name = "gdn_qkv", .out = 10240, .in = 2560, .group = 128 },
     .{ .name = "gdn_z", .out = 6144, .in = 2560, .group = 128 },
     .{ .name = "gdn_out", .out = 2560, .in = 6144, .group = 128 },
@@ -200,12 +202,12 @@ const trunk_shape_names = blk: {
 pub const trunk_prefill: report.Bench = .{
     .name = "shared.exl3_trunk_prefill",
     .scope = .shared,
-    .what = "one Flash-Next trunk projection at prefill width: the trellis bank on the sorted GEMM and decoded once to f16 for MLX's GEMM (served from 1024 rows), at K4 and K6 against affine-8 quantized_matmul and a dense bf16 matmul ceiling",
+    .what = "one trunk projection at prefill width: the sorted trellis GEMM and the billed path (decode once to f16 for MLX's GEMM where admitted), at K4, K5 and K6 against affine-8 quantized_matmul and a dense bf16 matmul ceiling",
     .unit = .us,
     .steps = 4,
     .axes = &.{
         .{ .name = "shape", .values = &trunk_shape_names, .numeric = false },
-        .{ .name = "k", .values = &.{ "4", "6" } },
+        .{ .name = "k", .values = &.{ "4", "5", "6" } },
         .{ .name = "rows", .values = &.{ "512", "2048", "4096" } },
     },
     .arms = &.{ "affine8", "sorted", "decoded", "dense" },
@@ -270,7 +272,9 @@ fn runTrunkPrefill(run: *report.Run) anyerror!void {
     for (TRUNK_SHAPES) |sh| {
         if (!listed(run.axis("shape"), sh.name)) continue;
         for (run.axis("k")) |k_text| {
-            const n: u32 = if (std.mem.eql(u8, k_text, "4")) 64 else if (std.mem.eql(u8, k_text, "6")) 96 else return error.BadK;
+            const k = try std.fmt.parseInt(u32, k_text, 10);
+            if (k < 4 or k > 6) return error.BadK;
+            const n = k * 16;
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const a = arena.allocator();

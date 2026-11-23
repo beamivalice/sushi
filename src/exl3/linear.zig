@@ -72,8 +72,8 @@ pub fn linearPair(s: mlx.mlx_stream, x: mlx.mlx_array, a: root.Proj, b: root.Pro
     if (ta[1] * 16 != in or tb[1] * 16 != groups * mid or @rem(in, 128) != 0 or @rem(mid, 128) != 0 or @rem(out, 128) != 0) return error.BadExl3Shape;
     if (dt != .bfloat16 and dt != .float16 and dt != .float32) return error.BadExl3Shape;
     if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
-    const ga = project_rows.rowsGeometry(in, mid, rows, groups, opts.rows);
-    const gb = project_rows.rowsGeometry(groups * mid, out, rows, 1, opts.rows);
+    const ga = project_rows.rowsGeometry(in, mid, rows, groups, ta[3], opts.rows);
+    const gb = project_rows.rowsGeometry(groups * mid, out, rows, 1, tb[3], opts.rows);
     for ([_]project_rows.RowsGeom{ ga, gb }) |g| if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
     if (!project_rows.hasFinish(ga)) return null;
     const lb: project_rows.RowsLaunch = .{ .in_dim = groups * mid, .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(tb[3])).n, .out_dt = dt };
@@ -103,7 +103,7 @@ pub fn linearGroupedRows(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec:
     const out = ts[2] * 16;
     if (@rem(xs[2], 128) != 0 or @rem(out, 128) != 0) return null;
     if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
-    const g = project_rows.rowsGeometry(xs[2], out, rows, groups, opts.rows);
+    const g = project_rows.rowsGeometry(xs[2], out, rows, groups, ts[3], opts.rows);
     if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX) or !project_rows.hasFinish(g)) return null;
     const l: project_rows.RowsLaunch = .{ .in_dim = xs[2], .out_dim = out, .rows = rows, .groups = groups, .n = (try kernels.packedRate(ts[3])).n, .out_dt = mlx.mlx_array_dtype(x) };
     var flat = mlx.mlx_array_new();
@@ -130,7 +130,7 @@ pub fn linearExpanded(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: ex
     const dt = mlx.mlx_array_dtype(x);
     if (@rem(xs[1], 128) != 0 or @rem(out, 128) != 0) return null;
     if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
-    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, opts.rows);
+    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, ts[3], opts.rows);
     if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
     const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = dt };
     const fitted = project_rows.fitExpand(l, g, expand) orelse return null;
@@ -179,7 +179,7 @@ pub const Geo = struct {
         geo.out = out;
         geo.n = rate.n;
         for (&geo.rows, 1..) |*slot, rows| {
-            const g = project_rows.rowsGeometry(in, out, @intCast(rows), 1, .{ .exact = mode.exact });
+            const g = project_rows.rowsGeometry(in, out, @intCast(rows), 1, ts[3], .{ .exact = mode.exact });
             if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) continue;
             slot.* = .{ .g = g, .pin = try project_rows.pinCfg(.{ .in_dim = in, .out_dim = out, .rows = @intCast(rows), .groups = 1, .n = rate.n, .out_dt = .bfloat16 }, g, bounds) };
         }
@@ -276,7 +276,7 @@ pub fn linearSharedNormed(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: 
     const rows = xs[0];
     const out = ts[2] * 16;
     if (force_arm != null or rows < 1 or rows > project_rows.rowsMax(opts.rows)) return false;
-    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, opts.rows);
+    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, ts[3], opts.rows);
     if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return false;
     var bounds: [3]c_int = @splat(sh.cols[sh.count]);
     for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
@@ -755,11 +755,11 @@ const exact: Opts = .{ .rows = .{ .exact = true } };
 test "exl3 linear: with exact rows a row has the same bytes at widths 1 to 8 at Flash-Next's trunk shapes, stacked, on the machine's own arm and on SIMD" {
     try mlx.requireGpu();
     // The arm follows the hardware, never the row count.
-    for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, exact.rows).nax);
+    for (1..9) |rows| try std.testing.expectEqual(kernels.gemmNaxOn(), project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, 64, exact.rows).nax);
     try exactRowsCase();
     const simd_only = device.withProfile(device.simdOnly());
     defer simd_only.end();
-    for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, exact.rows).nax);
+    for (1..9) |rows| try std.testing.expect(!project_rows.rowsGeometry(2560, 12288, @intCast(rows), 1, 64, exact.rows).nax);
     try exactRowsCase();
 }
 
@@ -1221,4 +1221,20 @@ test "exl3 linear: the GEMM inputs of one groups, rows and window are built once
     for (1..gemm_cache_len + 2) |k| _ = try gemmInputs(1, 40 + k, 32);
     const rebuilt = try gemmInputs(3, 70, 32);
     try t.expectEqualSlices(u32, try u32Values(direct.starts), try u32Values(rebuilt.tab.starts));
+}
+
+test "exl3 Ultra pins the K5 query projection geometry at every decode width" {
+    const scope = device.withProfile(device.Profile.from("g17d", .{ .major = 26, .minor = 2 }, false));
+    defer scope.end();
+    inline for (.{ 80, 64 }) |n| {
+        var weight = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(weight);
+        try mlx.check(mlx.mlx_zeros(&weight, &[_]c_int{ 1, 80, 2048, n }, 4, .uint16, mlx.gpuStream()));
+        const geo = try Geo.init(weight, null, .{ .exact = true });
+        for (geo.rows) |slot| {
+            const g = slot.?.g;
+            try std.testing.expectEqual(@as(c_int, if (n == 80) 2 else 4), g.kph);
+            try std.testing.expectEqual(@as(c_int, 1), g.nsplit);
+        }
+    }
 }

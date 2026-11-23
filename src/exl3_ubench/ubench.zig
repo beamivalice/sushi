@@ -38,6 +38,20 @@ pub const LAYOUTS = [_]Layout{
         .{ .n = .{ 24, 24, 24 }, .experts = 148 },
     } },
     .{ .key = "stage", .name = "stage n32 x128 top3", .topk = 3, .groups = &.{.{ .n = .{ 32, 32, 32 }, .experts = 128 }} },
+    // The 2.7bpw pack's layers 5 and 30 (K3.5 / K3 / K2.5) and its DSpark stage (K2.5).
+    .{ .key = "M5", .name = "M5 56:12 48:30 40:342", .topk = 6, .groups = &.{
+        .{ .n = .{ 56, 56, 56 }, .experts = 12 }, .{ .n = .{ 48, 48, 48 }, .experts = 30 }, .{ .n = .{ 40, 40, 40 }, .experts = 342 },
+    } },
+    .{ .key = "M30", .name = "M30 56:136 48:86 40:162", .topk = 6, .groups = &.{
+        .{ .n = .{ 56, 56, 56 }, .experts = 136 }, .{ .n = .{ 48, 48, 48 }, .experts = 86 }, .{ .n = .{ 40, 40, 40 }, .experts = 162 },
+    } },
+    .{ .key = "Mstage", .name = "Mstage n40 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 40, 40, 40 }, .experts = 384 }} },
+    // One rate over all 384 experts at top-6: a rate's chain per byte, beside the others.
+    .{ .key = "R32", .name = "R32 n32 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 32, 32, 32 }, .experts = 384 }} },
+    .{ .key = "R40", .name = "R40 n40 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 40, 40, 40 }, .experts = 384 }} },
+    .{ .key = "R48", .name = "R48 n48 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 48, 48, 48 }, .experts = 384 }} },
+    .{ .key = "R56", .name = "R56 n56 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 56, 56, 56 }, .experts = 384 }} },
+    .{ .key = "R64", .name = "R64 n64 x384 top6", .topk = 6, .groups = &.{.{ .n = .{ 64, 64, 64 }, .experts = 384 }} },
 };
 
 pub const Mode = enum { uniform, highest, lowest, shared };
@@ -93,10 +107,19 @@ pub const Ctx = struct {
     rows: c_int,
     topk: c_int,
     prefill: bool,
+    shared: ?rate_groups.SharedExpert = null,
+    expand: ?rate_groups.StreamExpand = null,
 };
 
 pub fn step(c: Ctx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_array) anyerror!mlx.mlx_array {
     const slots = c.routes[i % ROUTE_SETS];
+    if (c.shared) |se| {
+        const y = if (c.prefill)
+            try rate_groups.moePrefillClampedSharedFused(s, x, c.rb, slots, c.scores, c.topk, LIMIT, se)
+        else
+            try rate_groups.moeDecodeClampedSharedFusedExpand(s, x, c.rb, slots, c.scores, c.topk, .float32, se, LIMIT, c.expand);
+        return y orelse error.SharedFuseDeclined;
+    }
     return if (c.prefill)
         rate_groups.moePrefillClamped(s, x, c.rb, slots, c.scores, c.topk, LIMIT)
     else
@@ -109,27 +132,28 @@ pub const dsv41_experts: report.Bench = .{
     .what = "384-expert PAIR1 chain at the plan's layers: decode rows, verify widths, prefill, the DSpark bank",
     .unit = .us,
     .axes = &.{
-        .{ .name = "layout", .values = &.{ "L2", "L5", "L23", "stage" }, .numeric = false },
+        .{ .name = "layout", .values = &.{ "L2", "L5", "L23", "stage", "M5", "M30", "Mstage", "R32", "R40", "R48", "R56", "R64" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "5", "6", "16", "256" } },
         .{ .name = "mode", .values = &.{ "uniform", "highest", "lowest", "shared" }, .numeric = false },
     },
     // chain: as served (prepared, rows paired); ungrouped: prepared, one threadgroup a slot; plain: the unprepared chain.
-    .arms = &.{ "chain", "ungrouped", "plain" },
+    .arms = &.{ "chain", "ungrouped", "plain", "fused", "fused_ungrouped" },
     .ref = "chain",
+    .opts = &.{.{ .name = "splits", .help = "the pair GEMV's k splits (2 as served): one value a run" }},
     .run = runExperts,
 };
 
-const Sample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, steps: usize };
+const Sample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: Ctx, fused: Ctx, steps: usize };
 
 /// Nanoseconds of one call: the chain less the link floor measured beside it.
 fn sampleChain(smp: Sample, arm: usize) anyerror!f64 {
-    rate_groups.group_force = if (arm == 1) 0 else null;
+    rate_groups.group_force = if (arm == 1 or arm == 4) 0 else null;
     rate_groups.prepared_force = if (arm == 2) false else null;
     defer {
         rate_groups.group_force = null;
         rate_groups.prepared_force = null;
     }
-    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, smp.c, step);
+    const ns = try bench.chainNs(smp.s, smp.x0, smp.steps, if (arm >= 3) smp.fused else smp.c, step);
     const floor = try bench.chainNs(smp.s, smp.x0, smp.steps, {}, bench.linkOnly);
     return (@as(f64, @floatFromInt(ns)) - @as(f64, @floatFromInt(floor))) / @as(f64, @floatFromInt(smp.steps));
 }
@@ -144,6 +168,8 @@ fn runExperts(run: *report.Run) anyerror!void {
     var prng = std.Random.DefaultPrng.init(0xd54e);
     const rnd = prng.random();
     kernels.setDecodeParams(.{ .codebook = .pair1, .window = .w16 });
+    if (run.opt("splits")) |v| kernels.setPairSplitsForTest(std.fmt.parseInt(u32, v, 10) catch return error.BadOpt);
+    defer kernels.setPairSplitsForTest(null);
     for (LAYOUTS) |lay| {
         if (!listed(run.axis("layout"), lay.key)) continue;
         var banks: [8]root.Bank = undefined;
@@ -155,10 +181,30 @@ fn runExperts(run: *report.Run) anyerror!void {
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_eval(vec));
         for (banks[0..lay.groups.len]) |*b| bench.freeBank(b);
+        const fused = run.hasArm("fused") or run.hasArm("fused_ungrouped");
+        const shared_n: u32 = if (lay.key[0] == 'L' or std.mem.eql(u8, lay.key, "stage")) 64 else 80;
+        var shared_prng = std.Random.DefaultPrng.init(0xd54f);
+        var shared = if (fused) try bench.makeBank(shared_prng.random(), HIDDEN, INTER, @splat(shared_n), 1, 0.02, 0.9) else null;
+        defer if (shared) |*b| bench.freeBank(b);
+        var tiled = if (fused) try rate_groups.tileMajorCopy(s, &rb) else null;
+        defer if (tiled) |*r| r.deinit();
         const is_stage = lay.groups.len == 1;
         for (run.axis("rows")) |rows_text| {
             const rows = try std.fmt.parseInt(usize, rows_text, 10);
-            if (rows == 256 and is_stage) continue;
+            if (rows == 256 and is_stage and lay.key[0] != 'R') continue;
+            var stream = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stream);
+            var post = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(post);
+            var comb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(comb);
+            const r: c_int = @intCast(rows);
+            const expand: ?rate_groups.StreamExpand = if (fused and rows <= kernels.DECODE_ROWS_MAX) blk: {
+                try mlx.check(mlx.mlx_ones(&stream, &.{ r, 4, HIDDEN }, 3, .bfloat16, s));
+                try mlx.check(mlx.mlx_ones(&post, &.{ r, 4 }, 2, .float32, s));
+                try mlx.check(mlx.mlx_ones(&comb, &.{ r, 4, 4 }, 3, .float32, s));
+                break :blk .{ .x = stream, .post = post, .comb = comb };
+            } else null;
             for (run.axis("mode")) |mode_text| {
                 const mode = modeNamed(mode_text);
                 if (is_stage and mode != .uniform) continue;
@@ -181,11 +227,22 @@ fn runExperts(run: *report.Run) anyerror!void {
                 defer _ = mlx.mlx_array_free(scores);
                 const c: Ctx = .{ .rb = &rb, .routes = &routes, .scores = scores, .rows = @intCast(rows), .topk = @intCast(lay.topk), .prefill = rows > kernels.DECODE_ROWS_MAX };
                 const label = try std.fmt.allocPrint(run.a, "{s} rows {d} {s}", .{ lay.key, rows, mode_text });
-                try run.interleave(label, Sample{ .s = s, .x0 = x0, .c = c, .steps = run.steps(if (c.prefill) 4 else 16) }, sampleChain);
-                const us = run.lastMedianNs("chain") / 1e3;
-                try run.metric("chain", "MB read", "MB", bytes / 1e6);
-                try run.metric("chain", "GB/s", "GB/s", bench.gbps(bytes, us));
-                try run.metric("chain", "of roofline", "x", bench.gbps(bytes, us) / bench.ROOFLINE_GBPS);
+                var fc = c;
+                if (shared) |b| {
+                    fc.shared = .{ .bank = b, .dec = kernels.SPEC1_W15 };
+                    fc.rb = &tiled.?;
+                    fc.expand = expand;
+                }
+                try run.interleave(label, Sample{ .s = s, .x0 = x0, .c = c, .fused = fc, .steps = run.steps(if (c.prefill) 4 else 16) }, sampleChain);
+                for ([_][]const u8{ "chain", "fused", "fused_ungrouped" }) |arm| {
+                    if (!run.hasArm(arm)) continue;
+                    const shared_bytes = HIDDEN * INTER * 3 / 128 * shared_n;
+                    const read = bytes + if (!std.mem.eql(u8, arm, "chain")) @as(f64, @floatFromInt(shared_bytes)) else 0;
+                    const us = run.lastMedianNs(arm) / 1e3;
+                    try run.metric(arm, "MB read", "MB", read / 1e6);
+                    try run.metric(arm, "GB/s", "GB/s", bench.gbps(read, us));
+                    try run.metric(arm, "of M5 Max roofline", "x", bench.gbps(read, us) / bench.ROOFLINE_GBPS);
+                }
             }
         }
     }
@@ -1422,7 +1479,7 @@ pub const prefill_gemm: report.Bench = .{
     .steps = 4,
     .axes = &.{
         .{ .name = "shape", .values = &.{ "flash_gate_up", "flash_down", "mimo_gate_up", "mimo_down" }, .numeric = false },
-        .{ .name = "rate", .values = &.{ "24", "32", "36", "40", "42", "48", "64", "80", "96", "128" }, .numeric = false },
+        .{ .name = "rate", .values = &.{ "24", "32", "36", "40", "42", "48", "56", "64", "80", "96", "128" }, .numeric = false },
         .{ .name = "slots", .values = &.{ "170", "640", "2050", "5120", "20480" } },
     },
     .arms = &.{ "served", "reference", "n32", "n64" },
@@ -1598,6 +1655,7 @@ const TrunkShape = struct { name: []const u8, out: usize, in: usize, n: u32, gro
 /// DeepSeek-V4.1-Flash's trunk linears as the STQ pack stores them (`trunk_quant` n64, the head n96).
 const TRUNK_SHAPES = [_]TrunkShape{
     .{ .name = "wq_a", .out = 1280, .in = 5120, .n = 64 },
+    .{ .name = "wq_a_wkv", .out = 1792, .in = 5120, .n = 64 },
     .{ .name = "wq_b", .out = 32768, .in = 1280, .n = 64 },
     .{ .name = "wkv", .out = 512, .in = 5120, .n = 64 },
     .{ .name = "wo_a", .out = 1024, .in = 4096, .n = 64, .groups = 8 },
@@ -1617,12 +1675,16 @@ pub const trunk_rows: report.Bench = .{
     .unit = .us,
     .steps = 64,
     .axes = &.{
-        .{ .name = "shape", .values = &.{ "wq_a", "wq_b", "wkv", "wo_a", "wo_b", "shared_w1", "shared_w2", "comp_wkv", "idx_wq_b", "idx_wk", "head" }, .numeric = false },
+        .{ .name = "shape", .values = &.{ "wq_a", "wq_a_wkv", "wq_b", "wkv", "wo_a", "wo_b", "shared_w1", "shared_w2", "comp_wkv", "idx_wq_b", "idx_wk", "head" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "5", "8", "256" } },
     },
     // simd: the SIMD rows arm at every width, the per-shape alternative to exact's NAX that keeps a row's bytes.
     .arms = &.{ "served", "exact", "gemv", "mxfp8", "affine4", "floor", "simd" },
     .ref = "served",
+    .opts = &.{
+        .{ .name = "k", .help = "the trunk's bits a weight (4, the 1.75bpw pack's, by default; 5 the 2.7bpw pack's); the head stays K6" },
+        .{ .name = "geom", .help = "kph:nsplit forced on the NAX arm at every shape (the tuned table by default)" },
+    },
     .run = runTrunkRows,
 };
 
@@ -1774,8 +1836,20 @@ fn runTrunkRows(run: *report.Run) anyerror!void {
     var prng = std.Random.DefaultPrng.init(0x7a);
     const rnd = prng.random();
     try kernels.SPEC1_W15.requireTable();
-    for (TRUNK_SHAPES) |sh| {
-        if (!listed(run.axis("shape"), sh.name)) continue;
+    if (run.opt("geom")) |v| {
+        var it = std.mem.splitScalar(u8, v, ':');
+        const kph = std.fmt.parseInt(c_int, it.next() orelse return error.BadOpt, 10) catch return error.BadOpt;
+        const nsplit = std.fmt.parseInt(c_int, it.next() orelse return error.BadOpt, 10) catch return error.BadOpt;
+        project_rows.nax_geom_force = .{ .kph = kph, .nsplit = nsplit };
+    }
+    defer project_rows.nax_geom_force = null;
+    const trunk_n: ?u32 = if (run.opt("k")) |v| 16 * (std.fmt.parseInt(u32, v, 10) catch return error.BadOpt) else null;
+    for (TRUNK_SHAPES) |shape| {
+        if (!listed(run.axis("shape"), shape.name)) continue;
+        var sh = shape;
+        if (trunk_n) |n| if (!std.mem.eql(u8, sh.name, "head")) {
+            sh.n = n;
+        };
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -1823,9 +1897,12 @@ fn runTrunkRows(run: *report.Run) anyerror!void {
             const label = try std.fmt.allocPrint(run.a, "{s} G{d} [{d}x{d}] n{d} rows {d}", .{ sh.name, g, sh.out, sh.in, sh.n, rows });
             try run.interleave(label, TrunkSample{ .s = s, .x0 = x0, .t = t, .steps = run.steps(64) }, sampleTrunk);
             const bytes: f64 = @floatFromInt(trunkBytes(sh));
-            try run.metric("served", "MB", "MB", bytes / 1e6);
-            const us = run.lastMedianNs("served") / 1e3;
-            try run.metric("served", "GB/s", "GB/s", bench.gbps(bytes, us));
+            for ([_][]const u8{ "served", "exact", "floor" }) |arm| {
+                if (!run.hasArm(arm)) continue;
+                try run.metric(arm, "MB", "MB", bytes / 1e6);
+                const us = run.lastMedianNs(arm) / 1e3;
+                try run.metric(arm, "GB/s", "GB/s", bench.gbps(bytes, us));
+            }
         }
     }
 }
@@ -2164,7 +2241,7 @@ fn trunkLaunchStep(c: TrunkLaunchCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_ar
             // The served launch on the one-tile walk and the 64-bit reader (walk1), or with only one of them (unr2, r32).
             const p = c.shared[ci].p;
             const out: c_int = @intCast(totalOut(c.sh));
-            var g = project_rows.rowsGeometry(@intCast(c.sh.in), out, @intCast(c.rows), 1, .{ .exact = true });
+            var g = project_rows.rowsGeometry(@intCast(c.sh.in), out, @intCast(c.rows), 1, mlx.getShape(p.trellis)[3], .{ .exact = true });
             g.sw = false;
             if (c.arm != 4) g.unr = 1;
             if (c.arm != 5) g.r32 = false;

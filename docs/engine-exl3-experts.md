@@ -67,10 +67,14 @@ kernel on supported hardware.
     ([perf-baselines](perf-baselines.md#exl3-lane-third-word)). The decode GEMVs are ALU-bound, so the third word
     is merged as two 32-bit funnels of adjacent words, never OR-ed into a 64-bit shift (10% of the one-row chain at
     n42); a register shuffle, selects or a branch to save the load cost more than the load
-    ([perf-baselines](perf-baselines.md#exl3-lane-funnel)).
+    ([perf-baselines](perf-baselines.md#exl3-lane-funnel)). PAIR1 at n56 (K3.5) is the exception: there the bits under
+    a lane's window are the preceding lane's, and a shuffle of them beats the loads
+    ([perf-baselines](perf-baselines.md#m5u-stq27)).
   - simdgroup-matrix group: one or two 32-bit funnels, split at the widest weight whose first codeword still fits.
   - NAX fragment: one funnel per quad of weights; above n50 a quad's codewords pass 32 bits, and the funnel reads 64
-    bits from three words.
+    bits from three words. PAIR1 at n40, n48 and n56 builds a lane's four odd codewords from its three words, and n80
+    its four pairs from four adjacent words, one funnel each (`nax_k5_frag`: the sorted prefill and the K5 trunk rows;
+    [perf-baselines](perf-baselines.md#m5u-stq27)).
 - **The window is a pack field** (`expert_quant.window`, absent = 16, 8..16 admitted): the codeword is masked to the
   window in the one helper every weight kernel inlines, and kernel slots are keyed by codebook AND window. A w16
   bitstream decodes to different weights at every other window, so a window can never come from a flag.
@@ -514,7 +518,9 @@ or from 1024 rows the decoded path below.
   slice order, and `nsplit` 1 folds the finish into the launch (one dispatch, no partials). A row's bytes still do not
   depend on the row count: the geometry reads the shape alone (`NAX_TUNED`: wq_a+wkv k4 s5, wq_b k4 s1, wo_a k4 s8,
   wo_b k2 s4, head k1 s2; other shapes keep one slice and the split policy). Test: a row has the same bytes at widths 2
-  to 8 under kph 1/2/3/4/8 (kph 3 convicted a slice assignment read from the row-dependent chunk).
+  to 8 under kph 1/2/3/4/8 (kph 3 convicted a slice assignment read from the row-dependent chunk). On the widest
+  desktop class (M5 Ultra) a K5 bank takes its own split (`ultra_k5`: wq_b k2 s1, wo_a k4 s2, wo_b k2 s8), which sums
+  in another order: an owner-approved output change ([perf-baselines](perf-baselines.md#m5u-stq27)).
   Sweep (`SUSHI_DSV41_TRUNK_UBENCH`, 642d8ba6, `MLX_MAX_OPS_PER_BUFFER=16`, GPU lock, QUIET, fans max, `kph` 1/2/4/8 x
   every divisor `nsplit`, 7-12 rounds, same session as the "before"): the spread inside a shape is
   2 to 3 us at the top, so only the shapes below move.

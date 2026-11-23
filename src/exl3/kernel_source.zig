@@ -128,6 +128,13 @@ const HELPERS_TAIL: [:0]const u8 =
     \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
     \\  constexpr bool full = exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u);
     \\  const uint end = W * lane + W;
+    \\  // At K3.5 the W bits under a lane's 32-bit window are the high W bits of the preceding lane's
+    \\  // window, so a shuffle stands in for their loads. Every caller runs it with the simdgroup in step.
+    \\  if constexpr (N == 56u && EXL3_LANE_FIRST == 1u) {
+    \\    const uint low_bits = uint(exl3_window(words, end, W, false));
+    \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
+    \\    return as_type<ulong>(uint2(low_bits, prior >> (32u - W)));
+    \\  }
     \\  return exl3_lane_type<wide, !wide && full>::read(words, end, W, full);
     \\}
     \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
@@ -558,4 +565,16 @@ test "exl3 SPEC1 below K1.5 and above K4: every reader decodes every rate with i
         try kernels.weightReaderExactAt(n, .spec1, dec.window, false, .lane, dec.table);
         inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExactAt(n, .spec1, dec.window, false, reader, dec.table);
     };
+}
+
+test "exl3 K3.5 PAIR1 lane words match the host across every word and tile boundary" {
+    try kernels.weightReaderExact(56, .pair1, .w16, false, .lane);
+}
+
+test "exl3 K5 NAX fragments match host SPEC1 weights at both halfword alignments" {
+    try kernels.weightReaderExactAt(80, .spec1, .w15, false, .nax, kernels.SPEC1_W15.table);
+}
+
+test "exl3 routed prefill fragments match host PAIR1 weights at K2.5 K3 and K3.5" {
+    inline for (.{ 40, 48, 56 }) |n| try kernels.weightReaderExact(n, .pair1, .w16, false, .nax);
 }

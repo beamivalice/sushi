@@ -1,3 +1,4 @@
+const device = @import("device.zig");
 const exl3 = @import("expert_exl3.zig");
 const kernel_src = @import("kernel_source.zig");
 const mlx = @import("mlx_host").mlx;
@@ -550,13 +551,14 @@ fn dynGeom(l: RowsLaunch, g: RowsGeom) RowsGeom {
 }
 
 /// How many template sets a dynamic-rows launch of this shape compiles over every row total: one a cap.
-fn dynTemplates(in_dim: c_int, out_dim: c_int, groups: c_int, mode: Mode) usize {
+fn dynTemplates(in_dim: c_int, out_dim: c_int, groups: c_int, n: u32, mode: Mode, expected: NaxSplit) !usize {
     const Set = struct { cap: c_int, geom: RowsGeom };
     var seen: [@intCast(NAX_ROWS_MAX)]Set = undefined;
     var count: usize = 0;
     for (1..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
-        const l: RowsLaunch = .{ .in_dim = in_dim, .out_dim = out_dim, .rows = @intCast(rows), .groups = groups, .n = 0, .out_dt = .bfloat16 };
-        const d: Set = .{ .cap = dynCap(l.rows), .geom = dynGeom(l, rowsGeometry(in_dim, out_dim, @intCast(rows), groups, mode)) };
+        const l: RowsLaunch = .{ .in_dim = in_dim, .out_dim = out_dim, .rows = @intCast(rows), .groups = groups, .n = n, .out_dt = .bfloat16 };
+        const d: Set = .{ .cap = dynCap(l.rows), .geom = dynGeom(l, rowsGeometry(in_dim, out_dim, @intCast(rows), groups, @intCast(l.n), mode)) };
+        try std.testing.expectEqual(expected, NaxSplit{ .kph = d.geom.kph, .nsplit = d.geom.nsplit });
         for (seen[0..count]) |x| {
             if (std.meta.eql(x, d)) break;
         } else {
@@ -634,9 +636,9 @@ const W32_FRAGS: [:0]const u8 =
     \\  return true;
     \\}
     \\static inline constexpr bool rows_w32(uint N, uint R32) { return R32 != 0u && N != 64u && nax_w32_fits(N); }
-    \\static inline uint rows_funnel(uint late, uint early, uint s) { return uint(((ulong(early) << 32u) | ulong(late)) >> s); }
     \\template<uint N, uint R32, uint SW>
     \\static inline nfrag rows_wfrag(const device uint *words, uint lane) {
+    \\  if constexpr (N == 80u && SW != 0u) return nax_k5_frag<N>(words, lane);
     \\  if constexpr (rows_w32(N, R32)) {
     \\    constexpr uint W = N / 2u;
     \\    const uint b = (lane >> 3u) & 1u;
@@ -653,8 +655,8 @@ const W32_FRAGS: [:0]const u8 =
     \\      const uint w0 = words[l - 1u];
     \\      const uint w1 = words[l];
     \\      const uint w2 = words[l + 1u];
-    \\      lo = uint2(rows_funnel(w1, w0, s), rows_funnel(w0, wm, sp));
-    \\      hi = uint2(rows_funnel(w2, w1, sp), rows_funnel(w2, w1, s));
+    \\      lo = uint2(nax_funnel(w1, w0, s), nax_funnel(w0, wm, sp));
+    \\      hi = uint2(nax_funnel(w2, w1, sp), nax_funnel(w2, w1, s));
     \\    } else {
     \\      lo = nax_win2(words, end, W);
     \\      hi = nax_win2(words, end + W, W);
@@ -702,9 +704,9 @@ fn rowsChunk(in_dim: c_int, rows: c_int, nsplit: c_int) c_int {
 /// A bench arm: null follows the mode, a value forces the NAX arm on or off at every width.
 pub var nax_force: ?bool = null;
 
-pub fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, mode: Mode) RowsGeom {
+pub fn rowsGeometry(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_int, mode: Mode) RowsGeom {
     const nax = nax_force orelse if (mode.exact) !isLmHead(in_dim, out_dim, groups) else rows >= 2;
-    return rowsGeometryFor(in_dim, out_dim, rows, groups, nax and kernels.gemmNaxOn());
+    return rowsGeometryFor(in_dim, out_dim, rows, groups, n, nax and kernels.gemmNaxOn());
 }
 
 fn isLmHead(in_dim: c_int, out_dim: c_int, groups: c_int) bool {
@@ -714,20 +716,23 @@ fn isLmHead(in_dim: c_int, out_dim: c_int, groups: c_int) bool {
 /// DeepSeek's trunk linears on the NAX arm: `kph` simdgroups split a threadgroup's k range and sum in threadgroup
 /// memory, so a launch needs fewer k-split partials (none, and no finish dispatch, at `nsplit` 1). The geometry never
 /// depends on the row count, which keeps a row's bytes equal at every width.
-const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int };
+const NaxSplit = struct { kph: c_int, nsplit: c_int };
+/// `ultra_k5`: the split a K5 bank takes on the widest desktop class (an M5 Ultra); every other box and rate keeps
+/// `kph`/`nsplit`. A different split sums in another order, so the bytes differ by GPU class.
+const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int, ultra_k5: ?NaxSplit = null };
 
 const NAX_TUNED = [_]NaxTuned{
     .{ .in_dim = 5120, .out_dim = 1792, .groups = 1, .kph = 4, .nsplit = 5 },
-    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1 },
-    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8 },
-    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4 },
+    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1, .ultra_k5 = .{ .kph = 2, .nsplit = 1 } },
+    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8, .ultra_k5 = .{ .kph = 4, .nsplit = 2 } },
+    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 2, .nsplit = 8 } },
     .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2 },
 };
 
 /// The NAX arm walks two k-tiles' fragments ahead of their MMAs at one simdgroup per pair, on 32-bit funnels: a one-row
 /// trunk launch is bound by the fragment reads and decode, not the MMA.
-fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bool) RowsGeom {
-    var g = rowsLaunch(in_dim, out_dim, rows, groups, nax);
+fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_int, nax: bool) RowsGeom {
+    var g = rowsLaunch(in_dim, out_dim, rows, groups, n, nax);
     if (g.nax) {
         g.r32 = true;
         g.sw = true;
@@ -736,10 +741,17 @@ fn rowsGeometryFor(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, na
     return g;
 }
 
-fn rowsLaunch(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, nax: bool) RowsGeom {
+/// A bench arm: forces the NAX arm's `kph` and `nsplit` at every shape.
+pub var nax_geom_force: ?struct { kph: c_int, nsplit: c_int } = null;
+
+fn rowsLaunch(in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: c_int, nax: bool) RowsGeom {
+    if (nax) if (nax_geom_force) |f| return .{ .tgrp = 4, .kph = f.kph, .nsplit = f.nsplit, .chunk = rowsChunk(in_dim, rows, f.nsplit), .nax = true };
     if (nax) for (NAX_TUNED) |t| {
-        if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups)
-            return .{ .tgrp = 4, .kph = t.kph, .nsplit = t.nsplit, .chunk = rowsChunk(in_dim, rows, t.nsplit), .nax = true };
+        if (t.in_dim == in_dim and t.out_dim == out_dim and t.groups == groups) {
+            const base: NaxSplit = .{ .kph = t.kph, .nsplit = t.nsplit };
+            const g = if (n == 80 and device.current().class == .d) t.ultra_k5 orelse base else base;
+            return .{ .tgrp = 4, .kph = g.kph, .nsplit = g.nsplit, .chunk = rowsChunk(in_dim, rows, g.nsplit), .nax = true };
+        }
     };
     if (@divExact(out_dim, 128) * groups >= 1024) return .{ .tgrp = 4, .kph = if (nax) 1 else 2, .nsplit = 1, .chunk = rowsChunk(in_dim, rows, 1), .nax = nax };
     const blocks = @divExact(in_dim, 128);
@@ -763,7 +775,7 @@ pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, 
     const groups: c_int = if (ts.len == 4) ts[0] else 1;
     const rows = @divExact(xs[0], groups);
     const out = ts[ts.len - 2] * 16;
-    const g = rowsGeometry(xs[1], out, rows, groups, mode);
+    const g = rowsGeometry(xs[1], out, rows, groups, ts[ts.len - 1], mode);
     if (g.nax or groups != 1 or rows <= PROJECT_ROWS_MAX or rows > rowsMax(mode)) return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
     // A SIMD launch holds `PROJECT_ROWS_MAX` rows and sums a row the same at every count: a wider call goes in halves.
     const half = @divFloor(rows + 1, 2);
@@ -775,7 +787,7 @@ pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, 
         var xp: mlx.mlx_array = .{};
         defer _ = mlx.mlx_array_free(xp);
         try mlx.check(mlx.mlx_slice(&xp, x, &[_]c_int{ span[0], 0 }, 2, &[_]c_int{ span[1], xs[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
-        const gp = rowsGeometry(xs[1], out, span[1] - span[0], 1, mode);
+        const gp = rowsGeometry(xs[1], out, span[1] - span[0], 1, ts[ts.len - 1], mode);
         part.* = try projectRowsWith(s, xp, trellis, suh, svh, gp, try rowsKernel(gp), null);
     }
     const joined = mlx.mlx_vector_array_new_data(&parts, parts.len);
@@ -803,7 +815,7 @@ pub fn projectRowsSegmented(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.ml
         prev = b;
     }
     if (mlx.mlx_array_size(suh) != segs * @as(usize, @intCast(xs[1]))) return error.BadExl3Shape;
-    const g = rowsGeometry(xs[1], out, xs[0], 1, mode);
+    const g = rowsGeometry(xs[1], out, xs[0], 1, ts[3], mode);
     const y = try projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), bounds);
     defer _ = mlx.mlx_array_free(y);
     var flat = mlx.mlx_array_new();
@@ -1233,7 +1245,7 @@ test "exl3 multi-row projection holds the bar on every launch geometry and at ei
 
 test "exl3 multi-row projection holds the bar at every admitted rate on both kernels" {
     if (!mlx.streamIsGpu(mlx.gpuStream())) return error.SkipZigTest;
-    const nax = rowsGeometryFor(256, 256, 3, 1, true);
+    const nax = rowsGeometryFor(256, 256, 3, 1, 0, true);
     var n: u32 = exl3.Rate.min_n;
     while (n <= exl3.Rate.max_n) : (n += 2) {
         try kernels.reportGemmParity(try kernels.rowsParityStats(.{ .n = n, .out_dim = 256, .in_dim = 256, .rows = 3, .seed = 1601 + n, .geom = .{ .tgrp = 1, .kph = 4, .nsplit = 2, .chunk = 128 } }));
@@ -1266,11 +1278,11 @@ test "exl3 SIMD multi-row: every row equals the one-row launch bit for bit" {
     kernels.setDecodeParams(d.dec);
     const sh = [3]usize{ 384, 256, 2 };
     const rig = try RowsRig.init(alloc, 0x51d0 + sh[0], sh[0], sh[1], sh[2], d.n);
-    const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), false);
+    const g1 = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), @intCast(d.n), false);
     var alone: [@as(usize, @intCast(PROJECT_ROWS_MAX))][]const u16 = undefined;
     for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
     for ([_]usize{ 2, @intCast(PROJECT_ROWS_MAX) }) |rows| {
-        const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), false);
+        const g = rowsGeometryFor(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), @intCast(d.n), false);
         const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
         for (0..rows) |r| {
             for (0..sh[2]) |grp| try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
@@ -1292,7 +1304,7 @@ test "exl3 multi-row mode: at the lm_head's shape a wide exact verify of 9 to 16
     kernels.setDecodeParams(d.dec);
     const out: usize = 129280;
     const rig = try RowsRig.init(alloc, 0x1ead, 5120, out, 1, d.n);
-    try std.testing.expect(!rowsGeometry(5120, 129280, 9, 1, .{ .exact = true, .wide = true }).nax);
+    try std.testing.expect(!rowsGeometry(5120, 129280, 9, 1, 64, .{ .exact = true, .wide = true }).nax);
     const was = mlx.engine.enabled;
     defer mlx.engine.enabled = was;
     for ([_]bool{ false, true }) |on_engine| {
@@ -1325,12 +1337,12 @@ test "exl3 NAX multi-row: at 9 to 16 rows every row equals the one-row launch bi
     // A bank and a deep k split; trunk.zig's wide verify test holds a one-bank launch.
     for ([_][3]usize{ .{ 1024, 256, 2 }, .{ 131072, 256, 1 } }) |sh| {
         const rig = try RowsRig.init(alloc, 0x9a16 + sh[0] + n, sh[0], sh[1], sh[2], n);
-        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), exact);
+        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), @intCast(n), exact);
         var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
         for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
         // 9 and 16 rows stage the two chunk widths `rowsChunk` gives past eight.
         for ([_]usize{ 9, @intCast(NAX_ROWS_MAX) }) |rows| {
-            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), exact);
+            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), @intCast(n), exact);
             const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
             for (0..sh[2]) |grp| for (0..rows) |r|
                 try std.testing.expectEqualSlices(u16, alone[r][grp * sh[1] ..][0..sh[1]], many[(grp * rows + r) * sh[1] ..][0..sh[1]]);
@@ -1354,13 +1366,13 @@ test "exl3 NAX joined rows: one launch at every row total gives each row its one
     // A bank on the folded launch and a deep k split through the finish.
     for ([_][3]usize{ .{ 1024, 256, 2 }, .{ 131072, 256, 1 } }) |sh| {
         const rig = try RowsRig.init(alloc, 0x70a1 + sh[0] + n, sh[0], sh[1], sh[2], n);
-        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), exact);
+        const g1 = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), 1, @intCast(sh[2]), @intCast(n), exact);
         dyn_rows = false;
         var alone: [@as(usize, @intCast(NAX_ROWS_MAX))][]const u16 = undefined;
         for (&alone, 0..) |*a, r| a.* = try rig.run(alloc, r, 1, g1, try rowsKernel(g1));
         dyn_rows = true;
         for (1..@as(usize, @intCast(NAX_ROWS_MAX)) + 1) |rows| {
-            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), exact);
+            const g = rowsGeometry(@intCast(sh[0]), @intCast(sh[1]), @intCast(rows), @intCast(sh[2]), @intCast(n), exact);
             const many = try rig.run(alloc, 0, rows, g, try rowsKernel(g));
             for (0..sh[2]) |grp| for (0..rows) |r| {
                 errdefer std.debug.print("joined rows: {d}x{d} bank of {d}, {d} rows, row {d} of group {d}\n", .{ sh[0], sh[1], sh[2], rows, r, grp });
@@ -1368,8 +1380,12 @@ test "exl3 NAX joined rows: one launch at every row total gives each row its one
             };
         }
         // Every total ran one template set a cap: eight rows' and the cap's.
-        try std.testing.expectEqual(@as(usize, 2), dynTemplates(@intCast(sh[0]), @intCast(sh[1]), @intCast(sh[2]), exact));
+        try std.testing.expectEqual(@as(usize, 2), try dynTemplates(@intCast(sh[0]), @intCast(sh[1]), @intCast(sh[2]), n, exact, .{ .kph = g1.kph, .nsplit = g1.nsplit }));
     }
+    const profile = device.withProfile(device.Profile.from("g17d", .{ .major = 26, .minor = 2 }, false));
+    defer profile.end();
+    try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 80, exact, .{ .kph = 2, .nsplit = 8 }));
+    try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 64, exact, .{ .kph = 2, .nsplit = 4 }));
 }
 
 test "exl3 multi-row projection is one dispatch on an lm_head-wide output and two on a narrower one" {
@@ -1405,11 +1421,11 @@ test "exl3 multi-row mode: exact puts every width but the lm_head's on the NAX a
     try mlx.requireGpu();
     const nax = kernels.gemmNaxOn();
     try std.testing.expectEqual(PROJECT_ROWS_MAX, rowsMax(.{}));
-    try std.testing.expect(!rowsGeometry(2560, 12288, 1, 1, .{}).nax);
-    try std.testing.expectEqual(nax, rowsGeometry(2560, 12288, 2, 1, .{}).nax);
+    try std.testing.expect(!rowsGeometry(2560, 12288, 1, 1, 64, .{}).nax);
+    try std.testing.expectEqual(nax, rowsGeometry(2560, 12288, 2, 1, 64, .{}).nax);
     try std.testing.expectEqual(PROJECT_ROWS_MAX, rowsMax(.{ .wide = true }));
     try std.testing.expectEqual(if (nax) NAX_ROWS_MAX else PROJECT_ROWS_MAX, rowsMax(.{ .exact = true, .wide = true }));
-    try std.testing.expectEqual(nax, rowsGeometry(2560, 12288, 1, 1, .{ .exact = true }).nax);
-    try std.testing.expect(!rowsGeometry(5120, 129280, 1, 1, .{ .exact = true }).nax);
+    try std.testing.expectEqual(nax, rowsGeometry(2560, 12288, 1, 1, 64, .{ .exact = true }).nax);
+    try std.testing.expect(!rowsGeometry(5120, 129280, 1, 1, 64, .{ .exact = true }).nax);
     try std.testing.expectEqual(PROJECT_ROWS_MAX, rowsMax(.{ .exact = true }));
 }
