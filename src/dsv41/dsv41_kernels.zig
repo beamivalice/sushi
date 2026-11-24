@@ -19,7 +19,7 @@ const ci = sc_mod.ci;
 
 const Tmpl = struct { name: [*:0]const u8, v: c_int };
 const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
-const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype };
+const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype, into: ?A = null };
 
 /// A kernel's source and signature; the pipeline is built on first use.
 const Def = struct {
@@ -42,7 +42,7 @@ fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid:
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg[0]), ci(tg[1]), ci(tg[2])));
     for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, t.v));
     for (dts) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t.name, t.dt));
-    try qat_mod.applyKernel(sc, k, inputs, cfg, result);
+    try qat_mod.applyKernelInto(sc, k, inputs, cfg, result, outs[0].into);
 }
 
 fn f32Const(sc: *Scope, vals: []const f32) !A {
@@ -1241,7 +1241,6 @@ const ATTN_FUSED_HEAD =
     \\threadgroup float sp[NSG * HB * KT];
     \\threadgroup T ph[HB * KT], pl[HB * KT];
     \\threadgroup float cr[HB], rl[HB];
-    \\threadgroup int rsrc[KT];
     \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
     \\float m = sink[h0 + hh], lsum = 1.0f;
     \\const float scale = scal[0];
@@ -1254,25 +1253,12 @@ const ATTN_FUSED_HEAD =
     \\    metal::simdgroup_load(qf[r][d], q + (size_t(l) * H + h0 + r * 8) * D + d0 + d * 8, D);
     \\    o[r][d] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
     \\  }
-    \\for (int t0 = 0; t0 < total; t0 += KT) {
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (tid < KT) {
-    \\    const int t = t0 + int(tid);
-    \\    int src = -1;
-    \\    if (t < nw) src = c0 + t;
-    \\    else if (t < total) { const int c = topk[size_t(l) * K + t - nw]; if (c >= 0 && c < nc) src = -2 - c; }
-    \\    rsrc[tid] = src;
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  bool any = false;
-    \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
-    \\  if (!any) continue;
 ;
 
 /// The picked rows' tile load: `comp` holds them as bf16 rows, `topk` indexing its first `nc`.
 const ATTN_FUSED_LOAD_ROWS =
     \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
-    \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
+    \\    const int j = i / (D / 8), cc = i % (D / 8), src = source_row(j);
     \\    metal::uint4 v = metal::uint4(0);
     \\    if (src >= 0) v = ((const device metal::uint4*)(keys + size_t(src) * D))[cc];
     \\    else if (src != -1) v = ((const device metal::uint4*)(comp + size_t(-2 - src) * D))[cc];
@@ -1284,7 +1270,7 @@ const ATTN_FUSED_LOAD_ROWS =
 /// `qat_mod.packFp4`'s form): a picked row is decoded as `qat_mod.unpackFp4` does and lands in the tile as T.
 const ATTN_FUSED_LOAD_FP4 =
     \\  for (int i = int(tid); i < KT * (D / 8); i += NT) {
-    \\    const int j = i / (D / 8), cc = i % (D / 8), src = rsrc[j];
+    \\    const int j = i / (D / 8), cc = i % (D / 8), src = source_row(j);
     \\    if (src < -1) {
     \\      const size_t row = size_t(-2 - src);
     \\      const device uchar* cp = ccodes + row * (D / 2) + cc * 4;
@@ -1330,7 +1316,7 @@ const ATTN_FUSED_TAIL =
     \\  for (int jj = 0; jj < NJ; ++jj) {
     \\    const int j = sub + jj * TPH;
     \\    float v = -INFINITY;
-    \\    if (rsrc[j] != -1) {
+    \\    if (source_row(j) != -1) {
     \\      float a = 0.0f;
     \\      for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + j];
     \\      v = a * scale;
@@ -1416,7 +1402,7 @@ const ATTN_FUSED_TAIL =
     \\    #pragma clang loop unroll(full)
     \\    for (int d = 0; d < DT; ++d) {
     \\      const int flat = head * D + d0 + d * 8 + fn;
-    \\      device OT* dst = out + (size_t(flat / GIN) * q_shape[0] + l) * GIN + flat % GIN;
+    \\      device OT* dst = out + (size_t(flat / GIN) * meta[5] + meta[6] + l) * GIN + flat % GIN;
     \\      dst[0] = OT(v[d][0]);
     \\      dst[1] = OT(v[d][1]);
     \\    }
@@ -1490,7 +1476,6 @@ const ATTN_NAX_HEAD =
     \\threadgroup float sp[NSG * HB * KT];
     \\threadgroup T ph[HB * KT], pl[HB * KT];
     \\threadgroup float cr[HB], rl[HB];
-    \\threadgroup int rsrc[KT];
     \\const int hh = int(tid) / TPH, sub = int(tid) % TPH;
     \\float m = sink[h0 + hh], lsum = 1.0f;
     \\const float scale = scal[0];
@@ -1502,19 +1487,6 @@ const ATTN_NAX_HEAD =
     \\  for (int i = 0; i < 16; ++i) qt[ks][i] = q[(size_t(l) * H + h0 + dsv41_nax_c(lane, i % 8)) * D + d0 + ks * 32 + (i / 8) * 16 + dsv41_nax_r(lane, i % 8)];
     \\#pragma clang loop unroll(full)
     \\for (int i = 0; i < OF * 8; ++i) o[i] = 0.0f;
-    \\for (int t0 = 0; t0 < total; t0 += KT) {
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (tid < KT) {
-    \\    const int t = t0 + int(tid);
-    \\    int src = -1;
-    \\    if (t < nw) src = c0 + t;
-    \\    else if (t < total) { const int c = topk[size_t(l) * K + t - nw]; if (c >= 0 && c < nc) src = -2 - c; }
-    \\    rsrc[tid] = src;
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  bool any = false;
-    \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
-    \\  if (!any) continue;
 ;
 
 const ATTN_NAX_TAIL =
@@ -1536,7 +1508,7 @@ const ATTN_NAX_TAIL =
     \\  for (int jj = 0; jj < NJ; ++jj) {
     \\    const int j = sub + jj * TPH;
     \\    float v = -INFINITY;
-    \\    if (rsrc[j] != -1) {
+    \\    if (source_row(j) != -1) {
     \\      float a = 0.0f;
     \\      for (int g = 0; g < NSG; ++g) a += sp[(g * HB + hh) * KT + j];
     \\      v = a * scale;
@@ -1609,7 +1581,7 @@ const ATTN_NAX_TAIL =
     \\    #pragma clang loop unroll(full)
     \\    for (int f = 0; f < OF; ++f) {
     \\      const int flat = head * D + d0 + f * 16 + cc0;
-    \\      device OT* dst = out + (size_t(flat / GIN) * q_shape[0] + l) * GIN + flat % GIN;
+    \\      device OT* dst = out + (size_t(flat / GIN) * meta[5] + meta[6] + l) * GIN + flat % GIN;
     \\      #pragma clang loop unroll(full)
     \\      for (int j = 0; j < 4; ++j) dst[j] = OT(v[f][j]);
     \\    }
@@ -1623,10 +1595,43 @@ const ATTN_NAX_TAIL =
     \\}
 ;
 
-const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
-const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
-const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_NAX_TAIL;
-const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_NAX_TAIL;
+const ATTN_TILE_SOURCES =
+    \\threadgroup int rsrc[KT];
+    \\for (int t0 = 0; t0 < total; t0 += KT) {
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (tid < KT) {
+    \\    const int t = t0 + int(tid);
+    \\    int src = -1;
+    \\    if (t < nw) src = c0 + t;
+    \\    else if (t < total) { const int c = topk[size_t(l) * K + t - nw]; if (c >= 0 && c < nc) src = -2 - c; }
+    \\    rsrc[tid] = src;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  bool any = false;
+    \\  for (int j = 0; j < KT; ++j) any = any || rsrc[j] != -1;
+    \\  if (!any) continue;
+    \\  auto source_row = [&](int j) { return rsrc[j]; };
+;
+
+// Each lane holds one key row's source and the tile reads it by shuffle: no threadgroup store and barrier a tile.
+// KT (16) rows fit one 32-lane simdgroup.
+const ATTN_TILE_SHUFFLE =
+    \\for (int t0 = 0; t0 < total; t0 += KT) {
+    \\  const int t = t0 + int(lane % KT);
+    \\  int row_source = -1;
+    \\  if (t < nw) row_source = c0 + t;
+    \\  else if (t < total) {
+    \\    const int c = topk[size_t(l) * K + t - nw];
+    \\    if (c >= 0 && c < nc) row_source = -2 - c;
+    \\  }
+    \\  if (!metal::simd_any(row_source != -1)) continue;
+    \\  auto source_row = [&](int j) { return metal::simd_shuffle(row_source, ushort(j)); };
+;
+
+const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
+const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
+const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_NAX_TAIL;
+const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_NAX_TAIL;
 
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE, .header = ATTN_EPI_HEADER };
 var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
@@ -1651,7 +1656,14 @@ pub fn attnNaxFits(h: usize, d: usize) bool {
 
 /// What attnOut does to the heads before `wo_a`, done by the kernel's store: the tail's inverse rotation at
 /// `pos0 + row`, the fp8 round trip (`qat`), and the `[og, L, H * D / og]` layout.
-pub const Epilogue = struct { freqs: A, rd: usize, pos0: usize, qat: bool, og: usize };
+pub const Epilogue = struct {
+    freqs: A,
+    rd: usize,
+    pos0: usize,
+    qat: bool,
+    og: usize,
+    span: ?struct { into: A, first: usize, rows: usize } = null,
+};
 
 /// Whether the store can hold an `Epilogue` for `h` heads of `d` channels: fp8 groups of 32 lie inside a simdgroup's slice.
 pub fn attnEpilogueFits(h: usize, d: usize, og: usize) bool {
@@ -1686,7 +1698,11 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
     const L = dim(q, 0);
     const H = dim(q, 1);
     const D = dim(q, 2);
-    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc), if (epi) |e| ci(e.pos0) else 0 };
+    const span = if (epi) |e| e.span else null;
+    const rows = if (span) |part| part.rows else L;
+    const first = if (span) |part| part.first else 0;
+    if (first > rows or L > rows - first) return error.TensorShape;
+    const meta_v = [_]i32{ ci(wp), ci(window), ci(K), ci(nc), if (epi) |e| ci(e.pos0) else 0, ci(rows), ci(first) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
     var ins: [9]A = undefined;
     ins[0] = q;
@@ -1712,8 +1728,8 @@ fn attnFusedLaunch(sc: *Scope, def: *Def, sink: A, q: A, keys: A, comp: []const 
     @memcpy(tmpl[0..base.len], &base);
     @memcpy(tmpl[base.len..][0..extra.len], extra);
     var o: [1]A = undefined;
-    const out_shape: [3]c_int = if (epi != null) .{ ci(og), ci(L), ci(H * D / og) } else .{ ci(L), ci(H), ci(D) };
-    try launch(sc, def, ins[0..n], &.{.{ .shape = &out_shape, .dt = out_dt }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
+    const out_shape: [3]c_int = if (epi != null) .{ ci(og), ci(rows), ci(H * D / og) } else .{ ci(L), ci(H), ci(D) };
+    try launch(sc, def, ins[0..n], &.{.{ .shape = &out_shape, .dt = out_dt, .into = if (span) |part| part.into else null }}, .{ H / fused_hb * fused_nsg * 32, L, 1 }, .{ fused_nsg * 32, 1, 1 }, tmpl[0 .. base.len + extra.len], &.{ .{ .name = "T", .dt = mlx.mlx_array_dtype(q) }, .{ .name = "OT", .dt = out_dt } }, &o);
     return o[0];
 }
 

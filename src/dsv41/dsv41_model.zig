@@ -1519,7 +1519,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (c.engram.n > 0) try initEngram(m, weights, dir_path);
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
     if (mlx.streamIsGpu(s)) try kernels.probeTopk(gpa, s);
-    m.cfg.wide_arms = .of(m.fused, kernels.hcExpandProbed());
+    setWideArms(m);
     m.ced_split = c.cedSplit();
     return m;
 }
@@ -2294,7 +2294,10 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     // The kernel's store does attnOut's rotation, round trip and layout; the heads are no longer a tensor to trace.
     const fold = one_pass and rd > 0 and m.attn_epilogue and m.trace == null and m.tap == null and kernels.attnEpilogueFits(H, hd, c.o_groups);
     const n_spans = (L + span - 1) / span;
-    const heads = try sc.a.alloc(A, n_spans);
+    // Every span's epilogue writes its rows into the first span's buffer, so the grouped projection reads one input
+    // and no join copies the spans.
+    const write_grouped = fold and n_spans > 1 and mlx.engine.isStream(sc.s);
+    const heads = try sc.a.alloc(A, if (write_grouped) 1 else n_spans);
     defer sc.a.free(heads);
     for (0..n_spans) |si| {
         // A span's intermediates (the gathered rows above all) are released once its heads are made, not held
@@ -2318,8 +2321,16 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
         if (pf) |p| try p.mark(.indexer, &.{ keys_w, picks.comp_rows, picks.topk });
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
+        const epilogue: ?kernels.Epilogue = if (fold) .{
+            .freqs = rope,
+            .rd = rd,
+            .pos0 = p0 + a,
+            .qat = m.qat_on,
+            .og = c.o_groups,
+            .span = if (write_grouped) .{ .into = if (si == 0) none else heads[0], .first = a, .rows = L } else null,
+        } else null;
         const head = if (one_pass)
-            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act, if (fold) kernels.Epilogue{ .freqs = rope, .rd = rd, .pos0 = p0 + a, .qat = m.qat_on, .og = c.o_groups } else null, m.attn_nax and kernels.attnNaxFits(H, hd))
+            try fusedHeads(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks, scale, m.act, epilogue, m.attn_nax and kernels.attnNaxFits(H, hd))
         else if (m.attn_f16 and fus and (m.act == .bfloat16 or m.act == .float16) and wk + K <= kernels.attn_softmax_max_cols)
             try kernels.attnWide(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, p0 + a - lo, window, picks.comp_rows, picks.topk, scale, m.act)
         else blk: {
@@ -2329,13 +2340,13 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
             const band = try ssc.op2(mlx.mlx_logical_and, try ssc.op2(mlx.mlx_less_equal, kpos, qpos), try ssc.op2(mlx.mlx_greater, kpos, try ssc.sub(qpos, try ssc.i(ci(window)))));
             break :blk try attnCore(&ssc, ly.sink, try ssc.slice(q, 0, a, b), keys_w, band, picks.comp_rows, picks.topk, scale, m.act);
         };
-        heads[si] = try sc.keep(ssc.out(head));
-        if (L > NARROW_ROWS) try submit(heads[si]);
-        if (pf) |p| try p.mark(.core, &.{heads[si]});
+        if (!write_grouped or si == 0) heads[si] = try sc.share(head);
+        if (L > NARROW_ROWS) try submit(head);
+        if (pf) |p| try p.mark(.core, &.{head});
         if (m.trace) |t| if (si == 0) {
             try t.put("sa_q_{d}", .{li}, try ssc.slice(q, 0, a, b));
             try t.put("sa_kv_{d}", .{li}, keys_w);
-            try t.put("sa_o_{d}", .{li}, heads[si]);
+            try t.put("sa_o_{d}", .{li}, head);
         };
     }
     try ls.win.write(kv, p0, sc.s);
@@ -4245,10 +4256,16 @@ pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) 
     for (st.ds, 0..) |_, si| try shareInto(&out[2 * st.layers.len + si][0], fixed[2 * st.layers.len + si][0]);
 }
 
+fn setWideArms(m: *Model) void {
+    var arms = cfg_mod.WideArms.of(m.fused, kernels.hcExpandProbed());
+    arms.grouped_heads = m.fused and m.act == .bfloat16 and m.attn_epilogue;
+    m.cfg.wide_arms = arms;
+}
+
 /// Sets the kernels off (the diagnostic `SUSHI_DSV41_COMPOSED`, the KLD A/B's teacher arm) or on, and says which.
 pub fn setFused(m: *Model, composed: bool) void {
     m.fused = !composed;
-    m.cfg.wide_arms = .of(m.fused, kernels.hcExpandProbed());
+    setWideArms(m);
     log.info("[dsv41] fused kernels {s}{s}, hc expand kernel {s}\n", .{ if (m.fused) "on" else "off", if (composed) " (diag)" else "", if (m.fused and kernels.hcExpandProbed()) "on" else "off" });
 }
 
@@ -8421,4 +8438,78 @@ test "dsv41 fused prefill attention spans issue no standalone causal band" {
     }
     try testing.expectEqual(@as(u64, 2), spans);
     try testing.expectEqual(@as(u64, 0), masks);
+}
+
+test "dsv41 grouped prefill heads reach the projection without a span join" {
+    try mlx.requireGpu();
+    const core = @import("../tensor/core.zig");
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was_enabled);
+    const s = mlx.engine.stream();
+    const m = try tinyModel(try epiFixtureDir(), .{ .on_engine = true, .experts = false }, s);
+    defer m.deinit();
+    m.attn_epilogue = true;
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const vals = try testing.allocator.alloc(f32, 43 * m.cfg.dim);
+    defer testing.allocator.free(vals);
+    var rng = std.Random.DefaultPrng.init(317);
+    for (vals) |*v| v.* = rng.random().float(f32) - 0.5;
+    const h = try sc.astype(try sc.floats(vals, &.{ 43, ci(m.cfg.dim) }), m.act);
+    var outputs: [2]A = undefined;
+    for ([_]usize{ 43, 16 }, &outputs) |span, *out| {
+        var st = try newState(m);
+        defer st.deinit();
+        var sh = try Shared.init(testing.allocator, 3);
+        defer sh.deinit(testing.allocator);
+        try core.sync();
+        const old_prof = core.kernel_prof_hook;
+        core.kernel_prof_hook = true;
+        defer core.kernel_prof_hook = old_prof;
+        core.resetKernelProfile();
+        defer core.resetKernelProfile();
+        out.* = try attention(&sc, m, &st, 0, h, 0, &sh, span, null);
+        try core.sync();
+        if (span == 16) {
+            var spans: u64 = 0;
+            var joins: u64 = 0;
+            for (core.kernelProfile()) |k| {
+                if (std.mem.indexOf(u8, k.name, "dsv41_attn_fused") != null or std.mem.indexOf(u8, k.name, "dsv41_attn_nax") != null) spans += k.dispatches;
+                if (std.mem.indexOf(u8, k.name, "sushi_concat3") != null) joins += k.dispatches;
+            }
+            try testing.expectEqual(@as(u64, 3), spans);
+            try testing.expectEqual(@as(u64, 0), joins);
+        }
+    }
+    try testing.expectEqualSlices(u8, try hostBytes(&sc, outputs[0]), try hostBytes(&sc, outputs[1]));
+}
+
+test "dsv41 packed prefill attention resumes after a fully masked key tile" {
+    try mlx.requireGpu();
+    const gpu = mlx.gpuStream();
+    if (!kernels.attnNaxFits(64, 512)) return error.SkipZigTest;
+    var sc = Scope.plain(testing.allocator, gpu);
+    defer sc.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var cs = Scope.plain(testing.allocator, cpu);
+    defer cs.deinit();
+    const c = AttnCase{ .L = 17, .wp = 5, .K = 65, .nc = 53 };
+    const d = try attnCaseData(&sc, c, 0xa540);
+    var ids: [c.L * c.K]i32 = undefined;
+    for (&ids, 0..) |*id, i| {
+        const k = i % c.K;
+        id.* = if ((k >= 9 and k < 46) or k % 7 == 0) -1 else @intCast((11 * i + 5) % c.nc);
+    }
+    const topk = try sc.ints(&ids, &.{ c.L, c.K });
+    var rows = try packedStore(&sc, d.comp);
+    defer rows.deinit();
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(c.hd)));
+    const values = try rows.rows(&sc, c.nc);
+    const truth = try sc_mod.hostF32(try attnCore(&cs, d.sink, d.q, d.keys, d.band, values, topk, scale, .float32));
+    const actual = try fusedHeads(&sc, d.sink, d.q, d.keys, c.wp, c.window, try packedPicks(&sc, &rows, topk, true), scale, .float32, null, true);
+    const err = maxRelErr(try sc_mod.hostF32(actual), truth);
+    errdefer std.debug.print("relative error {e}\n", .{err});
+    try testing.expect(err < kernels.attn_nax_bar);
 }

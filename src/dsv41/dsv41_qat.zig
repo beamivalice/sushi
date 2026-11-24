@@ -78,12 +78,18 @@ pub fn kernelNew(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs:
 }
 
 pub fn applyKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, inputs: []const A, cfg: mlx.mlx_fast_metal_kernel_config, outs: []A) !void {
+    return applyKernelInto(sc, k, inputs, cfg, outs, null);
+}
+
+pub fn applyKernelInto(sc: *Scope, k: mlx.mlx_fast_metal_kernel, inputs: []const A, cfg: mlx.mlx_fast_metal_kernel_config, outs: []A, into: ?A) !void {
     const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     // A Metal kernel runs on the GPU stream even when the scope's ops run on the CPU stream (the tests' exact one).
-    if (mlx.streamIsGpu(sc.s)) {
+    if (into) |dst| {
+        try mlx.check(mlx.kernelApplyInto(&ov, k, iv, cfg, sc.s, dst) orelse return error.TensorUnsupported);
+    } else if (mlx.streamIsGpu(sc.s)) {
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, k, iv, cfg, sc.s));
     } else {
         const gpu = mlx.mlx_default_gpu_stream_new();

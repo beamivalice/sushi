@@ -6,6 +6,7 @@ pub const tests = .{
     @import("dsv41_vision.zig"),
     @import("dsv41_bills_live_test.zig"),
     @import("dsv41_config.zig"),
+    @import("dsv41_wide_bytes.zig"),
     @import("dsv41_qat.zig"),
     @import("dsv41_engram.zig"),
     @import("dsv41_source.zig"),

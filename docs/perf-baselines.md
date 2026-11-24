@@ -646,6 +646,26 @@ decode tok/s, base -> final.
 - Ruled out: copies backed by one occurrence (2.7bpw code 123.8 / 157.9 tok/s), widening shallow stage purchases (+1%
   at code 8k, slower at 4k), a single K split for six-row expert verify (469.7 -> 475.9 us on 1.75bpw).
 
+**Prefill attention writes its spans into the grouped projection input** (A B B A one load an arm, pages primed after
+load, zero physical reads in every wide chunk; base `7f17ab30` binary `d0658a8e380f2cc5`, final binary
+`f9379033dca3315f`): each span's epilogue writes its rows into one grouped buffer, so the 640 joins a chunk go (copies
+719 dispatches / 64.9 ms -> 79 / 0.5 ms a chunk), and the packed FP4 NAX attention shares a key tile's row sources
+by SIMD shuffle (packed attention 417.6 -> 394.9 ms a chunk). Prefill tok/s, base -> final:
+
+| request | 1.75bpw 4k | 1.75bpw 8k | 2.7bpw 4k | 2.7bpw 8k |
+|---|---|---|---|---|
+| code | 2,853 -> 2,967 | 2,752 -> 2,867 | 2,819 -> 2,990 | 2,726 -> 2,904 |
+| prose | 2,699 -> 2,833 | 2,683 -> 2,775 | 2,668 -> 2,808 | 2,619 -> 2,749 |
+
+- The 8,222-row second chunk of a 16,415-token prompt gains as much (1.75bpw code / prose +6.98 / +6.39%, 2.7bpw
+  +4.80 / +4.45%); 8cat KLD 0.152457202 / 0.060666116 and every continuation id and saved-state byte unchanged.
+- The wide attention bill falls with the buffer it no longer holds (one 8,192-row case 2,424,324,096 -> 1,887,453,184 B).
+- Ruled out: packed-word loads with vector tile stores (0.999x / 0.997x at spans 256 / 128).
+- Ruled out (decode): last-arrival fusion of the router, split attention + merge and the NAX k-split finishes, where
+  the last threadgroup of a dispatch does the next step. Bit-exact, 177-219 fewer dispatches and barriers a one-row
+  forward, but +3.7-12.8% slower on both packs: on the two-die M5 Ultra the partials need atomic traffic that costs
+  more than the barriers (about 0.75 us each; the router alone saved 0.2-0.8%). The one-row forward is ~98% GPU busy.
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh

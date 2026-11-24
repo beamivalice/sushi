@@ -77,18 +77,20 @@ pub const Vision = struct {
     }
 };
 
-/// A wide forward's hyper-connection expand (the fused kernel, or `hcExpandOps`'s chain) and Engram gate (the kernel, or
-/// `engramGateOps`'s chain): the chains hold planes the kernels do not.
+/// A wide forward's hyper-connection expand (the fused kernel, or `hcExpandOps`'s chain), Engram gate (the kernel, or
+/// `engramGateOps`'s chain) and attention heads (every span's epilogue writing one grouped buffer, or a buffer a span
+/// joined after): the chains hold planes the kernels do not.
 pub const WideArms = struct {
     expand_fused: bool,
     engram_fused: bool,
+    grouped_heads: bool,
 
     /// The served kernels' arms: a matrix-unit GPU with its fused kernels on.
-    pub const kernels: WideArms = .{ .expand_fused = true, .engram_fused = true };
+    pub const kernels: WideArms = .{ .expand_fused = true, .engram_fused = true, .grouped_heads = true };
 
     /// A load's arms: `fused`, its kernels on; `expand_probed`, `hcExpandFused` reproduces this GPU's chain.
     pub fn of(fused: bool, expand_probed: bool) WideArms {
-        return .{ .expand_fused = fused and expand_probed, .engram_fused = fused };
+        return .{ .expand_fused = fused and expand_probed, .engram_fused = fused, .grouped_heads = fused };
     }
 };
 

@@ -224,20 +224,31 @@ fn attention(c: *const Config, li: usize, L: u64, p0: u64) u64 {
     compress(&t, c, li, L);
     const n_spans = (L + cfg_mod.attn_span - 1) / cfg_mod.attn_span;
     const last = (n_spans - 1) * cfg_mod.attn_span;
+    const grouped = armsOf(c).grouped_heads and fusedHeads(c) and c.rope_dim > 0;
     // Every span's heads stay to the output projections.
     var heads: Tally = .{};
-    var a: u64 = 0;
-    while (a < last) : (a += cfg_mod.attn_span) heads.t(1, cfg_mod.attn_span * H * hd * act);
-    const span = spanBytes(c, li, L, p0, last);
+    var span: u64 = 0;
+    if (grouped) {
+        heads.t(1, L * H * hd * act);
+        var start: u64 = 0;
+        while (start < L) : (start += cfg_mod.attn_span) {
+            span = @max(span, spanBytes(c, li, L, p0, start, true));
+        }
+    } else {
+        var a: u64 = 0;
+        while (a < last) : (a += cfg_mod.attn_span) heads.t(1, cfg_mod.attn_span * H * hd * act);
+        span = spanBytes(c, li, L, p0, last, false);
+    }
     var out: Tally = .{};
-    out.t(1, L * H * hd * act);
+    if (!grouped) out.t(1, L * H * hd * act);
     if (!fusedHeads(c)) {
         // The composed arm: the heads concatenated, the tail rotated back, the fp8 round trip, `wo_a`'s rows.
         out.t(1, L * H * hd * act);
     }
     out.t(1, L * c.o_groups * c.o_lora * act);
     out.t(1, L * c.dim * act);
-    return t.bytes + heads.bytes + @max(span, (L - last) * H * hd * act + out.bytes);
+    const last_heads = if (grouped) 0 else (L - last) * H * hd * act;
+    return t.bytes + heads.bytes + @max(span, last_heads + out.bytes);
 }
 
 /// Whether the wide heads come from the one-pass kernel with its store's epilogue (`attnFusedFits`, `attnEpilogueFits`).
@@ -279,7 +290,7 @@ fn compress(t: *Tally, c: *const Config, li: usize, L: u64) void {
 
 /// One span's scope at its heads' end: the window band, the indexer's scores against every key (or one tile of a
 /// streamed scan), the picks, and the head kernel's or the composed core's intermediates.
-fn spanBytes(c: *const Config, li: usize, L: u64, p0: u64, a: u64) u64 {
+fn spanBytes(c: *const Config, li: usize, L: u64, p0: u64, a: u64, grouped: bool) u64 {
     const H: u64 = c.heads;
     const hd: u64 = c.head_dim;
     const w: u64 = c.window;
@@ -329,9 +340,9 @@ fn spanBytes(c: *const Config, li: usize, L: u64, p0: u64, a: u64) u64 {
         }
     }
     if (fusedHeads(c)) {
-        t.t(1, 20);
+        t.t(1, 28);
         t.t(2, 4);
-        t.t(1, ls * H * hd * act);
+        if (!grouped) t.t(1, ls * H * hd * act);
         return t.bytes;
     }
     // `attnCore`: f32 queries and keys, the logits over the window and the picks, the softmax, both products.
@@ -434,4 +445,13 @@ fn fp4Routed(c: *const Config, L: u64) u64 {
     t.t(1, n * D * act);
     t.t(1, L * D * act);
     return t.bytes;
+}
+
+test "dsv41 wide attention prices one grouped head buffer across prefill spans" {
+    const c = try cfg_mod.releaseStqForTest();
+    const rows = 8192;
+    const input_bytes = 2 * rows * (1280 + 512 + 64 * 512) * 2 + pool_class.page_bytes;
+    const head_bytes = rows * 64 * 512 * 2;
+    const projection_bytes = rows * (8 * 1024 + 5120) * 2;
+    try @import("std").testing.expectEqual(@as(u64, input_bytes + head_bytes + projection_bytes), attention(&c, 0, rows, 0));
 }
