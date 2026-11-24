@@ -5035,6 +5035,30 @@ const JoinedRows = struct {
     }
 };
 
+/// An Engram layer of a joined forward with an STQ table: every request's ids in one gather and one projection, in
+/// request order, the bytes each request's own lookup gives. Null where a request must take its own input.
+fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, li: usize, x: A) !?A {
+    const ei = m.cfg.engram.layerAt(li) orelse return null;
+    const e = &m.engrams[ei];
+    if (x.ctx == null or ps.len == 1 or e.wkv.stq == null or split_every_layer or
+        m.tap != null or m.profile != null or m.cfg.isDsparkTarget(li)) return null;
+
+    const cols = m.hash.?.cols();
+    const ids = try sc.a.alloc(u32, ps.len * cols);
+    defer sc.a.free(ids);
+    for (ps, 0..) |p, i| @memcpy(ids[i * cols ..][0..cols], p.rows[ei * cols ..][0..cols]);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const t0 = std.Io.Timestamp.now(io, .boot);
+    defer m.engram_wait_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
+    const table = blk: {
+        const rt = readStart();
+        defer readDone(.engram, rt);
+        break :blk try sc.keep(try e.table.gather(sc.a, ids, m.s));
+    };
+    return try engramApply(sc, m, e, x, table);
+}
+
 /// Layer `li` of a joined forward: each request's own input, then one block over all rows.
 fn buildLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *JoinedRows) !void {
     const gpa = m.gpa;
@@ -5051,7 +5075,9 @@ fn buildLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *Join
     }
     var x = rows.x;
     var pre = rows.pre;
-    if (x.ctx == null or layerTakesOwnInput(m, li)) {
+    if (try joinedEngram(&sc, m, ps, li, x)) |written| {
+        x = written;
+    } else if (x.ctx == null or layerTakesOwnInput(m, li)) {
         if (x.ctx != null) try rows.split(m, ps);
         const xs = try gpa.alloc(A, ps.len);
         defer gpa.free(xs);

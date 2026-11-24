@@ -4,6 +4,10 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **A fully resident DeepSeek load decodes several requests at once up to 8% faster with the same text**: the joined requests look up their Engram tables in one read instead of one each (M5 Ultra, 2.7bpw: 160 to 168 tok/s at 16 requests; one request unchanged).
+
 ## v1.7.4 — DeepSeek 2.7bpw for 256 GB Macs, and a faster DeepSeek
 
 - **DeepSeek-V4.1-Flash STQ 2.7bpw for 256 GB Macs**: `sushi pull deepseek-v4.1-flash:2.7bpw` fetches the 400 GB pack

@@ -556,6 +556,13 @@ then the shared head and the 16-part concatenate, then the wide-row correction; 
 - At 16 rows the base and the head+concat arms had 16 of 16 rows differ from solo (13 of 16 completions); the
   corrected arm matched every one of 8,273,920 logit bytes and all 16 completions. Dispatches at 16 rows: 8,666 to
   5,968 a step. Single-request decode unchanged (fast bench code 120.4 / 159.1, prose 64.8 / 82.6 tok/s at 4k / 8k).
+- **One Engram lookup for all joined requests** (`joinedEngram`, `4a63b634` on `9d01fb31`; `sushi-ubench run
+  dsv41.joined_decode`, 100 steps at 4,096 keys a request, one resident load an arm, A B B A, GPU lock, coordinator
+  QUIET, M5 Ultra): ms a step at 2 / 4 / 8 / 16 requests, 2.7bpw 20.67 / 30.67 / 51.12 / 94.73 to 20.49 / 30.07 /
+  49.58 / 87.62 (+0.9 / +2.0 / +3.1 / +8.1%), 1.75bpw 19.91 / 29.69 / 49.25 / 87.72 to 19.73 / 29.20 / 48.05 / 85.17
+  (+0.9 / +1.7 / +2.5 / +3.0%); dispatches 5,720 to 5,566 at 16; every width's logits equal solo. HTTP greedy wave,
+  2.7bpw: 93.4 / 123.4 / 148.1 / 160.1 to 94.0 / 125.4 / 152.2 / 167.6 tok/s; fast bench unchanged (code 128.1 / 166.0
+  to 128.3 / 166.2 at 4k / 8k). A 16-row step's GPU idle between command buffers is under 7% of its wall.
 - Ruled out: expert buckets of four (`dsv41.experts --arms fused`, 16 uniform rows: +5.6% on M5, +6.1% on M30; it saves
   ~4.7% only when every pick is in the hot group): two stays. Reusing unpacked attention keys across rows: -480
   dispatches at 16 rows, 100.3 against 99.9 ms.

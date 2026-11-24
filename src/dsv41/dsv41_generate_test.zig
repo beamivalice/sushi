@@ -5478,6 +5478,30 @@ test "dsv41 engine: requests joined as rows of one decode forward each get the b
     }
 }
 
+test "dsv41 engine: joined decode gathers each Engram table once across ragged requests (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const dsv = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    m.serves_rows = true;
+    var buf: [32]u32 = undefined;
+    const ids = fx.prompt(&buf);
+    var reqs: [4]dsv.Request = @splat(.{});
+    defer for (&reqs) |*r| r.deinit();
+    var segs: [reqs.len]dsv.Seg = undefined;
+    for (&reqs, 0..) |*r, i| {
+        _ = mlx.mlx_array_free(try forwardOn(&fx, r, ids[i .. 2 * i + 5]));
+        segs[reqs.len - 1 - i] = .{ .request = r, .ids = ids[2 * i + 5 ..][0..1] };
+    }
+    try testing.expect(m.engrams.len > 0);
+    const before = dsv.readsAt(.engram);
+    _ = mlx.mlx_array_free(try dsv41_serving.forwardRows(&fx.xfm, &segs));
+    try testing.expectEqual(@as(u64, m.engrams.len), dsv.readsAt(.engram) - before);
+}
+
 test "dsv41 engine: the widest joined head keeps every request's solo logits and next step (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
