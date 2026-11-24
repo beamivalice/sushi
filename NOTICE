@@ -374,6 +374,10 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * The DeepSeek-V4.1 fused attention kernel's matrix-unit arm (`dsv41_attn_nax` in `src/dsv41/dsv41_kernels.zig`: the
     `matmul2d` fragment helpers and the tiling of both products), from CommunityServe/plugins #6 by Samuel Reed (@STRML), MIT.
     Modifications: the epilogue store and the packed FP4 row load run on the fragment layout.
+  * The Hy4-Flash prefill attention core (`src/hy4flash/hy4_attn.zig`: the same fragment layout and tiling of both products,
+    keys the scores' left operand and the values' right operand, an f32 operand split into bf16 parts), after the
+    kernel above by Samuel Reed (@STRML), MIT. Modifications: Hy4's 576-wide key row whose first 512 channels are the
+    values, f32 queries split in three, row ranges and picks read where they lie, one simdgroup for the rope channels.
   * The DeepSeek-V4.1 DSpark copy round (`Index.matchBest`, `copyLen` and `CopyBackoff` in `src/mtp_lookup.zig`, the copy arm in
     `src/dsv41/dsv41_dspark.zig`), from CommunityServe/plugins #15 by Samuel Reed (@STRML), MIT. Modifications: the index and
     match code are the MTP lookup's, copies stop at eight verify rows, and the generator keeps the backoff per request.

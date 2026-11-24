@@ -2,13 +2,16 @@
 //! gate and `W_o` through trellis banks (the STQ pack's trunk) over a prefill chunk: one launch each per attention span
 //! against one over the chunk's whole spans (`hy4_forward.linearSpans`). Run by `sushi-ubench`, never by a test; the
 //! bytes of both arms are asserted by `hy4 attention spans` in `hy4_forward.zig`. `hy4.attn_core` times the attention
-//! core of one layer's chunk on Sushi Cooler's stream, as served (the per-span chain over kv8 keys, f32 products)
-//! against the GEMMs of its useful work and a read of the bytes it must read: the floor a fused kernel could near.
+//! core of one layer's chunk on Sushi Cooler's stream: the per-span op chain over kv8 keys at f32 products against the
+//! matrix-unit core (`hy4_attn`: the keys read to bf16 once, one launch a span), the GEMMs of its useful work and a
+//! read of the bytes it must read.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const Ops = @import("../mlx_ops.zig").Ops;
 const kv_quant = @import("../kv_quant.zig");
 const fwd = @import("hy4_forward.zig");
+const hy4_latent = @import("hy4_latent.zig");
+const hy4_attn = @import("hy4_attn.zig");
 const report = @import("../ubench_report.zig");
 const api = @import("sushi_exl3");
 const bench = @import("sushi_exl3_ubench").bench_util;
@@ -176,7 +179,7 @@ fn listed(values: []const []const u8, name: []const u8) bool {
     return false;
 }
 
-// ---- hy4.attn_core: one layer's attention core over a prefill chunk, served against its floor ----
+// ---- hy4.attn_core: one layer's attention core over a prefill chunk, the chain and the core against their floor ----
 
 const nope = 192;
 const rope = 64;
@@ -197,15 +200,15 @@ const CORE_KINDS = [_]CoreKind{
 pub const attn_core: report.Bench = .{
     .name = "hy4.attn_core",
     .scope = .hy4,
-    .what = "one layer's attention core over a prefill chunk ending at 32K keys, on Sushi Cooler's stream at f32 (dk 576, dv 512, absorbed): the served per-span chain over kv8 keys (sliding: 256-row spans over S + 511 keys; gathered: 32-row spans, each row its 2,048 picked keys), against its useful work as four batched GEMMs (f32 and bf16) and a read of the bytes it must read; ms per layer",
+    .what = "one layer's attention core over a prefill chunk ending at 32K keys, on Sushi Cooler's stream at f32 (dk 576, dv 512, absorbed): the per-span op chain over kv8 keys (sliding: 256-row spans over S + 511 keys; gathered: 32-row spans, each row its 2,048 picked keys) against the matrix-unit core over the same spans (the kv8 keys read to bf16 once a layer), their useful work as four batched GEMMs (f32 and bf16) and a read of the bytes it must read; ms per layer",
     .unit = .us,
     .steps = 2,
     .axes = &.{
         .{ .name = "kind", .values = &.{ "sliding", "gathered" }, .numeric = false },
         .{ .name = "rows", .values = &.{ "1024", "4096" } },
     },
-    .arms = &.{ "served", "gemm_f32", "gemm_bf16", "read" },
-    .ref = "served",
+    .arms = &.{ "chain", "fused", "gemm_f32", "gemm_bf16", "read" },
+    .ref = "chain",
     .run = runAttnCore,
 };
 
@@ -213,7 +216,7 @@ const CoreCtx = struct {
     s: mlx.mlx_stream,
     kind: CoreKind,
     rows: c_int,
-    /// The served chain's inputs: the queries [H, T, 256] f32, the keys as the state stores them (kv8 codes, scales,
+    /// The chain's and the core's inputs: the queries [H, T, 256] f32, the keys as the state stores them (kv8 codes, scales,
     /// biases; rope rows BF16), the gate rows, kv_b and its widening, the sinks; a gathered layer's picks.
     q: Arr,
     codes: Arr,
@@ -231,15 +234,15 @@ const CoreCtx = struct {
     g: [2][6]Arr,
     /// The read arm's buffer, the bytes a fused kernel must read and write once.
     floor: Arr,
-    link_ns: [4]f64 = @splat(0),
+    link_ns: [5]f64 = @splat(0),
 };
 
 fn keysOf(c: *const CoreCtx) c_int {
     return if (c.kind.gathered) picks else window;
 }
 
-/// The served chain over the chunk, span by span, as `hy4_model.attendSpan` runs it.
-fn served(c: *const CoreCtx, s: mlx.mlx_stream, q: Arr) !Arr {
+/// The chain over the chunk, span by span, as `hy4_model.attendSpan` runs it where the core is off.
+fn chain(c: *const CoreCtx, s: mlx.mlx_stream, q: Arr) !Arr {
     var outer: Ops = .{ .s = s };
     defer outer.deinit();
     var parts: [128]Arr = undefined;
@@ -263,6 +266,38 @@ fn served(c: *const CoreCtx, s: mlx.mlx_stream, q: Arr) !Arr {
             break :blk try fwd.attendGated(&o, in, qs, lat, try o.slice(c.k_pe, 0, r0, k1), c.attn, c.geo, try fwd.causalMask(&o, rows, k1 - r0, window - 1, window), null);
         };
         parts[n] = try outer.own(try o.result(y));
+        n += 1;
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const vec = mlx.mlx_vector_array_new_data(&parts, n);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 0, s));
+    return out;
+}
+
+/// The matrix-unit core over the same spans: the layer's kv8 rows read to bf16 once, then a launch a span.
+fn fused(c: *const CoreCtx, s: mlx.mlx_stream, q: Arr) !Arr {
+    var outer: Ops = .{ .s = s };
+    defer outer.deinit();
+    var parts: [128]Arr = undefined;
+    var n: usize = 0;
+    const keys: hy4_attn.Keys = .{
+        .c = try outer.own(try hy4_latent.rangeBf16(s, c.codes, c.scales, c.biases, 64)),
+        .k_pe = c.k_pe,
+    };
+    var r0: c_int = 0;
+    while (r0 < c.rows) : (r0 += c.kind.span) {
+        const r1 = @min(c.rows, r0 + c.kind.span);
+        var o: Ops = .{ .s = s };
+        defer o.deinit();
+        const qs = try o.slice(q, 1, r0, r1);
+        const in: fwd.SpanIn = .{ .gate = try o.slice(c.gate, 0, r0, r1), .kv_b32 = c.kv_b32 };
+        const core: fwd.CoreKeys = if (c.kind.gathered)
+            .{ .picks = .{ .keys = keys, .rows = try o.reshape(try o.slice(c.flat, 0, r0 * picks, r1 * picks), &.{ r1 - r0, picks }), .keep = try o.slice(c.keep, 0, r0, r1) } }
+        else
+            .{ .range = .{ .keys = .{ .c = try o.slice(keys.c, 0, r0, r1 + window - 1), .k_pe = try o.slice(keys.k_pe, 0, r0, r1 + window - 1) }, .p0 = window - 1, .window = window } };
+        parts[n] = try outer.own(try o.result(try fwd.attendCoreGated(&o, in, qs, core, c.attn, c.geo, null)));
         n += 1;
     }
     var out = mlx.mlx_array_new();
@@ -297,9 +332,10 @@ const CoreArm = struct { c: *const CoreCtx, arm: usize };
 
 fn coreStep(ac: CoreArm, s: mlx.mlx_stream, _: usize, x: Arr) anyerror!Arr {
     return switch (ac.arm) {
-        0 => served(ac.c, s, x),
-        1, 2 => blk: {
-            var g = ac.c.g[ac.arm - 1];
+        0 => chain(ac.c, s, x),
+        1 => fused(ac.c, s, x),
+        2, 3 => blk: {
+            var g = ac.c.g[ac.arm - 2];
             g[0] = x;
             break :blk gemms(g, s);
         },
@@ -314,8 +350,8 @@ fn coreStep(ac: CoreArm, s: mlx.mlx_stream, _: usize, x: Arr) anyerror!Arr {
 
 fn armInput(c: *const CoreCtx, arm: usize) Arr {
     return switch (arm) {
-        0 => c.q,
-        1, 2 => c.g[arm - 1][0],
+        0, 1 => c.q,
+        2, 3 => c.g[arm - 2][0],
         else => c.floor,
     };
 }
@@ -408,7 +444,7 @@ fn runAttnCore(run: *report.Run) anyerror!void {
             c.floor = try o.own(try hostArr(a, rnd, &.{@intCast(bytes / 4)}, .float32, 1));
             try mlx.check(mlx.mlx_array_eval(c.kv_b32));
             const steps = run.steps(2);
-            for (0..4) |arm| {
+            for (0..5) |arm| {
                 var t: [5]u64 = undefined;
                 for (&t) |*v| v.* = try bench.chainNs(s, armInput(&c, arm), steps, {}, bench.linkOnly);
                 c.link_ns[arm] = bench.median(&t);
@@ -416,7 +452,7 @@ fn runAttnCore(run: *report.Run) anyerror!void {
             const label = try std.fmt.allocPrint(run.a, "{s} H{d} rows {d} keys {d}", .{ kind.name, h, rows, k });
             try run.interleave(label, CoreSample{ .c = &c, .steps = steps }, coreSample);
             const flop: f64 = 2.0 * @as(f64, @floatFromInt(h)) * @as(f64, @floatFromInt(rows)) * (@as(f64, nope * latent) + @as(f64, @floatFromInt(k)) * (latent + rope + latent) + @as(f64, latent * v_dim));
-            for ([_][]const u8{ "served", "gemm_f32", "gemm_bf16" }) |arm| {
+            for ([_][]const u8{ "chain", "fused", "gemm_f32", "gemm_bf16" }) |arm| {
                 if (run.hasArm(arm)) try run.metric(arm, "TFLOP/s", "useful TFLOP/s", flop / run.lastMedianNs(arm) / 1e3);
             }
             if (run.hasArm("read")) try run.metric("read", "GB/s", "GB/s", @as(f64, @floatFromInt(bytes)) / run.lastMedianNs("read"));

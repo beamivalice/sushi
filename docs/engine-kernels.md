@@ -256,6 +256,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   1.6-1.7 to 1.5-1.6 ms (span 256), 0.9-1.0 to 0.9 (span 128), the same heads byte for byte (64 rows x 64 heads x 512 in f32,
   512 picks with gaps, compared at the landing).
   The trial is the probe-and-decline pattern above: a failed one is recorded by not setting the arm, never re-run per call. A Metal type name (`half`) as a loop variable fails the JIT compile and surfaces only as a failed test.
+- `hy4_attn` (Hy4-Flash's wide-span core, `src/hy4flash/hy4_attn.zig`) is that tiling on a 576-wide key row whose first 512
+  channels are the values: 8 simdgroups own 64 latent channels (one affine group) and a ninth the 64 rope channels, 16
+  heads a threadgroup (a layer's heads padded to a block), a row a threadgroup, 32 keys a tile and two barriers. The query
+  is f32 and the keys bf16, so the scores split the query into three bf16 parts (f32's range and 24 bits) and the value
+  sum splits P, which sits in [0, 1], into two. A
+  split's error is the kernel's error: two bf16 parts (2^-18) sat 4 to 10 times off the f64 truth beyond the op chain's,
+  and a model amplified it (a tiny's logits KL 1e-2 to 1e-1 off the chain's); `hy4 attn` holds the heads to the truth,
+  not to the chain. **An f16 part never carries an activation**: an f16 low part of the query (times 512) overflows at
+  |q| of 32,752, the absorbed query reaches it, and the head silently collapses onto its sink (finite: the softmax
+  starts at the sink), which put the real pack's KLD 16.7% over the chain's while every synthetic cell passed. The
+  kernel is bound by its matrix-unit passes: P at two parts instead of three is 6.4% less prefill time a chunk. Dequantizing a kv8 key row inside the kernel
+  costs more than its dot (a layer's 2,048 picks a row: 35 ms against 17): the store is read to bf16 once a layer
+  and chunk (`hy4_latent.rangeBf16`) and picks index into that copy.
 - Both kernels take an `Epilogue` (`attnEpilogueFits`: head width a multiple of 256): the store does what `attnOut` did to the
   heads, in the same order, so the bytes are the op chain's: round to the activation dtype, the tail's inverse rotation
   (`ropeTail`'s math, `meta[4] + row` the position), the fp8 / 32 / ue8m0 round trip over each 32 channels (four lanes of
@@ -313,6 +326,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   time (`project_rows.dyn_rows`: two pipelines, at eight rows and at the cap, past eight decided at compile time on the
   first); a plain group's total, its row count, stays a template value, since the warm joins every count and a run-time
   count costs a plain tick about 3%.
+- **The engine cuts a Metal compile error at 400 characters** (`tensor/route.zig`), the source line it names long gone:
+  assemble the kernel's source into a `[[kernel]]` wrapper and compile it offline with
+  `xcrun -sdk macosx metal -std=metal4.0 -c`, which names the line. A Zig `\\` string joins its lines with no final
+  newline, so a `#define` or `#pragma` at a snippet's end swallows the next snippet's first line: join snippets with `"\n"`.
 - **A cooperative-tensor template arg is `metal::remove_addrspace_t<decltype(t)>`**, never `decltype(t)` (the
   macOS 27 MPP header rejects the `thread` qualifier).
 - Metal JIT-compiles at first EVAL, not at apply, so an optional NAX arm is PROBED on a one-tile problem before it

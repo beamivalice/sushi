@@ -16,6 +16,7 @@ const row_store = @import("../row_store.zig");
 const fwd = @import("hy4_forward.zig");
 const hy4_config = @import("hy4_config.zig");
 const hy4_latent = @import("hy4_latent.zig");
+const hy4_attn = @import("hy4_attn.zig");
 const hy4_stq = @import("hy4_stq.zig");
 const exl3 = @import("sushi_exl3");
 const Arr = mlx.mlx_array;
@@ -938,7 +939,7 @@ pub const Model = struct {
     /// Rows `r0..r1` of the chunk's gated attention (`fwd.attendGated`), over the keys they read: a sliding row its
     /// window, a sparse row every key up to the selection threshold and its recalled groups' rows past it (`pooled` is
     /// then the layer's pooled keys). `in` holds the chunk's gate rows.
-    fn attendSpan(self: *Model, o: *Ops, l: usize, x: Arr, p: fwd.Projected, in: fwd.SpanIn, pooled: ?Arr, win: *LayerState, r0: c_int, r1: c_int, n: c_int, p0: c_int, tap: ?fwd.At) !Arr {
+    fn attendSpan(self: *Model, o: *Ops, l: usize, x: Arr, p: fwd.Projected, in: fwd.SpanIn, pooled: ?Arr, win: *LayerState, core_keys: ?hy4_attn.Keys, r0: c_int, r1: c_int, n: c_int, p0: c_int, tap: ?fwd.At) !Arr {
         const L = &self.layers[l];
         const st = &self.state[l];
         const rows = r1 - r0;
@@ -946,6 +947,7 @@ pub const Model = struct {
         const last = p0 + r1; // keys past the span's last row are never read
         const qs = try o.slice(p.q, 1, r0, r1);
         const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left };
+        if (core_keys) |ck| if (rows > fwd.verify_rows_max) return self.attendSpanCore(o, l, x, p, sin, qs, pooled, ck, win.base, r0, r1, n, p0, tap);
         if (L.indexer) |iw| {
             const ig = self.indexerGeometry();
             var keys = self.sparseKeys(st);
@@ -975,6 +977,58 @@ pub const Model = struct {
         const pe_win = try o.slice(win.k_pe.?, 0, s0 - win.base, last - win.base);
         if (fwd.isVerifyBlock(rows)) return fwd.attendGatedRing(o, sin, qs, c_win, pe_win, L.attn, L.geometry, at - s0, w, at, tap);
         return fwd.attendGatedCausal(o, sin, qs, c_win, pe_win, L.attn, L.geometry, at - s0, w, tap);
+    }
+
+    /// `attendSpan`'s rows in the matrix-unit core (`hy4_attn`) over `ck`, the chunk's keys at the dequantize's width
+    /// (`coreKeys`, whose first row is position `base` on a sliding layer): the same keys each row reads in the chain, and
+    /// on a sparse layer past its selection the picks read from the layer's rows where they lie.
+    fn attendSpanCore(self: *Model, o: *Ops, l: usize, x: Arr, p: fwd.Projected, sin: fwd.SpanIn, qs: Arr, pooled: ?Arr, ck: hy4_attn.Keys, base: c_int, r0: c_int, r1: c_int, n: c_int, p0: c_int, tap: ?fwd.At) !Arr {
+        const L = &self.layers[l];
+        const at = p0 + r0;
+        const last = p0 + r1; // keys past the span's last row are never read
+        if (L.indexer) |iw| {
+            const ig = self.indexerGeometry();
+            const thr = ig.group_topk * ig.ratio;
+            const all = pooled orelse return fwd.attendCoreGated(o, sin, qs, .{ .range = .{ .keys = try self.keysTo(o, ck, 0, last), .p0 = at, .window = 0 } }, L.attn, L.geometry, tap);
+            if (last <= thr) return fwd.attendCoreGated(o, sin, qs, .{ .range = .{ .keys = try self.keysTo(o, ck, 0, last), .p0 = at, .window = 0 } }, L.attn, L.geometry, tap);
+            if (at < thr) {
+                const cut = thr - at;
+                const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0 + cut, r1), try o.slice(p.q_resid, 0, r0 + cut, r1), all, iw, ig, thr, n);
+                if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
+                return fwd.attendCoreGated(o, sin, qs, .{ .straddle = .{ .cut = cut, .range = .{ .keys = try self.keysTo(o, ck, 0, thr), .p0 = at, .window = 0 }, .picks = .{ .keys = ck, .rows = sel.rows, .keep = sel.keep } } }, L.attn, L.geometry, tap);
+            }
+            const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
+            if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
+            return fwd.attendCoreGated(o, sin, qs, .{ .picks = .{ .keys = ck, .rows = sel.rows, .keep = sel.keep } }, L.attn, L.geometry, tap);
+        }
+        const w: c_int = @intCast(self.config.window);
+        const s0: c_int = @max(0, at - w + 1);
+        return fwd.attendCoreGated(o, sin, qs, .{ .range = .{ .keys = try self.keysTo(o, ck, s0 - base, last - base), .p0 = at - s0, .window = w } }, L.attn, L.geometry, tap);
+    }
+
+    /// Rows `start..end` of `ck`.
+    fn keysTo(_: *Model, o: *Ops, ck: hy4_attn.Keys, start: c_int, end: c_int) !hy4_attn.Keys {
+        return .{ .c = try o.slice(ck.c, 0, start, end), .k_pe = try o.slice(ck.k_pe, 0, start, end) };
+    }
+
+    /// The keys a chunk's wide spans read in the matrix-unit core, held by `keep`: a sliding layer's window rows (`win`,
+    /// the ring's rows then the chunk's own) or a sparse layer's rows to the chunk's end, the latent at the dequantize's
+    /// width (BF16 as stored, or kv8 read to BF16 once for every span).
+    fn coreKeys(self: *Model, keep: *Ops, L: *const Layer, st: *const LayerState, win: *const LayerState) !hy4_attn.Keys {
+        var o: Ops = .{ .s = self.s };
+        defer o.deinit();
+        const keys: LayerState = if (L.indexer == null) win.* else self.sparseKeys(st);
+        const rows: c_int = if (L.indexer == null) mlx.getShape(win.k_pe.?)[0] else @intCast(st.rows.?.used);
+        const c = try o.slice(keys.c.?, 0, 0, rows);
+        const pe = try o.slice(keys.k_pe.?, 0, 0, rows);
+        if (self.kv.scheme == .off) return .{ .c = try keep.own(try o.result(c)), .k_pe = try keep.own(try o.result(pe)) };
+        const sc = try o.slice(keys.c_scales.?, 0, 0, rows);
+        const bi = try o.slice(keys.c_biases.?, 0, 0, rows);
+        const wide = if (hy4_latent.rangeApplies(o.s, c, sc, bi, self.kv.group_size, self.kv.bits))
+            try o.own(try hy4_latent.rangeBf16(o.s, c, sc, bi, self.kv.group_size))
+        else
+            try o.own(try kv_quant.dequantizeAffine(o.s, c, sc, bi, self.kv.group_size, self.kv.bits));
+        return .{ .c = try keep.own(try o.result(wide)), .k_pe = try keep.own(try o.result(pe)) };
     }
 
     /// Appends the new rows' latent `c` [T, latent] at the request's width (BF16, or affine-quantized in groups along the
@@ -1908,6 +1962,8 @@ pub const Model = struct {
                 win.unordered = true;
             } else win = try self.windowKeys(&keep, st, &fresh, p0);
         }
+        // The keys a wide span's matrix-unit core reads, at the dequantize's width, made once for the chunk's spans.
+        const core_keys: ?hy4_attn.Keys = if (fwd.coreServes(self.s, L.attn, L.geometry, t)) try self.coreKeys(&keep, L, st, &win) else null;
         // Phase 2: attention a span of rows at a time, each in a scope of its own over only the keys it reads. The gate
         // and the spans' gated rows are held until W_o has read them; W_kvb is widened once for every span.
         const span = if (pooled != null) @min(self.span_rows, gathered_span) else self.span_rows;
@@ -1951,7 +2007,7 @@ pub const Model = struct {
             const r1 = @min(t, r0 + span);
             var so: Ops = .{ .s = self.s };
             defer so.deinit();
-            const rows_out = try self.attendSpan(&so, l, x, p, in, pooled, &win, r0, r1, n, p0, at);
+            const rows_out = try self.attendSpan(&so, l, x, p, in, pooled, &win, core_keys, r0, r1, n, p0, at);
             count += 1;
             const b = rows_block orelse {
                 spans[count - 1] = try held.own(try so.result(rows_out));

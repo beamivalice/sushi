@@ -36,6 +36,7 @@ pub const tests = .{
     @import("hy4_index.zig"),
     @import("hy4_front.zig"),
     @import("hy4_latent.zig"),
+    @import("hy4_attn.zig"),
     @import("hy4_repack_test.zig"),
     @import("hy4_plan.zig"),
     @import("hy4_plan_test.zig"),

@@ -1,6 +1,7 @@
 //! A layer's stored kv8 latent rows read to f32 in one launch: a row range (`range`) or picked rows (`gather`) of
 //! the codes, scales and biases, each value `bfloat16_t(scale * code + bias)` as MLX's affine dequantize computes it at
 //! bits 8, then widened to f32, so the bytes are those of the dequantize, the take and the cast it replaces.
+//! `rangeBf16` leaves the rows at the dequantize's own width.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const mlx_pages = @import("../mlx_pages.zig");
@@ -23,23 +24,42 @@ const source: [:0]const u8 =
     \\*dst = float4(float(v0), float(v1), float(v2), float(v3));
 ;
 
-var kernel: ?mlx.mlx_fast_metal_kernel = null;
+/// The range read's rows left as the dequantize gives them: four BF16 values a thread.
+const source_bf16: [:0]const u8 =
+    \\uint col_w = thread_position_in_grid.x;
+    \\uint out_row = thread_position_in_grid.y;
+    \\uint32_t word = q[size_t(out_row) * size_t(q_strides[0]) + size_t(col_w) * size_t(q_strides[1])];
+    \\uint g = col_w / uint(GS_WORDS);
+    \\bfloat16_t scale = scales[size_t(out_row) * size_t(scales_strides[0]) + size_t(g) * size_t(scales_strides[1])];
+    \\bfloat16_t bias = biases[size_t(out_row) * size_t(biases_strides[0]) + size_t(g) * size_t(biases_strides[1])];
+    \\bfloat16_t v0 = scale * uint8_t(word & 0xffu) + bias;
+    \\bfloat16_t v1 = scale * uint8_t((word >> 8) & 0xffu) + bias;
+    \\bfloat16_t v2 = scale * uint8_t((word >> 16) & 0xffu) + bias;
+    \\bfloat16_t v3 = scale * uint8_t((word >> 24) & 0xffu) + bias;
+    \\device bfloat16_t* dst = out + (size_t(out_row) * size_t(WORDS) + size_t(col_w)) * 4;
+    \\dst[0] = v0; dst[1] = v1; dst[2] = v2; dst[3] = v3;
+;
 
-fn getKernel() !mlx.mlx_fast_metal_kernel {
-    if (kernel) |k| return k;
+var kernel: ?mlx.mlx_fast_metal_kernel = null;
+var kernel_bf16: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getKernel(bf16_out: bool) !mlx.mlx_fast_metal_kernel {
+    if (bf16_out) {
+        if (kernel_bf16) |k| return k;
+    } else if (kernel) |k| return k;
     const ins = [_][*:0]const u8{ "q", "scales", "biases", "idx" };
     const outs = [_][*:0]const u8{"out"};
-    const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    const iv = mlx.mlx_vector_string_new_data(&ins, if (bf16_out) ins.len - 1 else ins.len);
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_hy4_latent_read", iv, ov, source, "", false, false);
+    const k = mlx.mlx_fast_metal_kernel_new(if (bf16_out) "sushi_hy4_latent_read_bf16" else "sushi_hy4_latent_read", iv, ov, if (bf16_out) source_bf16 else source, "", false, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
-    kernel = k;
+    if (bf16_out) kernel_bf16 = k else kernel = k;
     return k;
 }
 
-const Key = struct { gather: bool, rows: c_int, words: c_int, gs_words: c_int, idx_dt: mlx.mlx_dtype };
+const Key = struct { gather: bool, rows: c_int, words: c_int, gs_words: c_int, idx_dt: mlx.mlx_dtype, bf16_out: bool = false };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(k: Key) !kcfg.Config {
@@ -47,7 +67,7 @@ fn build(k: Key) !kcfg.Config {
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const tg_x: c_int = @min(k.words, 128);
     const tg_y: c_int = @min(k.rows, @divTrunc(256, tg_x));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, k.words * 4 }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, k.words * 4 }, 2, if (k.bf16_out) .bfloat16 else .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.words, k.rows, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg_x, tg_y, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "GATHER", k.gather));
@@ -81,16 +101,16 @@ pub fn gatherApplies(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: A
     return is.len == 1 and is[0] > 0 and (dt == .uint32 or dt == .int32);
 }
 
-fn launch(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: Arr, gather_on: bool, rows: c_int, group_size: u32) !Arr {
+fn launch(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: Arr, gather_on: bool, rows: c_int, group_size: u32, bf16_out: bool) !Arr {
     const words = mlx.getShape(q)[1];
     const gs_words: c_int = @intCast(group_size / 4);
-    const cfg = try cfgs.get(.{ .gather = gather_on, .rows = rows, .words = words, .gs_words = gs_words, .idx_dt = mlx.mlx_array_dtype(idx) }, build);
+    const cfg = try cfgs.get(.{ .gather = gather_on, .rows = rows, .words = words, .gs_words = gs_words, .idx_dt = mlx.mlx_array_dtype(idx), .bf16_out = bf16_out }, build);
     const ins = [_]Arr{ q, scales, biases, idx };
-    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    const iv = mlx.mlx_vector_array_new_data(&ins, if (bf16_out) ins.len - 1 else ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try getKernel(), iv, cfg, s));
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try getKernel(bf16_out), iv, cfg, s));
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
@@ -99,12 +119,17 @@ fn launch(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: Arr, gather_
 
 /// Every stored row of the parts, dequantized and widened: [rows, width] f32. The caller frees it.
 pub fn range(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, group_size: u32) !Arr {
-    return launch(s, q, scales, biases, q, false, mlx.getShape(q)[0], group_size);
+    return launch(s, q, scales, biases, q, false, mlx.getShape(q)[0], group_size, false);
+}
+
+/// `range` left at the dequantize's own width: [rows, width] BF16, the values `range` widens. The caller frees it.
+pub fn rangeBf16(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, group_size: u32) !Arr {
+    return launch(s, q, scales, biases, q, false, mlx.getShape(q)[0], group_size, true);
 }
 
 /// The rows `idx` picks, in its order (repeats allowed), dequantized and widened. The caller frees it.
 pub fn gather(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: Arr, group_size: u32) !Arr {
-    return launch(s, q, scales, biases, idx, true, mlx.getShape(idx)[0], group_size);
+    return launch(s, q, scales, biases, idx, true, mlx.getShape(idx)[0], group_size, false);
 }
 
 /// The most rows one `append` writes (a verify block).
@@ -227,7 +252,7 @@ fn bytesOf(o: *Ops, a: Arr) ![]const u8 {
     return std.mem.sliceAsBytes((mlx.mlx_array_data_float32(c) orelse return error.HostRead)[0..mlx.mlx_array_size(c)]);
 }
 
-test "hy4 latent read: kv8 store range and gather match MLX affine dequantize plus f32 cast byte for byte at width 512, 1 and 2048 rows" {
+test "hy4 latent read: kv8 store range (f32 and bf16) and gather match MLX affine dequantize plus its cast byte for byte at width 512, 1 and 2048 rows" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
@@ -281,10 +306,14 @@ test "hy4 latent read: kv8 store range and gather match MLX affine dequantize pl
         const cs = try o.slice(q_buf, 0, rng_pair[0], rng_pair[1]);
         const ss = try o.slice(s_buf, 0, rng_pair[0], rng_pair[1]);
         const bs = try o.slice(b_buf, 0, rng_pair[0], rng_pair[1]);
-        const want = try o.cast(try o.own(try kv_quant.dequantizeAffine(es, cs, ss, bs, 64, 8)), .float32);
+        const deq = try o.own(try kv_quant.dequantizeAffine(es, cs, ss, bs, 64, 8));
+        const want = try o.cast(deq, .float32);
         try testing.expect(rangeApplies(es, cs, ss, bs, 64, 8));
         const got = try o.own(try range(es, cs, ss, bs, 64));
         try testing.expectEqualSlices(u8, try bytesOf(&o, want), try bytesOf(&o, got));
+        // The same rows left at the dequantize's own width.
+        const got_bf = try o.own(try rangeBf16(es, cs, ss, bs, 64));
+        try testing.expectEqualSlices(u8, try rawBytesOf(&o, deq), try rawBytesOf(&o, got_bf));
     }
 
     for ([_]usize{ 1, 2048 }) |n_pick| {

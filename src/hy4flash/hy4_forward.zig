@@ -10,6 +10,7 @@ const Arr = mlx.mlx_array;
 const hy4_stq = @import("hy4_stq.zig");
 const expert_mv = @import("hy4_expert_mv.zig");
 const hy4_absorb = @import("hy4_absorb.zig");
+const hy4_attn = @import("hy4_attn.zig");
 const hy4_rope = @import("hy4_rope.zig");
 const hy4_norm = @import("hy4_norm.zig");
 const hy4_chain = @import("hy4_chain.zig");
@@ -985,7 +986,7 @@ pub fn attendGatedRing(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, 
 }
 
 /// The mask an attention core reads: an additive or boolean array, or the causal mask by positions.
-const MaskSpec = union(enum) {
+pub const MaskSpec = union(enum) {
     array: Arr,
     causal: struct { p0: c_int, window: c_int, ring_p0: ?c_int = null },
 };
@@ -1006,7 +1007,7 @@ fn attendGatedMask(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: A
     return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left);
 }
 
-fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask_spec: MaskSpec) !Arr {
+pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask_spec: MaskSpec) !Arr {
     const t = mlx.getShape(q_lat)[1];
     const n = mlx.getShape(c)[0];
     const own_stream = mlx.engine.isStream(o.s);
@@ -1153,7 +1154,7 @@ pub fn attendStraddleGated(o: *Ops, in: SpanIn, q: Arr, cut: c_int, c: Arr, k_pe
     return gatedOut(o, in.gate, try o.concat(&.{ u_d, u_g }, 1), ab.w_v, w, g, at, in.whole, in.o_left);
 }
 
-fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry) !Arr {
+pub fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry) !Arr {
     const t = mlx.getShape(q_lat_h)[1];
     const sel = selectedWidth(keep);
     const c_g = try o.reshape(try o.cast(c_g_flat, .float32), &.{ t, sel, g.latent }); // [T, S, latent]
@@ -1221,6 +1222,59 @@ fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: Arr,
         };
         break :blk try o.transpose(try o.binary(.mm, p, c_g), &.{ 1, 0, 2 });
     };
+}
+
+/// Whether a GPU stream runs a wide span's attention core (scores, sink softmax, value sum) as one launch on the matrix
+/// units (`hy4_attn`) rather than as the op chain. A test seam: the two agree to f32 rounding, not byte for byte.
+pub var core_kernel_on = true;
+
+/// Whether `hy4_attn` serves a span of `rows` rows of a layer with `w` and `g`: a wide span only, so a decode row and a
+/// verify block (2..8 rows) never reach it and keep the chain's bytes.
+pub fn coreServes(s: mlx.mlx_stream, w: Attn, g: AttnGeometry, rows: c_int) bool {
+    return core_kernel_on and rows > verify_rows_max and hy4_attn.fits(s, g.heads, g.latent, g.rope, w.sinks);
+}
+
+/// Where a wide span's keys are, as `hy4_attn` reads them: rows over a range of key rows, rows over their own picks of
+/// the layer's rows, or a span that straddles the selection threshold: its first `cut` rows over a range, the rest over
+/// their picks.
+pub const CoreKeys = union(enum) {
+    range: CoreRange,
+    picks: CorePicks,
+    straddle: struct { cut: c_int, range: CoreRange, picks: CorePicks },
+};
+
+/// Row `i` of the span (position `p0 + i` among `keys`) reads `keys` from `max(0, pos - window + 1)` to `pos`, or from
+/// the first when `window` is 0.
+pub const CoreRange = struct { keys: hy4_attn.Keys, p0: c_int, window: c_int };
+
+/// Row `i` reads `keys` at `rows[i, :]` where `keep[i, :]` (`recalledRows`' rows and keep mask).
+pub const CorePicks = struct { keys: hy4_attn.Keys, rows: Arr, keep: Arr };
+
+/// `attendGated` with the core as `hy4_attn`'s launch over `core`'s keys.
+pub fn attendCoreGated(o: *Ops, in: SpanIn, q: Arr, core: CoreKeys, w: Attn, g: AttnGeometry, at: ?At) !Arr {
+    const ab = try absorb(o, q, w, g, in.kv_b32);
+    const u_lat = try coreLatent(o, ab, core, w, g);
+    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left);
+}
+
+/// The attended latent [H, T, latent] of the absorbed query `ab` over `core`.
+fn coreLatent(o: *Ops, ab: Absorbed, core: CoreKeys, w: Attn, g: AttnGeometry) !Arr {
+    const q: hy4_attn.Query = .{ .lat = ab.q_lat, .pe = ab.q_pe };
+    const t = mlx.getShape(ab.q_lat)[1];
+    const scale = scaleOf(g);
+    switch (core) {
+        inline .range, .picks => |c| if (!hy4_attn.applies(o.s, q, c.keys, w.sinks)) return error.Hy4CoreRefused,
+        .straddle => |sg| if (!hy4_attn.applies(o.s, q, sg.range.keys, w.sinks) or !hy4_attn.applies(o.s, q, sg.picks.keys, w.sinks)) return error.Hy4CoreRefused,
+    }
+    switch (core) {
+        .range => |r| return o.own(try hy4_attn.range(o.s, q, r.keys, w.sinks, scale, r.p0, r.window, 0, t)),
+        .picks => |p| return o.own(try hy4_attn.picks(o.s, q, p.keys, p.rows, p.keep, w.sinks, scale, 0)),
+        .straddle => |sg| {
+            const dense = try o.own(try hy4_attn.range(o.s, q, sg.range.keys, w.sinks, scale, sg.range.p0, sg.range.window, 0, sg.cut));
+            const picked = try o.own(try hy4_attn.picks(o.s, q, sg.picks.keys, sg.picks.rows, sg.picks.keep, w.sinks, scale, sg.cut));
+            return o.concat(&.{ dense, picked }, 1);
+        },
+    }
 }
 
 /// The key rows a row reads past the selection threshold (`recalledRows`): the second axis of its rows or keep mask.

@@ -226,8 +226,9 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     not the casts around MLX's BF16 `gemv`.
   - A decode row's absorbed products (`hy4_absorb`) read the query's nope part in place (template `QS`, the row's
     width) and keep their launch configs; their grid's y takes a block's rows, each its one-row launch's bytes.
-  - The attention core is DeepSeek's window-and-picks kernel family (online f32 softmax with a sink, picked rows read
-    by index), given a K row wider than its V prefix and no inverse-rotation fold ([R5](#r5)).
+  - The attention core of a wide span (more than 8 rows, on an M5) is `hy4_attn`, one launch a span on the matrix units
+    ([R5](#r5)): the scores over the 576-wide key row, the sink softmax in f32, the value sum over its first 512
+    channels. A decode row and a verify block (2..8 rows) never reach it: they keep the op chain's bytes.
   - GLM's absorbed MLA (`glm5_attention.zig`) is the same math, but on MLX only.
 - **The composed forward's spans** (`hy4_model.layerFront`):
   - A chunk's attention runs in spans of `attn_span` (256) rows, `gathered_span` (32) on a sparse layer past its
@@ -246,6 +247,10 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     rows arm, so they launch as they stand.
     The rows arm takes a width as a template value, so a short last span's one to eight rows through a bank's gate and
     `W_o` are made at load (`warmSpanTails`); a width past the arm shares the GEMM's pipelines (`hy4 late` cells).
+  - A wide span's core reads its keys where they are held, not gathered per span: a sliding layer's window rows, and a
+    sparse layer's rows to the chunk's end, are read from kv8 to BF16 once a layer and chunk (`hy4_latent.rangeBf16`;
+    the region the load measures at its deepest reach holds the copy), and a row's picks are read from that copy by index in the kernel, never copied
+    (the chain gathered 2,048 rows a row, widened to f32, 134 MB a 32-row span).
   - Pinned by `hy4 attention spans`: at the release's gate and `W_o` shapes (trellis K4 and BF16, spans of 256 and
     32, short last spans), and on the tiny's BF16 and STQ trunks against the per-span order (`fwd.spans_share`, a
     test seam), byte for byte over windowed, gathered and decode rows. The tiny's logits also matched the parent
@@ -938,13 +943,28 @@ seam is generalized first, as its own part, with every existing arch's bytes, bi
     576-wide K whose first 512 are V, with no fold.
   - The general seam: the same kernels with `(dk, dv, fold)`.
   - Same 1.7.0 reason. Parts 1g and 1h.
-  - What it would buy: `sushi-ubench run hy4.attn_core` (dd6c1d6b, M5 Ultra, 7 rounds, GPU lock, AC), one layer's core
-    over a 4,096-row chunk ending at 32K keys, the served per-span chain against its useful work as four batched
-    GEMMs, ms: sliding (64 heads, 256-row spans over S + 511 keys) 36.3 served, 17.6 at f32, 5.0 at bf16; gathered
-    (32 heads, 32-row spans of 2,048 picks a row) 35.1, 27.3, 7.2. A chunk's 30 sliding and 12 sparse layers: 1.51 s
-    served, 0.85 s at the f32 GEMMs' rate, 0.24 s at bf16's. The sliding core is 2.1x its f32 floor (a third of
-    its scores are masked keys); the gathered one 1.3x. At 1,024 rows the gathered arm read the same 35 ms as at
-    4,096 (its f32 floor 6.9): open.
+  - What it bought, as an arch kernel and not the shared seam (DeepSeek's kernels are untouched, so its bytes are): the
+    key row, the f32 query split in three bf16 parts, the row ranges and picks, and the 9 simdgroups (8 over the latent's
+    64-channel slices, one over the rope channels) are Hy4's own, on DeepSeek's fragment layout (`hy4_attn.zig`).
+    The query is split into three bf16 parts the matrix units take (f32's range and 24 bits), P (in [0, 1]) into two;
+    the keys are bf16, so exact. Dropping a low pass moves the heads 5e-4 to 3e-3 of the peak from the f32 chain's. Two bf16
+    parts (2^-18) leave the kernel 4 to 10 times less exact than the op chain against the f64 truth (1.6e-5 against
+    7e-6 at a query of 4 sigma, 6e-5 against 3e-5 at 16), and a model amplifies that: a tiny's logits drift from the
+    chain's by KL 1e-2 to 1e-1 at the last prefill row; three parts on the query bring every release-shaped cell under the chain's own error (`hy4 attn
+    range`, `hy4 attn picks`, bar 5e-6 of the truth's peak at a query of 4 sigma) and hold the absorbed query's
+    outliers (`hy4 attn outliers`). An f16 low part of the query (times 512) overflowed past |q| of 32,752 and
+    collapsed a head onto its sink: real-pack 8-category KLD 0.025859 against the chain's 0.022150, and 0.021761 with
+    three bf16 parts on both (hy4-next 92bacb22 plus the core; two bf16 parts on both read 0.022844), 0.020555 with P
+    at two parts, the form served. Each pass is a matrix-unit product: the kernel is bound by them (P at two parts
+    takes a 4,096-row chunk after 4,096 in 2,208 ms against 2,357 at three, prefill meter, 408fcc02, M5 Ultra, STQ
+    4bpw, A B B A, QUIET, GPU lock). The tile is 32 keys, two
+    barriers a tile; the kernel runs near MLX's own bf16 GEMM rate (about 65 TFLOP/s counting its passes, MLX's bf16
+    GEMM 70 on this box), so its floor is the passes.
+  - In-process, M5 Ultra, `taskpolicy -a`, not quiet, no lock, best of 5 rounds in rotated order (`hy4_attn.zig`'s
+    timing, not committed), one layer's core over a 4,096-row chunk, ms: sliding (64 heads, 512-key windows) 23.7 for
+    the op chain, 9.5 in 256-row spans, 8.0 in one launch; gathered (32 heads, 2,048 picks a row) 55.4 for the chain
+    with its gather in 32-row spans, 18.7 in 32-row spans and 16.8 in 256-row spans, reading the store at BF16 (read
+    in the kernel from kv8 it took 34.8 to 41.3: a key row's dequantize costs more than its dot).
 - **Not a seam**:
   - The router (`moe.biasRouting` already takes an arch's numbers).
   - The rate-group chain (width and clamp are data).

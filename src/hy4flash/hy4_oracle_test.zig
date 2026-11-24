@@ -1232,6 +1232,85 @@ fn expectRowNear(got: []const f32, want: []const f32) !void {
     }
 }
 
+/// A forward of `ids[at..at + width]` after a prefill of `ids[0..at]` run on the op chain, its logits and the core's
+/// launches it made.
+fn afterChain(m: *@import("hy4_model.zig").Model, eo: *Ops, ids: []const u32, at: usize, width: usize) !struct { rows: []const f32, launches: u64 } {
+    const hy4_attn = @import("hy4_attn.zig");
+    m.reset();
+    fwd.core_kernel_on = false;
+    _ = try eo.own(try m.forwardReadout(ids[0..at], .none));
+    fwd.core_kernel_on = true;
+    const before = hy4_attn.launched;
+    const rows = try hostOf(eo, try eo.own(try m.forwardReadout(ids[at .. at + width], .all)));
+    return .{ .rows = rows, .launches = hy4_attn.launched - before };
+}
+
+test "hy4 core: a decode row and every verify block of 2..8 rows reach no core launch and give the op chain's bytes, and a wide chunk runs the core and gives the chain's logits within the bar (HY4_BF16_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    const hy4_attn = @import("hy4_attn.zig");
+    try mlx.requireGpu();
+    var t = try Tiny.open();
+    defer t.close();
+    fwd.products = .bf16;
+    const ids_f = try rawF32(try t.ref("ids", .{}));
+    var ids: [64]u32 = undefined;
+    for (ids_f, ids[0..ids_f.len]) |v, *d| d.* = @intFromFloat(v);
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    defer fwd.core_kernel_on = true;
+    const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, es);
+    defer m.deinit();
+    m.kv = .engine_default;
+    var eo: Ops = .{ .s = es };
+    defer eo.deinit();
+    const thr: usize = t.config.indexer.group_topk * t.config.indexer.group;
+    // A block after a prefill on the chain: the core is on for it, and never launches.
+    for ([_]usize{ thr - 1, thr + 1, 30 }) |at| for (1..9) |width| {
+        errdefer std.debug.print("hy4 core: at {d} width {d}\n", .{ at, width });
+        const on = try afterChain(m, &eo, &ids, at, width);
+        try testing.expectEqual(@as(u64, 0), on.launches);
+        m.reset();
+        fwd.core_kernel_on = false;
+        _ = try eo.own(try m.forwardReadout(ids[0..at], .none));
+        const off = try hostOf(&eo, try eo.own(try m.forwardReadout(ids[at .. at + width], .all)));
+        fwd.core_kernel_on = true;
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(off), std.mem.sliceAsBytes(on.rows));
+    };
+    // A chunk of 40 rows (past the selection and the window): the core runs on each layer, and its logits are the chain's
+    // to the bar, at f32 products and the BF16 latent (BF16 products and kv8 codes turn the sums' order into flipped
+    // roundings, codes and routing picks).
+    fwd.products = .f32;
+    m.reset();
+    m.kv = .dense;
+    fwd.core_kernel_on = false;
+    const chain = try eo.own(try m.forwardReadout(ids[0..40], .all));
+    const chain_rows = try hostOf(&eo, chain);
+    m.reset();
+    fwd.core_kernel_on = true;
+    const before = hy4_attn.launched;
+    const core_rows = try hostOf(&eo, try eo.own(try m.forwardReadout(ids[0..40], .all)));
+    try testing.expect(hy4_attn.launched - before >= t.config.layers);
+    if (std.c.getenv("SUSHI_HY4_ATTN_TRACE") != null) {
+        var worst: f64 = 0;
+        var peak: f64 = 1e-30;
+        for (core_rows, chain_rows) |x, y| {
+            worst = @max(worst, @abs(@as(f64, x) - y));
+            peak = @max(peak, @abs(@as(f64, y)));
+        }
+        std.debug.print("hy4 core: 40-row prefill logits, max |d| {e} of the peak {e}: {e}\n", .{ worst, peak, worst / peak });
+    }
+    try expectNearRows("core prefill", core_rows, chain_rows, core_bar);
+}
+
+/// How far the core's prefill logits may sit from the chain's, over the logits' peak: the attention's f32 sums in a
+/// different order through the tiny's six layers, 4.0e-4 measured. The chain's own two orders (spans of 7 rows and of
+/// 256) sit 4.3e-4 apart.
+const core_bar = 1e-3;
+
 /// The tiny's model on the engine stream with a hot cache beside it: the turns a live record is published from and
 /// the next turn's lookup (`hy4_prefix.rollbackLive`).
 const LiveRig = struct {
