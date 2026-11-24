@@ -31,5 +31,5 @@
 
 | Model | v1.7.4 |
 |---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | · |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw (DSpark) | · |
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | 260.3 / 96.5 mtp |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw (DSpark) | 128.2 / 69.9 dspark |
