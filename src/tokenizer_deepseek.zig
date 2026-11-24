@@ -1,13 +1,42 @@
-//! DeepSeek-V4.x pre-tokenizer: the three isolating Splits of its tokenizer.json, in order, each applied to
+//! DeepSeek-V4.x pre-tokenizer, which Hy4-Flash's tokenizer.json spells the same: the three isolating Splits, in order, each applied to
 //! the pieces the one before left. A piece never crosses a run's edge, so a `\s+(?!\S)` at the end of a piece
 //! sees the end of input (`"x  1"` keeps its two spaces whole).
 const std = @import("std");
-const utf8_seq = @import("../utf8_seq.zig");
-const uni = @import("../tokenizer_unicode.zig");
+const utf8_seq = @import("utf8_seq.zig");
+const uni = @import("tokenizer_unicode.zig");
+const tokenizer = @import("tokenizer.zig");
 
 pub const digits_regex = "\\p{N}{1,3}";
 pub const cjk_regex = "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+";
 pub const main_regex = "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+";
+
+/// The chat face's `pretokenizer` for every arch whose tokenizer.json spells this grammar (DeepSeek-V4.1, Hy4-Flash).
+pub const face = struct {
+    pub const name = "deepseek";
+    pub const split = preTokenize;
+
+    /// V4.x's `Sequence`: its three Splits (digits, CJK, the punctuation grammar), each isolated, then a ByteLevel
+    /// that does not split. Only that exact spelling is read as the grammar `tokenizer_deepseek` runs.
+    pub fn matches(pre_tokenizer: std.json.Value) bool {
+        if (pre_tokenizer != .object) return false;
+        const list = pre_tokenizer.object.get("pretokenizers") orelse return false;
+        if (list != .array or list.array.items.len != 4) return false;
+        const regexes = [_][]const u8{ digits_regex, cjk_regex, main_regex };
+        for (regexes, list.array.items[0..3]) |want, node| {
+            if (node != .object) return false;
+            const rx = tokenizer.splitRegexOf(node) orelse return false;
+            const behavior = node.object.get("behavior") orelse return false;
+            const invert = node.object.get("invert") orelse return false;
+            if (!std.mem.eql(u8, rx, want) or behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated") or invert != .bool or invert.bool) return false;
+        }
+        const byte_level = list.array.items[3];
+        if (byte_level != .object) return false;
+        const ty = byte_level.object.get("type") orelse return false;
+        if (ty != .string or !std.mem.eql(u8, ty.string, "ByteLevel")) return false;
+        const use_regex = byte_level.object.get("use_regex") orelse return false;
+        return use_regex == .bool and !use_regex.bool;
+    }
+};
 
 const Cp = struct { cp: u21, len: usize };
 

@@ -22,7 +22,7 @@ without it. An arch added later joins the list in the landing that adds it.
   order `sushi list` shows) and the load refusals' arch lists. `src/arch/flags.zig` reads each `flags` module, every
   part optional: `options` (the flags only that arch takes, parsed by `main.zig` through `parseOption`), `help` (their
   `--help` lines, placed before the shared flag they name), `think_help` and `think_refusal` (its `--think` words),
-  `command` (a subcommand such as DeepSeek's `repack`), `refusal` (launch flags it cannot act on), the settings-ignored
+  `command` (an arch's own subcommand; `repack` is the shared one), `refusal` (launch flags it cannot act on), the settings-ignored
   and boot lines, and `serve` / `warm` (the MLX-side hooks `arch/serve.zig` calls). `src/help.zig` assembles `--help`
   from the shared text and those parts; with every arch built the text is byte for byte the committed
   `src/fixtures/help.txt`. A flag, subcommand or refusal text is the owner's decision: moving one never changes it.
@@ -78,9 +78,10 @@ without it. An arch added later joins the list in the landing that adds it.
   the commit that fills its `State`: two owners of one pointer release it twice.
 - **Load, prefill and bill hooks an arch may declare** (every one optional; the default is stated where it is called).
   `arch.zig`: the `prefill_start_width` fact, `ubench`, `tools` (a tower's `ownStream()` gives the image encoder its
-  stream), `cooler_opt_out` (an arch on Sushi Cooler: its opt-out flag, which `arch_flags.options` parses from here, and its
-  model-settings key, checked at compile time; an arch that declares it must declare `coolerGap` (the loads it cannot
-  run on Sushi Cooler yet, with the reason), `cooler_contract` and its sched module's `coolerRows` too; `model.cooler_off`
+  stream), `cooler` (an arch on Sushi Cooler, which must declare `cooler_contract` and its sched module's `coolerRows`
+  too. Its `opt_out` is the flag `arch_flags.options` parses from here and the model-settings key, checked at compile
+  time, and an arch with one must declare `coolerGap` (the loads it cannot run on Sushi Cooler yet, with the reason);
+  a null `opt_out` runs every load on Sushi Cooler and declares no `coolerGap`, having no MLX route. `model.cooler_off`
   holds the archs whose flag was given, each load stamps only its own, a model of another arch loads as it would and its
   load names the flag, and `main` pins each given flag's setting). A load's side is one decision for every arch,
   `cooler_side.sideOf` (the opt-out, then the arch's gap, then a test's side; lint `cooler-side-query`), and its stream
@@ -147,7 +148,9 @@ without it. An arch added later joins the list in the landing that adds it.
   each `packs.dflash_target`; the pull hint names `packs.aliases[0]`. The DFlash2 round state a `Generator` keeps for an arch's
   native round is `native_*` (`native_draft_rate`, `native_lookup`, `native_prefill_window`, `native_round`, `native_gate`).
 - A trunk rule one arch keeps is a `Facts` flag on its config (`residual_from_embedding`, `moe_scores_f32`,
-  `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`. Where a pack keeps its routed experts (key
+  `qkv_split_rows`, `bias_routed_moe`), read with `arch_config.fact`. An arch whose STQ packs can be pair-major declares
+  `repack` (`arch_config.Repack`: the key text before a routed projection and the config key of the expert's hidden width, read by `sushi repack` through
+  `arch_config.repackOf`); an arch that declares none is refused by `RepackArchitectureUnsupported`. Where a pack keeps its routed experts (key
   prefix, stamped shards, the head's layer, rate groups) is `pack_layout` (`arch_config.PackLayout`, read by
   `pack_index`'s preflight), its trailing head layers the `trailingPackLayers` hook. An arch's committed test data (configs, its chat template) live in its chat face's `fixtures` (MLX-free): a shared test
   reads the config with `arch_config.fixtureConfig(name)` (null when the build left it out) and any other decl through
@@ -199,6 +202,8 @@ without it. An arch added later joins the list in the landing that adds it.
 5. Its live tests in `tests/<arch>/`, their rows in `tests/CLAUDE.md`, its pack-tier env in [testsuite](testsuite.md).
 6. `NOTICE` for any kernel it ports.
 7. The arch joins `DROPPABLE` in `tests/test_arch_drop.sh` in the same landing.
+8. `build.zig` names its folder in `test_dirs` and its `-Dmodel` value in `TestModel`: without them its MLX tests
+   join no bucket and never run, filtered or not.
 
 ## What an arch's `arch.zig` and slot modules offer shared code
 
@@ -242,6 +247,16 @@ the shared build names no arch for these:
 
 Bench paths are from the repo root. Dropping the folder drops its options.
 A key the file does not know, or a bench path that is missing, stops the configure.
+
+## Joining or dropping an arch on the static bill
+
+An arch on Sushi Cooler's static bill ([bill_redesign](bill_redesign.md), stage 5 on) owes, in its own folder: its
+frames and keys, its `choose` and `bound` sites, its context boundaries, its state module over the shared owners, its
+lend order if it lends, and its `bill` slot's `ledgerTerms` (a request's bill in closed form over its reach, which the
+ledger reads through the registry) with the state rates they read. It owes shared code nothing: no other hook in
+`bills.zig`, no term, no cap. Dropping one deletes its folder and its registry line; the ledger, the plan module and
+the owners do not name it. Hy4-Flash is the first (`hy4flash/hy4_ledger.zig`); DeepSeek-V4.1 and Qwen3.8 join at
+stages 6 and 7, on `bills.zig`'s hooks until then.
 
 ## Dropping an architecture
 

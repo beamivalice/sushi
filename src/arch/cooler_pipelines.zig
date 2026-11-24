@@ -126,6 +126,14 @@ pub const Plan = struct {
         return false;
     }
 
+    /// Where a planned load keeps the shapes its misses record: this key's directory, beside its manifest. Null with no
+    /// manifest root, as a load with none keeps no manifest.
+    pub fn shapeCache(p: *const Plan) ?@import("../tensor/plan/plan_book.zig").Cache {
+        const root = p.root orelse return null;
+        var buf: [manifest.Key.dir_len]u8 = undefined;
+        return .init(p.io, root, p.key.dirName(&buf));
+    }
+
     /// After a complete warm: the recipes the process made, written for this key, and the older builds of the scope
     /// removed. A failure is a warning, not a failed load.
     pub fn store(p: *Plan) void {

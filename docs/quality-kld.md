@@ -38,7 +38,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
   (the text holds EOS-like tokens): read `mean_kld` or the per-position rows.
 
 Native GLM capture runs the native forward through `sushi kld capture` with individual BF16 expert streaming,
-`--no-template --kv-quant off --ssd-budget-gb <total GiB>`. It audits indexed text headers before loading:
+`--no-template --kv-quant off`, plus `--ssd-budget-gb` only because GLM has no RAM default to stream its BF16 experts under. It audits indexed text headers before loading:
 the trunk must be BF16/F32 and routed experts BF16. The capture selects the reference arm of every GLM fast path
 (`glm5_model.reference_numerics`) and runs with `MLX_ENABLE_TF32=0`.
 Other architecture capture behavior, serving defaults and compare profiles remain unchanged. The total ledger includes
@@ -67,7 +67,7 @@ chunk with the same chunk width, state and kernels, so the order of work is the 
 seeded GLM checks this at several W, across chunks and across a resume (`glm5_layer_major.zig`,
 `glm5_kld_capture.zig`).
 - The tiny capture tests use a 1 GiB ledger and 128 MiB reserve floor; the CLI keeps its 8 GiB floor and Metal working-set check.
-- Measured (binary `65a5904b`, 16 real 500-token tune windows, W=8, `--ssd-budget-gb 100`, `taskpolicy -a`, GPU lock):
+- Measured (binary `65a5904b`, 16 real 500-token tune windows, W=8, `taskpolicy -a`, GPU lock):
   33.1 tok/s against 4.2 window-major (608.8 GB read per batch in ~48 s, ~9 s compute per window); byte-identical
   to window-major on 14 windows (131 files).
 - `SUSHI_IMATRIX_OUT=<abs>.safetensors` rides the same pass and writes the experts' imatrix
@@ -93,7 +93,7 @@ seeded GLM checks this at several W, across chunks and across a resume (`glm5_la
 <a id="dsv41-kld"></a>
 ### DeepSeek-V4.1
 
-`kld capture` and `compare` run `deepseek_v41` through the generic path, streamed (`--ssd-budget-gb` is optional: with no flag and no setting the load takes serve's RAM default through `model_load.withRamDefault`, fully resident on a 192 or 256 GB Mac, and a box outside the tiers is refused by name before touching the GPU). The state is the activation dtype and the model keeps its own, so a flag that
+`kld capture` and `compare` run `deepseek_v41` through the generic path on serve's RAM default (`model_load.withRamDefault`): fully resident on a 192 or 256 GB Mac, and a box outside the tiers is refused by name before touching the GPU. The state is the activation dtype and the model keeps its own, so a flag that
 would silently do nothing is refused by name at load (`kld_capture.refuse`): `--kv-quant` (`Dsv41KvQuantUnsupported`),
 `--qwen-gdn 16` (`Dsv41HasNoQwenGdnState`), `--hidden-out` (`Dsv41HiddenCaptureUnsupported`) and `SUSHI_IMATRIX_OUT`
 (`Dsv41ImatrixCaptureUnsupported`; the layer-major capture below takes it). The teacher is exact routing: `capture` refuses `--drop-expert`,
@@ -110,12 +110,76 @@ arm: a change to that arm's sum order leaves the KLD identical to the last digit
 main and for the reordered trunk rows) and is gated by the f32-truth bars and the width-invariance byte test instead.
 `--layer-major --tokens 1` instead runs the calibration capture below.
 
+<a id="hy4-kld"></a>
+### Hy4-Flash
+
+`kld capture` and `compare` run `hy_v4_flash` through the generic path on serve's RAM default, as DeepSeek's, with
+exact routing. The model takes the latent width from the cache config at a request's step 0, so `--kv-quant off|16`
+(BF16, the teacher's) and `--kv-quant 8` (the engine's affine kv8, group 64) both capture and compare: the 1y reading
+is a kv8 compare against a BF16-KV capture. Refused by name at load (`hy4_kld_capture.refuse`): another KV width
+(`Hy4KvQuantUnsupported`), `--qwen-gdn 16`, `--hidden-out` / `SUSHI_HIDDEN_OUT`, `SUSHI_IMATRIX_OUT`,
+`--expert-pick-tolerance` and `--drop-expert` (the routing is the host's exact top-k). `capture` refuses
+`--expert-cache-bias` (the teacher is exact routing); `compare --expert-cache-bias n` takes it on the one-row steps of a
+streamed load ([engine-expert-streaming](engine-expert-streaming.md#cache-bias)). Capture
+and compare run f32 products in f32 (`hy4_kld_capture.beforeLoad`, the offline seam's pre-load op): on a NAX GPU MLX and
+the engine take them on TF32 tiles unless `MLX_ENABLE_TF32=0`, which they read once per process, so an unset variable
+is set to 0 before the load, another value is refused (`Hy4KldNeedsTf32Off`), and a process that already read it on is
+refused (`Hy4KldTf32AlreadyRead`). The f32 products end with the load (`afterUnload`, the seam's post-load op), so a served load
+after it in a process measures its region as in a fresh one. On the tiny (`HY4_BF16_TINY`) a captured row is the oracle's within 2e-3, a compare
+of the same load reads KLD 0 and top-1 100%, and a kv8 compare reads 0.049 (top-1 71%): the tiny's random routing
+magnifies any rounding (TF32 alone puts its last prompt row 33% of the peak off the oracle), so its number says nothing
+about the release's.
+
+<a id="hy4-capture"></a>
+### Hy4-Flash calibration capture (layer-major)
+
+`--layer-major --tokens 1 --no-template` on the BF16 release (`hy4_layer_major.zig`) runs W windows
+through layer 0, then layer 1, and so on, through `hy4_model`'s layer entry (`embedStreams`, `engramRowsAfter`,
+`passLayer`, `releaseLayer`, `readoutStreams`), and writes DeepSeek's `calib/` contract with Hy4's inputs:
+- `mlp-in-LL.bf16`: what the routed experts read, the 1536-wide latent row `lat_down(ffn_in)`, MoE layers only. At the
+  BF16 routed products its values are BF16's, so the file holds them whole (a value that is not is refused,
+  `Hy4CaptureLatentNotBf16`); at f32 products it is `mlp-in-LL.f32`.
+- `route-LL.u16`, `route-w-LL.f32`: the picks and applied weights, tokens x top-k a layer.
+- `trunk-LL` / `trunk-head`: the `x x^T` sums of `attn_in`, `q_lora`, `kv_latent`, `o_in`, `ffn_in`, `lat_up_in`,
+  `shared_act` (layer 0: the dense activation), `engram_in`, and `head_in` on every position's final row (the head's
+  input when it serves), not only the row read out: a window's earlier chunks give theirs through `readoutStreams(.none)`
+  with the tap on. The read row's logits are computed on that row alone, as without a tap, so the bytes do not move.
+- `head-in.f32` (opt-in, `SUSHI_HY4_HEAD_ROWS=1`): the head's input for every token, `[tokens, 3072]` f32 little-endian in
+  window order (12 KB a token). The forward makes it in f32, so the file holds it whole where DeepSeek's `head-in.bf16`
+  holds a bf16 activation (a bf16 file would round the teacher); the run's manifest carries `mode: head-rows`, so a resume
+  without the switch, or with it on a run begun without, is refused. `layout.json` names it under `head_rows`.
+  With `SUSHI_HY4_CAPTURE_LEAN=1` as well (lean without head rows is refused, `Hy4CaptureLeanNeedsHeadRows`) the run
+  writes only `tokens.bin`, `windows.jsonl`, the fixture, `layout.json` and `head-in.f32` (12 KB a token), and none of the
+  rows, routes or sums or their GPU work; the manifest says `mode: head-rows-lean`, a rerun in another mode is refused, and
+  `layout.json` leaves out what it did not write. The head rows and logits equal the full run's byte for byte.
+- No imatrix: the encoder's Hessians come from these rows, and `SUSHI_IMATRIX_OUT` is refused
+  (`Hy4ImatrixCaptureUnsupported`: its writer cannot take an engine load's arrays).
+
+The run starts from a reset model at the BF16 latent. On the tiny (`HY4_BF16_TINY`, `MLX_ENABLE_TF32=0`) each window's
+logits equal its window-major `forwardReadout` byte for byte at W of 1 and 3 and chunks of 4 and 4096, and a run
+interrupted inside its second batch resumes at another W to the same logits, ids, rows and routes; the sums' bytes follow
+the batch partition, their values and row counts do not. The load keeps a whole layer's union workspace beside two cache
+slots a layer (`hy4_kld_capture.captureFloor`); the bill adds the widest layer's sums in flight and the one running
+window's transient, and each window carries its four f32 streams and its Engram rows (49,412 B a token on the release):
+W is the largest that fits, at most 32, or a `--batch-windows` past the budget is refused (`Hy4CaptureBudgetExceeded`).
+The ledger, resume and disk check are the shared `kld_calib.zig`. Each MoE layer's union is pinned once a batch
+(`Model.pin`), so its 512 experts are read once for all W windows.
+The routed experts run over up to 16,384 rows of pieces at once (`Model.ffnBatch`, `hy4_expert_mv.zig`): `gather_mm` over
+one-row operands is MLX's `gemv_gather`, a gemv per pick that re-reads its expert's matrix (at f32 products over the
+bank widened to f32), so batching rows through it does not help. The kernel sorts the picks by expert and applies four
+rows to every matrix tile with `gemv`'s thread layout and accumulation order, reading the BF16 bank as stored, so each
+product is the byte `gather_mm` writes; attention, router, latent and tail still run per piece at their own shapes. The
+per-piece run stays reachable in the tests (`per_piece_for_test`): every file of a capture, f32 and BF16 products, equals
+the per-piece run's byte for byte, across a resume from one into the other. The gram sums are submitted without a wait.
+Refused by name: a quantized latent,
+`--hidden-out`, `--imatrix-windows`, `--tokens` other than 1, a template, a missing budget.
+
 <a id="dsv41-capture"></a>
 ### DeepSeek-V4.1 calibration capture (layer-major)
 
 `--layer-major --tokens 1 --no-template` on a `deepseek_v41` checkpoint (`kld_capture.zig`) runs W windows through
 layer 0, then layer 1, and so on, with one pinned union of the layer's 384 FP4 experts per batch
-(`dsv41_stream.Stream.pin`, the budget sizes W: the cache itself stays at its two-slot floor). The budget is `--ssd-budget-gb`, else the setting, else serve's RAM default through `model_load.withRamDefault` (a resident default sizes W as an explicit budget of its size would); a default that buys no window, or a box outside the tiers, is refused before the load with `--ssd-budget-gb <GB>` named. A window is one
+(`dsv41_stream.Stream.pin`, the budget sizes W: the cache itself stays at its two-slot floor). The budget is the load's own (the setting, else serve's RAM default through `model_load.withRamDefault`) (a resident default sizes W as an explicit budget of its size would); a default that buys no window, or a box outside the tiers, is refused before the load, naming the budget one window needs. A window is one
 forward of at most 2048 rows (longer ones run in 2048-row chunks, each layer over all its chunks in order); the layer step
 is the model's own (`dsv41_model.passLayer`, the same code `extendSpan` loops), so the standard fixture (`prompts/NN_id`,
 `baseline.json`) is the window-major capture's byte for byte. It also writes, in `<out>/calib/`, what a quantizer needs:
@@ -143,7 +207,9 @@ no `act_quant` on the way ([dsv41-arch](dsv41-arch.md#gaps-against-the-reference
   and 3 and chunks of 4 and 64 rows, the generic `kld capture` fixture equals the layer-major one, the sums match an f64
   X^T X of the recorded inputs, the imatrix matches the dumped rows and routes, and an interruption inside a batch resumes to
   the uninterrupted bytes, also at another batch size.
-- Measured (32 real 2048-token windows, `--ssd-budget-gb 100`, `taskpolicy -a`, GPU lock, fans auto):
+- The engine writes and reads `imatrix.safetensors` itself (`src/imatrix.zig`): MLX's file I/O refuses an engine stream or map, so
+  a capture on a Sushi Cooler load never goes through it.
+- Measured (32 real 2048-token windows, `taskpolicy -a`, GPU lock, fans auto):
   309.5 s a batch = 212 tok/s; the forward alone 306 tok/s (213.8 s), the one-per-batch read of all 288.8 GB 27.5 s
   (0.69 s a layer), the capture's extras 68.2 s (22%: the X^T X sums, row and route writes, imatrix). 496 windows in 16
   batches take about 1.3 h. Disk at 1M tokens: rows 416 GB, DSpark rows 31 GB, sums 41 GB.
@@ -179,10 +245,9 @@ sushi kld compare --model "$STUDENT_MODEL" --fixture teacher-standard4 \
   --json comparison.json --kv-quant off
 ```
 
-If the teacher needs expert streaming, add `--ssd-budget-gb <total RAM GiB>`;
-choose a budget that fits the machine. Native BF16 GLM capture requires streaming;
-a GLM pack is scored with `sushi kld compare --model <pack> --fixture <teacher>`, resident or with
-`--ssd-budget-gb` (streamed experts score the same logits).
+A capture or compare needs no expert budget on DeepSeek or Hy4: the load takes serve's RAM default (streamed experts
+score the same logits). `--ssd-budget-gb` is for a box outside the RAM tiers, or a source with no RAM default that does
+not fit resident (GLM, MiMo BF16). A GLM pack is scored with `sushi kld compare --model <pack> --fixture <teacher>`.
 
 The saved fixture contains token IDs and all 512 full-vocabulary rows per prompt,
 including rows after EOS. Compare reports all positions and the first-EOS-inclusive
@@ -204,7 +269,7 @@ subset. This four-prompt screen is not the sixteen-prompt release reading.
 <a id="release-gate"></a>
 ## Release gate
 
-Each release scores two packs with `sushi kld compare --tokens 512 --top-k 10 --ctx-size 8192 --no-mtp`, read to the
+Each release scores two packs with `sushi kld compare --tokens 512 --ctx-size 8192`, read to the
 first EOS, against the previous release's reading (within ~1%). The fixture and flags are part of the reading.
 
 Public numbers (pack cards, the README) are the eight-category reading ([below](#eight-category)). A 16-prompt prose
@@ -214,9 +279,9 @@ fixture is a regression gate only: without the other categories its mean leans o
 |---|---|---|---|---|---|---|---|---|---|
 | Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 | 0.061793, 92.48%, 7061 positions (`c59df290`) | 0.061793, 92.48%, 7061 positions | · (the gate moved to STQ 4bpw) |
 | Qwen3.8-Flash-Next-Sushi-STQ-4bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | | | | 0.031214, 94.42%, 7061 positions (`c59df290`) | · | 0.031214, 94.42%, 7061 positions |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | `--ssd-budget-gb 110` | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`, `--ssd-budget-gb 108`) | 0.210682, 86.38%, 7533 positions (`--ssd-budget-gb 108`) | 0.209273, 86.78%, 7533 positions |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`) | 0.210682, 86.38%, 7533 positions | 0.209273, 86.78%, 7533 positions |
 
-DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46% (`--ssd-budget-gb 64`), so
+DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46%, so
 1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
 The published Qwen pack moved to revision 2.0 (6-bit STQ trunk) after 1.5.1: on the 1.5.1 code (`88c0173a`, the same
 flags) it reads 0.061834, 92.30%, 7061 positions, and 1.6.0 reads the same to the last digit. DeepSeek on 1.6.0 reads 0.6% above 1.5.1, equal to the 1.5.0 binary's reading of revision 2.0.
@@ -277,12 +342,12 @@ two prompts per category: code, math, reasoning, design, wikitext, multilingual,
 | Flash-Next 60x64 | Flash-Next | the 60x64 screen |
 | MiMo 16x512 raw | MiMo | the MOPD checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; captured 2026-09-30 by 83dc9b6c; mean strict NLL 0.2664; 652 s capture |
 
-Commands (MiMo; Flash-Next drops `--ssd-budget-gb` when the source fits):
+Commands (MiMo; `--ssd-budget-gb` only because MiMo has no RAM default to stream its source under):
 
 ```sh
 sushi kld capture --model <original checkpoint> \
   --prompts <the Flash-Next 16x512 raw fixture> --out <teacher dir> \
-  --tokens 512 --top-k 10 --label <label> --no-template --kv-quant off --ctx-size 8192 --ssd-budget-gb 94
+  --tokens 512 --top-k 10 --label <label> --no-template --kv-quant off --ctx-size 8192 --ssd-budget-gb <n>
 sushi kld compare --model <pack> --fixture <teacher dir> --label <label> \
   --kv-quant 8 --tokens 512 --top-k 10 --ctx-size 8192 --json <out>.json
 ```
@@ -310,7 +375,7 @@ Both are heavy GPU jobs: take the lock per run (CLAUDE.md, Team process).
 
 ## Lossy expert pick
 
-`--expert-pick-tolerance` on Sushi-2bpw, `--ssd-budget-gb 20` (251 slots/layer), kv8, 16 prompts x 128 tokens,
+`--expert-pick-tolerance` on Sushi-2bpw, a 20 GiB expert cache (251 slots/layer), kv8, 16 prompts x 128 tokens,
 teacher = the same pack with exact routing (`kld compare --expert-pick-tolerance n`).
 
 | tolerance | KLD | top-1 | NLL | KLD to first EOS | cache hit |
@@ -327,7 +392,7 @@ in every arm (worst run 0.983), no loop-stop cut in any of the 48 runs.
 
 <a id="lossy-expert-pick-mimo"></a>
 MiMo (sigmoid router: the pick compares sigmoid probabilities), the MOPD checkpoint (MXFP4 experts) streamed at
-`--ssd-budget-gb 60` (81 slots/layer), kv8, 16x512 raw, teacher = the same load with exact routing captured on this
+a 60 GiB expert cache (81 slots/layer), kv8, 16x512 raw, teacher = the same load with exact routing captured on this
 binary (built at cf23043d, the landed change's pick code; strict NLL 0.2609, cache hit 84.6%):
 
 | tolerance | KLD (to first EOS) | top-1 | NLL | cache hit | ids swapped |

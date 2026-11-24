@@ -1671,7 +1671,8 @@ fn checkBodies(run: *report.Run, c: GemmCtx) !void {
 }
 
 const TrunkShape = struct { name: []const u8, out: usize, in: usize, n: u32, groups: usize = 1 };
-/// DeepSeek-V4.1-Flash's trunk linears as the STQ pack stores them (`trunk_quant` n64, the head n96).
+/// DeepSeek-V4.1-Flash's trunk linears as the STQ pack stores them (`trunk_quant` n64, the head n96; the three widest
+/// again at n80, a `--trunk-k 5` pack), then Flash-Next's.
 const TRUNK_SHAPES = [_]TrunkShape{
     .{ .name = "wq_a", .out = 1280, .in = 5120, .n = 64 },
     .{ .name = "wq_a_wkv", .out = 1792, .in = 5120, .n = 64 },
@@ -1685,16 +1686,44 @@ const TRUNK_SHAPES = [_]TrunkShape{
     .{ .name = "idx_wq_b", .out = 4096, .in = 1280, .n = 64 },
     .{ .name = "idx_wk", .out = 128, .in = 512, .n = 64 },
     .{ .name = "head", .out = 129280, .in = 5120, .n = 96 },
+    .{ .name = "wq_b_k5", .out = 32768, .in = 1280, .n = 80 },
+    .{ .name = "wo_a_k5", .out = 1024, .in = 4096, .n = 80, .groups = 8 },
+    .{ .name = "wo_b_k5", .out = 5120, .in = 8192, .n = 80 },
+} ++ qwenTrunkShapes();
+
+/// Flash-Next's trunk projections at the K4 (n64) and K6 (n96) a `--trunk stq` pack may hold them at.
+fn qwenTrunkShapes() [14]TrunkShape {
+    const base = [_]struct { []const u8, usize, usize }{
+        .{ "qkv", 10240, 2560 },
+        .{ "z", 6144, 2560 },
+        .{ "out", 2560, 6144 },
+        .{ "q", 12288, 2560 },
+        .{ "kv", 512, 2560 },
+        .{ "sgate", 640, 2560 },
+        .{ "sdown", 2560, 640 },
+    };
+    var out: [14]TrunkShape = undefined;
+    for (base, 0..) |b, i| {
+        out[2 * i] = .{ .name = "qwen_" ++ b[0] ++ "_k4", .out = b[1], .in = b[2], .n = 64 };
+        out[2 * i + 1] = .{ .name = "qwen_" ++ b[0] ++ "_k6", .out = b[1], .in = b[2], .n = 96 };
+    }
+    return out;
+}
+
+const trunk_shape_names = blk: {
+    var names: [TRUNK_SHAPES.len][]const u8 = undefined;
+    for (TRUNK_SHAPES, 0..) |sh, i| names[i] = sh.name;
+    break :blk names;
 };
 
 pub const trunk_rows: report.Bench = .{
     .name = "shared.exl3_trunk_rows",
     .scope = .shared,
-    .what = "DeepSeek-V4.1 trunk linears by width over distinct banks, a forward's cold reads: served, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor",
+    .what = "DeepSeek-V4.1 and Flash-Next (K4 and K6) trunk linears by width over distinct banks, a forward's cold reads: served, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor",
     .unit = .us,
     .steps = 64,
     .axes = &.{
-        .{ .name = "shape", .values = &.{ "wq_a", "wq_a_wkv", "wq_b", "wkv", "wo_a", "wo_b", "shared_w1", "shared_w2", "comp_wkv", "idx_wq_b", "idx_wk", "head" }, .numeric = false },
+        .{ .name = "shape", .values = &trunk_shape_names, .numeric = false },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "5", "8", "256" } },
     },
     // simd: the SIMD rows arm at every width, the per-shape alternative to exact's NAX that keeps a row's bytes.
@@ -2170,11 +2199,36 @@ const FLASH_NEXT_LAUNCHES = [_]TrunkLaunch{
     .{ .name = "head", .parts = &.{248320}, .in = 2560, .group = 128, .k6_only = true },
 };
 
-const flash_next_launch_names = blk: {
-    var names: [FLASH_NEXT_LAUNCHES.len][]const u8 = undefined;
-    for (FLASH_NEXT_LAUNCHES, 0..) |sh, i| names[i] = sh.name;
-    break :blk names;
+fn launchNames(comptime table: []const TrunkLaunch) [table.len][]const u8 {
+    var names: [table.len][]const u8 = undefined;
+    for (table, 0..) |sh, i| names[i] = sh.name;
+    return names;
+}
+
+const flash_next_launch_names = launchNames(&FLASH_NEXT_LAUNCHES);
+
+/// Each decode launch of a Hy4-Flash layer, one linear a launch as `hy4_stq.apply` runs them: a sliding layer's q_a, q_b,
+/// gate and o (64 heads), a sparse layer's q_b, gate and o (32), the latent down and up, the shared expert's gate (its up
+/// is the same shape) and down, the dense layer 0's gate and down, the head.
+const HY4_LAUNCHES = [_]TrunkLaunch{
+    .{ .name = "q_a", .parts = &.{1024}, .in = 3072, .group = 64 },
+    .{ .name = "q_b", .parts = &.{16384}, .in = 1024, .group = 64 },
+    .{ .name = "gate", .parts = &.{16384}, .in = 3072, .group = 64 },
+    .{ .name = "o", .parts = &.{3072}, .in = 16384, .group = 64 },
+    .{ .name = "q_b_sparse", .parts = &.{8192}, .in = 1024, .group = 64 },
+    .{ .name = "gate_sparse", .parts = &.{8192}, .in = 3072, .group = 64 },
+    .{ .name = "o_sparse", .parts = &.{3072}, .in = 8192, .group = 64 },
+    .{ .name = "lat_down", .parts = &.{1536}, .in = 3072, .group = 64 },
+    .{ .name = "lat_up", .parts = &.{3072}, .in = 1536, .group = 64 },
+    .{ .name = "dense_gate", .parts = &.{13824}, .in = 3072, .group = 64 },
+    .{ .name = "dense_down", .parts = &.{3072}, .in = 13824, .group = 64 },
+    .{ .name = "head", .parts = &.{120832}, .in = 3072, .group = 64 },
 };
+
+const hy4_launch_names = launchNames(&HY4_LAUNCHES);
+
+/// `trunkLaunchStep`'s arms, by index: a bench of its steps lists them in this order and adds its own after.
+const trunk_launch_arms = [_][]const u8{ "affine8", "exact", "walk1", "floor", "unr2", "r32", "own" };
 
 pub const trunk_launches: report.Bench = .{
     .name = "shared.exl3_trunk_launches",
@@ -2187,9 +2241,25 @@ pub const trunk_launches: report.Bench = .{
         .{ .name = "k", .values = &.{ "4", "6" } },
         .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "5", "8" } },
     },
-    .arms = &.{ "affine8", "exact", "walk1", "floor", "unr2", "r32", "own" },
+    .arms = &trunk_launch_arms,
     .ref = "affine8",
     .run = runTrunkLaunches,
+};
+
+pub const trunk_hy4: report.Bench = .{
+    .name = "shared.exl3_trunk_hy4",
+    .scope = .shared,
+    .what = "Hy4-Flash trellis trunk launches (K6 SPEC1, one linear a launch, exact rows) as `hy4_stq.apply` ran them (`hy4`: f32 rows cast to bf16, the launch, cast to f32) and runs them (`thru`: the rounding inside the launch), each also with the f32 rms norm after it (`hy4_norm`: weight cast and norm; `thru_norm`: the norm in the finish where the output fits one threadgroup), against the bare launch and a streaming floor, over distinct banks",
+    .unit = .us,
+    .steps = 64,
+    .axes = &.{
+        .{ .name = "shape", .values = &hy4_launch_names, .numeric = false },
+        .{ .name = "k", .values = &.{"6"} },
+        .{ .name = "rows", .values = &.{ "1", "2", "4", "8" } },
+    },
+    .arms = &(trunk_launch_arms ++ [_][]const u8{ "hy4", "thru", "hy4_norm", "thru_norm" }),
+    .ref = "exact",
+    .run = runTrunkHy4,
 };
 
 const TrunkLaunchCtx = struct {
@@ -2201,6 +2271,9 @@ const TrunkLaunchCtx = struct {
     a8_b: []const []mlx.mlx_array,
     rows: usize,
     n: usize,
+    /// The norm a Hy4 linear's rows take after it (`hy4_norm`, `thru_norm`): a bf16 weight of the output's width.
+    norm_w: mlx.mlx_array = .{ .ctx = null },
+    eps: mlx.mlx_array = .{ .ctx = null },
     arm: usize = 0,
 };
 
@@ -2277,6 +2350,56 @@ fn trunkLaunchStep(c: TrunkLaunchCtx, s: mlx.mlx_stream, i: usize, x: mlx.mlx_ar
             ys[0] = try streamFloor(s, c.shared[ci].p.trellis, x, c.sh.in * totalOut(c.sh) * c.n / 128);
             return 1;
         },
+        7 => {
+            // `hy4_stq.apply`: the f32 rows rounded to bf16, the launch, its bf16 rows widened.
+            var xb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xb);
+            try mlx.check(mlx.mlx_astype(&xb, x, .bfloat16, s));
+            const y = try root.linear.linearWith(s, xb, c.shared[ci].p, kernels.SPEC1_W15, .{ .rows = .{ .exact = true }, .decoded_billed = true });
+            defer _ = mlx.mlx_array_free(y);
+            ys[0] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&ys[0], y, .float32, s));
+            return 1;
+        },
+        8 => {
+            // The same chain with the rounding inside the launch (`thru_bf16`).
+            ys[0] = try root.linear.linearWith(s, x, c.shared[ci].p, kernels.SPEC1_W15, .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true });
+            return 1;
+        },
+        9 => {
+            // `hy4` and the f32 norm after it as `fwd.norm` ran it: the weight widened, then MLX's rms norm.
+            const n = try trunkLaunchStep(withArm(c, 7), s, i, x, ys);
+            const plain = ys[0];
+            defer _ = mlx.mlx_array_free(plain);
+            var w32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(w32);
+            try mlx.check(mlx.mlx_astype(&w32, c.norm_w, .float32, s));
+            var y = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_fast_rms_norm(&y, plain, w32, 1e-5, s));
+            ys[0] = y;
+            return n;
+        },
+        10 => {
+            // `fwd.linearNormed`: the finish and the norm in one dispatch where it fits, else `thru` then the norm.
+            const opts: root.linear.Opts = .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true };
+            var y: [1]mlx.mlx_array = undefined;
+            const out: c_int = @intCast(totalOut(c.sh));
+            const one: root.linear.Shared = .{ .p = c.shared[ci].p, .cols = .{ 0, out, 0, 0, 0 }, .count = 1 };
+            if (try root.linear.linearSharedNormed(s, x, one, kernels.SPEC1_W15, &y, opts, .{ .w = c.norm_w, .eps = c.eps, .cols = out })) {
+                ys[0] = y[0];
+                return 1;
+            }
+            const n = try trunkLaunchStep(withArm(c, 8), s, i, x, ys);
+            const plain = ys[0];
+            defer _ = mlx.mlx_array_free(plain);
+            var w32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(w32);
+            try mlx.check(mlx.mlx_astype(&w32, c.norm_w, .float32, s));
+            var r = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_fast_rms_norm(&r, plain, w32, 1e-5, s));
+            ys[0] = r;
+            return n;
+        },
         else => unreachable,
     }
 }
@@ -2285,6 +2408,17 @@ fn totalOut(sh: TrunkLaunch) usize {
     var t: usize = 0;
     for (sh.parts) |p| t += p;
     return t;
+}
+
+/// Arms whose rows enter as f32, as a Hy4 forward's do.
+fn f32Rows(arm: usize) bool {
+    return arm >= 7;
+}
+
+fn withArm(c: TrunkLaunchCtx, arm: usize) TrunkLaunchCtx {
+    var d = c;
+    d.arm = arm;
+    return d;
 }
 
 fn trunkLaunchChainNs(s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: TrunkLaunchCtx) !u64 {
@@ -2306,7 +2440,7 @@ fn trunkLaunchChainNs(s: mlx.mlx_stream, x0: mlx.mlx_array, steps: usize, c: Tru
     return sw.read();
 }
 
-const TrunkLaunchSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, c: TrunkLaunchCtx, steps: usize, link_ns: f64 };
+const TrunkLaunchSample = struct { s: mlx.mlx_stream, x0: mlx.mlx_array, x0f: mlx.mlx_array, c: TrunkLaunchCtx, steps: usize, link_ns: f64 };
 
 /// One rung's link cost, the median of seven link-only chains: a per-sample link chain on a contended box adds its own
 /// noise to every sample.
@@ -2320,7 +2454,7 @@ fn sampleTrunkLaunch(smp: TrunkLaunchSample, arm: usize) anyerror!f64 {
     var c = smp.c;
     c.arm = arm;
     kernels.setDecodeParams(kernels.SPEC1_W15);
-    const ns = try trunkLaunchChainNs(smp.s, smp.x0, smp.steps, c);
+    const ns = try trunkLaunchChainNs(smp.s, if (f32Rows(arm)) smp.x0f else smp.x0, smp.steps, c);
     return (@as(f64, @floatFromInt(ns)) - smp.link_ns) / @as(f64, @floatFromInt(smp.steps));
 }
 
@@ -2330,7 +2464,7 @@ fn trunkLaunchBytes(a: std.mem.Allocator, smp: TrunkLaunchSample, arm: usize) ![
     c.arm = arm;
     kernels.setDecodeParams(kernels.SPEC1_W15);
     var ys: [3]mlx.mlx_array = undefined;
-    const n = try trunkLaunchStep(c, smp.s, 0, smp.x0, &ys);
+    const n = try trunkLaunchStep(c, smp.s, 0, if (f32Rows(arm)) smp.x0f else smp.x0, &ys);
     defer for (ys[0..n]) |y| {
         _ = mlx.mlx_array_free(y);
     };
@@ -2347,12 +2481,20 @@ fn trunkLaunchBytes(a: std.mem.Allocator, smp: TrunkLaunchSample, arm: usize) ![
 }
 
 fn runTrunkLaunches(run: *report.Run) anyerror!void {
+    return runLaunchTable(run, &FLASH_NEXT_LAUNCHES);
+}
+
+fn runTrunkHy4(run: *report.Run) anyerror!void {
+    return runLaunchTable(run, &HY4_LAUNCHES);
+}
+
+fn runLaunchTable(run: *report.Run, table: []const TrunkLaunch) anyerror!void {
     const s = mlx.gpuStream();
     defer kernels.setDecodeParams(.mul1);
     var prng = std.Random.DefaultPrng.init(0x51);
     const rnd = prng.random();
     try kernels.SPEC1_W15.requireTable();
-    for (FLASH_NEXT_LAUNCHES) |sh| {
+    for (table) |sh| {
         if (!listed(run.axis("shape"), sh.name)) continue;
         for (run.axis("k")) |k_text| {
             const n: u32 = if (std.mem.eql(u8, k_text, "4")) 64 else if (std.mem.eql(u8, k_text, "6")) 96 else return error.BadK;
@@ -2427,21 +2569,34 @@ fn runTrunkLaunches(run: *report.Run) anyerror!void {
                 for (xs) |*v| v.* = @truncate(@as(u32, @bitCast(rnd.float(f32) - 0.5)) >> 16);
                 const x0 = mlx.mlx_array_new_data(xs.ptr, &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, .bfloat16);
                 defer _ = mlx.mlx_array_free(x0);
-                const ctx: TrunkLaunchCtx = .{ .sh = sh, .copies = copies, .shared = shared, .a8_w = a8_w, .a8_s = a8_s, .a8_b = a8_b, .rows = rows, .n = n };
+                var x0f = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(x0f);
+                try mlx.check(mlx.mlx_astype(&x0f, x0, .float32, s));
+                try mlx.check(mlx.mlx_array_eval(x0f));
+                const nw = try a.alloc(u16, out);
+                for (nw) |*v| v.* = @truncate(@as(u32, @bitCast(0.5 + rnd.float(f32))) >> 16);
+                const norm_w = mlx.mlx_array_new_data(nw.ptr, &[_]c_int{@intCast(out)}, 1, .bfloat16);
+                defer _ = mlx.mlx_array_free(norm_w);
+                const eps_v = [_]f32{1e-5};
+                const eps = mlx.mlx_array_new_data(&eps_v, &[_]c_int{1}, 1, .float32);
+                defer _ = mlx.mlx_array_free(eps);
+                const ctx: TrunkLaunchCtx = .{ .sh = sh, .copies = copies, .shared = shared, .a8_w = a8_w, .a8_s = a8_s, .a8_b = a8_b, .rows = rows, .n = n, .norm_w = norm_w, .eps = eps };
                 const steps = run.steps(64);
                 // The served chain first, so the link floor is timed on clocks the arms run at, not after the bank fill.
                 var warm = ctx;
                 warm.arm = 1;
                 kernels.setDecodeParams(kernels.SPEC1_W15);
                 _ = try trunkLaunchChainNs(s, x0, steps, warm);
-                const smp = TrunkLaunchSample{ .s = s, .x0 = x0, .c = ctx, .steps = steps, .link_ns = try trunkLaunchLinkNs(s, x0, steps) };
+                const smp = TrunkLaunchSample{ .s = s, .x0 = x0, .x0f = x0f, .c = ctx, .steps = steps, .link_ns = try trunkLaunchLinkNs(s, x0, steps) };
                 if (run.hasArm("exact")) {
                     const want = try trunkLaunchBytes(a, smp, 1);
-                    for ([_][]const u8{ "walk1", "unr2", "r32", "own" }, [_]usize{ 2, 4, 5, 6 }) |name, arm| {
+                    for ([_][]const u8{ "walk1", "unr2", "r32", "own", "hy4", "thru" }, [_]usize{ 2, 4, 5, 6, 7, 8 }) |name, arm| {
                         if (run.hasArm(name) and !std.mem.eql(u32, want, try trunkLaunchBytes(a, smp, arm)))
                             run.invalid("a walk arm wrote other bytes than the served launch");
                     }
                 }
+                if (run.hasArm("hy4_norm") and run.hasArm("thru_norm") and !std.mem.eql(u32, try trunkLaunchBytes(a, smp, 9), try trunkLaunchBytes(a, smp, 10)))
+                    run.invalid("the normed arms wrote other bytes");
                 const label = try std.fmt.allocPrint(run.a, "{s} [{d}x{d}] K{s} rows {d}", .{ sh.name, out, sh.in, k_text, rows });
                 try run.interleave(label, smp, sampleTrunkLaunch);
                 if (!run.hasArm("exact")) continue;

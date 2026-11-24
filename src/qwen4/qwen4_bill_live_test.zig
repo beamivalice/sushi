@@ -471,7 +471,7 @@ test "Flash-Next streamed: a request refused at admission for its max_tokens nam
             defer _ = std.c.close(sv[1]);
             var conn: http_conn.Conn = undefined;
             http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
-            const admitted = try server.checkAttentionMemory(t.allocator, &conn, ids, max_tokens, cfg, null, false, null, false, false);
+            const admitted = try server.checkAttentionMemory(t.allocator, &conn, ids, max_tokens, cfg, null, false, null, false, false, null);
             _ = std.c.close(sv[0]);
             const raw = server.readAllFromPair(sv[1], out);
             return .{ .admitted = admitted, .body = raw[(std.mem.indexOf(u8, raw, "\r\n\r\n") orelse 0)..] };

@@ -430,22 +430,111 @@ pub var refused_threads: usize = 0;
 
 /// Runs `def` on `inputs` into fresh tensors written to `outputs` (one per output of `cfg`), which the caller owns.
 pub fn launch(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor) LaunchError!void {
-    return launchWith(def, inputs, cfg, outputs, null, false);
+    return launchWith(def, inputs, cfg, outputs, .fresh);
 }
 
 /// `launch`, its one output written over `into` (row-contiguous, of the output's shape and dtype): the elements the
 /// kernel does not write keep what `into` holds. `outputs[0]` shares its bytes. The caller promises the kernel writes
 /// none of the elements a pending write to `into` does, so it runs beside them (`core.bindOutDisjoint`).
 pub fn launchInto(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor, into: ?*Tensor) LaunchError!void {
-    return launchWith(def, inputs, cfg, outputs, into, into != null);
+    return launchWith(def, inputs, cfg, outputs, if (into) |t| .{ .into = t } else .fresh);
 }
 
 /// `launchInto` of a fresh output the later launches write into: bound as theirs are, it runs beside them.
 pub fn launchDisjoint(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor) LaunchError!void {
-    return launchWith(def, inputs, cfg, outputs, null, true);
+    return launchWith(def, inputs, cfg, outputs, .disjoint);
 }
 
-fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor, into: ?*Tensor, disjoint: bool) LaunchError!void {
+/// `launch` writing its outputs into `dsts`, the caller's tensors, instead of new ones: a pending update is settled
+/// first, and a shared or strided destination is copied first so the write never reaches another holder.
+pub fn launchInPlace(def: *Def, inputs: []const *Tensor, cfg: *Config, dsts: []*Tensor) LaunchError!void {
+    if (inputs.len != def.inputs.len or cfg.n_out != def.outputs.len or dsts.len != cfg.n_out) return error.TensorShape;
+    for (dsts, 0..) |dst, i| {
+        if (dst.dtype != cfg.out_dtypes[i]) return error.TensorShape;
+    }
+
+    var bound: [max_inputs]*Tensor = undefined;
+    var copied: [max_inputs]bool = @splat(false);
+    if (inputs.len > bound.len) return error.TensorShape;
+    var n_bound: usize = 0;
+    defer for (bound[0..n_bound], copied[0..n_bound]) |t, c| {
+        if (c) core.release(t);
+    };
+    for (inputs) |in| {
+        if (def.ensure_row_contiguous and !in.rowContiguous()) {
+            bound[n_bound] = try ops.contiguousCopy(in);
+            copied[n_bound] = true;
+        } else bound[n_bound] = in;
+        n_bound += 1;
+    }
+
+    // A dry recording looks no pipeline up (`core.dry_pipeline`), and caches none.
+    const pipeline = if (core.dryOn()) core.dry_pipeline else pipelineOf(def, bound[0..n_bound], cfg) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => |other| @as(LaunchError, @errorCast(other)),
+    };
+    const threads = @as(usize, @intCast(cfg.group[0])) * @as(usize, @intCast(cfg.group[1])) * @as(usize, @intCast(cfg.group[2]));
+    const granted = if (std.mem.startsWith(u8, def.name, grant_cap_name)) @min(pipeline.max_threads, grant_cap) else pipeline.max_threads;
+    if (threads > granted) {
+        refused_limit = granted;
+        refused_threads = threads;
+        return error.ThreadGroupTooLarge;
+    }
+
+    for (dsts) |dst| {
+        if (dst.pending != null) try ops.settle(dst);
+        const in_place = !dst.repeats() and dst.rowContiguous() and try core.sole(dst.store);
+        if (!in_place) core.adopt(dst, try ops.contiguousCopy(dst));
+        core.countUpdate(in_place);
+    }
+
+    const p = try core.pass();
+    p.pipeline(pipeline);
+    var index: usize = 0;
+    for (bound[0..n_bound], 0..) |in, i| {
+        core.bind(p, in, index);
+        index += 1;
+        if (in.ndim == 0) continue;
+        if (def.shape_infos[i][0]) {
+            p.bytes(std.mem.sliceAsBytes(in.shape[0..in.ndim]), index);
+            index += 1;
+        }
+        if (def.shape_infos[i][1]) {
+            var strides: [core.max_dims]i64 = undefined;
+            for (in.strides[0..in.ndim], 0..) |s, k| strides[k] = @intCast(s);
+            p.bytes(std.mem.sliceAsBytes(strides[0..in.ndim]), index);
+            index += 1;
+        }
+        if (def.shape_infos[i][2]) {
+            p.constant(@as(c_int, in.ndim), index);
+            index += 1;
+        }
+    }
+    for (dsts) |dst| {
+        core.bindOut(p, dst, index);
+        index += 1;
+    }
+    const grid: metal.Size = .{ .x = @intCast(cfg.grid[0]), .y = @intCast(cfg.grid[1]), .z = @intCast(cfg.grid[2]) };
+    core.dispatch(p, grid, .{
+        .x = @min(@as(usize, @intCast(cfg.group[0])), grid.x),
+        .y = @min(@as(usize, @intCast(cfg.group[1])), grid.y),
+        .z = @min(@as(usize, @intCast(cfg.group[2])), grid.z),
+    });
+}
+
+/// `launch` whose last output (u32 [core.counter_page_words]) is the engine's counter page, read and written: counted
+/// launches run in the order they were made, and each must leave the page's counters zero. `outputs`' last is a handle
+/// on the page.
+pub fn launchCounted(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor) LaunchError!void {
+    return launchWith(def, inputs, cfg, outputs, .counted);
+}
+
+/// Where a launch's outputs go: fresh; its one output over a tensor (bound disjoint); fresh and bound as the writes
+/// into it are; or its last output the counter page.
+const Outputs = union(enum) { fresh, into: *Tensor, disjoint, counted };
+
+fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tensor, how: Outputs) LaunchError!void {
+    if (core.intoArmed()) |dst| for (inputs) |in| if (in.store == dst) return core.refusing("a launch whose output `into` names reads it too", error.TensorUnsupported);
     if (inputs.len != def.inputs.len or cfg.n_out != def.outputs.len or outputs.len != cfg.n_out) return error.TensorShape;
 
     // A kernel that asks for row-contiguous inputs gets a copy of each input that is not.
@@ -464,7 +553,8 @@ fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
         n_bound += 1;
     }
 
-    const pipeline = pipelineOf(def, bound[0..n_bound], cfg) catch |e| return switch (e) {
+    // A dry recording looks no pipeline up (`core.dry_pipeline`), and caches none.
+    const pipeline = if (core.dryOn()) core.dry_pipeline else pipelineOf(def, bound[0..n_bound], cfg) catch |e| return switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => |other| @as(LaunchError, @errorCast(other)),
     };
@@ -479,12 +569,17 @@ fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
     var made: usize = 0;
     errdefer for (outputs[0..made]) |t| core.release(t);
     for (0..cfg.n_out) |i| {
-        outputs[i] = if (into) |t| blk: {
+        outputs[i] = if (how == .into) blk: {
+            const t = how.into;
             const shape = cfg.out_shapes[i][0..cfg.out_ndims[i]];
             if (cfg.n_out != 1 or t.dtype != cfg.out_dtypes[i] or t.ndim != shape.len or !t.rowContiguous()) return error.TensorShape;
             for (t.shape[0..t.ndim], shape) |a, b| if (a != b) return error.TensorShape;
             break :blk try core.share(t);
-        } else try core.fresh(cfg.out_dtypes[i], cfg.out_shapes[i][0..cfg.out_ndims[i]]);
+        } else if (how == .counted and i + 1 == cfg.n_out) blk: {
+            const shape = cfg.out_shapes[i][0..cfg.out_ndims[i]];
+            if (cfg.out_dtypes[i] != .uint32 or shape.len != 1 or shape[0] != core.counter_page_words) return error.TensorShape;
+            break :blk try core.counterPage();
+        } else try core.freshOut(cfg.out_dtypes[i], cfg.out_shapes[i][0..cfg.out_ndims[i]]);
         made += 1;
     }
 
@@ -511,7 +606,7 @@ fn launchWith(def: *Def, inputs: []const *Tensor, cfg: *Config, outputs: []*Tens
         }
     }
     for (outputs) |out| {
-        if (disjoint) core.bindOutDisjoint(p, out, index) else core.bindOut(p, out, index);
+        if (how == .into or how == .disjoint) core.bindOutDisjoint(p, out, index) else core.bindOut(p, out, index);
         index += 1;
     }
     const grid: metal.Size = .{ .x = @intCast(cfg.grid[0]), .y = @intCast(cfg.grid[1]), .z = @intCast(cfg.grid[2]) };
@@ -700,4 +795,91 @@ test "kernel: launches into one tensor over disjoint ranges run with no barrier 
     defer core.release(out[0]);
     const got = std.mem.bytesAsSlice(f32, try core.hostBytes(out[0]));
     for (got[0..1024], 0..) |v, i| try testing.expectEqual(@as(f32, @floatFromInt(2 * i)), v);
+}
+
+test "kernel: a launch's output is the tensor `core.into` names, recorded state-owned; a launch that reads it, an elementwise op and a recording begun with one armed are refused by name" {
+    try mlx.requireGpu();
+    const plan = @import("plan/plan_api.zig");
+    const def = try Def.create("kn_into_state", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    const dst = try core.fresh(.float32, &.{4});
+    defer core.release(dst);
+    var cfg: Config = .{};
+    try oneOutput(&cfg, 4);
+    var rec = try plan.Recorder.begin(testing.allocator, .{ .site = 1 });
+    defer rec.deinit();
+    {
+        try core.beginRecording(.real, &rec);
+        defer core.endRecording() catch {};
+        const g = try core.into(dst);
+        defer g.end();
+        var out: [1]*Tensor = undefined;
+        try launch(def, &.{x}, &cfg, &out);
+        defer core.release(out[0]);
+        try g.taken(out[0]);
+        try testing.expect(out[0].store == dst.store);
+    }
+    try testing.expect(rec.instances.items[0].asks.items[0].external);
+    try testing.expectEqualSlices(f32, &.{ 2, 4, 6, 8 }, @alignCast(std.mem.bytesAsSlice(f32, try core.hostBytes(dst))));
+    {
+        const g = try core.into(dst);
+        defer g.end();
+        var out: [1]*Tensor = undefined;
+        try testing.expectError(error.TensorUnsupported, launch(def, &.{dst}, &cfg, &out));
+    }
+    {
+        // An elementwise op's output, an input's copy or a cast as often as a result, takes no `into`.
+        const g = try core.into(dst);
+        defer g.end();
+        const sum = try ops.binary(.add, x, x);
+        defer core.release(sum);
+        try testing.expect(sum.store != dst.store);
+        try testing.expectError(error.TensorUnsupported, g.taken(sum));
+        try testing.expectError(error.TensorUnsupported, core.beginRecording(.real, &rec));
+    }
+}
+
+test "kernel: a counted launch's last threadgroup reads what every threadgroup wrote and leaves the counters zero, and counted launches on the same inputs run in order" {
+    try mlx.requireGpu();
+    const groups = 256;
+    const src =
+        \\const uint g = threadgroup_position_in_grid.x;
+        \\device atomic_uint *c = (device atomic_uint *)ctr;
+        \\threadgroup bool last[1];
+        \\if (thread_index_in_threadgroup == 0) {
+        \\  atomic_store_explicit(c + CTR + g, x[g], memory_order_relaxed);
+        \\  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        \\  last[0] = atomic_fetch_add_explicit(c, 1u, memory_order_relaxed) == uint(G - 1);
+        \\  atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
+        \\}
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\if (!last[0] || thread_index_in_threadgroup != 0) return;
+        \\uint sum = 0;
+        \\for (uint i = 0; i < uint(G); i++) sum += atomic_load_explicit(c + CTR + i, memory_order_relaxed);
+        \\out[0] = sum;
+        \\atomic_store_explicit(c, 0u, memory_order_relaxed);
+    ;
+    const def = try Def.create("kn_counted_sum", &.{"x"}, &.{ "out", "ctr" }, src, "", true, false);
+    var vals: [groups]u32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @intCast(3 * i + 1);
+    const x = try core.fromHost(std.mem.sliceAsBytes(&vals), .uint32, &.{groups});
+    defer core.release(x);
+    var cfg: Config = .{};
+    try cfg.addOutput(&.{1}, .uint32);
+    try cfg.addOutput(&.{core.counter_page_words}, .uint32);
+    try cfg.addTemplate("G", .{ .int = groups });
+    try cfg.addTemplate("CTR", .{ .int = core.counter_words });
+    cfg.grid = .{ groups * 32, 1, 1 };
+    cfg.group = .{ 32, 1, 1 };
+    var outs: [2][2]*Tensor = undefined;
+    const barriers = core.stats().barriers;
+    for (&outs) |*o| try launchCounted(def, &.{x}, &cfg, o);
+    defer for (outs) |o| for (o) |t| core.release(t);
+    var want: u32 = 0;
+    for (vals) |v| want += v;
+    for (outs) |o| try testing.expectEqual(want, std.mem.bytesAsSlice(u32, try core.hostBytes(o[0]))[0]);
+    // The second launch read nothing the first wrote but the page, and still waited for it.
+    try testing.expect(core.stats().barriers > barriers);
+    for (std.mem.bytesAsSlice(u32, try core.hostBytes(outs[1][1]))[0..core.counter_words]) |w| try testing.expectEqual(@as(u32, 0), w);
 }

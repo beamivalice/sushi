@@ -90,6 +90,66 @@ pub fn linearPair(s: mlx.mlx_stream, x: mlx.mlx_array, a: root.Proj, b: root.Pro
     return try project_rows.launchRowsFrom(s, part, a.svh, .{ .xsplit = ga.nsplit, .xodim = mid, .xdt = dt }, b.trellis, b.suh, b.svh, lb, gb, fitted);
 }
 
+/// A one-bank launch's k-split partials, `[rows * nsplit, out]` f32: row r's split s at row `r * nsplit + s`.
+pub const Parts = struct { part: mlx.mlx_array, nsplit: c_int, out: c_int };
+
+/// `linearWith` of f32 rows `x` `[rows, in]` through bf16 (`opts.rows.thru_bf16`) left as its launch's partials, for a
+/// reader that finishes them as `rows_finish_thru` does: the parts summed in order, H128, `psc · svh`, the bf16
+/// rounding. The caller frees `part`. Null, with nothing made, where the launch folds its finish or does not serve the
+/// rows (a forced arm, rows past one multi-row launch, a bank of another shape).
+pub fn linearParts(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts) !?Parts {
+    if (force_arm != null or !opts.rows.thru_bf16) return null;
+    const xs = mlx.getShape(x);
+    const t = mlx.getShape(p.trellis);
+    if (xs.len != 2 or t.len != 4 or t[0] != 1 or t[1] * 16 != xs[1] or mlx.mlx_array_dtype(x) != .float32) return null;
+    const rows = xs[0];
+    const in = xs[1];
+    const out = t[2] * 16;
+    if (@rem(in, 128) != 0 or @rem(out, 128) != 0 or rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const g = project_rows.rowsGeometry(in, out, rows, 1, t[3], opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX) or !project_rows.hasFinish(g)) return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    const l: project_rows.RowsLaunch = .{ .in_dim = in, .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(t[3])).n, .out_dt = .float32, .thru = true };
+    return .{ .part = try project_rows.launchRowsParts(s, x, p.trellis, p.suh, p.svh, l, g), .nsplit = g.nsplit, .out = out };
+}
+
+/// The one-bank through launch of f32 rows `x` [rows, in] through `p` that a counted launch takes, or null where none
+/// serves (a forced arm, rows past one multi-row launch, a bank of another shape).
+fn countedLaunch(x: mlx.mlx_array, p: root.Proj, opts: Opts) !?struct { l: project_rows.RowsLaunch, g: project_rows.RowsGeom } {
+    if (force_arm != null or !opts.rows.thru_bf16) return null;
+    const xs = mlx.getShape(x);
+    const t = mlx.getShape(p.trellis);
+    if (xs.len != 2 or t.len != 4 or t[0] != 1 or t[1] * 16 != xs[1] or mlx.mlx_array_dtype(x) != .float32) return null;
+    const rows = xs[0];
+    if (@rem(xs[1], 128) != 0 or @rem(t[2] * 16, 128) != 0 or rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const g = project_rows.rowsGeometry(xs[1], t[2] * 16, rows, 1, t[3], opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
+    return .{ .l = .{ .in_dim = xs[1], .out_dim = t[2] * 16, .rows = rows, .groups = 1, .n = (try kernels.packedRate(t[3])).n, .out_dt = .float32, .thru = true }, .g = g };
+}
+
+/// `linearParts`' launch finishing its own partials where the stream has a counter page (`project_rows.launchRowsCounted`):
+/// the rows `[rows, out]` that `linearWith` through bf16 gives (f32; bf16 when `c` is `stored`; rms-normed when
+/// `normed`), one dispatch. Null, with nothing launched, where `linearParts` is null or the stream has no page.
+pub fn linearCounted(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts, c: project_rows.Counted) !?mlx.mlx_array {
+    const k = (try countedLaunch(x, p, opts)) orelse return null;
+    if (!project_rows.countedFits(s, k.l, k.g, c)) return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    return project_rows.launchRowsCounted(s, x, p.trellis, p.suh, p.svh, k.l, k.g, c);
+}
+
+/// `silu(linearWith(x, gate)) · linearWith(x, up)` through bf16 of f32 rows `x` [rows, in], two banks of one shape, in
+/// one counted launch (`project_rows.launchRowsPair`): `[rows, out]` f32, the bytes of the two launches, their finishes
+/// and an f32 SwiGLU as MLX's Sigmoid and Multiply give it. Null, with nothing launched, where no counted launch serves.
+pub fn linearPairCounted(s: mlx.mlx_stream, x: mlx.mlx_array, gate: root.Proj, up: root.Proj, dec: exl3.Decode, opts: Opts) !?mlx.mlx_array {
+    const k = (try countedLaunch(x, gate, opts)) orelse return null;
+    if (!std.mem.eql(c_int, mlx.getShape(gate.trellis), mlx.getShape(up.trellis)) or !project_rows.pairFits(s, k.l, k.g)) return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    return project_rows.launchRowsPair(s, x, .{ gate.trellis, gate.suh, gate.svh }, .{ up.trellis, up.suh, up.svh }, k.l, k.g);
+}
+
 /// `linearGroupedWith` whose result leaves as `[rows, G * out]`, bank g's columns from `g * out`: what a transpose and
 /// a reshape of it give, without their copy, because the launch's finish writes the rows that way. Null, with nothing
 /// made, where no such finish serves: a row count past one multi-row launch, a launch that folds its finish, a forced arm.
@@ -280,12 +340,13 @@ pub fn linearSharedNormed(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: 
     if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return false;
     var bounds: [3]c_int = @splat(sh.cols[sh.count]);
     for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
-    const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = mlx.mlx_array_dtype(x) };
+    const thru = opts.rows.thru_bf16;
+    const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = if (thru) .float32 else mlx.mlx_array_dtype(x), .thru = thru };
     if (!project_rows.normedFits(l, g, bounds, norm)) return false;
     try dec.requireTable();
     kernels.setDecodeParams(dec);
-    const pin: ?project_rows.PinnedCfg = if (sh.geo) |geo| (if (l.out_dt == .bfloat16 and opts.rows.exact == geo.key.exact) (if (geo.row(rows)) |r| (if (std.meta.eql(r.g, g)) r.pin else null) else null) else null) else null;
-    const y = try project_rows.launchRowsNormed(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, l, g, try project_rows.rowsKernel(g), bounds, pin, norm);
+    const pin: ?project_rows.PinnedCfg = if (sh.geo) |geo| (if (!thru and l.out_dt == .bfloat16 and opts.rows.exact == geo.key.exact) (if (geo.row(rows)) |r| (if (std.meta.eql(r.g, g)) r.pin else null) else null) else null) else null;
+    const y = try project_rows.launchRowsNormed(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, l, g, if (thru) try project_rows.rowsThruKernel(g) else try project_rows.rowsKernel(g), bounds, pin, norm);
     defer _ = mlx.mlx_array_free(y);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
@@ -321,6 +382,20 @@ fn run(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, grou
     kernels.setDecodeParams(dec);
     if ((force_arm orelse if (rows <= project_rows.rowsMax(opts.rows)) Arm.rows else Arm.gemm) == .rows)
         return project_rows.projectRows(s, x, p.trellis, p.suh, p.svh, opts.rows);
+    // Past the rows arm a launch through bf16 is the casts around the bf16 launch, which it stands for.
+    if (opts.rows.thru_bf16) {
+        var inner_opts = opts;
+        inner_opts.rows.thru_bf16 = false;
+        var xb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xb);
+        try mlx.check(mlx.mlx_astype(&xb, x, .bfloat16, s));
+        const y = try run(s, xb, p, dec, groups, rows, inner_opts);
+        defer _ = mlx.mlx_array_free(y);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_astype(&out, y, .float32, s));
+        return out;
+    }
     const inputs = try gemmInputs(groups, rows, kernels.gemmWindowRows());
     const slots = inputs.slots;
     const prepared = try kernels.prepareIndexed(s, x, p.suh, slots);
@@ -360,26 +435,63 @@ pub fn dropGemmInputs(side: u1) void {
     ring.next = 0;
 }
 
+/// A wide forward's GEMM inputs (D97), from `GemmScope.begin` to its `end`: made by the forward and found by it alone,
+/// so its dry probe records the builds its execution makes, and freed at its end, so no process-wide entry holds the
+/// bytes of the region that made them. One scope at a time.
+var gemm_scope: ?std.ArrayList(struct { key: GemmKey, inputs: GemmInputs }) = null;
+
+pub const GemmScope = struct {
+    pub fn begin() error{GemmScopeOpen}!GemmScope {
+        if (gemm_scope != null) return error.GemmScopeOpen;
+        gemm_scope = .empty;
+        return .{};
+    }
+
+    pub fn end(_: GemmScope) void {
+        var list = gemm_scope.?;
+        for (list.items) |e| for ([_]mlx.mlx_array{ e.inputs.slots, e.inputs.tab.starts, e.inputs.tab.nlives }) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        list.deinit(std.heap.page_allocator);
+        gemm_scope = null;
+    }
+};
+
 /// The inputs depend on `(groups, rows, win)` alone, and a prefill chunk's trellis linears all share them, so they are
-/// built and uploaded once. The handles are the cache's: valid until a later call evicts them, never freed by the caller.
+/// built and uploaded once. The handles are the cache's (or the open `GemmScope`'s): valid until a later call evicts them
+/// or the scope ends, never freed by the caller.
 pub fn gemmInputs(groups: usize, rows: usize, win: c_int) !GemmInputs {
     const key = GemmKey{ .groups = groups, .rows = rows, .win = win };
+    if (gemm_scope) |*list| {
+        for (list.items) |e| if (std.meta.eql(e.key, key)) return e.inputs;
+        const made = try buildGemmInputs(groups, rows, win);
+        list.append(std.heap.page_allocator, .{ .key = key, .inputs = made }) catch {
+            for ([_]mlx.mlx_array{ made.slots, made.tab.starts, made.tab.nlives }) |a| _ = mlx.mlx_array_free(a);
+            return error.OutOfMemory;
+        };
+        return made;
+    }
     const ring = &gemm_cache[host_side.making()];
     for (ring.entries) |e| if (e) |hit| if (std.meta.eql(hit.key, key)) return hit.inputs;
+    if (host_side.dry()) return error.CacheFillDry;
+    const made = try buildGemmInputs(groups, rows, win);
+    const at = ring.next;
+    if (ring.entries[at]) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    ring.entries[at] = .{ .key = key, .inputs = made };
+    ring.next = (at + 1) % gemm_cache_len;
+    return ring.entries[at].?.inputs;
+}
+
+fn buildGemmInputs(groups: usize, rows: usize, win: c_int) !GemmInputs {
     const alloc = std.heap.page_allocator;
     const ids = try alloc.alloc(u32, groups * rows);
     defer alloc.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(i / rows);
     const slots = try host_side.made(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32));
     errdefer _ = mlx.mlx_array_free(slots);
-    const tab = try windowTable(groups, rows, win);
-    const at = ring.next;
-    if (ring.entries[at]) |old| for ([_]mlx.mlx_array{ old.inputs.slots, old.inputs.tab.starts, old.inputs.tab.nlives }) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    ring.entries[at] = .{ .key = key, .inputs = .{ .slots = slots, .tab = tab } };
-    ring.next = (at + 1) % gemm_cache_len;
-    return ring.entries[at].?.inputs;
+    return .{ .slots = slots, .tab = try windowTable(groups, rows, win) };
 }
 
 /// Windows of at most `win` rows that never straddle two banks.
@@ -1196,9 +1308,171 @@ fn pairCase(s: mlx.mlx_stream) !void {
     }
 }
 
+test "exl3 linear: a launch through bf16 takes f32 rows and gives f32 rows with the bytes of the rows cast to bf16, the launch and its rows cast back, folded, k-split and past the rows arm, on the machine's arm and SIMD, MLX's stream and the engine's" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        try thruCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
+    }
+    mlx.engine.enabled = false;
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
+    try std.testing.expect(!kernels.gemmNaxOn());
+    try thruCase(mlx.gpuStream());
+}
+
+/// Rows that are not bf16 values, ties among them, so the in-register rounding must be the cast's to the bit.
+fn thruCase(s: mlx.mlx_stream) !void {
+    const t = std.testing;
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x7b16);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // Hy4's q_a and latent up (k-split finishes), a launch NAX folds (DeepSeek's tuned 1280 x 32768), a small one.
+    const shapes = [_]struct { in: usize, out: usize, n: u32 }{
+        .{ .in = 3072, .out = 1024, .n = 96 },
+        .{ .in = 1536, .out = 3072, .n = 96 },
+        .{ .in = 1280, .out = 32768, .n = 64 },
+        .{ .in = 256, .out = 384, .n = 96 },
+    };
+    var served: usize = 0;
+    for (shapes) |sh| {
+        var h = try Host.init(alloc, rnd, 1, sh.in, sh.out, sh.n);
+        defer h.deinit();
+        for ([_]Opts{ .{}, exact, .{ .rows = .{ .exact = true, .wide = true } } }) |base| for ([_]usize{ 1, 3, 8, 12 }) |rows| {
+            const xf = try alloc.alloc(f32, rows * sh.in);
+            for (xf, 0..) |*f, i| {
+                const v = (rnd.float(f32) * 2 - 1) * 4;
+                f.* = if (i % 7 == 0) @bitCast((@as(u32, @bitCast(v)) & 0xffff0000) | 0x8000) else v;
+            }
+            const x = try host_side.made(mlx.mlx_array_new_data(xf.ptr, &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, .float32));
+            defer _ = mlx.mlx_array_free(x);
+            var xb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xb);
+            try mlx.check(mlx.mlx_astype(&xb, x, .bfloat16, s));
+            const plain = try linearWith(s, xb, h.p, dec, base);
+            defer _ = mlx.mlx_array_free(plain);
+            var cw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cw);
+            const want = try alloc.dupe(f32, try hostF32(s, plain, &cw));
+            var opts = base;
+            opts.rows.thru_bf16 = true;
+            const got = try linearWith(s, x, h.p, dec, opts);
+            defer _ = mlx.mlx_array_free(got);
+            var cg = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cg);
+            try t.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(got));
+            try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(try hostF32(s, got, &cg)));
+            served += 1;
+        };
+    }
+    try t.expectEqual(@as(usize, 4 * 3 * 4), served);
+}
+
+test "exl3 linear: a launch through bf16 whose rows leave rms-normed gives the through launch's rows widened, normed by MLX's f32 rms norm over its weight widened, 1 to 8 rows, on the machine's arm and SIMD, MLX's stream and the engine's" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    defer mlx.engine.enabled = was;
+    for ([_]bool{ false, true }) |on_engine| {
+        mlx.engine.enabled = on_engine;
+        try thruNormedCase(if (on_engine) mlx.engine.stream() else mlx.gpuStream());
+    }
+    mlx.engine.enabled = false;
+    const simd_only = device.withProfile(device.simdOnly());
+    defer simd_only.end();
+    try std.testing.expect(!kernels.gemmNaxOn());
+    try thruNormedCase(mlx.gpuStream());
+}
+
+/// f32 outputs show every ulp of the norm's sums; the weight is bf16 as Hy4 stores it, or f32.
+fn thruNormedCase(s: mlx.mlx_stream) !void {
+    const t = std.testing;
+    defer kernels.setDecodeParams(.mul1);
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(0x7b17);
+    const rnd = prng.random();
+    const dec = exl3.Decode.tabled(.spec1, .w15);
+    // Hy4's q_a (its q_a_layernorm) and a sparse layer's o (its post_proj_norm).
+    const shapes = [_]struct { in: usize, out: usize, n: u32 }{
+        .{ .in = 3072, .out = 1024, .n = 96 },
+        .{ .in = 8192, .out = 3072, .n = 96 },
+    };
+    const eps_v = [_]f32{1e-5};
+    const eps = try host_side.made(mlx.mlx_array_new_data(&eps_v, &[_]c_int{1}, 1, .float32));
+    defer _ = mlx.mlx_array_free(eps);
+    var served: usize = 0;
+    for (shapes) |sh| {
+        var h = try Host.init(alloc, rnd, 1, sh.in, sh.out, sh.n);
+        defer h.deinit();
+        const one = Shared{ .p = h.p, .cols = .{ 0, @intCast(sh.out), 0, 0, 0 }, .count = 1 };
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |wdt| {
+            const wf = try alloc.alloc(f32, sh.out);
+            const wb = try alloc.alloc(u16, sh.out);
+            for (wf, wb) |*f, *bits| {
+                bits.* = bf16Bits(0.5 + rnd.float(f32));
+                f.* = if (wdt == .float32) 0.5 + rnd.float(f32) else bf16ToF32(bits.*);
+            }
+            const w = try host_side.made(mlx.mlx_array_new_data(if (wdt == .float32) @ptrCast(wf.ptr) else @ptrCast(wb.ptr), &[_]c_int{@intCast(sh.out)}, 1, wdt));
+            defer _ = mlx.mlx_array_free(w);
+            var w32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(w32);
+            try mlx.check(mlx.mlx_astype(&w32, w, .float32, s));
+            for ([_]Opts{ .{}, exact }) |base| for ([_]usize{ 1, 3, 8 }) |rows| for ([_]f32{ 4, 1e-3 }) |amp| {
+                const xf = try alloc.alloc(f32, rows * sh.in);
+                for (xf) |*f| f.* = (rnd.float(f32) * 2 - 1) * amp;
+                const x = try host_side.made(mlx.mlx_array_new_data(xf.ptr, &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, .float32));
+                defer _ = mlx.mlx_array_free(x);
+                var opts = base;
+                opts.rows.thru_bf16 = true;
+                const plain = try linearWith(s, x, h.p, dec, opts);
+                defer _ = mlx.mlx_array_free(plain);
+                var normed = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(normed);
+                try mlx.check(mlx.mlx_fast_rms_norm(&normed, plain, w32, 1e-5, s));
+                var cw = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cw);
+                const want = try alloc.dupe(f32, try hostF32(s, normed, &cw));
+                var got: [1]mlx.mlx_array = undefined;
+                try t.expect(try linearSharedNormed(s, x, one, dec, &got, opts, .{ .w = w, .eps = eps, .cols = @intCast(sh.out) }));
+                defer _ = mlx.mlx_array_free(got[0]);
+                var cg = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cg);
+                try t.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(got[0]));
+                try t.expectEqualSlices(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(try hostF32(s, got[0], &cg)));
+                served += 1;
+            };
+        }
+    }
+    try t.expectEqual(@as(usize, 2 * 2 * 2 * 3 * 2), served);
+}
+
 fn u32Values(a: mlx.mlx_array) ![]const u32 {
     try mlx.check(mlx.mlx_array_eval(a));
     return (mlx.mlx_array_data_uint32(a) orelse return error.Unreadable)[0..mlx.mlx_array_size(a)];
+}
+
+test "exl3 linear: inside a GEMM scope a forward's inputs are its own: made and found again there, the process cache neither read nor filled, and freed at its end" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    const outer = try gemmInputs(2, 33, 32);
+    {
+        const scope = try GemmScope.begin();
+        defer scope.end();
+        const made = try gemmInputs(2, 33, 32);
+        try t.expect(made.slots.ctx != outer.slots.ctx);
+        try t.expectEqual(made.slots.ctx, (try gemmInputs(2, 33, 32)).slots.ctx);
+        _ = try gemmInputs(2, 917, 32);
+        try t.expectError(error.GemmScopeOpen, GemmScope.begin());
+    }
+    try t.expectEqual(outer.slots.ctx, (try gemmInputs(2, 33, 32)).slots.ctx);
+    for (gemm_cache[host_side.making()].entries) |e| if (e) |hit| try t.expect(hit.key.rows != 917);
 }
 
 test "exl3 linear: the GEMM inputs of one groups, rows and window are built once, and equal the bank ids and window table built directly" {

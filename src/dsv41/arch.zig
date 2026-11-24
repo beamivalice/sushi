@@ -87,6 +87,8 @@ pub const config_facts: arch_config.Facts = .{
     .streams_rate_groups = true,
     .reads_own_source = true,
 };
+/// Its STQ packs' routed experts, trunk and DSpark stages, take the pair-major layout (`sushi repack`).
+pub const repack: arch_config.Repack = .{};
 pub const OwnConfig = config_file.Config;
 pub const serveDefaults = config_file.Config.serveDefaults;
 
@@ -103,10 +105,10 @@ pub fn cacheLayoutNamespace(config: *const Config) ?[]const u8 {
     return dsv41_prefix.namespaceTag(dsparkOn(config));
 }
 
-pub const cooler_opt_out: @import("../arch/config.zig").CoolerOptOut = .{
+pub const cooler: @import("../arch/config.zig").Cooler = .{ .opt_out = .{
     .flag = "--ds41-mlx-engine",
     .setting = "ds41_cooler",
-};
+} };
 
 /// What the shared Sushi Cooler contract suite asks of this arch (`src/cooler_contract_test.zig`).
 pub const cooler_contract = @import("dsv41_contract.zig");

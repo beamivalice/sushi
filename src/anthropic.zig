@@ -632,7 +632,7 @@ pub fn handleAnthropicMessages(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{});
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, true, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, true, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head, req_media.deferred)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -2734,8 +2734,17 @@ test "an Anthropic tools array with a non-object entry converts to a JSON array 
     try std.testing.expectEqualStrings("[{\"type\":\"function\",\"function\":{\"name\":\"f\",\"description\":\"\",\"parameters\":{\"type\":\"object\"}}}]", tools);
 }
 
-test "tool stream: an Anthropic call that buffers for 23 s opens its tool_use block and sends an input_json_delta within every beat interval, never only a ping" {
+test "tool stream: an Anthropic call that buffers for 23 s opens its tool_use block and sends an input_json_delta within every beat interval, never only a ping, in every dialect" {
+    for (tool_progress.write_file_heads) |head| {
+        errdefer std.debug.print("head: {f}\n", .{std.zig.fmtString(head)});
+        try anthropicCallBuffers(head);
+    }
+}
+
+fn anthropicCallBuffers(call_head: []const u8) !void {
     const a = std.testing.allocator;
+    const head = try std.mem.concat(a, u8, &.{ "Writing it.\n", call_head });
+    defer a.free(head);
     var wire: http_conn.TestWire = undefined;
     try wire.init();
     defer wire.deinit();
@@ -2756,7 +2765,7 @@ test "tool stream: an Anthropic call that buffers for 23 s opens its tool_use bl
     for (0..230) |i| {
         wire.advance(100);
         since += 100;
-        try buffered.appendSlice(a, if (i == 0) "Writing it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n" else "- item: pending review\n");
+        try buffered.appendSlice(a, if (i == 0) head else "- item: pending review\n");
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;

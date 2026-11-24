@@ -90,6 +90,8 @@ test "cooler contract: a Cooler warm's image splice refused at any of its pool b
             try ld.openLight(C, dir, true);
             defer _ = ld.close();
             if (ld.config.image_token_id == 0) return error.SkipZigTest;
+            // The splice is a step of the warm, which asks the pool by design (D64); the sealed load's gate opens as a warm's does.
+            @import("arch/cooler.zig").warmBegins(ld.xfm);
             var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
             defer seen.deinit(a);
             const points = try firstAsks(a, &seen, C, &ld, go);
@@ -254,6 +256,11 @@ test "cooler contract: a second Cooler load beside a sealed one whose warm fails
             try first.open(C, dir, true);
             defer _ = first.close();
             try testing.expect(mlx.engine.sealed());
+            // Beside a load on the ledger the second is refused by name (D90), and the first stays sealed.
+            if (first.config.static_ledger != null) {
+                try contract.expectRefusedBesideLedger(C, dir);
+                return testing.expect(mlx.engine.sealed());
+            }
             // The warm's pool asks, counted on a second load that serves: it ends sealed.
             var total: u64 = 0;
             {

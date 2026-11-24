@@ -15,6 +15,7 @@ pub const MUL1_MULT: u32 = 0x83DCD12D;
 /// parameter, so another member of the family is a new pair, not a new code path.
 pub const HashMask = struct { mult: u32, mask: u32, scale: u32 = hash_mask_scale };
 pub const hash_mask_scale: u32 = 4096;
+pub const ALPHA: HashMask = .{ .mult = 0x84CC1707, .mask = 0x8FE08FC0 };
 
 /// PAIR1's pair codec: weights 2j and 2j+1 both decode from the window of weight 2j+1.
 /// `p = cw * mult`; weight 2j is the half sum of `p & mask0`, weight 2j+1 that of
@@ -54,23 +55,56 @@ pub fn pair1Pair(rate: Rate) ?Pair {
 pub const Codebook = enum(u8) {
     mul1 = 0,
     mcg = 1,
-    spec1 = 2,
-    pair1 = 3,
-    std1 = 4,
+    alpha = 2,
+    spec1 = 3,
+    pair1 = 4,
+    std1 = 5,
 
-    pub const count = 5;
+    pub const count = 6;
 
     pub fn fromName(name: []const u8) ?Codebook {
         if (std.mem.eql(u8, name, "mcg")) return .mcg;
         if (std.mem.eql(u8, name, "mul1")) return .mul1;
+        if (std.mem.eql(u8, name, "alpha")) return .alpha;
+        // The converter's name for alpha before its rename; older packs and stamps carry it.
+        if (std.mem.eql(u8, name, "andonly")) return .alpha;
         if (std.mem.eql(u8, name, "std1")) return .std1;
         if (std.mem.eql(u8, name, "spec1")) return .spec1;
         if (std.mem.eql(u8, name, "pair1")) return .pair1;
         return null;
     }
 
-    /// Whether the codebook decodes through the (multiplier, mask) row of its table: STD1 and SPEC1. A bank decodes
-    /// with `Decode.hashMask`.
+    /// A shard stamp's codebook: `s1`, `beta` and `sushi1` (SPEC1's names) and `dd1` and `cantona` (PAIR1's) are read
+    /// from shards stamped before their renames.
+    pub fn fromStampName(name: []const u8) ?Codebook {
+        if (std.mem.eql(u8, name, "s1") or std.mem.eql(u8, name, "beta") or std.mem.eql(u8, name, "sushi1")) return .spec1;
+        if (std.mem.eql(u8, name, "dd1") or std.mem.eql(u8, name, "cantona")) return .pair1;
+        return fromName(name);
+    }
+
+    /// Whether a shard stamped `name` belongs to a pack of this codebook. STD1's global pair was stamped as SPEC1
+    /// before it had a codebook of its own.
+    pub fn stampedAs(self: Codebook, name: []const u8) bool {
+        const stamped = fromStampName(name) orelse return false;
+        if (stamped == self) return true;
+        return self == .std1 and stamped == .spec1 and !std.mem.eql(u8, name, "spec1");
+    }
+
+    /// The codebook's fixed pair: ALPHA's. STD1 and SPEC1 have none, their pair is a row of the pack's table; a bank
+    /// decodes with `Decode.hashMask`.
+    pub fn hashMask(self: Codebook) ?HashMask {
+        return switch (self) {
+            .alpha => ALPHA,
+            .spec1, .std1, .mcg, .mul1, .pair1 => null,
+        };
+    }
+
+    /// Whether the codebook decodes through a (multiplier, mask) pair, fixed or from a table.
+    pub fn isHashMask(self: Codebook) bool {
+        return self == .alpha or self.tabledHashMask();
+    }
+
+    /// Whether the codebook decodes through the (multiplier, mask) row of its table: STD1 and SPEC1.
     pub fn tabledHashMask(self: Codebook) bool {
         return self == .spec1 or self == .std1;
     }
@@ -88,7 +122,7 @@ pub const Codebook = enum(u8) {
     /// The codebooks whose bytes the lane, one-row, cooperative-rows and prefill-grid kernels are proven on.
     pub fn servesLaneFastPaths(self: Codebook) bool {
         return switch (self) {
-            .mcg, .spec1, .std1, .pair1 => true,
+            .mcg, .alpha, .spec1, .std1, .pair1 => true,
             .mul1 => false,
         };
     }
@@ -163,10 +197,11 @@ pub const Decode = struct {
         if (self.codebook.tabledHashMask() and self.table == null) return error.Exl3CodebookTableUnknown;
     }
 
-    /// The hash-mask pair a bank at `rate` decodes with: the STD1 or SPEC1 table's row; null for any other
+    /// The hash-mask pair a bank at `rate` decodes with: ALPHA's, or the STD1 or SPEC1 table's row; null for any other
     /// codebook and for a rate the table has no row for.
     pub fn hashMask(self: Decode, rate: Rate) ?HashMask {
         return switch (self.codebook) {
+            .alpha => ALPHA,
             .spec1, .std1 => if (self.table) |t| codebook_tables.tabledPair(t, rate) else null,
             else => null,
         };
@@ -306,6 +341,7 @@ pub fn decodeCodeword(codeword: u16, codebook: Codebook) u16 {
     return switch (codebook) {
         .mcg => decodeMcg(codeword),
         .mul1 => decodeMul1(codeword),
+        .alpha => decodeHashMask(codeword, ALPHA),
         .spec1, .std1, .pair1 => unreachable,
     };
 }
@@ -403,14 +439,41 @@ fn hadamardEntry(row: usize, col: usize) f32 {
     return sign * HAD_SCALE;
 }
 
+const had_signed: [HAD_DIM][HAD_DIM]f32 = blk: {
+    @setEvalBranchQuota(200_000);
+    var t: [HAD_DIM][HAD_DIM]f32 = undefined;
+    for (0..HAD_DIM) |r| {
+        for (0..HAD_DIM) |k| t[r][k] = hadamardEntry(r, k);
+    }
+    break :blk t;
+};
+const had_lanes = 16;
+const HadVec = @Vector(had_lanes, f32);
+
+/// out[r] = sum over k of H[r][k] * values[k], each sum in k order; lanes run 16 outputs at once (H is symmetric).
 pub fn hadamard128(values: *[HAD_DIM]f32) void {
     var tmp: [HAD_DIM]f32 = undefined;
-    for (0..HAD_DIM) |r| {
-        var acc: f32 = 0;
-        for (0..HAD_DIM) |k| acc += hadamardEntry(r, k) * values[k];
-        tmp[r] = acc;
+    var c: usize = 0;
+    while (c < HAD_DIM) : (c += had_lanes) {
+        var acc: HadVec = @splat(0);
+        for (0..HAD_DIM) |k| acc += @as(HadVec, had_signed[k][c..][0..had_lanes].*) * @as(HadVec, @splat(values[k]));
+        tmp[c..][0..had_lanes].* = acc;
     }
     values.* = tmp;
+}
+
+/// `hadamard128` down every column of the HAD_DIM rows of `w` from `row0` ([rows, cols] row-major), 16 columns at a
+/// time; `tmp` holds HAD_DIM * cols.
+fn hadamardColumns(w: []f32, row0: usize, cols: usize, tmp: []f32) void {
+    for (0..HAD_DIM) |r| {
+        var c: usize = 0;
+        while (c < cols) : (c += had_lanes) {
+            var acc: HadVec = @splat(0);
+            for (0..HAD_DIM) |k| acc += @as(HadVec, @splat(had_signed[r][k])) * @as(HadVec, w[(row0 + k) * cols + c ..][0..had_lanes].*);
+            tmp[r * cols + c ..][0..had_lanes].* = acc;
+        }
+    }
+    @memcpy(w[row0 * cols ..][0 .. HAD_DIM * cols], tmp[0 .. HAD_DIM * cols]);
 }
 
 pub fn reconstructInner(
@@ -454,15 +517,10 @@ pub fn reconstructPublic(
     const w = try allocator.alloc(f32, in_features * out_features);
     defer allocator.free(w);
     for (inner, 0..) |bits, i| w[i] = f16BitsToF32(bits);
+    const tmp = try allocator.alloc(f32, HAD_DIM * out_features);
+    defer allocator.free(tmp);
     var row_block: usize = 0;
-    while (row_block < in_features) : (row_block += HAD_DIM) {
-        for (0..out_features) |col| {
-            var vec: [HAD_DIM]f32 = undefined;
-            for (0..HAD_DIM) |r| vec[r] = w[(row_block + r) * out_features + col];
-            hadamard128(&vec);
-            for (0..HAD_DIM) |r| w[(row_block + r) * out_features + col] = vec[r];
-        }
-    }
+    while (row_block < in_features) : (row_block += HAD_DIM) hadamardColumns(w, row_block, out_features, tmp);
     for (0..in_features) |r| {
         const s = f16BitsToF32(suh[r]);
         const row = w[r * out_features ..][0..out_features];
@@ -470,12 +528,7 @@ pub fn reconstructPublic(
     }
     var col_block: usize = 0;
     while (col_block < out_features) : (col_block += HAD_DIM) {
-        for (0..in_features) |r| {
-            var vec: [HAD_DIM]f32 = undefined;
-            for (0..HAD_DIM) |c| vec[c] = w[r * out_features + col_block + c];
-            hadamard128(&vec);
-            for (0..HAD_DIM) |c| w[r * out_features + col_block + c] = vec[c];
-        }
+        for (0..in_features) |r| hadamard128(w[r * out_features + col_block ..][0..HAD_DIM]);
     }
     for (0..out_features) |c| {
         const s = f16BitsToF32(svh[c]);
@@ -707,22 +760,48 @@ test "exl3 codebook names resolve and an unknown name is null" {
     const t = std.testing;
     try t.expectEqual(Codebook.mul1, Codebook.fromName("mul1").?);
     try t.expectEqual(Codebook.mcg, Codebook.fromName("mcg").?);
+    try t.expectEqual(Codebook.alpha, Codebook.fromName("alpha").?);
+    try t.expectEqual(Codebook.alpha, Codebook.fromName("andonly").?);
     try t.expectEqual(Codebook.std1, Codebook.fromName("std1").?);
     try t.expectEqual(Codebook.spec1, Codebook.fromName("spec1").?);
     try t.expectEqual(Codebook.pair1, Codebook.fromName("pair1").?);
-    try t.expectEqual(@as(?Codebook, null), Codebook.fromName("mul2"));
+    for ([_][]const u8{ "s1", "dd1", "beta", "sushi1", "cantona", "mul2" }) |old| try t.expectEqual(@as(?Codebook, null), Codebook.fromName(old));
+}
+
+test "a shard stamped before STD1, SPEC1 and PAIR1 reads as the codec it names today" {
+    const t = std.testing;
+    for ([_][]const u8{ "s1", "beta", "sushi1", "spec1" }) |name| try t.expectEqual(Codebook.spec1, Codebook.fromStampName(name).?);
+    for ([_][]const u8{ "dd1", "cantona", "pair1" }) |name| try t.expectEqual(Codebook.pair1, Codebook.fromStampName(name).?);
+    try t.expectEqual(Codebook.std1, Codebook.fromStampName("std1").?);
+    try t.expectEqual(@as(?Codebook, null), Codebook.fromStampName("mul2"));
+    // The global pair was stamped as SPEC1 before it had a codebook of its own.
+    for ([_][]const u8{ "s1", "beta", "sushi1", "std1" }) |name| try t.expect(Codebook.std1.stampedAs(name));
+    for ([_][]const u8{ "spec1", "pair1", "mcg" }) |name| try t.expect(!Codebook.std1.stampedAs(name));
+    try t.expect(Codebook.spec1.stampedAs("s1") and Codebook.spec1.stampedAs("spec1") and !Codebook.spec1.stampedAs("std1"));
+    try t.expect(Codebook.pair1.stampedAs("cantona") and !Codebook.pair1.stampedAs("std1"));
 }
 
 test "exl3 std1 decodes as spec1 does with the same pair at every rate" {
     const t = std.testing;
     const std1 = Decode.tabled(.std1, .w15);
     const as_spec1: Decode = .{ .codebook = .spec1, .window = .w15, .table = std1.table };
-    try t.expect(Codebook.std1.tabledHashMask());
+    try t.expect(Codebook.std1.isHashMask() and Codebook.std1.hashMask() == null);
     for ([_]u32{ 24, 32, 40, 48, 64 }) |n| {
         const hm = std1.hashMask(.{ .n = n }).?;
         try t.expectEqual(HashMask{ .mult = 0x840C1F37, .mask = 0x8FFE8FD0 }, hm);
         try t.expectEqual(hm, as_spec1.hashMask(.{ .n = n }).?);
     }
+}
+
+test "exl3 alpha codebook pins known codewords, subnormal halves included" {
+    const t = std.testing;
+    try t.expectEqual(@as(u16, 0x0000), decodeCodeword(0, .alpha));
+    try t.expectEqual(@as(u16, 0x3080), decodeCodeword(1, .alpha));
+    try t.expectEqual(@as(u16, 0xBD20), decodeCodeword(3, .alpha));
+    // Both masked halves are subnormal here.
+    try t.expectEqual(@as(u16, 0xB100), decodeCodeword(7, .alpha));
+    try t.expectEqual(@as(u16, 0xAB00), decodeCodeword(0x39, .alpha));
+    try t.expectEqual(@as(u16, 0xB9D0), decodeCodeword(0xFFFF, .alpha));
 }
 
 // Sashimi's reference decoder gives these bits for this fixture pair, whose half sum rounds on some codewords (0x15, 0x3E).
@@ -740,7 +819,7 @@ test "exl3 hash-mask decode pins known codewords, rounded half sums included" {
 
 test "exl3 spec1 has no pair of its own: only a table row decodes it" {
     const t = std.testing;
-    try t.expect(Codebook.spec1.tabledHashMask());
+    try t.expect(Codebook.spec1.hashMask() == null and Codebook.spec1.isHashMask() and Codebook.alpha.isHashMask());
     try t.expect((Decode{ .codebook = .spec1 }).hashMask(.{ .n = 40 }) == null);
     const w15 = codebook_tables.indexOf("spec1-w15");
     try t.expect((Decode{ .codebook = .spec1, .table = w15 }).hashMask(.{ .n = 40 }) != null);
@@ -834,6 +913,23 @@ test "exl3 pair1's host truth hooks find the first codeword or weight a decode g
     decodeTile(&words, rate, .{ .codebook = .pair1 }, &got);
     got[77] ^= 0x8000;
     try t.expectEqual(@as(?usize, 77), firstPair1TileMismatch(&words, rate, &got));
+}
+
+test "exl3 alpha decodes every codeword exactly, to zero or a normal half" {
+    const t = std.testing;
+    var subnormal_halves: usize = 0;
+    for (0..65536) |cw| {
+        const pair = (@as(u32, @intCast(cw)) *% ALPHA.mult) & ALPHA.mask;
+        for ([_]u16{ @truncate(pair), @truncate(pair >> 16) }) |h| {
+            if (h & 0x7C00 == 0 and h & 0x03FF != 0) subnormal_halves += 1;
+        }
+        const exact = (@as(f64, f16BitsToF32(@truncate(pair))) + @as(f64, f16BitsToF32(@truncate(pair >> 16)))) * 4096.0;
+        const got = f16BitsToF32(decodeCodeword(@intCast(cw), .alpha));
+        // No rounding anywhere, so every arithmetic order lands on the same half.
+        try t.expectEqual(exact, @as(f64, got));
+        try t.expect(got == 0 or @abs(got) >= std.math.floatMin(f16));
+    }
+    try t.expect(subnormal_halves > 0);
 }
 
 test "exl3 MUL1 codebook maps a zero codeword to the finite half" {
@@ -1086,5 +1182,37 @@ test "exl3 Sushi CPU scalar tiles match independent circular bit extraction" {
                 }
             }
         }
+    }
+}
+
+test "hadamard128 and the column pass give the bytes of the plain row-by-row sum" {
+    const t = std.testing;
+    var prng = std.Random.DefaultPrng.init(7);
+    const rnd = prng.random();
+    const cols = 48;
+    var w: [HAD_DIM * cols]f32 = undefined;
+    for (&w) |*v| v.* = rnd.floatNorm(f32) * 3;
+    var want = w;
+    for (0..cols) |c| {
+        var vec: [HAD_DIM]f32 = undefined;
+        for (0..HAD_DIM) |r| vec[r] = want[r * cols + c];
+        var out: [HAD_DIM]f32 = undefined;
+        for (0..HAD_DIM) |r| {
+            var acc: f32 = 0;
+            for (0..HAD_DIM) |k| acc += hadamardEntry(r, k) * vec[k];
+            out[r] = acc;
+        }
+        for (0..HAD_DIM) |r| want[r * cols + c] = out[r];
+    }
+    var tmp: [HAD_DIM * cols]f32 = undefined;
+    var got = w;
+    hadamardColumns(&got, 0, cols, &tmp);
+    try t.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&want)), std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(&got)));
+    var row: [HAD_DIM]f32 = w[0..HAD_DIM].*;
+    hadamard128(&row);
+    for (0..HAD_DIM) |r| {
+        var acc: f32 = 0;
+        for (0..HAD_DIM) |k| acc += hadamardEntry(r, k) * w[k];
+        try t.expectEqual(@as(u32, @bitCast(acc)), @as(u32, @bitCast(row[r])));
     }
 }

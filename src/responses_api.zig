@@ -779,7 +779,7 @@ fn handleResponsesInner(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter_resp, enable_mtp_resp, lm.dflash != null, lm.mtp != null, .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty });
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head, req_media.deferred)) return;
 
     // ── sampling ──
     var sampling = sampler.SamplingParams{
@@ -2711,8 +2711,17 @@ test "a Responses envelope names the call a reply declined, ahead of a thought's
     }
 }
 
-test "tool stream: a Responses call that buffers for 23 s sends its item and a function_call_arguments.delta within every beat interval, after the thought and text before it" {
+test "tool stream: a Responses call that buffers for 23 s sends its item and a function_call_arguments.delta within every beat interval, after the thought and text before it, in every dialect" {
+    for (tool_progress.write_file_heads) |head| {
+        errdefer std.debug.print("head: {f}\n", .{std.zig.fmtString(head)});
+        try responsesCallBuffers(head);
+    }
+}
+
+fn responsesCallBuffers(call_head: []const u8) !void {
     const a = std.testing.allocator;
+    const head = try std.mem.concat(a, u8, &.{ "<think>The file is long.</think>\n\nWriting it.\n", call_head });
+    defer a.free(head);
     var wire: http_conn.TestWire = undefined;
     try wire.init();
     defer wire.deinit();
@@ -2754,7 +2763,7 @@ test "tool stream: a Responses call that buffers for 23 s sends its item and a f
     for (0..230) |i| {
         wire.advance(100);
         since += 100;
-        try buffered.appendSlice(a, if (i == 0) "<think>The file is long.</think>\n\nWriting it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n" else "- item: pending review\n");
+        try buffered.appendSlice(a, if (i == 0) head else "- item: pending review\n");
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;

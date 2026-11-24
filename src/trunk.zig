@@ -1571,6 +1571,8 @@ pub const Trunk = struct {
     }
 
     pub fn deinitTrunk(self: *Trunk) void {
+        // A model that goes, by whatever path, leaves no turn or cap in force on its budget slot.
+        mlx.engine.forgetSlot(&self.cooler_budget);
         self.flushImatrix(); // `/v1/unload-model` reaches here on the inference thread
         self.releaseCells();
         self.releaseJoinedVerifyLogits();

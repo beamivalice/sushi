@@ -7,18 +7,22 @@ pub const Arch = enum {
     qwen4_exp,
     mimo_v2,
     glm5_next,
+    deepseek_v41,
+    hy_v4_flash,
 
     pub fn defaultTrunkBits(self: Arch) u32 {
         return switch (self) {
             .qwen4_exp, .mimo_v2 => 8,
             .glm5_next => 6,
+            .deepseek_v41 => 4,
+            .hy_v4_flash => 6,
         };
     }
 
     pub fn defaultTrunkGroup(self: Arch) u32 {
         return switch (self) {
             .qwen4_exp, .mimo_v2 => 64,
-            .glm5_next => 128,
+            .glm5_next, .deepseek_v41, .hy_v4_flash => 128,
         };
     }
 
@@ -27,6 +31,8 @@ pub const Arch = enum {
             .qwen4_exp => if (mtp) "language_model.mtp" else "language_model.model",
             .mimo_v2 => "model",
             .glm5_next => "model.language_model",
+            .deepseek_v41 => "layers",
+            .hy_v4_flash => "model.layers",
         };
     }
 };
@@ -92,6 +98,8 @@ pub fn identifyConfigJson(allocator: std.mem.Allocator, raw_json: []const u8) !A
     if (std.mem.eql(u8, mt, "qwen4_exp") or std.mem.eql(u8, mt, "qwen4_exp_text")) return .qwen4_exp;
     if (std.mem.eql(u8, mt, "mimo_v2")) return .mimo_v2;
     if (std.mem.eql(u8, mt, "glm5_next") or std.mem.eql(u8, mt, "glm5_next_text")) return .glm5_next;
+    if (std.mem.eql(u8, mt, "deepseek_v41")) return .deepseek_v41;
+    if (std.mem.eql(u8, mt, "hy_v4_flash")) return .hy_v4_flash;
     return error.ArchitectureUnsupported;
 }
 
@@ -118,11 +126,19 @@ pub fn publicFromBf16(raw_u16: []const u16, out_rows: usize, in_cols: usize, out
     if (out_rows == 0 or in_cols == 0) return error.EmptyTensor;
     const total = std.math.mul(usize, out_rows, in_cols) catch return error.ShapeMismatch;
     if (raw_u16.len != total or out_public.len != total) return error.ShapeMismatch;
-    for (0..out_rows) |r| {
-        const row = raw_u16[r * in_cols ..][0..in_cols];
-        for (row, 0..) |w, c| {
-            if ((w & 0x7F80) == 0x7F80) return error.NonFiniteSourceWeight;
-            out_public[c * out_rows + r] = @bitCast(@as(u32, w) << 16);
+    // Square tiles keep both the row reads and the transposed writes in cache.
+    const tile = 32;
+    var r0: usize = 0;
+    while (r0 < out_rows) : (r0 += tile) {
+        const r1 = @min(r0 + tile, out_rows);
+        var c0: usize = 0;
+        while (c0 < in_cols) : (c0 += tile) {
+            const c1 = @min(c0 + tile, in_cols);
+            for (r0..r1) |r| for (c0..c1) |c| {
+                const w = raw_u16[r * in_cols + c];
+                if ((w & 0x7F80) == 0x7F80) return error.NonFiniteSourceWeight;
+                out_public[c * out_rows + r] = @bitCast(@as(u32, w) << 16);
+            };
         }
     }
 }
@@ -350,6 +366,7 @@ pub fn trunkSpecForTensor(arch: Arch, key: []const u8, dtype: []const u8, shape:
             }
             return .{ .affine = .{ .bits = trunk_bits, .group_size = trunk_group, .override_in_config = true } };
         },
+        .deepseek_v41, .hy_v4_flash => return .retain_source,
         .mimo_v2 => {
             if (std.mem.eql(u8, key, "lm_head.weight") or
                 std.mem.eql(u8, key, "model.embed_tokens.weight") or
@@ -524,8 +541,10 @@ pub const SafetensorsSource = struct {
         if (dst_public.len != in_dim * out_dim) return error.ShapeMismatch;
         var key_buf: [192]u8 = undefined;
         switch (arch) {
-            .qwen4_exp => {
-                const pfx = if (mtp) "mtp.layers" else "model.language_model.layers";
+            .qwen4_exp, .hy_v4_flash => {
+                // Hy4-Flash fuses gate and up as Qwen does, `[E, 2I, in]` gate rows first, and has no MTP bank.
+                if (arch == .hy_v4_flash and mtp) return error.MissingTensor;
+                const pfx = if (arch == .hy_v4_flash) "model.layers" else if (mtp) "mtp.layers" else "model.language_model.layers";
                 const leaf = if (role == .down) "down_proj" else "gate_up_proj";
                 const key = try std.fmt.bufPrint(&key_buf, "{s}.{d}.mlp.experts.{s}", .{ pfx, layer, leaf });
                 const loc = self.tensors.get(key) orelse return error.MissingTensor;
@@ -553,24 +572,102 @@ pub const SafetensorsSource = struct {
                 var skey_buf: [192]u8 = undefined;
                 const wkey = try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.experts.{d}.{s}.weight", .{ layer, expert, role.suffix() });
                 const skey = try std.fmt.bufPrint(&skey_buf, "model.layers.{d}.mlp.experts.{d}.{s}.weight_scale", .{ layer, expert, role.suffix() });
-                const wloc = self.tensors.get(wkey) orelse return error.MissingTensor;
-                const sloc = self.tensors.get(skey) orelse return error.MissingTensor;
-                if (!std.mem.eql(u8, wloc.dtype, "U8") or !std.mem.eql(u8, sloc.dtype, "U8")) return error.UnknownDtype;
-                if (wloc.shape.len != 2 or sloc.shape.len != 2) return error.BadShape;
-                if (wloc.shape[0] != out_dim or wloc.shape[1] != in_dim / 2 or sloc.shape[0] != out_dim or sloc.shape[1] != in_dim / 32) return error.BadShape;
-                const w_bytes = try allocator.alloc(u8, out_dim * (in_dim / 2));
-                defer allocator.free(w_bytes);
-                const s_bytes = try allocator.alloc(u8, out_dim * (in_dim / 32));
-                defer allocator.free(s_bytes);
-                try self.readRange(wloc, 0, w_bytes);
-                try self.readRange(sloc, 0, s_bytes);
-                try publicFromMxfp4(w_bytes, s_bytes, out_dim, in_dim, dst_public);
+                try self.readMxfp4Public(allocator, wkey, "U8", skey, "U8", out_dim, in_dim, dst_public);
+            },
+            .deepseek_v41 => {
+                // `mtp` reads DSpark stage `layer`'s experts.
+                var skey_buf: [192]u8 = undefined;
+                const name = switch (role) {
+                    .gate => "w1",
+                    .up => "w3",
+                    .down => "w2",
+                };
+                const pfx = if (mtp) "mtp" else "layers";
+                const wkey = try std.fmt.bufPrint(&key_buf, "{s}.{d}.ffn.experts.{d}.{s}.weight", .{ pfx, layer, expert, name });
+                const skey = try std.fmt.bufPrint(&skey_buf, "{s}.{d}.ffn.experts.{d}.{s}.scale", .{ pfx, layer, expert, name });
+                try self.readMxfp4Public(allocator, wkey, "I8", skey, "F8_E8M0", out_dim, in_dim, dst_public);
             },
         }
     }
+
+    /// A dense linear `<base>.weight` `[out, in]` as the public `[in, out]` f32: BF16, or F8_E4M3 codes with one
+    /// F8_E8M0 scale per square block (the block from the scale's shape: DeepSeek-V4.1's are 32 x 32).
+    pub fn readLinearPublic(self: *const SafetensorsSource, allocator: std.mem.Allocator, base: []const u8, out_dim: usize, in_dim: usize, dst_public: []f32) !void {
+        if (dst_public.len != in_dim * out_dim) return error.ShapeMismatch;
+        var key_buf: [192]u8 = undefined;
+        const wloc = self.tensors.get(try std.fmt.bufPrint(&key_buf, "{s}.weight", .{base})) orelse return error.MissingTensor;
+        if (wloc.shape.len != 2 or wloc.shape[0] != out_dim or wloc.shape[1] != in_dim) return error.BadShape;
+        if (std.mem.eql(u8, wloc.dtype, "BF16")) {
+            const raw = try allocator.alloc(u16, out_dim * in_dim);
+            defer allocator.free(raw);
+            try self.readRange(wloc, 0, std.mem.sliceAsBytes(raw));
+            return publicFromBf16(raw, out_dim, in_dim, dst_public);
+        }
+        if (!std.mem.eql(u8, wloc.dtype, "F8_E4M3")) return error.UnknownDtype;
+        const sloc = self.tensors.get(try std.fmt.bufPrint(&key_buf, "{s}.scale", .{base})) orelse return error.MissingTensor;
+        if (!std.mem.eql(u8, sloc.dtype, "F8_E8M0") or sloc.shape.len != 2) return error.UnknownDtype;
+        const s_rows = sloc.shape[0];
+        const s_cols = sloc.shape[1];
+        const block = (out_dim + s_rows - 1) / s_rows;
+        if ((in_dim + block - 1) / block != s_cols) return error.BadShape;
+        const codes = try allocator.alloc(u8, out_dim * in_dim);
+        defer allocator.free(codes);
+        const scale_codes = try allocator.alloc(u8, s_rows * s_cols);
+        defer allocator.free(scale_codes);
+        try self.readRange(wloc, 0, codes);
+        try self.readRange(sloc, 0, scale_codes);
+        const scales = try allocator.alloc(f32, s_rows * s_cols);
+        defer allocator.free(scales);
+        for (scales, scale_codes) |*o, c| o.* = try e8m0Value(c);
+        const tile = 32;
+        var r0: usize = 0;
+        while (r0 < out_dim) : (r0 += tile) {
+            var c0: usize = 0;
+            while (c0 < in_dim) : (c0 += tile) for (r0..@min(r0 + tile, out_dim)) |r| for (c0..@min(c0 + tile, in_dim)) |c| {
+                const v = (try decodeFp8E4m3Byte(codes[r * in_dim + c])) * scales[(r / block) * s_cols + c / block];
+                if (!std.math.isFinite(v)) return error.NonFiniteSourceWeight;
+                dst_public[c * out_dim + r] = v;
+            };
+        }
+    }
+
+    /// A tensor's stored bytes.
+    pub fn readAllAlloc(self: *const SafetensorsSource, allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+        const loc = self.tensors.get(name) orelse return error.MissingTensor;
+        const bytes = try allocator.alloc(u8, loc.end - loc.start);
+        errdefer allocator.free(bytes);
+        try self.readRange(loc, 0, bytes);
+        return bytes;
+    }
+
+    /// An e2m1 weight `[out, in / 2]` bytes (low nibble first) with one e8m0 scale per 32 columns, as the public `[in, out]` f32.
+    fn readMxfp4Public(
+        self: *const SafetensorsSource,
+        allocator: std.mem.Allocator,
+        weight_key: []const u8,
+        weight_dtype: []const u8,
+        scale_key: []const u8,
+        scale_dtype: []const u8,
+        out_dim: usize,
+        in_dim: usize,
+        dst_public: []f32,
+    ) !void {
+        const wloc = self.tensors.get(weight_key) orelse return error.MissingTensor;
+        const sloc = self.tensors.get(scale_key) orelse return error.MissingTensor;
+        if (!std.mem.eql(u8, wloc.dtype, weight_dtype) or !std.mem.eql(u8, sloc.dtype, scale_dtype)) return error.UnknownDtype;
+        if (wloc.shape.len != 2 or sloc.shape.len != 2) return error.BadShape;
+        if (wloc.shape[0] != out_dim or wloc.shape[1] != in_dim / 2 or sloc.shape[0] != out_dim or sloc.shape[1] != in_dim / 32) return error.BadShape;
+        const w_bytes = try allocator.alloc(u8, out_dim * (in_dim / 2));
+        defer allocator.free(w_bytes);
+        const s_bytes = try allocator.alloc(u8, out_dim * (in_dim / 32));
+        defer allocator.free(s_bytes);
+        try self.readRange(wloc, 0, w_bytes);
+        try self.readRange(sloc, 0, s_bytes);
+        try publicFromMxfp4(w_bytes, s_bytes, out_dim, in_dim, dst_public);
+    }
 };
 
-fn preadAll(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
+pub fn preadAll(fd: std.c.fd_t, dst: []u8, offset: u64) !void {
     var done: usize = 0;
     while (done < dst.len) {
         const got = std.c.pread(fd, dst[done..].ptr, dst.len - done, @intCast(offset + done));
@@ -752,4 +849,86 @@ test "source: SafetensorsSource streams per-expert public weights for Qwen, GLM 
     defer t.allocator.free(mimo_gate);
     try src.readExpertPublic(t.allocator, .mimo_v2, 1, false, .gate, 0, 128, 64, mimo_gate);
     try t.expectEqualSlices(f32, st.slice(f32, file.tensors.get("mxfp4.public").?), mimo_gate);
+}
+
+test "source: DeepSeek-V4.1 FP4 experts (I8 e2m1 pairs, F8_E8M0 per 32) read as numpy dequantizes them" {
+    const t = std.testing;
+    const io = t.io;
+    var file = try st.parse(t.allocator, st.dsv41_expert);
+    defer file.deinit(t.allocator);
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = st.dsv41_expert });
+    try t.expectEqual(Arch.deepseek_v41, try identifySourceDir(t.allocator, io, tmp.dir));
+    var src = try SafetensorsSource.open(t.allocator, io, tmp.dir);
+    defer src.deinit();
+    const dim = 64;
+    const inter = 32;
+    for ([_]struct { role: ProjRole, name: []const u8, in_dim: usize, out_dim: usize }{
+        .{ .role = .gate, .name = "w1", .in_dim = dim, .out_dim = inter },
+        .{ .role = .up, .name = "w3", .in_dim = dim, .out_dim = inter },
+        .{ .role = .down, .name = "w2", .in_dim = inter, .out_dim = dim },
+    }) |c| {
+        var key_buf: [96]u8 = undefined;
+        const want = st.slice(f32, file.tensors.get(try std.fmt.bufPrint(&key_buf, "layers.3.ffn.experts.5.{s}.public", .{c.name})).?);
+        const got = try t.allocator.alloc(f32, c.in_dim * c.out_dim);
+        defer t.allocator.free(got);
+        try src.readExpertPublic(t.allocator, .deepseek_v41, 3, false, c.role, 5, c.in_dim, c.out_dim, got);
+        try t.expectEqualSlices(f32, want, got);
+    }
+    var scratch: [dim * inter]f32 = undefined;
+    var big: [dim * inter * 2]f32 = undefined;
+    try t.expectError(error.MissingTensor, src.readExpertPublic(t.allocator, .deepseek_v41, 3, false, .gate, 6, dim, inter, &scratch));
+    try t.expectError(error.BadShape, src.readExpertPublic(t.allocator, .deepseek_v41, 3, false, .gate, 5, dim, inter * 2, &big));
+    try t.expectError(error.MissingTensor, src.readExpertPublic(t.allocator, .deepseek_v41, 3, true, .gate, 5, dim, inter, &scratch));
+}
+
+test "source: a DeepSeek-V4.1 FP8 linear (E4M3 codes, one E8M0 scale per 32 x 32 block) and a BF16 one read as public [in, out]" {
+    const t = std.testing;
+    const io = t.io;
+    const out = 64;
+    const in = 96;
+    // e4m3 1.0, 1.5, -2.0 and the smallest subnormal 2^-9, cycled; block (rb, cb) scaled by 2^(rb - cb).
+    const pick = [_]u8{ 0x38, 0x3C, 0xC0, 0x01 };
+    const value = [_]f32{ 1.0, 1.5, -2.0, 1.0 / 512.0 };
+    var codes: [out * in]u8 = undefined;
+    for (&codes, 0..) |*c, i| c.* = pick[i % 4];
+    var scale_codes: [2 * 3]u8 = undefined;
+    for (0..2) |rb| for (0..3) |cb| {
+        scale_codes[rb * 3 + cb] = @intCast(127 + rb - cb);
+    };
+    var bf: [32 * 128]u16 = undefined;
+    for (&bf, 0..) |*v, i| v.* = @truncate(@as(u32, @bitCast(bfValue(i))) >> 16);
+    const header = try std.fmt.allocPrint(t.allocator, "{{\"q.weight\":{{\"dtype\":\"F8_E4M3\",\"shape\":[{d},{d}],\"data_offsets\":[0,{d}]}},\"q.scale\":{{\"dtype\":\"F8_E8M0\",\"shape\":[2,3],\"data_offsets\":[{d},{d}]}},\"b.weight\":{{\"dtype\":\"BF16\",\"shape\":[32,128],\"data_offsets\":[{d},{d}]}}}}", .{ out, in, out * in, out * in, out * in + 6, out * in + 6, out * in + 6 + bf.len * 2 });
+    defer t.allocator.free(header);
+    var raw = std.ArrayList(u8).empty;
+    defer raw.deinit(t.allocator);
+    var len_buf: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len_buf, header.len, .little);
+    try raw.appendSlice(t.allocator, &len_buf);
+    try raw.appendSlice(t.allocator, header);
+    try raw.appendSlice(t.allocator, &codes);
+    try raw.appendSlice(t.allocator, &scale_codes);
+    try raw.appendSlice(t.allocator, std.mem.sliceAsBytes(&bf));
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = raw.items });
+    var src = try SafetensorsSource.open(t.allocator, io, tmp.dir);
+    defer src.deinit();
+    var got: [out * in]f32 = undefined;
+    try src.readLinearPublic(t.allocator, "q", out, in, &got);
+    for (0..out) |r| for (0..in) |c| {
+        const e: i32 = @as(i32, @intCast(r / 32)) - @as(i32, @intCast(c / 32));
+        try t.expectEqual(value[(r * in + c) % 4] * std.math.pow(f32, 2, @floatFromInt(e)), got[c * out + r]);
+    };
+    var got_b: [32 * 128]f32 = undefined;
+    try src.readLinearPublic(t.allocator, "b", 32, 128, &got_b);
+    for (0..32) |r| for (0..128) |c| try t.expectEqual(bfValue(r * 128 + c), got_b[c * 32 + r]);
+    try t.expectError(error.BadShape, src.readLinearPublic(t.allocator, "q", in, out, &got));
+    try t.expectError(error.MissingTensor, src.readLinearPublic(t.allocator, "nope", out, in, &got));
+}
+
+fn bfValue(i: usize) f32 {
+    return @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.25;
 }

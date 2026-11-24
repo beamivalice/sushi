@@ -42,6 +42,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   takes any whole number 1-100; 50, 75 and 100 reach the encoder as its own words, `chat.scaleEffortFor`); no caps.
 - glm5_next (built-in): low, high, max (uncapped, a prompt instruction; `sends` takes low|high|max); `medium` folds to
   `high` and `xhigh` to `max`; off can never be offered (the template has no thinking-off switch).
+- hy_v4_flash (built-in, not served until its quant ships): off (the template's `no_think`), low and medium at `high`
+  under 2048 and 16384, high, and xhigh and max at `max`. The template reads the word; a row that sends it another
+  level's word (low and medium) keeps its cap where a template-read word otherwise drops it, since the cap is all that
+  tells those levels from high (`reasoningEffortFromWord`). The template's literal `no_think` makes `chat.templateSettings`
+  pass the arm's word through (`asks.noThinkWord`). Its preserve switch is spelled `preserved_thinking`; the same
+  `--preserve-thinking` / `preserve_thinking` setting reaches it under that name (`Settings.preserved_thinking`), and
+  unset leaves the template's own default (preserve when the request has tools).
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, are read from the served table on every call: `reasoning_efforts` (the offered
@@ -300,7 +307,8 @@ before reading a completed stream and requires clean EOF.
   strings (`instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`), `truncation` (auto or
   disabled) and `max_tool_calls` (on `/v1/responses/compact` too; the envelope echoes the whole number accepted, `3.0` as 3), `completionsFieldFault` the legacy integer `logprobs`, refused at any value): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
   float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties take a number; `stop` a string or
-  strings; `kv_quant` `off|0|4|6|8|16`; every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
+  strings; `kv_quant` `off|0|4|6|8|16` (a load on the static bill serves only the width it loaded with and refuses another
+  by name); every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000
   (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
   and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),

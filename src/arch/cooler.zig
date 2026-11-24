@@ -34,6 +34,10 @@ comptime {
 
 const onEngine = cooler_side.onEngine;
 
+/// An arch on the ledger (`bills.ledgerArch`) runs its narrow forwards on its plans and its wide ones in its region: its
+/// pool is its turn's gate (D64), never a forward's cap, and keeps no free buffer past a request.
+const plansForwards = bills.ledgerArch;
+
 /// Whether the arch's own module installs and lifts its caps (DeepSeek's beside the expert pools it releases).
 fn ownCaps(config: *const ModelConfig) bool {
     const tag = registry.ofModelType(config.model_type) orelse return false;
@@ -54,7 +58,7 @@ pub fn forwardCap(config: *const ModelConfig, rows: u64, seq: u64) u64 {
 /// free: the forward's own asks, which no parked buffer of another size serves, land on top of the buffers that stay,
 /// so only what the transient's bill leaves over can stay parked.
 fn forwardMargin(config: *const ModelConfig) u64 {
-    return if (bills.coolerPrefillRowBytes(config) > 0) bills.BILL_MARGIN_BYTES else 0;
+    return if (bills.coolerBillExact(config)) bills.BILL_MARGIN_BYTES else 0;
 }
 
 /// PURE: `forwardCap` of a forward that reads out every row through the head, which asks `readout` bytes
@@ -66,6 +70,9 @@ pub fn readoutCap(config: *const ModelConfig, rows: u64, seq: u64, readout: u64)
 
 /// PURE: the free buffers a request's end leaves the pool at most.
 pub fn restCap(config: *const ModelConfig) u64 {
+    // A load on the ledger runs its narrow phases on its arena: the next request asks the pool for none of them, and
+    // what the pool kept past the seal would be held outside every line.
+    if (plansForwards(config)) return 0;
     const tag = registry.ofModelType(config.model_type) orelse return forwardCap(config, verify_rows, 1);
     switch (tag) {
         inline else => |t| if (comptime @hasDecl(registry.Mod(t), "coolerRestCap")) return registry.Mod(t).coolerRestCap(config),
@@ -79,7 +86,9 @@ pub const Rows = struct {
     seq: u64,
     readout: u64 = 0,
 
-    pub fn cap(r: Rows, config: *const ModelConfig) u64 {
+    /// Null where the arch's forwards run under no cap (`plansForwards`).
+    pub fn cap(r: Rows, config: *const ModelConfig) ?u64 {
+        if (plansForwards(config)) return null;
         return readoutCap(config, r.rows, r.seq, r.readout);
     }
 };
@@ -87,7 +96,7 @@ pub const Rows = struct {
 /// A forward of the model of `config`, whose trunk is `head`, begins: its rows, and the position its last row ends at,
 /// read only when the shared seam acts on them or `want` asks (each read of a shape is a query of MLX's on an MLX load).
 pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.ForwardCtx, ids: mlx.mlx_array, head: *Trunk, want: bool) ?Rows {
-    const seam = onEngine(config) and !ownCaps(config);
+    const seam = onEngine(config) and !ownCaps(config) and !plansForwards(config);
     if (!seam and !want) return null;
     const shape = mlx.getShape(ids);
     const rows: u64 = if (shape.len == 0) 1 else @intCast(shape[shape.len - 1]);
@@ -98,7 +107,7 @@ pub fn enterForward(config: *const ModelConfig, ctx: *const model_handle.Forward
         // A prefill chunk holds no more than its bill: under the cap the pool gives up its free buffers before it asks
         // Metal for more. Uncapped, a 4096-row chunk of the Qwen cut kept ~2 GB of them on 2.9 GB in use, 1.4 GB past
         // its bill. The model's next narrow forward, or the request's end, lifts it.
-        enterWide(&head.cooler_budget, at.cap(config));
+        enterWide(&head.cooler_budget, at.cap(config).?);
         return at;
     }
     liftWide(config, &head.cooler_budget);
@@ -170,6 +179,104 @@ pub fn warmAbandoned(seal: ?mlx.engine.Seal) void {
     if (seal) |s| s.end();
 }
 
+/// A load that plans makes its arena: on the ledger once its chunk is fixed, before its warm, so the warm runs what a
+/// request runs (D107); else at its warm's end. An arch that declares `planBuild` records and packs its plans and keeps
+/// the shapes its misses record in `cache` (its pipeline manifest's directory); any other serves on the pool.
+pub fn planLoad(xfm: *Trunk, cache: ?@import("../tensor/plan/plan_book.zig").Cache) !void {
+    // The warm's free buffers leave the pool before the arena is made, so the two never stand together.
+    mlx.engine.close();
+    mlx.engine.trim();
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planBuild")) try registry.Mod(t).planBuild(m, cache),
+    }
+}
+
+/// A load on the ledger records its plans before its warm (D98), so its chunk is chosen on the arena they and the
+/// region ask (`planArena`); an arch that declares no `planRecord` records none.
+pub fn planRecord(xfm: *Trunk, cache: ?@import("../tensor/plan/plan_book.zig").Cache) !void {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planRecord")) try registry.Mod(t).planRecord(m, cache),
+    }
+}
+
+/// The arena the plans of `xfm` hold with prefill chunks of `chunk` rows, as Metal allocates it (whole pages); null for a
+/// load that planned none.
+pub fn planArena(xfm: *Trunk, chunk: u32) !?u64 {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "planArena")) {
+            const bytes = (try registry.Mod(t).planArena(m, chunk)) orelse return null;
+            return std.mem.alignForward(u64, bytes, @import("../tensor/pool_class.zig").page_bytes);
+        },
+    }
+    return null;
+}
+
+/// A sample on a load whose arch plans its samples (docs/bill_redesign.md, D24): from `beginSample` to `end` (or `token`,
+/// or `fail`) the sampler's work from the logits to the token is one execution of the root its mix names. An arch that
+/// declares `sampleBegin` answers whether one began, and refuses by name a mix it did not plan (`PlanMiss`); every other
+/// load samples as before.
+pub const Sample = struct {
+    xfm: *Trunk,
+    on: bool,
+
+    /// The execution ends: a miss it met is `PlanMiss`.
+    pub fn end(run: Sample) !void {
+        if (!run.on) return;
+        switch (registry.handleOf(run.xfm)) {
+            inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleBegin")) return registry.Mod(t).sampleEnd(m),
+        }
+    }
+
+    /// `lazy` (a draw's token, owned) as a token that outlives the execution, which ends: the arch's own block holds it.
+    pub fn token(run: Sample, lazy: mlx.mlx_array) !mlx.mlx_array {
+        if (!run.on) return lazy;
+        switch (registry.handleOf(run.xfm)) {
+            inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleBegin")) return registry.Mod(t).sampleToken(m, lazy),
+        }
+        return lazy;
+    }
+
+    /// The sampler failed inside the execution, which goes: a miss it met is `PlanMiss`, any other failure the caller's.
+    pub fn fail(run: Sample) error{PlanMiss}!void {
+        if (!run.on) return;
+        switch (registry.handleOf(run.xfm)) {
+            inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleBegin")) return registry.Mod(t).sampleFail(m),
+        }
+    }
+};
+
+/// A forward's input ids [1, n] where the arch of `xfm` holds them in a block of its own (`forwardIds`, a load on the
+/// static bill); null for every other load, whose input the caller makes.
+pub fn forwardIds(xfm: *Trunk, ids: []const i32) !?mlx.mlx_array {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "forwardIds")) return registry.Mod(t).forwardIds(m, ids),
+    }
+    return null;
+}
+
+/// A forced call's token `id` in the form the load's draws read a token in flight (`Sample.token`'s), or null where the
+/// arch plans no samples and the token stays the host array of its id.
+pub fn forcedToken(xfm: *Trunk, id: u32) !?mlx.mlx_array {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleForced")) return registry.Mod(t).sampleForced(m, id),
+    }
+    return null;
+}
+
+pub fn beginSample(xfm: *Trunk, mix: @import("../sampler.zig").Mix) !Sample {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| if (comptime @hasDecl(registry.Mod(t), "sampleBegin")) return .{ .xfm = xfm, .on = try registry.Mod(t).sampleBegin(m, mix) },
+    }
+    return .{ .xfm = xfm, .on = false };
+}
+
+/// A warm of the Cooler load of `xfm` begins: it asks the pool by design until its seal (`warmEnded`), so the load's
+/// gate opens, in force for the turn it runs in; a load's warm after its seal too.
+pub fn warmBegins(xfm: *Trunk) void {
+    xfm.cooler_budget.gate = .open;
+    mlx.engine.gatePool(.open);
+}
+
 /// The Cooler load of `xfm` ended its warm: a pipeline made from here is late (`engine.seal`), and the warm's transients
 /// leave the pool, so the load's memory reading is the model's.
 pub fn warmEnded(xfm: *Trunk) void {
@@ -177,6 +284,9 @@ pub fn warmEnded(xfm: *Trunk) void {
     mlx.engine.seal(true);
     mlx.engine.close();
     mlx.engine.trim();
+    // Past the seal a load of an arch on the ledger closes the pool for its turns: an ask outside a wide phase is
+    // refused by name (D64). Every other model's turns keep it open.
+    xfm.cooler_budget.gate = if (plansForwards(&xfm.config)) .refuse else .open;
 }
 
 /// What a load on the engine of our own owes the engine while it reads its weights and builds its model, in one place

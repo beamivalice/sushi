@@ -22,15 +22,14 @@ json-unchecked-shape src/model.zig:indexedResidentSplit indexWeightMap returns o
 json-unchecked-shape src/model.zig:loadWeightsFromOpenDirMode indexWeightMap returns only an object whose weight_map is an object
 json-unchecked-shape src/model.zig:loadSafetensorsFileMode SafetensorsHeader.read refuses a header that is not an object
 json-unchecked-shape src/weights_where.zig:loadWhere SafetensorsHeader.read refuses a header that is not an object
-json-unchecked-shape src/dsv41/dsv41_engram.zig:inShard SafetensorsHeader.read refuses a header that is not an object
-json-unchecked-shape src/dsv41/repack.zig:read SafetensorsHeader.read refuses a header that is not an object
-json-unchecked-shape src/dsv41/dsv41_source.zig:validateTileOrder SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/engram.zig:inShard SafetensorsHeader.read refuses a header that is not an object
+json-unchecked-shape src/repack.zig:read SafetensorsHeader.read refuses a header that is not an object
 json-unchecked-shape src/dsv41/dsv41_source.zig:sumBytes SafetensorsHeader.read refuses a header that is not an object
 json-unchecked-shape src/expert_io.zig:shardOf ShardIndex.open refuses an index whose weight_map is not an object
 json-unchecked-shape src/expert_store.zig:checkTileStamp cacheSourceHeader refuses a header that is not an object
 json-unchecked-shape src/expert_store.zig:cachedTensorRegion cacheSourceHeader refuses a header that is not an object
 json-unchecked-shape src/expert_store.zig:populateBf16IndividualStore validateBf16IndividualMap checks every expert key is present and a string
-json-unchecked-shape src/dsv41/repack_stamp.zig:equalExceptStamp headerStamp returned a string, so __metadata__ is an object
+json-unchecked-shape src/repack_stamp.zig:equalExceptStamp headerStamp returned a string, so __metadata__ is an object
 json-unchecked-shape src/dsv41/kld_capture.zig:foldJob sushi kld reads back the sums file it wrote itself
 json-unchecked-shape src/encoder/driver.zig:indexOfDir sushi convert over a source checkpoint: the converter is not served
 json-unchecked-shape src/encoder/driver.zig:layerKinds sushi convert over a source checkpoint: the converter is not served
@@ -48,7 +47,7 @@ owned-insert-arg src/launch.zig:parseChatEntries the entries and their copies li
 owned-insert-arg src/ubench_main.zig:main argv and its copies live in the run's arena
 owned-insert-arg src/encoder/pack.zig:buildConfig the config tree and its keys live in the build's arena
 owned-insert-arg src/glm5/glm_stream_fixture.zig:add TinyWriter's allocator is the fixture's arena
-owned-insert-arg src/dsv41/repack.zig:buildPlan buildPlan runs on the shard's arena
+owned-insert-arg src/repack.zig:buildPlan buildPlan runs on the shard's arena
 log-line-end src/ubench_main.zig:main the usage text it prints last ends the line
 log-line-end src/bench.zig:start the usage text it prints last ends the line
 test-unrooted src/arch/slice_check.zig:- build.zig compiles it as its own per-arch root with the arch_slice module, which no shared test root has
@@ -57,7 +56,7 @@ array-unowned-across-try src/verify_moe.zig:mtpCoarsePairs cachedScalarInt retur
 array-unowned-across-try src/cooler_warm.zig:spliceAhead spliceVisionRows takes h on every path, its error ones included
 array-unowned-across-try src/ubench_shared.zig:runTrunkPrefill a bench setup that fails ends the ubench process, which holds no pool beyond it
 array-unowned-across-try src/exl3_ubench/ubench.zig:runTrunkRows a bench setup that fails ends the ubench process, which holds no pool beyond it
-array-unowned-across-try src/exl3_ubench/ubench.zig:runTrunkLaunches a bench setup that fails ends the ubench process, which holds no pool beyond it
+array-unowned-across-try src/exl3_ubench/ubench.zig:runLaunchTable a bench setup that fails ends the ubench process, which holds no pool beyond it
 caught-error-unsettled src/scheduler.zig:pushToken a host append while a tick publishes: a latch pending then is the forward's, which the tick's checkErrorDecode reads
 caught-error-unsettled src/scheduler.zig:ensureLoadedOnce a host parse of the model's files on the requesting connection thread, which must never take the inference thread's latch
 caught-error-unsettled src/scheduler.zig:runSingleDecodeTick the reasoning protocol's own errors, raised by host code; the checkErrorDecode right after reads the tick's latch
@@ -69,6 +68,8 @@ promise-active src/models_api.zig:handleProps /props reports the active bytes as
 promise-active src/models_api.zig:handlePropsNoModel /props reports the active bytes as MLX and the engine count them, no promise
 promise-active src/expert_stream.zig:lentReading measures the lent term itself, on the reading admission subtracts it from
 promise-active src/model_load.zig:doLoadOnInferenceThread the load's decode profile measures what its forwards allocate, no promise
+promise-active src/static_bill.zig:now the engine's counts at a load's start, which its `seen` is measured from, no promise
+promise-active src/static_bill.zig:seal measures what the active count holds of the load's own model bill (the ledger's `seen`), no promise
 request-bool-read src/responses_api.zig:appendFunctionToolEcho echoes a tool's `strict` as null for another type; it reads nothing the request acts on
 request-bool-read src/server.zig:handleWebTools refuses a non-bool browse, vision and write by name before reading them
 request-bool-read src/server.zig:handleLoadModelStrict refuses a non-bool default by name before reading it
@@ -85,3 +86,5 @@ detached-global-read src/downloads.zig:claimDest runs on a connection thread (ha
 detached-global-read src/downloads.zig:handleStart runs on a connection thread, which the shutdown drain waits for
 detached-global-read src/downloads.zig:render runs on a connection thread (GET /v1/downloads), which the shutdown drain waits for
 in-place-write src/ssm_cache.zig:ssmSliceUpdateRow rewrites one row of a batch's stacked state at a fixed shape: a row patch, never an appended buffer, so it has no page grid
+engine-lifecycle src/hy4flash/ubench.zig:runAttnCore a microbench on synthetic tensors, no model load: it turns the engine on for its own process, as a Cooler load would
+device-probe src/cli.zig:parseModelEfforts reads the /v1/models JSON row's architecture field, not the GPU device profile

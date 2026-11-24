@@ -1,7 +1,7 @@
 const std = @import("std");
-const mlx = @import("../mlx.zig");
-const log = @import("../log.zig");
-const Stopwatch = @import("../io_util.zig").Stopwatch;
+const mlx = @import("mlx.zig");
+const log = @import("log.zig");
+const Stopwatch = @import("io_util.zig").Stopwatch;
 
 pub const RoundMeter = struct {
     pub const Phase = enum { entry, stage, head, markov, draft_read, plan, verify, verdict, finish, publish };
@@ -15,7 +15,7 @@ pub const RoundMeter = struct {
     parts: [count]Part = @splat(.{}),
 
     pub fn init(io: std.Io) RoundMeter {
-        return .{ .fence_draft = @import("../io_util.zig").diagEnvOn("SUSHI_DSV41_DSPARK_STAGE_TIMES"), .timer = Stopwatch.init(io), .last = mlx.engine.stats() };
+        return .{ .fence_draft = @import("io_util.zig").diagEnvOn("SUSHI_DSV41_DSPARK_STAGE_TIMES"), .timer = Stopwatch.init(io), .last = mlx.engine.stats() };
     }
 
     pub fn part(self: *RoundMeter, phase: Phase) *Part {

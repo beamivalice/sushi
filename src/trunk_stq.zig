@@ -14,6 +14,13 @@ pub const SHARED_ROWS_MAX = trunk.SHARED_ROWS_MAX;
 pub const isStq = trunk.isStq;
 pub const outDim = trunk.outDim;
 pub const matmul = trunk.matmul;
+pub const matmulThruBf16 = trunk.matmulThruBf16;
+pub const matmulThruBf16Normed = trunk.matmulThruBf16Normed;
+pub const matmulThruBf16Parts = trunk.matmulThruBf16Parts;
+pub const matmulThruBf16Counted = trunk.matmulThruBf16Counted;
+pub const matmulThruBf16Stored = trunk.matmulThruBf16Stored;
+pub const matmulThruBf16Swiglu = trunk.matmulThruBf16Swiglu;
+pub const Parts = exl3.linear.Parts;
 pub const fuse = trunk.fuse;
 pub const sharedProject = trunk.sharedProject;
 

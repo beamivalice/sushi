@@ -181,6 +181,11 @@ pub const PersistOutcome = enum {
 /// The KV extent one commit would persist, in tokens: clamped to the token record (the cache
 /// runs 1-2 positions ahead on EOS turns), from the initialized layers' offset, not `step`
 /// (0 on GDN hybrids). Shared by the commit and `holdsFullPrefix`.
+fn anyInitialized(kv_entries: []const trunk.KVCacheEntry) bool {
+    for (kv_entries) |*entry| if (entry.initialized) return true;
+    return false;
+}
+
 pub fn persistTargetLen(
     kv_entries: []const trunk.KVCacheEntry,
     step: usize,
@@ -216,6 +221,12 @@ pub const MediaLimits = struct {
         /// What a record holding media `(vision_key, media_start)` may share; null = nothing.
         limitFor: *const fn (ctx: *const anyopaque, vision_key: u64, media_start: ?u32) ?u32,
     };
+
+    /// The tokens a record holding media `(vision_key, media_start)` may share with the request: 0 when none.
+    pub fn ceilingFor(self: MediaLimits, vision_key: u64, media_start: ?u32) usize {
+        const r = self.rule orelse return UNBOUNDED;
+        return r.limitFor(r.ctx, vision_key, media_start) orelse 0;
+    }
 
     /// `e`'s ceiling, or null when it may share nothing at all.
     pub fn at(self: MediaLimits, e: *const IndexEntry) ?u32 {
@@ -356,6 +367,10 @@ pub const DiskTier = struct {
     ssm_max_per_entry: usize = SSM_DISK_MAX_PER_ENTRY_LEGACY,
     /// Set by an arch whose restore points carry rows that grow with the prompt; null stores every point whole.
     grown: ?GrownSpec = null,
+    /// The loaded arch's restore points hold its whole request state (Hy4-Flash, whose trunk cache holds no rows): a
+    /// commit with no KV rows persists its points over its tokens. Elsewhere such a commit persists nothing (GLM's
+    /// points hold only its KDA state; its rows persist through its own record).
+    points_hold_state: bool = false,
     /// Bytes this commit's checkpoint files may take: nonzero only while one conversation alone outgrows
     /// the tier, when the oldest points go first (`ssmTargetPositions`). Set by each commit.
     ssm_budget: u64 = 0,
@@ -575,7 +590,6 @@ pub const DiskTier = struct {
         const w = self.writer orelse return 0;
         return w.pendingBytes();
     }
-
 
     /// Background write failures so far.
     pub fn writeErrors(self: *DiskTier) u64 {
@@ -1194,6 +1208,98 @@ pub const DiskTier = struct {
         e.last_used = self.bump();
         self.writeMeta(e.*) catch {};
         return cp;
+    }
+
+    /// Where a point's arrays are read (`restorePointInto`): for array `field` (0 a snapshot layer's `conv`, 1 its `ssm`)
+    /// of snapshot layer `li`, the bytes that `t` fills from the array's row `row` on, exactly its size, or null to pass
+    /// it over.
+    pub const PointSink = struct {
+        ctx: *anyopaque,
+        dest: *const fn (ctx: *anyopaque, li: usize, field: u1, row: usize, t: vt.Named) anyerror!?[]u8,
+    };
+
+    /// `restoreCheckpointInto` with no array made: the point's arrays are read straight into the bytes `sink` names, a
+    /// growing array's rows from the entry's row segments and the point's own file each at their rows.
+    pub fn restorePointInto(self: *DiskTier, cache: *KVCache, idx: usize, cp_pos: u32, n_layers: usize, sink: PointSink, s: mlx.mlx_stream) !void {
+        const had_error = mlx.errorPending();
+        errdefer mlx.dropLatchedErrorUnless(had_error);
+        self.drainEntry(self.entries.items[idx].id);
+        const e = &self.entries.items[idx];
+        if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
+        if (std.mem.indexOfScalar(u32, e.ssm_positions, cp_pos) == null) return error.DiskCacheNoCheckpoint;
+        try self.readPointInto(e.id, cp_pos, n_layers, sink);
+        try self.restoreKvInto(cache, e, cp_pos, s);
+        e.last_used = self.bump();
+        self.writeMeta(e.*) catch {};
+    }
+
+    /// A point file's or a row segment's tensors handed to a `PointSink`, each at the row its array holds it from.
+    const PointRead = struct {
+        sink: PointSink,
+        divs: []const u32,
+        span: u32,
+        n_layers: usize,
+        /// The row segments the point leans on, from its file's `grown`; null until its metadata is read.
+        grown: ?u32 = null,
+        /// The segment being read (1-based), 0 for the point's own file.
+        segment: u32 = 0,
+
+        fn meta(ctx: *anyopaque, pairs: []const vt.MetaPair) anyerror!void {
+            const r: *PointRead = @ptrCast(@alignCast(ctx));
+            if (r.segment > 0) return;
+            const layers = metaValue(pairs, "layers") orelse return error.DiskCacheCorruptSsm;
+            if ((std.fmt.parseInt(usize, layers, 10) catch return error.DiskCacheCorruptSsm) != r.n_layers) return error.DiskCacheSsmLayerMismatch;
+            const k = metaValue(pairs, "grown") orelse "0";
+            r.grown = std.fmt.parseInt(u32, k, 10) catch return error.DiskCacheCorruptSsm;
+        }
+
+        fn dest(ctx: *anyopaque, t: vt.Named) anyerror!?[]u8 {
+            const r: *PointRead = @ptrCast(@alignCast(ctx));
+            const dot = std.mem.indexOfScalar(u8, t.key, '.') orelse return error.DiskCacheCorruptSsm;
+            if (t.key[0] != 'l') return error.DiskCacheCorruptSsm;
+            const li = std.fmt.parseInt(usize, t.key[1..dot], 10) catch return error.DiskCacheCorruptSsm;
+            const name = t.key[dot + 1 ..];
+            const field: u1 = if (std.mem.eql(u8, name, "conv")) 0 else if (std.mem.eql(u8, name, "ssm")) 1 else return error.DiskCacheCorruptSsm;
+            if (li >= r.n_layers) return error.DiskCacheCorruptSsm;
+            // A growing array's rows past the segments sit in the point's own file (`encodePoint`); a fixed one is whole.
+            const div: u32 = if (li < r.divs.len) r.divs[li] else 0;
+            const grows = div > 0 and r.span % div == 0 and t.shape.len == 2 and t.shape[0] > 0;
+            const row: usize = if (r.segment > 0) blk: {
+                if (!grows) return error.DiskCacheCorruptSsm;
+                break :blk (@as(usize, r.segment) - 1) * r.span / div;
+            } else if (grows and r.grown.? > 0) @as(usize, r.grown.?) * r.span / div else 0;
+            return r.sink.dest(r.sink.ctx, li, field, row, t);
+        }
+    };
+
+    fn metaValue(pairs: []const vt.MetaPair, key: []const u8) ?[]const u8 {
+        for (pairs) |p| if (std.mem.eql(u8, p.key, key)) return p.value;
+        return null;
+    }
+
+    fn readPointInto(self: *DiskTier, id: u64, pos: u32, n_layers: usize, sink: PointSink) !void {
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+        const g = self.grown;
+        var r: PointRead = .{ .sink = sink, .divs = if (g) |x| x.divs else &.{}, .span = if (g) |x| x.span else 0, .n_layers = n_layers };
+        const into: vt.Sink = .{ .ctx = &r, .dest = PointRead.dest, .meta = PointRead.meta };
+        self.last_point_held = self.heldIndex(id, pos) != null;
+        if (self.heldIndex(id, pos)) |hi| {
+            _ = try vt.readBytesInto(self.held.items[hi].bytes, aa, into);
+        } else {
+            const path = try std.fmt.allocPrint(aa, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos });
+            if (self.fs.size(path) == null) return error.DiskCacheNoCheckpoint;
+            _ = try self.fs.readTensorsInto(path, aa, into);
+        }
+        const k = r.grown orelse return error.DiskCacheCorruptSsm;
+        if (k > 0 and r.span == 0) return error.DiskCacheCorruptSsm;
+        for (1..@as(usize, k) + 1) |j| {
+            r.segment = @intCast(j);
+            const path = try std.fmt.allocPrint(aa, "{s}/e{d}/g{d:0>5}.safetensors", .{ self.root, id, j });
+            if (self.fs.size(path) == null) return error.DiskCacheNoCheckpoint;
+            _ = try self.fs.readTensorsInto(path, aa, into);
+        }
     }
 
     /// Largest persisted SSM checkpoint position ≤ `limit` for entry `idx`;
@@ -1960,7 +2066,9 @@ pub const DiskTier = struct {
         _ = self.harvestWriteFailures();
         self.dropPoisonedEntries();
 
-        const kv_target_u: usize = persistTargetLen(kv_entries, step, tokens.len);
+        // An arch whose points hold its whole state persists them over its tokens with no KV rows (`points_hold_state`).
+        const state_only = self.points_hold_state and !anyInitialized(kv_entries) and ssm_checkpoints != null and ssm_checkpoints.?.len > 0;
+        const kv_target_u: usize = if (state_only) @min(step, tokens.len) else persistTargetLen(kv_entries, step, tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return .skipped;
         var kv_target: u32 = @intCast(kv_target_u);
         // Every initialized layer must cover the persisted range with B == 1
@@ -2308,7 +2416,7 @@ pub const DiskTier = struct {
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
         const waited_ms: u64 = if (self.writer) |w| (w.waitedNs() -| waited_before) / std.time.ns_per_ms else 0;
-        log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms, {d}ms waiting on the writer); resident={d:.1} MB ({d} entries)\n", .{
+        log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms, {d}ms waiting on the writer); on SSD={d:.1} MB ({d} entries)\n", .{
             kv_len,                                                        kv_target,              chunks_done - keep, listed, wrote_mb, ms, waited_ms,
             @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0), self.entries.items.len,
         });
@@ -7698,9 +7806,12 @@ test "DiskTier: the per-entry cap holds the whole 8192 grid to 1M tokens, and pa
 /// The pre-fix materializer (one `mlx_array_eval` per tensor), kept only as the byte-identity golden below.
 fn materializeLegacyPerTensorForTest(tensors: []DiskTier.NamedTensor, s: mlx.mlx_stream) !void {
     for (tensors) |*t| {
-        var cont = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(cont);
-        try mlx.check(mlx.mlx_contiguous(&cont, t.arr, false, s));
+        const cont = blk: {
+            var made = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(made);
+            try mlx.check(mlx.mlx_contiguous(&made, t.arr, false, s));
+            break :blk made;
+        };
         _ = mlx.mlx_array_free(t.arr);
         t.arr = cont;
         try mlx.check(mlx.mlx_array_eval(t.arr));
@@ -8894,6 +9005,32 @@ test "DiskTier: a commit holding no KV rows persists nothing, even with checkpoi
     try std.testing.expectEqual(@as(u64, 0), tier.total_bytes);
 }
 
+test "DiskTier: where an arch's points hold its whole state, a commit holding no KV rows persists its points over its tokens" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var tier = try DiskTier.init(std.testing.allocator, io, base, "fp-state-points", 0, 128);
+    defer tier.deinit();
+    tier.points_hold_state = true;
+    // A cache whose state lives elsewhere (a request-held state): every layer uninitialized, step set.
+    var cache = try KVCache.init(std.testing.allocator, 3);
+    defer cache.deinit();
+    cache.step = 2048;
+    var entries = buildHybridEntries(s, 1, 100);
+    defer freeHybridEntries(&entries);
+    var cp = try trunk.captureSsmCheckpoint(std.testing.allocator, &entries, 2048, s);
+    defer cp.deinit(std.testing.allocator);
+    var tokens: [2048]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i);
+    try std.testing.expect(try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &.{cp}, s) != PersistOutcome.skipped);
+    try std.testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try std.testing.expectEqual(@as(u32, 2048), tier.entries.items[0].kv_len);
+    try std.testing.expectEqual(@as(usize, 1), tier.entries.items[0].ssm_positions.len);
+}
+
 test "DiskTier: a thought point past the prompt end is the newest point and survives a budget squeeze with the grid point" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
@@ -8936,7 +9073,7 @@ test "DiskTier: a thought point past the prompt end is the newest point and surv
 }
 
 fn wroteKind(tier: *const DiskTier, kind: write_stats.Kind) u64 {
-    return tier.stats.snapshot().written[@intFromEnum(kind)];
+    return tier.stats.snapshot().written[@backingInt(kind)];
 }
 
 fn sumBytes(items: []const u64) u64 {
@@ -8987,9 +9124,9 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     const cold = tier.stats.snapshot();
     const e = &tier.entries.items[0];
     try testing.expect(e.spec_bytes > 0);
-    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@intFromEnum(write_stats.Kind.kv)]);
-    try testing.expectEqual(e.spec_bytes, cold.written[@intFromEnum(write_stats.Kind.spec)]);
-    try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@intFromEnum(write_stats.Kind.meta)]);
+    try testing.expectEqual(sumBytes(e.chunk_bytes), cold.written[@backingInt(write_stats.Kind.kv)]);
+    try testing.expectEqual(e.spec_bytes, cold.written[@backingInt(write_stats.Kind.spec)]);
+    try testing.expectEqual(@as(u64, 600 * 4) + meta_json, cold.written[@backingInt(write_stats.Kind.meta)]);
     // What the layer stored is what it appended, every byte attributed: the guard on the store counters.
     try testing.expectEqual(appendedOf(&tier) - phys0, cold.totalStored() - start);
     for ([_]write_stats.Kind{ .ssm, .qsa, .ring }) |k| try testing.expectEqual(@as(u64, 0), wroteKind(&tier, k));
@@ -9007,9 +9144,9 @@ test "DiskTier write counters: a cold persist counts its kinds, an exact reuse a
     const ext = tier.stats.snapshot();
     const grown = &tier.entries.items[0];
     try testing.expectEqual(@as(usize, 7), grown.chunk_bytes.len);
-    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@intFromEnum(write_stats.Kind.kv)] - cold.written[@intFromEnum(write_stats.Kind.kv)]);
+    try testing.expectEqual(sumBytes(grown.chunk_bytes[4..]), ext.written[@backingInt(write_stats.Kind.kv)] - cold.written[@backingInt(write_stats.Kind.kv)]);
     try testing.expectEqual(appendedOf(&tier) - phys0, ext.totalStored() - start);
-    try testing.expectEqual(cold.written[@intFromEnum(write_stats.Kind.spec)], ext.written[@intFromEnum(write_stats.Kind.spec)]);
+    try testing.expectEqual(cold.written[@backingInt(write_stats.Kind.spec)], ext.written[@backingInt(write_stats.Kind.spec)]);
     try testing.expectEqual(@as(u64, 0), ext.failed);
 }
 
@@ -9261,7 +9398,7 @@ test "DiskTier write counters: the synchronous manifest write counts meta on suc
     const path = try std.fmt.allocPrint(testing.allocator, "{s}/e5/meta.json", .{tier.root});
     defer testing.allocator.free(path);
     const landed = tier.stats.snapshot();
-    try testing.expectEqual(kv_disk_fs.testSize(io, path).?, landed.written[@intFromEnum(write_stats.Kind.meta)]);
+    try testing.expectEqual(kv_disk_fs.testSize(io, path).?, landed.written[@backingInt(write_stats.Kind.meta)]);
     try testing.expectEqual(missing_dir.failed, landed.failed);
 }
 
@@ -9500,7 +9637,7 @@ test "DiskTier: an extend writes the new tail of the token record, not the whole
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-tail", 0, 128);
     defer tier.deinit();
     _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, null, s);
-    const kind = @intFromEnum(write_stats.Kind.meta);
+    const kind = @backingInt(write_stats.Kind.meta);
     const before = tier.stats.snapshot().written[kind];
     _ = try tier.appendCommit(cache.entries, 1200, cache.config, &tokens, false, null, s);
     const grown = tier.stats.snapshot().written[kind] - before;

@@ -85,8 +85,8 @@ pub fn device() Error!*const Device {
 const max_sets = 32;
 const no_set: u8 = 255;
 /// What a set holds. The pool's buffers come and go with every forward and a wrapped mapping stays for a load: kept
-/// apart, a scratch buffer never changes a set that lists gigabytes of weights.
-const Kind = enum { pool, mapped };
+/// apart, a scratch buffer never changes a set that lists gigabytes of weights. The plan's arena stays for a load too.
+const Kind = enum { pool, mapped, arena };
 const Set = struct {
     raw: id,
     kind: Kind,
@@ -212,6 +212,11 @@ pub const Device = struct {
     }
 
     /// The compute pipeline of `function` in `source`, compiled now. `lastError` holds the compiler's text on failure.
+    /// What Metal has allocated for this process on the device: every buffer, heap and resource, MLX's included.
+    pub fn currentAllocatedSize(dev: *const Device) usize {
+        return send(usize, dev.raw, "currentAllocatedSize", .{});
+    }
+
     pub fn compile(dev: *const Device, source: [:0]const u8, function: [:0]const u8) Error!Pipeline {
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
@@ -311,6 +316,15 @@ pub const Device = struct {
         return .{ .raw = raw, .set = dev.keepResident(raw, .pool) };
     }
 
+    /// A zeroed buffer of `len` bytes for the plan's arena, in residency sets of its own.
+    pub fn allocArena(dev: *const Device, len: usize) Error!Buffer {
+        const raw = send(id, dev.raw, "newBufferWithLength:options:", .{ @max(len, 1), alias_options }) orelse {
+            noteError(null, "Metal refused the arena's buffer");
+            return error.MetalBuffer;
+        };
+        return .{ .raw = raw, .set = dev.keepResident(raw, .arena) };
+    }
+
     /// A buffer over `len` bytes at the page-aligned `ptr`, which the caller keeps mapped until the buffer is released
     /// and every pass that binds it has run. No copy: the pages are wired once, under this buffer.
     pub fn wrap(dev: *const Device, ptr: [*]u8, len: usize) Error!Buffer {
@@ -358,12 +372,13 @@ pub const Device = struct {
         return .{ .pool = pool, .cmd = cmd, .encoder = send(id, cmd, "computeCommandEncoder", .{}) };
     }
 
-    /// A command buffer with one compute encoder whose dispatches may overlap: the encoder's caller puts a
-    /// `barrier` before a dispatch that reads what an earlier one wrote, or writes what an earlier one read.
-    pub fn beginConcurrent(dev: *const Device) Pass {
+    /// A command buffer with one compute encoder whose dispatches may overlap, held in `rec` until `Pass.replay`
+    /// encodes them by level.
+    pub fn beginConcurrent(dev: *const Device, rec: *Recorder) Pass {
         const pool = objc_autoreleasePoolPush();
         const cmd = send(id, dev.queue, "commandBuffer", .{});
-        return .{ .pool = pool, .cmd = cmd, .encoder = send(id, cmd, "computeCommandEncoderWithDispatchType:", .{@as(usize, 1)}) };
+        rec.clear();
+        return .{ .pool = pool, .cmd = cmd, .encoder = send(id, cmd, "computeCommandEncoderWithDispatchType:", .{@as(usize, 1)}), .rec = rec };
     }
 };
 
@@ -397,6 +412,11 @@ pub const Buffer = struct {
         return send([*]u8, b.raw, "contents", .{})[0..send(usize, b.raw, "length", .{})];
     }
 
+    /// The bytes Metal holds for it: its length rounded to the device's pages.
+    pub fn allocatedSize(b: Buffer) usize {
+        return send(usize, b.raw, "allocatedSize", .{});
+    }
+
     /// The owner's release: the buffer leaves its residency set. The inference thread only.
     pub fn release(b: Buffer) void {
         if (b.set != no_set) {
@@ -426,32 +446,142 @@ pub const Bound = struct { buffer: Buffer, offset: usize };
 /// The pipeline the latest `Pass.pipeline` set, whichever pass: the one thread that encodes asks it at a dispatch.
 pub var bound_pipeline: id = null;
 
+/// A concurrent pass's dispatches, held instead of encoded: each keeps the pipeline, buffers and bytes bound when it
+/// was made and its level in the pass's dependency order (`next_level`, set by the engine before it), so `replay`
+/// encodes them level by level with one barrier between levels.
+pub const Recorder = struct {
+    const slots = 32;
+    const Bind = struct { index: u8, raw: id, offset: usize };
+    const Bytes = struct { index: u8, at: u32, len: u32 };
+    const Cmd = struct { pipe: id, binds: [2]u32, bytes: [2]u32, grid: Size, group: Size, groups: bool, level: u32 };
+
+    pipe: id = null,
+    buf: [slots]Bind = undefined,
+    bytes_at: [slots]Bytes = undefined,
+    buf_set: u32 = 0,
+    bytes_set: u32 = 0,
+    /// The level `dispatch` gives the next dispatch, set by the engine before it.
+    next_level: u32 = 0,
+    cmds: std.ArrayList(Cmd) = .empty,
+    binds: std.ArrayList(Bind) = .empty,
+    byte_recs: std.ArrayList(Bytes) = .empty,
+    arena: std.ArrayList(u8) = .empty,
+    order: std.ArrayList(u32) = .empty,
+    counts: std.ArrayList(u32) = .empty,
+
+    fn setBuffer(r: *Recorder, raw: id, offset: usize, index: usize) void {
+        r.buf[index] = .{ .index = @intCast(index), .raw = raw, .offset = offset };
+        r.buf_set |= @as(u32, 1) << @intCast(index);
+        r.bytes_set &= ~(@as(u32, 1) << @intCast(index));
+    }
+
+    fn setBytes(r: *Recorder, data: []const u8, index: usize) void {
+        const at: u32 = @intCast(r.arena.items.len);
+        r.arena.appendSlice(std.heap.c_allocator, data) catch @panic("engine: out of memory recording a pass");
+        r.bytes_at[index] = .{ .index = @intCast(index), .at = at, .len = @intCast(data.len) };
+        r.bytes_set |= @as(u32, 1) << @intCast(index);
+        r.buf_set &= ~(@as(u32, 1) << @intCast(index));
+    }
+
+    fn record(r: *Recorder, grid: Size, group: Size, groups: bool) void {
+        const a = std.heap.c_allocator;
+        const b0: u32 = @intCast(r.binds.items.len);
+        const y0: u32 = @intCast(r.byte_recs.items.len);
+        var m = r.buf_set;
+        while (m != 0) : (m &= m - 1) r.binds.append(a, r.buf[@ctz(m)]) catch @panic("engine: out of memory recording a pass");
+        m = r.bytes_set;
+        while (m != 0) : (m &= m - 1) r.byte_recs.append(a, r.bytes_at[@ctz(m)]) catch @panic("engine: out of memory recording a pass");
+        r.cmds.append(a, .{ .pipe = r.pipe, .binds = .{ b0, @intCast(r.binds.items.len) }, .bytes = .{ y0, @intCast(r.byte_recs.items.len) }, .grid = grid, .group = group, .groups = groups, .level = r.next_level }) catch
+            @panic("engine: out of memory recording a pass");
+    }
+
+    /// Drops what is held: the pass's encoder starts with nothing bound.
+    pub fn clear(r: *Recorder) void {
+        r.pipe = null;
+        r.buf_set = 0;
+        r.bytes_set = 0;
+        r.cmds.clearRetainingCapacity();
+        r.binds.clearRetainingCapacity();
+        r.byte_recs.clearRetainingCapacity();
+        r.arena.clearRetainingCapacity();
+    }
+
+    /// Encodes the held dispatches into `p` in the order of their levels (the order made within one), a barrier
+    /// between levels; returns the barriers.
+    pub fn replay(r: *Recorder, p: Pass) u64 {
+        const a = std.heap.c_allocator;
+        // A counting sort by level: stable, so a level keeps the order its dispatches were made in.
+        var top: u32 = 0;
+        for (r.cmds.items) |c| top = @max(top, c.level);
+        r.counts.clearRetainingCapacity();
+        r.counts.appendNTimes(a, 0, top + 2) catch @panic("engine: out of memory recording a pass");
+        for (r.cmds.items) |c| r.counts.items[c.level + 1] += 1;
+        for (1..r.counts.items.len) |i| r.counts.items[i] += r.counts.items[i - 1];
+        r.order.resize(a, r.cmds.items.len) catch @panic("engine: out of memory recording a pass");
+        for (r.cmds.items, 0..) |c, i| {
+            r.order.items[r.counts.items[c.level]] = @intCast(i);
+            r.counts.items[c.level] += 1;
+        }
+        var barriers: u64 = 0;
+        var pipe: id = null;
+        var level: ?u32 = null;
+        for (r.order.items) |i| {
+            const c = r.cmds.items[i];
+            if (level) |l| if (l != c.level) {
+                send(void, p.encoder, "memoryBarrierWithScope:", .{@as(usize, 1)});
+                barriers += 1;
+            };
+            level = c.level;
+            if (c.pipe != pipe) send(void, p.encoder, "setComputePipelineState:", .{c.pipe});
+            pipe = c.pipe;
+            for (r.binds.items[c.binds[0]..c.binds[1]]) |b| send(void, p.encoder, "setBuffer:offset:atIndex:", .{ b.raw, b.offset, @as(usize, b.index) });
+            for (r.byte_recs.items[c.bytes[0]..c.bytes[1]]) |y| send(void, p.encoder, "setBytes:length:atIndex:", .{ @as(*const anyopaque, r.arena.items[y.at..].ptr), @as(usize, y.len), @as(usize, y.index) });
+            if (c.groups)
+                send(void, p.encoder, "dispatchThreadgroups:threadsPerThreadgroup:", .{ c.grid, c.group })
+            else
+                send(void, p.encoder, "dispatchThreads:threadsPerThreadgroup:", .{ c.grid, c.group });
+        }
+        r.clear();
+        return barriers;
+    }
+};
+
 pub const Pass = struct {
     pool: ?*anyopaque,
     cmd: id,
     encoder: id,
+    /// Set on a concurrent pass: its dispatches are held until `replay`.
+    rec: ?*Recorder = null,
 
     pub fn pipeline(p: Pass, state: Pipeline) void {
         bound_pipeline = state.raw;
+        if (p.rec) |r| {
+            r.pipe = state.raw;
+            return;
+        }
         send(void, p.encoder, "setComputePipelineState:", .{state.raw});
     }
 
     pub fn buffer(p: Pass, b: Buffer, offset: usize, index: usize) void {
+        if (p.rec) |r| return r.setBuffer(b.raw, offset, index);
         send(void, p.encoder, "setBuffer:offset:atIndex:", .{ b.raw, offset, index });
     }
 
     /// A small constant copied into the command buffer.
     pub fn constant(p: Pass, value: anytype, index: usize) void {
         const v = value;
+        if (p.rec) |r| return r.setBytes(std.mem.asBytes(&v), index);
         send(void, p.encoder, "setBytes:length:atIndex:", .{ @as(*const anyopaque, &v), @as(usize, @sizeOf(@TypeOf(v))), index });
     }
 
     /// A few constant bytes copied into the command buffer.
     pub fn bytes(p: Pass, data: []const u8, index: usize) void {
+        if (p.rec) |r| return r.setBytes(data, index);
         send(void, p.encoder, "setBytes:length:atIndex:", .{ @as(*const anyopaque, data.ptr), data.len, index });
     }
 
     pub fn dispatch(p: Pass, grid: Size, group: Size) void {
+        if (p.rec) |r| return r.record(grid, group, false);
         send(void, p.encoder, "dispatchThreads:threadsPerThreadgroup:", .{ grid, group });
     }
 
@@ -465,18 +595,21 @@ pub const Pass = struct {
         send(void, p.encoder, "updateFence:", .{fence.raw});
     }
 
-    /// Every dispatch encoded so far finishes its buffer writes before the next one starts.
-    pub fn barrier(p: Pass) void {
-        send(void, p.encoder, "memoryBarrierWithScope:", .{@as(usize, 1)});
+    /// Encodes the held dispatches by level (`Recorder.replay`); returns the barriers put between levels.
+    pub fn replay(p: Pass) u64 {
+        const r = p.rec orelse return 0;
+        return r.replay(p);
     }
 
     /// `grid` counts threadgroups, not threads.
     pub fn dispatchGroups(p: Pass, grid: Size, group: Size) void {
+        if (p.rec) |r| return r.record(grid, group, true);
         send(void, p.encoder, "dispatchThreadgroups:threadsPerThreadgroup:", .{ grid, group });
     }
 
     /// Ends the encoding and drops the command buffer without running it.
     pub fn discard(p: Pass) void {
+        if (p.rec) |r| r.clear();
         send(void, p.encoder, "endEncoding", .{});
         objc_autoreleasePoolPop(p.pool);
     }

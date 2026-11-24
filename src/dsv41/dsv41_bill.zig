@@ -90,7 +90,8 @@ fn boundEnd(room: Room) ?u64 {
 
 /// What a prefill chunk of `width` rows from `kv_len` adds to the cache on a Cooler load: the row stores its rows overflow,
 /// regrown from the rows each holds (`room.rows`) by the rule `Rows.append` grows them by. Not the KV cache's policy.
-pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, room: Room) ?u64 {
+pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: Room) ?u64 {
+    _ = kv_bits; // DeepSeek's row stores keep their own formats.
     const c = config.dsv41 orelse return null;
     if (!@import("../cooler_side.zig").onEngine(config)) return null;
     var caps = room.rows;

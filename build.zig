@@ -195,7 +195,7 @@ pub fn build(b: *std.Build) void {
     const host_filters = if (test_filter) |user| hostUserFilters(b, user) else hostFilters(b);
     const count_guard = addCountGuard(b, target);
     if (host_filters.len > 0) {
-        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b), .max_rss = 4 * gib });
+        const host_tests = b.addTest(.{ .name = "test-host", .root_module = host_mod, .filters = host_filters, .test_runner = testRunner(b), .max_rss = 5 * gib });
         test_build.dependOn(&b.addInstallArtifact(host_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         if (runs.add(host_tests, host_tests.name, &.{}, false, 1)) |run_host_tests| {
             test_host_step.dependOn(&run_host_tests.step);
@@ -245,7 +245,7 @@ pub fn build(b: *std.Build) void {
 
     const encoder_tests = b.addTest(.{
         .test_runner = testRunner(b),
-        .max_rss = 5 * gib,
+        .max_rss = 6 * gib,
         .name = "test-encoder",
         .root_module = encoder_mod,
         .filters = test_filter orelse &.{},
@@ -473,10 +473,11 @@ const test_domains = [_]TestDomain{
     .{
         .name = "cooler",
         .cut = true,
+        .compile_gib = 7,
         .files = &.{
             "cooler_contract_test",     "cooler_late_test",     "cooler_load_test",    "cooler_pool_test",
             "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test", "cooler_held_requests_test",
-            "cooler_held_restore_test", "cooler_load_fault_test",    "cooler_requests_fault_test",
+            "cooler_held_restore_test", "cooler_load_fault_test",    "cooler_requests_fault_test", "hy4flash/hy4_late_test",
         },
         .steps = &.{
             .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" } },
@@ -493,29 +494,31 @@ const test_domains = [_]TestDomain{
             .{ .name = "cooler-held-restore", .files = &.{"cooler_held_restore_test"} },
             // Every test of the file runs alone (`alone_tests`).
             .{ .name = "cooler-late", .files = &.{"cooler_late_test"} },
+            .{ .name = "cooler-late-hy4", .files = &.{"hy4flash/hy4_late_test"}, .holds_cut = false, .env = hy4_tf32_off },
         },
     },
     .{ .name = "deepseek", .folders = &.{"dsv41"}, .compile_gib = 8, .run_gib = 9 },
     .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true, .run_gib = 6 },
     .{ .name = "glm", .folders = &.{"glm5"} },
     .{ .name = "mimo", .folders = &.{"mimo2"} },
+    .{ .name = "hy4", .folders = &.{"hy4flash"}, .compile_gib = 8, .env = hy4_tf32_off },
     .{ .name = "kernels", .folders = &.{"tensor"}, .run_gib = 6, .files = &.{
-        "attn_kernels",       "dflash_conv",    "dflash_qmv",      "expert_bf16_kernels", "fp8_block",    "linear",     "metal",
+        "attn_kernels",       "dflash_conv",    "dflash_qmv",      "expert_bf16_kernels", "fp8_block",    "hc_kernels", "linear",     "metal",
         "metal_mlx",          "mlx",            "mlx_kernel_keys", "mlx_pages",           "mlx_util",     "moe_gqmv",   "moe_router",
         "moe_stream_compute", "mtp_dense_rows", "mtp_qmv",         "nax_gate",            "sampler_draw", "verify_moe", "verify_qmm",
     } },
-    .{ .name = "generate", .files = &.{
+    .{ .name = "generate", .compile_gib = 8, .files = &.{
         "arm_trial",     "degenerate",   "dflash",             "forward_diag", "generate",       "hc_prefill",   "kv_cache",
-        "kv_quant",      "mtp",                "mtp_plan",         "mtp_policy",     "mtp_round",    "mtp_tick",
-        "prefill_plan",  "restore_dump", "sampler",            "scheduler",    "slot_admission", "slot_outcome", "ssm_cache",
-        "think_penalty", "trunk",        "trunk_helpers_test", "trunk_stq",
+        "kv_quant",      "mtp",                "mtp_plan",     "mtp_policy",     "mtp_round",    "mtp_tick",
+        "prefill_plan",  "restore_dump", "row_store",          "sampler",      "scheduler",      "slot_admission", "slot_outcome",
+        "ssm_cache",     "think_penalty", "trunk",             "trunk_helpers_test", "trunk_stq",
     } },
     // `tests` is the MLX root: its own test only names the files the binaries reach.
-    .{ .name = "load", .folders = &.{"arch"}, .run_gib = 7, .files = &.{
-        "arch_host_stub", "bills_live_test", "exl3_flat_layout_test", "expert_io",     "expert_store", "expert_stream",
+    .{ .name = "load", .folders = &.{"arch"}, .compile_gib = 8, .run_gib = 7, .files = &.{
+        "arch_host_stub", "bills_live_test", "cooler_side", "engram", "exl3_flat_layout_test", "expert_io",     "expert_store", "expert_stream",
         "hidden_capture", "imatrix",         "kld",                   "layer_weights", "model",        "model_discovery",
         "model_load",     "model_registry",  "owned_weights",         "pack_index",    "tests",        "transient_peak",
-        "vision_common",
+        "vision_common",  "repack_stamp_test",
     } },
     .{ .name = "server", .compile_gib = 10, .files = &.{
         "anthropic",     "bench",          "byte_budget", "cli",           "completions", "downloads",      "generation_stream",
@@ -555,6 +558,15 @@ const alone_tests = [_]AloneTest{
     .{ .step = "deepseek-late-manifest", .file = "dsv41/dsv41_pipelines", .name = "dsv41 pipelines: a load with no manifest writes one with the wide chunks' recipes, and a load from it skips the engine's forwards, the wide ones included, serves the same tokens and compiles none inside a prompt (DSV41_STQ_TINY)" },
     .{ .step = "deepseek-late-topk-tiles", .file = "dsv41/dsv41_pipelines", .name = "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles nothing inside a prompt, after a full warm and after a load from the manifest (DSV41_STQ_TINY)" },
     .{ .step = "deepseek-late-stream", .file = "dsv41/dsv41_stream", .name = "dsv41 kernels: after the load's warm, prompts of any length, every verify width and a growing context compile no Metal library on the STQ pack, streamed and resident, DSpark on and off (DSV41_STQ_TINY)" },
+    .{ .step = "hy4-late-span-tail-bf16", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, a chunk's short last span of any width through the gate and W_o of any layer compiles no kernel (HY4_BF16_TINY)" },
+    .{ .step = "hy4-late-span-tail-stq", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, a chunk's short last span of any width through the gate and W_o of any layer compiles no kernel (HY4_STQ_TINY)" },
+    .{ .step = "hy4-late-verify-stq", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, a 2..8-row verify compiles no kernel (HY4_STQ_TINY)" },
+    .{ .step = "hy4-late-image-request", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, an image request's encode and its prompt's prefill compile no kernel at any grid (HY4_BF16_TINY)" },
+    .{ .step = "hy4-late-image-splice-stq", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, an image prompt's splice at its image ids compiles no kernel at the release's row counts (HY4_STQ_TINY)" },
+    .{ .step = "hy4-late-tower-bf16", .file = "hy4flash/hy4_vision_test", .name = "hy4 vision: a Cooler load's tower warms before the seal, so an image of any grid compiles nothing inside a request, at the release's widths, its matrices BF16" },
+    .{ .step = "hy4-late-tower-affine", .file = "hy4flash/hy4_vision_test", .name = "hy4 vision: a Cooler load's tower warms before the seal, so an image of any grid compiles nothing inside a request, at the release's widths, its matrices affine 8" },
+    .{ .step = "hy4-late-embed-gather", .file = "hy4flash/hy4_stq_test", .name = "hy4 stq: after warmKernels a GPU embedding gather of any block count, in any order, makes no pipeline (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" },
+    .{ .step = "hy4-late-vision-image", .file = "hy4flash/hy4_vision_test", .name = "hy4 vision: after warmKernels an image prompt's prefill makes no pipeline a text prefill of its width did not (HY4_BF16_TINY)" },
     .{ .step = "qwen-late-gdn-captured-verify", .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a captured verify makes the replay kernel at each count up to its own" },
     .{ .step = "qwen-late-gdn-final-state", .file = "qwen4/gdn_decode", .name = "gdn recur: on the engine before the seal a verify that keeps only its final state makes the replay at each count up to its own" },
     .{ .step = "qwen-late-vision-tower", .file = "qwen4/qwen_vision", .name = "qwen vision: a Cooler load's tower warms before the seal, so images and videos of any grid compile nothing inside a request" },
@@ -568,7 +580,11 @@ const alone_tests = [_]AloneTest{
 /// What every `alone_tests` entry proves: no kernel compiles after a load's warm or seal, which only a process whose
 /// pipeline cache that load filled can show (an earlier test's compiles would hide a late one).
 /// `holds_cut`: false for a test of a cut domain that never loads the Qwen cut (its runner then refuses it).
-const AloneTest = struct { step: []const u8, holds_cut: ?bool = null, file: []const u8, name: []const u8 };
+const AloneTest = struct { step: []const u8, holds_cut: ?bool = null, file: []const u8, name: []const u8, env: ?[2][]const u8 = null };
+
+/// Hy4-Flash's tiny GPU cells hold their bytes with f32 products off TF32: the steps that run them set it, so no cell
+/// depends on the caller's environment or on which test read MLX's TF32 setting first.
+const hy4_tf32_off: [2][]const u8 = .{ "MLX_ENABLE_TF32", "0" };
 
 const TestDomain = struct {
     name: []const u8,
@@ -577,6 +593,8 @@ const TestDomain = struct {
     compile_gib: u64 = 6,
     run_gib: u64 = 4,
     cut: bool = false,
+    /// What every step of the domain runs under, where the step names none of its own.
+    env: ?[2][]const u8 = null,
     /// The run steps that share the binary, each a process of its own; none means one, `test-<name>`, over every file.
     steps: []const RunStep = &.{},
 };
@@ -600,10 +618,10 @@ const alone_run_gib: u64 = 2;
 const gib: u64 = 1 << 30;
 
 /// The model folders hold their own test files beside the root's; src/exl3 and src/encoder are modules of their own.
-const test_dirs = [_][]const u8{ "src", "src/arch", "src/tensor", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41" };
+const test_dirs = [_][]const u8{ "src", "src/arch", "src/tensor", "src/qwen4", "src/mimo2", "src/glm5", "src/dsv41", "src/hy4flash" };
 
 /// A test's model is its file's folder; the src root is shared.
-const TestModel = enum { qwen4, mimo2, glm5, dsv41, exl3, enc };
+const TestModel = enum { qwen4, mimo2, glm5, dsv41, hy4flash, exl3, enc };
 
 /// Zig keeps a test when its fully qualified name holds any filter, and filters OR, so a user's filter cannot narrow
 /// a domain's: the scan names each test in full and keeps those the user's filters select.
@@ -823,7 +841,7 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
                 if (f.host or f.domain != di or !f.in_scope or !stepHolds(s, f.path)) continue;
                 for (f.names) |n| runs_one = runs_one or (!n.anonymous and selectedByUser(user, n.full) and selects(select.items, n.full));
             }
-            if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env, .holds_cut = s.holds_cut }, .again = s.again }) catch @panic("OOM");
+            if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env orelse d.env, .holds_cut = s.holds_cut }, .again = s.again }) catch @panic("OOM");
         }
         for (alone_tests) |t| {
             const f = for (files) |f| {
@@ -835,7 +853,7 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
             for (f.names) |n| held += @intFromBool(std.mem.startsWith(u8, n.full, full));
             if (held != 1) std.debug.panic("alone_tests' step {s} would run {d} tests, not one: {s}", .{ t.step, held, full });
             if (!selectedByUser(user, full)) continue;
-            planned.append(b.allocator, .{ .domain = di, .step = .{ .name = t.step, .select = b.fmt("{s}\n", .{full}), .env = null, .holds_cut = t.holds_cut, .run_gib = if (d.cut) null else alone_run_gib }, .again = false }) catch @panic("OOM");
+            planned.append(b.allocator, .{ .domain = di, .step = .{ .name = t.step, .select = b.fmt("{s}\n", .{full}), .env = t.env orelse d.env, .holds_cut = t.holds_cut, .run_gib = if (d.cut) null else alone_run_gib }, .again = false }) catch @panic("OOM");
         }
         for (d.steps) |s| for (s.files) |sf| if (domainOf(sf) != di)
             std.debug.panic("test-{s}'s step {s} names {s}, a file of another domain", .{ d.name, s.name, sf });
@@ -1069,7 +1087,7 @@ fn isHostFile(host_paths: []const []const u8, dir_path: []const u8, stem: []cons
 /// its compile's and its run's RSS bounds in GiB (as `test_domains`). Every file that holds a test is listed once, and
 /// every listed file holds one.
 const exl3_test_bins = [_]Exl3Bin{
-    .{ .area = "experts", .compile_gib = 3, .run_gib = 8, .files = &.{ "expert_exl3_kernels", "expert_exl3", "rate_groups", "project_rows", "coop_rows2", "prefill_grid", "sorted_windows", "geometry_5120x2304_test" } },
+    .{ .area = "experts", .compile_gib = 4, .run_gib = 8, .files = &.{ "expert_exl3_kernels", "expert_exl3", "rate_groups", "project_rows", "coop_rows2", "prefill_grid", "sorted_windows", "geometry_5120x2304_test" } },
     .{ .area = "trunk", .compile_gib = 2, .run_gib = 8, .cut = true, .files = &.{ "linear", "trunk", "trunk_gemm" } },
     .{ .area = "format", .compile_gib = 2, .run_gib = 4, .files = &.{ "root", "device", "kernel_source", "codebook_tables", "side_cache", "layout", "pack" } },
 };

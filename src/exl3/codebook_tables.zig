@@ -1,6 +1,7 @@
 //! Named, immutable codebook constant tables: what a pack's `expert_quant` points at with `codebook_table` and
 //! `codebook_digest`. One row of u32 constants per rate n = 16K, every even n of the table's own range (within 16 to
 //! 128), per codebook.
+//! sashimi compiles the same tables (`sashimi/ref/codebook_tables.py`) and pins the same digests.
 //!
 //! A SPEC1 table's window is the one it was tuned at, nothing more: any window the engine admits for MCG decodes it,
 //! and the kernels read the row of each bank's own rate from the table (`Decode.table`). PAIR1's pair codec reads
@@ -8,9 +9,11 @@
 //! have compiled (`format.pair1Pair`).
 //!
 //! STD1 and SPEC1 are table-driven only: a pack names one of `shipped`, and a pack naming none this build holds is
-//! refused. `std1` is one pair at every rate.
+//! refused. `std1` is the single pair every pack before the tables used, at every rate; a config that still names an
+//! old table or carries that pair as `beta_multiplier`/`beta_mask` is rewritten by sashimi's migrate tool, not read.
 //!
-//! To add a SPEC1 table: append one entry to `shipped` (name, window, rows, digest); no kernel changes.
+//! To add a SPEC1 table: append one entry to `shipped` (name, window, rows, digest) and keep sashimi's list equal; no
+//! kernel changes.
 const std = @import("std");
 const builtin = @import("builtin");
 const format = @import("expert_exl3.zig");
@@ -43,7 +46,7 @@ pub const Table = struct {
     n_lo: u32 = k4_lo,
     rows: []const Row,
     /// Digests of this table's earlier, shorter versions: their rows are this table's at their rates, and a pack
-    /// stamped with one is refused as a legacy config.
+    /// stamped with one is re-stamped by sashimi's migrate tool, not read.
     superseded: []const []const u8 = &.{},
 
     pub fn row(self: *const Table, rate: format.Rate) ?Row {
@@ -105,7 +108,7 @@ const shipped = [_]Table{
     .{ .name = "std1", .codebook = .std1, .window = .w15, .digest = "c5dba171", .fields = 2, .rows = &tabledRows(@as([k4_count]Pair, @splat(global_pair))) },
 };
 
-/// The set at window 15, n = 16..128. Its rows
+/// The searched set at window 15, n = 16..128 (sashimi's `spec1-w15`, `docs/s1-per-rate/s1-w15.csv`). Its rows
 /// n = 24..64 are the 21-row table it extends (digest `2ac2594d`), so a pack stamped with that digest decodes the same.
 fn w15Pairs() [57]Pair {
     return .{
@@ -169,7 +172,7 @@ fn w15Pairs() [57]Pair {
     };
 }
 
-/// The set at window 16, n = 24..64.
+/// The searched set at window 16, n = 24..64 (sashimi's `spec1-w16`).
 fn w16Pairs() [k4_count]Pair {
     return .{
         .{ 0x862d1c19, 0x8fee8c30 },
@@ -196,7 +199,7 @@ fn w16Pairs() [k4_count]Pair {
     };
 }
 
-/// The one pair `std1` decodes with, at every rate.
+/// The one pair every SPEC1 pack used before the per-rate tables, at every rate (sashimi's `std1`).
 const global_pair: Pair = .{ 0x840C1F37, 0x8FFE8FD0 };
 
 fn tabledRows(pairs: anytype) [pairs.len]Row {
@@ -262,11 +265,23 @@ pub fn digestOfTable(t: *const Table) [8]u8 {
     return digestOf(t.fields, ns[0..t.rows.len], t.rows);
 }
 
+const legacy_keys = [_][]const u8{ "cantona_constants", "cantona_scale", "beta_multiplier", "beta_mask" };
+const legacy_table_prefixes = [_][]const u8{ "s1-", "sushi1-", "beta-", "dd1-", "cantona-" };
+
+/// A table name from before STD1, SPEC1 and PAIR1; the removed partial table is not one, it has no successor.
+fn isLegacyTableName(name: []const u8) bool {
+    if (std.mem.endsWith(u8, name, "-partial")) return false;
+    for (legacy_table_prefixes) |prefix| if (std.mem.startsWith(u8, name, prefix)) return true;
+    return false;
+}
+
 /// The table `block` names for `codebook` at `window`, refusing by name. Only std1, spec1 and pair1 have tables.
 pub fn resolve(block: std.json.ObjectMap, codebook: format.Codebook, window: format.Window) Refusal!*const Table {
+    for (legacy_keys) |key| if (block.contains(key)) return error.Exl3CodebookTableLegacyConfig;
     if (!codebook.hasTable()) return error.Exl3CodebookTableCodebookMismatch;
     const name = block.get("codebook_table") orelse return error.Exl3CodebookTableUnknown;
     if (name != .string) return error.Exl3CodebookTableUnknown;
+    if (isLegacyTableName(name.string)) return error.Exl3CodebookTableLegacyConfig;
     const table = lookup(name.string) orelse return error.Exl3CodebookTableUnknown;
     const digest = block.get("codebook_digest") orelse return error.Exl3CodebookTableDigestMismatch;
     if (digest != .string) return error.Exl3CodebookTableDigestMismatch;
@@ -278,7 +293,10 @@ pub fn resolve(block: std.json.ObjectMap, codebook: format.Codebook, window: for
     return table;
 }
 
-test "the canonical digest is pinned by a fixed vector" {
+const legacy_table_names = [_][]const u8{ "s1-w15", "s1-w16", "s1-global", "sushi1-w15", "sushi1-global", "beta-global-v1", "beta-w15-v1", "dd1-w16-v1", "cantona-w16-v1" };
+
+// Shared with sashimi (its test_codebook_tables.py).
+test "the canonical digest is pinned by the same vector as sashimi's" {
     const t = std.testing;
     const rows = [_]Row{ .{ 1, 2, 3, 4 }, .{ 0xFFFFFFFF, 0, 0x80000000, 0x7FFFFFFF } };
     try t.expectEqualStrings("72fc0906", &digestOf(4, &.{ 24, 64 }, &rows));
@@ -298,6 +316,7 @@ test "every table keeps its pinned digest, and the tables from before K8 one row
     try t.expectEqualStrings("37f72431", lookup("spec1-w15").?.digest);
     try t.expectEqualStrings("c5dba171", lookup("std1").?.digest);
     try t.expectEqualStrings("753ffa03", lookup("spec1-w16").?.digest);
+    for (legacy_table_names) |old| try t.expect(lookup(old) == null);
     const s1 = lookup("spec1-w15").?;
     try t.expectEqual(Row{ 0x84c1cf49, 0x8fe08b47, 0, 0 }, s1.row(.{ .n = 24 }).?);
     try t.expectEqual(Row{ 0x3fed4cef, 0x8ff08ff0, 0, 0 }, s1.row(.{ .n = 64 }).?);
@@ -353,12 +372,32 @@ test "a config names its table and every refusal is named" {
         .{ .raw = "{\"codebook_table\":\"pair1-w16-v1\",\"codebook_digest\":\"c089b4eb\"}", .cb = .spec1, .w = .w16, .want = error.Exl3CodebookTableCodebookMismatch },
         .{ .raw = "{\"codebook_table\":\"pair1-w16-v1\",\"codebook_digest\":\"c089b4eb\"}", .cb = .mcg, .w = .w16, .want = error.Exl3CodebookTableCodebookMismatch },
         .{ .raw = "{\"codebook_table\":\"pair1-w16-v1\",\"codebook_digest\":\"c089b4eb\"}", .cb = .pair1, .w = .w15, .want = error.Exl3CodebookTableWindowMismatch },
+        .{ .raw = "{\"codebook_table\":\"pair1-w16-v1\",\"codebook_digest\":\"c089b4eb\",\"cantona_constants\":[]}", .cb = .pair1, .w = .w16, .want = error.Exl3CodebookTableLegacyConfig },
+        .{ .raw = "{\"cantona_scale\":4096}", .cb = .pair1, .w = .w16, .want = error.Exl3CodebookTableLegacyConfig },
+        .{ .raw = "{\"beta_multiplier\":2215386935,\"beta_mask\":2415824848}", .cb = .spec1, .w = .w15, .want = error.Exl3CodebookTableLegacyConfig },
         .{ .raw = "{\"codebook_table\":\"std1\",\"codebook_digest\":\"2ac2594d\"}", .cb = .std1, .w = .w15, .want = error.Exl3CodebookTableDigestMismatch },
         .{ .raw = "{\"codebook_table\":\"std1\",\"codebook_digest\":\"c5dba171\"}", .cb = .spec1, .w = .w15, .want = error.Exl3CodebookTableCodebookMismatch },
         .{ .raw = "{}", .cb = .spec1, .w = .w15, .want = error.Exl3CodebookTableUnknown },
-        // spec1-w15 before it grew to n = 16..128.
+        // spec1-w15 before it grew to n = 16..128: re-stamped by tool.
         .{ .raw = "{\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"2ac2594d\"}", .cb = .spec1, .w = .w15, .want = error.Exl3CodebookTableLegacyConfig },
     }) |c| try t.expectError(c.want, resolveText(c.raw, c.cb, c.w));
+}
+
+test "every name a table went by before STD1, SPEC1 and PAIR1 is refused as a legacy config, whatever its digest" {
+    const t = std.testing;
+    for (legacy_table_names) |old| {
+        var buf: [128]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "{{\"codebook_table\":\"{s}\",\"codebook_digest\":\"c5dba171\"}}", .{old});
+        for ([_]format.Codebook{ .std1, .spec1, .pair1 }) |cb| try t.expectError(error.Exl3CodebookTableLegacyConfig, resolveText(raw, cb, .w15));
+    }
+    try t.expectError(error.Exl3CodebookTableLegacyConfig, resolveText("{\"codebook_table\":\"s1-w15-v2\"}", .spec1, .w15));
+    // The window-15 partial table was removed, so its old names are no table at all: nothing may alias it to spec1-w15.
+    for ([_][]const u8{ "s1-w15-partial", "sushi1-w15-partial", "beta-w15-partial", "spec1-w15-partial" }) |gone| {
+        var buf: [128]u8 = undefined;
+        const raw = try std.fmt.bufPrint(&buf, "{{\"codebook_table\":\"{s}\",\"codebook_digest\":\"c1a1db2c\"}}", .{gone});
+        try t.expectError(error.Exl3CodebookTableUnknown, resolveText(raw, .spec1, .w15));
+    }
+    try t.expectError(error.Exl3CodebookTableUnknown, resolveText("{\"codebook_table\":\"spec1-w15-v2\"}", .spec1, .w15));
 }
 
 test "std1 is the one pair at every rate and decodes at every window" {

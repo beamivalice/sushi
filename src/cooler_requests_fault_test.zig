@@ -446,3 +446,67 @@ const RefuseOnce = struct {
         self.child.rawFree(memory, alignment, ra);
     }
 };
+
+test "cooler contract: a served drafted request failed at any checked MLX call site its plain request lacks leaves the next drafted request its tokens and the pool as it was" {
+    try contract.eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: contract.Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            // A load with no drafter serves no drafted request.
+            const head = @import("generate.zig").MtpHeadRef.fromModel(ld.xfm, true, null) orelse return error.SkipZigTest;
+            var sv: contract.Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            const n = @min(ids.len, 30);
+            const Req = struct {
+                sv: *contract.Served,
+                p: []const u32,
+                head: ?@import("generate.zig").MtpHeadRef,
+                fn go(q: @This()) anyerror!void {
+                    var d: u64 = 0;
+                    var got = try contract.servedDrafts(q.sv, q.p, 12, .{ .temperature = 0 }, q.head, &d);
+                    got.deinit(testing.allocator);
+                }
+            };
+            var d: u64 = 0;
+            var want = try contract.servedDrafts(&sv, ids[0..n], 12, .{ .temperature = 0 }, head, &d);
+            defer want.deinit(a);
+            const sites = &mlx.fault.sites;
+            defer sites.* = .{};
+            sites.lasts = false;
+            const plain = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = ids[0..n], .head = null }, Req.go);
+            defer a.free(plain);
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            defer seen.deinit(a);
+            for (plain) |pt| try seen.put(a, pt.site, {});
+            sites.* = .{ .lasts = true };
+            const all = try mlx.sweepSites(a, sites, Req{ .sv = &sv, .p = ids[0..n], .head = head }, Req.go);
+            defer a.free(all);
+            // A cold prompt between: the next turn shares nothing with the failed one.
+            var other: [30]u32 = undefined;
+            @memcpy(other[0..n], ids[0..n]);
+            other[0] = if (ids[0] == 1) 2 else 1;
+            for (all, 0..) |pt, at| {
+                if (seen.contains(pt.site)) continue;
+                sv.quiet_failures = true;
+                sites.armAt(pt);
+                if (contract.servedDrafts(&sv, ids[0..n], 12, .{ .temperature = 0 }, head, &d)) |g| {
+                    var got = g;
+                    got.deinit(a);
+                } else |_| {}
+                mlx.fault.disarm();
+                var said: [256]u8 = undefined;
+                _ = mlx.takeError(&said);
+                sv.quiet_failures = false;
+                errdefer std.debug.print("cooler contract: after the drafted request failed at MLX point {d} of {d} (call {d})\n", .{ at, all.len, pt.n });
+                var cold = try contract.servedDrafts(&sv, other[0..n], 12, .{ .temperature = 0 }, head, &d);
+                cold.deinit(a);
+                var again = try contract.servedDrafts(&sv, ids[0..n], 12, .{ .temperature = 0 }, head, &d);
+                defer again.deinit(a);
+                try testing.expectEqualSlices(u32, want.items, again.items);
+            }
+        }
+    }.run);
+}

@@ -42,6 +42,17 @@ const ROWS_X_PLAIN: []const u8 =
     \\
 ;
 
+/// `ROWS_X_PLAIN` over f32 rows, each element rounded to bf16 as it is read (`Mode.thru_bf16`).
+const ROWS_X_THRU: []const u8 =
+    \\    const auto xr = x + (size_t)r * uint(IDIM) + k;
+    \\    const float4 v = exl3_h128(float4(
+    \\      float(bfloat16_t(xr[lane])) * float(suh[k + lane]),
+    \\      float(bfloat16_t(xr[lane + 32u])) * float(suh[k + lane + 32u]),
+    \\      float(bfloat16_t(xr[lane + 64u])) * float(suh[k + lane + 64u]),
+    \\      float(bfloat16_t(xr[lane + 96u])) * float(suh[k + lane + 96u])), lane);
+    \\
+;
+
 /// `ROWS_X_PLAIN` where `x` holds the k-split partials of the launch before this one (`[XG * ROWS * XSPLIT, XODIM]` f32,
 /// that launch's bank g making input columns `g * XODIM` on): the block is first finished as `ROWS_FINISH_SOURCE`
 /// finishes it, in its order, and rounded to that launch's output type `XT`, so the prepared row is the same bytes.
@@ -362,6 +373,9 @@ const ROWS_FINISH_SOURCE: [:0]const u8 =
     \\yr[96] = OutT(v.w * psc * float(svh[g * uint(ODIM) + b + 96u]));
 ;
 
+/// `ROWS_FINISH_SOURCE` storing each output as its OutT (bf16) rounding into f32 rows (`Mode.thru_bf16`).
+const ROWS_FINISH_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, "device OutT *yr", "device float *yr");
+
 const ROWS_FINISH_ROW_MAJOR_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, ROWS_FINISH_AT, ROWS_FINISH_AT_ROW_MAJOR);
 
 /// `ROWS_FINISH_SOURCE` of a one-bank launch whose row `y` leaves as HC streams: stream i is
@@ -454,6 +468,15 @@ const ROWS_FINISH_RMS_SOURCE: [:0]const u8 =
     \\}
 ;
 
+/// `ROWS_FINISH_RMS_SOURCE` of a launch through bf16 (`Mode.thru_bf16`): each finished output rounded to bf16 and widened,
+/// the norm in f32 over `w` widened as stored, the rows f32 (OutT): the through launch, then MLX's f32 rms norm.
+const ROWS_FINISH_RMS_THRU_SOURCE: [:0]const u8 = blk: {
+    var t: []const u8 = ROWS_FINISH_RMS_SOURCE;
+    for ([_][]const u8{ "o0", "o1", "o2", "o3" }) |o| t = kernels.metalReplaceFound(t, "const OutT " ++ o ++ " = OutT(", "const float " ++ o ++ " = THRU_BF16(");
+    t = kernels.metalReplaceFound(t, "yr[i] = w[c0 + uint(i)] * OutT(tx[i] * inv_mean[0]);", "yr[i] = float(w[c0 + uint(i)]) * (tx[i] * inv_mean[0]);");
+    break :blk kernels.metalReplaceFound(t, "#pragma clang fp contract(off)\n", "#pragma clang fp contract(off)\n#define THRU_BF16(v) float(bfloat16_t(v))\n");
+};
+
 pub const PROJECT_ROWS_MAX: c_int = 8;
 
 /// The NAX arm runs one 16-row MMA tile whatever the row count, so it serves up to 16 rows on the same sums.
@@ -467,6 +490,9 @@ pub const Mode = struct {
     /// A spec verify's trunk launches: with `exact` on a NAX machine, rows past `PROJECT_ROWS_MAX` stay on the NAX arm
     /// instead of the sorted GEMM, so each still has its decode tick's bytes. Prefill chunks keep the GEMM.
     wide: bool = false,
+    /// `x` arrives f32 and each element is rounded to bf16 where the launch reads it; each output is stored f32 as its
+    /// bf16 rounding: the bytes of casting the rows to bf16, the bf16 launch and casting its rows back, two dispatches fewer.
+    thru_bf16: bool = false,
 };
 
 /// The most rows a multi-row launch serves in `mode`.
@@ -487,9 +513,9 @@ pub const RowsGeom = struct { tgrp: c_int, kph: c_int, nsplit: c_int, chunk: c_i
 /// row of `xodim` columns a bank, finished to `xdt`. `xsplit` 0: plain rows.
 pub const Pending = struct { xsplit: c_int = 0, xodim: c_int = 0, xdt: mlx.mlx_dtype = .float32 };
 
-const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom, pend: Pending = .{} };
+const RowsKey = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, bounds: [3]c_int, geom: RowsGeom, pend: Pending = .{}, thru: bool = false };
 
-const RowsFinishKey = struct { out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int };
+const RowsFinishKey = struct { out_dim: c_int, rows: c_int, groups: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int, thru: bool = false };
 
 /// DeepSeek's trunk alone holds a dozen shapes at each of a decode and a verify width, so a smaller cache thrashes.
 var rows_cfgs: kernel_src.CfgCache(RowsKey, 64) = .{};
@@ -603,12 +629,14 @@ fn launchRowsDyn(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, su
     return out;
 }
 
-const RowsFinishRmsKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int, norm: c_int };
+const RowsFinishRmsKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, bounds: [3]c_int, norm: c_int, thru: bool = false };
 
 /// A stacked shape at each of its decode widths.
 var rows_finish_rms_cfgs: kernel_src.CfgCache(RowsFinishRmsKey, 32) = .{};
 
 var rows_finish_rms_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+var rows_finish_rms_thru_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const RowsFinishExpandKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, hc: c_int };
 
@@ -683,6 +711,374 @@ const ROWS_NAX_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SO
 pub fn rowsPendKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
     if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_pend_kernel, "sushi_exl3_rows_nax_pend", &ROWS_PEND_INS, &.{"y"}, ROWS_NAX_PEND_SOURCE, ROWS_NAX_FRAGS);
     return kernel_src.codebookKernelWith(&rows_pend_kernel, "sushi_exl3_rows_pend", &ROWS_PEND_INS, &.{"y"}, ROWS_PEND_SOURCE, ROWS_HELPERS);
+}
+
+const ROWS_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_SOURCE, ROWS_X_PLAIN, ROWS_X_THRU);
+
+const ROWS_NAX_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_X_PLAIN, ROWS_X_THRU);
+
+var rows_thru_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
+var rows_nax_thru_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
+var rows_finish_thru_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// `rowsKernel` for a launch through bf16 (`Mode.thru_bf16`): f32 rows rounded where they are read. A folding launch
+/// stores its outputs as OutT, bf16, into its f32 rows.
+pub fn rowsThruKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
+    if (g.nax) return kernel_src.codebookKernelWith(&rows_nax_thru_kernel, "sushi_exl3_rows_nax_thru", &ROWS_INS, &.{"y"}, ROWS_NAX_THRU_SOURCE, ROWS_NAX_FRAGS);
+    return kernel_src.codebookKernelWith(&rows_thru_kernel, "sushi_exl3_rows_thru", &ROWS_INS, &.{"y"}, ROWS_THRU_SOURCE, ROWS_HELPERS);
+}
+
+/// A counted launch's stores: a partial by a relaxed device atomic, which the block's last threadgroup reads back; a
+/// finished output as its output's type (`exl3_fin`), or by an atomic where the launch's last reads it back. The
+/// SwiGLU is MLX's ops': its Sigmoid functor, then `(g · σ(g)) · u` with no fma contraction.
+const COUNTED_STORE: [:0]const u8 =
+    \\static inline void exl3_store_part(device float *p, float v) { metal::atomic_store_explicit((device metal::atomic_float *)p, v, metal::memory_order_relaxed); }
+    \\template <typename T, typename V> static inline void exl3_fin(device T *p, V v) { *p = T(v); }
+    \\template <typename V> static inline void exl3_fin_atomic(device float *p, V v) { exl3_store_part(p, float(v)); }
+    \\static inline float exl3_sigmoid(float x) {
+    \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
+    \\  return (x < 0) ? y : 1 - y;
+    \\}
+    \\static inline float exl3_swiglu(float g, float u) {
+    \\  #pragma clang fp contract(off)
+    \\  const float a = g * exl3_sigmoid(g);
+    \\  return a * u;
+    \\}
+    \\
+;
+
+/// A counted launch's count-in: every threadgroup counts itself in at its 128-wide output block's counter in the
+/// counter page `ctr`, fenced at device scope either side; all but the block's last of `ARRIVALS` return.
+const COUNTED_ENTER: [:0]const u8 =
+    \\  constexpr uint BT = 128u / (TGT * TILE);
+    \\  threadgroup bool t_last[1];
+    \\  const uint blk = uint(threadgroup_position_in_grid.x) / BT;
+    \\  metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\  threadgroup_barrier(mem_flags::mem_device);
+    \\  if (lid == 0u) {
+    \\    metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\    t_last[0] = metal::atomic_fetch_add_explicit((device metal::atomic_uint *)ctr + blk, 1u, metal::memory_order_relaxed) == ARRIVALS - 1u;
+    \\    metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  if (!t_last[0]) return;
+    \\  metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\
+;
+
+/// The block's partials at `PB` [ROWS · NSPLIT, ODIM] summed into `tgm` [ROWS, 128] as `ROWS_FINISH_SOURCE` sums
+/// them: a thread a column, its parts in order. A thread loads the parts of all its columns before it sums any, while
+/// they fit 96 registers.
+const COUNTED_SUM: [:0]const u8 =
+    \\  {
+    \\    constexpr uint TT = SGS * 32u;
+    \\    constexpr uint PER = (uint(ROWS) * 128u + TT - 1u) / TT;
+    \\    constexpr uint BATCH = PER * uint(NSPLIT) <= 96u ? PER : 1u;
+    \\    for (uint k0 = 0u; k0 < PER; k0 += BATCH) {
+    \\      float pv[BATCH][NSPLIT];
+    \\      #pragma clang loop unroll(full)
+    \\      for (uint k = 0u; k < BATCH; k++) {
+    \\        const uint i = lid + (k0 + k) * TT;
+    \\        if (i < uint(ROWS) * 128u) {
+    \\          const uint r = i / 128u;
+    \\          device metal::atomic_float *p = (device metal::atomic_float *)PB + (size_t)r * uint(NSPLIT) * uint(ODIM) + blk * 128u + (i - r * 128u);
+    \\          #pragma clang loop unroll(full)
+    \\          for (uint s = 0u; s < uint(NSPLIT); s++) pv[k][s] = metal::atomic_load_explicit(p + (size_t)s * uint(ODIM), metal::memory_order_relaxed);
+    \\        }
+    \\      }
+    \\      #pragma clang loop unroll(full)
+    \\      for (uint k = 0u; k < BATCH; k++) {
+    \\        const uint i = lid + (k0 + k) * TT;
+    \\        if (i < uint(ROWS) * 128u) {
+    \\          float acc = 0.0f;
+    \\          #pragma clang loop unroll(full)
+    \\          for (uint s = 0u; s < uint(NSPLIT); s++) acc += pv[k][s];
+    \\          tgm[i] = acc;
+    \\        }
+    \\      }
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  const uint b = blk * 128u + lane;
+    \\
+;
+
+/// A one-bank block's finish into `fin` [ROWS, ODIM]: a simdgroup a row takes the block's H128 and `psc · svh`, each
+/// output rounded to OutT, as `ROWS_FINISH_SOURCE` finishes it; the block's counter goes back to zero.
+const COUNTED_FIN: [:0]const u8 =
+    \\  for (uint r = sg; r < uint(ROWS); r += SGS) {
+    \\    const threadgroup float *pr = tgm + r * 128u + lane;
+    \\    const float4 v = exl3_h128(float4(pr[0], pr[32], pr[64], pr[96]), lane);
+    \\    const auto yr = fin + (size_t)r * uint(ODIM) + b;
+    \\    exl3_fin(yr, OutT(v.x * psc * float(svh[b])));
+    \\    exl3_fin(yr + 32u, OutT(v.y * psc * float(svh[b + 32u])));
+    \\    exl3_fin(yr + 64u, OutT(v.z * psc * float(svh[b + 64u])));
+    \\    exl3_fin(yr + 96u, OutT(v.w * psc * float(svh[b + 96u])));
+    \\  }
+    \\  if (lid == 0u) metal::atomic_store_explicit((device metal::atomic_uint *)ctr + blk, 0u, metal::memory_order_relaxed);
+    \\
+;
+
+/// After its block, the launch's last block to finish (its counter `ctr[ODIM / 128]`) rms-norms each finished row
+/// over `w` with `eps[0]` as `ROWS_FINISH_RMS_THRU_SOURCE` does: a virtual simdgroup a (row, 128-column block) squares
+/// four neighbours a lane by fma and takes their `simd_sum`, a simdgroup a row the blocks' sums, `rsqrt` of the mean
+/// plus eps; an output is `w · (x · inv)`. Every row at once: a simdgroup loads all its blocks before it sums any.
+const COUNTED_NORM: [:0]const u8 =
+    \\  {
+    \\    #pragma clang fp contract(off)
+    \\    constexpr uint NB = uint(ODIM) / 128u;
+    \\    constexpr uint PAIRS = uint(ROWS) * NB;
+    \\    constexpr uint PP = (PAIRS + SGS - 1u) / SGS;
+    \\    static_assert(NB <= 32u, "a row's block sums are one simdgroup's lanes");
+    \\    threadgroup float t_sums[uint(ROWS) * 32u];
+    \\    threadgroup float t_inv[ROWS];
+    \\    metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\    threadgroup_barrier(mem_flags::mem_device);
+    \\    if (lid == 0u) {
+    \\      metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\      t_last[0] = metal::atomic_fetch_add_explicit((device metal::atomic_uint *)ctr + NB, 1u, metal::memory_order_relaxed) == NB - 1u;
+    \\      metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    if (!t_last[0]) return;
+    \\    metal::atomic_thread_fence(metal::mem_flags::mem_device, metal::memory_order_seq_cst, metal::thread_scope_device);
+    \\    for (uint i = lid; i < uint(ROWS) * 32u; i += SGS * 32u) t_sums[i] = 0.0f;
+    \\    float tx[PP][4];
+    \\    #pragma clang loop unroll(full)
+    \\    for (uint k = 0u; k < PP; k++) {
+    \\      const uint p = sg + k * SGS;
+    \\      if (p < PAIRS) {
+    \\        device metal::atomic_float *fp = (device metal::atomic_float *)fin + (size_t)(p / NB) * uint(ODIM) + (p % NB) * 128u + lane * 4u;
+    \\        for (int i = 0; i < 4; i++) tx[k][i] = metal::atomic_load_explicit(fp + i, metal::memory_order_relaxed);
+    \\      }
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    #pragma clang loop unroll(full)
+    \\    for (uint k = 0u; k < PP; k++) {
+    \\      const uint p = sg + k * SGS;
+    \\      if (p < PAIRS) {
+    \\        float acc = 0.0f;
+    \\        for (int i = 0; i < 4; i++) acc = metal::fma(tx[k][i], tx[k][i], acc);
+    \\        acc = simd_sum(acc);
+    \\        if (lane == 0u) t_sums[(p / NB) * 32u + p % NB] = acc;
+    \\      }
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    for (uint r = sg; r < uint(ROWS); r += SGS) {
+    \\      const float acc = simd_sum(t_sums[r * 32u + lane]);
+    \\      if (lane == 0u) t_inv[r] = metal::precise::rsqrt(acc / uint(ODIM) + eps[0]);
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    #pragma clang loop unroll(full)
+    \\    for (uint k = 0u; k < PP; k++) {
+    \\      const uint p = sg + k * SGS;
+    \\      if (p < PAIRS) {
+    \\        const uint c0 = (p % NB) * 128u + lane * 4u;
+    \\        device float *fr = fin + (size_t)(p / NB) * uint(ODIM) + c0;
+    \\        for (int i = 0; i < 4; i++) fr[i] = float(w[c0 + uint(i)]) * (tx[k][i] * t_inv[p / NB]);
+    \\      }
+    \\    }
+    \\    if (lid == 0u) metal::atomic_store_explicit((device metal::atomic_uint *)ctr + NB, 0u, metal::memory_order_relaxed);
+    \\  }
+    \\
+;
+
+/// A gate and up pair's block (`launchRowsPair`): its last of both banks' threadgroups finishes the gate's block, then
+/// the up's, each as `ROWS_FINISH_THRU_SOURCE` does, and stores `exl3_swiglu` of the two into `fin`.
+const COUNTED_PAIR_FIN: [:0]const u8 =
+    \\  constexpr uint RPS = (uint(ROWS) + SGS - 1u) / SGS;
+    \\  float4 gv[RPS];
+    \\  for (uint h = 0u; h < 2u; h++) {
+++ kernels.metalReplaceFound(COUNTED_SUM, "PB", "(y0 + (size_t)h * uint(ROWS) * uint(NSPLIT) * uint(ODIM))") ++
+    \\    const auto sv = h == 0u ? svh : svh2;
+    \\    #pragma clang loop unroll(full)
+    \\    for (uint q = 0u; q < RPS; q++) {
+    \\      const uint r = sg + q * SGS;
+    \\      if (r < uint(ROWS)) {
+    \\        const threadgroup float *pr = tgm + r * 128u + lane;
+    \\        const float4 v = exl3_h128(float4(pr[0], pr[32], pr[64], pr[96]), lane);
+    \\        const float4 o = float4(float(OutT(v.x * psc * float(sv[b]))), float(OutT(v.y * psc * float(sv[b + 32u]))), float(OutT(v.z * psc * float(sv[b + 64u]))), float(OutT(v.w * psc * float(sv[b + 96u]))));
+    \\        if (h == 0u) {
+    \\          gv[q] = o;
+    \\        } else {
+    \\          device float *yr = fin + (size_t)r * uint(ODIM) + b;
+    \\          yr[0] = exl3_swiglu(gv[q].x, o.x);
+    \\          yr[32] = exl3_swiglu(gv[q].y, o.y);
+    \\          yr[64] = exl3_swiglu(gv[q].z, o.z);
+    \\          yr[96] = exl3_swiglu(gv[q].w, o.w);
+    \\        }
+    \\      }
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  }
+    \\  if (lid == 0u) metal::atomic_store_explicit((device metal::atomic_uint *)ctr + blk, 0u, metal::memory_order_relaxed);
+    \\
+;
+
+/// The tail a counted launch appends to its rows kernel, `fin` its finished rows.
+const COUNTED_TAIL: [:0]const u8 = "{\n  static_assert(PART_F >= uint(ROWS) * 128u, \"the finish sums a block's rows in tgm\");\n" ++
+    kernels.metalReplaceFound(COUNTED_ENTER, "ARRIVALS", "BT * uint(NSPLIT)") ++ kernels.metalReplaceFound(COUNTED_SUM, "PB", "y") ++ COUNTED_FIN ++ "}\n";
+
+const COUNTED_NORM_TAIL: [:0]const u8 = "{\n  static_assert(PART_F >= uint(ROWS) * 128u, \"the finish sums a block's rows in tgm\");\n" ++
+    kernels.metalReplaceFound(COUNTED_ENTER, "ARRIVALS", "BT * uint(NSPLIT)") ++ kernels.metalReplaceFound(COUNTED_SUM, "PB", "y") ++
+    kernels.metalReplaceFound(COUNTED_FIN, "exl3_fin(", "exl3_fin_atomic(") ++ COUNTED_NORM ++ "}\n";
+
+const COUNTED_PAIR_TAIL: [:0]const u8 = "{\n  static_assert(PART_F >= uint(ROWS) * 128u, \"the finish sums a block's rows in tgm\");\n  static_assert(GROUPS == 2, \"a pair is two banks\");\n" ++
+    kernels.metalReplaceFound(COUNTED_ENTER, "ARRIVALS", "2u * BT * uint(NSPLIT)") ++ COUNTED_PAIR_FIN ++ "}\n";
+
+/// A rows source whose partials leave by `exl3_store_part`.
+fn countedRows(comptime src: [:0]const u8) [:0]const u8 {
+    return kernels.metalReplaceFound(src, "exl3_store(y + ", "exl3_store_part(y + ");
+}
+
+/// `countedRows` of a pair: bank 1's threadgroups (grid z) read `trellis2` and `suh2` over the one input and store
+/// their partials past bank 0's; `y0` keeps where bank 0's start.
+fn pairRows(comptime src: [:0]const u8) [:0]const u8 {
+    return kernels.metalReplaceFound(countedRows(src),
+        \\if constexpr (GROUPS > 1) {
+        \\  const size_t grp = threadgroup_position_in_grid.z;
+        \\  x += grp * uint(ROWS) * uint(IDIM);
+        \\  trellis += grp * (uint(IDIM) / TILE) * OT * N;
+        \\  suh += grp * uint(IDIM);
+        \\  svh += grp * uint(ODIM);
+        \\
+    ,
+        \\device float *const y0 = y;
+        \\if constexpr (GROUPS > 1) {
+        \\  const size_t grp = threadgroup_position_in_grid.z;
+        \\  if (grp != 0u) {
+        \\    trellis = trellis2;
+        \\    suh = suh2;
+        \\  }
+        \\
+    );
+}
+
+const ROWS_THRU_COUNTED_SOURCE: [:0]const u8 = countedRows(ROWS_THRU_SOURCE) ++ COUNTED_TAIL;
+const ROWS_NAX_THRU_COUNTED_SOURCE: [:0]const u8 = countedRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_TAIL;
+const ROWS_THRU_COUNTED_RMS_SOURCE: [:0]const u8 = countedRows(ROWS_THRU_SOURCE) ++ COUNTED_NORM_TAIL;
+const ROWS_NAX_THRU_COUNTED_RMS_SOURCE: [:0]const u8 = countedRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_NORM_TAIL;
+const ROWS_THRU_COUNTED_PAIR_SOURCE: [:0]const u8 = pairRows(ROWS_THRU_SOURCE) ++ COUNTED_PAIR_TAIL;
+const ROWS_NAX_THRU_COUNTED_PAIR_SOURCE: [:0]const u8 = pairRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_PAIR_TAIL;
+
+/// A counted launch's kernels: [SIMD, NAX] of the one-bank, the normed and the pair's.
+var rows_counted_kernels: [3][2]kernel_src.KernelSlots = @splat(@splat(kernel_src.no_kernels));
+
+/// The most rows a trunk launch finishes its own partials for (`trunk`): a block's last threadgroup finishes every row
+/// alone, a tail that past three rows outweighs the finish launch it saves (hy4-flash-arch.md).
+pub const COUNTED_ROWS_MAX: c_int = 3;
+
+/// `COUNTED_ROWS_MAX` for a launch leaving `c`: a normed launch's last block norms every row of the output alone, a
+/// tail that past one row outweighs the finish it saves (hy4-flash-arch.md).
+pub fn countedRowsMax(c: Counted) c_int {
+    return if (c == .normed) 1 else COUNTED_ROWS_MAX;
+}
+
+/// What a counted launch's finisher leaves (`launchRowsCounted`).
+pub const Counted = union(enum) {
+    /// f32 rows of each output's bf16 rounding, as `rows_finish_thru` stores them.
+    thru,
+    /// bf16 rows, as `rows_finish` stores the same launch's over the rows cast to bf16.
+    stored,
+    /// `thru`'s rows rms-normed over `Norm.w` (the whole row), as `rows_finish_rms_thru` leaves them.
+    normed: Norm,
+};
+
+const CountedKey = struct { rows: RowsKey, kind: enum { thru, stored, normed, pair } };
+
+var rows_counted_cfgs: kernel_src.CfgCache(CountedKey, 64) = .{};
+
+const ROWS_COUNTED_OUTS = [_][*:0]const u8{ "y", "fin", "ctr" };
+
+/// Whether `launchRowsCounted` serves `l` under `g` on stream `s` leaving `c`: a one-bank through launch that leaves
+/// partials, on a stream whose counter page holds a counter for each 128-wide output block (and, normed, one more).
+pub fn countedFits(s: mlx.mlx_stream, l: RowsLaunch, g: RowsGeom, c: Counted) bool {
+    const blocks = @divFloor(l.out_dim, 128) + @intFromBool(c == .normed);
+    const fits = l.thru and l.groups == 1 and !rowsFolds(g) and @rem(l.out_dim, 128) == 0 and host_side.counters(s) >= blocks;
+    return fits and switch (c) {
+        .normed => |n| normedFits(l, g, @splat(l.out_dim), n),
+        else => true,
+    };
+}
+
+/// Whether `launchRowsPair` serves a gate and up pair of one shape `l` (one bank's launch) under `g` on stream `s`:
+/// as `countedFits` serves one bank's.
+pub fn pairFits(s: mlx.mlx_stream, l: RowsLaunch, g: RowsGeom) bool {
+    return countedFits(s, l, g, .thru);
+}
+
+fn countedCfg(key: CountedKey, l: RowsLaunch, g: RowsGeom, fin_dt: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
+    if (rows_counted_cfgs.get(key)) |c| return c;
+    const c = try buildRowsCfg(l, g, key.rows.bounds, .{}, null);
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.rows, l.out_dim }, 2, fin_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{host_side.counter_page_words}, 1, .uint32));
+    rows_counted_cfgs.put(key, c);
+    return c;
+}
+
+/// The counted launch of `kernel` over `inputs`: its finished rows, or null, with nothing launched, where the stream
+/// has no page.
+fn applyCountedRows(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, cfg: mlx.mlx_fast_metal_kernel_config) !?mlx.mlx_array {
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(host_side.applyCounted(&ov, kernel, iv, cfg, s) orelse return null);
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 1));
+    return y;
+}
+
+/// `launchRows` of a through launch (`countedFits`) whose finish rides it: the k-split partials leave by device
+/// atomics and each output block's last threadgroup to count in finishes it, so the rows `[rows, out]` (f32, or bf16
+/// when `stored`) are the bytes of the launch and its finish (and, `normed`, its rms norm) in one dispatch. Null,
+/// with nothing launched, where the stream has no page.
+pub fn launchRowsCounted(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, c: Counted) !?mlx.mlx_array {
+    if (!countedFits(s, l, g, c)) return error.BadExl3Shape;
+    const rk = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = @splat(l.out_dim), .geom = g, .thru = true };
+    const nax: usize = @intFromBool(g.nax);
+    switch (c) {
+        .thru, .stored => {
+            const cfg = try countedCfg(.{ .rows = rk, .kind = if (c == .thru) .thru else .stored }, l, g, if (c == .thru) .float32 else .bfloat16);
+            const kernel = if (g.nax)
+                try kernel_src.codebookKernelWith(&rows_counted_kernels[0][nax], "sushi_exl3_rows_nax_thru_counted", &ROWS_INS, &ROWS_COUNTED_OUTS, ROWS_NAX_THRU_COUNTED_SOURCE, ROWS_NAX_FRAGS ++ COUNTED_STORE)
+            else
+                try kernel_src.codebookKernelWith(&rows_counted_kernels[0][nax], "sushi_exl3_rows_thru_counted", &ROWS_INS, &ROWS_COUNTED_OUTS, ROWS_THRU_COUNTED_SOURCE, ROWS_HELPERS ++ COUNTED_STORE);
+            return applyCountedRows(s, kernel, &.{ x, trellis, suh, svh }, cfg);
+        },
+        .normed => |n| {
+            const cfg = try countedCfg(.{ .rows = rk, .kind = .normed }, l, g, .float32);
+            const ins = ROWS_INS ++ [_][*:0]const u8{ "w", "eps" };
+            const kernel = if (g.nax)
+                try kernel_src.codebookKernelWith(&rows_counted_kernels[1][nax], "sushi_exl3_rows_nax_thru_counted_rms", &ins, &ROWS_COUNTED_OUTS, ROWS_NAX_THRU_COUNTED_RMS_SOURCE, ROWS_NAX_FRAGS ++ COUNTED_STORE)
+            else
+                try kernel_src.codebookKernelWith(&rows_counted_kernels[1][nax], "sushi_exl3_rows_thru_counted_rms", &ins, &ROWS_COUNTED_OUTS, ROWS_THRU_COUNTED_RMS_SOURCE, ROWS_HELPERS ++ COUNTED_STORE);
+            return applyCountedRows(s, kernel, &.{ x, trellis, suh, svh, n.w, n.eps }, cfg);
+        },
+    }
+}
+
+/// A gate bank `a` and an up bank `b` of one shape over the same f32 rows `x` in one counted launch (`pairFits`, `l`
+/// one bank's): each bank's threadgroups run its own launch's sums and the last of a block's to count in finishes both
+/// as `rows_finish_thru` does, leaving `silu(gate) · up` `[rows, out]` f32 as MLX's Sigmoid and Multiply give it over
+/// the two finished rows. Null, with nothing launched, where the stream has no page.
+pub fn launchRowsPair(s: mlx.mlx_stream, x: mlx.mlx_array, a: [3]mlx.mlx_array, b: [3]mlx.mlx_array, l: RowsLaunch, g: RowsGeom) !?mlx.mlx_array {
+    if (!pairFits(s, l, g)) return error.BadExl3Shape;
+    var lp = l;
+    lp.groups = 2;
+    const rk = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 2, .n = l.n, .out_dt = l.out_dt, .bounds = @splat(l.out_dim), .geom = g, .thru = true };
+    const cfg = try countedCfg(.{ .rows = rk, .kind = .pair }, lp, g, .float32);
+    const ins = ROWS_INS ++ [_][*:0]const u8{ "trellis2", "suh2", "svh2" };
+    const nax: usize = @intFromBool(g.nax);
+    const kernel = if (g.nax)
+        try kernel_src.codebookKernelWith(&rows_counted_kernels[2][nax], "sushi_exl3_rows_nax_thru_counted_pair", &ins, &ROWS_COUNTED_OUTS, ROWS_NAX_THRU_COUNTED_PAIR_SOURCE, ROWS_NAX_FRAGS ++ COUNTED_STORE)
+    else
+        try kernel_src.codebookKernelWith(&rows_counted_kernels[2][nax], "sushi_exl3_rows_thru_counted_pair", &ins, &ROWS_COUNTED_OUTS, ROWS_THRU_COUNTED_PAIR_SOURCE, ROWS_HELPERS ++ COUNTED_STORE);
+    return applyCountedRows(s, kernel, &.{ x, a[0], a[1], a[2], b[0], b[1], b[2] }, cfg);
 }
 
 pub fn rowsKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
@@ -776,7 +1172,7 @@ pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, 
     const rows = @divExact(xs[0], groups);
     const out = ts[ts.len - 2] * 16;
     const g = rowsGeometry(xs[1], out, rows, groups, ts[ts.len - 1], mode);
-    if (g.nax or groups != 1 or rows <= PROJECT_ROWS_MAX or rows > rowsMax(mode)) return projectRowsWith(s, x, trellis, suh, svh, g, try rowsKernel(g), null);
+    if (g.nax or groups != 1 or rows <= PROJECT_ROWS_MAX or rows > rowsMax(mode)) return projectRowsThru(s, x, trellis, suh, svh, g, null, mode.thru_bf16);
     // A SIMD launch holds `PROJECT_ROWS_MAX` rows and sums a row the same at every count: a wider call goes in halves.
     const half = @divFloor(rows + 1, 2);
     var parts: [2]mlx.mlx_array = @splat(.{});
@@ -788,7 +1184,7 @@ pub fn projectRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, 
         defer _ = mlx.mlx_array_free(xp);
         try mlx.check(mlx.mlx_slice(&xp, x, &[_]c_int{ span[0], 0 }, 2, &[_]c_int{ span[1], xs[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
         const gp = rowsGeometry(xs[1], out, span[1] - span[0], 1, ts[ts.len - 1], mode);
-        part.* = try projectRowsWith(s, xp, trellis, suh, svh, gp, try rowsKernel(gp), null);
+        part.* = try projectRowsThru(s, xp, trellis, suh, svh, gp, null, mode.thru_bf16);
     }
     const joined = mlx.mlx_vector_array_new_data(&parts, parts.len);
     defer _ = mlx.mlx_vector_array_free(joined);
@@ -825,6 +1221,15 @@ pub fn projectRowsSegmented(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.ml
 }
 
 pub fn projectRowsWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, seg_bounds: ?[3]c_int) !mlx.mlx_array {
+    return projectRowsKernel(s, x, trellis, suh, svh, g, kernel, seg_bounds, false);
+}
+
+/// `projectRowsWith` on `g`'s own kernel, through bf16 when `thru` (`Mode.thru_bf16`).
+fn projectRowsThru(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, g: RowsGeom, seg_bounds: ?[3]c_int, thru: bool) !mlx.mlx_array {
+    return projectRowsKernel(s, x, trellis, suh, svh, g, if (thru) try rowsThruKernel(g) else try rowsKernel(g), seg_bounds, thru);
+}
+
+fn projectRowsKernel(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, seg_bounds: ?[3]c_int, thru: bool) !mlx.mlx_array {
     const xs = mlx.getShape(x);
     const ts = mlx.getShape(trellis);
     if (xs.len != 2 or !(ts.len == 3 or ts.len == 4)) return error.BadExl3Shape;
@@ -839,11 +1244,12 @@ pub fn projectRowsWith(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_arr
     }
     if (mlx.mlx_array_dtype(trellis) != .uint16) return error.BadExl3Shape;
     const rate = try kernels.packedRate(ts[ts.len - 1]);
-    return launchRows(s, x, trellis, suh, svh, .{ .in_dim = in_dim, .out_dim = out_tiles * 16, .rows = rows, .groups = groups, .n = rate.n, .out_dt = mlx.mlx_array_dtype(x) }, g, kernel, seg_bounds, null);
+    return launchRows(s, x, trellis, suh, svh, .{ .in_dim = in_dim, .out_dim = out_tiles * 16, .rows = rows, .groups = groups, .n = rate.n, .out_dt = if (thru) .float32 else mlx.mlx_array_dtype(x), .thru = thru }, g, kernel, seg_bounds, null);
 }
 
 /// What one multi-row launch reads off its operands: their shapes, the rate and `x`'s dtype.
-pub const RowsLaunch = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype };
+/// `thru`: f32 rows read through bf16 and outputs stored f32 as their bf16 rounding (`Mode.thru_bf16`; `out_dt` f32).
+pub const RowsLaunch = struct { in_dim: c_int, out_dim: c_int, rows: c_int, groups: c_int, n: u32, out_dt: mlx.mlx_dtype, thru: bool = false };
 
 /// The configs of a launch, kept for good so a call looks neither up: the kernel's and, when its k split needs a
 /// finish, the finish kernel's.
@@ -872,7 +1278,7 @@ fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending, tmp
     const sgs = g.tgrp * g.kph;
     const out_shape = [_]c_int{ l.groups * if (fold) l.rows else l.rows * g.nsplit, l.out_dim };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, if (fold) l.out_dt else .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", if (l.thru) .bfloat16 else l.out_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(@divExact(l.out_dim, 16), 2 * g.tgrp) * sgs * 32, g.nsplit, l.groups));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, sgs * 32, 1, 1));
     inline for (.{ "IDIM", "ODIM", "ROWS", "GROUPS", "TGRP", "KPH", "NSPLIT", "CHUNK", "FOLD" }, .{ l.in_dim, l.out_dim, tmpl_rows orelse l.rows, l.groups, g.tgrp, g.kph, g.nsplit, g.chunk, @as(c_int, @intFromBool(fold)) }) |name, v|
@@ -896,8 +1302,8 @@ fn buildRowsCfg(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, pend: Pending, tmp
 pub fn launchRows(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, seg_bounds: ?[3]c_int, pin: ?PinnedCfg) !mlx.mlx_array {
     const fold = rowsFolds(g);
     const bounds = seg_bounds orelse @as([3]c_int, @splat(l.out_dim));
-    if (dyn_rows and g.nax) return launchRowsDyn(s, x, trellis, suh, svh, l, g, bounds);
-    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    if (dyn_rows and g.nax and !l.thru) return launchRowsDyn(s, x, trellis, suh, svh, l, g, bounds);
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .thru = l.thru };
     const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
         const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
@@ -924,15 +1330,17 @@ pub const Norm = struct { w: mlx.mlx_array, eps: mlx.mlx_array, cols: c_int };
 /// Whether `launchRowsNormed` serves `l` under `g` with `bounds` and `norm`: a one-bank launch with a finish, its row
 /// one threadgroup wide, the normed columns its first segment, in `w`'s dtype.
 pub fn normedFits(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, norm: Norm) bool {
+    const wdt = mlx.mlx_array_dtype(norm.w);
+    const w_ok = if (l.thru) wdt == .bfloat16 or wdt == .float32 else wdt == l.out_dt;
     return l.groups == 1 and !rowsFolds(g) and l.out_dim <= 4096 and norm.cols >= 128 and @rem(norm.cols, 128) == 0 and norm.cols <= bounds[0] and
-        mlx.mlx_array_dtype(norm.w) == l.out_dt and mlx.mlx_array_size(norm.w) == @as(usize, @intCast(norm.cols)) and norm.cols == @min(bounds[0], l.out_dim);
+        w_ok and mlx.mlx_array_size(norm.w) == @as(usize, @intCast(norm.cols)) and norm.cols == @min(bounds[0], l.out_dim);
 }
 
 /// `launchRows` of a stacked launch with `mlx_fast_rms_norm(first segment, norm.w, eps)` in place of the first
 /// segment: the bytes of the launch, its finish and the norm, in one dispatch fewer.
 pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, bounds: [3]c_int, pin: ?PinnedCfg, norm: Norm) !mlx.mlx_array {
     if (!normedFits(l, g, bounds, norm)) return error.BadExl3Shape;
-    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .thru = l.thru };
     const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
         const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
@@ -943,7 +1351,7 @@ pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_ar
     var part = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(part);
     try mlx.check(mlx.mlx_vector_array_get(&part, pv, 0));
-    const fkey = RowsFinishRmsKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .bounds = bounds, .norm = norm.cols };
+    const fkey = RowsFinishRmsKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .bounds = bounds, .norm = norm.cols, .thru = l.thru };
     const fcfg = rows_finish_rms_cfgs.get(fkey) orelse blk: {
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
@@ -957,7 +1365,10 @@ pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_ar
         rows_finish_rms_cfgs.put(fkey, c);
         break :blk c;
     };
-    const fk = try kernels.getNamedKernel(&rows_finish_rms_kernel, "sushi_exl3_rows_finish_rms", &.{ "part", "svh", "w", "eps" }, &.{"y"}, ROWS_FINISH_RMS_SOURCE, ROWS_HELPERS);
+    const fk = if (l.thru)
+        try kernels.getNamedKernel(&rows_finish_rms_thru_kernel, "sushi_exl3_rows_finish_rms_thru", &.{ "part", "svh", "w", "eps" }, &.{"y"}, ROWS_FINISH_RMS_THRU_SOURCE, ROWS_HELPERS)
+    else
+        try kernels.getNamedKernel(&rows_finish_rms_kernel, "sushi_exl3_rows_finish_rms", &.{ "part", "svh", "w", "eps" }, &.{"y"}, ROWS_FINISH_RMS_SOURCE, ROWS_HELPERS);
     const ov = try kernels.applyOuts(s, fk, &.{ part, svh, norm.w, norm.eps }, fcfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var y = mlx.mlx_array_new();
@@ -971,13 +1382,13 @@ pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_ar
 pub fn launchRowsParts(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom) !mlx.mlx_array {
     if (rowsFolds(g)) return error.BadExl3Shape;
     const bounds: [3]c_int = @splat(l.out_dim);
-    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g };
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .thru = l.thru };
     const cfg = rows_cfgs.get(key) orelse blk: {
         const c = try buildRowsCfg(l, g, bounds, .{}, null);
         rows_cfgs.put(key, c);
         break :blk c;
     };
-    const ov = try kernels.applyOuts(s, try rowsKernel(g), &.{ x, trellis, suh, svh }, cfg, 1);
+    const ov = try kernels.applyOuts(s, if (l.thru) try rowsThruKernel(g) else try rowsKernel(g), &.{ x, trellis, suh, svh }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var part = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(part);
@@ -1090,7 +1501,7 @@ fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, tmpl_rows: ?c_
     const c = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.groups * l.rows, l.out_dim }, 2, l.out_dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", if (l.thru) .bfloat16 else l.out_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(l.out_dim, 128) * 32, l.rows, l.groups));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", l.out_dim));
@@ -1101,13 +1512,16 @@ fn buildFinishCfg(l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, tmpl_rows: ?c_
 }
 
 fn rowsFinish(s: mlx.mlx_stream, part: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, nsplit: c_int, bounds: [3]c_int, pin: ?mlx.mlx_fast_metal_kernel_config) !mlx.mlx_array {
-    const key = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = nsplit, .out_dt = l.out_dt, .bounds = bounds };
+    const key = RowsFinishKey{ .out_dim = l.out_dim, .rows = l.rows, .groups = l.groups, .nsplit = nsplit, .out_dt = l.out_dt, .bounds = bounds, .thru = l.thru };
     const cfg = pin orelse rows_finish_cfgs.get(key) orelse blk: {
         const c = try buildFinishCfg(l, nsplit, bounds, null);
         rows_finish_cfgs.put(key, c);
         break :blk c;
     };
-    const kernel = try kernels.getNamedKernel(&rows_finish_kernel, "sushi_exl3_rows_finish", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_SOURCE, ROWS_HELPERS);
+    const kernel = if (l.thru)
+        try kernels.getNamedKernel(&rows_finish_thru_kernel, "sushi_exl3_rows_finish_thru", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_THRU_SOURCE, ROWS_HELPERS)
+    else
+        try kernels.getNamedKernel(&rows_finish_kernel, "sushi_exl3_rows_finish", &.{ "part", "svh" }, &.{"y"}, ROWS_FINISH_SOURCE, ROWS_HELPERS);
     const ov = try kernels.applyOuts(s, kernel, &.{ part, svh }, cfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var y = mlx.mlx_array_new();

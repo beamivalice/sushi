@@ -37,6 +37,7 @@ const registry = [_]report.Bench{
     exl3_ubench.trunk_rows,
     exl3_ubench.wo_pair,
     exl3_ubench.trunk_launches,
+    exl3_ubench.trunk_hy4,
     exl3_ubench.routed_t1,
 } ++ [_]report.Bench{
     exl3_ubench.exl3_rate_groups,

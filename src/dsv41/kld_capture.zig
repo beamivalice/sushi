@@ -2164,3 +2164,65 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back (DSV41_TINY
     try testing.expectEqual(@as(f64, 0), try util.jsonNumber(o.get("mean_kld_to_eos").?));
     try testing.expectEqual(@as(f64, 1), try util.jsonNumber(o.get("mean_top1").?));
 }
+
+test "deepseek_v41 layer-major capture runs end to end and resumes on a Sushi Cooler load (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const src = try dsv.fixtureDir();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try stageTiny(a, io, tmp.dir, src);
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts.jsonl", .data = "{\"id\":\"a\",\"prompt\":\"ab\"}\n{\"id\":\"b\",\"prompt\":\"cd\"}\n" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const prompts = try std.fmt.allocPrint(a, "{s}/prompts.jsonl", .{root});
+    defer a.free(prompts);
+    const out_dir = try std.fmt.allocPrint(a, "{s}/cap", .{root});
+    defer a.free(out_dir);
+
+    var config = try model.parseConfig(io, a, root);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try dsv_stream.expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, root);
+    @import("../cooler_side.zig").forTest(&config, true);
+    var loaded = kld.Loaded{
+        .allocator = a,
+        .io = io,
+        .config = config,
+        .tok = undefined,
+        .chat_config = undefined,
+        .weights = undefined,
+        .xfm = undefined,
+    };
+    defer loaded.config.deinit(a);
+    loaded.tok = try tokenizer_mod.loadTokenizer(io, a, root);
+    defer loaded.tok.deinit();
+    loaded.weights = try model.loadWeightsForConfig(io, a, root, &loaded.config, false);
+    defer loaded.weights.deinit();
+    loaded.xfm = try model_load.initTrunk(io, a, &loaded.config, &loaded.weights);
+    defer loaded.xfm.deinit();
+
+    var quiet: kld.Out = .{ .silent = true };
+    const opts = kld.Options{
+        .command = .capture,
+        .layer_major = true,
+        .model_dir = root,
+        .prompts = prompts,
+        .out_dir = out_dir,
+        .tokens = 1,
+        .no_template = true,
+    };
+    interrupt_layers_for_test = 10;
+    defer interrupt_layers_for_test = null;
+    try testing.expectError(error.TestInterrupted, runLoaded(a, io, &loaded, opts, 1, chunk_rows, &quiet));
+    interrupt_layers_for_test = null;
+    try runLoaded(a, io, &loaded, opts, 1, chunk_rows, &quiet);
+    var base = try fixture_mod.readBaseline(a, io, out_dir);
+    defer base.deinit();
+    try testing.expectEqual(@as(usize, 2), base.prompts.len);
+    var imatrix = try SumsFile.open(a, io, root, "cap/calib/imatrix.safetensors", .{});
+    defer imatrix.deinit(a);
+    try testing.expect(imatrix.tensor("layers.0.ffn.experts.gate_up_proj") != null);
+    try testing.expect(imatrix.tensor("layers.0.ffn.experts.down_proj") != null);
+}

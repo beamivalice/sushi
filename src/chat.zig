@@ -480,9 +480,9 @@ const no_facts: Facts = .{};
 /// What the server asks of a chat template, answered from its facts, never by searching its text: a word in a
 /// comment or an unrelated literal is not use.
 pub const asks = struct {
-    /// It reads `preserve_thinking`: only then is the switch handed over.
+    /// It reads `preserve_thinking` (Qwen3.8) or `preserved_thinking` (Hy4-Flash): only then is the switch handed over.
     pub fn preserveThinking(f: *const Facts) bool {
-        return f.reads("preserve_thinking");
+        return f.reads("preserve_thinking") or f.reads("preserved_thinking");
     }
     /// It emits a think closer: the `think_penalty` needs one to arm.
     pub fn thinkSpan(f: *const Facts) bool {
@@ -503,6 +503,10 @@ pub const asks = struct {
     /// Qwen3.8's effort ladder: the literal 'xhigh' among its accepted words.
     pub fn effortLadder(f: *const Facts) bool {
         return f.hasLiteral("xhigh");
+    }
+    /// Hy4-Flash's words: it reads `reasoning_effort` and takes the literal 'no_think' for a turn that does not think.
+    pub fn noThinkWord(f: *const Facts) bool {
+        return f.reads("reasoning_effort") and f.hasLiteral("no_think");
     }
     /// DeepSeek-V4.1's encoder: it reads `thinking_mode`.
     pub fn thinkingMode(f: *const Facts) bool {
@@ -607,7 +611,7 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     // not be served at all.
     const a = std.testing.allocator;
 
-    {   // the shape that panicked: pick the entry named "default"
+    { // the shape that panicked: pick the entry named "default"
         const json =
             \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
             \\{"name":"default","template":"PLAIN"}]}
@@ -616,22 +620,25 @@ test "chat_template accepts HF's list-of-named-templates shape" {
         defer p.deinit();
         try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // no "default" named: fall back to the first usable entry
-        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+    { // no "default" named: fall back to the first usable entry
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // the ordinary string shape is untouched
-        const json = \\{"chat_template":"BARE"}
+    { // the ordinary string shape is untouched
+        const json =
+            \\{"chat_template":"BARE"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
     }
-    {   // junk shapes return null so the caller uses its jinja/family fallback
-        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+    { // junk shapes return null so the caller uses its jinja/family fallback
+        const json =
+            \\{"chat_template":[{"name":"x"},{"nope":1}]}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -639,26 +646,29 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     }
     try std.testing.expect(chatTemplateFromValue(null) == null);
 
-    {   // transformers >= 5 saves the template to chat_template.jinja and leaves
+    { // transformers >= 5 saves the template to chat_template.jinja and leaves
         // an `{% include %}` POINTER in tokenizer_config.json (mlx-community
         // oQ4e builds, issue #169). The engine has no `include`, so the
         // pointer taken literally would fail the template's compile.
         // Read it as "no inline template" so the sidecar file is used.
-        const json = \\{"chat_template":"{% include 'chat_template.jinja' %}"}
+        const json =
+            \\{"chat_template":"{% include 'chat_template.jinja' %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // whitespace/dash variants are the same pointer
-        const json = \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
+    { // whitespace/dash variants are the same pointer
+        const json =
+            \\{"chat_template":"\n  {%- include \"chat_template.jinja\" -%}\n"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
         try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
     }
-    {   // a real template that merely CONTAINS the word include is untouched
-        const json = \\{"chat_template":"{% if x %}include{% endif %}"}
+    { // a real template that merely CONTAINS the word include is untouched
+        const json =
+            \\{"chat_template":"{% if x %}include{% endif %}"}
         ;
         var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer p.deinit();
@@ -1404,10 +1414,12 @@ pub fn callDialect(allocator: std.mem.Allocator, chat_config: *const ChatConfig)
     const rendered = (try renderProbeCall(allocator, chat_config, .call)) orelse return null;
     defer allocator.free(rendered);
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
-    const before = rendered[name_at -| 48 .. name_at];
+    const before = rendered[name_at -| 48..name_at];
     if (std.mem.indexOf(u8, before, "<function=") != null) return .function_tag;
     if (std.mem.indexOf(u8, before, "DSML") != null) return .dsml;
-    if (std.mem.startsWith(u8, rendered[name_at + probe_name.len ..], "<arg_key>")) return .arg_key;
+    const after = rendered[name_at + probe_name.len ..];
+    // Hy4 spells GLM's tags with an `:opensource` suffix (`<arg_key:opensource>`).
+    if (std.mem.startsWith(u8, after, "<arg_key>") or std.mem.startsWith(u8, after, "<arg_key:opensource>")) return .arg_key;
     return null;
 }
 
@@ -1805,6 +1817,8 @@ const Settings = struct {
     reasoning_effort: Effort,
     thinking_mode: ?[]const u8 = null,
     preserve_thinking: ?bool = null,
+    /// Hy4-Flash's spelling of the same switch; set only for a template that reads that name.
+    preserved_thinking: ?bool = null,
 
     const Effort = union(enum) { word: []const u8, budget: i64 };
 
@@ -1816,7 +1830,8 @@ const Settings = struct {
             if (t) |x| try buf.print(allocator, "{d}:{s}", .{ x.len, x }) else try buf.append(allocator, '-');
         }
         const keep: u8 = if (self.preserve_thinking) |k| @intFromBool(k) else 2;
-        try buf.print(allocator, "{d}{d}", .{ @intFromBool(self.enable_thinking), keep });
+        const kept: u8 = if (self.preserved_thinking) |k| @intFromBool(k) else 2;
+        try buf.print(allocator, "{d}{d}{d}", .{ @intFromBool(self.enable_thinking), keep, kept });
         switch (self.reasoning_effort) {
             .word => |w| try buf.print(allocator, "{d}:{s}", .{ w.len, w }),
             .budget => |n| try buf.print(allocator, "#{d};", .{n}),
@@ -2003,6 +2018,9 @@ fn templateSettings(allocator: std.mem.Allocator, chat_config: *const ChatConfig
     else if (asks.effortLadder(facts))
         // Qwen3.8's vocabulary, keyed on the literal 'xhigh': every 3.8 template raises on OpenAI's "high".
         .{ .word = ladderEffortFor(effort, enable_thinking) }
+    else if (asks.noThinkWord(facts))
+        // Hy4-Flash's no_think|high|max: the arm's word as the effort table sends it (xhigh and max send max).
+        .{ .word = if (enable_thinking) effort orelse "high" else "no_think" }
     else
         .{ .word = if (enable_thinking) "high" else "no_think" };
     return .{
@@ -2013,7 +2031,8 @@ fn templateSettings(allocator: std.mem.Allocator, chat_config: *const ChatConfig
         // DeepSeek-V4.1's template switches on `thinking_mode` ("chat"|"thinking", the reference encoder's own
         // vocabulary). Only set when the template reads it — other families never see the key.
         .thinking_mode = if (scale_style) (if (enable_thinking) "thinking" else "chat") else null,
-        .preserve_thinking = if (asks.preserveThinking(facts)) chat_config.preserve_thinking else null,
+        .preserve_thinking = if (facts.reads("preserve_thinking")) chat_config.preserve_thinking else null,
+        .preserved_thinking = if (facts.reads("preserved_thinking")) chat_config.preserve_thinking else null,
     };
 }
 
@@ -2231,8 +2250,7 @@ test "collapseDoubledThinkTags leaves single </think> unchanged" {
 }
 
 test "collapseDoubledThinkTags handles multiple separated doublings" {
-    const out = try collapseDoubledThinkTags(testing.allocator,
-        .{ .bytes = "A</think></think>B</think></think>C" });
+    const out = try collapseDoubledThinkTags(testing.allocator, .{ .bytes = "A</think></think>B</think></think>C" });
     defer freeSpans(testing.allocator, out);
     try testing.expectEqualStrings("A</think>B</think>C", out.bytes);
 }
@@ -4405,7 +4423,7 @@ test "loadChatConfig: a key of tokenizer_config.json in a shape the load cannot 
     const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
     defer testing.allocator.free(root);
     for ([_][]const u8{
-        "{\"chat_template\": 7}",               "{\"bos_token\": 5}",                 "{\"eos_token\": []}",
+        "{\"chat_template\": 7}",            "{\"bos_token\": 5}",                            "{\"eos_token\": []}",
         "{\"eos_token\": {\"content\": 5}}", "{\"eos_token\": {\"__type\": \"AddedToken\"}}", "{\"add_bos_token\": \"yes\"}",
     }) |body| {
         try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = body });
@@ -4570,7 +4588,7 @@ test "chat: probes of one compiled template on many threads at once answer as a 
         .{ .enable_thinking = true, .reasoning_effort = .{ .word = "xhigh" }, .preserve_thinking = true },
     };
     var fresh: [extras.len * 3]?[]u8 = undefined;
-    for (&fresh, 0..) |*f, i| f.* = try renderProbeFresh(a, &compiled.main, @enumFromInt(i % 3), &extras[i / 3]);
+    for (&fresh, 0..) |*f, i| f.* = try renderProbeFresh(a, &compiled.main, @fromBackingInt(@intCast(i % 3)), &extras[i / 3]);
     defer for (fresh) |f| if (f) |r| a.free(r);
     const Worker = struct {
         fn run(tpl: *const Tpl, want: []const ?[]u8, ok: *bool) void {
@@ -4578,7 +4596,7 @@ test "chat: probes of one compiled template on many threads at once answer as a 
             ok.* = false;
             for (0..40) |n| {
                 const i = n % want.len;
-                const got = templateProbeRender(std.heap.smp_allocator, tpl, @enumFromInt(i % 3), &extras[i / 3]) catch return;
+                const got = templateProbeRender(std.heap.smp_allocator, tpl, @fromBackingInt(@intCast(i % 3)), &extras[i / 3]) catch return;
                 defer if (got) |g| std.heap.smp_allocator.free(g);
                 if ((got == null) != (want[i] == null)) return;
                 if (got) |g| if (!std.mem.eql(u8, g, want[i].?)) return;

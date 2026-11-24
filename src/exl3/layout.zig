@@ -2,6 +2,10 @@ const std = @import("std");
 const format = @import("expert_exl3.zig");
 
 pub const max_groups = 32;
+/// Key prefix of the zero pad tensors a pair-major shard carries to put the next trellis on a page; they are no weight.
+pub const pad_prefix = "__pad__.";
+/// The page a pair-major shard starts each routed trellis on: a pad fills the gap before it.
+pub const page: u64 = 16384;
 pub const Dtype = enum { u16, f16, other };
 pub const Name = struct {
     group: u32,

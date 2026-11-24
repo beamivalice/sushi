@@ -13,7 +13,7 @@ screen on Sushi-2.5bpw (kv8, FP32 decode attention, first teacher): KLD 0.0716 /
 prose 0.1107 / 84.9%.
 
 Teacher (every row of the table below was scored against the reference-arm capture, whose `identity.json` has no `nax_arms`): the BF16 source checkpoint through the native forward, `MLX_ENABLE_TF32=0 sushi kld capture --prompts
-standard4 --tokens 512 --no-template --kv-quant off --ssd-budget-gb 100` (streamed BF16 experts, dense prefill in
+standard4 --tokens 512 --no-template --kv-quant off` (BF16 experts, dense prefill in
 chunks of at most 512, synchronous layers, BF16 MLA cache, FP32 KDA state). Native prompt lengths 242/261/190/183; no
 EOS in the 2,048 rows, so first-EOS and all-positions readings are the same. Students carry MCG EXL3
 experts at W12 (K2.25 unless the row says K2.5; the shipped row is W14), BF16 MLA and FP32 KDA state, one resident target, MTP and DFlash2 off.

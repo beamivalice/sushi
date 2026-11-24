@@ -37,11 +37,11 @@ scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd...>
 
 `sushi-ubench` takes and releases the lock itself ([process-ubench](process-ubench.md)).
 
-- Lock = a full model load (server boot, `kld capture|compare`, live test) or a quiet-box bench or timing whose
-  absolute number is recorded. Conversions, pilots, builds and tests run in parallel without it when memory fits:
-  a conversion peaks near 20 GB, so it may run beside a Qwen-size load (~50-65 GB) but never beside a MiMo-size one
-  (~105 GB), and a MiMo load or a quiet bench waits until the parallel work ends. A timing taken beside parallel work
-  is stated as contended.
+- When to take it is the script's own rule (`scripts/gpu-lock.sh rule`): a quiet run, a recorded timing or a big job
+  whose memory beside the rest could OOM the box, never to block others. A conversion, a tune, a KLD reading, a
+  comparison, a pilot, a build or a test runs beside the holder without it when the memory sum fits (on the M5 Ultra:
+  30 GB under the box; one job of 120 GB or more takes the lock). A timing taken beside parallel work is stated as
+  contended.
 - Acquire immediately before each run, release as soon as it ends: never across a queue or batch, never while
   analysing, editing, building or waiting. An A B B A re-acquires per arm. All agents on the box share one lock
   directory (`GPU_LOCK_DIR`, default `/tmp/sushi-gpu.lock.d`).

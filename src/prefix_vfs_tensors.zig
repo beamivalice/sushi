@@ -611,6 +611,87 @@ fn loadBytesOr(allocator: Allocator, bytes: []const u8, s: mlx.mlx_stream) !Load
     return loaded;
 }
 
+/// One tensor of a file, as a reader into its caller's own bytes names it (`Sink`).
+pub const Named = struct { key: []const u8, dtype: mlx.mlx_dtype, shape: []const c_int };
+
+/// Where a file's tensors are read: the bytes the caller names for each, exactly its size, or null to pass it over.
+/// `meta`, when set, sees the file's metadata before any tensor is named.
+pub const Sink = struct {
+    ctx: *anyopaque,
+    dest: *const fn (ctx: *anyopaque, t: Named) anyerror!?[]u8,
+    meta: ?*const fn (ctx: *anyopaque, meta: []const MetaPair) anyerror!void = null,
+
+    pub fn begin(sink: Sink, meta: []const MetaPair) !void {
+        if (sink.meta) |f| try f(sink.ctx, meta);
+    }
+
+    fn take(sink: Sink, e: *const Entry) !?[]u8 {
+        const out = (try sink.dest(sink.ctx, .{ .key = e.key, .dtype = e.dtype, .shape = e.shape })) orelse return null;
+        if (out.len != e.nbytes) return error.VfsCorrupt;
+        return out;
+    }
+};
+
+/// A tensor file's parsed header (`head`: its length word and JSON): its tensors in the order their bytes follow it,
+/// each its byte count, and its metadata. In `aa`.
+pub const Head = struct {
+    tensors: []const Named,
+    nbytes: []const usize,
+    meta: []const MetaPair,
+
+    pub fn parse(aa: Allocator, head: []const u8) !Head {
+        const lay = try parseLayout(aa, head, &.{}, 0);
+        const tensors = try aa.alloc(Named, lay.entries.len);
+        const nbytes = try aa.alloc(usize, lay.entries.len);
+        for (lay.entries, tensors, nbytes) |e, *t, *n| {
+            t.* = .{ .key = e.key, .dtype = e.dtype, .shape = e.shape };
+            n.* = e.nbytes;
+        }
+        return .{ .tensors = tensors, .nbytes = nbytes, .meta = lay.meta };
+    }
+};
+
+/// The pinned file `path`'s tensors read into the bytes `sink` names, each block checked as `loadTensors` checks it, and
+/// no array made; its metadata, in `aa`. A file that does not parse or a block that fails raises `error.MlxError`.
+pub fn readInto(vfs: *Vfs, path: []const u8, aa: Allocator, sink: Sink) ![]const MetaPair {
+    return readIntoOr(vfs, path, aa, sink) catch |e| loadError(path, e);
+}
+
+fn readIntoOr(vfs: *Vfs, path: []const u8, aa: Allocator, sink: Sink) ![]const MetaPair {
+    const src = try Source.open(vfs, path);
+    defer src.close();
+    try sink.begin(src.meta);
+    for (src.entries) |*e| if (try sink.take(e)) |out| try fillEntry(src.vfs, src.pf, src.checked, e, out);
+    const meta = try aa.alloc(MetaPair, src.meta.len);
+    for (src.meta, meta) |m, *d| d.* = .{ .key = try aa.dupe(u8, m.key), .value = try aa.dupe(u8, m.value) };
+    return meta;
+}
+
+/// `readInto` for a tensor file held in memory as its bytes (`serializeSafetensors`' encoding).
+pub fn readBytesInto(bytes: []const u8, aa: Allocator, sink: Sink) ![]const MetaPair {
+    return readBytesIntoOr(bytes, aa, sink) catch |e| switch (e) {
+        error.OutOfMemory => e,
+        else => error.MlxError,
+    };
+}
+
+fn readBytesIntoOr(bytes: []const u8, aa: Allocator, sink: Sink) ![]const MetaPair {
+    if (bytes.len < 8) return error.VfsCorrupt;
+    const head_len = std.mem.readInt(u64, bytes[0..8], .little);
+    if (head_len > bytes.len - 8) return error.VfsCorrupt;
+    const head = bytes[0 .. 8 + @as(usize, @intCast(head_len))];
+    const lay = try parseLayout(aa, head, &.{}, 0);
+    try sink.begin(lay.meta);
+    var at: usize = head.len;
+    for (lay.entries) |*e| {
+        if (e.nbytes > bytes.len - at) return error.VfsCorrupt;
+        if (try sink.take(e)) |out| @memcpy(out, bytes[at..][0..e.nbytes]);
+        at += e.nbytes;
+    }
+    if (at != bytes.len) return error.VfsCorrupt;
+    return lay.meta;
+}
+
 /// The tensor names of a file held as its bytes, in the order its header lists them, and its metadata. In `aa`.
 pub fn headerOfBytes(aa: Allocator, bytes: []const u8) !struct { keys: []const []const u8, meta: []const MetaPair } {
     if (bytes.len < 8) return error.VfsCorrupt;

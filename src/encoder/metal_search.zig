@@ -6,6 +6,8 @@ const quantize = @import("quantize.zig");
 const st = @import("safetensors.zig");
 const stages_mod = @import("stages.zig");
 const gpu_factor = @import("gpu_factor.zig");
+const pair_search = @import("pair_search.zig");
+const pair_kernel = @import("pair_kernel.zig");
 pub const Pool = @import("pool.zig").Pool;
 
 pub const tile_len = encode.tile_len;
@@ -45,9 +47,17 @@ const Plan = struct {
     global_costs: bool,
     single_costs: bool,
     table: bool,
+    /// K1.5 at window 15 (fresh bits 1, 2): each 2-bit step and the 1-bit step after it run as one, the 2-bit
+    /// step's costs kept in registers, so the threadgroup row holds only the 1-bit step's 8192 costs.
+    pairs: bool = false,
 };
 
-const single_cost_bytes = 16 * 1024;
+const pair_window = 15;
+const pair_row = 1 << (pair_window - 2);
+
+/// Apple GPUs give a threadgroup 32 KB; a row that fills it keeps the pin word inside the row, which is dead by then.
+const single_cost_bytes = 32 * 1024;
+const pin_apart_bytes = 16 * 1024;
 const single_prev_regs = 32;
 // The most a threadgroup can hold on any Apple GPU; a pipeline may allow fewer.
 const device_threads = 1024;
@@ -59,7 +69,9 @@ var learned_threads: u32 = std.math.maxInt(u32);
 /// Wide windows keep one cost row in threadgroup memory, read a decode table and run 1024 threads per tile
 /// when every phase's predecessor costs fit in registers; other plans keep both rows and hash every codeword.
 fn buildPlan(rate: format.Rate, dec: format.Decode, max_threads: u32) Error!Plan {
-    const wide = try planFor(rate, dec, @min(single_threads, floorPow2(max_threads)));
+    var wide = try planFor(rate, dec, @min(single_threads, floorPow2(max_threads)));
+    wide.pairs = wide.single_costs and wide.threads == 1024 and dec.window.bits() == pair_window and wide.period == 2 and
+        wide.phases[0].k == 1 and wide.phases[1].k == 2;
     if (wide.single_costs) return wide;
     return planFor(rate, dec, @min(plain_threads, floorPow2(max_threads)));
 }
@@ -69,10 +81,10 @@ fn floorPow2(x: u32) u32 {
 }
 
 fn planFor(rate: format.Rate, dec: format.Decode, max_threads: u32) Error!Plan {
-    if (rate.n % 2 != 0 or rate.n < 24 or rate.n > format.Rate.max_n) return error.RateUnsupported;
+    if (!encode.runnableRate(rate)) return error.RateUnsupported;
     const w: u32 = dec.window.bits();
     if (w < 12 or w > 16) return error.WindowUnsupported;
-    if (!encode.searchable(dec.codebook)) return error.CodebookUnsupported;
+    if (!encode.searchable(dec, rate)) return error.CodebookUnsupported;
     const period: usize = 16 / std.math.gcd(@as(u32, 16), rate.n);
     var pattern: [8]u32 = undefined;
     var kmin: u32 = 32;
@@ -137,8 +149,8 @@ fn planFor(rate: format.Rate, dec: format.Decode, max_threads: u32) Error!Plan {
     };
 }
 
-fn appendDecodeExpr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cb: format.Codebook, cw_in: []const u8, dst: []const u8) !void {
-    switch (cb) {
+fn appendDecodeExpr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, code: encode.Code, cw_in: []const u8, dst: []const u8) !void {
+    switch (code) {
         .mcg => try out.print(allocator,
             \\                uint dq_cw = {s} * 0xCBAC1FEDu;
             \\                uint dq_r = (dq_cw & 0x8FFF8FFFu) ^ 0x3B603B60u;
@@ -146,6 +158,13 @@ fn appendDecodeExpr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cb: f
             \\                float {s} = float(dq_h2.x + dq_h2.y);
             \\
         , .{ cw_in, dst }),
+        // One half sum rounding, then the power-of-two rescale, exactly as `format.decodeHashMask`.
+        .hash_mask => |hm| try out.print(allocator,
+            \\                uint dq_r = ({s} * 0x{X}u) & 0x{X}u;
+            \\                half2 dq_h2 = as_type<half2>(dq_r);
+            \\                float {s} = float(dq_h2.x + dq_h2.y) * {d}.0f;
+            \\
+        , .{ cw_in, hm.mult, hm.mask, dst, hm.scale }),
         .mul1 => try out.print(allocator,
             \\                uint dq_cw = {s} * 0x83DCD12Du;
             \\                uint dq_sum = 0x6400u;
@@ -158,7 +177,6 @@ fn appendDecodeExpr(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cb: f
             \\                float {s} = float(fma(dq_h, dq_k_inv, dq_k_bias));
             \\
         , .{ cw_in, dst }),
-        .spec1, .pair1, .std1 => unreachable,
     }
 }
 
@@ -189,9 +207,15 @@ fn appendPtrRead(out: *std.ArrayList(u8), allocator: std.mem.Allocator, ph: Phas
     try out.print(allocator, " & {d}u)", .{ph.kk - 1});
 }
 
-fn appendDecode(out: *std.ArrayList(u8), allocator: std.mem.Allocator, cb: format.Codebook, table: bool, cw_in: []const u8, dst: []const u8) !void {
+/// The last step of a pass: 255, or in pass 0 of a shortened pin pass 2A - 1.
+fn lastStep(buf: []u8, pin_pass: u32, suffix: []const u8) []const u8 {
+    if (pin_pass == encode.full_pin_pass) return std.fmt.bufPrint(buf, "255{s}", .{suffix}) catch unreachable;
+    return std.fmt.bufPrint(buf, "(pass == 0u ? {d}{s} : 255{s})", .{ 2 * pin_pass - 1, suffix, suffix }) catch unreachable;
+}
+
+fn appendDecode(out: *std.ArrayList(u8), allocator: std.mem.Allocator, code: encode.Code, table: bool, cw_in: []const u8, dst: []const u8) !void {
     if (table) return out.print(allocator, "                float {s} = float(dq_tab[{s}]);\n", .{ dst, cw_in });
-    try appendDecodeExpr(out, allocator, cb, cw_in, dst);
+    try appendDecodeExpr(out, allocator, code, cw_in, dst);
 }
 
 /// A single-buffer step whose edges are scored a packed word at a time: every fresh value reads the
@@ -245,7 +269,7 @@ fn appendEdgeLoop(
     out: *std.ArrayList(u8),
     allocator: std.mem.Allocator,
     ph: Phase,
-    cb: format.Codebook,
+    code: encode.Code,
     plan: Plan,
     cost_store: []const u8,
     prev_cost_load: []const u8,
@@ -307,7 +331,7 @@ fn appendEdgeLoop(
             \\                    } else {
             \\
         );
-        try appendDecode(out, allocator, cb, plan.table, "cw", "dq_val");
+        try appendDecode(out, allocator, code, plan.table, "cw", "dq_val");
         try out.appendSlice(allocator,
             \\                        float dh = dq_val - target;
             \\                        err = dh * dh;
@@ -316,7 +340,7 @@ fn appendEdgeLoop(
             \\
         );
     } else {
-        try appendDecode(out, allocator, cb, plan.table, "cw", "dq_val");
+        try appendDecode(out, allocator, code, plan.table, "cw", "dq_val");
         const prev_val = if (single) "prevs[bi][fresh]" else if (ph.cache_prev) "prevs[fresh]" else prev_cost_load;
         if (ph.cache_prev) {
             try out.print(allocator,
@@ -349,9 +373,126 @@ fn appendEdgeLoop(
     try out.print(allocator, "[widx] = {s}(pk);\n                }}\n            }}\n", .{cast});
 }
 
-fn buildKernelSource(allocator: std.mem.Allocator, plan: Plan, cb: format.Codebook) ![:0]u8 {
+/// Steps 1..255 of a pass for a `pairs` plan. Thread `tid` owns the 2-bit step's edges m = f1 << 12 | (4 tid + d)
+/// and the 1-bit step's edges 8 tid .. 8 tid + 7; a 2-bit edge feeds exactly the two 1-bit edges 2 j and 2 j + 1 of
+/// j = m & 4095, so no thread needs another's registers. Every cost is rounded through half as the row would round
+/// it, candidates are compared in the same order and the choices are packed in each phase's own layout. The last
+/// step is a 2-bit one: pass 0 reduces its argmin across the threadgroup into the dead row.
+fn appendPairSteps(out: *std.ArrayList(u8), allocator: std.mem.Allocator, pin_pass: u32) !void {
+    var last_buf: [48]u8 = undefined;
+    const last = lastStep(&last_buf, pin_pass, "u");
+    const two_bit =
+        \\            float pv[2][4];
+        \\            #pragma clang loop unroll(full)
+        \\            for (uint f0 = 0u; f0 < 2u; f0++) {
+        \\                #pragma clang loop unroll(full)
+        \\                for (uint f1 = 0u; f1 < 4u; f1++) pv[f0][f1] = float(costs[(f0 << 12) | (f1 << 10) | tid]);
+        \\            }
+        \\            threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\            float mid[4][4];
+        \\            device uchar* row_a = edge_ptr + ulong(ri_a) * ROW_BYTES;
+        \\            #pragma clang loop unroll(full)
+        \\            for (uint f1 = 0u; f1 < 4u; f1++) {
+        \\                half4 c0 = *((const device half4*)(dq_tab + (f1 << 12) + 4u * tid));
+        \\                half4 c1 = *((const device half4*)(dq_tab + (1u << 14) + (f1 << 12) + 4u * tid));
+        \\                uint pk = 0u;
+        \\                #pragma clang loop unroll(full)
+        \\                for (uint d = 0u; d < 4u; d++) {
+        \\                    float best = H_INF_F;
+        \\                    uint best_fresh = 0u;
+        \\                    float dh0 = float(c0[d]) - ta;
+        \\                    float err0 = fma(dh0, dh0, pv[0][f1]);
+        \\                    if (err0 < best) { best = err0; best_fresh = 0u; }
+        \\                    float dh1 = float(c1[d]) - ta;
+        \\                    float err1 = fma(dh1, dh1, pv[1][f1]);
+        \\                    if (err1 < best) { best = err1; best_fresh = 1u; }
+        \\                    mid[f1][d] = float(half(best));
+        \\                    pk |= best_fresh << d;
+        \\                }
+        \\                row_a[(f1 << 10) | tid] = uchar(pk);
+        \\            }
+        \\
+    ;
+    try out.print(allocator,
+        \\        for (uint step = 1u; step < {s}; step += 2u) {{
+        \\            uint ri_a = (step + roll) & 255u;
+        \\            uint ri_b = (step + 1u + roll) & 255u;
+        \\            float ta = in_tile[ri_a];
+        \\            float tb = in_tile[ri_b];
+        \\
+    , .{last});
+    try out.appendSlice(allocator, two_bit);
+    try out.appendSlice(allocator,
+        \\            device uchar* row_b = edge_ptr + ulong(ri_b) * ROW_BYTES;
+        \\            half4 fin[4][2];
+        \\            #pragma clang loop unroll(full)
+        \\            for (uint f1 = 0u; f1 < 4u; f1++) {
+        \\                fin[f1][0] = *((const device half4*)(dq_tab + (f1 << 13) + 8u * tid));
+        \\                fin[f1][1] = *((const device half4*)(dq_tab + (f1 << 13) + 8u * tid + 4u));
+        \\            }
+        \\            #pragma clang loop unroll(full)
+        \\            for (uint q = 0u; q < 4u; q++) {
+        \\                uint pk = 0u;
+        \\                #pragma clang loop unroll(full)
+        \\                for (uint h = 0u; h < 2u; h++) {
+        \\                    float best = H_INF_F;
+        \\                    uint best_fresh = 0u;
+        \\                    #pragma clang loop unroll(full)
+        \\                    for (uint f1 = 0u; f1 < 4u; f1++) {
+        \\                        float dh = float(fin[f1][(2u * q + h) >> 2][(2u * q + h) & 3u]) - tb;
+        \\                        float err = fma(dh, dh, mid[f1][q]);
+        \\                        if (err < best) { best = err; best_fresh = f1; }
+        \\                    }
+        \\                    costs[8u * tid + 2u * q + h] = half(best);
+        \\                    pk |= best_fresh << (2u * h);
+        \\                }
+        \\                row_b[4u * tid + q] = uchar(pk);
+        \\            }
+        \\            threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\        }
+        \\        {
+        \\
+    );
+    try out.print(allocator,
+        \\            uint ri_a = ({s} + roll) & 255u;
+        \\            float ta = in_tile[ri_a];
+        \\
+    , .{last});
+    try out.appendSlice(allocator, two_bit);
+    try out.appendSlice(allocator,
+        \\            if (pass == 0u) {
+        \\                float best = H_INF_F;
+        \\                uint best_e = 0xFFFFFFFFu;
+        \\                #pragma clang loop unroll(full)
+        \\                for (uint f1 = 0u; f1 < 4u; f1++) {
+        \\                    #pragma clang loop unroll(full)
+        \\                    for (uint d = 0u; d < 4u; d++) {
+        \\                        if (mid[f1][d] < best) { best = mid[f1][d]; best_e = (f1 << 12) | (4u * tid + d); }
+        \\                    }
+        \\                }
+        \\                for (ushort off = 16; off > 0; off >>= 1) {
+        \\                    float v = simd_shuffle_down(best, off);
+        \\                    uint e = simd_shuffle_down(best_e, off);
+        \\                    if (v < best || (v == best && e < best_e)) { best = v; best_e = e; }
+        \\                }
+        \\                if (thread_index_in_simdgroup == 0u) {
+        \\                    cost_words[2u * simdgroup_index_in_threadgroup] = as_type<uint>(best);
+        \\                    cost_words[2u * simdgroup_index_in_threadgroup + 1u] = best_e;
+        \\                }
+        \\            }
+        \\            threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\        }
+        \\
+    );
+}
+
+fn buildKernelSource(allocator: std.mem.Allocator, plan: Plan, code: encode.Code, pin_pass: u32) ![:0]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
+    var last_buf: [48]u8 = undefined;
+    const pass_last = lastStep(&last_buf, pin_pass, "");
+    var steps_buf: [48]u8 = undefined;
+    const pass_steps = if (pin_pass == encode.full_pin_pass) "256u" else std.fmt.bufPrint(&steps_buf, "(pass == 0u ? {d}u : 256u)", .{2 * pin_pass}) catch unreachable;
     const cost_store = if (plan.single_costs) "costs[e]" else if (plan.global_costs) "costs[ulong(curr) * EDGES + e]" else "costs[curr][e]";
     const prev_cost_load = if (plan.single_costs) "costs[pred]" else if (plan.global_costs) "costs[ulong(prev_buf) * EDGES + pred]" else "costs[prev_buf][pred]";
     const barrier = if (plan.global_costs)
@@ -383,67 +524,104 @@ fn buildKernelSource(allocator: std.mem.Allocator, plan: Plan, cb: format.Codebo
         \\    device uchar* edge_ptr = (device uchar*)temp_edges + ulong(tile) * 256u * ROW_BYTES;
         \\
     );
-    if (plan.single_costs) {
+    const pin_in_costs = plan.pairs or (plan.single_costs and plan.edges_max * 2 > pin_apart_bytes);
+    if (pin_in_costs) {
+        try out.print(allocator, "    threadgroup uint cost_words[{d}u];\n    threadgroup half* costs = (threadgroup half*)cost_words;\n    threadgroup uint& sh_pin = cost_words[0];\n", .{(if (plan.pairs) pair_row else plan.edges_max) / 2});
+    } else if (plan.single_costs) {
         try out.appendSlice(allocator, "    threadgroup half costs[EDGES];\n");
     } else if (plan.global_costs) {
         try out.appendSlice(allocator, "    device half* costs = temp_costs + ulong(tile) * 2u * EDGES;\n");
     } else {
         try out.appendSlice(allocator, "    threadgroup half costs[2][EDGES];\n");
     }
+    if (!pin_in_costs) try out.appendSlice(allocator, "    threadgroup uint sh_pin;\n");
     try out.appendSlice(allocator,
-        \\    threadgroup uint sh_pin;
         \\    uint pin = 0u;
         \\    bool pinned = false;
         \\
         \\    for (uint pass = 0u; pass < 2u; pass++) {
         \\        uint curr = 0u;
-        \\        uint roll = pass == 0u ? 128u : 0u;
-        \\        float target = in_tile[roll];
         \\
     );
-    try appendEdgeLoop(&out, allocator, plan.phases[0], cb, plan, cost_store, prev_cost_load, true, "roll");
     try out.print(allocator,
-        \\        {s}
-        \\        for (uint step = 1u; step < 256u; step++) {{
-        \\            uint ri = (step + roll) & 255u;
-        \\            uint prev_buf = curr;
-        \\            curr = 1u - curr;
-        \\            float target = in_tile[ri];
+        \\        uint roll = pass == 0u ? {d}u : 0u;
+        \\        float target = in_tile[roll];
         \\
-    , .{barrier});
-    if (plan.period == 1) {
-        try appendEdgeLoop(&out, allocator, plan.phases[0], cb, plan, cost_store, prev_cost_load, false, "ri");
+    , .{tile_len - pin_pass});
+    try appendEdgeLoop(&out, allocator, plan.phases[0], code, plan, cost_store, prev_cost_load, true, "roll");
+    if (plan.pairs) {
+        try out.print(allocator, "        {s}\n", .{barrier});
+        try appendPairSteps(&out, allocator, pin_pass);
     } else {
-        try out.print(allocator, "            uint ph = ri & {d}u;\n            ", .{plan.period - 1});
-        for (0..plan.period) |i| {
-            if (i > 0) try out.appendSlice(allocator, " else ");
-            if (i + 1 < plan.period) try out.print(allocator, "if (ph == {d}u) ", .{i});
-            try out.appendSlice(allocator, "{\n");
-            try appendEdgeLoop(&out, allocator, plan.phases[i], cb, plan, cost_store, prev_cost_load, false, "ri");
-            try out.appendSlice(allocator, "            }");
+        try out.print(allocator,
+            \\        {s}
+            \\        for (uint step = 1u; step < {s}; step++) {{
+            \\            uint ri = (step + roll) & 255u;
+            \\            uint prev_buf = curr;
+            \\            curr = 1u - curr;
+            \\            float target = in_tile[ri];
+            \\
+        , .{ barrier, pass_steps });
+        if (plan.period == 1) {
+            try appendEdgeLoop(&out, allocator, plan.phases[0], code, plan, cost_store, prev_cost_load, false, "ri");
+        } else {
+            try out.print(allocator, "            uint ph = ri & {d}u;\n            ", .{plan.period - 1});
+            for (0..plan.period) |i| {
+                if (i > 0) try out.appendSlice(allocator, " else ");
+                if (i + 1 < plan.period) try out.print(allocator, "if (ph == {d}u) ", .{i});
+                try out.appendSlice(allocator, "{\n");
+                try appendEdgeLoop(&out, allocator, plan.phases[i], code, plan, cost_store, prev_cost_load, false, "ri");
+                try out.appendSlice(allocator, "            }");
+            }
+            try out.appendSlice(allocator, "\n");
         }
-        try out.appendSlice(allocator, "\n");
     }
-    try out.print(allocator,
-        \\            {s}
-        \\        }}
-        \\        if (tid == 0u) {{
-        \\            uint edge = pin;
-        \\            if (pass == 0u) {{
-        \\                float best = H_INF_F;
-        \\                edge = 0u;
-        \\                for (uint e = 0u; e < {d}u; e++) {{
-        \\                    float v = float({s});
-        \\                    if (v < best) {{
-        \\                        best = v;
-        \\                        edge = e;
-        \\                    }}
-        \\                }}
-        \\            }}
-        \\            for (int step_i = 255; step_i >= 0; step_i--) {{
-        \\                uint ri = (uint(step_i) + roll) & 255u;
-        \\
-    , .{ barrier, plan.phases[plan.period - 1].edges, cost_store });
+    if (plan.pairs) {
+        try out.appendSlice(allocator,
+            \\        if (tid == 0u) {
+            \\            uint edge = pin;
+            \\            if (pass == 0u) {
+            \\                float best = H_INF_F;
+            \\                uint best_e = 0xFFFFFFFFu;
+            \\                for (uint g = 0u; g < 32u; g++) {
+            \\                    float v = as_type<float>(cost_words[2u * g]);
+            \\                    uint e = cost_words[2u * g + 1u];
+            \\                    if (v < best || (v == best && e < best_e)) {
+            \\                        best = v;
+            \\                        best_e = e;
+            \\                    }
+            \\                }
+            \\                edge = best_e == 0xFFFFFFFFu ? 0u : best_e;
+            \\            }
+            \\
+        );
+        try out.print(allocator,
+            \\            for (int step_i = {s}; step_i >= 0; step_i--) {{
+            \\                uint ri = (uint(step_i) + roll) & 255u;
+            \\
+        , .{pass_last});
+    } else {
+        try out.print(allocator,
+            \\            {s}
+            \\        }}
+            \\        if (tid == 0u) {{
+            \\            uint edge = pin;
+            \\            if (pass == 0u) {{
+            \\                float best = H_INF_F;
+            \\                edge = 0u;
+            \\                for (uint e = 0u; e < {d}u; e++) {{
+            \\                    float v = float({s});
+            \\                    if (v < best) {{
+            \\                        best = v;
+            \\                        edge = e;
+            \\                    }}
+            \\                }}
+            \\            }}
+            \\            for (int step_i = {s}; step_i >= 0; step_i--) {{
+            \\                uint ri = (uint(step_i) + roll) & 255u;
+            \\
+        , .{ barrier, plan.phases[plan.period - 1].edges, cost_store, pass_last });
+    }
     if (plan.period == 1) {
         try out.appendSlice(allocator, "                uint state = (");
         try appendPtrRead(&out, allocator, plan.phases[0], "ri", "edge");
@@ -469,7 +647,7 @@ fn buildKernelSource(allocator: std.mem.Allocator, plan: Plan, cb: format.Codebo
         \\                    out_idx[ri] = ushort(state);
         \\
     );
-    try appendDecodeExpr(&out, allocator, cb, "state", "dq_out");
+    try appendDecodeExpr(&out, allocator, code, "state", "dq_out");
     try out.print(allocator,
         \\                    out_tile[ri] = dq_out;
         \\                }} else if (ri == 0u) {{
@@ -481,33 +659,40 @@ fn buildKernelSource(allocator: std.mem.Allocator, plan: Plan, cb: format.Codebo
         \\        {s}
         \\        pin = sh_pin;
         \\        pinned = true;
+        \\        {s}
         \\    }}
         \\
-    , .{barrier});
+    , .{ barrier, if (pin_in_costs) "threadgroup_barrier(mem_flags::mem_threadgroup);" else "" });
     return out.toOwnedSliceSentinel(allocator, 0);
 }
 
 const KernelKey = struct {
     n: u32,
-    cb: format.Codebook,
+    code: encode.Code,
     win: format.Window,
     single: bool,
     threads: u32,
+    pairs: bool,
+    pin_pass: u32,
 };
 
 var cached_keys: [64]KernelKey = undefined;
 var cached_kernels: [64]?mlx.mlx_fast_metal_kernel = @splat(null);
 var cached_len: usize = 0;
 
-fn getKernel(allocator: std.mem.Allocator, rate: format.Rate, dec: format.Decode, plan: Plan) Error!mlx.mlx_fast_metal_kernel {
-    const key = KernelKey{ .n = rate.n, .cb = dec.codebook, .win = dec.window, .single = plan.single_costs, .threads = plan.threads };
+fn getKernel(allocator: std.mem.Allocator, rate: format.Rate, dec: format.Decode, plan: Plan, pin_pass: u32) Error!mlx.mlx_fast_metal_kernel {
+    const code = encode.Code.of(dec, rate) orelse return error.CodebookUnsupported;
+    const key = KernelKey{ .n = rate.n, .code = code, .win = dec.window, .single = plan.single_costs, .threads = plan.threads, .pairs = plan.pairs, .pin_pass = pin_pass };
     for (cached_kernels[0..cached_len], 0..) |k_opt, i| {
         if (k_opt) |k| if (std.meta.eql(cached_keys[i], key)) return k;
     }
-    const source = try buildKernelSource(allocator, plan, dec.codebook);
+    const source = try buildKernelSource(allocator, plan, code, pin_pass);
     defer allocator.free(source);
-    var name_buf: [80]u8 = undefined;
-    const name_s = std.fmt.bufPrint(&name_buf, "sushi_exl3_search_n{d}_{s}_w{d}{s}", .{ rate.n, @tagName(dec.codebook), dec.window.bits(), if (plan.single_costs) "_single" else "" }) catch unreachable;
+    var name_buf: [112]u8 = undefined;
+    const pair: u32 = if (code == .hash_mask) code.hash_mask.mult else 0;
+    var pin_buf: [16]u8 = undefined;
+    const pin_tag = if (pin_pass == encode.full_pin_pass) "" else std.fmt.bufPrint(&pin_buf, "_pin{d}", .{pin_pass}) catch unreachable;
+    const name_s = std.fmt.bufPrint(&name_buf, "sushi_exl3_search_n{d}_{s}{x}_w{d}{s}{s}", .{ rate.n, @tagName(dec.codebook), pair, dec.window.bits(), if (plan.pairs) "_pairs" else if (plan.single_costs) "_single" else "", pin_tag }) catch unreachable;
     name_buf[name_s.len] = 0;
     const name: [:0]const u8 = name_buf[0..name_s.len :0];
     const ins_all = [_][*:0]const u8{ "tiles", "dq_tab" };
@@ -532,20 +717,21 @@ fn getKernel(allocator: std.mem.Allocator, rate: format.Rate, dec: format.Decode
 }
 
 var cached_tables: [4]?mlx.mlx_array = @splat(null);
-var cached_table_keys: [4]format.Decode = undefined;
+var cached_table_keys: [4]struct { encode.Code, format.Window } = undefined;
 
 /// Every codeword's decoded value as F16, from the same expression the search hashes, so a table read
 /// scores exactly what the hash would.
-fn decodeTable(allocator: std.mem.Allocator, s: mlx.mlx_stream, dec: format.Decode) Error!mlx.mlx_array {
-    for (cached_tables, 0..) |t_opt, i| if (t_opt) |t| if (std.meta.eql(cached_table_keys[i], dec)) return t;
+fn decodeTable(allocator: std.mem.Allocator, s: mlx.mlx_stream, code: encode.Code, window: format.Window) Error!mlx.mlx_array {
+    const key: @TypeOf(cached_table_keys[0]) = .{ code, window };
+    for (cached_tables, 0..) |t_opt, i| if (t_opt) |t| if (std.meta.eql(cached_table_keys[i], key)) return t;
     var src = std.ArrayList(u8).empty;
     defer src.deinit(allocator);
     try src.appendSlice(allocator, "    uint cw = thread_position_in_grid.x;\n");
-    try appendDecodeExpr(&src, allocator, dec.codebook, "cw", "value");
+    try appendDecodeExpr(&src, allocator, code, "cw", "value");
     try src.appendSlice(allocator, "    table[cw] = half(value);\n");
     try src.append(allocator, 0);
     var name_buf: [64]u8 = undefined;
-    const name = std.fmt.bufPrintSentinel(&name_buf, "sushi_exl3_decode_table_{s}", .{@tagName(dec.codebook)}, 0) catch unreachable;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "sushi_exl3_decode_table_{s}{x}", .{ @tagName(code), if (code == .hash_mask) code.hash_mask.mult else 0 }, 0) catch unreachable;
     const ins = [_][*:0]const u8{"like"};
     const outs = [_][*:0]const u8{"table"};
     const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
@@ -555,7 +741,7 @@ fn decodeTable(allocator: std.mem.Allocator, s: mlx.mlx_stream, dec: format.Deco
     const kernel = mlx.mlx_fast_metal_kernel_new(name.ptr, in_vec, out_vec, @ptrCast(src.items.ptr), "", true, false);
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
-    const codewords: c_int = @as(c_int, 1) << @intCast(dec.window.bits());
+    const codewords: c_int = @as(c_int, 1) << @intCast(window.bits());
     const like_data = [_]f32{0};
     const like = mlx.mlx_array_new_data(&like_data, &[_]c_int{1}, 1, .float32);
     defer _ = mlx.mlx_array_free(like);
@@ -576,12 +762,63 @@ fn decodeTable(allocator: std.mem.Allocator, s: mlx.mlx_stream, dec: format.Deco
     try mlx.check(mlx.mlx_array_eval(table));
     for (&cached_tables, 0..) |*slot, i| if (slot.* == null) {
         slot.* = table;
-        cached_table_keys[i] = dec;
+        cached_table_keys[i] = key;
         return table;
     };
     _ = mlx.mlx_array_free(cached_tables[0].?);
     cached_tables[0] = table;
-    cached_table_keys[0] = dec;
+    cached_table_keys[0] = key;
+    return table;
+}
+
+/// Test seam: the plan every PAIR1 launch runs (the ubench times the alternatives; the codewords do not change).
+pub var pair_plan_override: ?pair_kernel.Plan = null;
+
+const PairKey = struct { n: u32, threads: u32, pin: u32, tiles: u32, table_rows: u32 };
+var pair_keys: [16]PairKey = undefined;
+var pair_kernels: [16]?mlx.mlx_fast_metal_kernel = @splat(null);
+var pair_len: usize = 0;
+
+fn getPairKernel(allocator: std.mem.Allocator, n: u32, plan: pair_kernel.Plan, pin: u32) Error!mlx.mlx_fast_metal_kernel {
+    const key = PairKey{ .n = n, .threads = plan.threads, .pin = pin, .tiles = plan.tiles, .table_rows = plan.table_rows };
+    for (pair_kernels[0..pair_len], 0..) |k_opt, i| if (k_opt) |k| if (std.meta.eql(pair_keys[i], key)) return k;
+    const src = pair_kernel.source(allocator, n, plan, pin) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.RateUnsupported;
+    defer allocator.free(src);
+    const hdr = try pair_kernel.header(allocator, n);
+    defer allocator.free(hdr);
+    var name_buf: [64]u8 = undefined;
+    const name = std.fmt.bufPrintSentinel(&name_buf, "sushi_exl3_pair1_search_n{d}_g{d}_t{d}_r{d}_pin{d}", .{ n, plan.tiles, plan.threads, plan.table_rows, pin }, 0) catch unreachable;
+    const ins = [_][*:0]const u8{ "tiles", "dq_tab" };
+    const outs = [_][*:0]const u8{ "q_tiles", "indices", "temp_edges", "temp_costs" };
+    const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(name.ptr, in_vec, out_vec, src.ptr, hdr.ptr, true, false);
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    const slot = if (pair_len < pair_kernels.len) blk: {
+        pair_len += 1;
+        break :blk pair_len - 1;
+    } else blk: {
+        _ = mlx.mlx_fast_metal_kernel_free(pair_kernels[0].?);
+        break :blk 0;
+    };
+    pair_keys[slot] = key;
+    pair_kernels[slot] = kernel;
+    return kernel;
+}
+
+var pair_tables: [21]?mlx.mlx_array = @splat(null);
+
+/// Both weights of every codeword at `rate` as one half2 word, built on the host from `format.decodePair`.
+fn pairTable(allocator: std.mem.Allocator, rate: format.Rate) Error!mlx.mlx_array {
+    const slot = &pair_tables[(rate.n - 24) / 2];
+    if (slot.*) |t| return t;
+    const words = try pair_kernel.decodeTableWords(allocator, format.pair1Pair(rate).?);
+    defer allocator.free(words);
+    const table = mlx.mlx_array_new_data(words.ptr, &[_]c_int{1 << 16}, 1, .uint32);
+    try mlx.check(mlx.mlx_array_eval(table));
+    slot.* = table;
     return table;
 }
 
@@ -596,12 +833,13 @@ pub fn encodeTiles(
     tiles: []const f32,
     packed_out: []u16,
     recon: ?[]f32,
+    pin_pass: u32,
 ) Error!void {
     if (packed_out.len != tiles.len / tile_len * rate.n) {
         _ = try buildPlan(rate, dec, device_threads);
         return if (tiles.len == 0) error.EmptyTensor else error.ShapeMismatch;
     }
-    var search = try Search.submit(allocator, s, null, rate, dec, tiles, recon != null);
+    var search = try Search.submit(allocator, s, null, rate, dec, tiles, recon != null, pin_pass);
     defer search.deinit();
     try search.collect(null, packed_out, recon);
 }
@@ -615,16 +853,18 @@ pub const Search = struct {
     rate: format.Rate,
     n_tiles: usize,
     launches: []Pending,
+    /// PAIR1: `idx` holds 128 pair codewords per tile, expanded to the scalar windows on unpacking.
+    pair: bool = false,
 
-    pub fn submit(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool) Error!Search {
-        return submitCapped(allocator, s, pool, rate, dec, tiles, want_recon, device_threads);
+    pub fn submit(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, pin_pass: u32) Error!Search {
+        return submitCapped(allocator, s, pool, rate, dec, tiles, want_recon, pin_pass, device_threads);
     }
 
     /// Asks for `max_threads` per threadgroup, or for the pipeline limit MLX reports when a kernel cannot take that many.
-    pub fn submitCapped(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, max_threads: u32) Error!Search {
+    pub fn submitCapped(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, pin_pass: u32, max_threads: u32) Error!Search {
         var cap = @min(max_threads, learned_threads);
         while (true) {
-            return submitAt(allocator, s, pool, rate, dec, tiles, want_recon, cap) catch |e| {
+            return submitAt(allocator, s, pool, rate, dec, tiles, want_recon, pin_pass, cap) catch |e| {
                 const limit = (if (e == error.MlxError) mlx.takeThreadgroupLimit() else null) orelse return e;
                 learned_threads = @min(learned_threads, limit);
                 if (limit == 0 or limit >= cap) return e;
@@ -634,16 +874,18 @@ pub const Search = struct {
         }
     }
 
-    fn submitAt(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, cap: u32) Error!Search {
+    fn submitAt(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, pin_pass: u32, cap: u32) Error!Search {
+        if (dec.codebook == .pair1) return submitPair(allocator, s, pool, rate, dec, tiles, want_recon, pin_pass, cap);
         const plan = try buildPlan(rate, dec, cap);
+        if (!encode.validPinPass(pin_pass)) return error.PinPassUnsupported;
         if (tiles.len == 0) return error.EmptyTensor;
         if (tiles.len % tile_len != 0) return error.ShapeMismatch;
         const n_tiles = tiles.len / tile_len;
         var perm: [tile_len]usize = undefined;
         format.tensorCorePerm(&perm);
 
-        const kernel = try getKernel(allocator, rate, dec, plan);
-        const table = if (plan.table) try decodeTable(allocator, s, dec) else mlx.mlx_array_new();
+        const kernel = try getKernel(allocator, rate, dec, plan, pin_pass);
+        const table = if (plan.table) try decodeTable(allocator, s, encode.Code.of(dec, rate).?, dec.window) else mlx.mlx_array_new();
         defer if (!plan.table) {
             _ = mlx.mlx_array_free(table);
         };
@@ -708,6 +950,81 @@ pub const Search = struct {
         return .{ .allocator = allocator, .rate = rate, .n_tiles = n_tiles, .launches = launches };
     }
 
+    fn submitPair(allocator: std.mem.Allocator, s: mlx.mlx_stream, pool: ?*Pool, rate: format.Rate, dec: format.Decode, tiles: []const f32, want_recon: bool, pin_pass: u32, cap: u32) Error!Search {
+        if (!encode.pairSearchable(dec, rate)) return error.CodebookUnsupported;
+        if (!encode.validPinPass(pin_pass)) return error.PinPassUnsupported;
+        if (tiles.len == 0) return error.EmptyTensor;
+        if (tiles.len % tile_len != 0) return error.ShapeMismatch;
+        var plan = pair_plan_override orelse pair_kernel.planFor(rate.n);
+        // Fewer threads each carry more states; the codewords do not change.
+        while (plan.threads > cap and plan.threads / 2 >= 32 * plan.tiles) plan.threads /= 2;
+        if (plan.threads > cap) return error.GeometryUnsupported;
+        const shape = pair_kernel.shapeOf(rate.n, plan);
+        const kernel = try getPairKernel(allocator, rate.n, plan, pin_pass / 2);
+        const table = if (plan.table_rows > 0) try pairTable(allocator, rate) else mlx.mlx_array_new_int(0);
+        defer if (plan.table_rows == 0) {
+            _ = mlx.mlx_array_free(table);
+        };
+        const n_tiles = tiles.len / tile_len;
+        var perm: [tile_len]usize = undefined;
+        format.tensorCorePerm(&perm);
+        const per_tile_bytes: usize = pair_search.pairs * @as(usize, shape.sm) * 2;
+        const group: usize = plan.tiles;
+        const max_batch = @max(group, @min(launch_tiles_cap, max_scratch_bytes / per_tile_bytes) / group * group);
+        const n_launch = (n_tiles + max_batch - 1) / max_batch;
+        const launches = try allocator.alloc(Pending, n_launch);
+        var made: usize = 0;
+        errdefer {
+            for (launches[0..made]) |l| {
+                _ = mlx.mlx_array_free(l.q);
+                _ = mlx.mlx_array_free(l.idx);
+            }
+            allocator.free(launches);
+        }
+        const buf_rows = (@min(n_tiles, max_batch) + group - 1) / group * group;
+        const k_tiles_buf = try allocator.alloc(f32, buf_rows * tile_len);
+        defer allocator.free(k_tiles_buf);
+        const evals = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(evals);
+        var start: usize = 0;
+        while (start < n_tiles) {
+            const count = @min(max_batch, n_tiles - start);
+            const rows = (count + group - 1) / group * group;
+            var gather = Permute{ .src = tiles[start * tile_len ..][0 .. count * tile_len], .dst = k_tiles_buf[0 .. count * tile_len], .perm = &perm };
+            runChunks(pool, count, &gather, Permute.gather);
+            @memset(k_tiles_buf[count * tile_len .. rows * tile_len], 0);
+            const rows_c: c_int = @intCast(rows);
+            const in_arr = mlx.mlx_array_new_data(k_tiles_buf.ptr, &[_]c_int{ rows_c, 256 }, 2, .float32);
+            defer _ = mlx.mlx_array_free(in_arr);
+            const cfg = mlx.mlx_fast_metal_kernel_config_new();
+            defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows_c, 256 }, 2, .float32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows_c, 128 }, 2, .uint16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows_c, @intCast(128 * shape.sm / 2) }, 2, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{if (shape.pins_device) rows_c else 1}, 1, .uint32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @as(c_int, @intCast(rows / group)) * @as(c_int, @intCast(plan.threads)), 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @intCast(plan.threads), 1, 1));
+            const inputs = [_]mlx.mlx_array{ in_arr, table };
+            const inputs_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+            defer _ = mlx.mlx_vector_array_free(inputs_vec);
+            var outputs_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(outputs_vec);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, s));
+            if (mlx.mlx_vector_array_size(outputs_vec) != 4) return error.MetalKernelBadOutputCount;
+            // Owned by `launches` before the first fill, so the errdefer frees whatever a failed get left.
+            const l = &launches[made];
+            l.* = .{ .start = start, .count = count, .q = mlx.mlx_array_new(), .idx = mlx.mlx_array_new() };
+            made += 1;
+            try mlx.check(mlx.mlx_vector_array_get(&l.q, outputs_vec, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&l.idx, outputs_vec, 1));
+            try mlx.check(mlx.mlx_vector_array_append_value(evals, l.idx));
+            if (want_recon) try mlx.check(mlx.mlx_vector_array_append_value(evals, l.q));
+            start += count;
+        }
+        try mlx.check(mlx.mlx_async_eval(evals));
+        return .{ .allocator = allocator, .rate = rate, .n_tiles = n_tiles, .launches = launches, .pair = true };
+    }
+
     pub fn collect(self: *Search, pool: ?*Pool, packed_out: []u16, recon: ?[]f32) Error!void {
         if (packed_out.len != self.n_tiles * self.rate.n) return error.ShapeMismatch;
         if (recon) |r| if (r.len != self.n_tiles * tile_len) return error.ShapeMismatch;
@@ -715,10 +1032,12 @@ pub const Search = struct {
         format.tensorCorePerm(&perm);
         var ks: [tile_len]u8 = undefined;
         for (&ks, 0..) |*k, i| k.* = @intCast(self.rate.freshBits(i));
+        const t0 = stages_mod.nowNs();
         for (self.launches) |l| {
             if (recon != null) try mlx.check(mlx.mlx_array_eval(l.q));
             try mlx.check(mlx.mlx_array_eval(l.idx));
         }
+        stages_mod.waitedSince(t0);
         // The pool may still run work started before the wait; unpacking needs it.
         if (pool) |p| p.wait();
         for (self.launches) |l| {
@@ -729,6 +1048,7 @@ pub const Search = struct {
                 .states = mlx.mlx_array_data_uint16(l.idx).?,
                 .values = if (recon != null) mlx.mlx_array_data_float32(l.q).? else undefined,
                 .packed_out = packed_out[l.start * self.rate.n ..][0 .. l.count * self.rate.n],
+                .pair = self.pair,
                 .recon = if (recon) |r| r[l.start * tile_len ..][0 .. l.count * tile_len] else null,
             };
             runChunks(pool, l.count, &unpack, Unpack.run);
@@ -765,11 +1085,17 @@ const Unpack = struct {
     values: [*]const f32,
     packed_out: []u16,
     recon: ?[]f32,
+    pair: bool = false,
 
     fn run(self: *Unpack, lo: usize, hi: usize) void {
         const n = self.rate.n;
         for (lo..hi) |ti| {
-            const states_ptr: *const [tile_len]u16 = @ptrCast(self.states + ti * tile_len);
+            var expanded: [tile_len]u16 = undefined;
+            const states_ptr: *const [tile_len]u16 = if (self.pair) blk: {
+                var ks: [tile_len]u8 = undefined;
+                pair_search.expandScalar(self.rate, @ptrCast(self.states + ti * pair_search.pairs), &expanded, &ks);
+                break :blk &expanded;
+            } else @ptrCast(self.states + ti * tile_len);
             encode.Encoder.packStates(self.rate, self.ks, states_ptr, self.packed_out[ti * n ..][0..n]);
             if (self.recon) |r| {
                 const q = self.values + ti * tile_len;
@@ -827,6 +1153,7 @@ pub fn globalScaleBatch(
     pool: ?*Pool,
     rate: format.Rate,
     dec: format.Decode,
+    pin_pass: u32,
     inners: []const []const f32,
     rows: usize,
     cols: usize,
@@ -856,12 +1183,12 @@ pub fn globalScaleBatch(
     defer allocator.free(scores);
 
     const Probe = struct {
-        fn run(a: std.mem.Allocator, st_: mlx.mlx_stream, pl: ?*Pool, r: format.Rate, d: format.Decode, sm: []const []f32, gs: []const f32, scl: []f32, rec: []f32, scr: []u16, sc: []f64) Error!void {
+        fn run(a: std.mem.Allocator, st_: mlx.mlx_stream, pl: ?*Pool, r: format.Rate, d: format.Decode, pp: u32, sm: []const []f32, gs: []const f32, scl: []f32, rec: []f32, scr: []u16, sc: []f64) Error!void {
             const n = sm[0].len;
             for (sm, gs, 0..) |sample, g, b| for (scl[b * n ..][0..n], sample) |*o, v| {
                 o.* = v * g;
             };
-            var search = try Search.submit(a, st_, pl, r, d, scl, true);
+            var search = try Search.submit(a, st_, pl, r, d, scl, true, pp);
             defer search.deinit();
             try search.collect(pl, scr, rec);
             for (sm, gs, 0..) |sample, g, b| {
@@ -895,10 +1222,10 @@ pub fn globalScaleBatch(
         st_.* = .{ .a = a, .b = b, .x1 = a + resphi * (b - a), .x2 = b - resphi * (b - a), .f1 = 0, .f2 = 0 };
     }
     for (states, probes) |st_, *p| p.* = st_.x1;
-    try Probe.run(allocator, s, pool, rate, dec, samples, probes, scaled, recon, packed_scratch, scores);
+    try Probe.run(allocator, s, pool, rate, dec, pin_pass, samples, probes, scaled, recon, packed_scratch, scores);
     for (states, scores) |*st_, sc| st_.f1 = sc;
     for (states, probes) |st_, *p| p.* = st_.x2;
-    try Probe.run(allocator, s, pool, rate, dec, samples, probes, scaled, recon, packed_scratch, scores);
+    try Probe.run(allocator, s, pool, rate, dec, pin_pass, samples, probes, scaled, recon, packed_scratch, scores);
     for (states, scores) |*st_, sc| st_.f2 = sc;
     for (0..steps) |_| {
         for (states, probes) |*st_, *p| {
@@ -909,7 +1236,7 @@ pub fn globalScaleBatch(
             st_.a = a_n;
             st_.b = b_n;
         }
-        try Probe.run(allocator, s, pool, rate, dec, samples, probes, scaled, recon, packed_scratch, scores);
+        try Probe.run(allocator, s, pool, rate, dec, pin_pass, samples, probes, scaled, recon, packed_scratch, scores);
         for (states, scores, probes) |*st_, fp, probe| {
             const left = st_.f1 < st_.f2;
             if (left) {
@@ -1001,7 +1328,7 @@ const Ldlq = struct {
             for (self.err_row, self.inner[(i + m) * cols ..][0..cols], self.rec[(i + m) * cols ..][0..cols]) |*e, wv, rv| e.* = wv - rv;
             for (0..height) |r| {
                 const lv = self.l[(i + m) * rows + i + step.bi + r];
-                for (comp[r * cols ..][0..cols], self.err_row) |*c, e| c.* += lv * e;
+                for (comp[r * cols ..][0..cols], self.err_row) |*c, e| c.* = @mulAdd(f32, lv, e, c.*);
             }
         }
         for (0..height) |r| for (comp[r * cols ..][0..cols], self.inner[(i + step.bi + r) * cols ..][0..cols]) |*c, wv| {
@@ -1077,8 +1404,8 @@ fn transposeBlock(dst: []f32, src: []const f32, stride: usize, rows: usize, chun
 const ldlq_chunk = 128;
 const FeedLanes = @Vector(16, f32);
 
-/// prod[r] += sum over m of lt[r][m] * err[m], each element accumulated in ascending m with a rounded product
-/// then a rounded add, so every value matches the row-at-a-time loop bit for bit.
+/// prod[r] += sum over m of lt[r][m] * err[m], each element accumulated in ascending m with one fused multiply-add
+/// per term, so every value matches the row-at-a-time loop bit for bit.
 fn feedbackUpdate(prod: []f32, cols: usize, err: []const f32, lt: []const f32, chunk: usize) void {
     const rows = prod.len / cols;
     var r: usize = 0;
@@ -1098,10 +1425,10 @@ fn feedbackUpdate(prod: []f32, cols: usize, err: []const f32, lt: []const f32, c
                 const e1: FeedLanes = err[m * cols + c0 + 16 ..][0..16].*;
                 const l0: FeedLanes = @splat(l0row[m]);
                 const l1: FeedLanes = @splat(l1row[m]);
-                a00 += l0 * e0;
-                a01 += l0 * e1;
-                a10 += l1 * e0;
-                a11 += l1 * e1;
+                a00 = @mulAdd(FeedLanes, l0, e0, a00);
+                a01 = @mulAdd(FeedLanes, l0, e1, a01);
+                a10 = @mulAdd(FeedLanes, l1, e0, a10);
+                a11 = @mulAdd(FeedLanes, l1, e1, a11);
             }
             p0[0..16].* = a00;
             p0[16..32].* = a01;
@@ -1118,10 +1445,12 @@ pub const TensorJob = struct {
     h: []const f32,
     sign_in: []const f32,
     sign_out: []const f32,
+    /// Output scales to use instead of the regularizer's rule (`quantize.regularizeScaled`).
+    out_scales: ?[]const f32 = null,
 };
 
 fn workerCount(jobs: usize) usize {
-    const cpus = std.Thread.getCpuCount() catch 1;
+    const cpus = @import("pool.zig").cpuCount();
     return @max(1, @min(jobs, @min(cpus, 16)));
 }
 
@@ -1198,7 +1527,7 @@ const Prep = struct {
         const hdiag = self.allocator.alloc(f32, self.in) catch |e| return self.fail(b, e);
         defer self.allocator.free(hdiag);
         for (hdiag, 0..) |*d, i| d.* = job.h[i * self.in + i];
-        self.reg[b] = quantize.regularize(self.allocator, job.w, self.in, self.out, job.sign_in, job.sign_out, self.mode, hdiag) catch |e| return self.fail(b, e);
+        self.reg[b] = quantize.regularizeScaled(self.allocator, job.w, self.in, self.out, job.sign_in, job.sign_out, self.mode, hdiag, job.out_scales) catch |e| return self.fail(b, e);
         const rotated = quantize.rotatedHessian(self.allocator, job.h, self.reg[b].suh) catch |e| return self.fail(b, e);
         if (self.precision == .f32) {
             self.means[b] = quantize.dampDiagonal(rotated, self.in);
@@ -1219,6 +1548,7 @@ pub fn prepareBatch(allocator: std.mem.Allocator, pool: ?*Pool, jobs: []const Te
     if (in % 128 != 0 or out % 128 != 0) return error.GeometryUnsupported;
     for (jobs) |job| {
         if (job.w.len != in * out or job.h.len != in * in or job.sign_in.len != in or job.sign_out.len != out) return error.ShapeMismatch;
+        if (job.out_scales) |sc| if (sc.len != out) return error.ShapeMismatch;
     }
     const count = jobs.len;
     const reg = try allocator.alloc(quantize.Regularized, count);
@@ -1267,6 +1597,7 @@ pub fn finishBatch(
     prepared: *Prepared,
     rate: format.Rate,
     dec: format.Decode,
+    pin_pass: u32,
     stages: ?*stages_mod.Stages,
     results: []quantize.Quantized,
     side: ?Side,
@@ -1291,7 +1622,7 @@ pub fn finishBatch(
     for (inners, prepared.reg) |*o, r| o.* = r.inner;
     const gs = try allocator.alloc(f32, count);
     defer allocator.free(gs);
-    try globalScaleBatch(allocator, s, pool, rate, dec, inners, in, out, gs);
+    try globalScaleBatch(allocator, s, pool, rate, dec, pin_pass, inners, in, out, gs);
     for (prepared.reg, gs) |r, g| for (r.inner) |*v| {
         v.* *= g;
     };
@@ -1305,7 +1636,7 @@ pub fn finishBatch(
     const ls = try allocator.alloc([]const f32, count);
     defer allocator.free(ls);
     for (ls, prepared.l) |*o, l| o.* = l;
-    try ldlqBatch(allocator, s, pool, rate, dec, inners, ls, in, out, packed_out, &lap, side);
+    try ldlqBatch(allocator, s, pool, rate, dec, pin_pass, inners, ls, in, out, packed_out, &lap, side);
 
     var done: usize = 0;
     errdefer for (results[0..done]) |r| {
@@ -1345,7 +1676,7 @@ pub fn quantizeBatch(
     defer prepared.deinit();
     lap.mark(.prep);
     // Without a side job only the search's own errors can surface.
-    finishBatch(allocator, s, null, &prepared, rate, dec, stages, results, null) catch |e| return @errorCast(e);
+    finishBatch(allocator, s, null, &prepared, rate, dec, encode.full_pin_pass, stages, results, null) catch |e| return @errorCast(e);
 }
 
 /// One lane's tensors through the LDLQ steps: host feedback before each step's search, commit after.
@@ -1381,6 +1712,7 @@ fn ldlqBatch(
     pool: ?*Pool,
     rate: format.Rate,
     dec: format.Decode,
+    pin_pass: u32,
     inners: []const []const f32,
     ls: []const []const f32,
     rows: usize,
@@ -1431,7 +1763,7 @@ fn ldlqBatch(
     for (lanes) |*ln| {
         ln.step = steps[0];
         runParallel(pool, ln.states.len, ln, Lane.prepare);
-        ln.search = try Search.submit(allocator, s, pool, rate, dec, ln.tiles, true);
+        ln.search = try Search.submit(allocator, s, pool, rate, dec, ln.tiles, true, pin_pass);
     }
     lap.mark(.feedback);
     for (steps, 0..) |step, k| {
@@ -1446,7 +1778,7 @@ fn ldlqBatch(
             if (k + 1 < steps.len) {
                 ln.step = steps[k + 1];
                 runParallel(pool, ln.states.len, ln, Lane.prepare);
-                ln.search = try Search.submit(allocator, s, pool, rate, dec, ln.tiles, true);
+                ln.search = try Search.submit(allocator, s, pool, rate, dec, ln.tiles, true, pin_pass);
             }
             if (pool) |p| p.start(ln.states.len, ln, Lane.feedDeferred) else for (0..ln.states.len) |b| ln.feedDeferred(b);
             lap.mark(.feedback);
@@ -1505,13 +1837,13 @@ test "metal_search: invalid rate, window or slice length is refused by name" {
     const s = mlx.gpuStream();
     var tile: [tile_len]f32 = @splat(0);
     var out: [32]u16 = undefined;
-    try t.expectError(error.RateUnsupported, encodeTiles(t.allocator, s, .{ .n = 22 }, .mcg, &tile, out[0..22], null));
-    try t.expectError(error.RateUnsupported, encodeTiles(t.allocator, s, .{ .n = 33 }, .mcg, &tile, &out, null));
-    try t.expectError(error.RateUnsupported, encodeTiles(t.allocator, s, .{ .n = 130 }, .mcg, &tile, &out, null));
-    try t.expectError(error.WindowUnsupported, encodeTiles(t.allocator, s, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w11 }, &tile, &out, null));
-    try t.expectError(error.EmptyTensor, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, tile[0..0], out[0..0], null));
-    try t.expectError(error.ShapeMismatch, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, tile[0..100], &out, null));
-    try t.expectError(error.ShapeMismatch, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, &tile, out[0..16], null));
+    try t.expectError(error.RateUnsupported, encodeTiles(t.allocator, s, .{ .n = 22 }, .mcg, &tile, out[0..22], null, encode.full_pin_pass));
+    try t.expectError(error.RateUnsupported, encodeTiles(t.allocator, s, .{ .n = 33 }, .mcg, &tile, &out, null, encode.full_pin_pass));
+    try t.expectError(error.RateUnsupported, encodeTiles(t.allocator, s, .{ .n = 130 }, .mcg, &tile, &out, null, encode.full_pin_pass));
+    try t.expectError(error.WindowUnsupported, encodeTiles(t.allocator, s, .{ .n = 32 }, .{ .codebook = .mcg, .window = .w11 }, &tile, &out, null, encode.full_pin_pass));
+    try t.expectError(error.EmptyTensor, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, tile[0..0], out[0..0], null, encode.full_pin_pass));
+    try t.expectError(error.ShapeMismatch, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, tile[0..100], &out, null, encode.full_pin_pass));
+    try t.expectError(error.ShapeMismatch, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, &tile, out[0..16], null, encode.full_pin_pass));
 }
 
 test "metal_search: every admitted rate and window matches the CPU search code for code" {
@@ -1528,12 +1860,23 @@ test "metal_search: every admitted rate and window matches the CPU search code f
 
     const rates = [_]u32{ 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 80, 96, 128 };
     const windows = [_]format.Window{ .w12, .w13, .w14, .w15, .w16 };
-    for ([_]format.Codebook{ .mcg, .mul1 }) |cb| {
+    const tabled = [_]format.Decode{
+        .{ .codebook = .alpha },
+        .{ .codebook = .std1, .table = @import("sushi_exl3").codebook_tables.indexOf("std1") },
+        .{ .codebook = .spec1, .table = @import("sushi_exl3").codebook_tables.indexOf("spec1-test-per-rate") },
+    };
+    for ([_]format.Decode{ .{ .codebook = .mcg }, .{ .codebook = .mul1 } } ++ tabled) |base| {
         for (windows) |win| {
             for (rates) |n| {
                 if (win != .w12 and win != .w15 and !(win == .w16 and (n == 40 or n == 64)) and !(win == .w13 and n == 40) and !(win == .w14 and n == 48)) continue;
                 const rate = format.Rate{ .n = n };
-                const dec = format.Decode{ .codebook = cb, .window = win };
+                var dec = base;
+                dec.window = win;
+                if (!encode.searchable(dec, rate)) {
+                    try t.expect(dec.codebook.tabledHashMask() and n > 64);
+                    try t.expectError(error.CodebookUnsupported, encode.Encoder.init(t.allocator, rate, dec));
+                    continue;
+                }
                 var enc = try encode.Encoder.init(t.allocator, rate, dec);
                 defer enc.deinit();
 
@@ -1541,7 +1884,7 @@ test "metal_search: every admitted rate and window matches the CPU search code f
                 defer t.allocator.free(got_packed);
                 const got_recon = try t.allocator.alloc(f32, n_tiles * tile_len);
                 defer t.allocator.free(got_recon);
-                try encodeTiles(t.allocator, s, rate, dec, &tiles, got_packed, got_recon);
+                try encodeTiles(t.allocator, s, rate, dec, &tiles, got_packed, got_recon, encode.full_pin_pass);
 
                 for (0..n_tiles) |ti| {
                     var want_packed: [128]u16 = undefined;
@@ -1563,15 +1906,19 @@ test "metal_search: every admitted rate and window matches the CPU search code f
 
 test "metal_search: the 1024-thread single-cost plan needs 1024 threads and a lower pipeline limit plans another" {
     const t = std.testing;
-    const rate = format.Rate{ .n = 32 };
     const dec = format.Decode{ .codebook = .mcg, .window = .w15 };
-    const wide = try buildPlan(rate, dec, 1024);
-    try t.expect(wide.single_costs);
-    try t.expectEqual(@as(u32, 1024), wide.threads);
-    for ([_]u32{ 832, 640, 384, 256 }) |limit| {
-        const plan = try buildPlan(rate, dec, limit);
-        try t.expect(!plan.single_costs);
-        try t.expect(plan.threads <= limit);
+    // K2 runs the single-cost plan and K1.5 its paired steps; both need all 1024 threads.
+    for ([_]u32{ 32, 24 }) |n| {
+        const rate = format.Rate{ .n = n };
+        const wide = try buildPlan(rate, dec, 1024);
+        try t.expect(wide.single_costs);
+        try t.expectEqual(n == 24, wide.pairs);
+        try t.expectEqual(@as(u32, 1024), wide.threads);
+        for ([_]u32{ 832, 640, 384, 256 }) |limit| {
+            const plan = try buildPlan(rate, dec, limit);
+            try t.expect(!plan.single_costs and !plan.pairs);
+            try t.expect(plan.threads <= limit);
+        }
     }
 }
 
@@ -1584,23 +1931,27 @@ test "metal_search: a pipeline limit below the launch size searches the same cod
     const n_tiles = 3;
     var tiles: [n_tiles * tile_len]f32 = undefined;
     for (&tiles) |*v| v.* = r.floatNorm(f32);
-    const cases = [_]struct { n: u32, cb: format.Codebook, win: format.Window }{
-        .{ .n = 32, .cb = .mcg, .win = .w15 },
-        .{ .n = 40, .cb = .mul1, .win = .w15 },
-        .{ .n = 32, .cb = .mcg, .win = .w12 },
+    const spec1 = @import("sushi_exl3").codebook_tables.indexOf("spec1-test-per-rate");
+    const cases = [_]struct { n: u32, dec: format.Decode, pin_pass: u32 = encode.full_pin_pass }{
+        .{ .n = 32, .dec = .{ .codebook = .mcg, .window = .w15 } },
+        .{ .n = 40, .dec = .{ .codebook = .mul1, .window = .w15 } },
+        .{ .n = 32, .dec = .{ .codebook = .mcg, .window = .w12 } },
+        .{ .n = 24, .dec = .{ .codebook = .mcg, .window = .w15 }, .pin_pass = encode.default_pin_pass },
+        .{ .n = 32, .dec = .{ .codebook = .spec1, .window = .w15, .table = spec1 }, .pin_pass = encode.default_pin_pass },
+        .{ .n = 128, .dec = .{ .codebook = .mcg, .window = .w15 } },
     };
     // 832 and 384 are limits an M2 Pro reports. An M5 never refuses a plan, so the retry itself runs in the gpu_factor test.
     for (cases) |c| {
         const rate = format.Rate{ .n = c.n };
-        const dec = format.Decode{ .codebook = c.cb, .window = c.win };
-        var enc = try encode.Encoder.init(t.allocator, rate, dec);
+        const dec = c.dec;
+        var enc = try encode.Encoder.initPinned(t.allocator, rate, dec, c.pin_pass);
         defer enc.deinit();
         for ([_]u32{ 2048, 832, 384, 128 }) |cap| {
             const got_packed = try t.allocator.alloc(u16, n_tiles * c.n);
             defer t.allocator.free(got_packed);
             const got_recon = try t.allocator.alloc(f32, n_tiles * tile_len);
             defer t.allocator.free(got_recon);
-            var search = try Search.submitCapped(t.allocator, s, null, rate, dec, &tiles, true, cap);
+            var search = try Search.submitCapped(t.allocator, s, null, rate, dec, &tiles, true, c.pin_pass, cap);
             defer search.deinit();
             try search.collect(null, got_packed, got_recon);
             for (0..n_tiles) |ti| {
@@ -1739,7 +2090,7 @@ test "metal_search: a batch of tensors quantizes to the same bytes as one tensor
     }
 }
 
-test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quantizer's bytes" {
+test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quantizer's bytes, MCG and PAIR1" {
     try mlx.requireGpu();
     const t = std.testing;
     const s = mlx.gpuStream();
@@ -1760,15 +2111,17 @@ test "metal_search: a tensor of several 128-row chunks quantizes to the CPU quan
         for (0..24) |m| acc += x[i * 24 + m] * x[j * 24 + m];
         h[i * in + j] = acc;
     };
-    const rate = format.Rate{ .n = 32 };
-    const dec = format.Decode{ .codebook = .mcg, .window = .w12 };
-    var want = try quantize.quantizeNamed(t.allocator, w, h, in, out, 5, "chunks", rate, dec, .auto);
-    defer want.deinit(t.allocator);
-    var got = try quantizeNamed(t.allocator, s, w, h, in, out, 5, "chunks", rate, dec, .auto, null);
-    defer got.deinit(t.allocator);
-    try t.expectEqualSlices(u16, want.packed_out, got.packed_out);
-    try t.expectEqualSlices(u16, want.suh, got.suh);
-    try t.expectEqualSlices(u16, want.svh, got.svh);
+    const pair1: format.Decode = .{ .codebook = .pair1, .window = .w16, .table = @import("sushi_exl3").codebook_tables.indexOf("pair1-w16-v1") };
+    for ([_]struct { format.Rate, format.Decode }{ .{ .{ .n = 32 }, .{ .codebook = .mcg, .window = .w12 } }, .{ .{ .n = 28 }, pair1 } }) |c| {
+        const rate, const dec = c;
+        var want = try quantize.quantizeNamed(t.allocator, w, h, in, out, 5, "chunks", rate, dec, .auto);
+        defer want.deinit(t.allocator);
+        var got = try quantizeNamed(t.allocator, s, w, h, in, out, 5, "chunks", rate, dec, .auto, null);
+        defer got.deinit(t.allocator);
+        try t.expectEqualSlices(u16, want.packed_out, got.packed_out);
+        try t.expectEqualSlices(u16, want.suh, got.suh);
+        try t.expectEqualSlices(u16, want.svh, got.svh);
+    }
 }
 
 /// tr((W - What)^T H (W - What)) / tr(W^T H W): the error LDLQ minimizes, in the public basis.
@@ -1817,7 +2170,7 @@ test "metal_search: a float32 GPU factor quantizes as well as the float64 factor
     var prepared = try prepareBatch(t.allocator, null, &jobs, in, out, .auto, .f32);
     defer prepared.deinit();
     var got: [1]quantize.Quantized = undefined;
-    try finishBatch(t.allocator, s, null, &prepared, rate, dec, null, &got, null);
+    try finishBatch(t.allocator, s, null, &prepared, rate, dec, encode.full_pin_pass, null, &got, null);
     defer got[0].deinit(t.allocator);
     try t.expectEqual(@as(usize, 0), prepared.factor_stats.fallbacks);
 
@@ -1829,6 +2182,72 @@ test "metal_search: a float32 GPU factor quantizes as well as the float64 factor
         e.* = try hessianError(t.allocator, w, decoded, h, in, out);
     }
     try t.expect(errs[1] <= errs[0] * 1.02);
+}
+
+test "metal_search: a shortened pin pass picks the reference search's codes, code for code" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var fx = try encode.PinFixture.load(t.allocator);
+    defer fx.deinit();
+    const n_tiles = fx.tiles.len / tile_len;
+    for (encode.pin_cases) |c| {
+        const rate = format.Rate{ .n = c.n };
+        const got = try t.allocator.alloc(u16, n_tiles * c.n);
+        defer t.allocator.free(got);
+        const exact = try t.allocator.alloc(u16, n_tiles * c.n);
+        defer t.allocator.free(exact);
+        try encodeTiles(t.allocator, s, rate, c.dec, fx.tiles, got, null, c.pin_pass);
+        try encodeTiles(t.allocator, s, rate, c.dec, fx.tiles, exact, null, encode.full_pin_pass);
+        for (0..n_tiles) |ti| {
+            var want: [64]u16 = undefined;
+            fx.packedTile(c, ti, want[0..c.n]);
+            try t.expectEqualSlices(u16, want[0..c.n], got[ti * c.n ..][0..c.n]);
+        }
+        try t.expect(!std.mem.eql(u16, got, exact));
+    }
+}
+
+test "metal_search: a pin pass outside the admitted set is refused by name" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var tile: [tile_len]f32 = @splat(0);
+    var out: [32]u16 = undefined;
+    for ([_]u32{ 0, 8, 24, 144 }) |a| {
+        try t.expectError(error.PinPassUnsupported, encodeTiles(t.allocator, s, .{ .n = 32 }, .mcg, &tile, &out, null, a));
+    }
+}
+
+test "metal_search: a shortened pin pass reaches the global scale and the LDLQ search" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    var file = try st.parse(t.allocator, st.tensor);
+    defer file.deinit(t.allocator);
+    const in = 256;
+    const out = 128;
+    const w_raw = st.slice(f16, file.tensors.get("W").?);
+    const h_raw = st.slice(f16, file.tensors.get("H").?);
+    const h = try t.allocator.alloc(f32, in * in);
+    defer t.allocator.free(h);
+    for (h, h_raw) |*o, v| o.* = @floatCast(v);
+    const w = try t.allocator.alloc(f32, in * out);
+    defer t.allocator.free(w);
+    for (w, w_raw) |*o, v| o.* = @floatCast(v);
+    const both = try quantize.signs(t.allocator, 5, "pin", in + out);
+    defer t.allocator.free(both);
+    const jobs = [_]TensorJob{.{ .w = w, .h = h, .sign_in = both[0..in], .sign_out = both[in..] }};
+    const rate = format.Rate{ .n = 32 };
+    const dec = format.Decode{ .codebook = .mcg, .window = .w12 };
+
+    var results: [2]quantize.Quantized = undefined;
+    for ([_]u32{ encode.full_pin_pass, 32 }, &results) |a, *r| {
+        var prepared = try prepareBatch(t.allocator, null, &jobs, in, out, .auto, .f64);
+        defer prepared.deinit();
+        var one: [1]quantize.Quantized = undefined;
+        try finishBatch(t.allocator, s, null, &prepared, rate, dec, a, null, &one, null);
+        r.* = one[0];
+    }
+    defer for (&results) |*r| r.deinit(t.allocator);
+    try t.expect(!std.mem.eql(u16, results[0].packed_out, results[1].packed_out));
 }
 
 test "metal_search: the blocked feedback update equals the row-at-a-time loop bit for bit" {
@@ -1854,7 +2273,7 @@ test "metal_search: the blocked feedback update equals the row-at-a-time loop bi
     for (lt) |*v| v.* = r.floatNorm(f32) * 3;
     for (0..chunk) |m| for (0..rows) |row| {
         const lv = lt[row * chunk + m];
-        for (want[row * cols ..][0..cols], err[m * cols ..][0..cols]) |*c, e| c.* += lv * e;
+        for (want[row * cols ..][0..cols], err[m * cols ..][0..cols]) |*c, e| c.* = @mulAdd(f32, lv, e, c.*);
     };
     feedbackUpdate(prod, cols, err, lt, chunk);
     for (want, prod) |a, b| try t.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));

@@ -363,6 +363,14 @@ pub fn parkedStateBytes(entry: *model_registry.LoadedModel) u64 {
     };
 }
 
+/// Admission takes the room of the state a model parks: it reaches SSD where it keeps restore points, and is released.
+pub fn releaseParked(entry: *model_registry.LoadedModel) void {
+    const tag = tagOfConfig(entry.config) orelse return;
+    switch (tag) {
+        inline else => |t| if (comptime has(t, "releaseParked")) S(t).releaseParked(entry),
+    }
+}
+
 /// A slot the inference thread stops touching releases the state a later admission would otherwise read as held.
 pub fn releaseState(slot: *Slot) void {
     if (slot.request) |*request| request.reset();
@@ -551,7 +559,7 @@ const known_hooks = [_][]const u8{
     "facts",           "batches",       "rowCap",         "modelBatches",             "padsBatch",       "batchArm",
     "readyToBatch",    "coolerRows",
     "batchedForward",  "rowsForward",   "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
-    "checkKvQuant",    "coldLoadBill",  "modelStateBytes", "parkedStateBytes",      "commitsAtCull",
+    "checkKvQuant",    "coldLoadBill",  "modelStateBytes", "parkedStateBytes",      "releaseParked", "commitsAtCull",
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",
     "restoreTarget",   "restoreEnd",    "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
     "afterSpecBlock",  "endRequest",    "resetForRetry",  "flushResident",
@@ -655,6 +663,7 @@ test "only Flash-Next gates its long-context rules and caps its checkpoints; onl
         .{ .model_type = "glm5_next", .long_ctx = false, .caps = false, .thought = .always, .release = true, .always = false },
         .{ .model_type = "deepseek_v41", .long_ctx = false, .caps = false, .thought = .off, .release = false, .always = true },
         .{ .model_type = "mimo_v2", .long_ctx = false, .caps = false, .thought = .off, .release = false, .always = false },
+        .{ .model_type = "hy_v4_flash", .long_ctx = false, .caps = false, .thought = .off, .release = false, .always = true },
     };
     for (rows) |r| {
         if (registry.ofModelType(r.model_type) == null) continue;

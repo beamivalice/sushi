@@ -227,7 +227,8 @@ pub const Scope = struct {
         const neg = try sc.op1(mlx.mlx_negative, x);
         var o = mlx.mlx_array_new();
         const part = try sc.res(mlx.mlx_argpartition_axis(&o, neg, @intCast(k - 1), -1, sc.s), &o);
-        return sc.slice(part, -1, 0, k);
+        // Row-major: the routed experts' lease reads these ids on the host, which refuses a strided view.
+        return sc.contiguous(try sc.slice(part, -1, 0, k));
     }
     /// Indices that sort `x` along axis 0.
     pub fn argsort(sc: *Scope, x: A) !A {
@@ -292,5 +293,21 @@ test "a scope's concat of one part and astype to the same dtype give a handle of
         _ = try sc.floats(&.{ 9, 9, 9, 9 }, &.{4});
         try mlx.check(mlx.mlx_array_eval(got));
         try std.testing.expectEqualSlices(f32, &want, mlx.mlx_array_data_float32(got).?[0..4]);
+    }
+}
+
+test "a scope's top-k indices read back on the host: the op chain's slice of the partition is made row-major" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer mlx.engine.enabled = was;
+    var sc = Scope.plain(std.testing.allocator, mlx.engine.stream());
+    defer sc.deinit();
+    const x = try sc.floats(&.{ 0.1, 0.9, 0.5, 0.3, 0.7, 0.2, 0.8, 0.4 }, &.{ 2, 4 });
+    const ids = try hostI32(try sc.astype(try sc.topkIdx(x, 2), .int32));
+    try std.testing.expectEqual(@as(usize, 4), ids.len);
+    for ([_][2]i32{ .{ 1, 2 }, .{ 0, 2 } }, 0..) |want, r| {
+        const row = ids[r * 2 ..][0..2];
+        try std.testing.expect((row[0] == want[0] and row[1] == want[1]) or (row[0] == want[1] and row[1] == want[0]));
     }
 }

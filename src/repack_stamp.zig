@@ -3,9 +3,10 @@
 //! so a run cut short leaves a pack the loader refuses and a rerun finishes.
 const std = @import("std");
 const repack = @import("repack.zig");
-const expert_io = @import("../expert_io.zig");
-const disk_placement = @import("../disk_placement.zig");
-const log = @import("../log.zig");
+const arch_config = @import("arch/config.zig");
+const expert_io = @import("expert_io.zig");
+const disk_placement = @import("disk_placement.zig");
+const log = @import("log.zig");
 
 const tmp_suffix = ".stamp-tmp";
 const shard_suffix = ".safetensors";
@@ -554,12 +555,12 @@ pub fn parseArgs(a: std.mem.Allocator, args: []const []const u8) !Cli {
     return cli;
 }
 
-/// Is this a pack-order DeepSeek-V4.1 STQ pack, which `sushi repack` turns pair-major before it stamps?
+/// Is this a pack-order STQ pack of an arch that declares `repack`, which `sushi repack` turns pair-major before it stamps?
 pub fn wantsRepack(a: std.mem.Allocator, config_raw: []const u8) bool {
     const config = std.json.parseFromSliceLeaky(std.json.Value, a, config_raw, .{}) catch return false;
     if (config != .object) return false;
     const model_type = config.object.get("model_type") orelse return false;
-    if (model_type != .string or !std.mem.eql(u8, model_type.string, "deepseek_v41")) return false;
+    if (model_type != .string or arch_config.repackOf(model_type.string) == null) return false;
     const quant = config.object.get("expert_quant") orelse return false;
     if (quant != .object or quant.object.get("tile_order") != null) return false;
     const format = quant.object.get("format") orelse return false;

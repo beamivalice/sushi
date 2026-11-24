@@ -99,7 +99,7 @@ pub const dflash_targets_and = dflashTargets("and");
 pub const dflash_targets_or = dflashTargets("or");
 
 test "the alias table lists every arch's packs, in the arch gate's order, with their tiers and serve flags" {
-    if (registry.served_model_types.len != 4) return error.SkipZigTest;
+    if (registry.served_model_types.len != 5) return error.SkipZigTest;
     const Row = struct { name: []const u8, tag: []const u8, repo: []const u8, is_default: bool, tier_gb: u32, recommend_gb: u32, streams: bool, flags: []const u8 };
     const qwen_flags = "--mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size ";
     const rows = [_]Row{
@@ -125,10 +125,14 @@ test "the alias table lists every arch's packs, in the arch gate's order, with t
     }
 }
 
-test "every arch declares a product name and at least one pack" {
+test "every arch declares a product name and at least one pack, or names why it has none yet" {
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        try std.testing.expect(registry.Mod(t).packs.product.len > 0);
-        try std.testing.expect(registry.Mod(t).packs.aliases.len > 0);
+        const p = registry.Mod(t).packs;
+        try std.testing.expect(p.product.len > 0);
+        // `unreleased`: an arch still being built ships no pack, and says why; it goes when its first pack lands.
+        if (comptime @hasDecl(p, "unreleased")) {
+            try std.testing.expect(p.unreleased.len > 0 and p.aliases.len == 0);
+        } else try std.testing.expect(p.aliases.len > 0);
     }
 }
 

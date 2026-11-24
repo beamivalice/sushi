@@ -342,6 +342,7 @@ BUILTIN_CASES = [
     ('method rsplit', "{{ 'a,b,c'.rsplit(',', 1) }} {{ ' a  b c '.rsplit(None, 1) }}", {}),
     ('method rsplit', "{{ 'a,b,c'.rsplit(',', -9223372036854775807 - 1) }} {{ ' a b '.rsplit(None, -9223372036854775807 - 1) }}", {}),
     ('method replace', "{{ 'aaa'.replace('a', 'b', 1) }}", {}),
+    ('method format', "{{ '<{}|{}>'.format('a', 1) }} {{ '{1}{0}{1}'.format(none, true) }} {{ '{{{}}}'.format([1]) }}", {}),
     ('method replace', "{{ 'aaa'.replace('a', 'b', -9223372036854775807 - 1) }} {{ 'ab'.replace('', '-', -9223372036854775807 - 1) }}", {}),
     ('method get', "{{ d.get('a') }} {{ d.get('zz') }} {{ d.get('zz', 9) }}", D),
     ('method keys', "{{ d.keys()|list }} {{ d.keys()|length }}", D),

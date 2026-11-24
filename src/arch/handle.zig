@@ -79,7 +79,6 @@ pub fn adopt(t: *Trunk) Handle {
 /// Frees the model of a handle `adopt` made, the arch's own state first, and the handle's allocation.
 pub fn destroy(h: Handle, allocator: std.mem.Allocator) void {
     const on_engine = mlx.engine.isStream(stream(h));
-    mlx.engine.forgetSlot(&trunk(h).cooler_budget);
     arch_life.deinit(h);
     switch (h) {
         inline else => |m| allocator.destroy(m),

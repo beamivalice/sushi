@@ -107,6 +107,28 @@ pub const Tower = struct {
         }
     }
 
+    /// Whether the tower writes a request's image rows into a buffer of the request's own (`makeMedia`), sized from its
+    /// grids, in place of an array an image that the caller joins.
+    pub fn writesMedia(self: *const Tower) bool {
+        switch (self.arch) {
+            inline else => |*t| return @hasDecl(@TypeOf(t.*), "encodeInto"),
+        }
+    }
+
+    /// The request's buffer of `rows` image rows [1, rows, width].
+    pub fn makeMedia(self: *Tower, rows: usize) !mlx.mlx_array {
+        switch (self.arch) {
+            inline else => |*t| return if (comptime @hasDecl(@TypeOf(t.*), "makeMedia")) t.makeMedia(rows) else error.NoMediaBuffer,
+        }
+    }
+
+    /// One image, its patches as host bytes, written into `media` from row `row0` by the model `xfm` serves it for.
+    pub fn encodeInto(self: *Tower, xfm: *@import("../trunk.zig").Trunk, media: *mlx.mlx_array, row0: usize, pixels: []const u8, grid_h: u32, grid_w: u32) !void {
+        switch (self.arch) {
+            inline else => |*t| return if (comptime @hasDecl(@TypeOf(t.*), "encodeInto")) t.encodeInto(xfm, media, row0, pixels, grid_h, grid_w) else error.NoMediaBuffer,
+        }
+    }
+
     pub fn forwardVideo(self: *Tower, patches: mlx.mlx_array, grid_t: u32, grid_h: u32, grid_w: u32) !mlx.mlx_array {
         switch (self.arch) {
             inline else => |*t| {
@@ -123,6 +145,28 @@ pub fn scratchBytes(config: *const model.ModelConfig, patches: u64) u64 {
     return switch (tag) {
         inline else => |t| M(t).scratchBytes(config, patches),
     };
+}
+
+/// A request's encode bill where its arch writes the rows into the request's own buffer (`Tower.writesMedia`): the
+/// largest image's `worst` patches, the uploads' `input_bytes`, the `rows` the images give. Null for any other arch.
+pub fn mediaBill(config: *const model.ModelConfig, worst: u64, input_bytes: u64, rows: usize) ?u64 {
+    const tag = ofConfig(config) orelse return null;
+    return switch (tag) {
+        inline else => |t| if (comptime @hasDecl(M(t), "mediaBill")) M(t).mediaBill(config, worst, input_bytes, rows) else null,
+    };
+}
+
+/// The first of `images` whose grid holds more patches than the arch's encode is planned for (`maxImagePatches`), for
+/// an arch that plans it (one that declares `mediaBill`); null for every other arch. The processor's resize can pass
+/// its pixel bound at an extreme aspect, where a side's floor of one cell outweighs it.
+pub fn imagePastPlan(config: *const model.ModelConfig, images: []const chat.ImageData) ?usize {
+    const tag = ofConfig(config) orelse return null;
+    switch (tag) {
+        inline else => |t| if (comptime !@hasDecl(M(t), "mediaBill")) return null,
+    }
+    const most = maxImagePatches(preproc(config));
+    for (images, 0..) |img, i| if (@as(u64, img.grid_h) * img.grid_w > most) return i;
+    return null;
 }
 
 /// Patches of the largest single image this processor admits.

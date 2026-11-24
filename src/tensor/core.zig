@@ -14,11 +14,12 @@ const io_util = @import("../io_util.zig");
 const mlx = @import("../mlx.zig");
 const registry = @import("pipeline_registry.zig");
 const fill_marks = @import("../fill_marks.zig");
+const plan = @import("plan/plan_api.zig");
 
 pub const max_dims = 8;
 pub const Dtype = mlx.mlx_dtype;
 
-pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab, EnvUnparsed };
+pub const Error = metal.Error || error{ OutOfMemory, MlxError, NotEvaluated, NotRowContiguous, TensorShape, TensorDtype, TensorUnsupported, TensorNull, MlxAtRest, PoolOverBudget, ReadsFillingSlab, EnvUnparsed, DryReadback, DryHostWrite, DryStore, PlanMiss, PlanNeedsLease, PlanEscape, PoolClosed, WideFull };
 
 /// The restriction behind the last `TensorUnsupported` or `TensorDtype` an op returned through `refusing`; the route
 /// that reports the refusal names it once and clears it.
@@ -78,14 +79,42 @@ pub const Store = struct {
     /// The last pass that binds it. The host touches the bytes only once that pass has run.
     seq: u64 = 0,
     origin: Origin,
+    /// The recording that asked for it (`Recording.gen`, 0 for none) and its ask there.
+    plan_gen: u32 = 0,
+    plan_ref: plan.Ref = .{ .instance = 0, .ordinal = 0 },
+    /// The recording one of whose dispatches wrote it: a host read of it then reads that execution's GPU work (D10).
+    wrote_gen: u32 = 0,
+    /// A dry recording's dispatch wrote it, dropped: its bytes are not the ones its tensors say, so no real dispatch or
+    /// host read takes it again until it is freed (the counter page, which every launch leaves zero, aside).
+    dry_written: bool = false,
+    /// An arena store: the pass and the highest level of its last dispatches (`markOf`), which the next tenant of its
+    /// bytes goes above; its index in `Arena.live`; and whether its execution ended with it alive (`escaped`): its
+    /// bytes are another execution's from then, and a bind or a host read of it is refused.
+    level_seq: u64 = 0,
+    level_hi: u32 = 0,
+    live_at: u32 = 0,
+    escaped: bool = false,
 
     const Origin = union(enum) {
+        /// An ask of a dry recording: no buffer. A host ask keeps a host scratch of its bytes, which its filler writes
+        /// (D8); it lives only while recording and is no arena or pool memory.
+        dry: ?[]u8,
         /// A buffer of the pool, by size class.
         pool: u16,
         /// The memory of an MLX array, which this handle keeps alive.
         mlx: mlx.mlx_array,
-        /// Memory its maker mapped and the engine wrapped (`wrapMapped`): `release(payload)` gives it back.
-        mapped: struct { payload: ?*anyopaque, release: MappedRelease },
+        /// Memory its maker mapped and the engine wrapped (`wrapMapped`): `release(payload)` gives it back. `owned`: a
+        /// state owner's buffer (`wrapOwned`), written in place while it is sole; else its maker's (a weight), never.
+        mapped: struct { payload: ?*anyopaque, release: MappedRelease, owned: bool = false },
+        /// A buffer the engine holds for the process (`counterPage`): never released, never written in place.
+        held,
+        /// A place in the arena (`beginExecution`), the plan binder's for one execution: its slot goes back to the
+        /// binder when its last reference goes. A host-filled ask, from the host ring, holds no slot.
+        arena: plan.binder.Slot,
+        /// A place of a wide execution in the arena's scratch (`beginWide`), `len` bytes from `at`, given back to the
+        /// region's gaps when its last reference goes; a host-filled one, in the host ring's replica, at the next eval
+        /// (`evalPoint`).
+        wide: struct { at: u64, len: u64, host: bool },
     };
 };
 
@@ -183,11 +212,17 @@ pub var phase: u8 = 0;
 pub const phases = 6;
 const Finished = struct { cmd: metal.Committed, phase: u8, kernels: Kernels };
 
-/// The kernels a pass dispatched, by name; filled only while the kernel profile is on.
+/// The kernels a pass dispatched, by name, and the bytes they bind to read and to write (each store once a dispatch);
+/// filled only while the kernel profile is on.
 const Kernels = struct {
     n: u32 = 0,
     named: u8 = 0,
     names: [8][]const u8 = undefined,
+    read: u64 = 0,
+    write: u64 = 0,
+    /// The return addresses above the op's first dispatch: the code that made it.
+    site: [site_frames]usize = undefined,
+    site_n: u8 = 0,
 
     fn add(k: *Kernels, name: []const u8) void {
         if (k.named < k.names.len) {
@@ -211,14 +246,9 @@ const State = struct {
     boxes: std.ArrayList(*Tensor) = .empty,
     /// MLX-backed stores dropped while a pass that binds them had not run: released at the next sync.
     retired: std.ArrayList(*Store) = .empty,
-    /// The stores the dispatches since the last barrier read and wrote, and those of the dispatch being encoded.
-    /// MLX's rule (`CommandEncoder`): a barrier goes before a dispatch that reads what one of them wrote or writes
-    /// what one of them read; the rest overlap.
-    prev_in: Stores = .empty,
-    prev_out: Stores = .empty,
+    /// The stores the dispatch being encoded reads and writes, which give its level (`dispatchLevel`).
     next_in: Stores = .empty,
     next_out: Stores = .empty,
-    needs_barrier: bool = false,
     /// Every store the open pass reads or writes, and those it writes. No buffer of ours is hazard-tracked, so a
     /// pass waits for the fence of each earlier pass, not yet run, that wrote a store it binds (MLX's rule).
     pass_binds: Stores = .empty,
@@ -229,6 +259,9 @@ const State = struct {
     writers: std.AutoHashMapUnmanaged(*Store, Flying) = .empty,
     /// The most `pool_bytes` may be (`budget`); null before the first budget.
     pool_limit: ?u64 = null,
+    /// Whether an ask outside a wide phase may reach the pool (`closePool`), and how many wide phases are open.
+    pool_gate: PoolGate = .open,
+    wide: u32 = 0,
     /// Dispatches in the open pass, and how many an early hand-over waits for (`pass`).
     pass_dispatches: u32 = 0,
     kick_after: u32 = kick_first,
@@ -245,6 +278,17 @@ const State = struct {
     untimed: std.ArrayList(Finished) = .empty,
     pass_kernels: Kernels = .{},
     stats: Stats = .{},
+    /// The open pass's dispatches, held until its hand-over encodes them by level (`metal.Recorder`). A dispatch's level
+    /// is one past the levels in this pass of the writes it reads and, for a write, of the reads and writes before it
+    /// (a disjoint write, of the reads and the whole writes): independent work runs beside, whatever order it was made in.
+    rec: metal.Recorder = .{},
+    lv_write: std.AutoHashMapUnmanaged(*Store, u32) = .empty,
+    lv_read: std.AutoHashMapUnmanaged(*Store, u32) = .empty,
+    lv_whole: std.AutoHashMapUnmanaged(*Store, u32) = .empty,
+    /// The highest level of a dispatch in the open pass: with its number, the engine's mark (`markNow`).
+    pass_level_hi: u32 = 0,
+    /// The counter page (`counterPage`), made at its first ask.
+    counters: ?*Tensor = null,
 };
 
 pub const Stats = struct {
@@ -266,8 +310,13 @@ pub const Stats = struct {
     pool_evictions: u64 = 0,
     /// Passes handed over early: a burst's first because the GPU had none of ours to run, the rest behind it.
     kicks: u64 = 0,
-    /// Passes handed over because they had freed `pass_freed_cap` bytes they still bind.
+    /// Passes handed over because they had freed `pass_freed_cap` bytes they still bind, or, in an execution on the
+    /// arena, because they held `execution_pass_bounds.dispatches`.
     freed_kicks: u64 = 0,
+    bound_kicks: u64 = 0,
+    /// The most dispatches one pass held, and the most passes committed and unfinished at once.
+    longest_pass: u64 = 0,
+    most_flying: u64 = 0,
     /// Passes a caller handed over by `submit`, outside the kicks and the waits.
     handovers: u64 = 0,
     /// GPU time of our command buffers, and the time between one ending and the next beginning when that is under
@@ -291,6 +340,23 @@ pub const Stats = struct {
     /// Slice updates written into the base's bytes, and those that had to copy the base first.
     updates_in_place: u64 = 0,
     updates_copied: u64 = 0,
+    /// Tensors asked of the pool since the engine began, and their bytes (`freshFor`): a recording holds each one.
+    asks: u64 = 0,
+    ask_bytes: u64 = 0,
+    /// Asks made while the pool was closed and no wide phase open, and their bytes: refused, or served by a census.
+    closed_asks: u64 = 0,
+    closed_ask_bytes: u64 = 0,
+    /// Executions on the arena, the places they asked for, and those placed over bytes a dispatch of the open pass
+    /// still binds: each takes that dispatch's level as its floor (`markNow`).
+    executions: u64 = 0,
+    arena_asks: u64 = 0,
+    arena_floors: u64 = 0,
+    /// Wide executions (D97), the places they asked for, and their scratch's highest top.
+    wide_executions: u64 = 0,
+    wide_asks: u64 = 0,
+    wide_high: u64 = 0,
+    /// The last wide execution's own highest top.
+    wide_last_high: u64 = 0,
 };
 
 const gpa = std.heap.c_allocator;
@@ -388,13 +454,29 @@ fn publishPool(s: *const State) void {
 pub var kernel_prof_hook: ?bool = null;
 var kernel_prof_env: ?bool = null;
 
-/// With the profile on, every op's pass is handed over and waited for before the next op's begins, so the
-/// command buffer's GPU times are the op's. Timing changes; values do not.
+/// With the profile on, every op's pass is handed over on its own when the next op's begins, without a wait, so
+/// the GPU stays fed and the time from the end of the buffer before to the end of the op's is the op's. Timing
+/// changes; values do not.
 pub fn kernelProfOn() bool {
     return kernel_prof_hook orelse io_util.diagEnvOnCached(&kernel_prof_env, "SUSHI_ENGINE_KERNEL_PROF");
 }
 
-pub const KernelStat = struct { name: []const u8, dispatches: u64, total_ns: u64, max_ns: u64 };
+pub const KernelStat = struct {
+    name: []const u8,
+    dispatches: u64,
+    total_ns: u64,
+    max_ns: u64,
+    read_bytes: u64 = 0,
+    write_bytes: u64 = 0,
+    site: [site_frames]usize = undefined,
+    site_n: u8 = 0,
+};
+
+const site_frames = 40;
+
+/// A profile row is the names of an op's kernels and the code that made it: one kernel at two sites is two rows, and
+/// one site's ops of every size are one.
+const key_sep = 0;
 
 /// Pipeline handle to the name it was made by.
 var pipeline_names: std.AutoHashMapUnmanaged(usize, []const u8) = .empty;
@@ -405,27 +487,35 @@ fn pipelineName(raw: metal.id) []const u8 {
     return pipeline_names.get(@intFromPtr(raw)) orelse "(unnamed)";
 }
 
-/// One entry per distinct name; a pass of several dispatches is one entry named by all of them, joined by " + ".
+/// One entry per distinct name and site; a pass of several dispatches is one entry named by all of them, joined by " + ".
 fn noteKernels(k: Kernels, ns: u64) void {
-    var buf: [1024]u8 = undefined;
+    var buf: [1024 + 1 + 8]u8 = undefined;
     var len: usize = 0;
     for (k.names[0..k.named], 0..) |name, i| {
         const sep = if (i > 0) " + " else "";
-        if (len + sep.len + name.len > buf.len) break;
+        if (len + sep.len + name.len > 1024) break;
         @memcpy(buf[len..][0..sep.len], sep);
         len += sep.len;
         @memcpy(buf[len..][0..name.len], name);
         len += name.len;
     }
+    const name_len = len;
+    buf[len] = key_sep;
+    len += 1;
+    const site_hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(k.site[0..k.site_n]));
+    @memcpy(buf[len..][0..8], std.mem.asBytes(&site_hash));
+    len += 8;
     const key = buf[0..len];
     if (profile.getPtr(key)) |e| {
         e.dispatches += k.n;
         e.total_ns += ns;
         e.max_ns = @max(e.max_ns, ns);
+        e.read_bytes += k.read;
+        e.write_bytes += k.write;
         return;
     }
     const owned = gpa.dupe(u8, key) catch return;
-    profile.put(gpa, owned, .{ .name = owned, .dispatches = k.n, .total_ns = ns, .max_ns = ns }) catch gpa.free(owned);
+    profile.put(gpa, owned, .{ .name = owned[0..name_len], .dispatches = k.n, .total_ns = ns, .max_ns = ns, .read_bytes = k.read, .write_bytes = k.write, .site = k.site, .site_n = k.site_n }) catch gpa.free(owned);
 }
 
 /// Reads the times of every finished command buffer, waiting a moment for the ones Metal has not timed yet.
@@ -474,6 +564,12 @@ test "a kernel profile names its top 40 kernels, and every kernel where the swit
     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), profileTop("all"));
 }
 
+/// The executable's own address of a return address (the load's slide taken off), which `atos -i -o <binary>` reads
+/// back to its function, inlined callers and lines.
+fn fileAddress(addr: usize) usize {
+    return if (comptime builtin.os.tag.isDarwin()) addr -% std.c._dyld_get_image_vmaddr_slide(0) else addr;
+}
+
 /// Debug lines for the profile, `per` forwards to the totals; nothing while the switch is off.
 pub fn logKernelProfile(per: f64) void {
     if (!kernelProfOn()) return;
@@ -484,6 +580,8 @@ pub fn logKernelProfile(per: f64) void {
         if (i >= top) {
             other.dispatches += k.dispatches;
             other.total_ns += k.total_ns;
+            other.read_bytes += k.read_bytes;
+            other.write_bytes += k.write_bytes;
             more += 1;
             continue;
         }
@@ -499,7 +597,12 @@ fn logKernelLine(name: []const u8, k: KernelStat, per: f64) void {
     const log = @import("../log.zig");
     const n: f64 = @floatFromInt(k.dispatches);
     const ns: f64 = @floatFromInt(k.total_ns);
-    log.debug("[engine-prof] {s}: {d:.1} dispatches, {d:.3} ms total, {d:.2} us each\n", .{ name, n / per, ns / 1e6 / per, ns / 1e3 / @max(n, 1) });
+    const r: f64 = @floatFromInt(k.read_bytes);
+    const w: f64 = @floatFromInt(k.write_bytes);
+    var site: [site_frames * 19]u8 = undefined;
+    var sw = std.Io.Writer.fixed(&site);
+    for (k.site[0..k.site_n]) |addr| sw.print(" 0x{x}", .{fileAddress(addr)}) catch break;
+    log.debug("[engine-prof] {s}: {d:.1} dispatches, {d:.3} ms total, {d:.2} us each, reads {d:.0} B, writes {d:.0} B a forward; at{s}\n", .{ name, n / per, ns / 1e6 / per, ns / 1e3 / @max(n, 1), r / per, w / per, sw.buffered() });
 }
 
 // ── Handles ──
@@ -523,6 +626,11 @@ pub fn isOurs(a: mlx.mlx_array) bool {
 /// Where the memory `a`, a tensor of ours, lies in begins: its store's first byte, whatever view `a` is of it.
 pub fn storePointer(a: mlx.mlx_array) [*]const u8 {
     return of(a).store.ptr;
+}
+
+/// The store under `a` as a key, one a buffer: `storePointer` is its bytes, which every dry store shares (`dry_ptr`).
+pub fn storeKey(a: mlx.mlx_array) usize {
+    return @intFromPtr(of(a).store);
 }
 
 /// Whether `a`, a tensor of ours, lies over a mapping the engine wrapped (`wrapMapped`).
@@ -797,6 +905,52 @@ fn evict(s: *State, bytes: u64) bool {
     return s.stats.pool_bytes <= bytes;
 }
 
+/// Past a load's seal its narrow phases run on the arena it planned (docs/bill_redesign.md, part 9): an ask of the
+/// pool outside a wide phase is one the plan missed. `.refuse` fails it by name; `.census` counts it and serves it, a
+/// diagnostic that lists what a plan still leaves on the pool.
+pub const PoolGate = enum { open, census, refuse };
+
+pub fn closePool(gate: PoolGate) Error!void {
+    (try st()).pool_gate = gate;
+}
+
+/// The gate in force; `.open` before the engine begins, when there is no pool to gate.
+pub fn poolGate() PoolGate {
+    return if (state) |s| s.pool_gate else .open;
+}
+
+/// `closePool` from a model's turn (`route.turnToModel`): a closed gate begins the engine, so no ask made after passes
+/// it; an engine with no device has no pool to gate.
+pub fn gatePool(gate: PoolGate) void {
+    if (state == null and gate == .open) return;
+    const s = st() catch return;
+    s.pool_gate = gate;
+}
+
+/// A phase that asks the pool past the seal by design (a prefill, an encode, a capture or restore until each is
+/// planned): its asks pass the gate until `end`. Before the engine begins there is no gate to pass.
+pub const Wide = struct {
+    counted: bool,
+
+    pub fn end(w: Wide) void {
+        if (w.counted) state.?.wide -= 1;
+    }
+};
+
+pub fn widePhase() Wide {
+    const s = &(state orelse return .{ .counted = false });
+    s.wide += 1;
+    return .{ .counted = true };
+}
+
+fn gateAsk(len: usize) Error!void {
+    const s = &(state orelse return);
+    if (s.pool_gate == .open or s.wide > 0) return;
+    s.stats.closed_asks += 1;
+    s.stats.closed_ask_bytes += len;
+    if (s.pool_gate == .refuse) return error.PoolClosed;
+}
+
 /// The pool's cap in force: the in-use bytes when the budget went in plus the budget; null with none.
 pub fn poolLimit() ?u64 {
     return if (state) |s| s.pool_limit else null;
@@ -861,7 +1015,12 @@ fn dropStore(store: *Store) void {
     store.refs -= 1;
     if (store.refs > 0) return;
     const s = &state.?;
+    if (recordingOn()) noteDeath(store);
     switch (store.origin) {
+        .dry => |scratch| {
+            if (scratch) |b| freeDryScratch(b);
+            gpa.destroy(store);
+        },
         .pool => |class| {
             if (peakTraceOn()) _ = peak_live.remove(@intFromPtr(store));
             s.stats.pool_asked -= store.len;
@@ -880,6 +1039,9 @@ fn dropStore(store: *Store) void {
             }
             publishPool(s);
         },
+        .held => {},
+        .arena => |slot| dropArenaStore(store, slot),
+        .wide => |w| dropWideStore(store, w.at, w.len, w.host),
         // The buffer aliases pages someone else keeps: the last pass that binds it runs before they may go.
         .mlx, .mapped => if (store.seq > s.done) {
             s.retired.append(gpa, store) catch {
@@ -893,7 +1055,7 @@ fn dropStore(store: *Store) void {
 /// The end of a store over memory the pool does not own, once no pass binds it.
 fn freeAlias(s: *State, store: *Store) void {
     switch (store.origin) {
-        .pool => unreachable,
+        .pool, .held, .dry, .arena, .wide => unreachable,
         .mlx => |kept| _ = mlx.mlx_array_free(kept),
         .mapped => |m| {
             store.buffer.release();
@@ -941,6 +1103,10 @@ fn takeBack() void {
 /// has taken it.
 pub fn lend(t: *Tensor) Error!mlx.mlx_array {
     if (t.twin.ctx != null) return t.twin;
+    // A lent store dies on MLX's thread, at a time no recording can order.
+    if (plan.session.mode != .off) return refusing("a tensor lent to MLX inside a recording", error.TensorUnsupported);
+    if (t.store.escaped) return refusing("an arena store its execution left alive, lent to MLX", error.PlanEscape);
+    if (t.store.origin == .arena or t.store.origin == .wide) return refusing("an arena store lent to MLX: its bytes are an execution's", error.TensorUnsupported);
     if (mlx.engine.mlx_at_rest.on.load(.monotonic)) return error.MlxAtRest;
     if (t.offset != 0 or !t.rowContiguous() or t.pending != null) return error.NotRowContiguous;
     const s = try st();
@@ -1016,14 +1182,746 @@ pub fn fresh(dtype: Dtype, shape: []const c_int) Error!*Tensor {
     return freshFor(dtype, shape, false);
 }
 
+/// `fresh` for a launch's output (`kernel.launchWith`), as against its scratch: the tensor `into` named when one is
+/// armed, else a new ask. An elementwise op asks `fresh`: it is as often an input's copy or a cast inside another op.
+/// The ask an `into` takes is state-owned: the packer places none, so its levels are the owner store's.
+pub fn freshOut(dtype: Dtype, shape: []const c_int) Error!*Tensor {
+    const dst = into_next orelse return freshFor(dtype, shape, false);
+    into_next = null;
+    if (dst.dtype != dtype or !std.mem.eql(c_int, dst.dims(), shape) or !dst.rowContiguous() or dst.pending != null or dst.offset != 0)
+        return refusing("an op's output unlike the tensor `into` named for it", error.TensorShape);
+    const t = try share(dst);
+    errdefer release(t);
+    if (recordingOn()) _ = plan.session.recorder.?.ask(@max(t.nbytes(), 1), false, true) catch return error.OutOfMemory;
+    if (plan.session.mode == .replay) _ = plan.session.binder.?.ask(@max(t.nbytes(), 1), .external) catch |e| return planError(e);
+    into_taken = dst.store;
+    return t;
+}
+
+var into_next: ?*Tensor = null;
+var into_taken: ?*const Store = null;
+
+/// The tensor the next op's output is (`plan.into`): a state owner's, which the op writes and the forward holds nothing
+/// of after. `taken` with the op's result checks the op wrote there; `end` disarms it, on every path.
+pub fn into(dst: *Tensor) Error!Into {
+    if (into_next != null) return refusing("an `into` while another is armed", error.TensorUnsupported);
+    into_next = dst;
+    into_taken = null;
+    return .{};
+}
+
+/// The store an armed `into` names: a launch that reads it is refused (`kernel.launchWith`).
+pub fn intoArmed() ?*const Store {
+    return if (into_next) |t| t.store else null;
+}
+
+pub const Into = struct {
+    /// `result` must be the named tensor's bytes, its output asked through `freshOut`; an op whose output still comes
+    /// from `fresh` wrote somewhere else, refused by name.
+    pub fn taken(_: Into, result: *const Tensor) Error!void {
+        if (into_next != null) return refusing("an `into` that no op's output took", error.TensorUnsupported);
+        if (into_taken != result.store) return refusing("an op's result that is not the tensor `into` named", error.TensorUnsupported);
+    }
+
+    pub fn end(_: Into) void {
+        into_next = null;
+        into_taken = null;
+    }
+};
+
 fn freshFor(dtype: Dtype, shape: []const c_int, for_host: bool) Error!*Tensor {
     const t = try box();
     errdefer unbox(t);
     try setShape(t, shape);
     t.dtype = dtype;
     t.offset = 0;
-    t.store = try poolStore(@max(t.nbytes(), 1), for_host);
+    const len = @max(t.nbytes(), 1);
+    if (plan.session.mode == .replay) {
+        t.store = try arenaStore(len, for_host);
+    } else if (plan.session.mode == .wide) {
+        t.store = try wideStore(len, for_host);
+    } else if (dryOn()) {
+        t.store = try dryStore(len, for_host);
+    } else {
+        try gateAsk(len);
+        t.store = try poolStore(len, for_host);
+        const s = &state.?;
+        s.stats.asks += 1;
+        s.stats.ask_bytes += len;
+    }
+    t.store.plan_gen = 0;
+    t.store.wrote_gen = 0;
+    t.store.dry_written = false;
+    if (recordingOn()) {
+        errdefer dropStore(t.store);
+        t.store.plan_ref = plan.session.recorder.?.ask(len, for_host, false) catch return error.OutOfMemory;
+        t.store.plan_gen = recording.gen;
+    }
     return t;
+}
+
+// ── Recording (docs/bill_redesign.md#recorder) ──
+
+/// The engine's side of a recording: its generation, which tells its asks from an earlier recording's, and the levels
+/// of the stores its dispatches bound over the whole execution (D9): `dispatchLevel`'s rule on maps no pass cut clears,
+/// a store keyed by its ask, or by its address when it is from before the recording, until it dies.
+const Recording = struct {
+    gen: u32 = 0,
+    lv_write: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    lv_read: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    lv_whole: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// A level map could not grow: the recording's levels are short of some dispatches.
+    failed: bool = false,
+    /// Host reads of bytes the execution's dispatches wrote, and those of them a classified site made (`hostResult`).
+    readbacks: u32 = 0,
+    results: u32 = 0,
+    fill: Fill = .zeros,
+    /// The made-up bytes of a dry recording's classified readbacks, freed at its end.
+    made_up: std.ArrayList([]u8) = .empty,
+
+    fn deinit(r: *Recording) void {
+        for (r.made_up.items) |b| gpa.free(b);
+        r.made_up.deinit(gpa);
+        r.lv_write.deinit(gpa);
+        r.lv_read.deinit(gpa);
+        r.lv_whole.deinit(gpa);
+    }
+};
+var recording: Recording = .{};
+var recording_gens: u32 = 0;
+
+fn recordingOn() bool {
+    return plan.session.mode == .real or plan.session.mode == .dry;
+}
+
+/// Dry mode (`plan.Mode.dry`): every host decision runs and no GPU work does.
+pub fn dryOn() bool {
+    return plan.session.mode == .dry;
+}
+
+/// A dry recording's pipeline: none is looked up or made; a group may hold Metal's most threads.
+pub const dry_pipeline: metal.Pipeline = .{ .raw = null, .max_threads = 1024 };
+/// A dry pass's dispatches go nowhere: each is dropped as it is made.
+var dry_rec: metal.Recorder = .{};
+/// The address of a dry ask with no bytes, which nothing may read.
+const dry_ptr: [*]u8 = @ptrFromInt(page_bytes);
+
+/// A dry host ask this large takes whole pages, which the system hands out zeroed and backs only as they are touched:
+/// a state reserved for a long context is written by no host in a dry recording, and zeroing it each probe was most of
+/// a plan build's time.
+const dry_paged_min: usize = 64 << 10;
+
+fn dryScratch(len: usize) Error![]u8 {
+    if (len >= dry_paged_min) return std.heap.page_allocator.alloc(u8, len) catch error.OutOfMemory;
+    const b = gpa.alloc(u8, len) catch return error.OutOfMemory;
+    @memset(b, 0);
+    return b;
+}
+
+fn freeDryScratch(b: []u8) void {
+    if (b.len >= dry_paged_min) std.heap.page_allocator.free(b) else gpa.free(b);
+}
+
+/// Whether `t`'s bytes are a dry ask's, zeros until a host writes them (`dryStore`).
+pub fn dryFresh(t: *const Tensor) bool {
+    return t.store.origin == .dry;
+}
+
+fn dryStore(len: usize, for_host: bool) Error!*Store {
+    const store = gpa.create(Store) catch return error.OutOfMemory;
+    errdefer gpa.destroy(store);
+    // Zeros until its filler writes it, so a read before the fill gives the same bytes every run.
+    const scratch: ?[]u8 = if (for_host) try dryScratch(len) else null;
+    store.* = .{ .buffer = .{ .raw = null }, .at = 0, .ptr = if (scratch) |b| b.ptr else dry_ptr, .len = len, .origin = .{ .dry = scratch } };
+    return store;
+}
+
+/// The return addresses of the last dry host read refused (`DryReadback`): the site a classification is owed.
+pub var refused_readback: [8]usize = @splat(0);
+
+/// `t`'s bytes for a host read (`route.data`, `route.item`). In a recording, a read of bytes the execution's own
+/// dispatches wrote is a readback (D10): a real one reads them, a dry one has none and is refused by name; a read of
+/// bytes the host filled, or of state from before the recording, is a plain read.
+pub fn readBytes(t: *const Tensor) Error![]u8 {
+    if (!recordingOn()) return hostRead(t);
+    if (t.store.wrote_gen == recording.gen) {
+        recording.readbacks += 1;
+        if (!dryOn()) return hostRead(t);
+        refused_readback = @splat(0);
+        _ = std.debug.captureCurrentStackTrace(.{}, &refused_readback);
+        return refusing("a host read of bytes the dry execution's GPU work writes", error.DryReadback);
+    }
+    if (!dryOn()) return hostRead(t);
+    if (!t.rowContiguous()) return error.NotRowContiguous;
+    if (t.store.origin == .dry and t.store.origin.dry == null) return refusing("a host read of a dry tensor no host filled", error.DryReadback);
+    return (t.store.ptr + t.offset)[0..t.nbytes()];
+}
+
+/// Readbacks the running recording has made (D10), and those a classified site made.
+pub fn recordingReadbacks() struct { all: u32, results: u32 } {
+    return .{ .all = recording.readbacks, .results = recording.results };
+}
+
+/// A readback that steers no shape (`plan.hostResult`): `t`'s bytes, and in a dry recording made-up ones under its
+/// fill, zeros or the words 1, 2, 3, ... (each taken mod `below` when the site's values index something), so a dry
+/// recording under each fill holds the classification: two traces that differ prove the bytes steer a shape.
+pub fn hostResult(t: *const Tensor, below: ?u32) Error![]u8 {
+    if (!dryOn() or t.store.wrote_gen != recording.gen) {
+        if (recordingOn() and t.store.wrote_gen == recording.gen) recording.results += 1;
+        return readBytes(t);
+    }
+    if (!t.rowContiguous()) return error.NotRowContiguous;
+    recording.readbacks += 1;
+    recording.results += 1;
+    const b = gpa.alloc(u8, t.nbytes()) catch return error.OutOfMemory;
+    recording.made_up.append(gpa, b) catch {
+        gpa.free(b);
+        return error.OutOfMemory;
+    };
+    @memset(b, 0);
+    if (recording.fill == .ramp) for (std.mem.bytesAsSlice(u32, b[0 .. b.len / 4 * 4]), 0..) |*w, i| {
+        const v: u32 = @intCast((i + 1) & 0xffff_ffff);
+        w.* = if (below) |m| v % m else v;
+    };
+    return b;
+}
+
+fn recKey(store: *const Store) u64 {
+    return if (store.plan_gen == recording.gen) (@as(u64, 1) << 63) | (@as(u64, store.plan_ref.instance) << 32) | store.plan_ref.ordinal else @intFromPtr(store);
+}
+
+/// The store's last reference went: its ask died, or a store from before the recording leaves the maps, so that its
+/// address cannot lend a later store its levels.
+fn noteDeath(store: *const Store) void {
+    if (store.plan_gen == recording.gen) return plan.session.recorder.?.free(store.plan_ref);
+    const key: u64 = @intFromPtr(store);
+    _ = recording.lv_write.remove(key);
+    _ = recording.lv_read.remove(key);
+    _ = recording.lv_whole.remove(key);
+}
+
+/// The dispatch whose stores were just bound, at its level over the execution, given to the recorder for each ask it
+/// binds.
+fn noteDispatch(s: *State) void {
+    noteLevels(s) catch {
+        recording.failed = true;
+    };
+}
+
+fn noteLevels(s: *State) !void {
+    const r = &recording;
+    var lev: u32 = 0;
+    var it = s.next_in.keyIterator();
+    while (it.next()) |k| lev = @max(lev, r.lv_write.get(recKey(k.*)) orelse 0);
+    it = s.next_out.keyIterator();
+    while (it.next()) |k| {
+        const key = recKey(k.*);
+        const after = if (s.next_in.contains(k.*)) r.lv_write.get(key) orelse 0 else r.lv_whole.get(key) orelse 0;
+        lev = @max(lev, @max(after, r.lv_read.get(key) orelse 0));
+    }
+    lev += 1;
+    it = s.next_in.keyIterator();
+    while (it.next()) |k| {
+        touchAsk(k.*, lev);
+        if (s.next_out.contains(k.*)) continue;
+        const g = try r.lv_read.getOrPut(gpa, recKey(k.*));
+        g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
+    }
+    it = s.next_out.keyIterator();
+    while (it.next()) |k| {
+        k.*.wrote_gen = r.gen;
+        const key = recKey(k.*);
+        const g = try r.lv_write.getOrPut(gpa, key);
+        if (s.next_in.contains(k.*)) {
+            g.value_ptr.* = lev;
+            try r.lv_whole.put(gpa, key, lev);
+            _ = r.lv_read.remove(key);
+        } else {
+            g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
+            touchAsk(k.*, lev);
+        }
+    }
+}
+
+fn touchAsk(store: *const Store, lev: u32) void {
+    if (store.plan_gen == recording.gen) plan.session.recorder.?.touch(store.plan_ref, lev);
+}
+
+/// The made-up bytes a dry recording's classified readbacks read (`hostResult`): zeros, or a ramp of distinct words.
+pub const Fill = enum { zeros, ramp };
+
+/// How a recording runs: real, on the pool and the GPU (`plan.Mode.real`), or dry, no GPU work, its choices the
+/// driver's and its classified readbacks under `fill` (`plan.Mode.dry`).
+pub const How = union(enum) {
+    real,
+    dry: struct { driver: *plan.Driver, fill: Fill = .zeros },
+};
+
+/// From here to `endRecording` every ask, death and dispatch is `recorder`'s.
+pub fn beginRecording(how: How, recorder: *plan.Recorder) Error!void {
+    if (plan.session.mode != .off) return refusing("a recording inside an execution", error.TensorUnsupported);
+    if (into_next != null) return refusing("a recording begun with an `into` armed", error.TensorUnsupported);
+    const s = try st();
+    recording_gens += 1;
+    recording = .{ .gen = recording_gens };
+    switch (how) {
+        .real => plan.session = .{ .mode = .real, .recorder = recorder },
+        .dry => |d| {
+            // A dry recording starts with nothing of a real pass open or in flight.
+            try syncState(s);
+            recording.fill = d.fill;
+            plan.session = .{ .mode = .dry, .recorder = recorder, .driver = d.driver };
+        },
+    }
+}
+
+/// The recording's end; `OutOfMemory` when a level map could not grow, so its levels are short of some dispatches.
+pub fn endRecording() Error!void {
+    if (dryOn()) {
+        clearHazards(&state.?);
+        dry_rec.clear();
+    }
+    plan.session = .{};
+    into_next = null;
+    into_taken = null;
+    defer {
+        recording.deinit();
+        recording = .{};
+    }
+    if (recording.failed) return error.OutOfMemory;
+}
+
+// ── The arena (docs/bill_redesign.md#arena) ──
+
+/// The host ring's replicas: execution `k` fills replica `k mod ring_replicas`, so its host writes wait only for
+/// execution `k - ring_replicas` to have run.
+pub const ring_replicas = 2;
+
+/// The engine's one arena, `[host ring x replicas | scratch]`, made at a load's end and shared by every planned model:
+/// executions never overlap. An execution's asks are places in it that its binder gives.
+const Arena = struct {
+    buffer: metal.Buffer,
+    base: [*]u8,
+    layout: plan.binder.Layout,
+    binder: plan.Binder,
+    /// Per replica of the host ring, the last pass of the execution that filled it last.
+    ring_seq: [ring_replicas]u64 = @splat(0),
+    /// This execution's host asks have waited for their replica.
+    ring_ready: bool = false,
+    /// The arena stores alive now, each at its `live_at`: one alive when its execution ends escaped.
+    live: std.ArrayList(*Store) = .empty,
+    /// Escaped stores not yet dropped: the arena may not go under them.
+    escaped: u32 = 0,
+    spare: std.ArrayList(*Store) = .empty,
+    /// The planned loads that hold it (`arenaFor`): it goes with the last one's `arenaRelease`.
+    holders: u32 = 0,
+};
+var arena: ?Arena = null;
+var arena_total = std.atomic.Value(u64).init(0);
+
+/// The arena's bytes, readable off the inference thread: memory a load holds from its end, as it holds its weights.
+pub fn arenaTotal() u64 {
+    return arena_total.load(.monotonic);
+}
+
+/// The arena's layout; null before the first planned load.
+pub fn arenaLayout() ?plan.binder.Layout {
+    return if (arena) |ar| ar.layout else null;
+}
+
+/// Makes the arena `layout` asks for, at a planned load's end, which holds it until its `arenaRelease`; or keeps the one
+/// held where it holds each part at least as large: a second model takes the larger of each. Remade only between
+/// executions, the new buffer made before the old goes, so a refusal leaves the arena held as it was.
+pub fn arenaFor(layout: plan.binder.Layout) Error!void {
+    const s = try st();
+    if (plan.session.mode != .off) return refusing("an arena made inside a recording or an execution", error.TensorUnsupported);
+    if (layout.replicas != ring_replicas) return refusing("an arena of another number of ring replicas than the engine's", error.TensorUnsupported);
+    var want = layout;
+    var holders: u32 = 1;
+    if (arena) |*ar| {
+        if (ar.layout.alignment != layout.alignment or ar.layout.keep != layout.keep)
+            return refusing("an arena of another alignment or lease than the one held", error.TensorUnsupported);
+        if (layout.g <= ar.layout.g and layout.h <= ar.layout.h) {
+            ar.holders += 1;
+            return;
+        }
+        try arenaDroppable(ar);
+        want.g = @max(want.g, ar.layout.g);
+        want.h = @max(want.h, ar.layout.h);
+        holders += ar.holders;
+    }
+    const buffer = try s.dev.allocArena(want.arenaBytes());
+    if (arena != null) arenaDrop(s);
+    arena = .{ .buffer = buffer, .base = buffer.bytes().ptr, .layout = want, .binder = plan.Binder.init(gpa, want), .holders = holders };
+    arena_total.store(buffer.allocatedSize(), .monotonic);
+}
+
+/// A planned load lets go of the arena: it goes with the last holder, when none of its stores is alive.
+pub fn arenaRelease() Error!void {
+    const s = &(state orelse return);
+    const ar = &(arena orelse return);
+    if (ar.holders > 1) {
+        ar.holders -= 1;
+        return;
+    }
+    try arenaDroppable(ar);
+    arenaDrop(s);
+}
+
+fn arenaDroppable(ar: *const Arena) Error!void {
+    if (plan.session.mode == .replay) return refusing("the arena dropped inside an execution", error.TensorUnsupported);
+    if (ar.live.items.len > 0 or ar.escaped > 0) return refusing("the arena dropped while a store of it is alive", error.TensorUnsupported);
+}
+
+fn arenaDrop(s: *State) void {
+    const ar = &arena.?;
+    // The passes that bind it run before it goes; a pass that failed still ran.
+    syncState(s) catch {};
+    ar.buffer.release();
+    metal.commitResident();
+    for (ar.spare.items) |store| gpa.destroy(store);
+    ar.spare.deinit(gpa);
+    ar.live.deinit(gpa);
+    ar.binder.deinit();
+    arena = null;
+    arena_total.store(0, .monotonic);
+}
+
+/// The engine's mark: the open pass and the highest level of its dispatches so far; with no pass open, the next pass
+/// at level 0, which orders nothing (`plan_binder.zig`, "Order").
+fn markNow(s: *const State) u64 {
+    return (s.seq << 32) | (if (s.pass != null) s.pass_level_hi else 0);
+}
+
+fn sessionMark() u64 {
+    return markNow(&state.?);
+}
+
+/// The mark of an arena store's last dispatches: the next tenant of its bytes goes above them.
+fn markOf(store: *const Store) u64 {
+    return (store.level_seq << 32) | store.level_hi;
+}
+
+fn noteArenaLevel(store: *Store, seq: u64, lev: u32) void {
+    if (store.level_seq == seq) {
+        store.level_hi = @max(store.level_hi, lev);
+    } else {
+        store.level_seq = seq;
+        store.level_hi = lev;
+    }
+}
+
+fn planError(e: plan.binder.Error) Error {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.PlanMiss => refusing("an ask the plan did not foresee (the binder's miss names it)", error.PlanMiss),
+        error.PlanNeedsLease => error.PlanNeedsLease,
+    };
+}
+
+/// An execution of `root` on the arena begins: until `endExecution` (or `abortExecution`) every ask is a place the
+/// binder gives from `tables`, and one the plan did not foresee is refused by name (`executionMiss`), never allocated.
+pub fn beginExecution(tables: *const plan.pack.Tables, root: plan.FrameId) Error!void {
+    if (plan.session.mode != .off) return refusing("an execution begun inside a recording or another execution", error.TensorUnsupported);
+    if (into_next != null) return refusing("an execution begun with an `into` armed", error.TensorUnsupported);
+    const s = try st();
+    const ar = &(arena orelse return refusing("an execution with no arena made", error.TensorUnsupported));
+    if (tables.alignment != ar.layout.alignment) return refusing("tables packed at another alignment than the arena's", error.TensorUnsupported);
+    ar.binder.begin(tables, root, false, markNow(s)) catch |e| return planError(e);
+    ar.ring_ready = false;
+    plan.session = .{ .mode = .replay, .binder = &ar.binder, .mark = sessionMark };
+    s.stats.executions += 1;
+}
+
+/// The execution ended as it should: its root closes. A miss it met, or a store of it still alive, is `PlanMiss`.
+pub fn endExecution() Error!void {
+    const ar = &arena.?;
+    // A frame its code left open: the root cannot close over it.
+    if (ar.binder.stack.items.len != 1) {
+        ar.binder.refuse(.{ .kind = .structure, .id = ar.binder.innermost() }) catch {};
+        abortExecution();
+        return refusing("an execution ended with a frame still open", error.PlanMiss);
+    }
+    // A host-filled ask holds no slot the binder judges: alive past its execution, its replica is refilled under it.
+    if (ar.live.items.len > 0) ar.binder.refuse(.{ .kind = .lifetime, .id = ar.binder.innermost() }) catch {};
+    ar.binder.end() catch |e| {
+        leaveExecution(ar);
+        return planError(e);
+    };
+    leaveExecution(ar);
+}
+
+/// The execution failed: its frames go, and its stores still alive are escaped.
+pub fn abortExecution() void {
+    const ar = &arena.?;
+    ar.binder.abort();
+    leaveExecution(ar);
+}
+
+/// The first miss of the last execution: what was asked against what was recorded, where.
+pub fn executionMiss() ?plan.binder.Miss {
+    return if (arena) |ar| ar.binder.miss else null;
+}
+
+fn leaveExecution(ar: *Arena) void {
+    const s = &state.?;
+    if (comptime builtin.is_test) arena_check.ended(s, ar);
+    ar.ring_seq[ar.binder.replica()] = if (s.pass != null) s.seq else s.seq - 1;
+    for (ar.live.items) |store| store.escaped = true;
+    ar.escaped += @intCast(ar.live.items.len);
+    ar.live.clearRetainingCapacity();
+    plan.session = .{};
+    into_next = null;
+    into_taken = null;
+}
+
+// ── The wide region (D97, docs/bill_redesign.md): a prefill chunk's or an encode's execution ──
+
+/// A wide execution's placement in the arena: its scratch from the scratch's start by first fit, its host asks one after
+/// another in the host ring's replica. A place reused within the open pass goes above every dispatch that bound its
+/// bytes before, as an arena place does; the execution's first places go above everything the pass encoded before it.
+const Region = struct {
+    fit: plan.region.Fit = .{},
+    host_top: u64 = 0,
+    begin: u64 = 0,
+    replica: u32 = 0,
+    ring_ready: bool = false,
+};
+var region: Region = .{};
+
+pub const WideRefusal = struct { asked: u64, room: u64, host: bool };
+
+/// The first ask the open or last wide execution was refused (`WideFull`): what it wanted of the region a load holds,
+/// and the room there. An op behind MLX's C API reports any failure as its own, so the caller reads it here.
+pub var refused_wide: ?WideRefusal = null;
+
+/// A wide execution begins (D97): until `endWide` (or `abortWide`) every ask is a place in the arena's region, and one
+/// past it is refused by name (`WideFull`), never asked of the pool or of Metal.
+pub fn beginWide() Error!void {
+    if (plan.session.mode != .off) return refusing("a wide execution begun inside a recording or another execution", error.TensorUnsupported);
+    if (into_next != null) return refusing("a wide execution begun with an `into` armed", error.TensorUnsupported);
+    const s = try st();
+    const ar = &(arena orelse return refusing("a wide execution with no arena made", error.TensorUnsupported));
+    region.fit.gaps.clearRetainingCapacity();
+    region.fit.top = 0;
+    region.fit.top_mark = 0;
+    region.fit.high = 0;
+    region.host_top = 0;
+    region.begin = markNow(s);
+    // The host ring's replicas turn with every execution, planned or wide: each waits only for its replica's last.
+    region.replica = ar.binder.replica();
+    ar.binder.executions += 1;
+    region.ring_ready = false;
+    refused_wide = null;
+    plan.session = .{ .mode = .wide, .mark = sessionMark };
+    s.stats.wide_executions += 1;
+}
+
+/// The wide execution ended as it should: a store of it still alive is refused by name (`PlanEscape`), and escapes.
+pub fn endWide() Error!void {
+    const ar = &arena.?;
+    const alive = ar.live.items.len;
+    leaveWide(ar);
+    if (alive > 0) return refusing("a wide execution ended with a store of it still alive", error.PlanEscape);
+}
+
+/// The wide execution failed: its stores still alive escape.
+pub fn abortWide() void {
+    leaveWide(&arena.?);
+}
+
+fn leaveWide(ar: *Arena) void {
+    const s = &state.?;
+    const high = region.fit.high;
+    s.stats.wide_high = @max(s.stats.wide_high, high);
+    s.stats.wide_last_high = high;
+    ar.ring_seq[region.replica] = if (s.pass != null) s.seq else s.seq - 1;
+    for (ar.live.items) |store| store.escaped = true;
+    ar.escaped += @intCast(ar.live.items.len);
+    ar.live.clearRetainingCapacity();
+    plan.session = .{};
+    into_next = null;
+    into_taken = null;
+}
+
+fn wideStore(len: usize, for_host: bool) Error!*Store {
+    const s = &state.?;
+    const ar = &arena.?;
+    const place = std.mem.alignForward(u64, @max(len, 1), ar.layout.alignment);
+    var at: u64 = undefined;
+    var after: u64 = region.begin;
+    if (for_host) {
+        if (!region.ring_ready) {
+            const seq = ar.ring_seq[region.replica];
+            if (seq > s.done) try waitFor(s, seq);
+            region.ring_ready = true;
+        }
+        if (region.host_top + place > ar.layout.h) {
+            if (refused_wide == null) refused_wide = .{ .asked = region.host_top + place, .room = ar.layout.h, .host = true };
+            return refusing("a wide execution's host asks past the region the load holds", error.WideFull);
+        }
+        at = region.replica * ar.layout.h + region.host_top;
+        region.host_top += place;
+    } else {
+        const got = region.fit.take(place);
+        if (got.at + place > ar.layout.g) {
+            region.fit.give(gpa, got.at, got.at + place, got.mark) catch {};
+            if (refused_wide == null) refused_wide = .{ .asked = got.at + place, .room = ar.layout.g, .host = false };
+            return refusing("a wide execution's scratch past the region the load holds", error.WideFull);
+        }
+        at = ar.layout.h * ar.layout.replicas + got.at;
+        after = @max(after, got.mark);
+    }
+    errdefer if (!for_host) region.fit.give(gpa, at - ar.layout.h * ar.layout.replicas, at - ar.layout.h * ar.layout.replicas + place, after) catch {};
+    try ar.live.ensureUnusedCapacity(gpa, 1);
+    const store = ar.spare.pop() orelse (gpa.create(Store) catch return error.OutOfMemory);
+    store.* = .{ .buffer = ar.buffer, .at = at, .ptr = ar.base + at, .len = len, .origin = .{ .wide = .{ .at = at, .len = place, .host = for_host } } };
+    _ = s.lv_write.remove(store);
+    _ = s.lv_read.remove(store);
+    _ = s.lv_whole.remove(store);
+    const floor: u32 = @truncate(after);
+    if (after >> 32 == s.seq and floor > 0) {
+        try s.lv_write.ensureUnusedCapacity(gpa, 1);
+        try s.lv_read.ensureUnusedCapacity(gpa, 1);
+        try s.lv_whole.ensureUnusedCapacity(gpa, 1);
+        s.lv_write.putAssumeCapacity(store, floor);
+        s.lv_read.putAssumeCapacity(store, floor);
+        s.lv_whole.putAssumeCapacity(store, floor);
+        s.stats.arena_floors += 1;
+    }
+    store.live_at = @intCast(ar.live.items.len);
+    ar.live.appendAssumeCapacity(store);
+    s.stats.wide_asks += 1;
+    return store;
+}
+
+fn dropWideStore(store: *Store, at: u64, len: u64, host: bool) void {
+    const ar = &arena.?;
+    if (store.escaped) {
+        ar.escaped -= 1;
+    } else {
+        if (!host) region.fit.give(gpa, at - ar.layout.h * ar.layout.replicas, at - ar.layout.h * ar.layout.replicas + len, markOf(store)) catch {};
+        const last = ar.live.pop().?;
+        if (last != store) {
+            ar.live.items[store.live_at] = last;
+            last.live_at = store.live_at;
+        }
+    }
+    ar.spare.append(gpa, store) catch gpa.destroy(store);
+}
+
+/// A place in the arena for the next ask of the execution: scratch at its recorded offset, or a host-filled ask from
+/// this execution's replica of the host ring. Its first dispatch in the open pass goes above every dispatch that held
+/// its bytes before (`Got.after`): the level maps start it at that level.
+fn arenaStore(len: usize, for_host: bool) Error!*Store {
+    const s = &state.?;
+    const ar = &arena.?;
+    const got = ar.binder.ask(len, if (for_host) .host else .scratch) catch |e| return planError(e);
+    if (for_host and !ar.ring_ready) {
+        const seq = ar.ring_seq[ar.binder.replica()];
+        if (seq > s.done) try waitFor(s, seq);
+        ar.ring_ready = true;
+    }
+    // A place that fails from here is no store's: the binder gets it back, dead, and no record of it stays alive.
+    errdefer ar.binder.release(got.slot, 0);
+    try ar.live.ensureUnusedCapacity(gpa, 1);
+    const store = ar.spare.pop() orelse (gpa.create(Store) catch return error.OutOfMemory);
+    errdefer ar.spare.append(gpa, store) catch gpa.destroy(store);
+    store.* = .{ .buffer = ar.buffer, .at = got.offset, .ptr = ar.base + got.offset, .len = len, .origin = .{ .arena = got.slot } };
+    // A record reused while the open pass still names it carries its last tenant's levels.
+    _ = s.lv_write.remove(store);
+    _ = s.lv_read.remove(store);
+    _ = s.lv_whole.remove(store);
+    const floor: u32 = @truncate(got.after);
+    if (got.after >> 32 == s.seq and floor > 0) {
+        try s.lv_write.ensureUnusedCapacity(gpa, 1);
+        try s.lv_read.ensureUnusedCapacity(gpa, 1);
+        try s.lv_whole.ensureUnusedCapacity(gpa, 1);
+        s.lv_write.putAssumeCapacity(store, floor);
+        s.lv_read.putAssumeCapacity(store, floor);
+        s.lv_whole.putAssumeCapacity(store, floor);
+        s.stats.arena_floors += 1;
+    }
+    if (comptime builtin.is_test) if (got.slot.item != plan.trace_mod.none) try arena_check.handOut(s, ar, store, got.room, got.after);
+    store.live_at = @intCast(ar.live.items.len);
+    ar.live.appendAssumeCapacity(store);
+    s.stats.arena_asks += 1;
+    return store;
+}
+
+/// TEST-ONLY, the arena's `poison`: with `byte` set, a place is handed out over `byte` once every pass before it has run,
+/// and its guard (`plan_pack.Options.guard`) holds a canary. A canary found changed when its bytes are next handed out,
+/// or when its execution ends, counts in `hits`: a kernel wrote past its output. Compiled only under test.
+pub const arena_check = struct {
+    pub var byte: ?u8 = null;
+    pub var hits: u64 = 0;
+    /// Places handed out unpoisoned: a tenant before them is still in the open pass, which an op may be encoding.
+    pub var skipped: u64 = 0;
+    const canary: u8 = 0xA5;
+    /// A guard's bytes in the arena, and its store while that is alive.
+    const Guard = struct { lo: u64, hi: u64, store: ?*const Store };
+    var guards: std.ArrayList(Guard) = .empty;
+
+    fn handOut(s: *State, ar: *Arena, store: *const Store, place_bytes: u64, after: u64) Error!void {
+        const b = byte orelse return;
+        const lo = store.at;
+        const hi = lo + place_bytes;
+        // An op may ask for scratch with its pass open: only passes already handed over are waited for, never that one,
+        // so a place whose last tenant ran in the open pass goes unpoisoned. A mark at level 0 names no dispatch at all.
+        const ran = after >> 32 < s.seq or @as(u32, @truncate(after)) == 0;
+        if (ran and s.flying.items.len > 0) try waitFor(s, s.seq - 1);
+        var i: usize = 0;
+        while (i < guards.items.len) {
+            const g = guards.items[i];
+            if (g.store == null and g.lo < hi and lo < g.hi) {
+                if (ran) check(ar, g);
+                _ = guards.swapRemove(i);
+            } else i += 1;
+        }
+        if (!ran) {
+            skipped += 1;
+            return;
+        }
+        @memset(ar.base[lo..][0..store.len], b);
+        @memset(ar.base[lo + store.len .. hi], canary);
+        guards.append(gpa, .{ .lo = lo + store.len, .hi = hi, .store = store }) catch return error.OutOfMemory;
+    }
+
+    fn check(ar: *const Arena, g: Guard) void {
+        for (ar.base[g.lo..g.hi]) |c| if (c != canary) {
+            hits += 1;
+            return;
+        };
+    }
+
+    fn died(store: *const Store) void {
+        for (guards.items) |*g| if (g.store == store) {
+            g.store = null;
+        };
+    }
+
+    fn ended(s: *State, ar: *const Arena) void {
+        if (byte == null) return;
+        syncState(s) catch {};
+        for (guards.items) |g| check(ar, g);
+        guards.clearRetainingCapacity();
+    }
+};
+
+fn dropArenaStore(store: *Store, slot: plan.binder.Slot) void {
+    const ar = &arena.?;
+    if (comptime builtin.is_test) arena_check.died(store);
+    if (store.escaped) {
+        ar.escaped -= 1;
+    } else {
+        if (plan.session.mode == .replay) ar.binder.release(slot, markOf(store));
+        const last = ar.live.pop().?;
+        if (last != store) {
+            ar.live.items[store.live_at] = last;
+            last.live_at = store.live_at;
+        }
+    }
+    ar.spare.append(gpa, store) catch gpa.destroy(store);
 }
 
 /// `fresh` over a buffer no pass has yet to run over: the host may write it at once.
@@ -1044,6 +1942,31 @@ pub fn scalar(value: f64, dtype: Dtype) Error!*Tensor {
         },
         else => refusing("a host scalar of a dtype that is not float", error.TensorDtype),
     };
+}
+
+/// Words of the counter page (`counterPage`): the first `counter_words` are counters, the rest a counted launch's
+/// scratch.
+pub const counter_page_words = 8192;
+pub const counter_words = 256;
+
+/// A handle on the engine's counter page, u32 [counter_page_words], zero when Metal makes it and held for the process.
+/// Only a counted launch binds it (`kernel.launchCounted`), and each leaves the counters zero when it ends.
+pub fn counterPage() Error!*Tensor {
+    const s = try st();
+    if (s.counters == null) {
+        const t = try box();
+        errdefer unbox(t);
+        try setShape(t, &.{counter_page_words});
+        t.dtype = .uint32;
+        t.offset = 0;
+        const buffer = try s.dev.alloc(counter_page_words * 4);
+        errdefer buffer.release();
+        const store = gpa.create(Store) catch return error.OutOfMemory;
+        store.* = .{ .buffer = buffer, .at = 0, .ptr = buffer.bytes().ptr, .len = counter_page_words * 4, .origin = .held };
+        t.store = store;
+        s.counters = t;
+    }
+    return share(s.counters.?);
 }
 
 /// A tensor holding a copy of `bytes`.
@@ -1072,6 +1995,14 @@ pub fn wrapMapped(ptr: [*]u8, dtype: Dtype, shape: []const c_int, payload: ?*any
     t.store = store;
     s.stats.mapped_bytes += len;
     mapped_total.store(s.stats.mapped_bytes, .monotonic);
+    return t;
+}
+
+/// `wrapMapped` for a state owner's buffer (a request's `Media`): written in place by an op while it is sole, as the
+/// pool's are.
+pub fn wrapOwned(ptr: [*]u8, dtype: Dtype, shape: []const c_int, payload: ?*anyopaque, release_fn: MappedRelease) Error!*Tensor {
+    const t = try wrapMapped(ptr, dtype, shape, payload, release_fn);
+    t.store.origin.mapped.owned = true;
     return t;
 }
 
@@ -1134,6 +2065,8 @@ pub fn import(a: mlx.mlx_array) Error!*Tensor {
     // An array of no elements has no memory to share: its shape and dtype are all of it.
     const dims = mlx.getShape(a);
     for (dims) |d| if (d == 0) return fresh(mlx.mlx_array_dtype(a), dims);
+    if (dryOn()) return refusing("an MLX array met by a dry recording: MLX's work is never dry", error.TensorUnsupported);
+    if (plan.session.mode == .replay) return refusing("an MLX array met by an execution on the arena: MLX's memory is no part of the plan", error.TensorUnsupported);
     const s = try st();
     var available = false;
     try mlx.check(mlx._mlx_array_is_available(&available, a));
@@ -1192,14 +2125,15 @@ pub fn adopt(t: *Tensor, from: *Tensor) void {
 pub fn sole(store: *const Store) Error!bool {
     if (store.refs != 1) return false;
     switch (store.origin) {
-        .pool => return true,
+        .pool, .dry, .arena, .wide => return true,
         .mlx => |kept| {
             var only = false;
             try mlx.check(mlx._mlx_array_is_donatable(&only, kept));
             return only;
         },
-        // A wrapped mapping is its maker's (a weight): never written in place.
-        .mapped => return false,
+        // A wrapped mapping is its maker's (a weight), never written in place, but a state owner's own.
+        .mapped => |mp| return mp.owned,
+        .held => return false,
     }
 }
 
@@ -1230,6 +2164,11 @@ const kick_first = 4;
 /// then, so a pass grown by the kicks' doubling held every buffer it freed. MLX commits a command buffer by bytes too.
 pub const pass_freed_cap: u64 = 64 * 1024 * 1024;
 
+/// An execution's passes on the arena (docs/bill_redesign.md#arena): at most `dispatches` in one, since the pool's
+/// `pass_freed_cap` no longer cuts them and a pass the kicks' doubling grew would hold every reuse of the arena under a
+/// floor; and at most `passes` committed and unfinished, so Metal's memory for command buffers is bounded. Tests set them.
+pub var execution_pass_bounds: struct { dispatches: u32 = 512, passes: u32 = 16 } = .{};
+
 /// The most free bytes the pool keeps, MLX's cache limit beside it (`gpu_mem`): past it a freed buffer's size class is
 /// released at once, as MLX's cache releases past its own; null keeps every free buffer.
 pub var free_cap: ?u64 = null;
@@ -1241,12 +2180,11 @@ pub var free_cap: ?u64 = null;
 /// at the host's next wait. Never between a dispatch's binds and the dispatch.
 pub fn pass() Error!metal.Pass {
     const s = try st();
+    if (dryOn()) return .{ .pool = null, .cmd = null, .encoder = null, .rec = &dry_rec };
     if (s.pass) |open| {
         if (kernelProfOn() and s.pass_dispatches > 0) {
             s.pass = null;
             try commitPass(s, open);
-            try waitFor(s, s.seq - 1);
-            flushSpans(s);
         } else if (s.pass_dispatches >= s.kick_after and s.next_in.count() == 0 and s.next_out.count() == 0 and (s.burst or gpuIdle(s))) {
             s.pass = null;
             try commitPass(s, open);
@@ -1258,9 +2196,15 @@ pub fn pass() Error!metal.Pass {
             s.pass = null;
             try commitPass(s, open);
             s.stats.freed_kicks += 1;
+        } else if (plan.session.mode == .replay and s.pass_dispatches >= execution_pass_bounds.dispatches and s.next_in.count() == 0 and s.next_out.count() == 0) {
+            s.pass = null;
+            try commitPass(s, open);
+            s.stats.bound_kicks += 1;
         }
     }
-    if (s.pass == null) s.pass = s.dev.beginConcurrent();
+    if (s.pass == null) {
+        s.pass = s.dev.beginConcurrent(&s.rec);
+    }
     return s.pass.?;
 }
 
@@ -1272,14 +2216,15 @@ fn gpuIdle(s: *State) bool {
 /// Binds the bytes of `t`, which the dispatch being encoded reads, at `index` of the open pass.
 pub fn bind(p: metal.Pass, t: *const Tensor, index: usize) void {
     const s = &state.?;
-    s.next_in.put(gpa, t.store, {}) catch {
-        s.needs_barrier = true;
-    };
-    if (s.prev_out.contains(t.store)) s.needs_barrier = true;
+    const g = s.next_in.getOrPut(gpa, t.store) catch @panic("engine: out of memory tracking a pass");
+    if (dryOn()) return;
+    if (!g.found_existing and kernelProfOn()) s.pass_kernels.read += t.reach();
     bindBuffer(s, p, t, index);
 }
 
 fn bindBuffer(s: *State, p: metal.Pass, t: *const Tensor, index: usize) void {
+    if (t.store.origin == .dry or t.store.dry_written) @panic("engine: a real dispatch binds a store a dry recording made or wrote: reset the state it ran on");
+    if (t.store.escaped) @panic("engine: a dispatch binds an arena store its execution left alive: its bytes are another execution's");
     t.store.seq = s.seq;
     s.pass_binds.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
     if (t.store.origin == .mapped) {
@@ -1294,7 +2239,9 @@ fn bindBuffer(s: *State, p: metal.Pass, t: *const Tensor, index: usize) void {
 /// `bind` for bytes the dispatch being encoded writes.
 pub fn bindOut(p: metal.Pass, t: *const Tensor, index: usize) void {
     const s = &state.?;
-    bind(p, t, index);
+    s.next_in.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
+    if (dryOn()) return s.next_out.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
+    bindBuffer(s, p, t, index);
     bindOutTail(s, t);
 }
 
@@ -1303,55 +2250,101 @@ pub fn bindOut(p: metal.Pass, t: *const Tensor, index: usize) void {
 /// after waits for them all.
 pub fn bindOutDisjoint(p: metal.Pass, t: *const Tensor, index: usize) void {
     const s = &state.?;
+    if (dryOn()) return s.next_out.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
     bindBuffer(s, p, t, index);
     bindOutTail(s, t);
 }
 
 fn bindOutTail(s: *State, t: *const Tensor) void {
-    s.next_out.put(gpa, t.store, {}) catch {
-        s.needs_barrier = true;
-    };
-    if (s.prev_in.contains(t.store)) s.needs_barrier = true;
+    const g = s.next_out.getOrPut(gpa, t.store) catch @panic("engine: out of memory tracking a pass");
+    if (!g.found_existing and kernelProfOn()) s.pass_kernels.write += t.reach();
     s.pass_writes.put(gpa, t.store, {}) catch @panic("engine: out of memory tracking a pass");
 }
 
 fn beforeDispatch() void {
     const s = &state.?;
+    if (dryOn()) {
+        noteDispatch(s);
+        var it = s.next_out.keyIterator();
+        while (it.next()) |k| if (k.*.origin != .dry and (s.counters == null or k.* != s.counters.?.store)) {
+            k.*.dry_written = true;
+        };
+        s.next_in.clearRetainingCapacity();
+        s.next_out.clearRetainingCapacity();
+        dry_rec.clear();
+        return;
+    }
     s.stats.dispatches += 1;
     s.pass_dispatches += 1;
-    if (kernelProfOn()) s.pass_kernels.add(pipelineName(metal.bound_pipeline));
-    if (s.needs_barrier) {
-        s.pass.?.barrier();
-        s.stats.barriers += 1;
-        s.needs_barrier = false;
-        std.mem.swap(Stores, &s.prev_in, &s.next_in);
-        std.mem.swap(Stores, &s.prev_out, &s.next_out);
-    } else {
-        var it = s.next_in.keyIterator();
-        while (it.next()) |k| s.prev_in.put(gpa, k.*, {}) catch {};
-        it = s.next_out.keyIterator();
-        while (it.next()) |k| s.prev_out.put(gpa, k.*, {}) catch {};
+    if (kernelProfOn()) {
+        if (s.pass_kernels.n == 0) {
+            const trace = std.debug.captureCurrentStackTrace(.{}, &s.pass_kernels.site);
+            s.pass_kernels.site_n = @intCast(trace.return_addresses.len);
+        }
+        s.pass_kernels.add(pipelineName(metal.bound_pipeline));
     }
+    if (recordingOn()) noteDispatch(s);
+    s.rec.next_level = 2 * dispatchLevel(s);
     s.next_in.clearRetainingCapacity();
     s.next_out.clearRetainingCapacity();
 }
 
-/// Encodes the dispatch whose buffers were just bound, behind a barrier when it meets an earlier one's bytes.
+/// The level in the open pass of the dispatch whose stores were just bound (`State.rec`), noted for its stores.
+fn dispatchLevel(s: *State) u32 {
+    var lev: u32 = 0;
+    var it = s.next_in.keyIterator();
+    while (it.next()) |k| lev = @max(lev, s.lv_write.get(k.*) orelse 0);
+    it = s.next_out.keyIterator();
+    while (it.next()) |k| {
+        const after = if (s.next_in.contains(k.*)) s.lv_write.get(k.*) orelse 0 else s.lv_whole.get(k.*) orelse 0;
+        lev = @max(lev, @max(after, s.lv_read.get(k.*) orelse 0));
+    }
+    lev += 1;
+    s.pass_level_hi = @max(s.pass_level_hi, lev);
+    it = s.next_in.keyIterator();
+    while (it.next()) |k| {
+        if (k.*.origin == .arena or k.*.origin == .wide) noteArenaLevel(k.*, s.seq, lev);
+        if (s.next_out.contains(k.*)) continue;
+        const g = s.lv_read.getOrPut(gpa, k.*) catch @panic("engine: out of memory tracking a pass");
+        g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
+    }
+    it = s.next_out.keyIterator();
+    while (it.next()) |k| {
+        if (k.*.origin == .arena or k.*.origin == .wide) noteArenaLevel(k.*, s.seq, lev);
+        const g = s.lv_write.getOrPut(gpa, k.*) catch @panic("engine: out of memory tracking a pass");
+        if (s.next_in.contains(k.*)) {
+            g.value_ptr.* = lev;
+            s.lv_whole.put(gpa, k.*, lev) catch @panic("engine: out of memory tracking a pass");
+            _ = s.lv_read.remove(k.*);
+        } else g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
+    }
+    return lev;
+}
+
+/// Records the dispatch whose buffers were just bound, at its level in the pass.
 pub fn dispatch(p: metal.Pass, grid: metal.Size, group: metal.Size) void {
     beforeDispatch();
+    if (dryOn()) return;
     p.dispatch(grid, group);
     if (kernelDoubled()) {
-        p.barrier();
+        doubledLevel();
         p.dispatch(grid, group);
     }
+}
+
+/// A doubled dispatch runs after its first run and before the next level.
+fn doubledLevel() void {
+    const s = &state.?;
+    s.rec.next_level += 1;
 }
 
 /// `dispatch` with `grid` in threadgroups.
 pub fn dispatchGroups(p: metal.Pass, grid: metal.Size, group: metal.Size) void {
     beforeDispatch();
+    if (dryOn()) return;
     p.dispatchGroups(grid, group);
     if (kernelDoubled()) {
-        p.barrier();
+        doubledLevel();
         p.dispatchGroups(grid, group);
     }
 }
@@ -1441,6 +2434,7 @@ pub fn preloadedPipeline(name: []const u8, pipeline: metal.Pipeline) void {
 
 /// The pipeline of the kernel source `text`, entry point `function`: the one a manifest made ahead, else compiled now.
 pub fn pipelineFromSource(function: [:0]const u8, text: [:0]const u8) Error!metal.Pipeline {
+    if (dryOn()) return dry_pipeline;
     if (registry.takeSource(function, text)) |p| {
         preloadedPipeline(function, p);
         return p;
@@ -1462,6 +2456,10 @@ pub fn nowNs() u64 {
 /// and marks what it writes.
 fn commitPass(s: *State, open: metal.Pass) Error!void {
     if (fill_marks.live.load(.acquire) != 0) try refuseFillingReads(s, open);
+    // At most `passes` committed and unfinished once this one is: the open pass is not one of them, so no wait commits it.
+    if (plan.session.mode == .replay and s.flying.items.len >= execution_pass_bounds.passes)
+        try waitFor(s, s.flying.items[s.flying.items.len - execution_pass_bounds.passes].seq);
+    s.stats.barriers += open.replay();
     clearHazards(s);
     const fence = try s.dev.fence();
     errdefer fence.release();
@@ -1497,10 +2495,23 @@ fn commitPass(s: *State, open: metal.Pass) Error!void {
     clearPassBinds(s);
     s.flying.append(gpa, .{ .cmd = open.commit(), .fence = fence, .seq = s.seq, .phase = phase, .kernels = kernels }) catch return error.OutOfMemory;
     s.stats.commit_ns += nowNs() - t0;
+    s.stats.longest_pass = @max(s.stats.longest_pass, s.pass_dispatches);
     s.seq += 1;
     s.pass_dispatches = 0;
+    s.pass_level_hi = 0;
     s.pass_freed = 0;
     s.stats.submits += 1;
+    s.stats.most_flying = @max(s.stats.most_flying, s.flying.items.len);
+}
+
+/// The most dispatches one pass held and the most passes in flight at once since the last take; both start again.
+pub fn takePassHighs() struct { longest: u64, flying: u64 } {
+    const s = &(state orelse return .{ .longest = 0, .flying = 0 });
+    defer {
+        s.stats.longest_pass = 0;
+        s.stats.most_flying = 0;
+    }
+    return .{ .longest = s.stats.longest_pass, .flying = s.stats.most_flying };
 }
 
 /// A pass that binds bytes a host fill is still writing is dropped unrun: the GPU would read them half written.
@@ -1528,6 +2539,7 @@ fn refuseFillingReads(s: *State, open: metal.Pass) Error!void {
     clearPassBinds(s);
     s.pass_kernels = .{};
     s.pass_dispatches = 0;
+    s.pass_level_hi = 0;
     s.pass_freed = 0;
     return error.ReadsFillingSlab;
 }
@@ -1539,11 +2551,11 @@ fn clearPassBinds(s: *State) void {
 }
 
 fn clearHazards(s: *State) void {
-    s.prev_in.clearRetainingCapacity();
-    s.prev_out.clearRetainingCapacity();
+    s.lv_write.clearRetainingCapacity();
+    s.lv_read.clearRetainingCapacity();
+    s.lv_whole.clearRetainingCapacity();
     s.next_in.clearRetainingCapacity();
     s.next_out.clearRetainingCapacity();
-    s.needs_barrier = false;
 }
 
 /// Hands the open pass to the GPU without waiting for it.
@@ -1564,6 +2576,24 @@ pub fn openDispatches() u32 {
 /// Submits the open pass and waits until the GPU has run everything submitted.
 pub fn sync() Error!void {
     return syncState(try st());
+}
+
+/// The forward evaluated an array: a recording marks the wait, and a wide execution waits for every pass submitted
+/// and gives back its host ring's bytes past the highest host ask still alive (`plan_region`).
+pub fn evalPoint() Error!void {
+    if (recordingOn()) plan.session.recorder.?.wait() catch return error.OutOfMemory;
+    if (plan.session.mode != .wide) return;
+    try syncState(try st());
+    const ar = &arena.?;
+    const base = region.replica * ar.layout.h;
+    var top: u64 = 0;
+    for (ar.live.items) |store| switch (store.origin) {
+        .wide => |w| if (w.host) {
+            top = @max(top, w.at - base + w.len);
+        },
+        else => {},
+    };
+    region.host_top = top;
 }
 
 /// A store over an MLX array that waits for a pass of ours is freed now, its passes waited on. MLX's allocator goes to
@@ -1601,8 +2631,10 @@ fn readGpuSpans(s: *State, backlog: usize) void {
     for (s.untimed.items) |done| {
         const span = done.cmd.gpuSpan();
         if ((span[0] <= 0 or span[1] < span[0]) and s.untimed.items.len - n <= backlog) break;
+        // An op's time starts where the buffer before it ended: a buffer begun early waits there for its fence.
+        const from = @max(span[0], s.gpu_last_end);
         noteGpuSpan(s, span, done.phase);
-        if (done.kernels.n > 0 and span[0] > 0 and span[1] >= span[0]) noteKernels(done.kernels, @intFromFloat((span[1] - span[0]) * 1e9));
+        if (done.kernels.n > 0 and span[0] > 0 and span[1] >= span[0]) noteKernels(done.kernels, if (span[1] > from) @intFromFloat((span[1] - from) * 1e9) else 0);
         done.cmd.release();
         n += 1;
     }
@@ -1660,6 +2692,8 @@ fn waitFor(s: *State, upto_in: u64) Error!void {
     // A failed pass ends the rest for the caller, not for the GPU: the passes behind it run on, and each still binds
     // its buffers until it ends.
     if (failed != null) for (s.flying.items) |f| f.cmd.waitDone();
+    // A pass that failed may have stopped a counted launch part way: its counters start again from zero.
+    if (failed != null) if (s.counters) |c| @memset(c.store.ptr[0 .. counter_words * 4], 0);
     s.stats.wait_ns += nowNs() - t0;
     s.done = if (failed == null) upto else s.seq - 1;
     // Passes end in the order of their numbers: the ones behind that have ended too are done.
@@ -1713,6 +2747,9 @@ pub fn freshForHost(dtype: Dtype, shape: []const c_int) Error!*Tensor {
 /// may still be running. Row-contiguous tensors only. A host write takes `hostBytes`.
 pub fn hostRead(t: *const Tensor) Error![]u8 {
     if (!t.rowContiguous()) return error.NotRowContiguous;
+    // In a dry recording this is a wait (`mlx_array_eval`) and reads nothing.
+    if (!dryOn() and (t.store.origin == .dry or t.store.dry_written)) return refusing("a host read of a store a dry recording made or wrote: reset the state it ran on", error.DryStore);
+    if (t.store.escaped) return refusing("a host read of an arena store its execution left alive", error.PlanEscape);
     const s = try st();
     if (t.store.seq > s.done) {
         if (s.pass != null and s.pass_writes.contains(t.store)) {
@@ -1727,6 +2764,14 @@ pub fn hostRead(t: *const Tensor) Error![]u8 {
 /// `t`'s bytes on the host once every pass that binds them has run, for the host to write. Row-contiguous tensors only.
 pub fn hostBytes(t: *const Tensor) Error![]u8 {
     if (!t.rowContiguous()) return error.NotRowContiguous;
+    if (dryOn()) {
+        if (t.store.origin != .dry or t.store.origin.dry == null) return refusing("a host write in a dry recording into a tensor that is no host ask", error.DryHostWrite);
+        return (t.store.ptr + t.offset)[0..t.nbytes()];
+    }
+    // The host writes only what it filled: arena scratch is reused under the GPU's own order, which no host write follows.
+    if (t.store.origin == .wide and !t.store.origin.wide.host) return refusing("a host write into a wide execution's scratch", error.TensorUnsupported);
+    if (t.store.origin == .arena and t.store.origin.arena.item != plan.trace_mod.none) return refusing("a host write into the arena's scratch", error.TensorUnsupported);
+    if (t.store.escaped) return refusing("a host write into an arena store its execution left alive", error.PlanEscape);
     const s = try st();
     if (t.store.seq > s.done) try waitFor(s, t.store.seq);
     return (t.store.ptr + t.offset)[0..t.nbytes()];
@@ -1752,6 +2797,28 @@ test "a long open pass holds no more than it uses plus the bytes it may free bef
     defer release(x);
     const in_use = stats().pool_bytes - stats().pool_free;
     try t.expect(stats().pool_bytes - held0 <= in_use + pass_freed_cap + 2 * 8 * 1024 * 1024);
+}
+
+test "a pass encodes its dispatches by dependency level: two chains made one after the other run side by side, one barrier between their two levels" {
+    _ = metal.device() catch return error.SkipZigTest;
+    const ops = @import("ops.zig");
+    try sync();
+    var x = [2]*Tensor{ try fromHost(std.mem.sliceAsBytes(&[_]f32{ 1, 2, 3, 4 }), .float32, &.{4}), try fromHost(std.mem.sliceAsBytes(&[_]f32{ 5, 6, 7, 8 }), .float32, &.{4}) };
+    const b0 = stats().barriers;
+    // Made A1 A2 B1 B2 in one pass (the first kick comes after 4); encoded A1 B1 | A2 B2, where made order gave 2.
+    for (0..2) |c| for (0..2) |_| {
+        const y = try ops.binary(.add, x[c], x[c]);
+        release(x[c]);
+        x[c] = y;
+    };
+    try sync();
+    try std.testing.expectEqual(@as(u64, 1), stats().barriers - b0);
+    var got: [2][4]f32 = undefined;
+    for (x, &got) |t, *g| {
+        g.* = std.mem.bytesAsSlice(f32, try hostRead(t))[0..4].*;
+        release(t);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 4, 8, 12, 16, 20, 24, 28, 32 }, &@as([8]f32, @bitCast(got)));
 }
 
 test "the double switch is off at 0, off or empty, names a kernel by its text, and refuses a number or other characters" {
@@ -2129,3 +3196,650 @@ test "an MLX array imports fresh each time, and its store can still be written i
     try t.expect(try sole(x.store));
 }
 
+/// A test recording: its recorder and, dry, its driver.
+const TestRecording = struct {
+    recorder: plan.Recorder,
+    driver: plan.Driver,
+
+    fn begin(self: *TestRecording, dry: ?Fill) !void {
+        self.recorder = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
+        self.driver = .{ .gpa = std.testing.allocator };
+        try beginRecording(if (dry) |f| .{ .dry = .{ .driver = &self.driver, .fill = f } } else .real, &self.recorder);
+    }
+
+    fn deinit(self: *TestRecording) void {
+        self.driver.deinit();
+        self.recorder.deinit();
+    }
+};
+
+/// A forward in small: an op's output read back, then a scratch sized by the bytes read when `steer`.
+fn readThenAsk(steer: bool) !void {
+    const ops = @import("ops.zig");
+    const ones = [_]f32{ 1, 1, 1, 1 };
+    const a = try fromHost(std.mem.sliceAsBytes(&ones), .float32, &.{4});
+    defer release(a);
+    const sum = try ops.binary(.add, a, a);
+    defer release(sum);
+    const ids = try ops.astype(sum, .uint32);
+    defer release(ids);
+    const got = std.mem.bytesAsSlice(u32, try hostResult(ids, 8));
+    const scratch = try fresh(.float32, &.{@intCast(if (steer) 1 + got[0] else 4)});
+    release(scratch);
+}
+
+test "a dry recording refuses a host read of its own GPU work by name, and answers a classified one under its fill" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const ops = @import("ops.zig");
+    const ones = [_]f32{ 1, 1, 1 };
+    for ([_]Fill{ .zeros, .ramp }) |fill| {
+        var r: TestRecording = undefined;
+        try r.begin(fill);
+        defer r.deinit();
+        defer endRecording() catch {};
+        const a = try fromHost(std.mem.sliceAsBytes(&ones), .float32, &.{3});
+        defer release(a);
+        // Bytes the host filled read as they were filled.
+        try t.expectEqualSlices(u8, std.mem.sliceAsBytes(&ones), try readBytes(a));
+        const b = try ops.binary(.add, a, a);
+        defer release(b);
+        try t.expectError(error.DryReadback, readBytes(b));
+        const got = std.mem.bytesAsSlice(u32, try hostResult(b, 2));
+        try t.expectEqualSlices(u32, if (fill == .zeros) &.{ 0, 0, 0 } else &.{ 1, 0, 1 }, @alignCast(got));
+        try t.expectEqual(@as(u32, 2), recordingReadbacks().all);
+        try t.expectEqual(@as(u32, 1), recordingReadbacks().results);
+        try t.expectError(error.DryHostWrite, hostBytes(b));
+    }
+}
+
+test "two fills of a dry recording give one trace where a classified readback steers nothing, and part where it steers a size" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    for ([_]bool{ false, true }) |steer| {
+        var under: [2]TestRecording = undefined;
+        for (&under, [_]Fill{ .zeros, .ramp }) |*r, fill| {
+            try r.begin(fill);
+            defer endRecording() catch {};
+            try readThenAsk(steer);
+        }
+        defer for (&under) |*r| r.deinit();
+        const d = plan.trace_mod.firstDifference(under[0].recorder.instances.items, under[1].recorder.instances.items);
+        const want: ?plan.trace_mod.Difference = if (steer) .{ .instance = 0, .what = .asks, .at = 3 } else null;
+        try t.expectEqual(want, d);
+    }
+}
+
+test "a store a dry recording made, or wrote over, is refused by name where the host reads it after" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const ops = @import("ops.zig");
+    const ones = [_]f32{ 1, 2, 3, 4 };
+    const nine = [_]f32{9};
+    const one = try fromHost(std.mem.sliceAsBytes(&nine), .float32, &.{1});
+    defer release(one);
+    // A write pending from before the recording, on a store it alone holds: settled dry, it writes over that store.
+    const owed = blk: {
+        const a = try fromHost(std.mem.sliceAsBytes(&ones), .float32, &.{4});
+        defer release(a);
+        break :blk try ops.sliceUpdate(a, one, &.{0}, &.{1});
+    };
+    defer release(owed);
+    var r: TestRecording = undefined;
+    try r.begin(.zeros);
+    defer r.deinit();
+    const made = blk: {
+        defer endRecording() catch {};
+        try ops.settle(owed);
+        break :blk try ops.binary(.add, owed, owed);
+    };
+    defer release(made);
+    try t.expectError(error.DryStore, hostRead(made));
+    try t.expectError(error.DryStore, hostRead(owed));
+    // A store it only read stays the host's to read.
+    try t.expectEqualSlices(u8, std.mem.sliceAsBytes(&nine), try hostRead(one));
+}
+
+/// `run` recorded dry as an execution of root site 1, merged and packed by lifetimes.
+fn planOfTest(run: anytype) !plan.pack.Tables {
+    return planOfTestWith(run, .{ .level_rule = false });
+}
+
+fn planOfTestWith(run: anytype, options: plan.pack.Options) !plan.pack.Tables {
+    var r: TestRecording = undefined;
+    try r.begin(.zeros);
+    defer r.deinit();
+    {
+        defer endRecording() catch {};
+        try run.go();
+    }
+    var tr = try r.recorder.end();
+    defer tr.deinit();
+    var shapes = try plan.shape.merge(std.testing.allocator, &.{tr}, .{});
+    defer shapes.deinit();
+    return plan.pack.pack(std.testing.allocator, &shapes, options);
+}
+
+fn arenaOfTest(tables: *const plan.pack.Tables) !void {
+    try arenaFor(.{ .g = tables.g, .h = tables.h, .alignment = tables.alignment });
+}
+
+/// A forward in small, read out into `out`: `2a^2 + a` of the ramp `a`, with a scratch that dies before a later one is
+/// made, so its plan puts both on one place; `keep` leaves the result alive past the forward.
+const SmallForward = struct {
+    n: c_int,
+    out: []f32,
+    kept: ?*?*Tensor = null,
+
+    fn go(self: SmallForward) !void {
+        const ops = @import("ops.zig");
+        var ramp: [64]f32 = undefined;
+        for (&ramp, 0..) |*v, i| v.* = @floatFromInt(i);
+        const n: usize = @intCast(self.n);
+        const a = try fromHost(std.mem.sliceAsBytes(ramp[0..n]), .float32, &.{self.n});
+        defer release(a);
+        const b = try ops.binary(.add, a, a);
+        const c = blk: {
+            defer release(b);
+            break :blk try ops.binary(.multiply, b, a);
+        };
+        const d = blk: {
+            defer release(c);
+            break :blk try ops.binary(.add, c, a);
+        };
+        const got = std.mem.bytesAsSlice(f32, try hostResult(d, null));
+        for (self.out[0..n], got) |*o, v| o.* = v;
+        if (self.kept) |k| k.* = d else release(d);
+    }
+};
+
+test "arena: an execution gives the bytes of the pool and asks the pool for nothing" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [2][8]f32 = undefined;
+    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out[0] });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    try (SmallForward{ .n = 8, .out = &out[0] }).go();
+    try sync();
+    const before = stats();
+    try beginExecution(&tables, .{ .site = 1 });
+    try (SmallForward{ .n = 8, .out = &out[1] }).go();
+    try endExecution();
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+    try t.expectEqual(before.asks, stats().asks);
+    try t.expectEqual(before.pool_bytes, stats().pool_bytes);
+    try t.expect(stats().arena_asks > before.arena_asks);
+    // What the engine counts for the arena is what Metal holds for it: its layout, rounded to the device's pages.
+    try t.expectEqual(arena.?.buffer.allocatedSize(), arenaTotal());
+    const laid = arena.?.layout.arenaBytes();
+    try t.expect(arenaTotal() >= laid and arenaTotal() < laid + 16384);
+}
+
+/// Two products of one input where the second lands on the bytes of a scratch the first's reader still reads in the
+/// open pass: the pool runs the second beside the first, the arena after that reader.
+const Reuse = struct {
+    out: []f32,
+
+    fn go(self: Reuse) !void {
+        const ops = @import("ops.zig");
+        const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        const x = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+        defer release(x);
+        const a = try ops.binary(.add, x, x);
+        const c = blk: {
+            defer release(a);
+            break :blk try ops.binary(.multiply, a, a);
+        };
+        defer release(c);
+        const b = try ops.binary(.multiply, x, x);
+        defer release(b);
+        const d = try ops.binary(.add, c, b);
+        defer release(d);
+        const got = std.mem.bytesAsSlice(f32, try hostResult(d, null));
+        for (self.out, got) |*o, v| o.* = v;
+    }
+};
+
+test "arena: a place whose last tenant is still read in the open pass is written only after that read" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [2][8]f32 = undefined;
+    var tables = try planOfTest(Reuse{ .out = &out[0] });
+    defer tables.deinit();
+    const root = tables.get(.{ .site = 1 }).?;
+    // The fourth ask (x*x) takes the place of the second (x+x).
+    try t.expectEqual(root.asks[1].place.offset, root.asks[3].place.offset);
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    var barriers: [2]u64 = undefined;
+    for (&barriers, 0..) |*b, arm| {
+        try sync();
+        const before = stats();
+        if (arm == 1) try beginExecution(&tables, .{ .site = 1 });
+        try (Reuse{ .out = &out[arm] }).go();
+        if (arm == 1) try endExecution();
+        b.* = stats().barriers - before.barriers;
+        if (arm == 1) try t.expectEqual(before.arena_floors + 1, stats().arena_floors);
+    }
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+    // On the pool x*x runs beside x+x; on its bytes it waits for (x+x)^2, one level more.
+    try t.expectEqual(barriers[0] + 1, barriers[1]);
+}
+
+/// A host-filled ask and the GPU work on it, nothing read back: the execution's last pass may still be open at its end.
+const HostWrite = struct {
+    at: *usize,
+
+    fn go(self: HostWrite) !void {
+        const ops = @import("ops.zig");
+        const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        const x = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+        defer release(x);
+        self.at.* = x.store.at;
+        const y = try ops.binary(.add, x, x);
+        release(y);
+    }
+};
+
+test "arena: a host-filled ask writes its replica of the ring once the execution two before has run, and waits for nothing else" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var at: [3]usize = undefined;
+    var tables = try planOfTest(HostWrite{ .at = &at[0] });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    try sync();
+    var waits: [3]u64 = undefined;
+    for (&at, &waits) |*a, *w| {
+        const before = stats().waits;
+        try beginExecution(&tables, .{ .site = 1 });
+        try (HostWrite{ .at = a }).go();
+        try endExecution();
+        w.* = stats().waits - before;
+    }
+    try t.expectEqual(at[0], at[2]);
+    try t.expect(at[0] != at[1]);
+    // The second fills the other replica; the third the first's, whose GPU work it waits for once.
+    try t.expectEqualSlices(u64, &.{ 0, 0, 1 }, &waits);
+}
+
+test "arena: an ask past what the plan recorded is refused by name, and nothing is allocated for it" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [16]f32 = undefined;
+    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    try sync();
+    const before = stats();
+    try beginExecution(&tables, .{ .site = 1 });
+    try t.expectError(error.PlanMiss, (SmallForward{ .n = 16, .out = &out }).go());
+    abortExecution();
+    const miss = executionMiss().?;
+    try t.expectEqual(plan.binder.MissKind.oversize, miss.kind);
+    try t.expectEqual(@as(u64, 16 * 4), miss.asked);
+    try t.expectEqual(@as(u64, 8 * 4), miss.cap);
+    try t.expectEqual(before.asks, stats().asks);
+    try t.expectEqual(before.pool_bytes, stats().pool_bytes);
+}
+
+test "arena: a store alive when its execution ends is a miss, and a read of it after is refused by name" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [8]f32 = undefined;
+    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    var kept: ?*Tensor = null;
+    try beginExecution(&tables, .{ .site = 1 });
+    try (SmallForward{ .n = 8, .out = &out, .kept = &kept }).go();
+    try t.expectError(error.PlanMiss, endExecution());
+    try t.expectEqual(plan.binder.MissKind.lifetime, executionMiss().?.kind);
+    try t.expectError(error.PlanEscape, hostRead(kept.?));
+    try t.expectError(error.PlanEscape, lend(kept.?));
+    // A write owed from it to a tensor outside the execution is refused, never bound.
+    const ops = @import("ops.zig");
+    const zeros: [8]f32 = @splat(0);
+    const owner = try fromHost(std.mem.sliceAsBytes(&zeros), .float32, &.{8});
+    const owed = try ops.sliceUpdate(owner, kept.?, &.{0}, &.{8});
+    release(owner);
+    try t.expectError(error.PlanEscape, ops.settle(owed));
+    release(owed);
+    // The arena does not go while the escaped store is alive.
+    try t.expectError(error.TensorUnsupported, arenaRelease());
+    release(kept.?);
+    // A host-filled ask holds no place the binder judges: the engine finds it alive at the end.
+    var at: usize = 0;
+    var host_tables = try planOfTest(HostWrite{ .at = &at });
+    defer host_tables.deinit();
+    try arenaFor(.{ .g = host_tables.g, .h = host_tables.h, .alignment = host_tables.alignment });
+    defer arenaRelease() catch {};
+    try beginExecution(&host_tables, .{ .site = 1 });
+    const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const host = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+    release(try ops.binary(.add, host, host));
+    try t.expectError(error.PlanMiss, endExecution());
+    try t.expectEqual(plan.binder.MissKind.lifetime, executionMiss().?.kind);
+    try t.expectError(error.PlanEscape, hostRead(host));
+    release(host);
+}
+
+/// A chain of `n` one-dispatch ops on a vector of eight, read out into `out`.
+const Chain = struct {
+    n: usize,
+    out: []f32,
+
+    fn go(self: Chain) !void {
+        const ops = @import("ops.zig");
+        const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        var x = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+        defer release(x);
+        for (0..self.n) |_| {
+            const y = try ops.binary(.maximum, x, x);
+            release(x);
+            x = y;
+        }
+        const got = std.mem.bytesAsSlice(f32, try hostResult(x, null));
+        for (self.out, got) |*o, v| o.* = v;
+    }
+};
+
+test "arena: an execution hands a pass over at its bound on dispatches and waits while its bound on passes is in flight" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [2][8]f32 = undefined;
+    var tables = try planOfTest(Chain{ .n = 64, .out = &out[0] });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    const was = execution_pass_bounds;
+    execution_pass_bounds = .{ .dispatches = 8, .passes = 2 };
+    defer execution_pass_bounds = was;
+    var highs: [2]@TypeOf(takePassHighs()) = undefined;
+    for (&highs, 0..) |*h, arm| {
+        try sync();
+        _ = takePassHighs();
+        if (arm == 1) try beginExecution(&tables, .{ .site = 1 });
+        try (Chain{ .n = 64, .out = &out[arm] }).go();
+        if (arm == 1) try endExecution();
+        h.* = takePassHighs();
+    }
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+    // On the pool the kicks' doubling grows a pass past the bound; on the arena none passes it.
+    try t.expect(highs[0].longest > 8);
+    try t.expect(highs[1].longest <= 8);
+    try t.expect(highs[1].flying <= 2);
+}
+
+/// A scratch written one byte past its end after its dispatch ran, as a kernel that overruns its output would.
+const Overrun = struct {
+    fn go(_: Overrun) !void {
+        const ops = @import("ops.zig");
+        const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        const x = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+        defer release(x);
+        const y = try ops.binary(.add, x, x);
+        defer release(y);
+        if (dryOn()) return;
+        try sync();
+        y.store.ptr[y.store.len] = 0;
+    }
+};
+
+test "arena: with poison on, a write past a place is found by its canary, and a forward that writes only its own bytes gives the bytes of the pool" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    arena_check.byte = 0xFF;
+    defer arena_check.byte = null;
+    var over = try planOfTestWith(Overrun{}, .{ .level_rule = false, .guard = 256 });
+    defer over.deinit();
+    var out: [2][8]f32 = undefined;
+    var small = try planOfTestWith(SmallForward{ .n = 8, .out = &out[0] }, .{ .level_rule = false, .guard = 256 });
+    defer small.deinit();
+    try arenaFor(.{ .g = @max(over.g, small.g), .h = @max(over.h, small.h), .alignment = over.alignment });
+    defer arenaRelease() catch {};
+    const hits = arena_check.hits;
+    try beginExecution(&over, .{ .site = 1 });
+    try (Overrun{}).go();
+    try endExecution();
+    try t.expectEqual(hits + 1, arena_check.hits);
+    try (SmallForward{ .n = 8, .out = &out[0] }).go();
+    try beginExecution(&small, .{ .site = 1 });
+    try (SmallForward{ .n = 8, .out = &out[1] }).go();
+    try endExecution();
+    try t.expectEqual(hits + 1, arena_check.hits);
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+}
+
+/// A sum over 8192 floats: `reduce.all` asks for its partial sums with its pass already open.
+const SumAll = struct {
+    out: *f32,
+
+    fn go(self: SumAll) !void {
+        var vals: [8192]f32 = undefined;
+        for (&vals, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+        const x = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8192});
+        defer release(x);
+        const out = try fresh(.float32, &.{1});
+        defer release(out);
+        try @import("reduce.zig").all(.sum, x, out);
+        self.out.* = std.mem.bytesAsSlice(f32, try hostResult(out, null))[0];
+    }
+};
+
+test "arena: with poison on, an op that asks for scratch with its pass open keeps every dispatch it encodes" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var got: [2]f32 = undefined;
+    var tables = try planOfTestWith(SumAll{ .out = &got[0] }, .{ .level_rule = false, .guard = 256 });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    try (SumAll{ .out = &got[0] }).go();
+    arena_check.byte = 0xFF;
+    defer arena_check.byte = null;
+    try beginExecution(&tables, .{ .site = 1 });
+    try (SumAll{ .out = &got[1] }).go();
+    try endExecution();
+    try t.expectEqual(got[0], got[1]);
+}
+
+test "arena: an execution ended with a frame still open is refused by name, and the binder is idle after" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [8]f32 = undefined;
+    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
+    defer tables.deinit();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    try t.expectError(error.TensorUnsupported, arenaFor(.{ .g = tables.g, .h = tables.h, .alignment = tables.alignment, .replicas = 3 }));
+    try beginExecution(&tables, .{ .site = 1 });
+    // A frame no `end` closes: its code took the error path past its defer, or never had one.
+    plan.session.binder.?.enter(.{ .site = 9 }, .exact) catch {};
+    try t.expectError(error.PlanMiss, endExecution());
+    try t.expect(!arena.?.binder.active());
+    try beginExecution(&tables, .{ .site = 1 });
+    try (SmallForward{ .n = 8, .out = &out }).go();
+    try endExecution();
+}
+
+test "arena: its bytes count in the engine's live bytes from its making, as its weights do" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const gpu_mem = @import("../gpu_mem.zig");
+    var out: [8]f32 = undefined;
+    var tables = try planOfTest(SmallForward{ .n = 8, .out = &out });
+    defer tables.deinit();
+    try sync();
+    const before = gpu_mem.activeBytes();
+    const peak_before = gpu_mem.peakBytes();
+    try arenaOfTest(&tables);
+    defer arenaRelease() catch {};
+    try t.expect(arenaTotal() > 0);
+    try t.expectEqual(before + arenaTotal(), gpu_mem.activeBytes());
+    try t.expect(gpu_mem.peakBytes() >= peak_before + arenaTotal());
+}
+
+test "a closed pool refuses an ask by name and counts it, a census counts and serves it, and a wide phase opens it for its own asks" {
+    const t = std.testing;
+    _ = metal.device() catch return error.SkipZigTest;
+    defer closePool(.open) catch {};
+    const before = stats();
+    try closePool(.refuse);
+    try t.expectError(error.PoolClosed, fresh(.uint8, &.{64}));
+    try t.expectEqual(before.closed_asks + 1, stats().closed_asks);
+    try t.expectEqual(before.asks, stats().asks);
+    {
+        const wide = widePhase();
+        defer wide.end();
+        const a = try fresh(.uint8, &.{64});
+        release(a);
+    }
+    try t.expectEqual(before.closed_asks + 1, stats().closed_asks);
+    try t.expectError(error.PoolClosed, fresh(.uint8, &.{64}));
+    try closePool(.census);
+    const b = try fresh(.uint8, &.{128});
+    release(b);
+    try t.expectEqual(before.closed_asks + 3, stats().closed_asks);
+    try t.expectEqual(before.closed_ask_bytes + 64 + 64 + 128, stats().closed_ask_bytes);
+    try closePool(.open);
+    const c = try fresh(.uint8, &.{64});
+    release(c);
+    try t.expectEqual(before.closed_asks + 3, stats().closed_asks);
+}
+
+/// The region a forward asks by `plan.region.need` over its dry recording: what a wide execution of it places.
+fn regionOfTest(run: anytype) !plan.region.Need {
+    var r: TestRecording = undefined;
+    try r.begin(.zeros);
+    defer r.deinit();
+    {
+        defer endRecording() catch {};
+        try run.go();
+    }
+    var tr = try r.recorder.end();
+    defer tr.deinit();
+    return plan.region.need(std.testing.allocator, &tr, 256);
+}
+
+test "wide: an execution gives the bytes of the pool, asks the pool for nothing, and its scratch tops out where its recording's first fit says" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [2][64]f32 = undefined;
+    const need = try regionOfTest(SmallForward{ .n = 64, .out = &out[0] });
+    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
+    defer arenaRelease() catch {};
+    try (SmallForward{ .n = 64, .out = &out[0] }).go();
+    try sync();
+    const before = stats();
+    try beginWide();
+    try (SmallForward{ .n = 64, .out = &out[1] }).go();
+    try endWide();
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+    try t.expectEqual(before.asks, stats().asks);
+    try t.expectEqual(before.pool_bytes, stats().pool_bytes);
+    try t.expect(stats().wide_asks > before.wide_asks);
+    try t.expectEqual(need.scratch, stats().wide_high);
+}
+
+test "wide: a gap reused while its last tenant is still read in the open pass is written only after that read" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var out: [2][8]f32 = undefined;
+    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
+    defer arenaRelease() catch {};
+    var barriers: [2]u64 = undefined;
+    for (&barriers, 0..) |*b, arm| {
+        try sync();
+        const before = stats();
+        if (arm == 1) try beginWide();
+        try (Reuse{ .out = &out[arm] }).go();
+        if (arm == 1) try endWide();
+        b.* = stats().barriers - before.barriers;
+        if (arm == 1) try t.expect(stats().arena_floors > before.arena_floors);
+    }
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+    // On the pool x*x runs beside x+x; on its bytes it waits for (x+x)^2, one level more.
+    try t.expectEqual(barriers[0] + 1, barriers[1]);
+}
+
+test "wide: an ask past the region is refused by name and takes nothing; a store alive at the end is refused by name" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    try arenaFor(.{ .g = 8 << 10, .h = 4 << 10 });
+    defer arenaRelease() catch {};
+    const before = stats();
+    try beginWide();
+    const a = try fresh(.uint8, &.{6 << 10});
+    try t.expectError(error.WideFull, fresh(.uint8, &.{4 << 10}));
+    try t.expectEqual(@as(u64, 8 << 10), refused_wide.?.room);
+    try t.expect(!refused_wide.?.host);
+    try t.expectError(error.WideFull, freshHost(.uint8, &.{8 << 10}));
+    // The first refusal is the one kept.
+    try t.expect(!refused_wide.?.host);
+    try t.expectError(error.PlanEscape, endWide());
+    release(a);
+    try t.expectEqual(before.asks, stats().asks);
+    try t.expectEqual(before.pool_bytes, stats().pool_bytes);
+}
+
+const HostAfterWait = struct {
+    at: *[2]usize,
+
+    fn go(self: HostAfterWait) !void {
+        const ops = @import("ops.zig");
+        const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+        const x = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+        self.at[0] = x.store.at;
+        const y = try ops.binary(.add, x, x);
+        release(x);
+        try evalPoint();
+        const z = try fromHost(std.mem.sliceAsBytes(&vals), .float32, &.{8});
+        self.at[1] = z.store.at;
+        const w = try ops.binary(.add, y, z);
+        release(y);
+        release(z);
+        try evalPoint();
+        release(w);
+    }
+};
+
+test "wide: a host-filled ask after an eval takes the host bytes of the asks dead before it, as its recording's region says" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var at: [2]usize = undefined;
+    const need = try regionOfTest(HostAfterWait{ .at = &at });
+    try t.expectEqual(@as(u64, 256), need.host);
+    try arenaFor(.{ .g = 64 << 10, .h = 16 << 10 });
+    defer arenaRelease() catch {};
+    try beginWide();
+    try (HostAfterWait{ .at = &at }).go();
+    try endWide();
+    try t.expectEqual(at[0], at[1]);
+}
+
+test "wide: a host-filled ask takes the host ring's replica of its execution, its scratch the region past the ring" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    try arenaFor(.{ .g = 64 << 10, .h = 16 << 10 });
+    defer arenaRelease() catch {};
+    var at: [2]usize = undefined;
+    for (&at) |*x| {
+        try beginWide();
+        try (HostWrite{ .at = x }).go();
+        try endWide();
+    }
+    // Two executions fill the two replicas in turn.
+    try t.expect(at[0] < 2 * (16 << 10) and at[1] < 2 * (16 << 10));
+    try t.expect(at[0] / (16 << 10) != at[1] / (16 << 10));
+    try beginWide();
+    const s = try fresh(.float32, &.{8});
+    try t.expect(s.store.at >= 2 * (16 << 10));
+    release(s);
+    try endWide();
+}

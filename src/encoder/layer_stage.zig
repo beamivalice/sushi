@@ -3,6 +3,7 @@ const api = @import("sushi_exl3");
 const format = api.format;
 const pack = @import("pack.zig");
 const shard = @import("shard.zig");
+const source = @import("source.zig");
 
 const trunk_prefix = "language_model.model.layers.";
 
@@ -52,8 +53,22 @@ pub const PackMap = struct {
                 errdefer allocator.free(dtype);
                 const start: u64 = @intCast(offs[0].integer);
                 const end: u64 = @intCast(offs[1].integer);
+                const entry = PackTensor{ .file = fi, .at = 8 + header_len + start, .len = end - start, .dtype = dtype, .shape = shape };
                 try self.map.ensureUnusedCapacity(1);
-                self.map.putAssumeCapacity(try allocator.dupe(u8, e.key_ptr.*), .{ .file = fi, .at = 8 + header_len + start, .len = end - start, .dtype = dtype, .shape = shape });
+                const slot = self.map.getOrPutAssumeCapacity(e.key_ptr.*);
+                if (slot.found_existing) {
+                    const keep_new = isRerounded(name);
+                    const lose = if (keep_new) slot.value_ptr.* else entry;
+                    allocator.free(lose.dtype);
+                    allocator.free(lose.shape);
+                    if (keep_new) slot.value_ptr.* = entry;
+                    continue;
+                }
+                slot.key_ptr.* = allocator.dupe(u8, e.key_ptr.*) catch |err| {
+                    _ = self.map.remove(e.key_ptr.*);
+                    return err;
+                };
+                slot.value_ptr.* = entry;
             }
         }
         return self;
@@ -69,6 +84,14 @@ pub const PackMap = struct {
         self.map.deinit();
         for (self.files) |f| self.allocator.free(f);
         self.allocator.free(self.files);
+    }
+
+    pub fn bytes(self: *const PackMap, allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
+        const t = self.map.get(name) orelse return error.TensorMissing;
+        const out = try allocator.alloc(u8, @intCast(t.len));
+        errdefer allocator.free(out);
+        try self.read(io, t, out);
+        return out;
     }
 
     fn read(self: *const PackMap, io: std.Io, t: PackTensor, dst: []u8) !void {
@@ -90,6 +113,11 @@ pub const PackMap = struct {
         return names.toOwnedSlice(allocator);
     }
 };
+
+/// A shard of re-rounded trunk linears: its tensors replace the same names in the trunk shards they came from.
+pub fn isRerounded(file_name: []const u8) bool {
+    return std.mem.startsWith(u8, file_name, "trunk-");
+}
 
 fn isLayerTensor(name: []const u8) bool {
     return std.mem.startsWith(u8, name, trunk_prefix);
@@ -166,11 +194,33 @@ pub const Stage = struct {
     trunk_bits: u32,
     trunk_group: u32,
     overrides: []const pack.Override,
-    has_ngram: bool,
+    /// The pack's n-gram table, linked into the staged layer; null when the pack has none.
+    ngram: ?pack.NgramSpec,
     eq: pack.ExpertQuantSpec,
+    /// This layer's trunk linears staged from memory in place of the pack's.
+    linears: []const Linear = &.{},
 
-    pub const Experts = union(enum) { shard: []const u8, placeholder };
+    /// `source_bf16`: the layer's routed experts as the source holds them, BF16 and unquantized, so the staged layer
+    /// is the BF16 model's; `perm` is the pack's router order (stored row i is source expert `perm[i]`).
+    pub const Experts = union(enum) { shard: []const u8, placeholder, source_bf16: SourceBf16 };
+    pub const SourceBf16 = struct { src: *const source.SafetensorsSource, perm: ?[]const u32 = null };
 };
+
+/// A trunk linear by its served base name: a dense `.weight` alone, or affine with `.scales` and `.biases`.
+pub const Linear = struct {
+    base: []const u8,
+    weight: Part,
+    scales: ?Part = null,
+    biases: ?Part = null,
+
+    pub const Part = struct { dtype: []const u8, shape: [2]usize, bytes: []const u8 };
+};
+
+fn isReplaced(linears: []const Linear, name: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    for (linears) |l| if (std.mem.eql(u8, l.base, name[0..dot])) return true;
+    return false;
+}
 
 fn patchedSourceConfig(allocator: std.mem.Allocator, stage: Stage) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -192,6 +242,61 @@ fn patchedSourceConfig(allocator: std.mem.Allocator, stage: Stage) ![]u8 {
     try root.put(a, "text_config", .{ .object = text });
     try root.put(a, "language_model_only", .{ .bool = true });
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{});
+}
+
+/// The source's fused `gate_up_proj` [E, 2I, H] (gate rows first) and `down_proj` [E, H, I] of `layer`, written as
+/// the served layer 0's dense `switch_mlp` gate, up and down weights in `experts.safetensors`.
+fn writeSourceExperts(allocator: std.mem.Allocator, io: std.Io, src: *const source.SafetensorsSource, perm: ?[]const u32, layer: u32, dir: std.Io.Dir, names_out: *std.ArrayList([]u8)) !void {
+    var key_buf: [128]u8 = undefined;
+    const gu = src.tensors.get(try std.fmt.bufPrint(&key_buf, "model.language_model.layers.{d}.mlp.experts.gate_up_proj", .{layer})) orelse return error.SourceExpertsMissing;
+    const dn = src.tensors.get(try std.fmt.bufPrint(&key_buf, "model.language_model.layers.{d}.mlp.experts.down_proj", .{layer})) orelse return error.SourceExpertsMissing;
+    if (!std.mem.eql(u8, gu.dtype, "BF16") or !std.mem.eql(u8, dn.dtype, "BF16") or gu.shape.len != 3 or dn.shape.len != 3) return error.SourceExpertsMissing;
+    const e = gu.shape[0];
+    const inter = gu.shape[1] / 2;
+    const hidden = gu.shape[2];
+    if (gu.shape[1] != 2 * inter or dn.shape[0] != e or dn.shape[1] != hidden or dn.shape[2] != inter) return error.SourceExpertsMissing;
+    if (perm) |p| {
+        if (p.len != e) return error.SourceExpertsMissing;
+        for (p) |from| if (from >= e) return error.SourceExpertsMissing;
+    }
+    const half = inter * hidden * 2;
+    const parts = [_]struct { name: []const u8, shape: [3]usize }{
+        .{ .name = "gate_proj", .shape = .{ e, inter, hidden } },
+        .{ .name = "up_proj", .shape = .{ e, inter, hidden } },
+        .{ .name = "down_proj", .shape = .{ e, hidden, inter } },
+    };
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(allocator);
+    try header.append(allocator, '{');
+    for (parts, 0..) |part, i| {
+        if (i != 0) try header.append(allocator, ',');
+        try header.print(allocator, "\"{s}.layers.0.mlp.switch_mlp.{s}.weight\":{{\"dtype\":\"BF16\",\"shape\":[{d},{d},{d}],\"data_offsets\":[{d},{d}]}}", .{ shard.trunk_prefix, part.name, part.shape[0], part.shape[1], part.shape[2], i * e * half, (i + 1) * e * half });
+    }
+    try header.append(allocator, '}');
+    while (header.items.len % 8 != 0) try header.append(allocator, ' ');
+    var f = try dir.createFile(io, "experts.safetensors", .{});
+    defer f.close(io);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, header.items.len, .little);
+    try f.writePositionalAll(io, &len, 0);
+    try f.writePositionalAll(io, header.items, 8);
+    const data_at = 8 + header.items.len;
+    const buf = try allocator.alloc(u8, half);
+    defer allocator.free(buf);
+    for (0..e) |x| {
+        const from: usize = if (perm) |p| p[x] else x;
+        for (0..2) |which| {
+            try src.readRange(gu, (2 * from + which) * half, buf);
+            try f.writePositionalAll(io, buf, data_at + (which * e + x) * half);
+        }
+        try src.readRange(dn, from * half, buf);
+        try f.writePositionalAll(io, buf, data_at + (2 * e + x) * half);
+    }
+    for (parts) |part| {
+        const name = try std.fmt.allocPrint(allocator, "{s}.layers.0.mlp.switch_mlp.{s}.weight", .{ shard.trunk_prefix, part.name });
+        errdefer allocator.free(name);
+        try names_out.append(allocator, name);
+    }
 }
 
 fn copyRenamedShard(allocator: std.mem.Allocator, io: std.Io, src_dir: std.Io.Dir, src_name: []const u8, dst_dir: std.Io.Dir, dst_name: []const u8, layer: u32, names_out: *std.ArrayList([]u8)) !void {
@@ -303,6 +408,7 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
         const is_own = li == stage.layer;
         const is_ple = li == stage.ple_layer and std.mem.indexOf(u8, name, ".ple.") != null and stage.layer != stage.ple_layer;
         if (!is_own and !is_ple) continue;
+        if (is_own and isReplaced(stage.linears, name)) continue;
         const t = map.map.get(name).?;
         const raw = try allocator.alloc(u8, @intCast(t.len));
         defer allocator.free(raw);
@@ -312,6 +418,18 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
         try b.add(new_name, t.dtype, t.shape, raw);
         try layer_names.ensureUnusedCapacity(allocator, 1);
         layer_names.appendAssumeCapacity(try allocator.dupe(u8, new_name));
+    }
+    for (stage.linears) |l| {
+        for ([_]?Linear.Part{ l.weight, l.scales, l.biases }, [_][]const u8{ "weight", "scales", "biases" }) |part, suffix| {
+            const p = part orelse continue;
+            var full_buf: [240]u8 = undefined;
+            const new_name = try renamePrefix(allocator, try std.fmt.bufPrint(&full_buf, "{s}.{s}", .{ l.base, suffix }), stage.layer, null);
+            defer allocator.free(new_name);
+            try b.add(new_name, p.dtype, &p.shape, p.bytes);
+            const kept = try allocator.dupe(u8, new_name);
+            errdefer allocator.free(kept);
+            try layer_names.append(allocator, kept);
+        }
     }
     try b.flush(io, dir, "trunk.safetensors", &.{.{ "format", "mlx" }});
     for (layer_names.items) |n| try appendIndexEntry(allocator, &index, n, "trunk.safetensors");
@@ -344,6 +462,7 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
             defer root_map_dir.close(io);
             try copyRenamedShard(allocator, io, root_map_dir, "layer-0.safetensors", dir, "experts.safetensors", 0, &expert_names);
         },
+        .source_bf16 => |sb| try writeSourceExperts(allocator, io, sb.src, sb.perm, stage.layer, dir, &expert_names),
     }
     for (expert_names.items) |n| try appendIndexEntry(allocator, &index, n, "experts.safetensors");
 
@@ -353,11 +472,11 @@ pub fn stageLayer(allocator: std.mem.Allocator, io: std.Io, map: *const PackMap,
 
     const patched = try patchedSourceConfig(allocator, stage);
     defer allocator.free(patched);
-    const config = try pack.buildConfig(allocator, patched, stage.trunk_bits, stage.trunk_group, renamed.items, if (stage.has_ngram) pack.NgramSpec{} else null, stage.eq);
+    const config = try pack.buildConfig(allocator, patched, stage.trunk_bits, stage.trunk_group, renamed.items, stage.ngram, if (stage.experts == .source_bf16) null else stage.eq);
     defer allocator.free(config);
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
 
-    if (stage.has_ngram) {
+    if (stage.ngram != null) {
         var ng_buf: [std.fs.max_path_bytes]u8 = undefined;
         try link(io, dir, try std.fmt.bufPrint(&ng_buf, "{s}/ngram_table.bin", .{stage.pack_abs}), "ngram_table.bin");
     }
@@ -420,7 +539,7 @@ fn fixtureStage(fx: *const StageFixture, layer: u32, kind: Kind, experts: Stage.
         .trunk_bits = 8,
         .trunk_group = 64,
         .overrides = &.{},
-        .has_ngram = true,
+        .ngram = .{ .bits = 16, .group = 0 },
         .eq = .{ .k_text = "2", .codebook = "mcg", .window = 12 },
     };
 }
@@ -458,7 +577,10 @@ test "layer_stage: one layer of a pack becomes a one-layer model whose names, in
     try t.expectEqual(@as(i64, 1), text.get("ple_layer_ids").?.array.items[0].integer);
     try t.expectEqual(@as(i64, 0), text.get("mtp_num_hidden_layers").?.integer);
     try t.expect(cfg.value.object.get("expert_quant") != null);
-    try t.expect(cfg.value.object.get("ngram_table") != null);
+    // The staged layer states the pack's own n-gram table, here an unquantized one.
+    const ngram = cfg.value.object.get("ngram_table").?.object;
+    try t.expectEqual(@as(i64, 16), ngram.get("bits").?.integer);
+    try t.expectEqual(@as(i64, 0), ngram.get("group_size").?.integer);
 
     const idx_raw = try stage.readFileAlloc(io, "model.safetensors.index.json", t.allocator, .limited(1 << 20));
     defer t.allocator.free(idx_raw);
@@ -509,4 +631,48 @@ test "layer_stage: one layer of a pack becomes a one-layer model whose names, in
     defer cc.deinit();
     try t.expectEqual(@as(i64, 1000), cc.value.object.get("text_config").?.object.get("full_attention_interval").?.integer);
     try cap.access(io, "trunk.safetensors", .{});
+}
+
+test "layer_stage: the BF16 stage's routed experts are the source's, in the pack's router order" {
+    const t = std.testing;
+    const io = t.io;
+    var work = t.tmpDir(.{});
+    defer work.cleanup();
+    try work.dir.createDirPath(io, "src");
+    var src_dir = try work.dir.openDir(io, "src", .{ .iterate = true });
+    defer src_dir.close(io);
+    try driver.writeTinySource(t.allocator, io, src_dir);
+    var src = try source.SafetensorsSource.open(t.allocator, io, src_dir);
+    defer src.deinit();
+    var names = std.ArrayList([]u8).empty;
+    defer {
+        for (names.items) |n| t.allocator.free(n);
+        names.deinit(t.allocator);
+    }
+    const perm = [_]u32{ 1, 0 };
+    try writeSourceExperts(t.allocator, io, &src, &perm, 1, work.dir, &names);
+
+    const raw = try work.dir.readFileAlloc(io, "experts.safetensors", t.allocator, .limited(1 << 24));
+    defer t.allocator.free(raw);
+    const al = try t.allocator.alignedAlloc(u8, .of(u16), raw.len);
+    defer t.allocator.free(al);
+    @memcpy(al, raw);
+    var staged = try st.parse(t.allocator, al);
+    defer staged.deinit(t.allocator);
+    const gu = src.tensors.get("model.language_model.layers.1.mlp.experts.gate_up_proj").?;
+    const dn = src.tensors.get("model.language_model.layers.1.mlp.experts.down_proj").?;
+    const half = 128 * 128 * 2;
+    const want = try t.allocator.alloc(u8, half);
+    defer t.allocator.free(want);
+    for (perm, 0..) |from, x| {
+        for ([_][]const u8{ "gate_proj", "up_proj" }, 0..) |proj, which| {
+            var key: [96]u8 = undefined;
+            const got = staged.tensors.get(try std.fmt.bufPrint(&key, "language_model.model.layers.0.mlp.switch_mlp.{s}.weight", .{proj})).?;
+            try src.readRange(gu, (2 * from + which) * half, want);
+            try t.expectEqualSlices(u8, want, got.bytes[x * half ..][0..half]);
+        }
+        const got = staged.tensors.get("language_model.model.layers.0.mlp.switch_mlp.down_proj.weight").?;
+        try src.readRange(dn, from * half, want);
+        try t.expectEqualSlices(u8, want, got.bytes[x * half ..][0..half]);
+    }
 }

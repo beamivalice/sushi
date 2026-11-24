@@ -3,14 +3,17 @@ const exl3 = @import("expert_exl3.zig");
 const mlx = @import("mlx_host").mlx;
 const std = @import("std");
 const kernels = @import("expert_exl3_kernels.zig");
+const ResearchCodebook = kernels.ResearchCodebook;
 
 const N_CB = exl3.Codebook.count;
+
+const N_RC = std.enums.values(ResearchCodebook).len;
 
 const N_WIN = exl3.Window.count;
 
 const N_TABLES = codebook_tables.tables.len;
 
-const TABLED_ROW0 = 2 * N_CB;
+const TABLED_ROW0 = 2 * N_CB + N_RC;
 
 /// A SPEC1 kernel carries its table's rows, so each (table, folded or unfolded) pair has its own row after the codebooks'.
 pub const SLOT_ROWS = TABLED_ROW0 + 2 * N_TABLES;
@@ -42,6 +45,7 @@ pub fn cbSuffix(comptime cb: exl3.Codebook) [:0]const u8 {
     return switch (cb) {
         .mul1 => "",
         .mcg => "_mcg",
+        .alpha => "_alpha",
         .spec1 => "_spec1",
         .std1 => "_std1",
         .pair1 => "_pair1",
@@ -51,7 +55,7 @@ pub fn cbSuffix(comptime cb: exl3.Codebook) [:0]const u8 {
 /// The power of two `exl3_decode2` leaves out of a codebook's weights: a hash-mask codebook's
 /// scale, restored by `exl3_out` once per stored sum instead of once per decoded pair.
 fn foldScale(comptime cb: exl3.Codebook) u32 {
-    return if (cb.tabledHashMask()) exl3.hash_mask_scale else if (cb == .pair1) PAIR1_SCALE else 1;
+    return if (cb.isHashMask()) exl3.hash_mask_scale else if (cb == .pair1) PAIR1_SCALE else 1;
 }
 
 /// Every PAIR1 row's scale; `pair1Helpers` refuses a row that differs.
@@ -160,7 +164,12 @@ const HELPERS_TAIL: [:0]const u8 =
 fn decodeHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime fold: u32) [:0]const u8 {
     if (cb == .pair1) return comptime pair1Helpers(win, fold) ++ HELPERS_TAIL;
     if (cb.tabledHashMask()) return comptime tabledHelpers(win, fold) ++ HELPERS_TAIL;
-    const body: [:0]const u8 = comptime switch (cb) {
+    // The half sum rounds once, as `decodeHashMask` does on the host; its power-of-two rescale is exact.
+    const body: [:0]const u8 = comptime if (cb.hashMask()) |hm| std.fmt.comptimePrint(
+        \\  const uint2 r = (cw * uint2(0x{X}u)) & uint2(0x{X}u);
+        \\  const half4 h = as_type<half4>(r);
+        \\  return half2(h.x + h.y, h.z + h.w);
+    , .{ hm.mult, hm.mask }) else switch (cb) {
         .mul1 =>
         \\  const uint2 mixed = cw * uint2(0x83DCD12Du);
         \\  const uint2 pair_sums = (mixed & uint2(0x00FF00FFu)) + ((mixed >> uint2(8u)) & uint2(0x00FF00FFu));
@@ -175,14 +184,181 @@ fn decodeHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window, comptime
         ,
         else => unreachable,
     };
-    return comptime helpersWithBody(body, win);
+    return comptime helpersWithBody("", body, win, if (cb.hashMask()) |hm| hm.scale else null, fold);
 }
 
-fn helpersWithBody(comptime body: [:0]const u8, comptime win: exl3.Window) [:0]const u8 {
+const ANDONLY_MULT: u32 = 0x84CC1707;
+const ANDONLY_MASK: u32 = 0x8FE08FC0;
+/// sashimi's KRON_K3 multiplier; each rate's own multiplier costs the same.
+const KRON_MULT: u32 = 0x9F56F68B;
+const KRON_STD: f64 = 1.2441;
+
+fn kronBits(rc: ResearchCodebook) u5 {
+    return switch (rc) {
+        .kron8 => 8,
+        .kron10, .kron10s, .kron10h => 10,
+        .andonly, .kronlog, .kronlogsq => unreachable,
+    };
+}
+
+/// `KRON_STD * Phi^-1((i + 0.5) / 2^bits)` as half bits, Phi^-1 by AS241 (Python's NormalDist).
+fn kronTable(comptime bits: u5) [1 << bits]u16 {
+    @setEvalBranchQuota(10_000_000);
+    var out: [1 << bits]u16 = undefined;
+    for (&out, 0..) |*v, i| {
+        const p = (@as(f64, @floatFromInt(i)) + 0.5) / @as(f64, @floatFromInt(1 << bits));
+        v.* = exl3.f32ToF16Bits(@floatCast(KRON_STD * invNormal(p)));
+    }
+    return out;
+}
+
+fn invNormal(p: f64) f64 {
+    const q = p - 0.5;
+    if (@abs(q) <= 0.425) {
+        const r = 0.180625 - q * q;
+        const num = (((((((2509.0809287301226727 * r + 33430.575583588128105) * r + 67265.770927008700853) * r + 45921.953931549871457) * r + 13731.693765509461125) * r + 1971.5909503065514427) * r + 133.14166789178437745) * r + 3.387132872796366608);
+        const den = (((((((5226.495278852545925 * r + 28729.085735721942674) * r + 39307.89580009271061) * r + 21213.794301586595867) * r + 5394.1960214247511077) * r + 687.1870074920579083) * r + 42.313330701600911252) * r + 1.0);
+        return q * num / den;
+    }
+    var r = @sqrt(-@log(if (q <= 0) p else 1.0 - p));
+    var x: f64 = undefined;
+    if (r <= 5.0) {
+        r -= 1.6;
+        const num = (((((((7.7454501427834140764e-4 * r + 0.0227238449892691845833) * r + 0.24178072517745061177) * r + 1.27045825245236838258) * r + 3.64784832476320460504) * r + 5.7694972214606914055) * r + 4.6303378461565452959) * r + 1.42343711074968357734);
+        const den = (((((((1.05075007164441684324e-9 * r + 5.475938084995344946e-4) * r + 0.0151986665636164571966) * r + 0.14810397642748007459) * r + 0.68976733498510000455) * r + 1.6763848301838038494) * r + 2.05319162663775882187) * r + 1.0);
+        x = num / den;
+    } else {
+        r -= 5.0;
+        const num = (((((((2.01033439929228813265e-7 * r + 2.71155556874348757815e-5) * r + 0.0012426609473880784386) * r + 0.026532189526576123093) * r + 0.29656057182850489123) * r + 1.7848265399172913358) * r + 5.4637849111641143699) * r + 6.6579046435011037772);
+        const den = (((((((2.04426310338993978564e-15 * r + 1.4215117583164458887e-7) * r + 1.8463183175100546818e-5) * r + 7.868691311456132591e-4) * r + 0.0148753612908506148525) * r + 0.13692988092273580531) * r + 0.59983220655588793769) * r + 1.0);
+        x = num / den;
+    }
+    return if (q < 0) -x else x;
+}
+
+fn kronTableDecl(comptime bits: u5) [:0]const u8 {
+    @setEvalBranchQuota(10_000_000);
+    const table = comptime kronTable(bits);
+    comptime var hex: [table.len * 7]u8 = undefined;
+    inline for (table, 0..) |v, i| {
+        hex[i * 7 ..][0..2].* = "0x".*;
+        inline for (0..4) |d| hex[i * 7 + 2 + d] = "0123456789ABCDEF"[(v >> (12 - 4 * d)) & 0xF];
+        hex[i * 7 + 6] = ',';
+    }
+    const text = hex;
+    return std.fmt.comptimePrint("constant ushort EXL3_KRON[{d}] = {{", .{table.len}) ++ text ++ "};\n";
+}
+
+/// MCG's helpers with a research codebook's decode body (and kron's table ahead of them).
+fn researchHelpers(comptime rc: ResearchCodebook, comptime win: exl3.Window) [:0]const u8 {
+    @setEvalBranchQuota(10_000_000);
+    return comptime switch (rc) {
+        .andonly => helpersWithBody("", std.fmt.comptimePrint(
+            \\  const uint2 r = (cw * uint2(0x{X}u)) & uint2(0x{X}u);
+            \\  const half4 h = as_type<half4>(r);
+            \\  return half2(h.x + h.y, h.z + h.w) * half2(4096.0h);
+        , .{ ANDONLY_MULT, ANDONLY_MASK }), win, null, 1),
+        .kronlog, .kronlogsq => helpersWithBody("", std.fmt.comptimePrint(
+            \\  const uint2 x = cw * uint2(0x{X}u);
+            \\  const float2 a = float2(x);
+            \\  const float2 b = 4294967296.0f - a;
+            \\  const float2 y = float2(as_type<int2>(a) - as_type<int2>(b)) * 8.262958317573066e-08f;
+            \\
+        , .{KRON_MULT}) ++ (if (rc == .kronlog) "  return half2(y);" else "  return half2(y * fma(float2(-0.04f), fabs(y), float2(1.0f)));"), win, null, 1),
+        .kron8, .kron10, .kron10s, .kron10h => helpersWithBody(kronTableDecl(kronBits(rc)), std.fmt.comptimePrint(
+            \\  const uint2 x = (cw * uint2(0x{X}u)) >> uint2({d}u);
+            \\  return half2(as_type<half>(EXL3_KRON[x.x]), as_type<half>(EXL3_KRON[x.y]));
+        , .{ KRON_MULT, 32 - @as(u32, kronBits(rc)) }), win, null, 1),
+    };
+}
+
+/// The scalar truth of `researchHelpers`' decode for one (already masked) codeword.
+pub fn researchDecode(cw: u16, rc: ResearchCodebook) u16 {
+    switch (rc) {
+        .andonly => {
+            const r = (@as(u32, cw) *% ANDONLY_MULT) & ANDONLY_MASK;
+            const sum = exl3.f32ToF16Bits(exl3.f16BitsToF32(@truncate(r)) + exl3.f16BitsToF32(@truncate(r >> 16)));
+            return exl3.f32ToF16Bits(exl3.f16BitsToF32(sum) * 4096.0);
+        },
+        .kron8 => return (comptime kronTable(8))[(@as(u32, cw) *% KRON_MULT) >> 24],
+        .kron10, .kron10s, .kron10h => return (comptime kronTable(10))[(@as(u32, cw) *% KRON_MULT) >> 22],
+        .kronlog, .kronlogsq => {
+            const a: f32 = @floatFromInt(@as(u32, cw) *% KRON_MULT);
+            const b: f32 = 4294967296.0 - a;
+            const d = @as(i32, @bitCast(a)) -% @as(i32, @bitCast(b));
+            const y = @as(f32, @floatFromInt(d)) * @as(f32, 8.262958317573066e-08);
+            return exl3.f32ToF16Bits(if (rc == .kronlog) y else y * @mulAdd(f32, -0.04, @abs(y), 1.0));
+        },
+    }
+}
+
+fn stagedResearch(rc: ResearchCodebook) bool {
+    return rc == .kron10s or rc == .kron10h;
+}
+
+/// Kernel-body setup of a staged arm: its table copied into threadgroup memory before any decode.
+fn stagedPrologue(comptime rc: ResearchCodebook) [:0]const u8 {
+    const n: u32 = if (rc == .kron10h) 512 else 1024;
+    const src = if (rc == .kron10h) "EXL3_KRON_HALF" else "EXL3_KRON";
+    return comptime std.fmt.comptimePrint(
+        \\threadgroup ushort EXL3_KRON_TG[{d}];
+        \\for (uint exl3_i = uint(thread_index_in_threadgroup); exl3_i < {d}u; exl3_i += uint(threads_per_threadgroup.x)) EXL3_KRON_TG[exl3_i] = {s}[exl3_i];
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\
+    , .{ n, n, src });
+}
+
+/// After every helper a staged arm sends the kernel bodies' `exl3_decode2` to the staged table, which only
+/// the kernel body can see; helpers defined earlier keep the constant-table decode.
+fn stagedTail(comptime rc: ResearchCodebook, comptime win: exl3.Window) [:0]const u8 {
+    if (!stagedResearch(rc)) return "";
     const mask: [:0]const u8 = comptime if (win == .w16) "" else std.fmt.comptimePrint("  cw &= uint2(0x{X}u);\n", .{win.mask()});
-    return comptime "static inline half2 exl3_pairh(uint2 cw) {\n" ++ mask ++ body ++ "\n}\n" ++
+    const lookup: [:0]const u8 = comptime if (rc == .kron10s)
+        \\  return half2(as_type<half>(tab[x.x]), as_type<half>(tab[x.y]));
+    else
+        \\  const uint2 hi = x >> uint2(9u);
+        \\  const uint2 j = x ^ (hi * uint2(0x3FFu));
+        \\  return as_type<half2>(ushort2(tab[j.x], tab[j.y]) ^ ushort2(hi << uint2(15u)));
+    ;
+    const half_decl: [:0]const u8 = comptime if (rc == .kron10h) kronHalfTableDecl() else "";
+    return comptime half_decl ++ "static inline half2 exl3_pairh_tg(uint2 cw, threadgroup const ushort *tab) {\n" ++ mask ++
+        std.fmt.comptimePrint("  const uint2 x = (cw * uint2(0x{X}u)) >> uint2(22u);\n", .{KRON_MULT}) ++ lookup ++
+        "\n}\n#define exl3_decode2(cw) float2(exl3_pairh_tg((cw), EXL3_KRON_TG))\n";
+}
+
+fn kronHalfTableDecl() [:0]const u8 {
+    @setEvalBranchQuota(10_000_000);
+    const table = comptime kronTable(10);
+    comptime var hex: [512 * 7]u8 = undefined;
+    inline for (table[0..512], 0..) |v, i| {
+        hex[i * 7 ..][0..2].* = "0x".*;
+        inline for (0..4) |d| hex[i * 7 + 2 + d] = "0123456789ABCDEF"[(v >> (12 - 4 * d)) & 0xF];
+        hex[i * 7 + 6] = ',';
+    }
+    const text = hex;
+    return "constant ushort EXL3_KRON_HALF[512] = {" ++ text ++ "};\n";
+}
+
+
+/// `hash_scale` is a hash-mask codebook's scale, left out of `body`'s half sums (`fold` == it, or 1 to carry it).
+fn helpersWithBody(comptime prefix: [:0]const u8, comptime body: [:0]const u8, comptime win: exl3.Window, comptime hash_scale: ?u32, comptime fold: u32) [:0]const u8 {
+    const mask: [:0]const u8 = comptime if (win == .w16) "" else std.fmt.comptimePrint("  cw &= uint2(0x{X}u);\n", .{win.mask()});
+    const pair = comptime if (hash_scale) |scale|
+        prefix ++ "static inline half2 exl3_unscaled(uint2 cw) {\n" ++ mask ++ body ++ "\n}\n" ++
+            std.fmt.comptimePrint("static inline half2 exl3_pairh(uint2 cw) {{ return exl3_unscaled(cw) * half2({d}.0h); }}\n", .{scale})
+    else
+        prefix ++ "static inline half2 exl3_pairh(uint2 cw) {\n" ++ mask ++ body ++ "\n}\n";
+    const decode = comptime if (fold == 1)
         \\static inline float2 exl3_decode2(uint2 cw) { return float2(exl3_pairh(cw)); }
         \\static inline float exl3_out(float v) { return v; }
+        \\
+    else if (hash_scale != null and fold == hash_scale.?)
+        \\static inline float2 exl3_decode2(uint2 cw) { return float2(exl3_unscaled(cw)); }
+        \\
+    ++ std.fmt.comptimePrint("static inline float exl3_out(float v) {{ return v * {d}.0f; }}\n", .{fold})
+    else
+        @compileError("a fold is the hash-mask scale or none");
+    return comptime pair ++ decode ++
         \\static inline float exl3_decode1(uint cw) { return exl3_decode2(uint2(cw, 0u)).x; }
         \\// A generic reader's weight `slot` of a tile's unpacked codewords.
         \\static inline float exl3_slot(thread const ushort *cw, uint slot) { return exl3_decode1(uint(cw[slot])); }
@@ -302,6 +478,23 @@ pub fn codebookKernel(slots: *KernelSlots, comptime base: [:0]const u8, ins: []c
 
 /// `codebookKernel` with helpers of its own appended to the codebook header.
 pub fn codebookKernelWith(slots: *KernelSlots, comptime base: [:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [:0]const u8, comptime frags: [:0]const u8) !mlx.mlx_fast_metal_kernel {
+    if (kernels.research_codebook) |research| {
+        if (kernels.active_decode.codebook != .mcg) return error.ResearchCodebookNeedsMcg;
+        switch (research) {
+            inline else => |rc| switch (kernels.active_decode.window) {
+                inline else => |win| {
+                    const slot = &slots[2 * N_CB + @as(usize, @intFromEnum(rc))][win.index()];
+                    if (slot.*) |k| return k;
+                    const name = comptime base ++ "_rc_" ++ @tagName(rc) ++ winSuffix(win);
+                    const header = comptime researchHelpers(rc, win) ++ frags ++ stagedTail(rc, win);
+                    if (comptime !stagedResearch(rc)) return kernels.getNamedKernel(slot, name, ins, outs, source, header);
+                    const body = try std.mem.concatWithSentinel(std.heap.page_allocator, u8, &.{ stagedPrologue(rc), source }, 0);
+                    defer std.heap.page_allocator.free(body);
+                    return kernels.getNamedKernel(slot, name, ins, outs, body, header);
+                },
+            },
+        }
+    }
     switch (kernels.active_decode.codebook) {
         inline else => |cb| switch (kernels.active_decode.window) {
             inline else => |win| {
@@ -379,7 +572,7 @@ fn n40WeightReaderExact(comptime cb: exl3.Codebook, comptime win: exl3.Window, c
 
 // Both helpers, every codeword: the MMA operand `exl3_pairh`, and a GEMV's `exl3_decode2` as its
 // f32 sums carry it (the weight over the fold) and as `exl3_out` stores it, each against the host
-// decode. Spec1's halves are often subnormal and its half sum rounds, alike on both.
+// decode. Alpha's and spec1's halves are often subnormal; spec1's half sum rounds, alike on both.
 /// The host decode of one codeword at the probe rate n40.
 fn hostWeight(cw: u16, dec: exl3.Decode) u16 {
     return if (dec.hashMask(.{ .n = 40 })) |hm| exl3.decodeHashMask(cw, hm) else exl3.decodeCodeword(cw, dec.codebook);
@@ -468,6 +661,52 @@ test "exl3 MCG, spec1 and std1 decode every codeword, masked and unmasked, throu
             }
         }
     };
+}
+
+test "exl3 research codebooks decode every codeword like their scalar reference" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer kernels.setResearchCodebook(null);
+    defer kernels.setDecodeParams(.mul1);
+    const source =
+        \\const uint i = thread_position_in_grid.x;
+        \\result[i] = as_type<uint>(half2(exl3_decode2(uint2(codes[i], codes[65535u - i]))));
+    ;
+    const codes = try t.allocator.alloc(u32, 65536);
+    defer t.allocator.free(codes);
+    for (codes, 0..) |*v, i| v.* = @intCast(i);
+    const input = mlx.mlx_array_new_data(codes.ptr, &.{65536}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(input);
+    const inputs = mlx.mlx_vector_array_new_data(&.{input}, 1);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{65536}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 65536, 1, 1));
+    for (std.enums.values(ResearchCodebook)) |rc| {
+        for ([_]exl3.Window{ .w12, .w15 }) |win| {
+            kernels.setDecodeParams(.{ .codebook = .mcg, .window = win });
+            kernels.setResearchCodebook(rc);
+            var slots: KernelSlots = no_kernels;
+            const kernel = try codebookKernel(&slots, "exl3_research_pairs", &.{"codes"}, &.{"result"}, source);
+            defer _ = mlx.mlx_fast_metal_kernel_free(kernel);
+            var outputs = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(outputs);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, kernel, inputs, cfg, s));
+            var result = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(result);
+            try mlx.check(mlx.mlx_vector_array_get(&result, outputs, 0));
+            try mlx.check(mlx.mlx_array_eval(result));
+            const got = mlx.mlx_array_data_uint32(result) orelse return error.U32Unreadable;
+            for (codes, 0..) |cw, i| {
+                const lo = researchDecode(@as(u16, @intCast(cw)) & win.mask(), rc);
+                const hi = researchDecode(@as(u16, @intCast(65535 - cw)) & win.mask(), rc);
+                try t.expectEqual(@as(u32, lo) | (@as(u32, hi) << 16), got[i]);
+            }
+        }
+    }
 }
 
 // PAIR1 at every row of the pack contract: the odd weight's window alone decodes both weights, through the

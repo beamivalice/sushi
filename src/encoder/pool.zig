@@ -141,6 +141,23 @@ test "pool: every index runs exactly once across repeated dispatches" {
     for (&hits) |*h| try t.expectEqual(@as(u32, 60), h.load(.monotonic));
 }
 
+var cpu_cap: ?u32 = null;
+
+/// Caps `cpuCount` for the rest of the run (`--cpu-threads`); call it before any pool exists. Work splits use fixed
+/// chunk sizes, so the pack bytes do not depend on it.
+pub fn setCpuCap(cap: ?u32) void {
+    cpu_cap = cap;
+}
+
+/// The CPU count every encoder pool is sized from.
+pub fn cpuCount() usize {
+    return capped(std.Thread.getCpuCount() catch 1, cpu_cap);
+}
+
+fn capped(cpus: usize, cap: ?u32) usize {
+    return @max(1, if (cap) |c| @min(cpus, c) else cpus);
+}
+
 /// A one-shot flag a thread can wait on.
 pub const Event = struct {
     mutex: std.c.pthread_mutex_t = .{},
@@ -159,4 +176,18 @@ pub const Event = struct {
         while (!self.set) _ = std.c.pthread_cond_wait(&self.cond, &self.mutex);
         _ = std.c.pthread_mutex_unlock(&self.mutex);
     }
+
+    pub fn isSet(self: *Event) bool {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        return self.set;
+    }
 };
+
+test "pool: --cpu-threads caps the CPU count, never below one and never above the cores" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 18), capped(18, null));
+    try t.expectEqual(@as(usize, 9), capped(18, 9));
+    try t.expectEqual(@as(usize, 18), capped(18, 64));
+    try t.expectEqual(@as(usize, 1), capped(18, 0));
+}

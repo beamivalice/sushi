@@ -391,6 +391,25 @@ test "template: a function, which Python prints with its address, is refused by 
     }
 }
 
+test "template: str.format takes automatic and numbered fields and refuses what it does not run, by name" {
+    const cases = [_]struct { src: []const u8, why: []const u8 }{
+        .{ .src = "{{ '{:>3}'.format(1) }}", .why = "str.format: a field with a format spec or conversion is not supported" },
+        .{ .src = "{{ '{!r}'.format(1) }}", .why = "str.format: a field with a format spec or conversion is not supported" },
+        .{ .src = "{{ '{name}'.format(name=1) }}", .why = "str.format: a named field is not supported" },
+        .{ .src = "{{ '{}{0}'.format(1) }}", .why = "cannot switch from automatic field numbering to manual field specification" },
+        .{ .src = "{{ '{}{}'.format(1) }}", .why = "Replacement index 1 out of range for positional args tuple" },
+        .{ .src = "{{ '{'.format(1) }}", .why = "Single '{' encountered in format string" },
+        .{ .src = "{{ '}'.format(1) }}", .why = "Single '}' encountered in format string" },
+    };
+    for (cases) |c| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var diag = Diagnostic{};
+        try testing.expectError(error.TemplateRuntime, renderForTest(arena.allocator(), c.src, "[]", "{}", .{}, &diag));
+        try testing.expectEqualStrings(c.why, diag.message());
+    }
+}
+
 test "template: a raise reports its text and where it was raised" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -897,6 +916,7 @@ test "template: every string builtin keeps each byte's origin, the template's an
         .{ .tpl = "{{ c.split(',')|join('-') }}", .c = "x,y", .want = "«x»-«y»", .covers = &.{ "str.split", "join" } },
         .{ .tpl = "{{ c.rsplit(',')[0] }}-{{ c.split()[1] }}", .c = "x y,z", .want = "«x y»-«y,z»", .covers = &.{"str.rsplit"} },
         .{ .tpl = "{{ c|upper }}-{{ c.upper() }}", .want = "«XY»-«XY»", .covers = &.{"str.upper"} },
+        .{ .tpl = "{{ '<{}>'.format(c) }}-{{ '{1}{0}'.format(c, 'z') }}-{{ '{{{}}}'.format(c) }}", .want = "<«xy»>-z«xy»-{«xy»}", .covers = &.{"str.format"} },
         .{ .tpl = "{{ c|lower }}-{{ c.lower() }}", .c = "Xy", .want = "«xy»-«xy»", .covers = &.{ "lower", "str.lower" } },
         .{ .tpl = "{{ c|title }}-{{ c.title() }}", .c = "xy z", .want = "«Xy Z»-«Xy Z»", .covers = &.{ "title", "str.title" } },
         .{ .tpl = "{{ c|capitalize }}-{{ c.capitalize() }}", .c = "xy z", .want = "«Xy z»-«Xy z»", .covers = &.{ "capitalize", "str.capitalize" } },

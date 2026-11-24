@@ -1,6 +1,8 @@
 const std = @import("std");
 const source = @import("source.zig");
 const st = @import("safetensors.zig");
+const shard_mod = @import("shard.zig");
+const exl3 = @import("sushi_exl3");
 
 pub const Error = error{ UnknownSourceTensor, TrunkShapeUnsupported } || std.mem.Allocator.Error;
 
@@ -11,6 +13,17 @@ pub fn writeAllChunked(file: std.Io.File, io: std.Io, bytes: []const u8) !void {
     var at: usize = 0;
     while (at < bytes.len) : (at += write_chunk) try file.writeStreamingAll(io, bytes[at..][0..@min(write_chunk, bytes.len - at)]);
 }
+
+/// Fills `dst` from `file` at `offset`, `chunk` bytes per read: macOS refuses one read of 2 GiB or more (EINVAL).
+pub fn readAllChunked(file: std.Io.File, io: std.Io, dst: []u8, offset: u64, chunk: usize) !void {
+    var at: usize = 0;
+    while (at < dst.len) : (at += chunk) {
+        const part = dst[at..][0..@min(chunk, dst.len - at)];
+        if (try file.readPositionalAll(io, part, offset + at) != part.len) return error.FileTooShort;
+    }
+}
+
+pub const read_chunk: usize = 1 << 30;
 
 pub const ShardBuilder = struct {
     allocator: std.mem.Allocator,
@@ -135,11 +148,33 @@ fn record(trunk: *Trunk, tensor: []const u8, file: []const u8) !void {
     try trunk.index.append(trunk.allocator, .{ .tensor = t, .file = f });
 }
 
-fn bf16FromF32(v: f32) u16 {
+pub fn bf16FromF32(v: f32) u16 {
     const bits: u32 = @bitCast(v);
     return @truncate((bits + 0x7fff + ((bits >> 16) & 1)) >> 16);
 }
 
+/// The layer a served router name belongs to (`language_model.model.layers.L.mlp.gate.weight`).
+fn routerLayer(name: []const u8) ?usize {
+    const head = "language_model.model.layers.";
+    const tail = ".mlp.gate.weight";
+    if (!std.mem.startsWith(u8, name, head) or !std.mem.endsWith(u8, name, tail) or name.len <= head.len + tail.len) return null;
+    return std.fmt.parseInt(usize, name[head.len .. name.len - tail.len], 10) catch null;
+}
+
+/// Rewrites `raw` (`perm.len` rows) so its row i is the old row `perm[i]`: a planned layer's router in group order.
+fn permuteRows(allocator: std.mem.Allocator, raw: []u8, perm: []const u32) !void {
+    if (perm.len == 0 or raw.len % perm.len != 0) return error.RouterShape;
+    const row = raw.len / perm.len;
+    const old = try allocator.dupe(u8, raw);
+    defer allocator.free(old);
+    for (perm, 0..) |from, i| {
+        if (from >= perm.len) return error.RouterShape;
+        @memcpy(raw[i * row ..][0..row], old[from * row ..][0..row]);
+    }
+}
+
+/// The trunk of a Qwen pack from the source; `perms[L]`, where set, is layer L's stored router order (row i is
+/// source expert `perms[L][i]`), so a rate-grouped layer's router follows its groups.
 pub fn writeQwenTrunk(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -147,6 +182,7 @@ pub fn writeQwenTrunk(
     src: *const source.SafetensorsSource,
     trunk_bits: u32,
     trunk_group: u32,
+    perms: []const ?[]const u32,
 ) !Trunk {
     var trunk = Trunk{ .allocator = allocator };
     errdefer trunk.deinit();
@@ -177,6 +213,7 @@ pub fn writeQwenTrunk(
 
         switch (action) {
             .retain_source => {
+                if (routerLayer(served)) |layer| if (layer < perms.len) if (perms[layer]) |perm| try permuteRows(allocator, raw, perm);
                 try builder.add(served, loc.dtype, loc.shape, raw);
                 try pending.ensureUnusedCapacity(allocator, 1);
                 pending.appendAssumeCapacity(try allocator.dupe(u8, served));
@@ -358,11 +395,29 @@ pub fn writeNgramTable(
 }
 
 pub const ExpertQuantSpec = struct {
+    format: []const u8 = "exl3",
     k_text: []const u8,
     codebook: []const u8,
     window: u32,
+    /// The named constant table a table codebook decodes with, and its pinned digest.
+    table: ?[]const u8 = null,
+    digest: ?[]const u8 = null,
     provenance: []const [2][]const u8 = &.{},
 };
+
+/// The `expert_quant` stamp of a pack decoding with `dec` whose widest bank is `k_text`.
+pub fn expertQuant(dec: exl3.format.Decode, k_text: []const u8, provenance: []const [2][]const u8) ExpertQuantSpec {
+    const table = if (dec.table) |i| &exl3.codebook_tables.tables[i] else null;
+    return .{
+        .format = shard_mod.formatName(dec.codebook),
+        .k_text = k_text,
+        .codebook = @tagName(dec.codebook),
+        .window = dec.window.bits(),
+        .table = if (table) |tb| tb.name else null,
+        .digest = if (table) |tb| tb.digest else null,
+        .provenance = provenance,
+    };
+}
 
 pub fn buildConfig(
     allocator: std.mem.Allocator,
@@ -371,7 +426,8 @@ pub fn buildConfig(
     trunk_group: u32,
     overrides: []const Override,
     ngram: ?NgramSpec,
-    eq: ExpertQuantSpec,
+    /// Null for routed experts kept dense (BF16): the config then names no expert quantization.
+    eq_opt: ?ExpertQuantSpec,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -402,16 +458,65 @@ pub fn buildConfig(
         try root.put(a, "ngram_table", .{ .object = table });
     }
 
+    const eq = eq_opt orelse return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
     var expert = std.json.ObjectMap.empty;
-    try expert.put(a, "format", .{ .string = "exl3" });
+    try expert.put(a, "format", .{ .string = eq.format });
     try expert.put(a, "k", .{ .number_string = eq.k_text });
     try expert.put(a, "codebook", .{ .string = eq.codebook });
     try expert.put(a, "window", .{ .integer = eq.window });
+    if (eq.table) |name| try expert.put(a, "codebook_table", .{ .string = name });
+    if (eq.digest) |d| try expert.put(a, "codebook_digest", .{ .string = d });
     try expert.put(a, "out_scales", .{ .string = "svh" });
     for (eq.provenance) |pair| try expert.put(a, pair[0], .{ .string = pair[1] });
     try root.put(a, "expert_quant", .{ .object = expert });
 
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
+}
+
+/// An index entry naming `file` for every tensor of the safetensors file at `path`; returns the data bytes they span.
+pub fn appendShardEntries(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, entries: *std.ArrayList(IndexEntry)) !u64 {
+    return appendEntries(allocator, path, file, entries, .tensors);
+}
+
+/// The `__pad__.` gap tensors of a pair-major shard, in data order; `appendShardEntries` leaves them out.
+pub fn appendPadEntries(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, entries: *std.ArrayList(IndexEntry)) !void {
+    _ = try appendEntries(allocator, path, file, entries, .pads);
+}
+
+fn appendEntries(allocator: std.mem.Allocator, path: [:0]const u8, file: []const u8, entries: *std.ArrayList(IndexEntry), which: enum { tensors, pads }) !u64 {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return error.PackShardMissing;
+    defer _ = std.c.close(fd);
+    var len_buf: [8]u8 = undefined;
+    try source.preadAll(fd, &len_buf, 0);
+    const len = std.mem.readInt(u64, &len_buf, .little);
+    if (len > 128 << 20) return error.BadSafetensorsHeader;
+    const header = try allocator.alloc(u8, len);
+    defer allocator.free(header);
+    try source.preadAll(fd, header, 8);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, header, .{}) catch return error.BadSafetensorsHeader;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadSafetensorsHeader;
+    var total: u64 = 0;
+    var it = parsed.value.object.iterator();
+    while (it.next()) |t| {
+        if (std.mem.eql(u8, t.key_ptr.*, "__metadata__")) continue;
+        if (std.mem.startsWith(u8, t.key_ptr.*, "__pad__.") != (which == .pads)) continue;
+        const v = t.value_ptr.*;
+        if (v != .object) return error.BadSafetensorsHeader;
+        const offs = v.object.get("data_offsets") orelse return error.BadSafetensorsHeader;
+        if (offs != .array or offs.array.items.len != 2 or offs.array.items[0] != .integer or offs.array.items[1] != .integer) return error.BadSafetensorsHeader;
+        const lo = std.math.cast(u64, offs.array.items[0].integer) orelse return error.BadSafetensorsHeader;
+        const hi = std.math.cast(u64, offs.array.items[1].integer) orelse return error.BadSafetensorsHeader;
+        if (hi < lo) return error.BadSafetensorsHeader;
+        total += hi - lo;
+        const tensor = try allocator.dupe(u8, t.key_ptr.*);
+        errdefer allocator.free(tensor);
+        const owner = try allocator.dupe(u8, file);
+        errdefer allocator.free(owner);
+        try entries.append(allocator, .{ .tensor = tensor, .file = owner });
+    }
+    return total;
 }
 
 pub fn buildIndex(allocator: std.mem.Allocator, entries: []const IndexEntry, total_size: u64) ![]u8 {
@@ -515,7 +620,7 @@ test "pack: the Qwen trunk is renamed, affine-quantized by rule, and the experts
 
     var out_dir = t.tmpDir(.{});
     defer out_dir.cleanup();
-    var trunk = try writeQwenTrunk(t.allocator, io, out_dir.dir, &src, 8, 64);
+    var trunk = try writeQwenTrunk(t.allocator, io, out_dir.dir, &src, 8, 64, &.{});
     defer trunk.deinit();
     try t.expectEqual(@as(usize, 1), trunk.shard_files);
 
@@ -528,10 +633,10 @@ test "pack: the Qwen trunk is renamed, affine-quantized by rule, and the experts
     defer file.deinit(t.allocator);
 
     const must_exist = [_][]const u8{
-        "language_model.model.embed_tokens.weight",         "language_model.model.embed_tokens.scales",
+        "language_model.model.embed_tokens.weight",              "language_model.model.embed_tokens.scales",
         "language_model.model.layers.0.self_attn.q_proj.biases", "language_model.model.layers.0.linear_attn.in_proj_z.scales",
-        "language_model.model.layers.0.linear_attn.A_log",  "language_model.model.layers.0.mlp.gate.weight",
-        "vision_tower.blocks.0.attn.qkv.weight",            "language_model.mtp.fc_hidden.weight",
+        "language_model.model.layers.0.linear_attn.A_log",       "language_model.model.layers.0.mlp.gate.weight",
+        "vision_tower.blocks.0.attn.qkv.weight",                 "language_model.mtp.fc_hidden.weight",
         "language_model.lm_head.biases",
     };
     for (must_exist) |name| try t.expect(file.tensors.get(name) != null);
@@ -575,7 +680,7 @@ test "pack: the Qwen trunk stores norm weights as one plus the source, conv kern
     defer src.deinit();
     var out_dir = t.tmpDir(.{});
     defer out_dir.cleanup();
-    var trunk = try writeQwenTrunk(t.allocator, io, out_dir.dir, &src, 8, 64);
+    var trunk = try writeQwenTrunk(t.allocator, io, out_dir.dir, &src, 8, 64, &.{});
     defer trunk.deinit();
 
     const raw = try out_dir.dir.readFileAlloc(io, "model-trunk-00000.safetensors", t.allocator, .limited(1 << 24));
@@ -739,6 +844,25 @@ test "pack: config gains the quantization block, the n-gram table and the expert
     try t.expectError(error.FileNotFound, out_dir.dir.access(io, "config.json", .{}));
 }
 
+test "pack: a table codebook's stamp names its table and digest, and the engine's config parser takes it" {
+    const t = std.testing;
+    const dec = exl3.format.Decode{ .codebook = .std1, .window = .w15, .table = exl3.codebook_tables.indexOf("std1") };
+    const out = try buildConfig(t.allocator, "{\"model_type\":\"qwen4_exp\"}", 8, 64, &.{}, null, expertQuant(dec, "3", &.{}));
+    defer t.allocator.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, out, .{});
+    defer parsed.deinit();
+    const eq = parsed.value.object.get("expert_quant").?.object;
+    try t.expectEqualStrings("stq", eq.get("format").?.string);
+    try t.expectEqualStrings("std1", eq.get("codebook_table").?.string);
+    try t.expectEqualStrings("c5dba171", eq.get("codebook_digest").?.string);
+    const spec = try exl3.parseExpertQuant(parsed.value.object);
+    try t.expectEqual(@as(u32, 48), spec.rate.n);
+    try t.expectEqual(dec.table, spec.table);
+    const mcg = expertQuant(.{ .codebook = .mcg, .window = .w15 }, "2", &.{});
+    try t.expectEqualStrings("exl3", mcg.format);
+    try t.expect(mcg.table == null and mcg.digest == null);
+}
+
 fn modelsRoot(buf: []u8, name: []const u8) error{SkipZigTest}![]const u8 {
     const root = std.c.getenv("SUSHI_MODELS_DIR") orelse return error.SkipZigTest;
     const text = std.mem.span(root);
@@ -817,4 +941,32 @@ test "pack: a shard of more than 2 GiB is written whole" {
     var tail: [1]u8 = undefined;
     try t.expectEqual(@as(usize, 1), try f.readPositionalAll(io, &tail, stat.size - 1));
     try t.expectEqual(@as(u8, 7), tail[0]);
+}
+
+test "pack: a file read in chunks gives the bytes of one read, and a short file is refused" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var data: [1000]u8 = undefined;
+    for (&data, 0..) |*b, i| b.* = @truncate(i *% 31);
+    try tmp.dir.writeFile(io, .{ .sub_path = "f.bin", .data = &data });
+    var file = try tmp.dir.openFile(io, "f.bin", .{});
+    defer file.close(io);
+    var got: [990]u8 = undefined;
+    try readAllChunked(file, io, &got, 10, 7);
+    try t.expectEqualSlices(u8, data[10..], &got);
+    var long: [995]u8 = undefined;
+    try t.expectError(error.FileTooShort, readAllChunked(file, io, &long, 10, 7));
+}
+
+test "pack: a config states an unquantized n-gram table as 16 bits, group 0" {
+    const t = std.testing;
+    const out = try buildConfig(t.allocator, "{\"model_type\":\"qwen4_exp\"}", 8, 64, &.{}, .{ .bits = 16, .group = 0 }, .{ .k_text = "5", .codebook = "mcg", .window = 15 });
+    defer t.allocator.free(out);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, out, .{});
+    defer parsed.deinit();
+    const ngram = parsed.value.object.get("ngram_table").?.object;
+    try t.expectEqual(@as(i64, 16), ngram.get("bits").?.integer);
+    try t.expectEqual(@as(i64, 0), ngram.get("group_size").?.integer);
 }

@@ -1,12 +1,10 @@
 #!/bin/bash
 # gpu-lock.sh — the box-exclusive lock (CLAUDE.md, Team process).
 #
-# Take it for a full model load (server boot, `kld capture|compare`, a live test) or a quiet-box bench or
-# timing run whose absolute number is recorded. Conversions, pilots, builds and tests run without it, in
-# parallel, as long as memory fits (never beside a MiMo-size load).
-# Acquire right before EACH run and release as soon as it ends; never hold the
-# lock across a queue, or while analysing, editing, building or waiting.
+# When to take it is RULE below (`gpu-lock.sh rule` prints it). Acquire right before EACH run and release as soon as
+# it ends; never hold the lock across a queue, or while analysing, editing, building or waiting.
 #
+#   gpu-lock.sh rule              print the rule: what the lock is for, and what runs beside it without it
 #   gpu-lock.sh run <owner> [--max-min N] -- <cmd...>
 #                                 take the lock, run <cmd>, release on any exit (signals included), exit with its
 #                                 status; the recorded holder PID is the command's
@@ -29,6 +27,20 @@
 # the lock. A ticket whose waiter process is gone is skipped and pruned.
 # GPU_LOCK_DIR overrides the lock directory; every agent on the box must share it.
 set -u
+
+RULE='The GPU lock is for three things, and never there to block others:
+  1. quiet: a run that needs the box to itself (it also sets ~/.sushi/runs/QUIET);
+  2. timing: a bench, timing or profile whose number is recorded;
+  3. a big job: one whose memory beside the box'"'"'s other jobs could run it out of memory.
+Everything else runs beside whatever holds the lock, without taking it: a conversion, a tune, a KLD
+reading, a logits or byte comparison, a pilot, a build, a test. Load moves none of their results, only
+their speed.
+M5 Ultra (256 GB): before a job starts, add its planned peak to what the box holds now; when the sum stays
+30 GB under the box, it runs without the lock. A job that does not fit, or any one job of 120 GB or more
+(a resident DeepSeek STQ load, a BF16 Hy4-Flash load), takes the lock and waits for it.
+A long job that is not quiet, timed or big never holds the lock, so a conversion or a tune leaves it free
+for a KLD beside it. A timing taken beside other work is stated as contended; a quiet run waits for the
+box to empty.'
 
 L="${GPU_LOCK_DIR:-/tmp/sushi-gpu.lock.d}"
 Q="$L.queue"
@@ -130,7 +142,7 @@ release_as() {
 }
 
 usage() {
-  echo "usage: gpu-lock.sh run <owner> [--max-min N] -- <cmd...> | acquire <owner> [--pid P] [--max-min N] | release|break <owner> | status" >&2
+  echo "usage: gpu-lock.sh run <owner> [--max-min N] -- <cmd...> | acquire <owner> [--pid P] [--max-min N] | release|break <owner> | status | rule" >&2
   exit 2
 }
 
@@ -182,6 +194,9 @@ case "${1:-}" in
   release | break)
     owner="${2:-}"; [ -n "$owner" ] || usage
     release_as "$owner" "$1" || exit 1
+    ;;
+  rule)
+    echo "$RULE"
     ;;
   status)
     reap

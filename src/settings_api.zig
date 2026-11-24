@@ -80,6 +80,8 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "max_tokens")) return if (o.max_tokens) |v| .{ .integer = v } else null;
     if (eql(u8, name, "yarn_factor")) return if (o.yarn_factor) |v| .{ .string = if (v == 2) "2" else "4" } else null;
     if (eql(u8, name, "expert_cache_bias")) return if (o.expert_cache_bias) |v| .{ .float = v } else null;
+    if (eql(u8, name, "prefill_chunk_max")) return if (o.prefill_chunk_max) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "prefill_chunk_min")) return if (o.prefill_chunk_min) |v| .{ .integer = v } else null;
     return null;
 }
 
@@ -97,6 +99,8 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .max_tokens = config.max_tokens_override,
         .yarn_factor = config.yarn_factor_override,
         .expert_cache_bias = config.expert_cache_bias_override,
+        .prefill_chunk_max = config.prefill_chunk_max_override,
+        .prefill_chunk_min = config.prefill_chunk_min_override,
     };
     arch_flags.putCoolerSetting(config, &o, config.cooler_override);
     return o;
@@ -119,6 +123,11 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
         .max_tokens = request_policy.filledMaxTokensWith(0, bare.defaultMaxTokens()),
         .expert_cache_bias = 0,
     };
+    const widest = arch_config.staticChunkMax(&bare);
+    if (widest != 0) {
+        o.prefill_chunk_max = widest;
+        o.prefill_chunk_min = bills.defaultChunkMin(widest);
+    }
     arch_flags.putCoolerSetting(&bare, &o, bare.coolerChoice().on);
     return o;
 }
@@ -960,13 +969,13 @@ fn savesSsdTier(plan: Plan) bool {
 
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
-    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" };
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" };
     for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
 
 test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
-    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
     for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "continue_after_thought" }) |key| {
@@ -986,7 +995,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }

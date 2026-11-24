@@ -4,11 +4,12 @@ const std = @import("std");
 const log = @import("../log.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const pool_class = @import("../tensor/pool_class.zig");
+const engram = @import("../engram.zig");
 
 pub const max_layers = 64;
-pub const max_engram = 4;
-pub const max_ngram = 8;
-pub const max_heads = 16;
+pub const max_engram = engram.max_modules;
+pub const max_ngram = engram.max_ngram;
+pub const max_heads = engram.max_heads;
 pub const max_targets = 8;
 pub const max_block = 16;
 /// Rows a backbone window ring keeps past the window while DSpark is on, so a verify chunk writes its rows and
@@ -19,26 +20,7 @@ pub const ring_slack: u32 = 16;
 /// saves a wait a layer and loses a layer's work when a pick is outside the cache map; each row brings `top_k` picks.
 pub const route_spec_rows: u32 = 8;
 
-pub const Engram = struct {
-    n: u32 = 0,
-    layers: [max_engram]u32 = @splat(0),
-    rows: [max_engram]u64 = @splat(0),
-    max_ngram: u32 = 0,
-    vocab_size: u64 = 0,
-    heads: u32 = 0,
-    head_dim: u32 = 0,
-    pad_id: u32 = 0,
-    compressed_vocab: u32 = 0,
-
-    pub fn cols(self: Engram) u32 {
-        return (self.max_ngram - 1) * self.heads;
-    }
-
-    pub fn layerAt(self: Engram, layer: usize) ?usize {
-        for (self.layers[0..self.n], 0..) |l, i| if (l == layer) return i;
-        return null;
-    }
-};
+pub const Engram = engram.Geometry;
 
 /// The DSpark drafter the checkpoint ships in its `mtp.*` stages: a block `[t, noise...]` drafted in one pass over
 /// `n_mtp` sliding-window stages that read the main stream of the target layers.
@@ -653,6 +635,8 @@ pub fn parse(text: std.json.ObjectMap, root: std.json.ObjectMap) !Config {
         for (ids.array.items, rows, 0..) |l, r, i| {
             if (l != .integer or l.integer < 0 or l.integer >= c.layers or r != .integer or r.integer <= 0) return refuse("engram layer {d}", .{i});
             e.layers[i] = @intCast(l.integer);
+            // DeepSeek's engram.py draws a module's multipliers from its layer index, with no seed.
+            e.hash_ids[i] = @intCast(l.integer);
             e.rows[i] = @intCast(r.integer);
         }
         if (e.n > 0) {

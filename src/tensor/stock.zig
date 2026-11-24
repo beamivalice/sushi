@@ -37,6 +37,34 @@ pub fn lib(dev: *const metal.Device) Error!metal.Library {
     return library.?;
 }
 
+/// While set, a stock pipeline neither made nor kept is noted as its recipe and not made: the caller makes the notes on
+/// worker threads (`pipeline_cache`) and then asks again, taking each from the stock.
+pub var noting: ?*Notes = null;
+
+pub const Notes = struct {
+    arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
+    recipes: std.ArrayList(manifest.Recipe) = .empty,
+    keys: std.StringHashMapUnmanaged(void) = .empty,
+
+    pub fn deinit(n: *Notes) void {
+        n.arena.deinit();
+    }
+
+    fn note(n: *Notes, r: manifest.Recipe) Error!void {
+        if (pipelines.contains(r.key) or registry.inStock(r.key) or n.keys.contains(r.key)) return;
+        const a = n.arena.allocator();
+        const key = a.dupe(u8, r.key) catch return error.OutOfMemory;
+        n.keys.put(a, key, {}) catch return error.OutOfMemory;
+        n.recipes.append(a, .{
+            .kind = r.kind,
+            .function = a.dupe(u8, r.function) catch return error.OutOfMemory,
+            .key = key,
+            .flags = a.dupe(metal.Flag, r.flags) catch return error.OutOfMemory,
+            .ints = a.dupe(metal.IntConstant, r.ints) catch return error.OutOfMemory,
+        }) catch return error.OutOfMemory;
+    }
+};
+
 /// Keeps `pipeline`, made ahead from `recipe`, for the first `kernel` or `kernelFlags` that asks for its key.
 pub fn preload(recipe: manifest.Recipe, pipeline: metal.Pipeline) Error!bool {
     if (pipelines.contains(recipe.key)) return false;
@@ -51,7 +79,12 @@ pub fn forget(name: []const u8) void {
 
 /// The pipeline of the stock kernel `name`, built once.
 pub fn kernel(name: []const u8) Error!metal.Pipeline {
+    if (core.dryOn()) return core.dry_pipeline;
     if (pipelines.get(name)) |p| return p;
+    if (noting) |n| {
+        try n.note(.{ .kind = .stock, .function = name, .key = name });
+        return core.dry_pipeline;
+    }
     const dev = try metal.device();
     const owned = gpa.allocSentinel(u8, name.len, 0) catch return error.OutOfMemory;
     errdefer gpa.free(owned);
@@ -71,7 +104,12 @@ pub fn kernel(name: []const u8) Error!metal.Pipeline {
 
 /// The pipeline of the stock kernel `name` specialized by `flags`, built once per `hash`, MLX's name for the pair.
 pub fn kernelFlags(name: []const u8, hash: []const u8, flags: []const metal.Flag) Error!metal.Pipeline {
+    if (core.dryOn()) return core.dry_pipeline;
     if (pipelines.get(hash)) |p| return p;
+    if (noting) |n| {
+        try n.note(.{ .kind = .stock_flags, .function = name, .key = hash, .flags = flags });
+        return core.dry_pipeline;
+    }
     const dev = try metal.device();
     var buf: [192]u8 = undefined;
     const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;
@@ -92,7 +130,12 @@ pub fn kernelFlags(name: []const u8, hash: []const u8, flags: []const metal.Flag
 
 /// The pipeline of the stock kernel `name` specialized by boolean and int function constants, built once per `hash`.
 pub fn kernelConstants(name: []const u8, hash: []const u8, flags: []const metal.Flag, ints: []const metal.IntConstant) Error!metal.Pipeline {
+    if (core.dryOn()) return core.dry_pipeline;
     if (pipelines.get(hash)) |p| return p;
+    if (noting) |n| {
+        try n.note(.{ .kind = .stock_flags, .function = name, .key = hash, .flags = flags, .ints = ints });
+        return core.dry_pipeline;
+    }
     const dev = try metal.device();
     var buf: [192]u8 = undefined;
     const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;

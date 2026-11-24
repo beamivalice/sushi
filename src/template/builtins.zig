@@ -414,6 +414,57 @@ fn split(r: *Renderer, src: Str, sep_v: ?Value, max_v: ?Value, from_right: bool)
 }
 
 /// Python `str.replace(old, new, count)`: the kept bytes keep their origins, and each `new` brings its own.
+/// Python's `str.format` over `{}` (automatic) and `{N}` (numbered) fields and the `{{`/`}}` escapes, each argument
+/// as `str()` gives it with its origin kept; a field with a name, a format spec or a conversion is refused by name.
+fn strFormat(r: *Renderer, src: Str, args: []const Value) Failure!Str {
+    @setRuntimeSafety(true);
+    const s = src.bytes;
+    var buf: value.Builder = .{};
+    var auto: ?usize = null; // the next automatic index; null until the first field says which style
+    var manual = false;
+    var i: usize = 0;
+    var lit: usize = 0;
+    while (i < s.len) {
+        try r.tick(1);
+        const ch = s[i];
+        if (ch != '{' and ch != '}') {
+            i += 1;
+            continue;
+        }
+        try buf.appendPart(r.arena, src, lit, i);
+        if (i + 1 < s.len and s[i + 1] == ch) {
+            try buf.appendPart(r.arena, src, i, i + 1);
+            i += 2;
+            lit = i;
+            continue;
+        }
+        if (ch == '}') return r.fail("Single '}}' encountered in format string", .{});
+        const close = std.mem.indexOfScalarPos(u8, s, i + 1, '}') orelse return r.fail("Single '{{' encountered in format string", .{});
+        const field = s[i + 1 .. close];
+        if (std.mem.indexOfAny(u8, field, ":!") != null) return r.fail("str.format: a field with a format spec or conversion is not supported", .{});
+        const index: usize = if (field.len == 0) blk: {
+            if (manual) return r.fail("cannot switch from manual field specification to automatic field numbering", .{});
+            const n = auto orelse 0;
+            auto = n + 1;
+            break :blk n;
+        } else blk: {
+            const n = std.fmt.parseInt(usize, field, 10) catch return r.fail("str.format: a named field is not supported", .{});
+            if (auto != null) return r.fail("cannot switch from automatic field numbering to manual field specification", .{});
+            manual = true;
+            break :blk n;
+        };
+        if (index >= args.len) return r.fail("Replacement index {d} out of range for positional args tuple", .{index});
+        const text = try r.toText(args[index]);
+        try r.charge(buf.bytes.items.len + text.bytes.len);
+        try buf.append(r.arena, text);
+        i = close + 1;
+        lit = i;
+    }
+    try buf.appendPart(r.arena, src, lit, s.len);
+    try r.charge(buf.bytes.items.len);
+    return buf.str();
+}
+
 fn replace(r: *Renderer, src: Str, old: []const u8, new: Str, count: i64) Failure!Str {
     @setRuntimeSafety(true);
     const s = src.bytes;
@@ -891,7 +942,7 @@ pub fn contains(r: *Renderer, container: Value, item: Value) Failure!bool {
 // ── Attribute lookup ──
 
 const str_methods_unsupported = [_][]const u8{
-    "casefold",   "center",    "count",       "encode",     "expandtabs", "find",     "format",       "format_map",
+    "casefold",   "center",    "count",       "encode",     "expandtabs", "find",     "format_map",
     "index",      "isalnum",   "isalpha",     "isascii",    "isdecimal",  "isdigit",  "isidentifier", "islower",
     "isnumeric",  "isprintable", "isspace",   "istitle",    "isupper",    "join",     "ljust",        "maketrans",
     "partition",  "removeprefix", "removesuffix", "rfind",  "rindex",     "rjust",    "rpartition",   "splitlines",
@@ -961,7 +1012,7 @@ pub fn attribute(r: *Renderer, obj: Value, name: []const u8) Failure!?Value {
     };
     if (std.meta.stringToEnum(value.Method, name)) |m| {
         const fits = switch (m) {
-            .upper, .lower, .title, .capitalize, .strip, .lstrip, .rstrip, .startswith, .endswith, .split, .rsplit, .replace, .indent => kind == .str,
+            .upper, .lower, .title, .capitalize, .strip, .lstrip, .rstrip, .startswith, .endswith, .split, .rsplit, .replace, .format, .indent => kind == .str,
             .get, .keys, .values, .items => kind == .dict,
             .append => kind == .list and obj.list.kind == .list,
         };
@@ -1745,6 +1796,11 @@ fn callMethod(r: *Renderer, recv: Value, m: value.Method, args: []const Value, k
             const p = try bind(r, "indent", &.{ "width", "first", "blank" }, args, kws);
             const pad_origin: value.Origin = if (p[0]) |w| (try r.origin(w)) else .template;
             return .{ .string = .{ .bytes = try cppIndent(r, recv.str().?, p[0], p[1], p[2]), .origin = recv.strOf().?.origin.strictest(pad_origin) } };
+        },
+        .format => {
+            // Markup's format escapes its arguments; no template we serve calls it.
+            if (recv == .markup) return r.fail("unsupported method 'Markup.format'", .{});
+            return .{ .string = try strFormat(r, recv.strOf().?, args) };
         },
         .append => {
             try noKeywords(r, "append", kws);

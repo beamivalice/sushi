@@ -215,14 +215,9 @@ pub const StqStream = struct {
         }, .penalty = penaltyOpaque, .all_resident = allResident };
     }
 
-    /// Every active expert layer routes through its resident map (`Engine.residentRoute`): no route fills a slab from
-    /// the host.
     fn allResident(ctx: *anyopaque) bool {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        for (self.engine.layers, 0..) |*layer, li| {
-            if (layer.active and self.engine.residentRoute(@intCast(li)) == null) return false;
-        }
-        return true;
+        return self.engine.allResident();
     }
 
     fn penaltyOpaque(ctx: *anyopaque, layer: usize) anyerror!?A {
@@ -2946,7 +2941,7 @@ test "dsv41 pair-major: `sushi repack` of a copy of the tiny pack gives a pack t
         defer testing.allocator.free(bytes);
         try tmp.dir.writeFile(io, .{ .sub_path = entry.name, .data = bytes });
     }
-    try testing.expectEqual(@import("repack.zig").Outcome.repacked, try @import("repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
+    try testing.expectEqual(@import("../repack.zig").Outcome.repacked, try @import("../repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
     // At the budget alone: an evicting budget is the plain pair-major pack's.
     try expectPmParity(dir, copy, 0, &.{8});
 }

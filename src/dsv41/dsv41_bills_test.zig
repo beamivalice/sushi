@@ -873,11 +873,24 @@ test "DeepSeek: a request bound to its last row bills its stores whole at the fi
     var room: @import("../kv_cache.zig").Room = .{};
     room.hold = .{ .end = end };
     // A chunk wide enough that every store appends: the stores are made at the rows the request ends at.
-    const first = dsv41_bill.chunkGrowthBytes(&config, 2048, 0, room).?;
+    const first = dsv41_bill.chunkGrowthBytes(&config, 8, 2048, 0, room).?;
     try t.expectEqual(c.stateReservedBytes(true, end), first);
     const after = dsv41_bill.roomAfter(&config, 2048, 0, room).?;
-    try t.expectEqual(@as(u64, 0), dsv41_bill.chunkGrowthBytes(&config, 2048, 2048, after).?);
+    try t.expectEqual(@as(u64, 0), dsv41_bill.chunkGrowthBytes(&config, 8, 2048, 2048, after).?);
     // On MLX the generic term stands: its stores are not the engine's.
     config.cooler_for_test = false;
-    try t.expectEqual(@as(?u64, null), dsv41_bill.chunkGrowthBytes(&config, 2048, 0, room));
+    try t.expectEqual(@as(?u64, null), dsv41_bill.chunkGrowthBytes(&config, 8, 2048, 0, room));
+}
+
+test "DeepSeek: warmNeedBytes covers warmRequestBill with DSpark on Cooler" {
+    const t = std.testing;
+    var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
+    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.serve_defaults = dsv41_config.Config.serveDefaults(model_mod.ServeDefaults);
+    config.cooler_for_test = true;
+    const floor: u64 = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
+    const req = bills.warmRequestBill(&config, bills.defaultKvBits(&config), floor, true);
+    const need = bills.warmNeedBytes(&config);
+    errdefer std.debug.print("dsv41 floor={d}: warmNeedBytes={d} MB, warmRequestBill={d} MB\n", .{ floor, need >> 20, req >> 20 });
+    try t.expect(need >= req);
 }

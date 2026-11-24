@@ -2,7 +2,7 @@
 const std = @import("std");
 const testing = std.testing;
 const exl3 = @import("sushi_exl3");
-const repack = @import("repack.zig");
+const repack = @import("../repack.zig");
 const model = @import("../model.zig");
 const dsv41_source = @import("dsv41_source.zig");
 

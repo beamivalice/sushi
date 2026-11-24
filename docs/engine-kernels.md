@@ -26,6 +26,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   about 1 us of its 9.7, inside the noise of a forward: it lands in the stack, it would not have been built alone.
 - **Small bytes-equal folds are built as a stack and measured once**, arms alternating every 8 forwards in one load:
   one fold reads 0.2 to 0.5% and drowns in heat, seven read 3.3% and 3.7% the same way three loads running.
+- **A kernel of one thread a row of work fills few cores at decode; split each row over lanes that keep its order.**
+  The indexer's scores ran a key a thread (4 threadgroups at 1,024 keys, each thread 2,048 products);
+  `hy4_index.scores` gives a key 16 lanes, a head each, and its first lane sums the heads in order: the same bytes.
 - **A threadgroup is one GPU core's work.** A kernel that reduces a whole row in one group (1024 threads, its limit)
   pays 24 to 33 us for every walk of a 129k-wide row whatever the walk computes (127 ids a thread), and about 2 us a
   barrier: such a kernel is sized by its walks. The sampled draw (`sampler_draw.zig`) went from 70 walks (a bit of
@@ -95,6 +98,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - The decode meter splits eval into `mlx_async_eval` wall time and thread CPU. Wall far above CPU means the encoder is
   blocked on in-flight buffers. Host work still counts: the GPU starts each buffer when the host has encoded it, and
   cutting 2 ms of host CPU from a 17 ms forward made it 1.5 ms faster ([qwen4-perf](qwen4-perf.md#host-cpu)).
+- **A chain of small ops becomes one kernel that repeats each op's arithmetic in order**, so its bytes are the chain's
+  (Hy4's rope: MLX's `rope.metal` pair math over a strided view, the passthrough copied, the output at the dtype the
+  next cast wanted; its norm: `rms_single_row` with the BF16 weight widened in the register and an add folded in). Its unit cell compares it against the chain behind the seam and pins its one dispatch.
 - The meter's `process CPU` is every thread of the process per forward: the inference thread and Metal's submit and
   completion queues. It is the number to judge a host-side change by; `command buffers/forward` is what the queues'
   share follows.
@@ -328,6 +334,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
   mlx-c exposes no per-pipeline limit; the encoder's launches read it off that throw and retry below it ([engine-exl3-encoder](engine-exl3-encoder.md#search)).
+- **Threadgroups that meet at one counter order their partials by device atomics and fences, never by waiting**: relaxed
+  atomic stores of the partials, `atomic_thread_fence(mem_device, seq_cst, thread_scope_device)` before and after the
+  counter's `atomic_fetch_add`, then atomic loads in the last threadgroup ([counter page](engine-own-forward.md#metal-rules-the-engine-follows)).
+  Metal promises no forward progress to a threadgroup another spins on.
+- **On the M5 Ultra keep each counter's threadgroups inside one half of the grid**: Hy4's wide iHC mix (eight threadgroups
+  a row) ran 3 to 8 us a launch slower at 3, 5 and 7 rows than at 2, 4, 6 and 8 until the grid took an even row count,
+  its padding row returning at once (`hy4_hc`; in-process chained launches, GPU busy a launch, the change on 01871ac7).
 - **A custom kernel whose source fails to compile kills the process** at its first eval (mlx-c `array.cpp:352`, exit
   255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
   custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and
@@ -370,6 +383,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   truncates the operands the same way and is bit-identical (DeepSeek's `hcExpand`, `dsv41_hc_expand`); a fma chain, a
   sequential sum or round-to-nearest operands differ in 9% of bf16 and every f32 element. A true-f32 GPU (M1) does not
   match, so the fused arm is gated by a load probe against the chain.
+- A kernel that reproduces MLX's single-row reduction inside a wider (or narrower) threadgroup runs MLX's threads as
+  virtual lanes, `tid + r·TG`, so each `simd_sum` sees the same 32 values in the same lanes (`hy4_hc` back form).
 - `mlx_fast_rope` is not the composed rope: it keeps cos/sin in f32 and rounds once; the chain rounds the bf16 table,
   each product and the sum.
 

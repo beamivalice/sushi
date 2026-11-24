@@ -864,7 +864,8 @@ fn parseChatEntries(allocator: std.mem.Allocator, body: []const u8) !Models {
             .default_effort = if (obj.get("default_reasoning_effort")) |v| (if (v == .string) try a.dupe(u8, v.string) else null) else null,
         });
     }
-    return .{ .arena = arena, .entries = try list.toOwnedSlice(a) };
+    const entries = try list.toOwnedSlice(a);
+    return .{ .arena = arena, .entries = entries };
 }
 
 // ── Config writes ───────────────────────────────────────────────────────

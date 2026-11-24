@@ -218,7 +218,14 @@ pub fn reasoningEffortFromWord(word: []const u8, template_consumes_effort: bool,
         const arm = pick.arm;
         const from: ?[]const u8 = if (pick.rerouted_from) |f| @tagName(f) else null;
         if (arm.effort == .off) return .{ .enable = false, .budget = -1, .effort = word, .rerouted_from = from, .sends = word };
-        const budget = if (template_consumes_effort) -1 else arm.budget orelse -1;
+        // Where the template reads the word, the word is the lever and the table's cap is dropped, unless the row
+        // sends the template another level's word (Hy4-Flash's low and medium send `high`): there the cap is what
+        // tells the level apart, and it holds.
+        const cap_is_lever = switch (arm.sends) {
+            .word => |w| w != arm.effort,
+            else => false,
+        };
+        const budget = if (template_consumes_effort and !cap_is_lever) -1 else arm.budget orelse -1;
         return .{ .enable = true, .budget = budget, .effort = @tagName(arm.effort), .rerouted_from = from, .sends = effort_mod.templateValue(arm) };
     }
     if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = -1, .effort = word, .sends = word };
@@ -898,6 +905,51 @@ test "reasoningEffortFromWord: none disables, words budget exactly like the Open
     const consumed = try reasoningEffortFromWord("low", true, null);
     try std.testing.expect(consumed.enable);
     try std.testing.expectEqual(@as(i32, -1), consumed.budget);
+}
+
+test "reasoningEffortFromWord: a table's cap holds where the template reads the word only when the row sends another level's word" {
+    // Hy4-Flash (owner, 2026-11-18): low and medium think at the template's `high` under 2,048 and 16,384 tokens. The
+    // template cannot tell them from high, so the table's cap holds; Qwen's low sends `low` itself and keeps none.
+    try test_note.needArchs(&.{"hy4flash"});
+    const hy4 = effort_mod.effortArms("hy_v4_flash").?;
+    const low = try reasoningEffortFromWord("low", true, hy4);
+    try std.testing.expectEqual(@as(i32, 2048), low.budget);
+    try std.testing.expectEqualStrings("high", low.sends.?);
+    const medium = try reasoningEffortFromWord("medium", true, hy4);
+    try std.testing.expectEqual(@as(i32, 16384), medium.budget);
+    try std.testing.expectEqualStrings("high", medium.sends.?);
+    const high = try reasoningEffortFromWord("high", true, hy4);
+    try std.testing.expectEqual(@as(i32, -1), high.budget);
+    const xhigh = try reasoningEffortFromWord("xhigh", true, hy4);
+    try std.testing.expectEqual(@as(i32, -1), xhigh.budget);
+    try std.testing.expectEqualStrings("max", xhigh.sends.?);
+    try std.testing.expect(!(try reasoningEffortFromWord("off", true, hy4)).enable);
+}
+
+test "reasoningEffortFromWord: Hy4-Flash aliases minimal and on follow their rows and refuse when unoffered" {
+    try test_note.needArchs(&.{"hy4flash"});
+    defer effort_mod.publish(.hy_v4_flash, .{});
+    const hy4 = effort_mod.servedArms("hy_v4_flash").?;
+    const min_arm = try reasoningEffortFromWord("minimal", true, hy4.slice());
+    try std.testing.expect(min_arm.enable);
+    try std.testing.expectEqual(@as(i32, 2048), min_arm.budget);
+    try std.testing.expectEqualStrings("high", min_arm.sends.?);
+    try std.testing.expect(min_arm.rerouted_from == null);
+    const on_arm = try reasoningEffortFromWord("on", true, hy4.slice());
+    try std.testing.expect(on_arm.enable);
+    try std.testing.expectEqual(@as(i32, -1), on_arm.budget);
+    try std.testing.expectEqualStrings("high", on_arm.sends.?);
+    try std.testing.expect(on_arm.rerouted_from == null);
+    try std.testing.expect(!(try reasoningEffortFromWord("none", true, hy4.slice())).enable);
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("ultra", true, hy4.slice()));
+    var edits: effort_mod.Edits = .{};
+    edits.rows[effort_mod.rowIndex(.low).?].offered = false;
+    effort_mod.publish(.hy_v4_flash, edits);
+    const edited = effort_mod.servedArms("hy_v4_flash").?;
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("low", true, edited.slice()));
+    try std.testing.expectError(error.EffortRefused, reasoningEffortFromWord("minimal", true, edited.slice()));
+    const still_on = try reasoningEffortFromWord("on", true, edited.slice());
+    try std.testing.expectEqualStrings("high", still_on.sends.?);
 }
 
 test "reasoningEffortFromWord: a served arch refuses unknown words, and re-routes only the announced folds" {

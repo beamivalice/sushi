@@ -239,6 +239,61 @@ printf '%s\n' 'extern "c" fn mlx_array_new() u32;' > "$TMP/t/src/p.zig"
 echo 'mlx-extern src/p.zig:mlx_array_new reaches a symbol mlx.zig cannot name' > "$TMP/t/allow"
 expect_green "an allowlisted mlx-c extern"
 
+# rule errdefer-handover
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'const Next = struct { array: A, fn landed(_: Next) !void {} };' \
+  'fn write(up: *A) !Next { return .{ .array = up.* }; }' 'fn put(buf: *A) !void {' '    var up: A = .{};' '    errdefer _ = mlx_array_free(up);' \
+  '    const next = try write(&up);' '    buf.* = next.array;' '    try next.landed();' '}' > "$TMP/t/src/p.zig"
+expect_red "a handle written through its address and stored before a try" "src/p.zig:10:5 \[errdefer-handover\] put: 'up' went to its owner on line 9, and the errdefer on line 7"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'const InPlace = struct { array: A, fn adopt(a: A) InPlace { return .{ .array = a }; } };' \
+  'fn make(z: *A) !void { _ = z; }' 'fn eval(a: A) !void { _ = a; }' 'fn mark(slot: *InPlace) !void {' '    var zeros: A = .{};' '    errdefer _ = mlx_array_free(zeros);' \
+  '    try make(&zeros);' '    slot.* = InPlace.adopt(zeros);' '    try eval(slot.array);' '}' > "$TMP/t/src/p.zig"
+expect_red "a handle an owner adopts before a try" "\[errdefer-handover\] mark: 'zeros' went to its owner"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'const Next = struct { array: A, fn landed(_: Next) !void {} };' \
+  'fn write(up: *A) !Next { return .{ .array = up.* }; }' 'fn put(buf: *A) !void {' '    const next = blk: {' '        var up: A = .{};' '        errdefer _ = mlx_array_free(up);' \
+  '        break :blk try write(&up);' '    };' '    buf.* = next.array;' '    try next.landed();' '}' > "$TMP/t/src/p.zig"
+expect_green "an errdefer whose block ends before the store"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'fn more() !void {}' 'const S = struct { last: A = .{} };' \
+  'fn keep(self: *S, made: A) !void {' '    var h = made;' '    errdefer _ = mlx_array_free(h);' '    self.last = h;' '    h = .{};' '    try more();' '}' > "$TMP/t/src/p.zig"
+expect_green "a handle set again after its store"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'fn add(a: A) !A { return a; }' 'fn mean(a: A) !A { return a; }' \
+  'fn acc(slot: *A, g: A, first: bool) !void {' '    errdefer _ = mlx_array_free(g);' '    if (first) {' '        slot.* = g;' '    } else {' '        slot.* = try mean(g);' \
+  '        _ = try add(g);' '    }' '}' > "$TMP/t/src/p.zig"
+expect_green "a try in the branch beside the store, and a new array made from the handle"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null, n: u32 = 0 };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'fn mlx_fill(a: *A) c_int { _ = a; return 0; }' 'fn more() !u32 { return 1; }' 'const S = struct { last: A = .{}, n: u32 = 0, code: c_int = 0, slots: [2]A = .{ .{}, .{} } };' \
+  'fn read(self: *S, h: A) !void {' '    errdefer _ = mlx_array_free(h);' '    self.n = h.n;' '    _ = try more();' '}' \
+  'fn status(self: *S, made: A) !void {' '    var h = made;' '    errdefer _ = mlx_array_free(h);' '    const rc = mlx_fill(&h);' '    self.code = rc;' '    _ = try more();' '}' \
+  'fn local(h: A) !S {' '    errdefer _ = mlx_array_free(h);' '    var out: S = .{};' '    out.last = h;' '    _ = try more();' '    return out;' '}' \
+  'fn prong(self: *S, h: A, k: u8) !void {' '    errdefer _ = mlx_array_free(h);' '    switch (k) {' '        0 => {' '            self.last = h;' '        },' '        1 => _ = try more(),' '        else => {},' '    }' '}' \
+  'fn early(self: *S, h: A, c: bool) !void {' '    errdefer _ = mlx_array_free(h);' '    if (c) {' '        self.last = h;' '        return;' '    }' '    _ = try more();' '}' \
+  'fn counted(slots: []A, h: A) !void {' '    errdefer _ = mlx_array_free(h);' '    slots[0] = h;' '    _ = try more();' '}' > "$TMP/t/src/p.zig"
+expect_green "a field read from the handle, a status code, a local value, a sibling prong, a branch that returns and an element store"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null, n: u32 = 0 };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'fn mlx_fill(a: *A) c_int { _ = a; return 0; }' 'fn more() !u32 { return 1; }' 'const S = struct { last: A = .{}, n: u32 = 0, code: c_int = 0, slots: [2]A = .{ .{}, .{} } };' \
+  'fn f(self: *S, made: A, c: bool) !void {' '    const h = made;' '    errdefer _ = mlx_array_free(h);' '    if (c) self.last = h;' '    _ = try more();' '}' > "$TMP/t/src/p.zig"
+expect_red "a store a one-line if guards" "src/p.zig:10:9 \[errdefer-handover\] f: 'h' went to its owner on line 9"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null, n: u32 = 0 };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'fn mlx_fill(a: *A) c_int { _ = a; return 0; }' 'fn more() !u32 { return 1; }' 'const S = struct { last: A = .{}, n: u32 = 0, code: c_int = 0, slots: [2]A = .{ .{}, .{} } };' \
+  'fn f(self: *S, made: A) !void {' '    const h = made;' '    errdefer _ = mlx_array_free(h);' '    self.last = h;' '    if (self.n == 0) return error.Empty;' '}' > "$TMP/t/src/p.zig"
+expect_red "a store and a return of an error" "src/p.zig:10:22 \[errdefer-handover\] f: 'h' went to its owner on line 9"
+
+tree
+printf '%s\n' 'const A = struct { ctx: ?*u8 = null, n: u32 = 0 };' 'fn mlx_array_free(a: A) c_int { _ = a; return 0; }' 'fn mlx_fill(a: *A) c_int { _ = a; return 0; }' 'fn more() !u32 { return 1; }' 'const S = struct { last: A = .{}, n: u32 = 0, code: c_int = 0, slots: [2]A = .{ .{}, .{} } };' \
+  'fn f(self: *S, made: A) !void {' '    const h = made;' '    errdefer _ = mlx_array_free(h);' '    self.last = h;' '    self.n = more() catch |e| return e;' '}' > "$TMP/t/src/p.zig"
+expect_red "a store and a catch that returns its error" "src/p.zig:10:31 \[errdefer-handover\] f: 'h' went to its owner on line 9"
+
 # rule double-free
 tree
 printf '%s\n' 'fn free(x: u32) void { _ = x; }' 'fn work(x: u32) !u32 { return x; }' 'fn f(fold: bool) !u32 {' '    const y: u32 = 1;' \

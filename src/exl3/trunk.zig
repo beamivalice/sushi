@@ -49,15 +49,112 @@ pub fn gemmRows(rows: u64, wide: bool) bool {
     return rows > @as(u64, @intCast(project_rows.rowsMax(launchOpts(wide).rows)));
 }
 
+/// The bytes of the k-split partials `[rows * nsplit, out]` (f32) that `matmul` of `rows` rows through an `in` -> `out` bank
+/// of trellis width `n` leaves between its launch and its finish, on the arm the machine picks: none where the GEMM runs, where the launch folds
+/// its finish, or off the 128 grid (no bank).
+pub fn rowsPartialBytes(rows: u64, in: u64, out: u64, n: u64) u64 {
+    if (rows == 0 or gemmRows(rows, false) or @rem(in, 128) != 0 or @rem(out, 128) != 0) return 0;
+    const g = project_rows.rowsGeometry(@intCast(in), @intCast(out), @intCast(rows), 1, @intCast(n), launchOpts(false).rows);
+    return if (project_rows.hasFinish(g)) rows * @as(u64, @intCast(g.nsplit)) * out * @sizeOf(f32) else 0;
+}
+
+/// The bytes of the k-split partials a gate and up pair of `rows` rows through two `in` -> `out` banks leaves in its one
+/// launch on a stream with a counter page (`matmulThruBf16Swiglu`): both banks' in one buffer, none where it does not serve.
+pub fn pairPartialBytes(rows: u64, in: u64, out: u64, n: u64) u64 {
+    if (rows > project_rows.COUNTED_ROWS_MAX or out / 128 > host_side.counter_words) return 0;
+    return 2 * rowsPartialBytes(rows, in, out, n);
+}
+
 /// `x` `[..., in]` through the bank, in x's dtype, each row rounding as it does alone; `wide` marks a spec verify.
 pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, wide: bool) !mlx.mlx_array {
+    return matmulWith(s, x, w, suh, svh, dec, launchOpts(wide));
+}
+
+/// Whether a launch of up to `project_rows.countedRowsMax` rows on a stream with a counter page finishes its own
+/// partials (`selfFinished`) rather than leaving them to a finish dispatch. A test seam: both give the same bytes.
+pub var self_finish_on = true;
+
+/// `linear.linearCounted` of `x` where a trunk launch finishes its own partials: on a stream with a counter page, up to
+/// `countedRowsMax(c)` rows of f32. Null, with nothing launched, elsewhere.
+fn selfFinished(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, opts: linear.Opts, c: project_rows.Counted) !?mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    if (!self_finish_on or sh.len != 2 or sh[0] > project_rows.countedRowsMax(c) or host_side.counters(s) == 0) return null;
+    return linear.linearCounted(s, x, .{ .trellis = w, .suh = suh, .svh = svh }, dec, opts, c);
+}
+
+/// `matmul` of f32 rows into f32 rows through bf16 (`project_rows.Mode.thru_bf16`): the bytes of casting `x` to bf16,
+/// `matmul` and casting its rows to f32, with no cast dispatch at decode widths and, where `selfFinished` serves, no
+/// finish dispatch.
+pub fn matmulThruBf16(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, wide: bool) !mlx.mlx_array {
+    var opts = launchOpts(wide);
+    opts.rows.thru_bf16 = true;
+    if (try selfFinished(s, x, w, suh, svh, dec, opts, .thru)) |y| return y;
+    return matmulWith(s, x, w, suh, svh, dec, opts);
+}
+
+/// `matmul` of f32 rows `x` `[rows, in]` cast to bf16, its bf16 rows: where `selfFinished` serves one launch that
+/// reads `x` through bf16 and finishes its own partials, else the cast and `matmul`.
+pub fn matmulThruBf16Stored(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode) !mlx.mlx_array {
+    var opts = launchOpts(false);
+    opts.rows.thru_bf16 = true;
+    if (try selfFinished(s, x, w, suh, svh, dec, opts, .stored)) |y| return y;
+    var xb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xb);
+    try mlx.check(mlx.mlx_astype(&xb, x, .bfloat16, s));
+    return matmul(s, xb, w, suh, svh, dec, false);
+}
+
+/// `silu(matmulThruBf16(x, gate)) · matmulThruBf16(x, up)` of f32 rows `x` `[rows, in]` through two banks of one shape,
+/// in one launch that finishes both (`linear.linearPairCounted`): the bytes of the two, their finishes and an f32
+/// SwiGLU as MLX's Sigmoid and Multiply give it. Null, with nothing launched, where `selfFinished` would not serve.
+pub fn matmulThruBf16Swiglu(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Triple, up: Triple, dec: format.Decode) !?mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    if (!self_finish_on or sh.len != 2 or sh[0] > project_rows.COUNTED_ROWS_MAX or host_side.counters(s) == 0) return null;
+    var opts = launchOpts(false);
+    opts.rows.thru_bf16 = true;
+    return linear.linearPairCounted(s, x, .{ .trellis = gate.w, .suh = gate.s, .svh = gate.b }, .{ .trellis = up.w, .suh = up.s, .svh = up.b }, dec, opts);
+}
+
+/// `matmulThruBf16` of `x` `[rows, in]` whose rows leave rms-normed over `norm_w` (bf16 or f32, the bank's width) with
+/// the epsilon `eps[0]`, f32: the bytes of the through launch, then MLX's f32 rms norm over `norm_w` widened, with its
+/// finish and the norm in one dispatch. Null, with nothing made, where one launch does not serve it (rows past the
+/// multi-row arm, an output wider than one threadgroup's row).
+pub fn matmulThruBf16Normed(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, norm_w: mlx.mlx_array, eps: mlx.mlx_array) !?mlx.mlx_array {
+    const out: c_int = @intCast(outDim(w));
+    var opts = launchOpts(false);
+    opts.rows.thru_bf16 = true;
+    if (try selfFinished(s, x, w, suh, svh, dec, opts, .{ .normed = .{ .w = norm_w, .eps = eps, .cols = out } })) |y| return y;
+    const one: Shared = .{ .p = .{ .trellis = w, .suh = suh, .svh = svh }, .cols = .{ 0, out, 0, 0, 0 }, .count = 1 };
+    var y: [1]mlx.mlx_array = undefined;
+    if (!try linear.linearSharedNormed(s, x, one, dec, &y, opts, .{ .w = norm_w, .eps = eps, .cols = out })) return null;
+    return y[0];
+}
+
+/// `matmulThruBf16` of `x` `[rows, in]` left as its launch's k-split partials (`linear.linearParts`), for a reader that
+/// finishes them. Null, with nothing made, where that launch folds its finish or does not serve the rows.
+pub fn matmulThruBf16Parts(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode) !?linear.Parts {
+    var opts = launchOpts(false);
+    opts.rows.thru_bf16 = true;
+    return linear.linearParts(s, x, .{ .trellis = w, .suh = suh, .svh = svh }, dec, opts);
+}
+
+/// `matmulThruBf16` of `x` `[rows, in]` in one launch that finishes its own k-split partials on a stream with a
+/// counter page (`linear.linearCounted`) at any rows the rows arm takes: the same bytes, no finish dispatch. Null, with
+/// nothing launched, where `matmulThruBf16Parts` is null or the stream has no page.
+pub fn matmulThruBf16Counted(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode) !?mlx.mlx_array {
+    var opts = launchOpts(false);
+    opts.rows.thru_bf16 = true;
+    return linear.linearCounted(s, x, .{ .trellis = w, .suh = suh, .svh = svh }, dec, opts, .thru);
+}
+
+fn matmulWith(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, opts: linear.Opts) !mlx.mlx_array {
     const sh = mlx.getShape(x);
     const in = sh[sh.len - 1];
     const rows = leadingRows(sh);
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, x, &[_]c_int{ rows, in }, 2, s));
-    const y = try linear.linearWith(s, flat, .{ .trellis = w, .suh = suh, .svh = svh }, dec, launchOpts(wide));
+    const y = try linear.linearWith(s, flat, .{ .trellis = w, .suh = suh, .svh = svh }, dec, opts);
     defer _ = mlx.mlx_array_free(y);
     var shape: [8]c_int = undefined;
     @memcpy(shape[0..sh.len], sh);

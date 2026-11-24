@@ -64,23 +64,33 @@ names it; absent is the pack order.
   and every `trellis_pm` starts on a 16 KiB page of the file. Where the previous tensor does not end on a page, a
   zero-filled `__pad__.<shard stem>.<i>` tensor (`U8`, 1-D, under 16384 bytes) fills the gap and is listed in the index
   (safetensors readers reject gaps). The engine skips every `__pad__.` key: it is not loaded, billed or validated.
+  The index's `total_size` counts the tensors, never the pads.
   The published DeepSeek revision 2.0 starts 43 of its `trellis_pm` tensors on a 4 KiB block rather than a 16 KiB
   page; the loader accepts any start, and only the direct-read share depends on it.
-- Only `deepseek_v41` reads `pair_major` (its `config_facts.reads_pair_major`; the parse refuses the order under any other arch). Its streaming engine lands the bytes in the slot pools unchanged: no CPU
+- Only `deepseek_v41` and `hy_v4_flash` read `pair_major` (their `config_facts.reads_pair_major`; the parse refuses the order under any other arch). `hy_v4_flash` reads nothing else (`reads_pack_order` false): a pack-order Hy4-Flash pack is refused at parse, `Exl3TileOrderUnsupported`, and migrated by `sushi repack <pack>`. The refusal keys on the routed experts: the DFly2 drafter's banks are dense trellis banks and stay in the pack order. A load skips every `__pad__.` key. The streaming engine lands the bytes in the slot pools unchanged: no CPU
   reshuffle, and a read whose file offset, length and destination lie on pages goes straight into the slab. A
   pair-major pack's rate-group pools always start on pages (the layer's bill grows by under one page per pool, per
   projection), so a trellis that is off its page costs only its own reads their direct path.
-- Refused by name: `Exl3TileOrderUnsupported` (a value other than `pair_major`, or `pair_major` under another
-  architecture), `Exl3TileOrderMixed` (both keys in one pack or layer), `Exl3TileOrderMismatch` (the index names the
+- Refused by name: `Exl3TileOrderUnsupported` (a value other than `pair_major`, `pair_major` under another
+  architecture, or the pack order under Hy4-Flash), `Exl3TileOrderMixed` (both keys in one pack or layer), `Exl3TileOrderMismatch` (the index names the
   other order than the config), `Exl3GroupGeometry` (a `trellis_pm` shape that is not its projection's grid),
   `Exl3ShardStampMismatch` (a shard of routed trellis tensors whose stamp is not the config's order),
   `Exl3TileOrderNeedsGroups` (a `pair_major` layer that is not rate-grouped).
+- `model.loadWeightsForConfig` checks every routed shard's order, grid and stamp (`pack_index.validateTileOrder`) for every
+  EXL3/STQ pack, resident or streamed, whatever the arch, before any weight is read.
 
 <a id="repack"></a>
 #### `sushi repack <pack>`
 
 `sushi repack <pack>` (one positional; options below; a path, relative directory or known alias, never downloaded) turns a
-pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the one repacker.
+pack-order STQ pack into the pair-major one, in place. It is the one repacker, and shared: an arch whose packs can be
+pair-major (`deepseek_v41`, `hy_v4_flash`) declares `repack` in its `arch.zig` (the key text before a routed
+projection, `.mlp.switch_mlp.` for both, and the `text_config` key of the expert's hidden width: `hidden_size` for
+DeepSeek, `routed_expert_hidden_size` for Hy4, whose experts are narrower than its trunk), any other arch is `RepackArchitectureUnsupported`.
+
+- It repacks every routed rate group (`<layer>.mlp.switch_mlp.<proj>.g<N>.trellis`, a trunk layer's or a head's) and
+  nothing else: a dense trellis bank (a SPEC1 trunk matrix, a DFly2 drafter layer) has no pair-major form and its shard
+  is left byte for byte. Qwen3.8-Flash-Next STQ packs stay in the pack order, the one exemption.
 
 - It writes the shard layout above (trellis, scales, pads; `__metadata__` keeps its source fields and adds `tile_order`).
 - Refusals before any write: `RepackNotDownloaded`, `RepackArchitectureUnsupported`, `Exl3TileOrderUnsupported` (not
@@ -94,7 +104,9 @@ pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the 
   count), `F_FULLFSYNC`, re-read it with `F_NOCACHE` and compare with the original (every `trellis_pm` expert through
   `layout.tileMajorInverse`, every other tensor byte for byte, pads zero, header equal to the plan), rename over the
   shard, fsync the directory. Peak extra disk is one shard. Then the index (renamed keys, pads), then `config.json`
-  (`tile_order` inserted into `expert_quant`, every other byte unchanged), then the loader's own pre-load checks.
+  (`tile_order` inserted into `expert_quant`, every other byte unchanged), then a check of the result as a loader reads it
+  (config and index name pair-major, every routed shard passes the structure check, each grid is a pair-major grid of
+  the pack's hidden and expert widths).
 - A run cut short leaves shards in both orders under a pack-order index and config, which the loader refuses
   (`Exl3TileOrderMixed` / `Exl3TileOrderMismatch`); repeating the command skips the pair-major shards that pass the
   structure check and finishes. The output is byte-identical run to run and box to box.
@@ -113,7 +125,7 @@ pack-order `deepseek_v41` STQ pack into the pair-major one, in place. It is the 
   read from page-aligned offsets); any other shard stays 8-byte aligned.
 - `--shards <name-or-glob>` (repeatable; `*` and `?`) stamps only the matching shards, so a revision can land in steps;
   `config.json` is written last, and a loader refuses the pack until every shard not in `unstamped` carries the id. A
-  pattern that matches nothing is `RepackNoShardMatch`, before a write. On a pack-order DeepSeek-V4.1 STQ pack the whole
+  pattern that matches nothing is `RepackNoShardMatch`, before a write. On a pack-order STQ pack of an arch that declares `repack` the whole
   pack is repacked first (a partial repack is no pack); `--shards` narrows only the stamping.
 - A symlinked shard is never rewritten through the link: `--unstamped <shard>` (repeatable) lists it, and an unlisted
   one is `RepackShardIsLink` naming it; a listed name that is no shard is `RepackUnknownShard`.
@@ -171,12 +183,32 @@ stacked bank per projection with its own rate, read from its own trellis shape.
 "expert_quant": { "format": "exl3", "k": 3, "codebook": "mcg", "window": 15 }
 ```
 
-- `format` — `exl3` for the `mul1` and `mcg` codebooks, `stq` for the ones that name a table (`std1`, `spec1`,
-  `pair1`; see [STQ](#stq)). Any other string, or a codebook under the other format, is `ExpertLayoutUnsupported`.
+- `format` — `exl3` for MUL1, MCG and alpha; `stq` for the codebooks that name a table (`std1`, `spec1`, `pair1`). Any other
+  string, or a table codebook under `exl3` or MCG/MUL1/alpha under `stq`, is refused (`ExpertLayoutUnsupported`; a
+  config naming a name from before STD1, SPEC1 and PAIR1 (codebook `s1`, `dd1`, `beta`, `sushi1` or `cantona`, a table `s1-*`, `sushi1-*`, `beta-*`,
+  `dd1-*` or `cantona-*`, format `exs`, a table codebook under `exl3`) is `Exl3CodebookTableLegacyConfig`: migrate its config by tool).
 - `k` — the rate, a JSON number and possibly fractional. It names the WIDEST
   rate a layer packs and is what the engine bills.
-- `codebook` — `mul1` or `mcg` under `exl3`; MCG is the codebook for new packs; MUL1 serves
-  turboderp's packs. `std1`, `spec1` and `pair1` go under `stq`. Any other name is `ExpertLayoutUnsupported` (in a shard
+- `codebook` — `mul1` or `mcg`. MCG is the codebook for new packs; MUL1 serves
+  turboderp's packs; `alpha` (`andonly`, its earlier name) is accepted too and decodes as `decodeHashMask(cw, ALPHA)` says;
+  `std1` and `spec1` (together: the codebooks called `s1`, `beta` and `sushi1` before STD1, SPEC1 and PAIR1) decode the same way
+  with one `(multiplier, mask)` row per bank rate and must name their codebook table (`codebook_table`, `codebook_digest`). `std1` is the
+  standardized codec: its one table `std1` holds the pair `0x840C1F37`/`0x8FFE8FD0` at every rate, the pair every pack used before the
+  per-rate tables, and decodes at every `window` 8..16. `spec1` is the special per-rate, per-window codec: `spec1-w15`
+  (digest `37f72431`, every even n 16..128, so K1 to K8) or `spec1-w16` (n 24..64), the table's window being where it
+  was tuned, so a SPEC1 pack may use any `window` 8..16. Each table holds one row per even n of its own run; a bank
+  rate outside it is `Exl3CodebookTableRateMissing`. `spec1-w15` grew from n 24..64 (digest `2ac2594d`) with those rows
+  unchanged: a config still stamped `2ac2594d` is `Exl3CodebookTableLegacyConfig`, re-stamped by sashimi's
+  `codebook_table_migrate.py` (config only, no shard is touched). A pack that names no table
+  is refused, a table's old name (`s1-w15`, `s1-w16`, `s1-global`, `sushi1-*`, `beta-*`) is `Exl3CodebookTableLegacyConfig`,
+  a config carrying the global pair as `beta_multiplier` and `beta_mask` is `Exl3CodebookTableLegacyConfig` too: sashimi's
+  `codebook_table_migrate.py` rewrites them (the global pair to `std1`). The window-15 partial table (`s1-w15-partial`) was removed and is an unknown
+  table (`Exl3CodebookTableUnknown`): such a pack is reconverted;
+  `pair1` (`dd1` before) is the pair-wise codec at window 16: weight t reads the window of weight `t | 1`, and one product decodes
+  both weights of the pair with its rate's row (`pair1Pair`). The config names its table (`pair1-w16-v1`)
+  and digest and only holds at window 16. An unknown table, a digest, window (PAIR1) or codebook mismatch, a legacy `cantona_constants` or `beta_multiplier` config or a
+  bank at a rate the table has no row for is refused by name (`Exl3CodebookTable*`; `src/exl3/codebook_tables.zig`);
+  any other name is `ExpertLayoutUnsupported` (in a shard
   stamp, `Exl3ShardStampMismatch`). The codebook and window follow the MODEL: `exl3.moe` sets them
   (`expert_exl3_kernels.setDecodeParams`) before every dispatch, so packs with
   different codebooks can be resident together, and every weight kernel
@@ -276,6 +308,72 @@ A pack without `trunk_quant` is read exactly as before.
   expert gate/up, dense gate/up) when all are trellis banks of one input width and one rate: give those the same rate.
 - The bill is the stored bytes; a trellis head keeps no coarse rerank copy ([engine-memory-admission](engine-memory-admission.md)).
 
+<a id="hy4-stq"></a>
+### Hy4-Flash STQ packs (`hy_v4_flash`)
+
+Written by `sushi convert exl3` ([encoder](encoder.md#hy4-flash)); the engine's reader is part 1w of the Hy4 plan and not built
+yet. Every tensor keeps the release's own name unless a line below renames it.
+- **Routed experts**, `model-layer-LL.safetensors` per MoE layer: rate groups under the routed nesting,
+  `model.layers.{L}.mlp.switch_mlp.{gate,up,down}_proj.gN.{trellis,suh,svh}`, `expert_quant` an STQ PAIR1 block
+  (`pair1-w16-v1`, window 16). The fused `mlp.experts.gate_up_proj` `[E, 2I, L]` is split: gate is rows `0..I`, up rows
+  `I..2I`, each a bank `[E_g, L/16, I/16, n]` (in = the 1,536-wide latent `L`, out = `I`); down is `[E_g, I/16, L/16, n]`. The
+  fused source names are not in the pack. The router's `mlp.gate.weight` and `mlp.gate.e_score_correction_bias` rows follow group
+  order (row i is the source's row `perm[i]`, the groups' ids concatenated); a uniform layer is one group `g0` in source order.
+  `swiglu_limit` 10 is whole, as the clamped chain needs.
+- **Trunk banks**, `trunk_quant` an STQ SPEC1 block (`spec1-w15`, `k` 6): every BF16 `<base>.weight` on the 128 grid of the
+  attention (`q_a_proj`, `q_b_proj`, `kv_b_proj`, `o_proj`, `linear_gate`), the dense layer's MLP, the shared expert, the latent
+  `routed_expert_{down,up}_proj` and the DFly2 drafter (its layers' attention and MLP, `hidden_correction.{gate,up,down}_proj`,
+  `mtp_fusion.eh_proj`) is `<base>.trellis` U16 `[in/16, out/16, n]` (n 96 at K6; the drafter's banks at `drafter_quant`'s `k`),
+  `<base>.suh` F16 `[in]`, `<base>.svh` F16 `[out]` in place of `<base>.weight`, as DeepSeek's trunk. The loader reads each
+  bank's rate from its shape. `kv_a_proj_with_mqa` (576 rows) is off the grid and stays BF16; so do the
+  `confidence_head` and every 1-D tensor.
+- **Head**: `lm_head.{trellis,suh,svh}`, a K6 bank `[3072/16, 120832/16, 96]` (in 3072, out the vocabulary), computed in f32.
+- **Embedding**: `model.embed_tokens.{trellis,suh,svh}`, the same K6 bank form and orientation as the head: the stored
+  `[vocab, dim]` weight read as a linear with in = dim and out = vocab. Token t's row is column t of the decoded `[dim, vocab]`
+  matrix. The output-side Hadamard mixes 128 consecutive vocabulary ids, so a gather decodes the 128-id block holding t: the
+  tiles of output-tile columns `8b .. 8b+7` (b = t / 128) over all `dim/16` input tiles, the input side's Hadamard and `suh`, the
+  output side's Hadamard over the block and its 128 `svh`, then takes column t mod 128.
+- **Kept as stored**: norms, sinks, the iHC `fn`/`base`/`scale` (f32), the router bias (f32, reordered as above), the whole
+  compressed indexer, Engram's projections, norms, scales and `lookup_table`, the drafter's 1-D tensors and confidence head,
+  and the vision tower (BF16 as the encode writes it; the shipped pack's is affine 8, [below](#hy4-vision-affine8)).
+- **Engram tables** (`engram_layer.multi_head_embedding.embedding.weight`): BF16 as stored, in the source's own shards cloned as
+  `engram-<shard>` (copy-on-write; the clone's other tensors are not indexed). `config.json` says `"engram_tables": "bf16"`.
+- **Shards**: `model-trunk-LL` (layer LL's trunk banks and every other `model.layers.LL.` tensor), `model-dfly`,
+  `model-globals` (embedding, head, final norm, `hc_head`), each stamped `format` stq, `codebook` spec1, `codebook_table`
+  spec1-w15, `window` 15, `k` 6 (`model-dfly`: the drafter's rate); the expert shards carry the routed stamp. Every shard but the clones carries `pack_revision`,
+  `synthetic` and `hessian` (`none` for random codes, `identity` for a pack rounded with no calibration capture, `capture` for
+  one rounded from a calibration capture's Hessians).
+- **`config.json`**: the release's config plus top-level `expert_quant`, `trunk_quant` and, with a drafter, `drafter_quant`
+  (the same SPEC1 block at the drafter's `k`; each naming its `hessian`),
+  `engram_tables`, `synthetic` (true for a `--synthetic-codes` pack, whose codes are random: the format is real, the weights
+  are not) and `pack_revision` (`{"id": "synthetic-<12 hex>"` or `"identity-<12 hex>", "unstamped": [the clones]}`). A loader that reads `"synthetic": true` says so in a log line
+  (part 1w).
+
+<a id="hy4-vision-affine8"></a>
+#### Hy4-Flash vision tower at affine 8
+
+Written by `sushi convert vision-affine8 --model <pack> --out <dir>` over an encoded pack ([encoder](encoder.md#hy4-flash)).
+- **`model-vision.safetensors`** holds every `vit.*` tensor; the shard that held them (`model-globals`) is written again
+  without them, its stamp and other tensors' bytes unchanged, and every other file is the pack's, cloned.
+- **Affine matrices** (`hy4_census.visionAffine`): each block's `self_attn.{q,k,v,o}_proj` and `mlp.dense_h_to_4h`,
+  `mlp.dense_4h_to_h` where the group divides its input, and the merger's `perceive.proj.0` / `proj.2` (convolutions read
+  as `[out, C·kh·kw]`). Each is MLX's affine triple under its name: `<base>.weight` U32 `[out, in/4]`, `<base>.scales` and
+  `<base>.biases` BF16 `[out, in/group]`, as `mx.quantize(w, group, 8)` gives them.
+- **Group**: the widest of 128, 64 and 32 dividing the tower's width (the release's 1152: 128; the tiny's 32: 32).
+- **Kept BF16, by name**: a matrix no MLX group divides. On the release, the 27 `vit.layers.N.mlp.dense_4h_to_h.weight`
+  (4304 = 16 × 269 inputs, 267,743,232 bytes). The patch embedding, position table, norms, biases and `image_newline` are
+  not matrices of this list and stay as stored.
+- **Bytes**: the release's tower is 933,258,720 bytes BF16 and 630,438,816 at affine 8.
+- **`config.json`** `vision_quant`: `{"format": "affine", "bits": 8, "group_size": <group>, "bf16_kept": [{"tensor": <name>,
+  "reason": <why>}, ...], "encoder": <version>}`. A stamp whose format or bits differ, whose group is not the rule's,
+  or whose `bf16_kept` is not exactly the matrices no group fits (missing, extra, twice, no reason) is
+  `UnsupportedHy4Config`. The shard stamps `format` affine, `bits` 8, `group_size` and the pack's `pack_revision`.
+- **Loader** (`hy4_vision.Tower.init`): under `vision_quant` each affine matrix must be the triple at the stamped group;
+  every other matrix, and every matrix without `vision_quant`, BF16 or f32. Codes the config does not state, a stamped
+  matrix stored as a float, grids beside a float weight or beside no tower matrix, or any other dtype is
+  `Hy4VisionTensorFormat`, naming the tensor. The codes multiply through `quantized_matmul`, BF16 rows in and out as the
+  BF16 weight's.
+
 ### Stored-affine trunk linears (`mimo_v2`)
 
 A MiMo pack may STORE `o_proj` (every layer's `model.layers.{L}.self_attn.o_proj`),
@@ -338,7 +436,7 @@ string, because that is all safetensors stores. The engine reads these keys:
 |---|---|
 | `format` | `exl3`, or `stq` for `std1`, `spec1` and `pair1` |
 | `k` | the rate as written, e.g. `2.25` or `4` |
-| `codebook` | `mul1` \| `mcg` \| `std1` \| `spec1` \| `pair1` |
+| `codebook` | `mul1` \| `mcg` \| `alpha` \| `std1` \| `spec1` \| `pair1` (a shard stamped before the rename says `s1`, `beta` or `sushi1`: read as `spec1` (and accepted by a `std1` pack, the global pair having been stamped so), or `dd1` or `cantona`: read as `pair1`) |
 | `window` | the codeword width, e.g. `12` |
 | `tile_order` | `pair_major` on a shard holding `trellis_pm` tensors ([tile order](#tile-order)); absent otherwise |
 

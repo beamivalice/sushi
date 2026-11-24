@@ -299,6 +299,7 @@ var pipelines: std.StringHashMapUnmanaged(metal.Pipeline) = .empty;
 
 /// The pipeline of `source` with `$0`, `$1`, .. and `$O` standing for the input and output type names.
 fn pipelineFor(comptime tag: []const u8, source: []const u8, in_types: []const Dtype, out_type: Dtype) Error!metal.Pipeline {
+    if (core.dryOn()) return core.dry_pipeline;
     var key_buf: [96]u8 = undefined;
     var key: std.ArrayList(u8) = .initBuffer(&key_buf);
     key.appendSliceBounded(tag) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
@@ -750,6 +751,8 @@ pub fn sliceUpdate(base: *Tensor, update: *Tensor, start: []const c_int, stop: [
 /// Writes `t`'s pending slice update.
 pub fn settle(t: *Tensor) Error!void {
     const p = t.pending orelse return;
+    // An update from an execution's store that ended with it alive reads another execution's bytes.
+    if (p.update.store.escaped) return core.refusing("a slice update owed from an arena store its execution left alive", error.PlanEscape);
     // Off while the ops below read `t`; a write that fails leaves the update owed, for the next read to make.
     t.pending = null;
     errdefer t.pending = p;
@@ -1184,7 +1187,24 @@ pub fn arrayEqual(a: *Tensor, b: *Tensor, equal_nan: bool) Error!*Tensor {
 pub fn zeros(shape: []const c_int, dtype: Dtype) Error!*Tensor {
     const out = try core.freshForHost(dtype, shape);
     errdefer core.release(out);
-    @memset(try core.hostBytes(out), 0);
+    // A dry ask's bytes are zeros already.
+    if (!core.dryFresh(out)) @memset(try core.hostBytes(out), 0);
+    return out;
+}
+
+/// `zeros` written by a GPU pass: arena bytes, none of the host ring's.
+pub fn zerosOnGpu(shape: []const c_int, dtype: Dtype) Error!*Tensor {
+    const out = try core.fresh(dtype, shape);
+    errdefer core.release(out);
+    if (out.size() == 0) return out;
+    if (out.size() > std.math.maxInt(u32) - flat_per_thread) return core.refusing("GPU zeros past 2^32 elements", error.TensorShape);
+    const p = try core.pass();
+    p.pipeline(try pipelineFor("zeros_v0", comptime flatSource("zeros", "0", 0, 0), &.{}, dtype));
+    core.bindOut(p, out, 0);
+    const n: u32 = @intCast(out.size());
+    p.constant(n, 1);
+    const threads = (out.size() + flat_per_thread - 1) / flat_per_thread;
+    core.dispatch(p, .{ .x = threads }, .{ .x = @min(threads, 256) });
     return out;
 }
 
@@ -1278,6 +1298,19 @@ pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
 /// MLX's `put_along_axis`: a copy of `t` with `values` written at `indices` along `axis`. Two indices that meet
 /// write in no set order, as under MLX.
 pub fn putAlong(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int) Error!*Tensor {
+    const out = try contiguousCopy(t);
+    errdefer core.release(out);
+    try putAlongTo(t, indices, values_in, axis_in, out);
+    return out;
+}
+
+/// `putAlong` written into `t`'s own bytes, which nothing else may read meanwhile: no copy of `t` is made.
+pub fn putAlongInPlace(t: *Tensor, indices: *Tensor, values: *Tensor, axis: c_int) Error!void {
+    if (!t.rowContiguous()) return core.refusing("put_along in place into a tensor that is not row-contiguous", error.TensorUnsupported);
+    return putAlongTo(t, indices, values, axis, t);
+}
+
+fn putAlongTo(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int, out: *Tensor) Error!void {
     const axis: usize = @intCast(if (axis_in < 0) axis_in + @as(c_int, t.ndim) else axis_in);
     if (axis >= t.ndim or indices.ndim != t.ndim) return error.TensorShape;
     switch (indices.dtype) {
@@ -1291,9 +1324,7 @@ pub fn putAlong(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int
     defer core.release(typed);
     const values = try broadcastTo(typed, indices.dims());
     defer core.release(values);
-    const out = try contiguousCopy(t);
-    errdefer core.release(out);
-    if (indices.size() == 0) return out;
+    if (indices.size() == 0) return;
     const source =
         \\[[kernel]] void sushi_put_along(
         \\  const device $0* upd [[buffer(0)]],
@@ -1335,7 +1366,6 @@ pub fn putAlong(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int
     p.constant(@as(i64, @intCast(out.strides[axis])), 8);
     p.constant(t.shape[axis], 9);
     core.dispatch(p, g.size, g.group);
-    return out;
 }
 
 /// MLX's constant `pad`: `t` with `low[i]` and `high[i]` elements of `value` added around `axes[i]`.

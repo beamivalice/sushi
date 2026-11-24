@@ -680,6 +680,20 @@ pub const mlx_array_data_uint16 = routed("mlx_array_data_uint16", fn (arr: mlx_a
 pub const mlx_array_data_uint32 = routed("mlx_array_data_uint32", fn (arr: mlx_array) callconv(.c) ?[*]const u32);
 pub const mlx_array_data_uint8 = routed("mlx_array_data_uint8", fn (arr: mlx_array) callconv(.c) ?[*]const u8);
 
+/// `arr`'s evaluated elements for a readback that steers no shape (docs/bill_redesign.md#recorder): in a dry recording
+/// on the engine, made-up ones, each word below `below` when given (`engine.hostResult`); elsewhere its bytes.
+pub fn hostResult(comptime T: type, arr: mlx_array, below: ?u32) ![]const T {
+    if (engine.enabled and engine.isOurs(arr)) return engine.hostResult(T, arr, below);
+    const n = mlx_array_size(arr);
+    const p = switch (T) {
+        i32 => mlx_array_data_int32(arr),
+        u32 => mlx_array_data_uint32(arr),
+        f32 => mlx_array_data_float32(arr),
+        else => @compileError("hostResult reads i32, u32 or f32"),
+    } orelse return error.HostRead;
+    return p[0..n];
+}
+
 // Vector array
 pub fn mlx_vector_array_new() mlx_vector_array {
     return if (engine.active) engine.mlx_vector_array_new() else raw.mlx_vector_array_new();
@@ -1277,6 +1291,26 @@ pub fn kernelApplyInto(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, i
     };
 }
 
+/// A custom kernel applied into `dsts` on the engine's stream (`engine.kernelApplyInPlace`); null when the call is
+/// not the engine's, so the caller takes MLX's path.
+pub fn kernelApplyInPlace(cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream, dsts: []const mlx_array) ?c_int {
+    if (!engine.enabled) return null;
+    return switch (engine.side(.{ inputs, config, s })) {
+        .engine => if (faultAtEntry()) 1 else engine.kernelApplyInPlace(cls, inputs, config, dsts),
+        else => null,
+    };
+}
+
+/// A kernel whose last output is the engine's counter page on the engine's stream (`engine.kernelApplyCounted`); null
+/// where the stream is MLX's, which has no such page.
+pub fn kernelApplyCounted(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) ?c_int {
+    if (!engine.enabled) return null;
+    return switch (engine.side(.{ inputs, config, s })) {
+        .engine => if (faultAtEntry()) 1 else engine.kernelApplyCounted(outputs, cls, inputs, config),
+        else => null,
+    };
+}
+
 pub fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int {
     if (engine.enabled) switch (engine.side(.{ inputs, config, s })) {
         // The MLX path's entry is counted (`raw_kernel`); the engine's is this one.
@@ -1325,6 +1359,7 @@ pub const mlx_random_randint = routed("mlx_random_randint", fn (res: *mlx_array,
 pub const mlx_logsumexp_axis = routed("mlx_logsumexp_axis", fn (res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_all = routed("mlx_all", fn (res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_isfinite = routed("mlx_isfinite", fn (res: *mlx_array, a: mlx_array, s: mlx_stream) callconv(.c) c_int);
+pub const mlx_clip = routed("mlx_clip", fn (res: *mlx_array, a: mlx_array, a_min: mlx_array, a_max: mlx_array, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_contiguous = routed("mlx_contiguous", fn (res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) callconv(.c) c_int);
 pub const mlx_max = routed("mlx_max", fn (res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) callconv(.c) c_int);
 pub fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int {

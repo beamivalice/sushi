@@ -471,9 +471,6 @@ pub const Tokenizer = struct {
         };
     }
 
-
-
-
     /// Does token `id` carry a line break? Byte-level vocabularies spell byte 0x0A as U+010A.
     pub fn tokenHasNewline(self: *const Tokenizer, id: u32) bool {
         const token = self.id_to_token.get(id) orelse return false;
@@ -1171,6 +1168,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         }
     }
     tok.flagged_specials = try flagged.toOwnedSlice(allocator);
+    aliasOpensourceTags(&tok) catch return error.OutOfMemory;
 
     // Try to find BOS/EOS from common special token patterns
     const sp = &tok.special_tokens;
@@ -1450,7 +1448,6 @@ test "encode special-token scan: earliest match, longest tie-break, adjacency" {
         try testing.expectEqualSlices(u32, &[_]u32{ 1, 92 }, ids);
     }
 }
-
 
 // Helper for pre-tokenizer tests: run gpt2PreTokenize and compare the
 // emitted word strings to an expected slice. Owns the dupe'd word memory.
@@ -2080,6 +2077,26 @@ fn reservedOf(alloc: std.mem.Allocator, flagged: []const FlaggedSpecial, source:
     return reservedOutputIds(alloc, flagged, &t.facts, exempt_ids);
 }
 
+/// Hy4-Flash spells its reasoning and call markers `<tag:opensource>`. Where the pack has no plain `<tag>`, the token
+/// also answers to it (`specialTokenId`, a template-side encode) and decodes as it, so the reasoning split, the
+/// budget's closer and GLM's arg_key parser read Hy4's output as their own. The calls' wrapper `<tool_calls:opensource>`
+/// keeps its spelling (`tool_calls` strips it); prompt-side tags are left alone.
+const opensource_tags = [_][2][]const u8{
+    .{ "<think:opensource>", "<think>" },         .{ "</think:opensource>", "</think>" },
+    .{ "<tool_call:opensource>", "<tool_call>" }, .{ "</tool_call:opensource>", "</tool_call>" },
+    .{ "<arg_key:opensource>", "<arg_key>" },     .{ "</arg_key:opensource>", "</arg_key>" },
+    .{ "<arg_value:opensource>", "<arg_value>" }, .{ "</arg_value:opensource>", "</arg_value>" },
+};
+
+fn aliasOpensourceTags(tok: *Tokenizer) !void {
+    for (opensource_tags) |pair| {
+        const id = tok.special_tokens.get(pair[0]) orelse continue;
+        if (tok.special_tokens.contains(pair[1])) continue;
+        try tok.special_tokens.put(pair[1], id);
+        try tok.id_to_token.put(id, pair[1]);
+    }
+}
+
 /// A BPE tokenizer read the way a load reads one: bytes `a b < > s t u x`, the merge `a b`, and three added tokens,
 /// `<s>` and `<t>` flagged special, `<u>` not.
 fn spanTestTokenizer(a: std.mem.Allocator) !Tokenizer {
@@ -2095,14 +2112,12 @@ fn spanTestTokenizer(a: std.mem.Allocator) !Tokenizer {
 
 test "tokenizer: a tokenizer.json of valid JSON but the wrong shape fails by name" {
     const bodies = [_][]const u8{
-        "[]",                                                              "7",                                     "\"t\"",
-        "null",                                                            "{}",                                    "{\"model\": 7}",
-        "{\"model\": {}}",                                               "{\"model\": {\"vocab\": []}}",      "{\"model\": {\"vocab\": {\"a\": \"x\"}}}",
-        "{\"model\": {\"vocab\": {\"a\": -1}}}",                     "{\"model\": {\"vocab\": {\"a\": 4294967296}}}",
-        "{\"model\": {\"vocab\": {}, \"merges\": 7}}",                "{\"model\": {\"vocab\": {}}, \"added_tokens\": {}}",
-        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [7]}",       "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": 1}]}",
-        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": \"1\", \"content\": \"<s>\"}]}",
-        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": -2, \"content\": \"<s>\"}]}",
+        "[]",                                                                                      "7",                                                                                    "\"t\"",
+        "null",                                                                                    "{}",                                                                                   "{\"model\": 7}",
+        "{\"model\": {}}",                                                                         "{\"model\": {\"vocab\": []}}",                                                         "{\"model\": {\"vocab\": {\"a\": \"x\"}}}",
+        "{\"model\": {\"vocab\": {\"a\": -1}}}",                                                   "{\"model\": {\"vocab\": {\"a\": 4294967296}}}",                                        "{\"model\": {\"vocab\": {}, \"merges\": 7}}",
+        "{\"model\": {\"vocab\": {}}, \"added_tokens\": {}}",                                      "{\"model\": {\"vocab\": {}}, \"added_tokens\": [7]}",                                  "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": 1}]}",
+        "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": \"1\", \"content\": \"<s>\"}]}", "{\"model\": {\"vocab\": {}}, \"added_tokens\": [{\"id\": -2, \"content\": \"<s>\"}]}",
     };
     for (bodies) |body| try testing.expectError(error.InvalidTokenizerJson, parseTokenizerContent(testing.io, testing.allocator, body));
 }
@@ -2209,30 +2224,23 @@ test "tokenizer: a tokenizer.json of every wrong shape is a named load error, ne
     const vocab = "\"vocab\": {\"a\": 0, \"b\": 1}";
     const Case = struct { body: ?[]const u8, loads: bool };
     const cases = [_]Case{
-        .{ .body = "[]", .loads = false },                                                                  .{ .body = "7", .loads = false },
-        .{ .body = "null", .loads = false },                                                                .{ .body = "\"x\"", .loads = false },
-        .{ .body = "{}", .loads = false },                                                                  .{ .body = "{\"model\": []}", .loads = false },
-        .{ .body = "{\"model\": null}", .loads = false },                                                   .{ .body = "{\"model\": {}}", .loads = false },
-        .{ .body = "{\"model\": {\"vocab\": []}}", .loads = false },                                        .{ .body = "{\"model\": {\"vocab\": {\"a\": \"x\"}}}", .loads = false },
-        .{ .body = "{\"model\": {\"vocab\": {\"a\": -1}}}", .loads = false },                               .{ .body = "{\"model\": {\"vocab\": {\"a\": 99999999999}}}", .loads = false },
-        .{ .body = "{\"model\": {\"vocab\": {\"a\": 1.5}}}", .loads = false },                              .{ .body = "{\"model\": {\"vocab\": {\"a\": 0, \"a\": 1}}}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": {}}}", .loads = false },                      .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": null}}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": [5, [\"a\"], [\"a\", 5], null, \"ab\"]}}", .loads = true },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": {}}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [1]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5, \"content\": 5}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5, \"content\": \"\"}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"content\": \"<x>\"}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": \"5\", \"content\": \"<x>\"}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": -5, \"content\": \"<x>\"}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 99999999999, \"content\": \"<x>\"}]}", .loads = false },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": 5}", .loads = true },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": 5}}", .loads = true },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": [5, null, {\"type\": \"Split\", \"pattern\": 5}, {\"type\": \"Split\", \"pattern\": {\"Regex\": 5}}]}}", .loads = true },
-        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Split\", \"pattern\": 5}}", .loads = true },
-        .{ .body = "", .loads = false },                                                                    .{ .body = "{\"model\": {\"vocab\": {\"a\"", .loads = false },
-        .{ .body = "{\"model\": {\"vocab\": {\"\xff\xfe\": 0}}}", .loads = false },                         .{ .body = null, .loads = false },
+        .{ .body = "[]", .loads = false },                                                                                                                                                                                                  .{ .body = "7", .loads = false },
+        .{ .body = "null", .loads = false },                                                                                                                                                                                                .{ .body = "\"x\"", .loads = false },
+        .{ .body = "{}", .loads = false },                                                                                                                                                                                                  .{ .body = "{\"model\": []}", .loads = false },
+        .{ .body = "{\"model\": null}", .loads = false },                                                                                                                                                                                   .{ .body = "{\"model\": {}}", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": []}}", .loads = false },                                                                                                                                                                        .{ .body = "{\"model\": {\"vocab\": {\"a\": \"x\"}}}", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": {\"a\": -1}}}", .loads = false },                                                                                                                                                               .{ .body = "{\"model\": {\"vocab\": {\"a\": 99999999999}}}", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": {\"a\": 1.5}}}", .loads = false },                                                                                                                                                              .{ .body = "{\"model\": {\"vocab\": {\"a\": 0, \"a\": 1}}}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": {}}}", .loads = false },                                                                                                                                                      .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": null}}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ ", \"merges\": [5, [\"a\"], [\"a\", 5], null, \"ab\"]}}", .loads = true },                                                                                                                   .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": {}}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [1]}", .loads = false },                                                                                                                                               .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5, \"content\": 5}]}", .loads = false },                                                                                                                     .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 5, \"content\": \"\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"content\": \"<x>\"}]}", .loads = false },                                                                                                                          .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": \"5\", \"content\": \"<x>\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": -5, \"content\": \"<x>\"}]}", .loads = false },                                                                                                              .{ .body = "{\"model\": {" ++ vocab ++ "}, \"added_tokens\": [{\"id\": 99999999999, \"content\": \"<x>\"}]}", .loads = false },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": 5}", .loads = true },                                                                                                                                                 .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": 5}}", .loads = true },
+        .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Sequence\", \"pretokenizers\": [5, null, {\"type\": \"Split\", \"pattern\": 5}, {\"type\": \"Split\", \"pattern\": {\"Regex\": 5}}]}}", .loads = true }, .{ .body = "{\"model\": {" ++ vocab ++ "}, \"pre_tokenizer\": {\"type\": \"Split\", \"pattern\": 5}}", .loads = true },
+        .{ .body = "", .loads = false },                                                                                                                                                                                                    .{ .body = "{\"model\": {\"vocab\": {\"a\"", .loads = false },
+        .{ .body = "{\"model\": {\"vocab\": {\"\xff\xfe\": 0}}}", .loads = false },                                                                                                                                                         .{ .body = null, .loads = false },
     };
     var wrong: usize = 0;
     for (cases, 0..) |c, i| {
@@ -2381,6 +2389,37 @@ test "ignore_merges: an added token's text in client input is text, and the temp
     const placed = try tok.encodeSpans(a, .{ .bytes = "/x", .origin = .template });
     defer a.free(placed);
     try testing.expectEqualSlices(u32, &.{9}, placed);
+}
+
+test "an added token spelled <tag:opensource> (Hy4) answers to and decodes as <tag> where the pack has no <tag>" {
+    const a = testing.allocator;
+    const content =
+        \\{"model": {"type": "BPE", "vocab": {"a": 0, "<": 1, ">": 2}, "merges": []},
+        \\ "added_tokens": [{"id": 9, "content": "<think:opensource>", "special": false},
+        \\  {"id": 10, "content": "</think:opensource>", "special": false},
+        \\  {"id": 11, "content": "<tool_call:opensource>", "special": false},
+        \\  {"id": 12, "content": "<arg_key:opensource>", "special": false},
+        \\  {"id": 13, "content": "<tool_calls:opensource>", "special": false},
+        \\  {"id": 14, "content": "<tool_response:opensource>", "special": true}],
+        \\ "pre_tokenizer": {"type": "ByteLevel"}}
+    ;
+    var tok = try parseTokenizerContent(testing.io, a, content);
+    defer tok.deinit();
+    // The server finds the reasoning markers by their plain text (the budget's closer, the prompt's opener).
+    try testing.expectEqual(@as(?u32, 9), tok.specialTokenId("<think>"));
+    try testing.expectEqual(@as(?u32, 10), tok.specialTokenId("</think>"));
+    const closer = try tok.encode(a, "</think>");
+    defer a.free(closer);
+    try testing.expectEqualSlices(u32, &.{10}, closer);
+    // The template's own spelling still encodes to its token.
+    const own = try tok.encode(a, "<think:opensource>");
+    defer a.free(own);
+    try testing.expectEqualSlices(u32, &.{9}, own);
+    // Decoded output reads in the plain spelling every splitter and parser takes; the calls' outer wrapper and the
+    // tool-result tags (a prompt-side special) keep theirs.
+    const text = try tok.decode(a, &.{ 9, 0, 10, 11, 12, 13, 14 });
+    defer a.free(text);
+    try testing.expectEqualStrings("<think>a</think><tool_call><arg_key><tool_calls:opensource><tool_response:opensource>", text);
 }
 
 test "an added token still decodes and is found by text for a logit bias" {

@@ -329,6 +329,16 @@ pub const Fs = struct {
         meta.* = loaded.meta;
     }
 
+    /// The tensors of the file at `path` (without its `\x00`) read into the bytes `into` names, no array made; its
+    /// metadata, in `aa`. A missing, short or unparsable file fails as `loadSafetensors` fails on it.
+    pub fn readTensorsInto(self: *const Fs, path: []const u8, aa: Allocator, into: vt.Sink) ![]const vt.MetaPair {
+        if (self.vfs) |v| return vt.readInto(v, self.rel(path) orelse return error.MlxError, aa, into);
+        return readFileInto(self.io, path, aa, into) catch |e| switch (e) {
+            error.OutOfMemory => e,
+            else => error.MlxError,
+        };
+    }
+
     /// Writes a tensor file in place on the calling thread. Returns its size. `maps` is empty or parallel to `tensors`.
     pub fn saveTensorsNow(self: *const Fs, path: []const u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, maps: []const ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         const v = self.vfs.?;
@@ -454,6 +464,28 @@ pub fn readFileAlloc(allocator: Allocator, io: std.Io, abs_path: []const u8, lim
     var rb: [8192]u8 = undefined;
     var rs = f.reader(io, &rb);
     return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
+}
+
+/// A plain tensor file's header parsed, then each tensor `into` names read at its offset straight into its bytes.
+fn readFileInto(io: std.Io, path: []const u8, aa: Allocator, into: vt.Sink) ![]const vt.MetaPair {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var word: [8]u8 = undefined;
+    if (try f.readPositionalAll(io, &word, 0) != word.len) return error.EndOfStream;
+    const head_len = std.mem.readInt(u64, &word, .little);
+    if (head_len > 1 << 30) return error.EndOfStream;
+    const head = try aa.alloc(u8, 8 + @as(usize, @intCast(head_len)));
+    if (try f.readPositionalAll(io, head, 0) != head.len) return error.EndOfStream;
+    const h = try vt.Head.parse(aa, head);
+    try into.begin(h.meta);
+    var at: u64 = head.len;
+    for (h.tensors, h.nbytes) |t, n| {
+        defer at += n;
+        const out = (try into.dest(into.ctx, t)) orelse continue;
+        if (out.len != n) return error.EndOfStream;
+        if (try f.readPositionalAll(io, out, at) != n) return error.EndOfStream;
+    }
+    return h.meta;
 }
 
 comptime {
@@ -602,6 +634,87 @@ test "kv_disk_fs: SUSHI_PREFIX_FS takes cas by default, real on request, and ref
     try testing.expectEqual(Backend.cas, try parseBackend("cas"));
     try testing.expectEqual(Backend.real, try parseBackend("real"));
     try testing.expectError(error.PrefixFsUnknown, parseBackend("files"));
+}
+
+test "kv_disk_fs: a tensor file reads into the bytes its reader names on the layer, as plain files and from its bytes, its metadata seen first and a tensor passed over left unread" {
+    try mlx.requireGpu();
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var cas = try Fs.open(testing.allocator, io, root, .cas);
+    defer cas.close();
+    var dir_buf: [600]u8 = undefined;
+    try cas.mkdirp(try std.fmt.bufPrint(&dir_buf, "{s}/e1", .{root}));
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    try mlx.check(mlx.mlx_arange(&a, 0, 12, 1, .float32, s));
+    var a2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a2);
+    try mlx.check(mlx.mlx_reshape(&a2, a, &[_]c_int{ 4, 3 }, 2, s));
+    var b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_arange(&b, 0, 5, 1, .uint32, s));
+    try mlx.check(mlx.mlx_array_eval(a2));
+    try mlx.check(mlx.mlx_array_eval(b));
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/e1/s0000012.safetensors", .{root});
+    defer testing.allocator.free(path);
+    _ = try cas.saveTensorsNow(path, &.{ .{ .key = "a", .arr = a2 }, .{ .key = "b", .arr = b } }, &.{.{ .key = "layers", .value = "2" }}, &.{}, .ssm, s);
+    const image = testRead(io, path, 1 << 20).?;
+    defer testing.allocator.free(image);
+    var plain_tmp = std.testing.tmpDir(.{});
+    defer plain_tmp.cleanup();
+    var plain_buf: [512]u8 = undefined;
+    const plain_root = plain_buf[0..try plain_tmp.dir.realPath(io, &plain_buf)];
+    const plain_path = try std.fmt.allocPrint(testing.allocator, "{s}/s0000012.safetensors", .{plain_root});
+    defer testing.allocator.free(plain_path);
+    {
+        const f = try std.Io.Dir.createFileAbsolute(io, plain_path, .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, image, 0);
+    }
+    var plain = try Fs.open(testing.allocator, io, plain_root, .real);
+    defer plain.close();
+    const Into = struct {
+        out: [12]f32 = @splat(-1),
+        /// The metadata lives only for the read: its `layers` value is kept as read.
+        layers: ?u8 = null,
+        named_before_meta: bool = false,
+
+        fn meta(ctx: *anyopaque, pairs: []const vt.MetaPair) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            for (pairs) |p| if (std.mem.eql(u8, p.key, "layers") and p.value.len == 1) {
+                self.layers = p.value[0];
+            };
+        }
+
+        fn dest(ctx: *anyopaque, t: vt.Named) anyerror!?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.layers == null) self.named_before_meta = true;
+            if (!std.mem.eql(u8, t.key, "a")) return null;
+            try testing.expectEqual(mlx.mlx_dtype.float32, t.dtype);
+            try testing.expectEqualSlices(c_int, &.{ 4, 3 }, t.shape);
+            return std.mem.sliceAsBytes(&self.out);
+        }
+    };
+    var want: [12]f32 = undefined;
+    for (&want, 0..) |*x, i| x.* = @floatFromInt(i);
+    for (0..3) |how| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        var into: Into = .{};
+        const sink: vt.Sink = .{ .ctx = &into, .dest = Into.dest, .meta = Into.meta };
+        _ = switch (how) {
+            0 => try cas.readTensorsInto(path, arena.allocator(), sink),
+            1 => try plain.readTensorsInto(plain_path, arena.allocator(), sink),
+            else => try vt.readBytesInto(image, arena.allocator(), sink),
+        };
+        try testing.expect(!into.named_before_meta);
+        try testing.expectEqual(@as(?u8, '2'), into.layers);
+        try testing.expectEqualSlices(f32, &want, &into.out);
+    }
 }
 
 test "kv_disk_fs: a file larger than half the writer's permit goes to the writer in parts, the caller appending nothing" {

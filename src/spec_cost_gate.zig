@@ -67,6 +67,18 @@ pub const Gate = struct {
         return self.mode == .probe;
     }
 
+    pub fn nextIsPlainAfter(self: *const Gate, steps: u32) bool {
+        return switch (self.mode) {
+            .probe => self.probe_seen + steps < probe_ticks,
+            .plain => self.plain_tokens + steps < self.retrial,
+            .rounds => false,
+        };
+    }
+
+    pub fn nextIsPlainAfterPlain(self: *const Gate) bool {
+        return self.nextIsPlainAfter(1);
+    }
+
     /// One assistant round: wall ms and tokens it emitted (the pending token plus accepted drafts).
     pub fn observeRound(self: *Gate, ms: f64, tokens: u32) void {
         self.ms = self.ms * decay + ms;

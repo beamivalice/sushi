@@ -238,8 +238,8 @@ llmprobe (`--mtp`, six boots) did not resolve the change on battery: prefill, wh
 `sushi-ubench run shared.exl3_rate_groups --rungs rows=1,4`: one Flash-Next MoE layer per step (2560 -> 640, E=512, top-10, bf16
 rows, the gated shared expert folded at one row and separate at four), 48 dependent steps, arms interleaved in one
 process, median of 9, ratio to uniform n32 as served. Groups split the 512 experts evenly; each slot draws its group
-from the layout's mix. M5 Max 128 GB, AC power, fans at max, `taskpolicy -a`, GPU lock, quiet window, ReleaseFast,
-measured on the tree this was ported from.
+from the layout's mix. M5 Max 128 GB, 2026-10-15, AC power, fans at max, `taskpolicy -a`, GPU lock `rategroups`,
+quiet window. Code `b8510d33` (an experiment branch, `rategroups`), ReleaseFast.
 
 | layout | SPEC1 w15, 1 row | PAIR1, 1 row | SPEC1, 4 rows | PAIR1, 4 rows |
 |---|---|---|---|---|
@@ -255,7 +255,9 @@ measured on the tree this was ported from.
 - The masked `moeGroups` this replaces read 1.91-1.94 at 2 groups, 2.47-2.80 at 3 and 16.5-18.7 at 20 in the same run.
 - The switch costs 1.3-3.1% at 12-21 classes, measured against the switch-free twin; that twin routes into 25 experts and
   is cache-warm, hence under 1.0. The rest of the per-expert cost is the rate mix.
-- A switch inside the pair kernel's projection loop read 1.26-1.29 for the per-expert mix; the class switch is the fix.
+- Before the class switch (`cd57a4e8`, the switch inside the pair kernel's projection loop) the per-expert mix read
+  1.26-1.29. A sweep with every slot in one n32 group (one row, S1) put the pair kernel's switch at 1.014 / 1.037 /
+  1.121 / 1.413 for 2 / 7 / 11 / 21 cases; the down kernel's 21 cases cost 1.010.
 - One pass per group (each pass skipping other groups' slots, then a G-plane reduce) read 1.36 / 1.55 / 9.0 at 2 / 3 /
   20 groups, one row. Its early exit saved nothing (passes over every slot cost the same): a dispatch costs a fixed
   ~10 us in this chain. Host-compacted slot lists still read 1.10 / 1.35 / 4.4.
@@ -263,9 +265,10 @@ measured on the tree this was ported from.
 <a id="dsv41-stq"></a>
 ## DeepSeek-V4.1 STQ pack kernels (trunk linears, routed chain)
 
-ReleaseFast, `taskpolicy -a`, M5 Max, NO GPU lock: another job held the GPU. Dependent-chain timings queue behind its
-long kernels (a one-row chain read 2-3 ms instead of ~250 us), so each cell is the best of 40 chains of 4 calls with the
-chain link removed: orderings and ratios hold, absolute microseconds are upper bounds. Re-take the cells on a quiet box before recording any as a baseline.
+Binary: `dsv41-stq-kernels` at bb4667c9 (ReleaseFast, `taskpolicy -a`), M5 Max, NO GPU lock: the conversion of
+`dsv41-stq-d4` held the GPU. Dependent-chain timings queue behind its long kernels (a one-row chain read 2-3 ms instead
+of ~250 us), so each cell is the best of 40 chains of 4 calls with the chain link removed: orderings and ratios hold,
+absolute microseconds are upper bounds. Re-take the cells on a quiet box before recording any as a baseline.
 Meters: `SUSHI_DSV41_STQ_UBENCH=1` with `SUSHI_UBENCH_STEPS=4 SUSHI_UBENCH_ROUNDS=40` (exl3 test binary,
 `-Dtest-filter=UBENCH`); the expert chain is now `sushi-ubench run dsv41.experts` and the trunk table
 `sushi-ubench run shared.exl3_trunk_rows` ([process-ubench](process-ubench.md)).
@@ -294,7 +297,8 @@ every width), `rows` the multi-row kernel (SIMD at 1 row, NAX from 2), mxfp8 the
 - `wq_a` and `wkv` in one stacked launch against two (`SUSHI_DSV41_STQ_UBENCH=shared`, 8-step chains, best of 40,
   same conditions, three runs): one row 29.4-38.1 us against 34.1-47.7 (0.80 to 0.88), five rows 35.7-47.7 against
   43.3-51.3 (0.81 to 1.05).
-- The cells time `linear` on f16 rows. Served on bf16 rows a call stores bf16 directly (no cast dispatch); not re-timed.
+- The cells time `linear` on f16 rows. Served on bf16 rows a call also paid an f16-to-bf16 cast dispatch until
+  b3f1367f and 6924383a, which store bf16 directly; not re-timed.
 
 Routed chain (`moeDecodeClamped` / `moePrefillClamped`, 5120->2304->5120, top-6 clamped SwiGLU, bf16 rows, 16 route sets
 so the experts are cold), us per call over the picked experts' bytes:

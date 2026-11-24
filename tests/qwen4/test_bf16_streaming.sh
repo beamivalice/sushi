@@ -16,7 +16,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 # The KLD run loads the checkpoint itself, so it holds the lock on its own and lets go before the server boots.
 "$SUSHI_ROOT/scripts/gpu-lock.sh" acquire tests-bf16-kld
-taskpolicy -a "$SUSHI_BIN" kld compare --model "$CHECKPOINT" --fixture "$FIXTURE" --limit 3 --ssd-budget-gb 60 --no-mtp --kv-quant off --json "$WORK/kld.json" \
+taskpolicy -a "$SUSHI_BIN" kld compare --model "$CHECKPOINT" --fixture "$FIXTURE" --limit 3 --no-mtp --kv-quant off --json "$WORK/kld.json" \
     || { "$SUSHI_ROOT/scripts/gpu-lock.sh" release tests-bf16-kld; exit 1; }
 "$SUSHI_ROOT/scripts/gpu-lock.sh" release tests-bf16-kld
 jq -e '.mean_kld_to_eos < 0.02 and .mean_top1_to_eos > 0.95' "$WORK/kld.json" > /dev/null

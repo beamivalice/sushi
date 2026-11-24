@@ -41,6 +41,12 @@ pub const Geometry = struct {
     /// Absolute layer at which routed expert banks begin; earlier layers stay
     /// addressable but get no bank (MiMo and GLM keep a dense prefix).
     first_moe_layer: u16 = 0,
+    /// The arch never asks one route for more distinct experts than a layer's cache holds (it routes in groups of at
+    /// most the cache's slots): the store keeps no union workspace and the fill peak is the cache's.
+    union_within_cache: bool = false,
+    /// The fused BF16 banks' tensor names: `<prefix><layer>.mlp.experts.{gate_up,down}_proj` (Qwen's checkpoint by
+    /// default; Hy4-Flash's is `model.layers.`).
+    fused_prefix: []const u8 = "model.language_model.layers.",
     /// EXL3 halfwords per packed tile (K = n/16); ignored by every other layout.
     exl3_n: u32 = 64,
     /// The bank rates the config names decoders for (`Spec.rates`); null admits any up to `exl3_n`.
@@ -447,7 +453,7 @@ fn populateBf16IndividualStore(allocator: std.mem.Allocator, model_dir: []const 
 pub fn isRoutedExpertKey(layout: Layout, key: []const u8) bool {
     return switch (layout) {
         .bf16_individual, .fp8_individual => parseBf16IndividualKey(key) == .valid,
-        .bf16_fused => std.mem.startsWith(u8, key, "model.language_model.layers.") and
+        .bf16_fused => (std.mem.startsWith(u8, key, "model.language_model.layers.") or std.mem.startsWith(u8, key, "model.layers.")) and
             (std.mem.endsWith(u8, key, ".mlp.experts.gate_up_proj") or
                 std.mem.endsWith(u8, key, ".mlp.experts.down_proj")),
         .quantized_split => std.mem.startsWith(u8, key, AFFINE_PREFIX) and
@@ -729,6 +735,16 @@ fn layoutOfWeightMap(model_type: []const u8, map: std.json.ObjectMap, layers: u1
         if (exl3BankComplete(map, EXL3_PREFIXES[1], first_moe_layer, layers)) return .exl3_k4;
         if (!mxfp4IndividualBankCompleteFromFirst(.mxfp4_w123, map, layers, null, first_moe_layer)) return null;
         return .mxfp4_w123;
+    }
+    if (source == .fused_banks) {
+        // An STQ pack's rate-group trellis banks under the routed nesting (Hy4-Flash's), or the release's fused banks.
+        if (exl3BankComplete(map, EXL3_PREFIXES[1], first_moe_layer, layers)) return .exl3_k4;
+        var key_buf: [96]u8 = undefined;
+        for (first_moe_layer..layers) |l| for ([_][]const u8{ "gate_up_proj", "down_proj" }) |part| {
+            const key = std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.experts.{s}", .{ l, part }) catch return null;
+            if (map.get(key) == null) return null;
+        };
+        return .bf16_fused;
     }
     const mimo = source == .flat_banks;
     const layout = layoutFromWeightMapWithFirstMoe(map, layers, first_moe_layer, mimo) orelse return null;

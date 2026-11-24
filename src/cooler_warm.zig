@@ -59,7 +59,6 @@ fn warmMarker(scope: [16]u8, c: *const @import("model.zig").ModelConfig, drafter
     d.addInt("kv scheme", @intFromEnum(kv.scheme));
     d.addInt("kv bits", kv.bits);
     d.addInt("kv group", kv.group_size);
-    const dspark = if (drafter) |h| h.kind() == .dspark else false;
     d.addInt("drafter", if (drafter) |h| @as(u64, @intFromEnum(h.kind())) + 1 else 0);
     d.addInt("verify drafts", generate.Generator.mtpVerifyDraftsMax(c));
     if (drafter != null) {
@@ -69,7 +68,7 @@ fn warmMarker(scope: [16]u8, c: *const @import("model.zig").ModelConfig, drafter
         d.addInt("mtp min depth", depth.min);
         d.addInt("mtp max depth", depth.max);
     }
-    d.addInt("bill", bills.warmRequestBill(c, if (kv.scheme == .off) 16 else kv.bits, chunk, drafter != null and !dspark));
+    d.addInt("bill", bills.warmRequestBill(c, if (kv.scheme == .off) 16 else kv.bits, chunk, drafter != null));
     d.addInt("checkpoint stride", @import("server_state.zig").ssm_checkpoint_stride);
     d.addInt("indexer budget", c.indexer_budget);
     d.addInt("vocab", c.vocab_size);
@@ -83,6 +82,11 @@ fn warmMarker(scope: [16]u8, c: *const @import("model.zig").ModelConfig, drafter
 
 /// Test seam: the bill the warm's widest request is held to, in place of its own.
 pub var bill_for_test: ?u64 = null;
+
+/// What the warm's widest request asked of the pool at its peak, what the pool held then (its free buffers too) and its
+/// bill, as the last served warm measured them.
+pub const Longest = struct { asked: u64, held: u64, bill: u64 };
+pub var longest_for_test: ?Longest = null;
 
 /// `drafter`: the load's drafter, if it drafts; a DSpark one drafts in its own rounds, as the scheduler arms it. The warm
 /// ends by recording its marker; a load whose manifest holds that marker skips the requests, and still refuses by name a
@@ -98,10 +102,12 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     // A request's chunk is sized by the live headroom: the warm's widest is what fits beside the load now.
     const top = bills.widestServedRung(c);
     const kv = bills.configuredKvQuantFor(c);
-    const headroom = bills.prefillHeadroomNow(c, 0);
-    const chunk = bills.warmChunkAdmitted(c, if (kv.scheme == .off) 16 else kv.bits, top, headroom);
+    const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
+    // A static-bill load warms the one chunk its ledger fixed (D4): its arena and its request at its context fit there.
+    const fixed = c.static_prefill_chunk;
+    const headroom = if (fixed != 0) 0 else bills.prefillHeadroomNow(c, 0);
+    const chunk: u32 = if (fixed != 0) fixed else bills.warmChunkAdmitted(c, bits, top, headroom);
     if (chunk == 0) {
-        const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
         const floor = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
         const ceil = bills.ceilingNow();
         var under_buf: [160]u8 = undefined;
@@ -114,7 +120,10 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         });
         return error.WarmChunkDoesNotFit;
     }
-    log.info("[warm] the widest chunk is {d} rows of {d}: headroom {d} MB\n", .{ chunk, top, headroom >> 20 });
+    if (fixed != 0)
+        log.info("[warm] the chunk is the {d} rows the load fixed on its ledger\n", .{chunk})
+    else
+        log.info("[warm] the widest chunk is {d} rows of {d}: headroom {d} MB\n", .{ chunk, top, headroom >> 20 });
     const longest: usize = @intCast(bills.warmLongestPrompt(c, chunk));
     const drafts = if (drafter) |d| (if (d.kind() == .dspark) "DSpark" else "the MTP head") else "no drafter";
     // A manifest that holds the marker of a warm that ran whole under this shape has every pipeline these requests
@@ -147,8 +156,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         // that the pool refuses, is refused here by name, not deep in a kernel on a served request. What the pool keeps
         // free up to its cap is not a bill's. The bill lends no decoder pool: the warm's chunk fits the headroom
         // (`warmChunkAdmitted` lends none either), so it releases none and takes its whole cap from the pool.
-        const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
-        const billed = bills.warmRequestBill(c, bits, chunk, spec.drafter != null);
+        const billed = bills.warmRequestBill(c, bits, chunk, spec.drafter != null or spec.dspark);
         const bill = if (@import("builtin").is_test) bill_for_test orelse billed else billed;
         mlx.engine.close();
         const in_use0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
@@ -161,6 +169,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         const held = mlx.engine.poolHeldPeak(.process) -| held0;
         const refused = mlx.engine.poolRefusals() != refusals0;
         log.debug("[warm] a {d}-token request at {d}-row chunks: {d} MB in use at its peak, {d} MB held, bill {d} MB\n", .{ longest, chunk, asked >> 20, held >> 20, bill >> 20 });
+        if (@import("builtin").is_test) longest_for_test = .{ .asked = asked, .held = held, .bill = bill };
         if (refused or asked > bill) {
             log.err("[warm] a {d}-token request at {d}-row chunks {s}: {d} MB in use at its peak ({d} MB held) against its {d} MB bill; the bill misses a term of this pack\n", .{ longest, chunk, if (refused) "was refused by the pool" else "asked more than its bill", asked >> 20, held >> 20, bill >> 20 });
             return error.WarmOverBill;

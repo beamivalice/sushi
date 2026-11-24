@@ -9,6 +9,9 @@ const arm_trial = @import("../arm_trial.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
 const nax_gate = @import("../nax_gate.zig");
+const metal_def = @import("../metal_def.zig");
+pub const hck = @import("../hc_kernels.zig");
+pub const sel = @import("../sparse_select.zig");
 
 const A = sc_mod.A;
 const Scope = sc_mod.Scope;
@@ -17,32 +20,15 @@ const ci = sc_mod.ci;
 
 // ── launching ────────────────────────────────────────────────────────────
 
-const Tmpl = struct { name: [*:0]const u8, v: c_int };
-const TDtype = struct { name: [*:0]const u8, dt: mlx.mlx_dtype };
-const OutSpec = struct { shape: []const c_int, dt: mlx.mlx_dtype, into: ?A = null };
-
-/// A kernel's source and signature; the pipeline is built on first use.
-const Def = struct {
-    name: [*:0]const u8,
-    ins: []const [*:0]const u8,
-    outs: []const [*:0]const u8,
-    source: [:0]const u8,
-    header: [:0]const u8 = "",
-    built: ?mlx.mlx_fast_metal_kernel = null,
-};
-
-const Grid = [3]usize;
+const Tmpl = metal_def.Tmpl;
+const TDtype = metal_def.TDtype;
+const OutSpec = metal_def.OutSpec;
+const Def = metal_def.Def;
+const Grid = metal_def.Grid;
 
 fn launch(sc: *Scope, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, result: []A) !void {
-    const k = try qat_mod.kernelNew(&def.built, def.name, def.ins, def.outs, def.source, def.header);
-    const cfg = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(grid[0]), ci(grid[1]), ci(grid[2])));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg[0]), ci(tg[1]), ci(tg[2])));
-    for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, t.v));
-    for (dts) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t.name, t.dt));
-    try qat_mod.applyKernelInto(sc, k, inputs, cfg, result, outs[0].into);
+    try metal_def.launch(sc.s, def, inputs, outs, grid, tg, ints, dts, result);
+    try keepAll(sc, result);
 }
 
 fn f32Const(sc: *Scope, vals: []const f32) !A {
@@ -311,121 +297,6 @@ const ROUTE_BODY =
     \\}
 ;
 
-/// The K largest of each row of `x` [L, n] f32 (K <= n), as their indices in ascending order, ties to the lower
-/// index: a radix select of the order-preserving uint keys, 8 bits a pass, then one pass writing every key above
-/// the threshold and the first ties. One threadgroup a row; the split variant runs it on G chunks of a row, then on
-/// the chunks' candidates (ascending in the row's index, so a tie still goes to the lower index). A variant defines
-/// `n`, `xr`, `ELEM(i)` (the key of element i) and `EMIT(p, i)` (pick p is element i).
-const TOPK_BODY =
-    \\threadgroup atomic_uint hist[256];
-    \\threadgroup uint t_sel[2], t_part[TG / 32];
-    \\const uint K = uint(kk[0]);
-    \\uint prefix = 0, krem = K;
-    \\for (int pass = 0; pass < 4; ++pass) {
-    \\  const int shift = 24 - 8 * pass;
-    \\  const uint hmask = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
-    \\  for (uint b = tid; b < 256; b += TG) atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = int(tid); i < n; i += TG) {
-    \\    const uint key = ELEM(i);
-    \\    if ((key & hmask) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, metal::memory_order_relaxed);
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (sg == 0) {
-    \\    uint c[8], tot = 0;
-    \\    for (int j = 0; j < 8; ++j) { c[j] = atomic_load_explicit(&hist[255 - (lane * 8 + j)], metal::memory_order_relaxed); tot += c[j]; }
-    \\    const uint before = metal::simd_prefix_exclusive_sum(tot);
-    \\    const bool mine = before < krem && before + tot >= krem;
-    \\    if (mine) {
-    \\      uint acc = before;
-    \\      int j = 0;
-    \\      for (; j < 8; ++j) { if (acc + c[j] >= krem) break; acc += c[j]; }
-    \\      t_sel[0] = prefix | (uint(255 - (lane * 8 + j)) << shift);
-    \\      t_sel[1] = krem - acc;
-    \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  prefix = t_sel[0];
-    \\  krem = t_sel[1];
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\const int C = (n + TG - 1) / TG, i0 = int(tid) * C, i1 = metal::min(n, i0 + C);
-    \\uint gt = 0, eq = 0;
-    \\for (int i = i0; i < i1; ++i) { const uint key = ELEM(i); gt += key > prefix; eq += key == prefix; }
-    \\uint s = metal::simd_prefix_exclusive_sum(eq);
-    \\if (lane == 31) t_part[sg] = s + eq;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\uint off = 0;
-    \\for (uint g = 0; g < sg; ++g) off += t_part[g];
-    \\const uint eq_before = s + off;
-    \\const uint take = eq_before >= krem ? 0u : metal::min(eq, krem - eq_before);
-    \\const uint sel = gt + take;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\s = metal::simd_prefix_exclusive_sum(sel);
-    \\if (lane == 31) t_part[sg] = s + sel;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\off = 0;
-    \\for (uint g = 0; g < sg; ++g) off += t_part[g];
-    \\uint pos = s + off, taken = 0;
-    \\for (int i = i0; i < i1; ++i) {
-    \\  const uint key = ELEM(i);
-    \\  if (key > prefix || (key == prefix && taken < take)) {
-    \\    taken += key == prefix;
-    \\    EMIT(pos, i);
-    \\    ++pos;
-    \\  }
-    \\}
-;
-
-const TOPK_PRE =
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-;
-
-const TOPK_SOURCE = TOPK_PRE ++
-    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
-    \\const auto xr = x + size_t(l) * n;
-    \\#define ELEM(i) dsv41_key(xr[i])
-    \\#define EMIT(p, i) out[size_t(l) * K + (p)] = (i)
-    \\
-++ TOPK_BODY;
-
-/// Chunk g of G of each row: its K picks as row indices, `[L, G * K]`; kk = {K, G}.
-const TOPK_CHUNK_SOURCE = TOPK_PRE ++
-    \\const int l = threadgroup_position_in_grid.y, g = threadgroup_position_in_grid.x, G = kk[1], N = x_shape[1];
-    \\const size_t c0 = size_t(N) * g / G;
-    \\const int n = int(size_t(N) * (g + 1) / G - c0);
-    \\const auto xr = x + size_t(l) * N + c0;
-    \\#define ELEM(i) dsv41_key(xr[i])
-    \\#define EMIT(p, i) out[(size_t(l) * G + g) * kk[0] + (p)] = int(c0) + (i)
-    \\
-++ TOPK_BODY;
-
-/// `TOPK_SOURCE` that writes -1 for a pick not under its row's length `lens[l]`.
-const TOPK_BELOW_SOURCE = TOPK_PRE ++
-    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
-    \\const auto xr = x + size_t(l) * n;
-    \\#define ELEM(i) dsv41_key(xr[i])
-    \\#define EMIT(p, i) out[size_t(l) * K + (p)] = (int(i) < lens[l] ? int(i) : -1)
-    \\
-++ TOPK_BODY;
-
-/// The K largest of each row of `x` among its candidate indices `ids` `[L, C]` (ascending).
-const TOPK_MERGE_SOURCE = TOPK_PRE ++
-    \\const int l = threadgroup_position_in_grid.y, n = ids_shape[1];
-    \\const auto xr = x + size_t(l) * x_shape[1];
-    \\const auto ir = ids + size_t(l) * n;
-    \\#define ELEM(i) dsv41_key(xr[ir[i]])
-    \\#define EMIT(p, i) out[size_t(l) * kk[0] + (p)] = ir[i]
-    \\
-++ TOPK_BODY;
-
-const TOPK_HEADER =
-    \\inline uint dsv41_key(float f) {
-    \\  const uint u = as_type<uint>(f);
-    \\  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    \\}
-;
-
 /// `x` [L, K] times dense rows `w` [N, K] (any float dtypes) in f32, RPS rows a simdgroup: the product the
 /// reference computes after widening w, rounded once to OT. A row's sum never depends on L.
 const DENSE_F32X_SOURCE =
@@ -467,15 +338,9 @@ var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"log
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
 var route_split_def = Def{ .name = "dsv41_route_split", .ins = &.{ "logits", "bias", "scal", "z", "eps" }, .outs = &.{ "idx", "wts", "pre", "post", "comb" }, .source = ROUTE_SPLIT_SOURCE };
 var route_split_slots_def = Def{ .name = "dsv41_route_split_slots", .ins = &.{ "logits", "bias", "scal", "z", "eps", "map" }, .outs = &.{ "idx", "wts", "pre", "post", "comb", "local" }, .source = ROUTE_SPLIT_SLOTS_SOURCE };
-var topk_def = Def{ .name = "dsv41_topk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_SOURCE, .header = TOPK_HEADER };
-var topk_below_def = Def{ .name = "dsv41_topk_below", .ins = &.{ "x", "kk", "lens" }, .outs = &.{"out"}, .source = TOPK_BELOW_SOURCE, .header = TOPK_HEADER };
-var topk_chunk_def = Def{ .name = "dsv41_topk_chunk", .ins = &.{ "x", "kk" }, .outs = &.{"out"}, .source = TOPK_CHUNK_SOURCE, .header = TOPK_HEADER };
-var topk_merge_def = Def{ .name = "dsv41_topk_merge", .ins = &.{ "x", "ids", "kk" }, .outs = &.{"out"}, .source = TOPK_MERGE_SOURCE, .header = TOPK_HEADER };
 var dense_f32x_def = Def{ .name = "dsv41_dense_f32x", .ins = &.{ "x", "w" }, .outs = &.{"out"}, .source = DENSE_F32X_SOURCE };
 
 const gate_sgs = 8;
-/// Threads a top-k threadgroup runs; `probeTopk` halves it where the GPU caps the kernel lower.
-pub var topk_tg: usize = 1024;
 const dense_f32x_rps = 4;
 
 /// `x` `[L, D]` times the router rows `w` `[E, D]` in f32 (`D` a multiple of 8).
@@ -552,47 +417,23 @@ pub fn routeSplitSlots(sc: *Scope, logits: A, bias: A, k: usize, norm: bool, sca
     return .{ .routes = .{ .idx = o[0], .wts = o[1], .local = o[5] }, .split = .{ .pre = o[2], .post = o[3], .comb = o[4] } };
 }
 
-/// Chunks a row of `n` scores splits into for its top-k. Past these sizes one threadgroup a row leaves the GPU idle;
-/// below them, or at a wide k, the merge costs what the split saves (`sushi-ubench run dsv41.topk`).
-pub fn topkSplits(rows: usize, n: usize, k: usize) usize {
-    if (rows > topk_split_rows or k > topk_split_max_k) return 1;
-    return if (n >= (if (rows == 1) topk_split_min_n_one_row else topk_split_min_n)) topk_splits else 1;
-}
-
-const topk_split_rows = 16;
-const topk_split_max_k = 512;
-const topk_split_min_n_one_row: usize = 131072;
-const topk_split_min_n: usize = 262144;
-pub const topk_splits: usize = 8;
+/// `sparse_select.topkSplits`.
+pub const topkSplits = sel.topkSplits;
+pub const topk_splits = sel.topk_splits;
 
 /// The indices of the `k` largest of each row of `x` `[L, n]` (f32), ascending, ties to the lower index.
 pub fn topkIndices(sc: *Scope, x: A, k: usize) !A {
-    return topkIndicesSplit(sc, x, k, topkSplits(dim(x, 0), dim(x, 1), k));
+    return sc.keep(try sel.topkIndices(sc.s, x, k));
 }
 
-/// `topkIndices` of `x` `[rows, n]`, which `topkSplits` leaves in one threadgroup a row, with every pick not under its
-/// row's `lens[row]` (int32 `[rows, 1]`) given as -1, in the one launch.
+/// `topkIndices` of `x` `[rows, n]` in one threadgroup a row, every pick not under its row's `lens[row]` given as -1.
 pub fn topkIndicesBelow(sc: *Scope, x: A, rows: usize, k: usize, lens: A) !A {
-    var o: [1]A = undefined;
-    try launch(sc, &topk_below_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}), lens }, &.{.{ .shape = &.{ ci(rows), ci(k) }, .dt = .int32 }}, .{ topk_tg, rows, 1 }, .{ topk_tg, 1, 1 }, &.{.{ .name = "TG", .v = ci(topk_tg) }}, &.{}, &o);
-    return o[0];
+    return sc.keep(try sel.topkIndicesBelow(sc.s, x, rows, k, lens));
 }
 
 /// `topkIndices` over `splits` chunks of each row (1: one threadgroup a row); each chunk holds at least `k` scores.
 pub fn topkIndicesSplit(sc: *Scope, x: A, k: usize, splits: usize) !A {
-    const L = dim(x, 0);
-    var o: [1]A = undefined;
-    const tmpl: []const Tmpl = &.{.{ .name = "TG", .v = ci(topk_tg) }};
-    const spec: []const OutSpec = &.{.{ .shape = &.{ ci(L), ci(k) }, .dt = .int32 }};
-    // k rides in a buffer: as a template arg every index width up to index_topk was its own Metal compile.
-    if (splits <= 1) {
-        try launch(sc, &topk_def, &.{ x, try sc.ints(&.{ci(k)}, &.{1}) }, spec, .{ topk_tg, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &o);
-        return o[0];
-    }
-    var cand: [1]A = undefined;
-    try launch(sc, &topk_chunk_def, &.{ x, try sc.ints(&.{ ci(k), ci(splits) }, &.{2}) }, &.{.{ .shape = &.{ ci(L), ci(splits * k) }, .dt = .int32 }}, .{ topk_tg * splits, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &cand);
-    try launch(sc, &topk_merge_def, &.{ x, cand[0], try sc.ints(&.{ci(k)}, &.{1}) }, spec, .{ topk_tg, L, 1 }, .{ topk_tg, 1, 1 }, tmpl, &.{}, &o);
-    return o[0];
+    return sc.keep(try sel.topkIndicesSplit(sc.s, x, k, splits));
 }
 
 /// Whether `denseF32x` serves a `[N, K]` weight.
@@ -1436,29 +1277,7 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
 /// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
 /// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
 /// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
-const ATTN_NAX_HEADER =
-    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-    \\inline short dsv41_nax_r(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 4) | ((short(lane) >> 1) & 3)) + (i >> 2) * 8; }
-    \\inline short dsv41_nax_c(ushort lane, int i) { const short qid = short(lane) >> 2; return ((qid & 2) | (short(lane) & 1)) * 4 + (i & 3); }
-    \\template <int N, int KK, typename AT, typename BT>
-    \\inline void dsv41_nax_mma(thread float* c, thread const AT* a, thread const BT* b) {
-    \\  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(16, N, KK, false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
-    \\  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    \\  auto ca = op.template get_left_input_cooperative_tensor<AT, BT, float>();
-    \\  auto cb = op.template get_right_input_cooperative_tensor<AT, BT, float>();
-    \\  auto cc = op.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ca)>, metal::remove_addrspace_t<decltype(cb)>, float>();
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < KK / 2; ++i) ca[i] = a[i];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < KK * N / 32; ++i) cb[i] = b[i];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < N / 2; ++i) cc[i] = c[i];
-    \\  op.run(ca, cb, cc);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < N / 2; ++i) c[i] = cc[i];
-    \\}
-    \\
-;
+const ATTN_NAX_HEADER = metal_def.NAX_HEADER;
 
 /// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 keys x 16 heads over 32-channel steps
 /// (keys the left operand, so a tile's key fragments are read once and serve P x V as its right operand), P x V as
@@ -1798,97 +1617,25 @@ pub fn attnNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, h: usize, d: usize,
 
 // ── indexer ──────────────────────────────────────────────────────────────
 
-/// The indexer's scores `[L, nb]`: sum over heads of weight * relu(q_h . k_n), a weight being its projection times
-/// `wsc`, keys read in their cached dtype, -inf past the groups row l's query sees ((p0 + l + 1) / ratio).
-/// meta = {p0, ratio}.
-const IDX_SCORE_FIRST =
-    \\const int n = thread_position_in_grid.x, l = thread_position_in_grid.y;
-    \\const uint tid = thread_index_in_threadgroup, tgn = threads_per_threadgroup.x;
-;
-
-const IDX_SCORE_SECOND =
-    \\threadgroup float qs[IH * IHD];
-    \\for (uint k = tid; k < IH * IHD; k += tgn) qs[k] = float(q[l * IH * IHD + k]);
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (n >= nb) return;
-    \\float dots[IH];
-    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
-;
-
-const IDX_SCORE_DOT =
-    \\for (int j = 0; j < IHD; ++j) {
-    \\  const float kv = KEY(j);
-    \\  for (int h = 0; h < IH; ++h) dots[h] += qs[h * IHD + j] * kv;
-    \\}
-    \\float s = 0.0f;
-    \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
-;
-
-/// `IDX_SCORE_SECOND` with q in four-wide rows, for `IDX_SCORE_DOT4`.
-const IDX_SCORE_SECOND4 =
-    \\threadgroup float4 qs[IH * IHD / 4];
-    \\for (uint k = tid; k < IH * IHD / 4; k += tgn) {
-    \\  const device float* qp = q + size_t(l) * IH * IHD + 4 * k;
-    \\  qs[k] = float4(qp[0], qp[1], qp[2], qp[3]);
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (n >= nb) return;
-    \\float dots[IH];
-    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
-;
-
-/// `IDX_SCORE_DOT` reading four channels of q a threadgroup load: each head still adds channel j, j + 1, j + 2, j + 3 in
-/// that order, so the scores keep their bits.
-const IDX_SCORE_DOT4 =
-    \\for (int j = 0; j < IHD; j += 4) {
-    \\  const float k0 = KEY(j), k1 = KEY(j + 1), k2 = KEY(j + 2), k3 = KEY(j + 3);
-    \\  for (int h = 0; h < IH; ++h) {
-    \\    const float4 qv = qs[(h * IHD + j) / 4];
-    \\    dots[h] += qv.x * k0;
-    \\    dots[h] += qv.y * k1;
-    \\    dots[h] += qv.z * k2;
-    \\    dots[h] += qv.w * k3;
-    \\  }
-    \\}
-    \\float s = 0.0f;
-    \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
-;
-
-const IDX_SCORE_TAIL =
-    \\const int seen = (meta[0] + l + 1) / meta[1];
-    \\scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
-;
-
-const IDX_SCORE_LAST = IDX_SCORE_DOT ++ IDX_SCORE_TAIL;
-
-const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
-    \\const int nb = keys_shape[0];
-    \\
-++ IDX_SCORE_SECOND ++
-    \\const device KT* kr = keys + size_t(n) * IHD;
-    \\#define KEY(j) float(kr[j])
-    \\
-++ IDX_SCORE_LAST;
-
 /// The same scores from packed index keys (`codes` `[nb, IHD / 2]`, `scales` `[nb, IHD / G]`, `qat_mod.packFp4`'s
 /// form), each key value decoded as `qat_mod.unpackFp4` does, so no unpacked copy of the keys exists.
-const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
+const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
     \\const int nb = codes_shape[0];
     \\
-++ IDX_SCORE_SECOND4 ++
+++ sel.IDX_SCORE_SECOND4 ++
     \\const auto kc = codes + size_t(n) * (IHD / 2);
     \\const auto ks = scales + size_t(n) * (IHD / G);
     \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
     \\
-++ IDX_SCORE_DOT4 ++ IDX_SCORE_TAIL;
+++ sel.IDX_SCORE_DOT4 ++ sel.IDX_SCORE_TAIL;
 
 /// The packed scores of candidate blocks only: score c of row l is key `blocks[l, c / BS] * BS + c % BS` (`blocks`
 /// `[L, KB]` int32, ascending, < 0 = none), -inf for no block or a key the query cannot see. A key scores the bits it
 /// does in `IDX_SCORE_PACKED_SOURCE`.
-const IDX_GATHER_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
+const IDX_GATHER_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
     \\const int nb = blocks_shape[1] * BS;
     \\
-++ IDX_SCORE_SECOND4 ++
+++ sel.IDX_SCORE_SECOND4 ++
     \\const int blk = blocks[l * blocks_shape[1] + n / BS];
     \\const int key = blk * BS + n % BS;
     \\if (blk < 0 || key >= (meta[0] + l + 1) / meta[1]) {
@@ -1899,7 +1646,7 @@ const IDX_GATHER_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const auto ks = scales + size_t(key) * (IHD / G);
     \\#define KEY(j) dsv41_fp4_at(kc, ks, j, G, MODE)
     \\
-++ IDX_SCORE_DOT4 ++
+++ sel.IDX_SCORE_DOT4 ++
     \\scores[size_t(l) * nb + n] = s;
 ;
 
@@ -1923,101 +1670,16 @@ const IDX_PACKED_HEADER: [:0]const u8 = qat_mod.PACK_HEADER ++
     \\}
 ;
 
-/// `IDX_SCORE_SOURCE` for a wide block: one threadgroup a (query, KT-key tile), its four simdgroups each KT/4 keys x
-/// every head on 8x8 matrix ops over the keys staged in threadgroup memory; a head tile is relu'd, weighted and
-/// summed as it completes, so no [L, IH, nb] scratch. A tile the query cannot see is -inf without the work. `q`
-/// arrives in the keys' dtype, so the cast is exact. meta = {p0, ratio, key offset}: `keys` may be a slice of a longer
-/// key list starting at that offset.
-const IDX_TILE_SOURCE =
-    \\const int l = threadgroup_position_in_grid.y, n0 = threadgroup_position_in_grid.x * KT;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int nb = keys_shape[0];
-    \\const int seen = (meta[0] + l + 1) / meta[1] - meta[2];
-    \\const int end = metal::min(nb, n0 + KT);
-    \\if (n0 >= seen) {
-    \\  for (int n = n0 + int(tid); n < end; n += 128) scores[size_t(l) * nb + n] = -INFINITY;
-    \\  return;
-    \\}
-    \\constexpr int RT = IH / 8, CT = KT / 32, C4 = IHD / 4;
-    \\using T4 = metal::vec<T, 4>;
-    \\threadgroup T kt[KT * IHD];
-    \\threadgroup float wt[IH], red[4][64];
-    \\for (uint i = tid; i < KT * C4; i += 128) {
-    \\  const int n = n0 + int(i / C4);
-    \\  ((threadgroup T4*)kt)[i] = n < nb ? ((const device T4*)keys)[size_t(n) * C4 + i % C4] : T4(0);
-    \\}
-    \\if (tid < IH) wt[tid] = float(w[size_t(l) * IH + tid]) * wsc[0];
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\const device T* qr = q + size_t(l) * IH * IHD;
-    \\const threadgroup T* kr = kt + sg * (KT / 4) * IHD;
-    \\metal::simdgroup_matrix<float, 8, 8> acc[RT][CT];
-    \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) acc[r][c] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\for (int d = 0; d < IHD; d += 8) {
-    \\  metal::simdgroup_matrix<T, 8, 8> a[RT], b[CT];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) metal::simdgroup_load(a[r], qr + r * 8 * IHD + d, IHD);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) metal::simdgroup_load(b[c], kr + c * 8 * IHD + d, IHD, metal::ulong2(0, 0), true);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r)
-    \\    #pragma clang loop unroll(full)
-    \\    for (int c = 0; c < CT; ++c) metal::simdgroup_multiply_accumulate(acc[r][c], a[r], b[c], acc[r][c]);
-    \\}
-    \\// A finished tile's rows are heads: relu, weight and sum them through this simdgroup's scratch.
-    \\// Threadgroup barriers: on M1 a simdgroup barrier let lanes read the scratch before the store landed.
-    \\const int col = lane & 7, row = (lane >> 3) * 2;
-    \\float s[CT];
-    \\#pragma clang loop unroll(full)
-    \\for (int c = 0; c < CT; ++c) s[c] = 0.0f;
-    \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) {
-    \\    metal::simdgroup_store(acc[r][c], red[sg], 8);
-    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\    float p = metal::max(red[sg][row * 8 + col], 0.0f) * wt[r * 8 + row] + metal::max(red[sg][(row + 1) * 8 + col], 0.0f) * wt[r * 8 + row + 1];
-    \\    p += metal::simd_shuffle_xor(p, 8);
-    \\    p += metal::simd_shuffle_xor(p, 16);
-    \\    s[c] += p;
-    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  }
-    \\if (lane < 8)
-    \\  for (int c = 0; c < CT; ++c) {
-    \\    const int n = n0 + int(sg) * (KT / 4) + c * 8 + col;
-    \\    if (n < nb) scores[size_t(l) * nb + n] = n < seen ? s[c] : -INFINITY;
-    \\  }
-;
-
-var idx_score_def = Def{ .name = "dsv41_index_scores", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_SOURCE };
 var idx_packed_def = Def{ .name = "dsv41_index_scores_fp4", .ins = &.{ "q", "codes", "scales", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_SCORE_PACKED_SOURCE, .header = IDX_PACKED_HEADER };
-var idx_tile_def = Def{ .name = "dsv41_index_tile", .ins = &.{ "q", "keys", "w", "meta", "wsc" }, .outs = &.{"scores"}, .source = IDX_TILE_SOURCE };
 var idx_gather_def = Def{ .name = "dsv41_index_scores_gather", .ins = &.{ "q", "codes", "scales", "w", "meta", "wsc", "blocks" }, .outs = &.{"scores"}, .source = IDX_GATHER_SOURCE, .header = IDX_PACKED_HEADER };
 var cand_keys_def = Def{ .name = "dsv41_cand_keys", .ins = &.{ "pos", "blocks" }, .outs = &.{"out"}, .source = CAND_KEYS_SOURCE };
 
-/// Keys one threadgroup of `indexScoresTile` scores for keys of `dt`: a slice scored at an offset must start on one.
-pub fn indexKeyTile(dt: mlx.mlx_dtype) usize {
-    return if (dt == .float32) 32 else 64;
-}
-
-/// Whether `indexScoresTile` serves `ih` heads of `ihd` channels (the matrix tiles need multiples of 8).
-pub fn indexTileFits(ih: usize, ihd: usize, nb: usize) bool {
-    return nb > 0 and ih % 8 == 0 and ih <= 128 and ihd % 8 == 0 and ihd % 4 == 0;
-}
+pub const indexKeyTile = sel.indexKeyTile;
+pub const indexTileFits = sel.indexTileFits;
 
 /// Scores `[L, nb]` of `q` `[L, IH, IHD]` (f32) against `keys` `[nb, IHD]`, one thread a key: the decode arm.
 pub fn indexScores(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, ratio: usize) !A {
-    const L = dim(q, 0);
-    const nb = dim(keys, 0);
-    const meta = try sc.ints(&.{ ci(p0), ci(ratio) }, &.{2});
-    const tg: usize = 256;
-    var o: [1]A = undefined;
-    try launch(sc, &idx_score_def, &.{ q, keys, w, meta, try f32Const(sc, &.{wscale}) }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + tg - 1) / tg * tg, L, 1 }, .{ tg, 1, 1 }, &.{
-        .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(q, 2)) },
-    }, &.{.{ .name = "KT", .dt = mlx.mlx_array_dtype(keys) }}, &o);
-    return o[0];
+    return sc.keep(try sel.indexScores(sc.s, q, keys, w, wscale, @intCast(p0), ratio));
 }
 
 /// `indexScores` over packed keys (`codes`, `scales`: `packFp4`'s form of `mode` and `group`), the bits of the unpacked
@@ -2424,17 +2086,7 @@ pub fn indexNaxTrials(a: std.mem.Allocator, s: mlx.mlx_stream) !bool {
 /// `indexScores` for a wide block on 8x8 matrix ops; `q` is cast to the keys' dtype. `keys` are the list's rows from
 /// `key0` on, a multiple of the kernel's key tile, so a slice scores the bits the whole list's columns would.
 pub fn indexScoresTile(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, ratio: usize, key0: usize) !A {
-    const L = dim(q, 0);
-    const nb = dim(keys, 0);
-    const dt = mlx.mlx_array_dtype(keys);
-    const kt = indexKeyTile(dt);
-    std.debug.assert(key0 % kt == 0);
-    const meta = try sc.ints(&.{ ci(p0), ci(ratio), ci(key0) }, &.{3});
-    var o: [1]A = undefined;
-    try launch(sc, &idx_tile_def, &.{ try sc.astype(q, dt), keys, w, meta, try f32Const(sc, &.{wscale}) }, &.{.{ .shape = &.{ ci(L), ci(nb) }, .dt = .float32 }}, .{ (nb + kt - 1) / kt * 128, L, 1 }, .{ 128, 1, 1 }, &.{
-        .{ .name = "IH", .v = ci(dim(q, 1)) }, .{ .name = "IHD", .v = ci(dim(q, 2)) }, .{ .name = "KT", .v = ci(kt) },
-    }, &.{.{ .name = "T", .dt = dt }}, &o);
-    return o[0];
+    return sc.keep(try sel.indexScoresTile(sc.s, try sc.astype(q, mlx.mlx_array_dtype(keys)), keys, w, wscale, @intCast(p0), ratio, key0));
 }
 
 // ── DSpark draft ─────────────────────────────────────────────────────────
@@ -2510,405 +2162,59 @@ pub fn markovStep(sc: *Scope, logits: A, head: A, embed: A, prev: A, hout: A, cw
 
 // ── hyper-connections ────────────────────────────────────────────────────
 
-/// A mix's index into the three scales (pre, post, comb) the checkpoint ships.
-const HC_HEADER =
-    \\template <int HC>
-    \\inline int dsv41_scale_at(int m) { return m < HC ? 0 : (m < 2 * HC ? 1 : 2); }
-;
-
-/// `hcMixes`' projection: per row, the mixing logits of the flattened stream, rms-scaled, times scale plus base.
-/// One threadgroup an R-row x M-mix tile, so each fn and stream load serves the tile; every (row, mix) dot keeps
-/// `HC_STAGE_SOURCE`'s order (thread tid the terms k = tid + c * TG in c order, one simd sum, the simdgroups in
-/// order), which is what makes the two agree to the bit.
-const HC_MIX_SOURCE =
-    \\#pragma clang fp contract(off)
-    \\const int m0 = threadgroup_position_in_grid.x * M, l0 = threadgroup_position_in_grid.y * R;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int N = fn_shape[1], MIX = fn_shape[0], L = x_shape[0];
-    \\float d[R][M], ss[R];
-    \\for (int r = 0; r < R; ++r) { ss[r] = 0.0f; for (int j = 0; j < M; ++j) d[r][j] = 0.0f; }
-    \\for (int k = tid; k < N; k += TG) {
-    \\  float fv[M];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < M; ++j) fv[j] = fn[size_t(m0 + j) * N + k];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
-    \\    const float v = l0 + r < L ? float(x[size_t(l0 + r) * N + k]) : 0.0f;
-    \\    #pragma clang loop unroll(full)
-    \\    for (int j = 0; j < M; ++j) d[r][j] = metal::fma(v, fv[j], d[r][j]);
-    \\    ss[r] = metal::fma(v, v, ss[r]);
-    \\  }
-    \\}
-    \\threadgroup float t_d[R][M][TG / 32], t_s[R][TG / 32];
-    \\for (int r = 0; r < R; ++r) {
-    \\  for (int j = 0; j < M; ++j) { const float v = metal::simd_sum(d[r][j]); if (lane == 0) t_d[r][j][sg] = v; }
-    \\  const float v = metal::simd_sum(ss[r]);
-    \\  if (lane == 0) t_s[r][sg] = v;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (tid < R * M) {
-    \\  const int r = tid / M, j = tid % M;
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int g = 0; g < TG / 32; ++g) { a += t_d[r][j][g]; b += t_s[r][g]; }
-    \\  if (l0 + r < L) z[(l0 + r) * MIX + m0 + j] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[dsv41_scale_at<HC>(m0 + j)] + base[m0 + j];
-    \\}
-;
-
-/// `HC_MIX_SOURCE` on the matrix units: a threadgroup takes 16 rows and every mix, its simdgroups a k range each of
-/// 16 rows x 32 mix columns over 16-wide k steps, `fn` split into a high and a low half so the product keeps f32's
-/// bits. The sums' order differs from the ALU kernel's.
-const HC_MIX_NAX_SOURCE =
-    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
-    \\const ushort lane = thread_index_in_simdgroup;
-    \\const int MIX = fn_shape[0], L = x_shape[0];
-    \\const int l0 = threadgroup_position_in_grid.x * 16;
-    \\constexpr int STEPS = NK / 16 / NSG;
-    \\const int k0 = int(sg) * STEPS * 16;
-    \\const int ra = metal::min(l0 + int(dsv41_nax_r(lane, 0)), L - 1), rb = metal::min(l0 + int(dsv41_nax_r(lane, 4)), L - 1);
-    \\const device T* xa = x + size_t(ra) * NK + k0 + dsv41_nax_c(lane, 0);
-    \\const device T* xb = x + size_t(rb) * NK + k0 + dsv41_nax_c(lane, 0);
-    \\float d[16];
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < 16; ++i) d[i] = 0.0f;
-    \\float ssa = 0.0f, ssb = 0.0f;
-    \\for (int s = 0; s < STEPS; ++s) {
-    \\  T a[8];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < 4; ++j) { a[j] = xa[s * 16 + j]; a[4 + j] = xb[s * 16 + j]; }
-    \\  half bh[16], bl[16];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 16; ++i) {
-    \\    const int mix = (i / 8) * 16 + dsv41_nax_c(lane, i % 8);
-    \\    const float f = mix < MIXN ? fn[size_t(mix) * NK + k0 + s * 16 + dsv41_nax_r(lane, i % 8)] * 1024.0f : 0.0f;
-    \\    const half hi = half(f);
-    \\    bh[i] = hi;
-    \\    bl[i] = half(f - float(hi));
-    \\  }
-    \\  dsv41_nax_mma<32, 16>(d, a, bl);
-    \\  dsv41_nax_mma<32, 16>(d, a, bh);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < 4; ++j) {
-    \\    const float va = float(a[j]), vb = float(a[4 + j]);
-    \\    ssa = metal::fma(va, va, ssa);
-    \\    ssb = metal::fma(vb, vb, ssb);
-    \\  }
-    \\}
-    \\ssa += metal::simd_shuffle_xor(ssa, ushort(1));
-    \\ssa += metal::simd_shuffle_xor(ssa, ushort(8));
-    \\ssb += metal::simd_shuffle_xor(ssb, ushort(1));
-    \\ssb += metal::simd_shuffle_xor(ssb, ushort(8));
-    \\threadgroup float t_d[NSG][16][MIXN], t_s[NSG][16];
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < 16; ++i) {
-    \\  const int col = (i / 8) * 16 + dsv41_nax_c(lane, i % 8);
-    \\  if (col < MIXN) t_d[sg][dsv41_nax_r(lane, i % 8)][col] = d[i];
-    \\}
-    \\if ((lane & 9) == 0) { t_s[sg][dsv41_nax_r(lane, 0)] = ssa; t_s[sg][dsv41_nax_r(lane, 4)] = ssb; }
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (tid < 16 * MIXN) {
-    \\  const int r = tid / MIXN, j = tid % MIXN;
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int g = 0; g < NSG; ++g) { a += t_d[g][r][j]; b += t_s[g][r]; }
-    \\  if (l0 + r < L) z[(l0 + r) * MIX + j] = (a * (1.0f / 1024.0f)) * metal::precise::rsqrt(b / float(NK) + eps[0]) * scale[dsv41_scale_at<HC>(j)] + base[j];
-    \\}
-;
-
-/// One hyper-connection stage as two kernels. The staggered collapse reads the PREVIOUS mix (`HC_PRE`), so in
-/// `HC_STAGE_SOURCE` threadgroup 0 collapses and rms-norms the stream without waiting for this stage's mixes, while
-/// threadgroups 1..MIX each take one mix's dot; the FFN side rebuilds the stream from the block output in every
-/// threadgroup and threadgroup 0 stores it. The split (`HC_SPLIT_SOURCE`) is read only later, except where
-/// `HC_STAGE_Z_SOURCE` derives the previous split itself.
-const HC_STAGE_HEAD =
-    \\#pragma clang fp contract(off)
-    \\const uint role = threadgroup_position_in_grid.x;
-    \\const int l = threadgroup_position_in_grid.y;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int D = x_shape[2], N = fn_shape[1];
-    \\threadgroup float t_a[TG / 32], t_b[TG / 32];
-    \\const device auto* xr = x + size_t(l) * HC * D;
-    \\float v[HC][ND];
-    \\
-;
-
-const HC_STAGE_LOOP =
-    \\for (int c = 0; c < ND; ++c) {
-    \\  const int d = int(tid) + c * TG;
-    \\  for (int i = 0; i < HC; ++i) v[i][c] = 0.0f;
-;
-
-/// The collapse weights are `cpre`.
-const HC_COEF_PLAIN =
-    \\#define HC_PRE(j) cpre[l * HC + (j)]
-    \\
-;
-
-/// The previous split arrives as arrays.
-const HC_COEF_ARRAYS = HC_COEF_PLAIN ++
-    \\#define HC_POST(i) spost[l * HC + (i)]
-    \\#define HC_COMB(j, i) scomb[l * HC * HC + (j) * HC + (i)]
-    \\
-;
-
-/// The previous mixes `za` arrive unsplit: simdgroup 0 splits them into threadgroup memory.
-const HC_COEF_Z =
-    \\threadgroup float t_pre[HC], t_post[HC], t_comb[HC * HC];
-    \\#define HC_PRE(j) t_pre[(j)]
-    \\#define HC_POST(i) t_post[(i)]
-    \\#define HC_COMB(j, i) t_comb[(j) * HC + (i)]
-    \\#define HC_SPLIT_PRE(i, v) t_pre[(i)] = (v)
-    \\#define HC_SPLIT_POST(i, v) t_post[(i)] = (v)
-    \\#define HC_SPLIT_COMB(i, v) t_comb[(i)] = (v)
-    \\if (sg == 0) {
-    \\  const device float* zr = za + l * ((2 + HC) * HC);
-++ "\n" ++ HC_SPLIT_BODY ++
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\
-;
-
-/// The stream is `x` itself.
-const HC_STAGE_LOAD_PLAIN =
-    \\  if (d < D) for (int i = 0; i < HC; ++i) v[i][c] = float(xr[i * D + d]);
-    \\}
-;
-
-/// The stream is `hcExpand(x, y, previous split)`, rounded to T where the expand rounds it.
-const HC_STAGE_LOAD_EXPAND =
-    \\  if (d < D) {
-    \\    float sv[HC];
-    \\    for (int j = 0; j < HC; ++j) sv[j] = float(xr[j * D + d]);
-    \\    const float yv = float(y[size_t(l) * D + d]);
-    \\    for (int i = 0; i < HC; ++i) {
-    \\      float acc = 0.0f;
-    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(HC_COMB(j, i), sv[j], acc);
-    \\      const T o = T(metal::fma(HC_POST(i), yv, acc));
-    \\      v[i][c] = float(o);
-    \\      if (role == 0) x1[(size_t(l) * HC + i) * D + d] = o;
-    \\    }
-    \\  }
-    \\}
-;
-
-const HC_STAGE_TAIL =
-    \\if (role == 0) {
-    \\  float cp[HC];
-    \\  for (int j = 0; j < HC; ++j) cp[j] = HC_PRE(j);
-    \\  float ss = 0.0f;
-    \\  T hv[ND];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
-    \\    float h = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) h += cp[j] * v[j][c];
-    \\    hv[c] = T(h);
-    \\    ss += float(hv[c]) * float(hv[c]);
-    \\  }
-    \\  ss = metal::simd_sum(ss);
-    \\  if (lane == 0) t_a[sg] = ss;
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  float tot = 0.0f;
-    \\  for (int g = 0; g < TG / 32; ++g) tot += t_a[g];
-    \\  const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
-    \\    const int d = int(tid) + c * TG;
-    \\    if (d < D) h_out[size_t(l) * D + d] = w[d] * T(float(hv[c]) * inv);
-    \\  }
-    \\  return;
-    \\}
-    \\const int m = int(role) - 1;
-    \\const device float* fr = fn + size_t(m) * N;
-    \\float dd = 0.0f, sq = 0.0f;
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < HC; ++i)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
-    \\    const int d = int(tid) + c * TG;
-    \\    const float u = v[i][c];
-    \\    if (d < D) dd = metal::fma(u, fr[i * D + d], dd);
-    \\    sq = metal::fma(u, u, sq);
-    \\  }
-    \\dd = metal::simd_sum(dd); sq = metal::simd_sum(sq);
-    \\if (lane == 0) { t_a[sg] = dd; t_b[sg] = sq; }
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (tid == 0) {
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int g = 0; g < TG / 32; ++g) { a += t_a[g]; b += t_b[g]; }
-    \\  z[l * ((2 + HC) * HC) + m] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[dsv41_scale_at<HC>(m)] + base[m];
-    \\}
-;
-
-/// The hc split of the mixes `zr` (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb); one simdgroup a row, lane
-/// a * HC + b holding comb[a][b] and each sum gathering its HC terms in the serial order. The includer declares
-/// `lane` and `zr` and defines the stores `HC_SPLIT_PRE`, `HC_SPLIT_POST` and `HC_SPLIT_COMB`.
-const HC_SPLIT_BODY =
-    \\const float e = eps[1];
-    \\if (lane < HC) {
-    \\  HC_SPLIT_PRE(lane, 1.0f / (1.0f + metal::precise::exp(-zr[lane])) + e);
-    \\  HC_SPLIT_POST(lane, 2.0f / (1.0f + metal::precise::exp(-zr[HC + lane])));
-    \\}
-    \\const bool act = lane < HC * HC;
-    \\const ushort a = act ? lane / HC : 0, b = act ? lane % HC : 0;
-    \\float v = zr[2 * HC + a * HC + b];
-    \\float mx = metal::simd_shuffle(v, a * HC);
-    \\for (ushort k = 1; k < HC; ++k) mx = metal::max(mx, metal::simd_shuffle(v, a * HC + k));
-    \\v = metal::precise::exp(v - mx);
-    \\float sm = 0.0f;
-    \\for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, a * HC + k);
-    \\v = v / sm + e;
-    \\for (int t = 0; t < 2 * ITERS - 1; ++t) {
-    \\  const bool rows = t % 2 == 1;
-    \\  sm = 0.0f;
-    \\  for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, rows ? a * HC + k : k * HC + b);
-    \\  v = v / (sm + e);
-    \\}
-    \\if (act) HC_SPLIT_COMB(lane, v);
-;
-
-/// The split of row `l` of `z` into the output arrays.
-const HC_SPLIT_GLOBAL =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const device float* zr = z + l * ((2 + HC) * HC);
-    \\#define HC_SPLIT_PRE(i, v) pre[l * HC + (i)] = (v)
-    \\#define HC_SPLIT_POST(i, v) post[l * HC + (i)] = (v)
-    \\#define HC_SPLIT_COMB(i, v) comb[l * HC * HC + (i)] = (v)
-    \\
-;
-const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
-
-/// The hc split, then the stream collapsed with `cpre` (f32, rounded to T like `hcCollapse`) and rms-normed like
-/// MLX's `rms_norm`. One threadgroup a row.
-const HC_NORM_SOURCE =
-    \\#pragma clang fp contract(off)
-    \\const int l = threadgroup_position_in_grid.y;
-    \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int D = x_shape[2];
-    \\if (sg == 0) {
-++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
-    \\}
-    \\float cp[HC];
-    \\for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
-    \\float ss = 0.0f;
-    \\for (int d = tid; d < D; d += TG) {
-    \\  float h = 0.0f;
-    \\  for (int j = 0; j < HC; ++j) h += cp[j] * float(x[(size_t(l) * HC + j) * D + d]);
-    \\  const T hb = T(h);
-    \\  h_out[size_t(l) * D + d] = hb;
-    \\  ss += float(hb) * float(hb);
-    \\}
-    \\threadgroup float t_s[TG / 32];
-    \\ss = metal::simd_sum(ss);
-    \\if (thread_index_in_simdgroup == 0) t_s[sg] = ss;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float tot = 0.0f;
-    \\for (int g = 0; g < TG / 32; ++g) tot += t_s[g];
-    \\const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-    \\for (int d = tid; d < D; d += TG) {
-    \\  const size_t o = size_t(l) * D + d;
-    \\  h_out[o] = w[d] * T(float(h_out[o]) * inv);
-    \\}
-;
-
-const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_COEF_PLAIN ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
-const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_COEF_ARRAYS ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
-const HC_STAGE_Z_SOURCE = HC_STAGE_HEAD ++ HC_COEF_Z ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
-
-var hc_mix_def = Def{ .name = "dsv41_hc_mix", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_SOURCE, .header = HC_HEADER };
-var hc_mix_nax_def = Def{ .name = "dsv41_hc_mix_nax", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_NAX_SOURCE, .header = ATTN_NAX_HEADER ++ HC_HEADER };
-var hc_stage_def = Def{ .name = "dsv41_hc_stage", .ins = &.{ "x", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z" }, .source = HC_STAGE_SOURCE, .header = HC_HEADER };
-var hc_stage_x_def = Def{ .name = "dsv41_hc_stage_x", .ins = &.{ "x", "y", "spost", "scomb", "cpre", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_X_SOURCE, .header = HC_HEADER };
-var hc_stage_z_def = Def{ .name = "dsv41_hc_stage_z", .ins = &.{ "x", "y", "za", "w", "fn", "scale", "base", "eps" }, .outs = &.{ "h_out", "z", "x1" }, .source = HC_STAGE_Z_SOURCE, .header = HC_HEADER };
-var hc_split_def = Def{ .name = "dsv41_hc_split", .ins = &.{ "z", "eps" }, .outs = &.{ "pre", "post", "comb" }, .source = HC_SPLIT_SOURCE };
-var hc_norm_def = Def{ .name = "dsv41_hc_norm", .ins = &.{ "z", "x", "cpre", "w", "eps" }, .outs = &.{ "pre", "post", "comb", "h_out" }, .source = HC_NORM_SOURCE };
-
-/// Threads a hyper-connection threadgroup runs; `probeHc` halves it where the GPU caps register-heavy kernels lower.
-pub const hc_tg_widest: usize = 1024;
-pub var hc_tg: usize = hc_tg_widest;
-/// The row x mix tile a `hcMix` threadgroup takes. Every tile gives the same bytes (each dot keeps its order); the
-/// tile only moves the time, and `hc_mix_tile` is its test seam.
-pub const HcMixTile = struct { rows: usize, cols: usize };
-pub var hc_mix_tile: HcMixTile = .{ .rows = 2, .cols = 12 };
-
-pub const HcWeights = struct { fn_w: A, scale: A, base: A };
-pub const HcSplit = struct { pre: A, post: A, comb: A };
-pub const HcStaged = struct { h: A, z: A, x1: A };
-/// The previous mixes of a stage that expands: their split, or the mixes `z` it splits itself.
-pub const HcPrev = union(enum) { split: HcSplit, z: struct { z: A, iters: usize } };
-/// The stream `hcExpand(x, y, previous post, previous comb)` that a stage rebuilds in place of `x` and collapses with
-/// the previous pre.
-pub const HcExpand = struct { y: A, prev: HcPrev };
+const HC_SPLIT_GLOBAL = hck.HC_SPLIT_GLOBAL;
+const HC_SPLIT_BODY = hck.HC_SPLIT_BODY;
+pub const hc_tg_widest = hck.hc_tg_widest;
+pub const HcMixTile = hck.HcMixTile;
+pub const HcWeights = hck.HcWeights;
+pub const HcSplit = hck.HcSplit;
+pub const HcStaged = hck.HcStaged;
+pub const HcPrev = hck.HcPrev;
+pub const HcExpand = hck.HcExpand;
 
 pub fn hcEps(sc: *Scope, rms_eps: f32, hc_eps: f32) !A {
     return f32Const(sc, &.{ rms_eps, hc_eps });
 }
 
+/// The arrays `xs` a shared kernel launch made, kept by the scope; a failed keep frees the rest.
+fn keepAll(sc: *Scope, xs: []const A) !void {
+    for (xs, 0..) |x, i| {
+        _ = sc.keep(x) catch |e| {
+            for (xs[i + 1 ..]) |rest| _ = mlx.mlx_array_free(rest);
+            return e;
+        };
+    }
+}
+
 /// A decode-width stage: `h = rms(collapse(x, cpre))` and the mixes `z` `[L, mix]` of `x` (of the expanded stream
 /// with `ex`, returned as `x1`).
 pub fn hcStage(sc: *Scope, x: A, ex: ?HcExpand, cpre: A, norm_w: A, hw: HcWeights, eps: A) !HcStaged {
-    const L = dim(x, 0);
-    const hc = dim(x, 1);
-    const D = dim(x, 2);
-    const mix = dim(hw.fn_w, 0);
     const dt = mlx.mlx_array_dtype(x);
-    const tg = hc_tg;
-    var o: [3]A = undefined;
-    const outs3 = [_]OutSpec{
-        .{ .shape = &.{ ci(L), ci(D) }, .dt = dt },
-        .{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 },
-        .{ .shape = mlx.getShape(x), .dt = dt },
-    };
-    const ints = [_]Tmpl{ .{ .name = "TG", .v = ci(tg) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ND", .v = ci((D + tg - 1) / tg) } };
-    const dts = [_]TDtype{.{ .name = "T", .dt = dt }};
-    if (ex) |e| {
-        const grid: Grid = .{ (mix + 1) * tg, L, 1 };
-        const y = try sc.astype(e.y, dt);
-        switch (e.prev) {
-            .split => |sp| try launch(sc, &hc_stage_x_def, &.{ x, y, sp.post, sp.comb, sp.pre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &ints, &dts, &o),
-            .z => |p| try launch(sc, &hc_stage_z_def, &.{ x, y, p.z, norm_w, hw.fn_w, hw.scale, hw.base, eps }, &outs3, grid, .{ tg, 1, 1 }, &(ints ++ [_]Tmpl{.{ .name = "ITERS", .v = ci(p.iters) }}), &dts, &o),
-        }
-        return .{ .h = o[0], .z = o[1], .x1 = o[2] };
-    }
-    try launch(sc, &hc_stage_def, &.{ x, cpre, norm_w, hw.fn_w, hw.scale, hw.base, eps }, outs3[0..2], .{ (mix + 1) * tg, L, 1 }, .{ tg, 1, 1 }, &ints, &dts, o[0..2]);
-    return .{ .h = o[0], .z = o[1], .x1 = x };
+    var e = ex;
+    if (e) |*v| v.y = try sc.astype(v.y, dt);
+    const r = try hck.stage(sc.s, dt, x, e, cpre, norm_w, hw, eps);
+    try keepAll(sc, if (ex != null) &.{ r.h, r.z, r.x1 } else &.{ r.h, r.z });
+    return r;
 }
 
 /// The split of mixes `z` `[L, (2 + hc) * hc]` (scale and base already applied).
 pub fn hcSplitZ(sc: *Scope, z: A, hc: usize, iters: usize, eps: A) !HcSplit {
-    const L = dim(z, 0);
-    var o: [3]A = undefined;
-    try launch(sc, &hc_split_def, &.{ z, eps }, &.{
-        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
-        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
-        .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
-    }, .{ 32, L, 1 }, .{ 32, 1, 1 }, &.{ .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(iters) } }, &.{}, &o);
-    return .{ .pre = o[0], .post = o[1], .comb = o[2] };
+    const r = try hck.splitZ(sc.s, z, hc, iters, eps);
+    try keepAll(sc, &.{ r.pre, r.post, r.comb });
+    return r;
 }
 
 /// The mixes `z` `[L, mix]` of the stream `x` `[L, hc, D]`, a tile of rows and mixes a threadgroup (wide blocks).
 pub fn hcMix(sc: *Scope, x: A, hw: HcWeights, eps: A) !A {
-    return hcMixTiled(sc, x, hw, eps, hc_mix_tile);
+    return hcMixTiled(sc, x, hw, eps, hck.hc_mix_tile);
 }
 
-/// Simdgroups a matrix-unit mix threadgroup splits the flattened stream over.
-const hc_mix_nsg = 16;
-
-/// Whether `hcMixNax` serves `hc` copies of `d` channels into `mix` mixes here: the stream splits into whole 16-wide k
-/// steps a simdgroup, a tile's 32 columns hold every mix, and the GPU has the units.
-pub fn hcMixNaxFits(hc: usize, d: usize, mix: usize) bool {
-    return (hc * d) % (16 * hc_mix_nsg) == 0 and mix <= 32 and nax_gate.verifyQmmNaxAvailable();
-}
+pub const hcMixNaxFits = hck.mixNaxFits;
 
 /// `hcMix` on the matrix units for a bf16 stream (`hcMixNaxFits` must hold): the same mixes with the sums in another
-/// order. A row's bytes do not depend on the block's width or on where the row sits in it.
+/// order.
 pub fn hcMixNax(sc: *Scope, x: A, hw: HcWeights, eps: A) !A {
-    const L = dim(x, 0);
-    const mix = dim(hw.fn_w, 0);
-    const n = dim(hw.fn_w, 1);
-    std.debug.assert(mlx.mlx_array_dtype(x) == .bfloat16 and n % (16 * hc_mix_nsg) == 0 and mix <= 32);
-    var o: [1]A = undefined;
-    try launch(sc, &hc_mix_nax_def, &.{ x, hw.fn_w, hw.scale, hw.base, eps }, &.{.{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 }}, .{ (L + 15) / 16 * hc_mix_nsg * 32, 1, 1 }, .{ hc_mix_nsg * 32, 1, 1 }, &.{
-        .{ .name = "NK", .v = ci(n) }, .{ .name = "NSG", .v = hc_mix_nsg }, .{ .name = "MIXN", .v = ci(mix) }, .{ .name = "HC", .v = ci(dim(x, 1)) },
-    }, &.{.{ .name = "T", .dt = .bfloat16 }}, &o);
-    return o[0];
+    return sc.keep(try hck.mixNax(sc.s, x, hw, eps));
 }
 
 /// How far the matrix-unit mixes may sit from the ALU kernel's in the load's trial, as a fraction of the peak: both are
@@ -2936,32 +2242,14 @@ pub fn hcMixNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, d: usiz
 }
 
 pub fn hcMixTiled(sc: *Scope, x: A, hw: HcWeights, eps: A, tile: HcMixTile) !A {
-    const L = dim(x, 0);
-    const hc = dim(x, 1);
-    const mix = dim(hw.fn_w, 0);
-    const cols = if (mix % tile.cols == 0) tile.cols else 1;
-    std.debug.assert(tile.rows * cols <= hc_tg);
-    var o: [1]A = undefined;
-    try launch(sc, &hc_mix_def, &.{ x, hw.fn_w, hw.scale, hw.base, eps }, &.{.{ .shape = &.{ ci(L), ci(mix) }, .dt = .float32 }}, .{ mix / cols * hc_tg, (L + tile.rows - 1) / tile.rows, 1 }, .{ hc_tg, 1, 1 }, &.{
-        .{ .name = "TG", .v = ci(hc_tg) }, .{ .name = "R", .v = ci(tile.rows) }, .{ .name = "M", .v = ci(cols) }, .{ .name = "HC", .v = ci(hc) },
-    }, &.{}, &o);
-    return o[0];
+    return sc.keep(try hck.mixTiled(sc.s, x, hw, eps, tile));
 }
 
 /// The split of `z` and `h = rms(collapse(x, cpre))`, one threadgroup a row.
 pub fn hcNorm(sc: *Scope, z: A, x: A, cpre: A, norm_w: A, iters: usize, eps: A) !struct { sp: HcSplit, h: A } {
-    const L = dim(x, 0);
-    const hc = dim(x, 1);
-    const D = dim(x, 2);
-    const dt = mlx.mlx_array_dtype(x);
-    var o: [4]A = undefined;
-    try launch(sc, &hc_norm_def, &.{ z, x, cpre, norm_w, eps }, &.{
-        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
-        .{ .shape = &.{ ci(L), ci(hc) }, .dt = .float32 },
-        .{ .shape = &.{ ci(L), ci(hc), ci(hc) }, .dt = .float32 },
-        .{ .shape = &.{ ci(L), ci(D) }, .dt = dt },
-    }, .{ hc_tg, L, 1 }, .{ hc_tg, 1, 1 }, &.{ .{ .name = "TG", .v = ci(hc_tg) }, .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(iters) } }, &.{.{ .name = "T", .dt = dt }}, &o);
-    return .{ .sp = .{ .pre = o[0], .post = o[1], .comb = o[2] }, .h = o[3] };
+    const r = try hck.norm(sc.s, z, x, cpre, norm_w, iters, eps);
+    try keepAll(sc, &.{ r.sp.pre, r.sp.post, r.sp.comb, r.h });
+    return .{ .sp = r.sp, .h = r.h };
 }
 
 /// Whether `hcExpandFused` reproduces this GPU's `hcExpandOps` byte for byte; set by `probeHc`.
@@ -2978,64 +2266,32 @@ pub fn hcExpandServes(x: A) bool {
     return hc_expand_tf32 and dim(x, 1) == 4;
 }
 
-/// `hcExpand`'s op chain as one pass: `out[k] = post[k] * y + sum_j comb[j, k] * x[j]`. The chain's f32 matmul is
-/// TF32-class on a NAX GPU: both operands keep their top 10 mantissa bits (truncated), the four products are exact, and
-/// the sum is `(p0 + p1) + (p2 + p3)`; a GPU whose matmul is true f32 fails the probe and keeps the chain. `COPY` sets
-/// how a thread maps to output: one element (`k` from the grid's z), or all HC copies of one column.
-const HC_EXPAND_SOURCE =
-    \\#pragma clang fp contract(off)
-    \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y);
-    \\const int D = x_shape[2];
-    \\if (d >= D) return;
-    \\const size_t xo = size_t(l) * HC * D + d;
-    \\float xv[HC];
-    \\for (int j = 0; j < HC; ++j) xv[j] = as_type<float>(as_type<uint>(float(x[xo + size_t(j) * D])) & 0xFFFFE000u);
-    \\const float yv = float(y[size_t(l) * D + d]);
-    \\const int k0 = COPY ? int(thread_position_in_grid.z) : 0, k1 = COPY ? k0 + 1 : HC;
-    \\for (int k = k0; k < k1; ++k) {
-    \\  float p[HC];
-    \\  for (int j = 0; j < HC; ++j) p[j] = as_type<float>(as_type<uint>(comb[l * HC * HC + j * HC + k]) & 0xFFFFE000u) * xv[j];
-    \\  out[xo + size_t(k) * D] = T(post[l * HC + k] * yv + ((p[0] + p[1]) + (p[2] + p[3])));
-    \\}
-;
-
-var hc_expand_def = Def{ .name = "dsv41_hc_expand", .ins = &.{ "x", "y", "post", "comb" }, .outs = &.{"out"}, .source = HC_EXPAND_SOURCE };
 
 /// `hcExpand` of four copies in one kernel, in `x`'s dtype, one thread an output element; valid only where
 /// `hcExpandServes`.
 pub fn hcExpandFused(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
-    return hcExpandLaunch(sc, x, y, post, comb, true);
+    return sc.keep(try hck.expand(sc.s, x, y, post, comb, true));
 }
 
 /// The same bytes with a thread a column writing all four copies: the previous grid, kept for the microbench.
 pub fn hcExpandPerColumn(sc: *Scope, x: A, y: A, post: A, comb: A) !A {
-    return hcExpandLaunch(sc, x, y, post, comb, false);
-}
-
-fn hcExpandLaunch(sc: *Scope, x: A, y: A, post: A, comb: A, per_element: bool) !A {
-    const L = dim(x, 0);
-    const D = dim(x, 2);
-    const dt = mlx.mlx_array_dtype(x);
-    var o: [1]A = undefined;
-    const grid: Grid = .{ (D + 255) / 256 * 256, L, if (per_element) 4 else 1 };
-    try launch(sc, &hc_expand_def, &.{ x, y, post, comb }, &.{.{ .shape = mlx.getShape(x), .dt = dt }}, grid, .{ 256, 1, 1 }, &.{ .{ .name = "HC", .v = 4 }, .{ .name = "COPY", .v = @intFromBool(per_element) } }, &.{.{ .name = "T", .dt = dt }}, &o);
-    return o[0];
+    return sc.keep(try hck.expand(sc.s, x, y, post, comb, false));
 }
 
 /// Launches the top-k kernels (one threadgroup a row, chunked, and cut at each row's length) at `topk_tg` threads, halving
 /// it until they run.
 pub fn probeTopk(gpa: std.mem.Allocator, s: mlx.mlx_stream) !void {
     defer mlx.expected_refusal = null;
-    const widest = topk_tg;
+    const widest = sel.topk_tg;
     while (true) {
         // The floor's refusal is the load's error, logged as one.
-        mlx.expected_refusal = if (topk_tg > 32) "Thread group size" else null;
+        mlx.expected_refusal = if (sel.topk_tg > 32) "Thread group size" else null;
         probeTopkOnce(gpa, s) catch |e| {
-            if (e != error.MlxError or topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
-            topk_tg /= 2;
+            if (e != error.MlxError or sel.topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            sel.topk_tg /= 2;
             continue;
         };
-        if (topk_tg < widest) log.info("[dsv41] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ topk_tg, widest });
+        if (sel.topk_tg < widest) log.info("[dsv41] top-k kernels run {d} threads a group on this GPU (widest {d})\n", .{ sel.topk_tg, widest });
         return;
     }
 }
@@ -3056,10 +2312,10 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
     defer mlx.expected_refusal = null;
     while (true) {
         // The floor's refusal is the load's error, logged as one.
-        mlx.expected_refusal = if (hc_tg > 32) "Thread group size" else null;
+        mlx.expected_refusal = if (hck.hc_tg > 32) "Thread group size" else null;
         probeHcOnce(gpa, s, hc, D, iters) catch |e| {
-            if (e != error.MlxError or hc_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
-            hc_tg /= 2;
+            if (e != error.MlxError or hck.hc_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return e;
+            hck.hc_tg /= 2;
             continue;
         };
         break;
@@ -3067,8 +2323,8 @@ pub fn probeHc(gpa: std.mem.Allocator, s: mlx.mlx_stream, hc: usize, D: usize, i
     mlx.expected_refusal = null;
     // The wide mix and norm and the narrow stage sum a row's terms in one order only where the thread count suits D: a
     // GPU that granted fewer than the widest group is held to it (the widest is the bytes every pack was made on).
-    while (hc_tg < hc_tg_widest and hc_tg > 32 and !try hcStageAgrees(gpa, s, hc, D, iters)) hc_tg /= 2;
-    if (hc_tg < hc_tg_widest) log.info("[dsv41] hyper-connection kernels run {d} threads a group on this GPU (widest {d})\n", .{ hc_tg, hc_tg_widest });
+    while (hck.hc_tg < hc_tg_widest and hck.hc_tg > 32 and !try hcStageAgrees(gpa, s, hc, D, iters)) hck.hc_tg /= 2;
+    if (hck.hc_tg < hc_tg_widest) log.info("[dsv41] hyper-connection kernels run {d} threads a group on this GPU (widest {d})\n", .{ hck.hc_tg, hc_tg_widest });
     hc_expand_tf32 = hc_expand_probe_override orelse (hc == 4 and probeHcExpand(gpa, s, D));
 }
 
@@ -3672,15 +2928,15 @@ test "dsv41 topk: the picks do not depend on the threadgroup width" {
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     try probeTopk(sc.a, sc.s);
-    const widest = topk_tg;
-    defer topk_tg = widest;
+    const widest = sel.topk_tg;
+    defer sel.topk_tg = widest;
     const k = 100;
     const x = try randn(&sc, &.{ 3, 5000 }, .float32, 52, 1.0);
     const want = try testing.allocator.dupe(i32, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
     defer testing.allocator.free(want);
     for ([_]usize{ 256, 512, 1024 }) |w| {
         if (w > widest) continue;
-        topk_tg = w;
+        sel.topk_tg = w;
         try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 1)));
         try testing.expectEqualSlices(i32, want, try sc_mod.hostI32(try topkIndicesSplit(&sc, x, k, 4)));
     }
@@ -4750,12 +4006,12 @@ test "a scope on the engine's stream makes its scalars and host arrays there, ou
 
 test "dsv41 hc kernels: a halved or narrowed hc_tg is settled where the narrow stage and the wide pair give one row the same bits, whatever D" {
     try mlx.requireGpu();
-    const saved = hc_tg;
-    defer hc_tg = saved;
+    const saved = hck.hc_tg;
+    defer hck.hc_tg = saved;
     for ([_]usize{ 512, 256 }) |tg| for ([_]usize{ 256, 384, 5120, 4096, 2048 }) |D| {
-        hc_tg = tg;
+        hck.hc_tg = tg;
         try probeHc(testing.allocator, mlx.gpuStream(), 4, D, 20);
-        try testing.expect(hc_tg <= tg);
+        try testing.expect(hck.hc_tg <= tg);
         try testing.expect(try hcStageAgrees(testing.allocator, mlx.gpuStream(), 4, D, 20));
     };
 }
@@ -4765,19 +4021,19 @@ test "dsv41 topk: the load's probe launches every top-k kernel, so one the GPU g
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    const saved = topk_tg;
+    const saved = sel.topk_tg;
     defer {
-        topk_tg = saved;
+        sel.topk_tg = saved;
         mlx.engine.kernel.grant_cap = std.math.maxInt(usize);
         mlx.engine.kernel.grant_cap_name = "";
     }
     for ([_][]const u8{ "dsv41_topk_below", "dsv41_topk_chunk", "dsv41_topk_merge", "dsv41_topk" }) |name| {
-        topk_tg = 1024;
+        sel.topk_tg = 1024;
         mlx.engine.kernel.grant_cap = 512;
         mlx.engine.kernel.grant_cap_name = name;
         const scope = mlx.engine.enter(mlx.engine.stream());
         defer scope.end();
         try probeTopk(testing.allocator, mlx.engine.stream());
-        try testing.expectEqual(@as(usize, 512), topk_tg);
+        try testing.expectEqual(@as(usize, 512), sel.topk_tg);
     }
 }

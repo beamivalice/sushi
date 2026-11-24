@@ -1,0 +1,735 @@
+//! DFly2 (part 1x) on the tiny: `HY4_BF16_TINY_STQ` (beamster test-fixtures/hy4-bf16-tiny-stq), whose drafter tensors
+//! are random in the release's names and shapes. A random drafter drafts near-misses; what these hold is what any
+//! drafter must: it reads the target and never writes it, and rounds of it give the serial run's tokens.
+const std = @import("std");
+const testing = std.testing;
+const mlx = @import("../mlx.zig");
+const Ops = @import("../mlx_ops.zig").Ops;
+const model_mod = @import("../model.zig");
+const hy4_config = @import("hy4_config.zig");
+const hy4_model = @import("hy4_model.zig");
+const hy4_dfly = @import("hy4_dfly.zig");
+const Arr = mlx.mlx_array;
+
+const Fixture = struct {
+    w: model_mod.Weights,
+    config: hy4_config.Config,
+
+    fn open(s: mlx.mlx_stream) !Fixture {
+        const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY_STQ") orelse return error.SkipZigTest);
+        const a = testing.allocator;
+        var f: Fixture = .{ .w = model_mod.Weights.init(a), .config = undefined };
+        errdefer f.w.deinit();
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+        defer a.free(path);
+        try model_mod.loadSafetensorsFile(a, &f.w, path.ptr, s, true);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+        defer d.close(io);
+        const text = try d.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+        defer a.free(text);
+        f.config = try hy4_config.parseText(text);
+        return f;
+    }
+};
+
+fn engineOn() bool {
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    return was;
+}
+
+fn argmaxLast(o: *Ops, logits: Arr) !u32 {
+    const t = mlx.getShape(logits)[0];
+    const am = try o.slot();
+    try mlx.check(mlx.mlx_argmax_axis(am, try o.slice(logits, 0, t - 1, t), 1, false, o.s));
+    const v = try o.contiguous(try o.cast(am.*, .uint32));
+    try mlx.check(mlx.mlx_array_eval(v));
+    return mlx.mlx_array_data_uint32(v).?[0];
+}
+
+fn prompt(vocab: u32) [24]u32 {
+    var ids: [24]u32 = undefined;
+    var r = std.Random.DefaultPrng.init(0xdf1);
+    for (&ids) |*d| d.* = r.random().uintLessThan(u32, vocab - 1) + 1;
+    return ids;
+}
+
+test "hy4 dfly: the drafter loads the tiny's DFly2 tensors and drafts a block from the target's state without writing it, the same block twice (HY4_BF16_TINY_STQ)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = engineOn();
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var f = try Fixture.open(es);
+    defer f.w.deinit();
+    const ids = prompt(f.config.vocab);
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    // The target's next row without a drafter, for the comparison.
+    const plain = blk: {
+        const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+        defer m.deinit();
+        const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+        break :blk .{ t1, try hostOf(&o, try o.own(try m.forwardReadout(&.{t1}, .last))) };
+    };
+    const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+    defer m.deinit();
+    var d = try hy4_dfly.Drafter.init(a, m, &f.w);
+    defer d.deinit();
+    const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+    try testing.expectEqual(plain[0], t1);
+    var b1 = try d.draft(m, t1);
+    defer b1.deinit();
+    var b2 = try d.draft(m, t1);
+    defer b2.deinit();
+    try testing.expectEqual(@as(usize, f.config.dfly.draft + 1), b1.ids.len);
+    try testing.expectEqual(t1, b1.ids[0]);
+    try testing.expectEqualSlices(u32, b1.ids, b2.ids);
+    try testing.expectEqualSlices(f32, b1.conf, b2.conf);
+    for (b1.ids[1..], b1.conf) |id, cf| {
+        try testing.expect(id < f.config.vocab);
+        try testing.expect(cf > 0 and cf < 1);
+    }
+    // The target as it stood: its position, history and next row's logits.
+    try testing.expectEqual(@as(usize, ids.len), m.pos);
+    try testing.expectEqual(@as(usize, ids.len), m.history.items.len);
+    try testing.expectEqualSlices(f32, plain[1], try hostOf(&o, try o.own(try m.forwardReadout(&.{t1}, .last))));
+}
+
+test "hy4 dfly: greedy rounds (draft a block, verify it, keep the agreed prefix, roll back the rest) give the serial run's tokens, rounds of every accepted count (HY4_BF16_TINY_STQ)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = engineOn();
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var f = try Fixture.open(es);
+    defer f.w.deinit();
+    const ids = prompt(f.config.vocab);
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const n_out = 24;
+    var serial: [n_out]u32 = undefined;
+    {
+        const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+        defer m.deinit();
+        var next = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+        for (&serial) |*tok| {
+            tok.* = next;
+            next = try argmaxLast(&o, try o.own(try m.forwardReadout(&.{next}, .last)));
+        }
+    }
+    const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+    defer m.deinit();
+    var d = try hy4_dfly.Drafter.init(a, m, &f.w);
+    defer d.deinit();
+    var out: std.ArrayList(u32) = .empty;
+    defer out.deinit(a);
+    var counts: [8]usize = @splat(0);
+    var pending = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+    while (out.items.len < n_out) {
+        var block = try d.draft(m, pending);
+        defer block.deinit();
+        // A random drafter rarely agrees: every few rounds the block's drafts are the serial tokens themselves, so
+        // the rounds reach every accepted count.
+        const k = out.items.len;
+        const forced = (counts[0] + counts[1] + counts[2] + counts[3] + counts[4] + counts[5]) % 3 == 1;
+        if (forced) for (block.ids[1..], 1..) |*v, i| {
+            v.* = if (k + i < n_out) serial[k + i] else serial[n_out - 1];
+        };
+        var mk = try m.mark();
+        defer m.dropMark(&mk);
+        const logits = try o.own(try m.forwardReadout(block.ids, .all));
+        var accepted: usize = 0;
+        var verdict: u32 = 0;
+        for (0..block.ids.len) |r| {
+            verdict = try argmaxLast(&o, try o.slice(logits, 0, 0, @intCast(r + 1)));
+            if (r + 1 < block.ids.len and verdict == block.ids[r + 1]) accepted += 1 else break;
+        }
+        try m.rollbackTo(&mk, block.ids[0 .. 1 + accepted]);
+        try out.appendSlice(a, block.ids[0 .. 1 + accepted]);
+        counts[@min(accepted, 7)] += 1;
+        pending = verdict;
+    }
+    try testing.expectEqualSlices(u32, &serial, out.items[0..n_out]);
+    // Rounds of none accepted and of more than one.
+    try testing.expect(counts[0] > 0);
+    var multi: usize = 0;
+    for (counts[2..]) |n| multi += n;
+    try testing.expect(multi > 0);
+}
+
+test "hy4 dfly probe: the acceptance probe scores a block at every k-th position whose drafts the greedy run covers, and leaves the model reset (HY4_BF16_TINY_STQ)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = engineOn();
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var f = try Fixture.open(es);
+    defer f.w.deinit();
+    const ids = prompt(f.config.vocab);
+    const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+    defer m.deinit();
+    var d = try hy4_dfly.Drafter.init(a, m, &f.w);
+    defer d.deinit();
+    var tally: hy4_dfly.Tally = .{};
+    // 16 greedy tokens drafted at 0, 3, .., 15: the blocks at 0 to 9 have their 5 drafts' tokens behind them.
+    try hy4_dfly.probe(&d, m, &ids, 16, 3, &tally);
+    try testing.expectEqual(@as(usize, 4), tally.blocks);
+    try testing.expectEqual(@as(usize, 4), tally.reached[0]);
+    try testing.expectEqual(@as(usize, 0), m.pos);
+    try testing.expectEqual(@as(usize, 0), m.history.items.len);
+}
+
+/// The drafter's oracle (`fixtures/hy4_dfly_oracle.json`, `tests/dump_hy4_dfly_fixture.py`): AngelSpec's own DFly2
+/// modules, run on the tiny's drafter weights over the state the target hands the drafter (the state is the engine's,
+/// recorded beside the oracle's outputs).
+const Oracle = struct {
+    const Layer = struct { target: u32, c: []const []const f32, k_pe: []const []const f32, keep: ?[]const bool };
+    const State = struct { prompt: []const u32, t1: u32, pos: usize, hidden: []const f32, layers: []const Layer };
+    /// A slot's logits at `ids`: the oracle's top ones and a fixed spread over the vocab.
+    const Logits = struct { ids: []const u32, values: []const f32 };
+    const Want = struct { draft: []const u32, conf: []const f32, logits: []const Logits };
+    state: State,
+    want: Want,
+};
+
+/// The state the target hands the drafter: its last hidden state and each drafter layer's shared rows and picks.
+fn handover(a: std.mem.Allocator, o: *Ops, m: *hy4_model.Model, prompt_ids: []const u32, t1: u32) !Oracle.State {
+    const n = m.config.dfly.layers;
+    const layers = try a.alloc(Oracle.Layer, n);
+    for (layers, 0..) |*ly, i| {
+        const target = m.config.dfly.targets[i];
+        const sh = try m.sharedRows(o, target);
+        ly.* = .{ .target = target, .c = try hostRows(a, o, sh.c), .k_pe = try hostRows(a, o, sh.k_pe), .keep = null };
+        if (sh.keep) |k| {
+            const kf = try hostOf(o, k);
+            const keep = try a.alloc(bool, kf.len);
+            for (keep, kf) |*d, v| d.* = v != 0;
+            ly.keep = keep;
+        }
+    }
+    return .{ .prompt = prompt_ids, .t1 = t1, .pos = m.pos, .hidden = try a.dupe(f32, try hostOf(o, m.last_hidden.?)), .layers = layers };
+}
+
+fn hostRows(a: std.mem.Allocator, o: *Ops, x: Arr) ![]const []const f32 {
+    const shape = mlx.getShape(x);
+    const flat = try hostOf(o, x);
+    const w: usize = @intCast(shape[1]);
+    const rows = try a.alloc([]const f32, @intCast(shape[0]));
+    for (rows, 0..) |*r, i| r.* = try a.dupe(f32, flat[i * w ..][0..w]);
+    return rows;
+}
+
+/// The largest |got - want| over want's peak magnitude.
+fn relErr(got: []const f32, want: []const f32) f32 {
+    var peak: f32 = 0;
+    var worst: f32 = 0;
+    for (got, want) |g, w| {
+        peak = @max(peak, @abs(w));
+        worst = @max(worst, @abs(g - w));
+    }
+    return worst / @max(peak, 1e-30);
+}
+
+test "hy4 dfly oracle: the drafter's block (each slot's logits, its draft and its confidence) is AngelSpec's DFly2 over the same target state (HY4_BF16_TINY_STQ)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = engineOn();
+    defer @import("../test_support.zig").restoreEngine(was);
+    // The oracle runs in f32: so do the products.
+    const fwd = @import("hy4_forward.zig");
+    const products = fwd.products;
+    fwd.products = .f32;
+    defer fwd.products = products;
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var f = try Fixture.open(es);
+    defer f.w.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ids = prompt(f.config.vocab);
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+    defer m.deinit();
+    var d = try hy4_dfly.Drafter.init(a, m, &f.w);
+    defer d.deinit();
+    const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+    const state = try handover(arena, &o, m, &ids, t1);
+    // SUSHI_HY4_DFLY_STATE_DUMP=<abs path>: writes the state for the dumper and compares nothing.
+    if (std.c.getenv("SUSHI_HY4_DFLY_STATE_DUMP")) |path| {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const text = try std.json.Stringify.valueAlloc(arena, state, .{});
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = std.mem.span(path), .data = text });
+        return;
+    }
+    const parsed = try std.json.parseFromSlice(Oracle, arena, @embedFile("fixtures/hy4_dfly_oracle.json"), .{ .ignore_unknown_fields = true });
+    const want = parsed.value;
+    // The state the oracle ran on is the one this target hands over.
+    try testing.expectEqualSlices(u32, want.state.prompt, state.prompt);
+    try testing.expectEqual(want.state.t1, state.t1);
+    try testing.expectEqual(want.state.pos, state.pos);
+    try testing.expect(relErr(state.hidden, want.state.hidden) < 1e-5);
+    for (state.layers, want.state.layers) |got, ref| {
+        try testing.expectEqual(ref.target, got.target);
+        try testing.expectEqual(ref.c.len, got.c.len);
+        for (got.c, ref.c, got.k_pe, ref.k_pe) |gc, rc, gp, rp| {
+            try testing.expect(relErr(gc, rc) < 1e-5);
+            try testing.expect(relErr(gp, rp) < 1e-5);
+        }
+        try testing.expectEqual(ref.keep == null, got.keep == null);
+        if (ref.keep) |k| try testing.expectEqualSlices(bool, k, got.keep.?);
+    }
+    const out = try d.forwardBlock(&o, m, t1);
+    const logits = try hostOf(&o, out.logits);
+    const conf = try hostOf(&o, out.conf);
+    const best = try hostOf(&o, try o.cast(out.best, .float32));
+    const vocab = f.config.vocab;
+    var logit_err: f32 = 0;
+    var conf_err: f32 = 0;
+    var drafts_agree = true;
+    for (want.want.logits, want.want.draft, want.want.conf, 0..) |slot, id, cf, j| {
+        const got = try arena.alloc(f32, slot.ids.len);
+        for (got, slot.ids) |*g, v| g.* = logits[j * vocab + v];
+        logit_err = @max(logit_err, relErr(got, slot.values));
+        conf_err = @max(conf_err, @abs(conf[j] - cf));
+        drafts_agree = drafts_agree and @as(u32, @intFromFloat(best[j])) == id;
+    }
+    // Each slot's logits within 1e-4 of their peak, the confidence within 1e-5: f32 against f32, one rounding order
+    // from another.
+    if (!drafts_agree or logit_err > 1e-4 or conf_err > 1e-5) {
+        std.debug.print("dfly oracle: drafts agree {}, logits {e:.3} of peak, confidence {e:.3}\n", .{ drafts_agree, logit_err, conf_err });
+        return error.TestUnexpectedResult;
+    }
+}
+
+fn hostOf(o: *Ops, a: Arr) ![]const f32 {
+    const c = try o.contiguous(try o.cast(a, .float32));
+    try mlx.check(mlx.mlx_array_eval(c));
+    return mlx.mlx_array_data_float32(c).?[0..mlx.mlx_array_size(c)];
+}
+
+test "hy4 dfly: a draft whose confidence rows cannot be read to the host leaves nothing allocated" {
+    const a = testing.allocator;
+    const ids = try a.alloc(u32, 3);
+    defer a.free(ids);
+    const best = [_]u32{ 7, 8 };
+    try testing.expectError(error.HostRead, hy4_dfly.hostDraft(a, ids, &best, null));
+}
+
+fn openStq(a: std.mem.Allocator, dir: []const u8, s: mlx.mlx_stream) !struct {
+    w: model_mod.Weights,
+    config: hy4_config.Config,
+    quant: @import("hy4_stq.zig").Quant,
+} {
+    const hy4_stq = @import("hy4_stq.zig");
+    var w = model_mod.Weights.init(a);
+    errdefer w.deinit();
+    for ([_][]const u8{
+        "model-globals",
+        "model-trunk-00",
+        "model-trunk-01",
+        "model-trunk-02",
+        "model-trunk-03",
+        "model-trunk-04",
+        "model-trunk-05",
+        "model-layer-01",
+        "model-layer-02",
+        "model-layer-03",
+        "model-layer-04",
+        "model-layer-05",
+        "model-dfly",
+    }) |shard| {
+        const path = try std.fmt.allocPrintSentinel(a, "{s}/{s}.safetensors", .{ dir, shard }, 0);
+        defer a.free(path);
+        try model_mod.loadSafetensorsFile(a, &w, path.ptr, s, true);
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    const text = try d.readFileAlloc(io, "config.json", a, .limited(1 << 20));
+    defer a.free(text);
+    return .{
+        .w = w,
+        .config = try hy4_config.parseText(text),
+        .quant = try hy4_stq.parseQuantText(a, text),
+    };
+}
+
+test "hy4 dfly: a draft waits for the GPU once across all slots (HY4_BF16_TINY_STQ, HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = engineOn();
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    {
+        var f = try Fixture.open(es);
+        defer f.w.deinit();
+        const ids = prompt(f.config.vocab);
+        const m = try hy4_model.Model.init(a, f.config, &f.w, es);
+        defer m.deinit();
+        var d = try hy4_dfly.Drafter.init(a, m, &f.w);
+        defer d.deinit();
+        const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+        const before = mlx.engine.stats().waits;
+        var b = try d.draft(m, t1);
+        defer b.deinit();
+        const waits = mlx.engine.stats().waits - before;
+        try testing.expectEqual(@as(u64, 1), waits);
+    }
+    {
+        const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+        var f = try openStq(a, dir, es);
+        defer f.w.deinit();
+        const ids = prompt(f.config.vocab);
+        const m = try hy4_model.Model.initWith(a, f.config, &f.w, es, .{ .dir = dir, .quant = f.quant });
+        defer m.deinit();
+        var d = try hy4_dfly.Drafter.init(a, m, &f.w);
+        defer d.deinit();
+        const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
+        const before = mlx.engine.stats().waits;
+        var b = try d.draft(m, t1);
+        defer b.deinit();
+        const waits = mlx.engine.stats().waits - before;
+        try testing.expectEqual(@as(u64, 1), waits);
+    }
+}
+
+test "hy4 dfly: a plain round of a DFly2 request makes no more launches, waits or ring copies than a plain decode step (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const contract = @import("../cooler_contract_test.zig");
+    const hy4_contract = @import("hy4_contract.zig");
+    const arch_handle = @import("../arch/handle.zig");
+    const arch_sched = @import("../arch/sched.zig");
+    const Generator = @import("../generate.zig").Generator;
+    const Tokenizer = @import("../tokenizer.zig").Tokenizer;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    const p = ids[0..24];
+    const Count = struct { dispatches: u64, waits: u64, updates_copied: u64, pool_bytes_delta: i64, tok: u32 };
+    const plain: Count = blk: {
+        var ld: contract.Load = undefined;
+        try ld.prepare(hy4_contract, dir, true);
+        ld.config.stream_mtp_head = false;
+        try ld.loadServed(dir);
+        defer _ = ld.close();
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{});
+        defer gen.deinit(a);
+        _ = try gen.next(a);
+        _ = try gen.next(a);
+        const s0 = mlx.engine.stats();
+        var t: u32 = 0;
+        for (0..4) |_| t = (try gen.next(a)).?;
+        const s1 = mlx.engine.stats();
+        break :blk .{
+            .dispatches = s1.dispatches - s0.dispatches,
+            .waits = s1.waits - s0.waits,
+            .updates_copied = s1.updates_copied - s0.updates_copied,
+            .pool_bytes_delta = @as(i64, @intCast(s1.pool_bytes)) - @as(i64, @intCast(s0.pool_bytes)),
+            .tok = t,
+        };
+    };
+    const dfly: Count = blk: {
+        var ld: contract.Load = undefined;
+        try ld.open(hy4_contract, dir, true);
+        defer _ = ld.close();
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_policy.gate.mode = .plain;
+        gen.dspark_policy.gate.plain_tokens = 4;
+        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        const s0 = mlx.engine.stats();
+        var t: u32 = 0;
+        for (0..4) |_| {
+            const r = (try gen.nextDspark(a)).?;
+            t = r.tokens[0];
+            a.free(r.tokens);
+        }
+        try testing.expectEqual(@as(u64, 6), gen.dspark_stats.plain);
+        const s1 = mlx.engine.stats();
+        break :blk .{
+            .dispatches = s1.dispatches - s0.dispatches,
+            .waits = s1.waits - s0.waits,
+            .updates_copied = s1.updates_copied - s0.updates_copied,
+            .pool_bytes_delta = @as(i64, @intCast(s1.pool_bytes)) - @as(i64, @intCast(s0.pool_bytes)),
+            .tok = t,
+        };
+    };
+    errdefer std.debug.print("hy4 dfly plain step: plain(dispatches={d}, waits={d}, updates_copied={d}, pool_delta={d}) vs dfly(dispatches={d}, waits={d}, updates_copied={d}, pool_delta={d})\n", .{
+        plain.dispatches, plain.waits, plain.updates_copied, plain.pool_bytes_delta,
+        dfly.dispatches,  dfly.waits,  dfly.updates_copied,  dfly.pool_bytes_delta,
+    });
+    try testing.expectEqual(plain.tok, dfly.tok);
+    try testing.expect(dfly.waits <= plain.waits);
+    try testing.expect(dfly.updates_copied <= plain.updates_copied);
+    try testing.expect(dfly.dispatches <= plain.dispatches);
+}
+
+test "hy4 dfly: a plain stretch hands over fresh hidden and picks to the retrial draft round (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const contract = @import("../cooler_contract_test.zig");
+    const hy4_contract = @import("hy4_contract.zig");
+    const arch_handle = @import("../arch/handle.zig");
+    const arch_sched = @import("../arch/sched.zig");
+    const Generator = @import("../generate.zig").Generator;
+    const Tokenizer = @import("../tokenizer.zig").Tokenizer;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    const p = ids[0..24];
+    var ld: contract.Load = undefined;
+    try ld.open(hy4_contract, dir, true);
+    defer _ = ld.close();
+    var want = try contract.serial(&ld, p, 12, .{ .temperature = 0.0 });
+    defer want.deinit(a);
+    const turn = arch_handle.turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer arch_sched.endRequest(&ld.config);
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    try ld.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    gen.dspark_policy.gate.mode = .plain;
+    gen.dspark_policy.gate.retrial = 6;
+    gen.dspark_policy.gate.plain_tokens = 0;
+    gen.dspark_policy.gate.ms = 1000;
+    gen.dspark_policy.gate.tokens = 1;
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(a);
+    while (try gen.nextDspark(a)) |r| {
+        defer a.free(r.tokens);
+        try got.appendSlice(a, r.tokens);
+    }
+    try testing.expectEqualSlices(u32, want.items, got.items);
+    try testing.expect(gen.dspark_stats.plain >= 6);
+    try testing.expect(gen.dspark_stats.rounds > gen.dspark_stats.plain);
+}
+
+test "hy4 dfly: a plain stretch pipelines one step in flight like plain decode (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const contract = @import("../cooler_contract_test.zig");
+    const hy4_contract = @import("hy4_contract.zig");
+    const arch_handle = @import("../arch/handle.zig");
+    const arch_sched = @import("../arch/sched.zig");
+    const Generator = @import("../generate.zig").Generator;
+    const Tokenizer = @import("../tokenizer.zig").Tokenizer;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    const p = ids[0..24];
+    const Run = struct { waits: u64, submits: u64, in_flight: usize, toks: [4]u32 };
+    const plain: Run = blk: {
+        var ld: contract.Load = undefined;
+        try ld.prepare(hy4_contract, dir, true);
+        ld.config.stream_mtp_head = false;
+        try ld.loadServed(dir);
+        defer _ = ld.close();
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{});
+        defer gen.deinit(a);
+        _ = try gen.next(a);
+        _ = try gen.next(a);
+        const s0 = mlx.engine.stats();
+        var toks: [4]u32 = undefined;
+        var in_flight: usize = 0;
+        for (&toks) |*t| {
+            t.* = (try gen.next(a)).?;
+            if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
+        }
+        const s1 = mlx.engine.stats();
+        break :blk .{ .waits = s1.waits - s0.waits, .submits = s1.submits - s0.submits, .in_flight = in_flight, .toks = toks };
+    };
+    const dfly: Run = blk: {
+        var ld: contract.Load = undefined;
+        try ld.open(hy4_contract, dir, true);
+        defer _ = ld.close();
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        var tok = Tokenizer.initEmpty(a);
+        defer tok.deinit();
+        try ld.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+        defer gen.deinit(a);
+        gen.dspark_policy.gate.mode = .plain;
+        gen.dspark_policy.gate.plain_tokens = 4;
+        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        const s0 = mlx.engine.stats();
+        var toks: [4]u32 = undefined;
+        var in_flight: usize = 0;
+        for (&toks) |*t| {
+            const r = (try gen.nextDspark(a)).?;
+            t.* = r.tokens[0];
+            a.free(r.tokens);
+            if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
+        }
+        try testing.expectEqual(@as(u64, 6), gen.dspark_stats.plain);
+        const s1 = mlx.engine.stats();
+        break :blk .{ .waits = s1.waits - s0.waits, .submits = s1.submits - s0.submits, .in_flight = in_flight, .toks = toks };
+    };
+    errdefer std.debug.print("hy4 dfly pipeline: plain(waits={d}, submits={d}, in_flight={d}) vs dfly(waits={d}, submits={d}, in_flight={d})\n", .{
+        plain.waits, plain.submits, plain.in_flight,
+        dfly.waits,  dfly.submits,  dfly.in_flight,
+    });
+    try testing.expectEqualSlices(u32, &plain.toks, &dfly.toks);
+    try testing.expectEqual(@as(usize, 4), plain.in_flight);
+    try testing.expectEqual(plain.in_flight, dfly.in_flight);
+    try testing.expectEqual(plain.waits, dfly.waits);
+    try testing.expect(dfly.submits <= plain.submits);
+}
+
+test "hy4 dfly: a resident load keeps DFly2 by default where the pack ships it and drops it under mtp off (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const arch = @import("arch.zig");
+    const hy4_load = @import("hy4_load.zig");
+    const model_load = @import("../model_load.zig");
+    const trunk_mod = @import("../trunk.zig");
+    var cfg = try model_mod.parseConfig(io, a, dir);
+    defer cfg.deinit(a);
+    cfg.expert_source_dir = try a.dupe(u8, dir);
+    const mtp = model_load.mtpChoiceFor(null, &cfg);
+    try testing.expect(mtp.on);
+    const billed_on = (try hy4_load.residentLoadBytes(io, a, dir, &cfg, false, true)).?;
+    const billed_off = (try hy4_load.residentLoadBytes(io, a, dir, &cfg, false, false)).?;
+    try testing.expect(billed_on > billed_off);
+    const ships = hy4_load.shipsHead(io, a, dir);
+    var load_cfg = cfg;
+    load_cfg.stream_mtp_head = (try model_load.residentHead(mtp, ships)).kept;
+    try testing.expect(arch.dsparkOn(&load_cfg));
+    var off_cfg = cfg;
+    off_cfg.mtp_override = false;
+    off_cfg.stream_mtp_head = (try model_load.residentHead(model_load.mtpChoiceFor(null, &off_cfg), ships)).kept;
+    try testing.expect(!arch.dsparkOn(&off_cfg));
+    var w = try model_mod.loadWeightsForConfig(io, a, dir, &load_cfg, false);
+    defer w.deinit();
+    var xfm = try trunk_mod.Trunk.init(io, a, load_cfg, &w);
+    defer xfm.deinit();
+    try testing.expect(xfm.arch_state.hy4flash.drafter != null);
+}
+
+test "hy4 dfly: coolerPipelineScope distinguishes DFly2 on vs off (HY4_STQ_TINY)" {
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const arch = @import("arch.zig");
+    var cfg_off = try model_mod.parseConfig(io, a, dir);
+    defer cfg_off.deinit(a);
+    cfg_off.expert_streaming = true;
+    cfg_off.stream_mtp_head = false;
+    var cfg_on = cfg_off;
+    cfg_on.stream_mtp_head = true;
+    const scope_off = arch.coolerPipelineScope(&cfg_off);
+    const scope_on = arch.coolerPipelineScope(&cfg_on);
+    errdefer std.debug.print("hy4 coolerPipelineScope: off={s} on={s}\n", .{ scope_off, scope_on });
+    try testing.expect(!std.mem.eql(u8, &scope_off, &scope_on));
+    var res_on = cfg_off;
+    res_on.expert_streaming = false;
+    res_on.stream_mtp_head = true;
+    var res_off = res_on;
+    res_off.stream_mtp_head = false;
+    try testing.expect(!std.mem.eql(u8, &arch.coolerPipelineScope(&res_off), &arch.coolerPipelineScope(&res_on)));
+}
+
+test "hy4 bill: warmNeedBytes and warmRequestBill bill Hy4 DFly2 warm request with drafting on" {
+    const bills = @import("../bills.zig");
+    const c = try hy4_config.parseText(hy4_config.release_config);
+    var mc = @import("../model.zig").ModelConfig{
+        .model_type = "hy_v4_flash",
+        .hy4flash = c,
+        .stream_mtp_head = true,
+        .expert_streaming = true,
+        .vocab_size = c.vocab,
+        .hidden_size = c.dim,
+        .num_hidden_layers = c.layers,
+    };
+    const floor: u64 = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
+    var plain = mc;
+    plain.stream_mtp_head = false;
+    const bill_plain = bills.warmRequestBill(&plain, 8, floor, false);
+    const bill_off = bills.warmRequestBill(&mc, 8, floor, false);
+    const bill_on = bills.warmRequestBill(&mc, 8, floor, true);
+    const warm_need = bills.warmNeedBytes(&mc);
+    errdefer std.debug.print("hy4 release floor=512: warmRequestBill(no DFly2)={d} MB, (DFly2, mtp=false)={d} MB, (DFly2, mtp=true)={d} MB, warmNeedBytes={d} MB\n", .{
+        bill_plain >> 20, bill_off >> 20, bill_on >> 20, warm_need >> 20,
+    });
+    // A load that drafts holds its drafting blocks for a request that does not draft (D56); a round adds its rows.
+    try testing.expect(bill_off > bill_plain);
+    try testing.expect(bill_on >= bill_off);
+    try testing.expect(warm_need >= bill_on);
+}
+
+test "hy4 bill: on a load that drafts, the closed-form terms at a request's reach hold the blocks reserveFor makes for it, drafting or not, at 8 and 16 bits (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const arch = @import("arch.zig");
+    const contract = @import("../cooler_contract_test.zig");
+    const hy4_contract = @import("hy4_contract.zig");
+    const arch_handle = @import("../arch/handle.zig");
+    const arch_sched = @import("../arch/sched.zig");
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const seq: u64 = 500;
+    const max_tokens: u32 = 100;
+    const chunk: u64 = 512;
+    for ([_]u64{ 8, 16 }) |kv| {
+        var ld: contract.Load = undefined;
+        try ld.open(hy4_contract, dir, true);
+        defer _ = ld.close();
+        const turn = arch_handle.turnFor(ld.h, &ld.config);
+        defer turn.end();
+        defer arch_sched.endRequest(&ld.config);
+        const m = ld.xfm.arch_state.hy4flash.model.?;
+        try testing.expect(arch.dsparkOn(&ld.config));
+        try testing.expect(m.keep_hidden);
+        m.reset();
+        m.kv = if (kv == 8) .engine_default else .dense;
+        const end = seq + max_tokens;
+        try m.reserveFor(@intCast(end));
+        const held = @import("hy4_prefix.zig").heldBytes(m, null);
+        const terms = @import("hy4_ledger.zig").ledgerTerms(&ld.config, kv, chunk).?;
+        errdefer std.debug.print("[hy4-bill] kv{d}: reserveFor({d}) holds {d} B, the terms {d} B\n", .{ kv, end, held, terms.at(end) });
+        try testing.expect(held <= terms.at(end));
+    }
+}
+

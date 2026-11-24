@@ -1,8 +1,10 @@
-//! DSpark's rounds as the generator and the scheduler reach them: the `dspark_rounds` of the first built arch whose
-//! drafter declares one, else a stand-in that refuses (no request drafts with DSpark in a build without such an arch).
+//! DSpark's rounds as the generator and the scheduler reach them: the `dspark_rounds` of the loaded model's arch, bound
+//! by the model's tag at run time (a build may hold several DSpark archs), else a stand-in that refuses (an arch whose
+//! drafter declares no rounds).
 //!
 //! A `dspark_rounds` module declares `nextDspark`, `dsparkResumeAfterForced`, `dsparkEmitPending`, `dsparkDiag`
-//! (the diagnostic switch the arch reads) and `stageBlock` (drafts one stage block holds, from the loaded model).
+//! (the diagnostic switch the arch reads) and `stageBlock` (drafts one stage block holds, from the loaded model). The
+//! shared round body is `dspark_round.Rounds`, over the arch's hooks.
 const std = @import("std");
 const registry = @import("registry.zig");
 const generate = @import("../generate.zig");
@@ -31,16 +33,40 @@ const Refuse = struct {
 /// The block a DSpark policy assumes before a model says its own.
 pub const default_block: u32 = 5;
 
-// Binds the first built arch that declares DSpark rounds, at comptime: a build has one DSpark arch.
-const Impl = blk: {
-    for (std.meta.tags(registry.Tag)) |t| {
-        if (@hasDecl(registry.Mod(t).drafter, "dspark_rounds")) break :blk registry.Mod(t).drafter.dspark_rounds;
-    }
-    break :blk Refuse;
-};
+/// The DSpark rounds of the arch `t`, or the refusal when its drafter declares none.
+fn RoundsOf(comptime t: registry.Tag) type {
+    const M = registry.Mod(t);
+    if (@hasDecl(M, "drafter") and @hasDecl(M.drafter, "dspark_rounds")) return M.drafter.dspark_rounds;
+    return Refuse;
+}
 
-pub const nextDspark = Impl.nextDspark;
-pub const dsparkResumeAfterForced = Impl.dsparkResumeAfterForced;
-pub const dsparkEmitPending = Impl.dsparkEmitPending;
-pub const dsparkDiag = Impl.dsparkDiag;
-pub const stageBlock = Impl.stageBlock;
+pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?Generator.DrafterStepResult {
+    switch (self.xfm.arch) {
+        inline else => |t| return RoundsOf(t).nextDspark(self, allocator),
+    }
+}
+
+pub fn dsparkResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !dspark_rows.Resume {
+    switch (self.xfm.arch) {
+        inline else => |t| return RoundsOf(t).dsparkResumeAfterForced(self, allocator),
+    }
+}
+
+pub fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+    switch (self.xfm.arch) {
+        inline else => |t| return RoundsOf(t).dsparkEmitPending(self, allocator),
+    }
+}
+
+/// The diagnostic switch the loaded model's arch reads.
+pub fn dsparkDiag(xfm: *const trunk.Trunk) dspark_rows.Diag {
+    switch (xfm.arch) {
+        inline else => |t| return RoundsOf(t).dsparkDiag(),
+    }
+}
+
+pub fn stageBlock(xfm: *trunk.Trunk) u32 {
+    switch (xfm.arch) {
+        inline else => |t| return RoundsOf(t).stageBlock(xfm),
+    }
+}

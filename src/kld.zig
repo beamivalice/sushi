@@ -17,6 +17,7 @@ const server_state = @import("server_state.zig");
 const hidden_capture = @import("hidden_capture.zig");
 const fp8_block = @import("fp8_block.zig");
 const offline = @import("arch/offline.zig");
+const arch_config = @import("arch/config.zig");
 const fixture_mod = @import("kld_fixture.zig");
 const cli_error = @import("cli_error.zig");
 const testing = std.testing;
@@ -44,6 +45,8 @@ pub const Options = struct {
     /// DeepSeek only, compare only: the student drops this many routed experts a layer by the pack's usage list.
     drop_expert: u16 = 0,
     ssd_budget_bytes: u64 = 0,
+    /// A Flash-Next model reads its n-gram table from the BF16 shards of this checkpoint instead of its own table.
+    ngram_bf16_dir: []const u8 = "",
     ssd_prefetch: ?u8 = null,
     pick_tolerance: f32 = 0,
     cache_bias: f32 = 0,
@@ -243,12 +246,14 @@ pub const USAGE =
     \\                        scored against the f32 teacher. A GLM pack has no GDN arm and refuses it.
     \\  --drop-expert <n>     compare only, on a pack with an expert usage list: drop the n least-used routed experts of every layer by
     \\                        the pack's expert_usage.json (a multiple of 8; 0 = off). The teacher is never pruned.
-    \\  --ssd-budget-gb <n>   expert streaming budget (GiB)
+    \\  --ssd-budget-gb <n>   expert streaming budget (GiB). Optional, and it never changes the KLD: without it the load
+    \\                        takes the model-settings value, else serve's RAM default. For a box outside the RAM tiers
+    \\                        (or a model with no RAM default), which has no default to take.
     \\  --ssd-prefetch <n>    streamed-expert prefetch read cap: percent (0..100, default 0) of the SSD read rate; 0 = no prefetch
     \\  --mtp                 keep the MTP head resident (refused under streaming)
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
-    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1 and Qwen3.8: score an uncached expert n lower at decode widths (0..2)
+    \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1, Qwen3.8 and Hy4-Flash: score an uncached expert n lower at decode widths (0..2)
     \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
     \\  --layer-major         native GLM BF16 teacher or a streamed checkpoint's calibration capture, --tokens 1:
     \\                        batches of windows run layer by layer, each layer's experts read once per batch;
@@ -286,6 +291,7 @@ pub const Loaded = struct {
         self.weights.deinit();
         self.chat_config.deinit();
         self.tok.deinit();
+        offline.afterUnload(&self.config);
         self.config.deinit(allocator);
         allocator.destroy(self);
     }
@@ -307,7 +313,13 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         .xfm = undefined,
     };
     errdefer self.config.deinit(allocator);
+    if (opts.ngram_bf16_dir.len > 0 and arch_config.isOf(&self.config, "qwen4")) {
+        if (self.config.ngram_bf16_dir) |old| allocator.free(old);
+        self.config.ngram_bf16_dir = try allocator.dupe(u8, opts.ngram_bf16_dir);
+    }
     try offline.refuse(&self.config, opts);
+    try offline.beforeLoad(&self.config, opts);
+    errdefer offline.afterUnload(&self.config);
     if (arch_flags.archFlagRefusal(&self.config, .{ .drop_expert = opts.drop_expert != 0, .ssd_prefetch = opts.ssd_prefetch != null })) |why| {
         log.err("{s}\n", .{why});
         return error.LaunchFlagUnsupported;

@@ -91,8 +91,8 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
 
 ## Budget
 
-- `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a TOTAL resident
-  target of N GiB = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
+- `expert_stream.budgetLedger`, one `[expert-stream] ssd budget` boot line. `--ssd-budget-gb N` is a weights budget
+  of N GiB (owner, 2026-11-24: the KV cache, prefill and a static-bill load's arena sit beside it) = trunk + MTP + vision tower (under `--vision`) + the all-experts union workspace + selected slab +
   bounce + the MLX buffer pool a model caps for itself (`StoreShape.pool_bytes`, DeepSeek only; others keep the
   RAM/16 cap outside the ledger) + the scales a load keeps in host memory (`StoreShape.kept_bytes`, below; the boot
   line names them only where there are some); the remainder is a uniform per-layer LRU. The ledger refuses a budget under two slots per layer, and under
@@ -102,7 +102,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   every pool to its whole layer, reads all of them at load (`[expert-stream] resident:` line; no 80% warm) and maps
   each expert to its slot (`LayerState.resident_map`), so a DeepSeek STQ route takes its slots on the GPU with no
   host read of the picks (`Engine.residentRoute`). Same bytes out as the streamed path (tested on the tiny STQ pack).
-- Precedence: `--ssd-budget-gb` > setting > the RAM default (DeepSeek only: `model_load.ramDefaultBudget`) > `ExpertStreamingRequired` 503 naming all three. The default is 80 GiB on a 96 GB Mac, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), the planner's resident need on 192 and 256 GB, each stepped down to the largest whole GiB that fits the lower of the residency limit and the user-wire cap beside a 1M request and an image encode. Every load path that takes a budget (serve, `kld`) resolves it through `model_load.withRamDefault`, never its own copy; the DeepSeek layer-major capture sizes its window batch from that budget.
+- Precedence: `--ssd-budget-gb` > setting > the RAM default (DeepSeek and Hy4-Flash, the archs whose `serveDefaults` set `ram_budget`: `model_load.ramDefaultBudget`) > `ExpertStreamingRequired` 503 naming all three. The default is 80 GiB on a 96 GB Mac, 96 on 128 GB (108 with `iogpu.wired_limit_mb` at 120000 or more), the planner's resident need on 192 and 256 GB, each stepped down to the largest whole GiB that fits the lower of the residency limit and the user-wire cap beside a 1M request and an image encode. Every load path that takes a budget (serve, `kld`) resolves it through `model_load.withRamDefault`, never its own copy; the DeepSeek layer-major capture sizes its window batch from that budget.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit
@@ -291,7 +291,11 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   one-row steps that score the generated tokens; its prompt prefill is exact.
 - A streamed GLM has no pick: `glm5_stream` always fetches a miss, so the flag does nothing there.
 
+<a id="cache-bias"></a>
 ## Cache-favoring pick (`--expert-cache-bias <n>`, 0..2, default 0 = exact)
+
+An arch takes it where `ExpertStreamTraits.cache_bias` says so (DeepSeek-V4.1, Qwen3.8, Hy4-Flash); the settings page and
+its reason read that trait.
 
 - DeepSeek-V4.1 and Qwen3.8 STQ, decode widths (DSpark and MTP verify rows included, up to `DECODE_ROWS_MAX`): the pick
   scores an expert the layer's cache lacks `n` lower (`Engine.cachePenalty`, f32 `[experts]` rebuilt with the GPU cache
@@ -301,13 +305,18 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   still queued ahead of the host (`canQueue` stays true). Qwen's softmax router picks on logits plus the penalty
   (`Trunk.cachePenalizedRouting`, `moeRoutingChainOn`; `n` is in router logits, a probability factor of e^-n) and
   weights the picked experts by the plain softmax; it queues no chain of its own, so the gain is fewer SSD reads.
+- Hy4-Flash STQ, decode widths (`hy4_model.moeStqStreamed`, rows up to `DECODE_ROWS_MAX`): the same penalty is added to
+  `e_score_correction_bias` (`hy4_forward.cacheBiased`), the bias row `hy4_route.pick` reads, in sigmoid score units
+  (0..1), so a bias near 1 or above makes every decode pick a held expert. The weights stay the unbiased sigmoids. The
+  picks are read on the host as before. A prefill chunk routes exactly; an exact boot keeps the route's bytes. The SSD
+  prefix namespace names a non-zero bias (`hy4_prefix.diskLayoutKey`, `cbias<hex>`).
 - A tolerance above 0 swaps on the host and keeps nothing queued, so a boot with both ignores the bias (and says so).
 - Prefill chunks, image rows and layers without a pooled map route exactly. `ExpertStreamTraits.cache_bias` names the
   archs whose router takes it; another arch's engine keeps the bias 0. The prefix-cache namespace names a non-zero bias
   (`-cbias`, and `-pick` for a tolerance: `dsv41_prefix.layoutKey`, `qwen4_prefix.diskLayoutKey`), so its states never mix with an exact boot's. A load whose arch has no such pick says so (`[expert-bias] ignored`).
   `kld compare` takes it; `capture` refuses the flag and ignores a model setting, with a log line.
-- Per model: model-settings.json `expert_cache_bias` (the web UI's "Faster SSD streaming (not exact)", offered only to a
-  DeepSeek or Qwen STQ pack that streams); the flag outranks it. `ModelConfig.expertCacheBias` resolves it per load and
+- Per model: model-settings.json `expert_cache_bias` (the web UI's "Faster SSD streaming (not exact)", offered only to an STQ
+  pack of a `cache_bias` arch that streams); the flag outranks it. `ModelConfig.expertCacheBias` resolves it per load and
   the load hands it to its own engine (`Options.cache_bias`) and namespace, so a second resident model never reads
   another's bias.
 - Output depends on cache state, so it is not reproducible across runs or prompt histories. `kld capture` refuses a
@@ -344,6 +353,9 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
 - The `[expert-stream] forward=` line ends with `bounced_gb` (bytes read through the bounce buffer since boot) and
   `reshuffled_gb` (tile bytes the CPU permuted); a pair-major pack on aligned shards shows both falling to the share
   of reads that cannot be direct, `reshuffled_gb` at 0.
+- The `[expert-stream] forward=` and `route forward=` lines (forwards 1, 2 and every `BREAKDOWN_EVERY`) print only while
+  some layer streams: a load whose every active layer routes through its resident map (`Engine.allResident`) logs them
+  at `--log-level debug` only, as their counters are all zero.
 - `FillPool` workers park on their condition without broadcasting: `submit` signals after every push, and a
   broadcast before the wait makes idle workers wake each other forever.
 - `PageSlab` epoch leases (`free → filling → ready → leased → readers_complete → reclaimable`, CPU writes only in
@@ -369,7 +381,7 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   experts ...`, `GLM serving streams FP8 source experts ...`); `every real streamed pack and source on this box
   plans a streamed load` plans each pack on the box.
 - Live (main `1e484c10` plus this change): GLM-5.3-Flash-Sushi-2.3bpw `kld compare --limit 1` on the 4x512 BF16
-  teacher scores the same every field streamed at `--ssd-budget-gb 32` (81 slots/layer) and resident, with the BF16
+  teacher scores the same every field streamed with a 32 GiB cache (81 slots/layer) and resident, with the BF16
   latent (KLD 0.044647, top-1 489/512) and with `--kv-quant 8` (KLD 0.042316, top-1 492/512).
 - Cross-day comparisons must match forwards on `hits` + `fill_bytes_per_row` (the SSD's delivered rate drifts).
 - `SUSHI_NGRAM_BF16_DIR=<hf checkpoint>` serves any pack with the ORIGINAL bf16 n-gram table so `kld compare`
@@ -393,6 +405,9 @@ tokens x top-k exactly on every layer; the two load-time warmup forwards add a f
   A layer-major run resumes with its sums: each committed batch leaves `imatrix-<windows>.safetensors` (raw
   accumulators) in `<out>.partial`, and a resume without the matching file is refused (`GlmLayerMajorImatrixStateMissing`).
   Only BF16 experts are observed; any other layout is refused (`GlmImatrixNeedsBf16Experts`).
+- **DeepSeek-V4.1**: the layer-major capture ([quality-kld](quality-kld.md#dsv41-capture)) feeds the same collector from the
+  router's global ids (`layers.{L}.ffn.experts.{gate_up_proj,down_proj}[.rows]`); `SUSHI_IMATRIX_OUT` names the file, else it is
+  `imatrix.safetensors` in the capture's `calib/` directory. The down inputs carry the route weight, as the forward applies it.
 - **Hidden capture** (`SUSHI_HIDDEN_OUT=<abs dir>`): `sushi kld capture` (no prefix cache, no warmup) appends every
   prompt token's residual at each block boundary (`boundary-XX.bin`, raw bf16 [tokens, hidden]; 00 = layer 0's input,
   b = layer b-1's output), then its ids (`tokens.bin`, u32); `forwardMoeWith` and the native GLM teacher (all four

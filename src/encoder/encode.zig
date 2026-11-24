@@ -1,14 +1,77 @@
 const std = @import("std");
 const format = @import("sushi_exl3").format;
+const codebook_tables = @import("sushi_exl3").codebook_tables;
 const st = @import("safetensors.zig");
+const pair_search = @import("pair_search.zig");
 
 pub const tile_len = format.TILE_VALUES;
 
-pub const Error = error{ RateUnsupported, WindowTooNarrow, WindowUnsupported, ShapeMismatch, CodebookUnsupported } || std.mem.Allocator.Error;
+pub const Error = error{ RateUnsupported, WindowTooNarrow, WindowUnsupported, ShapeMismatch, CodebookUnsupported, PinPassUnsupported } || std.mem.Allocator.Error;
 
-/// The codebooks the encoder searches.
-pub fn searchable(codebook: format.Codebook) bool {
-    return codebook == .mcg or codebook == .mul1;
+/// Pass 0 of the tail-biting search only picks the pin, the state entering position 0. It covers `pin_pass` positions
+/// on each side of the wrap; the full 128 is the whole tile. A multiple of 16 keeps both ends on the rate pattern's period.
+pub const full_pin_pass: u32 = tile_len / 2;
+pub const default_pin_pass: u32 = 64;
+
+pub fn validPinPass(pin_pass: u32) bool {
+    return pin_pass >= 16 and pin_pass <= full_pin_pass and pin_pass % 16 == 0;
+}
+
+/// How a codeword decodes in the search: MCG and MUL1 by their own expressions, the hash-mask codebooks (alpha, and
+/// STD1 and SPEC1 through their table's row for the rate) by their pair. PAIR1's pair codec reads two weights from one
+/// window, which the search's one-codeword-per-weight trellis does not model.
+pub const Code = union(enum) {
+    mcg,
+    mul1,
+    hash_mask: format.HashMask,
+
+    pub fn of(dec: format.Decode, rate: format.Rate) ?Code {
+        return switch (dec.codebook) {
+            .mcg => .mcg,
+            .mul1 => .mul1,
+            .alpha, .spec1, .std1 => if (dec.hashMask(rate)) |hm| .{ .hash_mask = hm } else null,
+            .pair1 => null,
+        };
+    }
+
+    /// The weight a codeword decodes to, as F16 bits: the host decoders the engine's kernels are held to.
+    pub fn value(self: Code, cw: u16) u16 {
+        return switch (self) {
+            .mcg => format.decodeCodeword(cw, .mcg),
+            .mul1 => format.decodeCodeword(cw, .mul1),
+            .hash_mask => |hm| format.decodeHashMask(cw, hm),
+        };
+    }
+};
+
+/// Whether the codebook's pair comes from a named table the pack must carry.
+pub fn needsTable(cb: format.Codebook) bool {
+    return cb.tabledHashMask();
+}
+
+/// A table the search can encode against: one of a searchable codebook's, never PAIR1's pair codec.
+pub fn tableSearchable(t: *const codebook_tables.Table) bool {
+    return needsTable(t.codebook);
+}
+
+/// The rates the GPU search and the shard writer run: `--experts-k`'s range in steps of one eighth of a bit.
+pub fn runnableRate(rate: format.Rate) bool {
+    return rate.n % 2 == 0 and rate.n >= 24 and rate.n <= format.Rate.max_n;
+}
+
+/// The codebooks the encoder searches: every scalar decode, STD1 and SPEC1 only at a rate their table has a row for,
+/// PAIR1 (`pair_search`) at window 16 and a rate its table has a row for.
+pub fn searchable(dec: format.Decode, rate: format.Rate) bool {
+    return Code.of(dec, rate) != null or pairSearchable(dec, rate);
+}
+
+pub fn pairSearchable(dec: format.Decode, rate: format.Rate) bool {
+    return dec.codebook == .pair1 and dec.window == .w16 and format.pair1Pair(rate) != null;
+}
+
+/// A table the search can encode against: a scalar codebook's, or PAIR1's (it names the pair rows the search uses).
+pub fn tableSearchableAny(t: *const codebook_tables.Table) bool {
+    return tableSearchable(t) or t.codebook == .pair1;
 }
 
 pub const Work = struct {
@@ -117,6 +180,7 @@ pub const Encoder = struct {
     allocator: std.mem.Allocator,
     rate: format.Rate,
     dec: format.Decode,
+    pin_pass: u32,
     w: u5,
     stride: usize,
     table: []f32,
@@ -126,17 +190,27 @@ pub const Encoder = struct {
     perm: [tile_len]usize,
     x: [tile_len]f32,
     path: [tile_len]u16,
+    /// PAIR1: the pair trellis, searched in pairs with a pin of `pin_pass / 2` pairs.
+    pair: ?*pair_search.Search = null,
 
     pub fn init(allocator: std.mem.Allocator, rate: format.Rate, dec: format.Decode) Error!Encoder {
-        if (!searchable(dec.codebook)) return error.CodebookUnsupported;
+        return initPinned(allocator, rate, dec, full_pin_pass);
+    }
+
+    pub fn initPinned(allocator: std.mem.Allocator, rate: format.Rate, dec: format.Decode, pin_pass: u32) Error!Encoder {
+        if (dec.codebook == .pair1) return initPair(allocator, rate, dec, pin_pass);
+        const code = Code.of(dec, rate) orelse return error.CodebookUnsupported;
         if (rate.n % 2 != 0 or rate.n < format.Rate.min_n or rate.n > format.Rate.max_n) return error.RateUnsupported;
         if (dec.window.bits() < 12 or dec.window.bits() > 16) return error.WindowUnsupported;
+        if (!validPinPass(pin_pass)) return error.PinPassUnsupported;
         const w: u5 = @intCast(dec.window.bits());
         var self: Encoder = undefined;
         self.allocator = allocator;
         self.rate = rate;
         self.dec = dec;
+        self.pin_pass = pin_pass;
         self.w = w;
+        self.pair = null;
         var kmin: u5 = 31;
         var kmax: u5 = 0;
         for (&self.ks, 0..) |*k, t| {
@@ -150,7 +224,7 @@ pub const Encoder = struct {
         self.table = try allocator.alloc(f32, @as(usize, 1) << w);
         errdefer allocator.free(self.table);
         for (self.table, 0..) |*v, cw| {
-            v.* = format.f16BitsToF32(format.decodeCodeword(@intCast(cw), dec.codebook));
+            v.* = format.f16BitsToF32(code.value(@intCast(cw)));
         }
         self.costs[0] = try allocator.alloc(f16, self.stride);
         errdefer allocator.free(self.costs[0]);
@@ -160,7 +234,53 @@ pub const Encoder = struct {
         return self;
     }
 
+    fn initPair(allocator: std.mem.Allocator, rate: format.Rate, dec: format.Decode, pin_pass: u32) Error!Encoder {
+        if (dec.window != .w16) return error.WindowUnsupported;
+        if (!pairSearchable(dec, rate)) return error.RateUnsupported;
+        if (!validPinPass(pin_pass)) return error.PinPassUnsupported;
+        const search = try allocator.create(pair_search.Search);
+        errdefer allocator.destroy(search);
+        search.* = pair_search.Search.init(allocator, rate) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else error.RateUnsupported;
+        var self: Encoder = undefined;
+        self.allocator = allocator;
+        self.rate = rate;
+        self.dec = dec;
+        self.pin_pass = pin_pass;
+        self.w = 16;
+        self.stride = 0;
+        self.table = &.{};
+        self.costs = .{ &.{}, &.{} };
+        self.back = &.{};
+        for (&self.ks, 0..) |*k, t| k.* = @intCast(rate.freshBits(t));
+        format.tensorCorePerm(&self.perm);
+        self.pair = search;
+        return self;
+    }
+
+    fn encodePairTile(self: *Encoder, search: *pair_search.Search, packed_out: []u16, recon: ?*[tile_len]f32) f64 {
+        var cws: [pair_search.pairs]u16 = undefined;
+        search.run(&self.x, self.pin_pass / 2, &cws);
+        var ks: [tile_len]u8 = undefined;
+        pair_search.expandScalar(self.rate, &cws, &self.path, &ks);
+        self.pack(packed_out);
+        var sse: f64 = 0;
+        for (cws, 0..) |cw, j| {
+            const v = [2]f32{ search.w0[cw], search.w1[cw] };
+            for (0..2) |h| {
+                const d = @as(f64, self.x[2 * j + h]) - @as(f64, v[h]);
+                sse += d * d;
+                if (recon) |out| out[self.perm[2 * j + h]] = v[h];
+            }
+        }
+        return sse;
+    }
+
     pub fn deinit(self: *Encoder) void {
+        if (self.pair) |p| {
+            p.deinit(self.allocator);
+            self.allocator.destroy(p);
+            return;
+        }
         self.allocator.free(self.back);
         self.allocator.free(self.costs[1]);
         self.allocator.free(self.costs[0]);
@@ -173,14 +293,16 @@ pub const Encoder = struct {
     pub fn encodeTile(self: *Encoder, tile: *const [tile_len]f32, packed_out: []u16, recon: ?*[tile_len]f32) Error!f64 {
         if (packed_out.len != self.rate.n) return error.ShapeMismatch;
         for (&self.x, self.perm) |*v, p| v.* = tile[p];
+        if (self.pair) |search| return self.encodePairTile(search, packed_out, recon);
         const h_inf: f32 = 65504.0;
         var pin: usize = 0;
         var pinned = false;
         for (0..2) |pass| {
-            const roll: usize = if (pass == 0) tile_len / 2 else 0;
+            const steps: usize = if (pass == 0) 2 * self.pin_pass else tile_len;
+            const roll: usize = if (pass == 0) tile_len - self.pin_pass else 0;
             var prev = self.costs[0];
             var curr = self.costs[1];
-            for (0..tile_len) |step| {
+            for (0..steps) |step| {
                 const ri = (step + roll) & (tile_len - 1);
                 const k: u5 = @intCast(self.ks[ri]);
                 const k_next: u5 = @intCast(self.ks[(ri + 1) & (tile_len - 1)]);
@@ -244,7 +366,7 @@ pub const Encoder = struct {
                     }
                 }
             }
-            var step_i: usize = tile_len;
+            var step_i: usize = steps;
             while (step_i > 0) {
                 step_i -= 1;
                 const ri = (step_i + roll) & (tile_len - 1);
@@ -483,6 +605,102 @@ test "encode: packed codes match the reference search code for code" {
     }
 }
 
+pub const PinCase = struct { dec: format.Decode, n: u32, pin_pass: u32 };
+
+/// Every search plan the reference's shortened pin pass was dumped for: MCG and the STD1 and SPEC1 tables at K1.5, K2 and K3.
+pub const pin_cases = blk: {
+    const books = [_]format.Decode{
+        .{ .codebook = .mcg, .window = .w15 },
+        .{ .codebook = .std1, .window = .w15, .table = codebook_tables.indexOf("std1") },
+        .{ .codebook = .spec1, .window = .w15, .table = codebook_tables.indexOf("spec1-w15") },
+    };
+    var out: [21]PinCase = undefined;
+    var i: usize = 0;
+    for (books) |dec| for ([_]u32{ 24, 32, 48 }) |n| for ([_]u32{ 32, 64 }) |a| {
+        out[i] = .{ .dec = dec, .n = n, .pin_pass = a };
+        i += 1;
+    };
+    out[i] = .{ .dec = books[0], .n = 32, .pin_pass = 16 };
+    out[i + 1] = .{ .dec = .{ .codebook = .mcg, .window = .w12 }, .n = 32, .pin_pass = 64 };
+    out[i + 2] = .{ .dec = .{ .codebook = .mcg, .window = .w16 }, .n = 40, .pin_pass = 64 };
+    break :blk out;
+};
+
+/// The tiles the reference searched, row-major, and the codewords it chose for each case.
+pub const PinFixture = struct {
+    allocator: std.mem.Allocator,
+    file: st.File,
+    tiles: []f32,
+
+    pub fn load(allocator: std.mem.Allocator) !PinFixture {
+        var file = try st.parse(allocator, st.pinpass);
+        errdefer file.deinit(allocator);
+        const kernel_order = fixtureSlice(f32, file.tensors.get("x").?);
+        const tiles = try allocator.alloc(f32, kernel_order.len);
+        var perm: [tile_len]usize = undefined;
+        format.tensorCorePerm(&perm);
+        for (0..kernel_order.len / tile_len) |ti| {
+            for (perm, 0..) |p, i| tiles[ti * tile_len + p] = kernel_order[ti * tile_len + i];
+        }
+        return .{ .allocator = allocator, .file = file, .tiles = tiles };
+    }
+
+    pub fn deinit(self: *PinFixture) void {
+        self.allocator.free(self.tiles);
+        self.file.deinit(self.allocator);
+    }
+
+    pub fn states(self: PinFixture, c: PinCase) []const u16 {
+        var key: [48]u8 = undefined;
+        const name = std.fmt.bufPrint(&key, "{s}_n{d}_w{d}_a{d}", .{ @tagName(c.dec.codebook), c.n, c.dec.window.bits(), c.pin_pass }) catch unreachable;
+        return fixtureSlice(u16, self.file.tensors.get(name).?);
+    }
+
+    /// The packed halfwords of the case's tile `ti`, the way the loader reads them.
+    pub fn packedTile(self: PinFixture, c: PinCase, ti: usize, out: []u16) void {
+        var ks: [tile_len]u8 = undefined;
+        for (&ks, 0..) |*k, i| k.* = @intCast((format.Rate{ .n = c.n }).freshBits(i));
+        Encoder.packStates(.{ .n = c.n }, &ks, self.states(c)[ti * tile_len ..][0..tile_len], out);
+    }
+};
+
+test "encode: a shortened pin pass picks the reference search's codes, code for code" {
+    const t = std.testing;
+    var fx = try PinFixture.load(t.allocator);
+    defer fx.deinit();
+    const n_tiles = fx.tiles.len / tile_len;
+    for (pin_cases) |c| {
+        var enc = try Encoder.initPinned(t.allocator, .{ .n = c.n }, c.dec, c.pin_pass);
+        defer enc.deinit();
+        var full = try Encoder.init(t.allocator, .{ .n = c.n }, c.dec);
+        defer full.deinit();
+        var differs: usize = 0;
+        for (0..n_tiles) |ti| {
+            var want: [64]u16 = undefined;
+            var got: [64]u16 = undefined;
+            var exact: [64]u16 = undefined;
+            fx.packedTile(c, ti, want[0..c.n]);
+            _ = try enc.encodeTile(fx.tiles[ti * tile_len ..][0..tile_len], got[0..c.n], null);
+            try t.expectEqualSlices(u16, want[0..c.n], got[0..c.n]);
+            _ = try full.encodeTile(fx.tiles[ti * tile_len ..][0..tile_len], exact[0..c.n], null);
+            if (!std.mem.eql(u16, got[0..c.n], exact[0..c.n])) differs += 1;
+        }
+        // A shortened pass that never moved a code would also pass the parity above.
+        try t.expect(differs > 0);
+    }
+}
+
+test "encode: a pin pass that is not a multiple of 16 in 16..128 is refused by name" {
+    const t = std.testing;
+    for ([_]u32{ 0, 8, 24, 129, 144, 256 }) |a| {
+        try t.expectError(error.PinPassUnsupported, Encoder.initPinned(t.allocator, .{ .n = 32 }, .mcg, a));
+    }
+    for ([_]u32{ 16, 32, 64, 112, 128 }) |a| {
+        var enc = try Encoder.initPinned(t.allocator, .{ .n = 32 }, .mcg, a);
+        enc.deinit();
+    }
+}
+
 test "encode: a rate or window the trellis cannot carry is refused" {
     const t = std.testing;
     try t.expectError(error.RateUnsupported, Encoder.init(t.allocator, .{ .n = 41 }, .mcg));
@@ -500,4 +718,56 @@ test "encode: a short packed slice or a window outside 12..16 is refused" {
     @memset(&tile, 0);
     var codes: [16]u16 = undefined;
     try t.expectError(error.ShapeMismatch, enc.encodeTile(&tile, &codes, null));
+}
+
+test "encode: PAIR1 is searchable at window 16 and every even rate from K1.5 to K4, and its encoder refuses the rest" {
+    const t = std.testing;
+    const pair1: format.Decode = .{ .codebook = .pair1, .window = .w16, .table = codebook_tables.indexOf("pair1-w16-v1") };
+    var n: u32 = format.Rate.min_n;
+    while (n <= format.Rate.max_n) : (n += 1) try t.expectEqual(n % 2 == 0 and n >= 24 and n <= 64, searchable(pair1, .{ .n = n }));
+    try t.expect(!searchable(.{ .codebook = .pair1, .window = .w15 }, .{ .n = 32 }));
+    try t.expectError(error.WindowUnsupported, Encoder.init(t.allocator, .{ .n = 32 }, .{ .codebook = .pair1, .window = .w15 }));
+    try t.expectError(error.RateUnsupported, Encoder.init(t.allocator, .{ .n = 66 }, pair1));
+    try t.expectError(error.PinPassUnsupported, Encoder.initPinned(t.allocator, .{ .n = 32 }, pair1, 8));
+}
+
+test "encode: the PAIR1 encoder writes the host pair search's codewords, which decode to the values it returns" {
+    const t = std.testing;
+    const pair1: format.Decode = .{ .codebook = .pair1, .window = .w16, .table = codebook_tables.indexOf("pair1-w16-v1") };
+    var prng = std.Random.DefaultPrng.init(23);
+    for ([_]u32{ 24, 28, 36, 64 }) |n| for ([_]u32{ full_pin_pass, default_pin_pass }) |pin| {
+        const rate = format.Rate{ .n = n };
+        var enc = try Encoder.initPinned(t.allocator, rate, pair1, pin);
+        defer enc.deinit();
+        var search = try pair_search.Search.init(t.allocator, rate);
+        defer search.deinit(t.allocator);
+        var tile: [tile_len]f32 = undefined;
+        testTile(&prng, &tile);
+        const words = try t.allocator.alloc(u16, n);
+        defer t.allocator.free(words);
+        var recon: [tile_len]f32 = undefined;
+        _ = try enc.encodeTile(&tile, words, &recon);
+        var x: [tile_len]f32 = undefined;
+        for (&x, enc.perm) |*v, p| v.* = tile[p];
+        var cws: [pair_search.pairs]u16 = undefined;
+        search.run(&x, pin / 2, &cws);
+        var states: [tile_len]u16 = undefined;
+        var ks: [tile_len]u8 = undefined;
+        pair_search.expandScalar(rate, &cws, &states, &ks);
+        try t.expectEqualSlices(u16, &states, &enc.path);
+        var got: [tile_len]u16 = undefined;
+        format.decodeTile(words, rate, pair1, &got);
+        for (got, recon) |g, r| try t.expectEqual(g, format.f32ToF16Bits(r));
+    };
+}
+
+test "encode: SPEC1 on spec1-w15 is searchable at every rate from K1 to K8, STD1 on std1 at K1.5 to K4" {
+    const t = std.testing;
+    const spec1: format.Decode = .{ .codebook = .spec1, .window = .w15, .table = codebook_tables.indexOf("spec1-w15") };
+    const std1: format.Decode = .{ .codebook = .std1, .window = .w15, .table = codebook_tables.indexOf("std1") };
+    var n: u32 = format.Rate.min_n;
+    while (n <= format.Rate.max_n) : (n += 2) {
+        try t.expect(searchable(spec1, .{ .n = n }));
+        try t.expectEqual(n >= 24 and n <= 64, searchable(std1, .{ .n = n }));
+    }
 }

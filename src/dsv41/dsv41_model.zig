@@ -1574,7 +1574,7 @@ fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
         // Only the product is read.
         m.disown(qw);
         m.disown(kw);
-        var table = try engram.Table.open(m.gpa, dir_path, l, e.rows[i], e.head_dim);
+        var table = try engram.openTable(m.gpa, dir_path, l, e.rows[i], e.head_dim);
         errdefer table.close();
         const rows = @min(engram.cache_rows, e.rows[i]);
         if (engram.RowCache.bytesFor(rows, e.head_dim, e.head_dim / 32) > 0) table.cache = try engram.RowCache.create(m.gpa, rows, e.head_dim, e.head_dim / 32);
@@ -5410,14 +5410,14 @@ pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
     return draftMeasured(m, t1, heads_wanted, null, null);
 }
 
-pub fn draftMeasured(m: *Model, t1: u32, heads_wanted: Heads, limit: ?u32, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
+pub fn draftMeasured(m: *Model, t1: u32, heads_wanted: Heads, limit: ?u32, meter: ?*@import("../round_meter.zig").RoundMeter) !Draft {
     const width = @min(m.cfg.dspark.block, limit orelse m.cfg.dspark.block);
     transient_peak.begin();
     defer transient_peak.end(.draft, width, null);
     return draftPass(m, t1, heads_wanted, width, meter);
 }
 
-fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
+fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("../round_meter.zig").RoundMeter) !Draft {
     const gpa = m.gpa;
     const saved_profile = m.profile;
     m.profile = null;
@@ -5494,6 +5494,62 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("
     if (with_heads) @memcpy(out.logits, try sc_mod.hostF32(heads));
     if (with_conf) @memcpy(out.conf, try sc_mod.hostF32(conf));
     return out;
+}
+
+/// The DSpark stages over one window's stored main rows `main_rows` `[T, targets * dim]`, for the converter's
+/// calibration: each anchor p (1 <= p < T) drafts the block `[ids[p], noise...]` at positions p.. over the stage
+/// windows of main rows [p - window, p), as `draft` does after a prefill of p tokens; all anchors run as one batch.
+/// Only `m.tap` sees the pass: the stages' inputs and routes as layers `cfg.layers + si`, and the main projection's
+/// input as layer `cfg.layers`, kind `.dspark_in`.
+pub fn dsparkCalibrate(m: *Model, ids: []const u32, main_rows: A, anchors: []const usize) !void {
+    const gpa = m.gpa;
+    const c = &m.cfg;
+    const ds = &(m.dspark orelse return error.Dsv41NoDspark);
+    const T = dim(main_rows, 0);
+    if (ids.len != T) return error.Dsv41CalibShape;
+    const B = c.dspark.block;
+    const rows = anchors.len * B;
+    const width = T + rows;
+    var sc = m.scope();
+    defer sc.deinit();
+    const block_ids = try gpa.alloc(i32, rows);
+    defer gpa.free(block_ids);
+    const block_pos = try gpa.alloc(i32, rows);
+    defer gpa.free(block_pos);
+    const sees = try gpa.alloc(i32, rows * width);
+    defer gpa.free(sees);
+    @memset(sees, 0);
+    for (anchors, 0..) |p, a| {
+        if (p == 0 or p >= T) return error.Dsv41CalibShape;
+        for (0..B) |k| {
+            const r = a * B + k;
+            block_ids[r] = @intCast(if (k == 0) ids[p] else c.dspark.noise_id);
+            block_pos[r] = @intCast(p + k);
+            const lo = p -| c.window;
+            @memset(sees[r * width + lo ..][0 .. p - lo], 1);
+            @memset(sees[r * width + T + a * B ..][0..B], 1);
+        }
+    }
+    try tapInput(m, c.layers, .dspark_in, main_rows);
+    const main_x = try sc.rms(try ds.main_proj.apply(&sc, main_rows), ds.main_norm, c.eps);
+    const all_pos = try posArray(&sc, 0, T, 1);
+    const band = try sc.ge(try sc.ints(sees, &.{ ci(rows), ci(width) }), try sc.i(1));
+    const pos = try sc.ints(block_pos, &.{ci(rows)});
+    const emb = try m.embed.rows(&sc, try sc.ints(block_ids, &.{ci(rows)}), m.act);
+    var x = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(rows), ci(c.hc_mult), ci(c.dim) }));
+    var pre = try sc.broadcast(try sc.astype(try sc.op2(mlx.mlx_equal, try sc.arange(0, c.hc_mult), try sc.i(0)), .float32), &.{ ci(rows), ci(c.hc_mult) });
+    var st = try newState(m);
+    defer st.deinit();
+    var dummy = try Shared.init(gpa, 1);
+    defer dummy.deinit(gpa);
+    for (0..c.n_mtp) |si| {
+        const ly = &m.layers[c.layers + si];
+        const keys = try windowRow(&sc, m, ly, try ly.wkv.apply(&sc, main_x), m.rope_plain.freqs, all_pos);
+        const out = try block(&sc, m, &st, c.layers + si, x, pre, 0, &dummy, SPAN, .{ .keys = keys, .band = band, .pos = pos }, &.{});
+        x = try sc.keep(out.x);
+        pre = try sc.keep(out.pre);
+        try evalAll(&.{ x, pre });
+    }
 }
 
 /// Advances the request by `ids` (`[t1, drafts...]`) as a chunk it can give back: the logits of every row (f32

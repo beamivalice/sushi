@@ -17,7 +17,17 @@ pub const kld = kld_mod;
 pub const bench = bench_mod;
 pub const imatrix = @import("imatrix.zig");
 pub const model_handle = @import("model_handle.zig");
-const trunk = @import("trunk.zig");
+pub const trunk = @import("trunk.zig");
+// pub: the encoder's converters read the engine's model, loader and calibration capture.
+pub const dsv41_model = @import("dsv41/dsv41_model.zig");
+pub const dsv41_config = @import("dsv41/dsv41_config.zig");
+pub const dsv41_source = @import("dsv41/dsv41_source.zig");
+pub const dsv41_scope = @import("dsv41/dsv41_scope.zig");
+pub const dsv41_kld_capture = @import("dsv41/kld_capture.zig");
+pub const hy4_config = @import("hy4flash/hy4_config.zig");
+pub const hy4_census = @import("hy4flash/hy4_census.zig");
+pub const expert_io = @import("expert_io.zig");
+pub const model = @import("model.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -51,6 +61,7 @@ const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
 const parent_watch = @import("parent_watch.zig");
 const update_mod = @import("update.zig");
+const repack_mod = @import("repack.zig");
 const sampler = @import("sampler.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -111,7 +122,7 @@ fn commandUsesGpu(proc_args: std.process.Args) bool {
     var first = true;
     while (it.next()) |a| {
         if (first and (std.mem.eql(u8, a, "pull") or std.mem.eql(u8, a, "list") or std.mem.eql(u8, a, "launch") or
-            std.mem.eql(u8, a, "update") or arch_flags.commandSkipsGpu(a))) return false;
+            std.mem.eql(u8, a, "update") or std.mem.eql(u8, a, "repack") or arch_flags.commandSkipsGpu(a))) return false;
         first = false;
         if (std.mem.eql(u8, a, "--version") or std.mem.eql(u8, a, "--guest-manifest") or
             std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return false;
@@ -203,14 +214,14 @@ fn runCli(init: std.process.Init) !void {
             printUsage(io);
             return;
         } else if (std.mem.eql(u8, cmd, "pull")) {
-            const model = cli_mod.parsePullArgs(args[2..]) catch |err| {
+            const pull_model = cli_mod.parsePullArgs(args[2..]) catch |err| {
                 switch (err) {
                     error.MissingModel => log.err("usage: sushi pull <model>\n", .{}),
                     error.UnexpectedArgument => log.err("sushi pull: unexpected argument '{s}' (usage: sushi pull <model>)\n", .{args[3]}),
                 }
                 std.process.exit(1);
             };
-            try cli_mod.cmdPull(allocator, io, model);
+            try cli_mod.cmdPull(allocator, io, pull_model);
             return;
         } else if (std.mem.eql(u8, cmd, "list")) {
             cli_mod.parseListArgs(args[2..]) catch {
@@ -262,6 +273,9 @@ fn runCli(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, cmd, "convert")) {
             try encoder_cli.cmdConvert(allocator, io, args[2..]);
+            return;
+        } else if (std.mem.eql(u8, cmd, "repack")) {
+            try repack_mod.cmdRepack(allocator, io, args[2..]);
             return;
         } else if (std.mem.eql(u8, cmd, "update")) {
             try update_mod.cmdUpdate(allocator, io, args[2..]);
@@ -698,6 +712,10 @@ fn runCli(init: std.process.Init) !void {
     };
     model_settings_mod.vision_flag = model_settings_mod.onOffFlagFrom(vision, no_vision) catch {
         log.err("--vision and --no-vision conflict; pass one\n", .{});
+        std.process.exit(1);
+    };
+    if (settings_resolve.launch.prefill_chunk_min) |lo| if (settings_resolve.launch.prefill_chunk_max) |hi| if (lo > hi) {
+        log.err("--prefill-chunk-min {d} is above --prefill-chunk-max {d}\n", .{ lo, hi });
         std.process.exit(1);
     };
 
@@ -1152,6 +1170,7 @@ fn runCli(init: std.process.Init) !void {
     }
 
     const load_vision = config.has_vision and !no_vision;
+    config.keeps_tower = load_vision;
 
     if (serve_mode) {
         // ── Plan 05: build the ModelRegistry, register a stub for the
@@ -1544,6 +1563,9 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (model_settings_mod.expert_cache_bias_flag) |b| locks.modelMut("expert_cache_bias").pin("{d}", .{b});
+    // `--prefill-chunk` means `--prefill-chunk-max` on a static-bill load (D4) and outranks the key as that flag would.
+    if (settings_resolve.launch.prefill_chunk_max) |n| locks.modelMut("prefill_chunk_max").pin("{d}", .{n}) else if (settings_resolve.prefill_chunk.source == .flag) locks.modelMut("prefill_chunk_max").pin("{d}", .{settings_resolve.prefill_chunk.value});
+    if (settings_resolve.launch.prefill_chunk_min) |n| locks.modelMut("prefill_chunk_min").pin("{d}", .{n});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
     if (model_mod.configOverridesSetRope()) locks.modelMut("yarn_factor").pin("--config-overrides", .{});
@@ -1620,6 +1642,20 @@ test "both boot modes build their server defaults from the same launch flags" {
     const none = unset.serverConfig();
     try std.testing.expectEqual(@as(?f32, null), none.default_temperature);
     try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
+}
+
+test "launch flags: --prefill-chunk pins prefill_chunk_max, which it means on a static-bill load, and no flag leaves it free" {
+    const saved = model_settings_mod.launch_locks;
+    defer model_settings_mod.launch_locks = saved;
+    const chunk_was = settings_resolve.prefill_chunk;
+    defer settings_resolve.prefill_chunk = chunk_was;
+    model_settings_mod.launch_locks = .{};
+    settings_resolve.prefill_chunk = .{ .value = 2048, .source = .default };
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.model("prefill_chunk_max").?.set);
+    settings_resolve.prefill_chunk = .{ .value = 2048, .source = .flag };
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expectEqualStrings("2048", model_settings_mod.launch_locks.model("prefill_chunk_max").?.text());
 }
 
 test "launch flags: --port pins server.port as typed, and no flag leaves it free" {

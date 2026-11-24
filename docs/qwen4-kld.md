@@ -119,7 +119,7 @@ against kv8 (6.5 against 8.5 bits per element) for a cost the floor can hide.
 The 16x512 teachers above round the GatedDeltaNet gate and state to bf16 like every student, so their KLD cannot price that
 rounding. This teacher stores both f32. Numbers on it are read only against each other.
 
-- Teacher `qwen38-flash-next-bf16-gdnf32-v1` (under `kld-teacher/`): the BF16 checkpoint streamed (`--ssd-budget-gb 94`),
+- Teacher `qwen38-flash-next-bf16-gdnf32-v1` (under `kld-teacher/`): the BF16 checkpoint,
   `--kv-quant off`, the f32 state and f32 gate (the default; `--qwen-gdn fp32` then, `--qwen-gdn 32` now), `--no-template`, `--ctx-size 20480`, `--top-k 10`, no MTP,
   `MLX_ENABLE_TF32=0`, binary built at `0a50c13c` (the f32-gate change, mtime 2026-10-12 10:43:43, sha256 `c19e5a35...`).
 - Three views of it, each a normal fixture: `raw` (the 16 wikitext prompts of the Flash-Next 16x512 raw fixture, 512 greedy
@@ -193,7 +193,7 @@ Memorized control (`serde_json/src/de.rs`, teacher NLL 0.058 / 0.0038 / 0.0014 a
 
 The [8-category fixture](quality-kld.md#eight-category) on the served packs, at bf16 KV and `--qwen-gdn 32`. Each cell is
 the mean KLD to the first EOS against the BF16 teacher.
-- Teacher: the BF16 checkpoint streamed (`--ssd-budget-gb 94`), dense KV, f32 GDN state and gate, MTP off. The capture took
+- Teacher: the BF16 checkpoint, dense KV, f32 GDN state and gate, MTP off. The capture took
   864 s at a 100.8 GB peak, mean strict NLL 0.1934.
 - Students: binary main `4511de70` (sha256 `f6d10384...`, the served path unchanged at `87089338`), `taskpolicy -a`, GPU lock
   per run.

@@ -1,10 +1,9 @@
 //! DeepSeek-V4.1's chat face (`arch/chat.zig` reads it): its effort scale, the encoder-pinned template, and the
-//! pre-tokenizer its tokenizer.json spells.
+//! pre-tokenizer its tokenizer.json spells (shared with Hy4-Flash, `tokenizer_deepseek.face`).
 const std = @import("std");
 const eff = @import("../effort.zig");
 const arch_chat = @import("../arch/chat.zig");
-const tokenizer = @import("../tokenizer.zig");
-const pretok = @import("tokenizer_deepseek.zig");
+const pretok = @import("../tokenizer_deepseek.zig");
 
 pub const model_types = [_][]const u8{"deepseek_v41"};
 
@@ -27,32 +26,7 @@ pub const fixtures = @import("dsv41_fixtures.zig");
 
 pub const pin: arch_chat.Pin = .{ .template = @embedFile("../fixtures/dsv41_chat_template.jinja"), .image_placeholder = image_atom };
 
-pub const pretokenizer = struct {
-    pub const name = "deepseek";
-    pub const split = pretok.preTokenize;
-
-    /// V4.x's `Sequence`: its three Splits (digits, CJK, the punctuation grammar), each isolated, then a ByteLevel
-    /// that does not split. Only that exact spelling is read as the grammar `tokenizer_deepseek` runs.
-    pub fn matches(pre_tokenizer: std.json.Value) bool {
-        if (pre_tokenizer != .object) return false;
-        const list = pre_tokenizer.object.get("pretokenizers") orelse return false;
-        if (list != .array or list.array.items.len != 4) return false;
-        const regexes = [_][]const u8{ pretok.digits_regex, pretok.cjk_regex, pretok.main_regex };
-        for (regexes, list.array.items[0..3]) |want, node| {
-            if (node != .object) return false;
-            const rx = tokenizer.splitRegexOf(node) orelse return false;
-            const behavior = node.object.get("behavior") orelse return false;
-            const invert = node.object.get("invert") orelse return false;
-            if (!std.mem.eql(u8, rx, want) or behavior != .string or !std.mem.eql(u8, behavior.string, "Isolated") or invert != .bool or invert.bool) return false;
-        }
-        const byte_level = list.array.items[3];
-        if (byte_level != .object) return false;
-        const ty = byte_level.object.get("type") orelse return false;
-        if (ty != .string or !std.mem.eql(u8, ty.string, "ByteLevel")) return false;
-        const use_regex = byte_level.object.get("use_regex") orelse return false;
-        return use_regex == .bool and !use_regex.bool;
-    }
-};
+pub const pretokenizer = pretok.face;
 
 fn userSide(role: []const u8) bool {
     return std.mem.eql(u8, role, "user") or std.mem.eql(u8, role, "tool");

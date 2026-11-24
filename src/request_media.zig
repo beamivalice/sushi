@@ -471,6 +471,17 @@ fn mediaKindRefusal(messages: []const chat_mod.Message, flat: FlatMedia, has_tow
 /// (a video's block is one temporal group, `forwardVideo` evaluates each alone),
 /// every block's f32 pixels, and three bf16 copies of the soft-token rows.
 pub fn visionEncodeBill(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize) struct { bytes: u64, largest_group_patches: u64 } {
+    const in = mediaInputs(config, images, videos);
+    const worst = in.worst;
+    const input_bytes = in.input_bytes;
+    if (arch_media.mediaBill(config, worst, input_bytes, rows)) |bytes| return .{ .bytes = bytes, .largest_group_patches = worst };
+    const output_bytes = @as(u64, rows) * @max(config.qv_out_hidden, 1) * 2;
+    return .{ .bytes = arch_media.scratchBytes(config, worst) + input_bytes + 3 * output_bytes, .largest_group_patches = worst };
+}
+
+/// The largest block's patches, and every block's f32 pixels as the host holds them for the encode (decoded, whatever
+/// the request sent).
+pub fn mediaInputs(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData) struct { worst: u64, input_bytes: u64 } {
     var worst: u64 = 0;
     var input_bytes: u64 = 0;
     const patch_bytes: u64 = 3 * @as(u64, config.qv_temporal_patch) * config.qv_patch * config.qv_patch * 4;
@@ -484,8 +495,7 @@ pub fn visionEncodeBill(config: *const model_mod.ModelConfig, images: []const ch
         worst = @max(worst, patches);
         input_bytes += @max(vd.pixels.len, @as(u64, vd.grid_t) * patches * patch_bytes);
     }
-    const output_bytes = @as(u64, rows) * @max(config.qv_out_hidden, 1) * 2;
-    return .{ .bytes = arch_media.scratchBytes(config, worst) + input_bytes + 3 * output_bytes, .largest_group_patches = worst };
+    return .{ .worst = worst, .input_bytes = input_bytes };
 }
 
 /// The encode bill of the largest single image this tower's processor admits: a streamed
@@ -684,11 +694,19 @@ pub fn placeRequestMedia(allocator: std.mem.Allocator, lm: *LoadedModel, message
     if (found.images != flat.images.len or found.videos != flat.videos.len) {
         return .{ .refused = MediaFault.init(false, "the rendered prompt holds {d} image and {d} video placeholders for {d} images and {d} videos (media in a system message, or placeholder text in the content)", .{ found.images, found.videos, flat.images.len, flat.videos.len }) };
     }
+    if (pastPlanRefusal(config, flat.images)) |fault| return .{ .refused = fault };
     const placed = placeMedia(allocator, ids, config, flat.images, flat.videos, lm.tokenizer.?) catch |err| switch (err) {
         error.MediaLayoutUnsupported => return .{ .refused = MediaFault.init(false, "this model's vision tower cannot place images inside a conversation", .{}) },
         else => return err,
     };
     return .{ .placed = placed };
+}
+
+/// An image past the most patches the arch's encode is planned for (`arch_media.imagePastPlan`), refused by name.
+pub fn pastPlanRefusal(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData) ?MediaFault {
+    const i = arch_media.imagePastPlan(config, images) orelse return null;
+    const most = arch_media.maxImagePatches(visionPreprocFromConfig(config));
+    return MediaFault.init(false, "image {d} resizes to {d} x {d} patches, past the {d} this model's tower encodes: send a less elongated image", .{ i + 1, images[i].grid_h, images[i].grid_w, most });
 }
 
 /// Place every message's media at its template placeholder, refuse by name

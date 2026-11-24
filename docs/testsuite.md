@@ -59,6 +59,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   The host binary is filtered to the tests of those files (`hostFilters` in build.zig); its module is built with
   `build_options.host_tier`, under which a live GPU read (`gpu_mem.zig`) panics and the NAX probe answers false.
   Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
+  A host file's stem must not end another file's stem: the binary keeps a test by `<stem>.test.`, so a host
+  `plan.zig` kept `prefill_plan`'s and `mtp_plan`'s MLX tests and the link failed on `_mlx_array_free`.
   A bill test that needs the live GPU lives in `bills_live_test.zig` (or `<arch>_bill_test.zig`) in the MLX tier.
 - `zig build test` runs the host tier, the MLX domains, the exl3 binaries and the encoder binary, `test-encoder`.
   **The MLX domains** (`test_domains` in build.zig) are one binary each, named by what its tests prove:
@@ -66,10 +68,10 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   | binary | holds |
   |---|---|
   | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), one per family's fault sweeps (`cooler-load-fault`, `-requests-fault`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
-  | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, less their prefix-cache files |
-  | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, MLX and Metal glue) |
+  | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo`, `test-hy4` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, `src/hy4flash/`, less their prefix-cache files |
+  | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, hyper-connections, MLX and Metal glue) |
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
-  | `test-load` | `src/arch/`, the model and its loader, registry, discovery, owned weights, expert I/O, imatrix, KLD, live bills |
+  | `test-load` | `src/arch/`, the model and its loader, registry, discovery, owned weights, expert I/O, Engram tables, the Cooler side, imatrix, KLD, live bills |
   | `test-server` | the HTTP server and its APIs, the CLI, launch and main |
   | `test-prefix-cache` | the prefix cache and its SSD tier, run twice: `test-prefix-cache` and, on a run with no `-Dtest-filter`, `test-prefix-cache (SUSHI_PREFIX_FS=real)` |
 
@@ -177,6 +179,14 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   changed config, other weights' mappings or a dispatch open; the step's end unloads them and asks for an empty pool.
   Pool bytes in use are not read: a model keeps caches its longest request grew. A cell that measures the pool or
   makes a speculative request's first-use state keeps its own load.
+  A load on the ledger holds its whole budget (D90): `heldLoad` unloads the held loads on it before any other opens,
+  so a cell's load is made again where it asks for one.
+  An arch's contract `prompt` makes no MLX op: it runs while the step's held loads stand, where the engine refuses an
+  MLX stream.
+- **A load on the ledger in a contract cell**: its pool is closed to a served request (D64) and its forwards run under no cap,
+  so a cell of the pool-cap regime skips it with `requirePoolCap`, naming the ledger test that holds the same property; a
+  cell's own raw ops past the seal take `test_support.openTurn`, a warm step the warm's gate (`warmBegins`), and a second
+  load beside it is refused by name (`expectRefusedBesideLedger`).
 - **Tests that run alone** (`alone_tests` in build.zig): each is a run step of its own, a fresh process, left out of its
   file's step. Every test that proves nothing compiles after a load's warm or seal is one (the contract's late cells,
   DeepSeek's, Qwen's GDN, QSA and vision warms, the engine route's first uses): an earlier test's compiles in the same
@@ -184,7 +194,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
   (`device.current().has(.matrix_g17)`), never a chip.
-- The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
+- The pack tier's envs: `HY4_BF16_TINY` (the Hy4-Flash tiny in the release's layout and its transformers oracle, `${SUSHI_MODELS_DIR}/tiny-models/hy4-bf16-tiny`; `tests/dump_hy4_fixtures.py`; its GPU tests run with `MLX_ENABLE_TF32=0`, which the `test-hy4` and `hy4-late-*` steps set themselves (`hy4_tf32_off` in `build.zig`), else TF32 products move the logits past the oracle's bar), `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack;
@@ -256,7 +266,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   call counter sits ([engine-own-forward](engine-own-forward.md#the-seam)).
   `undefined-nested-write` flags, in a test block, `v.a.b = ...` on a `var v: T = undefined` before `v.a = ...`, `v = ...`
   or a `v.method()` call; its allowlist key is the test name with every non-alphanumeric character as `_`.
-  `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again.
+  `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again. `errdefer-handover` flags a
+  `try` after a store hands an MLX array or engine tensor to an owner (`buf.* = next`, `self.x = h`, `InPlace.adopt(h)`,
+  the value made through `&h` included) while the `errdefer` that frees it is still armed: end its block before the store.
   `scope-state` flags a hand write of `engine.active` (anywhere outside `src/tensor/`) or of `engine.enabled`
   (outside tests): the guards of [the seam](engine-own-forward.md#the-seam) are the only writers.
   `engine-hold-end` flags a call of `engine.unhold` outside `arch_handle.engineHoldEnd` and `src/tensor/`: the last

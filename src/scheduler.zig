@@ -361,6 +361,8 @@ pub const Slot = struct {
     /// What the request's admission bill priced it to hold at its peak, margin excluded: memory that comes back
     /// once it finishes (`slot_admission.liveHold`).
     admitted_held: u64 = 0,
+    /// What the request reserved on its load's ledger (`static_bill.admit`); its end parks what its state holds.
+    ledger: ?@import("static_bill.zig").Reservation = null,
     /// Counted in `Scheduler.live_hold` from its admission until its free.
     hold_counted: bool = false,
     /// This tick decodes plain (batched) although the slot's MTP head is armed: the
@@ -743,7 +745,7 @@ pub const Slot = struct {
     /// terminal, so an uncopyable name falls back to a static one instead of leaving it null.
     fn latchErrorLocked(self: *Slot, name: []const u8) void {
         if (self.error_code == null) {
-            if (std.mem.eql(u8, name, "PrefillChunkDoesNotFit")) self.forward_refusal = forward_refusal_mod.take();
+            if (std.mem.eql(u8, name, "PrefillChunkDoesNotFit") or std.mem.eql(u8, name, "PrefillDoesNotFit")) self.forward_refusal = forward_refusal_mod.take();
             self.error_code = self.allocator.dupe(u8, name) catch static_error_name;
             // The client sees only "generation failed" for most names; this line is the one place the name is kept.
             log.err("[slot] request {d} failed ({s}): {s}\n", .{ self.request_id, @tagName(self.state), name });
@@ -2962,6 +2964,8 @@ pub fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
     if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
     if (s.model.handle) |h| arch_state.resetTables(arch_handle.trunk(h));
     if (s.model.config) |c| sched.endRequest(c);
+    // A client that left mid-decode never reaches the inference thread's release: its reservation ends here.
+    @import("static_bill.zig").requestEnded(s);
 }
 
 pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*Scheduler, *Slot) void) void {
@@ -2970,9 +2974,11 @@ pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*S
 
 /// Native GLM has no reusable prefix snapshot: a slot the inference thread stops touching
 /// (finished, errored or cancelled) releases its reserved target state before the next
-/// admission read, not when its connection thread completes it.
+/// admission read, not when its connection thread completes it. A request on a load's ledger parks what its state
+/// holds here too: its connection thread completes it after the next request may run.
 pub fn releaseNativeState(slot: *Slot) void {
     sched.releaseState(slot);
+    @import("static_bill.zig").requestEnded(slot);
 }
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
@@ -3699,6 +3705,8 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         sch.inflight_prefill_tokens.store(0, .monotonic);
         sch.inflight_prefill_expected.store(0, .monotonic);
     };
+    // A load on the ledger admits the request on its lines before it allocates anything.
+    try @import("static_bill.zig").admit(slot);
 
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,

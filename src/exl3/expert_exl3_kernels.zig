@@ -980,6 +980,17 @@ pub fn activeDecode() exl3.Decode {
 /// Test seam: a hash-mask or PAIR1 codebook's weight kernels decode the scale into every weight and store
 /// their sums as they are (the converter's form), built into slot row `N_CB + cbIndex(cb)`.
 pub var unfolded_for_test: bool = false;
+/// Candidate codebooks a timing bench swaps into the MCG kernels' decode body, never served:
+/// `active_decode` stays MCG, so every lane and dispatch choice is MCG's and only `exl3_pairh`
+/// differs. kron8 / kron10 read their Gaussian quantile table from constant memory; kron10s stages it in
+/// threadgroup memory, kron10h stages only its negative half (the table is antisymmetric) and flips the sign.
+/// kronlog / kronlogsq are M1's table-free Kronecker decodes: a logistic quantile from the float bit pattern
+/// as a piecewise log2, kronlogsq with a soft quadratic tail fix (the table's quality).
+pub const ResearchCodebook = enum { andonly, kron8, kron10, kron10s, kron10h, kronlog, kronlogsq };
+pub var research_codebook: ?ResearchCodebook = null;
+pub fn setResearchCodebook(rc: ?ResearchCodebook) void {
+    research_codebook = rc;
+}
 
 const IndexedKey = struct { in_dim: c_int, out_dim: c_int, topk: c_int, n: u32 };
 const UnaryKey = struct { dim: c_int, topk: c_int };
@@ -1104,7 +1115,40 @@ fn getGemmNaxKernel() !mlx.mlx_fast_metal_kernel {
     return getGemmNaxKernelFor(.pack, mlx.gpuStream());
 }
 
-/// The kernel of the active decode and `order`, built and proven on `s` at its first use.
+/// Where the NAX GEMM kernel of `dec` and `order` is kept once proven.
+fn gemmNaxSlot(dec: exl3.Decode, order: TileOrder) *?mlx.mlx_fast_metal_kernel {
+    const ref = nax_reference_override and order == .pack;
+    const slots = if (ref) &gemm_nax_ref_kernel else if (order == .tile_major) &gemm_nax_tm_kernel else &gemm_nax_kernel;
+    return switch (dec.codebook) {
+        inline else => |cb| &slots[kernel_src.slotRow(cb, false)][dec.window.index()],
+    };
+}
+
+/// Whether the NAX GEMM kernel of `dec` and `order` is built and proven.
+pub fn gemmNaxProven(dec: exl3.Decode, order: TileOrder) bool {
+    return gemmNaxSlot(dec, order).* != null;
+}
+
+/// A test's hold on a proven kernel: its slot left empty until `putBack`.
+pub const TakenGemmNax = struct {
+    slot: *?mlx.mlx_fast_metal_kernel,
+    kernel: ?mlx.mlx_fast_metal_kernel,
+
+    pub fn putBack(self: *TakenGemmNax) void {
+        if (self.slot.*) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        self.slot.* = self.kernel;
+    }
+};
+
+pub fn takeGemmNaxForTest(dec: exl3.Decode, order: TileOrder) TakenGemmNax {
+    const slot = gemmNaxSlot(dec, order);
+    defer slot.* = null;
+    return .{ .slot = slot, .kernel = slot.* };
+}
+
+/// The kernel of the active decode and `order`, built and proven on `s` at its first use. A dry recording runs no
+/// launch, so its proof would prove nothing: a kernel not yet proven there is refused, and the load proves it first
+/// (`prepareGemmNax`).
 fn getGemmNaxKernelFor(order: TileOrder, s: mlx.mlx_stream) !mlx.mlx_fast_metal_kernel {
     @setEvalBranchQuota(100_000);
     const ref = nax_reference_override and order == .pack;
@@ -1114,6 +1158,7 @@ fn getGemmNaxKernelFor(order: TileOrder, s: mlx.mlx_stream) !mlx.mlx_fast_metal_
             inline else => |win| {
                 const slot = &slots[kernel_src.slotRow(cb, false)][win.index()];
                 if (slot.*) |k| return k;
+                if (host_side.dry()) return error.Exl3KernelProofDry;
                 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer arena.deinit();
                 const alloc = arena.allocator();
@@ -5506,6 +5551,16 @@ fn rowsMutantKernel(g: project_rows.RowsGeom) !mlx.mlx_fast_metal_kernel {
     return kernel_src.codebookKernelWith(&rows_mutant_kernel, "sushi_exl3_rows_row_mutant", &project_rows.ROWS_INS, &.{"y"}, metalReplaceFound(project_rows.ROWS_SOURCE, ROWS_ROW_MUTANT[0], ROWS_ROW_MUTANT[1]), project_rows.ROWS_HELPERS);
 }
 
+/// `decodeTile` under the active research codebook, when one is set.
+fn decodeTileResearch(words: []const u16, rate: exl3.Rate, dec: exl3.Decode, rc: ?ResearchCodebook, out: *[exl3.TILE_VALUES]u16) void {
+    const arm = rc orelse return exl3.decodeTile(words, rate, dec, out);
+    var cws: [exl3.TILE_VALUES]u16 = undefined;
+    exl3.unpackTile(words, rate, &cws);
+    var perm: [exl3.TILE_VALUES]usize = undefined;
+    exl3.tensorCorePerm(&perm);
+    for (cws, 0..) |cw, i| out[perm[i]] = kernel_src.researchDecode(cw & dec.window.mask(), arm);
+}
+
 /// The unnormalized 128-point Walsh-Hadamard transform, in f64.
 fn hadamard128F64(v: *[exl3.HAD_DIM]f64) void {
     var h: usize = 1;
@@ -5523,6 +5578,7 @@ fn hadamard128F64(v: *[exl3.HAD_DIM]f64) void {
 
 pub const RowsCase = struct {
     n: u32,
+    rc: ?ResearchCodebook = null,
     in_dim: usize,
     out_dim: usize,
     rows: usize,
@@ -5541,6 +5597,8 @@ pub fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
     const dec: exl3.Decode = .{ .codebook = .mcg, .window = .w15 };
     setDecodeParams(dec);
     defer setDecodeParams(.mul1);
+    setResearchCodebook(c.rc);
+    defer setResearchCodebook(null);
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -5592,7 +5650,7 @@ pub fn rowsParityStats(c: RowsCase) !Exl3GemmParityStats {
     const w = try alloc.alloc(f32, c.in_dim * c.out_dim);
     var tile: [exl3.TILE_VALUES]u16 = undefined;
     for (0..it) |tk| for (0..ot) |tn| {
-        exl3.decodeTile(tr[(tk * ot + tn) * nh ..][0..nh], rate, ref_dec, &tile);
+        decodeTileResearch(tr[(tk * ot + tn) * nh ..][0..nh], rate, ref_dec, c.rc, &tile);
         for (0..16) |r| for (0..16) |cc| {
             w[(tk * 16 + r) * c.out_dim + tn * 16 + cc] = exl3.f16BitsToF32(tile[r * 16 + cc]);
         };
@@ -6719,8 +6777,44 @@ test "exl3 every K1.5 to K2 rate decodes exactly on every reader at the window e
     }
 }
 
+const ALPHA_W15: exl3.Decode = .{ .codebook = .alpha, .window = .w15 };
 pub const SPEC1_W15 = exl3.Decode.tabled(.spec1, .w15);
 pub const STD1_W15 = exl3.Decode.tabled(.std1, .w15);
+
+test "exl3 alpha prefill GEMM holds the host-decode parity bar on the NAX, simdgroup-matrix and scalar bodies" {
+    defer gemm_simdmat_force = null;
+    for ([_]exl3.Rate{ .{ .n = 32 }, .{ .n = 42 }, .{ .n = 48 }, exl3.Rate.fromK(4) }) |rate| {
+        for ([_]?bool{ null, true, false }) |simdmat| {
+            var env: SimdOnly = .{};
+            if (simdmat != null) env.force();
+            defer if (simdmat != null) env.restore();
+            gemm_simdmat_force = simdmat;
+            for (0..PARITY_SEEDS) |i| try sortedGemmParity(rate, ALPHA_W15, 32, 3001 + 10 * rate.n + i);
+            if (rate.n == 42) for (0..PARITY_SEEDS) |i| {
+                try reportGemmParity(try sortedGemmParityShape(rate, ALPHA_W15, 32, 3501 + i, .none, .{ .in_dim = 2560, .out_dim = 640 }));
+            };
+        }
+    }
+}
+
+test "exl3 alpha decode chain matches the host SwiGLU reference and the host tile decode" {
+    try fusedChainMatchesHost(exl3.fixtures.k2p5_mcg, .{ .n = 40 }, ALPHA_W15);
+    try fusedChainMatchesHost(exl3.fixtures.k4, exl3.Rate.fromK(4), ALPHA_W15);
+    for (0..PARITY_SEEDS) |i| {
+        for ([_]u32{ 32, 42, 48, 64 }) |n| try indexedParity(.{ .n = n }, 128, 128, 4, 10, 4001 + 10 * n + i, ALPHA_W15);
+    }
+    try indexedParity(.{ .n = 32 }, 2560, 640, 4, 10, 4901, ALPHA_W15);
+    try indexedParity(.{ .n = 42 }, 640, 2560, 4, 10, 4903, ALPHA_W15);
+}
+
+test "exl3 alpha decode and prefill rows hold the f32-truth bar at Flash-Next's top-k" {
+    for ([_]u32{ 32, 42, 48, 64 }) |n| {
+        for ([_]usize{ 1, 4, 9, 33 }) |rows| {
+            for (0..3) |seed| try bf16TruthCase(.{ .e = 16, .hidden = 256, .inter = 128, .topk = 10, .rows = rows, .rate = .{ .n = n }, .dec = ALPHA_W15, .seed = 5000 + 10 * n + seed, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, rows <= DECODE_ROWS_MAX);
+        }
+    }
+    for ([_]usize{ 1, 4 }) |rows| try bf16TruthCase(.{ .e = 32, .hidden = 2560, .inter = 640, .topk = 10, .rows = rows, .rate = .{ .n = 32 }, .dec = ALPHA_W15, .seed = 5900 + rows, .banks = SERVED_W12_BANKS, .x_scale = 3 }, 32, true);
+}
 
 const PAIR1_W16: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
 const PAIR1_NS = [_]u32{ 24, 28, 32, 36, 40, 42, 48, 56, 64 };
@@ -8490,6 +8584,379 @@ test "exl3 GLM one-row decode chain equals the lane chain to the byte and engage
                 defer _ = mlx.mlx_array_free(open);
                 try std.testing.expect(!std.mem.eql(u8, try f32Bytes(open), try f32Bytes(one)));
             }
+        }
+    }
+}
+
+// One MoE layer's decode chain when its routed experts carry one, several, or per-expert rates, at Flash-Next
+// geometry (2560 -> 640, top-10), alpha w15, 48 dependent steps per arm, arms interleaved in one process.
+// Prints only under SUSHI_EXL3_GRAN_UBENCH (a diagnostic, never a test).
+const GRAN_HIDDEN: c_int = 2560;
+const GRAN_INTER: c_int = 640;
+const GRAN_TILES: usize = (2560 / 16) * (640 / 16);
+const GRAN_STEPS: usize = 48;
+const GRAN_SETS = [_][]const u32{ &.{ 24, 48 }, &.{ 24, 40, 64 }, &.{ 24, 28, 32, 36, 40, 48, 64 } };
+var gran_kernels: [2 * GRAN_SETS.len]?mlx.mlx_fast_metal_kernel = @splat(null);
+var gran_link_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// The served decode body with the rate read per threadgroup (`nmap[eid]`) from a ragged bank (`offs[eid]`
+/// halfwords): one switch case per compiled rate, each the body with its N a constant. A threadgroup is one
+/// slot, so the switch never diverges inside it.
+fn granMixedSource(alloc: std.mem.Allocator, source: []const u8, anchor: []const u8, rates: []const u32) ![:0]u8 {
+    const decl = "constexpr uint N = uint(NHW);\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n";
+    const d = std.mem.indexOf(u8, source, decl) orelse return error.GranSourceAnchor;
+    const a = std.mem.indexOf(u8, source, anchor) orelse return error.GranSourceAnchor;
+    if (a < d + decl.len) return error.GranSourceAnchor;
+    const ragged = try std.mem.replaceOwned(u8, alloc, source[a..], "((size_t)eid * (size_t)IT * (size_t)OT) * PACKED_HW", "eoff");
+    defer alloc.free(ragged);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, source[0..d]);
+    try out.appendSlice(alloc, source[d + decl.len .. a]);
+    try out.appendSlice(alloc, "const size_t eoff = (size_t)offs[eid];\nswitch (uint(nmap[eid])) {\n");
+    for (rates) |n| {
+        try out.print(alloc, "case {d}u: {{\nconstexpr uint N = {d}u;\nconstexpr uint PACKED_HW = N;\nconstexpr uint PACKED_W = N / 2u;\n", .{ n, n });
+        try out.appendSlice(alloc, ragged);
+        try out.appendSlice(alloc, "} break;\n");
+    }
+    try out.appendSlice(alloc, "default: break;\n}\n");
+    return out.toOwnedSliceSentinel(alloc, 0);
+}
+
+fn granKernel(set: usize, down: bool) !mlx.mlx_fast_metal_kernel {
+    const slot = &gran_kernels[2 * set + @intFromBool(down)];
+    if (slot.*) |k| return k;
+    const alloc = std.heap.page_allocator;
+    const src = if (down)
+        try granMixedSource(alloc, DOWN_FUSED_SOURCE, "float acc[OTPT][8] = {};", GRAN_SETS[set])
+    else
+        try granMixedSource(alloc, PAIR_GEMV_SOURCE, "for (uint proj = 0u; proj < 2u; proj++) {", GRAN_SETS[set]);
+    defer alloc.free(src);
+    const name = try std.fmt.allocPrintSentinel(alloc, "sushi_exl3_gran_{s}_set{d}", .{ if (down) "down" else "pair", set }, 0);
+    defer alloc.free(name);
+    const pair_ins = [_][*:0]const u8{ "x", "suhg", "suhu", "tg", "tu", "slots", "nmap", "offs" };
+    const down_ins = [_][*:0]const u8{ "ig", "iu", "trellis", "svhg", "svhu", "suhd", "slots", "nmap", "offs" };
+    const pair_outs = [_][*:0]const u8{ "yg", "yu" };
+    const down_outs = [_][*:0]const u8{"y"};
+    const ins: []const [*:0]const u8 = if (down) &down_ins else &pair_ins;
+    const outs: []const [*:0]const u8 = if (down) &down_outs else &pair_outs;
+    return getNamedKernel(slot, name.ptr, ins, outs, src, comptime kernel_src.codebookHelpers(.alpha, .w15));
+}
+
+/// One pass's experts: expert r*k + j (row r, slot j) carries gate/up rate `gu[j]` and down rate `dn[j]`, so every
+/// slot is its own expert. `set` null stacks a uniform bank as served; a set index packs it ragged for the mixed
+/// kernels. The same seed and rates give the same bytes either way.
+const GranBank = struct {
+    gate: mlx.mlx_array,
+    up: mlx.mlx_array,
+    down: mlx.mlx_array,
+    suh_h: mlx.mlx_array,
+    svh_i: mlx.mlx_array,
+    suh_i: mlx.mlx_array,
+    slots: mlx.mlx_array,
+    ragged: ?[4]mlx.mlx_array,
+    set: usize,
+    nslots: c_int,
+    topk: c_int,
+
+    fn init(alloc: std.mem.Allocator, seed: u64, rows: usize, gu: []const u32, dn: []const u32, set: ?usize) !GranBank {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rnd = prng.random();
+        const k = gu.len;
+        const e = rows * k;
+        var trellis: [3]mlx.mlx_array = undefined;
+        var maps: [2][]u32 = undefined;
+        var offs: [2][]u32 = undefined;
+        for (&trellis, 0..) |*t, p| {
+            const rates = if (p == 2) dn else gu;
+            var total: usize = 0;
+            for (0..e) |i| total += GRAN_TILES * rates[i % k];
+            const words = try alloc.alloc(u16, total);
+            for (words) |*v| v.* = @truncate(rnd.int(u32));
+            if (set == null) {
+                for (rates) |n| if (n != rates[0]) return error.GranUniformBankMixesRates;
+                const it: c_int = if (p == 2) GRAN_INTER / 16 else GRAN_HIDDEN / 16;
+                const ot: c_int = if (p == 2) GRAN_HIDDEN / 16 else GRAN_INTER / 16;
+                t.* = try mlx.newData(words.ptr, &[_]c_int{ @intCast(e), it, ot, @intCast(rates[0]) }, .uint16);
+            } else {
+                t.* = try mlx.newData(words.ptr, &[_]c_int{@intCast(total)}, .uint16);
+                if (p != 1) {
+                    const m = try alloc.alloc(u32, e);
+                    const o = try alloc.alloc(u32, e);
+                    var at: usize = 0;
+                    for (0..e) |i| {
+                        m[i] = rates[i % k];
+                        o[i] = @intCast(at);
+                        at += GRAN_TILES * rates[i % k];
+                    }
+                    maps[p / 2] = m;
+                    offs[p / 2] = o;
+                }
+            }
+        }
+        var scales: [3]mlx.mlx_array = undefined;
+        for (&scales, [_]c_int{ GRAN_HIDDEN, GRAN_INTER, GRAN_INTER }) |*sc, width| {
+            const h = try alloc.alloc(u16, e * @as(usize, @intCast(width)));
+            for (h) |*v| v.* = exl3.f32ToF16Bits(if (rnd.boolean()) 0.9 else -0.9);
+            sc.* = try mlx.newData(h.ptr, &[_]c_int{ @intCast(e), width }, .float16);
+        }
+        const ids = try alloc.alloc(u32, e);
+        for (ids, 0..) |*v, i| v.* = @intCast(i);
+        const ci: c_int = @intCast(e);
+        return .{
+            .gate = trellis[0],
+            .up = trellis[1],
+            .down = trellis[2],
+            .suh_h = scales[0],
+            .svh_i = scales[1],
+            .suh_i = scales[2],
+            .slots = try mlx.newData(ids.ptr, &[_]c_int{ci}, .uint32),
+            .ragged = if (set == null) null else .{
+                try mlx.newData(maps[0].ptr, &[_]c_int{ci}, .uint32),
+                try mlx.newData(offs[0].ptr, &[_]c_int{ci}, .uint32),
+                try mlx.newData(maps[1].ptr, &[_]c_int{ci}, .uint32),
+                try mlx.newData(offs[1].ptr, &[_]c_int{ci}, .uint32),
+            },
+            .set = set orelse 0,
+            .nslots = ci,
+            .topk = @intCast(k),
+        };
+    }
+
+    fn deinit(self: *GranBank) void {
+        for ([_]mlx.mlx_array{ self.gate, self.up, self.down, self.suh_h, self.svh_i, self.suh_i, self.slots }) |a| _ = mlx.mlx_array_free(a);
+        if (self.ragged) |r| for (r) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+    }
+
+    /// The pair GEMV and fused-mid down for x [rows, hidden]: the served kernels, or the mixed ones.
+    fn chain(self: *const GranBank, s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
+        const r = self.ragged orelse {
+            const inner = try pairGemv(s, x, self.suh_h, self.suh_h, self.gate, self.up, self.slots, GRAN_HIDDEN, GRAN_INTER, self.nslots, self.topk, 0);
+            defer _ = mlx.mlx_array_free(inner[0]);
+            defer _ = mlx.mlx_array_free(inner[1]);
+            return downGemvFusedMid(s, inner[0], inner[1], self.down, self.svh_i, self.svh_i, self.suh_i, self.slots, GRAN_INTER, GRAN_HIDDEN, self.nslots);
+        };
+        const nsplit: c_int = @intCast(pairSplitCountFor(GRAN_HIDDEN));
+        const pc = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(pc);
+        const psh = [_]c_int{ self.nslots * nsplit, GRAN_INTER };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pc, &psh, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pc, &psh, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(pc, @divExact(GRAN_INTER, 32) * 128, self.nslots, nsplit));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(pc, 128, 1, 1));
+        for ([_][*:0]const u8{ "IDIM", "ODIM", "NSPLIT", "TOPK", "FUNNEL", "OTPT" }, [_]c_int{ GRAN_HIDDEN, GRAN_INTER, nsplit, self.topk, 1, 2 }) |name, v|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(pc, name, v));
+        const pv = try applyOuts(s, try granKernel(self.set, false), &.{ x, self.suh_h, self.suh_h, self.gate, self.up, self.slots, r[0], r[1] }, pc, 2);
+        defer _ = mlx.mlx_vector_array_free(pv);
+        var ig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ig);
+        var iu = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(iu);
+        try mlx.check(mlx.mlx_vector_array_get(&ig, pv, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&iu, pv, 1));
+        const dc = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(dc);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(dc, &[_]c_int{ self.nslots, GRAN_HIDDEN }, 2, .float16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(dc, @divExact(GRAN_HIDDEN, 32) * 128, self.nslots, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(dc, 128, 1, 1));
+        for ([_][*:0]const u8{ "IDIM", "ODIM", "NSPLIT", "FUNNEL", "OTPT" }, [_]c_int{ GRAN_INTER, GRAN_HIDDEN, nsplit, 1, 2 }) |name, v|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(dc, name, v));
+        const dv = try applyOuts(s, try granKernel(self.set, true), &.{ ig, iu, self.down, self.svh_i, self.svh_i, self.suh_i, self.slots, r[2], r[3] }, dc, 1);
+        defer _ = mlx.mlx_vector_array_free(dv);
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, dv, 0));
+        return y;
+    }
+};
+
+/// A copy of `a` that waits on every pass's output, so the steps run one after another and no pass is dropped.
+const GRAN_LINK_SOURCE: [:0]const u8 =
+    \\const uint i = thread_position_in_grid.x;
+    \\if (i >= uint(LEN)) return;
+    \\out[i] = a[i];
+    \\if (i == 0u && (float(d0[0]) == 1.5e30f || float(d1[0]) == 1.5e30f || float(d2[0]) == 1.5e30f || float(d3[0]) == 1.5e30f)) out[0] = a[1];
+;
+
+/// An arm is one to four passes over the same x: one pass is a layer's whole routed set; several are rate
+/// groups, each over its own slots, or (`masked`) each over all slots as `moeGroups` runs them today.
+const GranArm = struct {
+    name: []const u8,
+    banks: []GranBank,
+    ns: u64 = std.math.maxInt(u64),
+    err: ?anyerror = null,
+    times: [9]u64 = undefined,
+};
+
+fn granChainNs(s: mlx.mlx_stream, arm: *const GranArm, x0: mlx.mlx_array, rows: c_int) !u64 {
+    const link = try getNamedKernel(&gran_link_kernel, "sushi_exl3_gran_link", &.{ "a", "d0", "d1", "d2", "d3" }, &.{"out"}, GRAN_LINK_SOURCE, "");
+    const len = rows * GRAN_HIDDEN;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{ rows, GRAN_HIDDEN }, 2, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, len, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LEN", len));
+    var x = try applyUnary(s, link, &.{ x0, x0, x0, x0, x0 }, cfg);
+    defer _ = mlx.mlx_array_free(x);
+    for (0..GRAN_STEPS) |_| {
+        var ys: [4]mlx.mlx_array = undefined;
+        var made: usize = 0;
+        defer for (ys[0..made]) |y| {
+            _ = mlx.mlx_array_free(y);
+        };
+        for (arm.banks) |*b| {
+            ys[made] = try b.chain(s, x);
+            made += 1;
+        }
+        const last = ys[made - 1];
+        const next = try applyUnary(s, link, &.{ x0, ys[0], if (made > 1) ys[1] else last, if (made > 2) ys[2] else last, last }, cfg);
+        _ = mlx.mlx_array_free(x);
+        x = next;
+    }
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sw = io_util.Stopwatch.init(io);
+    try mlx.check(mlx.mlx_array_eval(x));
+    return sw.read();
+}
+
+/// One step's output bytes of a mixed bank against the served bank with the same seed and one rate.
+fn granBytesEqual(s: mlx.mlx_stream, a: *const GranBank, b: *const GranBank, x: mlx.mlx_array) !bool {
+    const ya = try a.chain(s, x);
+    defer _ = mlx.mlx_array_free(ya);
+    const yb = try b.chain(s, x);
+    defer _ = mlx.mlx_array_free(yb);
+    var ca = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ca);
+    var cb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cb);
+    const pa = try evalF16(s, ya, &ca);
+    const pb = try evalF16(s, yb, &cb);
+    const n = mlx.mlx_array_size(ya);
+    return std.mem.eql(u8, std.mem.sliceAsBytes(pa[0..n]), std.mem.sliceAsBytes(pb[0..n]));
+}
+
+/// Writes the mixed kernels' sources and the codebook header for an offline `xcrun metal` check; no GPU work.
+fn granDump(dir: []const u8) !void {
+    const alloc = std.heap.page_allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+    defer d.close(io);
+    try d.writeFile(io, .{ .sub_path = "header.metal", .data = comptime kernel_src.codebookHelpers(.alpha, .w15) });
+    for (GRAN_SETS, 0..) |rates, set| {
+        for ([_]bool{ false, true }) |down| {
+            const src = if (down)
+                try granMixedSource(alloc, DOWN_FUSED_SOURCE, "float acc[OTPT][8] = {};", rates)
+            else
+                try granMixedSource(alloc, PAIR_GEMV_SOURCE, "for (uint proj = 0u; proj < 2u; proj++) {", rates);
+            defer alloc.free(src);
+            const name = try std.fmt.allocPrint(alloc, "{s}_set{d}.metal", .{ if (down) "down" else "pair", set });
+            defer alloc.free(name);
+            try d.writeFile(io, .{ .sub_path = name, .data = src });
+        }
+    }
+}
+
+const GranPass = struct { gu: []const u32, dn: []const u32, set: ?usize = null };
+const GranSpec = struct { name: []const u8, passes: []const GranPass };
+
+fn granRep(comptime n: u32, comptime k: usize) [k]u32 {
+    return @splat(n);
+}
+
+/// Slot mixes from the Fisher x eta allocation's routed-row shares at 2.0 bpw (K1.5|K3 is the whole-model
+/// two-rate set, K1.5|K2.5|K4 the three-rate set, the last the per-expert optimum).
+const GRAN_SPECS = blk: {
+    const r = granRep;
+    break :blk [_]GranSpec{
+        .{ .name = "served n24", .passes = &.{.{ .gu = &r(24, 10), .dn = &r(24, 10) }} },
+        .{ .name = "served n28", .passes = &.{.{ .gu = &r(28, 10), .dn = &r(28, 10) }} },
+        .{ .name = "served n32", .passes = &.{.{ .gu = &r(32, 10), .dn = &r(32, 10) }} },
+        .{ .name = "served n36", .passes = &.{.{ .gu = &r(36, 10), .dn = &r(36, 10) }} },
+        .{ .name = "served n40", .passes = &.{.{ .gu = &r(40, 10), .dn = &r(40, 10) }} },
+        .{ .name = "served n48", .passes = &.{.{ .gu = &r(48, 10), .dn = &r(48, 10) }} },
+        .{ .name = "served n64", .passes = &.{.{ .gu = &r(64, 10), .dn = &r(64, 10) }} },
+        .{ .name = "2 passes 5xn24 + 5xn48", .passes = &.{ .{ .gu = &r(24, 5), .dn = &r(24, 5) }, .{ .gu = &r(48, 5), .dn = &r(48, 5) } } },
+        .{ .name = "3 passes 4xn24 + 5xn40 + 1xn64", .passes = &.{ .{ .gu = &r(24, 4), .dn = &r(24, 4) }, .{ .gu = &r(40, 5), .dn = &r(40, 5) }, .{ .gu = &r(64, 1), .dn = &r(64, 1) } } },
+        .{ .name = "2 masked passes (moeGroups today) n24 + n48", .passes = &.{ .{ .gu = &r(24, 10), .dn = &r(24, 10) }, .{ .gu = &r(48, 10), .dn = &r(48, 10) } } },
+        .{ .name = "mixed{24,48} all n24", .passes = &.{.{ .gu = &r(24, 10), .dn = &r(24, 10), .set = 0 }} },
+        .{ .name = "mixed{24,48} all n48", .passes = &.{.{ .gu = &r(48, 10), .dn = &r(48, 10), .set = 0 }} },
+        .{ .name = "mixed{24,48} 5xn24 + 5xn48", .passes = &.{.{ .gu = &(r(24, 5) ++ r(48, 5)), .dn = &(r(24, 5) ++ r(48, 5)), .set = 0 }} },
+        .{ .name = "mixed{24,48} K1.5|K3 alloc (down 3:7)", .passes = &.{.{ .gu = &(r(24, 5) ++ r(48, 5)), .dn = &(r(24, 3) ++ r(48, 7)), .set = 0 }} },
+        .{ .name = "mixed{24,40,64} 4xn24 + 5xn40 + 1xn64", .passes = &.{.{ .gu = &(r(24, 4) ++ r(40, 5) ++ r(64, 1)), .dn = &(r(24, 4) ++ r(40, 5) ++ r(64, 1)), .set = 1 }} },
+        .{ .name = "mixed{7} all n32", .passes = &.{.{ .gu = &r(32, 10), .dn = &r(32, 10), .set = 2 }} },
+        .{ .name = "mixed{7} all n64", .passes = &.{.{ .gu = &r(64, 10), .dn = &r(64, 10), .set = 2 }} },
+        .{ .name = "mixed{7} per-expert alloc", .passes = &.{.{ .gu = &[_]u32{ 24, 24, 24, 28, 32, 36, 40, 48, 48, 64 }, .dn = &[_]u32{ 24, 24, 28, 32, 36, 40, 40, 48, 48, 64 }, .set = 2 }} },
+    };
+};
+
+test "exl3 rate-granularity decode chain arms (SUSHI_EXL3_GRAN_UBENCH=1)" {
+    if (std.c.getenv("SUSHI_EXL3_GRAN_DUMP")) |dir| return granDump(std.mem.span(dir));
+    if (!diagEnvValueOn(std.c.getenv("SUSHI_EXL3_GRAN_UBENCH"))) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    setDecodeParams(.{ .codebook = .alpha, .window = .w15 });
+    defer setDecodeParams(.mul1);
+    for ([_]usize{ 1, 4 }) |rows| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var prng = std.Random.DefaultPrng.init(0x6a4);
+        const rnd = prng.random();
+        const xh = try alloc.alloc(u16, rows * @as(usize, @intCast(GRAN_HIDDEN)));
+        for (xh) |*v| v.* = exl3.f32ToF16Bits((rnd.float(f32) * 2 - 1) * 0.05);
+        const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ @intCast(rows), GRAN_HIDDEN }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x0);
+        if (rows == 1) {
+            for ([_][2]u32{ .{ 32, 2 }, .{ 24, 0 }, .{ 48, 0 } }) |c| {
+                const rates: [10]u32 = @splat(c[0]);
+                var served = try GranBank.init(alloc, 0x7700 + c[0], rows, &rates, &rates, null);
+                defer served.deinit();
+                var mixed = try GranBank.init(alloc, 0x7700 + c[0], rows, &rates, &rates, c[1]);
+                defer mixed.deinit();
+                const same = granBytesEqual(s, &mixed, &served, x0) catch |e| {
+                    std.debug.print("[gran] mixed set{d} at n{d}: error {s}\n", .{ c[1], c[0], @errorName(e) });
+                    continue;
+                };
+                std.debug.print("[gran] mixed set{d} at n{d} equals the served bytes: {}\n", .{ c[1], c[0], same });
+            }
+        }
+        var arms: [GRAN_SPECS.len]GranArm = undefined;
+        for (&arms, GRAN_SPECS, 0..) |*arm, spec, si| {
+            const banks = try alloc.alloc(GranBank, spec.passes.len);
+            for (spec.passes, banks, 0..) |p, *b, pi| b.* = try GranBank.init(alloc, 0x9000 + si * 8 + pi, rows, p.gu, p.dn, p.set);
+            arm.* = .{ .name = spec.name, .banks = banks };
+        }
+        defer for (&arms) |*a| for (a.banks) |*b| b.deinit();
+        for (0..10) |round| {
+            for (0..arms.len) |j| {
+                const a = &arms[(round + j) % arms.len];
+                if (a.err != null) continue;
+                const ns = granChainNs(s, a, x0, @intCast(rows)) catch |e| {
+                    a.err = e;
+                    continue;
+                };
+                if (round > 0) a.times[round - 1] = ns;
+            }
+        }
+        var ref: f64 = 0;
+        for (&arms) |*a| {
+            if (a.err != null) continue;
+            std.mem.sort(u64, &a.times, {}, std.sort.asc(u64));
+            a.ns = a.times[a.times.len / 2];
+            if (std.mem.eql(u8, a.name, "served n32")) ref = @floatFromInt(a.ns);
+        }
+        const per_step: f64 = 1e3 * @as(f64, GRAN_STEPS);
+        for (arms) |a| {
+            if (a.err) |e| {
+                std.debug.print("[gran] rows={d} {s}: error {s}\n", .{ rows, a.name, @errorName(e) });
+                continue;
+            }
+            const med: f64 = @floatFromInt(a.ns);
+            const lo: f64 = @floatFromInt(a.times[0]);
+            std.debug.print("[gran] rows={d} {s}: {d:.2} us/step median, {d:.2} min, {d:.3} of served n32\n", .{ rows, a.name, med / per_step, lo / per_step, med / ref });
         }
     }
 }

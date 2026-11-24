@@ -21,6 +21,7 @@
 #  15. once the lock is taken, the command waits until available memory stops rising (a previous holder's memory is
 #      still coming back), at most the settle cap; with memory flat it starts at once
 #  16. status names a QUIET marker and its age
+#  17. `rule` prints the rule the lock enforces, and `usage` names it
 #
 # No GPU, no model, seconds.
 #
@@ -249,6 +250,12 @@ touch "$GPU_LOCK_QUIET"
 [ "$($LOCK status | tail -1 | cut -d'(' -f1)" = "QUIET set 0 min ago " ]; check $? "status names a QUIET marker and its age, last"
 rm -f "$GPU_LOCK_QUIET"
 [ "$($LOCK status)" = free ]; check $? "status is free with no QUIET marker"
+
+# rule
+R=$($LOCK rule); [ $? = 0 ]; check $? "rule exits 0"
+echo "$R" | grep -q "never there to block"; check $? "rule says the lock never blocks others"
+echo "$R" | grep -q "M5 Ultra"; check $? "rule names the M5 Ultra's memory sum"
+$LOCK nope 2>&1 | grep -q "| rule"; check $? "usage names rule"
 
 echo "gpu-lock: $PASS passed, $FAIL failed"
 [ $FAIL = 0 ]

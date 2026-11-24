@@ -89,7 +89,6 @@ pub const QuantMode = enum {
     }
 };
 
-
 /// What an architecture serves with no flag and no setting; 0 and false = nothing of its own.
 pub const ServeDefaults = struct {
     context: u32 = 0,
@@ -143,9 +142,17 @@ pub const ModelConfig = struct {
     expert_streaming: bool = false,
     /// The streaming plan holds every routed expert (`CachePlan.resident`): no union workspace, no misses.
     expert_resident: bool = false,
-    /// A streamed load that serves `--mtp` keeps the head, and its own routed experts, resident.
+    /// The load keeps its drafting head: a streamed load that serves `--mtp` (the head and its own routed experts
+    /// resident), or a resident load whose arch reads the head from the pack (`arch_load.shipsHead`).
     stream_mtp_head: bool = false,
     expert_layout: expert_quant.Layout = .bf16_fused,
+    /// The routed experts' input width when it is not `hidden_size` (Hy4-Flash's run in a 1,536-wide latent); 0 is
+    /// `hidden_size`.
+    expert_hidden: u32 = 0,
+    /// The fused BF16 banks' name prefix when it is not Qwen's (`expert_store.Geometry.fused_prefix`).
+    expert_key_prefix: ?[]const u8 = null,
+    /// The arch routes in groups of at most a layer's cache slots (`expert_store.Geometry.union_within_cache`).
+    expert_union_within_cache: bool = false,
     expert_quant_rate: expert_exl3.Rate = .{ .n = 64 },
     expert_quant_codebook: expert_exl3.Codebook = .mul1,
     expert_quant_window: expert_exl3.Window = .w16,
@@ -266,6 +273,7 @@ pub const ModelConfig = struct {
     fp8_block128_trunk: bool = false,
     /// deepseek_v41's own geometry, parsed once from config.json.
     dsv41: ?arch_config.OwnConfig("dsv41") = null,
+    hy4flash: ?arch_config.OwnConfig("hy4flash") = null,
     serve_defaults: ServeDefaults = .{},
 
     // Multi-head Latent Attention (GLM's full-attention layers,
@@ -288,7 +296,7 @@ pub const ModelConfig = struct {
     // attention, whatever the interval says. The reference's rule is
     // `(idx+1) % group == 0 OR idx >= n_layers // group * group`, i.e. the
     // ragged tail after the last WHOLE group never gets linear attention.
-        partial_rotary_factor: f32 = 1.0,
+    partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
     // Qwen4-Exp (Qwen3.8-Flash-Next): gated residual streams ("hyper
@@ -340,8 +348,6 @@ pub const ModelConfig = struct {
     /// whole dims. Only the flat-`rope_parameters` readers set it.
     yarn_truncate: bool = true,
 
-
-
     // BOS id from config.json.
     bos_token_id: ?u32 = null,
     /// The id a raw-text prompt must open with, where the model's chat template writes BOS itself and its base model
@@ -379,6 +385,9 @@ pub const ModelConfig = struct {
     max_tokens_override: ?u32 = null,
     /// The per-model `yarn_factor` the config was parsed with; null = none applied (unset, or an arch that ignores it).
     yarn_factor_override: ?u8 = null,
+    /// The per-model `prefill_chunk_max` / `prefill_chunk_min`; null = unset.
+    prefill_chunk_max_override: ?u32 = null,
+    prefill_chunk_min_override: ?u32 = null,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -393,6 +402,13 @@ pub const ModelConfig = struct {
     /// `prefill_plan.effectivePrefillChunk` all read THIS field, so the bill and the
     /// forward can never disagree. Explicit `--prefill-chunk` still wins.
     pinned_prefill_chunk: u32 = 0,
+    /// The prefill chunk a load on the static bill fixed (`bills.fixStaticPrefillChunk`, D4): every prefill runs chunks
+    /// of exactly these rows and one shorter tail, and the arena is planned for it. 0 = not fixed: the chunk is chosen
+    /// as before.
+    static_prefill_chunk: u32 = 0,
+    /// The ledger of a load on the static bill that plans (`static_bill`, docs/bill_redesign.md part 9): its budget,
+    /// its model bill and its requests' lines. Null for every other load: its bills are read from the allocators.
+    static_ledger: ?*@import("ledger.zig").Ledger = null,
 
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = @splat(0),
@@ -433,8 +449,9 @@ pub const ModelConfig = struct {
 
     // Vision encoder
     has_vision: bool = false,
+    /// Whether this load keeps the checkpoint's vision tower: set where the load decides (`--no-vision`, the planner).
+    keeps_tower: bool = false,
     image_token_id: u32 = 0, // 0 = no image token
-
 
     // Flash-Next vision (Qwen3-VL ViT): a fused-qkv ViT with a patch merger, and
     // the text trunk uses INTERLEAVED M-RoPE (image tokens get 2D grid
@@ -597,6 +614,7 @@ pub const ModelConfig = struct {
     /// once at load: a long session's load-time reserve (and, ungated, the hot-cache ask) pins
     /// every ordinary prompt to a narrow rung.
     pub fn perRequestPrefillChunk(self: *const ModelConfig) bool {
+        if (self.static_prefill_chunk != 0) return false;
         const f = arch_config.facts(self) orelse arch_config.Facts{};
         return self.longCtxGated() or self.swaRingTokens() > 0 or f.prefill_start_width != 0 or f.prefill_start_width_of != null;
     }
@@ -909,7 +927,9 @@ pub const ModelConfig = struct {
         return .{
             .layers = @intCast(self.num_hidden_layers),
             .experts = @intCast(self.num_experts),
-            .hidden = self.hidden_size,
+            .hidden = if (self.expert_hidden != 0) self.expert_hidden else self.hidden_size,
+            .fused_prefix = self.expert_key_prefix orelse "model.language_model.layers.",
+            .union_within_cache = self.expert_union_within_cache,
             .intermediate = self.moe_intermediate_size,
             .first_moe_layer = @intCast(self.first_k_dense_replace),
             .exl3_n = self.expert_quant_rate.n,
@@ -1187,9 +1207,14 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
                 config.expert_quant_table = spec.table;
                 config.expert_quant_rates = spec.rates;
                 config.expert_tile_order = spec.tile_order;
-                // Only the DeepSeek loader reads pair-major tiles; the index must name the order the config does.
-                if (spec.tile_order == .pair_major and !(arch_config.facts(&config) orelse arch_config.Facts{}).reads_pair_major) return error.Exl3TileOrderUnsupported;
+                // An arch reads the orders its facts name; the index must name the order the config does.
+                const facts = arch_config.facts(&config) orelse arch_config.Facts{};
+                if (spec.tile_order == .pair_major and !facts.reads_pair_major) return error.Exl3TileOrderUnsupported;
                 if (try expert_quant.tileOrderOfDir(allocator, io, model_dir) != spec.tile_order) return error.Exl3TileOrderMismatch;
+                if (spec.tile_order == .pack and !facts.reads_pack_order) {
+                    if (!@import("builtin").is_test) log.err("[load] {s} stores its routed experts in the pack order, which {s} does not read: run `sushi repack {s}`\n", .{ model_dir, config.model_type, model_dir });
+                    return error.Exl3TileOrderUnsupported;
+                }
                 config.expert_rate_groups = try sushi_exl3.pack.widestRateGroupsOfDir(allocator, io, model_dir);
                 var k_buf: [8]u8 = undefined;
                 log.info("[expert-exl3] engaged K={s} codebook={s} window={d}\n", .{ spec.rate.kText(&k_buf), @tagName(spec.codebook), spec.window.bits() });
@@ -2052,7 +2077,7 @@ pub const served_model_types = registry.registered_model_types;
 /// checkpoint that declares thinking off keeps no default word unless the file names one.
 fn tableDefaultArm(config: *const ModelConfig, snap: *const effort_mod.Snapshot) ?effort_mod.EffortArm {
     const family = effort_mod.Family.of(config.model_type) orelse return null;
-    const edits = snap[@intFromEnum(family)];
+    const edits = snap[@backingInt(family)];
     if (edits.default == null and config.fact("thinking_off_checkpoint") and config.gen_enable_thinking == false) return null;
     const t = effort_mod.merge(family, edits);
     const row = t.row(t.default);
@@ -2145,6 +2170,7 @@ pub fn loadWeightsForConfig(
 ) !Weights {
     try archGate(config);
     if (config.pack_revision) |rev| try pack_revision_mod.verify(io, allocator, model_dir, rev);
+    if (config.expert_layout == .exl3_k4) try @import("pack_index.zig").validateTileOrder(io, allocator, model_dir, config.expert_tile_order, config.expertGeometry().hidden, config.moe_intermediate_size);
     if (config.expert_layout == .exl3_k4 and !(arch_config.facts(config) orelse arch_config.Facts{}).reads_own_source) try @import("pack_index.zig").validateExl3Pack(io, allocator, model_dir, config);
     const scope = try @import("arch/cooler.zig").LoadScope.weights(config);
     defer scope.end();
@@ -2381,9 +2407,9 @@ fn indexWeightMap(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?st
 /// MLX's safetensors dtype table (`dtype_from_safetensor_str`): FP8 codes load as `uint8`.
 fn safetensorsDtype(name: []const u8) ?struct { mlx.mlx_dtype, u64 } {
     const table = [_]struct { []const u8, mlx.mlx_dtype, u64 }{
-        .{ "F32", .float32, 4 },  .{ "F16", .float16, 2 }, .{ "BF16", .bfloat16, 2 }, .{ "I64", .int64, 8 },
-        .{ "I32", .int32, 4 },    .{ "I16", .int16, 2 },   .{ "I8", .int8, 1 },       .{ "U64", .uint64, 8 },
-        .{ "U32", .uint32, 4 },   .{ "U16", .uint16, 2 },  .{ "U8", .uint8, 1 },      .{ "BOOL", .bool_, 1 },
+        .{ "F32", .float32, 4 },   .{ "F16", .float16, 2 },   .{ "BF16", .bfloat16, 2 }, .{ "I64", .int64, 8 },
+        .{ "I32", .int32, 4 },     .{ "I16", .int16, 2 },     .{ "I8", .int8, 1 },       .{ "U64", .uint64, 8 },
+        .{ "U32", .uint32, 4 },    .{ "U16", .uint16, 2 },    .{ "U8", .uint8, 1 },      .{ "BOOL", .bool_, 1 },
         .{ "C64", .complex64, 8 }, .{ "F8_E4M3", .uint8, 1 }, .{ "F8_E8M0", .uint8, 1 },
     };
     for (table) |row| if (std.mem.eql(u8, row[0], name)) return .{ row[1], row[2] };
@@ -3026,7 +3052,6 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
     other.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, null), other.gen_top_k);
     try testing.expectEqual(@as(?f32, null), other.gen_top_p);
-
 }
 
 test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
@@ -3086,8 +3111,20 @@ test "effortArms: every engine word on each served arch" {
             } else try testing.expect(got == null);
         }
     }
-    // `minimal` parses but no served table lists it.
-    for (served_model_types) |t| try testing.expect(effort_mod.findEffortArm(effort_mod.effortArms(t).?, effort_mod.parseEffort("minimal").?) == null);
+    // `minimal` parses; a served table lists it only as its own alias (Hy4-Flash's, to `low`).
+    for (served_model_types) |t| {
+        if (registry.ofModelType(t) == null) continue;
+        const arms = effort_mod.effortArms(t).?;
+        const min_arm = effort_mod.findEffortArm(arms, effort_mod.parseEffort("minimal").?);
+        const alias_takes: ?effort_mod.Effort = if (effort_mod.Family.of(t)) |f| blk: {
+            for (effort_mod.builtin(f).aliases) |al| if (al.word == .minimal) break :blk al.takes;
+            break :blk null;
+        } else null;
+        if (alias_takes) |takes| {
+            const row = effort_mod.builtin(effort_mod.Family.of(t).?).row(takes);
+            try testing.expectEqualDeep(effort_mod.EffortArm{ .effort = .minimal, .budget = row.cap, .sends = row.sends }, min_arm.?);
+        } else try testing.expect(min_arm == null);
+    }
     try testing.expect(effort_mod.parseEffort("ultra") == null);
     // Inherited arches keep the legacy ladder.
     try testing.expect(effort_mod.effortArms("not_a_served_arch") == null);
@@ -4175,10 +4212,10 @@ test "thinking policy: --think binds the models that take it, the rest keep thei
     effort_mod.think_effort_flag = .off;
     try testing.expectEqualStrings("off", defaultEffortWord(&mimo).?);
     try testing.expectEqualStrings("high", defaultEffortWord(&glm).?);
-    try testing.expectEqual(@as(?effort_mod.Effort, .on), effort_mod.selectEffort(&.{ .off, .on }, .max));
-    try testing.expectEqual(@as(?effort_mod.Effort, .off), effort_mod.selectEffort(&.{ .off, .on }, .off));
-    try testing.expectEqual(@as(?effort_mod.Effort, null), effort_mod.selectEffort(&.{ .low, .high, .max }, .off));
-    try testing.expectEqual(@as(?effort_mod.Effort, null), effort_mod.selectEffort(&.{ .off, .low, .medium, .xhigh }, .minimal));
+    try testing.expectEqual(@as(?effort_mod.Effort, .on), effort_mod.selectEffort(effort_mod.effortArms("mimo_v2").?, .max));
+    try testing.expectEqual(@as(?effort_mod.Effort, .off), effort_mod.selectEffort(effort_mod.effortArms("mimo_v2").?, .off));
+    try testing.expectEqual(@as(?effort_mod.Effort, null), effort_mod.selectEffort(effort_mod.effortArms("glm5_next").?, .off));
+    try testing.expectEqual(@as(?effort_mod.Effort, null), effort_mod.selectEffort(effort_mod.effortArms("qwen4_exp").?, .minimal));
     // A model loaded on demand never fails its load over the flag.
     effort_mod.think_effort_flag = .on;
     if (loadWeightsForConfig(testing.io, testing.allocator, "/nonexistent/sushi-think-gate", &qwen, false)) |w| {
@@ -4608,8 +4645,9 @@ fn pinValue(w: *std.Io.Writer, comptime T: type, v: T, d: ?T, name: []const u8) 
         .@"struct" => |info| inline for (info.field_names) |f| {
             var buf: [192]u8 = undefined;
             const sub = try std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ name, if (name.len > 0) "." else "", f });
-            // The parse's wide arms guess this GPU's class (`gemmNaxOn`): a box-dependent value, never the config text's.
-            if (comptime !std.mem.eql(u8, f, "arch") and !std.mem.eql(u8, f, "wide_arms"))
+            // The parse's wide arms guess this GPU's class (`gemmNaxOn`): a box-dependent value, never the config text's;
+            // a load's ledger is the load's, set after the parse.
+            if (comptime !std.mem.eql(u8, f, "arch") and !std.mem.eql(u8, f, "wide_arms") and !std.mem.eql(u8, f, "static_ledger"))
                 try pinValue(w, @FieldType(T, f), @field(v, f), if (d) |dd| @field(dd, f) else null, sub);
         },
         .@"union" => try w.print("{s}={any}\n", .{ name, v }),

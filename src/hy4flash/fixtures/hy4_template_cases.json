@@ -1,0 +1,176 @@
+{
+ "generator": "tests/dump_hy4_template.py: transformers c2ec8505 apply_chat_template",
+ "cases": [
+  {
+   "label": "system and user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "hi"
+    }
+   ],
+   "thinking": true,
+   "sends": null,
+   "preserve": false,
+   "want": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>Be brief.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "label": "history thinking is dropped without tools",
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "add them"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "thinking": true,
+   "sends": null,
+   "preserve": false,
+   "want": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>and 3+3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "label": "preserved thinking keeps history thinking",
+   "preserve": true,
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "add them"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "thinking": true,
+   "sends": null,
+   "want": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>add them</think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>and 3+3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "label": "no_think keeps history think tags empty",
+   "thinking": false,
+   "messages": [
+    {
+     "role": "user",
+     "content": "2+2?"
+    },
+    {
+     "role": "assistant",
+     "content": "4",
+     "reasoning_content": "add them"
+    },
+    {
+     "role": "user",
+     "content": "and 3+3?"
+    }
+   ],
+   "sends": null,
+   "preserve": false,
+   "want": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>and 3+3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+  },
+  {
+   "label": "tools, a call and its result",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "You help."
+    },
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning_content": "use the tool",
+     "tool_calls": [
+      {
+       "id": "call_1",
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Paris\"}"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "{\"temp\": 18}",
+     "tool_call_id": "call_1"
+    }
+   ],
+   "thinking": true,
+   "sends": null,
+   "preserve": false,
+   "want": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nYou help.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>use the tool</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Paris</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>{\"temp\": 18}</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "label": "max effort with tools",
+   "effort": "max",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather for a city.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Paris?"
+    }
+   ],
+   "thinking": true,
+   "sends": "max",
+   "preserve": false,
+   "want": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Weather for a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Paris?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  }
+ ]
+}

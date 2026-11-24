@@ -1170,18 +1170,7 @@ const REDUCE_EXPAND_STORE: [:0]const u8 =
     \\}
 ;
 
-const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
-    REDUCE_FUSED_SOURCE,
-    "const float scv = 0.08838834764831845f;",
-    REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"),
-    "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));",
-    REDUCE_EXPAND_STORE),
-    "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));",
-    ""),
-    "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));",
-    ""),
-    "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));",
-    "");
+const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const float scv = 0.08838834764831845f;", REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", REDUCE_EXPAND_STORE), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", ""), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", ""), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "");
 
 /// One for MLX's streams and one for the engine's: an array belongs to the side that made it.
 var unit_score: @import("side_cache.zig").SideCache(void, 1) = .{};
@@ -1636,8 +1625,8 @@ pub var prefill_chains: u64 = 0;
 
 fn logEngaged(arm: enum { decode, prefill }, rb: *const Ragged, pair: usize, down: usize) void {
     if (arm == .prefill) prefill_chains += 1;
-    if (engaged[@intFromEnum(arm)]) return;
-    engaged[@intFromEnum(arm)] = true;
+    if (engaged[@backingInt(arm)]) return;
+    engaged[@backingInt(arm)] = true;
     if (@import("builtin").is_test) return;
     switch (arm) {
         .decode => log.info("[exl3-groups] decode engaged groups={d} pair classes={d} down classes={d}\n", .{ rb.count, pair, down }),
@@ -2058,15 +2047,22 @@ pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged,
 
 /// `moePrefillClamped`, keeping each pool's gate and up planes in `early`.
 pub fn moePrefillEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, early: ?*EarlyPlanes) !mlx.mlx_array {
-    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit);
+    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit, null);
+}
+
+/// `moePrefillEarly` returning its routed sum in `out_dtype` (the finish's reduce writes it, as the decode chain's
+/// does): f32 lets a caller that adds several routes' sums (a route split into expert groups) round once.
+pub fn moePrefillEarlyTo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, early: ?*EarlyPlanes, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit, out_dtype);
 }
 
 /// `moePrefillEarly` with the fill read group by group (`FillStages`), as `moePrefillSharedFusedStaged`.
 pub fn moePrefillStaged(s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, stages: FillStages) !mlx.mlx_array {
-    return moePrefillFrom(s, x, .{ .staged = stages }, slots, scores, topk, limit);
+    return moePrefillFrom(s, x, .{ .staged = stages }, slots, scores, topk, limit, null);
 }
 
-fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int) !mlx.mlx_array {
+/// `out_dtype` null: the routed sum in x's dtype.
+fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, out_dtype: ?mlx.mlx_dtype) !mlx.mlx_array {
     const rb = try src.bank();
     const rows = mlx.getShape(x)[0];
     const n = rows * topk;
@@ -2095,7 +2091,7 @@ fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: 
     defer _ = mlx.mlx_array_free(mid);
     const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win, null);
     defer _ = mlx.mlx_array_free(d);
-    return sorted_windows.finishSortedInverse(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, mlx.mlx_array_dtype(x));
+    return sorted_windows.finishSortedInverse(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, out_dtype orelse mlx.mlx_array_dtype(x));
 }
 
 // ---- Prefill with the shared expert riding the routed launches ----
@@ -2130,36 +2126,13 @@ const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalR
     kernels.MID_SOURCE,
     "const uint eid = uint(slots[slot]);",
     "",
-), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"),
-    "v = float4(float(iu[xb + lane]),",
-    "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"),
-    "if constexpr (CLAMP_LIMIT > 0) {",
-    "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"),
-    "const float h0 = silu0 * u0;",
-    "const float h0 = float(bfloat16_t(silu0 * u0));"),
-    "const float h1 = silu1 * u1;",
-    "const float h1 = float(bfloat16_t(silu1 * u1));"),
-    "const float h2 = silu2 * u2;",
-    "const float h2 = float(bfloat16_t(silu2 * u2));"),
-    "const float h3 = silu3 * u3;",
-    "const float h3 = float(bfloat16_t(silu3 * u3));");
+), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"), "v = float4(float(iu[xb + lane]),", "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"), "if constexpr (CLAMP_LIMIT > 0) {", "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"), "const float h0 = silu0 * u0;", "const float h0 = float(bfloat16_t(silu0 * u0));"), "const float h1 = silu1 * u1;", "const float h1 = float(bfloat16_t(silu1 * u1));"), "const float h2 = silu2 * u2;", "const float h2 = float(bfloat16_t(silu2 * u2));"), "const float h3 = silu3 * u3;", "const float h3 = float(bfloat16_t(silu3 * u3));");
 
 const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
 
 /// `REDUCE_FUSED_SOURCE` over a sorted down plane: the routed slot's row is `inverse[slot]`, and the sum is the f32 add
 /// of the routed bf16 sum and the shared bf16 result, stored f32 (the add the forward makes after both).
-const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
-    REDUCE_FUSED_SOURCE,
-    "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;",
-    "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"),
-    "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));",
-    "y[yb + lane] = float(T(a0)) + float(ST(b0));"),
-    "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));",
-    "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"),
-    "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));",
-    "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"),
-    "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));",
-    "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
+const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;", "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", "y[yb + lane] = float(T(a0)) + float(ST(b0));"), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
 
 /// `PREFILL_REDUCE_SOURCE` reading a routed row from the plane of its rate group (`inner0..`).
 const PREFILL_REDUCE_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
@@ -2227,7 +2200,7 @@ fn prefillFused(stage: PrefillStage, g: PrefillGeo) !PrefillFused {
     defer arena.deinit();
     const alloc = arena.allocator();
     const p = try prefillParts(alloc, stage, g);
-    const slot = &prefill_fused_kernels[@intFromEnum(stage)];
+    const slot = &prefill_fused_kernels[@backingInt(stage)];
     const kernel = slot.* orelse blk: {
         const src = try fuse.sourceRuntime(alloc, p.a, p.b);
         const head = try fuse.header(alloc, p.a, p.b);
@@ -2749,6 +2722,7 @@ fn toF32(s: mlx.mlx_stream, a: mlx.mlx_array, out: *mlx.mlx_array) ![]const f32 
 /// The served codebooks at their pack windows; PAIR1's rates are its rows.
 const CODEBOOKS = [_]exl3.Decode{
     .{ .codebook = .mcg, .window = .w16 },
+    .{ .codebook = .alpha, .window = .w15 },
     exl3.Decode.tabled(.spec1, .w15),
     exl3.Decode.tabled(.std1, .w15),
     .{ .codebook = .pair1, .window = .w16 },
@@ -2794,7 +2768,7 @@ test "exl3 rate groups: a slot's planes keep their bytes at the rates outside K1
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    kernels.setDecodeParams(exl3.Decode.tabled(.spec1, .w15));
+    kernels.setDecodeParams(.{ .codebook = .alpha, .window = .w15 });
     defer kernels.setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();

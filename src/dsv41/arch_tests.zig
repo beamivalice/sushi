@@ -24,10 +24,7 @@ pub const tests = .{
     @import("dsv41_kernels.zig"),
     @import("kld_capture.zig"),
     @import("dsv41_thought_point.zig"),
-    @import("repack.zig"),
     @import("repack_test.zig"),
-    @import("repack_stamp.zig"),
-    @import("repack_stamp_test.zig"),
     @import("arch.zig"),
     @import("dsv41_sched.zig"),
     @import("dsv41_scope.zig"),
@@ -35,8 +32,6 @@ pub const tests = .{
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.
 pub const host_tests = .{
-    @import("tokenizer_deepseek.zig"),
-    @import("row_grammar.zig"),
     @import("dsv41_bills_test.zig"),
     @import("dsv41_flags_test.zig"),
     @import("dsv41_replay_test.zig"),

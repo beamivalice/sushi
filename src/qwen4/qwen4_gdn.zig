@@ -2805,13 +2805,17 @@ pub fn gatedDeltaNetProjected(
         defer _ = mlx.mlx_array_free(flat);
         if (self.spec_capture_ssm) {
             // Rollback slices the conv INPUT, as the chain stashes it.
-            var conv_input = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(conv_input);
-            const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
-            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s));
+            const conv_input = blk: {
+                var made = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(made);
+                const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
+                const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+                defer _ = mlx.mlx_vector_array_free(vec);
+                try mlx.check(mlx.mlx_concatenate_axis(&made, vec, 1, self.s));
+                break :blk made;
+            };
             if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+            // The state holds the capture from here: a failure below leaves it the state's to release.
             ssm.spec_conv_input = conv_input;
             if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
             ssm.spec_state_seq = .{ .ctx = null };

@@ -58,7 +58,7 @@ A `--contended` number is a smoke, never a recorded baseline.
 ## Adding a bench
 
 - A bench is a `report.Bench` entry in the registry (`src/ubench_main.zig`): name `<scope>.<what>` (scope `qwen4`,
-  `mimo2`, `glm5`, `dsv41`, `enc` or `shared`), kind (kernel on synthetic tensors, or pack), unit, steps, axes, arms,
+  `mimo2`, `glm5`, `dsv41`, `hy4`, `enc` or `shared`), kind (kernel on synthetic tensors, or pack), unit, steps, axes, arms,
   reference arm, opts, and a body.
 - The body calls `run.interleave(label, ctx, f)` per rung, then `run.metric` / `run.invalid`. Chains of dependent calls
   come from `src/exl3_ubench/bench_util.zig`, so launch latency counts as it does in a forward.
@@ -76,9 +76,12 @@ A `--contended` number is a smoke, never a recorded baseline.
 | `shared.exl3_grouped_decode` | shared | the decode chain at 1 to 8 rows with verify rows sharing expert reads: ungrouped, prepared, pairs, sized member capacity, on Flash-Next and DeepSeek geometry |
 | `shared.exl3_moe_layer` | shared | a Flash-Next MoE layer (E512, K4, top-10) on MUL1, MCG, STD1, SPEC1 and PAIR1 against MLX's affine-4 `gather_qmm` x3, from 1 to 2048 rows |
 | `shared.exl3_prefill_gemm` | shared | the sorted prefill GEMM of one projection at Flash-Next and MiMo shapes: served body against the reference body, a rate against n32 and n64, by slot count |
-| `shared.exl3_trunk_rows` | shared | DeepSeek-V4.1 trunk linears by width (1 to 256 rows) over distinct banks: the served arm, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor |
+| `shared.exl3_trunk_rows` | shared | DeepSeek-V4.1 (n64; `wq_b_k5`, `wo_a_k5`, `wo_b_k5` at n80) and Flash-Next (`qwen_*_k4`, `qwen_*_k6`) trunk linears by width (1 to 256 rows) over distinct banks: the served arm, NAX at every width, the indexed GEMV, mxfp8, affine-4 and a streaming floor |
 | `shared.exl3_trunk_launches` | shared | Flash-Next's trellis trunk launches (GDN qkv+z, out, attention q+k+v, o, indexer, shared gate+up, down; lm_head at K6) at K4 and K6, 1 to 8 rows, as served (`rows_exact`, stacked parts one launch) against the affine-8 `quantized_matmul` per part they replace, the one-tile 64-bit NAX walk (`walk1`) and the walk with each window loading its own words (`own`), whose bytes must equal the served arm's and a streaming floor; one link floor per rung |
+| `shared.exl3_trunk_hy4` | shared | Hy4-Flash's K6 trellis trunk launches (sliding and sparse q_a, q_b, gate, o; latent down/up; dense layer 0; head), 1 to 8 rows: the bare exact launch, `hy4_stq.apply` as it was (`hy4`: f32 rows cast to bf16, the launch, cast back) and as it is (`thru`: the rounding inside the launch), whose bytes must equal it, each also with the f32 rms norm after it (`hy4_norm`, `thru_norm`: the norm in the finish where the row fits one threadgroup), and a streaming floor |
 | `shared.exl3_trunk_prefill` | shared | one Flash-Next trunk projection at prefill width (32 to 4096 rows, K4 and K6): the sorted GEMM, the decoded path (served from 1024 rows), affine-8 `quantized_matmul` and a dense bf16 matmul ceiling, with TFLOP/s |
+| `hy4.span_linears` | hy4 | a Hy4-Flash layer's attention gate and `W_o` through trellis banks (K4, K6) over a 1,024- or 4,096-row chunk: one launch of each per attention span (256 rows sliding, 32 gathered) against one over the chunk, with TFLOP/s |
+| `hy4.attn_core` | hy4 | one Hy4-Flash layer's attention core over a prefill chunk ending at 32K keys on Sushi Cooler's stream at f32: the served per-span chain over kv8 keys (sliding 256-row spans over S + 511 keys, gathered 32-row spans of 2,048 picks a row) against its useful work as four batched GEMMs (f32, bf16) and a read of the bytes it must read; ms per layer, useful TFLOP/s |
 | `glm5.routed_t1` | glm5 | GLM's one-row routed chain (E288, n36 and n40, MCG w14) up to each phase, per layer: lane GEMVs against the one-row cooperative ones |
 | `dsv41.index_decode` | dsv41 | a decode block's indexer stages over packed keys (scores on the scalar and the integer matrix kernel, the candidate-block gather on both, mask applied, top-512, candidate-source blocks, scores + top-k), by keys and rows; the setup refuses a matrix arm that differs by a bit |
 | `dsv41.index_peak` | dsv41 | one wide span's indexer, whole scores against the streamed top-k, by context; MLX peak beyond the inputs in MB, reported as the lowest and the highest over the rounds (when freed buffers are released varies from run to run, so the floor and the worst case differ; a bill covers the worst) |

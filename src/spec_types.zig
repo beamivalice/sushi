@@ -50,6 +50,12 @@ pub const CommittedArgmax = struct {
         return self.arr;
     }
 
+    /// The realized ids, `vocab` wide, as a readback that steers no shape (`mlx.hostResult`); the caller must have
+    /// evaluated `lazy()` first.
+    pub fn result(self: CommittedArgmax, len: usize, vocab: u32) ![]const i32 {
+        return (try mlx.hostResult(i32, self.arr, vocab))[0..len];
+    }
+
     /// The realized ids; the caller must have evaluated `lazy()` first.
     pub fn ids(self: CommittedArgmax, len: usize) ![]const i32 {
         const data = mlx.mlx_array_data_int32(self.arr) orelse return error.MlxArrayDataNull;

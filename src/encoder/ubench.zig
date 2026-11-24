@@ -106,7 +106,7 @@ fn searchSample(c: SearchRung, _: usize) anyerror!f64 {
     const rate: format.Rate = .{ .n = 40 };
     const dec: format.Decode = .{ .codebook = .mcg, .window = .w15 };
     const t0 = stages.nowNs();
-    for (0..c.steps) |_| try metal_search.encodeTiles(std.heap.page_allocator, c.s, rate, dec, c.tiles, c.packed_out, c.recon);
+    for (0..c.steps) |_| try metal_search.encodeTiles(std.heap.page_allocator, c.s, rate, dec, c.tiles, c.packed_out, c.recon, @import("encode.zig").full_pin_pass);
     const dt = stages.nowNs() - t0;
     return @as(f64, @floatFromInt(dt)) / @as(f64, @floatFromInt(c.steps * SEARCH_TILES));
 }

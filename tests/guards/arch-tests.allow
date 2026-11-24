@@ -29,13 +29,15 @@ GLM release defaults advertise the full context at the widest prefill chunk that
 GLM requests prefill at 2048 and step down a rung only where a chunk stops fitting
 GLM serves PAIR1 on group2's routed chain with the unfolded oracle's bytes
 GLM serves PAIR1 on the prefill grid with the unfolded sorted chain's bytes
+GLM serves alpha on the prefill grid and probes a failing kernel once per codebook and window
 GLM serves spec1 on group2's routed chain with the unfolded oracle's bytes
 GLM serves spec1 on the prefill grid with the unfolded sorted chain's bytes
-GLM serves std1 on the prefill grid and probes a failing kernel once per codebook and window
 GLM serving accepts native effort levels and thinks by default
 GLM serving memory bills one latent at the request's KV width and pooled index per token
 GLM serving template receives low high max without a derived reasoning budget
 GLM vision serving processor carries image and video token budgets without M-RoPE
+Hy4's template teaches GLM's arg_key calls under its :opensource spelling
+Hy4's tokenizer.json pre-tokenizer is read as DeepSeek's grammar
 MiMo EXL3 streaming CPU accepts budgets and preserves the resident default
 MiMo EXL3 streaming CPU geometry ledger and slab ids cross the dense prefix
 MiMo EXL3 streaming CPU slab capacities preserve resident kernel arms
@@ -62,7 +64,12 @@ an SSD tier bounds the checkpoints a Qwen prefill holds, at both GDN widths
 an unloaded qwen4 stub is text-only only when the checkpoint must stream
 applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config
 bf16 slab kernels hold parity at the Qwen3.8-Flash-Next expert geometry
+capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): a re-rounded trunk writes every layer's and the head's linears, the pack it makes reproduces the streamed boundaries, and the taps see exactly the forward's inputs without changing it
+capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): an STQ trunk keeps the pack's experts byte for byte, writes banks whose dense twin reproduces the streamed boundaries, and keeps what the trellis cannot hold
+capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): the BF16 path's rows at the PLE layer read the source's n-gram shards, not the pack's table
+capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): the in-run BF16 boundaries are the BF16 slice's own layer outputs, every stream, under a reordered router
 capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): the layer-streamed capture of a real four-layer slice reproduces the full forward's hidden boundaries, MLP input rows, routing and Hessians
+capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS_DIR): windows of one length forwarded as one batch give each window's own boundaries and MLP rows
 capture: a calibration window's forward runs on the cut Qwen pack, bound at the window's rows (QWEN4_TEST_MODEL)
 characterization: a sidecar boot's width-trial SCHEDULE re-reads its period like qwen4
 chat: Qwen's late-system edit reaches only a Qwen-typed config, never another arch's or an untyped one
@@ -116,10 +123,17 @@ cooler contract: every exit of a DeepSeek pool's release, read-back and heal, on
 cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit
 cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)
 cooler contract: three DeepSeek DSpark requests decoding at once run as joined plain rows, each its solo DSpark text greedy and seeded, and the one left alone drafts again
+deepseek pre-tokenizer: a split that runs out of memory at any allocation frees all it made
+deepseek pre-tokenizer: digits, CJK and the punctuation grammar split as HF's Splits do
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
 deepseek_v41 thinks by default, at its native high effort
 deepseek_v41: the image token spelled in a text-only prompt is text, with no placeholder check
 driver: a tiny Qwen source becomes a complete pack, and a second run into it is refused
+dsv41 convert: a DSpark trunk with no rate of its own is written at the trunk's (DSV41_STQ_SRC)
+dsv41 convert: a real layer shard decodes to its source weights and keeps the routed rows' outputs (DSV41_RT_PACK)
+dsv41 convert: a stopped run resumed writes the pack an uninterrupted run writes (DSV41_STQ_SRC)
+dsv41 convert: a tiny checkpoint's layer-major capture converts end to end into a pack the engine serves (DSV41_STQ_SRC)
+dsv41 convert: the trunk, DSpark trunk and DSpark expert rates a run names are the rates its shards stamp and the engine serves (DSV41_STQ_SRC)
 dsv41 geometry: the grouped chain at 5120x2304 over n24, n26 and a mixed class holds the f32-truth bar
 dsv41 geometry: the shared expert as a one-expert fused chain gives a row the same bytes at every decode width and holds the f32-truth bar
 effort off default: DeepSeek and GLM resolve and render as before
@@ -178,7 +192,6 @@ mimo_v2 streaming discovery validates MXFP4 headers without a PLE table
 mimo_v2 warm bill credits only the restored global rows, never the ring
 mimo_v2 with an SSD tier bills a restored global layer beside its first grow
 mimo_v2: a 64k prompt keeps 2048 rows at every chunk where its box has room
-model_settings: expert_cache_bias shows only for a DeepSeek or Qwen pack whose STQ experts stream
 mtpAdaptiveHeadEligible: the qwen4 head and MiMo's heads switch to serial, DSpark does not
 mtpLookupAllowed: the qwen4 and MiMo heads, also at a pinned depth, never a batched head or a planner-owned round
 ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got
@@ -229,7 +242,9 @@ selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused
 selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays quiet
 server: a served cell runs on every arch whose fixture is present and notes the one it skips (DSV41_TINY)
 slice (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1, SUSHI_MODELS_DIR and ENCODER_SLICE_OUT): writes a layers-by-experts slice for conversion runs
+source: DeepSeek-V4.1 FP4 experts (I8 e2m1 pairs, F8_E8M0 per 32) read as numpy dequantizes them
 source: SafetensorsSource streams per-expert public weights for Qwen, GLM and MiMo and refuses GGUF
+source: a DeepSeek-V4.1 FP8 linear (E4M3 codes, one E8M0 scale per 32 x 32 block) and a BF16 one read as public [in, out]
 spliceVisionRows: video placeholders are scattered like image rows (Qwen video_token_id)
 stock Qwen adapter leaves prompts without late notes byte-identical, tools, thinking and media included
 stock Qwen adapter: a late note between media turns renders in place
@@ -250,6 +265,7 @@ thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only th
 thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on
 thinking policy launch defaults are model-specific and preserve GLM high
 towerFitFault bills a MiMo image by the MiMo-ViT's measured scratch, not score sheets
+trunk stq: a tensor rounds to the bytes the DeepSeek-V4.1 trunk's search gives on the same Gram, and its dense twin is what the kernels apply
 yarn correction range for the qwen4_exp geometry
 yarn inv_freq matches HF _compute_yarn_parameters (qwen4_exp 262k -> 1M)
 zcode starts MiMo thinking, its own default
