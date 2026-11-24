@@ -34,6 +34,8 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - A parity test between two engines (Sushi Cooler against MLX, a kernel against its replaced kernel) once the new
   one is proven: it proves a fact, then repeats it on every run and catches nothing. It goes in the landing that
   proves it, with its numbers in the commit; the oracle tests against a reference model stay.
+  A fused kernel's cell against the MLX op chain at release shapes stays (owner, 2026-11-25): the op chain is its
+  reference, it costs milliseconds, and no tiny fixture reaches release shapes.
 - A reference parity test of a part that changes speed and never text (a drafter, an MTP head) once it is proven:
   its error costs acceptance, which the bench reads, and the spec-equals-serial test holds the output. Nor a
   fixture whose reference ran on a state our own engine dumped: it pins that code's past rounding, not the truth.
