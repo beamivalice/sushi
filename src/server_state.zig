@@ -15,6 +15,62 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 /// Global flag set by signal handler for graceful shutdown.
 pub var shutdown_requested = std.atomic.Value(bool).init(false);
 
+var shutdown_wake_state = std.atomic.Value(u8).init(0);
+var shutdown_wake_read = std.atomic.Value(std.posix.fd_t).init(-1);
+var shutdown_wake_write = std.atomic.Value(std.posix.fd_t).init(-1);
+
+/// A self-pipe that a shutdown writes so the accept loop and connection waits wake at once instead of at their poll
+/// timeout; the write end is safe to use from the signal handler.
+pub fn ensureShutdownWake() std.posix.fd_t {
+    while (true) {
+        switch (shutdown_wake_state.load(.acquire)) {
+            2 => return shutdown_wake_read.load(.acquire),
+            3 => return -1,
+            1 => std.atomic.spinLoopHint(),
+            else => {
+                if (shutdown_wake_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) continue;
+                var fds: [2]std.posix.fd_t = undefined;
+                if (std.c.pipe(&fds) != 0) {
+                    shutdown_wake_state.store(3, .release);
+                    return -1;
+                }
+                const nonblock: usize = @as(u32, @bitCast(std.c.O{ .NONBLOCK = true }));
+                for (fds) |fd| {
+                    _ = std.posix.system.fcntl(fd, std.posix.F.SETFD, @as(usize, std.posix.FD_CLOEXEC));
+                    const fl = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+                    if (fl >= 0) _ = std.posix.system.fcntl(fd, std.posix.F.SETFL, @as(usize, @intCast(fl)) | nonblock);
+                }
+                shutdown_wake_read.store(fds[0], .release);
+                shutdown_wake_write.store(fds[1], .release);
+                shutdown_wake_state.store(2, .release);
+                return fds[0];
+            },
+        }
+    }
+}
+
+pub fn shutdownWakeReadFd() std.posix.fd_t {
+    return shutdown_wake_read.load(.acquire);
+}
+
+pub fn wakeShutdown() void {
+    const wfd = shutdown_wake_write.load(.acquire);
+    if (wfd < 0) return;
+    const b = [_]u8{1};
+    _ = std.posix.system.write(wfd, &b, 1);
+}
+
+pub fn drainShutdownWakeIfNotRequested() void {
+    const rfd = shutdown_wake_read.load(.acquire);
+    if (rfd < 0) return;
+    var buf: [64]u8 = undefined;
+    while (!shutdown_requested.load(.acquire)) {
+        const rc = std.posix.system.read(rfd, &buf, buf.len);
+        if (rc <= 0) break;
+    }
+    if (shutdown_requested.load(.acquire)) wakeShutdown();
+}
+
 pub var completion_id_counter = std.atomic.Value(i64).init(0);
 
 /// The cap in bytes on an HTTP request and a WebSocket message. The settings API changes it while serving; each reads it once.
@@ -87,6 +143,8 @@ pub const ServerConfig = struct {
     embedded_client: ?*const fn () anyerror!std.Thread = null,
     /// A test build's server names the side its loads run on (`cooler_side.forTest`); null keeps a test's MLX.
     test_on_cooler: ?bool = null,
+    /// A test build's cold loads skip the served warm sweep (`cooler_warm.warmServed`); a release build ignores it.
+    test_skip_warm: bool = false,
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
     /// Request timeout in seconds (0 = no timeout). `--timeout N`.

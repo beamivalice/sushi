@@ -139,6 +139,10 @@ var touch_scratch: ?Buffer = null;
 /// Passes `Device.touch` has handed over.
 pub var touches: u64 = 0;
 
+pub fn touchesCount() u64 {
+    return @atomicLoad(u64, &touches, .acquire);
+}
+
 fn addSet(dev: *const Device, kind: Kind) ?u8 {
     if (n_sets == max_sets) return null;
     var ns_error: id = null;
@@ -330,7 +334,7 @@ pub const Device = struct {
         send(void, blit, "endEncoding", .{});
         commitSets();
         send(void, cmd, "commit", .{});
-        touches += 1;
+        _ = @atomicRmw(u64, &touches, .Add, 1, .release);
     }
 
     pub fn fence(dev: *const Device) Error!Fence {

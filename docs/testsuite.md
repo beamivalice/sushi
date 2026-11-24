@@ -356,6 +356,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A server scenario under concurrency (requests racing a delete, a shutdown or an unload) runs in process through
   `src/server_test.zig`: `serve` with an embedded client, each arch's servable tiny (`cooler_contract.serverDir`) on
   Sushi Cooler, socketpair connections, an allocator that poisons what it frees.
+  A scenario waits on the event it needs (a registry or scheduler state, a closed connection, the GPU warm tick),
+  never a fixed sleep; its cold loads skip the served warm sweep (`test_skip_warm`, test builds only: the `cooler
+  contract` load tests cover the warm) and its unloads the wired-pages wait (`unwire_wait_max_ms`).
   A scenario that fails while a connection thread still loads leaves `serve` with `ConnectionsOutliveShutdown` and no
   teardown: the harness prints the scenario's error beside it and ends the process, as `main` does, since freeing under
   the live scheduler and inference thread is undefined (a segfault that hid the cause).

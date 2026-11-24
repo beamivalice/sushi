@@ -1167,6 +1167,9 @@ pub const Scheduler = struct {
     inference_thread: ?std.Thread,
     /// `ServerConfig.test_on_cooler`, for the cold loads (read in test builds only).
     test_on_cooler: ?bool = null,
+    /// `ServerConfig.test_skip_warm`, for the cold loads (read in test builds only).
+    test_skip_warm: bool = false,
+    budget_revise_gen: std.atomic.Value(u64) = .init(0),
     shutdown: std.atomic.Value(bool),
     /// Set by `beginShutdown`, the first step of a shutdown (queue_mu): from here no new request, load, image encode,
     /// unload or cache job is taken, while the inference thread still settles what was already in flight.
@@ -1888,7 +1891,7 @@ pub const Scheduler = struct {
             .drafter_dir = model_load.coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
             .no_drafter = self.no_drafter,
             .load_vision = model_load.coldLoadVision(owned.config, false),
-            .warmup_eager = true,
+            .warmup_eager = if (comptime @import("builtin").is_test) !self.test_skip_warm else true,
             .kv_quant = self.kv_quant,
             // Cold loads get the SAME prefix-cache configuration as the
             // startup model — pre-plumbing these were (1, 0, stride 0),
@@ -2255,6 +2258,7 @@ pub fn hotCacheMemForLoad(
 /// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
 /// entries are excluded from the read so a full cache cannot ratchet itself down.
 fn reviseHotCacheBudgets(sch: *Scheduler) void {
+    defer _ = sch.budget_revise_gen.fetchAdd(1, .release);
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
@@ -2448,6 +2452,12 @@ fn rearmDeclinedTiers(sch: *Scheduler) void {
 /// thread keeps the GPU awake. Left idle, the driver drops the resident set's state, and the next
 /// submission then waits before any work runs (docs/server-lifecycle.md#threads).
 pub var gpu_warm_secs: u32 = 60;
+pub var gpu_warm_tick_ns: u64 = sched_policy.GPU_WARM_TICK_NS;
+
+pub fn effectiveGpuWarmParkNs(idle_ns: ?u64, window_ns: u64) ?u64 {
+    const park = gpuWarmParkNs(idle_ns, window_ns) orelse return null;
+    return @min(park, gpu_warm_tick_ns);
+}
 const gpuWarmTickDue = sched_policy.gpuWarmTickDue;
 const gpuWarmParkNs = sched_policy.gpuWarmParkNs;
 const gpuWarmBeforePark = sched_policy.gpuWarmBeforePark;
@@ -2634,7 +2644,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             while (!hasWorkPendingLocked(sch) and !rearmCheckDue(sch) and !sch.shutdown.load(.acquire)) {
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(false);
-                if (gpuWarmParkNs(if (warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
+                if (effectiveGpuWarmParkNs(if (warm_since) |sw| sw.read() else null, warm_ns)) |park_ns| {
                     const timed_out = if (sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{
                         .raw = .fromNanoseconds(@intCast(park_ns)),
                         .clock = .awake,

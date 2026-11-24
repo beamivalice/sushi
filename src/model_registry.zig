@@ -797,6 +797,7 @@ pub const ModelRegistry = struct {
     state_cond: std.Io.Condition,
     /// A shutdown was asked: every wait on `state_cond` returns `error.Shutdown` instead of waiting (`beginShutdown`).
     shutting_down: std.atomic.Value(bool) = .init(false),
+    state_waiters: std.atomic.Value(u32) = .init(0),
     /// Disk reads begun (a rescan's walk, one folder's probe), numbered under `mutex` before they read: two rescans
     /// at once walk outside the lock, so the older read must never apply over the newer.
     reads_begun: u64 = 0,
@@ -1516,6 +1517,8 @@ pub const ModelRegistry = struct {
     /// entries may never change again.
     pub fn waitStateChangeLocked(self: *ModelRegistry) error{Shutdown}!void {
         if (self.shutting_down.load(.acquire)) return error.Shutdown;
+        _ = self.state_waiters.fetchAdd(1, .acq_rel);
+        defer _ = self.state_waiters.fetchSub(1, .acq_rel);
         self.state_cond.waitUncancelable(self.io, &self.mutex);
     }
 

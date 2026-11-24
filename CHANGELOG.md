@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A server that is asked to stop closes its connections at once** instead of after its next poll (up to a second).
 - **sushibar's menu bar icon shows the model, not just the server**: a grey outline fish while the server runs with no model, an orange outline while a model loads, and the filled sushi once it is ready.
 - **DeepSeek prefill 3.4-6.5% faster on both STQ packs**: attention writes each span straight into the projection's input instead of copying the spans together, and its packed key tiles share row ids within a SIMD group.
 - **DeepSeek with DSpark picks its draft rounds better, up to 14% faster decode with the same text**: a low-confidence draft no longer buys a verify row, drafts shorten while they keep missing, and prompt copies need a second occurrence in the history (M5 Ultra, 1.75bpw code 149 to 170 / 160 to 179 tok/s at 4k / 8k, 2.7bpw prose 66 to 70 / 86 to 90).

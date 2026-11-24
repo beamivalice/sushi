@@ -255,6 +255,9 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
     loads_first = !needs.cold;
     scenario_limit_ms = if (needs.cold or needs.loads or needs.tiny2) load_limit_ms else if (needs.decodes) decode_limit_ms else read_limit_ms;
     failed = null;
+    const unwire_was = model_load.unwire_wait_max_ms;
+    model_load.unwire_wait_max_ms = 0;
+    defer model_load.unwire_wait_max_ms = unwire_was;
     const prev_max = server_state.max_concurrent;
     server_state.max_concurrent = max_concurrent;
     defer server_state.max_concurrent = prev_max;
@@ -265,6 +268,7 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
         .on_ready = if (needs.listener) startClientOnReady else null,
         .request_timeout_sec = 300,
         .test_on_cooler = true,
+        .test_skip_warm = true,
     }) catch |err| {
         // The scenario's own error is the cause when it failed first: a shutdown it asked on the way out is what
         // serve then failed to drain.
@@ -564,10 +568,10 @@ fn completionBody(buf: []u8, text: []const u8, n: u32, stream: bool) ![]const u8
 /// Polls `done` every 10 ms for at most `ms`; whether it came.
 fn within(ms: u32, done: *const fn () bool) bool {
     var waited: u32 = 0;
-    while (!done()) : (waited += 10) {
+    while (!done()) : (waited += 1) {
         if (waited >= ms) return false;
         var none = [_]std.posix.pollfd{};
-        _ = std.posix.poll(&none, 10) catch {};
+        _ = std.posix.poll(&none, 1) catch {};
     }
     return true;
 }
@@ -715,18 +719,18 @@ fn behindAStalledReader(ms: u32) ![2][]u8 {
     for (&asked, 0..) |*q, i| {
         threads[i] = try std.Thread.spawn(.{}, Asked.run, .{q});
         // The unload has marked the model before the other request asks for it.
-        if (i == 0) while (!unloadPending()) : (waited += 10) {
+        if (i == 0) while (!unloadPending()) : (waited += 1) {
             if (waited >= ms) break;
             var none = [_]std.posix.pollfd{};
-            _ = std.posix.poll(&none, 10) catch {};
+            _ = std.posix.poll(&none, 1) catch {};
         };
     }
     var unclaimed: u32 = 0;
-    while (!(asked[0].done.load(.acquire) and asked[1].done.load(.acquire)) and waited < ms and unclaimed < claim_ms) : (waited += 10) {
+    while (!(asked[0].done.load(.acquire) and asked[1].done.load(.acquire)) and waited < ms and unclaimed < claim_ms) : (waited += 1) {
         var none = [_]std.posix.pollfd{};
-        _ = std.posix.poll(&none, 10) catch {};
+        _ = std.posix.poll(&none, 1) catch {};
         const behind_waits = asked[0].done.load(.acquire) and !asked[1].done.load(.acquire);
-        unclaimed = if (behind_waits and tinyState() == .unloaded) unclaimed + 10 else 0;
+        unclaimed = if (behind_waits and tinyState() == .unloaded) unclaimed + 1 else 0;
     }
     const wedged = !asked[1].done.load(.acquire);
     // The stall ends here either way, so the threads end.
@@ -789,6 +793,10 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
             for (asked) |q| if (!q.done.load(.acquire)) return false;
             return true;
         }
+        fn behindWaiting() bool {
+            const reg = server_state.global_registry.?;
+            return reg.state_waiters.load(.acquire) >= 2 or asked[1].done.load(.acquire) or asked[2].done.load(.acquire);
+        }
         fn run() !void {
             var b: [2][512]u8 = undefined;
             gpa.free(try request("POST", "/v1/completions", try completionBody(&b[0], "hi", 2, false)));
@@ -804,8 +812,7 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
             var behind: [2]std.Thread = undefined;
             for (&behind, asked[1..]) |*t, *q| t.* = try std.Thread.spawn(.{}, Asked.run, .{q});
             // The requests reach their wait behind the unload before the shutdown is asked.
-            var none = [_]std.posix.pollfd{};
-            _ = std.posix.poll(&none, 300) catch {};
+            const waited_behind = within(5000, behindWaiting);
             server.requestShutdown();
             const answered = within(2000, allDone);
             _ = std.c.shutdown(stalled, std.posix.SHUT.RDWR);
@@ -813,6 +820,7 @@ test "server: a shutdown during an unload's drain ends the unload and the reques
             for (behind) |t| t.join();
             defer for (asked) |q| gpa.free(q.out);
             if (!marked) return error.UnloadNeverMarked;
+            if (!waited_behind) return error.BehindNeverWaited;
             if (!answered) return error.ShutdownLeftAWaiterUnanswered;
             // One shutdown error: the unload and the request behind it carry the same type too.
             const shutdown_type = "\"type\":\"" ++ http.shutting_down_type ++ "\"";
@@ -884,10 +892,15 @@ test "server: a load that fails after evicting the model in use leaves no view o
     for ([_]bool{ false, true }) |ram| {
         server_state.prefix_cache_ram_enabled = ram;
         try eachArch(4, .{ .tiny2 = true, .max_resident = 1 }, struct {
+            var revise_before: u64 = 0;
+            fn revisedAfterLoad() bool {
+                return server_state.global_scheduler.?.budget_revise_gen.load(.acquire) > revise_before;
+            }
             fn run() !void {
                 var b: [512]u8 = undefined;
                 gpa.free(try request("POST", "/v1/completions", try completionBody(&b, "the river runs to the sea and on and on", 8, false)));
                 const sch = server_state.global_scheduler.?;
+                revise_before = sch.budget_revise_gen.load(.acquire);
                 // The load of tiny2 evicts tiny, then fails at its first pool buffer.
                 mlx.engine.fault.arm(1);
                 const failed_load = try request("POST", "/v1/completions", "{\"model\":\"tiny2\",\"prompt\":\"hi\",\"max_tokens\":2}");
@@ -906,8 +919,7 @@ test "server: a load that fails after evicting the model in use leaves no view o
                 reg.mutex.unlock(reg.io);
                 if (!evicted) return error.VictimNotEvicted;
                 // The inference loop runs its post-load revise between jobs.
-                var none = [_]std.posix.pollfd{};
-                _ = std.posix.poll(&none, 200) catch {};
+                if (!within(5000, revisedAfterLoad)) return error.PostLoadReviseNeverRan;
                 if (sch.current_model == tiny or sch.hotPrefixCache() != null) return error.EvictedModelStillInView;
                 if (tiny.hot_gauge.resident.load(.monotonic) != 0) return error.EvictedModelHotCacheCredited;
                 gpa.free(try request("POST", "/v1/load-model", "{\"model\":\"tiny2\"}"));
@@ -1131,11 +1143,15 @@ test "server: a cold load asked while another model's load runs keeps --max-resi
             var first = Background{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}" };
             const t1 = try std.Thread.spawn(.{}, Background.run, .{&first});
             defer gpa.free(first.out);
-            var none = [_]std.posix.pollfd{};
-            _ = std.posix.poll(&none, 200) catch {};
+            const reached = within(5000, struct {
+                fn check() bool {
+                    return server_state.global_registry.?.state_waiters.load(.acquire) >= 1 or tinyState() != .unloaded;
+                }
+            }.check);
             LoadBodyHold.released.store(true, .release);
             t2.join();
             t1.join();
+            if (!reached) return error.ConcurrentLoadNeverReachedRegistry;
             reg.mutex.lockUncancelable(reg.io);
             const resident = reg.countLoadedLocked();
             reg.mutex.unlock(reg.io);
@@ -2104,7 +2120,11 @@ test "server: a shutdown while a body trickles, a chunked upload waits and a fra
             defer _ = std.c.close(a3);
             try sendAll(a3, &.{ 0x81, 0x80 | 20, 0, 0, 0, 0, '{', '"' });
             for ([_]std.posix.fd_t{ a1, a2, a3 }) |fd| try readLimit(fd, 5);
-            pause(200);
+            if (!within(5000, struct {
+                fn check() bool {
+                    return http_conn.Conn.awaitingReaders() >= 3;
+                }
+            }.check)) return error.ConnectionsNeverParked;
             server.requestShutdown();
             for ([_]std.posix.fd_t{ a1, a2 }, [_][]const u8{ "trickled body", "waiting chunked upload" }) |fd, what| {
                 const ms = try msUntilClosed(fd);
@@ -2136,7 +2156,11 @@ test "server: a Content-Length body read past the reader's buffer, then stalled,
             try req.appendSlice(gpa, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 40000\r\n\r\n{\"model\":\"tiny\",\"user\":\"");
             try req.appendNTimes(gpa, 'a', 30_000);
             try sendAll(fd, req.items);
-            pause(300);
+            if (!within(5000, struct {
+                fn check() bool {
+                    return http_conn.Conn.awaitingReaders() >= 1;
+                }
+            }.check)) return error.ConnectionNeverParked;
             server.requestShutdown();
             const ms = try msUntilClosed(fd);
             if (ms >= 4500) {
@@ -2473,6 +2497,7 @@ const Flood = struct {
     fd: std.posix.fd_t,
     bytes: []const u8,
     stop: std.atomic.Value(bool) = .init(false),
+    writes: std.atomic.Value(u32) = .init(0),
     /// Monotonic ms when a send first failed (the server closed); 0 while it takes bytes.
     ended_ms: std.atomic.Value(i64) = .init(0),
     fn run(f: *Flood) void {
@@ -2486,12 +2511,18 @@ const Flood = struct {
                 f.ended_ms.store(nowMsMonotonic(io), .release);
                 return;
             }
+            _ = f.writes.fetchAdd(1, .release);
         }
     }
 };
 
 test "server: a shutdown ends a chunked upload whose client floods carriage returns, and a WebSocket fed empty continuation frames" {
     try eachArch(4, .{}, struct {
+        var active_floods: *[2]Flood = undefined;
+        fn floodsActive() bool {
+            return (active_floods[0].writes.load(.acquire) >= 4 or active_floods[0].ended_ms.load(.acquire) != 0) and
+                (active_floods[1].writes.load(.acquire) >= 4 or active_floods[1].ended_ms.load(.acquire) != 0);
+        }
         fn run() !void {
             var cr: [16 * 1024]u8 = @splat('\r');
             const up = try connectReceiveWide();
@@ -2503,16 +2534,18 @@ test "server: a shutdown ends a chunked upload whose client floods carriage retu
             defer _ = std.c.close(ws);
             try sendAll(ws, &.{ 0x01, 0x80 | 1, 0, 0, 0, 0, '{' });
             var floods = [_]Flood{ .{ .fd = up, .bytes = &cr }, .{ .fd = ws, .bytes = &empties } };
+            active_floods = &floods;
             var threads: [2]std.Thread = undefined;
             for (&floods, 0..) |*f, i| threads[i] = try std.Thread.spawn(.{}, Flood.run, .{f});
-            pause(500);
+            const started = within(5000, floodsActive);
             const t0 = nowMsMonotonic(io);
             server.requestShutdown();
             // The drain is 35 s; give each a 5 s bound, then let go so serve can finish.
             var waited: i64 = 0;
-            while (waited < 5000 and (floods[0].ended_ms.load(.acquire) == 0 or floods[1].ended_ms.load(.acquire) == 0)) : (waited += 20) pause(20);
+            while (waited < 5000 and (floods[0].ended_ms.load(.acquire) == 0 or floods[1].ended_ms.load(.acquire) == 0)) : (waited += 1) pause(1);
             for (&floods) |*f| f.stop.store(true, .release);
             for (threads) |th| th.join();
+            if (!started) return error.FloodsNeverStarted;
             var bad: usize = 0;
             for (floods, [_][]const u8{ "chunked CR flood", "WS empty-continuation flood" }) |f, what| {
                 const end = f.ended_ms.load(.acquire);
@@ -3103,12 +3136,40 @@ test "server: /v1/messages reads a system message inside messages into the promp
 
 test "server: the loaded model stays on the GPU before its first request" {
     const metal = @import("metal.zig");
-    const before = metal.touches;
+    const tick_was = scheduler_mod.gpu_warm_tick_ns;
+    scheduler_mod.gpu_warm_tick_ns = 10 * std.time.ns_per_ms;
+    defer scheduler_mod.gpu_warm_tick_ns = tick_was;
+    const before = metal.touchesCount();
     try eachArch(1, .{}, struct {
+        var arch_before: u64 = 0;
+        fn touched() bool {
+            return metal.touchesCount() > arch_before;
+        }
         fn body() anyerror!void {
-            try std.Io.sleep(io, .fromNanoseconds(3 * @import("sched_policy.zig").GPU_WARM_TICK_NS), .awake);
+            arch_before = metal.touchesCount();
+            if (!within(2000, touched)) return error.GpuNeverTouched;
         }
     }.body);
-    errdefer std.debug.print("GPU touches across load and idle: {d}\n", .{metal.touches - before});
-    try testing.expect(metal.touches > before);
+    errdefer std.debug.print("GPU touches across load and idle: {d}\n", .{metal.touchesCount() - before});
+    try testing.expect(metal.touchesCount() > before);
+}
+
+test "server: gpu_warm_tick_ns caps gpuWarmParkNs while keeping the served default" {
+    const policy = @import("sched_policy.zig");
+    try testing.expectEqual(policy.GPU_WARM_TICK_NS, scheduler_mod.gpu_warm_tick_ns);
+    const was = scheduler_mod.gpu_warm_tick_ns;
+    scheduler_mod.gpu_warm_tick_ns = 10 * std.time.ns_per_ms;
+    defer scheduler_mod.gpu_warm_tick_ns = was;
+    try testing.expectEqual(@as(?u64, 10 * std.time.ns_per_ms), scheduler_mod.effectiveGpuWarmParkNs(0, 60 * std.time.ns_per_s));
+    try testing.expectEqual(@as(?u64, null), scheduler_mod.effectiveGpuWarmParkNs(null, 60 * std.time.ns_per_s));
+}
+
+test "server: test_skip_warm skips cooler_warm.warmServed on cold loads" {
+    const cooler_warm = @import("cooler_warm.zig");
+    try testing.expectEqual(false, (server_state.ServerConfig{}).test_skip_warm);
+    const before = cooler_warm.runs_for_test;
+    try eachArch(1, .{}, struct {
+        fn body() anyerror!void {}
+    }.body);
+    try testing.expectEqual(before, cooler_warm.runs_for_test);
 }

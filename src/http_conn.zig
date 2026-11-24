@@ -371,6 +371,11 @@ pub const Conn = struct {
 
     /// How often a wait for a client's bytes looks at the shutdown flag.
     const SHUTDOWN_POLL_MS: i64 = 100;
+    var awaiting_readers = std.atomic.Value(u32).init(0);
+
+    pub fn awaitingReaders() u32 {
+        return awaiting_readers.load(.acquire);
+    }
 
     /// Waits up to `limit_ms` (null: no limit) for bytes to read; false when none came. Every read of a connection
     /// waits here, and the shutdown flag is read first: a client that keeps bytes arriving cannot hold the drain, and
@@ -379,11 +384,31 @@ pub const Conn = struct {
         if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
         if (c.early.len > 0 or c.reader().bufferedLen() > 0) return true;
         const deadline = if (limit_ms) |ms| nowMsMonotonic(c.io) +| ms else null;
-        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+        const wake = server_state.shutdownWakeReadFd();
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const nfds: usize = if (wake >= 0) 2 else 1;
+        var parked = false;
+        defer if (parked) {
+            _ = awaiting_readers.fetchSub(1, .acq_rel);
+        };
         var slice_ms: i64 = 0;
         while (true) {
-            const n = std.posix.poll(&fds, @intCast(slice_ms)) catch return true;
-            if (n > 0) return true;
+            if (slice_ms > 0 and !parked) {
+                parked = true;
+                _ = awaiting_readers.fetchAdd(1, .acq_rel);
+            }
+            const n = std.posix.poll(fds[0..nfds], @intCast(slice_ms)) catch return true;
+            if (n > 0) {
+                if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
+                if (fds[0].revents != 0) return true;
+                if (nfds == 2 and fds[1].revents != 0) {
+                    server_state.drainShutdownWakeIfNotRequested();
+                    if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
+                }
+            }
             if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
             const left = if (deadline) |d| d - nowMsMonotonic(c.io) else SHUTDOWN_POLL_MS;
             if (left <= 0) return false;
@@ -405,11 +430,19 @@ pub const Conn = struct {
         const fd = c.stream.socket.handle;
         _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
         const deadline = nowMsMonotonic(c.io) + if (c.length_framed) linger_ms else CLOSE_WAIT_MS;
-        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const wake = server_state.shutdownWakeReadFd();
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 },
+            .{ .fd = wake, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const nfds: usize = if (wake >= 0) 2 else 1;
         var sink: [256]u8 = undefined;
         while (nowMsMonotonic(c.io) < deadline and !server_state.shutdown_requested.load(.acquire)) {
-            const n = std.posix.poll(&fds, @intCast(std.math.clamp(deadline - nowMsMonotonic(c.io), 0, 500))) catch break;
+            const n = std.posix.poll(fds[0..nfds], @intCast(std.math.clamp(deadline - nowMsMonotonic(c.io), 0, 500))) catch break;
             if (n == 0) continue;
+            if (server_state.shutdown_requested.load(.acquire)) break;
+            if (nfds == 2 and fds[1].revents != 0) server_state.drainShutdownWakeIfNotRequested();
+            if (fds[0].revents == 0) continue;
             // EOF or reset ends the wait; discard any pipelined request bytes.
             if (std.c.recv(fd, &sink, sink.len, std.posix.MSG.DONTWAIT) <= 0) break;
         }

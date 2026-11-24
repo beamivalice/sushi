@@ -133,6 +133,8 @@ const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
 /// detached conn thread still in `Scheduler.complete` would otherwise race
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
+var conn_drain_mu: std.Io.Mutex = .init;
+var conn_drain_cond: std.Io.Condition = .init;
 
 
 
@@ -147,6 +149,7 @@ const sampler = @import("sampler.zig");
 
 fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     server_state.shutdown_requested.store(true, .release);
+    server_state.wakeShutdown();
 }
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
@@ -159,6 +162,7 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 
 pub fn requestShutdown() void {
     server_state.shutdown_requested.store(true, .release);
+    server_state.wakeShutdown();
     if (server_state.global_registry) |r| r.beginShutdown();
 }
 
@@ -755,6 +759,8 @@ pub fn serve(
 ) !void {
     // Before the listener and the SSD tier take their descriptors.
     fd_limits.raiseOpenFileLimit();
+    _ = server_state.ensureShutdownWake();
+    server_state.drainShutdownWakeIfNotRequested();
     server_state.server_config = cfg;
     // Before `Scheduler.init`: that call starts the model load and every load-time bill inside it
     // asks for the KV width.
@@ -809,6 +815,7 @@ pub fn serve(
     defer server_state.global_registry = null;
     scheduler.registry.load_gate = downloads.loadGate;
     scheduler.test_on_cooler = cfg.test_on_cooler;
+    scheduler.test_skip_warm = cfg.test_skip_warm;
     responses_api.initGlobalResponseStore(io, allocator);
     defer if (drained) responses_api.deinitGlobalResponseStore();
 
@@ -1036,24 +1043,35 @@ fn startAccepting(allocator: std.mem.Allocator, io: std.Io, listener: *?std.Io.n
 /// Accepts until shutdown, one detached thread per connection. With no listener (an embedded client) it only
 /// watches the shutdown flag: poll ignores a negative fd and sleeps out the timeout.
 fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, listener: ?*std.Io.net.Server) void {
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = if (listener) |l| l.socket.handle else -1,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
+    const wake_fd = server_state.ensureShutdownWake();
+    var poll_fds = [_]std.posix.pollfd{
+        .{
+            .fd = if (listener) |l| l.socket.handle else -1,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+        .{
+            .fd = wake_fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
+        },
+    };
+    const nfds: usize = if (wake_fd >= 0) 2 else 1;
     // Out of descriptors, every accept fails alike: the census is logged once, until an accept succeeds again, and the
     // loop pauses between tries.
     var fd_quota_logged = false;
 
     while (!server_state.shutdown_requested.load(.acquire)) {
         // Poll with 1-second timeout so we can check shutdown flag
-        const poll_result = std.posix.poll(&poll_fds, 1000) catch |err| {
+        const poll_result = std.posix.poll(poll_fds[0..nfds], 1000) catch |err| {
             if (server_state.shutdown_requested.load(.acquire)) break;
             log.err("poll error: {}\n", .{err});
             continue;
         };
         if (poll_result == 0) continue; // timeout, re-check shutdown flag
         if (server_state.shutdown_requested.load(.acquire)) break;
+        if (nfds == 2 and poll_fds[1].revents != 0) server_state.drainShutdownWakeIfNotRequested();
+        if (listener == null or poll_fds[0].revents == 0) continue;
 
         const accepted_stream = listener.?.accept(io) catch |err| {
             if (server_state.shutdown_requested.load(.acquire)) break;
@@ -1146,12 +1164,16 @@ fn stopServing(io: std.Io, accept_thread: *?std.Thread) bool {
         accept_thread.* = null;
     }
     if (server_state.global_scheduler) |sch| sch.beginShutdown();
-    var waited_ms: u64 = 0;
-    var idle_fds = [_]std.posix.pollfd{};
-    while ((active_conn_threads.load(.acquire) > 0 or downloads.registryBusy()) and waited_ms < CONN_DRAIN_MS) {
-        _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
-        waited_ms += 20;
+    const drain_start_ms = io_util.nowMsMonotonic(io);
+    conn_drain_mu.lockUncancelable(io);
+    while (active_conn_threads.load(.acquire) > 0 or downloads.registryBusy()) {
+        const elapsed = io_util.nowMsMonotonic(io) - drain_start_ms;
+        if (elapsed >= CONN_DRAIN_MS) break;
+        const step_ms: i64 = @min(@as(i64, @intCast(CONN_DRAIN_MS)) - elapsed, 20);
+        conn_drain_cond.waitTimeout(io, &conn_drain_mu, .{ .duration = .{ .raw = .fromMilliseconds(step_ms), .clock = .awake } }) catch {};
     }
+    conn_drain_mu.unlock(io);
+    const waited_ms: u64 = @intCast(@max(0, io_util.nowMsMonotonic(io) - drain_start_ms));
     const remaining = active_conn_threads.load(.acquire);
     const downloads_busy = downloads.registryBusy();
     if (remaining > 0 or downloads_busy) {
@@ -1164,10 +1186,17 @@ fn stopServing(io: std.Io, accept_thread: *?std.Thread) bool {
 }
 
 fn handleConnectionThread(args: *http_conn.ConnThreadArgs) void {
+    const conn_io = args.io;
     // Decrement LAST (declared first → runs after every other defer), so the
     // shutdown drain in `serve` only sees this thread leave once it has fully
     // returned from `complete()` and closed its socket.
-    defer _ = active_conn_threads.fetchSub(1, .acq_rel);
+    defer {
+        if (active_conn_threads.fetchSub(1, .acq_rel) == 1) {
+            conn_drain_mu.lockUncancelable(conn_io);
+            conn_drain_cond.broadcast(conn_io);
+            conn_drain_mu.unlock(conn_io);
+        }
+    }
     var conn: http_conn.Conn = undefined;
     http_conn.Conn.init(&conn, args.accepted_stream, args.io);
     defer conn.close();
@@ -2217,6 +2246,7 @@ fn handleUpdate(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers: 
     log.info("[update] updating {s} -> {s} from the chat page; the server restarts\n", .{ update_mod.version, latest.? });
     update_mod.relaunch_requested.store(true, .release);
     server_state.shutdown_requested.store(true, .release);
+    server_state.wakeShutdown();
 }
 
 fn handleTokenize(
@@ -4276,4 +4306,17 @@ test "a kv_quant the arch refuses ends a Responses WebSocket turn in its error f
     const cfg = try fixtures.glmAssistantFixture();
     try std.testing.expect(!try checkAttentionMemory(a, &conn, &.{ 1, 2, 3 }, 8, &cfg, null, false, trunk.KVQuantConfig.affine(4), false, false));
     try std.testing.expect(std.mem.startsWith(u8, frames.out.items, "{\"type\":\"error\",\"status\":400,"));
+}
+
+test "acceptLoop wakes on requestShutdown without waiting out the poll timeout" {
+    const t = std.testing;
+    const prev = server_state.shutdown_requested.swap(false, .acq_rel);
+    defer server_state.shutdown_requested.store(prev, .release);
+    const th = try std.Thread.spawn(.{}, acceptLoop, .{ t.allocator, t.io, @as(?*std.Io.net.Server, null) });
+    std.Io.sleep(t.io, .fromMilliseconds(50), .awake) catch {};
+    const t0 = io_util.nowMsMonotonic(t.io);
+    requestShutdown();
+    th.join();
+    const elapsed = io_util.nowMsMonotonic(t.io) - t0;
+    try t.expect(elapsed < 500);
 }

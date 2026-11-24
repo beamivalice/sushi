@@ -2957,13 +2957,15 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
 fn waitForUnwire(io: std.Io, wired_before: u64, freed: u64) void {
     if (wired_before == 0 or freed == 0) return;
     var waited_ms: u32 = 0;
-    while (!unwireSettled(wired_before, status.getWiredMemBytes(), freed) and waited_ms < UNWIRE_WAIT_MAX_MS) : (waited_ms += 50) {
+    while (!unwireSettled(wired_before, status.getWiredMemBytes(), freed) and waited_ms < unwire_wait_max_ms) : (waited_ms += 50) {
         std.Io.sleep(io, .fromMilliseconds(50), .real) catch return;
     }
     if (waited_ms > 0) log.info("[registry] waited {d} ms for the unloaded model's memory to unwire\n", .{waited_ms});
 }
 
 const UNWIRE_WAIT_MAX_MS: u32 = 3000;
+/// How long an unload waits for its pages to leave the wired set; a test's tiny model never frees 90% of its bill.
+pub var unwire_wait_max_ms: u32 = UNWIRE_WAIT_MAX_MS;
 
 /// Nine tenths of the freed bytes back from the wired set; other processes wire and unwire too.
 pub fn unwireSettled(wired_before: u64, wired_now: u64, freed: u64) bool {
@@ -2976,6 +2978,17 @@ test "unwireSettled: the unload waits until most of the freed bytes left the wir
     try testing.expect(unwireSettled(53 * gib, 7 * gib, 50 * gib)); // t+0.7 s
     try testing.expect(unwireSettled(53 * gib, 60 * gib, 0)); // nothing freed, nothing to wait for
     try testing.expect(!unwireSettled(10 * gib, 12 * gib, 5 * gib)); // wired grew: never underflows
+}
+
+test "waitForUnwire honors unwire_wait_max_ms" {
+    try testing.expectEqual(@as(u32, UNWIRE_WAIT_MAX_MS), unwire_wait_max_ms);
+    const was = unwire_wait_max_ms;
+    unwire_wait_max_ms = 0;
+    defer unwire_wait_max_ms = was;
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const t0 = io_util.nowMsMonotonic(tio);
+    waitForUnwire(tio, 1 << 30, 100 << 30);
+    try testing.expect(io_util.nowMsMonotonic(tio) - t0 < 500);
 }
 
 /// The decode meter's context: `tokens` ids through the model in chunks of 2048, as a served prefill runs them. No
