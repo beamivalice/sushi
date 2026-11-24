@@ -1532,8 +1532,9 @@ pub const ModelRegistry = struct {
 
     /// Phase D: block until `entry.refcount == 0`. Caller holds `mutex`.
     /// Wakes when any `release` lands on a zero refcount.
-    pub fn waitForRefcountZeroLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+    pub fn waitForRefcountZeroLocked(self: *ModelRegistry, entry: *LoadedModel) error{Shutdown}!void {
         while (entry.refcount.load(.acquire) != 0) {
+            if (self.shutting_down.load(.acquire)) return error.Shutdown;
             self.state_cond.waitUncancelable(self.io, &self.mutex);
         }
     }
@@ -4097,4 +4098,49 @@ test "ModelRegistry: a folder a pull writes is never dropped for its config, and
     const after = try reg.rescanWithSettings(no_settings);
     try testing.expectEqual(@as(u32, 1), after.removed);
     try testing.expect(reg.peek("beamster/P") == null);
+}
+
+test "ModelRegistry: waitForRefcountZeroLocked ends with error.Shutdown on beginShutdown" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStub("m", "/path/to/m", 1024);
+    e.state = .evicting;
+    e.refcount.store(1, .release);
+    defer e.refcount.store(0, .release);
+
+    const Waiter = struct {
+        reg: *ModelRegistry,
+        entry: *LoadedModel,
+        entered: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        got: error{Shutdown}!void = {},
+        fn run(w: *@This()) void {
+            w.reg.mutex.lockUncancelable(w.reg.io);
+            defer w.reg.mutex.unlock(w.reg.io);
+            w.entered.set(w.reg.io);
+            w.got = w.reg.waitForRefcountZeroLocked(w.entry);
+            w.done.set(w.reg.io);
+        }
+    };
+    var w: Waiter = .{ .reg = reg, .entry = e };
+    const th = try std.Thread.spawn(.{}, Waiter.run, .{&w});
+    w.entered.waitUncancelable(io);
+    reg.beginShutdown();
+    const woke = blk: {
+        w.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch break :blk false;
+        break :blk true;
+    };
+    if (!woke) {
+        reg.mutex.lockUncancelable(io);
+        e.refcount.store(0, .release);
+        reg.state_cond.broadcast(io);
+        reg.mutex.unlock(io);
+    }
+    th.join();
+    if (!woke) {
+        std.debug.print("waitForRefcountZeroLocked waiting on beginShutdown did not wake within 10000 ms\n", .{});
+        return error.WaitOutlivedShutdown;
+    }
+    try testing.expectError(error.Shutdown, w.got);
 }

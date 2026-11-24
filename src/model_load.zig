@@ -2963,7 +2963,8 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
 fn waitForUnwire(io: std.Io, wired_before: u64, freed: u64) void {
     if (wired_before == 0 or freed == 0) return;
     var waited_ms: u32 = 0;
-    while (!unwireSettled(wired_before, status.getWiredMemBytes(), freed) and waited_ms < unwire_wait_max_ms) : (waited_ms += 50) {
+    while (!unwireSettled(wired_before, status.getWiredMemBytes(), freed) and waited_ms < unwire_wait_max_ms and !server_state.shutdown_requested.load(.acquire)) : (waited_ms += 50) {
+        if (comptime @import("builtin").is_test) _ = unwire_polls_for_test.fetchAdd(1, .acq_rel);
         std.Io.sleep(io, .fromMilliseconds(50), .real) catch return;
     }
     if (waited_ms > 0) log.info("[registry] waited {d} ms for the unloaded model's memory to unwire\n", .{waited_ms});
@@ -2972,6 +2973,7 @@ fn waitForUnwire(io: std.Io, wired_before: u64, freed: u64) void {
 const UNWIRE_WAIT_MAX_MS: u32 = 3000;
 /// How long an unload waits for its pages to leave the wired set; a test's tiny model never frees 90% of its bill.
 pub var unwire_wait_max_ms: u32 = UNWIRE_WAIT_MAX_MS;
+var unwire_polls_for_test = std.atomic.Value(u32).init(0);
 
 /// Nine tenths of the freed bytes back from the wired set; other processes wire and unwire too.
 pub fn unwireSettled(wired_before: u64, wired_now: u64, freed: u64) bool {
@@ -2995,6 +2997,18 @@ test "waitForUnwire honors unwire_wait_max_ms" {
     const t0 = io_util.nowMsMonotonic(tio);
     waitForUnwire(tio, 1 << 30, 100 << 30);
     try testing.expect(io_util.nowMsMonotonic(tio) - t0 < 500);
+}
+
+test "waitForUnwire returns at once when shutdown_requested is set" {
+    const prev_max = unwire_wait_max_ms;
+    unwire_wait_max_ms = 500;
+    defer unwire_wait_max_ms = prev_max;
+    const prev_shutdown = server_state.shutdown_requested.swap(true, .acq_rel);
+    defer server_state.shutdown_requested.store(prev_shutdown, .release);
+    unwire_polls_for_test.store(0, .release);
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    waitForUnwire(tio, 1, 10 << 30);
+    try testing.expectEqual(@as(u32, 0), unwire_polls_for_test.load(.acquire));
 }
 
 /// The decode meter's context: `tokens` ids through the model in chunks of 2048, as a served prefill runs them. No

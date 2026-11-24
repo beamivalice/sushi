@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A server asked to stop no longer keeps a connection open for up to a minute**: a reply blocked on a client that stopped reading, a request waiting for a model to unload or a cache to clear, and the wait for unloaded memory now end at the shutdown.
 - **A fully resident DeepSeek load decodes several requests at once up to 8% faster with the same text**: the joined requests look up their Engram tables in one read instead of one each (M5 Ultra, 2.7bpw: 160 to 168 tok/s at 16 requests; one request unchanged).
 
 ## v1.7.4 — DeepSeek 2.7bpw for 256 GB Macs, and a faster DeepSeek

@@ -135,6 +135,8 @@ const unescapeJsonSlashes = request_parse.unescapeJsonSlashes;
 var active_conn_threads = std.atomic.Value(u32).init(0);
 var conn_drain_mu: std.Io.Mutex = .init;
 var conn_drain_cond: std.Io.Condition = .init;
+/// A test runs this between the drain loop and the drain's verdict, to prove the verdict reads what the loop read.
+pub var after_drain_loop_for_test: ?*const fn () void = null;
 
 
 
@@ -831,7 +833,7 @@ pub fn serve(
     var accept_thread: ?std.Thread = null;
     var stopped = false;
     defer if (!stopped) {
-        drained = stopServing(io, &accept_thread);
+        drained = stopServing(io, &accept_thread, &listener, &client_thread);
     };
     // A `--model` boot accepts while its model loads: a request that got the model waits at `boot_gate` for the hooks
     // below. A headless boot has no gate and loads nothing, so it accepts once they are installed.
@@ -1021,7 +1023,7 @@ pub fn serve(
         accept_thread = null;
     } else acceptLoop(allocator, io, null);
     stopped = true;
-    drained = stopServing(io, &accept_thread);
+    drained = stopServing(io, &accept_thread, &listener, &client_thread);
     if (!drained) return error.ConnectionsOutliveShutdown;
 
     log.info("\nShutting down gracefully...\n", .{});
@@ -1154,7 +1156,7 @@ const CONN_DRAIN_MS: u64 = 35_000;
 /// the teardown frees, so `serve` skips that teardown and returns
 /// `error.ConnectionsOutliveShutdown`, and its caller must free nothing it passed in.
 /// Idempotent; also the cleanup of a boot whose load failed with the listener up.
-fn stopServing(io: std.Io, accept_thread: *?std.Thread) bool {
+fn stopServing(io: std.Io, accept_thread: *?std.Thread, listener: *?std.Io.net.Server, client_thread: *?std.Thread) bool {
     // A request parked at the boot gate holds the drain below: a boot that stops before its gate opened fails it first.
     if (!boot_gate.process.opened.isSet()) boot_gate.process.fail(io);
     requestShutdown();
@@ -1164,22 +1166,35 @@ fn stopServing(io: std.Io, accept_thread: *?std.Thread) bool {
         accept_thread.* = null;
     }
     if (server_state.global_scheduler) |sch| sch.beginShutdown();
+    // The embedded client may still send after the shutdown: it ends before the drain counts the connections.
+    if (listener.*) |*l| {
+        http_conn.closeEmbeddedListener(io, l, client_thread.*);
+        listener.* = null;
+        client_thread.* = null;
+    } else if (client_thread.*) |t| {
+        t.join();
+        client_thread.* = null;
+    }
     const drain_start_ms = io_util.nowMsMonotonic(io);
     conn_drain_mu.lockUncancelable(io);
-    while (active_conn_threads.load(.acquire) > 0 or downloads.registryBusy()) {
+    var remaining = active_conn_threads.load(.acquire);
+    var downloads_busy = downloads.registryBusy();
+    while (remaining > 0 or downloads_busy) {
         const elapsed = io_util.nowMsMonotonic(io) - drain_start_ms;
         if (elapsed >= CONN_DRAIN_MS) break;
         const step_ms: i64 = @min(@as(i64, @intCast(CONN_DRAIN_MS)) - elapsed, 20);
         conn_drain_cond.waitTimeout(io, &conn_drain_mu, .{ .duration = .{ .raw = .fromMilliseconds(step_ms), .clock = .awake } }) catch {};
+        remaining = active_conn_threads.load(.acquire);
+        downloads_busy = downloads.registryBusy();
     }
     conn_drain_mu.unlock(io);
+    if (comptime @import("builtin").is_test) if (after_drain_loop_for_test) |f| f();
     const waited_ms: u64 = @intCast(@max(0, io_util.nowMsMonotonic(io) - drain_start_ms));
-    const remaining = active_conn_threads.load(.acquire);
-    const downloads_busy = downloads.registryBusy();
     if (remaining > 0 or downloads_busy) {
         var held_buf: [512]u8 = undefined;
         const held = if (server_state.global_scheduler) |sch| sch.stillHeld(&held_buf) else "nothing the scheduler knows";
         log.warn("shutdown: {d} connection thread(s) and {s} still active after {d}ms, holding {s}: ending without the teardown that would free it\n", .{ remaining, if (downloads_busy) "a downloads thread reading the registry" else "no downloads thread", waited_ms, held });
+        if (comptime @import("builtin").is_test) std.debug.print("shutdown: {d} connection thread(s) and {s} still active after {d}ms, holding {s}\n", .{ remaining, if (downloads_busy) "a downloads thread reading the registry" else "no downloads thread", waited_ms, held });
         return false;
     }
     return true;
@@ -4319,4 +4334,27 @@ test "acceptLoop wakes on requestShutdown without waiting out the poll timeout" 
     th.join();
     const elapsed = io_util.nowMsMonotonic(t.io) - t0;
     try t.expect(elapsed < 500);
+}
+
+test "stopServing does not fail at 0 ms when active_conn_threads rises after the drain loop" {
+    const t = std.testing;
+    const prev = server_state.shutdown_requested.swap(false, .acq_rel);
+    defer server_state.shutdown_requested.store(prev, .release);
+    const Hook = struct {
+        var bumped = std.atomic.Value(bool).init(false);
+        fn run() void {
+            _ = active_conn_threads.fetchAdd(1, .acq_rel);
+            bumped.store(true, .release);
+        }
+    };
+    Hook.bumped.store(false, .release);
+    after_drain_loop_for_test = Hook.run;
+    defer {
+        after_drain_loop_for_test = null;
+        if (Hook.bumped.load(.acquire)) _ = active_conn_threads.fetchSub(1, .acq_rel);
+    }
+    var accept_thread: ?std.Thread = null;
+    var listener: ?std.Io.net.Server = null;
+    var client_thread: ?std.Thread = null;
+    try t.expect(stopServing(t.io, &accept_thread, &listener, &client_thread));
 }

@@ -187,13 +187,15 @@ pub var send_limit_ms: i64 = SEND_LIMIT_MS;
 pub const SocketWriter = struct {
     interface: std.Io.Writer,
     fd: std.posix.fd_t,
+    io: std.Io,
     err: ?anyerror = null,
 
-    fn init(fd: std.posix.fd_t, buffer: []u8) SocketWriter {
-        const limit: std.posix.timeval = .{ .sec = @intCast(@divTrunc(send_limit_ms, 1000)), .usec = @intCast(@rem(send_limit_ms, 1000) * 1000) };
+    fn init(fd: std.posix.fd_t, io: std.Io, buffer: []u8) SocketWriter {
+        const sock_ms = @max(@as(i64, 1), @min(send_limit_ms, Conn.SHUTDOWN_POLL_MS));
+        const limit: std.posix.timeval = .{ .sec = @intCast(@divTrunc(sock_ms, 1000)), .usec = @intCast(@rem(sock_ms, 1000) * 1000) };
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&limit)) catch |e|
             log.warn("[http] a connection's writes stay unbounded: SO_SNDTIMEO refused ({s})\n", .{@errorName(e)});
-        return .{ .fd = fd, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
+        return .{ .fd = fd, .io = io, .interface = .{ .vtable = &.{ .drain = drain }, .buffer = buffer } };
     }
 
     fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
@@ -226,12 +228,32 @@ pub const SocketWriter = struct {
     /// A send that moved some bytes returns their count; one that moved none in `send_limit_ms` fails.
     fn sendWithin(w: *SocketWriter, iov: []const std.posix.iovec_const) !usize {
         const msg: std.posix.msghdr_const = .{ .name = null, .namelen = 0, .iov = iov.ptr, .iovlen = @intCast(iov.len), .control = null, .controllen = 0, .flags = 0 };
+        const deadline = nowMsMonotonic(w.io) +| send_limit_ms;
+        const wake = server_state.shutdownWakeReadFd();
+        var fds = [_]std.posix.pollfd{
+            .{ .fd = w.fd, .events = std.posix.POLL.OUT, .revents = 0 },
+            .{ .fd = wake, .events = std.posix.POLL.IN, .revents = 0 },
+        };
+        const nfds: usize = if (wake >= 0) 2 else 1;
         while (true) {
             const rc = std.posix.system.sendmsg(w.fd, &msg, std.posix.MSG.NOSIGNAL);
             switch (std.posix.errno(rc)) {
                 .SUCCESS => return @intCast(rc),
                 .INTR => continue,
-                .AGAIN => return error.SendTimedOut,
+                .AGAIN => {
+                    // The socket's own timeout is one poll slice: the send waits out its limit in slices a shutdown wakes.
+                    if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
+                    const left = deadline - nowMsMonotonic(w.io);
+                    if (left <= 0) return error.SendTimedOut;
+                    const slice_ms = @min(left, Conn.SHUTDOWN_POLL_MS);
+                    const n = std.posix.poll(fds[0..nfds], @intCast(slice_ms)) catch return error.SendTimedOut;
+                    if (n > 0) {
+                        if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
+                        if (nfds == 2 and fds[1].revents != 0) server_state.drainShutdownWakeIfNotRequested();
+                    }
+                    if (server_state.shutdown_requested.load(.acquire)) return error.Shutdown;
+                    continue;
+                },
                 .PIPE => return error.BrokenPipe,
                 .CONNRESET => return error.ConnectionResetByPeer,
                 else => |e| return std.posix.unexpectedErrno(e),
@@ -283,7 +305,7 @@ pub const Conn = struct {
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
-        c.write_state = SocketWriter.init(stream.socket.handle, &c.write_buf);
+        c.write_state = SocketWriter.init(stream.socket.handle, io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.early = &.{};
@@ -422,11 +444,15 @@ pub const Conn = struct {
     const LINGER_MS: i64 = 250;
     /// `LINGER_MS`, which a test shortens so it does not wait out the real linger.
     var linger_ms: i64 = LINGER_MS;
+    var close_flushes_for_test = std.atomic.Value(u32).init(0);
 
     /// Keep close-delimited responses owned until the reader closes: orphaned FIN_WAIT_2
     /// sockets can expire with a reset while a slow client is still consuming the body.
     pub fn close(c: *Conn) void {
-        c.flush() catch {};
+        if (c.write_state.err == null) {
+            if (comptime @import("builtin").is_test) _ = close_flushes_for_test.fetchAdd(1, .acq_rel);
+            c.flush() catch {};
+        }
         const fd = c.stream.socket.handle;
         _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
         const deadline = nowMsMonotonic(c.io) + if (c.length_framed) linger_ms else CLOSE_WAIT_MS;
@@ -3366,4 +3392,129 @@ test "read: RFC 9112 framing statuses: chunked not last is a 400, Transfer-Encod
         }
     }
     try std.testing.expectEqual(@as(usize, 0), bad);
+}
+
+fn fillSocketNonBlocking(fd: std.posix.fd_t) void {
+    const fl = std.posix.system.fcntl(fd, std.posix.F.GETFL, @as(usize, 0));
+    if (fl < 0) return;
+    const nonblock: usize = @as(u32, @bitCast(std.c.O{ .NONBLOCK = true }));
+    _ = std.posix.system.fcntl(fd, std.posix.F.SETFL, @as(usize, @intCast(fl)) | nonblock);
+    defer _ = std.posix.system.fcntl(fd, std.posix.F.SETFL, @as(usize, @intCast(fl)));
+    var fill: [1024]u8 = @splat('x');
+    for (0..256) |_| {
+        if (std.c.send(fd, &fill, fill.len, 0) <= 0) break;
+    }
+}
+
+test "SocketWriter: a shutdown wakes a write blocked on a full socket buffer and close does not wait out a second send limit" {
+    const t = std.testing;
+    const prev_limit = send_limit_ms;
+    send_limit_ms = 2000;
+    defer send_limit_ms = prev_limit;
+    const prev_shutdown = server_state.shutdown_requested.swap(false, .acq_rel);
+    defer {
+        server_state.shutdown_requested.store(prev_shutdown, .release);
+        server_state.drainShutdownWakeIfNotRequested();
+    }
+    _ = server_state.ensureShutdownWake();
+    server_state.drainShutdownWakeIfNotRequested();
+
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv));
+    defer _ = std.c.close(sv[1]);
+    const small: c_int = 2048;
+    _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+    fillSocketNonBlocking(sv[0]);
+
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    const State = struct {
+        conn: *Conn,
+        peer: std.posix.fd_t,
+        started: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        write_err: ?anyerror = null,
+        flushes_in_close: u32 = 0,
+        watchdog_fired: std.atomic.Value(bool) = .init(false),
+        fn run(s: *@This()) void {
+            var chunk: [4096]u8 = @splat('y');
+            s.started.set(s.conn.io);
+            s.conn.writeAll(&chunk) catch |e| {
+                s.write_err = e;
+            };
+            const before = Conn.close_flushes_for_test.load(.acquire);
+            s.conn.close();
+            s.flushes_in_close = Conn.close_flushes_for_test.load(.acquire) - before;
+            s.done.set(s.conn.io);
+        }
+        fn watch(s: *@This()) void {
+            s.done.waitTimeout(s.conn.io, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch {
+                s.watchdog_fired.store(true, .release);
+                _ = std.c.shutdown(s.peer, std.posix.SHUT.RDWR);
+            };
+        }
+    };
+    var st: State = .{ .conn = &conn, .peer = sv[1] };
+    const th = try std.Thread.spawn(.{}, State.run, .{&st});
+    const wd = try std.Thread.spawn(.{}, State.watch, .{&st});
+    st.started.waitUncancelable(t.io);
+    server_state.shutdown_requested.store(true, .release);
+    server_state.wakeShutdown();
+    th.join();
+    wd.join();
+    if (st.watchdog_fired.load(.acquire)) {
+        std.debug.print("SocketWriter writeAll/close waiting on shutdown did not return within 10000 ms\n", .{});
+        return error.WriteOutlivedShutdown;
+    }
+    try t.expectEqual(@as(?anyerror, error.WriteFailed), st.write_err);
+    try t.expectEqual(@as(?anyerror, error.Shutdown), conn.write_state.err);
+    try t.expectEqual(@as(u32, 0), st.flushes_in_close);
+}
+
+test "Conn.close does not wait out a second send limit after a write fails" {
+    const t = std.testing;
+    const prev_limit = send_limit_ms;
+    send_limit_ms = 300;
+    defer send_limit_ms = prev_limit;
+    const prev_linger = Conn.linger_ms;
+    Conn.linger_ms = 10;
+    defer Conn.linger_ms = prev_linger;
+    var sv: [2]std.posix.fd_t = undefined;
+    try t.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &sv));
+    defer _ = std.c.close(sv[1]);
+    const small: c_int = 2048;
+    _ = std.c.setsockopt(sv[0], std.posix.SOL.SOCKET, std.posix.SO.SNDBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+    _ = std.c.setsockopt(sv[1], std.posix.SOL.SOCKET, std.posix.SO.RCVBUF, std.mem.asBytes(&small), @sizeOf(c_int));
+    fillSocketNonBlocking(sv[0]);
+
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+    conn.length_framed = true;
+    var chunk: [4096]u8 = @splat('y');
+    try t.expectError(error.WriteFailed, conn.writeAll(&chunk));
+    try t.expectEqual(@as(?anyerror, error.SendTimedOut), conn.write_state.err);
+    const Watch = struct {
+        io: std.Io,
+        peer: std.posix.fd_t,
+        done: std.Io.Event = .unset,
+        fired: std.atomic.Value(bool) = .init(false),
+        fn run(w: *@This()) void {
+            w.done.waitTimeout(w.io, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch {
+                w.fired.store(true, .release);
+                _ = std.c.shutdown(w.peer, std.posix.SHUT.RDWR);
+            };
+        }
+    };
+    var watch: Watch = .{ .io = t.io, .peer = sv[1] };
+    const wd = try std.Thread.spawn(.{}, Watch.run, .{&watch});
+    const flushes_before = Conn.close_flushes_for_test.load(.acquire);
+    conn.close();
+    watch.done.set(t.io);
+    wd.join();
+    if (watch.fired.load(.acquire)) {
+        std.debug.print("Conn.close after write failure did not return within 10000 ms\n", .{});
+        return error.CloseWaitedSecondSendLimit;
+    }
+    try t.expectEqual(flushes_before, Conn.close_flushes_for_test.load(.acquire));
 }

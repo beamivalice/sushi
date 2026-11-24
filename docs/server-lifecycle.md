@@ -472,7 +472,11 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   the slots, so a submit (one waiting for room too), a cold load, an image encode, an unload and a cache job after it
   are refused with `error.Shutdown`, and queued loads and encodes fail then, not at `deinit`; with a connection thread
   still alive past the drain bound `serve` skips the teardown that would free what it holds and returns
-  `error.ConnectionsOutliveShutdown` (the CLI exits 1 on it before its own defers free anything).
+  `error.ConnectionsOutliveShutdown` (the CLI exits 1 on it before its own defers free anything). Every wait a connection
+  thread can hold wakes on the shutdown: a send to a full socket (`SocketWriter.sendWithin`), and `close` skips the flush
+  after a failed write; the registry's wait for a model's last user; queued unloads and cache clears; the vision orphan
+  queue; the post-unload wire wait. `stopServing` joins an embedded client before it drains, and judges the drain from
+  the counts its loop read.
 - **A shutdown ends every read of a client's bytes**: `Conn.awaitReadable` is the one read wait, reads the flag first
   and then every 100 ms, so an idle connection closes, a WebSocket between turns gets its 1001 close and a client that
   keeps bytes arriving is cut off at once; a request whose line arrived gets the shutdown error (`Conn.readArrived`

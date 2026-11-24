@@ -3173,3 +3173,29 @@ test "server: test_skip_warm skips cooler_warm.warmServed on cold loads" {
     }.body);
     try testing.expectEqual(before, cooler_warm.runs_for_test);
 }
+
+test "server: stopServing waits for an embedded client's post-shutdown requests before draining" {
+    const State = struct {
+        var client_done = std.atomic.Value(bool).init(false);
+        var drained_before_client = std.atomic.Value(bool).init(false);
+        fn hook() void {
+            if (!client_done.load(.acquire)) drained_before_client.store(true, .release);
+        }
+        fn run() !void {
+            client_done.store(false, .release);
+            server.requestShutdown();
+            if (!within(10_000, draining)) return error.NeverDrained;
+            const answer = try askedBeforeServed("/v1/completions", "{\"model\":\"tiny\",\"prompt\":\"hi\",\"max_tokens\":2}");
+            defer gpa.free(answer);
+            if (!std.mem.startsWith(u8, answer, "HTTP/1.1 503") or std.mem.indexOf(u8, answer, http.shutting_down_message) == null) {
+                return error.NotTheShutdownError;
+            }
+            client_done.store(true, .release);
+        }
+    };
+    State.drained_before_client.store(false, .release);
+    server.after_drain_loop_for_test = State.hook;
+    defer server.after_drain_loop_for_test = null;
+    try eachArch(4, .{}, State.run);
+    try testing.expect(!State.drained_before_client.load(.acquire));
+}

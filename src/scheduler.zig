@@ -958,6 +958,7 @@ pub const LoadRequest = struct {
 /// in the registry so it can reload later).
 pub const UnloadRequest = struct {
     entry: *model_registry_mod.LoadedModel,
+    shutdown: bool = false,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
@@ -1412,6 +1413,22 @@ pub const Scheduler = struct {
     fn failQueuedWaiters(self: *Scheduler) void {
         for (self.load_queue.items) |req| finishShutdown(self, req);
         self.load_queue.clearRetainingCapacity();
+        for (self.unload_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.shutdown = true;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.unload_queue.clearRetainingCapacity();
+        for (self.prefix_clear_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.shutdown = true;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.prefix_clear_queue.clearRetainingCapacity();
     }
 
     fn finishShutdown(self: *Scheduler, req: *LoadRequest) void {
@@ -1500,7 +1517,7 @@ pub const Scheduler = struct {
     pub fn orphanVision(self: *Scheduler, ve: mlx.mlx_array) void {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
-        while (self.orphan_vision_n == vision_queue.orphan_vision_cap and !self.shutdown.load(.acquire)) {
+        while (self.orphan_vision_n == vision_queue.orphan_vision_cap and !self.refusingLocked()) {
             self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
         }
         if (self.orphan_vision_n == vision_queue.orphan_vision_cap) return;
@@ -1873,7 +1890,7 @@ pub const Scheduler = struct {
             n_victims = n;
             attempt.victims = victims_buf[0..n_victims];
             // Drain readers on each victim before the inference thread frees it.
-            for (victims_buf[0..n_victims]) |v| self.registry.waitForRefcountZeroLocked(v);
+            for (victims_buf[0..n_victims]) |v| try self.registry.waitForRefcountZeroLocked(v);
             self.registry.mutex.unlock(self.io);
         }
 
@@ -2045,7 +2062,14 @@ pub const Scheduler = struct {
         };
         req.done_mu.lockUncancelable(self.io);
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        const shut = req.shutdown;
         req.done_mu.unlock(self.io);
+        if (shut) {
+            self.registry.mutex.lockUncancelable(self.io);
+            defer self.registry.mutex.unlock(self.io);
+            if (entry.state == .evicting) self.registry.unmarkEvictingLocked(entry);
+            return error.Shutdown;
+        }
     }
 
     /// A saved SSD-cache setting: the loop tries the declined tiers again at its next turn.
@@ -2068,7 +2092,9 @@ pub const Scheduler = struct {
         }
         req.done_mu.lockUncancelable(self.io);
         while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        const shut = req.shutdown;
         req.done_mu.unlock(self.io);
+        if (shut) return error.Shutdown;
         return req;
     }
 
@@ -7141,4 +7167,159 @@ test "the disk-stats publisher keeps the namespace of a model that is loading or
     entry.state = .unloaded;
     publishDiskStats(&sch);
     try testing.expectEqual(@as(u64, 0), entry.disk_stats.snapshot().namespace);
+}
+
+test "beginShutdown fails a queued unload with error.Shutdown and restores the entry" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("a", "/a", 10);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(entry, 10);
+    reg.mutex.unlock(io);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.unload_queue.deinit(testing.allocator);
+
+    const State = struct {
+        sch: *Scheduler,
+        done: std.Io.Event = .unset,
+        got: anyerror!void = {},
+        fn run(s: *@This()) void {
+            s.got = s.sch.unloadModel("a");
+            s.done.set(s.sch.io);
+        }
+    };
+    var st: State = .{ .sch = &sch };
+    const th = try std.Thread.spawn(.{}, State.run, .{&st});
+    sch.queue_mu.lockUncancelable(io);
+    while (sch.unload_queue.items.len == 0) {
+        sch.queue_cond.waitTimeout(io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch break;
+    }
+    const queued = sch.unload_queue.items.len == 1;
+    sch.queue_mu.unlock(io);
+    if (!queued) {
+        sch.beginShutdown();
+        th.join();
+        std.debug.print("unloadModel never posted to unload_queue within 10000 ms\n", .{});
+        return error.UnloadNeverQueued;
+    }
+    sch.beginShutdown();
+    const woke = blk: {
+        st.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch break :blk false;
+        break :blk true;
+    };
+    if (!woke) {
+        sch.queue_mu.lockUncancelable(io);
+        for (sch.unload_queue.items) |req| {
+            req.done_mu.lockUncancelable(io);
+            req.done = true;
+            req.done_cond.broadcast(io);
+            req.done_mu.unlock(io);
+        }
+        sch.unload_queue.clearRetainingCapacity();
+        sch.queue_mu.unlock(io);
+    }
+    th.join();
+    const state_after = entry.state;
+    reg.mutex.lockUncancelable(io);
+    if (entry.state == .evicting) reg.unmarkEvictingLocked(entry);
+    reg.mutex.unlock(io);
+    if (!woke) {
+        std.debug.print("beginShutdown left queued unload waiting past 10000 ms\n", .{});
+        return error.QueuedUnloadOutlivedShutdown;
+    }
+    try testing.expectError(error.Shutdown, st.got);
+    try testing.expectEqual(model_registry_mod.LoadState.ready, state_after);
+}
+
+test "beginShutdown fails a queued prefix-cache clear with error.Shutdown" {
+    const io = testing.io;
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("a", "/a", 10);
+    var sch = coldLoadTestScheduler(reg);
+    defer sch.prefix_clear_queue.deinit(testing.allocator);
+
+    const State = struct {
+        sch: *Scheduler,
+        entry: *LoadedModel,
+        done: std.Io.Event = .unset,
+        got: anyerror!prefix_cache_admin.ClearRequest = error.TestUnexpectedResult,
+        fn run(s: *@This()) void {
+            s.got = s.sch.prefixAdmin(.{ .entry = s.entry });
+            s.done.set(s.sch.io);
+        }
+    };
+    var st: State = .{ .sch = &sch, .entry = entry };
+    const th = try std.Thread.spawn(.{}, State.run, .{&st});
+    sch.queue_mu.lockUncancelable(io);
+    while (sch.prefix_clear_queue.items.len == 0) {
+        sch.queue_cond.waitTimeout(io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch break;
+    }
+    const queued = sch.prefix_clear_queue.items.len == 1;
+    sch.queue_mu.unlock(io);
+    if (!queued) {
+        sch.beginShutdown();
+        th.join();
+        std.debug.print("prefixAdmin never posted to prefix_clear_queue within 10000 ms\n", .{});
+        return error.ClearNeverQueued;
+    }
+    sch.beginShutdown();
+    const woke = blk: {
+        st.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch break :blk false;
+        break :blk true;
+    };
+    if (!woke) {
+        sch.queue_mu.lockUncancelable(io);
+        for (sch.prefix_clear_queue.items) |req| {
+            req.done_mu.lockUncancelable(io);
+            req.done = true;
+            req.done_cond.broadcast(io);
+            req.done_mu.unlock(io);
+        }
+        sch.prefix_clear_queue.clearRetainingCapacity();
+        sch.queue_mu.unlock(io);
+    }
+    th.join();
+    if (!woke) {
+        std.debug.print("beginShutdown left queued prefix clear waiting past 10000 ms\n", .{});
+        return error.QueuedClearOutlivedShutdown;
+    }
+    try testing.expectError(error.Shutdown, st.got);
+}
+
+test "beginShutdown wakes orphanVision when the orphan queue is full" {
+    const io = testing.io;
+    var sch = submitTestScheduler(testing.allocator, 1);
+    sch.orphan_vision_n = vision_queue.orphan_vision_cap;
+
+    const State = struct {
+        sch: *Scheduler,
+        entered: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        fn run(s: *@This()) void {
+            s.entered.set(s.sch.io);
+            s.sch.orphanVision(undefined);
+            s.done.set(s.sch.io);
+        }
+    };
+    var st: State = .{ .sch = &sch };
+    const th = try std.Thread.spawn(.{}, State.run, .{&st});
+    st.entered.waitUncancelable(io);
+    sch.beginShutdown();
+    const woke = blk: {
+        st.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10_000), .clock = .awake } }) catch break :blk false;
+        break :blk true;
+    };
+    if (!woke) {
+        sch.queue_mu.lockUncancelable(io);
+        sch.shutdown.store(true, .release);
+        sch.submit_cond.broadcast(io);
+        sch.queue_mu.unlock(io);
+    }
+    th.join();
+    if (!woke) {
+        std.debug.print("beginShutdown left orphanVision waiting past 10000 ms\n", .{});
+        return error.OrphanVisionOutlivedShutdown;
+    }
 }

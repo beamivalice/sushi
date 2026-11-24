@@ -187,6 +187,7 @@ pub const ClearRequest = struct {
     outcome: ClearOutcome = .not_loaded,
     freed_bytes: u64 = 0,
     entries_removed: u32 = 0,
+    shutdown: bool = false,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
