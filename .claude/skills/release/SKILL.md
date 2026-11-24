@@ -5,7 +5,7 @@ description: sushi pre-release validation checklist, SemVer versioning, release 
 
 ## Pre-release validation
 
-On the Apple M5 Max 128 GB, on the FINAL release tree, with a fresh `zig build -Doptimize=ReleaseFast`. Run the steps
+On the M5 Ultra 256 GB (from 1.7.4; the M5 Max before), on the FINAL release tree, with a fresh `zig build -Doptimize=ReleaseFast`. Run the steps
 directly: no driver script, no pause/resume bookkeeping. A failed step goes to the owner before anything else. Model
 loads take the GPU lock; step 2 waits for a quiet box (no builds, no AirDrop or other transfers).
 

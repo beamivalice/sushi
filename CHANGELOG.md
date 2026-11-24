@@ -4,33 +4,35 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.7.4 — DeepSeek 2.7bpw for 256 GB Macs, and a faster DeepSeek
 
-- **A server that is asked to stop closes its connections at once** instead of after its next poll (up to a second).
-- **sushibar's menu bar icon shows the model, not just the server**: a grey outline fish while the server runs with no model, an orange outline while a model loads, and the filled sushi once it is ready.
-- **DeepSeek prefill 3.4-6.5% faster on both STQ packs**: attention writes each span straight into the projection's input instead of copying the spans together, and its packed key tiles share row ids within a SIMD group.
-- **DeepSeek with DSpark picks its draft rounds better, up to 14% faster decode with the same text**: a low-confidence draft no longer buys a verify row, drafts shorten while they keep missing, and prompt copies need a second occurrence in the history (M5 Ultra, 1.75bpw code 149 to 170 / 160 to 179 tok/s at 4k / 8k, 2.7bpw prose 66 to 70 / 86 to 90).
-- **DeepSeek prose prompts prefill 17-22% faster and the first prompt after a load up to twice as fast**: Engram rows already in the page cache are read on 4 threads instead of 64 (25x less CPU), widening only when a read reaches the SSD, and the GPU warm window now opens when a model loads, so an idle server keeps the pack wired.
-- **DeepSeek decodes with DSpark up to 8% faster on both STQ packs**: a verify forward decodes each shared-expert weight once for several of its rows (M5 Ultra fast bench: 2.7bpw code 120 to 128 / 159 to 162 tok/s at 4k / 8k, 1.75bpw code 140 to 149 / 148 to 160).
-- **A long DeepSeek reply with DSpark is now exactly what serial decoding gives**: a verify of 9 to 16 rows took the attention input in separate launches, so an adaptive stream could part from serial decode thousands of tokens in (token 8,293 of an 8k code reply).
-- **DeepSeek prefill runs about 1% faster with 3,960 fewer GPU dispatches per 8,192-token chunk**: fused prefill attention no longer builds a separate causal mask it computes inside the kernel.
-- **Nine to sixteen DeepSeek requests decoding together now each get the same text they would alone**: past 8 joined rows the attention input took separate launches whose sums ran in another order than a request's solo step, so its tokens could drift from what it generates alone.
-- **A fully resident DeepSeek load serves several requests at once up to 14% faster**: the joined rows share one vocabulary head and wait, and up to 16 tensor parts join in one dispatch (M5 Ultra, 2.7bpw: 108 to 124 tok/s at 8 requests, 117 to 134 at 16).
-- **`sushi pull deepseek-v4.1-flash:2.7bpw`**: DeepSeek-V4.1-Flash STQ 2.7bpw (400 GB, KLD 0.0607 against the 1.75bpw pack's 0.1525) is listed by `sushi pull`, `sushi list` and the web page, and recommended on 256 GB Macs; the bare name still pulls 1.75bpw.
-- **DeepSeek-V4.1-Flash STQ 2.7bpw decodes 13-20% faster on an M5 Ultra**: its K3.5 routed experts and K5 trunk read their weights with fewer loads at the same output, and on the Ultra the K5 trunk splits its sums its own way, which moves the pack's KLD from 0.06114 to 0.06067.
-- **Logprobs are no longer served**: a request that asks for them (`logprobs`, `top_logprobs`, a legacy completion's integer `logprobs`, or a Responses `include` of `message.output_text.logprobs`) is refused with a 400 naming the field; chat `logprobs: false`, `top_logprobs: 0` and null still pass; a legacy completion's integer `logprobs` is refused at any value, 0 included.
-- **A stream with no tools declared holds a thought that writes call markup until the reply ends**: the whole reply reads such a thought's close by the call's own value end, which a later byte can flip, so its reasoning after the call and the answer after `</think>` arrive at the reply's end instead of as they come.
-- **On Sushi Cooler a request reserves its whole reply up front, and the hot cache keeps only the rows it used**: every request now holds its last row from its first chunk (a prompt under 32,768 tokens grew its cache through the decode before, and one past it carried a chunk of slack), so its bill no longer carries a decode regrow, and a commit cuts the cache to the rows it holds, so a short chat that asked for a long reply no longer keeps the reply's reservation, gigabytes for a long ask, in the hot cache.
-- **The debug log no longer reports a tool call as dropped while the model is still writing it**: a stream's keepalive re-read the growing call and wrote "tool markup parsed to no call" for each read (22 lines in one Claude Code run, every call delivered). Only the final read writes the line now, and it names the cut call's own start, its length and the calls parsed before it.
-- **Current Codex runs on sushi again**: `/v1/responses` serves a `namespace` tool (Codex's `multi_agent_v1`) by offering its member functions to the model and returning a call to one with its `namespace`, a malformed namespace is a 400 naming it, a hosted `web_search` is a 400 naming the tool and Codex's `web_search = "disabled"` setting, and `sushi launch codex` writes that setting.
-- **A thought that holds a call with a mangled quote splits the same on a stream as on the whole reply**: `plan <tool_call>{"name":"f","arguments":{"k":"v}}</tool_call> done</think>answer "q` read the thought's close while it streamed and lost it when the answer's own quote arrived; a call's end is now judged from the bytes before its closer, never from a quote after it.
-- **A JSON or Gemma call whose string spells braces that close the object right before a closer now ends there**: `{"k":"}}</tool_call> y"}}` was read as one call to its last closer because a quote followed; the bytes before a closer cannot tell `}}` in a string from a dropped quote, so the call ends at the first closer, as it does for `{"k":"v}}` (cell `r174-f-closer-monotone`).
-- **`sushi launch aider` is gone**: aider is not an agent sushi supports, so the launcher now refuses it as an unknown agent and no longer writes `~/.sushi/aider/`.
-- **The `[admission]` line names the decoder-pool bytes a DeepSeek prefill borrows**: `lendable` sits beside `needed`, so a resident prefill's hold, which is more than `needed` by design, can be checked against `needed + lendable` from the log.
-- **A DeepSeek-V4.1 row store whose grow fails inside MLX no longer keeps a part at a size its capacity disagrees with**: the codes grew before the scales, so a failure at the scales (or at a trim after a truncate) left the codes at the new size and the capacity at the old one, which under-billed the store or let a later append write past the codes' end; every part is now built before any old one is freed.
-- **A thought with one stray backtick before its close is no longer swallowed whole**: `<think>use the ` key</think>answer` returned its whole text as reasoning and an empty answer, because the lone backtick opened a code span to the end of the line; a span now opens only where its closing backtick follows on the line, on every surface, stream or not.
-- **A request's memory bill is its larger phase, not the sum of both**: the bill added the decode step's cache regrow to the prefill chunk's transient, which are never held together, so a request whose prefill dominates was billed up to 0.5 GB (MiMo, its sliding rings) more than it holds, and the context Sushi advertises and the refusals that name a context or `max_tokens` follow the lower bill.
-- **A decode step's dense KV rebuild is now billed**: no bill carried the bytes a decode step rebuilds its packed KV cache into, so a long reply on Sushi Cooler with the packed attention arms off, where a decode step rebuilds the whole cache, was under-billed by up to 2.0 GB (Flash-Next at 786,432 keys); the decode phase now prices that rebuild the way the prefill phase does.
+- **DeepSeek-V4.1-Flash STQ 2.7bpw for 256 GB Macs**: `sushi pull deepseek-v4.1-flash:2.7bpw` fetches the 400 GB pack
+  (KLD 0.0607 against the 1.75bpw pack's 0.1525), which keeps every expert resident; `sushi list` and the web page list
+  it and recommend it on 256 GB Macs, and the bare name still pulls 1.75bpw. On an M5 Ultra it decodes 13-20% faster
+  than on 1.7.3.
+- **DeepSeek decodes faster with the same text**: DSpark picks its draft rounds better (a low-confidence draft no longer
+  buys a verify row, drafts shorten while they miss) and a verify reads each shared-expert weight once for all its rows:
+  up to 14% and 8% faster on the M5 Ultra; the release bench on an M5 Max reads 104.9 tok/s code decode at 4k on the
+  1.75bpw pack, against 95.3 on 1.7.3.
+- **DeepSeek prefills faster**: prose prompts 17-22% faster and the first prompt after a load up to twice as fast (Engram
+  reads use 25x less CPU, and the GPU warms when a model loads: a cold 4k code prompt 1,135 to 1,517 tok/s on an M5 Max),
+  and attention 3.4-6.5% faster on both STQ packs.
+- **Several DeepSeek requests at once, each with its own text**: a fully resident load serves them up to 14% faster
+  (2.7bpw on an M5 Ultra: 108 to 124 tok/s at 8 requests, 117 to 134 at 16), and 9 to 16 joined requests, or a long
+  DSpark reply, now get exactly the tokens they would alone.
+- **Current Codex runs on sushi again, and tool calls split the same everywhere**: `/v1/responses` serves Codex's
+  `namespace` tool and refuses a hosted `web_search` by name, and `sushi launch codex` turns that search off; a thought
+  holding call markup, a mangled quote, braces in a string or a stray backtick now reads the same on a stream as on the
+  whole reply.
+- **Memory bills match what runs**: on Sushi Cooler a request reserves its whole reply up front and the prompt cache
+  keeps only the rows it used (a short chat that asked for a long reply no longer holds gigabytes there); a request is
+  billed for its larger phase, not both (up to 0.5 GB less), and a decode step's KV rebuild (up to 2.0 GB) and a failed
+  DeepSeek row-store grow are billed where they happen.
+- **Smaller changes**: sushibar's menu bar icon shows whether a model is absent, loading or ready; a server asked to stop
+  closes its connections at once; logprobs are no longer served, and a request for them is a 400 naming
+  the field; `sushi launch aider` is gone.
+
+---
 
 ## v1.7.3 — Claude Code and tool calls that hold, requests checked end to end
 
