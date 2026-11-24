@@ -2,8 +2,7 @@
 //! in one pass over the target's own state. Each drafter layer is MLA in the sparse layers' shape with its own
 //! projections, reading the target's cached rows at its shared layer (`dfly_target_kv_layers`) beside the block's own
 //! rows; it keeps no KV of its own. The forward is the released drafter's training code, Tencent AngelSpec at
-//! 0505773a (Apache-2.0; NOTICE), held to it by `tests/dump_hy4_dfly_fixture.py`. A drafter changes how fast the target
-//! speaks, never what it says.
+//! 0505773a (Apache-2.0; NOTICE). A drafter changes how fast the target speaks, never what it says.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const plan = @import("../tensor/plan/plan_api.zig");

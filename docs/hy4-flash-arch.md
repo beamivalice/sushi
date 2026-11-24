@@ -489,11 +489,10 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     slot 1 and slot j-1's draft (its argmax) after that.
   - Each slot's logits are the target's head over `h'_j`, with no other norm. Its confidence is `σ(proj(h'_j))`.
   - The chain is 5 head passes and 5 host reads a draft, one after another.
-- **Parity**: the oracle test `hy4 dfly oracle` holds each slot's logits within 1e-4 of their peak, its draft exact and
-  its confidence within 1e-5 (measured 6.6e-7 and 5.4e-7). The reference is AngelSpec's own modules in f32 on CPU
-  (`tests/dump_hy4_dfly_fixture.py`, fixture `fixtures/hy4_dfly_oracle.json`, the state from the test under
-  `SUSHI_HY4_DFLY_STATE_DUMP`), run on the tiny's drafter weights over
-  the target state the engine hands over. Before 1z the wiring was guessed from the README and tensors: the fusion
+- **Parity**: proven against AngelSpec's own modules in f32 on CPU, on the tiny's drafter weights over the target
+  state the engine hands over: each slot's logits 6.6e-7 of their peak, the drafts exact, the confidence 5.4e-7 off.
+  The test is retired: a drafter changes speed, never text, so `hy4 dfly: greedy rounds` holds the output and the
+  bench's decode holds acceptance. Before 1z the wiring was guessed from the README and tensors: the fusion
   replaced `E(x_a)` and skipped the target's final norm, the correction ran on every input row from the target's `h`
   with the embedding first, the block was fully visible and the confidence read the uncorrected hidden. On the tiny
   that left the drafts wrong, the logits 1.28 of peak off and the confidence 0.46 off.

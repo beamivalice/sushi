@@ -141,7 +141,8 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
 - **A test exists to catch an error a change can make.** A parity test against another engine goes once the new one
-  is proven; no check repeats over fixtures, lengths or arms on one code path.
+  is proven, as does a drafter's or MTP head's reference parity (speed, never text; [testsuite](docs/testsuite.md));
+  no check repeats over fixtures, lengths or arms on one code path.
 - **No unreliable test**: a test whose verdict varies run to run on the same tree is made deterministic (a fixed seed,
   a bounded wait, a structural reading) or removed, naming what still covers it; never rerun until green. No blanket
   long wait: a read waits for its own measured work, a model load once, and a timeout names what it waited for.

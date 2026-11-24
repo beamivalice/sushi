@@ -303,8 +303,7 @@ released drafter's training code at commit 0505773a
 (`angelspec/models/draft/dflash.py`, `hy4_mla.py`, `dspark.py`, and
 `angelspec/models/dflash.py`): the slot-0 MTP fusion, the block-causal mask,
 the hidden correction's served chain and the confidence head over its output.
-It is reimplemented in Zig on Sushi Cooler; tests/dump_hy4_dfly_fixture.py
-loads the unmodified AngelSpec modules externally to generate its fixture.
+It is reimplemented in Zig on Sushi Cooler.
 
 
 ================================================================================
