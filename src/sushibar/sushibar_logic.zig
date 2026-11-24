@@ -289,11 +289,16 @@ fn titleBase(buf: []u8, v: View) []const u8 {
     return text catch "";
 }
 
-pub const Icon = enum { outline, color };
+/// The menu bar icon: the outline template while no server answers; once one does, the colour box alone (no model),
+/// with an outline fish (a model loading) or with the whole sushi (a model ready).
+pub const Icon = enum { outline, empty, loading, ready };
 
-/// The outline template while no server answers; the colour sushi once one does, whatever it says.
-pub fn iconFor(link: Link) Icon {
-    return if (link == .offline or link == .silent) .outline else .color;
+/// What `/v1/models` says of the watched server's model, as the header card reads it.
+pub const ModelSeen = struct { ready: bool = false, loading: bool = false };
+
+pub fn iconFor(link: Link, model: ModelSeen) Icon {
+    if (!answering(link)) return .outline;
+    return if (model.ready) .ready else if (model.loading) .loading else .empty;
 }
 
 /// A server replied, whatever it said.
@@ -1915,7 +1920,7 @@ test "silent: a sushi that listens and does not answer is Not answering, with St
     try std.testing.expect(t.action == .stop and t.enabled);
     try std.testing.expect(!enabled(.{ .link = .silent, .sushi_listening = true }).start);
     try std.testing.expect(!openEnabled(.silent));
-    try std.testing.expectEqual(Icon.outline, iconFor(.silent));
+    try std.testing.expectEqual(Icon.outline, iconFor(.silent, .{ .ready = true }));
 }
 
 test "status: the line names the port, and a port held by another program blocks Start" {
@@ -2555,9 +2560,19 @@ test "tracker: the last speed outlives the request, and since follows the newest
     try std.testing.expect(t.live == null and !t.decoding);
 }
 
-test "icon and link: outline only when nothing answers, and a silent server is offline" {
-    try std.testing.expectEqual(Icon.outline, iconFor(.offline));
-    for ([_]Link{ .up, .unauthorized, .metrics_off }) |l| try std.testing.expectEqual(Icon.color, iconFor(l));
+test "icon and link: outline while nothing answers; an answering server shows its model's state" {
+    for ([_]Link{ .offline, .silent }) |l| {
+        try std.testing.expectEqual(Icon.outline, iconFor(l, .{}));
+        try std.testing.expectEqual(Icon.outline, iconFor(l, .{ .ready = true }));
+        try std.testing.expectEqual(Icon.outline, iconFor(l, .{ .loading = true }));
+    }
+    for ([_]Link{ .up, .unauthorized, .metrics_off }) |l| {
+        try std.testing.expectEqual(Icon.empty, iconFor(l, .{}));
+        try std.testing.expectEqual(Icon.loading, iconFor(l, .{ .loading = true }));
+        try std.testing.expectEqual(Icon.ready, iconFor(l, .{ .ready = true }));
+        // A model being replaced is still ready to use until it goes.
+        try std.testing.expectEqual(Icon.ready, iconFor(l, .{ .ready = true, .loading = true }));
+    }
     try std.testing.expectEqual(Link.offline, linkFor(null));
     try std.testing.expectEqual(Link.up, linkFor(200));
     try std.testing.expectEqual(Link.unauthorized, linkFor(401));

@@ -1328,7 +1328,7 @@ var menu_target: objc.id = null;
 var top_menu: objc.id = null;
 var port_field_mi: objc.id = null;
 var note_mi: objc.id = null;
-var icons: [2]objc.id = .{ null, null };
+var icons: [std.enums.values(logic.Icon).len]objc.id = @splat(null);
 var shown_icon: ?logic.Icon = null;
 var tick_count: u32 = 0;
 var last_title: [128]u8 = undefined;
@@ -1723,7 +1723,7 @@ fn refresh() void {
     tv.update_waiting = uv.available;
     const title = logic.title(&last_title, tv);
     const button = objc.msg(objc.id, status_item, "button", .{});
-    showIcon(button, logic.iconFor(view.link));
+    showIcon(button, logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 }));
     showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
     setButtonTitle(button, title);
     var status_buf: [200]u8 = undefined;
@@ -2025,7 +2025,9 @@ const icon_h = 18;
 
 fn loadIcons() void {
     icons[@intFromEnum(logic.Icon.outline)] = objc.loadSvg(@embedFile("sushibar/icon-offline.svg"), true, icon_w, icon_h);
-    icons[@intFromEnum(logic.Icon.color)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
+    icons[@intFromEnum(logic.Icon.empty)] = objc.loadSvg(@embedFile("sushibar/icon-empty.svg"), false, icon_w, icon_h);
+    icons[@intFromEnum(logic.Icon.loading)] = objc.loadSvg(@embedFile("sushibar/icon-loading.svg"), false, icon_w, icon_h);
+    icons[@intFromEnum(logic.Icon.ready)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
 }
 
 const find_show_interface: isize = 1;
@@ -2255,11 +2257,14 @@ fn renderBadge(dir: []const u8) void {
     loadIcons();
     const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", badge: bool = false };
     const cases = [_]Case{
-        .{ .name = "live", .icon = .color, .title = "105 tok/s" },
-        .{ .name = "last", .icon = .color, .title = "88.0 tok/s" },
-        .{ .name = "generating", .icon = .color, .title = "generating…" },
-        .{ .name = "reading", .icon = .color, .title = "prompt…" },
-        .{ .name = "badge", .icon = .color, .badge = true },
+        .{ .name = "live", .icon = .ready, .title = "105 tok/s" },
+        .{ .name = "last", .icon = .ready, .title = "88.0 tok/s" },
+        .{ .name = "generating", .icon = .ready, .title = "generating…" },
+        .{ .name = "reading", .icon = .ready, .title = "prompt…" },
+        .{ .name = "badge", .icon = .ready, .badge = true },
+        .{ .name = "no-model", .icon = .empty },
+        .{ .name = "loading", .icon = .loading },
+        .{ .name = "key-needed", .icon = .empty, .badge = true },
         .{ .name = "offline", .icon = .outline },
     };
     for (cases) |c| for ([_]bool{ false, true }) |dark| {
