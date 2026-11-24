@@ -237,32 +237,57 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
     // Copy rounds keep to the widest verify whose rows are the serial step's (`Model.exactVerifyRows`).
     // The lookup context is the prompt, the output the model is about to write, and the prompt again: the generated
     // tail then matches the output's start, and the copy is the model's own continuation. `wrong_every` spoils drafts.
-    for ([_]usize{ 0, 11 }) |wrong_every| {
-        const ctx = try a.alloc(u32, prompt.len * 2 + serial.items.len);
+    const Case = struct { spoil: usize, suffix: ?usize = null, kept: f32 = 5, whole: u8 = 0, agrees: ?usize = null, first_drafts: ?u32 = null };
+    for ([_]Case{
+        .{ .spoil = 0 },
+        .{ .spoil = 7, .suffix = 4, .agrees = 6, .first_drafts = 6 },
+        .{ .spoil = 7, .suffix = 4, .agrees = 3, .first_drafts = 0 },
+        .{ .spoil = 11 },
+        .{ .spoil = 7, .suffix = 22, .whole = 2, .first_drafts = 7 },
+        .{ .spoil = 7, .suffix = 18, .agrees = 3, .first_drafts = 0 },
+        .{ .spoil = 11, .kept = 0, .first_drafts = 2 },
+        .{ .spoil = 7, .suffix = 6, .first_drafts = 0 },
+    }) |case| {
+        const wrong_every = case.spoil;
+        const segment = prompt.len + serial.items.len;
+        const ctx = try a.alloc(u32, prompt.len + segment * @as(usize, if (case.agrees == null) 1 else 2));
         defer a.free(ctx);
         @memcpy(ctx[0..prompt.len], prompt);
         @memcpy(ctx[prompt.len..][0..serial.items.len], serial.items);
         if (wrong_every > 0) {
+            ctx[prompt.len + 2] +%= 1;
             var i: usize = wrong_every;
             while (i < serial.items.len) : (i += wrong_every) ctx[prompt.len + i] +%= 1;
         }
-        @memcpy(ctx[prompt.len + serial.items.len ..], prompt);
+        if (case.suffix) |suffix| ctx[prompt.len - suffix] +%= 1;
+        if (case.agrees) |n| {
+            @memcpy(ctx[segment..][0..segment], ctx[0..segment]);
+            ctx[segment + prompt.len + n + 1] +%= 1;
+        }
+        @memcpy(ctx[ctx.len - prompt.len ..], prompt);
         try xfm.resetCache();
         var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true, .lookup_prompt = ctx });
         defer gen.deinit(a);
         gen.dspark_copy = true;
+        gen.dspark_copy_backoff.kept = case.kept;
+        gen.dspark_copy_backoff.whole = case.whole;
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
         while (try gen.nextDspark(a)) |r| {
             defer a.free(r.tokens);
+            if (got.items.len == 0) if (case.first_drafts) |n| {
+                try testing.expectEqual(@as(u32, @intFromBool(n > 0)), gen.dspark_stats.copy_rounds);
+                try testing.expectEqual(n, gen.dspark_stats.copy_drafted);
+                if (n > 0) try testing.expectEqual(@as(u32, 1), r.accepted_tokens);
+            };
             try got.appendSlice(a, r.tokens);
         }
         try testing.expectEqualSlices(u32, serial.items, got.items);
         const st = gen.dspark_stats;
-        try testing.expect(st.copy_rounds > 0);
+        if (case.suffix == null) try testing.expect(st.copy_rounds > 0);
         try testing.expect(st.copy_accepted <= st.copy_drafted);
         try testing.expect(wrong_every > 0 or st.copy_accepted == st.copy_drafted);
-        try testing.expect(wrong_every == 0 or st.copy_accepted < st.copy_drafted);
+        if (case.suffix == null) try testing.expect(wrong_every == 0 or st.copy_accepted < st.copy_drafted);
         // A copy that keeps landing whole widens to the widest verify whose rows are the serial step's.
         const widest = dsv41_state.modelOf(&xfm).?.exactVerifyRows();
         var at_widest: u32 = 0;
@@ -6704,5 +6729,117 @@ test "dsv41 DSpark: the widest verify probe also traces the following serial row
     try std.testing.expectEqual(@as(usize, 0), try WidthProbe.at(std.testing.allocator, &fx.xfm, fx.ids[0..8], &cont, 1, false));
     for ([_]usize{ 0, w + 1 }) |invalid| {
         try std.testing.expectError(error.BadProbeWidth, WidthProbe.at(std.testing.allocator, &fx.xfm, fx.ids[0..8], &cont, invalid, false));
+    }
+}
+
+test "dsv41 engine: consecutive low acceptance shortens the stage draft and a recovered round restores it (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var serial: [18]u32 = undefined;
+    {
+        var plain = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, .{ .temperature = 0 }, &.{}, .{ .dspark_enabled = true });
+        defer plain.deinit(a);
+        plain.dspark_diag = .{ .rows = 1 };
+        for (&serial) |*t| {
+            const round = (try plain.nextDspark(a)).?;
+            defer a.free(round.tokens);
+            t.* = round.tokens[0];
+        }
+    }
+    try fx.xfm.resetCache();
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, .{ .temperature = 0 }, &.{}, .{ .dspark_enabled = true });
+    defer gen.deinit(a);
+    gen.dspark_copy = false;
+    var offset: usize = 0;
+    var full_dispatches: u64 = 0;
+    const late = mlx.engine.latePipelines();
+    for (0..3) |phase| {
+        const policy = &gen.dspark_policy;
+        if (phase == 1) for (0..3) |_| policy.observeRound(&.{ 0, 0, 0, 0 }, 2, 0, 1, 1);
+        if (phase == 2) policy.observeRound(&.{ 0, 0 }, 3, 2, 1, 1);
+        policy.owed = 0;
+        policy.gate = .{};
+        var meter = dsv41_dspark.RoundMeter.init(io);
+        meter.fence_draft = true;
+        const round = (try dsv41_dspark.measuredRound(&gen, a, &meter)).?;
+        defer a.free(round.tokens);
+        try testing.expectEqualSlices(u32, serial[offset..][0..round.tokens.len], round.tokens);
+        offset += round.tokens.len;
+        const dispatches = meter.part(.markov).dispatches;
+        errdefer std.debug.print("draft phase {d}: Markov dispatches {d}, full {d}\n", .{ phase, dispatches, full_dispatches });
+        try testing.expect(dispatches > 0);
+        if (phase == 0) full_dispatches = dispatches;
+        if (phase == 1) try testing.expect(dispatches < full_dispatches);
+        if (phase == 2) try testing.expectEqual(full_dispatches, dispatches);
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    }
+}
+
+test "dsv41 engine: a full stage block found in history verifies its continuation and leaves the serial successor (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    var tok = Tokenizer.initEmpty(a);
+    defer tok.deinit();
+    var buf: [48]u32 = undefined;
+    const prompt = fx.prompt(&buf)[0..40];
+    const block = fx.model().cfg.dspark.block;
+    var lookup: [2 * dsv41_max_drafts + 3]u32 = undefined;
+    const greedy = SamplingParams{ .temperature = 0 };
+    var serial: [24]u32 = undefined;
+    {
+        var probe = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, greedy, &.{}, .{ .dspark_enabled = true });
+        defer probe.deinit(a);
+        var draft = try dsv41_serving.dsv41DraftImpl(&fx.xfm, &probe.ctx, probe.next_token_id);
+        defer draft.deinit();
+        @memcpy(lookup[0..block], draft.ids[1..]);
+        for (lookup[block..][0..block], 0..) |*t, i| t.* = @intCast(47 + i);
+        @memcpy(lookup[block * 2 ..][0..3], &[_]u32{ 250, 249, 248 });
+        probe.dspark_diag = .{ .rows = 1 };
+        for (&serial) |*t| {
+            const r = (try probe.nextDspark(a)).?;
+            defer a.free(r.tokens);
+            t.* = r.tokens[0];
+        }
+    }
+    const Case = struct { allow: bool, shallow: bool = false, drafts: usize };
+    for ([_]Case{
+        .{ .allow = false, .drafts = block },
+        .{ .allow = true, .drafts = 2 * block },
+        .{ .allow = false, .shallow = true, .drafts = 1 },
+        .{ .allow = true, .shallow = true, .drafts = 1 },
+    }) |case| {
+        try fx.xfm.resetCache();
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, greedy, &.{}, .{ .dspark_enabled = true, .lookup_prompt = lookup[0 .. 2 * block + 3] });
+        defer gen.deinit(a);
+        gen.dspark_copy = case.allow;
+        if (case.shallow) {
+            gen.dspark_policy.cost = .{ .plain_ms = 15, .step_ms = 3.3, .draft_ms = 2.7 };
+            gen.dspark_policy.calib = .{ .hit = @splat(400), .seen = @splat(1000) };
+        } else gen.dspark_policy.calib.hit = @splat(1000);
+        const result = (try gen.nextDspark(a)).?;
+        defer a.free(result.tokens);
+        try testing.expectEqual(@as(u32, 0), gen.dspark_stats.copy_rounds);
+        try testing.expectEqual(case.drafts, gen.dspark_stats.drafted);
+        try testing.expectEqualSlices(u32, serial[0..result.tokens.len], result.tokens);
+        gen.dspark_diag = .{ .rows = 1 };
+        for (serial[result.tokens.len..]) |expected| {
+            const r = (try gen.nextDspark(a)).?;
+            defer a.free(r.tokens);
+            try testing.expectEqual(expected, r.tokens[0]);
+        }
     }
 }

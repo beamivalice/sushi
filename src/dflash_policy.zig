@@ -115,6 +115,9 @@ pub const Calibration = struct {
     /// A bin forgets this share of its history per observation it takes.
     const KEEP: f32 = 0.97;
 
+    /// Start from the draft's own confidence and learn a bin's correction to it (outcome - confidence), so a bin's
+    /// low and high confidences stay apart; off, a bin's hit rate prices every confidence in it alike.
+    identity_prior: bool = false,
     hit: [BINS]f32 = @splat(0),
     seen: [BINS]f32 = @splat(0),
 
@@ -133,12 +136,15 @@ pub const Calibration = struct {
 
     pub fn probability(self: *const Calibration, conf: f32) f32 {
         const b = bin(conf);
+        if (self.identity_prior) return std.math.clamp(conf + self.hit[b] / (self.seen[b] + PRIOR_WEIGHT), 0, 1);
         return (self.hit[b] + PRIOR_WEIGHT * prior(conf)) / (self.seen[b] + PRIOR_WEIGHT);
     }
 
     pub fn observe(self: *Calibration, conf: f32, accepted: bool) void {
         const b = bin(conf);
-        self.hit[b] = self.hit[b] * KEEP + @as(f32, if (accepted) 1 else 0);
+        const outcome: f32 = if (accepted) 1 else 0;
+        const sample = if (self.identity_prior) outcome - conf else outcome;
+        self.hit[b] = self.hit[b] * KEEP + sample;
         self.seen[b] = self.seen[b] * KEEP + 1;
     }
 

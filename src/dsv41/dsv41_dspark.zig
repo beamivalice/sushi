@@ -90,11 +90,27 @@ fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, dra
     const block: usize = m.cfg.dspark.block;
     if (cap <= block) return 0;
     const idx = try self.mtpLookupIndex(allocator);
-    const found = idx.matchBest(t1, @intCast(self.dspark_copy_backoff.width(cap, copy_narrow)));
-    const n = mtp_lookup.copyLen(found, cap, block, mtp_lookup.COPY_SUFFIX);
+    const match = idx.matchBest(t1, @intCast(cap)) orelse return 0;
+    const available = idx.copyAvailable(t1, match, block);
+    const width_cap = if (match.suffix >= mtp_lookup.STRONG_SUFFIX) cap else @min(cap, copy_narrow);
+    const n = @min(available, self.dspark_copy_backoff.width(width_cap, copy_narrow));
     if (n == 0 or !self.dspark_copy_backoff.take()) return 0;
-    @memcpy(drafts[0..n], found.?.draft[0..n]);
+    @memcpy(drafts[0..n], match.draft[0..n]);
     return n;
+}
+
+fn extendStage(self: *Generator, allocator: std.mem.Allocator, ids: []u32, rows: usize) !usize {
+    if (!self.dspark_copy or self.spec_disabled_runtime or @import("../mtp_depth_bounds.zig").active.explicit()) return rows;
+    const m = dsv41_state.modelOf(self.xfm) orelse return rows;
+    if (rows != m.cfg.dspark.block + 1 or rows <= mtp_lookup.NGRAM) return rows;
+    const cap = @min(ids.len, self.dspark_copy_rows orelse dsv41_max_verify_rows, m.exactVerifyRows(), self.max_tokens - self.completion_tokens);
+    const extra = @min(cap -| rows, rows - 1);
+    if (extra == 0) return rows;
+    const idx = try self.mtpLookupIndex(allocator);
+    const match = idx.matchTail(ids[0..rows], @intCast(extra)) orelse return rows;
+    if (match.suffix < rows - 1) return rows;
+    @memcpy(ids[rows..][0..match.draft.len], match.draft);
+    return rows + match.draft.len;
 }
 
 /// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
@@ -167,7 +183,8 @@ pub fn measuredRound(self: *Generator, allocator: std.mem.Allocator, meter: ?*Ro
     var block_len: usize = 1 + copied;
     if (meter) |m| m.mark(.entry);
     if (copied == 0 and (forced == null or forced.? > 1)) {
-        block = try dsv41_serving.dsv41DraftMeasured(xfm, &self.ctx, t1, meter);
+        const limit = if (adaptive and forced == null) policy.draftLimit() else null;
+        block = try dsv41_serving.dsv41DraftMeasured(xfm, &self.ctx, t1, limit, meter);
         block_len = block.?.ids.len;
         @memcpy(ids_buf[0..block_len], block.?.ids);
         @memcpy(conf_buf[0 .. block_len - 1], block.?.conf);
@@ -179,7 +196,7 @@ pub fn measuredRound(self: *Generator, allocator: std.mem.Allocator, meter: ?*Ro
         ids_buf[i] = ids_buf[block_len - 1];
     };
     // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
-    const wanted: usize = forced orelse policy.rows(conf_buf[0 .. block_len - 1]);
+    const wanted = forced orelse try extendStage(self, allocator, &ids_buf, policy.rows(conf_buf[0 .. block_len - 1]));
     // Nothing past an end-of-turn draft is published: the round ends on it, where the reply's restore point stands.
     const turn = ids_buf[0..mtp_plan.rowsThroughAny(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.eos_token_ids)];
     var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(turn, self.dspark_round_ends_at), think_room);

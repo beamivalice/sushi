@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **DeepSeek with DSpark picks its draft rounds better, up to 14% faster decode with the same text**: a low-confidence draft no longer buys a verify row, drafts shorten while they keep missing, and prompt copies need a second occurrence in the history (M5 Ultra, 1.75bpw code 149 to 170 / 160 to 179 tok/s at 4k / 8k, 2.7bpw prose 66 to 70 / 86 to 90).
 - **DeepSeek prose prompts prefill 17-22% faster and the first prompt after a load up to twice as fast**: Engram rows already in the page cache are read on 4 threads instead of 64 (25x less CPU), widening only when a read reaches the SSD, and the GPU warm window now opens when a model loads, so an idle server keeps the pack wired.
 - **DeepSeek decodes with DSpark up to 8% faster on both STQ packs**: a verify forward decodes each shared-expert weight once for several of its rows (M5 Ultra fast bench: 2.7bpw code 120 to 128 / 159 to 162 tok/s at 4k / 8k, 1.75bpw code 140 to 149 / 148 to 160).
 - **A long DeepSeek reply with DSpark is now exactly what serial decoding gives**: a verify of 9 to 16 rows took the attention input in separate launches, so an adaptive stream could part from serial decode thousands of tokens in (token 8,293 of an 8k code reply).

@@ -109,6 +109,9 @@ pub const Range = struct {
 };
 
 pub const Policy = struct {
+    pub const short_drafts: u32 = 2;
+
+    low_stages: u2 = 0,
     gate: spec_cost_gate.Gate = .{},
     calib: dflash_policy.Calibration = identityCalibration(),
     cost: Cost = .{},
@@ -145,6 +148,10 @@ pub const Policy = struct {
         return action;
     }
 
+    pub fn draftLimit(self: *const Policy) ?u32 {
+        return if (self.low_stages == 3 and self.range.min_rows == 1) short_drafts else null;
+    }
+
     /// Rows (t1 included) to verify of a block whose drafts carry confidence logits `conf`.
     pub fn rows(self: *const Policy, conf: []const f32) u32 {
         var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
@@ -160,6 +167,7 @@ pub const Policy = struct {
         var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
         const n = @min(conf.len, p.len);
         for (conf[0..n], p[0..n]) |c, *o| o.* = sigmoid(c);
+        self.low_stages = if (accepted < short_drafts) self.low_stages +| 1 else 0;
         self.calib.observeRound(p[0..n], verified - 1, accepted);
         if (verified == 1) self.cost.observePlain(verify_ms) else self.cost.observeRound(verified, verify_ms, draft_ms);
         self.gate.observeRound(draft_ms + verify_ms, 1 + accepted);
@@ -199,14 +207,7 @@ pub const Policy = struct {
 /// The confidence head's logit is a calibrated probability (the rounds measured bins of it landing within a few
 /// points), so each bin starts as that many pseudo-rounds at its centre instead of the selector's fitted prior.
 fn identityCalibration() dflash_policy.Calibration {
-    var c: dflash_policy.Calibration = .{};
-    const weight = 30;
-    for (&c.hit, &c.seen, 0..) |*hit, *seen, b| {
-        const axis = (@as(f32, @floatFromInt(b)) + 0.5) / 4;
-        seen.* = weight;
-        hit.* = weight * (1 - std.math.pow(f32, 10, -axis));
-    }
-    return c;
+    return .{ .identity_prior = true, .seen = @splat(30) };
 }
 
 fn sigmoid(x: f32) f32 {
@@ -511,4 +512,11 @@ test "dspark rows: a floored width never schedules a plain step, however badly t
         }
     }
     try testing.expect(plain > 100);
+}
+
+test "dspark rows: confidence distinguishes cheap second rows from unlikely proposals within a calibration bin" {
+    var p = Policy{};
+    p.cost = .{ .plain_ms = 15, .step_ms = 3.3, .draft_ms = 2.7 };
+    try testing.expectEqual(@as(u32, 1), p.rows(&.{logit(0.05)}));
+    try testing.expectEqual(@as(u32, 2), p.rows(&.{logit(0.4)}));
 }

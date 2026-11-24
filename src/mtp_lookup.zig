@@ -93,36 +93,71 @@ pub const Index = struct {
         if (toks.len < NGRAM - 1 or max_draft == 0) return null;
         const t = toks[toks.len - (NGRAM - 1) ..];
         const p: usize = self.next.get(key(t[0], t[1], t[2], t1)) orelse return null;
-        return self.matchAt(p, t1, max_draft);
+        return self.matchAt(p, &.{t1}, max_draft);
     }
 
     /// `match`, but of the last `CANDIDATES` occurrences the one that agrees furthest back (the latest among equals): an
     /// edit that left the latest occurrence on the wrong copy still finds the right one.
     pub fn matchBest(self: *const Index, t1: u32, max_draft: u32) ?Match {
-        const toks = self.toks.items;
-        if (toks.len < NGRAM - 1 or max_draft == 0) return null;
-        const t = toks[toks.len - (NGRAM - 1) ..];
-        var p: usize = self.next.get(key(t[0], t[1], t[2], t1)) orelse return null;
-        var best = self.matchAt(p, t1, max_draft);
+        return self.matchTail(&.{t1}, max_draft);
+    }
+
+    pub fn matchTail(self: *const Index, tail: []const u32, max_draft: u32) ?Match {
+        const total = self.toks.items.len + tail.len;
+        if (tail.len == 0 or total < NGRAM or max_draft == 0) return null;
+        var gram: [NGRAM]u32 = undefined;
+        for (&gram, total - NGRAM..) |*v, i| v.* = self.at(tail, i);
+        var p: usize = self.next.get(key(gram[0], gram[1], gram[2], gram[3])) orelse return null;
+        var best = self.matchAt(p, tail, max_draft);
         var seen: u32 = 1;
         while (seen < CANDIDATES and best.suffix < SUFFIX_CAP and self.prev.items[p] != none) : (seen += 1) {
             p = self.prev.items[p];
-            const m = self.matchAt(p, t1, max_draft);
+            const m = self.matchAt(p, tail, max_draft);
             if (m.suffix > best.suffix) best = m;
         }
         return best;
     }
 
-    fn matchAt(self: *const Index, p: usize, t1: u32, max_draft: u32) Match {
+    fn at(self: *const Index, tail: []const u32, pos: usize) u32 {
+        const toks = self.toks.items;
+        return if (pos < toks.len) toks[pos] else tail[pos - toks.len];
+    }
+
+    /// How far past `block` the history backs `best`: as far as a second occurrence agrees, and no further than any
+    /// equally long match agrees (one-backed short copies kept 6 of 24 tokens, two-backed 20 of 20). 0: no copy.
+    pub fn copyAvailable(self: *const Index, t1: u32, best: Match, block: usize) usize {
+        if (best.draft.len <= block) return 0;
+        const toks = self.toks.items;
+        if (toks.len < NGRAM - 1) return 0;
+        const t = toks[toks.len - (NGRAM - 1) ..];
+        var pos = self.next.get(key(t[0], t[1], t[2], t1)) orelse return 0;
+        var supported = copyLen(best, best.draft.len, block, COPY_SUFFIX);
+        var unanimous = best.draft.len;
+        for (0..CANDIDATES) |_| {
+            const other = self.matchAt(pos, &.{t1}, @intCast(best.draft.len));
+            if (other.draft.ptr != best.draft.ptr and other.suffix >= @min(best.suffix, 6)) {
+                const shared = std.mem.findDiff(u32, best.draft, other.draft) orelse best.draft.len;
+                supported = @max(supported, shared);
+                if (other.suffix == best.suffix) unanimous = @min(unanimous, shared);
+                if (unanimous <= block) return 0;
+            }
+            pos = self.prev.items[pos];
+            if (pos == none) break;
+        }
+        const n = @min(supported, unanimous);
+        return if (n > block) n else 0;
+    }
+
+    fn matchAt(self: *const Index, p: usize, tail: []const u32, max_draft: u32) Match {
         const toks = self.toks.items;
         var suffix: u32 = 0;
         var crosses = false;
         var a: usize = p;
-        var b: usize = toks.len + 1;
+        var b: usize = toks.len + tail.len;
         while (suffix < SUFFIX_CAP and a > 0) : (suffix += 1) {
             a -= 1;
             b -= 1;
-            if (toks[a] != (if (b == toks.len) t1 else toks[b])) break;
+            if (toks[a] != self.at(tail, b)) break;
             // A break counts only with agreement after it: a line's last token (a code line
             // ends in e.g. `):\n`) agrees whatever the next line starts with.
             crosses = crosses or (suffix > 0 and self.breaks.items[a]);
@@ -413,4 +448,32 @@ test "dspark copy backoff: a wide round that misses doubles the whole rounds the
     try testing.expectEqual(@as(usize, 15), b.width(15, 7));
     for (0..8) |_| b.observeCopy(15, 0, 120, 7);
     try testing.expectEqual(CopyBackoff.max_wide_after, b.wide_after);
+}
+
+test "lookup tail: a proposed block keeps the longest preceding context and leaves the index at the committed token" {
+    var idx = Index.init(testing.allocator);
+    defer idx.deinit();
+    try idx.extend(&.{ 20, 21, 7, 8, 9, 10, 11, 12, 100, 101, 102, 99, 88, 7, 8, 9, 10, 11, 12, 210, 211, 212, 20, 21 }, TestLines{});
+    const before = idx.toks.items.len;
+    const m = idx.matchTail(&.{ 7, 8, 9, 10, 11, 12 }, 3) orelse return error.NoMatch;
+    try testing.expectEqualSlices(u32, &.{ 100, 101, 102 }, m.draft);
+    try testing.expectEqual(@as(u32, 8), m.suffix);
+    try testing.expectEqual(before, idx.toks.items.len);
+    try testing.expect(idx.matchTail(&.{ 8, 9, 10, 13 }, 3) == null);
+}
+
+test "lookup copy: equally long contexts stop a copy at their first disagreement" {
+    var idx = Index.init(testing.allocator);
+    defer idx.deinit();
+    var prefix: [22]u32 = undefined;
+    for (&prefix, 0..) |*token, i| token.* = @intCast(100 + i);
+    for ([_]u32{ 76, 77, 77 }) |variant| {
+        try idx.extend(&prefix, TestLines{});
+        try idx.extend(&.{ 31, 32, 33, 34, 35, 36, variant, 38, 39, 40, 41, 42 }, TestLines{});
+    }
+    try idx.extend(&.{999}, TestLines{});
+    try idx.extend(prefix[0 .. prefix.len - 1], TestLines{});
+    const last = prefix[prefix.len - 1];
+    const candidate = idx.matchBest(last, 12) orelse return error.NoMatch;
+    try testing.expectEqual(@as(usize, 6), idx.copyAvailable(last, candidate, 5));
 }

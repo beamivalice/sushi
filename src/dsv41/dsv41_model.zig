@@ -3734,6 +3734,10 @@ fn warmOwnFills(m: *Model, t1: u32) !void {
         try warmBudget(m, 1);
         var d = try draftHeads(m, t1, .conf);
         d.deinit();
+        if (m.cfg.dspark.block > @import("../dspark_rows.zig").Policy.short_drafts) {
+            var short = try draftMeasured(m, t1, .conf, @import("../dspark_rows.zig").Policy.short_drafts, null);
+            short.deinit();
+        }
     }
 }
 
@@ -3895,7 +3899,8 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
 /// as a copy round's rows are whatever the context held.
 fn warmRound(m: *Model, t1: u32, w: usize) !void {
     try warmBudget(m, w);
-    var d = try draftHeads(m, t1, .conf);
+    const short = @import("../dspark_rows.zig").Policy.short_drafts;
+    var d = try draftMeasured(m, t1, .conf, if (w == short + 1) short else null, null);
     defer d.deinit();
     var round: [cfg_mod.ring_slack]u32 = undefined;
     round[0] = t1;
@@ -5359,17 +5364,17 @@ pub fn draft(m: *Model, t1: u32, with_heads: bool) !Draft {
 /// the windows of committed main rows, the trunk head over the last stage's norm, then the Markov bigram bias chained
 /// token to token.
 pub fn draftHeads(m: *Model, t1: u32, heads_wanted: Heads) !Draft {
-    return draftMeasured(m, t1, heads_wanted, null);
+    return draftMeasured(m, t1, heads_wanted, null, null);
 }
 
-pub fn draftMeasured(m: *Model, t1: u32, heads_wanted: Heads, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
+pub fn draftMeasured(m: *Model, t1: u32, heads_wanted: Heads, limit: ?u32, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
+    const width = @min(m.cfg.dspark.block, limit orelse m.cfg.dspark.block);
     transient_peak.begin();
-    defer transient_peak.end(.draft, m.cfg.dspark.block, null);
-    const out = try draftPass(m, t1, heads_wanted, meter);
-    return out;
+    defer transient_peak.end(.draft, width, null);
+    return draftPass(m, t1, heads_wanted, width, meter);
 }
 
-fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
+fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("round_meter.zig").RoundMeter) !Draft {
     const gpa = m.gpa;
     const saved_profile = m.profile;
     m.profile = null;
@@ -5381,7 +5386,6 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, meter: ?*@import("round_me
     const ds = &(m.dspark orelse return error.Dsv41NoDspark);
     var sc = m.scope();
     defer sc.deinit();
-    const B = c.dspark.block;
     const n = st.n;
     const hc = c.hc_mult;
     var in: [cfg_mod.max_block]i32 = undefined;

@@ -626,6 +626,26 @@ TFLOP/s and a streaming read at 768 GB/s, `sushi-ubench`; base `578b0279`): frac
 - Ruled out: twice the attention span (-35 ms GPU, but more idle: 2,459 -> 2,488 ms wall); parking the Engram consumer
   on an event (round 1's loss was cold pages; with pages primed it ties, and a reverse-order residual stays unexplained).
 
+**DSpark round selection on both STQ packs** (resident A B B A one load an arm, base `644e5f44` binary
+`6e14ecc578792ad3`, final binary `bf8f27a0a444f9e7`, 96 samples at nominal pressure; HTTP fast bench beside it):
+decode tok/s, base -> final.
+
+| request | 2.7bpw | 1.75bpw |
+|---|---|---|
+| code 4k | 127.55 -> 128.26 | 149.32 -> 170.50 |
+| code 8k | 161.91 -> 166.20 | 160.01 -> 178.74 |
+| prose 4k | 65.83 -> 70.11 | 68.07 -> 71.90 |
+| prose 8k | 86.38 -> 90.14 | 84.37 -> 84.57 |
+
+- The levers, all of them changing what is proposed and none what is emitted (every history equals serial decode; 8cat
+  KLD 0.060666116 / 0.152457202): the confidence calibration learns a bin's correction to the draft's confidence
+  (a 5% proposal no longer buys a second verify row); a draft shortens after three low-acceptance rounds and comes back
+  after two hits (1.75bpw stage time 2.69 -> 2.09 ms); a confident stage block extends from matching history; short
+  prompt copies retry within the allowance, need a second occurrence and stop where equally long matches disagree.
+- The one-row and three-row forwards did not move (2.7bpw 15.61 / 22.54 -> 15.54 / 22.48 ms): the gain is the rounds.
+- Ruled out: copies backed by one occurrence (2.7bpw code 123.8 / 157.9 tok/s), widening shallow stage purchases (+1%
+  at code 8k, slower at 4k), a single K split for six-row expert verify (469.7 -> 475.9 us on 1.75bpw).
+
 <a id="m5u-chunk-handoff"></a>
 **The chunk hand-off: a kept pool and layers in flight across a state-only chunk** (GPU idle a 29k-token request,
 `[engine] GPU busy` line; then `tests`-free prefill A B A B, one boot an arm, 2 samples a rung, code text with a fresh
