@@ -586,6 +586,9 @@ pub const Generator = struct {
     /// Forces the verify width (the `SUSHI_DSV41_DSPARK_ROWS` diagnostic, and the tests).
     dspark_diag: dspark_rows.Diag = .off,
     dspark_policy: dspark_rows.Policy = .{},
+    /// Test builds only: this cost's modelled ms stand in for every measured DSpark draft and verify, so an injected
+    /// cost holds while the gate still decides.
+    dspark_timing: ?dspark_rows.Cost = null,
     /// A DSpark round commits through the first draft with this id and no further, so the request's state
     /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
     dspark_round_ends_at: ?u32 = null,

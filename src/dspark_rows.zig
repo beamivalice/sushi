@@ -83,6 +83,11 @@ pub const Cost = struct {
         for (2..max_rows + 1) |r| out[r] = self.draft_ms + self.plain_ms + self.step_ms * @as(f32, @floatFromInt(r - 1));
         return out;
     }
+
+    /// The ms of a `rows`-row verify forward, as this cost models it.
+    pub fn verifyMs(self: *const Cost, rows: u32) f32 {
+        return self.plain_ms + self.step_ms * @as(f32, @floatFromInt(rows -| 1));
+    }
 };
 
 /// The verify widths `--mtp-min-depth` / `--mtp-max-depth` leave a round: depth is the drafts a round verifies, so a
@@ -519,4 +524,50 @@ test "dspark rows: confidence distinguishes cheap second rows from unlikely prop
     p.cost = .{ .plain_ms = 15, .step_ms = 3.3, .draft_ms = 2.7 };
     try testing.expectEqual(@as(u32, 1), p.rows(&.{logit(0.05)}));
     try testing.expectEqual(@as(u32, 2), p.rows(&.{logit(0.4)}));
+}
+
+test "dspark rows: modelled timings keep the injected cost fixed while the gate still decides rounds vs plain" {
+    const dear_cost: Cost = .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+    const cheap_cost: Cost = .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+    const conf = [_]f32{ 0, 0, 0, 0, 0 };
+    var dear = Policy{};
+    dear.cost = dear_cost;
+    var cheap = Policy{};
+    cheap.cost = cheap_cost;
+    var dear_plain: usize = 0;
+    var cheap_plain: usize = 0;
+    for (0..60) |_| {
+        switch (dear.next()) {
+            .plain => {
+                dear.observePlain(dear_cost.plain_ms);
+                dear_plain += 1;
+            },
+            .round => {
+                const r = dear.rows(&conf);
+                dear.observeRound(&conf, r, 0, dear_cost.draft_ms, dear_cost.verifyMs(r));
+            },
+        }
+        switch (cheap.next()) {
+            .plain => {
+                cheap.observePlain(cheap_cost.plain_ms);
+                cheap_plain += 1;
+            },
+            .round => {
+                const r = cheap.rows(&conf);
+                cheap.observeRound(&conf, r, 0, cheap_cost.draft_ms, cheap_cost.verifyMs(r));
+            },
+        }
+    }
+    try testing.expectApproxEqAbs(dear_cost.plain_ms, dear.cost.plain_ms, 1e-3);
+    try testing.expectApproxEqAbs(dear_cost.step_ms, dear.cost.step_ms, 1e-3);
+    try testing.expectApproxEqAbs(dear_cost.draft_ms, dear.cost.draft_ms, 1e-3);
+    try testing.expectEqual(@TypeOf(dear.gate.mode).rounds, dear.gate.mode);
+    try testing.expectApproxEqAbs(cheap_cost.plain_ms, cheap.cost.plain_ms, 1e-3);
+    try testing.expectApproxEqAbs(cheap_cost.step_ms, cheap.cost.step_ms, 1e-3);
+    try testing.expectApproxEqAbs(cheap_cost.draft_ms, cheap.cost.draft_ms, 1e-3);
+    try testing.expectEqual(@TypeOf(cheap.gate.mode).plain, cheap.gate.mode);
+    try testing.expect(dear.rows(&conf) > 1);
+    try testing.expectEqual(@as(u32, 1), cheap.rows(&conf));
+    try testing.expect(cheap_plain > 0);
+    try testing.expect(cheap.gate.plain_tokens > 0);
 }

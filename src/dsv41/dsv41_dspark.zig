@@ -272,12 +272,20 @@ pub fn measuredRound(self: *Generator, allocator: std.mem.Allocator, meter: ?*Ro
                 return @floatCast(@as(f64, @floatFromInt(ns)) / 1e6);
             }
         }.of;
+        const draft_ms: f32 = if (comptime @import("builtin").is_test)
+            if (self.dspark_timing) |c| (if (block != null) c.draft_ms else 0) else ms(draft_ns)
+        else
+            ms(draft_ns);
+        const verify_ms: f32 = if (comptime @import("builtin").is_test)
+            if (self.dspark_timing) |c| c.verifyMs(@intCast(rows)) else ms(verify_ns)
+        else
+            ms(verify_ns);
         if (copied > 0) {
             // The stage policy learns from stage blocks only: a wide copy verify would move its fitted row price.
-            self.dspark_copy_backoff.observeCopy(rows - 1, accepted, ms(draft_ns + verify_ns), copy_narrow);
+            self.dspark_copy_backoff.observeCopy(rows - 1, accepted, draft_ms + verify_ms, copy_narrow);
         } else {
-            self.dspark_copy_backoff.observeStage(n_commit, ms(draft_ns + verify_ns));
-            if (block == null) policy.observePlain(ms(verify_ns)) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, ms(draft_ns), ms(verify_ns));
+            self.dspark_copy_backoff.observeStage(n_commit, draft_ms + verify_ms);
+            if (block == null) policy.observePlain(verify_ms) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, draft_ms, verify_ms);
         }
     }
     if (meter) |m| {

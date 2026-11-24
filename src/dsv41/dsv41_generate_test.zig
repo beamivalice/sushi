@@ -427,8 +427,14 @@ test "dsv41 generator: on MLX's route a seeded sampled request verifies at one w
         try testing.expect(gen.dspark);
         switch (perturb) {
             .none => {},
-            .dear => gen.dspark_policy.cost = .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 },
-            .cheap => gen.dspark_policy.cost = .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 },
+            .dear => {
+                gen.dspark_policy.cost = .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+                gen.dspark_timing = gen.dspark_policy.cost;
+            },
+            .cheap => {
+                gen.dspark_policy.cost = .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+                gen.dspark_timing = gen.dspark_policy.cost;
+            },
             .owed => {
                 gen.dspark_policy.owed = 6;
                 gen.dspark_policy.period = 8;
@@ -456,7 +462,8 @@ test "dsv41 generator: on MLX's route a seeded sampled request verifies at one w
         try xfm.resetCache();
         var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8 }, &.{}, .{ .dspark_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_policy.cost = if (perturb == .dear) .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 } else .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+        gen.dspark_policy.cost = if (perturb == .dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+        gen.dspark_timing = gen.dspark_policy.cost;
         while (try gen.nextDspark(a)) |r| a.free(r.tokens);
         widths[i] = gen.dspark_stats.rows_hist;
     }
@@ -4472,12 +4479,15 @@ test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy 
 
     // The cost model moves the widths of a seeded request, never its tokens.
     var widths: [2][dsv41_max_drafts + 2]u32 = undefined;
-    for ([_]bool{ true, false }, &widths) |dear, *hist| {
+    var drafted: [2]u64 = undefined;
+    var plain_steps: [2]u32 = undefined;
+    for ([_]bool{ true, false }, &widths, &drafted, &plain_steps) |dear, *hist, *d, *plain| {
         checked = if (dear) "tokens under a dear cost model" else "tokens under a cheap cost model";
         try fx.xfm.resetCache();
         var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .dspark_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 } else .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+        gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+        gen.dspark_timing = gen.dspark_policy.cost;
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
         while (try gen.nextDspark(a)) |r| {
@@ -4486,9 +4496,14 @@ test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy 
         }
         try testing.expectEqualSlices(u32, fixed.items, got.items);
         hist.* = gen.dspark_stats.rows_hist;
+        d.* = gen.dspark_stats.drafted;
+        plain.* = gen.dspark_policy.gate.plain_tokens;
     }
     checked = "the widths move with the cost model";
     try testing.expect(!std.mem.eql(u32, &widths[0], &widths[1]));
+    try testing.expect(drafted[0] > 0);
+    try testing.expectEqual(@as(u64, 0), drafted[1]);
+    try testing.expect(plain_steps[1] > 0);
     checked = "tokens and copy rounds";
 
     // The prompt, the text the request is about to write, and the prompt again: its tail copies its own continuation.
@@ -6152,7 +6167,8 @@ fn expectOneTextAtEveryCost(fx: *EngineFixture, sampling: SamplingParams) !void 
             try fx.xfm.resetCache();
             var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, &buf, 40, sampling, &.{}, .{ .dspark_enabled = true });
             defer gen.deinit(a);
-            gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 40, .draft_ms = 40, .prior = 40 } else .{ .plain_ms = 5, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+            gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+            gen.dspark_timing = gen.dspark_policy.cost;
             while (try gen.nextDspark(a)) |r| {
                 defer a.free(r.tokens);
                 try got.appendSlice(a, r.tokens);
