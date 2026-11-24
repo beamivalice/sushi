@@ -77,6 +77,19 @@ pub const Load = struct {
         try self.loadServed(dir);
     }
 
+    /// `open` with the warm skipped, for a cell that asserts nothing the warm compiles or grows.
+    pub fn openLight(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
+        try self.prepare(C, dir, cooler);
+        self.config.test_skip_warm = true;
+        try self.loadServed(dir);
+    }
+
+    /// `loadServed` with the warm skipped.
+    pub fn loadLight(self: *Load, dir: []const u8) !void {
+        self.config.test_skip_warm = true;
+        try self.loadServed(dir);
+    }
+
     /// `load` and then `serve`, as a served load runs them; on an error nothing of the load stays.
     pub fn loadServed(self: *Load, dir: []const u8) !void {
         try self.load(dir);
@@ -151,6 +164,7 @@ pub fn heldLoad(comptime C: type, dir: []const u8) !*Load {
     const ld = try a.create(Load);
     errdefer a.destroy(ld);
     try ld.prepareOn(a, C, dir, true);
+    ld.config.test_skip_warm = true;
     try ld.loadServed(dir);
     errdefer _ = ld.close();
     const name = try a.dupe(u8, dir);
@@ -464,6 +478,41 @@ test "cooler contract runner: SUSHI_CONTRACT_FIXTURE names the fixtures a run ta
     var named_unset: Tally = .{};
     named_unset.absent();
     try testing.expectError(error.SkipZigTest, named_unset.verdict());
+}
+
+test "cooler contract: test_skip_warm skips the warm on a light load and never reaches a served load" {
+    try testing.expectEqual(false, (model_mod.ModelConfig{}).test_skip_warm);
+    try testing.expectEqual(false, (@import("server_state.zig").ServerConfig{}).test_skip_warm);
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const cooler_warm = @import("cooler_warm.zig");
+            const prompt = ids[0..@min(ids.len, 16)];
+            const served_before = cooler_warm.runs_for_test;
+            const arch_before = cooler_warm.arch_warm_runs_for_test;
+            var want: std.ArrayList(u32) = .empty;
+            defer want.deinit(testing.allocator);
+            {
+                var served: Load = undefined;
+                try served.open(C, dir, true);
+                defer _ = served.close();
+                try testing.expectEqual(false, served.config.test_skip_warm);
+                try testing.expectEqual(served_before + 1, cooler_warm.runs_for_test);
+                if (@import("arch/config.zig").isOf(&served.config, "dsv41"))
+                    try testing.expectEqual(arch_before + 1, cooler_warm.arch_warm_runs_for_test);
+                want = try greedy(&served, prompt, 4);
+            }
+            const light_before = cooler_warm.runs_for_test;
+            const light_arch_before = cooler_warm.arch_warm_runs_for_test;
+            var light: Load = undefined;
+            try light.openLight(C, dir, true);
+            defer _ = light.close();
+            try testing.expectEqual(light_before, cooler_warm.runs_for_test);
+            try testing.expectEqual(light_arch_before, cooler_warm.arch_warm_runs_for_test);
+            var got = try greedy(&light, prompt, 4);
+            defer got.deinit(testing.allocator);
+            try testing.expectEqualSlices(u32, want.items, got.items);
+        }
+    }.run);
 }
 
 /// `e`, after naming the fixture it came from.

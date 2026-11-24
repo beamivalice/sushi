@@ -267,6 +267,12 @@ pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32
 /// (`cooler_warm.warmServed`). On MLX a failed step warns and the load serves. On Sushi Cooler a forward that fails in
 /// the warm fails in a request, so the load does not serve; a warm that ends seals the engine.
 pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig) !void {
+    if (comptime @import("builtin").is_test) {
+        if (config.test_skip_warm) {
+            if (arch_handle.onEngine(null, config)) @import("arch/cooler.zig").warmEnded(xfm);
+            return;
+        }
+    }
     const warmup_start = std.Io.Timestamp.now(io, .awake);
     const on_engine = arch_handle.onEngine(null, config);
     // A Cooler load first makes what its manifest lists (the warm's and what earlier requests compiled late), on worker

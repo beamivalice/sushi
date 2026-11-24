@@ -57,7 +57,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     };
     const engine = engine_mine.?;
     if (dsv41_borrow.keepsScales(&config) and !engine.plan.resident) try engine.keepScales();
-    var plan = beginPipelines(allocator, &config, engine, own_decode);
+    const skip_warm = if (comptime @import("builtin").is_test) config.test_skip_warm else false;
+    var plan = if (skip_warm)
+        cooler_pipelines.begin(allocator, std.Io.Threaded.global_single_threaded.io(), null, "test_skip_warm", .{ .scope = @splat('0'), .build = @splat('0') }, 0)
+    else
+        beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
     // The pools a route makes follow the plan this load runs under, whatever the config said before it.
     var own_cfg = config.dsv41.?;
@@ -113,6 +117,10 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     mdl_mine = null;
     shell.expert_stream = engine;
     engine_mine = null;
+    if (skip_warm) {
+        if (own_decode) mlx.engine.trim() else _ = mlx.mlx_clear_cache();
+        return shell;
+    }
     var clock = expert_stream_mod.Clock.init();
     const had_error = mlx.errorPending();
     const warm_t0 = load_clock.now();
@@ -153,6 +161,7 @@ pub fn warmAll(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStr
 
 /// `warmAll` with the widest wide chunk it runs.
 pub fn warmAllAt(self: *Trunk, mdl: *dsv41_model.Model, stq: ?*dsv41_stream.StqStream, scope: dsv41_model.WarmScope, width: usize) !void {
+    if (@import("builtin").is_test) @import("../cooler_warm.zig").arch_warm_runs_for_test += 1;
     dsv41_borrow.warm_budget = true;
     defer dsv41_borrow.endWarmMlx();
     warmForwards(self, mdl, stq, scope, width) catch |e| {

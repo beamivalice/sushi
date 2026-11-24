@@ -180,6 +180,8 @@ pub const ModelConfig = struct {
     cooler_ask: arch_config.CoolerAsk = .none,
     /// A test names the side its load runs on, before the load; a served load never sets it.
     cooler_for_test: ?bool = null,
+    /// A test load that asserts nothing of the warm skips it (read only in test builds); a served load never sets it.
+    test_skip_warm: bool = false,
     expert_ssd_budget_bytes: u64 = 0,
     expert_workspace_bytes: u64 = 0,
     /// What the streamed store bills beyond its mean expert, set by the streaming plan.

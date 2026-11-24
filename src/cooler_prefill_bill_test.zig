@@ -21,7 +21,7 @@ test "cooler contract: a Cooler prefill's chunks before the tail project no logi
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             var long: [700]u32 = undefined;
             for (&long, 0..) |*t, i| t.* = ids[i % ids.len];
@@ -43,7 +43,7 @@ test "cooler contract: an exact Cooler prefill bill is what each kind of layer a
             if (!@hasDecl(C, "prefill_kind_sets")) return error.SkipZigTest;
             const bills = @import("bills.zig");
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             if (bills.coolerPrefillRowBytes(&ld.config) == 0) return error.SkipZigTest;
             const kv = bills.configuredKvQuantFor(&ld.config);
@@ -172,7 +172,7 @@ test "cooler contract: a hybrid prefill with the prefix cache off takes no check
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const server_state = @import("server_state.zig");
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             const per_cp = ld.config.ssmCheckpointBytes();
             if (per_cp == 0) return error.SkipZigTest;
@@ -208,7 +208,7 @@ test "cooler contract: the load's sizer reserves at a width what a request's bil
         fn run(comptime Q: type, dir: []const u8, _: []const u32) !void {
             const bills = @import("bills.zig");
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             // A load that runs the head: the sizer prices every width for it.
             if (!bills.mtpHeadDefaultOn(&ld.config)) return error.SkipZigTest;

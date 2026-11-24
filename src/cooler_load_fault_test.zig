@@ -25,7 +25,7 @@ test "cooler contract: a Cooler load refused at a pool buffer where its cleanup 
             defer want.deinit(testing.allocator);
             {
                 var first: Load = undefined;
-                try first.open(C, dir, true);
+                try first.openLight(C, dir, true);
                 defer _ = first.close();
                 want = try greedy(&first, prompt, 8);
             }
@@ -66,7 +66,7 @@ test "cooler contract: a Cooler load refused at a pool buffer where its cleanup 
                 try testing.expectEqual(base, Sheet.now());
             }
             var after: Load = undefined;
-            try after.open(C, dir, true);
+            try after.openLight(C, dir, true);
             defer _ = after.close();
             var got = try greedy(&after, prompt, 8);
             defer got.deinit(testing.allocator);
@@ -87,7 +87,7 @@ test "cooler contract: a Cooler warm's image splice refused at any of its pool b
             const a = testing.allocator;
             defer mlx.engine.fault.disarm();
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             if (ld.config.image_token_id == 0) return error.SkipZigTest;
             var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;

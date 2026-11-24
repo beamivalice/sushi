@@ -46,7 +46,7 @@ test "cooler contract: a Cooler load that serves more than one row gives each ro
 
         fn rowsAgainstSolo(comptime C: type, ld: *Load, dir: []const u8, ids: []const u32, rows: usize) !void {
             const a = testing.allocator;
-            try ld.loadServed(dir);
+            try ld.loadLight(dir);
             defer _ = ld.close();
             const n = @min(rows, 3);
             var prompts: [3][]const u32 = undefined;
@@ -76,7 +76,7 @@ test "cooler contract: a Cooler load's request and unload ask nothing of MLX" {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const prompt = ids[0..@min(ids.len, 30)];
             var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
+            try cooler.openLight(C, dir, true);
             var closed = false;
             defer if (!closed) {
                 _ = cooler.close();
@@ -109,7 +109,7 @@ test "cooler contract: a Cooler load's speculative requests ask nothing of MLX, 
             if (comptime !@hasDecl(C, "specTokens")) return error.SkipZigTest;
             const base = Sheet.now();
             var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
+            try cooler.openLight(C, dir, true);
             {
                 errdefer _ = cooler.close();
                 try testing.expect(C.headLoaded(cooler.xfm));
@@ -137,7 +137,7 @@ test "cooler contract: requests, repeated, leave the engine as they found it, an
             for (0..2) |_| {
                 const before = Sheet.now();
                 var cooler: Load = undefined;
-                try cooler.open(C, dir, true);
+                try cooler.openLight(C, dir, true);
                 {
                     errdefer _ = cooler.close();
                     for (0..2) |_| {
@@ -160,7 +160,7 @@ test "cooler contract: two unseeded sampled requests under one sampler decoded a
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -179,7 +179,7 @@ test "cooler contract: a grouped tick after another request's prefill chunk runs
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -241,7 +241,7 @@ test "cooler contract: four requests, three speculative and one plain, the last 
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -259,7 +259,7 @@ test "cooler contract: three speculative requests, one restored from its last tu
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -443,10 +443,10 @@ fn qwenAndDeepSeekLoaded(comptime body: fn (qld: *Load, qdir: []const u8, dld: *
     const dids = try D.prompt(a, ddir);
     defer a.free(dids);
     var qld: Load = undefined;
-    try qld.open(Q, qdir, true);
+    try qld.openLight(Q, qdir, true);
     defer _ = qld.close();
     var dld: Load = undefined;
-    try dld.open(D, ddir, true);
+    try dld.openLight(D, ddir, true);
     defer _ = dld.close();
     try body(&qld, qdir, &dld, ddir, qids, dids);
 }
@@ -569,7 +569,7 @@ test "cooler contract: on real text, joined decode rows say their solo rows' tok
     const ids = try realTextIds(a, dir, 4200);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     // A long chunked row past the two-pass context beside a short one; three short rows are the tiny's.
     const sets = [_][]const usize{&.{ 4097, 17 }};
@@ -609,7 +609,7 @@ test "cooler contract: a Cooler load's sampled speculative requests, seeded or n
             if (comptime !@hasDecl(C, "specTokensWith")) return error.SkipZigTest;
             const a = testing.allocator;
             var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
+            try cooler.openLight(C, dir, true);
             defer _ = cooler.close();
             const cases = [_]@import("sampler.zig").SamplingParams{
                 .{ .temperature = 0.8, .top_p = 0.95 },
@@ -652,7 +652,7 @@ test "cooler contract: a seeded sampled speculative request says the seeded seri
             if (comptime !@hasDecl(C, "specTokensAt") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             // Verify rows another plan computes at each row count give no position one token.
             if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
@@ -767,7 +767,7 @@ test "cooler contract: a greedy request's thought closed by its budget says the 
             if (comptime !@hasDecl(C, "specOptions") or !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
             const depth_bounds = @import("mtp_depth_bounds.zig");
@@ -810,7 +810,7 @@ test "cooler contract: an exact Cooler speculative request says its greedy token
             if (comptime !@hasDecl(C, "specIsGreedy")) return error.SkipZigTest;
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             if (!C.specIsGreedy(&ld.config)) return error.SkipZigTest;
             for ([_]usize{ 1, 9, 40 }) |len| {
@@ -845,7 +845,7 @@ test "cooler contract: on real text, greedy speculative at depths 1, 3 and 6 say
     const ids = try realTextIds(a, dir, 4097);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     // Below and past the 2048 context where verify takes the two-pass kernel, the second a chunked prefill; the short
     // prompt arms are the tiny's.
@@ -980,7 +980,7 @@ test "cooler contract: three DeepSeek DSpark requests decoding at once run as jo
     const ids = try D.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(D, dir, true);
+    try ld.openLight(D, dir, true);
     defer _ = ld.close();
     if ((arch_sched.rowCap(&ld.config) orelse 1) < 3) return error.SkipZigTest;
     var bufs: [3][18]u32 = undefined;
@@ -1137,7 +1137,7 @@ test "cooler contract: a plain request, or one near its token budget, beside lon
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var bufs: [3][120]u32 = undefined;
             for (&bufs, 0..) |*b, r| for (b, 0..) |*t, i| {
@@ -1182,7 +1182,7 @@ test "cooler contract: a request that cannot join the planner's tick leaves the 
     try eachQwenServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var bufs: [3][700]u32 = undefined;
             for (&bufs, 0..) |*b, r| for (b, 0..) |*t, i| {

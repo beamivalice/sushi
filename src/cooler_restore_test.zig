@@ -74,7 +74,7 @@ test "cooler contract: a DeepSeek request cancelled as its prefill ends, its cle
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             try testing.expectEqual(@as(usize, 1), arch_sched.rowCap(&ld.config) orelse 1);
             var long: [1300]u32 = undefined;
@@ -114,7 +114,7 @@ test "cooler contract: a DeepSeek request committed after another took the state
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const scheduler = Served.scheduler;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             var long: [1300]u32 = undefined;
             var other: [600]u32 = undefined;
@@ -304,7 +304,7 @@ test "cooler contract: a streamed Qwen Cooler load decodes one row per forward, 
                 if (ld.config.expert_source_dir == null) ld.config.expert_source_dir = try a.dupe(u8, dir);
                 try testing.expect(ld.config.expert_streaming and !ld.config.expert_resident);
             }
-            try ld.loadServed(dir);
+            try ld.loadLight(dir);
             defer _ = ld.close();
             try testing.expect(ld.onEngine());
             // The gate: one row per forward, so no tick joins two requests and no group goes live.

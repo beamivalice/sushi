@@ -73,7 +73,7 @@ test "cooler contract: a Cooler load runs on the engine and holds every weight i
     try eachLayout(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
             var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
+            try cooler.openLight(C, dir, true);
             defer _ = cooler.close();
             try testing.expect(cooler.onEngine());
             try testing.expectEqual(@as(usize, 0), try C.weightsOutsideRegions(cooler.xfm));
@@ -148,7 +148,7 @@ test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engi
             const prefix_arch = @import("arch/prefix.zig");
             inline for (.{ true, false }) |cool| {
                 var ld: Load = undefined;
-                try ld.open(C, dir, cool);
+                try ld.openLight(C, dir, cool);
                 defer _ = ld.close();
                 const on = prefix_arch.arraysOn(&ld.config);
                 errdefer std.debug.print("cooler contract: a load {s} keeps its prefix arrays on {s}\n", .{ if (cool) "on Cooler" else "on MLX", if (on == null) "MLX" else "the engine" });
@@ -584,7 +584,7 @@ test "cooler contract: a Cooler load under each KV precision and context extensi
                     var d: []const u8 = undefined;
                     fn body() !void {
                         var ld: Load = undefined;
-                        try ld.open(C, d, true);
+                        try ld.openLight(C, d, true);
                         defer _ = ld.close();
                         // A row the web UI does not offer for this model (DeepSeek keeps no KV cache to quantize, a
                         // RoPE with no YaRN) has nothing to hold; one it offers must take effect, never skip.

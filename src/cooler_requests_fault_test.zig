@@ -28,7 +28,7 @@ test "cooler contract: two served requests as rows say their solo tokens, and a 
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -193,7 +193,7 @@ fn unitFaultCell(comptime shape: UnitShape) fn (comptime type, []const u8, []con
             const a = testing.allocator;
             const scheduler = Served.scheduler;
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             // The joined unit's rows: two for the alone shape, three for the company shape.
             if ((arch_sched.rowCap(&ld.config) orelse 1) < (if (shape == .company) 3 else 2)) return error.SkipZigTest;
@@ -284,7 +284,7 @@ test "cooler contract: joined speculative rows under a logit bias, failed at any
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -360,7 +360,7 @@ test "cooler contract: a Cooler request failed at any of its checked MLX call si
             defer mlx.fault.disarm();
             const prompt = ids[0..@min(ids.len, 30)];
             var cooler: Load = undefined;
-            try cooler.open(C, dir, true);
+            try cooler.openLight(C, dir, true);
             defer _ = cooler.close();
             var want = try greedy(&cooler, prompt, 6);
             defer want.deinit(testing.allocator);

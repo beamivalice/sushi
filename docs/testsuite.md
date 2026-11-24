@@ -134,6 +134,9 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   teardown asking MLX nothing, an exact speculative request saying its greedy tokens, fault sweeps over the load and a
   request, nothing compiled after it, and a load of more than one row (`coolerRows`) giving each row its solo request's
   tokens (the arch's `greedyRows`; skipped at one row). It holds no cell against the MLX load: Sushi Cooler is proven.
+  A cell that asserts nothing the warm compiles or grows opens a light load (`Load.openLight`, `test_skip_warm`), which
+  skips the served warm; every cell that reads a kernel compile, a manifest, a pipeline count or the pool's grown
+  buffers keeps the full warm.
   Requests run in the model's turn and end as serve ends them; unloads run serve's teardown. A contract load makes its
   trunk as serve does (`model_load.initTrunk`), so the config a cell bills from carries what the load recorded past
   the parse (DeepSeek's wide arms). An arch on Sushi

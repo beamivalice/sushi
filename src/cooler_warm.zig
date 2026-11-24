@@ -40,6 +40,8 @@ const penalized = [_]sampler.SamplingParams{
 
 /// Served warms that ran their requests, in a test process.
 pub var runs_for_test: u32 = 0;
+/// Arch warms (DeepSeek's `warmAllAt`) that ran, in a test process.
+pub var arch_warm_runs_for_test: u32 = 0;
 /// The manifest's name for a served warm that ran whole.
 const marker_function = "served warm";
 

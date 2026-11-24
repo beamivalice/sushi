@@ -39,7 +39,7 @@ test "cooler contract: a Cooler request ends with its pass closed and at most it
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const before = Sheet.now();
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             {
                 errdefer _ = ld.close();
                 // Lengths rising: each new one takes buffers of new sizes, which a pool without an owner keeps.
@@ -71,7 +71,7 @@ test "cooler contract: a Cooler prefill chunk, the widest on the load's first re
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             const bills = @import("bills.zig");
             const kv = bills.configuredKvQuantFor(&ld.config);
@@ -144,7 +144,7 @@ test "cooler contract: a DeepSeek chunk's cache growth is billed from the rows i
             const a = testing.allocator;
             const bills = @import("bills.zig");
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             // Stores no request has bound grow by the policy: a sixteenth in some chunks, the rows asked in others.
             const prompt = try a.alloc(u32, 3000);
@@ -183,7 +183,7 @@ test "cooler contract: a DeepSeek request's row stores are made at its last row 
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             const prompt = try a.alloc(u32, 3000);
             defer a.free(prompt);
@@ -219,7 +219,7 @@ test "cooler contract: a DeepSeek request whose row stores are made at its last 
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             // Long enough that the policy regrows the stores several times; the model's own state, no request having bound its stores.
             const prompt = try a.alloc(u32, 1500);
@@ -247,7 +247,7 @@ test "cooler contract: a contract load bills a chunk from what its trunk serves,
             if (against) C.armsAgainstParse(true);
             defer if (against) C.armsAgainstParse(false);
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             const bills = @import("bills.zig");
             const kv = bills.configuredKvQuantFor(&ld.config);
@@ -297,7 +297,7 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8, spec: bool) !void {
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     // Past the threshold, so the cache reserves the prompt and the whole reply up front.
@@ -362,7 +362,7 @@ fn headPrefillWithinStorage(comptime Q: type, dir: []const u8) !void {
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, false);
+    try ld.openLight(Q, dir, false);
     defer _ = ld.close();
     const c = &ld.config;
     const chunk: usize = prefill_plan.PREFILL_CHUNK_FLOOR;
@@ -437,7 +437,7 @@ test "cooler contract: a served request refused at its prefill's first pool buff
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(C, dir, true);
+            try ld.openLight(C, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -494,7 +494,7 @@ test "cooler contract: a pool refusal in one request of a mixed tick fails that 
     try qwenTinyServed(struct {
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -563,7 +563,7 @@ test "cooler contract: a cold prompt admitted at its 512-row bill holds no more 
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     // Long enough that the request's reservation outgrows the cache's floor.
     const len: usize = @intCast(@import("kv_cache.zig").KVCache.RESERVE_MIN_TOKENS + 1024);
@@ -613,7 +613,7 @@ test "cooler contract: a Cooler request's bill is its larger phase, the prefill'
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     const KV = @import("kv_cache.zig").KVCache;
@@ -745,7 +745,7 @@ test "cooler contract: a Cooler request reserves its last row before its first c
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     const KV = @import("kv_cache.zig").KVCache;
@@ -800,7 +800,7 @@ test "cooler contract: a commit hands its checkpoint the QSA history's own rows,
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     const qsa_state = @import("qwen4/qwen4_qsa_state.zig");
@@ -945,7 +945,7 @@ test "cooler contract: a prefill cancelled between two chunks commits the rows i
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             const KV = @import("kv_cache.zig").KVCache;
             const prompt = try a.alloc(u32, 20000);
@@ -1000,7 +1000,7 @@ test "cooler contract: a speculative request whose reply ends at a cache step gr
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     const depth_bounds = @import("mtp_depth_bounds.zig");
@@ -1050,7 +1050,7 @@ test "cooler contract: a speculative request's growth commit, less its resident 
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, true);
+    try ld.openLight(Q, dir, true);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     const outstandingGrowth = @import("slot_admission.zig").outstandingGrowth;
@@ -1109,7 +1109,7 @@ test "cooler contract: a served request, plain or speculative, solo or joined, s
             const saved = depth_bounds.active;
             defer depth_bounds.active = saved;
             var ld: Load = undefined;
-            try ld.open(Q, dir, true);
+            try ld.openLight(Q, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -1290,7 +1290,7 @@ test "cooler contract: a DeepSeek prefill that releases decoder pools keeps them
     const ids = try D.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(D, dir, true);
+    try ld.openLight(D, dir, true);
     defer _ = ld.close();
     if ((arch_sched.rowCap(&ld.config) orelse 1) < 2) return error.SkipZigTest;
     const borrow = @import("dsv41/dsv41_borrow.zig");
@@ -1403,7 +1403,7 @@ const LentLease = struct {
         const a = testing.allocator;
         const ids = try D.prompt(a, dir);
         defer a.free(ids);
-        try self.ld.open(D, dir, cooler);
+        try self.ld.openLight(D, dir, cooler);
         errdefer _ = self.ld.close();
         const status = @import("status.zig");
         self.avail_was = status.available_mem_override;
@@ -1688,7 +1688,7 @@ fn twoLessees(dir: []const u8, dir2: []const u8, cooler: bool) !void {
     try lease.open(dir, cooler);
     defer lease.close();
     var other: Load = undefined;
-    try other.open(ContractOf("dsv41"), dir2, cooler);
+    try other.openLight(ContractOf("dsv41"), dir2, cooler);
     defer _ = other.close();
     const e = lease.engine;
     if (e.layers.len - e.borrow_from < 3) return error.SkipZigTest;
@@ -1758,7 +1758,7 @@ test "cooler contract: a DeepSeek decode whose read-back of a released pool is r
     const ids = try D.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(D, dir, true);
+    try ld.openLight(D, dir, true);
     defer _ = ld.close();
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const xfm = arch_handle.trunk(ld.h);
@@ -1861,7 +1861,7 @@ test "cooler contract: a DeepSeek layer left released with no union workspace is
     const ids = try D.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(D, dir, true);
+    try ld.openLight(D, dir, true);
     defer _ = ld.close();
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const engine = arch_handle.trunk(ld.h).expert_stream.?;
@@ -1934,7 +1934,7 @@ test "cooler contract: a DeepSeek decode forward reads back every pool its prefi
     const ids = try D.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(D, dir, true);
+    try ld.openLight(D, dir, true);
     defer _ = ld.close();
     const borrow = @import("dsv41/dsv41_borrow.zig");
     const pool_class = @import("tensor/pool_class.zig");
@@ -2145,7 +2145,7 @@ fn oneTokenRequestHeld(comptime Q: type, cooler: bool) !void {
     const ids = try Q.prompt(a, dir);
     defer a.free(ids);
     var ld: Load = undefined;
-    try ld.open(Q, dir, cooler);
+    try ld.openLight(Q, dir, cooler);
     defer _ = ld.close();
     const bills = @import("bills.zig");
     const c = &ld.config;
@@ -2188,7 +2188,7 @@ test "cooler contract: a DeepSeek request restored from a tier makes no store gr
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             const first = try a.alloc(u32, 1300);
             defer a.free(first);
@@ -2222,7 +2222,7 @@ test "cooler contract: DeepSeek requests decoding together keep their stores who
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             // A load of one row has no decode of requests together to check.
             if (arch_sched.coolerRows(&ld.config).rows <= 1) return;
@@ -2253,7 +2253,7 @@ test "cooler contract: a DeepSeek request cancelled well before its last row giv
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             var sv: Served = undefined;
             try sv.init(&ld, dir);
@@ -2278,7 +2278,7 @@ test "cooler contract: a DeepSeek request restored from a point makes its stores
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             const prompt = try a.alloc(u32, 1300);
             defer a.free(prompt);
@@ -2298,7 +2298,7 @@ test "cooler contract: a DeepSeek request's first forward finds its whole state 
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             _ = ids;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             const end: usize = 1300 + 64;
             const bound = try D.bindMade(ld.xfm, end);
@@ -2315,7 +2315,7 @@ test "cooler contract: a DeepSeek wide forward's pool growth, the buffers its pa
         fn run(comptime D: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             const c = ld.config.dsv41.?;
             for ([_]usize{ 64, 512, 2048 }) |w| {
@@ -2340,7 +2340,7 @@ test "cooler contract: a DeepSeek prefill holds no more than the needed and the 
             const a = testing.allocator;
             const bills = @import("bills.zig");
             var ld: Load = undefined;
-            try ld.open(D, dir, true);
+            try ld.openLight(D, dir, true);
             defer _ = ld.close();
             // Wide enough that the prefill's cap, not the decode forward's, is the term the bill nets the lendable from.
             const rows: usize = 8192;
