@@ -24,7 +24,7 @@ Order (owner, 2026-10-31):
 | # | Step | Command | Pass |
 |---|---|---|---|
 | 1 | **Local gate** + binary | `git fetch && tests/gate.sh` (origin/main, refused while the GPU lock is held: lint, ubench, the full suite with the tiny-fixture envs and the hermetic guards beside it, in a clean worktree); `zig build -Doptimize=ReleaseFast`; `sushi --version` | `~/.sushi/runs/gate/<sha>.json` written; names `build.zig.zon`'s version |
-| 2 | **Perf gate** | `tests/bench.sh --version <ver> [--tokens 512] <pack>` (below; `--tokens 512` for Qwen and GLM) on Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw, Sushi-4bpw, GLM-5.3-Flash-Sushi-2.4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
+| 2 | **Perf gate** | `tests/bench.sh --version <ver> [--tokens 512] <pack>` (below; `--tokens 512` for Qwen and GLM) on the M5 Ultra: Qwen3.8-Flash-Next-Sushi-STQ-4bpw and DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw (Hy4-Flash-Sushi-STQ-4bpw from 1.8.0) | each model within noise of its previous `docs/bench/` report, speculative mode engaged; commit `docs/bench/v<ver>/`, append this release's `benchmarks.md` column |
 | 3 | **KLD gate** | `sushi kld compare` 16x512 to first EOS on Qwen Sushi-STQ-2.75bpw and the DeepSeek STQ pack | within ~1% of its row in `docs/quality-kld.md` |
 | 4 | Live | `test_format_matrix.sh`, `test_smoke_matrix.sh` on the `qwen4`, `glm5` and `dsv41` passes, plus the live test of each area the release changed (step 2's bench covers the rest) | all pass |
 | 5 | CI | `./release.sh` beside steps 2-4: it refuses without step 1's record for origin's main head; `release.yml` builds that commit from the pins on the macOS 26.2 runner, smoke-tests, checks the staged mlx and packages it, and a failure leaves no draft | green, a DRAFT exists |
@@ -41,7 +41,9 @@ Order (owner, 2026-10-31):
   source beside it. A run that touched battery is discarded and rerun on AC: battery cost GLM 8–18% decode on 2026-10-11.
   - All other GPU work keeps the battery-above-30% rule.
 - **MiMo-V2.6-Flash is unsupported from 1.5.1:** it still loads, but no gate, bench or tuning step runs on it.
-- **The perf gate is four models: Qwen STQ 2.75bpw, Qwen MCG 4bpw, GLM MCG 2.4bpw, DeepSeek STQ 1.75bpw.** It is ONE
+- **The perf gate is the STQ packs on the M5 Ultra** (from 1.7.4): Qwen STQ 4bpw and DeepSeek STQ 2.7bpw, Hy4 STQ
+  4bpw from 1.8.0. The M5 Max's last release ladder is 1.7.4's DeepSeek STQ 1.75bpw (to 64k). No EXL3-class pack (Qwen
+  2.75bpw, Qwen MCG 4bpw, GLM 2.4bpw) is benched again unless a PR or a release item is about it. It is ONE
   `tests/bench.sh --version <ver> <pack> [-- <serve flags>]` run per model whose output IS the published
   `docs/bench/v<ver>/` report (`summary.md` plus one `<model>.md` per run; protocol in
   `docs/process-measurement.md#release-bench`). The wrapper holds the GPU lock per model, fans max and an idle under 50 °C
@@ -50,7 +52,7 @@ Order (owner, 2026-10-31):
   quiet box before anyone bisects. A run with Warnings (a window that did not restore) is not a measurement: rerun it.
 - **Never quote a win without naming the engine it is over.**
 - **`benchmarks.md` gets one new column per release**, from step 2's report. Obey its header rules: tables
-  only, M5 Max only.
+  only, one box per table (the M5 Ultra table from 1.7.4).
 
 ## Release artifacts
 

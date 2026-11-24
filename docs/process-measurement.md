@@ -107,6 +107,10 @@ the driver touches once the fans are at max. Nothing else may compute during the
 <a id="release-bench"></a>
 ## 4c. The release bench
 
+**Which box and packs** (owner, from 1.7.4): the M5 Ultra, STQ packs only: Qwen STQ 4bpw and DeepSeek STQ 2.7bpw,
+Hy4 STQ 4bpw from 1.8.0. The M5 Max's last release ladder is 1.7.4's (DeepSeek STQ 1.75bpw to 64k). An EXL3-class pack
+is benched again only for a PR or release item about it or its platform.
+
 `tests/bench.sh --version <ver> <pack> [-- <serve flags>]` is the perf gate: one model, one server boot, one run. It
 takes the box rules itself (clean tree, fresh ReleaseFast build, QUIET marker, AC power, GPU lock, fans max and an idle
 under 50 °C for at most 3 min, `taskpolicy -a`, a private `SUSHI_PREFIX_CACHE_DIR` under `~/.sushi/runs/bench-<tag>/`,

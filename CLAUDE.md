@@ -144,8 +144,9 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 
 ## Releases and packs
 
-`/release` holds the process; the perf gate is `tests/bench.sh` on the FINAL tree (Qwen STQ 2.75bpw, Qwen 4bpw, GLM
-2.4bpw, DeepSeek STQ 1.75bpw). Deferred repo work goes to `docs/private/future.md`, never agent memory.
+`/release` holds the process; the perf gate is `tests/bench.sh` on the FINAL tree, on the M5 Ultra, STQ packs only
+(from 1.7.4: Qwen STQ 4bpw, DeepSeek STQ 2.7bpw; Hy4 STQ 4bpw from 1.8.0). An EXL3-class pack is benched only for a PR or
+release item about it. Deferred repo work goes to `docs/private/future.md`, never agent memory.
 - A pack reaches Hugging Face only as the staged, checked copy that `docs/private/hf-upload.md` describes, with an
   owner-approved card.
 - **Pair-major only** ([tile order](docs/pack-format.md#tile-order)): every pack we make, convert, re-quantize or repack

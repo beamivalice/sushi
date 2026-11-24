@@ -2,7 +2,8 @@
 
 **Update rules — read before editing:**
 - Results go into the tables ONLY. No text, no commentary, no per-release notes — commit messages carry the stories.
-- **Apple M5 Max 128 GB ONLY.** Numbers across hardware are not comparable and one mixed column poisons the history.
+- **One box per table.** Numbers across hardware are not comparable and one mixed column poisons the history. The M5 Max
+  128 GB tables end at v1.7.4; from v1.7.4 the release baseline is the M5 Ultra 256 GB table, STQ packs only.
 - A cell is `./tests/bench.sh` decode tok/s (llmprobe `--bench-only`: warmup discarded, median of measured runs (3 unless specified), its own code-completion prompt), sushi ReleaseFast at its FASTEST config, with the speculative mode that engaged named beside the number. `·` = not measured that release.
 - From v1.4.0 a cell is `sushi bench` (`./tests/bench.sh`): the code arm's 4k decode median of 3 samples of 512 tokens, shipping defaults, prose median beside it; its numbers are not comparable with the llmprobe table above it. From v1.4.1 the prose median decodes 128 tokens on every model.
 - The perf gate is one pack, Qwen3.8-Flash-Next-Sushi-4bpw. `speedup` = first measured column vs the latest.
@@ -18,10 +19,17 @@
 
 ## Decode tok/s by release, sushi bench (code / prose, 4k)
 
-| Model | v1.4.0 | v1.4.1 | v1.5.0 | v1.5.1 | v1.6.0 | v1.7.0 | v1.7.2 | v1.7.3 |
-|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp | 161.0 / 68.6 mtp | 166.9 / 68.2 mtp | 175.0 / 73.0 mtp | 168.1 / 76.9 mtp | · | 193.4 / 81.6 mtp | 190.6 / 78.7 mtp |
-| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp | 144.8 / 77.4 mtp | 142.7 / 77.1 mtp | 145.0 / 79.9 mtp | 146.2 / 79.5 mtp | · | · | · |
-| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | · | · | · | · | · | 160.9 / 73.1 mtp | 191.3 / 81.4 mtp | 192.5 / 83.7 mtp |
-| GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash | 70.5 / 41.0 dflash | 70.7 / 40.5 dflash | 70.4 / · dflash | 71.5 / 40.9 dflash | · | · | 72.6 / 41.0 dflash |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark | 80.9 / 52.8 dspark | 98.2 / 56.4 dspark | 95.5 / 50.3 dspark | 90.6, 93.0 / · dspark (2 runs) | 95.1 / 58.2 dspark | 95.3 / 58.0 dspark |
+| Model | v1.4.0 | v1.4.1 | v1.5.0 | v1.5.1 | v1.6.0 | v1.7.0 | v1.7.2 | v1.7.3 | v1.7.4 |
+|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw (MTP) | 168.6 / 62.8 mtp | 161.0 / 68.6 mtp | 166.9 / 68.2 mtp | 175.0 / 73.0 mtp | 168.1 / 76.9 mtp | · | 193.4 / 81.6 mtp | 190.6 / 78.7 mtp | · |
+| Qwen3.8-Flash-Next-Sushi-4bpw (MTP) | 146.2 / 65.6 mtp | 144.8 / 77.4 mtp | 142.7 / 77.1 mtp | 145.0 / 79.9 mtp | 146.2 / 79.5 mtp | · | · | · | · |
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | · | · | · | · | · | 160.9 / 73.1 mtp | 191.3 / 81.4 mtp | 192.5 / 83.7 mtp | · |
+| GLM-5.3-Flash-Sushi-2.4bpw (DFlash2) | 71.5 / 50.9 dflash | 70.5 / 41.0 dflash | 70.7 / 40.5 dflash | 70.4 / · dflash | 71.5 / 40.9 dflash | · | · | 72.6 / 41.0 dflash | · |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw (DSpark, `--ssd-budget-gb 108`) | 76.6 / 49.3 dspark | 79.5 / 51.4 dspark | 80.9 / 52.8 dspark | 98.2 / 56.4 dspark | 95.5 / 50.3 dspark | 90.6, 93.0 / · dspark (2 runs) | 95.1 / 58.2 dspark | 95.3 / 58.0 dspark | 104.9 / 58.1 dspark |
+
+## M5 Ultra 256 GB, decode tok/s by release, sushi bench (code / prose, 4k)
+
+| Model | v1.7.4 |
+|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | · |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw (DSpark) | · |

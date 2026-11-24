@@ -20,3 +20,6 @@ Hardware: **Apple M5 Max, 128 GB unified memory**, AC power, `iogpu.wired_limit_
 Against [1.7.3](../v1.7.3/summary.md) (`fc2fd843`, which ran `--ctx-size 1000000 --max-tokens 128000`): the cold 4k code
 prefill 1,135 to 1,517 tok/s, code decode +10% at 4k and 8k and +6.5% at 16k, level at 32k and 64k; the 8k windows
 from 8k to 64k +1.0% on code and +0.7% on prose. One run on each side.
+
+This is the M5 Max's last release ladder. From 1.7.4 the release baseline is the M5 Ultra on the STQ packs only (Qwen
+STQ 4bpw, DeepSeek STQ 2.7bpw; Hy4 STQ 4bpw from 1.8.0): their reports join this directory.
