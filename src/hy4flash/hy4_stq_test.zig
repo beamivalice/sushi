@@ -2189,6 +2189,59 @@ test "hy4 verify: a 6..8-row BF16 linear at W_kva's 576x3072 shape gives each ro
     }
 }
 
+test "hy4 verify launches: a 2..8-row BF16 linear at W_kva's shape is one launch whatever the rows, each row its one-row step's bytes" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+
+    const a = testing.allocator;
+    const k_max: c_int = 8;
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    var prng = std.Random.DefaultPrng.init(0x5761);
+    for ([_][2]c_int{ .{ 576, 3072 }, .{ 144, 128 } }) |sh| {
+        const n = sh[0];
+        const k = sh[1];
+        const wv = try a.alloc(f32, @intCast(n * k));
+        defer a.free(wv);
+        for (wv) |*v| v.* = prng.random().floatNorm(f32) * 0.05;
+        const xv = try a.alloc(f32, @intCast(k_max * k));
+        defer a.free(xv);
+        for (xv) |*v| v.* = prng.random().floatNorm(f32);
+        const w = try o.cast(try o.own(mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ n, k }, 2, .float32)), .bfloat16);
+        const x_all = try o.own(mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ k_max, k }, 2, .float32));
+        try mlx.check(mlx.mlx_array_eval(w));
+        try mlx.check(mlx.mlx_array_eval(x_all));
+        const lin: fwd.Lin = .{ .w = w };
+        const row_b = @as(usize, @intCast(n)) * 4;
+        var t: c_int = 2;
+        while (t <= k_max) : (t += 1) {
+            const x = try o.contiguous(try o.slice(x_all, 0, 0, t));
+            try mlx.check(mlx.mlx_array_eval(x));
+            const d0 = mlx.engine.stats().dispatches;
+            const y = try o.contiguous(try fwd.linear(&o, x, lin));
+            try mlx.check(mlx.mlx_array_eval(y));
+            const launches = mlx.engine.stats().dispatches - d0;
+            errdefer std.debug.print("{d}-row linear at {d}x{d}: {d} launches\n", .{ t, n, k, launches });
+            try testing.expectEqual(@as(u64, 1), launches);
+            const y_blk = try copyF32Bytes(a, y);
+            defer a.free(y_blk);
+            for (0..@as(usize, @intCast(t))) |r| {
+                const ri: c_int = @intCast(r);
+                const y1 = try copyF32Bytes(a, try fwd.linear(&o, try o.contiguous(try o.slice(x_all, 0, ri, ri + 1)), lin));
+                defer a.free(y1);
+                try testing.expectEqualSlices(u8, y1, y_blk[r * row_b ..][0..row_b]);
+            }
+        }
+    }
+}
+
 test "hy4 verify: an 8-row block on HY4_BF16_TINY gives each row its one-row step's logits" {
     const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");

@@ -2,10 +2,13 @@
 //! the register, MLX's `gemv` over the BF16 operands (`gemv.h`, `GEMVKernel` bm4 bn1 sm1 sn32 tm4 tn4: 4 simdgroups of
 //! 4 rows, 4 columns a lane, f32 sums, `simd_shuffle_down` over 32 lanes), the sum rounded to BF16 and widened. So a
 //! row is the bytes of the cast in, MLX's BF16 `gemv` and the cast out (the latent projection `W_kva`, stored BF16).
+//! A verify block's rows share one launch: the weight is read once, and each row keeps its one-row sums.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
 const Arr = mlx.mlx_array;
 const kcfg = @import("hy4_kcfg.zig");
+
+pub const max_rows: c_int = 8;
 
 const source: [:0]const u8 =
     \\constexpr int TM = 4;
@@ -16,56 +19,70 @@ const source: [:0]const u8 =
     \\int out_row = int(threadgroup_position_in_grid.x) * 4 * TM + int(sg) * TM;
     \\const device bfloat16_t* mat = w + (size_t)out_row * (size_t)K;
     \\static_assert(K % BLOCK_N == 0, "a row off the gemv tile");
-    \\float result[TM] = {0.0f, 0.0f, 0.0f, 0.0f};
+    \\float result[R][TM];
+    \\for (int r = 0; r < R; ++r) {
+    \\  for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
+    \\}
     \\int bn = int(lane) * TN;
     \\constexpr int n_iter = K / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
-    \\  float coeff[TN];
-    \\  for (int tn = 0; tn < TN; ++tn) coeff[tn] = static_cast<float>(static_cast<bfloat16_t>(x[bn + tn]));
+    \\  float inter[TM][TN];
     \\  for (int tm = 0; tm < TM; ++tm) {
-    \\    float inter[TN];
-    \\    for (int tn = 0; tn < TN; ++tn) inter[tn] = static_cast<float>(mat[(size_t)tm * (size_t)K + bn + tn]);
-    \\    for (int tn = 0; tn < TN; ++tn) result[tm] += inter[tn] * coeff[tn];
+    \\    for (int tn = 0; tn < TN; ++tn) inter[tm][tn] = static_cast<float>(mat[(size_t)tm * (size_t)K + bn + tn]);
+    \\  }
+    \\  for (int r = 0; r < R; ++r) {
+    \\    float coeff[TN];
+    \\    const device float* xr = x + (size_t)r * (size_t)K;
+    \\    for (int tn = 0; tn < TN; ++tn) coeff[tn] = static_cast<float>(static_cast<bfloat16_t>(xr[bn + tn]));
+    \\    for (int tm = 0; tm < TM; ++tm) {
+    \\      for (int tn = 0; tn < TN; ++tn) result[r][tm] += inter[tm][tn] * coeff[tn];
+    \\    }
     \\  }
     \\  bn += BLOCK_N;
     \\}
-    \\for (int tm = 0; tm < TM; ++tm) {
-    \\  for (ushort sn = 16; sn >= 1; sn >>= 1) result[tm] += simd_shuffle_down(result[tm], sn);
+    \\for (int r = 0; r < R; ++r) {
+    \\  for (int tm = 0; tm < TM; ++tm) {
+    \\    for (ushort sn = 16; sn >= 1; sn >>= 1) result[r][tm] += simd_shuffle_down(result[r][tm], sn);
+    \\  }
     \\}
     \\if (lane == 0u) {
-    \\  for (int tm = 0; tm < TM; ++tm) out[out_row + tm] = static_cast<float>(static_cast<bfloat16_t>(result[tm]));
+    \\  for (int r = 0; r < R; ++r) {
+    \\    for (int tm = 0; tm < TM; ++tm) out[(size_t)r * (size_t)N + out_row + tm] = static_cast<float>(static_cast<bfloat16_t>(result[r][tm]));
+    \\  }
     \\}
 ;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
-/// Whether `rowThru` takes `x` [1, K] f32 against `w` [N, K] BF16: a GPU stream and the shapes MLX's `gemv` runs with
-/// this tile (as `hy4_row.applies`).
+/// Whether `rowsThru` takes `x` [R, K] f32 (1 to `max_rows` rows) against `w` [N, K] BF16: a GPU stream and the shapes
+/// MLX's `gemv` runs with this tile (as `hy4_row.applies`).
 pub fn applies(s: mlx.mlx_stream, x: Arr, w: Arr) bool {
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
-    if (xs.len != 2 or ws.len != 2 or xs[0] != 1 or xs[1] != ws[1]) return false;
+    if (xs.len != 2 or ws.len != 2 or xs[0] < 1 or xs[0] > max_rows or xs[1] != ws[1]) return false;
     const n = ws[0];
     const k = ws[1];
     return mlx.streamIsGpu(s) and mlx.mlx_array_dtype(x) == .float32 and mlx.mlx_array_dtype(w) == .bfloat16 and
         n < 4096 and @rem(n, 16) == 0 and k > 64 and @rem(k, 128) == 0 and k < 16 * n;
 }
 
-const Key = struct { n: c_int, k: c_int };
+const Key = struct { rows: c_int, n: c_int, k: c_int };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(key: Key) !kcfg.Config {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.n }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ key.rows, key.n }, 2, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * @divExact(key.n, 16), 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", key.k));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", key.n));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", key.rows));
     return cfg;
 }
 
-/// `cast(cast(x, bf16) · Wᵀ, f32)` for one row, [1, N]. The caller frees the result.
-pub fn rowThru(s: mlx.mlx_stream, x: Arr, w: Arr) !Arr {
+/// `cast(cast(x, bf16) · Wᵀ, f32)` for each of `x`'s rows, [R, N]. The caller frees the result.
+pub fn rowsThru(s: mlx.mlx_stream, x: Arr, w: Arr) !Arr {
     if (kernel == null) {
         const ins = [_][*:0]const u8{ "w", "x" };
         const outs = [_][*:0]const u8{"out"};
@@ -78,7 +95,7 @@ pub fn rowThru(s: mlx.mlx_stream, x: Arr, w: Arr) !Arr {
         kernel = made;
     }
     const ws = mlx.getShape(w);
-    const cfg = try cfgs.get(.{ .n = ws[0], .k = ws[1] }, build);
+    const cfg = try cfgs.get(.{ .rows = mlx.getShape(x)[0], .n = ws[0], .k = ws[1] }, build);
     const ins = [_]Arr{ w, x };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -123,7 +140,7 @@ test "hy4 gemv: one row through a BF16 weight, rounded in and out in the launch,
         try testing.expect(applies(es, x, w));
         try mlx.check(mlx.mlx_array_eval(w));
         const before = mlx.engine.stats().dispatches;
-        const got = try o.own(try rowThru(es, x, w));
+        const got = try o.own(try rowsThru(es, x, w));
         try mlx.check(mlx.mlx_array_eval(got));
         try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
         try testing.expectEqualSlices(u8, want, std.mem.sliceAsBytes(mlx.mlx_array_data_float32(got).?[0..@intCast(sh[0])]));

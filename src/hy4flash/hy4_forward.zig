@@ -285,7 +285,8 @@ pub var products: Products = .bf16;
 pub fn linear(o: *Ops, x: Arr, lin: Lin) !Arr {
     if (lin.stq) |b| return hy4_stq.apply(o, x, b);
     // One row through a BF16 weight with the casts in the launch, the product's bytes.
-    if (chain_kernels_on and products == .bf16 and hy4_gemv.applies(o.s, x, lin.w)) return o.own(try hy4_gemv.rowThru(o.s, x, lin.w));
+    const rows = mlx.getShape(x)[0];
+    if (chain_kernels_on and products == .bf16 and (rows == 1 or isVerifyBlock(rows)) and hy4_gemv.applies(o.s, x, lin.w)) return o.own(try hy4_gemv.rowsThru(o.s, x, lin.w));
     return o.cast(try linearStored(o, x, lin), .float32);
 }
 
