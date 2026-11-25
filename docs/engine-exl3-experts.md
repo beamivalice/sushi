@@ -614,6 +614,10 @@ threadgroup that leads them reads and decodes each weight once and feeds every m
 (bucket 2, two output tiles per threadgroup): an expert picked by three rows is led twice. Buckets 4 and 8 halve the
 tiles per threadgroup and measured live (real pack, DSpark sweep, median verify ms, grouped / per-slot) 5 / 7 / 14%
 slower at 5 / 6 / 8 rows, level at 2 to 4, so they are built and byte-tested but not served.
+Decoding each distinct expert once for all its members (upstream mlx-serve's affine shape) cannot keep the byte bar:
+a member's per-lane sums live across the threadgroup's whole k span (8 KiB a member), so caching the decoded span
+(~320 KiB at DeepSeek's shapes) overflows threadgroup memory; a two-tile register arm of up to four members was level
+at 2 to 3 rows and 8-24% slower at 4 to 8 (M5 Max, `shared.exl3_grouped_decode`, c5e46626), so it is not kept.
 Tested bit-exact against the one-slot chain (`group_force = 0`) at 2, 9 and 16 rows, random, all-rows-equal, disjoint
 and core-plus-private routes, PAIR1, four rate groups with a mixed gate/up/down class, on the served bucket.
 The saving is the weight
