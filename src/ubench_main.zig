@@ -3,7 +3,6 @@
 //! is never a test: the exit code says whether it measured, never how fast.
 //! Docs: process-ubench.md.
 const std = @import("std");
-const io_util = @import("io_util.zig");
 const builtin = @import("builtin");
 const stamp = @import("ubench_stamp");
 // pub: src/exl3 and src/exl3_ubench reach mlx, log, io_util and the bench types through this host root.
