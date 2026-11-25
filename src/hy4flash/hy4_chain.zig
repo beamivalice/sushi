@@ -577,6 +577,264 @@ pub fn ringKeys(s: mlx.mlx_stream, c: Arr, k_pe: Arr, t: c_int, p0: c_int, windo
     return .{ .c = out[0], .pe = out[1] };
 }
 
+/// A decode row's two score products: over the latent keys (`s1`) and over the rope keys (`s2`), f32.
+pub const Scores = struct { s1: Arr, s2: Arr };
+
+const SteelPlan = struct { parts: c_int, pk: c_int };
+
+fn ceilDiv(a: c_int, b: c_int) c_int {
+    return @divTrunc(a + b - 1, b);
+}
+
+/// MLX's choice for an f32 `[m, k] x [k, n]` product at these shapes (`steel_matmul` in the pinned mlx's
+/// `matmul.cpp`): split-k into `parts` partitions of `pk` each, added in order, or one fused chain (`parts` 1); null where
+/// MLX takes another kernel. The steel launches' bytes are MLX's only while this mirrors it: an mlx bump re-proves it.
+fn steelPlan(m: c_int, n: c_int, k: c_int) ?SteelPlan {
+    if (m < 32 or @rem(m, 32) != 0 or n < 32 or @rem(n, 8) != 0 or @rem(k, 16) != 0) return null;
+    const tm16 = ceilDiv(m, 16);
+    const tn16 = ceilDiv(n, 16);
+    const tk = @divTrunc(k, 16);
+    if (tm16 * tn16 > 1024) return null;
+    if (!(tk >= 8 and k >= @max(m, n))) return .{ .parts = 1, .pk = k };
+    const per = @divTrunc(tk, ceilDiv(m, 32) * ceilDiv(n, 32));
+    var parts: c_int = 2;
+    while (parts < per and parts < 32) parts *= 2;
+    if (@rem(tk, parts) != 0) return null;
+    return .{ .parts = parts, .pk = @divTrunc(tk, parts) * 16 };
+}
+
+const steel_scores_source: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint sg = simdgroup_index_in_threadgroup;
+    \\const int key0 = int(threadgroup_position_in_grid.x) * 8;
+    \\const ulong qs = ulong(ql_strides[QA]);
+    \\const ulong ps = ulong(qp_strides[PA]);
+    \\const ulong cs = ulong(c_strides[CA]);
+    \\const device float* qrow = ql + size_t(sg * 8) * size_t(qs);
+    \\const device float* prow = qp + size_t(sg * 8) * size_t(ps);
+    \\const device float* crow = c + size_t(key0) * size_t(cs);
+    \\threadgroup float pes[8 * R];
+    \\for (int e = int(thread_position_in_threadgroup.x); e < 8 * R; e += H * 4)
+    \\  pes[e] = static_cast<float>(pe[size_t(key0 + e / R) * size_t(pe_strides[EA]) + size_t(e % R)]);
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\simdgroup_float8x8 acc[NPART];
+    \\simdgroup_float8x8 rope = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\#pragma clang loop unroll(full)
+    \\for (int p = 0; p < NPART; ++p) acc[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\for (int kb = 0; kb < PK / 8; kb += U) {
+    \\  simdgroup_float8x8 a[NPART][U], b[NPART][U];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int p = 0; p < NPART; ++p) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int u = 0; u < U; ++u) {
+    \\      const int k0 = p * PK + (kb + u) * 8;
+    \\      simdgroup_load(b[p][u], crow + k0, cs, ulong2(0, 0), true);
+    \\      simdgroup_load(a[p][u], qrow + k0, qs);
+    \\    }
+    \\  }
+    \\  #pragma clang loop unroll(full)
+    \\  for (int u = 0; u < U; ++u) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int p = 0; p < NPART; ++p) simdgroup_multiply_accumulate(acc[p], a[p][u], b[p][u], acc[p]);
+    \\  }
+    \\}
+    \\{
+    \\  simdgroup_float8x8 a[R / 8], b[R / 8];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int kk = 0; kk < R / 8; ++kk) {
+    \\    simdgroup_load(b[kk], pes + kk * 8, R, ulong2(0, 0), true);
+    \\    simdgroup_load(a[kk], prow + kk * 8, ps);
+    \\  }
+    \\  #pragma clang loop unroll(full)
+    \\  for (int kk = 0; kk < R / 8; ++kk) simdgroup_multiply_accumulate(rope, a[kk], b[kk], rope);
+    \\}
+    \\simdgroup_float8x8 res;
+    \\#pragma clang loop unroll(full)
+    \\for (int e = 0; e < 2; ++e) {
+    \\  float v = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int p = 0; p < NPART; ++p) v += acc[p].thread_elements()[e];
+    \\  res.thread_elements()[e] = v;
+    \\}
+    \\simdgroup_store(res, s1 + size_t(sg * 8) * N + key0, N);
+    \\simdgroup_store(rope, s2 + size_t(sg * 8) * N + key0, N);
+;
+
+const steel_values_source: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint sg = simdgroup_index_in_threadgroup;
+    \\const int d0 = int(threadgroup_position_in_grid.x) * 8;
+    \\const ulong ps = ulong(pp_strides[PA]);
+    \\const ulong cs = ulong(c_strides[CA]);
+    \\const device float* prow = pp + size_t(sg * 8) * size_t(ps);
+    \\const device float* ccol = c + d0;
+    \\simdgroup_float8x8 acc[NPART];
+    \\#pragma clang loop unroll(full)
+    \\for (int p = 0; p < NPART; ++p) acc[p] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    \\for (int kb = 0; kb < PK / 8; kb += U) {
+    \\  simdgroup_float8x8 a[NPART][U], b[NPART][U];
+    \\  #pragma clang loop unroll(full)
+    \\  for (int p = 0; p < NPART; ++p) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int u = 0; u < U; ++u) {
+    \\      const int k0 = p * PK + (kb + u) * 8;
+    \\      simdgroup_load(b[p][u], ccol + size_t(k0) * size_t(cs), cs);
+    \\      simdgroup_load(a[p][u], prow + k0, ps);
+    \\    }
+    \\  }
+    \\  #pragma clang loop unroll(full)
+    \\  for (int u = 0; u < U; ++u) {
+    \\    #pragma clang loop unroll(full)
+    \\    for (int p = 0; p < NPART; ++p) simdgroup_multiply_accumulate(acc[p], a[p][u], b[p][u], acc[p]);
+    \\  }
+    \\}
+    \\simdgroup_float8x8 res;
+    \\#pragma clang loop unroll(full)
+    \\for (int e = 0; e < 2; ++e) {
+    \\  float v = 0.0f;
+    \\  #pragma clang loop unroll(full)
+    \\  for (int p = 0; p < NPART; ++p) v += acc[p].thread_elements()[e];
+    \\  res.thread_elements()[e] = v;
+    \\}
+    \\simdgroup_store(res, u + size_t(sg * 8) * W + d0, W);
+;
+
+var steel_scores_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var steel_values_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+const SteelKey = struct { h: c_int, n: c_int, w: c_int, r: c_int = 0, parts: c_int, pk: c_int, a0: c_int, a1: c_int, a2: c_int, a3: c_int = 0, scores: bool };
+var steel_cfgs: kcfg.Cache(SteelKey) = .{};
+
+/// The k-steps a simdgroup loads before its multiplies: 16 over the partitions, a divisor of the partition's steps.
+fn batchOf(parts: c_int, pk: c_int) c_int {
+    var u: c_int = @max(1, @divTrunc(16, parts));
+    while (@rem(@divTrunc(pk, 8), u) != 0) u -= 1;
+    return u;
+}
+
+fn steelBuild(k: SteelKey) !kcfg.Config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    if (k.scores) {
+        const shape = if (k.a0 == 0) [3]c_int{ k.h, 1, k.n } else [3]c_int{ 1, k.h, k.n };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(k.n, 8) * k.h * 4, 1, 1));
+        for ([_]struct { [:0]const u8, c_int }{ .{ "N", k.n }, .{ "R", k.r }, .{ "QA", k.a0 }, .{ "PA", k.a1 }, .{ "CA", k.a2 }, .{ "EA", k.a3 } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0].ptr, kv[1]));
+    } else {
+        const shape = if (k.a0 == 0) [3]c_int{ k.h, 1, k.w } else [3]c_int{ 1, k.h, k.w };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(k.w, 8) * k.h * 4, 1, 1));
+        for ([_]struct { [:0]const u8, c_int }{ .{ "W", k.w }, .{ "PA", k.a0 }, .{ "CA", k.a1 } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0].ptr, kv[1]));
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, k.h * 4, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", k.h));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "U", batchOf(k.parts, k.pk)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NPART", k.parts));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PK", k.pk));
+    return cfg;
+}
+
+fn rowAxis(a: Arr) ?c_int {
+    const sh = mlx.getShape(a);
+    return switch (sh.len) {
+        2 => 0,
+        3 => if (sh[0] == 1 and sh[1] != 1) 1 else if (sh[1] == 1) 0 else null,
+        else => null,
+    };
+}
+
+fn rowsOf(a: Arr) c_int {
+    const sh = mlx.getShape(a);
+    return sh[@intCast(rowAxis(a).?)];
+}
+
+fn colsOf(a: Arr) c_int {
+    const sh = mlx.getShape(a);
+    return sh[sh.len - 1];
+}
+
+/// Whether `steelScores` takes these operands: an engine stream, one query row a head, and products `steelPlan` mirrors.
+pub fn steelScoresApplies(s: mlx.mlx_stream, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr) bool {
+    if (!mlx.streamIsGpu(s) or !mlx.engine.isStream(s)) return false;
+    const qa = rowAxis(q_lat) orelse return false;
+    const pa = rowAxis(q_pe) orelse return false;
+    const ca = rowAxis(c) orelse return false;
+    const ea = rowAxis(k_pe) orelse return false;
+    _ = .{ qa, pa, ca, ea };
+    if (mlx.mlx_array_dtype(q_lat) != .float32 or mlx.mlx_array_dtype(q_pe) != .float32 or mlx.mlx_array_dtype(c) != .float32 or mlx.mlx_array_dtype(k_pe) != .bfloat16) return false;
+    const h = rowsOf(q_lat);
+    const n = rowsOf(c);
+    const lat = colsOf(c);
+    const rope = colsOf(k_pe);
+    if (rowsOf(q_pe) != h or rowsOf(k_pe) != n or colsOf(q_lat) != lat or colsOf(q_pe) != rope) return false;
+    if (h != 32 and h != 64) return false;
+    if (@rem(rope, 8) != 0 or rope > 128 or @rem(lat, 16) != 0) return false;
+    if (steelPlan(h, n, rope) == null or steelPlan(h, n, rope).?.parts != 1) return false;
+    return steelPlan(h, n, lat) != null and @rem(n, 8) == 0;
+}
+
+/// A decode row's score products over its keys in one launch, each element summed in MLX's order (`steelPlan`), so the
+/// bytes are the op chain's `q_lat · cᵀ` and `q_pe · k_peᵀ`.
+pub fn steelScores(s: mlx.mlx_stream, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr) !Scores {
+    if (steel_scores_kernel == null) {
+        const ins = [_][*:0]const u8{ "ql", "qp", "c", "pe" };
+        const outs = [_][*:0]const u8{ "s1", "s2" };
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const made = mlx.mlx_fast_metal_kernel_new("sushi_hy4_steel_scores", iv, ov, steel_scores_source, "", false, false);
+        if (made.ctx == null) return error.MetalKernelCompileFailed;
+        steel_scores_kernel = made;
+    }
+    const h = rowsOf(q_lat);
+    const n = rowsOf(c);
+    const plan = steelPlan(h, n, colsOf(c)).?;
+    const cfg = try steel_cfgs.get(.{ .h = h, .n = n, .w = colsOf(c), .r = colsOf(k_pe), .parts = plan.parts, .pk = plan.pk, .a0 = rowAxis(q_lat).?, .a1 = rowAxis(q_pe).?, .a2 = rowAxis(c).?, .a3 = rowAxis(k_pe).?, .scores = true }, steelBuild);
+    var out: [2]Arr = undefined;
+    try applyOuts(s, steel_scores_kernel.?, &.{ q_lat, q_pe, c, k_pe }, cfg, &out);
+    return .{ .s1 = out[0], .s2 = out[1] };
+}
+
+/// Whether `steelValues` takes `p` [H, 1, n] or [1, H, n] against `c`: an engine stream and a product `steelPlan` mirrors.
+pub fn steelValuesApplies(s: mlx.mlx_stream, p: Arr, c: Arr) bool {
+    if (!mlx.streamIsGpu(s) or !mlx.engine.isStream(s)) return false;
+    _ = rowAxis(p) orelse return false;
+    _ = rowAxis(c) orelse return false;
+    if (mlx.mlx_array_dtype(p) != .float32 or mlx.mlx_array_dtype(c) != .float32) return false;
+    const h = rowsOf(p);
+    const n = rowsOf(c);
+    const lat = colsOf(c);
+    if (colsOf(p) != n or (h != 32 and h != 64) or @rem(lat, 8) != 0) return false;
+    return steelPlan(h, lat, n) != null and @rem(n, 16) == 0;
+}
+
+/// A decode row's value product `p · c` in one launch, summed in MLX's order, so the bytes are the op chain's.
+pub fn steelValues(s: mlx.mlx_stream, p: Arr, c: Arr) !Arr {
+    if (steel_values_kernel == null) {
+        const ins = [_][*:0]const u8{ "pp", "c" };
+        const outs = [_][*:0]const u8{"u"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const made = mlx.mlx_fast_metal_kernel_new("sushi_hy4_steel_values", iv, ov, steel_values_source, "", false, false);
+        if (made.ctx == null) return error.MetalKernelCompileFailed;
+        steel_values_kernel = made;
+    }
+    const h = rowsOf(p);
+    const n = rowsOf(c);
+    const lat = colsOf(c);
+    const plan = steelPlan(h, lat, n).?;
+    const cfg = try steel_cfgs.get(.{ .h = h, .n = n, .w = lat, .parts = plan.parts, .pk = plan.pk, .a0 = rowAxis(p).?, .a1 = rowAxis(c).?, .a2 = 0, .scores = false }, steelBuild);
+    var out: [1]Arr = undefined;
+    try applyOuts(s, steel_values_kernel.?, &.{ p, c }, cfg, &out);
+    return out[0];
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -898,4 +1156,72 @@ test "hy4 chain: swigluAs accepts bf16 inputs and writes bf16 output in one laun
     const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(cw) orelse return error.HostRead);
     const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(cg) orelse return error.HostRead);
     try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
+}
+
+test "hy4 chain: a decode row's score and value products as one launch each give the bytes of MLX's split-k and fused GEMMs, at the release's sliding window and selected rows" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+
+    const lat: c_int = 512;
+    const rope: c_int = 64;
+    const Case = struct { h: c_int, n: c_int, heads_lead: bool };
+    const cases = [_]Case{
+        .{ .h = 64, .n = 512, .heads_lead = true },
+        .{ .h = 64, .n = 256, .heads_lead = true },
+        .{ .h = 64, .n = 128, .heads_lead = true },
+        .{ .h = 64, .n = 64, .heads_lead = true },
+        .{ .h = 32, .n = 2048, .heads_lead = false },
+        .{ .h = 32, .n = 512, .heads_lead = false },
+        .{ .h = 32, .n = 128, .heads_lead = false },
+    };
+    for (cases, 0..) |cs, ci| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed = 1000 * ci;
+        const q_full = try randomF32(&o, &.{ cs.h, 1, 256 }, seed + 1, 1.5);
+        const q_pe_h = try o.slice(q_full, 2, 192, 256);
+        const q_lat_h = try randomF32(&o, &.{ cs.h, 1, lat }, seed + 2, 1.5);
+        const keys = try randomF32(&o, &.{ cs.n + 7, lat }, seed + 3, 2.0);
+        const c = try o.slice(keys, 0, 3, 3 + cs.n);
+        const pe_f = try randomF32(&o, &.{ cs.n + 7, rope }, seed + 4, 1.0);
+        const pe_all = try o.cast(pe_f, .bfloat16);
+        const pe = try o.slice(pe_all, 0, 3, 3 + cs.n);
+        const probs = try randomF32(&o, &.{ cs.h, 1, cs.n }, seed + 5, 0.01);
+
+        const q_lat = if (cs.heads_lead) q_lat_h else try o.transpose(q_lat_h, &.{ 1, 0, 2 });
+        const q_pe = if (cs.heads_lead) q_pe_h else try o.transpose(q_pe_h, &.{ 1, 0, 2 });
+        const p = if (cs.heads_lead) probs else try o.transpose(probs, &.{ 1, 0, 2 });
+        const c_in = if (cs.heads_lead) c else try o.reshape(c, &.{ 1, cs.n, lat });
+        const pe_in = if (cs.heads_lead) pe else try o.reshape(pe, &.{ 1, cs.n, rope });
+        const pe32 = try o.cast(pe, .float32);
+        const want1 = if (cs.heads_lead) try o.binary(.mm, q_lat, try o.transpose(c, &.{ 1, 0 })) else try o.binary(.mm, q_lat, try o.transpose(c_in, &.{ 0, 2, 1 }));
+        const want2 = if (cs.heads_lead) try o.binary(.mm, q_pe, try o.transpose(pe32, &.{ 1, 0 })) else try o.binary(.mm, q_pe, try o.transpose(try o.reshape(pe32, &.{ 1, cs.n, rope }), &.{ 0, 2, 1 }));
+        const wantu = if (cs.heads_lead) try o.binary(.mm, p, c) else try o.binary(.mm, p, c_in);
+        const w1 = try hostF32(&o, want1);
+        const w2 = try hostF32(&o, want2);
+        const wu = try hostF32(&o, wantu);
+        for ([_]Arr{ q_lat, q_pe, c_in, pe_in, p }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        try testing.expect(steelScoresApplies(es, q_lat, q_pe, c_in, pe_in));
+        const d_s, const got = try dispatchesOf(steelScores, .{ es, q_lat, q_pe, c_in, pe_in });
+        _ = try o.own(got.s1);
+        _ = try o.own(got.s2);
+        try mlx.check(mlx.mlx_array_eval(got.s1));
+        try mlx.check(mlx.mlx_array_eval(got.s2));
+        try testing.expectEqual(@as(u64, 1), d_s);
+        try testing.expectEqualSlices(u8, w1, try hostF32(&o, got.s1));
+        try testing.expectEqualSlices(u8, w2, try hostF32(&o, got.s2));
+
+        try testing.expect(steelValuesApplies(es, p, c_in));
+        const d_v, const gu = try dispatchesOf(steelValues, .{ es, p, c_in });
+        _ = try o.own(gu);
+        try mlx.check(mlx.mlx_array_eval(gu));
+        try testing.expectEqual(@as(u64, 1), d_v);
+        try testing.expectEqualSlices(u8, wu, try hostF32(&o, gu));
+    }
 }

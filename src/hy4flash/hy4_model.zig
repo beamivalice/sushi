@@ -949,7 +949,7 @@ pub const Model = struct {
         const at = p0 + r0;
         const last = p0 + r1; // keys past the span's last row are never read
         const qs = try o.slice(p.q, 1, r0, r1);
-        const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left, .dst = if (in.dst) |d| .{ .block = d.block, .row = r0 } else null, .index = in.index, .rows_as = in.rows_as };
+        const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left, .dst = if (in.dst) |d| .{ .block = d.block, .row = r0 } else null, .index = in.index, .rows_as = in.rows_as, .q_raw = if (p.q_raw) |r| try o.slice(r, 1, r0, r1) else null };
         if (core_keys) |ck| if (rows > fwd.verify_rows_max) return self.attendSpanCore(o, l, x, p, sin, qs, pooled, ck, win.base, r0, r1, n, p0, tap);
         if (L.indexer) |iw| {
             const ig = self.indexerGeometry();
@@ -976,7 +976,10 @@ pub const Model = struct {
         if (win.unordered) {
             // A decode row reads every row the ring holds, in ring order: the keys carry their positions already.
             const k = @min(n, w);
-            return fwd.attendGatedCausal(o, sin, qs, try self.latentRange(o, win, 0, k), try o.slice(win.k_pe.?, 0, 0, k), L.attn, L.geometry, k - 1, 0, tap);
+            const keys_c = try self.latentRange(o, win, 0, k);
+            const keys_pe = try o.slice(win.k_pe.?, 0, 0, k);
+            if (n > w) return fwd.attendGatedFull(o, sin, qs, keys_c, keys_pe, L.attn, L.geometry, k - 1, tap);
+            return fwd.attendGatedCausal(o, sin, qs, keys_c, keys_pe, L.attn, L.geometry, k - 1, 0, tap);
         }
         const s0: c_int = @max(0, at - w + 1);
         const c_win = try self.latentRange(o, win, s0 - win.base, last - win.base);
@@ -1964,7 +1967,7 @@ pub const Model = struct {
             post_a = try keep.own(try o.result(a.post));
             x = try keep.own(try o.result(xx));
             if (share_bf) x_bf = try keep.own(try o.result(xx_bf));
-            p = .{ .q = try keep.own(try o.result(pp.q)), .c = undefined, .k_pe = undefined, .q_resid = try keep.own(try o.result(pp.q_resid)) };
+            p = .{ .q = try keep.own(try o.result(pp.q)), .c = undefined, .k_pe = undefined, .q_resid = try keep.own(try o.result(pp.q_resid)), .q_raw = if (pp.q_raw) |r| try keep.own(try o.result(r)) else null };
         }
         // The window a sliding layer's spans read: a decode row writes its row into the ring and reads the ring as it
         // stands; a chunk reads the ring's last `window - 1` rows in position order before its own rows, and writes its
@@ -2078,13 +2081,13 @@ pub const Model = struct {
             var o: Ops = .{ .s = self.s };
             defer o.deinit();
             // The chunk's only span ran W_o and its norm itself (`SpanIn.whole`).
-            const gated = if (rows_block) |b| b else try o.concat(spans[0..count], 0);
-            y = if (in.whole)
-                try keep.own(try o.result(spans[0]))
-            else if (fuse_o_norm)
-                try keep.own(try o.result(try fwd.linearSpans(&o, gated, L.attn.o, span)))
-            else
-                try keep.own(try o.result(try fwd.output(&o, gated, L.attn, L.geometry, span)));
+            y = if (in.whole) try keep.own(try o.result(spans[0])) else blk: {
+                const gated = if (rows_block) |b| b else try o.concat(spans[0..count], 0);
+                break :blk if (fuse_o_norm)
+                    try keep.own(try o.result(try fwd.linearSpans(&o, gated, L.attn.o, span)))
+                else
+                    try keep.own(try o.result(try fwd.output(&o, gated, L.attn, L.geometry, span)));
+            };
         }
         held.deinit();
         held.count = 0;

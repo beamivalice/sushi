@@ -987,8 +987,8 @@ pub fn attention(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, mask: A
 
 /// The new rows' projections: the rotated queries `q` [H, T, qk], the normalized latent `c` [T, latent] and the
 /// rotated `k_pe` [T, rope] at the cache's BF16 (a row the cache keeps for every later query), and `q_resid` for the
-/// indexer.
-pub const Projected = struct { q: Arr, c: Arr, k_pe: Arr, q_resid: Arr };
+/// indexer; a decode row also keeps `q_raw`, its queries before the rotation, for the absorb to read beside the rope.
+pub const Projected = struct { q: Arr, c: Arr, k_pe: Arr, q_resid: Arr, q_raw: ?Arr = null };
 
 pub fn project(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int) !Projected {
     return projectWith(o, x, w, g, pos0, .float32, .float32, .float32);
@@ -1020,7 +1020,7 @@ fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx
             return e;
         };
         const k_pe = try o.own(f.k_pe);
-        return .{ .q = try rope(o, q, g.rope, g.theta, pos0), .c = c, .k_pe = k_pe, .q_resid = q_resid };
+        return .{ .q = try rope(o, q, g.rope, g.theta, pos0), .c = c, .k_pe = k_pe, .q_resid = q_resid, .q_raw = if (t == 1 and rope_kernel_on and hy4_rope.applies(o.s, q, g.rope)) q else null };
     }
     const c = try normAs(o, try o.slice(ckv, 1, 0, g.latent), null, w.kv_a_norm, g.eps, c_dt);
     const k_pe = try o.reshape(try o.slice(ckv, 1, g.latent, g.latent + g.rope), &.{ 1, t, g.rope });
@@ -1048,7 +1048,7 @@ pub const GatedDst = struct { block: Arr, row: c_int };
 /// A sparse layer's indexer inputs made once for the chunk's rows from `r0` (`indexPrepare`): the rotated queries, the
 /// head weights and the rotated group keys, sliced per span.
 pub const IndexIn = struct { r0: c_int, qt: Arr, hw: Arr, k_rot: Arr };
-pub const SpanIn = struct { gate: Arr, kv_b32: ?Arr = null, whole: bool = false, o_left: ?*OLeft = null, dst: ?GatedDst = null, index: ?IndexIn = null, rows_as: ?c_int = null };
+pub const SpanIn = struct { gate: Arr, kv_b32: ?Arr = null, whole: bool = false, o_left: ?*OLeft = null, dst: ?GatedDst = null, index: ?IndexIn = null, rows_as: ?c_int = null, q_raw: ?Arr = null };
 
 /// What a whole span's W_o left for the iHC mix: its rows normed, its k-split partials (`osplit` a row) for
 /// `expandMixNormParts`, or its finished rows for `expandMixNormRows`.
@@ -1058,6 +1058,12 @@ pub const OLeft = union(enum) { normed, parts: c_int, rows };
 /// `in.whole`.
 pub fn attendGated(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask: Arr, at: ?At) !Arr {
     return attendGatedMask(o, in, q, c, k_pe, w, g, .{ .array = mask }, at);
+}
+
+/// `attendGated` for a decode row over a full window of keys (the context past the window): every key visible, the
+/// score and value products as steel launches.
+pub fn attendGatedFull(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, p0: c_int, at: ?At) !Arr {
+    return attendGatedMask(o, in, q, c, k_pe, w, g, .{ .causal = .{ .p0 = p0, .window = 0, .steel = true } }, at);
 }
 
 /// `attendGated` under the causal mask of rows at `p0..` (and only the `window` keys ending at each when `window` > 0),
@@ -1073,7 +1079,7 @@ pub fn attendGatedRing(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, 
 /// The mask an attention core reads: an additive or boolean array, or the causal mask by positions.
 pub const MaskSpec = union(enum) {
     array: Arr,
-    causal: struct { p0: c_int, window: c_int, ring_p0: ?c_int = null },
+    causal: struct { p0: c_int, window: c_int, ring_p0: ?c_int = null, steel: bool = false },
 };
 
 fn freshBuf(o: *Ops, shape: []const c_int, dtype: mlx.mlx_dtype) !Arr {
@@ -1087,7 +1093,7 @@ fn mmInto(a: Arr, b: Arr, dst: Arr) !void {
 }
 
 fn attendGatedMask(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask_spec: MaskSpec, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as); // [H, T, latent], [H, T, rope]
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw); // [H, T, latent], [H, T, rope]
     const u_lat = try causalLatent(o, ab.q_lat, ab.q_pe, c, k_pe, w, g, mask_spec);
     return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
@@ -1205,9 +1211,18 @@ pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, 
         }
     } else blk: {
         const c32 = try o.cast(c, .float32);
-        const pe32 = try o.cast(k_pe, .float32);
-        const s1 = try o.binary(.mm, q_lat, try o.transpose(c32, &.{ 1, 0 }));
-        const s2 = try o.binary(.mm, q_pe, try o.transpose(pe32, &.{ 1, 0 }));
+        const steel = t == 1 and chain_kernels_on and mask_spec == .causal and mask_spec.causal.steel and hy4_chain.steelScoresApplies(o.s, q_lat, q_pe, c32, k_pe);
+        var s1: Arr = undefined;
+        var s2: Arr = undefined;
+        if (steel) {
+            const sc = try hy4_chain.steelScores(o.s, q_lat, q_pe, c32, k_pe);
+            s1 = try o.own(sc.s1);
+            s2 = try o.own(sc.s2);
+        } else {
+            const pe32 = try o.cast(k_pe, .float32);
+            s1 = try o.binary(.mm, q_lat, try o.transpose(c32, &.{ 1, 0 }));
+            s2 = try o.binary(.mm, q_pe, try o.transpose(pe32, &.{ 1, 0 }));
+        }
         const p = switch (mask_spec) {
             .causal => |cm| if (chain_kernels_on and hy4_chain.sinkSoftmaxCausalApplies(o.s, s1, s2, w.sinks, true))
                 try o.own(try hy4_chain.sinkSoftmaxCausal(o.s, s1, s2, w.sinks, scaleOf(g), cm.p0, cm.window, true))
@@ -1218,6 +1233,7 @@ pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, 
             else
                 try sinkSoftmax(o, try o.binary(.add, try o.binary(.mul, try o.binary(.add, s1, s2), try o.scalar(scaleOf(g), .float32)), m), w.sinks, g.heads, t, n, true),
         };
+        if (steel and hy4_chain.steelValuesApplies(o.s, p, c32)) break :blk try o.own(try hy4_chain.steelValues(o.s, p, c32));
         break :blk try o.binary(.mm, p, c32);
     };
 }
@@ -1226,14 +1242,14 @@ pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, 
 /// `keep` [T, S] (whether each is one the row reads). A sparse layer past its selection threshold reads its recalled
 /// groups' rows this way, so a row's cost does not grow with the context.
 pub fn attendRowsGated(o: *Ops, in: SpanIn, q: Arr, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as);
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw);
     const u_lat = try rowsLatent(o, ab.q_lat, ab.q_pe, c_g_flat, pe_g_flat, keep, w, g);
     return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
 
 pub fn attendStraddleGated(o: *Ops, in: SpanIn, q: Arr, cut: c_int, c: Arr, k_pe: Arr, p0: c_int, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry, at: ?At) !Arr {
     const t = mlx.getShape(q)[1];
-    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as);
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw);
     const u_d = try causalLatent(o, try o.slice(ab.q_lat, 1, 0, cut), try o.slice(ab.q_pe, 1, 0, cut), c, k_pe, w, g, .{ .causal = .{ .p0 = p0, .window = 0 } });
     const u_g = try rowsLatent(o, try o.slice(ab.q_lat, 1, cut, t), try o.slice(ab.q_pe, 1, cut, t), c_g_flat, pe_g_flat, keep, w, g);
     return gatedOut(o, in.gate, try o.concat(&.{ u_d, u_g }, 1), ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
@@ -1243,9 +1259,11 @@ pub fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: 
     const t = mlx.getShape(q_lat_h)[1];
     const sel = selectedWidth(keep);
     const c_g = try o.reshape(try o.cast(c_g_flat, .float32), &.{ t, sel, g.latent }); // [T, S, latent]
-    const pe_g = try o.reshape(try o.cast(pe_g_flat, .float32), &.{ t, sel, g.rope });
+    const pe_g_bf = try o.reshape(pe_g_flat, &.{ t, sel, g.rope });
     const q_lat = try o.transpose(q_lat_h, &.{ 1, 0, 2 }); // [T, H, latent]
     const q_pe = try o.transpose(q_pe_h, &.{ 1, 0, 2 });
+    const steel = t == 1 and chain_kernels_on and hy4_chain.steelScoresApplies(o.s, q_lat, q_pe, c_g, pe_g_bf);
+    const pe_g = if (steel) pe_g_bf else try o.reshape(try o.cast(pe_g_flat, .float32), &.{ t, sel, g.rope });
     const c_g_t = try o.transpose(c_g, &.{ 0, 2, 1 });
     const pe_g_t = try o.transpose(pe_g, &.{ 0, 2, 1 });
     // A verify block's rows each take the one-row shapes of the score and value products: their bytes are the
@@ -1296,8 +1314,16 @@ pub fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: 
         }
         break :blk try o.transpose(try o.concat(u_rows[0..tu], 0), &.{ 1, 0, 2 });
     } else blk: {
-        const s1 = try o.binary(.mm, q_lat, c_g_t);
-        const s2 = try o.binary(.mm, q_pe, pe_g_t);
+        var s1: Arr = undefined;
+        var s2: Arr = undefined;
+        if (steel) {
+            const sc = try hy4_chain.steelScores(o.s, q_lat, q_pe, c_g, pe_g_bf);
+            s1 = try o.own(sc.s1);
+            s2 = try o.own(sc.s2);
+        } else {
+            s1 = try o.binary(.mm, q_lat, c_g_t);
+            s2 = try o.binary(.mm, q_pe, pe_g_t);
+        }
         const p = if (chain_kernels_on and hy4_chain.sinkSoftmaxMaskApplies(o.s, s1, s2, keep, w.sinks, false))
             try o.own(try hy4_chain.sinkSoftmaxMask(o.s, s1, s2, keep, w.sinks, scaleOf(g), false))
         else inner: {
@@ -1305,6 +1331,7 @@ pub fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: 
             const mask = try o.reshape(try additive(o, keep), &.{ t, 1, sel });
             break :inner try sinkSoftmax(o, try o.binary(.add, try o.binary(.mul, scores, try o.scalar(scaleOf(g), .float32)), mask), w.sinks, g.heads, t, sel, false);
         };
+        if (steel and hy4_chain.steelValuesApplies(o.s, p, c_g)) break :blk try o.transpose(try o.own(try hy4_chain.steelValues(o.s, p, c_g)), &.{ 1, 0, 2 });
         break :blk try o.transpose(try o.binary(.mm, p, c_g), &.{ 1, 0, 2 });
     };
 }
@@ -1337,7 +1364,7 @@ pub const CorePicks = struct { keys: hy4_attn.Keys, rows: Arr, keep: Arr };
 
 /// `attendGated` with the core as `hy4_attn`'s launch over `core`'s keys.
 pub fn attendCoreGated(o: *Ops, in: SpanIn, q: Arr, core: CoreKeys, w: Attn, g: AttnGeometry, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as);
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as, in.q_raw);
     const u_lat = try coreLatent(o, ab, core, w, g);
     return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
@@ -1376,11 +1403,11 @@ const Absorbed = struct { q_lat: Arr, q_pe: Arr, w_v: ?Arr };
 
 /// `q` [H, T, qk] split: its nope part taken into the latent through `W_k` [H, nope, latent], its rope part kept; and
 /// `W_v` [H, v, latent], both from `kv_b` [H·(nope+v), latent] widened to f32 (`kv_b32` when the caller widened it).
-fn absorb(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr, rows_as: ?c_int) !Absorbed {
+fn absorb(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr, rows_as: ?c_int, q_raw: ?Arr) !Absorbed {
     if (absorbServes(o.s, w.kv_b, g, mlx.getShape(q)[1])) {
         // The absorb kernel reads the query's nope part in place.
         const q32 = try o.contiguous(try o.cast(q, .float32));
-        return .{ .q_lat = try o.own(try hy4_absorb.queryLatent(o.s, q32, w.kv_b, absorbGeometry(g))), .q_pe = try o.slice(q32, 2, g.nope, g.nope + g.rope), .w_v = null };
+        return .{ .q_lat = try o.own(try hy4_absorb.queryLatent(o.s, q_raw orelse q32, w.kv_b, absorbGeometry(g))), .q_pe = try o.slice(q32, 2, g.nope, g.nope + g.rope), .w_v = null };
     }
     const kvb = try o.reshape(kv_b32 orelse try o.cast(w.kv_b, .float32), &.{ g.heads, g.nope + g.v, g.latent });
     const w_k = try o.slice(kvb, 1, 0, g.nope);
@@ -1409,12 +1436,14 @@ pub fn absorbServes(s: mlx.mlx_stream, kv_b: Arr, g: AttnGeometry, rows: c_int) 
 /// The attended latent [H, T, latent] out through `W_v`, gated by `σ` of its rows' `gate` (as stored), as `W_o` reads it.
 fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeometry, at: ?At, whole: bool, o_left: ?*OLeft, dst: ?GatedDst, rows_as: ?c_int) !Arr {
     const t = mlx.getShape(u_lat)[1];
-    const u = if (w_v) |wv| try mmHeadsAs(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 }), rows_as) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, absorbGeometry(g))); // [H, T, v]
-    if (at == null and !whole) if (dst) |d| if (chain_kernels_on and hy4_chain.gatedIntoApplies(o.s, u, gate_rows, d.block)) {
+    // A span that writes into its chunk's block keeps that write; the joined launch returns rows only.
+    const joined = dst == null and w_v == null and chain_kernels_on and hy4_absorb.valueOutGatedApplies(o.s, u_lat, w.kv_b, absorbGeometry(g), gate_rows);
+    const u = if (joined) u_lat else if (w_v) |wv| try mmHeadsAs(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 }), rows_as) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, absorbGeometry(g))); // [H, T, v]
+    if (!joined and at == null and !whole) if (dst) |d| if (chain_kernels_on and hy4_chain.gatedIntoApplies(o.s, u, gate_rows, d.block)) {
         try hy4_chain.gatedInto(o.s, u, gate_rows, d.block, d.row);
         return mlx.mlx_array_new();
     };
-    const gated = if (chain_kernels_on and hy4_chain.gatedApplies(o.s, u, gate_rows)) try o.own(try hy4_chain.gated(o.s, u, gate_rows)) else blk: {
+    const gated = if (joined) try o.own(try hy4_absorb.valueOutGated(o.s, u_lat, w.kv_b, absorbGeometry(g), gate_rows)) else if (chain_kernels_on and hy4_chain.gatedApplies(o.s, u, gate_rows)) try o.own(try hy4_chain.gated(o.s, u, gate_rows)) else blk: {
         const gate = try o.unary(.sigmoid, try o.transpose(try o.reshape(try o.cast(gate_rows, .float32), &.{ t, g.heads, g.v }), &.{ 1, 0, 2 }));
         break :blk try o.reshape(try o.transpose(try o.binary(.mul, u, gate), &.{ 1, 0, 2 }), &.{ t, g.heads * g.v });
     };
@@ -2589,5 +2618,124 @@ test "hy4 sparse core spans: 3D matmulRowsAs matches 32-row absorb and valueOut 
         const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(want) orelse return error.HostRead);
         const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(got) orelse return error.HostRead);
         try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
+    }
+}
+
+test "hy4 attention decode row: the sliding window's and the selected rows' latent products run as a score, a softmax and a value launch, and give the op chain's bytes at the release's 64 and 32 heads" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    defer chain_kernels_on = true;
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+
+    const Case = struct { heads: c_int, n: c_int, sparse: bool };
+    for ([_]Case{
+        .{ .heads = 64, .n = 512, .sparse = false },
+        .{ .heads = 32, .n = 2048, .sparse = true },
+        .{ .heads = 32, .n = 2048, .sparse = false },
+    }, 0..) |case, ci| {
+        const g: AttnGeometry = .{ .heads = case.heads, .nope = 192, .rope = 64, .v = 256, .latent = 512, .theta = 1e4, .eps = 1e-5 };
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed: u64 = 77 * (ci + 1);
+        const q32 = try ihcValues(&o, &.{ case.heads, 1, 256 }, seed + 1, 1.5);
+        const q_lat = try ihcValues(&o, &.{ case.heads, 1, 512 }, seed + 2, 1.5);
+        const q_pe = try o.slice(q32, 2, 192, 256);
+        const keys = try ihcValues(&o, &.{ case.n, 512 }, seed + 3, 2.0);
+        const pe = try o.cast(try ihcValues(&o, &.{ case.n, 64 }, seed + 4, 1.0), .bfloat16);
+        const sinks = try ihcValues(&o, &.{case.heads}, seed + 5, 1.0);
+        var attn: Attn = undefined;
+        attn.sinks = sinks;
+        const kv = try testing.allocator.alloc(bool, @intCast(case.n));
+        defer testing.allocator.free(kv);
+        for (kv, 0..) |*d, i| d.* = (i % 5) != 0;
+        const keep_arr = try o.own(mlx.mlx_array_new_data(kv.ptr, &[_]c_int{ 1, case.n }, 2, .bool_));
+        for ([_]Arr{ q_lat, q_pe, keys, pe, sinks, keep_arr }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        var bytes: [2][]const f32 = undefined;
+        var launches: [2]u64 = undefined;
+        for ([_]bool{ true, false }, 0..) |on, arm| {
+            chain_kernels_on = on;
+            const before = mlx.engine.stats().dispatches;
+            const u = if (case.sparse)
+                try rowsLatent(&o, q_lat, q_pe, keys, pe, keep_arr, attn, g)
+            else
+                try causalLatent(&o, q_lat, q_pe, keys, pe, attn, g, .{ .causal = .{ .p0 = case.n - 1, .window = 0, .steel = true } });
+            launches[arm] = mlx.engine.stats().dispatches - before;
+            bytes[arm] = try hostRows(&o, u);
+        }
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(bytes[1]), std.mem.sliceAsBytes(bytes[0]));
+        try testing.expect(launches[1] > launches[0]);
+        try testing.expectEqual(@as(u64, 3), launches[0]);
+    }
+}
+
+test "hy4 attention decode row: the absorbed query read from the unrotated queries is the rotated queries' product, one launch, at the release's 64 and 32 heads" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    for ([_]c_int{ 64, 32 }, 0..) |heads, ci| {
+        const g: AttnGeometry = .{ .heads = heads, .nope = 192, .rope = 64, .v = 256, .latent = 512, .theta = 1e4, .eps = 1e-5 };
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed: u64 = 31 * (ci + 1);
+        const rows = try ihcValues(&o, &.{ 1, heads * 256 }, seed + 1, 1.5);
+        const q_raw = try o.transpose(try o.reshape(rows, &.{ 1, heads, 256 }), &.{ 1, 0, 2 });
+        const q = try rope(&o, q_raw, g.rope, g.theta, 77);
+        const kv_b = try o.cast(try ihcValues(&o, &.{ heads * 448, 512 }, seed + 2, 0.2), .bfloat16);
+        var attn: Attn = undefined;
+        attn.kv_b = kv_b;
+        for ([_]Arr{ q_raw, q, kv_b }) |a| try mlx.check(mlx.mlx_array_eval(a));
+        try testing.expect(absorbServes(es, kv_b, g, 1));
+        const before = mlx.engine.stats().dispatches;
+        const raw = try absorb(&o, q, attn, g, null, null, q_raw);
+        const launches = mlx.engine.stats().dispatches - before;
+        const rot = try absorb(&o, q, attn, g, null, null, null);
+        try testing.expectEqual(@as(u64, 1), launches);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, rot.q_lat)), std.mem.sliceAsBytes(try hostRows(&o, raw.q_lat)));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, rot.q_pe)), std.mem.sliceAsBytes(try hostRows(&o, raw.q_pe)));
+    }
+}
+
+test "hy4 attention span into a chunk's block: a one-row span's gated row lands in the block at its row and the span returns none, at the release's 64 and 32 heads" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    for ([_]c_int{ 64, 32 }, 0..) |heads, ci| {
+        const g: AttnGeometry = .{ .heads = heads, .nope = 192, .rope = 64, .v = 256, .latent = 512, .theta = 1e4, .eps = 1e-5 };
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed: u64 = 53 * (ci + 1);
+        const u_lat = try ihcValues(&o, &.{ heads, 1, 512 }, seed + 1, 1.5);
+        const gate = try ihcValues(&o, &.{ 1, heads * 256 }, seed + 2, 2.0);
+        var attn: Attn = undefined;
+        attn.kv_b = try o.cast(try ihcValues(&o, &.{ heads * 448, 512 }, seed + 3, 0.2), .bfloat16);
+        attn.o = Lin.dense(try o.cast(try ihcValues(&o, &.{ 64, heads * 256 }, seed + 4, 0.1), .bfloat16));
+        for ([_]Arr{ u_lat, gate, attn.kv_b }) |a| try mlx.check(mlx.mlx_array_eval(a));
+        const want = try o.own(try hy4_chain.gated(es, try o.own(try hy4_absorb.valueOut(es, u_lat, attn.kv_b, absorbGeometry(g))), gate));
+        const block = try ihcValues(&o, &.{ 4, heads * 256 }, seed + 5, 1.0);
+        try mlx.check(mlx.mlx_array_eval(block));
+        const got = try gatedOut(&o, gate, u_lat, null, attn, g, null, false, null, .{ .block = block, .row = 2 }, null);
+        try testing.expectEqual(@as(?*anyopaque, null), got.ctx);
+        const rows = try hostRows(&o, block);
+        const w = try hostRows(&o, want);
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(w), std.mem.sliceAsBytes(rows[@intCast(2 * heads * 256)..][0..w.len]));
     }
 }

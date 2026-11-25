@@ -227,6 +227,12 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     rounded to BF16 in the register, MLX's `gemv` tile over the BF16 operands, the sum rounded to BF16 and widened,
     not the casts around MLX's BF16 `gemv`. A verify block of 2 to 8 rows is one launch too, the weight read once
     and each row its one-row sums (3-row verify 21.68 to 21.41 ms a forward, 92d6397b, M5 Ultra, STQ 4bpw, A B B A).
+  - A decode row's attention past the window is a score, a softmax and a value launch (`hy4_chain.steelScores`,
+    `steelValues`): each sums in MLX's split-k or fused order (`steelPlan` mirrors the pinned mlx's choice), so the
+    bytes are the op chain's; the output gate rides the launch that reads `W_v` (`hy4_absorb.valueOutGated`) for a
+    span that returns its rows (a chunk's span, even of one row, writes into the chunk's block through `gatedInto`), and
+    the absorbed query reads the queries before their rotation (`Projected.q_raw`), so the rope runs beside it. A row:
+    15.45 to 14.84 ms, 1,618 to 1,378 dispatches (dbcca609, M5 Ultra, STQ 4bpw, kv8, 4,096 tokens, A B B A).
   - A decode row's absorbed products (`hy4_absorb`) read the query's nope part in place (template `QS`, the row's
     width) and keep their launch configs; their grid's y takes a block's rows, each its one-row launch's bytes.
   - The attention core of a wide span (more than 8 rows, on an M5) is `hy4_attn`, one launch a span on the matrix units
