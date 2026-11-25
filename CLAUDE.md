@@ -231,7 +231,8 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   spec verify first; one that changes output goes through the KLD gate ([quality-kld](docs/quality-kld.md)).
 - A lever is sized as the combined gain of its set (every fusion of one forward, every step of one chain), never one
   step at a time: a set over the bar is built even when no single step is.
-- At the gate, a KLD change under 0.01% passes; a larger one goes to the owner with its speed gain to decide.
+- At the gate, a KLD change under 0.01% passes, and so does one that moves KLD lower (closer to the BF16 teacher);
+  a larger rise goes to the owner with its speed gain to decide.
 - Exactness is judged on one hardware path: a NAX arm whose bytes differ from the SIMD arm's (new vs old hardware) is
   not an output change. Bytes that diverge by GPU class or generation are hardware divergence: we never chase identical
   bits across GPUs, and a byte pin holds on the GPU class it was proven on.
