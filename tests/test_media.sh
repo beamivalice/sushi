@@ -4,7 +4,7 @@
 # per-arch fixture tests; this checks what only a running server shows:
 #   [1] /v1/models advertises images, and video exactly where the arch serves it;
 #   [2] the answer reads what only the pixels hold (the four quadrant colors) on chat completions, and the default
-#       speculative mode (MTP, DFlash2 or DSpark) engages on that image request;
+#       speculative mode (MTP, DFlash2, DSpark or DFly2) engages on that image request;
 #   [3] a stream and a non-stream answer are the same bytes;
 #   [4] a second turn recalls the image;
 #   [5] /v1/messages reads the same image as a base64 block and as a data-URL source;
@@ -122,7 +122,7 @@ else:
 PY
 py() { python3 -I "$WORK/m.py" "$@"; }
 post() { curl -s -m 1800 -o "$WORK/out" -w '%{http_code}' "$BASE$1" -H 'content-type: application/json' -d @-; }
-spec_lines() { sushi_log_since | grep -cE '\[spec-stats\] mode=(mtp|dspark|dflash)' | one; }
+spec_lines() { sushi_log_since | grep -cE '\[spec-stats\] mode=(mtp|dflash|dspark|dfly2)' | one; }
 
 echo "[1] images (and video where served) are advertised"
 read -r cap_vision mod_image mod_video <<< "$(curl -s "$BASE/v1/models" | py models)"

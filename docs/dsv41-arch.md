@@ -813,7 +813,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
 - **Exact greedy costs nothing measurable** (base `1aececf3` + the exact route, the knob on against off in one binary; the shipped
   STQ 1.75bpw, `--ssd-budget-gb 108 --ctx-size 65536`, `taskpolicy -a`, GPU lock, QUIET, fans max, die under 50 C at each boot, one
   boot per arm and kind, A then B; a ~4.9k-token code prompt (a Zig source review) and a ~4.0k-token prose prompt, 600 greedy
-  tokens, second pass of each; forced `SUSHI_DSV41_DSPARK_ROWS=sweep`, verify ms trimmed means of `[dspark-round]`, ~30-40 rounds a
+  tokens, second pass of each; forced `SUSHI_DSV41_DSPARK_ROWS=sweep`, verify ms trimmed means of `[drafter-round]`, ~30-40 rounds a
   width). A = arms that sum by width (`SUSHI_DSV41_DSPARK_EXACT=0`), B = exact (the default):
 
 | R | code A | code B | delta | prose A | prose B | delta |

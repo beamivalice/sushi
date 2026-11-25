@@ -226,7 +226,7 @@ Each is optional; shared code asks through the dispatch file named, never the ar
   `loadLines(config, LoadLog)` (`arch/serve.zig`).
 - The `drafter` slot's `drafter_rounds` (`nextDrafterRound`, `drafterResumeAfterForced`, `drafterEmitPending`, `drafterDiag`, `stageBlock`):
   `arch/drafter_rounds.zig` binds them for the generator and the scheduler, or a stand-in that refuses in a build without such an arch. The
-  generator's DSpark types are the shared `drafter_rows.zig`.
+  generator's drafter types, DSpark's and DFly2's, are the shared `drafter_rows.zig`.
 - `ubench` in `arch.zig`: the arch's microbench module, whose `benches` `ubench_main.zig` lists. It may also declare
   `sharedFold(run, stream, layouts)`, the arch's arm of `shared.shared_expert_fold` (`glm5` does).
 - A `State` may declare `specRollsBack` (`arch_state.zig`): its decode state rewinds across a speculative verify.

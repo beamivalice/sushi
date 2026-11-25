@@ -62,7 +62,7 @@ status() { curl -s -o /dev/null -w '%{http_code}' --max-time 60 "$BASE$1" -H "Co
 status_body() { curl -s -w '\n%{http_code}' --max-time 60 "$BASE$1" -H "Content-Type: application/json" -d "$(merge "$1" "$2")"; }
 # Counts in this script's own slice of the shared log; read from a file so no early-exiting grep breaks a pipe.
 log_count() { sushi_log_since > "$WORK/log"; grep -cE "$1" "$WORK/log"; }
-SPEC_RE='spec-stats\] mode=(mtp|dspark|drafter|dflash)'
+SPEC_RE='spec-stats\] mode=(mtp|dflash|dspark|dfly2)'
 Q="$SUSHI_NONCE Reply in one short sentence: what colour is the sky on a clear day?"
 TOOLS='[{"type":"function","function":{"name":"get_weather","description":"Current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
 TAGS='<think>|</think>|<\|channel>|<channel\|>|<tool_call>|<function=|DSML'

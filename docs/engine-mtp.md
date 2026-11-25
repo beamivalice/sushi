@@ -35,7 +35,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
   `costProfile`, `evSeed`, `setEvSeed`, `moduleOwned`, `makeCache`, `destroyHead`) is answered by the arch's
   `src/<arch>/<arch>_drafter.zig`, published as `drafter` in its `arch.zig`; an operation the module omits has the
   default stated on the method (no step, no shortlist, `generic` cost profile). `arch/drafter.zig` imports no arch
-  folder. Shared code asks `kind()` (`mtp`, `dspark`), `batchesHeadRows()` and the cache's `positionDrift`,
+  folder. Shared code asks `kind()` (`mtp`, `dspark`, `dfly2`), `batchesHeadRows()` and the cache's `positionDrift`,
   `reseedAfterForcedCommit` and `rebuiltFromTail`, never an arch.
 - A DFlash2 round is `Generator.nextDflash`, which calls the loaded arch's `drafter.nextDflash`: GLM's native round
   (`glm5_generate.nextGlmDflash`), or `dflash_round.zig`, the generic round Flash-Next and MiMo list. An arch whose
