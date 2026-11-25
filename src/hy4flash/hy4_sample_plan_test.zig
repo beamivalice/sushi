@@ -25,6 +25,7 @@ const Drafting = struct {
 /// makes them (`sampler.installSuppressMask`, `generate.installThinkMarkers`), before its warm plans.
 fn openMasked(ld: *contract.Load, dir: []const u8) !void {
     try ld.prepare(Drafting, dir, true);
+    ld.config.test_skip_warm = true;
     try ld.load(dir);
     errdefer ld.discard();
     const vocab: usize = ld.xfm.config.vocab_size;
