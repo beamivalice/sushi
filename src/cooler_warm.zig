@@ -88,6 +88,16 @@ pub var bill_for_test: ?u64 = null;
 pub const Longest = struct { asked: u64, held: u64, bill: u64 };
 pub var longest_for_test: ?Longest = null;
 
+fn underDeclaredLimit(buf: []u8, c: bills.Ceiling) []const u8 {
+    const declared = c.declared.? >> 20;
+    const mb = c.unplanned >> 20;
+    if (c.unplanned <= c.margin)
+        return std.fmt.bufPrint(buf, "iogpu.wired_limit_mb={d} less the {d} MB --wired-margin-gib keeps unplanned", .{ declared, mb }) catch "the declared limit";
+    if (c.gpu_floor == 0)
+        return std.fmt.bufPrint(buf, "iogpu.wired_limit_mb={d} less the {d} MB slack", .{ declared, mb }) catch "the declared limit";
+    return std.fmt.bufPrint(buf, "iogpu.wired_limit_mb={d} less the {d} MB the GPU memory other processes hold, plus 512 MB, keeps unplanned", .{ declared, mb }) catch "the declared limit";
+}
+
 /// `drafter`: the load's drafter, if it drafts; a block drafter (DSpark, DFly2) drafts in its own rounds, as the scheduler arms it. The warm
 /// ends by recording its marker; a load whose manifest holds that marker skips the requests, and still refuses by name a
 /// load no chunk fits.
@@ -111,10 +121,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         const floor = bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1];
         const ceil = bills.ceilingNow();
         var under_buf: [160]u8 = undefined;
-        const under = if (ceil.declared) |d|
-            std.fmt.bufPrint(&under_buf, "iogpu.wired_limit_mb={d} less the {d} MB {s} keeps unplanned", .{ d >> 20, ceil.unplanned >> 20, ceil.unplannedName() }) catch "the declared limit"
-        else
-            "the GPU working set";
+        const under = if (ceil.declared != null) underDeclaredLimit(&under_buf, ceil) else "the GPU working set";
         log.warn("[warm] no prefill chunk fits beside the load: the narrowest ({d} rows) needs {d} MB, the headroom is {d} MB (under {s}); a lower --ssd-budget-gb leaves room\n", .{
             floor, bills.warmChunkPeakBytes(c, bits, floor) >> 20, headroom >> 20, under,
         });
@@ -478,4 +485,16 @@ fn request(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, spec
     });
     defer gen.deinit(a);
     try drain(a, &gen);
+}
+
+test "the [warm] line names a declared limit's unplanned bytes once" {
+    const t = std.testing;
+    const mib: u64 = 1 << 20;
+    var buf: [160]u8 = undefined;
+    const slack = underDeclaredLimit(&buf, .{ .declared = 300 * mib, .total_ram = 32 << 30, .margin = 0, .gpu_floor = 0, .unplanned = 512 * mib, .working_set = 24 << 30 });
+    try t.expectEqualStrings("iogpu.wired_limit_mb=300 less the 512 MB slack", slack);
+    const floor = underDeclaredLimit(&buf, .{ .declared = 2_048 * mib, .total_ram = 32 << 30, .margin = 1 << 30, .gpu_floor = 1_600 * mib, .unplanned = 2_112 * mib, .working_set = 24 << 30 });
+    try t.expectEqualStrings("iogpu.wired_limit_mb=2048 less the 2112 MB the GPU memory other processes hold, plus 512 MB, keeps unplanned", floor);
+    const margin = underDeclaredLimit(&buf, .{ .declared = 120_000 * mib, .total_ram = 128 << 30, .margin = 8 << 30, .gpu_floor = 0, .unplanned = 8 << 30, .working_set = 100 << 30 });
+    try t.expectEqualStrings("iogpu.wired_limit_mb=120000 less the 8192 MB --wired-margin-gib keeps unplanned", margin);
 }

@@ -783,7 +783,7 @@ fn runCli(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
     };
-    var margin_buf: [192]u8 = undefined;
+    var margin_buf: [bills_mod.WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
     if (bills_mod.wiredMarginRefusal(&margin_buf, bills_mod.ceilingNow())) |why| {
         log.err("{s}\n", .{why});
         std.process.exit(1);

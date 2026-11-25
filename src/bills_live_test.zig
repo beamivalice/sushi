@@ -905,7 +905,7 @@ test "a Ceiling the unplanned margin leaves no floor is refused at boot, whateve
         const was = m.pin();
         defer _ = was.pin();
         const c = bills.ceilingNow();
-        var buf: [192]u8 = undefined;
+        var buf: [bills.WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
         // As main.zig and `sushi kld` call it.
         const refused = bills.wiredMarginRefusal(&buf, c) != null;
         const runtime = c.runtime(0, 20 * GiB);

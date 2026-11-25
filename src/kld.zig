@@ -989,7 +989,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.cache_bias > 0) @import("model_settings.zig").expert_cache_bias_flag = opts.cache_bias;
     if (opts.wired_margin_bytes) |b| server_state.wired_margin_flag_bytes = b;
-    var margin_buf: [192]u8 = undefined;
+    var margin_buf: [@import("bills.zig").WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
     if (@import("bills.zig").wiredMarginRefusal(&margin_buf, @import("bills.zig").ceilingNow())) |why| {
         log.err("sushi kld: {s}\n", .{why});
         std.process.exit(1);

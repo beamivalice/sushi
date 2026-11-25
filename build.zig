@@ -528,7 +528,7 @@ const test_domains = [_]TestDomain{
     } },
     // `tests` is the MLX root: its own test only names the files the binaries reach.
     .{ .name = "load", .folders = &.{"arch"}, .compile_gib = 8, .run_gib = 7, .files = &.{
-        "arch_host_stub", "bills_live_test", "cooler_side", "engram", "exl3_flat_layout_test", "expert_io",     "expert_store", "expert_stream",
+        "arch_host_stub", "bills_live_test", "cooler_side", "cooler_warm", "engram", "exl3_flat_layout_test", "expert_io",     "expert_store", "expert_stream",
         "hidden_capture", "imatrix",         "kld",                   "layer_weights", "model",        "model_discovery",
         "model_load",     "model_registry",  "owned_weights",         "pack_index",    "tests",        "transient_peak",
         "vision_common",  "repack_stamp_test",

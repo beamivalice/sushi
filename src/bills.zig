@@ -307,14 +307,26 @@ pub fn wiredLimitFloor(wired_limit: ?u64, total_ram: u64, margin: u64) ?u64 {
     return (if (total_ram > 0) @min(limit, total_ram) else limit) -| margin;
 }
 
+const wired_margin_refusal_fmt = "iogpu.wired_limit_mb={d} leaves the GPU no memory: {s} keeps {d} MB unplanned under it (--wired-margin-gib {d} GiB, GPU memory other processes hold {d} MB), at or past the limit or the {d} MB of RAM; lower the margin or raise the limit";
+
+/// The longest `wiredMarginRefusal` text: its format at every number's widest and the longest `unplannedName`.
+pub const WIRED_MARGIN_REFUSAL_MAX = blk: {
+    const w = std.math.maxInt(u64);
+    var name: []const u8 = "";
+    for (Ceiling.unplanned_names) |n| if (n.len > name.len) {
+        name = n;
+    };
+    break :blk std.fmt.count(wired_margin_refusal_fmt, .{ w, name, w, w, w, w });
+};
+
 /// The refusal of a declared ceiling the unplanned bytes leave nothing of (`--wired-margin-gib`, the GPU memory other
 /// processes hold, or the 512 MB slack, at or past the limit or the RAM); null when it has room.
-pub fn wiredMarginRefusal(buf: []u8, c: Ceiling) ?[]const u8 {
+pub fn wiredMarginRefusal(buf: *[WIRED_MARGIN_REFUSAL_MAX]u8, c: Ceiling) ?[]const u8 {
     const declared = c.declared orelse return null;
     if (c.floor().? > 0) return null;
-    return std.fmt.bufPrint(buf, "iogpu.wired_limit_mb={d} leaves the GPU no memory: {s} keeps {d} MB unplanned under it (--wired-margin-gib {d} GiB, GPU memory other processes hold {d} MB), at or past the limit or the {d} MB of RAM; lower the margin or raise the limit", .{
+    return std.fmt.bufPrint(buf, wired_margin_refusal_fmt, .{
         declared >> 20, c.unplannedName(), c.unplanned >> 20, c.margin >> 30, c.gpu_floor >> 20, c.total_ram >> 20,
-    }) catch "the unplanned margin is at or past iogpu.wired_limit_mb";
+    }) catch unreachable;
 }
 
 pub fn parseWiredMarginGib(raw: []const u8) error{InvalidWiredMargin}!u64 {
@@ -478,9 +490,11 @@ pub const Ceiling = struct {
     }
 
     /// What sets the unplanned bytes, for a text that names it.
+    pub const unplanned_names = [_][]const u8{ "--wired-margin-gib", "the 512 MB slack", "the GPU memory other processes hold, plus 512 MB," };
+
     pub fn unplannedName(c: Ceiling) []const u8 {
-        if (c.unplanned <= c.margin) return "--wired-margin-gib";
-        return if (c.gpu_floor == 0) "the 512 MB slack" else "the GPU memory other processes hold, plus 512 MB,";
+        if (c.unplanned <= c.margin) return unplanned_names[0];
+        return if (c.gpu_floor == 0) unplanned_names[1] else unplanned_names[2];
     }
 
     /// What a live check reads: a declared limit's floor, else the working set capped at MLX's `footprint` plus the
@@ -4171,7 +4185,7 @@ test "a margin of 0 plans to the declared limit less the floor and the 512 MB sl
     try t.expectEqual(GPU_FLOOR_SLACK_BYTES, c.unplanned);
     try t.expectEqualStrings("the 512 MB slack", c.unplannedName());
     try t.expectEqual(limit - GPU_FLOOR_SLACK_BYTES, c.floor().?);
-    var buf: [192]u8 = undefined;
+    var buf: [WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
     try t.expect(wiredMarginRefusal(&buf, c) == null);
 
     gpu_floor_bytes.store(620 << 20, .monotonic);
@@ -4181,6 +4195,46 @@ test "a margin of 0 plans to the declared limit less the floor and the 512 MB sl
 
     launch_state.wired_margin_flag_bytes = null;
     try t.expectEqual(@as(u64, 8 * gib), launch_state.wiredMarginBytes());
+}
+
+test "the wired-margin refusal reaches the operator whole, the 512 MB slack's case included" {
+    const t = std.testing;
+    const mib: u64 = 1 << 20;
+    const c: Ceiling = .{
+        .declared = 300 * mib,
+        .total_ram = 32 << 30,
+        .margin = 0,
+        .gpu_floor = 0,
+        .unplanned = GPU_FLOOR_SLACK_BYTES,
+        .working_set = 24 << 30,
+    };
+    try t.expectEqual(@as(u64, 0), c.floor().?);
+    var buf: [WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
+    const why = wiredMarginRefusal(&buf, c) orelse return error.TestExpectedRefusal;
+    errdefer std.debug.print("the boot refusal: {s}\n", .{why});
+    try t.expect(std.mem.indexOf(u8, why, "the 512 MB slack keeps 512 MB unplanned") != null);
+    try t.expect(std.mem.endsWith(u8, why, "raise the limit"));
+}
+
+test "the wired-margin refusal's longest case fits the buffer its callers hold" {
+    const t = std.testing;
+    const mib: u64 = 1 << 20;
+    const declared = 999_999 * mib;
+    const c: Ceiling = .{
+        .declared = declared,
+        .total_ram = declared,
+        .margin = 32 << 30,
+        .gpu_floor = declared - GPU_FLOOR_SLACK_BYTES,
+        .unplanned = declared,
+        .working_set = 24 << 30,
+    };
+    try t.expectEqual(@as(u64, 0), c.floor().?);
+    var buf: [WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
+    const why = wiredMarginRefusal(&buf, c) orelse return error.TestExpectedRefusal;
+    errdefer std.debug.print("the longest boot refusal: {d} bytes: {s}\n", .{ why.len, why });
+    try t.expect(WIRED_MARGIN_REFUSAL_MAX > 192);
+    try t.expect(std.mem.indexOf(u8, why, "the GPU memory other processes hold, plus 512 MB, keeps 999999 MB unplanned") != null);
+    try t.expect(std.mem.endsWith(u8, why, "raise the limit"));
 }
 
 test "a GPU floor of 0 still keeps the 512 MB slack unplanned" {
@@ -9187,11 +9241,11 @@ test "a --wired-margin-gib at or past the declared limit never gives back the wh
         try t.expect(ceiling <= prev);
         prev = ceiling;
         // One at or past the limit leaves none, and the launch refuses it by name.
-        var buf: [192]u8 = undefined;
+        var buf: [WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
         const c: Ceiling = .{ .declared = limit, .total_ram = ram, .margin = margin, .unplanned = margin, .working_set = limit };
         try t.expectEqual(margin >= limit, wiredMarginRefusal(&buf, c) != null);
     }
-    var buf: [192]u8 = undefined;
+    var buf: [WIRED_MARGIN_REFUSAL_MAX]u8 = undefined;
     try t.expect(wiredMarginRefusal(&buf, .{ .declared = null, .total_ram = ram, .margin = 32 * GiB, .unplanned = 32 * GiB, .working_set = limit }) == null);
 }
 

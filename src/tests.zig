@@ -84,6 +84,7 @@ test {
     _ = @import("cooler_load_fault_test.zig");
     _ = @import("cooler_requests_fault_test.zig");
     _ = @import("cooler_side.zig");
+    _ = @import("cooler_warm.zig");
     _ = @import("engram.zig");
     _ = @import("effort.zig");
     _ = @import("exl3_flat_layout_test.zig");
