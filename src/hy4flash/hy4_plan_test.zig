@@ -61,6 +61,16 @@ const Resident = struct {
     }
 };
 
+/// `Resident` with its context pinned, as `--ctx-size` or `ctx_size` in model-settings.json pins it.
+fn Pinned(comptime ctx: u32) type {
+    return struct {
+        pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
+            try Resident.prepare(a, config, dir);
+            config.ctx_override = ctx;
+        }
+    };
+}
+
 /// `Resident` with DFly2 loaded where the fixture ships it, as a drafting request runs.
 const Drafting = struct {
     pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
@@ -94,6 +104,33 @@ fn decodeAt(m: anytype, ids: []const u32, p: usize, how: ?core.How, rec: ?*plan.
     }
     const after = core.stats();
     return .{ .dispatches = after.dispatches - before.dispatches, .submits = after.submits - before.submits, .pool_bytes = after.pool_bytes -| before.pool_bytes, .asks = after.asks - before.asks, .pipelines = core.pipelines - compiled };
+}
+
+test "hy4 plan: a load whose context is pinned plans its forwards to that context, its last position planned; a load on auto context plans to the model's cap (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
+    const pinned: u32 = 65536;
+    inline for (.{ true, false }) |pin| {
+        var ld: contract.Load = undefined;
+        try ld.openLight(if (pin) Pinned(pinned) else Resident, dir, true);
+        defer _ = ld.close();
+        const m = ld.xfm.arch_state.hy4flash.model.?;
+        const p = m.plans.?;
+        const cap: usize = ld.config.contextCap();
+        try testing.expect(cap > pinned);
+        try testing.expectEqual(if (pin) @as(usize, pinned) else cap, p.reach);
+        if (pin) try testing.expect(p.tables(.{ .rows = 1, .readout = .last, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = pinned - 1 }) != null);
+    }
+}
+
+test "hy4 plan: a load pinned to a context narrower than its own served warm plans to the warm's reach, and warms (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
+    const narrow: u32 = 600;
+    var ld: contract.Load = undefined;
+    try ld.open(Pinned(narrow), dir, true);
+    defer _ = ld.close();
+    try testing.expect(ld.xfm.arch_state.hy4flash.model.?.plans.?.reach > narrow);
 }
 
 test "hy4 plan: a dry decode asks what the real decode asks, ask for ask, death for death and level for level, and runs no GPU work (HY4_STQ_TINY)" {

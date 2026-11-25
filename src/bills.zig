@@ -103,6 +103,17 @@ pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
     return model_settings.contextPick(launch_state.server_config.max_context_size, config.ctx_override).value;
 }
 
+/// The context a load plans its forwards to: a manual context, which caps every request, else the model's cap (auto
+/// context is solved on the ledger after the plans, so it cannot bound them). A manual context narrower than the load's
+/// own served warm is planned to the warm's reach at the widest chunk the ledger may fix, a verify block past it.
+pub fn planReach(config: *const model_mod.ModelConfig) u32 {
+    const cap = config.contextCap();
+    const manual = manualContext(config);
+    if (manual == 0 or manual >= cap) return cap;
+    const warm = warmReach(config, arch_config.staticChunkMax(config)) + @import("mtp_policy.zig").mtpVerifyDraftsMax(config) + 1;
+    return @intCast(@min(cap, @max(manual, warm)));
+}
+
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
 /// Every post-load reserve reads it through `resolvedPrefixCacheMem()`. Atomic: written on the
 /// inference thread, read from connection threads. `maxInt(u64)` is the unresolved sentinel,

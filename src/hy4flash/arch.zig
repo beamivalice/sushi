@@ -190,7 +190,7 @@ pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Ca
     // The ledger holds the encode where the load recorded that it keeps the tower (`ModelConfig.keeps_tower`).
     if ((tower != null) != xfm.config.keeps_tower) return error.Hy4TowerUnbilled;
     const encode: ?@import("hy4_plan.zig").Encode = if (tower) |*t| .{ .tower = t, .max_patches = media.maxImagePatches(media.preproc(&xfm.config)) } else null;
-    const p = try @import("hy4_plan.zig").record(m, xfm.allocator, xfm.config.contextCap(), dfly, bills.configuredKvQuantFor(&xfm.config), cache, encode);
+    const p = try @import("hy4_plan.zig").record(m, xfm.allocator, bills.planReach(&xfm.config), dfly, bills.configuredKvQuantFor(&xfm.config), cache, encode);
     errdefer p.deinit(xfm.allocator);
     try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = xfm.suppress_mask, .think = xfm.think_marker_mask });
     m.recorded = p;
@@ -201,7 +201,7 @@ pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Ca
 pub fn planArena(xfm: Model, chunk: u32) !?u64 {
     const m = xfm.arch_state.hy4flash.model orelse return null;
     const p = m.recorded orelse m.plans orelse return null;
-    return p.layoutWith(try @import("hy4_plan.zig").regionAt(m, p, chunk)).arenaBytes();
+    return p.layoutWith(try @import("hy4_plan.zig").regionAt(m, p, @min(chunk, p.reach))).arenaBytes();
 }
 
 /// The load's plans, at its warm's end (`arch/cooler.zig` `planLoad`): those recorded before the warm (`planRecord`),
@@ -212,7 +212,7 @@ pub fn planBuild(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Cac
     if (m.plans != null) return;
     try planRecord(xfm, cache);
     const p = m.recorded.?;
-    try @import("hy4_plan.zig").makeArena(m, p, @import("../prefill_plan.zig").widestPrefillWidth(&xfm.config));
+    try @import("hy4_plan.zig").makeArena(m, p, @min(@import("../prefill_plan.zig").widestPrefillWidth(&xfm.config), p.reach));
     m.recorded = null;
     m.plans = p;
 }
