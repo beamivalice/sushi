@@ -736,19 +736,29 @@ fn fusedNax(c: Call) Error!void {
     return fusedLaunch(c, "steel_gemm_fused_nax", ts.t, ts.swizzle);
 }
 
-fn fusedNaxTile(c: Call) struct { t: Tile, swizzle: u5 } {
+/// A fused NAX launch's tile and swizzle.
+pub const FusedNaxTile = struct { t: Tile, swizzle: u5 };
+
+fn fusedNaxTile(c: Call) FusedNaxTile {
+    return fusedNaxTileFor(c.g.class, c.m, c.arm_m, c.n, c.k);
+}
+
+/// The fused NAX tile of an m x n x k product on GPU class `class`. On class d a wide K (12,288 or more, both other
+/// sides past 1,024) takes the 128 x 64 tile, swizzled, which reuses a large weight from cache; a tile never moves a
+/// sum's K order, so the bytes are the other tile's.
+pub fn fusedNaxTileFor(class: device.Class, m: usize, arm_m: usize, n: usize, k: usize) FusedNaxTile {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
-    const class = c.g.class;
+    const wide_k_d = class == .d and k >= 12288 and m >= 1024 and n >= 1024;
     if (class == .s or class == .c) {
-        t.bk = if (c.k >= 8192 and c.k > c.arm_m + c.n) 64 else 256;
+        t.bk = if (k >= 8192 and k > arm_m + n) 64 else 256;
         t.bm = 64;
         t.wm = 2;
     } else if (class == .d) {
-        t = if (c.n > c.arm_m) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
+        t = if (n > arm_m or wide_k_d) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
     }
-    const tiles_m = (c.m + t.bm - 1) / t.bm;
+    const tiles_m = (m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;
-    if (class == .s or class == .c) swizzle = 2 else if (class == .d) swizzle = if (c.m > c.n) 0 else 2;
+    if (class == .s or class == .c) swizzle = 2 else if (class == .d) swizzle = if (m > n and !wide_k_d) 0 else 2;
     return .{ .t = t, .swizzle = swizzle };
 }
 

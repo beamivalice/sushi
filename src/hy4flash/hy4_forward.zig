@@ -1044,7 +1044,8 @@ pub fn attend(o: *Ops, x: Arr, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeomet
 /// `o_left`: with `whole`, W_o's launch may leave its rows un-normed or its k-split partials for the iHC mix to finish:
 /// the span's result is then what it left, and which one lands here.
 /// A span's gated rows written in place: the chunk's block `W_o` reads, and the span's first row in it.
-pub const GatedDst = struct { block: Arr, row: c_int };
+/// With `suh`, the block holds `W_o`'s prepared rows (`hy4_chain.gatedPreparedInto`).
+pub const GatedDst = struct { block: Arr, row: c_int, suh: ?Arr = null };
 /// A sparse layer's indexer inputs made once for the chunk's rows from `r0` (`indexPrepare`): the rotated queries, the
 /// head weights and the rotated group keys, sliced per span.
 pub const IndexIn = struct { r0: c_int, qt: Arr, hw: Arr, k_rot: Arr };
@@ -1439,9 +1440,15 @@ fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeom
     // A span that writes into its chunk's block keeps that write; the joined launch returns rows only.
     const joined = dst == null and w_v == null and chain_kernels_on and hy4_absorb.valueOutGatedApplies(o.s, u_lat, w.kv_b, absorbGeometry(g), gate_rows);
     const u = if (joined) u_lat else if (w_v) |wv| try mmHeadsAs(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 }), rows_as) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, absorbGeometry(g))); // [H, T, v]
-    if (!joined and at == null and !whole) if (dst) |d| if (chain_kernels_on and hy4_chain.gatedIntoApplies(o.s, u, gate_rows, d.block)) {
-        try hy4_chain.gatedInto(o.s, u, gate_rows, d.block, d.row);
-        return mlx.mlx_array_new();
+    if (!joined and at == null and !whole) if (dst) |d| {
+        if (d.suh) |suh| if (chain_kernels_on and hy4_chain.gatedPreparedIntoApplies(o.s, u, gate_rows, suh, d.block)) {
+            try hy4_chain.gatedPreparedInto(o.s, u, gate_rows, suh, d.block, d.row);
+            return mlx.mlx_array_new();
+        };
+        if (chain_kernels_on and hy4_chain.gatedIntoApplies(o.s, u, gate_rows, d.block)) {
+            try hy4_chain.gatedInto(o.s, u, gate_rows, d.block, d.row);
+            return mlx.mlx_array_new();
+        }
     };
     const gated = if (joined) try o.own(try hy4_absorb.valueOutGated(o.s, u_lat, w.kv_b, absorbGeometry(g), gate_rows)) else if (chain_kernels_on and hy4_chain.gatedApplies(o.s, u, gate_rows)) try o.own(try hy4_chain.gated(o.s, u, gate_rows)) else blk: {
         const gate = try o.unary(.sigmoid, try o.transpose(try o.reshape(try o.cast(gate_rows, .float32), &.{ t, g.heads, g.v }), &.{ 1, 0, 2 }));

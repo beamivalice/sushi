@@ -83,9 +83,76 @@ pub const Lin = struct {
 /// dispatches around it. A test seam: both give the same bytes.
 pub var thru_bf16_on = true;
 
+/// Hy4's cap on a trunk bank decoded to f16 for one wide forward (128 MiB of f16): the sliding layers' gate and `W_o`
+/// and layer 0's dense FFN pass it; the head does not.
+pub const decoded_max_weights: usize = 1 << 26;
+
+/// `applyStored` of rows already prepared for the bank (`prepareIndexed`'s f16 rows): the bank decoded to f16 and
+/// multiplied where that serves, in the sorted GEMM's K order (the fused arm where MLX would split K), else the sorted
+/// GEMM; then the finish.
+pub fn applyPreparedStored(o: *Ops, prepared: Arr, b: Bank) !Arr {
+    const sh = mlx.getShape(prepared);
+    const rows = sh[0];
+    const in = sh[1];
+    const out = b.outDim();
+    const weights: usize = @as(usize, @intCast(in)) * @as(usize, @intCast(out));
+    const exact_order = exl3.trunk_gemm.denseOrderMatches(rows, in, out);
+    const use_decoded = exl3.trunk_gemm.decodedCanServe() and exl3.linear.force_arm == null and
+        rows >= exl3.trunk_gemm.DECODED_MIN_ROWS and weights <= decoded_max_weights and
+        (exact_order or mlx.engine.isStream(o.s));
+    try b.dec.requireTable();
+    exl3.kernels.setDecodeParams(b.dec);
+    const inputs = try exl3.linear.gemmInputs(1, @intCast(rows), exl3.kernels.gemmWindowRows());
+    const inner = if (use_decoded) blk: {
+        exl3.trunk_gemm.decoded_calls += 1;
+        const w = try exl3.trunk_gemm.decodeDense(o.s, b.w);
+        defer _ = mlx.mlx_array_free(w);
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        try mlx.check(mlx.mlx_transpose(&wt, w, o.s));
+        var mm = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(mm);
+        if (exact_order) {
+            try mlx.check(mlx.mlx_matmul(&mm, prepared, wt, o.s));
+        } else {
+            const arm_m: usize = @max(1025, @as(usize, @intCast(@divTrunc(in, 3))) + 1);
+            try mlx.check(mlx.engine.matmulRowsAs(&mm, prepared, wt, arm_m));
+        }
+        break :blk mm;
+    } else try exl3.kernels.innerGemmSortedTable(o.s, prepared, b.w, inputs.slots, exl3.kernels.gemmWindowRows(), true, inputs.tab);
+    defer _ = mlx.mlx_array_free(inner);
+    return try o.own(try exl3.kernels.finishIndexedAs(o.s, inner, b.svh, inputs.slots, .bfloat16));
+}
+
+/// A wide chunk through a bank the shared decoded arm refuses (past `trunk_gemm.DECODED_MAX_WEIGHTS`, or a K order
+/// only the fused arm keeps): `applyPreparedStored` of its prepared rows, the sorted GEMM's bytes. Null where the
+/// shared arms serve.
+fn applyWideDecoded(o: *Ops, x: Arr, b: Bank) !?Arr {
+    if (!exl3.trunk_gemm.decodedCanServe() or exl3.linear.force_arm != null) return null;
+    const sh = mlx.getShape(x);
+    if (sh.len != 2) return null;
+    const rows = sh[0];
+    const in = sh[1];
+    if (rows < exl3.trunk_gemm.DECODED_MIN_ROWS or in != b.inDim()) return null;
+    const out = b.outDim();
+    const weights: usize = @as(usize, @intCast(in)) * @as(usize, @intCast(out));
+    if (weights > decoded_max_weights) return null;
+    const exact_order = exl3.trunk_gemm.denseOrderMatches(rows, in, out);
+    if (weights <= exl3.trunk_gemm.DECODED_MAX_WEIGHTS and exact_order) return null;
+    if (!exact_order and !mlx.engine.isStream(o.s)) return null;
+    try b.dec.requireTable();
+    exl3.kernels.setDecodeParams(b.dec);
+    const xb = try o.cast(x, .bfloat16);
+    const inputs = try exl3.linear.gemmInputs(1, @intCast(rows), exl3.kernels.gemmWindowRows());
+    const prepared = try exl3.kernels.prepareIndexed(o.s, xb, b.suh, inputs.slots);
+    defer _ = mlx.mlx_array_free(prepared);
+    return try applyPreparedStored(o, prepared, b);
+}
+
 /// `x · Wᵀ` through the bank as f32: the rows rounded to BF16 (the kernels' input, as the BF16 forward rounds them), the
 /// kernel's sums, the result rounded to BF16 and widened.
 pub fn apply(o: *Ops, x: Arr, b: Bank) !Arr {
+    if (try applyWideDecoded(o, x, b)) |y| return o.cast(y, .float32);
     if (thru_bf16_on) return o.own(try trunk_stq.matmulThruBf16(o.s, x, b.w, b.suh, b.svh, b.dec, false));
     const y = try o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, false));
     return o.cast(y, .float32);
@@ -93,6 +160,7 @@ pub fn apply(o: *Ops, x: Arr, b: Bank) !Arr {
 
 /// `apply` before its widening: the kernel's BF16 rows, f32 rows read through bf16 in the launch where it serves.
 pub fn applyStored(o: *Ops, x: Arr, b: Bank) !Arr {
+    if (try applyWideDecoded(o, x, b)) |y| return y;
     if (thru_bf16_on and mlx.mlx_array_dtype(x) == .float32) return o.own(try trunk_stq.matmulThruBf16Stored(o.s, x, b.w, b.suh, b.svh, b.dec));
     return o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, false));
 }

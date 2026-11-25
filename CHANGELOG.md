@@ -37,6 +37,9 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A Hy4-Flash prefill chunk that crosses the selection threshold no longer asks more host memory than its load measured**: the region probed the state's start and its deepest only, and a chunk whose span the threshold cuts asks more of the host ring in between and was refused (`WideFull`), so the load now probes the cut too.
 - **A forced tool call on Hy4-Flash no longer fails the draw after its last forced token under the think penalty**: that token reached the next draw as a host array, which its planned sample refused (`PlanMiss`) in every think-penalty kind that reads ids.
 - **A Hy4-Flash request that does not draft is billed the blocks its DFly2 load holds for it**: the bill added the round's mark, selections and hidden state only for a request running a round, while the load reserves them for every request, so a request without a round (the drafter off for it) was under-billed by them.
+- **Hy4-Flash prefills about 3% faster at the same output**: its widest trunk projections run decoded on the matrix
+  units, with a tile that reuses the weight from cache, and the output projection's input is prepared where its rows
+  are written.
 - **Hy4-Flash decodes about 4% faster with the same text**: a decode row's attention runs its scores, softmax and value sum as three launches in MLX's own summation order, and the output gate rides the value product.
 - **Hy4-Flash prefill runs its glue in fewer launches, with the same text**: the hyper-connection mix, the router's pick, the attention gate and the indexer's projections run once a chunk or inside the launch beside them, and rows stay at the width the next launch reads.
 - **Hy4-Flash checks a speculative block's tokens with its BF16 latent projection in one launch over the block**, reading the weight once instead of once a row.

@@ -38,7 +38,7 @@ fn getKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []cons
 }
 
 /// Which launch a config is for, and its shape.
-const Kind = enum { swiglu, groups, rows, gated, gated_into, sink_sm_causal, sink_sm_mask, ring_keys };
+const Kind = enum { swiglu, groups, rows, gated, gated_into, gated_prepared_into, sink_sm_causal, sink_sm_mask, ring_keys };
 const Key = struct { kind: Kind, a: c_int, b: c_int, c: c_int = 0, d: c_int = 0, e: c_int = 0 };
 var cfgs: kcfg.Cache(Key) = .{};
 
@@ -84,6 +84,13 @@ fn build(k: Key) !kcfg.Config {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(k.b, 256), 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", k.c));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", out_dt));
+        },
+        .gated_prepared_into => {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.e, k.b }, 2, .float16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(k.b, 128) * 32, k.a, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", k.c));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HV", k.b));
         },
         .sink_sm_causal, .sink_sm_mask => {
             const heads_first = (k.d & 1) != 0;
@@ -332,6 +339,99 @@ pub fn gatedInto(s: mlx.mlx_stream, u: Arr, gate: Arr, dst: Arr, r0: c_int) !voi
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.kernelApplyInto(&ov, gate_into_kernel.?, iv, cfg, s, dst) orelse return error.MlxError);
+}
+
+const gate_prepared_into_source: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\uint block = uint(threadgroup_position_in_grid.x);
+    \\uint t = uint(threadgroup_position_in_grid.y);
+    \\ushort lane = thread_index_in_simdgroup;
+    \\uint hv = uint(HV);
+    \\uint base = block * 128u;
+    \\float4 v;
+    \\{
+    \\  uint i0 = base + lane;
+    \\  uint h0 = i0 / uint(V); uint c0 = i0 % uint(V);
+    \\  float g0 = static_cast<float>(gate[(size_t)t * (size_t)gate_strides[0] + (size_t)i0 * (size_t)gate_strides[1]]);
+    \\  float u0 = u[(size_t)h0 * (size_t)u_strides[0] + (size_t)t * (size_t)u_strides[1] + (size_t)c0 * (size_t)u_strides[2]];
+    \\  v.x = float(bfloat16_t(u0 * hy4_sigmoid(g0))) * float(suh[i0]);
+    \\  uint i1 = i0 + 32u;
+    \\  uint h1 = i1 / uint(V); uint c1 = i1 % uint(V);
+    \\  float g1 = static_cast<float>(gate[(size_t)t * (size_t)gate_strides[0] + (size_t)i1 * (size_t)gate_strides[1]]);
+    \\  float u1 = u[(size_t)h1 * (size_t)u_strides[0] + (size_t)t * (size_t)u_strides[1] + (size_t)c1 * (size_t)u_strides[2]];
+    \\  v.y = float(bfloat16_t(u1 * hy4_sigmoid(g1))) * float(suh[i1]);
+    \\  uint i2 = i0 + 64u;
+    \\  uint h2 = i2 / uint(V); uint c2 = i2 % uint(V);
+    \\  float g2 = static_cast<float>(gate[(size_t)t * (size_t)gate_strides[0] + (size_t)i2 * (size_t)gate_strides[1]]);
+    \\  float u2 = u[(size_t)h2 * (size_t)u_strides[0] + (size_t)t * (size_t)u_strides[1] + (size_t)c2 * (size_t)u_strides[2]];
+    \\  v.z = float(bfloat16_t(u2 * hy4_sigmoid(g2))) * float(suh[i2]);
+    \\  uint i3 = i0 + 96u;
+    \\  uint h3 = i3 / uint(V); uint c3 = i3 % uint(V);
+    \\  float g3 = static_cast<float>(gate[(size_t)t * (size_t)gate_strides[0] + (size_t)i3 * (size_t)gate_strides[1]]);
+    \\  float u3 = u[(size_t)h3 * (size_t)u_strides[0] + (size_t)t * (size_t)u_strides[1] + (size_t)c3 * (size_t)u_strides[2]];
+    \\  v.w = float(bfloat16_t(u3 * hy4_sigmoid(g3))) * float(suh[i3]);
+    \\}
+    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\  const float p0 = simd_shuffle_xor(v.x, bit);
+    \\  const float p1 = simd_shuffle_xor(v.y, bit);
+    \\  const float p2 = simd_shuffle_xor(v.z, bit);
+    \\  const float p3 = simd_shuffle_xor(v.w, bit);
+    \\  const bool lower = (lane & bit) == 0u;
+    \\  v.x = lower ? v.x + p0 : p0 - v.x;
+    \\  v.y = lower ? v.y + p1 : p1 - v.y;
+    \\  v.z = lower ? v.z + p2 : p2 - v.z;
+    \\  v.w = lower ? v.w + p3 : p3 - v.w;
+    \\}
+    \\const float s0 = v.x + v.y;
+    \\const float s1 = v.x - v.y;
+    \\const float s2 = v.z + v.w;
+    \\const float s3 = v.z - v.w;
+    \\const float sc = 0.08838834764831845f;
+    \\const size_t yb = (size_t)(uint(row0[0]) + t) * (size_t)hv + base;
+    \\out[yb + lane] = half((s0 + s2) * sc);
+    \\out[yb + lane + 32u] = half((s1 + s3) * sc);
+    \\out[yb + lane + 64u] = half((s0 - s2) * sc);
+    \\out[yb + lane + 96u] = half((s1 - s3) * sc);
+;
+
+var gate_prepared_into_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// Whether `gatedPreparedInto` serves: `gatedIntoApplies`' shapes, an f16 `dst` and `suh` as wide as the gate, in
+/// whole 128-column blocks.
+pub fn gatedPreparedIntoApplies(s: mlx.mlx_stream, u: Arr, gate: Arr, suh: Arr, dst: Arr) bool {
+    if (!mlx.engine.isStream(s) or !gatedApplies(s, u, gate)) return false;
+    const gs = mlx.getShape(gate);
+    const ds = mlx.getShape(dst);
+    return ds.len == 2 and ds[1] == gs[1] and @rem(gs[1], 128) == 0 and mlx.mlx_array_dtype(dst) == .float16 and
+        mlx.mlx_array_dtype(suh) == .float16 and mlx.mlx_array_size(suh) == @as(usize, @intCast(gs[1]));
+}
+
+/// `gatedInto` with `W_o`'s input preparation in the launch: the span's gated rows written to `dst` from row `r0` as
+/// `exl3.kernels.prepareIndexed` makes them from their BF16 rounding (scaled by `suh`, Hadamard-rotated, f16).
+pub fn gatedPreparedInto(s: mlx.mlx_stream, u: Arr, gate: Arr, suh: Arr, dst: Arr, r0: c_int) !void {
+    if (gate_prepared_into_kernel == null) {
+        const ins = [_][*:0]const u8{ "u", "gate", "suh", "row0" };
+        const outs = [_][*:0]const u8{"out"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const made = mlx.mlx_fast_metal_kernel_new("sushi_hy4_gated_prepared_into", iv, ov, gate_prepared_into_source, header, false, false);
+        if (made.ctx == null) return error.MetalKernelCompileFailed;
+        gate_prepared_into_kernel = made;
+    }
+    const gs = mlx.getShape(gate);
+    const ds = mlx.getShape(dst);
+    const cfg = try cfgs.get(.{ .kind = .gated_prepared_into, .a = gs[0], .b = gs[1], .c = mlx.getShape(u)[2], .e = ds[0] }, build);
+    const rv = [_]i32{r0};
+    const row0 = try intsArr(&rv);
+    defer _ = mlx.mlx_array_free(row0);
+    const inputs = [_]Arr{ u, gate, suh, row0 };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.kernelApplyInto(&ov, gate_prepared_into_kernel.?, iv, cfg, s, dst) orelse return error.MlxError);
 }
 
 const sink_softmax_tail: [:0]const u8 =
@@ -1224,4 +1324,52 @@ test "hy4 chain: a decode row's score and value products as one launch each give
         try testing.expectEqual(@as(u64, 1), d_v);
         try testing.expectEqualSlices(u8, wu, try hostF32(&o, gu));
     }
+}
+
+test "hy4 chain: gatedPreparedInto fuses gatedInto and prepare_h128 in one launch per span, byte for byte" {
+    const exl3 = @import("sushi_exl3");
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const h: c_int = 32;
+    const t: c_int = 12;
+    const v: c_int = 256;
+    const cut: c_int = 5;
+    const u = try o.transpose(try randomF32(&o, &.{ t, h, v }, 61, 2), &.{ 1, 0, 2 });
+    const gate = try o.cast(try randomF32(&o, &.{ t, h * v }, 62, 3), .bfloat16);
+    const suh = try o.cast(try randomF32(&o, &.{ 1, h * v }, 63, 0.05), .float16);
+    const plain = try o.cast(try o.own(try gated(es, u, gate)), .bfloat16);
+    const inputs = try exl3.linear.gemmInputs(1, @intCast(t), exl3.kernels.gemmWindowRows());
+    const want = try o.own(try exl3.kernels.prepareIndexed(es, plain, suh, inputs.slots));
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(u));
+    try mlx.check(mlx.mlx_array_eval(gate));
+    try mlx.check(mlx.mlx_array_eval(suh));
+    var dst = mlx.mlx_array_new();
+    try mlx.check(mlx.engine.freshArray(&dst, &.{ t, h * v }, .float16));
+    _ = try o.own(dst);
+    const ua = try o.slice(u, 1, 0, cut);
+    const g0 = try o.slice(gate, 0, 0, cut);
+    const ub = try o.slice(u, 1, cut, t);
+    const g1 = try o.slice(gate, 0, cut, t);
+    try testing.expect(gatedPreparedIntoApplies(es, ua, g0, suh, dst));
+    const before = mlx.engine.stats().dispatches;
+    try gatedPreparedInto(es, ua, g0, suh, dst, 0);
+    try gatedPreparedInto(es, ub, g1, suh, dst, cut);
+    try mlx.check(mlx.mlx_array_eval(dst));
+    try testing.expectEqual(@as(u64, 2), mlx.engine.stats().dispatches - before);
+    const cw = try o.contiguous(want);
+    const cg = try o.contiguous(dst);
+    try mlx.check(mlx.mlx_array_eval(cw));
+    try mlx.check(mlx.mlx_array_eval(cg));
+    const n = mlx.mlx_array_size(cw);
+    const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(cw) orelse return error.HostRead);
+    const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_float16(cg) orelse return error.HostRead);
+    try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
 }

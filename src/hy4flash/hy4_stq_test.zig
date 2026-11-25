@@ -2462,3 +2462,64 @@ test "hy4 stq: every verify width 2..8 is its one-row steps' bytes at every line
         }
     }
 }
+
+test "hy4 stq: wide trunk banks (sliding gate, W_o, dense FFN) take the decoded NAX GEMM on Sushi Cooler with the sorted GEMM's exact bytes" {
+    const exl3 = @import("sushi_exl3");
+    try mlx.requireGpu();
+    if (!exl3.kernels.gemmNaxOn()) return error.SkipZigTest;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const was_en = exl3.trunk_gemm.enabled;
+    defer exl3.trunk_gemm.enabled = was_en;
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+
+    var prng = std.Random.DefaultPrng.init(0x9a1e);
+    const rnd = prng.random();
+    const dec = exl3.format.Decode.tabled(.spec1, .w15);
+    const rows_n: c_int = exl3.trunk_gemm.DECODED_MIN_ROWS;
+    const cases = [_]struct { in: usize, out: usize, stored: bool }{
+        .{ .in = 3072, .out = 16384, .stored = true },
+        .{ .in = 16384, .out = 3072, .stored = true },
+        .{ .in = 3072, .out = 13824, .stored = false },
+        .{ .in = 13824, .out = 3072, .stored = false },
+        .{ .in = 8192, .out = 2048, .stored = true },
+    };
+    for (cases) |cs| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const tb = try exl3.trunk.TestBank.init(alloc, rnd, cs.in, cs.out, 64);
+        const tr = try tb.triple(es);
+        const bank: hy4_stq.Bank = .{ .w = try o.own(tr.w), .suh = try o.own(tr.s), .svh = try o.own(tr.b), .dec = dec };
+        const x = try randomArr(&o, alloc, rnd, &.{ rows_n, @intCast(cs.in) }, -1, 2, .bfloat16);
+
+        exl3.trunk_gemm.enabled = false;
+        const want = if (cs.stored) try hy4_stq.applyStored(&o, x, bank) else try hy4_stq.apply(&o, x, bank);
+        try mlx.check(mlx.mlx_array_eval(want));
+
+        exl3.trunk_gemm.enabled = true;
+        const before = exl3.trunk_gemm.decoded_calls;
+        const got = if (cs.stored) try hy4_stq.applyStored(&o, x, bank) else try hy4_stq.apply(&o, x, bank);
+        try mlx.check(mlx.mlx_array_eval(got));
+        try testing.expectEqual(before + 1, exl3.trunk_gemm.decoded_calls);
+        try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want)), std.mem.sliceAsBytes(try hostRows(&o, got)));
+    }
+}
+
+test "hy4 stq: wide-K fused NAX on Ultra picks bm128 bn64 swizzle 2 for L2 reuse" {
+    const mm = @import("../tensor/matmul.zig");
+    const wo = mm.fusedNaxTileFor(.d, 4096, 5462, 3072, 16384);
+    try testing.expectEqual(@as(usize, 128), wo.t.bm);
+    try testing.expectEqual(@as(usize, 64), wo.t.bn);
+    try testing.expectEqual(@as(u5, 2), wo.swizzle);
+    const small = mm.fusedNaxTileFor(.d, 4096, 4096, 3072, 8192);
+    try testing.expectEqual(@as(usize, 64), small.t.bm);
+    try testing.expectEqual(@as(usize, 128), small.t.bn);
+    try testing.expectEqual(@as(u5, 0), small.swizzle);
+}

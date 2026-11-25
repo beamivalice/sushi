@@ -271,6 +271,12 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     to 256 rows, their products at 32-row launches' bytes (`matmulRowsAs`); BF16 rows stay BF16 into the norms, rope,
     SwiGLU and the routed latent up. A 4,096-row chunk after 4,096: 2,240 to 1,952 ms, 24,291 to about 13,000
     dispatches (bc7f5124 on 36090072, M5 Ultra, STQ 4bpw, prefill meter, A B B A, GPU lock).
+  - A wide chunk's trunk banks past the shared decoded cap (the sliding layers' gate and `W_o`, layer 0's dense FFN)
+    are decoded to f16 for the forward and multiplied on NAX (`hy4_stq.applyWideDecoded`, cap
+    `decoded_max_weights`), forced to the fused arm where MLX would split K; on the Ultra a wide K takes the 128 x 64
+    tile (`matmul.fusedNaxTileFor`); and a chunk's spans write `W_o`'s prepared rows (`hy4_chain.gatedPreparedInto`),
+    so its sorted GEMM runs no prepare. Each keeps the sorted GEMM's bytes. A 4,096-row chunk after 4,096: 2,075 to
+    2,012 ms (024543f7 on dff0cc49, M5 Ultra, STQ 4bpw, prefill meter, A B B A, GPU lock).
   - Pinned by `hy4 attention spans`: at the release's gate and `W_o` shapes (trellis K4 and BF16, spans of 256 and
     32, short last spans), and on the tiny's BF16 and STQ trunks against the per-span order (`fwd.spans_share`, a
     test seam), byte for byte over windowed, gathered and decode rows. The tiny's logits also matched the parent

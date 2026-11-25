@@ -949,7 +949,7 @@ pub const Model = struct {
         const at = p0 + r0;
         const last = p0 + r1; // keys past the span's last row are never read
         const qs = try o.slice(p.q, 1, r0, r1);
-        const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left, .dst = if (in.dst) |d| .{ .block = d.block, .row = r0 } else null, .index = in.index, .rows_as = in.rows_as, .q_raw = if (p.q_raw) |r| try o.slice(r, 1, r0, r1) else null };
+        const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left, .dst = if (in.dst) |d| .{ .block = d.block, .row = r0, .suh = d.suh } else null, .index = in.index, .rows_as = in.rows_as, .q_raw = if (p.q_raw) |r| try o.slice(r, 1, r0, r1) else null };
         if (core_keys) |ck| if (rows > fwd.verify_rows_max) return self.attendSpanCore(o, l, x, p, sin, qs, pooled, ck, win.base, r0, r1, n, p0, tap);
         if (L.indexer) |iw| {
             const ig = self.indexerGeometry();
@@ -1772,6 +1772,28 @@ pub const Model = struct {
                 try mlx.check(mlx.mlx_array_eval(try fwd.linearStored(&o, x.*, pair[0])));
             }
         };
+        // The prepared gated write's pipeline, made at load as a chunk's spans take it.
+        if (mlx.engine.isStream(self.s)) {
+            const hy4_chain = @import("hy4_chain.zig");
+            for (self.layers[0..self.config.layers]) |*layer| {
+                const bank = layer.attn.o.stq orelse continue;
+                const h = layer.geometry.heads;
+                const v = layer.geometry.v;
+                if (@rem(h * v, 128) != 0) continue;
+                var o: Ops = .{ .s = self.s };
+                defer o.deinit();
+                const u = try o.slot();
+                try mlx.check(mlx.mlx_zeros(u, &[_]c_int{ h, 1, v }, 3, .float32, self.s));
+                const g = try o.slot();
+                try mlx.check(mlx.mlx_zeros(g, &[_]c_int{ 1, h * v }, 2, .bfloat16, self.s));
+                const dst = try o.slot();
+                try mlx.check(mlx.engine.freshArray(dst, &.{ 1, h * v }, .float16));
+                if (hy4_chain.gatedPreparedIntoApplies(self.s, u.*, g.*, bank.suh, dst.*)) {
+                    try hy4_chain.gatedPreparedInto(self.s, u.*, g.*, bank.suh, dst.*, 0);
+                    try mlx.check(mlx.mlx_array_eval(dst.*));
+                }
+            }
+        }
         if (self.lm_head_stq) |bank| {
             var rows: c_int = 2;
             while (rows <= fwd.verify_rows_max) : (rows += 1) {
@@ -2061,6 +2083,10 @@ pub const Model = struct {
         // their offset, made before the spans: nothing holds every span's rows and their join at once (D76). MLX's
         // stream joins them, where a write would copy the block.
         const placed = !in.whole and mlx.engine.isStream(self.s);
+        const fuse_o_norm = !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_expand_on and fwd.mix_norm_on and fwd.hc_kernels_on and mlx.streamIsGpu(self.s);
+        // A chunk whose W_o runs the sorted GEMM takes its rows prepared by the spans that write them.
+        const prep_o = placed and at == null and fuse_o_norm and fwd.chain_kernels_on and fwd.spans_share and L.attn.o.stq != null and
+            @rem(t, span) == 0 and @rem(L.geometry.heads * L.geometry.v, 128) == 0 and exl3.trunk.gemmRows(@intCast(t), false);
         var rows_block: ?Arr = null;
         defer if (rows_block) |b| {
             _ = mlx.mlx_array_free(b);
@@ -2068,10 +2094,10 @@ pub const Model = struct {
         if (placed) {
             var b = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(b);
-            try mlx.check(mlx.engine.freshArray(&b, &.{ t, L.geometry.heads * L.geometry.v }, fwd.linearInputDtype(L.attn.o)));
+            try mlx.check(mlx.engine.freshArray(&b, &.{ t, L.geometry.heads * L.geometry.v }, if (prep_o) .float16 else fwd.linearInputDtype(L.attn.o)));
             rows_block = b;
         }
-        in.dst = if (rows_block != null and at == null) .{ .block = rows_block.?, .row = 0 } else null;
+        in.dst = if (rows_block != null and at == null) .{ .block = rows_block.?, .row = 0, .suh = if (prep_o) L.attn.o.stq.?.suh else null } else null;
         var r0: c_int = 0;
         while (r0 < t) {
             if (count == max_spans) return error.Hy4ChunkTooWide;
@@ -2103,14 +2129,15 @@ pub const Model = struct {
         }
         // W_o and its norm once over the chunk's gated rows, each row as its span's own launch gives it.
         var y: Arr = undefined;
-        const fuse_o_norm = !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_expand_on and fwd.mix_norm_on and fwd.hc_kernels_on and mlx.streamIsGpu(self.s);
         {
             var o: Ops = .{ .s = self.s };
             defer o.deinit();
             // The chunk's only span ran W_o and its norm itself (`SpanIn.whole`).
             y = if (in.whole) try keep.own(try o.result(spans[0])) else blk: {
                 const gated = if (rows_block) |b| b else try o.concat(spans[0..count], 0);
-                break :blk if (fuse_o_norm)
+                break :blk if (prep_o)
+                    try keep.own(try o.result(try hy4_stq.applyPreparedStored(&o, gated, L.attn.o.stq.?)))
+                else if (fuse_o_norm)
                     try keep.own(try o.result(try fwd.linearSpans(&o, gated, L.attn.o, span)))
                 else
                     try keep.own(try o.result(try fwd.output(&o, gated, L.attn, L.geometry, span)));
