@@ -818,7 +818,8 @@ history.
     the pool, canaries clean; a shape no probe recorded misses, is learned and kept, and is then served. A dry model
     of the release builds every root's plan to 1,048,575 with no ambiguity, and a sweep of 1,460 positions (every one
     to 600, then denser to sparser to 8,200, either side of each power of two to 1M, 100 seeded) replays against it
-    with no miss (`SUSHI_PLAN_SWEEP`). On the release pack, the bytes to 8,192 positions (`HY4_PLAN_PACK`).
+    with no miss. On the release pack, the bytes to 8,192 positions. Both were one-off runs; their env-gated cells,
+    which no gate set, are gone.
 - As built, verify (stage 3b): a load that drafts plans a DSpark round's block of 2 to `verify_rows_max` (8) rows,
   every row read out and the handover kept (`hy4_plan.verifyRoot`); a wider round is a prefill block, on the pool, and
   its term stays in the request bill until stage 4. A block's probes are candidates either side of every edge its

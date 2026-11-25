@@ -244,52 +244,6 @@ test "hy4 plan audit: a dry model of the release builds the plans of its one-row
     try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = suppress, .think = think });
 }
 
-test "hy4 plan audit: with SUSHI_PLAN_SWEEP set, a dry model of the release serves the one-row forward a sweep of positions records, each trace replayed against its plan with no miss" {
-    try mlx.requireGpu();
-    if (std.c.getenv("SUSHI_PLAN_SWEEP") == null) return error.SkipZigTest;
-    const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const s = mlx.engine.stream();
-    const scope = mlx.engine.enter(s);
-    defer scope.end();
-    const c = try hy4_config.parseText(hy4_config.release_config);
-    try @import("../hc_kernels.zig").probeIdentity(s, c.hc_mult, c.dim);
-    var load: Dry = undefined;
-    try load.begin(.{ .site = 100 });
-    var w = dryWeights(&c) catch |e| return load.failed(e);
-    defer w.deinit();
-    const m = Model.initWith(a, c, &w, s, .{}) catch |e| return load.failed(e);
-    defer m.deinit();
-    load.abort();
-    const hy4_plan = @import("hy4_plan.zig");
-    const reach: usize = 1 << 20;
-    m.plans = try hy4_plan.build(m, a, reach, null, .engine_default, null, 0);
-    const p = m.plans.?;
-    const tables = p.tables(.{ .rows = 1, .readout = .last, .keep_hidden = false, .kv = p.kv }).?;
-    const binder = @import("../tensor/plan/plan_binder.zig");
-    var b = binder.Binder.init(a, p.book.layout());
-    defer b.deinit();
-    var positions: std.ArrayList(usize) = .empty;
-    defer positions.deinit(a);
-    var n: usize = 0;
-    while (n < 8200) : (n += if (n < 600) 1 else if (n < 2100) 3 else 31) try positions.append(a, n);
-    var j: u6 = 12;
-    while (j <= 20) : (j += 1) for (0..7) |d| try positions.append(a, @min((@as(usize, 1) << j) + d -| 3, reach - 1));
-    var rng = std.Random.DefaultPrng.init(0x5eed);
-    for (0..100) |_| try positions.append(a, rng.random().uintLessThan(usize, reach));
-    for (positions.items) |at| {
-        var passes = try hy4_plan.recordChecked(m, a, .{ .rows = 1, .readout = .last, .keep_hidden = false, .kv = p.kv, .n = at }, reach);
-        defer passes.deinit();
-        for (passes.traces) |*tr| binder.replayTrace(&b, tables, tr) catch |e| {
-            const miss = b.miss.?;
-            std.debug.print("hy4 plan sweep: a one-row forward at {d} misses: {t}, asked {d} B against {d} B (frame {d}/{d}, ordinal {d})\n", .{ at, miss.kind, miss.asked, miss.cap, miss.id.site, miss.id.key, miss.ordinal });
-            return e;
-        };
-    }
-}
-
 fn releaseModel(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const hy4_config.Config, w: *model_mod.Weights) !*Model {
     var load: Dry = undefined;
     try load.begin(.{ .site = 100 });

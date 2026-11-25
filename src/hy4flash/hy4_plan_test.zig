@@ -1043,28 +1043,6 @@ test "hy4 plan: a streamed load with --expert-cache-bias plans its one-row forwa
     try arenaMatchesPool(a, m, ids, &.{ 17, 30, ids.len - 1 });
 }
 
-test "hy4 plan: on the pack HY4_PLAN_PACK names, a one-row forward at each edge of its structure to 8k runs on the arena with the bytes of the pool and no ask of it" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_PLAN_PACK") orelse return error.SkipZigTest);
-    // As a served load takes a pack its budget covers: every expert resident in the stream.
-    var ld: contract.Load = undefined;
-    try ld.open(ResidentInStream, dir, true);
-    defer _ = ld.close();
-    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    // The reading counts only as the resident load's: every MoE layer's picks map to their slots on the GPU.
-    for (m.config.dense_layers..m.config.layers) |l| try testing.expect(m.experts.?.residentRoute(@intCast(l)) != null);
-    const ids = try a.alloc(u32, 8193);
-    defer a.free(ids);
-    for (ids, 0..) |*d, i| d.* = @intCast((i * 7919) % @as(usize, @intCast(m.config.vocab)));
-    // About the release's group of 4, window of 512 and threshold of 2048, and the fast bench's rungs.
-    try arenaMatchesPool(a, m, ids, &.{ 0, 1, 3, 4, 7, 511, 512, 513, 2047, 2048, 2049, 4095, 4096, 8191 });
-}
-
 test "hy4 plan: a load that drafts plans DFly2's draft, and at every depth the prompt holds it runs on the arena with the bytes of the pool, its drafts and their confidence, and no ask of it (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -1147,79 +1125,6 @@ test "hy4 plan: a drafting load whose context is narrower than a verify block or
     const logits = try hy4_plan.run(m, ids[2..3], null, .last);
     _ = mlx.mlx_array_free(logits);
     try testing.expectEqual(@as(u64, 1), core.stats().executions - before.executions);
-}
-
-/// `ResidentInStream` with DFly2 loaded, as a drafting request on a pack its budget covers runs.
-const ResidentDrafting = struct {
-    pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
-        try ResidentInStream.prepare(a, config, dir);
-        config.stream_mtp_head = true;
-    }
-};
-
-test "hy4 plan: on the pack HY4_PLAN_PACK names, with DFly2, a verify block of 2 to 8 rows at each edge of its structure to 8k runs on the arena with the bytes of the pool, its logits and its handover, and no ask of it" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_PLAN_PACK") orelse return error.SkipZigTest);
-    var ld: contract.Load = undefined;
-    try ld.open(ResidentDrafting, dir, true);
-    defer _ = ld.close();
-    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    try testing.expect(ld.xfm.arch_state.hy4flash.drafter != null);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    for (m.config.dense_layers..m.config.layers) |l| try testing.expect(m.experts.?.residentRoute(@intCast(l)) != null);
-    const saved = m.plans;
-    defer m.plans = saved;
-    const keep_was = m.keep_hidden;
-    defer m.keep_hidden = keep_was;
-    const ids = try a.alloc(u32, 8200);
-    defer a.free(ids);
-    for (ids, 0..) |*d, i| d.* = @intCast((i * 7919) % @as(usize, @intCast(m.config.vocab)));
-    var pool: std.ArrayList(u8) = .empty;
-    defer pool.deinit(a);
-    var arena: std.ArrayList(u8) = .empty;
-    defer arena.deinit(a);
-    m.reset();
-    try m.reserveFor(ids.len);
-    var at: usize = 0;
-    // About the release's group of 4, window of 512 and threshold of 2048, each block straddling or below them.
-    for ([_]usize{ 1, 506, 509, 510, 511, 2041, 2044, 2045, 2046, 2047, 4093, 8180 }) |p| {
-        m.keep_hidden = false;
-        if (p > at) _ = mlx.mlx_array_free(try m.forwardReadout(ids[at..p], .none));
-        at = p;
-        var mk = try m.mark();
-        defer m.dropMark(&mk);
-        for ([_]usize{ 2, 3, 5, 6, 8 }) |rows| {
-            for ([_]bool{ false, true }, [_]*std.ArrayList(u8){ &pool, &arena }) |planned, out| {
-                out.clearRetainingCapacity();
-                m.plans = if (planned) saved else null;
-                m.keep_hidden = true;
-                m.dropHidden();
-                mlx.engine.close();
-                const before = core.stats();
-                const lg = try hy4_plan.run(m, ids[p .. p + rows], null, .all);
-                defer _ = mlx.mlx_array_free(lg);
-                try mlx.check(mlx.mlx_array_eval(lg));
-                try out.appendSlice(a, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.TestNoLogits)[0..mlx.mlx_array_size(lg)]));
-                var hc = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(hc);
-                try mlx.check(mlx.mlx_astype(&hc, m.last_hidden orelse return error.TestNoHandover, .float32, m.s));
-                try mlx.check(mlx.mlx_array_eval(hc));
-                try out.appendSlice(a, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(hc) orelse return error.TestNoHandover)[0..mlx.mlx_array_size(hc)]));
-                const after = core.stats();
-                errdefer std.debug.print("[hy4-plan] a block of {d} rows at {d} on the {s}\n", .{ rows, p, if (planned) "arena" else "pool" });
-                try testing.expectEqual(@as(u64, @intFromBool(planned)), after.executions - before.executions);
-                if (planned) try testing.expectEqual(@as(u64, 0), after.asks - before.asks);
-                m.plans = saved;
-                try m.rollbackTo(&mk, &.{});
-            }
-            errdefer std.debug.print("[hy4-plan] a block of {d} rows at {d}: the arena's bytes are not the pool's\n", .{ rows, p });
-            try testing.expectEqualSlices(u8, pool.items, arena.items);
-        }
-    }
 }
 
 /// `arr`'s bytes appended to `out`.
@@ -1320,72 +1225,6 @@ test "hy4 plan: a DSpark round's mark and replay ask nothing of a closed pool: a
         try testing.expectEqual(hits, core.arena_check.hits);
     }
     if (!ran) return error.SkipZigTest;
-}
-
-test "hy4 plan: on the pack HY4_PLAN_PACK names, with DFly2, a DSpark round at each edge of its structure to 8k marks and replays asking nothing of a closed pool, its replay of each kept count one execution, the state it leaves the pool's" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_PLAN_PACK") orelse return error.SkipZigTest);
-    var ld: contract.Load = undefined;
-    try ld.open(ResidentDrafting, dir, true);
-    defer _ = ld.close();
-    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    try testing.expect(ld.xfm.arch_state.hy4flash.drafter != null);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    for (m.config.dense_layers..m.config.layers) |l| try testing.expect(m.experts.?.residentRoute(@intCast(l)) != null);
-    const saved = m.plans;
-    defer m.plans = saved;
-    const ids = try a.alloc(u32, 8200);
-    defer a.free(ids);
-    for (ids, 0..) |*d, i| d.* = @intCast((i * 7919) % @as(usize, @intCast(m.config.vocab)));
-    try core.closePool(.census);
-    defer core.closePool(.open) catch {};
-    var pool: std.ArrayList(u8) = .empty;
-    defer pool.deinit(a);
-    var arena: std.ArrayList(u8) = .empty;
-    defer arena.deinit(a);
-    const rows: usize = @intCast(@import("hy4_forward.zig").verify_rows_max);
-    m.reset();
-    try m.reserveFor(ids.len);
-    var at: usize = 0;
-    // About the release's group of 4, window of 512, latent width of 512 and threshold of 2048, each round straddling
-    // or below them.
-    for ([_]usize{ 1, 504, 506, 509, 511, 2041, 2044, 2046, 2047, 4093, 8180 }) |p| {
-        if (p > at) _ = mlx.mlx_array_free(try m.forwardReadout(ids[at..p], .none));
-        at = p;
-        mlx.engine.close();
-        const s0 = core.stats();
-        var mk = try m.mark();
-        defer m.dropMark(&mk);
-        try testing.expectEqual(s0.closed_asks, core.stats().closed_asks);
-        for ([_]usize{ 1, 2, 4, 7 }) |keep| {
-            for ([_]bool{ false, true }, [_]*std.ArrayList(u8){ &pool, &arena }) |planned, out| {
-                out.clearRetainingCapacity();
-                m.plans = if (planned) saved else null;
-                _ = mlx.mlx_array_free(try hy4_plan.run(m, ids[p .. p + rows], null, .all));
-                mlx.engine.close();
-                const before = core.stats();
-                try m.rollbackTo(&mk, ids[p .. p + keep]);
-                mlx.engine.close();
-                const after = core.stats();
-                errdefer std.debug.print("[hy4-plan] a round at {d} keeping {d} on the {s}: {d} executions, {d} asks of the closed pool\n", .{ p, keep, if (planned) "arena" else "pool", after.executions - before.executions, after.closed_asks - before.closed_asks });
-                try testing.expectEqual(@as(u64, @intFromBool(planned)), after.executions - before.executions);
-                if (planned) try testing.expectEqual(before.closed_asks, after.closed_asks);
-                // The state the replay leaves, as the next decode row reads it, and the handover beside it.
-                try appendHost(a, m.last_hidden orelse return error.TestNoHandover, out);
-                const next = try hy4_plan.run(m, ids[p + keep .. p + keep + 1], null, .last);
-                defer _ = mlx.mlx_array_free(next);
-                try appendHost(a, next, out);
-                m.plans = saved;
-                try m.rollbackTo(&mk, &.{});
-            }
-            errdefer std.debug.print("[hy4-plan] a round at {d} keeping {d}: the arena's state is not the pool's\n", .{ p, keep });
-            try testing.expectEqualSlices(u8, pool.items, arena.items);
-        }
-    }
 }
 
 /// A served DSpark request of `n` tokens after `prompt`, every round drafted and verifying `rows` rows, on the arena when
@@ -1555,61 +1394,6 @@ test "hy4 plan: a load plans the shapes earlier misses kept beside its manifest,
         }
     }.of;
     try testing.expectEqual(traces(&plain.book, id) + 1, traces(&with.book, id));
-}
-
-/// The engine's work over `n` one-row forwards from position `p`, on the arena when `planned`, else on the pool: per
-/// forward, from a real prefill of the rows before `p`.
-fn perForward(m: anytype, ids: []const u32, p: usize, n: usize, planned: bool) !struct { dispatches: f64, barriers: f64, submits: f64, waits: f64, busy_ms: f64, host_ms: f64 } {
-    const saved = m.plans;
-    if (!planned) m.plans = null;
-    defer m.plans = saved;
-    m.reset();
-    try m.reserveFor(p + n);
-    if (p > 0) _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..p], .none));
-    mlx.engine.close();
-    const clock = @import("../load_clock.zig");
-    const before = core.stats();
-    const t0 = clock.now();
-    for (p..p + n) |at| {
-        const lg = try hy4_plan.run(m, ids[at .. at + 1], null, .last);
-        defer _ = mlx.mlx_array_free(lg);
-        try mlx.check(mlx.mlx_array_eval(lg));
-    }
-    const wall = clock.now() - t0;
-    const after = core.stats();
-    const k: f64 = @floatFromInt(n);
-    return .{
-        .dispatches = @as(f64, @floatFromInt(after.dispatches - before.dispatches)) / k,
-        .barriers = @as(f64, @floatFromInt(after.barriers - before.barriers)) / k,
-        .submits = @as(f64, @floatFromInt(after.submits - before.submits)) / k,
-        .waits = @as(f64, @floatFromInt(after.waits - before.waits)) / k,
-        .busy_ms = @as(f64, @floatFromInt(after.gpu_busy_ns - before.gpu_busy_ns)) / k / 1e6,
-        .host_ms = @as(f64, @floatFromInt(wall)) / k / 1e6,
-    };
-}
-
-test "hy4 plan: on the pack HY4_PLAN_PACK names, with HY4_PLAN_REPORT set, the engine's work a one-row forward on the pool and on the arena, arms interleaved" {
-    try mlx.requireGpu();
-    if (std.c.getenv("HY4_PLAN_REPORT") == null) return error.SkipZigTest;
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_PLAN_PACK") orelse return error.SkipZigTest);
-    // As a served load takes a pack its budget covers: every expert resident in the stream.
-    var ld: contract.Load = undefined;
-    try ld.open(ResidentInStream, dir, true);
-    defer _ = ld.close();
-    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    const steps = 32;
-    const ids = try a.alloc(u32, 8192 + steps);
-    defer a.free(ids);
-    for (ids, 0..) |*d, i| d.* = @intCast((i * 7919) % @as(usize, @intCast(m.config.vocab)));
-    for ([_]usize{ 4096 - steps, 8192 - steps }) |p| for ([_]bool{ false, true, true, false }) |planned| {
-        const w = try perForward(m, ids, p, steps, planned);
-        std.debug.print("[plan-report] {s} at {d}: {d:.1} dispatches, {d:.1} barriers, {d:.2} command buffers, {d:.2} waits, GPU busy {d:.3} ms, host {d:.3} ms a forward\n", .{ if (planned) "arena" else "pool ", p, w.dispatches, w.barriers, w.submits, w.waits, w.busy_ms, w.host_ms });
-    };
 }
 
 test "hy4 plan: a forward at another KV width than the load planned, or one that splices an image's rows, runs on the pool with no miss; an image request's decode past its image runs on the arena (HY4_BF16_TINY)" {

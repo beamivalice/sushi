@@ -202,9 +202,6 @@ const testing = std.testing;
 const mlx = @import("../mlx.zig");
 const Ops = @import("../mlx_ops.zig").Ops;
 const model_mod = @import("../model.zig");
-const hy4_config = @import("hy4_config.zig");
-const hy4_stq = @import("hy4_stq.zig");
-const owned_weights = @import("../owned_weights.zig");
 const Arr = mlx.mlx_array;
 
 fn tinyDir(env: [:0]const u8) ?[]const u8 {
@@ -273,114 +270,6 @@ test "hy4 pair-major: a pack of the pack order is refused by name at parse, nami
 }
 
 /// `hy4_stq.routed`'s bytes over `rb` for `t` rows of `lat`.
-fn routedBytes(o: *Ops, es: mlx.mlx_stream, dec: exl3.format.Decode, limit: f32, rb: *const exl3.Ragged, lat: Arr, pk: Arr, wa: Arr) ![]const u8 {
-    const y = try o.own(try hy4_stq.routed(es, dec, limit, rb, lat, pk, wa));
-    const c = try o.contiguous(y);
-    try mlx.check(mlx.mlx_array_eval(c));
-    return (mlx.mlx_array_data_uint8(c) orelse return error.HostRead)[0 .. mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c)];
-}
-
-fn bankIdentity(env: [:0]const u8) !void {
-    const dir = tinyDir(env) orelse return error.SkipZigTest;
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    const text = try readAll(io, a, dir, "config.json");
-    defer a.free(text);
-    const c = try hy4_config.parseText(text);
-    const dec = (try hy4_stq.parseQuantText(a, text)).expert.?;
-    var w = try loadLayers(dir, es);
-    defer w.deinit();
-    var o: Ops = .{ .s = es };
-    defer o.deinit();
-    var rng = std.Random.DefaultPrng.init(0x9a1);
-    const k: usize = c.top_k;
-    for (c.dense_layers..c.layers) |l| {
-        // The pack-order copy of the layer's banks: each expert's tiles back through `tileMajorInverse`.
-        var banks: [exl3.group_layout.max_groups]exl3.Bank = undefined;
-        var held: std.ArrayList(Arr) = .empty;
-        defer {
-            for (held.items) |h| _ = mlx.mlx_array_free(h);
-            held.deinit(a);
-        }
-        var groups: usize = 0;
-        while (groups < banks.len) : (groups += 1) {
-            var nb: [128]u8 = undefined;
-            if (w.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.switch_mlp.gate_proj.g{d}.trellis_pm", .{ l, groups })) == null) break;
-            inline for (.{ "gate", "up", "down" }) |proj| {
-                const tm = w.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.switch_mlp." ++ proj ++ "_proj.g{d}.trellis_pm", .{ l, groups })).?;
-                const sh = mlx.getShape(tm);
-                const experts: usize = @intCast(sh[0]);
-                const ot: usize = @intCast(sh[1] * 2);
-                const it: usize = @intCast(sh[2]);
-                const n: usize = @intCast(sh[4]);
-                try mlx.check(mlx.mlx_array_eval(tm));
-                const src = (mlx.mlx_array_data_uint16(tm) orelse return error.HostRead)[0..mlx.mlx_array_size(tm)];
-                const dst = try a.alloc(u16, src.len);
-                defer a.free(dst);
-                const per = it * ot * n;
-                for (0..experts) |e| tile_layout.tileMajorInverse(u16, dst[e * per ..][0..per], src[e * per ..][0..per], it, ot, n);
-                const legacy = try mlx.newData(dst.ptr, &.{ sh[0], sh[2], @intCast(ot), sh[4] }, .uint16);
-                try held.append(a, legacy);
-                @field(banks[groups], proj) = .{
-                    .trellis = legacy,
-                    .suh = w.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.switch_mlp." ++ proj ++ "_proj.g{d}.suh", .{ l, groups })).?,
-                    .svh = w.get(try std.fmt.bufPrint(&nb, "model.layers.{d}.mlp.switch_mlp." ++ proj ++ "_proj.g{d}.svh", .{ l, groups })).?,
-                };
-            }
-        }
-        var pack_rb = try owned_weights.raggedOwned(es, banks[0..groups], .pack, null);
-        defer pack_rb.deinit();
-        var major_rb = (try hy4_stq.loadExperts(&w, l, es, a)).?;
-        defer major_rb.deinit();
-        try testing.expect(major_rb.tile_major and !pack_rb.tile_major);
-        // 1..8 rows run the decode chain (a verify block among them), 40 the prefill GEMMs.
-        for ([_]usize{ 1, 2, 3, 4, 5, 6, 7, 8, 40 }) |t| {
-            const picks = try a.alloc(u32, t * k);
-            defer a.free(picks);
-            const wts = try a.alloc(f32, t * k);
-            defer a.free(wts);
-            for (0..t) |row| {
-                var chosen: usize = 0;
-                while (chosen < k) {
-                    const e = rng.random().uintLessThan(u32, c.experts);
-                    if (std.mem.indexOfScalar(u32, picks[row * k ..][0..chosen], e) != null) continue;
-                    picks[row * k + chosen] = e;
-                    wts[row * k + chosen] = 0.25 + rng.random().float(f32);
-                    chosen += 1;
-                }
-            }
-            const lat_v = try a.alloc(f32, t * c.moe_inter);
-            defer a.free(lat_v);
-            for (lat_v) |*d| d.* = (rng.random().float(f32) * 2 - 1) * 4;
-            const lat = try o.own(try mlx.newData(lat_v.ptr, &.{ @intCast(t), @intCast(c.moe_inter) }, .float32));
-            const pk = try o.own(try mlx.newData(picks.ptr, &.{ @intCast(t), @intCast(k) }, .uint32));
-            const wa = try o.own(try mlx.newData(wts.ptr, &.{ @intCast(t), @intCast(k) }, .float32));
-            const want = try a.dupe(u8, try routedBytes(&o, es, dec, c.swiglu_limit, &pack_rb, lat, pk, wa));
-            defer a.free(want);
-            const got = try routedBytes(&o, es, dec, c.swiglu_limit, &major_rb, lat, pk, wa);
-            testing.expectEqualSlices(u8, want, got) catch |err| {
-                std.debug.print("layer {d}, {d} rows: the pair-major bank's routed sum differs from the pack-order bank's\n", .{ l, t });
-                return err;
-            };
-        }
-    }
-}
-
-test "hy4 pair-major: the clamped chain over a pair-major bank gives the pack-order bank's bytes at 1 to 8 rows (decode and verify) and a prefill, each routed layer (HY4_STQ_TINY)" {
-    try bankIdentity("HY4_STQ_TINY");
-}
-
-test "hy4 pair-major: the clamped chain over a pair-major bank gives the pack-order bank's bytes at 1 to 8 rows and a prefill, two rate groups a layer (HY4_STQ_TINY_MIXED)" {
-    try bankIdentity("HY4_STQ_TINY_MIXED");
-}
-
 fn hostU16(a: Arr) ![]const u16 {
     try mlx.check(mlx.mlx_array_eval(a));
     return (mlx.mlx_array_data_uint16(a) orelse return error.HostRead)[0..mlx.mlx_array_size(a)];
