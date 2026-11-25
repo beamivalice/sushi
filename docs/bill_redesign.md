@@ -1445,6 +1445,20 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   ask past its recorded size or past the sequence is refused by name (`Hy4WidePlanMiss`, `PlanMiss`), never placed.
   Chunks below the deep zone, other widths, an image's splice and a readout other than the last row (a capture's
   hidden row) keep D97's measure.
+- **D111. A load keeps its prefill region beside its manifest and the next load of the build and pack reads it
+  back** (2026-11-25). What `regionAt` measures (D97's probes and D110's classes, one recording a class over one
+  input, read out by the last row as a served chunk is) is a function of the build, the pack and the load's settings,
+  and it was most of a same-build load's planning: the release 2.25bpw (M5 Max, 896c30d4, chunks 512 and 8192)
+  measured its two regions in 6.9 s of 10.8 s, and a load of the same build reads them back in 36 ms. The load writes it, with the
+  classes' pads, to `region-<hash>.bin` in its manifest's directory (`Plans.cache`, keyed by the build and the kernels'
+  scope, pruned with the build); the hash names the pack (`Plans.pack`, `pipeline_manifest.addPack`: its config, index
+  and shard names and sizes, since Hy4's kernel scope names none), the reach, the chunk width, the KV width, the
+  drafter's handover, expert streaming and its slots, the alignment and the deep zone. The key decides; a reading
+  checks it: the file must be whole (a checksum, every value in its field's range), name the live load's width, deep
+  zone and class count, and one probe recorded now (a load-width chunk at the deepest, read out by its last row) must
+  ask exactly what it asked when the file was written. One probe cannot see a change confined to a shallow width or
+  another class, so an input that sizes the region belongs in the key, not to the probe. Anything else is measured
+  again, said in the log.
 
 ## 15. Risks
 

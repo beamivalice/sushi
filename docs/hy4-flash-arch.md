@@ -261,6 +261,8 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     the copy grows with depth, so a deep-zone chunk runs padded to its class's deepest recording: [D110](bill_redesign.md)),
     and a row's picks are read from that copy by index in the kernel, never copied (the chain gathered 2,048 rows a
     row, widened to f32, 134 MB a 32-row span).
+  - The region and the classes a load measures are kept beside its manifest and read back by the next load of the
+    build where one probe still asks what it asked ([D111](bill_redesign.md)).
   - **A wide forward's structure turns with depth only through `Model.wideClass`**: an edge, an arm or a span width
     that depth decides goes into it, or a chunk of one class asks unlike its recording and is refused by name (the
     `hy4 plan: a load-width prefill chunk` cells sweep every residue and span-width edge).

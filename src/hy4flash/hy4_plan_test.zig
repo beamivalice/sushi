@@ -1652,6 +1652,80 @@ test "hy4 plan: a load-width prefill chunk in the deep zone read out by a readou
     try testing.expect(core.stats().wide_last_high <= p.region.scratch);
 }
 
+test "hy4 plan: a load keeps its chunk width's region beside its manifest, named by its pack, and the next reads it back, checked by one probe; a damaged file, another deep zone, a check that differs or another pack is measured again (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.open(Resident, dir, true);
+    defer _ = ld.close();
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    const p = m.plans.?;
+    const rows = p.region_rows;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const was = p.cache;
+    defer p.cache = was;
+    p.cache = .init(testing.io, tmp.dir, "scope-build");
+    const full = (try forget(p, rows)).probes;
+    var name_buf: [40]u8 = undefined;
+    const name = hy4_plan.regionFileName(m, p, rows, &name_buf);
+    // Measured, then kept: the next load reads the region and its classes back, recording only the check.
+    const measured = try hy4_plan.regionAt(m, p, rows);
+    try testing.expectEqual(full, (try forget(p, rows)).probes);
+    const read = try hy4_plan.regionAt(m, p, rows);
+    try testing.expectEqual(measured, read);
+    const got = p.measured.items[p.measured.items.len - 1];
+    try testing.expectEqual(@as(u64, 1), got.probes);
+    var classes: u64 = 0;
+    var it = p.pads.valueIterator();
+    while (it.next()) |c| classes += @intFromBool(c.rows == rows);
+    try testing.expect(got.classes > 0 and got.classes == classes);
+    // A damaged file and one whose check differs are each measured again, in full.
+    var sub = try tmp.dir.openDir(testing.io, "scope-build", .{});
+    defer sub.close(testing.io);
+    const kept = try sub.readFileAlloc(testing.io, name, a, .limited(1 << 30));
+    defer a.free(kept);
+    _ = try forget(p, rows);
+    try sub.writeFile(testing.io, .{ .sub_path = name, .data = kept[0 .. kept.len / 2] });
+    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    try testing.expectEqual(full, (try forget(p, rows)).probes);
+    const stale = try hy4_plan.regionWithCheckForTest(a, kept, .{ .scratch = 1, .host = 1 });
+    defer a.free(stale);
+    try sub.writeFile(testing.io, .{ .sub_path = name, .data = stale });
+    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    try testing.expectEqual(full, (try forget(p, rows)).probes);
+    // A file whose deep zone is not the live load's is measured again, before its check is recorded.
+    const elsewhere = try hy4_plan.regionWithDeepForTest(a, kept, p.deep + 1);
+    defer a.free(elsewhere);
+    try sub.writeFile(testing.io, .{ .sub_path = name, .data = elsewhere });
+    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    try testing.expectEqual(full, (try forget(p, rows)).probes);
+    // Another pack keeps its own file: a load of it reads none of this one's, and one with no pack identity keeps none.
+    const pack = p.pack;
+    defer p.pack = pack;
+    var other_buf: [40]u8 = undefined;
+    p.pack.?[0] +%= 1;
+    try testing.expect(!std.mem.eql(u8, name, hy4_plan.regionFileName(m, p, rows, &other_buf)));
+    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    try testing.expectEqual(full, (try forget(p, rows)).probes);
+    p.pack = null;
+    try sub.deleteFile(testing.io, name);
+    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    try testing.expectError(error.FileNotFound, sub.statFile(testing.io, name, .{}));
+    try testing.expectEqual(full, (try forget(p, rows)).probes);
+}
+
+/// Drops what `p` measured for `rows`-row chunks and its classes, so the next `regionAt` finds neither: what was kept.
+fn forget(p: anytype, rows: usize) !@TypeOf(p.measured.items[0]) {
+    for (p.measured.items, 0..) |r, i| if (r.rows == rows) {
+        _ = p.measured.orderedRemove(i);
+        hy4_plan.forgetClassesForTest(p, rows);
+        return r;
+    };
+    return error.TestUnexpectedResult;
+}
+
 test "hy4 plan: prefill ubench honours kv context and rolls back between iterations (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);

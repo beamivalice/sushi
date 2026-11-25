@@ -170,6 +170,9 @@ pub const Plans = struct {
     reach: usize,
     kv: KVQuantConfig,
     cache: ?plan_book.Cache = null,
+    /// The pack's identity (`pipeline_manifest.addPack`), which names the region kept beside the manifest; none keeps
+    /// no region and reads none.
+    pack: ?[16]u8 = null,
     /// The load's DFly2, whose drafts are planned; null for a load that does not draft.
     drafter: ?*const Drafter = null,
     /// Misses served since the load, and of them the shapes learned in place.
@@ -191,8 +194,9 @@ pub const Plans = struct {
     /// `probes`: the wide forwards recorded to measure it; `classes`: the deep zone's classes among them.
     pub const Measured = struct { rows: usize, need: plan.region.Need, probes: u64, classes: u64 = 0 };
 
-    /// A class's deepest member, recorded: where it is, the scratch it tops out at, and each pass's asks and choices.
-    pub const Class = struct { at: usize, need: u64, passes: []core.PadPass };
+    /// A class's deepest member, recorded: its chunk width, where it is, the scratch it tops out at, and each pass's
+    /// asks and choices.
+    pub const Class = struct { rows: usize, at: usize, need: u64, passes: []core.PadPass };
 
     pub fn tables(p: *const Plans, probe: Probe) ?*const plan.pack.Tables {
         return p.book.tables(root(probe));
@@ -600,6 +604,11 @@ pub fn regionAt(m: *Model, p: *Plans, rows: usize) !plan.region.Need {
     for (p.measured.items) |r| if (r.rows == rows) return r.need;
     const gpa = p.book.gpa;
     const t0 = @import("../load_clock.zig").now();
+    if (p.cache) |*c| if (p.pack != null) if (try readRegion(m, p, c, rows)) |kept| {
+        const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
+        log.info("[plan] a prefill of {d}-row chunks asks a region of {d} KB, host {d} KB, its {d} classes past {d} rows padded to their deepest; read from the load's cache and checked in {d} ms\n", .{ rows, kept.scratch >> 10, kept.host >> 10, p.measured.items[p.measured.items.len - 1].classes, p.deep, ms });
+        return kept;
+    };
     const span = @min(@as(usize, @import("../prefill_plan.zig").final_span_rows), rows);
     const widths = [_]usize{ rows, span, rows - 1 };
     var most: plan.region.Need = .{};
@@ -617,9 +626,228 @@ pub fn regionAt(m: *Model, p: *Plans, rows: usize) !plan.region.Need {
     const classes = try measureClasses(m, p, rows, &most);
     probes += classes;
     try p.measured.append(gpa, .{ .rows = rows, .need = most, .probes = probes, .classes = classes });
+    if (p.cache) |*c| if (p.pack != null) keepRegion(m, p, c, rows) catch |e| log.warn("[plan] the region of {d}-row chunks not kept for the next load: {s}\n", .{ rows, @errorName(e) });
     const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
     log.info("[plan] a prefill of {d}-row chunks asks a region of {d} KB, host {d} KB, its {d} classes past {d} rows padded to their deepest; measured in {d} ms\n", .{ rows, most.scratch >> 10, most.host >> 10, classes, p.deep, ms });
     return most;
+}
+
+// ── The region kept for the next load ──
+//
+// A load keeps what `regionAt` measured beside its manifest (`Plans.cache`, keyed by the build and the kernels' scope),
+// in a file named by the pack and what else sizes the region (`regionFileName`): the build, the kernels' scope, the
+// pack and the load's settings decide it. The next load reads it back where the file is whole and agrees with the live
+// load, and one probe recorded now, a load-width chunk at the deepest read out by its last row, asks what it asked
+// when the file was written; anything else is measured again.
+
+const region_version: u64 = 2;
+const region_magic = "HY4REGN\x01";
+
+/// The file of `rows`-row chunks' region: named by what sizes it past the directory's build and kernel scope.
+pub fn regionFileName(m: *const Model, p: *const Plans, rows: usize, buf: *[40]u8) []const u8 {
+    var h = std.hash.Wyhash.init(region_version);
+    std.hash.autoHash(&h, p.pack.?);
+    for ([_]u64{ rows, p.reach, p.book.alignment, @intFromBool(m.keep_hidden), @intFromBool(m.streamed), @backingInt(p.kv.scheme), p.kv.bits, p.kv.group_size, deepZone(&m.config), if (m.experts) |e| e.plan.slots_per_layer else 0 }) |v| std.hash.autoHash(&h, v);
+    return std.fmt.bufPrint(buf, "region-{x:0>16}.bin", .{h.final()}) catch unreachable;
+}
+
+/// What a region file is checked by: a load-width chunk at the deepest read out by its last row, over one input.
+fn checkNeed(m: *Model, p: *const Plans, rows: usize) !plan.region.Need {
+    var passes = try recordPasses(m, p.book.gpa, .{ .rows = rows, .readout = .last, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = p.reach -| rows, .phase = .wide }, p.reach, .zeros, .zeros);
+    defer passes.deinit();
+    var most: plan.region.Need = .{};
+    for (passes.traces) |*t| most = most.max(try plan.region.need(p.book.gpa, t, p.book.alignment));
+    return most;
+}
+
+/// A region file's content: what `regionAt` measured for a width, its check, and its classes.
+const Kept = struct {
+    measured: Plans.Measured,
+    check: plan.region.Need,
+    deep: u64,
+    keys: []u64,
+    classes: []Plans.Class,
+
+    fn deinit(k: *Kept, gpa: std.mem.Allocator) void {
+        for (k.classes) |c| freeClass(gpa, c);
+        gpa.free(k.classes);
+        gpa.free(k.keys);
+    }
+};
+
+fn encodeRegion(gpa: std.mem.Allocator, k: Kept) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll(region_magic);
+    for ([_]u64{ k.measured.rows, k.measured.need.scratch, k.measured.need.host, k.measured.probes, k.measured.classes, k.check.scratch, k.check.host, k.deep, k.classes.len }) |v| try w.writeInt(u64, v, .little);
+    for (k.keys, k.classes) |key, c| {
+        for ([_]u64{ key, c.rows, c.at, c.need, c.passes.len }) |v| try w.writeInt(u64, v, .little);
+        for (c.passes) |ps| {
+            try w.writeInt(u64, ps.sizes.len, .little);
+            for (ps.sizes) |v| try w.writeInt(u64, v, .little);
+            try w.writeInt(u64, ps.choices.len, .little);
+            for (ps.choices) |ch| for ([_]u64{ ch.site, ch.value, ch.at }) |v| try w.writeInt(u64, v, .little);
+        }
+    }
+    try w.writeInt(u64, std.hash.Wyhash.hash(region_version, out.written()), .little);
+    return out.toOwnedSlice();
+}
+
+const Cursor = struct {
+    b: []const u8,
+    at: usize = 0,
+
+    fn int(c: *Cursor) !u64 {
+        if (c.b.len - c.at < 8) return error.Hy4RegionFileDamaged;
+        defer c.at += 8;
+        return std.mem.readInt(u64, c.b[c.at..][0..8], .little);
+    }
+
+    /// The next value, refused as damage where it does not fit `T`.
+    fn narrow(c: *Cursor, comptime T: type) !T {
+        return std.math.cast(T, try c.int()) orelse error.Hy4RegionFileDamaged;
+    }
+
+    fn len(c: *Cursor, each: usize) !usize {
+        const n = try c.int();
+        if (n > (c.b.len - c.at) / each) return error.Hy4RegionFileDamaged;
+        return @intCast(n);
+    }
+};
+
+fn decodeRegion(gpa: std.mem.Allocator, b: []const u8) !Kept {
+    if (b.len < region_magic.len + 8 or !std.mem.eql(u8, b[0..region_magic.len], region_magic)) return error.Hy4RegionFileDamaged;
+    const body = b[0 .. b.len - 8];
+    if (std.mem.readInt(u64, b[b.len - 8 ..][0..8], .little) != std.hash.Wyhash.hash(region_version, body)) return error.Hy4RegionFileDamaged;
+    var c: Cursor = .{ .b = body, .at = region_magic.len };
+    var k: Kept = .{ .measured = undefined, .check = undefined, .deep = 0, .keys = &.{}, .classes = &.{} };
+    k.measured = .{ .rows = try c.narrow(usize), .need = .{ .scratch = try c.int(), .host = try c.int() }, .probes = try c.int(), .classes = try c.int() };
+    k.check = .{ .scratch = try c.int(), .host = try c.int() };
+    k.deep = try c.int();
+    const n = try c.len(5 * 8);
+    k.keys = try gpa.alloc(u64, n);
+    errdefer gpa.free(k.keys);
+    var classes: std.ArrayList(Plans.Class) = .empty;
+    errdefer {
+        for (classes.items) |cl| freeClass(gpa, cl);
+        classes.deinit(gpa);
+    }
+    for (k.keys) |*key| {
+        key.* = try c.int();
+        var cl: Plans.Class = .{ .rows = try c.narrow(usize), .at = try c.narrow(usize), .need = try c.int(), .passes = &.{} };
+        cl.passes = try gpa.alloc(core.PadPass, try c.len(2 * 8));
+        var made: usize = 0;
+        errdefer freePasses(gpa, cl.passes, made);
+        for (cl.passes) |*ps| {
+            const sizes = try gpa.alloc(u64, try c.len(8));
+            errdefer gpa.free(sizes);
+            for (sizes) |*v| v.* = try c.int();
+            const choices = try gpa.alloc(plan.TraceChoice, try c.len(3 * 8));
+            errdefer gpa.free(choices);
+            for (choices) |*ch| ch.* = .{ .site = try c.narrow(@FieldType(plan.TraceChoice, "site")), .value = try c.narrow(u32), .at = try c.narrow(u32) };
+            ps.* = .{ .sizes = sizes, .choices = choices };
+            made += 1;
+        }
+        try classes.append(gpa, cl);
+    }
+    if (c.at != body.len) return error.Hy4RegionFileDamaged;
+    k.classes = try classes.toOwnedSlice(gpa);
+    return k;
+}
+
+/// Writes what `regionAt` just measured for `rows`-row chunks, with its check, through a temp file.
+fn keepRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !void {
+    const gpa = p.book.gpa;
+    var keys: std.ArrayList(u64) = .empty;
+    defer keys.deinit(gpa);
+    var classes: std.ArrayList(Plans.Class) = .empty;
+    defer classes.deinit(gpa);
+    var it = p.pads.iterator();
+    while (it.next()) |e| if (e.value_ptr.rows == rows) {
+        try keys.append(gpa, e.key_ptr.*);
+        try classes.append(gpa, e.value_ptr.*);
+    };
+    const measured = p.measured.items[p.measured.items.len - 1];
+    const bytes = try encodeRegion(gpa, .{ .measured = measured, .check = try checkNeed(m, p, rows), .deep = p.deep, .keys = keys.items, .classes = classes.items });
+    defer gpa.free(bytes);
+    var dir = try c.root.createDirPathOpen(c.io, c.name(), .{});
+    defer dir.close(c.io);
+    var name_buf: [40]u8 = undefined;
+    const name = regionFileName(m, p, rows, &name_buf);
+    var temp_buf: [64]u8 = undefined;
+    const temp = std.fmt.bufPrint(&temp_buf, "{s}.{d}.tmp", .{ name, std.c.getpid() }) catch unreachable;
+    errdefer dir.deleteFile(c.io, temp) catch {};
+    try dir.writeFile(c.io, .{ .sub_path = temp, .data = bytes });
+    try dir.rename(temp, dir, name, c.io);
+}
+
+/// The region of `rows`-row chunks the cache keeps, installed on `p` with its classes, where its check holds; null
+/// where there is none, it is damaged, or its check differs (each said in the log), and `regionAt` measures.
+fn readRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !?plan.region.Need {
+    const gpa = p.book.gpa;
+    var name_buf: [40]u8 = undefined;
+    const name = regionFileName(m, p, rows, &name_buf);
+    var dir = c.root.createDirPathOpen(c.io, c.name(), .{}) catch return null;
+    defer dir.close(c.io);
+    const bytes = dir.readFileAlloc(c.io, name, gpa, .limited(1 << 30)) catch |e| {
+        if (e != error.FileNotFound) log.warn("[plan] the kept region of {d}-row chunks unread: {s}; measured again\n", .{ rows, @errorName(e) });
+        return null;
+    };
+    defer gpa.free(bytes);
+    var k = decodeRegion(gpa, bytes) catch |e| {
+        log.warn("[plan] the kept region of {d}-row chunks unread: {s}; measured again\n", .{ rows, @errorName(e) });
+        return null;
+    };
+    defer k.deinit(gpa);
+    // The deep zone and the class count are the live load's own: a file that names others is not this load's.
+    const deep: u64 = if (p.reach >= rows and p.reach - rows >= deepZone(&m.config)) deepZone(&m.config) else 0;
+    if (k.measured.rows != rows or k.deep != deep or k.measured.classes != k.keys.len) {
+        log.warn("[plan] the kept region of {d}-row chunks is not this load's: {d} rows, deep zone {d}, {d} classes of {d} recorded; measured again\n", .{ rows, k.measured.rows, k.deep, k.keys.len, k.measured.classes });
+        return null;
+    }
+    const live = try checkNeed(m, p, rows);
+    if (live.scratch != k.check.scratch or live.host != k.check.host) {
+        log.info("[plan] the kept region of {d}-row chunks no longer holds: its check asks {d} KB, host {d} KB, now against {d} KB, host {d} KB, kept; measured again\n", .{ rows, live.scratch >> 10, live.host >> 10, k.check.scratch >> 10, k.check.host >> 10 });
+        return null;
+    }
+    try p.measured.ensureUnusedCapacity(gpa, 1);
+    try p.pads.ensureUnusedCapacity(gpa, @intCast(k.classes.len));
+    for (k.keys, k.classes) |key, cl| {
+        const got = p.pads.getOrPutAssumeCapacity(key);
+        if (got.found_existing) freeClass(gpa, got.value_ptr.*);
+        got.value_ptr.* = cl;
+    }
+    gpa.free(k.classes);
+    k.classes = &.{};
+    if (k.deep > 0) p.deep = @intCast(k.deep);
+    p.measured.appendAssumeCapacity(.{ .rows = rows, .need = k.measured.need, .probes = 1, .classes = k.measured.classes });
+    return k.measured.need;
+}
+
+/// Test seam: `bytes`, a kept region, with its check replaced. The caller frees it.
+pub fn regionWithCheckForTest(gpa: std.mem.Allocator, bytes: []const u8, check: plan.region.Need) ![]u8 {
+    var k = try decodeRegion(gpa, bytes);
+    defer k.deinit(gpa);
+    k.check = check;
+    return encodeRegion(gpa, k);
+}
+
+/// Test seam: `bytes`, a kept region, with its deep zone replaced. The caller frees it.
+pub fn regionWithDeepForTest(gpa: std.mem.Allocator, bytes: []const u8, deep: u64) ![]u8 {
+    var k = try decodeRegion(gpa, bytes);
+    defer k.deinit(gpa);
+    k.deep = deep;
+    return encodeRegion(gpa, k);
+}
+
+/// Test seam: `p` forgets the classes of `rows`-row chunks.
+pub fn forgetClassesForTest(p: *Plans, rows: usize) void {
+    var doomed: std.ArrayList(u64) = .empty;
+    defer doomed.deinit(p.book.gpa);
+    var it = p.pads.iterator();
+    while (it.next()) |e| if (e.value_ptr.rows == rows) doomed.append(p.book.gpa, e.key_ptr.*) catch return;
+    for (doomed.items) |key| if (p.pads.fetchRemove(key)) |kv| freeClass(p.book.gpa, kv.value);
 }
 
 /// Where the deep zone starts: past it no row of a chunk meets the selection threshold or the window's first fill, so
@@ -652,12 +880,9 @@ fn measureClasses(m: *Model, p: *Plans, rows: usize, most: *plan.region.Need) !u
             log.err("[plan] a forward of {d} rows at {d} leaves its scratch apart across the passes of its choices: a choice's asks outlive it\n", .{ rows, n.* });
             return error.Hy4PlanChoicesApart;
         }
-        var class: Plans.Class = .{ .at = n.*, .need = 0, .passes = try gpa.alloc(core.PadPass, passes.traces.len) };
+        var class: Plans.Class = .{ .rows = rows, .at = n.*, .need = 0, .passes = try gpa.alloc(core.PadPass, passes.traces.len) };
         var made: usize = 0;
-        errdefer {
-            class.passes = class.passes[0..made];
-            freeClass(gpa, class);
-        }
+        errdefer freePasses(gpa, class.passes, made);
         for (passes.traces, class.passes) |*t, *ps| {
             const sizes = try plan.region.padOf(gpa, t, p.book.alignment);
             errdefer gpa.free(sizes);
@@ -675,11 +900,16 @@ fn measureClasses(m: *Model, p: *Plans, rows: usize, most: *plan.region.Need) !u
 }
 
 fn freeClass(gpa: std.mem.Allocator, c: Plans.Class) void {
-    for (c.passes) |ps| {
+    freePasses(gpa, c.passes, c.passes.len);
+}
+
+/// `passes`, of which the first `made` are filled: their asks and choices, then the whole array as allocated.
+fn freePasses(gpa: std.mem.Allocator, passes: []core.PadPass, made: usize) void {
+    for (passes[0..made]) |ps| {
         gpa.free(ps.sizes);
         gpa.free(ps.choices);
     }
-    gpa.free(c.passes);
+    gpa.free(passes);
 }
 
 /// `most`, and what a wide forward of `rows` rows after `n` read out by `readout` asks.
@@ -812,4 +1042,42 @@ test "hy4 plan: the decode positions take every residue of a group below and pas
     // A group of 4, the window of 512, the threshold of 2048, the top-k's split at 131,072 groups and the last position.
     const want = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7, 508, 509, 510, 511, 512, 513, 514, 515, 2044, 2045, 2046, 2047, 2048, 2049, 2050, 2051, 524_283, 524_284, 524_285, 524_286, 524_287, 524_288, 524_289, 524_290, 1_048_572, 1_048_573, 1_048_574, 1_048_575 };
     try testing.expectEqualSlices(usize, &want, got);
+}
+
+/// A kept region of two classes of two passes, each pass with asks and a choice: what a decoder walks.
+fn keptForTest(gpa: std.mem.Allocator) !Kept {
+    const k: Kept = .{ .measured = .{ .rows = 512, .need = .{ .scratch = 4096, .host = 64 }, .probes = 9, .classes = 2 }, .check = .{ .scratch = 2048, .host = 32 }, .deep = 2048, .keys = try gpa.dupe(u64, &.{ 11, 22 }), .classes = try gpa.alloc(Plans.Class, 2) };
+    for (k.classes, 0..) |*c, i| {
+        c.* = .{ .rows = 512, .at = 4000 + i, .need = 1024, .passes = try gpa.alloc(core.PadPass, 2) };
+        for (c.passes, 0..) |*ps, j| ps.* = .{ .sizes = try gpa.dupe(u64, &.{ 256, 512 + j }), .choices = try gpa.dupe(plan.TraceChoice, &.{.{ .site = @intCast(0xabcd00 + 2 * i + j), .value = 1, .at = 1 }}) };
+    }
+    return k;
+}
+
+fn decodeAndFree(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    var k = try decodeRegion(gpa, bytes);
+    k.deinit(gpa);
+}
+
+test "hy4 plan: a kept region's decoder frees all it made when any of its allocations fails" {
+    const a = testing.allocator;
+    var k = try keptForTest(a);
+    defer k.deinit(a);
+    const bytes = try encodeRegion(a, k);
+    defer a.free(bytes);
+    try testing.checkAllAllocationFailures(a, decodeAndFree, .{bytes});
+}
+
+test "hy4 plan: a kept region whose value does not fit its field is refused as damaged under a whole checksum, never narrowed" {
+    const a = testing.allocator;
+    var k = try keptForTest(a);
+    defer k.deinit(a);
+    const bytes = try encodeRegion(a, k);
+    defer a.free(bytes);
+    var site: [8]u8 = undefined;
+    std.mem.writeInt(u64, &site, 0xabcd00, .little);
+    const at = std.mem.indexOf(u8, bytes, &site).?;
+    std.mem.writeInt(u64, bytes[at..][0..8], 1 << 32, .little);
+    std.mem.writeInt(u64, bytes[bytes.len - 8 ..][0..8], std.hash.Wyhash.hash(region_version, bytes[0 .. bytes.len - 8]), .little);
+    try testing.expectError(error.Hy4RegionFileDamaged, decodeRegion(a, bytes));
 }

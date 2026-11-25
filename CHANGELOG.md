@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A second Hy4-Flash load of the same build and pack starts sooner**: it reads the prefill region its first load
+  measured back from beside the pipeline manifest instead of measuring it again.
 - **Hy4-Flash drafts faster after a missed guess, with the same text**: a DFly2 round keeps the tokens it accepted
   from the verify instead of running them through the model again, so a round after a rejection costs about a
   quarter of what it did.

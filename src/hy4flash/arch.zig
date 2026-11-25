@@ -192,8 +192,17 @@ pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Ca
     const encode: ?@import("hy4_plan.zig").Encode = if (tower) |*t| .{ .tower = t, .max_patches = media.maxImagePatches(media.preproc(&xfm.config)) } else null;
     const p = try @import("hy4_plan.zig").record(m, xfm.allocator, bills.planReach(&xfm.config), dfly, bills.configuredKvQuantFor(&xfm.config), cache, encode);
     errdefer p.deinit(xfm.allocator);
+    p.pack = try packKey(xfm);
     try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = xfm.suppress_mask, .think = xfm.think_marker_mask });
     m.recorded = p;
+}
+
+/// The pack's identity, which names the region a load keeps (`hy4_plan.Plans.pack`).
+fn packKey(xfm: Model) ![16]u8 {
+    const manifest = @import("../pipeline_manifest.zig");
+    var d: manifest.Digest = .{};
+    try manifest.addPack(&d, xfm.allocator, std.Io.Threaded.global_single_threaded.io(), xfm.config.expert_source_dir orelse return error.MissingExpertSourceDir);
+    return d.hex();
 }
 
 /// The arena a load whose plans are recorded or built holds with prefill chunks of `chunk` rows: its plans' and the
