@@ -1161,7 +1161,8 @@ pub const Model = struct {
         const rope: c_int = @intCast(c.rope_dim);
         const dense = self.kv.scheme == .off;
         const words: c_int = @intCast(kv_quant.packedWords(latent, self.kv.bits));
-        const groups: c_int = @divExact(latent, @as(c_int, @intCast(self.kv.group_size)));
+        // A BF16 store has no groups: its width names none.
+        const groups: c_int = if (dense) 0 else @divExact(latent, @as(c_int, @intCast(self.kv.group_size)));
         for (self.state[0..c.layers], 0..) |*st, l| {
             if (self.layers[l].indexer != null) {
                 if (st.rows == null) st.rows = row_store.Store.init(if (dense) &.{ .{ .cols = @intCast(latent), .dtype = .bfloat16 }, .{ .cols = @intCast(rope), .dtype = .bfloat16 } } else &.{
