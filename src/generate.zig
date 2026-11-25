@@ -866,7 +866,15 @@ pub const Generator = struct {
 
     /// The mode `logSpecStats` reports: the first that drafted.
     pub fn specMode(self: *const Generator) SpecMode {
-        if (self.drafter_on and self.drafter_stats.rounds > 0) return if (drafter.Drafter.blockKindOf(self.xfm) == .dfly2) .dfly2 else .dspark;
+        if (self.drafter_on and self.drafter_stats.rounds > 0) {
+            // `arch/drafter_rounds.zig` refuses to build an arch whose rounds have no block-drafter kind.
+            const kind = drafter.Drafter.blockKindOf(self.xfm) orelse @panic("drafter rounds ran on an arch with no block drafter");
+            return switch (kind) {
+                .dspark => .dspark,
+                .dfly2 => .dfly2,
+                .mtp, .dflash2 => @panic("drafter rounds ran under a drafter that drafts no block"),
+            };
+        }
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) return .mtp;
         if (self.dflash != null and self.dflash_attempted > 0) return .dflash;
         return .none;

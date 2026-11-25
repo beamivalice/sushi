@@ -36,7 +36,13 @@ pub const default_block: u32 = 5;
 /// The drafter rounds of the arch `t`, or the refusal when its drafter declares none.
 fn RoundsOf(comptime t: registry.Tag) type {
     const M = registry.Mod(t);
-    if (@hasDecl(M, "drafter") and @hasDecl(M.drafter, "drafter_rounds")) return M.drafter.drafter_rounds;
+    if (@hasDecl(M, "drafter") and @hasDecl(M.drafter, "drafter_rounds")) {
+        // The rounds report under the arch's own block drafter (`Generator.specMode`): an arch with rounds names one.
+        comptime for (M.drafter.kinds) |k| {
+            if (k.blockDrafter()) break;
+        } else @compileError(@tagName(t) ++ "'s drafter declares drafter_rounds but no block-drafter kind (spec_types.Kind.blockDrafter)");
+        return M.drafter.drafter_rounds;
+    }
     return Refuse;
 }
 

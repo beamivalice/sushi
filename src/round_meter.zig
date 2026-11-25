@@ -44,7 +44,7 @@ pub const RoundMeter = struct {
     }
 
     pub fn report(self: *const RoundMeter, ctx: usize, rows: usize, accepted: u32, source: []const u8) void {
-        log.info("[dspark-meter] ctx={d} rows={d} accepted={d} source={s} start_ns={d} entry/stage/head/markov/draft_read/plan/verify/verdict/finish/publish wall_ns={any} wait_ns={any} waits={any} dispatches={any} barriers={any}\n", .{
+        log.info("[drafter-meter] ctx={d} rows={d} accepted={d} source={s} start_ns={d} entry/stage/head/markov/draft_read/plan/verify/verdict/finish/publish wall_ns={any} wait_ns={any} waits={any} dispatches={any} barriers={any}\n", .{
             ctx, rows, accepted, source, self.timer.started_at.nanoseconds, self.column("wall_ns"), self.column("wait_ns"), self.column("waits"), self.column("dispatches"), self.column("barriers"),
         });
     }
