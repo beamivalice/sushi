@@ -2510,9 +2510,16 @@ fn moeLayerRest(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.MoeG
         const acc = try o.own(try fwd.routedExperts(self.gpa, o.s, lat, r.weights, null, rows, g, p.prepared.raw_gate_up, p.prepared.raw_down, tap_all));
         return moeEnd(o, x, m, g, acc, at);
     };
-    // The stream holds no union workspace: each route asks for at most a layer's cache slots of distinct experts. The
-    // picks go in groups of distinct experts that fit; each group lands its picks at their positions in one [T·k, L]
-    // sum, so the rows sum their k as one group's would.
+    const acc = try o.own(try streamedSum(self, o.s, l, lat, r.weights, host, experts, g, engine, at));
+    return moeEnd(o, x, m, g, acc, at);
+}
+
+/// A streamed route's routed sum [T, L] f32. The stream holds no union workspace: each route asks for at most a layer's
+/// cache slots of distinct experts. The picks go in groups of distinct experts that fit; one group reads its slots in
+/// place, more each land their picks at their positions in one [T·k, L] sum: a `plan.choose` arm each. The sum is made
+/// before the arm and written in place, and all else an arm makes dies inside it, so either arm leaves first fit as the
+/// other does (`choicesAgree`).
+fn streamedSum(self: *Model, s: mlx.mlx_stream, l: usize, lat: Arr, weights: Arr, host: []const u32, experts: usize, g: fwd.MoeGeometry, engine: *expert_stream.Engine, at: ?fwd.At) !Arr {
     const slots = engine.slotsPerLayer();
     const groups = try expertGroups(self.gpa, host, slots);
     defer self.gpa.free(groups);
@@ -2527,21 +2534,25 @@ fn moeLayerRest(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.MoeG
     const rows = try self.gpa.alloc(u32, host.len);
     defer self.gpa.free(rows);
     const t = mlx.getShape(lat)[0];
-    var placed: ?Arr = null;
-    defer if (placed) |a| {
-        _ = mlx.mlx_array_free(a);
-    };
-    // One group reads its slots in place; more each land their picks in one sum: a variant each (`plan.choose`).
+    const row_ids = try self.gpa.alloc(u32, @intCast(t));
+    defer self.gpa.free(row_ids);
+    for (row_ids, 0..) |*d, i| d.* = @intCast(i);
+    var acc = try fwd.placedZeros(s, t, 1, mlx.getShape(lat)[1]);
+    errdefer _ = mlx.mlx_array_free(acc);
     const arm = try plan.frame(@src(), .{});
     defer arm.end();
     const many = if (mostGroups(host.len, experts, slots) > 1) plan.choose(@src(), bool, n_groups > 1) else false;
     const kind = if (plan.planned()) try plan.each(@src(), many) else plan.Frame.none;
     defer kind.end();
-    // The arm keys the loop and its iterations: the one-group arm ends the layer inside its only iteration.
+    // The arm keys the loop and its iterations: the one-group arm lands the sum inside its only iteration.
     const loop = try plan.frame(@src(), many);
     defer loop.end();
     // The groups land their picks in one sum made before them: no group hands one up.
-    if (many) placed = try fwd.placedZeros(o.s, t, g.top_k, mlx.getShape(lat)[1]);
+    var placed: ?Arr = null;
+    defer if (placed) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    if (many) placed = try fwd.placedZeros(s, t, g.top_k, mlx.getShape(lat)[1]);
     var gi: u32 = 0;
     while (gi < (if (many) n_groups else 1)) : (gi += 1) {
         const it = if (plan.planned()) try plan.each(@src(), .{ many, gi > 0 }) else plan.Frame.none;
@@ -2563,20 +2574,20 @@ fn moeLayerRest(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.MoeG
         var prepared = try prepareRoute(engine, @intCast(l), occurrences[0..n], @min(n, slots));
         defer prepared.deinit();
         for (prepared.remapped, rows[0..n]) |v, *d| d.* = v;
-        const tap: ?fwd.ExpertTap = if (at) |a| .{ .at = a, .experts = tapped[0..n] } else null;
-        // Read from the route's slots: evaluated before they are given back.
+        const tap: ?fwd.ExpertTap = if (at) |ta| .{ .at = ta, .experts = tapped[0..n] } else null;
+        // Read from the route's slots: landed (and so evaluated) before they are given back.
         if (!many) {
-            const acc = try o.own(try fwd.routedExperts(self.gpa, o.s, lat, r.weights, null, rows[0..n], g, prepared.raw_gate_up, prepared.raw_down, tap));
-            try mlx.check(mlx.mlx_array_eval(acc));
-            return moeEnd(o, x, m, g, acc, at);
+            var one: Ops = .{ .s = s };
+            defer one.deinit();
+            try fwd.landRows(&one, &acc, try one.own(try fwd.routedExperts(self.gpa, s, lat, weights, null, rows[0..n], g, prepared.raw_gate_up, prepared.raw_down, tap)), row_ids);
+            return acc;
         }
-        try fwd.placeExperts(self.gpa, o.s, &placed.?, lat, r.weights, picks[0..n], rows[0..n], g, prepared.raw_gate_up, prepared.raw_down, tap);
+        try fwd.placeExperts(self.gpa, s, &placed.?, lat, weights, picks[0..n], rows[0..n], g, prepared.raw_gate_up, prepared.raw_down, tap);
     }
-    const acc = try o.own(try fwd.sumPlaced(o.s, placed.?, t, g.top_k));
-    // Freed inside the arm's frame: both arms hand up the same arrays, the sum and what the layer's end makes.
-    _ = mlx.mlx_array_free(placed.?);
-    placed = null;
-    return moeEnd(o, x, m, g, acc, at);
+    var sum: Ops = .{ .s = s };
+    defer sum.deinit();
+    try fwd.landRows(&sum, &acc, try sum.own(try fwd.sumPlaced(s, placed.?, t, g.top_k)), row_ids);
+    return acc;
 }
 
 /// The MoE layer's end after its routed sum `acc` (in the latent): `moeFinish`, evaluated.
@@ -2647,11 +2658,17 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     try fwd.At.input(at, .expert_in, lat);
     const shape = mlx.getShape(r.weights);
     const dec = self.quant.expert.?;
-    var routed: ?Arr = null;
-    errdefer if (routed) |acc| {
-        _ = mlx.mlx_array_free(acc);
+    const row_ids = try self.gpa.alloc(u32, @intCast(shape[0]));
+    defer self.gpa.free(row_ids);
+    for (row_ids, 0..) |*d, i| d.* = @intCast(i);
+    // The groups' sum, made before them and written in place: no group, and no arm of a route's `plan.choose`, hands
+    // up what it made (`choicesAgree`).
+    var sum = try fwd.placedZeros(o.s, shape[0], 1, mlx.getShape(lat)[1]);
+    var handed = false;
+    errdefer if (!handed) {
+        _ = mlx.mlx_array_free(sum);
     };
-    // Every group runs every pick, those outside it at weight 0: a group's sizes are the picks', the first adds nothing.
+    // Every group runs every pick, those outside it at weight 0: a group's sizes are the picks'.
     const loop = try plan.frame(@src(), .{});
     defer loop.end();
     var gi: u32 = 0;
@@ -2680,20 +2697,17 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
         const pk = try go.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
         const mask = try go.own(mlx.mlx_array_new_data(mask_v.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .float32));
         const w = try go.binary(.mul, r.weights, mask);
-        // Read from the route's slots: evaluated before they are given back. Its frame is the bank's alone.
-        const part = blk: {
-            const kind = try routeKind(&prepared);
-            defer kind.end();
-            break :blk try go.own(try hy4_stq.routed(go.s, dec, g.swiglu_limit, rb, lat, pk, w));
-        };
-        // The first group carries a copy of its part, so every group's part dies inside it, as a later one's in its add.
-        const next = if (routed) |acc| try go.result(try go.contiguous(try go.binary(.add, acc, part))) else (try copyOf(part, go.s)).?;
-        try mlx.check(mlx.mlx_array_eval(next));
-        if (routed) |acc| _ = mlx.mlx_array_free(acc);
-        routed = next;
+        // Read from the route's slots: landed (and so evaluated) before they are given back. Its frame is the bank's
+        // alone, and what it makes dies in it.
+        const kind = try routeKind(&prepared);
+        defer kind.end();
+        var ko: Ops = .{ .s = o.s };
+        defer ko.deinit();
+        const part = try ko.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, w));
+        try fwd.landRows(&ko, &sum, try ko.binary(.add, sum, part), row_ids);
     }
-    const acc = try o.own(routed.?);
-    routed = null;
+    handed = true;
+    const acc = try o.own(sum);
     // Nothing waits at the layer's end: the next streamed layer's picks read (`hostPicks`) waits for it.
     return o.contiguous(try fwd.moeFinish(o, x, m, g, acc, at));
 }

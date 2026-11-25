@@ -822,6 +822,25 @@ pub fn placeExperts(gpa: std.mem.Allocator, s: mlx.mlx_stream, placed: *Arr, lat
     _ = try runExperts(gpa, s, lat, weights, picks, rows, g, gate_up_bank, down_bank, tap, placed);
 }
 
+/// `sum` [T, L] set to `value` [T, L] row by row (`ids` 0..T-1) and evaluated: on the engine in `sum`'s own bytes, so a
+/// `plan.choose` arm that writes it hands up nothing it made.
+pub fn landRows(o: *Ops, sum: *Arr, value: Arr, ids: []const u32) !void {
+    const t: c_int = @intCast(ids.len);
+    const l = mlx.getShape(value)[1];
+    const at = try o.broadcast(try o.reshape(try o.own(mlx.mlx_array_new_data(ids.ptr, &[_]c_int{t}, 1, .uint32)), &.{ t, 1 }), &.{ t, l });
+    if (mlx.engine.isStream(o.s)) {
+        try mlx.engine.putAlongInPlace(sum.*, at, value, 0);
+        return mlx.check(mlx.mlx_array_eval(sum.*));
+    }
+    const put = try o.slot();
+    try mlx.check(mlx.mlx_put_along_axis(put, sum.*, at, value, 0, o.s));
+    const next = try o.result(put.*);
+    errdefer _ = mlx.mlx_array_free(next);
+    try mlx.check(mlx.mlx_array_eval(next));
+    _ = mlx.mlx_array_free(sum.*);
+    sum.* = next;
+}
+
 /// Each row's sum of its k placed picks, [T, L] f32. The caller frees it.
 pub fn sumPlaced(s: mlx.mlx_stream, placed: Arr, t: c_int, k: c_int) !Arr {
     var o: Ops = .{ .s = s };

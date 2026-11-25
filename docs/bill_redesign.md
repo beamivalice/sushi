@@ -190,6 +190,9 @@ pub fn hostResult(t: *const core.Tensor) Error![]u8; // a readback that steers n
   every shorter one. Its cost: a value a variable-count loop carries from one iteration to the next is not reused
   across iterations. A loop of fixed count (the layers) is exact frames and has no such cost: its carried streams
   take two places.
+- **A `plan.choose` arm hands up nothing it made.** What outlives the arm is made before the choice and written in
+  place (Hy4's streamed groups land in a sum made before them); an ask made after a choice that outlives the frame the
+  choice was made in lands where its own arm left room, and `choicesAgree` refuses the recording by name.
 - **`choose` goes where data picks a structure**: a streamed route's kind (cache bank, union, spill split), a rollback
   that replays. Its value is the key of the frame it guards, so each variant is its own unit and they never multiply.
 - **`bound` goes where data picks a size**: the picks of an expert group, the distinct id blocks of an embedding

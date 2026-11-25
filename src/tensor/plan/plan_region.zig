@@ -102,6 +102,7 @@ fn padInstance(gpa: std.mem.Allocator, t: *const Trace, i: u32, alignment: u64, 
 /// the same sites in the same order, and leaves first fit in one state at each, the frees before its next scratch ask
 /// taken. Then each stretch between two choices places as the pass it follows did, from the state that pass had.
 pub fn choicesAgree(gpa: std.mem.Allocator, traces: []const Trace, alignment: u64) Error!bool {
+    for (traces) |*tr| if (!choicesKeepTheirAsks(tr)) return false;
     if (traces.len < 2) return true;
     const first = try statesAt(gpa, &traces[0], alignment);
     defer gpa.free(first);
@@ -111,6 +112,42 @@ pub fn choicesAgree(gpa: std.mem.Allocator, traces: []const Trace, alignment: u6
         const got = try statesAt(gpa, tr, alignment);
         defer gpa.free(got);
         if (!std.mem.eql(u64, first, got)) return false;
+    }
+    return true;
+}
+
+/// Whether every scratch ask `t` made after a choice, in the instance the choice was made in or below it, died inside
+/// that instance. One that outlives it lands where its own arm left room, so the arms' passes part wherever first fit
+/// happens to place it apart: an arm hands up only what was made before it.
+fn choicesKeepTheirAsks(t: *const Trace) bool {
+    for (t.choices) |c| {
+        if (c.frame == 0) continue;
+        for (t.instances, 0..) |inst, h| {
+            // The instance's way into the choice's: its own events when it is the choice's, else the child it is under.
+            var below: u32 = 0;
+            var c_inst: u32 = @intCast(h);
+            while (c_inst != c.frame) : (below += 1) {
+                const up = t.instances[c_inst].parent;
+                if (up == trace_mod.none) break;
+                if (up == c.frame) {
+                    if (t.instances[c_inst].at < c.event) break;
+                    below += 1;
+                    c_inst = up;
+                    break;
+                }
+                c_inst = up;
+            }
+            if (c_inst != c.frame) continue;
+            for (inst.events.items, 0..) |e, k| switch (e) {
+                .ask => |o| {
+                    const a = inst.asks.items[o];
+                    if (a.host or a.external) continue;
+                    if (h == c.frame and k < c.event) continue;
+                    if (a.death == trace_mod.none or a.lift > below) return false;
+                },
+                .child => {},
+            };
+        }
     }
     return true;
 }

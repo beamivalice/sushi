@@ -31,8 +31,9 @@ pub const Ask = struct {
 /// host asks dead by then give their bytes back (`plan_region`).
 pub const Wait = struct { instance: u32, at: u32, deaths: u32 };
 
-/// A `plan.choose` a dry pass met: its site, the value it took, and how many scratch asks came before it.
-pub const Choice = struct { site: frame.Site, value: u32, at: u32 };
+/// A `plan.choose` a dry pass met: its site, the value it took, how many scratch asks came before it, and the instance it
+/// was made in with that instance's event count then (a recording read back from the plan cache has the root's 0, 0).
+pub const Choice = struct { site: frame.Site, value: u32, at: u32, frame: u32 = 0, event: u32 = 0 };
 
 pub const Event = union(enum) {
     /// The ask of this ordinal.
@@ -156,7 +157,8 @@ pub const Recorder = struct {
 
     /// A `plan.choose` at `site` took `value` here; `end` reports a note that could not be kept.
     pub fn noteChoice(r: *Recorder, site: frame.Site, value: u32) void {
-        r.choices.append(r.gpa, .{ .site = site, .value = value, .at = r.scratch }) catch {
+        const in = r.top();
+        r.choices.append(r.gpa, .{ .site = site, .value = value, .at = r.scratch, .frame = in, .event = @intCast(r.instances.items[in].events.items.len) }) catch {
             r.choice_oom = true;
         };
     }

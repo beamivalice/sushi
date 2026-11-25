@@ -3940,6 +3940,40 @@ test "wide: an execution padded to every pass of its recording follows its own c
     try t.expect(!try plan.region.choicesAgree(t.allocator, apart, 256));
 }
 
+/// A choice made in a frame whose two arms ask the same bytes; `hand_up` keeps the arm's ask past the frame's end.
+const FramedChoiceForward = struct {
+    hand_up: bool,
+
+    fn go(self: FramedChoiceForward) !void {
+        const u: c_int = 64 << 10;
+        var out: ?*Tensor = null;
+        {
+            const f = try plan.frame(@src(), .{});
+            defer f.end();
+            _ = plan.choose(@src(), bool, true);
+            const a = try fresh(.uint8, &.{u});
+            if (self.hand_up) out = a else release(a);
+        }
+        if (out) |o| release(o);
+        const y = try fresh(.uint8, &.{u});
+        release(y);
+    }
+};
+
+test "wide: an ask made after a choice that outlives the frame the choice was made in parts the passes, though first fit agrees after either arm" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    for ([_]bool{ false, true }) |hand_up| {
+        const traces = try passesOfTest(FramedChoiceForward{ .hand_up = hand_up });
+        defer {
+            for (traces) |*tr| tr.deinit();
+            t.allocator.free(traces);
+        }
+        try t.expectEqual(@as(usize, 2), traces.len);
+        try t.expectEqual(!hand_up, try plan.region.choicesAgree(t.allocator, traces, 256));
+    }
+}
+
 test "wide: a gap reused while its last tenant is still read in the open pass is written only after that read" {
     const t = std.testing;
     try mlx.requireGpu();
