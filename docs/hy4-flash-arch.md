@@ -134,7 +134,8 @@ activation dtype before the weight multiplies.
   K6 embedding bank ([pack-format](pack-format.md#hy4-stq)) is gathered on the GPU where the trellis decode kernel runs
   (`hy4_embed`): the chunk's 128-id blocks decoded (`trunk_gemm.decodeDense`), then two kernels take the Hadamard down
   each 128-row chunk and along the token's column and scale by `suh·svh`, in the host decode's f32 order, so a row is
-  `EmbedGather.rows`' bytes (the host gather stays the fallback). A group launches at a power-of-two block count (`launchBlocks`):
+  `EmbedGather.rows`' bytes (the host gather stays the fallback: an M1 or M2, which has no NAX decode, takes it; under a
+  dry recording it writes zeros and decodes no block, since a dry pass reads no value). A group launches at a power-of-two block count (`launchBlocks`):
   the decode is templated on its width, so its six widths are made at load (`warmKernels`), never inside a request, with
   a second group's join and its take back into the ids' order (a prompt's ids are in no block order). Its
   buffers are a forward's. On the engine the last group is not evaluated: host data is

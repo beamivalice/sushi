@@ -130,6 +130,71 @@ test "hy4 plan: a dry decode asks what the real decode asks, ask for ask, death 
     try testing.expectEqual(Work{ .dispatches = 0, .submits = 0, .pool_bytes = 0, .asks = 0, .pipelines = 0 }, dry_work);
 }
 
+test "hy4 plan: on the host embedding gather an M1 or M2 load takes, a dry decode decodes no block and asks what the real decode asks, ask for ask (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.open(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const hy4_stq = @import("hy4_stq.zig");
+    // Where the GPU gathers the embedding, the gather a GPU without the NAX decode takes is made from its bank.
+    const gpu_was = m.embed_gpu;
+    var forced: ?hy4_stq.EmbedGather = null;
+    if (gpu_was) |g| {
+        forced = try hy4_stq.EmbedGather.of(a, g.bank);
+        m.embed_gather = forced;
+        m.embed_gpu = null;
+    }
+    defer if (forced) |*f| {
+        m.embed_gather = null;
+        m.embed_gpu = gpu_was;
+        f.deinit(a);
+    };
+    try testing.expect(m.embed_gather != null);
+    try m.probeWide();
+    const p = 20;
+    _ = try decodeAt(m, ids, p, null, null);
+    var real = try plan.Recorder.begin(a, .{ .site = 1 });
+    defer real.deinit();
+    _ = try decodeAt(m, ids, p, .real, &real);
+    var dry = try plan.Recorder.begin(a, .{ .site = 1 });
+    defer dry.deinit();
+    var driver: plan.Driver = .{ .gpa = a };
+    defer driver.deinit();
+    _ = try decodeAt(m, ids, p, .{ .dry = .{ .driver = &driver } }, &dry);
+    try testing.expectEqual(@as(?plan_trace.Difference, null), plan_trace.firstDifference(real.instances.items, dry.instances.items));
+    // The blocks the recorded forward decodes, counted over it alone: `decodeAt`'s prefill to `p` runs for real.
+    for ([_]bool{ false, true }) |is_dry| {
+        m.reset();
+        const pre = try m.forwardReadout(ids[0..p], .none);
+        _ = mlx.mlx_array_free(pre);
+        mlx.engine.close();
+        var rec = try plan.Recorder.begin(a, .{ .site = 1 });
+        defer rec.deinit();
+        var d: plan.Driver = .{ .gpa = a };
+        defer d.deinit();
+        const before = hy4_stq.EmbedGather.blocks_decoded;
+        try core.beginRecording(if (is_dry) .{ .dry = .{ .driver = &d } } else .real, &rec);
+        {
+            defer if (is_dry) m.reset();
+            defer core.endRecording() catch {};
+            const lg = try m.forwardReadout(ids[p .. p + 1], .last);
+            try mlx.check(mlx.mlx_array_eval(lg));
+            _ = mlx.mlx_array_free(lg);
+        }
+        const decoded = hy4_stq.EmbedGather.blocks_decoded - before;
+        if (is_dry) try testing.expectEqual(@as(usize, 0), decoded) else try testing.expectEqual(@as(usize, 1), decoded);
+    }
+}
+
 test "hy4 plan: a GPU that refuses one form's wide mix and grants the rest: the probe before a recording latches each pipeline's own grant, the granted forms launch wide and a dry decode plans what the real one runs (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;

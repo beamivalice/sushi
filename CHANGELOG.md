@@ -12,6 +12,7 @@ earlier history is mlx-serve's, in that project's changelog.
   the green slot blinks; under Reduce motion it stays still.
 - **Sushibar's menu bar icon lights its disk slot green whenever a server answers**: a dark-set green bar replaces the
   black slot on the no-model, loading and ready icons, and the no-model icon draws the striped fish of the offline one.
+- **A Hy4-Flash load on an M1 or M2 Mac plans in seconds, not minutes**: the load's dry plan recordings decoded the STQ embedding on the CPU for every forward, though a dry pass reads no value; they now skip it.
 - **Hy4-Flash loads on an M1 or M2 Mac**: those GPUs grant its hyper-connection kernels and its sampler fewer than 1,024 threads a group, and the load failed with a Metal error or a missed plan; each kernel now runs at the widest group the GPU grants it, learned before the load records its plans.
 - **A Hy4-Flash load that skips its warm (a manifest of the same build) compiles nothing inside a request**: a prompt past a restored prefix took a matrix layout no warm forward runs; the first product of a dtype now makes every layout's tiles, on worker threads.
 - **A Hy4-Flash STQ load serves a prompt whose ids fall in a few blocks of the vocabulary**, where the warm's own prompt asked past the region the load measured and the load failed (`WideFull`): the embedding gather now asks what its recording asked whichever blocks the ids touch.

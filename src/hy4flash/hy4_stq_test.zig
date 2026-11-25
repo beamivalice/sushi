@@ -976,6 +976,45 @@ test "hy4 stq: the K6 embedding gathered by 128-id block gives each token the ro
     try testing.expect(worst <= 1.0 / 64.0 and rel <= 1.0 / 256.0);
 }
 
+test "hy4 stq: a dry recording gathers the host embedding's rows as zeros, decoding no block, and still refuses an id past the vocabulary (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    var owned: std.ArrayList(Arr) = .empty;
+    defer {
+        for (owned.items) |x| _ = mlx.mlx_array_free(x);
+        owned.deinit(a);
+    }
+    const bank = (try hy4_stq.load(&p.stq, "model.embed_tokens", p.quant.trunk, &owned, a, es)).?;
+    var g = try hy4_stq.EmbedGather.of(a, bank);
+    defer g.deinit(a);
+    const v: u32 = p.config.vocab;
+    const d: usize = p.config.dim;
+    const ids = [_]u32{ 0, 128, 5000, v - 1 };
+    const out = try a.alloc(f32, ids.len * d);
+    defer a.free(out);
+    @memset(out, 1);
+    const plan = @import("../tensor/plan/plan_api.zig");
+    var driver: plan.Driver = .{ .gpa = a };
+    defer driver.deinit();
+    plan.session = .{ .mode = .dry, .driver = &driver };
+    defer plan.session = .{};
+    const before = hy4_stq.EmbedGather.blocks_decoded;
+    try g.rows(a, &ids, out);
+    try testing.expectEqual(before, hy4_stq.EmbedGather.blocks_decoded);
+    for (out) |x| try testing.expectEqual(@as(f32, 0), x);
+    try testing.expectError(error.TokenOutOfRange, g.rows(a, &[_]u32{v}, out[0..d]));
+    plan.session = .{};
+    try g.rows(a, &ids, out);
+    try testing.expectEqual(before + 4, hy4_stq.EmbedGather.blocks_decoded);
+}
+
 test "hy4 stq served: a server's streamed load reads the STQ pack's rate-group banks as the stream's layout, not a refusal (HY4_STQ_TINY)" {
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
     const io = std.Io.Threaded.global_single_threaded.io();

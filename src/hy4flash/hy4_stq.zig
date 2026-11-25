@@ -262,6 +262,9 @@ pub const EmbedGather = struct {
     n: u32,
     dec: exl3.format.Decode,
 
+    /// Test seam: the blocks `rows` has decoded in this process.
+    pub var blocks_decoded: usize = 0;
+
     /// A host copy of the bank's words and scales.
     pub fn of(gpa: std.mem.Allocator, b: Bank) !EmbedGather {
         for ([_]Arr{ b.w, b.suh, b.svh }) |a| try mlx.check(mlx.mlx_array_eval(a));
@@ -292,10 +295,15 @@ pub const EmbedGather = struct {
         return 2 * (self.words.len + self.suh.len + self.svh.len);
     }
 
-    /// Each id's row into `out` [ids.len · dim], f32. An id past the vocabulary is refused.
+    /// Each id's row into `out` [ids.len · dim], f32. An id past the vocabulary is refused. A dry recording reads no
+    /// value: its rows are zeros, and no block is decoded on the host.
     pub fn rows(self: EmbedGather, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
         const d = self.dim;
         if (out.len != ids.len * d) return error.BadExl3Shape;
+        if (mlx.engine.dryOn()) {
+            for (ids) |id| if (id >= self.vocab) return error.TokenOutOfRange;
+            return @memset(out, 0);
+        }
         const order = try gpa.alloc(u32, ids.len);
         defer gpa.free(order);
         for (order, 0..) |*o, i| o.* = @intCast(i);
@@ -316,6 +324,7 @@ pub const EmbedGather = struct {
             // The block's 8 output tiles over every input tile, in the bank's own order.
             for (0..d / 16) |tk| @memcpy(sub[tk * 8 * self.n ..][0 .. 8 * self.n], self.words[(tk * ot + b * 8) * self.n ..][0 .. 8 * self.n]);
             try exl3.linear.decodeDense(gpa, sub, self.suh, self.svh[b * 128 ..][0..128], d, 128, self.n, self.dec, blk);
+            if (@import("builtin").is_test) blocks_decoded += 1;
             while (i < order.len and ids[order[i]] / 128 == b) : (i += 1) {
                 const row = order[i];
                 const col = ids[row] % 128;
