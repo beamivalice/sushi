@@ -1441,7 +1441,8 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   there. At each `plan.choose` the execution follows a pass that took the same value, sound where every pass leaves
   first fit in one state at each choice (`plan.region.choicesAgree`, checked at load). A chunk of no recorded class, an
   ask past its recorded size or past the sequence is refused by name (`Hy4WidePlanMiss`, `PlanMiss`), never placed.
-  Chunks below the deep zone, other widths and an image's splice keep D97's measure.
+  Chunks below the deep zone, other widths, an image's splice and a readout other than none or the last row (a
+  capture's hidden row) keep D97's measure.
 
 ## 15. Risks
 

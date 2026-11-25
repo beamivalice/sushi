@@ -721,8 +721,9 @@ pub fn run(m: *Model, ids: []const u32, vision: ?Model.VisionRows, readout: Read
 /// An ask past the region refuses the forward by name (`WideFull`).
 fn wide(m: *Model, p: *const Plans, ids: []const u32, vision: ?Model.VisionRows, readout: Readout) !mlx.mlx_array {
     const at = m.pos;
-    // A load-width chunk in the deep zone runs padded to its class's recording, so it tops out where that did.
-    if (p.deep > 0 and vision == null and ids.len == p.region_rows and at >= p.deep) {
+    // A load-width chunk in the deep zone read out as the load recorded its classes runs padded to its class's
+    // recording, so it tops out where that did; another readout (a capture's hidden row) keeps D97's measure.
+    if (p.deep > 0 and vision == null and ids.len == p.region_rows and at >= p.deep and (readout == .none or readout == .last)) {
         const class = p.pads.get(m.wideClass(@intCast(at), @intCast(ids.len), readout)) orelse {
             log.err("[plan] a forward of {d} rows at {d} is of no class the load recorded\n", .{ ids.len, at });
             return error.Hy4WidePlanMiss;

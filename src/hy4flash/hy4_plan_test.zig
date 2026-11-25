@@ -1802,6 +1802,33 @@ test "hy4 plan: the region of a chunk is measured at each width's two ends and a
     if (!ran) return error.SkipZigTest;
 }
 
+test "hy4 plan: a load-width prefill chunk in the deep zone read out by a readout its load recorded no class for, its hidden last row, runs in the region its load measured (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.open(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const p = m.plans.?;
+    const chunk = p.region_rows;
+    const ids = try spreadIds(a, &m.config, 2 * chunk);
+    defer a.free(ids);
+    m.reset();
+    try m.reserveFor(2 * chunk);
+    _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..chunk], .none));
+    mlx.engine.close();
+    try testing.expect(chunk >= p.deep);
+    const h = try hy4_plan.run(m, ids[chunk .. 2 * chunk], null, .hidden_last);
+    defer _ = mlx.mlx_array_free(h);
+    try mlx.check(mlx.mlx_array_eval(h));
+    try testing.expect(core.stats().wide_last_high <= p.region.scratch);
+}
+
 test "hy4 plan: prefill ubench honours kv context and rolls back between iterations (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
