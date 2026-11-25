@@ -466,8 +466,6 @@ pub fn record(m: *Model, p: *Plans, masks: Masks) !void {
     const st = &p.sample;
     st.* = .{ .planned = true, .masks = masks, .rows_max = if (p.drafter != null) @intCast(fwd.verify_rows_max) else 0 };
     errdefer st.deinit();
-    // The draw's threads a group settle on what the GPU grants before the probes record them (an M1 grants it 512).
-    try @import("../sampler_draw.zig").settle(m.config.vocab, .float32, m.s);
     try makeTokens(m, st);
     const all = try mixes(gpa, st);
     defer gpa.free(all);

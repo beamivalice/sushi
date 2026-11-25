@@ -265,10 +265,7 @@ pub const Model = struct {
         errdefer m.freeEngram();
         for (0..config.layers) |l| m.layers[l] = try m.resolveLayer(weights, l);
         if (config.engram.n > 0) try m.initEngram(weights, src.dir);
-        if (fwd.hc_kernels_on and mlx.streamIsGpu(s)) {
-            try @import("../hc_kernels.zig").probeIdentity(s, config.hc_mult, config.dim);
-            if (config.hc_mult == 4 and mlx.engine.side(.{s}) == .engine) try @import("hy4_hc.zig").probeForms(s, @intCast(config.dim));
-        }
+        if (fwd.hc_kernels_on and mlx.streamIsGpu(s)) try @import("../hc_kernels.zig").probeIdentity(s, config.hc_mult, config.dim);
         {
             const host = mlx.engine.enter(s);
             defer host.end();
