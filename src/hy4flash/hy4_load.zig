@@ -133,6 +133,7 @@ pub fn warmUbench(allocator: std.mem.Allocator, xfm: *@import("../trunk.zig").Tr
     dflyProbe(allocator, xfm, kv, std.mem.sliceTo(raw, 0), tok) catch |err| log.warn("[dfly-probe] failed: {s}\n", .{@errorName(err)});
 }
 
+/// The prefill meter's mark (`arch/load.zig` `ubenchMark`): the model's state after its `_KV` tokens.
 pub fn ubenchMark(xfm: *@import("../trunk.zig").Trunk) !bool {
     const st = &xfm.arch_state.hy4flash;
     const m = st.model orelse return false;
@@ -140,6 +141,7 @@ pub fn ubenchMark(xfm: *@import("../trunk.zig").Trunk) !bool {
     return true;
 }
 
+/// Back to the meter's mark, the forward's step with it.
 pub fn ubenchRollback(xfm: *@import("../trunk.zig").Trunk, ctx: *@import("../trunk.zig").ForwardCtx) !void {
     const st = &xfm.arch_state.hy4flash;
     const m = st.model orelse return error.Hy4ModelMissing;
@@ -148,6 +150,7 @@ pub fn ubenchRollback(xfm: *@import("../trunk.zig").Trunk, ctx: *@import("../tru
     ctx.cache.step = m.pos;
 }
 
+/// Frees the meter's mark.
 pub fn ubenchDropMark(xfm: *@import("../trunk.zig").Trunk) void {
     const st = &xfm.arch_state.hy4flash;
     if (st.ubench_mark) |*mk| {

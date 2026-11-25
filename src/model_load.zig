@@ -3140,6 +3140,7 @@ pub fn meterPrefill(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("mo
     return meterPrefillChunk(allocator, xfm, ctx, tokens, 2048);
 }
 
+/// `meterPrefill` in chunks of `chunk_max`.
 fn meterPrefillChunk(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("model_handle.zig").ForwardCtx, tokens: usize, chunk_max: usize) !usize {
     const stride = @max(1, chunk_max);
     const ids = try allocator.alloc(i32, @min(stride, @max(1, tokens)));
@@ -3162,8 +3163,9 @@ fn meterPrefillChunk(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("m
 }
 
 /// DIAGNOSTIC (SUSHI_PREFILL_UBENCH=N): N cold one-chunk prefills per arm at load, each from an
-/// empty cache, logits never projected (the chunk loop never reads them). `_ROWS` (default 2025)
-/// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
+/// empty cache, logits never projected (the chunk loop never reads them), or with `_KV=<n>` each after n tokens (an
+/// arch that marks its state rolls back to the mark between chunks; any other prefills them again, untimed).
+/// `_ROWS` (default 2025) is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
 /// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body, or with
 /// `_LEVER=decoded` 0 on the trunk's sorted GEMM instead of its decoded path.
 pub const PrefillUbenchOpts = struct {
@@ -3176,6 +3178,7 @@ pub const PrefillUbenchOpts = struct {
     quiet: bool = false,
 };
 
+/// Where the meter's last timed chunk started and ended, and how many chunks ran (warm-up included).
 pub const PrefillUbenchResult = struct {
     last_start_pos: usize = 0,
     last_end_pos: usize = 0,
@@ -3208,6 +3211,7 @@ fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig,
     };
 }
 
+/// The prefill meter's run: `opts.n` timed chunks of `opts.rows` per arm, each after `opts.kv` tokens.
 pub fn runPrefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, tok: ?*Tokenizer, opts: PrefillUbenchOpts) !PrefillUbenchResult {
     const tio = std.Io.Threaded.global_single_threaded.io();
     const n = @max(1, opts.n);

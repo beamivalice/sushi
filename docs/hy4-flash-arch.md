@@ -318,6 +318,10 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     kernel's sum, a key on 16 lanes (one head each, its dot in channel order) and the heads summed in order by the
     key's first lane. It replaces the query rope, the rotated f32 copy of every pooled key each token made, and the
     shared kernel's one thread a key (4 threadgroups at 1,024 groups). Seam `fwd.index_kernel_on`.
+  - A prefill span's scores are one tiled launch (`hy4_index.wideScores`, f32): 8 rows by 32 keys a threadgroup, the
+    queries and keys staged 16 channels at a time and each head's dot summed in channel order, so a score is
+    `sparse.indexScores`' bytes; a tile past every row's seen groups writes −∞ and reads nothing. The shared kernel
+    re-read a row's queries for every key, and its share of a chunk grows with the context.
   - The top-k writes each pick's group, key rows and keep flags where `recallGroups` and `recalledRows` write them
     (`hy4_index.pick`, `sparse.TOPK_BODY`), while it stays one threadgroup a row: one launch, not three. The picks
     do not depend on its thread count (`hy4_index.pick_tg`, a seam for timing it).

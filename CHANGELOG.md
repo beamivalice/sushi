@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Hy4-Flash prefills long prompts faster at the same output**: a chunk scores its indexer's groups in one tiled
+  launch, byte for byte, the part of a chunk that grows with its context.
 - **Sushibar's loading icon moves while a model loads**: the fish's orange sweeps toward its top right and back as
   the green slot blinks; under Reduce motion it stays still.
 - **Sushibar's menu bar icon lights its disk slot green whenever a server answers**: a dark-set green bar replaces the

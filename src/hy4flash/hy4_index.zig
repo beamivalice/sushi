@@ -264,8 +264,9 @@ pub fn pick(s: mlx.mlx_stream, scores_: Arr, k: c_int, p0: c_int, n: c_int, rati
     return .{ .groups = out[0], .rows = out[1], .keep = out[2] };
 }
 
-pub var wide_scores_on = true;
-
+// 8 rows by 32 keys a threadgroup (a simdgroup a row, a lane a key), the queries and keys staged 16 channels at a
+// time: each head's dot sums its channels in order, as `sparse.indexScores` does, so the bytes are its. A tile past
+// every row's seen groups writes -inf and reads nothing.
 const wide_score_source: [:0]const u8 =
     \\constexpr int QL = 8, KN = 32, BK = 16, TG = 256, BK4 = BK / 4, IH4 = IH / 4;
     \\const int l0 = int(threadgroup_position_in_grid.y) * QL;
@@ -376,8 +377,10 @@ fn buildWide(k: WideKey) !kcfg.Config {
     return cfg;
 }
 
+/// Whether `wideScores` serves `q` [T, heads, dim] against `keys` [groups, dim] with head weights `w` [T, heads]:
+/// f32, a GPU stream, heads in fours up to 32, dim in sixteens.
 pub fn wideScoresApply(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr) bool {
-    if (!wide_scores_on or !mlx.streamIsGpu(s)) return false;
+    if (!mlx.streamIsGpu(s)) return false;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(keys);
     const ws = mlx.getShape(w);
@@ -387,6 +390,8 @@ pub fn wideScoresApply(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr) bool {
     return mlx.mlx_array_dtype(q) == .float32 and mlx.mlx_array_dtype(keys) == .float32 and mlx.mlx_array_dtype(w) == .float32;
 }
 
+/// `sparse.indexScores` of a prefill span, its bytes, as one tiled launch: each row's score of every group it sees
+/// (from `p0`, `ratio` tokens a group), -inf past them.
 pub fn wideScores(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, wscale: f32, p0: i32, ratio: usize) !Arr {
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(keys);

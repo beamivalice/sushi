@@ -15,6 +15,7 @@ pub const State = struct {
     drafter: ?hy4_dfly.Drafter = null,
     /// A DSpark round's open verify: the state before the block and the block's ids (`hy4_dspark`).
     verify: ?Verify = null,
+    /// The prefill meter's mark (`SUSHI_PREFILL_UBENCH_KV`), each timed chunk rolled back to it.
     ubench_mark: ?hy4_model.Model.Mark = null,
 
     pub const Verify = struct { mark: ?hy4_model.Model.Mark = null, ids: [16]u32, n: usize };
