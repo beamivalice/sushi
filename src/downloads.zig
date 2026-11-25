@@ -1314,6 +1314,7 @@ test "downloads: a pull whose files finished as the server stops ends done and r
 }
 
 test "downloads: a Stop sent while the finished pull's pack is being registered is refused as too late, not answered stopped" {
+    start();
     const io = testing.io;
     const md = @import("model_discovery.zig");
     var tmp = testing.tmpDir(.{ .iterate = true });
@@ -1365,6 +1366,7 @@ test "downloads: a Stop sent while the finished pull's pack is being registered 
 }
 
 test "downloads: a Stop that lands as the last file verifies ends the job stopped, with its pack not registered" {
+    start();
     const io = testing.io;
     const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
     defer reg.deinit();
