@@ -16,7 +16,7 @@ test "hy4 plan: a served request on the pool yields each forward's real trace, e
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(hy4_contract, dir, true);
+    try ld.openLight(hy4_contract, dir, true);
     defer _ = ld.close();
     // The pool's traces: the load's one-row forwards off the arena for this request.
     const m = ld.xfm.arch_state.hy4flash.model.?;
@@ -103,7 +103,7 @@ test "hy4 plan: a dry decode asks what the real decode asks, ask for ask, death 
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -137,7 +137,7 @@ test "hy4 plan: on the host embedding gather an M1 or M2 load takes, a dry decod
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -215,7 +215,7 @@ test "hy4 plan: a GPU that refuses one form's wide mix and grants the rest: the 
         hy4_hc.forgetGrants();
     }
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -258,7 +258,7 @@ test "hy4 plan: a dry state of n rows, made without the forwards that reach it, 
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(Resident, dir, true);
+        try ld.openLight(Resident, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -306,7 +306,7 @@ test "hy4 plan: a request's state is reserved at its own reach: a smaller reach 
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(Resident, dir, true);
+        try ld.openLight(Resident, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -474,7 +474,7 @@ fn quietOn(env: [:0]const u8, drafts: bool) !?bool {
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    if (drafts) try ld.open(Drafting, dir, true) else try ld.open(Resident, dir, true);
+    if (drafts) try ld.openLight(Drafting, dir, true) else try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -609,7 +609,7 @@ test "hy4 plan: a resident load plans its one-row forwards, and each runs on the
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(Resident, dir, true);
+        try ld.openLight(Resident, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -798,7 +798,7 @@ test "hy4 plan: a one-row forward on the arena orders its dispatches with the po
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(Resident, dir, true);
+        try ld.openLight(Resident, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -863,7 +863,7 @@ test "hy4 plan: a load that drafts plans its verify blocks of 2 to 8 rows, and e
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(Drafting, dir, true);
+        try ld.openLight(Drafting, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -918,7 +918,7 @@ test "hy4 plan: a load whose STQ experts the stream holds resident plans its one
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(ResidentInStream, dir, true);
+        try ld.openLight(ResidentInStream, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -959,7 +959,7 @@ test "hy4 plan: a streamed load plans its one-row forwards, and each runs on the
             const ids = try hy4_contract.prompt(a, dir);
             defer a.free(ids);
             var ld: contract.Load = undefined;
-            try ld.open(StreamedCache(case[1]), dir, true);
+            try ld.openLight(StreamedCache(case[1]), dir, true);
             defer _ = ld.close();
             const turn = hy4_contract.openTurn(ld.h, &ld.config);
             defer turn.end();
@@ -994,7 +994,7 @@ test "hy4 plan: a streamed load with --expert-cache-bias plans its one-row forwa
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(BiasedCache(200_000), dir, true);
+    try ld.openLight(BiasedCache(200_000), dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1039,7 +1039,7 @@ test "hy4 plan: a load that drafts plans DFly2's draft, and at every depth the p
         const ids = try hy4_contract.prompt(a, dir);
         defer a.free(ids);
         var ld: contract.Load = undefined;
-        try ld.open(Drafting, dir, true);
+        try ld.openLight(Drafting, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -1086,7 +1086,7 @@ test "hy4 plan: a drafting load whose context is narrower than a verify block or
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Drafting, dir, true);
+    try ld.openLight(Drafting, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1242,7 +1242,7 @@ test "hy4 plan: a DSpark round's mark and replay ask nothing of a closed pool: a
         if (!@import("hy4_load.zig").shipsHead(std.Io.Threaded.global_single_threaded.io(), a, dir)) continue;
         ran = true;
         var ld: contract.Load = undefined;
-        try ld.open(Drafting, dir, true);
+        try ld.openLight(Drafting, dir, true);
         defer _ = ld.close();
         const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
         defer turn.end();
@@ -1400,7 +1400,7 @@ test "hy4 plan: served DSpark rounds give the pool's tokens and state, each roun
         if (!@import("hy4_load.zig").shipsHead(std.Io.Threaded.global_single_threaded.io(), a, dir)) continue;
         ran = true;
         var ld: contract.Load = undefined;
-        try ld.open(Drafting, dir, true);
+        try ld.openLight(Drafting, dir, true);
         defer _ = ld.close();
         const turn = hy4_contract.openTurn(ld.h, &ld.config);
         defer turn.end();
@@ -1438,7 +1438,7 @@ test "hy4 plan: a one-row forward whose shape no probe recorded is refused by na
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1486,7 +1486,7 @@ test "hy4 plan: a load plans the shapes earlier misses kept beside its manifest,
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1582,7 +1582,7 @@ test "hy4 plan: a forward at another KV width than the load planned, or one that
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1630,7 +1630,7 @@ test "hy4 plan: a forward that splices an image's rows moves the request's splic
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1762,7 +1762,7 @@ test "hy4 plan: a round that reads out more rows than the logits blocks hold is 
     const ids = try hy4_contract.prompt(a, dir);
     defer a.free(ids);
     var ld: contract.Load = undefined;
-    try ld.open(Drafting, dir, true);
+    try ld.openLight(Drafting, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
@@ -1804,7 +1804,7 @@ test "hy4 plan: prefill ubench honours kv context and rolls back between iterati
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
     var ld: contract.Load = undefined;
-    try ld.open(Resident, dir, true);
+    try ld.openLight(Resident, dir, true);
     defer _ = ld.close();
     const turn = hy4_contract.openTurn(ld.h, &ld.config);
     defer turn.end();
