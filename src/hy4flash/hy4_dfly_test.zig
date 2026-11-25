@@ -1,6 +1,7 @@
 //! DFly2 (part 1x) on the tiny: `HY4_BF16_TINY_STQ` (beamster test-fixtures/hy4-bf16-tiny-stq), whose drafter tensors
 //! are random in the release's names and shapes. A random drafter drafts near-misses; what these hold is what any
-//! drafter must: it reads the target and never writes it, and rounds of it give the serial run's tokens.
+//! drafter's machinery must. That rounds of it give the serial run's tokens is the served contract's
+//! ("cooler contract: a served Hy4 STQ request with DFly2 says its serial tokens greedy and seeded").
 const std = @import("std");
 const testing = std.testing;
 const mlx = @import("../mlx.zig");
@@ -55,114 +56,6 @@ fn prompt(vocab: u32) [24]u32 {
     return ids;
 }
 
-test "hy4 dfly: the drafter loads the tiny's DFly2 tensors and drafts a block from the target's state without writing it, the same block twice (HY4_BF16_TINY_STQ)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const was = engineOn();
-    defer @import("../test_support.zig").restoreEngine(was);
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    var f = try Fixture.open(es);
-    defer f.w.deinit();
-    const ids = prompt(f.config.vocab);
-    var o: Ops = .{ .s = es };
-    defer o.deinit();
-    // The target's next row without a drafter, for the comparison.
-    const plain = blk: {
-        const m = try hy4_model.Model.init(a, f.config, &f.w, es);
-        defer m.deinit();
-        const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
-        break :blk .{ t1, try hostOf(&o, try o.own(try m.forwardReadout(&.{t1}, .last))) };
-    };
-    const m = try hy4_model.Model.init(a, f.config, &f.w, es);
-    defer m.deinit();
-    var d = try hy4_dfly.Drafter.init(a, m, &f.w);
-    defer d.deinit();
-    const t1 = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
-    try testing.expectEqual(plain[0], t1);
-    var b1 = try d.draft(m, t1);
-    defer b1.deinit();
-    var b2 = try d.draft(m, t1);
-    defer b2.deinit();
-    try testing.expectEqual(@as(usize, f.config.dfly.draft + 1), b1.ids.len);
-    try testing.expectEqual(t1, b1.ids[0]);
-    try testing.expectEqualSlices(u32, b1.ids, b2.ids);
-    try testing.expectEqualSlices(f32, b1.conf, b2.conf);
-    for (b1.ids[1..], b1.conf) |id, cf| {
-        try testing.expect(id < f.config.vocab);
-        try testing.expect(cf > 0 and cf < 1);
-    }
-    // The target as it stood: its position, history and next row's logits.
-    try testing.expectEqual(@as(usize, ids.len), m.pos);
-    try testing.expectEqual(@as(usize, ids.len), m.history.items.len);
-    try testing.expectEqualSlices(f32, plain[1], try hostOf(&o, try o.own(try m.forwardReadout(&.{t1}, .last))));
-}
-
-test "hy4 dfly: greedy rounds (draft a block, verify it, keep the agreed prefix, roll back the rest) give the serial run's tokens, rounds of every accepted count (HY4_BF16_TINY_STQ)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const was = engineOn();
-    defer @import("../test_support.zig").restoreEngine(was);
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    var f = try Fixture.open(es);
-    defer f.w.deinit();
-    const ids = prompt(f.config.vocab);
-    var o: Ops = .{ .s = es };
-    defer o.deinit();
-    const n_out = 24;
-    var serial: [n_out]u32 = undefined;
-    {
-        const m = try hy4_model.Model.init(a, f.config, &f.w, es);
-        defer m.deinit();
-        var next = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
-        for (&serial) |*tok| {
-            tok.* = next;
-            next = try argmaxLast(&o, try o.own(try m.forwardReadout(&.{next}, .last)));
-        }
-    }
-    const m = try hy4_model.Model.init(a, f.config, &f.w, es);
-    defer m.deinit();
-    var d = try hy4_dfly.Drafter.init(a, m, &f.w);
-    defer d.deinit();
-    var out: std.ArrayList(u32) = .empty;
-    defer out.deinit(a);
-    var counts: [8]usize = @splat(0);
-    var pending = try argmaxLast(&o, try o.own(try m.forwardReadout(&ids, .last)));
-    while (out.items.len < n_out) {
-        var block = try d.draft(m, pending);
-        defer block.deinit();
-        // A random drafter rarely agrees: every few rounds the block's drafts are the serial tokens themselves, so
-        // the rounds reach every accepted count.
-        const k = out.items.len;
-        const forced = (counts[0] + counts[1] + counts[2] + counts[3] + counts[4] + counts[5]) % 3 == 1;
-        if (forced) for (block.ids[1..], 1..) |*v, i| {
-            v.* = if (k + i < n_out) serial[k + i] else serial[n_out - 1];
-        };
-        var mk = try m.mark();
-        defer m.dropMark(&mk);
-        const logits = try o.own(try m.forwardReadout(block.ids, .all));
-        var accepted: usize = 0;
-        var verdict: u32 = 0;
-        for (0..block.ids.len) |r| {
-            verdict = try argmaxLast(&o, try o.slice(logits, 0, 0, @intCast(r + 1)));
-            if (r + 1 < block.ids.len and verdict == block.ids[r + 1]) accepted += 1 else break;
-        }
-        try m.rollbackTo(&mk, block.ids[0 .. 1 + accepted]);
-        try out.appendSlice(a, block.ids[0 .. 1 + accepted]);
-        counts[@min(accepted, 7)] += 1;
-        pending = verdict;
-    }
-    try testing.expectEqualSlices(u32, &serial, out.items[0..n_out]);
-    // Rounds of none accepted and of more than one.
-    try testing.expect(counts[0] > 0);
-    var multi: usize = 0;
-    for (counts[2..]) |n| multi += n;
-    try testing.expect(multi > 0);
-}
-
 test "hy4 dfly probe: the acceptance probe scores a block at every k-th position whose drafts the greedy run covers, and leaves the model reset (HY4_BF16_TINY_STQ)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -185,12 +78,6 @@ test "hy4 dfly probe: the acceptance probe scores a block at every k-th position
     try testing.expectEqual(@as(usize, 4), tally.reached[0]);
     try testing.expectEqual(@as(usize, 0), m.pos);
     try testing.expectEqual(@as(usize, 0), m.history.items.len);
-}
-
-fn hostOf(o: *Ops, a: Arr) ![]const f32 {
-    const c = try o.contiguous(try o.cast(a, .float32));
-    try mlx.check(mlx.mlx_array_eval(c));
-    return mlx.mlx_array_data_float32(c).?[0..mlx.mlx_array_size(c)];
 }
 
 test "hy4 dfly: a draft whose confidence rows cannot be read to the host leaves nothing allocated" {
