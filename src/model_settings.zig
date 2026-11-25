@@ -29,7 +29,7 @@ pub const default_max_request_mb: u32 = 128;
 pub const max_request_mb_limit: u32 = 1024;
 /// The safety margin under the GPU memory limit, in GiB: `--wired-margin-gib` and `server.wired_margin_gib` share it.
 pub const default_wired_margin_gib: u32 = 1;
-pub const wired_margin_gib_min: u32 = 1;
+pub const wired_margin_gib_min: u32 = 0;
 pub const wired_margin_gib_max: u32 = 32;
 
 /// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
@@ -1343,7 +1343,8 @@ test "model_settings: server.wired_margin_gib reads an integer from the lowest t
     for ([_]struct { value: []const u8, want: ?u32 }{
         .{ .value = "1", .want = 1 },
         .{ .value = "32", .want = 32 },
-        .{ .value = "0", .want = null },
+        .{ .value = "0", .want = 0 },
+        .{ .value = "-1", .want = null },
         .{ .value = "33", .want = null },
         .{ .value = "1.5", .want = null },
         .{ .value = "\"4\"", .want = null },

@@ -50,7 +50,7 @@ pub const Options = struct {
     ssd_prefetch: ?u8 = null,
     pick_tolerance: f32 = 0,
     cache_bias: f32 = 0,
-    wired_margin_bytes: u64 = 0,
+    wired_margin_bytes: ?u64 = null,
     /// `--mtp` / `--no-mtp`; null = not given (the head stays off).
     mtp: ?bool = null,
     /// `SUSHI_HIDDEN_OUT`: capture appends each prompt forward's block boundaries here.
@@ -986,7 +986,7 @@ pub fn cmdKld(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8
     if (opts.layer_major) return error.LayerMajorNeedsNativeGlmTeacher;
     expert_stream_mod.pick_tolerance = opts.pick_tolerance;
     if (opts.cache_bias > 0) @import("model_settings.zig").expert_cache_bias_flag = opts.cache_bias;
-    if (opts.wired_margin_bytes > 0) server_state.wired_margin_flag_bytes = opts.wired_margin_bytes;
+    if (opts.wired_margin_bytes) |b| server_state.wired_margin_flag_bytes = b;
     var margin_buf: [192]u8 = undefined;
     if (@import("bills.zig").wiredMarginRefusal(&margin_buf, @import("bills.zig").ceilingNow())) |why| {
         log.err("sushi kld: {s}\n", .{why});
@@ -1099,9 +1099,10 @@ test "kld: the argument parser reads every flag and refuses an unknown one" {
     try testing.expectEqual(@as(f32, 0.2), biased.cache_bias);
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-cache-bias", "2.5" }));
     try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-cache-bias", "0.2" }));
-    try testing.expectEqual(@as(u64, 5) << 30, routed.wired_margin_bytes);
+    try testing.expectEqual(@as(?u64, 5 << 30), routed.wired_margin_bytes);
     try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--expert-pick-tolerance", "0.7" }));
-    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "0" }));
+    try testing.expectEqual(@as(?u64, 0), (try parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "0" })).wired_margin_bytes);
+    try testing.expectError(error.BadFlagValue, parseArgs(&.{ "compare", "--model", "/m", "--fixture", "/f", "--wired-margin-gib", "33" }));
 
     try testing.expectError(error.TeacherMustBeLossless, parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-pick-tolerance", "0.3" }));
     const exact_capture = try parseArgs(&.{ "capture", "--model", "/m", "--prompts", "/p", "--out", "/o", "--expert-pick-tolerance", "0" });

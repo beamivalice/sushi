@@ -4091,6 +4091,9 @@ test "the declared ceiling reads the safety margin at call time: the saved value
     try t.expectEqual(limit - 8 * gib, ceilingNow().floor().?);
     launch_state.setWiredMarginFile(2);
     try t.expectEqual(limit - 2 * gib, ceilingNow().floor().?);
+    // A saved margin of 0 is a margin of 0, not the default.
+    launch_state.setWiredMarginFile(0);
+    try t.expectEqual(@as(u64, 0), launch_state.wiredMarginBytes());
     launch_state.wired_margin_flag_bytes = 4 * gib;
     try t.expectEqual(limit - 4 * gib, ceilingNow().floor().?);
 }
@@ -4822,14 +4825,14 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
     try testing.expect(with_reserve > 1024);
 }
 
-test "parseWiredMarginGib accepts 1..32 and names a bad value" {
+test "parseWiredMarginGib accepts 0..32 and names a bad value" {
     const t = std.testing;
     try t.expectEqual(@as(u64, 1) << 30, try parseWiredMarginGib("1"));
     try t.expectEqual(@as(u64, 8) << 30, try parseWiredMarginGib("8"));
     try t.expectEqual(@as(u64, 6) << 30, try parseWiredMarginGib("6"));
     try t.expectEqual(@as(u64, 2) << 30, try parseWiredMarginGib("2"));
     try t.expectEqual(@as(u64, 32) << 30, try parseWiredMarginGib("32"));
-    try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("0"));
+    try t.expectEqual(@as(u64, 0), try parseWiredMarginGib("0"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("33"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("nope"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib(""));

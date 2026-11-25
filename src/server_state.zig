@@ -298,18 +298,20 @@ pub const WIRED_LIMIT_MARGIN_BYTES: u64 = @as(u64, model_settings.default_wired_
 /// `--wired-margin-gib` in bytes; null = not given. It outranks the saved `server.wired_margin_gib`.
 pub var wired_margin_flag_bytes: ?u64 = null;
 
-/// The saved `server.wired_margin_gib`, 0 = none. The settings API sets it while serving.
-var wired_margin_file_gib = std.atomic.Value(u32).init(0);
+/// The saved `server.wired_margin_gib`, `no_wired_margin_file` = none (0 is a margin). The settings API sets it while
+/// serving.
+const no_wired_margin_file = std.math.maxInt(u32);
+var wired_margin_file_gib = std.atomic.Value(u32).init(no_wired_margin_file);
 
 pub fn setWiredMarginFile(gib: ?u32) void {
-    wired_margin_file_gib.store(gib orelse 0, .monotonic);
+    wired_margin_file_gib.store(gib orelse no_wired_margin_file, .monotonic);
 }
 
 /// What stays unplanned under a raised wired limit: flag, else the saved value, else the default. Every reader asks at
 /// the moment it plans, so a save reaches the next request and the next load.
 pub fn wiredMarginBytes() u64 {
     const file = wired_margin_file_gib.load(.monotonic);
-    return settings_resolve.resolve(u64, wired_margin_flag_bytes, if (file > 0) @as(u64, file) << 30 else null, WIRED_LIMIT_MARGIN_BYTES).value;
+    return settings_resolve.resolve(u64, wired_margin_flag_bytes, if (file != no_wired_margin_file) @as(u64, file) << 30 else null, WIRED_LIMIT_MARGIN_BYTES).value;
 }
 
 // Numeric slot diagnostics cross to error mapping only on this connection's thread.

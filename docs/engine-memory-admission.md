@@ -27,7 +27,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   healthy inputs = MEMORY symptom.
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
-- `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- `--wired-margin-gib` (default 1, integers 0..32; 0 plans to the limit less the GPU floor alone) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
   `server.wired_margin_gib` (Settings > GPU memory, same range) saves it; the flag outranks it. Every reader asks
   `server_state.wiredMarginBytes()` as it plans, never a boot copy, so a save reaches the next request and the next load.
   It binds only under a declared GPU limit; with none set it only moves the default SSD budget, and the Settings row says so.

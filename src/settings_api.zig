@@ -1373,17 +1373,17 @@ test "settings api: request size limit accepts MiB or null and rejects invalid v
     }
 }
 
-test "settings api: wired_margin_gib accepts 1..32 or null and rejects every other value" {
+test "settings api: wired_margin_gib accepts 0..32 or null and rejects every other value" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const plan = parseRequest(arena_state.allocator(), "{\"server\":{\"wired_margin_gib\":8}}");
     try testing.expectEqual(@as(i64, 8), plan.ok.server_edits[0].value.?.integer);
     try testing.expect(parseRequest(arena_state.allocator(), "{\"server\":{\"wired_margin_gib\":null}}").ok.server_edits[0].value == null);
-    for ([_][]const u8{ "1", "32" }) |value| {
+    for ([_][]const u8{ "0", "1", "32" }) |value| {
         const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"wired_margin_gib\":{s}}}}}", .{value});
         try testing.expect(parseRequest(arena_state.allocator(), body) == .ok);
     }
-    for ([_][]const u8{ "0", "-1", "33", "1.5", "\"4\"", "true" }) |value| {
+    for ([_][]const u8{ "-1", "33", "1.5", "\"4\"", "true" }) |value| {
         const body = try std.fmt.allocPrint(arena_state.allocator(), "{{\"server\":{{\"wired_margin_gib\":{s}}}}}", .{value});
         try expectRejected(body, 400, "invalid_setting");
     }

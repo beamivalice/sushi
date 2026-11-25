@@ -19,6 +19,7 @@ earlier history is mlx-serve's, in that project's changelog.
   the green slot blinks; under Reduce motion it stays still.
 - **Sushibar's menu bar icon lights its disk slot green whenever a server answers**: a dark-set green bar replaces the
   black slot on the no-model, loading and ready icons, and the no-model icon draws the striped fish of the offline one.
+- **`--wired-margin-gib` takes 0**: the Cooler bill holds the exact bytes a load and its requests use, so a raised `iogpu.wired_limit_mb` can be planned to without a spare gibibyte; the default stays 1, as does `server.wired_margin_gib`'s.
 - **A Hy4-Flash load with `--ctx-size` plans only to that context**: its plans and the prefill region it measures were recorded to the model's 1M-token cap whatever the context, holding arena and load time no request could use.
 - **Hy4-Flash on an M1 or M2 Mac stops re-decoding its embedding for every token**: each prefill chunk and decode step decoded its tokens' 128-id embedding blocks on the CPU again; the gather now keeps the last 64 MiB of decoded blocks, with the same output.
 - **A Hy4-Flash load on an M1 or M2 Mac plans in seconds, not minutes**: the load's dry plan recordings decoded the STQ embedding on the CPU for every forward, though a dry pass reads no value; they now skip it.
