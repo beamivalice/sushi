@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A prompt restored from the prompt cache shows how much is already read**: sushibar, the web UI and
+  `return_progress` read 0% for a prompt mostly restored from the cache, and no prompt's progress reached 100% before
+  its first token; it now starts at the restored share and ends at the whole prompt.
 - **A launch the wired margin leaves no GPU memory says why, with its numbers**: the refusal of a declared
   `iogpu.wired_limit_mb` that the margin, the GPU floor or the 512 MB slack fills printed a short line naming no
   number; it now names what keeps the memory, the margin, the floor and the RAM. The `[warm]` line names it once.

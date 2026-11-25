@@ -1214,9 +1214,9 @@ pub const Generator = struct {
         /// Total tokens this prefill will forward (post-cache tail, same scale
         /// as `prefill_progress`), published once; null on the bypass engines.
         prefill_expected: ?*std.atomic.Value(u64) = null,
-        /// Per-slot live prefill progress (`scheduler.Slot.PrefillProgress`), stored once per chunk like
-        /// `prefill_progress` above: absolute prompt tokens processed (the restored prefix included, so it climbs to
-        /// the whole prompt) and the prefill's forwarding milliseconds so far. Null unless a `return_progress` stream
+        /// Per-slot live prefill progress (`scheduler.Slot.PrefillProgress`), stored once per chunk and once the final
+        /// span is forwarded: absolute prompt tokens processed (the restored prefix included, so it ends at the whole
+        /// prompt) and the prefill's forwarding milliseconds so far. Null unless a `return_progress` stream
         /// or the metrics' live rows read it, so an unwatched prefill stores nothing.
         prefill_progress_abs: ?*std.atomic.Value(u64) = null,
         prefill_progress_ms: ?*std.atomic.Value(u64) = null,
@@ -1943,6 +1943,8 @@ pub const Generator = struct {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        if (options.prefill_progress_abs) |p| p.store(@intCast(prompt_ids.len + ssm_cp_offset), .monotonic);
+        if (options.prefill_progress_ms) |p| p.store(prefill_sw.read() / std.time.ns_per_ms, .monotonic);
         // The prefill's last logits are this function's until a path frees them or hands them to the Generator.
         var held = raw_logits;
         errdefer if (held.ctx != null) {

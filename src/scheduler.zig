@@ -254,18 +254,19 @@ pub const NextResult = union(enum) {
 };
 
 /// Live prefill progress, written only while someone reads it: a `return_progress` stream or the metrics' live rows.
-/// The inference thread's chunk loop stores it once per chunk (`generate.InitOptions` `prefill_progress_abs` /
+/// The prefix lookup starts `processed` at the restored prefix; the inference thread stores it once per chunk and once
+/// the final span is forwarded (`generate.InitOptions` `prefill_progress_abs` /
 /// `prefill_progress_ms`) and wakes a `return_progress` reader (`notePrefillProgress`), which ships a llama.cpp-shaped
 /// `prompt_progress` chunk at most every `PROGRESS_INTERVAL_MS`. Atomic because the two threads meet here without any
 /// lock the prefill could wait on.
 pub const PrefillProgress = struct {
-    /// Absolute prompt tokens processed: the restored prefix plus the tail the
-    /// chunk loop has forwarded so far.
+    /// Absolute prompt tokens processed: the restored prefix plus the tail
+    /// forwarded so far, never below `cache`.
     processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Wall-clock milliseconds the prefill has spent forwarding, as of `processed`.
     elapsed_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Prompt tokens the prefix lookup restored, published once before the
-    /// chunk loop starts.
+    /// chunk loop starts (0 from the prefill's entry until then).
     cache: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
@@ -3745,7 +3746,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in
-    // generate.zig stores absolute progress into `inflight_prefill_tokens`.
+    // generate.zig stores the forwarded tail into `inflight_prefill_tokens`.
     //
     // Gated on `--metrics`, per the observability contract: when it's off the
     // prefill path executes NO extra instruction at all (the chunk loop's hook
@@ -3769,6 +3770,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     try @import("static_bill.zig").admit(slot);
     const watch_prefill = slot.return_progress or observe;
     if (watch_prefill) {
+        slot.prefill_progress.cache.store(0, .monotonic);
         slot.prefill_progress.processed.store(0, .monotonic);
         slot.prefill_progress.elapsed_ms.store(0, .monotonic);
     }
@@ -3907,7 +3909,10 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             }
             // The `return_progress` reader counts from the restored prefix on;
             // published once, before the chunk loop stores its first chunk.
-            if (watch_prefill) slot.prefill_progress.cache.store(hot_matched, .monotonic);
+            if (watch_prefill) {
+                slot.prefill_progress.processed.store(hot_matched, .monotonic);
+                slot.prefill_progress.cache.store(hot_matched, .monotonic);
+            }
             // The entry this request restored off may be evicted before it commits, so the fork
             // keeps its own restore point; a full reuse is covered by the prompt end.
             if (hot_matched >= prefix_cache_mod.RING_RESTORE_MIN_TOKENS and !lookup.full_match and slot.ring_cps.fork == null) {

@@ -525,3 +525,88 @@ test "hy4 ledger: a fixed context the seal's lines no longer hold refuses the lo
         }
     }.run);
 }
+
+test "hy4 ledger: a request restored whole from its load's cache reports the prompt processed, not zero (HY4_STQ_TINY)" {
+    try contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            _ = try openOnLedger(&ld, C, dir);
+            defer _ = ld.close();
+            defer static_bill.close(&ld.config);
+            const l = ld.config.static_ledger.?;
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            const prompt = try a.alloc(u32, 600);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[(i * 5 + 1) % ids.len];
+            var restored: u32 = 0;
+            var first = try sv.request(prompt, 8, &restored);
+            first.deinit(a);
+            try testing.expectEqual(@as(u64, 0), l.of(.state));
+            var second = try sv.sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 8, .return_progress = true });
+            defer {
+                sv.sch.complete(second);
+                for (sv.sch.cleanup_queue.items) |s| s.deinit();
+                sv.sch.cleanup_queue.clearRetainingCapacity();
+            }
+            _ = sv.sch.pending.orderedRemove(0);
+            try Served.scheduler.runPrefill(&sv.sch, second);
+            const cache = second.prefill_progress.cache.load(.monotonic);
+            const processed = second.prefill_progress.processed.load(.monotonic);
+            errdefer std.debug.print("hy4 ledger: a restored prefill of {d} tokens published cache {d}, processed {d}, elapsed {d} ms\n", .{ prompt.len, cache, processed, second.prefill_progress.elapsed_ms.load(.monotonic) });
+            try testing.expect(cache > 0);
+            try testing.expect(cache <= processed);
+            try testing.expectEqual(@as(u64, prompt.len), processed);
+            try sv.sch.decoding.append(a, second);
+            var one = [_]*Served.scheduler.Slot{second};
+            if (second.joinsTick()) try Served.scheduler.runDecodeTick(&sv.sch, &one);
+            const after_tick = second.prefill_progress.processed.load(.monotonic);
+            errdefer std.debug.print("hy4 ledger: after the first decode of the restored request processed is {d} of {d} (cache {d})\n", .{ after_tick, prompt.len, cache });
+            try testing.expectEqual(@as(u64, prompt.len), after_tick);
+        }
+    }.run);
+}
+
+test "hy4 ledger: a cold prompt that spans chunks reports the whole prompt processed before its first token (HY4_STQ_TINY)" {
+    try contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const sr = @import("../settings_resolve.zig");
+            const saved_launch = sr.launch;
+            const saved_legacy = sr.prefill_chunk;
+            defer {
+                sr.launch = saved_launch;
+                sr.prefill_chunk = saved_legacy;
+            }
+            sr.launch.prefill_chunk_max = 512;
+            sr.launch.prefill_chunk_min = 512;
+            var ld: Load = undefined;
+            _ = try openOnLedger(&ld, C, dir);
+            defer _ = ld.close();
+            defer static_bill.close(&ld.config);
+            try testing.expectEqual(@as(u32, 512), ld.config.static_prefill_chunk);
+            var sv: Served = undefined;
+            try sv.initTiers(&ld, dir, 1 << 30);
+            defer sv.deinit();
+            const prompt = try a.alloc(u32, 600);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = ids[(i * 11 + 3) % ids.len];
+            var slot = try sv.sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 8, .return_progress = true });
+            defer {
+                sv.sch.complete(slot);
+                for (sv.sch.cleanup_queue.items) |s| s.deinit();
+                sv.sch.cleanup_queue.clearRetainingCapacity();
+            }
+            _ = sv.sch.pending.orderedRemove(0);
+            try Served.scheduler.runPrefill(&sv.sch, slot);
+            const cache = slot.prefill_progress.cache.load(.monotonic);
+            const processed = slot.prefill_progress.processed.load(.monotonic);
+            errdefer std.debug.print("hy4 ledger: a cold prefill of {d} tokens over chunks of {d} published cache {d}, processed {d}, elapsed {d} ms\n", .{ prompt.len, ld.config.static_prefill_chunk, cache, processed, slot.prefill_progress.elapsed_ms.load(.monotonic) });
+            try testing.expectEqual(@as(u64, 0), cache);
+            try testing.expectEqual(@as(u64, prompt.len), processed);
+            try testing.expectEqual(@as(usize, 0), slot.out_buf.items.len);
+        }
+    }.run);
+}
