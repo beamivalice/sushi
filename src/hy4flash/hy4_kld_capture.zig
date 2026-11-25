@@ -57,7 +57,7 @@ pub fn accepts(config: *const model.ModelConfig, opts: kld.Options) !bool {
     // The encoder's Hessians come from the stored rows; the imatrix file's writer cannot take an engine load's arrays.
     if (opts.imatrix_out.len > 0) return error.Hy4ImatrixCaptureUnsupported;
     if (opts.tokens != 1) return error.Hy4LayerMajorNeedsOneRow;
-    if (!opts.no_template or (opts.mtp orelse false) or opts.wired_margin_bytes != 0) return error.Hy4CaptureNeedsLosslessStreaming;
+    if (!opts.no_template or (opts.mtp orelse false) or (opts.wired_margin_bytes orelse 0) != 0) return error.Hy4CaptureNeedsLosslessStreaming;
     return true;
 }
 
@@ -205,6 +205,12 @@ test "kld: a hy_v4_flash layer-major capture takes one row a window of lossless 
     bad = ok;
     bad.no_template = false;
     try testing.expectError(error.Hy4CaptureNeedsLosslessStreaming, accepts(&cfg, bad));
+    // A wired margin is refused where one is given and is not zero; an omitted flag gives none.
+    var margin = ok;
+    margin.wired_margin_bytes = 0;
+    try testing.expect(try accepts(&cfg, margin));
+    margin.wired_margin_bytes = 1 << 30;
+    try testing.expectError(error.Hy4CaptureNeedsLosslessStreaming, accepts(&cfg, margin));
     bad = ok;
     bad.imatrix_windows = 8;
     try testing.expectError(error.Hy4ImatrixWindowsUnsupported, accepts(&cfg, bad));
