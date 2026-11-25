@@ -289,8 +289,8 @@ fn titleBase(buf: []u8, v: View) []const u8 {
     return text catch "";
 }
 
-/// The menu bar icon: the outline template while no server answers; once one does, the colour box alone (no model),
-/// with an outline fish (a model loading) or with the whole sushi (a model ready).
+/// The menu bar icon: the outline template while no server answers; once one does, the colour box with its slot lit
+/// green and a grey striped fish (no model), an orange-outlined fish (a model loading) or the whole sushi (a model ready).
 pub const Icon = enum { outline, empty, loading, ready };
 
 /// What `/v1/models` says of the watched server's model, as the header card reads it.
