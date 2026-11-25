@@ -38,9 +38,9 @@ bad() { echo "FAIL $1"; shift; for line in "$@"; do echo "  $line"; done; FAIL=$
 start_server() { # $1 = boot name, $2 = pack, rest = flags
     local name=$1 pack=$2
     shift 2
-    # --prefix-cache-entries 0: a warm restore re-runs the hybrid recurrence in another block size.
+    # --prefix-cache-mem off --prefix-cache-disk off: a warm restore re-runs the hybrid recurrence in another block size.
     # shellcheck disable=SC2086
-    sushi_boot "$name" "$pack" --prefix-cache-entries 0 --log-level info $EXTRA_ARGS "$@" || exit $?
+    sushi_boot "$name" "$pack" --prefix-cache-disk off --log-level info $EXTRA_ARGS "$@" || exit $?
     LOG="$SUSHI_LOG"
     PORT="$SUSHI_PORT"
 }

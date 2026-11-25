@@ -221,19 +221,17 @@ const shared =
     \\                        refused. Equal to the max, it pins every prompt to it
     \\                        and turns the per-chunk adaptive width off. Outranks
     \\                        the model's prefill_chunk_min setting.
-    \\  --max-concurrent <n>  Sizes the submit queue (n + 32). Requests batch at
-    \\                        any value, at least 1 (default: 1). Above the
-    \\                        default prefix-cache entry count it raises that
-    \\                        count to n; an explicit --prefix-cache-entries
-    \\                        below n is refused.
+    \\  --max-concurrent <n>  How many requests of each model run at once, at
+    \\                        least 1 (default: no limit; a value you set is
+    \\                        held to the model's own batch width). The next
+    \\                        one waits in the queue until a slot frees. It
+    \\                        outranks the model's max_concurrent setting; a
+    \\                        model that owns its decode state always serves
+    \\                        one at a time.
     \\  --prefill-decode-share <s>
     \\                      Target decode wall-time share during another
     \\                        request's prefill (0..0.9); never narrows
     \\                        chunks. Default 0.25.
-    \\  --prefix-cache-entries <n>
-    \\                      Prefix cache capacity in entries, for both the
-    \\                        RAM and SSD tiers (default: 32). 0 disables
-    \\                        all prefix reuse.
     \\  --prefix-cache-mem <n>{KB,MB,GB}
     \\                      Turn on RAM retention of idle prefix-cache
     \\                        entries with this KV-bytes budget (default:
@@ -242,8 +240,8 @@ const shared =
     \\                      Pass 0 (or off) to keep RAM retention off.
     \\  --prefix-cache-disk <n>{KB,MB,GB}
     \\                      SSD tier byte budget for the prefix cache
-    \\                        (default: on, min(entries x context x bytes
-    \\                        per token + 2GB, 20GB, free disk - 4GB)).
+    \\                        (default: on, min(32 x context x bytes per
+    \\                        token + 2GB, 20GB, free disk - 4GB)).
     \\                      Sizes are binary: 1GB = 1 GiB.
     \\                      Seen prefixes persist under ~/.sushi/kv-cache
     \\                        (SUSHI_PREFIX_CACHE_DIR) and are restored

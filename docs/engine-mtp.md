@@ -269,7 +269,7 @@ serve up to `SINGLE_VERIFY_ROWS_MAX` (9) rows. `dflash_policy.ladder()` is that 
   range there and every round reads the cap again, since a machine can lose its wide arm after the load), so the width
   a round takes cannot flip a greedy token.
 - `test_mtp_equivalence.sh` compares full output bytes with `--no-mtp` and acquits nothing
-  (`test_mtp_equivalence_strict.py`); its servers boot `--prefix-cache-entries 0`.
+  (`test_mtp_equivalence_strict.py`); its servers boot `--prefix-cache-disk off` (RAM retention is off by default).
 - **On the engine a sampled draft stands while it is the target's draw at its position** (`mtpDrawsAtPositions`: a draw
   root): draft and verify row j take the key of the position they predict (`sampler.shortlistDraw`,
   `sampler.verifyDraws`, the serial step's `engineDraws`), so every emitted token is the serial step's draw from its

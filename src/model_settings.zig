@@ -10,6 +10,7 @@ const log = @import("log.zig");
 const default_port = @import("default_port.zig");
 const effort = @import("effort.zig");
 const settings_resolve = @import("settings_resolve.zig");
+const sched_policy = @import("sched_policy.zig");
 
 const Source = settings_resolve.Source;
 
@@ -191,12 +192,17 @@ pub const Override = struct {
     /// The rows a static-bill load's prefill chunk is chosen within (`--prefill-chunk-max` / `--prefill-chunk-min`).
     prefill_chunk_max: ?u32 = null,
     prefill_chunk_min: ?u32 = null,
+    /// How many requests of this model run at once; null takes the launch `--max-concurrent`, else 1.
+    max_concurrent: ?u32 = null,
+    /// The most prompt + max_tokens this model's live and retained slots may hold; null/0 = no cap.
+    max_kv_tokens: ?u64 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
             o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null and o.expert_cache_bias == null and
-            o.prefill_chunk_max == null and o.prefill_chunk_min == null;
+            o.prefill_chunk_max == null and o.prefill_chunk_min == null and
+            o.max_concurrent == null and o.max_kv_tokens == null;
     }
 };
 
@@ -276,6 +282,12 @@ fn fromValue(v: std.json.Value) Override {
     inline for (.{ "prefill_chunk_max", "prefill_chunk_min" }) |key| if (obj.get(key)) |g| if (accepts(key, g)) {
         @field(o, key) = std.fmt.parseInt(u32, chunkChoice(g).?, 10) catch unreachable;
     };
+    if (obj.get("max_concurrent")) |g| if (accepts("max_concurrent", g)) {
+        o.max_concurrent = @intCast(g.integer);
+    };
+    if (obj.get("max_kv_tokens")) |g| if (accepts("max_kv_tokens", g)) {
+        o.max_kv_tokens = @intCast(g.integer);
+    };
     if (obj.get("yarn_factor")) |g| if (accepts("yarn_factor", g)) {
         o.yarn_factor = std.fmt.parseInt(u8, yarnChoice(g).?, 10) catch unreachable;
     };
@@ -348,6 +360,7 @@ pub fn warnRejected(section: []const u8, obj: std.json.ObjectMap, specs: []const
 pub const removed_model_keys = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "mtp_acceptance", .why = "MTP accepts drafts by the exact rule only" },
     .{ .name = "mtp_greedy_tail", .why = "MTP accepts drafts by the exact rule only" },
+    .{ .name = "prefix_cache_entries", .why = "the hot cache keeps as many finished conversations as its memory holds, never fewer than the model's max_concurrent; set prefix_cache_mem or max_kv_tokens" },
 };
 
 /// Why `key` is no longer a setting; null when it never was one or still is.
@@ -502,6 +515,8 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "expert_cache_bias", .kind = .number, .min = 0, .max = expert_cache_bias_max },
     .{ .name = "prefill_chunk_max", .kind = .choice, .choices = &chunk_choices, .normalize = chunkChoice },
     .{ .name = "prefill_chunk_min", .kind = .choice, .choices = &chunk_choices, .normalize = chunkChoice },
+    .{ .name = "max_concurrent", .kind = .int, .min = 1, .max = sched_policy.MAX_BATCH_GROUP },
+    .{ .name = "max_kv_tokens", .kind = .int, .min = 0, .max = std.math.maxInt(u32) },
 };
 
 /// Server-wide keys, under the file's `"server"` object (a model's key is its absolute path, so the two never meet).
@@ -560,6 +575,10 @@ pub const Fit = struct {
     window_default: u32 = 0,
     /// The model setting that turns this arch's Sushi Cooler off; null for an arch without the engine.
     cooler_setting: ?[]const u8 = null,
+    /// The model serves one request at a time: `max_concurrent` is fixed at 1.
+    exclusive_decode: bool = false,
+    /// The rows one batched tick of this model carries, its own bound or the shared batch width.
+    max_concurrent_cap: u32 = sched_policy.MAX_BATCH_GROUP,
 };
 
 /// The context window the model has once `yarn_factor` (null = unset) is applied; 0 = unknown.
@@ -677,6 +696,12 @@ pub fn limit(key: []const u8, fit: Fit) Limit {
         l.why = "An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.";
     }
     if (eql(u8, key, "ctx_size") or eql(u8, key, "max_tokens")) l.max = fit.context_cap;
+    if (eql(u8, key, "max_concurrent")) {
+        if (fit.exclusive_decode) {
+            l.max = 1;
+            l.why = "This model serves one request at a time.";
+        } else l.max = fit.max_concurrent_cap;
+    }
     return l;
 }
 
@@ -696,7 +721,7 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
         if (v == .string and !choiceAllowed(e.key, v.string, fit)) return .{ .key = e.key, .why = "This model's cache cannot store that width." };
         if (isChunkBound(e.key) and v == .integer and !settings_resolve.isStaticChunkRung(@intCast(@max(v.integer, 0))))
             return .{ .key = e.key, .why = "This model's prefill chunk is one of " ++ settings_resolve.static_chunk_rungs_text ++ "." };
-        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = if (lim.why.len > 0) lim.why else maxWhy(buf, lim.max) };
+        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = if (lim.why.len > 0) lim.why else if (std.mem.eql(u8, e.key, "max_concurrent")) "This model's decode joins at most this many requests at once." else maxWhy(buf, lim.max) };
         for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
     }
     if (chunkMinAboveMax(existing, edits, buf)) |r| return r;

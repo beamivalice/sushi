@@ -471,6 +471,10 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   `volume` = `{name, path, free_bytes, total_bytes}` of the cache root, read per request; `name`, `free_bytes` and
   `total_bytes` are null when it is unavailable ([engine-prefix-cache](engine-prefix-cache.md#listing-and-clearing-from-the-admin-api)).
 - `/props.settings.prefill_decode_share` reports the effective process-wide share, including zero under the interleave kill switch.
+- `/props.settings.max_concurrent`, `max_kv_tokens` (0 = no cap) and `reserved_tokens` are the answering model's:
+  its resolved concurrency (0 = no limit), its token cap, and the tokens its live requests reserve (prompt plus `max_tokens`) plus its
+  RAM hot cache's retained entries. A request whose own reservation is above `max_kv_tokens` is answered 400 naming
+  the cap and the reservation, the same bytes streamed or not.
 
 ## Security and observability
 

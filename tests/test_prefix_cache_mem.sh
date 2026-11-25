@@ -30,8 +30,8 @@ GROW_TURNS="${GROW_TURNS:-5}"
 GROW_WORDS="${GROW_WORDS:-2000}"
 
 MODEL=$(sushi_pack qwen4) || exit $?
-echo "  starting server (--prefix-cache-entries 8 --prefix-cache-mem ${SHORT_BUDGET_MB}MB)..."
-sushi_boot cachemem "$MODEL" --prefix-cache-entries 8 --prefix-cache-mem "${SHORT_BUDGET_MB}MB" --prefix-cache-disk off || exit $?
+echo "  starting server (--prefix-cache-mem ${SHORT_BUDGET_MB}MB)..."
+sushi_boot cachemem "$MODEL" --prefix-cache-mem "${SHORT_BUDGET_MB}MB" --prefix-cache-disk off || exit $?
 BASE="$SUSHI_URL"
 LOGFILE="$SUSHI_LOG"
 

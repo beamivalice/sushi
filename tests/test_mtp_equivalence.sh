@@ -130,12 +130,12 @@ python3 "$(dirname "$0")/test_mtp_equivalence_strict.py" || exit 1
 start_server() { # $1 = boot label, rest = extra flags; SUSHI_* env of the caller reaches the server
     local label=$1
     shift
-    # --prefix-cache-entries 0: byte-stable greedy on a HYBRID needs the prefix cache off (docs/engine-prefix-cache.md):
+    # --prefix-cache-mem off --prefix-cache-disk off: byte-stable greedy on a HYBRID needs the prefix cache off (docs/engine-prefix-cache.md):
     # a warm restore re-runs the recurrence in a different block size and legitimately flips near-tie argmaxes.
     # --no-drafter: a pack shipping its own drafter/ would otherwise outrank the MTP head and this script would
     # measure DFlash.
     # shellcheck disable=SC2086
-    sushi_boot "$label" "$MODEL" --no-drafter --prefix-cache-entries 0 --log-level info $EXTRA_ARGS "$@" || exit $?
+    sushi_boot "$label" "$MODEL" --no-drafter --prefix-cache-disk off --log-level info $EXTRA_ARGS "$@" || exit $?
     LOG="$SUSHI_LOG"
     PORT="$SUSHI_PORT"
 }

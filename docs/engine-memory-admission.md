@@ -329,7 +329,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - **The writer's permit is a 128th of host RAM, 128 MiB to 1 GiB** (`kv_disk_writer.permitForRam`, set once at startup
   into `server.disk_writer_permit_bytes`, which arms every writer). A prefill stages one blob per chunk and the SSD
   drains it before the next, so a larger permit buys no speed and on a small Mac crowds macOS's share of RAM.
-- The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
+- The ungated hot-cache ask is zero when RAM retention is off or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next, deepseek_v41) prefills every
   request from its `--prefill-chunk-max` (default its start width, `prefillStartWidth`: 4096, 2048, 2048, 8192). Each
@@ -490,7 +490,7 @@ request holds, not the ones it captures (`server.ssmResidentCap`, `ssm_cache.SSM
 |---|---:|---|
 | SSD tier up, with or without a RAM tier (the default) | 3 | a write-through prefill holds 2 (the previous newest until its file is written, and the one just taken); a request it cannot serve is thinned to 2 and holds a third while one is captured |
 | RAM only, or the tier declined with RAM retention on (until it re-arms) | up to `--ssm-checkpoint-max` | nowhere else to restore from |
-| no cache: `--prefix-cache-entries 0`, or RAM retention off with no SSD tier (declined included) | 0 | the prefill takes none |
+| no cache: RAM retention off with no SSD tier (declined included) | 0 | the prefill takes none |
 
 **A bill holds a checkpoint only where the prefill takes it**: every checkpoint term (Qwen's prefill and thought point,
 GLM's and DeepSeek's restore points) reads `bills.launchCheckpointStride`, the stride `main` hands the load, so a launch
@@ -651,6 +651,13 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
 - The generation bill uses the request's concrete `max_tokens` (the client's, else the filled default, never the
   rest of the window), cut to what the window leaves ([server-http-apis](server-http-apis.md)).
 - One `[admission] needed=… lendable=… available=… reclaimable=… width=… verdict=…` line per decision.
+- Two per-model gates pick the candidates memory admission then prices (`sched_policy.admitPendingTick`, then
+  `memoryAdmitCount` on its picks), neither a bill; a candidate held by either holds later requests of its model: `max_concurrent` holds a
+  request while its model runs that many; `max_kv_tokens` (a model-settings key, absent = no cap) holds one while the
+  model's reserved tokens (each live request's prompt plus its `max_tokens`, and the RAM hot cache's retained entries)
+  plus its own would pass the cap, evicting retained entries oldest-first before it waits (never one a live request uses or
+  the candidate restores from), and refuses at once with a 400 naming the cap a request whose own reservation passes it. The gates
+  reserve no bytes: on a Sushi Cooler load the ledger stays the one memory accountant.
 - `--prefill-chunk-max N` caps the per-request ladder and `--prefill-chunk-min M` floors it: N if it fits, else the
   widest rung below N that fits, down to M (default 512); refused only when that floor does not fit. The per-chunk
   adaptive width stays on within the bounds; equal bounds pin the width and turn it off. `requestPrefillPick` is the one rule for

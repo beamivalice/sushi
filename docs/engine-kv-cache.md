@@ -150,7 +150,7 @@ slot's `moe_seq_offset`; the pad-waste cap reads `KVCache.kvLenForBatching`. Bat
 ## Byte stability
 
 - INT4 long-greedy divergence is legit (the AR/verify INT4 kernel float-noise tail).
-- Byte-stable greedy ⇒ no spec + `--kv-quant off/8` + `--prefix-cache-entries 0`.
+- Byte-stable greedy ⇒ no spec + `--kv-quant off/8` + `--prefix-cache-mem off --prefix-cache-disk off`.
 - A prompt longer than one chunk is byte-stable only at a fixed prefill width: MiMo at 64k gives a first-token
   logprob of -1.0685 at 4096 and -1.0807 at 2048 (each width repeats exactly), and the per-request ladder narrows
   the width when memory is short. `--prefill-chunk-max N` caps it and `--prefill-chunk-min` floors it.

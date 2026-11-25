@@ -200,22 +200,15 @@ pub var global_registry: ?*ModelRegistry = null;
 /// Edit chip then switches them for itself.
 pub var g_web_edit: bool = false;
 
-/// Module-level capacity for plan 03 hot prefix cache. main.zig writes this
-/// from `--prefix-cache-entries N` before calling `serve()`.
-// Default 32: agent clients (Claude Code, the app's agent loop) interleave
-// requests from several conversation roots — main thread, subagents, title
-// generation — and a single-entry cache gets its long system-prompt prefix
-// evicted by every interleaved request, forcing a full re-prefill each
-// turn. The count cap is pure retention metadata; the SSD byte budget
-// (`prefixCacheDiskForLoad`) is what bounds the bytes. 0 disables.
-pub var prefix_cache_capacity: u32 = 32;
+/// Whether prefix reuse is configured at all: 1 when RAM retention or the SSD tier is on, 0 only when both are off.
+/// Not a count: the hot cache keeps what its memory holds.
+pub var prefix_cache_capacity: u32 = 1;
 /// RAM retention is opt-in: `--prefix-cache-mem` turns it on, `0` or `off` keeps it off.
 pub var prefix_cache_ram_enabled: bool = false;
 
 /// The RAM tier's byte budget, read only where RAM retention is on (`--prefix-cache-mem`). The cache
 /// evicts LRU entries on commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. 0
-/// disables the byte budget (the machine's headroom and the count cap from `--prefix-cache-entries`
-/// still apply).
+/// disables the byte budget (the machine's headroom and a model's `max_kv_tokens` still apply).
 pub var prefix_cache_mem_bytes: u64 = PREFIX_CACHE_MEM_DEFAULT;
 pub const PREFIX_CACHE_MEM_DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
 /// `.flag` once `--prefix-cache-mem` is given: the operator's number is used as given, even when it equals the default.
@@ -290,6 +283,8 @@ pub var ssm_checkpoint_max: u32 = 16;
 /// (handler refactor + per-connection threads), which the `serve()` startup
 /// guard checks before enabling.
 pub var max_concurrent: u32 = 1;
+/// `--max-concurrent` as given; null = the flag was not passed, so a model's own key (else 1) decides.
+pub var max_concurrent_flag: ?u32 = null;
 
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.

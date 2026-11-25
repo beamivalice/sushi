@@ -103,7 +103,7 @@ it after running the command; the page says so while the two differ.
 sushi pull qwen3.8-flash-next:2bpw
 sushi serve --model ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-2bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 131072 \
-  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
+  --max-tokens 32000 --prefix-cache-disk 20GB --temp 1
 ```
 
 **64 GB Mac, Qwen Sushi-STQ-2.75bpw** (limit 59000; above it macOS runs out of memory first and the kernel panics)
@@ -113,7 +113,7 @@ sushi pull qwen3.8-flash-next:2.75bpw
 # 8-bit KV, the default quality
 sushi serve --model ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --qwen-gdn 16 --ctx-size 250000 \
-  --max-tokens 32000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
+  --max-tokens 32000 --prefix-cache-disk 20GB --temp 1
 # or 4-bit KV for 1.8 times the context: --kv-quant 4 --ctx-size 450000 --max-tokens 64000
 ```
 
@@ -126,7 +126,7 @@ each). 96 GB and up keep the f32 default. Context is set explicitly because auto
 sushi pull qwen3.8-flash-next:4bpw
 sushi serve --model ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-4bpw \
   --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk-max 2048 \
-  --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
+  --max-tokens 64000 --prefix-cache-disk 20GB --temp 1
 ```
 
 **DFlash2 on Qwen (opt-in).** MTP stays the default. `--drafter <dir>` loads Inco.ai's
@@ -235,8 +235,13 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 
 ### Common flags
 
-- `--prefix-cache-disk 20GB` sizes the SSD prefix cache (on by default, capped at 20 GB); `--prefix-cache-entries 1`
-  keeps one conversation, raise it to 4-8 for several agents; `--prefix-cache-mem 1GB` also keeps prefixes in RAM.
+- `--prefix-cache-disk 20GB` sizes the SSD prefix cache (on by default, capped at 20 GB); `--prefix-cache-mem 1GB` also
+  keeps prefixes in RAM, as many conversations as fit.
+- Each model's settings take `max_concurrent` (requests that run at once; empty is no limit, and a value is held
+  to the model's own batch width: Qwen 8, GLM and MiMo 4, Hy4-Flash 1; `--max-concurrent N` sets it for every model) and
+  `max_kv_tokens` (a shared token budget for that model's running requests and its kept conversations; empty is no
+  cap). A request reserves its prompt plus its `max_tokens`; one that does not fit beside the others waits, one that
+  can never fit alone is refused with the numbers.
 - A restore point sits every 8192 tokens and at each prompt's end, so a 1M-token conversation takes about 0.9 GB of
   SSD (DeepSeek), 7-14 GB of points plus 16 GB of rows (Qwen) or 24 GB (GLM): raise `--prefix-cache-disk` for long
   contexts. A conversation past the budget drops its oldest points first.

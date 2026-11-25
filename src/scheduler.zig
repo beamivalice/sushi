@@ -2560,42 +2560,29 @@ const TO_PREFILL_MAX = 16;
 fn admitPendingLocked(sch: *Scheduler, to_prefill: *[TO_PREFILL_MAX]*Slot) usize {
     // Nothing waits: no candidate list to build and no decoding slot to scan.
     if (sch.pending.items.len == 0 or sch.refusingLocked()) return 0;
+    var planned: [TO_PREFILL_MAX]*Slot = undefined;
+    var refused: [64]*Slot = undefined;
+    const tick = slot_admission.admitWithinCaps(sch, &planned, &refused);
     var n_prefill: usize = 0;
-    // Single-flight admission: a model with
-    // MODULE-OWNED decode state admits at most one live slot.
-    // Snapshot live exclusive-model slots (same liveness predicate
-    // as the step-3 active list), let `admitPendingTick` decide,
-    // and leave held slots in `pending` — their conn threads keep
-    // flowing SSE keepalives while they wait, and the wait
-    // in `inferenceLoop` never blocks while `pending` is non-empty,
-    // so a held slot admits on the first tick after the active one
-    // is culled (step 5, same mutex).
-    var live_buf: [32]sched_policy.AdmitCand = undefined;
-    const n_live = slot_admission.heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slot_admission.slotExclusiveDecode);
-    var cand_buf: [32]sched_policy.AdmitCand = undefined;
-    const n_cands = @min(sch.pending.items.len, cand_buf.len);
-    for (sch.pending.items[0..n_cands], 0..) |s, i| {
-        cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slot_admission.slotExclusiveDecode(s) };
-    }
-    var admit_idx: [TO_PREFILL_MAX]usize = undefined;
-    // Pending admits only through admitPendingTick.
-    const n_admit = slot_admission.memoryAdmitCount(sch, admit_idx[0..sched_policy.admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)]);
-    for (admit_idx[0..n_admit]) |idx| {
-        to_prefill[n_prefill] = admitForPrefillLocked(sch, idx);
+    for (refused[0..tick.refused]) |s| removePendingLocked(sch, s);
+    for (planned[0..tick.admits]) |slot| {
+        removePendingLocked(sch, slot);
+        to_prefill[n_prefill] = admitForPrefillLocked(sch, slot);
         n_prefill += 1;
-    }
-    // Remove admitted entries in DESCENDING index order so the
-    // earlier (ascending) indices stay valid during removal.
-    var r = n_admit;
-    while (r > 0) {
-        r -= 1;
-        _ = sch.pending.orderedRemove(admit_idx[r]);
     }
     var queue_line: [192]u8 = undefined;
     for (sch.pending.items) |held| {
         if (slot_admission.queueLogLine(sch, &queue_line, held)) |line| log.info("{s}\n", .{line});
     }
     return n_prefill;
+}
+
+/// Removes `slot` from `pending` if it is there (queue_mu held).
+fn removePendingLocked(sch: *Scheduler, slot: *Slot) void {
+    for (sch.pending.items, 0..) |p, i| if (p == slot) {
+        _ = sch.pending.orderedRemove(i);
+        return;
+    };
 }
 
 fn inferenceLoop(ctx: ThreadCtx) void {
@@ -3016,6 +3003,7 @@ pub fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
     if (s.model.config) |c| sched.endRequest(c);
     // A client that left mid-decode never reaches the inference thread's release: its reservation ends here.
     @import("static_bill.zig").requestEnded(s);
+    slot_admission.publishModelReserved(sch, s.model);
 }
 
 pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*Scheduler, *Slot) void) void {
@@ -3685,8 +3673,7 @@ fn interleaveDecodeTick(sch: *Scheduler) u64 {
 
 /// Take `pending[idx]` into this tick's prefill pass (queue_mu held; the caller removes it
 /// from `pending`).
-fn admitForPrefillLocked(sch: *Scheduler, idx: usize) *Slot {
-    const slot = sch.pending.items[idx];
+fn admitForPrefillLocked(sch: *Scheduler, slot: *Slot) *Slot {
     var start_line: [64]u8 = undefined;
     const waited_ns: u64 = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
     if (slot_admission.queueStartLine(&start_line, slot, waited_ns)) |line| log.info("{s}\n", .{line});
@@ -4081,6 +4068,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                     }
                 };
                 publishHotCacheResidency(sch);
+                slot_admission.publishModelReserved(sch, slot.model);
                 // What the allocator returned, not what the cache was billed for.
                 evicted_live_bytes = report.bytes;
                 const kept: ?u32 = if (!report.admitted and slot.facts.bills_checkpoints and cp_stride > 0)

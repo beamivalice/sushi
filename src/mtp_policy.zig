@@ -1422,7 +1422,7 @@ pub const MtpEvCosts = struct {
 /// (`splitCausalSdpa` — dense verify q 6..9 now rides the vector path,
 /// invalidating the ramp the old hi partially priced): same-session
 /// saturated ECHO sweep, Jundot oQ4e 27B @8K cold reps
-/// (--prefix-cache-entries 0), M4 Max, SUSHI_MTP_ADAPTIVE=0 forced
+/// (prefix cache off), M4 Max, SUSHI_MTP_ADAPTIVE=0 forced
 /// depths, saturated (m_avg==N) trace windows only — T(1)=44.6,
 /// T(2)=51.0, T(3)=59.2, T(4)=68.2, T(6)=95.4, T(8)=142.3 ms → floor
 /// ≈ 38.2 ms. Composite marginals in floor units: k<=4 ≈ 0.20 (6.4-9.0

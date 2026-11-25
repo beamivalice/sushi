@@ -8,7 +8,7 @@ set -u
 MODEL="${BENCH_MODEL:?}"; PORT=$1; CSV=$2; NS="${3:-1 2 3 4 6 8}"; MAXTOK=${4:-200}
 BINARY="${SUSHI_BINARY:-./zig-out/bin/sushi}"; LABEL="${BENCH_LABEL:-$(basename $(dirname $(dirname $BINARY)))}"
 LOG=$(mktemp)
-SUSHI_ROUND_COST_PERSIST=0 "$BINARY" --model "$MODEL" --serve --port "$PORT" --mtp --max-concurrent 16 --prefix-cache-entries 0 > "$LOG" 2>&1 &
+SUSHI_ROUND_COST_PERSIST=0 "$BINARY" --model "$MODEL" --serve --port "$PORT" --mtp --max-concurrent 16 --prefix-cache-disk off > "$LOG" 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f "$LOG"' EXIT
 for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
 P=("Write a short essay about the history of quantum computing." "Explain how a compiler turns source code into machine code." "Describe the water cycle for a graduate seminar." "Summarize the causes of the French revolution." "Write a poem about the sea in the style of Whitman." "Explain TCP congestion control to a junior engineer." "Describe how vaccines train the immune system." "Outline a beginner's plan to learn the piano.")

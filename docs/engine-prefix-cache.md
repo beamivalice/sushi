@@ -12,7 +12,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 | File | Role |
 |---|---|
-| `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-entries`, `--prefix-cache-mem`) |
+| `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-mem`, `max_kv_tokens` eviction) |
 | `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
 | `src/prefix_policy.zig` | The cache's rules on positions, lengths and byte counts, host tier: the checkpoint drop index and `ThinPolicy`, `specAdoptPlan`, the ring mark positions, the shed simulation, the lookup's `BestMatch`, the eviction victim (`lruIndexExcluding`), the shared-return stop and the restore lien. [Policy and format](#policy-format) |
 | `src/disk_format.zig` | The SSD record's wire format, host tier: the safetensors header, `IndexEntry` and the `meta.json` manifest (render, version stamp, parse). [Policy and format](#policy-format) |
@@ -48,8 +48,13 @@ and golden strings (`zig build test-host`, no GPU, no lock).
   loaded (v11) entry; the SHA-256 pins of the three entry directories stay in `kv_disk_cache.zig`.
   `HEAD_MARKS_MAX` (the marks a head sidecar records) is the format's constant; the QSA code takes `QSA_HEAD_MARKS_MAX`
   from it, so the file imports no arch.
-- Entry-count walks in `HotPrefixCache` are bounded by `--prefix-cache-entries` and none grows with the context, so
+- Entry walks in `HotPrefixCache` are bounded by the entries its memory holds and none grows with the context, so
   they stay walks.
+- **The RAM hot cache has no entry count** (`--prefix-cache-entries` is removed and refused by name): it keeps finished
+  conversations until the `--prefix-cache-mem` budget or admission's reclaim drops them, never fewer than a model's
+  `max_concurrent`. Where a model sets `max_kv_tokens`, its retained entries count in that token pool and a request
+  that needs the room evicts them oldest-first; an entry a live request holds or restores from counts once, in that
+  request's reservation.
 
 <a id="arch-seam"></a>
 ## Arch seam
@@ -122,7 +127,7 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   post-preprocessing, so a preprocessing change rolls the key by itself. The tower's storage is in the key's seed
   (`--vision-bf16` or the requantized affine-8 tower give other rows for the same pixels); text records stay shared.
 - **A restore is not bit-identical on a HYBRID** (≤ 0.047 nats; the chunking class ~0.3 nats top-5 for QSA state) ⇒
-  byte-stable greedy needs `--prefix-cache-entries 0`. On Sushi Cooler a restore at the request's own point says the
+  byte-stable greedy needs the prefix cache off (`--prefix-cache-mem off --prefix-cache-disk off`). On Sushi Cooler a restore at the request's own point says the
   cold bytes; one from another prompt's record (every multi-turn append) reaches the tail in two spans where cold
   forwards one, so it is deterministic but not cold's bytes (tiny flips at token 0, the stq4 cut at 6). The contract
   holds both. Open (R2): chunked against one forward can select a different QSA block set exactly at the indexer
@@ -299,9 +304,9 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   SSD-first (`prefix_cache.ssdFirstActive`: a disk tier and RAM off).
 - **The SSD tier is on and sized per model at load** (`server.prefixCacheDiskForLoad` through
   `LoadParams.prefix_cache_disk_resolver`, the pure `disk_placement.resolveDiskBudget`):
-  `min(entries x context x bytes_per_token + 2 GB, 20 GB, free disk - 4 GB)`. **Sizes are binary: 1 GB = 1 GiB and 1 KB = 1 KiB**, as
+  `min(32 x context x bytes_per_token + 2 GB, 20 GB, free disk - 4 GB)`. **Sizes are binary: 1 GB = 1 GiB and 1 KB = 1 KiB**, as
   `--prefix-cache-disk 20GB` is read; every `GB` and `KB` in the lines, the logs and the page is that unit.
-  - entries = `--prefix-cache-entries`; context = the model's PINNED served context (`diskContextForLoad` runs the
+  - 32 is a sizing term (`bills.default_disk_sizing_entries`, the old default entry count), not a retention limit; context = the model's PINNED served context (`diskContextForLoad` runs the
     idempotent `pinAutoContext`), so the line, `/props` and `/v1/models` name one number; free disk =
     `disk_placement.volumeSpaceNear` of the cache dir (`SUSHI_PREFIX_CACHE_DIR` or `~/.sushi/kv-cache`).
   - bytes_per_token = `server.diskBytesPerToken`, from the SERIALIZED geometry: KV rows at the served width, the one
@@ -313,8 +318,7 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
     resolution, as `refreshDiskBudget` adds `total_bytes` live), and `DiskTier.operator_cap` is only the flag or the
     formula / 20 GB cap, never a free-space number; else a restart on a full volume evicts what the last boot stored.
   - A result of zero or less turns the tier off and one line says why. `--prefix-cache-disk <n>` is the budget as
-    given (an operator's cap: the tier still stores no more than the volume leaves) and `0`/`off` disables;
-    `--prefix-cache-entries 0` disables both tiers.
+    given (an operator's cap: the tier still stores no more than the volume leaves) and `0`/`off` disables.
   - It is a budget, not a preallocation, and ONE reserve governs it: free space less 4 GB (`disk_placement.freeDiskRoom`,
     `DISK_FREE_RESERVE`) at resolution, before every store (`refreshDiskBudget`) and in the report. A budget under 1 GB
     still stores.
@@ -371,7 +375,7 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
 
 `--prefix-cache-mem off --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
 prefixes on SSD without retaining idle KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
-buffers temporarily. The entry count must remain positive: `--prefix-cache-entries 0` disables both tiers.
+buffers temporarily. No reuse at all is `--prefix-cache-mem off --prefix-cache-disk off`.
 With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
 `settings.prefix_cache.ram_enabled=false` and `mem_bytes=0` when RAM retention is off.
 Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode, regardless

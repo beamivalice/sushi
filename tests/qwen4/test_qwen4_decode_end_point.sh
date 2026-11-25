@@ -119,13 +119,13 @@ run_tier() { # <ram|ssd>
 }
 
 echo "=== Qwen decode-end restore points ==="
-sushi_boot decode-end-ram "$MODEL" --prefix-cache-entries 4 --prefix-cache-mem 4GB --prefix-cache-disk 0 \
+sushi_boot decode-end-ram "$MODEL" --prefix-cache-mem 4GB --prefix-cache-disk 0 \
     --log-level debug || exit $?
 sushi_require mtp
 run_tier ram
 sushi_stop
 
-sushi_boot decode-end-ssd "$MODEL" --prefix-cache-entries 4 --prefix-cache-mem 0 --prefix-cache-disk 8GB \
+sushi_boot decode-end-ssd "$MODEL" --prefix-cache-mem 0 --prefix-cache-disk 8GB \
     --log-level debug || exit $?
 run_tier ssd
 sushi_stop

@@ -8,7 +8,7 @@
 #       image across a second turn, reads a video_url of four solid colors, then unloads the model and cold-loads it
 #       through /v1/load-model, which must bill the tower again and answer the same bytes.
 # Each boot takes the GPU lock and runs under a private HOME (no saved model settings). Speculation and the prefix
-# cache are off in both boots (--no-mtp --no-drafter --prefix-cache-entries 0), so the greedy bytes compare one cold
+# cache are off in both boots (--no-mtp --no-drafter --prefix-cache-mem off --prefix-cache-disk off), so the greedy bytes compare one cold
 # forward. STREAM_VISION_BODY='{json}' merges into each request.
 set -uo pipefail
 . "$(dirname "$0")/lib/boot.sh"
@@ -20,7 +20,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 pass=0; fail=0
 check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo "  FAIL $1: got '$2' want '$3'"; fail=$((fail+1)); fi; }
-COMMON=(--log-level debug --no-mtp --no-drafter --prefix-cache-entries 0 --ctx-size 16384)
+COMMON=(--log-level debug --no-mtp --no-drafter --prefix-cache-disk off --ctx-size 16384)
 boot_failed() { echo "  FAIL boot ($1)"; fail=$((fail+1)); }
 one() { sed 's/^[1-9][0-9]*$/1/'; }
 

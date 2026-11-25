@@ -285,7 +285,7 @@ fn qwen4PackTripleMatches(w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, 
 /// every constant this controller ever shipped was fitted at ONE
 /// context length, and 8K is the house one). Forced-depth saturated
 /// echo (the test_mtp_equivalence echo appended to ~8.3k of neutral
-/// filler, temp 0, `--prefix-cache-entries 0`, round-cost persist off),
+/// filler, temp 0, prefix cache off, round-cost persist off),
 /// depths {1,2,3,4,6} x two reversed passes x 3 reps, medians of
 /// per-request round_ms: T(1)=25.41, T(2)=31.18, T(3)=35.70,
 /// T(4)=41.33, T(6)=53.58 ms -> 20.34 ms floor, composite

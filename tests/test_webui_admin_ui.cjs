@@ -27,6 +27,7 @@ const KEYS = [
   { name: 'expert_cache_bias', type: 'number', min: 0, max: 2 },
   { name: 'prefill_chunk_max', type: 'choice', choices: ['512', '1024', '2048', '4096', '8192'] },
   { name: 'prefill_chunk_min', type: 'choice', choices: ['512', '1024', '2048', '4096', '8192'] },
+  { name: 'max_concurrent', type: 'int', min: 1, max: 32 }, { name: 'max_kv_tokens', type: 'int', min: 0, max: 4294967295 },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
 const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'preserve_thinking', 'think_penalty', 'max_tokens'];
@@ -1755,6 +1756,30 @@ async function main() {
       await page.click('.savebar button:text-is("Save")');
       await page.waitForFunction(() => document.querySelector('.set[data-key="prefill_chunk_max"] .badges')?.textContent.includes('Saved'));
       assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1), { model: 'Qwen-A', set: { prefill_chunk_max: '2048', prefill_chunk_min: '512' } });
+    });
+
+    // Concurrency and the KV token pool are plain fields on every model; an exclusive model's max_concurrent is fixed at 1.
+    const withCaps = (s) => { s.state.models[0].keys = [...BASE_KEYS, 'max_concurrent', 'max_kv_tokens']; s.state.models[0].defaults = { ...(s.state.models[0].defaults ?? {}), max_concurrent: 0, max_kv_tokens: 0 }; };
+    await scenario('concurrency and the KV token budget render, show their defaults, and save', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: withCaps }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('max_concurrent')} input`);
+      assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'No limit');
+      assert.equal(await page.getAttribute(`${row('max_kv_tokens')} input`, 'placeholder'), 'No cap');
+      await page.fill(`${row('max_concurrent')} input`, '4');
+      await page.fill(`${row('max_kv_tokens')} input`, '65536');
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="max_concurrent"] .badges')?.textContent.includes('Saved'));
+      const posted = server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1);
+      assert.deepEqual(posted, { model: 'Qwen-A', set: { max_concurrent: 4, max_kv_tokens: 65536 } });
+    });
+    await scenario('an exclusive model shows max_concurrent disabled at 1 with its reason', { path: '/models#Qwen-A', open: { mode: 'advanced' }, serverOpts: { limits: true }, setup: (s) => {
+      s.state.models[0].keys = [...BASE_KEYS, 'max_concurrent'];
+      s.state.models[0].limits = { max_concurrent: { max: 1, why: 'This model serves one request at a time.' } };
+    } }, async ({ page }) => {
+      await page.waitForSelector(`${row('max_concurrent')} input`);
+      const box = `${row('max_concurrent')} input`;
+      assert.equal(await page.isDisabled(box), true);
+      assert.equal(await page.inputValue(box), '1');
+      assert.match(await page.textContent(`${row('max_concurrent')} .help`), /one request at a time/);
     });
 
     // One refresh rule: an action that moves server state re-reads what it moved, and every view shows the latest answer.

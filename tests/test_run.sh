@@ -134,9 +134,9 @@ P_QWEN4='pass qwen4
     test_api_a.sh
     test_api_b.py
     test_sleep_inhibit.sh
-  boot exact: --metrics --log-level debug --max-concurrent 4 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off --mtp-min-depth 3 --mtp-max-depth 3
+  boot exact: --metrics --log-level debug --max-concurrent 4 --prefix-cache-mem off --prefix-cache-disk off --mtp-min-depth 3 --mtp-max-depth 3
     test_exact.sh
-  boot ram: --metrics --log-level debug --max-concurrent 4 --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off
+  boot ram: --metrics --log-level debug --max-concurrent 4 --prefix-cache-mem 2GB --prefix-cache-disk off
     test_ram.sh
   own qwen4/test_q_own.sh pack=default boots=2
   own test_own_each.sh pack=each boots=1
@@ -146,7 +146,7 @@ P_SHARED='pass shared
   hermetic test_node.cjs needs=node
   host test_host.sh
   pack test_pack.sh
-  boot knobs: --metrics --log-level debug --think medium --think-penalty 2 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off
+  boot knobs: --metrics --log-level debug --think medium --think-penalty 2 --prefix-cache-mem off --prefix-cache-disk off
     test_knobs.sh
   own test_own_def.sh pack=default boots=1
   own test_own_glm.sh pack=glm5 boots=2
@@ -173,9 +173,9 @@ eq "a model with no folder scripts still gets the root attach and each scripts" 
     test_api_a.sh
     test_api_b.py
     test_sleep_inhibit.sh
-  boot exact: --metrics --log-level debug --max-concurrent 4 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off
+  boot exact: --metrics --log-level debug --max-concurrent 4 --prefix-cache-mem off --prefix-cache-disk off
     test_exact.sh
-  boot ram: --metrics --log-level debug --max-concurrent 4 --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off
+  boot ram: --metrics --log-level debug --max-concurrent 4 --prefix-cache-mem 2GB --prefix-cache-disk off
     test_ram.sh
   own test_own_each.sh pack=each boots=1
   boots: 3 shared + 1 own"
@@ -499,9 +499,9 @@ eq "sushi_pack: an absolute path is taken as it is" "$(val "$out" abs)" "$WORK/e
 
 PROF="$WORK/profiles.sh"
 printf '. "%s/lib/profiles.sh"\nsushi_profile_flags "$@"\n' "$TESTS" > "$PROF"
-eq "profile exact on glm5 carries no MTP depth" "$(/bin/bash "$PROF" exact glm5)" "--metrics --log-level debug --max-concurrent 4 --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off"
+eq "profile exact on glm5 carries no MTP depth" "$(/bin/bash "$PROF" exact glm5)" "--metrics --log-level debug --max-concurrent 4 --prefix-cache-mem off --prefix-cache-disk off"
 eq "profile exact accepts an arch name" "$(/bin/bash "$PROF" exact mimo_v2)" "$(/bin/bash "$PROF" exact mimo2)"
-eq "SUSHI_TEST_DSV41_BUDGET sets the streamed budget" "$(SUSHI_TEST_DSV41_BUDGET=64 /bin/bash "$PROF" ram dsv41)" "--metrics --log-level debug --ssd-budget-gb 64 --max-concurrent 1 --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off"
+eq "SUSHI_TEST_DSV41_BUDGET sets the streamed budget" "$(SUSHI_TEST_DSV41_BUDGET=64 /bin/bash "$PROF" ram dsv41)" "--metrics --log-level debug --ssd-budget-gb 64 --max-concurrent 1 --prefix-cache-mem 2GB --prefix-cache-disk off"
 /bin/bash "$PROF" api nope > /dev/null 2>&1
 eq "an unknown model is an error" "$?" "1"
 printf '. "%s/lib/profiles.sh"\nsushi_profile_settings "$@"\n' "$TESTS" > "$WORK/settings.sh"

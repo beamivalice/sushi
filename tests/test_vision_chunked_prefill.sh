@@ -73,7 +73,7 @@ PYEOF
 
 run_arm() {
     local arm="$1" env_val="$2"
-    SUSHI_VISION_CHUNKED="$env_val" sushi_boot "vision-$arm" "$MODEL" --prefill-chunk-max 512 --prefill-chunk-min 512 --prefix-cache-entries 0 --log-level debug || exit $?
+    SUSHI_VISION_CHUNKED="$env_val" sushi_boot "vision-$arm" "$MODEL" --prefill-chunk-max 512 --prefill-chunk-min 512 --prefix-cache-disk off --log-level debug || exit $?
     sushi_require vision
     curl -sf -m 300 "$SUSHI_URL/v1/chat/completions" \
         -H 'Content-Type: application/json' \

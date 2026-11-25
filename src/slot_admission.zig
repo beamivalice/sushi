@@ -19,6 +19,7 @@ const submitTestScheduler = scheduler_mod.submitTestScheduler;
 const sched = @import("arch/sched.zig");
 const sched_policy = @import("sched_policy.zig");
 const static_bill = @import("static_bill.zig");
+const forward_refusal_mod = @import("forward_refusal.zig");
 
 pub const PostEvictionWidth = struct {
     /// The width the prefill runs at. Always the re-ask.
@@ -181,6 +182,236 @@ pub fn slotExclusiveDecode(slot: *const Slot) bool {
 /// still owns its native state and keeps blocking exclusive admission.
 fn slotHoldsAdmission(slot: *const Slot) bool {
     return sched_policy.holdsAdmission(slot.finished, slot.error_code != null);
+}
+
+/// The prompts plus `max_tokens` a live slot reserved.
+pub fn slotReservation(s: *const Slot) u64 {
+    return @as(u64, s.full_prompt.len) +| s.max_tokens;
+}
+
+/// Live slots of `model` (decoding, prefilling, or queued for cleanup and not freed) and the tokens they reserved.
+pub const ModelLive = struct { slots: u32 = 0, reserved: u64 = 0 };
+
+pub fn liveCountFor(sch: *Scheduler, model: usize) u32 {
+    var n: u32 = 0;
+    for ([_][]const *Slot{ sch.decoding.items, sch.prefilling.items, sch.cleanup_queue.items }) |list| for (list) |s| {
+        if (@intFromPtr(s.model) == model and slotHoldsAdmission(s)) n +|= 1;
+    };
+    return n;
+}
+
+pub fn liveFor(sch: *Scheduler, model: usize) ModelLive {
+    var live: ModelLive = .{};
+    for ([_][]const *Slot{ sch.decoding.items, sch.prefilling.items, sch.cleanup_queue.items }) |list| for (list) |s| {
+        if (@intFromPtr(s.model) != model or !slotHoldsAdmission(s)) continue;
+        live.slots +|= 1;
+        live.reserved +|= slotReservation(s);
+    };
+    return live;
+}
+
+/// Entry ids the model's live slots restored from (shared buffers or a checkout): each is inside that slot's own
+/// reservation, so the token pool counts it once and no eviction may take it.
+pub fn liveEntryIds(sch: *Scheduler, model: usize, out: []u64) usize {
+    var n: usize = 0;
+    for ([_][]const *Slot{ sch.decoding.items, sch.prefilling.items, sch.cleanup_queue.items }) |list| for (list) |s| {
+        if (@intFromPtr(s.model) != model or !slotHoldsAdmission(s) or s.restored_entry == 0) continue;
+        if (std.mem.indexOfScalar(u64, out[0..n], s.restored_entry) != null) continue;
+        if (n < out.len) {
+            out[n] = s.restored_entry;
+            n += 1;
+        }
+    };
+    return n;
+}
+
+/// Tokens the model's retained hot-cache entries hold in RAM, never an entry a live slot uses (its slot's
+/// reservation holds it) and never a checked-out one. The SSD tier's records hold nothing in the token pool.
+pub fn retainedTokensFor(sch: *Scheduler, model: *const model_registry_mod.LoadedModel) u64 {
+    const hc = model.prefix_cache orelse return 0;
+    var ids: [64]u64 = undefined;
+    const n = liveEntryIds(sch, @intFromPtr(model), &ids);
+    var tokens: u64 = 0;
+    for (hc.entries.items) |e| {
+        if (e.checkout != null) continue;
+        if (std.mem.indexOfScalar(u64, ids[0..n], e.id) != null) continue;
+        tokens +|= e.tokens.len;
+    }
+    return tokens;
+}
+
+/// Inference thread, `queue_mu` held: publishes what `/props` reads without touching the hot cache.
+pub fn publishModelReservedLocked(sch: *Scheduler, model: *model_registry_mod.LoadedModel) void {
+    const n = liveFor(sch, @intFromPtr(model)).reserved +| retainedTokensFor(sch, model);
+    model.reserved_tokens.store(n, .monotonic);
+}
+
+pub fn publishModelReserved(sch: *Scheduler, model: *model_registry_mod.LoadedModel) void {
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    publishModelReservedLocked(sch, model);
+}
+
+/// A request's admission refusal for a `max_kv_tokens` its own reservation cannot fit, as the client reads it.
+pub fn maxKvTokensRefusal(buf: []u8, cap: u64, reservation: u64, prompt: usize, max_tokens: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "This request reserves {d} tokens (prompt {d} + max_tokens {d}), above the model's max_kv_tokens {d}; lower the prompt or max_tokens, or raise max_kv_tokens", .{ reservation, prompt, max_tokens, cap }) catch "This request is above the model's max_kv_tokens.";
+}
+
+pub const AdmitTick = struct { admits: usize = 0, refused: usize = 0 };
+
+/// The `[queue]` line of a candidate one of its model's caps holds this tick; null when neither cap holds it (an
+/// earlier request of its model, an exclusive model's running one, or memory).
+pub fn capWaitLine(buf: []u8, c: sched_policy.AdmitCand, cands: []const sched_policy.AdmitCand, verdicts: []const sched_policy.AdmitVerdict) ?[]const u8 {
+    var tick_live: u32 = 0;
+    var tick_reserved: u64 = 0;
+    for (cands, verdicts) |o, v| if (v == .admit and o.model == c.model) {
+        tick_live += 1;
+        tick_reserved +|= o.reservation;
+    };
+    if (c.max_concurrent > 0 and c.live +| tick_live >= c.max_concurrent)
+        return std.fmt.bufPrint(buf, "[queue] waiting for max_concurrent {d}: {d} of this model's requests run", .{ c.max_concurrent, c.live +| tick_live }) catch null;
+    const held = c.reserved +| tick_reserved +| (c.retained -| c.own_retained);
+    if (c.max_kv_tokens > 0 and held +| c.reservation > c.max_kv_tokens)
+        return std.fmt.bufPrint(buf, "[queue] waiting for max_kv_tokens {d}: {d} tokens held, this request reserves {d}", .{ c.max_kv_tokens, held, c.reservation }) catch null;
+    return null;
+}
+
+/// `queue_mu` held: this tick's admits and refusals from `sch.pending`, under each model's `max_concurrent` and
+/// `max_kv_tokens`. A candidate held only by retained entries first evicts them oldest-first (never one a live slot
+/// holds or has checked out) and is asked again; one over the cap alone is refused with the number it needs. Fills
+/// `to_prefill` and `refused` with slot pointers; the caller removes them from `pending`.
+pub fn admitWithinCaps(sch: *Scheduler, to_prefill: []*Slot, refused: []*Slot) AdmitTick {
+    const CAND_MAX = 64;
+    var cand_buf: [CAND_MAX]sched_policy.AdmitCand = undefined;
+    var verdicts: [CAND_MAX]sched_policy.AdmitVerdict = undefined;
+    var admit_idx: [16]usize = undefined;
+    const n_cands = @min(sch.pending.items.len, CAND_MAX);
+    var tick: AdmitTick = .{};
+    var pass: u8 = 0;
+    while (true) : (pass += 1) {
+        var live_buf: [32]sched_policy.AdmitCand = undefined;
+        const n_live = heldExclusive(&live_buf, &.{ sch.decoding.items, sch.cleanup_queue.items }, slotExclusiveDecode);
+        for (sch.pending.items[0..n_cands], 0..) |s, i| {
+            const model = @as(usize, @intFromPtr(s.model));
+            const cfg = s.model.config;
+            const count_gate = if (cfg) |c| c.max_concurrent > 0 else false;
+            const kv_cap = if (cfg) |c| c.max_kv_tokens > 0 else false;
+            const live = if (kv_cap) liveFor(sch, model) else ModelLive{ .slots = if (count_gate) liveCountFor(sch, model) else 0 };
+            const retained = if (kv_cap) retainedTokensFor(sch, s.model) else 0;
+            var own: u64 = 0;
+            var own_id: u64 = 0;
+            if (kv_cap) if (s.model.prefix_cache) |*cache| {
+                const match = cache.restoreEntry(s.full_prompt);
+                var ids: [64]u64 = undefined;
+                const n_ids = liveEntryIds(sch, model, &ids);
+                if (match.id != 0 and std.mem.indexOfScalar(u64, ids[0..n_ids], match.id) == null) {
+                    own = match.tokens;
+                    own_id = match.id;
+                }
+            };
+            cand_buf[i] = .{
+                .model = model,
+                .exclusive = slotExclusiveDecode(s),
+                .live = live.slots,
+                .reserved = live.reserved,
+                .retained = retained,
+                .own_retained = own,
+                .own_id = own_id,
+                .reservation = slotReservation(s),
+                .max_concurrent = if (cfg) |c| c.max_concurrent else 0,
+                .max_kv_tokens = if (cfg) |c| c.max_kv_tokens else 0,
+            };
+        }
+        _ = sched_policy.admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx, verdicts[0..n_cands]);
+        // Retained entries are the only obstacle: give the pool room, then ask again.
+        var reclaimed = false;
+        for (sch.pending.items[0..n_cands], verdicts[0..n_cands]) |s, v| {
+            if (v != .reclaim) continue;
+            const cfg = s.model.config orelse continue;
+            const hc = if (s.model.prefix_cache) |*h| h else continue;
+            const live = liveFor(sch, @intFromPtr(s.model));
+            var protect: [64]u64 = undefined;
+            const n_ids = liveEntryIds(sch, @intFromPtr(s.model), &protect);
+            const match = hc.restoreEntry(s.full_prompt);
+            const own = if (match.id != 0 and std.mem.indexOfScalar(u64, protect[0..n_ids], match.id) == null) match.tokens else 0;
+            var n_protect = n_ids;
+            if (match.id != 0 and n_protect < protect.len) {
+                protect[n_protect] = match.id;
+                n_protect += 1;
+            }
+            // A candidate this tick admits is not live yet: its reservation is held and its restore match kept.
+            var sib_reserved: u64 = 0;
+            var sib_own: u64 = 0;
+            for (sch.pending.items[0..n_cands], verdicts[0..n_cands]) |o, ov| {
+                if (ov != .admit or o.model != s.model) continue;
+                sib_reserved +|= slotReservation(o);
+                const m = hc.restoreEntry(o.full_prompt);
+                if (m.id == 0 or std.mem.indexOfScalar(u64, protect[0..n_protect], m.id) != null) continue;
+                sib_own +|= m.tokens;
+                if (n_protect < protect.len) {
+                    protect[n_protect] = m.id;
+                    n_protect += 1;
+                }
+            }
+            const held = live.reserved +| sib_reserved +| (retainedTokensFor(sch, s.model) -| own -| sib_own) +| slotReservation(s);
+            const need = held -| cfg.max_kv_tokens;
+            if (need == 0 or hc.evictOldestForTokens(need, protect[0..n_protect]) == 0) continue;
+            reclaimed = true;
+        }
+        if (!reclaimed or pass >= 8) break;
+    }
+    // Policy first (exclusive, then the two caps), memory second: exactly the admits the policy picked are billed
+    // together, and `admitted_held` is what later admissions and `/props` see.
+    var admitted_idx: [64]usize = undefined;
+    var n_admits: usize = 0;
+    for (verdicts[0..n_cands], 0..) |v, i| {
+        if (v != .admit or n_admits >= admitted_idx.len) continue;
+        admitted_idx[n_admits] = i;
+        n_admits += 1;
+    }
+    const n_memory = memoryAdmitCount(sch, admitted_idx[0..n_admits]);
+    for (sch.pending.items[0..n_cands], 0..) |s, i| {
+        switch (verdicts[i]) {
+            .admit => {
+                if (std.mem.indexOfScalar(usize, admitted_idx[0..n_memory], i) == null) continue;
+                if (tick.admits < to_prefill.len) {
+                    to_prefill[tick.admits] = s;
+                    tick.admits += 1;
+                }
+            },
+            .refuse => {
+                const cfg = s.model.config orelse continue;
+                var text = forward_refusal_mod.Text{};
+                const line = maxKvTokensRefusal(&text.buf, cfg.max_kv_tokens, slotReservation(s), s.full_prompt.len, s.max_tokens);
+                text.len = line.len;
+                forward_refusal_mod.record(line);
+                s.markError("PrefillDoesNotFit");
+                log.info("[admission] refused: {s}\n", .{line});
+                if (tick.refused < refused.len) {
+                    refused[tick.refused] = s;
+                    tick.refused += 1;
+                }
+            },
+            .wait, .reclaim => {
+                if (s.queue_logged) continue;
+                var buf: [192]u8 = undefined;
+                const line = capWaitLine(&buf, cand_buf[i], cand_buf[0..n_cands], verdicts[0..n_cands]) orelse continue;
+                s.queue_logged = true;
+                log.info("{s}\n", .{line});
+            },
+        }
+    }
+    var published: [64]usize = undefined;
+    var n_published: usize = 0;
+    for (sch.pending.items[0..n_cands]) |s| {
+        const id = @intFromPtr(s.model);
+        if (std.mem.indexOfScalar(usize, published[0..n_published], id) != null) continue;
+        if (n_published >= published.len) continue;
+        published[n_published] = id;
+        n_published += 1;
+        publishModelReservedLocked(sch, s.model);
+    }
+    return tick;
 }
 
 /// Exclusive slots in `lists` (decoding, then queued for cleanup) that still hold admission.
@@ -353,7 +584,8 @@ pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         bills[i] = null;
         const s = sch.pending.items[idx];
         const cfg = s.model.config orelse continue;
-        if (s.model.handle == null) continue;
+        // A model with no handle is not loaded, except where a test's own bill hook stands in for the load.
+        if (s.model.handle == null and numbers_fn == null) continue;
         bills[i] = static_bill.holdBill(cfg, s.full_prompt.len, s.max_tokens, s.deferred_media) orelse if (numbers_fn) |f|
             f(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, prefill_plan.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp)
         else
@@ -716,4 +948,349 @@ test "the streamed queue notice is one SSE comment line with the same numbers" {
         ": queued behind 2 request(s); running 8000 of 32768 tokens (~619 s at 40.0 tok/s)",
         queueWaitText(&buf, w, false),
     );
+}
+
+fn admissionTestEntry(allocator: std.mem.Allocator, tokens: []const u32, used: u64) !@import("prefix_cache.zig").Entry {
+    return .{
+        .tokens = try allocator.dupe(u32, tokens),
+        .has_tools = false,
+        .snapshot = .{ .entries = try allocator.alloc(trunk.KVCacheEntry, 0), .step = 0, .allocator = allocator, .config = trunk.KVQuantConfig.dense },
+        .last_used = used,
+        .quant_config = @import("kv_quant.zig").KVQuantConfig.dense,
+        .kv_bytes = tokens.len * 10,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    };
+}
+
+fn admissionTestModel(cfg: *ModelConfig, ram: bool, model: *model_registry_mod.LoadedModel) void {
+    model.* = undefined;
+    model.config = cfg;
+    model.handle = null;
+    model.mtp = null;
+    model.prefix_cache = if (ram) @import("prefix_cache.zig").HotPrefixCache.initWithMem(testing.allocator, @import("prefix_cache.zig").unlimited_entries, 0) else null;
+}
+
+test "a request a cap holds says which cap in its queue line, and one only behind its model's earlier request says nothing" {
+    const t = testing;
+    var buf: [192]u8 = undefined;
+    const A: usize = 0xA0;
+    const cands = [_]sched_policy.AdmitCand{
+        .{ .model = A, .exclusive = false, .live = 1, .max_concurrent = 2, .reservation = 10 },
+        .{ .model = A, .exclusive = false, .live = 1, .max_concurrent = 2, .reservation = 10 },
+    };
+    const verdicts = [_]sched_policy.AdmitVerdict{ .admit, .wait };
+    try t.expectEqualStrings("[queue] waiting for max_concurrent 2: 2 of this model's requests run", capWaitLine(&buf, cands[1], &cands, &verdicts).?);
+    const kv = [_]sched_policy.AdmitCand{.{ .model = A, .exclusive = false, .reserved = 3410, .reservation = 3410, .max_kv_tokens = 6000 }};
+    try t.expectEqualStrings("[queue] waiting for max_kv_tokens 6000: 3410 tokens held, this request reserves 3410", capWaitLine(&buf, kv[0], &kv, &.{.wait}).?);
+    const fifo = [_]sched_policy.AdmitCand{.{ .model = A, .exclusive = false, .reserved = 10, .reservation = 10, .max_kv_tokens = 6000 }};
+    try t.expect(capWaitLine(&buf, fifo[0], &fifo, &.{.wait}) == null);
+}
+
+test "with max_kv_tokens set, a candidate evicts the oldest retained entry and admits instead of waiting" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_concurrent = 4;
+    cfg.max_kv_tokens = 200;
+    var model: model_registry_mod.LoadedModel = undefined;
+    admissionTestModel(&cfg, true, &model);
+    defer model.prefix_cache.?.deinit();
+    const hc = &model.prefix_cache.?;
+    try hc.entries.append(a, try admissionTestEntry(a, &.{ 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030 }, 1));
+    try hc.entries.append(a, try admissionTestEntry(a, &.{ 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025, 2026, 2027, 2028, 2029, 2030 }, 2));
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    var prompt: [80]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 1);
+    const slot = try sch.submit(.{ .model = &model, .prompt_ids = &prompt, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 70 });
+    defer {
+        sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+    }
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    try testing.expectEqual(@as(usize, 1), tick.admits);
+    try testing.expectEqual(@as(usize, 0), tick.refused);
+    try testing.expect(planned[0] == slot);
+    // The oldest entry paid; the newer one stays.
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(u32, 2001), hc.entries.items[0].tokens[0]);
+}
+
+test "a candidate over max_kv_tokens alone is refused once, naming the cap and its reservation" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_concurrent = 4;
+    cfg.max_kv_tokens = 200;
+    var model: model_registry_mod.LoadedModel = undefined;
+    admissionTestModel(&cfg, false, &model);
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    var prompt: [120]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(i + 1);
+    const slot = try sch.submit(.{ .model = &model, .prompt_ids = &prompt, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 100 });
+    defer {
+        sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+    }
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    try testing.expectEqual(@as(usize, 0), tick.admits);
+    try testing.expectEqual(@as(usize, 1), tick.refused);
+    try testing.expect(refused[0] == slot);
+    try testing.expect(slot.errorNameIs("PrefillDoesNotFit"));
+    try testing.expect(std.mem.indexOf(u8, slot.forward_refusal.?.text(), "max_kv_tokens 200") != null);
+    try testing.expect(std.mem.indexOf(u8, slot.forward_refusal.?.text(), "220 tokens") != null);
+}
+
+test "the caps pick the candidates and memory admits from them: two that fit alone admit one, with their hold billed" {
+    const a = testing.allocator;
+    const Probe = struct {
+        fn numbers(_: *const ModelConfig, _: usize, _: u32, _: trunk.KVQuantConfig, _: bool, _: bool) MemoryBill {
+            return .{ .needed = 8, .available = 10, .commit = 6, .held = 5 };
+        }
+    };
+    const saved = scheduler_mod.prefill_admission_numbers;
+    scheduler_mod.prefill_admission_numbers = Probe.numbers;
+    defer scheduler_mod.prefill_admission_numbers = saved;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_concurrent = 4;
+    cfg.max_kv_tokens = 0;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.config = &cfg;
+    model.handle = null;
+    model.prefix_cache = null;
+    model.mtp = null;
+    var prompt = [_]u32{1};
+    var slots: [2]Slot = undefined;
+    for (&slots, 0..) |*s, i| {
+        s.model = &model;
+        s.full_prompt = prompt[0..];
+        s.max_tokens = 1;
+        s.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = trunk.KVQuantConfig.dense };
+        s.request = null;
+        s.vision_embeddings = null;
+        s.deferred_media = null;
+        s.enable_mtp = false;
+        s.enable_drafter = false;
+        s.dflash = null;
+        s.legacy_gen = null;
+        s.memory_hold_logged = true;
+        s.queue_logged = true;
+        s.cancelled = std.atomic.Value(bool).init(false);
+        s.finished = false;
+        s.error_code = null;
+        s.growth_commit = 0;
+        s.admitted_held = 0;
+        s.restored_entry = 0;
+        if (i == 1) prompt[0] = 2;
+    }
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    try sch.pending.append(a, &slots[0]);
+    try sch.pending.append(a, &slots[1]);
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    try testing.expectEqual(@as(usize, 1), tick.admits);
+    try testing.expect(planned[0] == &slots[0]);
+    try testing.expectEqual(@as(u64, 5), slots[0].admitted_held);
+    try testing.expectEqual(@as(u64, 6), slots[0].growth_commit);
+    try testing.expectEqual(@as(u64, 0), slots[1].admitted_held);
+}
+
+fn kvCapSlot(model: *model_registry_mod.LoadedModel, prompt: []u32, max_tokens: u32, restored_entry: u64) Slot {
+    var s: Slot = undefined;
+    s.model = model;
+    s.full_prompt = prompt;
+    s.max_tokens = max_tokens;
+    s.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = trunk.KVQuantConfig.dense };
+    s.request = null;
+    s.vision_embeddings = null;
+    s.deferred_media = null;
+    s.enable_mtp = false;
+    s.enable_drafter = false;
+    s.dflash = null;
+    s.legacy_gen = null;
+    s.memory_hold_logged = true;
+    s.queue_logged = true;
+    s.cancelled = std.atomic.Value(bool).init(false);
+    s.finished = false;
+    s.error_code = null;
+    s.growth_commit = 0;
+    s.admitted_held = 0;
+    s.restored_entry = restored_entry;
+    return s;
+}
+
+fn kvCapModel(cfg: *ModelConfig, model: *model_registry_mod.LoadedModel) *@import("prefix_cache.zig").HotPrefixCache {
+    cfg.max_concurrent = 0;
+    model.config = cfg;
+    model.handle = null;
+    model.mtp = null;
+    model.prefix_cache = @import("prefix_cache.zig").HotPrefixCache.initWithMem(testing.allocator, @import("prefix_cache.zig").unlimited_entries, 0);
+    return &model.prefix_cache.?;
+}
+
+test "a stale last-restored entry never blocks eviction: nothing live, the candidate admits" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_kv_tokens = 200;
+    var model: model_registry_mod.LoadedModel = undefined;
+    const hc = kvCapModel(&cfg, &model);
+    defer model.prefix_cache.?.deinit();
+    var entry_tokens: [100]u32 = undefined;
+    for (&entry_tokens, 0..) |*t, i| t.* = @intCast(i + 1);
+    try hc.entries.append(a, try admissionTestEntry(a, &entry_tokens, 1));
+    hc.entries.items[0].id = 1;
+    hc.last_restored_used = 1; // the PREVIOUS request's restore, stale
+    var prompt: [80]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(101 + i);
+    var slot = kvCapSlot(&model, &prompt, 70, 0);
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    try sch.pending.append(a, &slot);
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    try testing.expectEqual(@as(usize, 1), tick.admits);
+    try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+}
+
+test "the candidate's own restore match is the last entry evicted, never the first" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_kv_tokens = 150;
+    var model: model_registry_mod.LoadedModel = undefined;
+    const hc = kvCapModel(&cfg, &model);
+    defer model.prefix_cache.?.deinit();
+    var own: [30]u32 = undefined;
+    for (&own, 0..) |*t, i| t.* = @intCast(i + 1);
+    try hc.entries.append(a, try admissionTestEntry(a, &own, 1));
+    hc.entries.items[0].id = 1;
+    var other: [60]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(1001 + i);
+    try hc.entries.append(a, try admissionTestEntry(a, &other, 2));
+    hc.entries.items[1].id = 2;
+    var slot = kvCapSlot(&model, &own, 90, 0);
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    try sch.pending.append(a, &slot);
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    try testing.expectEqual(@as(usize, 1), tick.admits);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(u32, 1), hc.entries.items[0].tokens[0]);
+}
+
+test "a later candidate's reclaim never evicts the entry a candidate admitted in the same tick restores from" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_kv_tokens = 250;
+    var model: model_registry_mod.LoadedModel = undefined;
+    const hc = kvCapModel(&cfg, &model);
+    defer model.prefix_cache.?.deinit();
+    var first: [80]u32 = undefined;
+    for (&first, 0..) |*t, i| t.* = @intCast(i + 1);
+    try hc.entries.append(a, try admissionTestEntry(a, first[0..50], 1));
+    hc.entries.items[0].id = 1;
+    var other: [60]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(1001 + i);
+    try hc.entries.append(a, try admissionTestEntry(a, &other, 2));
+    hc.entries.items[1].id = 2;
+    var second: [80]u32 = undefined;
+    for (&second, 0..) |*t, i| t.* = @intCast(5001 + i);
+    var slot_a = kvCapSlot(&model, &first, 20, 0);
+    var slot_b = kvCapSlot(&model, &second, 70, 0);
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    try sch.pending.append(a, &slot_a);
+    try sch.pending.append(a, &slot_b);
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    // 100 + 150 reserved fills the 250 cap once the unrelated 60 goes; the first request's 50-token match stays.
+    try testing.expectEqual(@as(usize, 2), tick.admits);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(u32, 1), hc.entries.items[0].tokens[0]);
+}
+
+test "an entry a live slot restored from counts once and is never evicted" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_kv_tokens = 200;
+    var model: model_registry_mod.LoadedModel = undefined;
+    const hc = kvCapModel(&cfg, &model);
+    defer model.prefix_cache.?.deinit();
+    var live_tokens: [60]u32 = undefined;
+    for (&live_tokens, 0..) |*t, i| t.* = @intCast(1001 + i);
+    try hc.entries.append(a, try admissionTestEntry(a, &live_tokens, 1)); // oldest
+    hc.entries.items[0].id = 1;
+    var other: [30]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(2001 + i);
+    try hc.entries.append(a, try admissionTestEntry(a, &other, 2));
+    hc.entries.items[1].id = 2;
+    var live_prompt: [50]u32 = undefined;
+    for (&live_prompt, 0..) |*p, i| p.* = @intCast(3001 + i);
+    var live = kvCapSlot(&model, &live_prompt, 50, 1);
+    var prompt: [80]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(4001 + i);
+    var slot = kvCapSlot(&model, &prompt, 10, 0);
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    try sch.decoding.append(a, &live);
+    try sch.pending.append(a, &slot);
+    var planned: [16]*Slot = undefined;
+    var refused: [16]*Slot = undefined;
+    const tick = admitWithinCaps(&sch, &planned, &refused);
+    try testing.expectEqual(@as(usize, 1), tick.admits);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(u32, 1001), hc.entries.items[0].tokens[0]);
+}
+
+test "the reserved-token gauge is what /props reads, published without touching the hot cache" {
+    const a = testing.allocator;
+    var cfg = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 0 };
+    cfg.max_kv_tokens = 1000;
+    var model: model_registry_mod.LoadedModel = undefined;
+    const hc = kvCapModel(&cfg, &model);
+    defer model.prefix_cache.?.deinit();
+    var entry_tokens: [40]u32 = undefined;
+    for (&entry_tokens, 0..) |*t, i| t.* = @intCast(1001 + i);
+    try hc.entries.append(a, try admissionTestEntry(a, &entry_tokens, 1));
+    var prompt: [60]u32 = undefined;
+    for (&prompt, 0..) |*p, i| p.* = @intCast(3001 + i);
+    var slot = kvCapSlot(&model, &prompt, 40, 0);
+    var sch = submitTestScheduler(a, 8);
+    defer sch.pending.deinit(a);
+    defer sch.decoding.deinit(a);
+    defer sch.cleanup_queue.deinit(a);
+    defer sch.prefilling.deinit(a);
+    try sch.decoding.append(a, &slot);
+    publishModelReserved(&sch, &model);
+    try testing.expectEqual(@as(u64, 60 + 40 + 40), model.reserved_tokens.load(.monotonic));
 }

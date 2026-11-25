@@ -167,13 +167,13 @@ pub fn diskTierOn(config: *const model_mod.ModelConfig) bool {
 }
 
 /// PURE: the boot line for a requested hot prefix cache that did not engage, naming the cause that applies.
-pub fn hotCacheDisabledLine(buf: []u8, capacity: u32, ram_enabled: bool, disk_on: bool, full_attention: bool) []const u8 {
+pub fn hotCacheDisabledLine(buf: []u8, ram_enabled: bool, disk_on: bool, full_attention: bool) []const u8 {
     const text = if (!ram_enabled and !disk_on)
         std.fmt.bufPrint(buf, "Prefix cache: OFF, no prompt-prefix reuse (RAM retention is off and the SSD tier is off; --prefix-cache-mem <n> turns on RAM retention)", .{})
     else if (full_attention)
-        std.fmt.bufPrint(buf, "Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled", .{capacity})
+        std.fmt.bufPrint(buf, "Hot prefix cache: requested but the model uses full-attention-interval — disabled", .{})
     else
-        std.fmt.bufPrint(buf, "Hot prefix cache: requested capacity={d} but disabled by scheduler", .{capacity});
+        std.fmt.bufPrint(buf, "Hot prefix cache: requested but disabled by scheduler", .{});
     return text catch "Hot prefix cache: disabled";
 }
 
@@ -2201,6 +2201,10 @@ pub fn diskContextForLoad(config: *model_mod.ModelConfig) u64 {
 /// there is none (`quiet`: neither). Runs on the inference thread beside `prefixCacheMemForLoad`.
 /// `held` is what this model's tier already occupies under `dir`: it counts as available, or a restart on a
 /// nearly full volume would evict what the last boot stored.
+/// The SSD tier's default ask sizes for this many remembered conversations when no byte budget is given. It is a
+/// sizing term of the formula, not a retention limit: the cache keeps what its byte budget holds.
+pub const default_disk_sizing_entries: u32 = 32;
+
 pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, held: u64, quiet: bool) ?disk_placement.DefaultDiskBudget {
     const kv_bits = defaultKvBits(config);
     const bpt = diskBytesPerToken(config, kv_bits);
@@ -2209,11 +2213,12 @@ pub fn prefixCacheDiskForLoad(config: *model_mod.ModelConfig, dir: []const u8, h
     // An unreadable volume is no reason to refuse: the tier re-checks before every store.
     const free: u64 = if (disk_placement.volumeSpaceNear(dir)) |v| v.free else std.math.maxInt(u64);
     var buf: [384]u8 = undefined;
-    const plan = disk_placement.resolveDiskBudget(ask.explicit(), ask.bytes, launch_state.prefix_cache_capacity, ctx, bpt, free, held) orelse {
+    const sizing_entries = if (ask.explicit()) 0 else default_disk_sizing_entries;
+    const plan = disk_placement.resolveDiskBudget(ask.explicit(), ask.bytes, sizing_entries, ctx, bpt, free, held) orelse {
         if (!quiet) log.info("{s}\n", .{disk_placement.diskOffLine(&buf, free, dir, if (ask.explicit() and ask.bytes == 0) ask.sourceName() else null)});
         return null;
     };
-    if (!quiet) log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, launch_state.prefix_cache_capacity, ctx, bpt, dir, ask.sourceName())});
+    if (!quiet) log.info("{s}\n", .{disk_placement.allocatingDiskLine(&buf, plan, sizing_entries, ctx, bpt, dir, ask.sourceName())});
     return plan;
 }
 
@@ -4139,9 +4144,9 @@ test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off p
 test "the hot-cache boot line names RAM retention and the SSD tier before the attention layout" {
     const t = std.testing;
     var buf: [192]u8 = undefined;
-    try t.expect(std.mem.startsWith(u8, hotCacheDisabledLine(&buf, 32, false, false, true), "Prefix cache: OFF"));
-    try t.expect(std.mem.indexOf(u8, hotCacheDisabledLine(&buf, 32, true, false, true), "full-attention-interval") != null);
-    try t.expect(std.mem.indexOf(u8, hotCacheDisabledLine(&buf, 32, false, true, false), "disabled by scheduler") != null);
+    try t.expect(std.mem.startsWith(u8, hotCacheDisabledLine(&buf, false, false, true), "Prefix cache: OFF"));
+    try t.expect(std.mem.indexOf(u8, hotCacheDisabledLine(&buf, true, false, true), "full-attention-interval") != null);
+    try t.expect(std.mem.indexOf(u8, hotCacheDisabledLine(&buf, false, true, false), "disabled by scheduler") != null);
 }
 
 test "a load with no model resident lowers a GPU floor other processes have released, never raises it" {
@@ -5533,7 +5538,7 @@ test "resolvePrefillChunk: the sizer and the guard bill the chunk that was pinne
 
 test "prefillMemoryNeeded: a GDN trunk's prefill peaks stay covered" {
     // Peak GPU bytes above steady state for ONE request on a clean boot
-    // (`--prefix-cache-entries 0 --no-mtp --no-drafter`, /props
+    // (prefix cache off, `--no-mtp --no-drafter`, /props
     // peak_bytes minus active_bytes, M4 Max) — byte-identical across repeat
     // boots, so these are exact figures, not samples. An estimate BELOW a peak
     // we have actually seen ends in an uncatchable Metal OOM instead of a 400.
@@ -9414,4 +9419,26 @@ test "prefill chunk bounds: every served model takes both flags and both keys, a
         try testing.expectEqualStrings("model-settings.json prefill_chunk_min 4096 is above model-settings.json prefill_chunk_max 1024", try refusedPick(prefillChunkBounds(&buf, &config)));
     }
     try testing.expect(seen > 0);
+}
+
+test "max_kv_tokens is a token pool, never a bill: the same request holds the same bytes at any cap" {
+    var cfg = model_mod.ModelConfig{
+        .model_type = "not_a_served_arch",
+        .num_hidden_layers = 4,
+        .hidden_size = 512,
+        .num_attention_heads = 8,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .num_experts = 8,
+        .num_experts_per_tok = 2,
+        .moe_intermediate_size = 256,
+        .intermediate_size = 1024,
+        .vocab_size = 1000,
+    };
+    const off = requestHeldBytes(&cfg, 1000, 100, 8, 512, .{});
+    try testing.expect(off > 0);
+    for ([_]u64{ 1, 4096, 1 << 20 }) |cap| {
+        cfg.max_kv_tokens = cap;
+        try testing.expectEqual(off, requestHeldBytes(&cfg, 1000, 100, 8, 512, .{}));
+    }
 }

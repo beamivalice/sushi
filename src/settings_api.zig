@@ -83,6 +83,8 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "expert_cache_bias")) return if (o.expert_cache_bias) |v| .{ .float = v } else null;
     if (eql(u8, name, "prefill_chunk_max")) return if (o.prefill_chunk_max) |v| .{ .integer = v } else null;
     if (eql(u8, name, "prefill_chunk_min")) return if (o.prefill_chunk_min) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "max_concurrent")) return if (o.max_concurrent) |v| .{ .integer = v } else null;
+    if (eql(u8, name, "max_kv_tokens")) return if (o.max_kv_tokens) |v| .{ .integer = @intCast(v) } else null;
     return null;
 }
 
@@ -102,6 +104,8 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .expert_cache_bias = config.expert_cache_bias_override,
         .prefill_chunk_max = config.prefill_chunk_max_override,
         .prefill_chunk_min = config.prefill_chunk_min_override,
+        .max_concurrent = config.max_concurrent_override,
+        .max_kv_tokens = config.max_kv_tokens_override,
     };
     arch_flags.putCoolerSetting(config, &o, config.cooler_override);
     return o;
@@ -127,6 +131,8 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
     const widest = settings_resolve.defaultChunkMax(&bare);
     o.prefill_chunk_max = widest;
     o.prefill_chunk_min = settings_resolve.defaultChunkMin(widest);
+    o.max_concurrent = bare.max_concurrent;
+    o.max_kv_tokens = bare.max_kv_tokens;
     arch_flags.putCoolerSetting(&bare, &o, bare.coolerChoice().on);
     return o;
 }
@@ -968,13 +974,13 @@ fn savesSsdTier(plan: Plan) bool {
 
 /// Whether saving `key` changes what a load or its preflight reads, so a model that failed to load deserves another try.
 pub fn reachesLoad(key: []const u8) bool {
-    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" };
+    const reads = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "max_concurrent", "max_kv_tokens", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" };
     for (reads) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
 
 test "settings api: every saved key is classified, and the ones a load reads clear a stored load failure" {
-    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
+    for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "max_concurrent", "max_kv_tokens", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
     for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "continue_after_thought" }) |key| {
@@ -994,7 +1000,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "max_concurrent", "max_kv_tokens", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -1694,6 +1700,70 @@ test "settings api: a ready model reports the default each key resolves to; an u
     }
     try testing.expectEqual(@as(i64, @intCast(settings_resolve.defaultChunkMax(&dsv41))), d.get("prefill_chunk_max").?.integer);
     try testing.expectEqual(@as(i64, 512), d.get("prefill_chunk_min").?.integer);
+}
+
+test "settings api: max_concurrent and max_kv_tokens are offered with their defaults, and an exclusive model refuses more than one" {
+    if (arch_config.ofConfigType("deepseek_v41") == null) return error.SkipZigTest;
+    var file = try model_settings.parse(testing.allocator, "{}");
+    defer file.deinit();
+    const locks: model_settings.LaunchLocks = .{};
+    const dsv41 = model_mod.ModelConfig{ .model_type = "deepseek_v41", .max_position_embeddings = 1_048_576, .serve_defaults = arch_config.releaseServeDefaults("dsv41") };
+    const rows = [_]ModelRow{.{ .id = "ready", .path = "/m/a", .state = "ready", .bytes = 5, .defaults = resolvedDefaults(&dsv41), .fit = arch_flags.settingsFit(&dsv41) }};
+    const body = try render(testing.allocator, "/h/s.json", &file, &rows, &locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    var seen_concurrent = false;
+    var seen_kv = false;
+    for (root.get("model_keys").?.array.items) |k| {
+        const key = k.object;
+        if (std.mem.eql(u8, key.get("name").?.string, "max_concurrent")) {
+            seen_concurrent = true;
+            try testing.expectEqualStrings("int", key.get("type").?.string);
+            try testing.expectEqual(@as(i64, 1), key.get("min").?.integer);
+        }
+        if (std.mem.eql(u8, key.get("name").?.string, "max_kv_tokens")) {
+            seen_kv = true;
+            try testing.expectEqualStrings("int", key.get("type").?.string);
+            try testing.expectEqual(@as(i64, 0), key.get("min").?.integer);
+        }
+    }
+    try testing.expect(seen_concurrent and seen_kv);
+    const d = root.get("models").?.array.items[0].object.get("defaults").?.object;
+    // No flag and no key: the count gate is absent (0), not 1.
+    try testing.expectEqual(@as(i64, 0), d.get("max_concurrent").?.integer);
+    try testing.expectEqual(@as(i64, 0), d.get("max_kv_tokens").?.integer);
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    // A resident DeepSeek load batches rows, so its config is not "fixed at 1".
+    const fit = arch_flags.settingsFit(&dsv41);
+    try testing.expect(refusalMessage(arena_state.allocator(), fit, null, &.{.{ .key = "max_concurrent", .value = .{ .integer = 2 } }}) == null);
+    try testing.expect(refusalMessage(arena_state.allocator(), fit, null, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } }}) == null);
+    // Only an arch whose decode can never batch (Hy4-Flash) is fixed at 1 with its reason.
+    const hy4 = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
+    const hfit = arch_flags.settingsFit(&hy4);
+    try testing.expectEqual(@as(u32, 1), model_settings.limit("max_concurrent", hfit).max);
+    const why = refusalMessage(arena_state.allocator(), hfit, null, &.{.{ .key = "max_concurrent", .value = .{ .integer = 2 } }}).?;
+    try testing.expect(std.mem.indexOf(u8, why, "one request at a time") != null);
+
+    // A non-exclusive model takes no more rows than its own batched tick carries.
+    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+    const qfit = arch_flags.settingsFit(&qwen);
+    try testing.expectEqual(@as(u32, 8), model_settings.limit("max_concurrent", qfit).max);
+    const cap_why = refusalMessage(arena_state.allocator(), qfit, null, &.{.{ .key = "max_concurrent", .value = .{ .integer = 9 } }}).?;
+    try testing.expect(std.mem.indexOf(u8, cap_why, "joins at most this many") != null);
+    try testing.expect(refusalMessage(arena_state.allocator(), qfit, null, &.{.{ .key = "max_concurrent", .value = .{ .integer = 8 } }}) == null);
+}
+
+test "settings api: the removed prefix-cache entry key is refused by name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const parsed = parseRequest(arena_state.allocator(), "{\"model\":\"m\",\"set\":{\"prefix_cache_entries\":32}}");
+    try testing.expectEqual(@as(u32, 400), parsed.rejected.status);
+    try testing.expect(std.mem.indexOf(u8, parsed.rejected.message, "prefix_cache_entries") != null);
+    try testing.expect(std.mem.indexOf(u8, parsed.rejected.message, "removed") != null);
 }
 
 test "settings api: the resolved defaults ignore the file's values the config was stamped with" {

@@ -233,28 +233,117 @@ pub fn slotDrivesHead(enable_mtp: bool, enable_drafter: bool, has_dflash: bool) 
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
-/// admission needs: an opaque model identity + the exclusive-decode bit.
-pub const AdmitCand = struct { model: usize, exclusive: bool };
+/// admission needs: an opaque model identity, the exclusive-decode bit, and
+/// the model's concurrency and KV-token facts.
+pub const AdmitCand = struct {
+    model: usize,
+    exclusive: bool,
+    /// Live slots of this model that hold admission this tick (decoding,
+    /// prefilling, or queued for cleanup and not freed).
+    live: u32 = 0,
+    /// Prompt + max_tokens of those live slots.
+    reserved: u64 = 0,
+    /// Tokens this model's retained hot-cache entries hold; counted only
+    /// when `max_kv_tokens` is set.
+    retained: u64 = 0,
+    /// Tokens of the retained entry this candidate would restore from, already
+    /// inside `reservation`: counted once, never also as retained.
+    own_retained: u64 = 0,
+    /// The retained entry `own_retained` is (0: none), so two candidates restoring from one entry count it once.
+    own_id: u64 = 0,
+    /// This candidate's own prompt + max_tokens.
+    reservation: u64 = 0,
+    /// The model's resolved count cap; 0 = none (no flag and no key: no count gate).
+    max_concurrent: u32 = 0,
+    /// The model's KV-token cap; 0 = no cap.
+    max_kv_tokens: u64 = 0,
+};
+
+pub const AdmitVerdict = enum { admit, wait, refuse, reclaim };
 
 /// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
 /// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
 /// admitted exclusive candidate claimed it this tick
 /// (a same-tick sibling is not in `decoding` yet — the claim covers the
-/// window). Non-exclusive candidates always admit — no head-of-line
-/// blocking behind a held exclusive request. Writes admitted candidate
-/// indices to `out` (queue order preserved), returns the count. Held
-/// candidates stay where they are and retry next tick; no release
-/// bookkeeping exists — the busy signal IS presence in `decoding`.
-pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize) usize {
+/// window). A non-exclusive candidate waits while its model already runs
+/// `max_concurrent` slots. With a `max_kv_tokens` cap, a candidate whose
+/// reservation would not fit beside the live reservations is `refuse`d when
+/// it alone exceeds the cap, and is `reclaim` when only retained entries
+/// stand in its way (the caller evicts them and asks again); it `wait`s when
+/// live slots alone fill the pool. Writes admitted candidate indices to `out`
+/// (queue order preserved) and one verdict per candidate to `verdicts`,
+/// returns the admitted count. Held candidates stay where they are and retry
+/// next tick; no release bookkeeping exists — the busy signal IS presence in
+/// `decoding`.
+pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize, verdicts: []AdmitVerdict) usize {
     var n: usize = 0;
-    outer: for (cands, 0..) |c, i| {
-        if (n >= out.len) break;
+    // FIFO per model: a candidate that waits holds back every later candidate of the same model, so a small request
+    // never passes a large one of its own model.
+    var blocked: [MAX_BATCH_GROUP * 2]usize = undefined;
+    var n_blocked: usize = 0;
+    for (cands, 0..) |c, i| {
+        verdicts[i] = .wait;
+        if (c.max_kv_tokens > 0 and c.reservation > c.max_kv_tokens) {
+            verdicts[i] = .refuse;
+            continue;
+        }
+        var held = false;
+        for (blocked[0..n_blocked]) |m| {
+            if (m != c.model) continue;
+            held = true;
+            break;
+        }
+        if (held) continue;
         if (c.exclusive) {
-            for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
-            for (out[0..n]) |j| {
-                if (cands[j].exclusive and cands[j].model == c.model) continue :outer;
+            var claimed = false;
+            for (active) |a| if (a.exclusive and a.model == c.model) {
+                claimed = true;
+                break;
+            };
+            if (!claimed) for (out[0..n]) |j| {
+                if (cands[j].exclusive and cands[j].model == c.model) {
+                    claimed = true;
+                    break;
+                }
+            };
+            if (claimed) continue;
+        }
+        var tick_live: u32 = 0;
+        var tick_reserved: u64 = 0;
+        // Retained entries this tick's admits restore from are inside their reservations: count each once.
+        var tick_own: u64 = 0;
+        for (out[0..n], 0..) |j, k| if (cands[j].model == c.model) {
+            tick_live += 1;
+            tick_reserved +|= cands[j].reservation;
+            const id = cands[j].own_id;
+            if (id == 0 or id == c.own_id) continue;
+            const seen = for (out[0..k]) |e| {
+                if (cands[e].model == c.model and cands[e].own_id == id) break true;
+            } else false;
+            if (!seen) tick_own +|= cands[j].own_retained;
+        };
+        if (c.max_concurrent > 0 and c.live +| tick_live >= c.max_concurrent) {
+            if (n_blocked < blocked.len) blocked[n_blocked] = c.model;
+            n_blocked += 1;
+            continue;
+        }
+        if (c.max_kv_tokens > 0) {
+            const live_tokens = c.reserved +| tick_reserved +| c.reservation;
+            if (live_tokens > c.max_kv_tokens) {
+                if (n_blocked < blocked.len) blocked[n_blocked] = c.model;
+                n_blocked += 1;
+                continue;
+            }
+            const retained = c.retained -| c.own_retained -| tick_own;
+            if (retained > 0 and live_tokens +| retained > c.max_kv_tokens) {
+                verdicts[i] = .reclaim;
+                if (n_blocked < blocked.len) blocked[n_blocked] = c.model;
+                n_blocked += 1;
+                continue;
             }
         }
+        if (n >= out.len) continue;
+        verdicts[i] = .admit;
         out[n] = i;
         n += 1;
     }
@@ -594,17 +683,19 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
     const A: usize = 0xA0;
     const B: usize = 0xB0;
     var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
 
     // Held while a live slot on the same exclusive model is decoding.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.wait, verdicts[0]);
     }
     // Admits once no live slot holds the model.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
         try testing.expectEqual(@as(usize, 0), out[0]);
     }
     // Two exclusive candidates on the SAME model in one tick: only the
@@ -614,7 +705,7 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
             .{ .model = A, .exclusive = true },
             .{ .model = A, .exclusive = true },
         };
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
         try testing.expectEqual(@as(usize, 0), out[0]);
     }
     // Distinct exclusive models admit independently.
@@ -623,7 +714,7 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
             .{ .model = A, .exclusive = true },
             .{ .model = B, .exclusive = true },
         };
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out));
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out, &verdicts));
         try testing.expectEqual(@as(usize, 0), out[0]);
         try testing.expectEqual(@as(usize, 1), out[1]);
     }
@@ -632,41 +723,191 @@ test "admitPendingTick: exclusive single-flight FIFO contract" {
 test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
     const A: usize = 0xA0;
     const L: usize = 0x10;
+    const wide = MAX_BATCH_GROUP;
     var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
 
     // Non-exclusive candidates (per-slot state) admit freely
     // even beside live slots — their serial-tick interleave is safe.
     {
         const cands = [_]AdmitCand{
-            .{ .model = L, .exclusive = false },
-            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false, .max_concurrent = wide },
+            .{ .model = L, .exclusive = false, .max_concurrent = wide },
         };
         const active = [_]AdmitCand{.{ .model = L, .exclusive = false }};
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &active, &out, &verdicts));
     }
     // A held exclusive candidate must not head-of-line-block a later
     // candidate on another model (requests for OTHER models keep flowing).
     {
         const cands = [_]AdmitCand{
             .{ .model = A, .exclusive = true },
-            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false, .max_concurrent = wide },
         };
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out, &verdicts));
         try testing.expectEqual(@as(usize, 1), out[0]);
     }
     // `out` caps the admitted count (mirrors to_prefill's 16), in order.
     {
         const cands = [_]AdmitCand{
-            .{ .model = L, .exclusive = false },
-            .{ .model = L, .exclusive = false },
-            .{ .model = L, .exclusive = false },
+            .{ .model = L, .exclusive = false, .max_concurrent = wide },
+            .{ .model = L, .exclusive = false, .max_concurrent = wide },
+            .{ .model = L, .exclusive = false, .max_concurrent = wide },
         };
         var small: [2]usize = undefined;
-        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &small));
+        try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &small, &verdicts));
         try testing.expectEqual(@as(usize, 0), small[0]);
         try testing.expectEqual(@as(usize, 1), small[1]);
     }
+}
+
+test "admitPendingTick: a model at its max_concurrent holds the next candidate, another model still admits, and a freed slot admits it" {
+    const A: usize = 0xA0;
+    const B: usize = 0xB0;
+    var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
+
+    // A runs its one slot: its next request waits, B's still admits.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = false, .max_concurrent = 1, .live = 1 },
+            .{ .model = B, .exclusive = false, .max_concurrent = 2, .live = 0 },
+        };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(@as(usize, 1), out[0]);
+        try testing.expectEqual(AdmitVerdict.wait, verdicts[0]);
+        try testing.expectEqual(AdmitVerdict.admit, verdicts[1]);
+    }
+    // One frees: the held candidate admits on the next tick.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false, .max_concurrent = 1, .live = 0 }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.admit, verdicts[0]);
+    }
+    // Two arrivals on a two-slot model: the first admits, the second sees the tick's claim and waits.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = false, .max_concurrent = 2, .live = 1 },
+            .{ .model = A, .exclusive = false, .max_concurrent = 2, .live = 1 },
+        };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.admit, verdicts[0]);
+        try testing.expectEqual(AdmitVerdict.wait, verdicts[1]);
+    }
+}
+
+test "admitPendingTick: a KV cap holds a candidate that would pass the sum, admits one that fits beside, and refuses a lone one over it" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
+
+    // Live 6,000 + candidate 4,000 = the cap exactly: fits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 6_000, .reservation = 4_000, .max_kv_tokens = 10_000 }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.admit, verdicts[0]);
+    }
+    // 6,000 + 4,001 passes the cap: waits.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 6_000, .reservation = 4_001, .max_kv_tokens = 10_000 }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.wait, verdicts[0]);
+    }
+    // Retained entries are the only thing over the line: reclaim them, do not wait.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 6_000, .retained = 3_000, .reservation = 4_000, .max_kv_tokens = 10_000 }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.reclaim, verdicts[0]);
+    }
+    // A lone candidate over the cap is refused, never waited out.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false, .max_concurrent = 4, .reservation = 12_000, .max_kv_tokens = 10_000 }};
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.refuse, verdicts[0]);
+    }
+    // Siblings in one tick share the pool.
+    {
+        const cands = [_]AdmitCand{
+            .{ .model = A, .exclusive = false, .max_concurrent = 4, .reservation = 6_000, .max_kv_tokens = 10_000 },
+            .{ .model = A, .exclusive = false, .max_concurrent = 4, .reservation = 6_000, .max_kv_tokens = 10_000 },
+        };
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.admit, verdicts[0]);
+        try testing.expectEqual(AdmitVerdict.wait, verdicts[1]);
+    }
+    // No cap: reservations never hold anyone.
+    {
+        const cands = [_]AdmitCand{.{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 1_000_000, .reservation = 1_000_000 }};
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+        try testing.expectEqual(AdmitVerdict.admit, verdicts[0]);
+    }
+}
+
+test "a candidate restoring its own retained entry counts that entry once and admits at the cap" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
+    // Cap 100,000; the entry it restores from holds 60,000; its own request reserves
+    // 70,000 prompt + 20,000 reply = 90,000, which fits alone. Counting the entry
+    // again would wait forever, since that entry is the one it restores from.
+    const cands = [_]AdmitCand{.{
+        .model = A,
+        .exclusive = false,
+        .max_concurrent = 4,
+        .retained = 60_000,
+        .own_retained = 60_000,
+        .reservation = 90_000,
+        .max_kv_tokens = 100_000,
+    }};
+    try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &.{}, &out, &verdicts));
+    try testing.expectEqual(AdmitVerdict.admit, verdicts[0]);
+}
+
+test "no max_concurrent means no count gate: any number of that model's requests admit" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
+    const cands = [_]AdmitCand{
+        .{ .model = A, .exclusive = false, .max_concurrent = 0, .live = 5 },
+        .{ .model = A, .exclusive = false, .max_concurrent = 0, .live = 5 },
+    };
+    try testing.expectEqual(@as(usize, 2), admitPendingTick(&cands, &.{}, &out, &verdicts));
+}
+
+test "a candidate waiting on max_kv_tokens holds back later candidates of its own model" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
+    // The first needs 80 of 70 free (30 live); the second would fit, but FIFO keeps it behind the big one.
+    const cands = [_]AdmitCand{
+        .{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 30, .reservation = 80, .max_kv_tokens = 100 },
+        .{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 30, .reservation = 5, .max_kv_tokens = 100 },
+    };
+    try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &.{}, &out, &verdicts));
+    try testing.expectEqual(AdmitVerdict.wait, verdicts[0]);
+    try testing.expectEqual(AdmitVerdict.wait, verdicts[1]);
+    // Once the big one fits, it admits before the small one.
+    const roomy = [_]AdmitCand{
+        .{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 0, .reservation = 80, .max_kv_tokens = 100 },
+        .{ .model = A, .exclusive = false, .max_concurrent = 4, .reserved = 0, .reservation = 5, .max_kv_tokens = 100 },
+    };
+    try testing.expectEqual(@as(usize, 2), admitPendingTick(&roomy, &.{}, &out, &verdicts));
+    try testing.expectEqual(@as(usize, 0), out[0]);
+    try testing.expectEqual(@as(usize, 1), out[1]);
+}
+
+test "a candidate over max_kv_tokens alone is refused at once, even behind a waiting one of its model" {
+    const A: usize = 0xA0;
+    var out: [16]usize = undefined;
+    var verdicts: [16]AdmitVerdict = undefined;
+    const cands = [_]AdmitCand{
+        .{ .model = A, .exclusive = false, .reserved = 30, .reservation = 80, .max_kv_tokens = 100 },
+        .{ .model = A, .exclusive = false, .reserved = 30, .reservation = 120, .max_kv_tokens = 100 },
+    };
+    try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &.{}, &out, &verdicts));
+    try testing.expectEqual(AdmitVerdict.wait, verdicts[0]);
+    try testing.expectEqual(AdmitVerdict.refuse, verdicts[1]);
 }
 
 test "idleEvictTickMs: sweeps well inside the window without spinning" {

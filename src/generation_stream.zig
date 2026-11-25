@@ -3485,3 +3485,18 @@ fn chatCallBuffers(call_head: []const u8) !void {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, raw, "\"name\":\"write_file\""));
     try std.testing.expectEqual(@as(usize, 4), std.mem.count(u8, raw, "\"arguments\":\"\""));
 }
+
+test "a max_kv_tokens refusal answers 400 with the cap and the request's reservation, not a 500" {
+    var text = forward_refusal_mod.Text{};
+    const line = "This request reserves 9000 tokens (prompt 8000 + max_tokens 1000), above the model's max_kv_tokens 4096; lower the prompt or max_tokens, or raise max_kv_tokens";
+    text.len = line.len;
+    @memcpy(text.buf[0..line.len], line);
+    server_state.slot_forward_refusal = text;
+    const t = std.testing;
+    const w = try mapGenerationError(t.allocator, error.PrefillDoesNotFit);
+    defer w.deinit(t.allocator);
+    try t.expectEqual(@as(u32, 400), w.code);
+    try t.expectEqualStrings("invalid_request_error", w.openai_type);
+    try t.expect(std.mem.indexOf(u8, w.message, "max_kv_tokens 4096") != null);
+    try t.expect(std.mem.indexOf(u8, w.message, "9000 tokens") != null);
+}

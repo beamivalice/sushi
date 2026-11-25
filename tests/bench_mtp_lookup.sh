@@ -74,7 +74,7 @@ LOG="$OUT/server.log"
 
 # Both arms: no stored round-cost table, so each boot measures from the same cold start.
 SUSHI_ROUND_COST_PERSIST=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --ctx-size 131072 --kv-quant 8 \
-    --prefix-cache-entries 0 --no-drafter --log-level info "$@" >"$LOG" 2>&1 &
+    --prefix-cache-disk off --no-drafter --log-level info "$@" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null' EXIT
 for _ in $(seq 1 600); do

@@ -22,7 +22,6 @@ exec "$binary" serve \
   --max-tokens 64000 \
   --mtp \
   --prefix-cache-mem 12GB \
-  --prefix-cache-entries 1 \
   --prefix-cache-disk 100GB \
   --ssm-checkpoint-max 16 \
   --metrics \

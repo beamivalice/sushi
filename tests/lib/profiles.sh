@@ -25,10 +25,10 @@ sushi_profile_flags() {
         exact)
             local depth=""
             case "$model" in qwen4 | mimo2) depth=" --mtp-min-depth 3 --mtp-max-depth 3" ;; esac
-            echo "$common $slots --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off$depth"
+            echo "$common $slots --prefix-cache-mem off --prefix-cache-disk off$depth"
             ;;
-        ram) echo "$common $slots --prefix-cache-entries 4 --prefix-cache-mem 2GB --prefix-cache-disk off" ;;
-        knobs) echo "$common --think medium --think-penalty ${SUSHI_TEST_THINK_PENALTY:-2} --prefix-cache-entries 0 --prefix-cache-mem off --prefix-cache-disk off" ;;
+        ram) echo "$common $slots --prefix-cache-mem 2GB --prefix-cache-disk off" ;;
+        knobs) echo "$common --think medium --think-penalty ${SUSHI_TEST_THINK_PENALTY:-2} --prefix-cache-mem off --prefix-cache-disk off" ;;
         *) echo "sushi_profile_flags: unknown profile '$profile'" >&2; return 1 ;;
     esac
 }

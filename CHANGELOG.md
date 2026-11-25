@@ -6,6 +6,12 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Each model sets how many requests run at once and how many tokens they may hold together**: the settings keys
+  `max_concurrent` (no limit by default; `--max-concurrent` sets it for every model) and
+  `max_kv_tokens` (no cap by default), both in the web UI. A request that does not fit waits; one that never could is
+  refused with the numbers.
+- **`--prefix-cache-entries` is removed**: the RAM prefix cache keeps as many conversations as its memory holds;
+  given, the launch refuses it by name.
 - **Every model takes `--prefill-chunk-max` and `--prefill-chunk-min`**, each one of 512, 1024, 2048, 4096 or 8192
   rows, and their settings keys, which the web UI offers as a list of those five. A request starts at the max (by
   default the model's own start width, so nothing changes without a flag) and steps down no lower than the min.

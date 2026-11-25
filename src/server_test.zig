@@ -123,6 +123,8 @@ const Needs = struct {
     loads: bool = false,
     /// The scenario waits out a request that decodes thousands of tokens, so its reads wait for that (`decode_limit_ms`).
     decodes: bool = false,
+    /// The model-settings.json `max_kv_tokens` the fixture's load stamps.
+    kv_cap_tokens: ?u64 = null,
 };
 
 /// `body` as the embedded client of a server of `max_concurrent` rows, once per arch that declares a servable fixture
@@ -217,12 +219,17 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
     reg.settings_path = try std.fmt.bufPrint(&settings_buf, "{s}/.sushi/model-settings.json", .{home});
     var pb2: [1024]u8 = undefined;
     const model_dir2 = try std.fmt.bufPrint(&pb2, "{s}/m2", .{root});
-    if (ssd_budget_gb) |gb| {
-        var sb: [2400]u8 = undefined;
+    if (ssd_budget_gb != null or needs.kv_cap_tokens != null) {
+        var ssd_buf: [48]u8 = undefined;
+        var kv_buf: [48]u8 = undefined;
+        const ssd = if (ssd_budget_gb) |gb| try std.fmt.bufPrint(&ssd_buf, "\"ssd_budget_gb\":{d}", .{gb}) else "";
+        const kv = if (needs.kv_cap_tokens) |cap| try std.fmt.bufPrint(&kv_buf, "\"max_kv_tokens\":{d}", .{cap}) else "";
+        const comma = if (ssd.len > 0 and kv.len > 0) "," else "";
         const settings = if (needs.tiny2)
-            try std.fmt.bufPrint(&sb, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}},\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb, model_dir2, gb })
+            try std.fmt.allocPrint(a, "{{\"{s}\":{{{s}{s}{s}}},\"{s}\":{{{s}{s}{s}}}}}", .{ model_dir, ssd, comma, kv, model_dir2, ssd, comma, kv })
         else
-            try std.fmt.bufPrint(&sb, "{{\"{s}\":{{\"ssd_budget_gb\":{d}}}}}", .{ model_dir, gb });
+            try std.fmt.allocPrint(a, "{{\"{s}\":{{{s}{s}{s}}}}}", .{ model_dir, ssd, comma, kv });
+        defer a.free(settings);
         try tmp.dir.writeFile(io, .{ .sub_path = "home/.sushi/model-settings.json", .data = settings });
     }
     const entry = try reg.registerStub("tiny", model_dir, 90 << 20);
@@ -3420,4 +3427,24 @@ test "server: stopServing waits for an embedded client's post-shutdown requests 
     defer server.after_drain_loop_for_test = null;
     try eachArch(4, .{}, State.run);
     try testing.expect(!State.drained_before_client.load(.acquire));
+}
+
+test "server: a request over max_kv_tokens is refused 400 naming the cap, stream and non-stream the same bytes" {
+    try eachArch(2, .{ .kv_cap_tokens = 64 }, struct {
+        fn run() !void {
+            const plain_body = "{\"model\":\"tiny\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+            const stream_body = "{\"model\":\"tiny\",\"max_tokens\":100,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+            const plain = try request("POST", "/v1/chat/completions", plain_body);
+            defer gpa.free(plain);
+            const streamed = try request("POST", "/v1/chat/completions", stream_body);
+            defer gpa.free(streamed);
+            if (!std.mem.startsWith(u8, plain, "HTTP/1.1 400 ") or !std.mem.startsWith(u8, streamed, "HTTP/1.1 400 ")) {
+                std.debug.print("kv cap refusal: {s}\n---\n{s}\n", .{ plain[0..@min(plain.len, 500)], streamed[0..@min(streamed.len, 500)] });
+                return error.NotRefused;
+            }
+            const p = bodyOf(plain);
+            try testing.expect(std.mem.indexOf(u8, p, "max_kv_tokens 64") != null);
+            try testing.expectEqualStrings(p, bodyOf(streamed));
+        }
+    }.run);
 }

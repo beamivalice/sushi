@@ -41,7 +41,7 @@ for arm in resident streamed; do
     FLAGS=()
     [[ "$arm" == streamed ]] && FLAGS=(--ssd-budget-gb "$BUDGET")
     sushi_boot "exl3-$arm" "$RUN/pack" --no-vision --ctx-size 4096 --prefill-chunk-max 512 --prefill-chunk-min 512 --max-concurrent 1 \
-        --prefix-cache-entries 0 --prefix-cache-mem 0 --prefix-cache-disk 0 --kv-quant 8 --metrics ${FLAGS[@]+"${FLAGS[@]}"} || exit $?
+        --prefix-cache-mem 0 --prefix-cache-disk 0 --kv-quant 8 --metrics ${FLAGS[@]+"${FLAGS[@]}"} || exit $?
     if [[ "$arm" == streamed ]]; then
         grep -q '\[expert-stream\] ssd budget' "$SUSHI_LOG"
         grep -q '\[expert-stream\] cache .*fallback_imports=0' "$SUSHI_LOG"

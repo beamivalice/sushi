@@ -334,7 +334,6 @@ fn runCli(init: std.process.Init) !void {
     var max_resident_models: u32 = 3;
     var max_resident_mem_flag: ?u64 = null; // null = auto (80% of wired limit at startup)
     var idle_evict_secs: ?u32 = null;
-    var prefix_cache_entries_flag: ?u32 = null;
     var metrics_enabled = true;
     var log_level_flag: ?log.Level = null;
     var decode_share_flag: ?[]const u8 = null;
@@ -552,10 +551,6 @@ fn runCli(init: std.process.Init) !void {
         } else if (removedFlagRefusal(args[i])) |line| {
             log.err("{s}\n", .{line});
             std.process.exit(1);
-        } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and flag_value.follows(args, i)) {
-            i += 1;
-            prefix_cache_entries_flag = flagInt(u32, "--prefix-cache-entries", args[i], 0);
-            server_state.prefix_cache_capacity = prefix_cache_entries_flag.?;
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and flag_value.follows(args, i)) {
             // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
             // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
@@ -619,6 +614,7 @@ fn runCli(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and flag_value.follows(args, i)) {
             i += 1;
             server_state.max_concurrent = flagInt(u32, "--max-concurrent", args[i], 1);
+            server_state.max_concurrent_flag = server_state.max_concurrent;
         } else if (std.mem.eql(u8, args[i], "--model-dir") and flag_value.follows(args, i)) {
             // REPEATABLE. A user's library can live in more than one place (the
             // app's download folder, an external drive, an LM Studio tree), and
@@ -768,16 +764,8 @@ fn runCli(init: std.process.Init) !void {
         log.err("--drafter-min-depth {d} is above --drafter-max-depth {d}\n", .{ lo, hi });
         std.process.exit(1);
     };
-    var entries_buf: [160]u8 = undefined;
-    if (cli_mod.prefixCacheEntriesRefusal(&entries_buf, prefix_cache_entries_flag, server_state.max_concurrent)) |why| {
-        log.err("{s}\n", .{why});
-        std.process.exit(1);
-    }
-    const capacity = cli_mod.prefixCacheCapacity(prefix_cache_entries_flag, server_state.prefix_cache_capacity, server_state.max_concurrent);
-    if (capacity != server_state.prefix_cache_capacity) {
-        log.info("Hot prefix cache: capacity follows --max-concurrent ({d} -> {d}); the default of --prefix-cache-entries is below it\n", .{ server_state.prefix_cache_capacity, capacity });
-        server_state.prefix_cache_capacity = capacity;
-    }
+    // The hot cache keeps no entry-count limit; this is its "reuse configured" bit, on when either tier is.
+    server_state.prefix_cache_capacity = if (server_state.prefix_cache_ram_enabled or server_state.prefix_cache_disk_bytes > 0) 1 else 0;
     depth_bounds.validate(depth_bounds.active) catch {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
@@ -1550,6 +1538,8 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
 /// The line a removed launch flag refuses with, naming both replacements and their values; null for any other argument.
 pub fn removedFlagRefusal(arg: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, arg, "--prefix-cache-entries") or std.mem.startsWith(u8, arg, "--prefix-cache-entries="))
+        return "--prefix-cache-entries is removed: a model's prefix cache keeps as many finished conversations as its memory holds, never fewer than its max_concurrent; set --prefix-cache-mem or the model's max_kv_tokens";
     if (!std.mem.eql(u8, arg, "--prefill-chunk") and !std.mem.startsWith(u8, arg, "--prefill-chunk=")) return null;
     return "--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (" ++ settings_resolve.static_chunk_rungs_text ++ ")";
 }
@@ -1652,6 +1642,13 @@ test "launch flags: --prefill-chunk is gone and refuses by name, naming both rep
     try std.testing.expectEqualStrings("--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (512, 1024, 2048, 4096 or 8192 rows)", removedFlagRefusal("--prefill-chunk=4096").?);
     try std.testing.expect(removedFlagRefusal("--prefill-chunk-max") == null);
     try std.testing.expect(removedFlagRefusal("--prefill-chunk-min") == null);
+}
+
+test "launch flags: --prefix-cache-entries is gone and refuses by name, naming what replaces it" {
+    const want = "--prefix-cache-entries is removed: a model's prefix cache keeps as many finished conversations as its memory holds, never fewer than its max_concurrent; set --prefix-cache-mem or the model's max_kv_tokens";
+    try std.testing.expectEqualStrings(want, removedFlagRefusal("--prefix-cache-entries").?);
+    try std.testing.expectEqualStrings(want, removedFlagRefusal("--prefix-cache-entries=32").?);
+    try std.testing.expect(removedFlagRefusal("--prefix-cache-mem") == null);
 }
 
 test "launch flags: --prefill-chunk-max and --prefill-chunk-min pin their keys, and no flag leaves them free" {

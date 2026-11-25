@@ -31,7 +31,7 @@ OFF=0
 boot() {
     OFF=$(wc -c 2> /dev/null < "${SUSHI_RUN_DIR:-/nonexistent}/$LABEL.log" || echo 0)
     OFF=${OFF// /}
-    sushi_boot "$LABEL" "$MODEL" --kv-quant 8 --prefix-cache-entries 2 --prefix-cache-mem 8GB --prefix-cache-disk 16GB --log-level info || exit $?
+    sushi_boot "$LABEL" "$MODEL" --kv-quant 8 --prefix-cache-mem 8GB --prefix-cache-disk 16GB --log-level info || exit $?
     BASE="$SUSHI_URL"
     CACHE_ROOT="$SUSHI_RUN_DIR/$LABEL.kv-cache"
 }

@@ -3850,6 +3850,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Lower it if a long prompt runs out of memory. It takes effect the next time the model loads.", "prefill chunk max (prefill_chunk_max)"],
     prefill_chunk_min: ["Narrowest prompt step (rows)", "The fewest tokens the model reads at once while it reads a prompt, for a step that does not fit wider. Equal to the widest, it pins every step.", "--prefill-chunk-min",
       "Raise it only when a prompt that fails to fit should be refused instead of read in smaller steps. It takes effect the next time the model loads.", "prefill chunk min (prefill_chunk_min)"],
+    max_concurrent: ["Requests at once", "How many requests of this model run at the same time. The next one waits in the queue until one finishes.", "--max-concurrent",
+      "One suits almost every model: a later request waits its turn. Raise it only when the model can answer several chats at once without slowing down. It takes effect the next time the model loads.", "max concurrent requests"],
+    max_kv_tokens: ["Token budget for memory of past chats", "The most prompt and reply tokens this model may hold across its running requests and the conversations it keeps for reuse. Empty means no limit.", "",
+      "Set it only to bound how much a long-lived server keeps for reuse. A request that would pass it waits; one larger than the whole budget is refused. It takes effect the next time the model loads.", "max KV tokens"],
   };
   const COMMON = ["ctx_size", "kv_quant", "mtp", "vision", "ssd_budget_gb", "max_tokens", "yarn_factor"];
   const CHOICE_LABEL = { yarn_factor: { 2: "YaRN ×2", 4: "YaRN ×4" }, kv_quant: { off: "16-bit (exact)", 4: "4-bit", 6: "6-bit", 8: "8-bit" } };
@@ -3857,6 +3861,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   // What the server would use with the key unset, as the label of the Default choice; a bare "Default" when it cannot say.
   const defaultLabel = (m, spec) => {
     if (spec.name === "yarn_factor") return "Model default";
+    if (spec.name === "max_kv_tokens" && !Number(m.defaults?.[spec.name] ?? 0)) return "No cap";
+    if (spec.name === "max_concurrent" && !Number(m.defaults?.[spec.name] ?? 0)) return "No limit";
     const v = m.defaults?.[spec.name];
     if (v == null) return "Default";
     if (spec.type === "bool") return `Default (${v ? "On" : "Off"})`;
@@ -4238,13 +4244,16 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function patchSet(F, S, m) {
     const key = S.spec.name, s = m.settings[key] ?? { file: null, flag: null, locked: false }, P = per(F.id), lim = m.limits?.[key];
     const locked = !!s.locked, why = locked ? "" : whyDisabled(m, key);
-    S.row.classList.toggle("locked", locked || !!why);
+    // A key the model takes at one value only (an exclusive model's max_concurrent) shows that value, disabled.
+    const fixed = !!lim && lim.max != null && lim.max > 0 && lim.max <= Math.max(1, S.spec.min);
+    if (fixed) S.control.set(String(lim.max));
+    S.row.classList.toggle("locked", locked || !!why || fixed);
     badges(S.badge, s);
-    S.control.lock(locked || !!why, locked ? s.flag ?? "" : undefined);
+    S.control.lock(locked || !!why || fixed, locked ? s.flag ?? "" : fixed ? String(lim.max) : undefined);
     S.control.allow?.(lim?.choices);
     S.control.def(defaultLabel(m, S.spec));
-    if (!locked && !(key in P.texts) && !S.control.focused()) { const want = adminFileText(s.file); if (S.control.get() !== want) S.control.set(want); }
-    setText(S.help, locked ? (key === "yarn_factor" ? "The --config-overrides launch flag sets the RoPE or the window, and outranks this setting. Start sushi without it to change it here." : flagHelp(key, s.flag)) : why || KEY[key][1]);
+    if (!locked && !fixed && !(key in P.texts) && !S.control.focused()) { const want = adminFileText(s.file); if (S.control.get() !== want) S.control.set(want); }
+    setText(S.help, locked ? (key === "yarn_factor" ? "The --config-overrides launch flag sets the RoPE or the window, and outranks this setting. Start sushi without it to change it here." : flagHelp(key, s.flag)) : why || (fixed && lim ? lim.why ?? "" : "") || KEY[key][1]);
     setHidden(S.remove, locked || !why || s.file == null);
     const text = S.control.get(), saved = adminFileText(s.file), parsed = adminControlValue(S.spec, text);
     const changed = !locked && !why && key in P.texts && !(parsed.ok && adminSameAsFile(parsed, s.file));

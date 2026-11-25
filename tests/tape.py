@@ -43,8 +43,8 @@ LOCK = ROOT / "scripts/gpu-lock.sh"
 PROMPTS_SRC = MODELS / "kld-teacher"
 IMAGE = ROOT / "tests/fixtures/house.jpeg"
 
-EXACT = ["--prefix-cache-entries", "0", "--prefix-cache-mem", "off", "--prefix-cache-disk", "off"]
-HOT = ["--prefix-cache-entries", "8", "--prefix-cache-mem", "4GB", "--prefix-cache-disk", "off"]
+EXACT = ["--prefix-cache-mem", "off", "--prefix-cache-disk", "off"]
+HOT = ["--prefix-cache-mem", "4GB", "--prefix-cache-disk", "off"]
 SSD = ["--prefix-cache-mem", "off", "--prefix-cache-disk", "4GB"]
 SLOTS = ["--max-concurrent", "4"]
 MTP33 = ["--mtp-min-depth", "3", "--mtp-max-depth", "3"]
@@ -87,7 +87,7 @@ QUICK = {"qwen-stq": (HOT + MTP33, ["serial", "spec", "batch", "repeat"]),
          "qwen-2bpw": (HOT + MTP33, ["serial", "spec", "batch", "repeat"]),
          "glm": (HOT + ["--drafter-min-depth", "4", "--drafter-max-depth", "4"], ["serial", "spec", "batch", "repeat", "image"]),
          "dsv41": (HOT + ["--vision", "--mtp-min-depth", "2", "--mtp-max-depth", "2"], ["serial", "spec", "repeat", "image"]),
-         "mimo": (["--prefix-cache-entries", "4", "--prefix-cache-mem", "1GB", "--prefix-cache-disk", "off"] + MTP33,
+         "mimo": (["--prefix-cache-mem", "1GB", "--prefix-cache-disk", "off"] + MTP33,
                   ["serial", "spec", "batch", "repeat"])}
 CAPTURE_IDS = ["code-python-intervalset", "math-compute-integral", "multilingual-translate-th-zh-ja-ar", "story-night-train"]
 IDS_FILE = {"qwen": "qwen38-flash-next-bf16-gdnf32-8cat-v1.prompts.jsonl",

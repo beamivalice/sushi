@@ -243,6 +243,9 @@ pub const LoadedModel = struct {
     /// borrow `*const ModelConfig` and we want one consistent ownership
     /// pattern across config/tokenizer/chat_config).
     config: ?*ModelConfig,
+    /// `/props` gauge: the model's live reservations plus its retained hot-cache tokens, published by the inference
+    /// thread (the only thread that may walk the hot cache). 0 = nothing reserved.
+    reserved_tokens: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     weights: ?*Weights,
     handle: ?arch_handle.Handle,
     /// Per-model tokenizer (different vocabularies across models). Phase 05

@@ -25,7 +25,7 @@ def main():
         "--host", "127.0.0.1", "--port", str(port),
         "--kv-quant", "8", "--ctx-size", "4096", "--prefill-chunk-max", "512", "--prefill-chunk-min", "512",
         "--max-tokens", "32", "--no-mtp", "--no-vision",
-        "--prefix-cache-entries", "0", "--log-file", str(out / "server.log"),
+        "--prefix-cache-disk", "off", "--log-file", str(out / "server.log"),
     ]
     transcript = bytearray()
     sent = finished = False

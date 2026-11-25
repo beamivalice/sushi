@@ -897,13 +897,13 @@ pub fn serve(
             log.info("Prefix cache: SSD ONLY (RAM retention off)\n", .{});
         } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB)\n", .{ server_state.prefix_cache_capacity, cap_mb });
+            log.info("Hot prefix cache: ENABLED (mem-cap={d:.1} MB)\n", .{cap_mb});
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{server_state.prefix_cache_capacity});
+            log.info("Hot prefix cache: ENABLED (mem-cap=unlimited)\n", .{});
         }
     } else if (server_state.prefix_cache_capacity > 0) {
         var line_buf: [192]u8 = undefined;
-        log.info("{s}\n", .{bills.hotCacheDisabledLine(&line_buf, server_state.prefix_cache_capacity, server_state.prefix_cache_ram_enabled, diskTierOn(config), config.full_attention_interval > 0)});
+        log.info("{s}\n", .{bills.hotCacheDisabledLine(&line_buf, server_state.prefix_cache_ram_enabled, diskTierOn(config), config.full_attention_interval > 0)});
     }
 
     // `--max-concurrent N` is honored when the model can ride the batched
@@ -917,10 +917,11 @@ pub fn serve(
     // safe).
     // `--max-concurrent` sizes the submit queue; requests decode together at
     // any value. Whether they share ONE forward is the model's answer, printed
-    // at every value so a default-1 boot does not read as "one at a time".
+    // at every value so a default boot does not read as "one at a time".
     const startup_entry = scheduler.registry.resolveEntry("") catch null;
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
-    log.info("Concurrency: --max-concurrent={d}, {s} (arch: {s})\n", .{ server_state.max_concurrent, concurrencyClause(verdict), config.model_type });
+    const concurrency_source = if (server_state.max_concurrent_flag != null) "--max-concurrent" else if (config.max_concurrent_override != null) "model-settings.json" else "no limit";
+    log.info("Concurrency: max_concurrent={d} ({s}), {s} (arch: {s})\n", .{ config.max_concurrent, concurrency_source, concurrencyClause(verdict), config.model_type });
     // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -1718,6 +1719,21 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         return false;
     }
     const prompt_len: usize = prompt_ids.len;
+    // Refused before any byte, so a stream and a non-stream request answer the same; the scheduler refuses the same rule.
+    if (config.max_kv_tokens > 0) {
+        const reservation = @as(u64, prompt_len) + max_tokens;
+        if (reservation > config.max_kv_tokens) {
+            var buf: [512]u8 = undefined;
+            const msg = slot_admission.maxKvTokensRefusal(&buf, config.max_kv_tokens, reservation, prompt_len, max_tokens);
+            countRejected();
+            if (is_anthropic) {
+                try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            } else {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+            }
+            return false;
+        }
+    }
     if (config.static_ledger != null) switch (static_bill.check(config, prompt_len, max_tokens, media)) {
         .proceed => return true,
         .refused => |r| {
@@ -3641,14 +3657,6 @@ test "Responses: a stored reasoning turn renders as the model's own think block"
 
 
 
-test "prefix cache default capacity covers interleaved agent flows" {
-    // Claude Code-style clients interleave several conversation roots (main
-    // thread, subagents, title generation). With capacity 1, every
-    // interleaved request evicted the long system-prompt prefix and forced a
-    // full re-prefill per turn.
-    try testing.expect(server_state.prefix_cache_capacity >= 4);
-}
-
 test "finishDetailsField: the loop cause rides beside finish_reason, and only a known cause reaches the wire" {
     // Absent = the field is not emitted at all, so every ordinary response
     // is byte-identical to what it was before this existed.
@@ -4005,12 +4013,15 @@ test "tool_choice none bans each family's one-token call opener, and nothing els
 }
 
 test "settingsPropsJson: /props reports the prefill decode share" {
-    const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
+    const frag = try models_api.settingsPropsJson(testing.allocator, .{ .engine = "mlx", .kv_quant = "off", .prefill_chunk = 8192, .mtp_loaded = false, .mtp_default_on = false, .mtp_depth = 0, .mtp_adaptive = false, .max_mtp_ctx = 0, .drafter = "none", .max_concurrent = 8, .max_kv_tokens = 65_536, .reserved_tokens = 1234, .prefix_cache_mem_bytes = 0, .prefix_cache_disk_bytes = 0, .prefill_decode_share = 0.5 });
     defer testing.allocator.free(frag);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
     defer parsed.deinit();
     const v = parsed.value.object.get("prefill_decode_share") orelse return error.MissingShare;
     try testing.expectApproxEqAbs(@as(f64, 0.5), v.float, 1e-6);
+    try testing.expectEqual(@as(i64, 8), parsed.value.object.get("max_concurrent").?.integer);
+    try testing.expectEqual(@as(i64, 65_536), parsed.value.object.get("max_kv_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 1234), parsed.value.object.get("reserved_tokens").?.integer);
 }
 
 test "liveSessions copies the queue snapshot and stamps the effective context limit" {

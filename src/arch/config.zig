@@ -118,6 +118,10 @@ pub const Facts = struct {
     /// Its weight loader reads and checks the pack itself; the shared EXL3 pack index check does not apply.
     reads_own_source: bool = false,
     /// Its RoPE reads `rope_parameters` of type yarn, so a per-model `yarn_factor` reaches it.
+    /// A request's decode owns state the whole model shares, so the model serves one request at a time.
+    exclusive_decode: bool = false,
+    /// `exclusive_decode` read from the config, where the arch's answer depends on it (a streamed load).
+    exclusive_decode_of: ?*const fn (*const model.ModelConfig) bool = null,
     reads_yarn: bool = false,
 };
 
@@ -155,6 +159,13 @@ pub fn hyperConnected(config: *const model.ModelConfig) bool {
 /// One of the config's arch's `Facts`; false for an unclaimed config.
 pub fn fact(config: *const model.ModelConfig, comptime name: []const u8) bool {
     return if (facts(config)) |f| @field(f, name) else false;
+}
+
+/// Whether a request of this model owns decode state the whole model shares, so it serves one request at a time.
+pub fn exclusiveDecode(config: *const model.ModelConfig) bool {
+    const f = facts(config) orelse return false;
+    if (f.exclusive_decode_of) |of| return of(config);
+    return f.exclusive_decode;
 }
 
 /// The widest chunk a load of the config's arch may fix when it is on the static bill (`Facts.static_chunk_max`); 0 when

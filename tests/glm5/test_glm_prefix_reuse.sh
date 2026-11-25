@@ -20,7 +20,7 @@ set -uo pipefail
 
 . "$(dirname "$0")/../lib/boot.sh"
 MODEL=$(sushi_pack glm5) || exit $?
-sushi_boot glm-prefix "$MODEL" --prefix-cache-entries 1 --prefix-cache-mem 1GB --prefix-cache-disk off --log-level info || exit $?
+sushi_boot glm-prefix "$MODEL" --prefix-cache-mem 1GB --prefix-cache-disk off --log-level info || exit $?
 BASE="$SUSHI_URL"
 export SUSHI_NONCE="glp$$"
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }

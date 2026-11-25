@@ -19,7 +19,7 @@ if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN | grep -q LISTEN; then
   echo "port $PORT is already in use; stop that server or set QWEN4_AB_PORT" >&2
   exit 1
 fi
-flags=(--max-concurrent 4 --prefix-cache-entries 0 --log-level info)
+flags=(--max-concurrent 4 --prefix-cache-disk off --log-level info)
 [[ $mode == mtp ]] && flags+=(--mtp)
 nohup $BIN --model $PACK --serve --host 127.0.0.1 --port $PORT $flags "$@" > $LOG 2>&1 &
 SERVER_PID=$!

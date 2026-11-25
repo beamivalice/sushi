@@ -19,6 +19,8 @@ const arch_config = @import("config.zig");
 const admission = @import("admission.zig");
 const flag_value = @import("../flag_value.zig");
 const settings_resolve = @import("../settings_resolve.zig");
+const arch_sched = @import("sched.zig");
+const sched_policy = @import("../sched_policy.zig");
 
 /// The launch flags a load can be refused for, as the process was started.
 pub const LaunchFlagUse = struct {
@@ -251,6 +253,8 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
         .cooler_setting = coolerSettingName(config),
+        .exclusive_decode = arch_config.exclusiveDecode(config),
+        .max_concurrent_cap = if (arch_config.exclusiveDecode(config)) 1 else @intCast(arch_sched.rowCap(config) orelse sched_policy.MAX_BATCH_GROUP),
     };
 }
 

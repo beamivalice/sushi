@@ -642,8 +642,13 @@ pub const HotCacheGauge = struct {
     }
 };
 
+/// A served cache keeps no entry-count limit; a finished conversation is withheld only by the byte budget or admission.
+pub const unlimited_entries: u32 = std.math.maxInt(u32);
+
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
+    /// Kept for the tests that exercise the old count machinery; a served cache passes `unlimited_entries`, so a
+    /// finished conversation is retained until `max_kv_bytes` or admission says otherwise.
     max_entries: u32,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
@@ -2690,7 +2695,7 @@ pub const HotPrefixCache = struct {
     fn retainNewEntry(self: *HotPrefixCache, entry: Entry) !bool {
         var incoming = entry;
         errdefer freeEntryOwnedState(self.allocator, &incoming);
-        while (self.entries.items.len >= self.max_entries) {
+        while (self.max_entries != unlimited_entries and self.entries.items.len >= self.max_entries) {
             if (!self.evictOneLruProgress("count cap", incoming.cache_key)) break;
         }
         if (self.max_kv_bytes > 0) {
@@ -2699,7 +2704,7 @@ pub const HotPrefixCache = struct {
                 if (!self.reclaimFromLru("byte budget", incoming.cache_key, need)) break;
             }
         }
-        if (self.entries.items.len >= self.max_entries) return self.declineIncoming(&incoming, "count cap");
+        if (self.max_entries != unlimited_entries and self.entries.items.len >= self.max_entries) return self.declineIncoming(&incoming, "count cap");
         if (incoming.ssm_checkpoints) |cps| {
             if (self.takeCpsIfQsaBank(cps)) |kept| {
                 incoming.ssm_checkpoints = kept;
@@ -3945,6 +3950,60 @@ pub const HotPrefixCache = struct {
         }
     }
 
+    /// Prompt tokens the entries retained in RAM hold, never one a live slot has checked out (that slot's own
+    /// reservation already holds it). What a model's `max_kv_tokens` pool counts beside its live slots; the SSD
+    /// tier's records hold nothing in RAM and are not counted.
+    pub fn retainedTokens(self: *const HotPrefixCache) u64 {
+        var tokens: u64 = 0;
+        for (self.entries.items) |e| {
+            if (e.checkout != null) continue;
+            tokens +|= e.tokens.len;
+        }
+        return tokens;
+    }
+
+    /// The entry a request with `prompt` will restore from: the longest retained (not checked out) entry whose
+    /// tokens are a prefix of it. Its tokens are inside the request's own reservation, so the pool must not count
+    /// them a second time; it must also never be evicted for that request.
+    pub const RestoreMatch = struct { id: u64 = 0, tokens: u64 = 0 };
+
+    pub fn restoreEntry(self: *const HotPrefixCache, prompt: []const u32) RestoreMatch {
+        var best: RestoreMatch = .{};
+        for (self.entries.items) |e| {
+            if (e.checkout != null or e.tokens.len <= best.tokens or e.tokens.len > prompt.len) continue;
+            if (std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len])) best = .{ .id = e.id, .tokens = e.tokens.len };
+        }
+        return best;
+    }
+
+    pub fn restoreEntryTokens(self: *const HotPrefixCache, prompt: []const u32) u64 {
+        return self.restoreEntry(prompt).tokens;
+    }
+
+    /// Evicts whole retained entries oldest-first until `tokens` are freed. `protect` names the entries a live slot
+    /// uses and the candidate's own restore match; nothing else is protected (a previous request's restore is not).
+    /// Returns the tokens freed.
+    pub fn evictOldestForTokens(self: *HotPrefixCache, tokens: u64, protect: []const u64) u64 {
+        var freed: u64 = 0;
+        while (freed < tokens) {
+            var idx: ?usize = null;
+            var oldest: u64 = std.math.maxInt(u64);
+            for (self.entries.items, 0..) |e, i| {
+                if (e.checkout != null) continue;
+                if (std.mem.indexOfScalar(u64, protect, e.id) != null) continue;
+                if (e.last_used < oldest) {
+                    oldest = e.last_used;
+                    idx = i;
+                }
+            }
+            const i = idx orelse break;
+            const held: u64 = self.entries.items[i].tokens.len;
+            self.evictAt(i, "max_kv_tokens");
+            freed +|= held;
+        }
+        return freed;
+    }
+
     /// Does a commit record the live state for the SSD tier (`pending_disk`)? Wherever the flush
     /// lands it whole: SSD-first, or a tier with the background writer.
     pub fn capturesLiveForDisk(self: *const HotPrefixCache) bool {
@@ -4113,10 +4172,18 @@ pub const HotPrefixCache = struct {
     fn logResident(self: *const HotPrefixCache) void {
         const mb = @as(f64, @floatFromInt(self.current_kv_bytes)) / (1024.0 * 1024.0);
         if (self.max_kv_bytes == 0) {
-            log.info("  [hot-cache] resident={d:.2} MB ({d}/{d} entries)\n", .{ mb, self.entries.items.len, self.max_entries });
+            if (self.max_entries == unlimited_entries) {
+                log.info("  [hot-cache] resident={d:.2} MB ({d} entries)\n", .{ mb, self.entries.items.len });
+            } else {
+                log.info("  [hot-cache] resident={d:.2} MB ({d}/{d} entries)\n", .{ mb, self.entries.items.len, self.max_entries });
+            }
         } else {
             const cap_mb = @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0);
-            log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d}/{d} entries)\n", .{ mb, cap_mb, self.entries.items.len, self.max_entries });
+            if (self.max_entries == unlimited_entries) {
+                log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d} entries)\n", .{ mb, cap_mb, self.entries.items.len });
+            } else {
+                log.info("  [hot-cache] resident={d:.2} / {d:.2} MB ({d}/{d} entries)\n", .{ mb, cap_mb, self.entries.items.len, self.max_entries });
+            }
         }
     }
 
@@ -10710,6 +10777,67 @@ fn appendCounterStubs(cache: *HotPrefixCache) !void {
         });
     }
     cache.current_kv_bytes = 300;
+}
+
+/// A layerless entry of `tokens.len` prompt tokens, `last_used = used`, no checkpoints.
+fn appendTokenStub(hc: *HotPrefixCache, tokens: []const u32, used: u64) !void {
+    try hc.entries.append(testing.allocator, .{
+        .tokens = try testing.allocator.dupe(u32, tokens),
+        .has_tools = false,
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
+        .last_used = used,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = tokens.len * 10,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+    hc.current_kv_bytes += tokens.len * 10;
+}
+
+test "a hot cache with no count limit keeps the 33rd conversation where the old default of 32 dropped it" {
+    var cache = HotPrefixCache.initWithMem(testing.allocator, unlimited_entries, 0);
+    defer cache.deinit();
+    for (0..33) |i| {
+        const tokens = [_]u32{ @intCast(i), @intCast(i + 1) };
+        try testing.expect(try cache.retainNewEntry(.{
+            .tokens = try testing.allocator.dupe(u32, &tokens),
+            .has_tools = false,
+            .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
+            .last_used = i + 1,
+            .quant_config = kv_quant.KVQuantConfig.dense,
+            .kv_bytes = 20,
+            .ssm_checkpoints = null,
+            .ssm_bytes = 0,
+        }));
+    }
+    try testing.expectEqual(@as(usize, 33), cache.entries.items.len);
+}
+
+test "retained tokens count every entry in RAM, and eviction takes the oldest first" {
+    var cache = HotPrefixCache.initWithMem(testing.allocator, unlimited_entries, 0);
+    defer cache.deinit();
+    try appendTokenStub(&cache, &.{ 1, 2 }, 1);
+    try appendTokenStub(&cache, &.{ 3, 4 }, 2);
+    try appendTokenStub(&cache, &.{ 5, 6 }, 3);
+    try testing.expectEqual(@as(u64, 6), cache.retainedTokens());
+    try testing.expectEqual(@as(u64, 4), cache.evictOldestForTokens(4, &.{}));
+    try testing.expectEqual(@as(u64, 2), cache.retainedTokens());
+    try testing.expectEqual(@as(u32, 5), cache.entries.items[0].tokens[0]);
+}
+
+test "a retained entry a live slot has checked out is never evicted for tokens" {
+    var cache = HotPrefixCache.initWithMem(testing.allocator, unlimited_entries, 0);
+    defer cache.deinit();
+    try appendTokenStub(&cache, &.{ 1, 2 }, 1);
+    try appendTokenStub(&cache, &.{ 3, 4 }, 2);
+    try pcAppendCheckedOut(&cache, &.{ 5, 6 }, 20, 3);
+    // The checked-out entry is the live slot's own reservation now, so the pool holds only the two free ones.
+    try testing.expectEqual(@as(u64, 4), cache.retainedTokens());
+    // Six asked: the two free entries give four, the checked-out one stays.
+    try testing.expectEqual(@as(u64, 4), cache.evictOldestForTokens(6, &.{}));
+    try testing.expectEqual(@as(usize, 1), cache.entries.items.len);
+    try testing.expect(cache.entries.items[0].checkout != null);
+    try testing.expectEqual(@as(u64, 0), cache.retainedTokens());
 }
 
 test "HotPrefixCache: a capacity eviction is counted with its bytes in the hot tier" {

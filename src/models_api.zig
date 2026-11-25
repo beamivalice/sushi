@@ -818,6 +818,10 @@ const PropsSettings = struct {
     max_mtp_ctx: u32,
     drafter: []const u8,
     max_concurrent: u32,
+    /// The model's KV token cap; 0 = no cap.
+    max_kv_tokens: u64 = 0,
+    /// Live reservations plus retained prefix entries' tokens.
+    reserved_tokens: u64 = 0,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
     /// The SSD tier's bytes in use and entry count, as the inference thread last published them.
@@ -856,7 +860,9 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_adaptive = mtp_depth_bounds.active.adaptive(generate_mod.Generator.mtpAdaptiveEnabled()),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else "none",
-        .max_concurrent = server_state.max_concurrent,
+        .max_concurrent = config.max_concurrent,
+        .max_kv_tokens = config.max_kv_tokens,
+        .reserved_tokens = lm.reserved_tokens.load(.monotonic),
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_ram_enabled = server_state.prefix_cache_capacity > 0 and server_state.prefix_cache_ram_enabled,
         .prefix_cache_disk_bytes = disk.budget,
@@ -880,7 +886,7 @@ fn js(s: []const u8) json_text.Str {
 pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
     const vision = try std.fmt.allocPrint(allocator, "{{\"loaded\":{},\"source\":{f},\"streamed_tower_bytes\":{d},\"streamed_encode_bytes\":{d}}}", .{ st.vision.loaded, json_text.Str{ .s = st.vision.source }, st.vision.tower_bytes, st.vision.encode_bytes });
     defer allocator.free(vision);
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"depth\":{d},\"depth_source\":{f},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":{f},\"engine\":{f},\"kv_quant\":{f},\"kv_cache\":{{\"scheme\":{f},\"source\":{f}}},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"source\":{f},\"depth\":{d},\"depth_source\":{f},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":{f},\"max_concurrent\":{d},\"max_kv_tokens\":{d},\"reserved_tokens\":{d},\"prefill_decode_share\":{d},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d},\"disk_used_bytes\":{d},\"disk_written_bytes\":{d},\"disk_entries\":{d}{s}}},\"vision\":{s}}}", .{
         js(build_options.version),                          js(st.engine),
         js(st.kv_quant),                                    js(st.kv_cache.label()),
         js(st.kv_cache.sourceName()),
@@ -890,7 +896,8 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         st.mtp_depth,                                       js(st.mtp_depth_source),
         st.mtp_adaptive,
         st.max_mtp_ctx,                                     js(st.drafter),
-        st.max_concurrent,                                  st.prefill_decode_share,
+        st.max_concurrent,                                  st.max_kv_tokens,
+        st.reserved_tokens,                                 st.prefill_decode_share,
         st.prefix_cache_ram_enabled,                        st.prefix_cache_mem_bytes,
         st.prefix_cache_disk_bytes,                         st.prefix_cache_disk_used_bytes,
         st.prefix_cache_disk_written_bytes,                 st.prefix_cache_disk_entries,

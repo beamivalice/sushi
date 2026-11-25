@@ -117,7 +117,7 @@ boot() {
     LOGOFF=$(wc -c 2> /dev/null < "${SUSHI_RUN_DIR:-/nonexistent}/$LABEL.log" || echo 0)
     LOGOFF=${LOGOFF// /}
     # shellcheck disable=SC2046
-    sushi_boot "$LABEL" "$MODEL" $(sushi_profile_flags api "$KEY") --prefix-cache-entries 4 --prefix-cache-mem off \
+    sushi_boot "$LABEL" "$MODEL" $(sushi_profile_flags api "$KEY") --prefix-cache-mem off \
         --prefix-cache-disk "$DISK" --prefill-chunk-max 1024 --prefill-chunk-min 1024 $([ "$FD_ARM" = 1 ] && echo --ctx-size 65536) "$@" || exit $?
     CACHE="$SUSHI_RUN_DIR/$LABEL.kv-cache"
 }

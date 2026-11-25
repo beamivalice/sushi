@@ -354,23 +354,24 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
 test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its own class" {
     const A: usize = 0xA0;
     var out: [16]usize = undefined;
+    var verdicts: [16]sched_policy.AdmitVerdict = undefined;
     // An MTP candidate beside a live PLAIN slot on the same model admits.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = false }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out, &verdicts));
     }
     // An MTP candidate beside a live MTP slot holds.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = true }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 0), admitPendingTick(&cands, &active, &out, &verdicts));
     }
     // A plain candidate beside a live MTP slot admits.
     {
         const cands = [_]AdmitCand{.{ .model = A, .exclusive = false }};
         const active = [_]AdmitCand{.{ .model = A, .exclusive = true }};
-        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out));
+        try testing.expectEqual(@as(usize, 1), admitPendingTick(&cands, &active, &out, &verdicts));
     }
 }
 

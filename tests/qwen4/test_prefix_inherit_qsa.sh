@@ -20,7 +20,7 @@ set -e
 . "$(dirname "$0")/../lib/boot.sh"
 MODEL=$(sushi_pack qwen4) || exit $?
 # The 1-token tail needs a hot cache of eight entries; the ram boot's four evict the donor first.
-sushi_boot inherit-qsa "$MODEL" --prefix-cache-entries 8 --prefix-cache-mem 2048MB --prefix-cache-disk off --log-level debug || exit $?
+sushi_boot inherit-qsa "$MODEL" --prefix-cache-mem 2048MB --prefix-cache-disk off --log-level debug || exit $?
 BASE="$SUSHI_URL"
 export SUSHI_NONCE=inh
 RED='\033[0;31m'

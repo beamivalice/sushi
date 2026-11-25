@@ -246,9 +246,42 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.expert_cache_bias_override = o.expert_cache_bias;
     config.prefill_chunk_max_override = o.prefill_chunk_max;
     config.prefill_chunk_min_override = o.prefill_chunk_min;
+    config.max_concurrent_override = o.max_concurrent;
+    config.max_kv_tokens_override = o.max_kv_tokens;
+    resolveConcurrency(config);
     if (yarnFactorIgnoredLine(config, o.yarn_factor)) |line| log.warn("{s}\n", .{line});
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
+}
+
+/// The rows one batched tick of this model carries: the arch's own bound, else the shared batch width. An exclusive
+/// model has one.
+pub fn maxConcurrentCapFor(config: *const ModelConfig) u32 {
+    if (arch_config.exclusiveDecode(config)) return 1;
+    return @intCast(arch_sched.rowCap(config) orelse @import("sched_policy.zig").MAX_BATCH_GROUP);
+}
+
+/// Resolves `max_concurrent` onto the config. No flag and no key leave it absent (0): no count gate at all, the
+/// behaviour before the key existed. A given value is held to the model's own batched width and named when over it.
+/// An arch whose decode state can never batch (config-time `exclusiveDecode`, Hy4-Flash) is fixed at 1; a model that
+/// owns its state only at runtime (DeepSeek when it does not serve rows, a streamed GLM) is left to the admission
+/// gate's runtime `ownsModuleDecodeState` answer.
+pub fn resolveConcurrency(config: *ModelConfig) void {
+    const cap = maxConcurrentCapFor(config);
+    const never_batches = arch_config.exclusiveDecode(config);
+    const given: ?u32 = server_state.max_concurrent_flag orelse config.max_concurrent_override;
+    config.max_kv_tokens = config.max_kv_tokens_override orelse 0;
+    if (never_batches) {
+        if (given) |v| if (v > 1) log.info("[concurrency] {s} serves one request at a time: max_concurrent {d} is fixed at 1\n", .{ config.model_type, v });
+        config.max_concurrent = 1;
+        return;
+    }
+    const v = given orelse {
+        config.max_concurrent = 0;
+        return;
+    };
+    if (v > cap) log.info("[concurrency] {s}: max_concurrent {d} is above its {d}-row decode limit; serving {d}\n", .{ config.model_type, v, cap, cap });
+    config.max_concurrent = @min(v, cap);
 }
 
 /// A saved `yarn_factor` the parse did not apply is ignored with this one line, never a refusal: the file outlives the arch it was saved for.
@@ -2004,7 +2037,7 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
             }
             entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
                 allocator,
-                if (ram_prefix_cache) p.capacity else 0,
+                if (ram_prefix_cache) prefix_cache_mod.unlimited_entries else 0,
                 clamped_prefix_mem,
             );
             entry.prefix_cache.?.qsa_history_required = config.indexer_budget != 0 and !arch_config.fact(config, "latent_kv");
@@ -3819,4 +3852,46 @@ test "a model of no served arch is refused as such before any launch flag it can
     const r = launchRefusal(&buf, &other, trunk.KVQuantConfig.affine(8), 0).?;
     try testing.expect(r.err == error.ArchitectureUnsupported);
     try testing.expect(std.mem.startsWith(u8, r.line, "model_type \"mistral\" is not served by this build ("));
+}
+
+test "model settings: max_concurrent is the launch flag, else the model key, else absent; a given value is held to the batch width, and a never-batching arch is fixed at 1" {
+    const saved = server_state.max_concurrent_flag;
+    defer server_state.max_concurrent_flag = saved;
+    server_state.max_concurrent_flag = null;
+
+    var qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    applyModelSettings(&qwen, .{});
+    try testing.expectEqual(@as(u32, 0), qwen.max_concurrent);
+    applyModelSettings(&qwen, .{ .max_concurrent = 4 });
+    try testing.expectEqual(@as(u32, 4), qwen.max_concurrent);
+
+    // A resident DeepSeek load batches rows, so the config does not call it exclusive.
+    try testing.expect(!arch_config.exclusiveDecode(&ModelConfig{ .model_type = "deepseek_v41" }));
+    try testing.expect(arch_config.exclusiveDecode(&ModelConfig{ .model_type = "hy_v4_flash" }));
+
+    // An explicit launch flag outranks the model's key.
+    server_state.max_concurrent_flag = 6;
+    applyModelSettings(&qwen, .{ .max_concurrent = 4 });
+    try testing.expectEqual(@as(u32, 6), qwen.max_concurrent);
+
+    // A model that owns its decode state at runtime is not fixed by the config.
+    server_state.max_concurrent_flag = null;
+    var ds = ModelConfig{ .model_type = "deepseek_v41" };
+    applyModelSettings(&ds, .{ .max_concurrent = 4 });
+    try testing.expectEqual(@as(u32, 4), ds.max_concurrent);
+    var hy4 = ModelConfig{ .model_type = "hy_v4_flash" };
+    applyModelSettings(&hy4, .{ .max_concurrent = 8 });
+    try testing.expectEqual(@as(u32, 1), hy4.max_concurrent);
+
+    // A model runs no more rows than its batched tick carries (qwen4 joins 8).
+    server_state.max_concurrent_flag = null;
+    var batched = ModelConfig{ .model_type = "qwen4_exp" };
+    applyModelSettings(&batched, .{ .max_concurrent = 12 });
+    try testing.expectEqual(@as(u32, 8), batched.max_concurrent);
+
+    // max_kv_tokens is the key alone; unset is no cap.
+    applyModelSettings(&qwen, .{ .max_kv_tokens = 65_536 });
+    try testing.expectEqual(@as(u64, 65_536), qwen.max_kv_tokens);
+    applyModelSettings(&qwen, .{});
+    try testing.expectEqual(@as(u64, 0), qwen.max_kv_tokens);
 }

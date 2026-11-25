@@ -63,7 +63,7 @@ pub const samplingDefaults = @import("hy4_config.zig").samplingDefaults;
 /// An STQ pack's routed banks sit under the release's own names (`model.layers.{L}.mlp.switch_mlp`); its trunk shards
 /// carry the trunk's SPEC1 stamp beside the experts' PAIR1, so the shard stamps are not held to the expert block.
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model", .head = .none, .streams_groups = true };
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .streams_experts = true, .vision_on_streamed = true, .expert_source = .fused_banks, .prefill_start_width = 4096, .static_chunk_max = @import("hy4_config.zig").widest_chunk, .static_chunk_default = @import("hy4_config.zig").default_chunk, .streams_rate_groups = true, .reads_pair_major = true, .reads_pack_order = false };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .streams_experts = true, .vision_on_streamed = true, .expert_source = .fused_banks, .prefill_start_width = 4096, .static_chunk_max = @import("hy4_config.zig").widest_chunk, .static_chunk_default = @import("hy4_config.zig").default_chunk, .streams_rate_groups = true, .reads_pair_major = true, .reads_pack_order = false, .exclusive_decode = true };
 pub const OwnConfig = config_file.Config;
 pub const serveDefaults = config_file.Config.serveDefaults;
 /// The family's fields, then an STQ pack's trunk rate (`trunk_quant`), which the MLX-free family parse does not read:
