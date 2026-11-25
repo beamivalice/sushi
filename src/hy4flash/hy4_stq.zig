@@ -224,6 +224,11 @@ pub fn loadExperts(w: *model_mod.Weights, l: usize, s: mlx.mlx_stream, gpa: std.
 /// into f32 (a caller adding groups' sums rounds once). The rows enter in BF16, as the trellis kernels take them. The
 /// caller frees the result.
 pub fn routed(s: mlx.mlx_stream, dec: exl3.format.Decode, limit: f32, rb: *const exl3.Ragged, lat: Arr, picks: Arr, weights: Arr) !Arr {
+    return routedAs(s, dec, limit, rb, lat, picks, weights, .float32);
+}
+
+/// `routed` with its output in `out_dt`: BF16 where the next launch reads BF16, with no cast between.
+pub fn routedAs(s: mlx.mlx_stream, dec: exl3.format.Decode, limit: f32, rb: *const exl3.Ragged, lat: Arr, picks: Arr, weights: Arr, out_dt: mlx.mlx_dtype) !Arr {
     var o: Ops = .{ .s = s };
     defer o.deinit();
     const sh = mlx.getShape(picks);
@@ -238,8 +243,8 @@ pub fn routed(s: mlx.mlx_stream, dec: exl3.format.Decode, limit: f32, rb: *const
     const y = if (@as(usize, @intCast(t)) <= exl3.kernels.DECODE_ROWS_MAX)
         try o.own(try exl3.rate_groups.moeDecodeClamped(s, x, rb, flat, scores, k, .float32, null, null, lim))
     else
-        try o.own(try exl3.rate_groups.moePrefillEarlyTo(s, x, rb, flat, scores, k, lim, null, .float32));
-    return o.result(try o.reshape(try o.cast(y, .float32), &.{ t, mlx.getShape(lat)[1] }));
+        try o.own(try exl3.rate_groups.moePrefillEarlyTo(s, x, rb, flat, scores, k, lim, null, out_dt));
+    return o.result(try o.reshape(try o.cast(y, out_dt), &.{ t, mlx.getShape(lat)[1] }));
 }
 
 /// The embedding stored as a trellis bank, read by row (docs/pack-format.md#hy4-stq): the bank's `[vocab, dim]` weight is

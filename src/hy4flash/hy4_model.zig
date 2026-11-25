@@ -946,7 +946,7 @@ pub const Model = struct {
         const at = p0 + r0;
         const last = p0 + r1; // keys past the span's last row are never read
         const qs = try o.slice(p.q, 1, r0, r1);
-        const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left };
+        const sin: fwd.SpanIn = .{ .gate = try o.slice(in.gate, 0, r0, r1), .kv_b32 = in.kv_b32, .whole = in.whole, .o_left = in.o_left, .dst = if (in.dst) |d| .{ .block = d.block, .row = r0 } else null, .index = in.index, .rows_as = in.rows_as };
         if (core_keys) |ck| if (rows > fwd.verify_rows_max) return self.attendSpanCore(o, l, x, p, sin, qs, pooled, ck, win.base, r0, r1, n, p0, tap);
         if (L.indexer) |iw| {
             const ig = self.indexerGeometry();
@@ -961,7 +961,10 @@ pub const Model = struct {
                 const flat = try o.reshape(sel.rows, &.{ (rows - cut) * fwd.selectedWidth(sel.rows) });
                 return fwd.attendStraddleGated(o, sin, qs, cut, try self.latentRange(o, &keys, 0, thr), try o.slice(keys.k_pe.?, 0, 0, thr), at, try self.latentAt(o, &keys, flat), try o.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry, tap);
             }
-            const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
+            const sel = if (sin.index != null and r0 >= sin.index.?.r0)
+                try fwd.recalledPrepared(o, sin.index.?, r0, r1, mlx.getShape(all)[0], ig, at, n)
+            else
+                try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
             if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
             const flat = try o.reshape(sel.rows, &.{rows * fwd.selectedWidth(sel.rows)});
             return fwd.attendRowsGated(o, sin, qs, try self.latentAt(o, &keys, flat), try o.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry, tap);
@@ -997,7 +1000,10 @@ pub const Model = struct {
                 if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
                 return fwd.attendCoreGated(o, sin, qs, .{ .straddle = .{ .cut = cut, .range = .{ .keys = try self.keysTo(o, ck, 0, thr), .p0 = at, .window = 0 }, .picks = .{ .keys = ck, .rows = sel.rows, .keep = sel.keep } } }, L.attn, L.geometry, tap);
             }
-            const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
+            const sel = if (sin.index != null and r0 >= sin.index.?.r0)
+                try fwd.recalledPrepared(o, sin.index.?, r0, r1, mlx.getShape(all)[0], ig, at, n)
+            else
+                try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
             if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
             return fwd.attendCoreGated(o, sin, qs, .{ .picks = .{ .keys = ck, .rows = sel.rows, .keep = sel.keep } }, L.attn, L.geometry, tap);
         }
@@ -1890,6 +1896,7 @@ pub const Model = struct {
         var h: Arr = undefined;
         var post_a: Arr = undefined;
         var x: Arr = undefined;
+        var x_bf: ?Arr = null;
         var p: fwd.Projected = undefined;
         var pooled: ?Arr = null;
         // A sliding layer's new rows at the stored width, written to its ring once the spans have read the window.
@@ -1919,8 +1926,12 @@ pub const Model = struct {
             const hh = with_engram;
             const a = pre orelse try fwd.mixNorm(&o, hh, L.mix_attn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.input_norm);
             const xx = a.x;
+            const share_bf = t > 1 and at == null and fwd.linearInputDtype(L.attn.q_a) == .bfloat16 and
+                fwd.linearInputDtype(L.attn.kv_a) == .bfloat16 and fwd.linearInputDtype(L.attn.gate) == .bfloat16;
+            const xx_bf = if (share_bf) try o.cast(xx, .bfloat16) else xx;
             // The latent only goes to the cache (BF16), unless a tap reads it as the norm gives it.
-            const pp = try fwd.projectAs(&o, xx, L.attn, L.geometry, p0, if (at == null) .bfloat16 else .float32);
+            const q_dt: mlx.mlx_dtype = if (t > 1 and at == null and L.indexer == null and fwd.linearInputDtype(L.attn.q_b) == .bfloat16) .bfloat16 else .float32;
+            const pp = try fwd.projectAsQ(&o, xx_bf, L.attn, L.geometry, p0, if (at == null) .bfloat16 else .float32, q_dt);
             try fwd.At.input(at, .attn_in, xx);
             try fwd.At.input(at, .q_lora, pp.q_resid);
             try fwd.At.input(at, .kv_latent, pp.c);
@@ -1949,6 +1960,7 @@ pub const Model = struct {
             h = try keep.own(try o.result(hh));
             post_a = try keep.own(try o.result(a.post));
             x = try keep.own(try o.result(xx));
+            if (share_bf) x_bf = try keep.own(try o.result(xx_bf));
             p = .{ .q = try keep.own(try o.result(pp.q)), .c = undefined, .k_pe = undefined, .q_resid = try keep.own(try o.result(pp.q_resid)) };
         }
         // The window a sliding layer's spans read: a decode row writes its row into the ring and reads the ring as it
@@ -1967,15 +1979,40 @@ pub const Model = struct {
         // Phase 2: attention a span of rows at a time, each in a scope of its own over only the keys it reads. The gate
         // and the spans' gated rows are held until W_o has read them; W_kvb is widened once for every span.
         const span = if (pooled != null) @min(self.span_rows, gathered_span) else self.span_rows;
+        const loop_span: c_int = blk: {
+            if (pooled == null or core_keys == null or !mlx.engine.isStream(self.s) or !fwd.spans_share or self.span_rows <= span) break :blk span;
+            const groups = mlx.getShape(pooled.?)[0];
+            var ws = self.span_rows;
+            while (ws > span and @as(i64, ws) * @as(i64, groups) * 4 > 32 * 1024 * 1024) ws = @divTrunc(ws, 2);
+            const ig = self.indexerGeometry();
+            const thr = ig.group_topk * ig.ratio;
+            if (ws > span and @rem(ws, span) == 0 and (p0 >= thr or @rem(thr - p0, ws) == 0)) break :blk ws;
+            break :blk span;
+        };
         var held: Ops = .{ .s = self.s };
         defer held.deinit();
         var in: fwd.SpanIn = undefined;
         {
             var o: Ops = .{ .s = self.s };
             defer o.deinit();
-            in.gate = try held.own(try o.result(try fwd.linearSpans(&o, x, L.attn.gate, span)));
+            in.gate = try held.own(try o.result(try fwd.linearSpans(&o, x_bf orelse x, L.attn.gate, span)));
             in.kv_b32 = if (t > 1 and fwd.spans_share and !fwd.absorbServes(self.s, L.attn.kv_b, L.geometry, t)) try held.own(try o.result(try o.cast(L.attn.kv_b, .float32))) else null;
             in.whole = t <= span;
+            in.index = null;
+            if (L.indexer) |iw| if (pooled) |all| if (!in.whole) {
+                const ig = self.indexerGeometry();
+                const thr = ig.group_topk * ig.ratio;
+                const sel_r0: c_int = @max(0, thr - p0);
+                const idx_r0: c_int = if (sel_r0 == 0) 0 else @divTrunc(sel_r0 + span - 1, span) * span;
+                if (idx_r0 < t) if (try fwd.indexPrepare(&o, x, p.q_resid, all, iw, ig, p0, idx_r0, span)) |prep| {
+                    in.index = .{
+                        .r0 = prep.r0,
+                        .qt = try held.own(try o.result(prep.qt)),
+                        .hw = try held.own(try o.result(prep.hw)),
+                        .k_rot = try held.own(try o.result(prep.k_rot)),
+                    };
+                };
+            };
         }
         // W_o's rows (or its partials) go to the iHC mix's launch, which norms them (no tap reads the attention's output).
         var o_left: fwd.OLeft = .normed;
@@ -2001,14 +2038,20 @@ pub const Model = struct {
             try mlx.check(mlx.engine.freshArray(&b, &.{ t, L.geometry.heads * L.geometry.v }, fwd.linearInputDtype(L.attn.o)));
             rows_block = b;
         }
+        in.dst = if (rows_block != null and at == null) .{ .block = rows_block.?, .row = 0 } else null;
         var r0: c_int = 0;
-        while (r0 < t) : (r0 += span) {
+        while (r0 < t) {
             if (count == max_spans) return error.Hy4ChunkTooWide;
-            const r1 = @min(t, r0 + span);
+            const rem = t - r0;
+            const step: c_int = if (rem >= loop_span) loop_span else if (loop_span > span and rem >= span) @divTrunc(rem, span) * span else @min(rem, span);
+            const r1 = r0 + step;
+            in.rows_as = if (step > span) span else null;
             var so: Ops = .{ .s = self.s };
             defer so.deinit();
             const rows_out = try self.attendSpan(&so, l, x, p, in, pooled, &win, core_keys, r0, r1, n, p0, at);
+            r0 = r1;
             count += 1;
+            if (rows_out.ctx == null) continue;
             const b = rows_block orelse {
                 spans[count - 1] = try held.own(try so.result(rows_out));
                 continue;
@@ -2027,12 +2070,18 @@ pub const Model = struct {
         }
         // W_o and its norm once over the chunk's gated rows, each row as its span's own launch gives it.
         var y: Arr = undefined;
+        const fuse_o_norm = !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_expand_on and fwd.mix_norm_on and fwd.hc_kernels_on and mlx.streamIsGpu(self.s);
         {
             var o: Ops = .{ .s = self.s };
             defer o.deinit();
             // The chunk's only span ran W_o and its norm itself (`SpanIn.whole`).
             const gated = if (rows_block) |b| b else try o.concat(spans[0..count], 0);
-            y = if (in.whole) try keep.own(try o.result(spans[0])) else try keep.own(try o.result(try fwd.output(&o, gated, L.attn, L.geometry, span)));
+            y = if (in.whole)
+                try keep.own(try o.result(spans[0]))
+            else if (fuse_o_norm)
+                try keep.own(try o.result(try fwd.linearSpans(&o, gated, L.attn.o, span)))
+            else
+                try keep.own(try o.result(try fwd.output(&o, gated, L.attn, L.geometry, span)));
         }
         held.deinit();
         held.count = 0;
@@ -2045,7 +2094,9 @@ pub const Model = struct {
         {
             var o: Ops = .{ .s = self.s };
             defer o.deinit();
-            const em = switch (o_left) {
+            const em = if (fuse_o_norm)
+                try fwd.expandNormMixNorm(&o, h, post_a, y, L.attn.post_norm, L.geometry.eps, L.mix_ffn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm)
+            else switch (o_left) {
                 .parts => |osplit| try fwd.expandMixNormParts(&o, h, post_a, y, osplit, L.attn, L.geometry.eps, L.mix_ffn, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm),
                 .rows => try fwd.expandMixNormRows(&o, h, post_a, y, L.attn, L.geometry.eps, L.mix_ffn, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm),
                 .normed => try fwd.expandMixNorm(&o, h, post_a, y, L.mix_ffn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm),
@@ -2305,11 +2356,15 @@ fn moeStqRouted(self: *Model, o: *Ops, x: Arr, m: fwd.Moe, g: fwd.MoeGeometry, r
         defer self.gpa.free(host);
         try a.tap.routes(a.tap.ctx, a.layer, host, r.weights);
     }
-    const lat = try fwd.expertLatent(o, x, m.lat_down, at);
+    const share_bf = mlx.getShape(x)[0] > 1 and at == null and fwd.linearInputDtype(m.lat_down) == .bfloat16 and
+        fwd.linearInputDtype(m.shared.gate) == .bfloat16 and fwd.linearInputDtype(m.shared.up) == .bfloat16;
+    const x_bf = if (share_bf) try o.cast(x, .bfloat16) else x;
+    const lat = try fwd.expertLatent(o, x_bf, m.lat_down, at);
     try fwd.At.input(at, .expert_in, lat);
     const picks = rm.slots orelse r.picks;
-    const routed = try o.own(try hy4_stq.routed(o.s, self.quant.expert.?, g.swiglu_limit, rb, lat, picks, r.weights));
-    const fin = try fwd.moeFinishBack(o, x, m, g, routed, at, back);
+    const routed_dt: mlx.mlx_dtype = if (mlx.getShape(x)[0] > 1 and at == null and fwd.linearInputDtype(m.lat_up) == .bfloat16) .bfloat16 else .float32;
+    const routed = try o.own(try hy4_stq.routedAs(o.s, self.quant.expert.?, g.swiglu_limit, rb, lat, picks, r.weights, routed_dt));
+    const fin = try fwd.moeFinishBack(o, x_bf, m, g, routed, at, back);
     return .{ .y = try o.contiguous(fin.y), .expanded = fin.expanded, .next = fin.next };
 }
 

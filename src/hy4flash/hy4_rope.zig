@@ -13,7 +13,7 @@ const source: [:0]const u8 =
     \\uint t = thread_position_in_grid.y;
     \\uint a = thread_position_in_grid.z;
     \\const device T* row = x + (size_t)a * (size_t)x_strides[0] + (size_t)t * (size_t)x_strides[1];
-    \\device OT* dst = out + ((size_t)a * (size_t)threads_per_grid.y + (size_t)t) * (size_t)(NOPE + 2 * HALF);
+    \\device OT* dst = out + (ROW_MAJOR ? ((size_t)t * (size_t)threads_per_grid.z + (size_t)a) : ((size_t)a * (size_t)threads_per_grid.y + (size_t)t)) * (size_t)(NOPE + 2 * HALF);
     \\size_t s2 = (size_t)x_strides[2];
     \\if (j < uint(NOPE)) {
     \\  dst[j] = static_cast<OT>(row[(size_t)j * s2]);
@@ -55,17 +55,19 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
 /// Whether `tail` takes `x` [A, T, D] f32: a GPU stream and an even rope width within the row.
 pub fn applies(s: mlx.mlx_stream, x: Arr, rope_dims: c_int) bool {
     const sh = mlx.getShape(x);
-    return mlx.streamIsGpu(s) and sh.len == 3 and mlx.mlx_array_dtype(x) == .float32 and @rem(rope_dims, 2) == 0 and
+    const dt = mlx.mlx_array_dtype(x);
+    return mlx.streamIsGpu(s) and sh.len == 3 and (dt == .float32 or dt == .bfloat16) and @rem(rope_dims, 2) == 0 and
         rope_dims > 0 and rope_dims <= sh[2];
 }
 
-const Key = struct { a: c_int, t: c_int, nope: c_int, half: c_int, in_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, base: c_int, scale: c_int };
+const Key = struct { a: c_int, t: c_int, nope: c_int, half: c_int, in_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, base: c_int, scale: c_int, row_major: bool = false };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(k: Key) !kcfg.Config {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.t, k.nope + 2 * k.half }, 3, k.out_dt));
+    const out_sh = if (k.row_major) [3]c_int{ k.t, k.a, k.nope + 2 * k.half } else [3]c_int{ k.a, k.t, k.nope + 2 * k.half };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_sh, 3, k.out_dt));
     const width = k.nope + k.half;
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, width, k.t, k.a));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(width, 256), 1, 1));
@@ -75,17 +77,27 @@ fn build(k: Key) !kcfg.Config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HALF", k.half));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BASE", k.base));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SCALE", k.scale));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "ROW_MAJOR", k.row_major));
     return cfg;
 }
 
 /// `x` [A, T, D] with its trailing `rope_dims` rotated, row t at position `(pos0 + t) · step`, as `out_dt` [A, T, D]
 /// (contiguous). The caller frees the result.
 pub fn tail(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, pos0: c_int, step: c_int, out_dt: mlx.mlx_dtype) !Arr {
+    return tailWith(s, x, rope_dims, theta, pos0, step, out_dt, false);
+}
+
+/// `tail` over rows laid out row-major [T, H, d] (each row's heads together), in `out_dt`.
+pub fn tailRows(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, pos0: c_int, step: c_int, out_dt: mlx.mlx_dtype) !Arr {
+    return tailWith(s, x, rope_dims, theta, pos0, step, out_dt, true);
+}
+
+fn tailWith(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, pos0: c_int, step: c_int, out_dt: mlx.mlx_dtype, row_major: bool) !Arr {
     const sh = mlx.getShape(x);
     const half = @divExact(rope_dims, 2);
     const k = try getKernel();
     // The base and scale as MLX's rope takes them (log2 θ in f32, the step as a float), as the bits of template ints.
-    const cfg = try cfgs.get(.{ .a = sh[0], .t = sh[1], .nope = sh[2] - rope_dims, .half = half, .in_dt = mlx.mlx_array_dtype(x), .out_dt = out_dt, .base = kcfg.bits(std.math.log2(theta)), .scale = kcfg.bits(@floatFromInt(step)) }, build);
+    const cfg = try cfgs.get(.{ .a = sh[0], .t = sh[1], .nope = sh[2] - rope_dims, .half = half, .in_dt = mlx.mlx_array_dtype(x), .out_dt = out_dt, .base = kcfg.bits(std.math.log2(theta)), .scale = kcfg.bits(@floatFromInt(step)), .row_major = row_major }, build);
     const pv = [_]i32{pos0};
     const pos = try mlx.newData(&pv, &.{1}, .int32);
     defer _ = mlx.mlx_array_free(pos);
@@ -194,4 +206,26 @@ test "hy4 rope: a chunk of a new width takes the pipeline its first launch made"
         try mlx.check(mlx.mlx_array_eval(y));
     }
     try testing.expectEqual(before, mlx.engine.pipelinesMade().count);
+}
+
+test "hy4 rope: bf16 input widens in register and matches f32 input byte for byte in one launch" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const q_bf = try o.transpose(try o.cast(try randomRows(&o, &.{ 16, 32, 256 }, 77), .bfloat16), &.{ 1, 0, 2 });
+    const q_f32 = try o.cast(q_bf, .float32);
+    const want = try hostBytes(&o, try o.own(try tail(es, q_f32, 64, 1e4, 4096, 1, .float32)));
+    try testing.expect(applies(es, q_bf, 64));
+    try mlx.check(mlx.mlx_array_eval(q_bf));
+    const before = mlx.engine.stats().dispatches;
+    const got = try o.own(try tail(es, q_bf, 64, 1e4, 4096, 1, .float32));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+    try testing.expectEqualSlices(u8, want, try hostBytes(&o, got));
 }

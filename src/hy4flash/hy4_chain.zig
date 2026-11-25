@@ -17,9 +17,9 @@ const header: [:0]const u8 =
 const swiglu_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint i = thread_position_in_grid.x;
-    \\float x = g[i];
+    \\float x = static_cast<float>(g[i]);
     \\float a = x * hy4_sigmoid(x);
-    \\out[i] = a * u[i];
+    \\out[i] = static_cast<OT>(a * static_cast<float>(u[i]));
 ;
 
 var swiglu_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -38,8 +38,8 @@ fn getKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []cons
 }
 
 /// Which launch a config is for, and its shape.
-const Kind = enum { swiglu, groups, rows, gated, sink_sm_causal, sink_sm_mask, ring_keys };
-const Key = struct { kind: Kind, a: c_int, b: c_int, c: c_int = 0, d: c_int = 0 };
+const Kind = enum { swiglu, groups, rows, gated, gated_into, sink_sm_causal, sink_sm_mask, ring_keys };
+const Key = struct { kind: Kind, a: c_int, b: c_int, c: c_int = 0, d: c_int = 0, e: c_int = 0 };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn sinkSoftmaxGroup(n: c_int) c_int {
@@ -53,9 +53,11 @@ fn build(k: Key) !kcfg.Config {
     // (outputs, grid x and y, threads a group)
     switch (k.kind) {
         .swiglu => {
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b }, 2, .float32));
+            const out_dt: mlx.mlx_dtype = @enumFromInt(k.d);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b }, 2, out_dt));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.a * k.b, 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(k.a * k.b, 256), 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", out_dt));
         },
         .groups => {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b + 1 }, 2, .float32));
@@ -74,6 +76,14 @@ fn build(k: Key) !kcfg.Config {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.b, k.a, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(k.b, 256), 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", k.c));
+        },
+        .gated_into => {
+            const out_dt: mlx.mlx_dtype = @enumFromInt(k.d);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.e, k.b }, 2, out_dt));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.b, k.a, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(k.b, 256), 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", k.c));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", out_dt));
         },
         .sink_sm_causal, .sink_sm_mask => {
             const heads_first = (k.d & 1) != 0;
@@ -100,16 +110,30 @@ fn build(k: Key) !kcfg.Config {
 
 /// Whether `swiglu` takes `g` and `u`: f32 of one shape on a GPU stream.
 pub fn swigluApplies(s: mlx.mlx_stream, g: Arr, u: Arr) bool {
-    return mlx.streamIsGpu(s) and mlx.mlx_array_dtype(g) == .float32 and mlx.mlx_array_dtype(u) == .float32 and
+    const gd = mlx.mlx_array_dtype(g);
+    const ud = mlx.mlx_array_dtype(u);
+    return mlx.streamIsGpu(s) and (gd == .float32 or gd == .bfloat16) and (ud == .float32 or ud == .bfloat16) and
         std.mem.eql(c_int, mlx.getShape(g), mlx.getShape(u)) and mlx.mlx_array_size(g) > 0;
 }
 
 /// `silu(g) · u` in f32, `g` and `u` of one shape. The caller frees the result.
 pub fn swiglu(s: mlx.mlx_stream, g: Arr, u: Arr) !Arr {
+    return swigluAs(s, g, u, .float32);
+}
+
+/// `swiglu`'s launch with its output in `out_dt` (BF16 or f32): the gate and up rows as stored, no casts around it.
+pub fn swigluAs(s: mlx.mlx_stream, g: Arr, u: Arr, out_dt: mlx.mlx_dtype) !Arr {
     const k = try getKernel(&swiglu_kernel, "sushi_hy4_swiglu", &.{ "g", "u" }, swiglu_source);
     const sh = mlx.getShape(g);
     const rows: c_int = if (sh.len == 2) sh[0] else 1;
-    const cfg = try cfgs.get(.{ .kind = .swiglu, .a = rows, .b = @divExact(@as(c_int, @intCast(mlx.mlx_array_size(g))), rows) }, build);
+    const cfg = try cfgs.get(.{
+        .kind = .swiglu,
+        .a = rows,
+        .b = @divExact(@as(c_int, @intCast(mlx.mlx_array_size(g))), rows),
+        .c = @intFromEnum(mlx.mlx_array_dtype(g)),
+        .d = @intFromEnum(out_dt),
+        .e = @intFromEnum(mlx.mlx_array_dtype(u)),
+    }, build);
     var out: [1]Arr = undefined;
     try applyOuts(s, k, &.{ g, u }, cfg, &out);
     if (sh.len == 2) return out[0];
@@ -257,6 +281,57 @@ pub fn gated(s: mlx.mlx_stream, u: Arr, gate: Arr) !Arr {
     var out: [1]Arr = undefined;
     try applyOuts(s, gate_kernel.?, &.{ u, gate }, cfg, &out);
     return out[0];
+}
+
+const gate_into_source: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\uint i = thread_position_in_grid.x;
+    \\uint t = thread_position_in_grid.y;
+    \\uint hv = threads_per_grid.x;
+    \\uint h = i / uint(V);
+    \\uint c = i % uint(V);
+    \\float g = static_cast<float>(gate[(size_t)t * (size_t)gate_strides[0] + (size_t)i * (size_t)gate_strides[1]]);
+    \\float uv = u[(size_t)h * (size_t)u_strides[0] + (size_t)t * (size_t)u_strides[1] + (size_t)c * (size_t)u_strides[2]];
+    \\out[(size_t)(uint(row0[0]) + t) * hv + i] = static_cast<OT>(uv * hy4_sigmoid(g));
+;
+
+var gate_into_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// Whether `gatedInto` takes `u` and `gate` into `dst`: an engine stream, `gated`'s shapes, `dst` as wide as the gate
+/// in BF16 or f32.
+pub fn gatedIntoApplies(s: mlx.mlx_stream, u: Arr, gate: Arr, dst: Arr) bool {
+    if (!mlx.engine.isStream(s) or !gatedApplies(s, u, gate)) return false;
+    const ds = mlx.getShape(dst);
+    const dd = mlx.mlx_array_dtype(dst);
+    return ds.len == 2 and ds[1] == mlx.getShape(gate)[1] and (dd == .bfloat16 or dd == .float32);
+}
+
+/// `gated`'s rows written into `dst` from row `r0`, in `dst`'s dtype: a span's gated rows land in the chunk's block
+/// that `W_o` reads, with no join after the spans.
+pub fn gatedInto(s: mlx.mlx_stream, u: Arr, gate: Arr, dst: Arr, r0: c_int) !void {
+    if (gate_into_kernel == null) {
+        const ins = [_][*:0]const u8{ "u", "gate", "row0" };
+        const outs = [_][*:0]const u8{"out"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const made = mlx.mlx_fast_metal_kernel_new("sushi_hy4_gated_into", iv, ov, gate_into_source, header, false, false);
+        if (made.ctx == null) return error.MetalKernelCompileFailed;
+        gate_into_kernel = made;
+    }
+    const gs = mlx.getShape(gate);
+    const ds = mlx.getShape(dst);
+    const cfg = try cfgs.get(.{ .kind = .gated_into, .a = gs[0], .b = gs[1], .c = mlx.getShape(u)[2], .d = @intFromEnum(mlx.mlx_array_dtype(dst)), .e = ds[0] }, build);
+    const rv = [_]i32{r0};
+    const row0 = try intsArr(&rv);
+    defer _ = mlx.mlx_array_free(row0);
+    const inputs = [_]Arr{ u, gate, row0 };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.kernelApplyInto(&ov, gate_into_kernel.?, iv, cfg, s, dst) orelse return error.MlxError);
 }
 
 const sink_softmax_tail: [:0]const u8 =
@@ -741,4 +816,86 @@ test "hy4 chain: attention score add, scale, mask, sink concat and softmax in on
             try testing.expectEqualSlices(u8, want_c, try hostF32(&o, got_c));
         }
     }
+}
+
+test "hy4 chain: gatedInto writes spans directly into a bf16 or f32 destination block in one launch per span, byte for byte" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |out_dt| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const h: c_int = 32;
+        const t: c_int = 12;
+        const v: c_int = 256;
+        const cut: c_int = 5;
+        const u = try o.transpose(try randomF32(&o, &.{ t, h, v }, 41, 2), &.{ 1, 0, 2 });
+        const gate = try o.cast(try randomF32(&o, &.{ t, h * v }, 42, 3), .bfloat16);
+        const want = try o.cast(try o.own(try gated(es, u, gate)), out_dt);
+        try mlx.check(mlx.mlx_array_eval(want));
+        try mlx.check(mlx.mlx_array_eval(u));
+        try mlx.check(mlx.mlx_array_eval(gate));
+        var dst = mlx.mlx_array_new();
+        try mlx.check(mlx.engine.freshArray(&dst, &.{ t, h * v }, out_dt));
+        _ = try o.own(dst);
+        const ua = try o.slice(u, 1, 0, cut);
+        const g0 = try o.slice(gate, 0, 0, cut);
+        const ub = try o.slice(u, 1, cut, t);
+        const g1 = try o.slice(gate, 0, cut, t);
+        try testing.expect(gatedIntoApplies(es, ua, g0, dst));
+        const before = mlx.engine.stats().dispatches;
+        try gatedInto(es, ua, g0, dst, 0);
+        try gatedInto(es, ub, g1, dst, cut);
+        try mlx.check(mlx.mlx_array_eval(dst));
+        try testing.expectEqual(@as(u64, 2), mlx.engine.stats().dispatches - before);
+        const c_want = try o.contiguous(want);
+        const c_got = try o.contiguous(dst);
+        try mlx.check(mlx.mlx_array_eval(c_want));
+        try mlx.check(mlx.mlx_array_eval(c_got));
+        const n = mlx.mlx_array_size(c_want);
+        if (out_dt == .bfloat16) {
+            const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(c_want) orelse return error.HostRead);
+            const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(c_got) orelse return error.HostRead);
+            try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
+        } else {
+            const wf = (mlx.mlx_array_data_float32(c_want) orelse return error.HostRead)[0..n];
+            const gf = (mlx.mlx_array_data_float32(c_got) orelse return error.HostRead)[0..n];
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(wf), std.mem.sliceAsBytes(gf));
+        }
+    }
+}
+
+test "hy4 chain: swigluAs accepts bf16 inputs and writes bf16 output in one launch, byte for byte" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const g_bf = try o.cast(try randomF32(&o, &.{ 16, 1536 }, 81, 4), .bfloat16);
+    const u_bf = try o.cast(try randomF32(&o, &.{ 16, 1536 }, 82, 3), .bfloat16);
+    const want = try o.cast(try o.own(try swiglu(es, try o.cast(g_bf, .float32), try o.cast(u_bf, .float32))), .bfloat16);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(g_bf));
+    try mlx.check(mlx.mlx_array_eval(u_bf));
+    try testing.expect(swigluApplies(es, g_bf, u_bf));
+    const before = mlx.engine.stats().dispatches;
+    const got = try o.own(try swigluAs(es, g_bf, u_bf, .bfloat16));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+    const cw = try o.contiguous(want);
+    const cg = try o.contiguous(got);
+    try mlx.check(mlx.mlx_array_eval(cw));
+    try mlx.check(mlx.mlx_array_eval(cg));
+    const n = mlx.mlx_array_size(cw);
+    const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(cw) orelse return error.HostRead);
+    const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(cg) orelse return error.HostRead);
+    try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
 }

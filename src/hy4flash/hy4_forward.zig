@@ -182,6 +182,21 @@ pub fn expandMixNormRows(o: *Ops, h: Arr, post: Arr, y: Arr, attn: Attn, o_eps: 
     return .{ .m = try o.own(r.m.?), .mixed = .{ .post = try o.own(r.post), .x = try o.own(r.h) } };
 }
 
+/// `expandMixNorm` with the attention's `post_proj_norm` of `y` in the same launch on a GPU stream (`hy4_hc.expandNormMixNorm`).
+pub fn expandNormMixNorm(o: *Ops, h: Arr, post: Arr, y: Arr, y_norm_w: Arr, y_eps: f32, w: Mix, n: c_int, magnitude: f32, eps: f32, norm_eps: f32, norm_w: Arr) !Expanded {
+    if (norm_kernel_on and mix_expand_on and mix_norm_on and hcKernels(o)) {
+        const hf = try o.contiguous(try o.cast(h, .float32));
+        const pf = try o.contiguous(try o.cast(post, .float32));
+        if (hy4_hc.expandNormApplies(o.s, hf, pf, y, y_norm_w, w.fn_, w.scale)) {
+            const k = try o.own(try hck.identityEps(norm_eps, eps, magnitude));
+            const hw: hck.HcWeights = .{ .fn_w = w.fn_, .scale = w.scale, .base = w.base };
+            const r = try hy4_hc.expandNormMixNorm(o.s, hf, pf, try o.contiguous(y), y_norm_w, y_eps, hw, k, norm_w);
+            return .{ .m = try o.own(r.m.?), .mixed = .{ .post = try o.own(r.post), .x = try o.own(r.h) } };
+        }
+    }
+    return expandMixNorm(o, h, post, try norm(o, y, y_norm_w, y_eps), w, n, magnitude, eps, norm_eps, norm_w);
+}
+
 /// The streams after a sublayer's write-back `m` [T, n, D] and the next mix of them.
 pub const Expanded = struct { m: Arr, mixed: Mixed };
 
@@ -362,6 +377,26 @@ fn mmHeadsByRow(o: *Ops, a: Arr, b: Arr) !Arr {
     return o.concat(rows[0..tu], 1);
 }
 
+/// `mmHeadsByRow` with its rows computed as `rows_as`-row launches would compute them (`matmulRowsAs`), so a row's
+/// bytes do not depend on the span's width.
+fn mmHeadsAs(o: *Ops, a: Arr, b: Arr, rows_as: ?c_int) !Arr {
+    const r = rows_as orelse return mmHeadsByRow(o, a, b);
+    const t = mlx.getShape(a)[1];
+    if (r < 2 or t <= r or !mlx.engine.isStream(o.s)) return mmHeadsByRow(o, a, b);
+    const full = t - @rem(t, r);
+    if (full == t) {
+        const out = try o.slot();
+        try mlx.check(mlx.engine.matmulRowsAs(out, a, b, @intCast(r)));
+        return out.*;
+    }
+    const whole = if (full > r) blk: {
+        const out = try o.slot();
+        try mlx.check(mlx.engine.matmulRowsAs(out, try o.slice(a, 1, 0, full), b, @intCast(r)));
+        break :blk out.*;
+    } else try mmHeadsByRow(o, try o.slice(a, 1, 0, full), b);
+    return o.concat(&.{ whole, try mmHeadsByRow(o, try o.slice(a, 1, full, t), b) }, 1);
+}
+
 /// Whether a chunk's attention spans share one launch of the gate and of `W_o` (`linearSpans`) and one widened `W_kvb`,
 /// or each span makes its own (the per-span order, a test seam).
 pub var spans_share = true;
@@ -391,8 +426,20 @@ pub fn linearSpans(o: *Ops, x: Arr, lin: Lin, span: c_int) !Arr {
 
 /// `norm(linear(x, lin), w, eps)`, a trellis bank's finish and the norm in one dispatch where its launch serves it.
 pub fn linearNormed(o: *Ops, x: Arr, lin: Lin, w: Arr, eps: f32) !Arr {
-    if (lin.stq) |b| if (try hy4_stq.applyNormed(o, x, b, w, eps)) |y| return y;
-    return norm(o, try linear(o, x, lin), w, eps);
+    return linearNormedAs(o, x, lin, w, eps, .float32);
+}
+
+/// Whether a linear may take `x` as stored: a BF16 or plain weight, a BF16 input, or rows past a verify block's width;
+/// a decode or verify row through an STQ bank keeps its BF16 product in the launch.
+fn storedCheap(x: Arr, lin: Lin) bool {
+    return lin.stq == null or mlx.mlx_array_dtype(x) == .bfloat16 or mlx.getShape(x)[0] > 16;
+}
+
+fn linearNormedAs(o: *Ops, x: Arr, lin: Lin, w: Arr, eps: f32, out_dt: mlx.mlx_dtype) !Arr {
+    if (out_dt == .float32) if (lin.stq) |b| if (try hy4_stq.applyNormed(o, x, b, w, eps)) |y| return y;
+    if (norm_kernel_on and mlx.streamIsGpu(o.s) and storedCheap(x, lin) and (lin.stq != null or mlx.getShape(x)[0] > 1))
+        return normAs(o, try linearStored(o, x, lin), null, w, eps, out_dt);
+    return normAs(o, try linear(o, x, lin), null, w, eps, out_dt);
 }
 
 /// `x · Wᵀ` in f32 throughout (f32 rows, the stored weight's values, f32 sums): the head (llama.cpp's f32 head), the
@@ -400,6 +447,17 @@ pub fn linearNormed(o: *Ops, x: Arr, lin: Lin, w: Arr, eps: f32) !Arr {
 /// time, each in a scope of its own: a forward holds at most one block's f32 copy (`widen_block_bytes`).
 pub fn linearF32(o: *Ops, x: Arr, w: Arr) !Arr {
     return linearF32As(o, x, w, null);
+}
+
+/// `linearF32` over `x`'s rows in launches of `span` rows each (`linearF32As`), the tail its own: a row's bytes do not
+/// depend on how many rows run beside it.
+pub fn linearF32Spans(o: *Ops, x: Arr, w: Arr, span: c_int) !Arr {
+    const t = mlx.getShape(x)[0];
+    if (t <= span) return linearF32(o, x, w);
+    const full = t - @rem(t, span);
+    if (full == t) return linearF32As(o, x, w, span);
+    const whole = if (full > span) try linearF32As(o, try o.slice(x, 0, 0, full), w, span) else try linearF32(o, try o.slice(x, 0, 0, full), w);
+    return o.concat(&.{ whole, try linearF32(o, try o.slice(x, 0, full, t), w) }, 0);
 }
 
 fn linearF32As(o: *Ops, x: Arr, w: Arr, rows_as: ?c_int) !Arr {
@@ -441,24 +499,37 @@ pub const Swiglu = struct { gate: Lin, up: Lin, down: Lin };
 
 /// `down(silu(gate·x) ⊙ up·x)`: the dense layer's FFN and the shared expert (`HYV4FlashMLP`, before its norm).
 pub fn swiglu(o: *Ops, x: Arr, w: Swiglu, at: ?At) !Arr {
-    return linear(o, try swigluAct(o, x, w, at), w.down);
+    return linear(o, try swigluActAs(o, x, w, if (at == null) linearInputDtype(w.down) else .float32, at), w.down);
+}
+
+fn swigluStored(o: *Ops, x: Arr, w: Swiglu, at: ?At) !Arr {
+    return linearStored(o, try swigluActAs(o, x, w, if (at == null) linearInputDtype(w.down) else .float32, at), w.down);
 }
 
 /// `norm(swiglu(x, w), norm_w, eps)`: the dense layer's FFN and its `post_fc2_norm` (`linearNormed`).
 pub fn swigluNormed(o: *Ops, x: Arr, w: Swiglu, norm_w: Arr, eps: f32, at: ?At) !Arr {
-    return linearNormed(o, try swigluAct(o, x, w, at), w.down, norm_w, eps);
+    return linearNormed(o, try swigluActAs(o, x, w, if (at == null) linearInputDtype(w.down) else .float32, at), w.down, norm_w, eps);
 }
 
 /// `silu(gate·x) ⊙ up·x` in f32, the rows `down` reads: through trellis banks one launch where it serves
 /// (`hy4_stq.applySwiglu`), else the two linears and the SwiGLU's launch.
 pub fn swigluAct(o: *Ops, x: Arr, w: Swiglu, at: ?At) !Arr {
+    return swigluActAs(o, x, w, .float32, at);
+}
+
+fn swigluActAs(o: *Ops, x: Arr, w: Swiglu, out_dt: mlx.mlx_dtype, at: ?At) !Arr {
     if (chain_kernels_on) if (w.gate.stq) |gb| if (w.up.stq) |ub| if (try hy4_stq.applySwiglu(o, x, gb, ub)) |act| {
         try At.input(at, .shared_act, act);
         return act;
     };
-    const g = try linear(o, x, w.gate);
-    const u = try linear(o, x, w.up);
-    const act = if (chain_kernels_on and hy4_chain.swigluApplies(o.s, g, u)) try o.own(try hy4_chain.swiglu(o.s, g, u)) else try o.binary(.mul, try o.silu(g), u);
+    const narrow = at == null and chain_kernels_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
+    const stored = narrow and storedCheap(x, w.gate) and storedCheap(x, w.up);
+    const g = if (stored) try linearStored(o, x, w.gate) else try linear(o, x, w.gate);
+    const u = if (stored) try linearStored(o, x, w.up) else try linear(o, x, w.up);
+    const act = if (chain_kernels_on and hy4_chain.swigluApplies(o.s, g, u))
+        try o.own(try hy4_chain.swigluAs(o.s, g, u, if (narrow) out_dt else .float32))
+    else
+        try o.binary(.mul, try o.silu(try o.cast(g, .float32)), try o.cast(u, .float32));
     try At.input(at, .shared_act, act);
     return act;
 }
@@ -583,8 +654,9 @@ pub fn moeFinishBack(o: *Ops, x: Arr, w: Moe, g: MoeGeometry, routed: Arr, at: ?
     try At.input(at, .lat_up_in, routed);
     // The shared expert first: launches that finish themselves run in the order made, so it runs beside the routed
     // experts rather than after W_lat_up.
-    const shared = try swiglu(o, x, w.shared, at);
-    const up = try linear(o, routed, w.lat_up);
+    const narrow = norm_kernel_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
+    const shared = if (narrow and storedCheap(x, w.shared.down)) try swigluStored(o, x, w.shared, at) else try swiglu(o, x, w.shared, at);
+    const up = if (narrow and storedCheap(routed, w.lat_up)) try linearStored(o, routed, w.lat_up) else try linear(o, routed, w.lat_up);
     if (back) |b| if (norm_kernel_on and mix_expand_on and hcKernels(o)) {
         const h = try o.contiguous(try o.cast(b.h, .float32));
         const post = try o.contiguous(try o.cast(b.post, .float32));
@@ -919,22 +991,29 @@ pub fn attention(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, mask: A
 pub const Projected = struct { q: Arr, c: Arr, k_pe: Arr, q_resid: Arr };
 
 pub fn project(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int) !Projected {
-    return projectWith(o, x, w, g, pos0, .float32, .float32);
+    return projectWith(o, x, w, g, pos0, .float32, .float32, .float32);
 }
 
 /// `project` with the latent `c` at `c_dt` (the cache's BF16 for a caller that only stores it).
 pub fn projectAs(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype) !Projected {
-    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16);
+    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, .float32);
 }
 
-fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, k_dt: mlx.mlx_dtype) !Projected {
+/// `projectAs` with the q residual written in `q_dt`: BF16 where `W_qb` reads its input at BF16 anyway.
+pub fn projectAsQ(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) !Projected {
+    return projectWith(o, x, w, g, pos0, c_dt, .bfloat16, q_dt);
+}
+
+fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx.mlx_dtype, k_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) !Projected {
     const t = mlx.getShape(x)[0];
     const qk = g.nope + g.rope;
-    const q_resid = try linearNormed(o, x, w.q_a, w.q_a_norm, g.eps);
-    const q = try o.transpose(try o.reshape(try linear(o, q_resid, w.q_b), &.{ t, g.heads, qk }), &.{ 1, 0, 2 }); // [H, T, qk]
-    const ckv = try linear(o, x, w.kv_a); // [T, latent + rope]
+    const q_resid = try linearNormedAs(o, x, w.q_a, w.q_a_norm, g.eps, q_dt);
+    const qb_raw = if (t > 1 and rope_kernel_on and mlx.streamIsGpu(o.s) and storedCheap(q_resid, w.q_b)) try linearStored(o, q_resid, w.q_b) else try linear(o, q_resid, w.q_b);
+    const q = try o.transpose(try o.reshape(qb_raw, &.{ t, g.heads, qk }), &.{ 1, 0, 2 }); // [H, T, qk]
+    const use_front = k_dt == .bfloat16 and front_kernel_on and norm_kernel_on and rope_kernel_on;
+    const ckv = if (t > 1 and use_front and mlx.streamIsGpu(o.s) and storedCheap(x, w.kv_a)) try linearStored(o, x, w.kv_a) else try linear(o, x, w.kv_a); // [T, latent + rope]
     // The latent's norm and its key's rotation in one launch.
-    if (k_dt == .bfloat16 and front_kernel_on and norm_kernel_on and rope_kernel_on and hy4_front.applies(o.s, ckv, w.kv_a_norm, g.latent, g.rope)) {
+    if (use_front and hy4_front.applies(o.s, ckv, w.kv_a_norm, g.latent, g.rope)) {
         const f = try hy4_front.run(o.s, try o.contiguous(ckv), w.kv_a_norm, g.latent, g.rope, g.theta, g.eps, pos0, c_dt);
         const c = o.own(f.c) catch |e| {
             _ = mlx.mlx_array_free(f.k_pe);
@@ -964,7 +1043,12 @@ pub fn attend(o: *Ops, x: Arr, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeomet
 /// A span's shared inputs; `whole` when it is the chunk's only span, so `attendGated` runs `W_o` and its norm itself.
 /// `o_left`: with `whole`, W_o's launch may leave its rows un-normed or its k-split partials for the iHC mix to finish:
 /// the span's result is then what it left, and which one lands here.
-pub const SpanIn = struct { gate: Arr, kv_b32: ?Arr = null, whole: bool = false, o_left: ?*OLeft = null };
+/// A span's gated rows written in place: the chunk's block `W_o` reads, and the span's first row in it.
+pub const GatedDst = struct { block: Arr, row: c_int };
+/// A sparse layer's indexer inputs made once for the chunk's rows from `r0` (`indexPrepare`): the rotated queries, the
+/// head weights and the rotated group keys, sliced per span.
+pub const IndexIn = struct { r0: c_int, qt: Arr, hw: Arr, k_rot: Arr };
+pub const SpanIn = struct { gate: Arr, kv_b32: ?Arr = null, whole: bool = false, o_left: ?*OLeft = null, dst: ?GatedDst = null, index: ?IndexIn = null, rows_as: ?c_int = null };
 
 /// What a whole span's W_o left for the iHC mix: its rows normed, its k-split partials (`osplit` a row) for
 /// `expandMixNormParts`, or its finished rows for `expandMixNormRows`.
@@ -1003,9 +1087,9 @@ fn mmInto(a: Arr, b: Arr, dst: Arr) !void {
 }
 
 fn attendGatedMask(o: *Ops, in: SpanIn, q: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask_spec: MaskSpec, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32); // [H, T, latent], [H, T, rope]
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as); // [H, T, latent], [H, T, rope]
     const u_lat = try causalLatent(o, ab.q_lat, ab.q_pe, c, k_pe, w, g, mask_spec);
-    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left);
+    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
 
 pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, g: AttnGeometry, mask_spec: MaskSpec) !Arr {
@@ -1142,17 +1226,17 @@ pub fn causalLatent(o: *Ops, q_lat: Arr, q_pe: Arr, c: Arr, k_pe: Arr, w: Attn, 
 /// `keep` [T, S] (whether each is one the row reads). A sparse layer past its selection threshold reads its recalled
 /// groups' rows this way, so a row's cost does not grow with the context.
 pub fn attendRowsGated(o: *Ops, in: SpanIn, q: Arr, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32);
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as);
     const u_lat = try rowsLatent(o, ab.q_lat, ab.q_pe, c_g_flat, pe_g_flat, keep, w, g);
-    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left);
+    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
 
 pub fn attendStraddleGated(o: *Ops, in: SpanIn, q: Arr, cut: c_int, c: Arr, k_pe: Arr, p0: c_int, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry, at: ?At) !Arr {
     const t = mlx.getShape(q)[1];
-    const ab = try absorb(o, q, w, g, in.kv_b32);
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as);
     const u_d = try causalLatent(o, try o.slice(ab.q_lat, 1, 0, cut), try o.slice(ab.q_pe, 1, 0, cut), c, k_pe, w, g, .{ .causal = .{ .p0 = p0, .window = 0 } });
     const u_g = try rowsLatent(o, try o.slice(ab.q_lat, 1, cut, t), try o.slice(ab.q_pe, 1, cut, t), c_g_flat, pe_g_flat, keep, w, g);
-    return gatedOut(o, in.gate, try o.concat(&.{ u_d, u_g }, 1), ab.w_v, w, g, at, in.whole, in.o_left);
+    return gatedOut(o, in.gate, try o.concat(&.{ u_d, u_g }, 1), ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
 
 pub fn rowsLatent(o: *Ops, q_lat_h: Arr, q_pe_h: Arr, c_g_flat: Arr, pe_g_flat: Arr, keep: Arr, w: Attn, g: AttnGeometry) !Arr {
@@ -1253,9 +1337,9 @@ pub const CorePicks = struct { keys: hy4_attn.Keys, rows: Arr, keep: Arr };
 
 /// `attendGated` with the core as `hy4_attn`'s launch over `core`'s keys.
 pub fn attendCoreGated(o: *Ops, in: SpanIn, q: Arr, core: CoreKeys, w: Attn, g: AttnGeometry, at: ?At) !Arr {
-    const ab = try absorb(o, q, w, g, in.kv_b32);
+    const ab = try absorb(o, q, w, g, in.kv_b32, in.rows_as);
     const u_lat = try coreLatent(o, ab, core, w, g);
-    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left);
+    return gatedOut(o, in.gate, u_lat, ab.w_v, w, g, at, in.whole, in.o_left, in.dst, in.rows_as);
 }
 
 /// The attended latent [H, T, latent] of the absorbed query `ab` over `core`.
@@ -1292,7 +1376,7 @@ const Absorbed = struct { q_lat: Arr, q_pe: Arr, w_v: ?Arr };
 
 /// `q` [H, T, qk] split: its nope part taken into the latent through `W_k` [H, nope, latent], its rope part kept; and
 /// `W_v` [H, v, latent], both from `kv_b` [H·(nope+v), latent] widened to f32 (`kv_b32` when the caller widened it).
-fn absorb(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr) !Absorbed {
+fn absorb(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr, rows_as: ?c_int) !Absorbed {
     if (absorbServes(o.s, w.kv_b, g, mlx.getShape(q)[1])) {
         // The absorb kernel reads the query's nope part in place.
         const q32 = try o.contiguous(try o.cast(q, .float32));
@@ -1302,7 +1386,7 @@ fn absorb(o: *Ops, q: Arr, w: Attn, g: AttnGeometry, kv_b32: ?Arr) !Absorbed {
     const w_k = try o.slice(kvb, 1, 0, g.nope);
     const w_v = try o.slice(kvb, 1, g.nope, g.nope + g.v);
     const q32 = try o.cast(q, .float32);
-    return .{ .q_lat = try mmHeadsByRow(o, try o.slice(q32, 2, 0, g.nope), w_k), .q_pe = try o.slice(q32, 2, g.nope, g.nope + g.rope), .w_v = w_v };
+    return .{ .q_lat = try mmHeadsAs(o, try o.slice(q32, 2, 0, g.nope), w_k, rows_as), .q_pe = try o.slice(q32, 2, g.nope, g.nope + g.rope), .w_v = w_v };
 }
 
 /// Softmax over the last axis (`n` keys) with each head's sink logit beside them, the sink's share dropped after.
@@ -1323,9 +1407,13 @@ pub fn absorbServes(s: mlx.mlx_stream, kv_b: Arr, g: AttnGeometry, rows: c_int) 
 }
 
 /// The attended latent [H, T, latent] out through `W_v`, gated by `σ` of its rows' `gate` (as stored), as `W_o` reads it.
-fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeometry, at: ?At, whole: bool, o_left: ?*OLeft) !Arr {
+fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeometry, at: ?At, whole: bool, o_left: ?*OLeft, dst: ?GatedDst, rows_as: ?c_int) !Arr {
     const t = mlx.getShape(u_lat)[1];
-    const u = if (w_v) |wv| try mmHeadsByRow(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 })) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, absorbGeometry(g))); // [H, T, v]
+    const u = if (w_v) |wv| try mmHeadsAs(o, u_lat, try o.transpose(wv, &.{ 0, 2, 1 }), rows_as) else try o.own(try hy4_absorb.valueOut(o.s, u_lat, w.kv_b, absorbGeometry(g))); // [H, T, v]
+    if (at == null and !whole) if (dst) |d| if (chain_kernels_on and hy4_chain.gatedIntoApplies(o.s, u, gate_rows, d.block)) {
+        try hy4_chain.gatedInto(o.s, u, gate_rows, d.block, d.row);
+        return mlx.mlx_array_new();
+    };
     const gated = if (chain_kernels_on and hy4_chain.gatedApplies(o.s, u, gate_rows)) try o.own(try hy4_chain.gated(o.s, u, gate_rows)) else blk: {
         const gate = try o.unary(.sigmoid, try o.transpose(try o.reshape(try o.cast(gate_rows, .float32), &.{ t, g.heads, g.v }), &.{ 1, 0, 2 }));
         break :blk try o.reshape(try o.transpose(try o.binary(.mul, u, gate), &.{ 1, 0, 2 }), &.{ t, g.heads * g.v });
@@ -1351,7 +1439,10 @@ fn gatedOut(o: *Ops, gate_rows: Arr, u_lat: Arr, w_v: ?Arr, w: Attn, g: AttnGeom
 /// The gated attention rows (`attendGated`, as `W_o` reads them) through `W_o` and `post_proj_norm`, in f32; with `span`
 /// each row as its own attention span's launch would give it (`linearSpans`).
 pub fn output(o: *Ops, gated: Arr, w: Attn, g: AttnGeometry, span: ?c_int) !Arr {
-    const y = if (span) |r| try o.cast(try linearSpans(o, gated, w.o, r), .float32) else try linear(o, gated, w.o);
+    const y = if (span) |r| blk: {
+        const s = try linearSpans(o, gated, w.o, r);
+        break :blk if (norm_kernel_on and mlx.streamIsGpu(o.s)) s else try o.cast(s, .float32);
+    } else try linear(o, gated, w.o);
     return norm(o, y, w.post_norm, g.eps);
 }
 
@@ -1517,7 +1608,9 @@ pub fn selectionSplits(g: IndexerGeometry, p0: c_int, t: c_int) bool {
 
 /// The key rows [T, S] uint32 rows at positions `p0..` read past the selection over `n` keys, and their keep mask:
 /// `recalledRows` of `recallAt`'s groups. On a GPU stream the top-k launch writes them (`hy4_index.pick`).
-pub fn recalledAt(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: IndexerGeometry, p0: c_int, n: c_int) !struct { rows: Arr, keep: Arr } {
+pub const Recalled = struct { rows: Arr, keep: Arr };
+
+pub fn recalledAt(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: IndexerGeometry, p0: c_int, n: c_int) !Recalled {
     const t = mlx.getShape(x)[0];
     const take = @min(g.group_topk - 1, mlx.getShape(pooled)[0]);
     if (index_kernel_on and chain_kernels_on and select_kernels_on and mlx.streamIsGpu(o.s) and take > 0) {
@@ -1533,6 +1626,47 @@ pub fn recalledAt(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: Ind
     }
     const rec = try recallAt(o, x, q_resid, pooled, w, g, p0);
     const sel = try recalledRows(o, t, n, p0, rec.groups, g.ratio);
+    return .{ .rows = sel.rows, .keep = sel.keep };
+}
+
+/// The indexer's query and head-weight projections, rope and group keys once for every span of a chunk from `r0`, or
+/// null where the spans run their own (`recalledAt`).
+pub fn indexPrepare(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: IndexerGeometry, p0: c_int, r0: c_int, span: c_int) !?IndexIn {
+    const t = mlx.getShape(x)[0];
+    const take = @min(g.group_topk - 1, mlx.getShape(pooled)[0]);
+    if (!spans_share or !index_kernel_on or !chain_kernels_on or !select_kernels_on or !rope_kernel_on) return null;
+    if (!mlx.streamIsGpu(o.s) or !mlx.engine.isStream(o.s) or take <= 0 or span <= verify_rows_max or t - r0 <= span) return null;
+    const rows = t - r0;
+    const xs = if (r0 == 0) x else try o.slice(x, 0, r0, t);
+    const qs = if (r0 == 0) q_resid else try o.slice(q_resid, 0, r0, t);
+    const q_rows = try linearF32Spans(o, qs, w.query, span);
+    const hw = try o.cast(try linearF32Spans(o, xs, w.head_weight, span), .float32);
+    const q_in = try o.transpose(try o.reshape(q_rows, &.{ rows, g.heads, g.dim }), &.{ 1, 0, 2 });
+    const qt = if (hy4_rope.applies(o.s, q_in, g.rope))
+        try o.own(try hy4_rope.tailRows(o.s, q_in, g.rope, g.theta, p0 + r0, 1, .float32))
+    else
+        try o.contiguous(try o.transpose(try o.cast(try rope(o, q_in, g.rope, g.theta, p0 + r0), .float32), &.{ 1, 0, 2 }));
+    const k_rot = try rotateGroupKeys(o, pooled, g);
+    return .{ .r0 = r0, .qt = qt, .hw = hw, .k_rot = k_rot };
+}
+
+/// `recalledAt` for rows `r0..r1` over the inputs `indexPrepare` made: the same picks, read from the shared inputs.
+pub fn recalledPrepared(o: *Ops, idx: IndexIn, r0: c_int, r1: c_int, pooled_groups: c_int, g: IndexerGeometry, p0: c_int, n: c_int) !Recalled {
+    const t = r1 - r0;
+    const s0 = r0 - idx.r0;
+    const s1 = r1 - idx.r0;
+    const take = @min(g.group_topk - 1, pooled_groups);
+    const scale = std.math.pow(f32, @floatFromInt(g.heads * g.dim), -0.5);
+    const qt = try o.slice(idx.qt, 0, s0, s1);
+    const hw = try o.slice(idx.hw, 0, s0, s1);
+    const logits = try o.own(try sparse.indexScores(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
+    if (hy4_index.pickApplies(o.s, logits, take)) {
+        const r = try hy4_index.pick(o.s, logits, take, p0, n, g.ratio);
+        _ = try o.own(r.groups);
+        return .{ .rows = try o.own(r.rows), .keep = try o.own(r.keep) };
+    }
+    const order = try o.own(try sparse.topkIndices(o.s, logits, @intCast(take)));
+    const sel = try recalledRows(o, t, n, p0, try o.own(try hy4_chain.recallGroups(o.s, order, p0, g.ratio)), g.ratio);
     return .{ .rows = sel.rows, .keep = sel.keep };
 }
 
@@ -2312,4 +2446,142 @@ test "hy4 placedZeros: zeros written on the GPU, so a dry recording asks the are
         asked += as.bytes;
     };
     try testing.expect(asked >= 3 * 2 * 40 * 4);
+}
+
+test "hy4 indexer spans: hoisted projections and rope match per-span recalledAt byte for byte with fewer dispatches" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+
+    const g: IndexerGeometry = .{ .heads = 16, .dim = 128, .rope = 64, .ratio = 4, .group_topk = 512, .theta = 1e7, .eps = 1e-5 };
+    const span: c_int = 32;
+    const p0: c_int = 4096;
+    const groups: c_int = 1048;
+    const q_lora: c_int = 1024;
+    const d_model: c_int = 3072;
+
+    for ([_]c_int{ 96, 70 }) |t| {
+        const n = p0 + t;
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const x = try ihcValues(&o, &.{ t, d_model }, @intCast(t + 101), 0.5);
+        const q_resid = try ihcValues(&o, &.{ t, q_lora }, @intCast(t + 102), 0.5);
+        const pooled = try ihcValues(&o, &.{ groups, g.dim }, @intCast(t + 103), 0.5);
+        const w: Indexer = .{
+            .query = try o.cast(try ihcValues(&o, &.{ g.heads * g.dim, q_lora }, 104, 0.05), .bfloat16),
+            .head_weight = try o.cast(try ihcValues(&o, &.{ g.heads, d_model }, 105, 0.05), .bfloat16),
+            .token_key = undefined,
+            .token_key_norm = undefined,
+            .key_value = undefined,
+            .key_gate = undefined,
+            .ape = undefined,
+            .key_norm = undefined,
+        };
+        for ([_]Arr{ x, q_resid, pooled, w.query, w.head_weight }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        const d0 = mlx.engine.stats().dispatches;
+        var want_rows: [4]Arr = undefined;
+        var want_keep: [4]Arr = undefined;
+        var ns: usize = 0;
+        var r0: c_int = 0;
+        while (r0 < t) : (r0 += span) {
+            const r1 = @min(t, r0 + span);
+            const sel = try recalledAt(&o, try o.slice(x, 0, r0, r1), try o.slice(q_resid, 0, r0, r1), pooled, w, g, p0 + r0, n);
+            want_rows[ns] = sel.rows;
+            want_keep[ns] = sel.keep;
+            ns += 1;
+        }
+        const wr = try o.contiguous(try o.concat(want_rows[0..ns], 0));
+        const wk = try o.contiguous(try o.concat(want_keep[0..ns], 0));
+        try mlx.check(mlx.mlx_array_eval(wr));
+        try mlx.check(mlx.mlx_array_eval(wk));
+        const old_d = mlx.engine.stats().dispatches - d0;
+
+        const d1 = mlx.engine.stats().dispatches;
+        const idx = (try indexPrepare(&o, x, q_resid, pooled, w, g, p0, 0, span)).?;
+        var got_rows: [4]Arr = undefined;
+        var got_keep: [4]Arr = undefined;
+        ns = 0;
+        r0 = 0;
+        while (r0 < t) : (r0 += span) {
+            const r1 = @min(t, r0 + span);
+            const sel = try recalledPrepared(&o, idx, r0, r1, groups, g, p0 + r0, n);
+            got_rows[ns] = sel.rows;
+            got_keep[ns] = sel.keep;
+            ns += 1;
+        }
+        const gr = try o.contiguous(try o.concat(got_rows[0..ns], 0));
+        const gk = try o.contiguous(try o.concat(got_keep[0..ns], 0));
+        try mlx.check(mlx.mlx_array_eval(gr));
+        try mlx.check(mlx.mlx_array_eval(gk));
+        const new_d = mlx.engine.stats().dispatches - d1;
+
+        try testing.expect(new_d < old_d);
+        const nr = mlx.mlx_array_size(wr);
+        try testing.expectEqualSlices(u32, (mlx.mlx_array_data_uint32(wr) orelse return error.HostRead)[0..nr], (mlx.mlx_array_data_uint32(gr) orelse return error.HostRead)[0..nr]);
+        try testing.expectEqualSlices(bool, (mlx.mlx_array_data_bool(wk) orelse return error.HostRead)[0..nr], (mlx.mlx_array_data_bool(gk) orelse return error.HostRead)[0..nr]);
+    }
+}
+
+test "hy4 sparse core spans: 3D matmulRowsAs matches 32-row absorb and valueOut byte for byte with fewer dispatches" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+
+    const g: AttnGeometry = .{ .heads = 32, .nope = 192, .rope = 64, .v = 256, .latent = 512, .theta = 1e7, .eps = 1e-5 };
+    const span: c_int = 32;
+    const n_keys: c_int = 256;
+    for ([_]c_int{ 96, 256 }) |t| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const q = try ihcValues(&o, &.{ g.heads, t, g.nope + g.rope }, @intCast(t + 201), 0.3);
+        const c_keys = try o.cast(try ihcValues(&o, &.{ n_keys, g.latent }, @intCast(t + 202), 0.3), .bfloat16);
+        const pe_keys = try o.cast(try ihcValues(&o, &.{ n_keys, g.rope }, @intCast(t + 203), 0.3), .bfloat16);
+        const kv_b32 = try ihcValues(&o, &.{ g.heads * (g.nope + g.v), g.latent }, 204, 0.05);
+        const gate = try o.cast(try ihcValues(&o, &.{ t, g.heads * g.v }, @intCast(t + 205), 0.5), .bfloat16);
+        const sinks = try ihcValues(&o, &.{g.heads}, 206, 0.5);
+        var w: Attn = undefined;
+        w.kv_b = try o.cast(kv_b32, .bfloat16);
+        w.sinks = sinks;
+        w.o = .{ .w = try o.zeros(&.{ 1, 1 }, .bfloat16) };
+        for ([_]Arr{ q, c_keys, pe_keys, kv_b32, gate, sinks }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        const d0 = mlx.engine.stats().dispatches;
+        var want_parts: [8]Arr = undefined;
+        var ns: usize = 0;
+        var r0: c_int = 0;
+        while (r0 < t) : (r0 += span) {
+            const r1 = @min(t, r0 + span);
+            const sin: SpanIn = .{ .gate = try o.slice(gate, 0, r0, r1), .kv_b32 = kv_b32, .whole = false };
+            want_parts[ns] = try attendCoreGated(&o, sin, try o.slice(q, 1, r0, r1), .{ .range = .{ .keys = .{ .c = c_keys, .k_pe = pe_keys }, .p0 = r0, .window = 0 } }, w, g, null);
+            ns += 1;
+        }
+        const want = try o.contiguous(try o.concat(want_parts[0..ns], 0));
+        try mlx.check(mlx.mlx_array_eval(want));
+        const old_d = mlx.engine.stats().dispatches - d0;
+
+        const d1 = mlx.engine.stats().dispatches;
+        const wide_in: SpanIn = .{ .gate = gate, .kv_b32 = kv_b32, .whole = false, .rows_as = span };
+        const got = try o.contiguous(try attendCoreGated(&o, wide_in, q, .{ .range = .{ .keys = .{ .c = c_keys, .k_pe = pe_keys }, .p0 = 0, .window = 0 } }, w, g, null));
+        try mlx.check(mlx.mlx_array_eval(got));
+        const new_d = mlx.engine.stats().dispatches - d1;
+
+        try testing.expect(new_d < old_d);
+        const n = mlx.mlx_array_size(want);
+        const wb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(want) orelse return error.HostRead);
+        const gb: [*]const u16 = @ptrCast(mlx.mlx_array_data_bfloat16(got) orelse return error.HostRead);
+        try testing.expectEqualSlices(u16, wb[0..n], gb[0..n]);
+    }
 }

@@ -185,7 +185,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
 pub fn applies(s: mlx.mlx_stream, logits: Arr, bias: Arr, k: c_int) bool {
     const sh = mlx.getShape(logits);
     const bd = mlx.mlx_array_dtype(bias);
-    return mlx.streamIsGpu(s) and sh.len == 2 and sh[0] >= 1 and sh[0] <= max_rows and mlx.mlx_array_dtype(logits) == .float32 and
+    return mlx.streamIsGpu(s) and sh.len == 2 and sh[0] >= 1 and mlx.mlx_array_dtype(logits) == .float32 and
         k >= 1 and k <= max_k and k <= sh[1] and sh[1] <= max_experts and mlx.mlx_array_size(bias) == @as(usize, @intCast(sh[1])) and
         (bd == .float32 or bd == .bfloat16);
 }
@@ -622,4 +622,59 @@ test "hy4 route: the selection path's picks, weights and slots are the full sort
             }
         }
     }
+}
+
+test "hy4 route: wide prefill rows past max_rows run in one launch and match the ops byte for byte" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const e: c_int = 512;
+    const k: c_int = 16;
+    const tu: usize = 64;
+    const eu: usize = 512;
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const lg = try testing.allocator.alloc(f32, tu * eu);
+    defer testing.allocator.free(lg);
+    const bs = try testing.allocator.alloc(f32, eu);
+    defer testing.allocator.free(bs);
+    const mp = try testing.allocator.alloc(i32, eu);
+    defer testing.allocator.free(mp);
+    var r = std.Random.DefaultPrng.init(0x52007e);
+    for (lg) |*l| l.* = @floatCast(r.random().floatNorm(f64) * 2);
+    for (bs, mp, 0..) |*b, *m, i| {
+        b.* = @floatCast(r.random().floatNorm(f64) * 0.1);
+        m.* = @intCast((i * 37 + 11) % eu);
+    }
+    const logits = try o.own(mlx.mlx_array_new_data(lg.ptr, &[_]c_int{ @intCast(tu), e }, 2, .float32));
+    const bias = try o.own(mlx.mlx_array_new_data(bs.ptr, &[_]c_int{e}, 1, .float32));
+    const map = try o.own(mlx.mlx_array_new_data(mp.ptr, &[_]c_int{e}, 1, .int32));
+    const scores = try o.unary(.sigmoid, logits);
+    const choice = try o.binary(.add, scores, bias);
+    const order = try o.slot();
+    try mlx.check(mlx.mlx_argpartition_axis(order, try o.unary(.negative, choice), k - 1, -1, es));
+    const want_picks = try o.slice(order.*, 1, 0, k);
+    const picked = try o.slot();
+    try mlx.check(mlx.mlx_take_along_axis(picked, scores, want_picks, -1, es));
+    const total = try o.binary(.add, try o.reduce(picked.*, -1, false, true), try o.scalar(1e-20, .float32));
+    const want_w = try o.binary(.mul, try o.binary(.div, picked.*, total), try o.scalar(3.998, .float32));
+    const want_slots = try o.cast(try o.take(map, try o.cast(want_picks, .int32), 0), .uint32);
+    const wp = try hostBytes(&o, want_picks);
+    const ww = try hostBytes(&o, want_w);
+    const wsl = try hostBytes(&o, want_slots);
+    try testing.expect(applies(es, logits, bias, k));
+    const before = mlx.engine.stats().dispatches;
+    const got = try pick(es, logits, bias, k, 3.998, map);
+    _ = try o.own(got.picks);
+    _ = try o.own(got.weights);
+    _ = try o.own(got.slots.?);
+    try mlx.check(mlx.mlx_array_eval(got.weights));
+    try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+    try testing.expectEqualSlices(u8, wp, try hostBytes(&o, got.picks));
+    try testing.expectEqualSlices(u8, ww, try hostBytes(&o, got.weights));
+    try testing.expectEqualSlices(u8, wsl, try hostBytes(&o, got.slots.?));
 }

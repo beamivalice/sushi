@@ -221,9 +221,10 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
 - **Cooler**:
   - The projections are trunk linears; `W_qa`, `W_kva` and `W_g` read the same `x` and stack into one launch, as
     DeepSeek's `Layer.in_shared`.
-  - A decode row's BF16 linear (the STQ pack's `W_kva`, stored BF16) is one launch (`hy4_gemv.rowThru`): the row
+  - A decode row's BF16 linear (the STQ pack's `W_kva`, stored BF16) is one launch (`hy4_gemv.rowsThru`): the row
     rounded to BF16 in the register, MLX's `gemv` tile over the BF16 operands, the sum rounded to BF16 and widened,
-    not the casts around MLX's BF16 `gemv`.
+    not the casts around MLX's BF16 `gemv`. A verify block of 2 to 8 rows is one launch too, the weight read once
+    and each row its one-row sums (3-row verify 21.68 to 21.41 ms a forward, 92d6397b, M5 Ultra, STQ 4bpw, A B B A).
   - A decode row's absorbed products (`hy4_absorb`) read the query's nope part in place (template `QS`, the row's
     width) and keep their launch configs; their grid's y takes a block's rows, each its one-row launch's bytes.
   - The attention core of a wide span (more than 8 rows, on an M5) is `hy4_attn`, one launch a span on the matrix units
@@ -251,6 +252,13 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     sparse layer's rows to the chunk's end, are read from kv8 to BF16 once a layer and chunk (`hy4_latent.rangeBf16`;
     the region the load measures at its deepest reach holds the copy), and a row's picks are read from that copy by index in the kernel, never copied
     (the chain gathered 2,048 rows a row, widened to f32, 134 MB a 32-row span).
+  - A prefill chunk's glue runs in the launches beside it, each byte for byte: the iHC mix, expand and write-back and
+    the router's pick take wide prefill rows in their fused kernels; `post_proj_norm` rides the expand's mix
+    (`hy4_hc.expandNormMixNorm`); a span's gated rows land in the chunk's `W_o` block (`hy4_chain.gatedInto`); a
+    sparse layer's indexer projections, rope and group keys run once a chunk (`fwd.indexPrepare`); sparse spans widen
+    to 256 rows, their products at 32-row launches' bytes (`matmulRowsAs`); BF16 rows stay BF16 into the norms, rope,
+    SwiGLU and the routed latent up. A 4,096-row chunk after 4,096: 2,240 to 1,952 ms, 24,291 to about 13,000
+    dispatches (bc7f5124 on 36090072, M5 Ultra, STQ 4bpw, prefill meter, A B B A, GPU lock).
   - Pinned by `hy4 attention spans`: at the release's gate and `W_o` shapes (trellis K4 and BF16, spans of 256 and
     32, short last spans), and on the tiny's BF16 and STQ trunks against the per-span order (`fwd.spans_share`, a
     test seam), byte for byte over windowed, gathered and decode rows. The tiny's logits also matched the parent

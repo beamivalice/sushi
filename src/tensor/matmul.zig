@@ -305,9 +305,10 @@ fn matmulImpl(a_in: *Tensor, b_in: *Tensor, dst_in: ?*Tensor) Error!*Tensor {
 /// beside it; a caller whose rows must not depend on their company fixes the count. The rows are computed as they are:
 /// nothing is padded.
 pub fn matmulRowsAs(a: *Tensor, b: *Tensor, rows_as: usize) Error!*Tensor {
-    if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype) return error.TensorShape;
+    if (a.ndim < 2 or a.ndim != b.ndim or a.dtype != b.dtype) return error.TensorShape;
     if (a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return core.refusing("a matmul in a dtype other than f32, f16 and bf16", error.TensorDtype);
-    if (a.shape[1] != b.shape[0]) return error.TensorShape;
+    if (!std.mem.eql(c_int, a.shape[0 .. a.ndim - 2], b.shape[0 .. b.ndim - 2])) return error.TensorShape;
+    if (a.shape[a.ndim - 1] != b.shape[b.ndim - 2]) return error.TensorShape;
     if (a.size() == 0 or b.size() == 0 or rows_as < 2) return core.refusing("a rows-as matmul of an empty operand or under two rows", error.TensorUnsupported);
     return product(a, b, rows_as, null);
 }

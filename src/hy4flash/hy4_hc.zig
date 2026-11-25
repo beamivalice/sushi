@@ -27,15 +27,17 @@ const head =
 
 // The mixes' simd sums into `t_d` and `t_s`: thread `tid` the terms `k = tid + c·TG` in order.
 const mix_sums =
+    \\float sv[(D % TG == 0) ? (HC * DT) : 1];
     \\float dd[MIXN], ss = 0.0f;
     \\for (int j = 0; j < MIXN; ++j) dd[j] = 0.0f;
-    \\for (int k = tid; k < N; k += TG) {
+    \\for (int c = 0, k = tid; k < N; k += TG, ++c) {
     \\  float fv[MIXN];
     \\  #pragma clang loop unroll(full)
     \\  for (int j = 0; j < MIXN; ++j) fv[j] = fn[size_t(j) * N + k];
     \\  const size_t o = size_t(l) * N + k;
     \\  const float v = STREAM(o, k);
     \\  STORE_M;
+    \\  if (D % TG == 0) sv[c] = v;
     \\  #pragma clang loop unroll(full)
     \\  for (int j = 0; j < MIXN; ++j) dd[j] = metal::fma(v, fv[j], dd[j]);
     \\  ss = metal::fma(v, v, ss);
@@ -155,49 +157,57 @@ const wide_sums =
 // The back form's first part, outside the mix's contract(off): `hy4_norm.rowsExpand`'s norm of `a + b` by `wn`
 // (MLX's `rms_single_row`: its RG threads of four columns each, here RR to a lane, the same simd sums in the same
 // lanes), the normed row into `t_y`.
-const back_norm =
-    \\threadgroup float t_y[D], t_ls[32], t_inv[1];
-    \\{
-    \\  constexpr uint axis_size = uint(D);
-    \\  constexpr int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
-    \\  float thread_x[RR][4];
-    \\  if (sg == 0) t_ls[lane] = 0;
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int r = 0; r < RR; ++r) {
-    \\    const uint vt = tid + uint(r * TG);
-    \\    if (vt < uint(RG)) {
-    \\      float acc = 0;
-    \\      for (int i = 0; i < 4; i++) {
-    \\        uint c = vt * 4 + i;
-    \\        float v = 0;
-    \\        if (c < axis_size) {
-    \\          v = static_cast<float>(a[size_t(l) * D + c]);
-    \\          v = v + static_cast<float>(b[size_t(l) * D + c]);
-    \\        }
-    \\        thread_x[r][i] = v;
-    \\        acc += thread_x[r][i] * thread_x[r][i];
-    \\      }
-    \\      acc = simd_sum(acc);
-    \\      if (lane == 0) t_ls[vt / 32] = acc;
-    \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (sg == 0) {
-    \\    float acc = simd_sum(t_ls[lane]);
-    \\    if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int r = 0; r < RR; ++r) {
-    \\    const uint vt = tid + uint(r * TG);
-    \\    for (int i = 0; i < 4; i++) {
-    \\      uint c = vt * 4 + i;
-    \\      if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
-    \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\
-;
+fn backNorm(comptime add: bool) []const u8 {
+    return
+        \\threadgroup float t_y[D], t_ls[32], t_inv[1];
+        \\{
+        \\  constexpr uint axis_size = uint(D);
+        \\  constexpr int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
+        \\  float thread_x[RR][4];
+        \\  if (sg == 0) t_ls[lane] = 0;
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  for (int r = 0; r < RR; ++r) {
+        \\    const uint vt = tid + uint(r * TG);
+        \\    if (vt < uint(RG)) {
+        \\      float acc = 0;
+        \\      for (int i = 0; i < 4; i++) {
+        \\        uint c = vt * 4 + i;
+        \\        float v = 0;
+        \\        if (c < axis_size) {
+        \\          v = static_cast<float>(a[size_t(l) * D + c]);
+        \\
+    ++ (if (add)
+        \\          v = v + static_cast<float>(b[size_t(l) * D + c]);
+        \\
+    else "") ++
+        \\        }
+        \\        thread_x[r][i] = v;
+        \\        acc += thread_x[r][i] * thread_x[r][i];
+        \\      }
+        \\      acc = simd_sum(acc);
+        \\      if (lane == 0) t_ls[vt / 32] = acc;
+        \\    }
+        \\  }
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  if (sg == 0) {
+        \\    float acc = simd_sum(t_ls[lane]);
+        \\    if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+        \\  }
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\  for (int r = 0; r < RR; ++r) {
+        \\    const uint vt = tid + uint(r * TG);
+        \\    for (int i = 0; i < 4; i++) {
+        \\      uint c = vt * 4 + i;
+        \\      if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
+        \\    }
+        \\  }
+        \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+        \\}
+        \\
+    ;
+}
+
+const back_norm = backNorm(true);
 
 /// The expand form's `y` as `W_o`'s launch's finish and norm give it (`rows_finish_rms_thru`), from that launch's k-split
 /// partials `op` (`[L * OSPLIT, D]` f32), its `osvh` and the norm's `ow` and ε (`OEPS`, f32 bits): each simdgroup
@@ -297,9 +307,9 @@ const o_rows_norm =
 /// A launch's form: the plain mix, the mix of the stream expanded by a sublayer's output `y`, or by the combine norm of
 /// `a + b` it computes first (`back`: the layer boundary); or expanded by `y` finished and normed from W_o's partials
 /// in the launch (`expand_parts`), or normed from W_o's finished rows (`expand_rows`).
-pub const Form = enum { plain, expand, back, expand_parts, expand_rows };
+pub const Form = enum { plain, expand, back, expand_norm, expand_parts, expand_rows };
 
-var kernels: [2][5]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
+var kernels: [2][6]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
 
 /// The form's kernel: one threadgroup a row, or `wide`, `2·HC` threadgroups a row that count into the counter page.
 fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
@@ -309,6 +319,7 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
         .plain => &.{ "x", "fn", "scale", "base", "eps", "w" },
         .expand => &.{ "x", "y", "pin", "fn", "scale", "base", "eps", "w" },
         .back => &.{ "x", "pin", "a", "b", "wn", "fn", "scale", "base", "eps", "w" },
+        .expand_norm => &.{ "x", "pin", "a", "wn", "fn", "scale", "base", "eps", "w" },
         .expand_parts => &.{ "x", "op", "osvh", "ow", "pin", "fn", "scale", "base", "eps", "w" },
         .expand_rows => &.{ "x", "oy", "ow", "pin", "fn", "scale", "base", "eps", "w" },
     };
@@ -330,16 +341,17 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
                 const stream = switch (f) {
                     .plain => "#define STREAM(o, k) float(x[o])\n#define STORE_M (void)0\n",
                     .expand => "#define STREAM(o, k) (pin[l * HC + (k) / D] * float(y[size_t(l) * D + (k) % D]) + float(x[o]))\n#define STORE_M m[o] = v\n",
-                    .back, .expand_parts, .expand_rows => "#define STREAM(o, k) (pin[l * HC + (k) / D] * t_y[(k) % D] + float(x[o]))\n#define STORE_M m[o] = v\n",
+                    .back, .expand_norm, .expand_parts, .expand_rows => "#define STREAM(o, k) (pin[l * HC + (k) / D] * t_y[(k) % D] + float(x[o]))\n#define STORE_M m[o] = v\n",
                 };
                 const first = switch (f) {
                     .plain, .expand => "",
                     .back => back_norm,
+                    .expand_norm => comptime backNorm(false),
                     .expand_parts => o_norm,
                     .expand_rows => o_rows_norm,
                 };
                 // Where the collapse reads its stream values and norm weight: the wide launch's prefetch, else the inputs.
-                const sums = if (w) "#define SV(j, i, d) sv[(j) * DT + (i)]\n#define WV(i, d) wv[i]\n" ++ wide_sums else "#define SV(j, i, d) STREAM((size_t(l) * HC + (j)) * D + (d), (j) * D + (d))\n#define WV(i, d) w[d]\n" ++ mix_sums;
+                const sums = if (w) "#define SV(j, i, d) sv[(j) * DT + (i)]\n#define WV(i, d) wv[i]\n" ++ wide_sums else "#define SV(j, i, d) ((D % TG == 0) ? sv[(j) * DT + (i)] : STREAM((size_t(l) * HC + (j)) * D + (d), (j) * D + (d)))\n#define WV(i, d) w[d]\n" ++ mix_sums;
                 // A wide grid's padding row (`build`) returns before it reads.
                 const gate = if (w) "if (l >= x_shape[0]) return;\n" else "";
                 const src = stream ++ head ++ gate ++ first ++ "{\n#pragma clang fp contract(off)\n" ++ sums ++ mix_tail ++ "}\n";
@@ -347,6 +359,7 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
                     .plain => "sushi_hy4_hc_mix_norm",
                     .expand => "sushi_hy4_hc_mix_expand_norm",
                     .back => "sushi_hy4_hc_back_mix_norm",
+                    .expand_norm => "sushi_hy4_hc_expand_norm_mix_norm",
                     .expand_parts => "sushi_hy4_hc_expand_parts_mix_norm",
                     .expand_rows => "sushi_hy4_hc_expand_rows_mix_norm",
                 } ++ (if (w) "_wide" else "");
@@ -368,7 +381,7 @@ pub fn applies(s: mlx.mlx_stream, x: Arr, fn_w: Arr, scale: Arr) bool {
     const xs = mlx.getShape(x);
     const fs = mlx.getShape(fn_w);
     if (xs.len != 3 or fs.len != 2) return false;
-    return mlx.streamIsGpu(s) and xs[0] >= 1 and xs[0] <= rows_max and xs[1] <= 8 and fs[0] == 2 * xs[1] and
+    return mlx.streamIsGpu(s) and xs[0] >= 1 and xs[1] <= 8 and fs[0] == 2 * xs[1] and
         fs[1] == xs[1] * xs[2] and mlx.mlx_array_size(scale) >= 2 and mlx.mlx_array_dtype(x) == .float32 and
         mlx.mlx_array_dtype(fn_w) == .float32 and mlx.mlx_array_dtype(scale) == .float32;
 }
@@ -377,6 +390,7 @@ pub fn applies(s: mlx.mlx_stream, x: Arr, fn_w: Arr, scale: Arr) bool {
 /// sums a virtual simdgroup a row, fit the counter page past its counters, one counter a row.
 fn takesWide(s: mlx.mlx_stream, rows: c_int, hc: c_int) bool {
     comptime std.debug.assert(rows_max <= mlx.engine.counter_words);
+    if (rows > rows_max) return false;
     const parts: usize = @intCast(rows * (2 * hc + 1));
     return wide_on and mlx.engine.side(.{s}) == .engine and parts * (hck.hc_tg / 32) <= mlx.engine.counter_page_words - mlx.engine.counter_words;
 }
@@ -403,7 +417,7 @@ fn build(k: Key) !kcfg.Config {
     inline for (.{ "TG", "HC", "MIXN", "D" }, .{ k.tg, k.hc, 2 * k.hc, k.d }) |n, v|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, v));
     if (k.wide) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "CTR", mlx.engine.counter_words));
-    if (k.form == .back) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPS", k.eps));
+    if (k.form == .back or k.form == .expand_norm) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPS", k.eps));
     if (k.form == .expand_rows) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "OEPS", k.eps));
     if (k.form == .expand_parts) inline for (.{ "OSPLIT", "OEPS" }, .{ k.osplit, k.eps }) |n, v|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, v));
@@ -557,6 +571,26 @@ pub fn mixExpandNorm(s: mlx.mlx_stream, h: Arr, y: Arr, post_in: Arr, hw: hck.Hc
 /// next layer's. `a`, `b` [L, D] f32 or BF16, `wn` [D]; the rest as `mixExpandNorm`. The caller frees all three.
 pub fn backMixNorm(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, b: Arr, wn: Arr, combine_eps: f32, hw: hck.HcWeights, eps: Arr, norm_w: Arr) !Normed {
     return run(s, &.{ h, post_in, a, b, wn, hw.fn_w, hw.scale, hw.base, eps, norm_w }, h, norm_w, hw.base, .back, kcfg.bits(combine_eps));
+}
+
+/// The expand of `h` by the post mix and `a` normed by `wn`, then the next mix and its norm, in one launch: `a`'s norm
+/// and the expand's write-back no longer launch apart.
+pub fn expandNormMixNorm(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, wn: Arr, norm_eps: f32, hw: hck.HcWeights, eps: Arr, norm_w: Arr) !Normed {
+    return run(s, &.{ h, post_in, a, wn, hw.fn_w, hw.scale, hw.base, eps, norm_w }, h, norm_w, hw.base, .expand_norm, kcfg.bits(norm_eps));
+}
+
+/// Whether `expandNormMixNorm` takes these operands: `applies`' shapes, the attention rows `a` [T, d] f32 or BF16 with
+/// their norm weight, the post mix [T, n] f32.
+pub fn expandNormApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, wn: Arr, fn_w: Arr, scale: Arr) bool {
+    if (!applies(s, h, fn_w, scale)) return false;
+    const hs = mlx.getShape(h);
+    const rows = [_]c_int{ hs[0], hs[2] };
+    const lanes = [_]c_int{ hs[0], hs[1] };
+    const ad = mlx.mlx_array_dtype(a);
+    const wd = mlx.mlx_array_dtype(wn);
+    return hs[2] <= 4096 and std.mem.eql(c_int, mlx.getShape(a), &rows) and (ad == .float32 or ad == .bfloat16) and
+        std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
+        mlx.getShape(wn).len == 1 and mlx.getShape(wn)[0] == hs[2] and (wd == .float32 or wd == .bfloat16);
 }
 
 /// `mixExpandNorm(h, y, post_in)` of `y = RMSNorm_ow(W_o's rows)` finished in the launch from that launch's k-split
@@ -782,6 +816,7 @@ const FormCase = struct {
             .plain => try mixNorm(o.s, c.h, c.hw, c.eps, c.w),
             .expand => try mixExpandNorm(o.s, c.h, c.y, c.pin, c.hw, c.eps, c.w),
             .back => try backMixNorm(o.s, c.h, c.pin, c.up, c.shared, c.wn, 1e-5, c.hw, c.eps, c.w),
+            .expand_norm => try expandNormMixNorm(o.s, c.h, c.pin, c.y, c.wn, 1e-5, c.hw, c.eps, c.w),
             .expand_parts => try mixExpandNormParts(o.s, c.h, c.pin, c.op, c.osvh, c.osplit, c.ow, 1e-5, c.hw, c.eps, c.w),
             .expand_rows => try mixExpandNormRows(o.s, c.h, c.pin, c.y, c.ow, 1e-5, c.hw, c.eps, c.w),
         };
@@ -970,4 +1005,127 @@ test "hy4 hc: a census refuses by name an input it cannot note (more inputs than
     try testing.expectError(error.Hy4HcCensusInputs, cs.note(pipe, &many));
     try testing.expectError(error.Hy4HcCensusInputs, cs.note(pipe, &.{ flat, deep }));
     try testing.expectEqual(@as(usize, 0), cs.noted.items.len);
+}
+
+test "hy4 hc: prefill rows past rows_max run plain, expand and back in one launch each, byte for byte" {
+    try mlx.requireGpu();
+    const hy4_norm = @import("hy4_norm.zig");
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    for ([_]struct { t: c_int, d: c_int }{ .{ .t = 33, .d = 128 }, .{ .t = 64, .d = 3072 } }) |cs| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed: u64 = @intCast(11 * cs.t + cs.d);
+        const h = try o.contiguous(try randomArr(&o, &.{ cs.t, 4, cs.d }, .float32, seed, 1));
+        const y = try o.contiguous(try randomArr(&o, &.{ cs.t, cs.d }, .float32, seed + 1, 1));
+        const pin = try o.contiguous(try randomArr(&o, &.{ cs.t, 4 }, .float32, seed + 2, 1));
+        const up = try o.contiguous(try randomArr(&o, &.{ cs.t, cs.d }, .bfloat16, seed + 3, 0.7));
+        const shared = try o.contiguous(try randomArr(&o, &.{ cs.t, cs.d }, .bfloat16, seed + 4, 0.4));
+        const wn = try o.contiguous(try randomArr(&o, &.{cs.d}, .bfloat16, seed + 5, 0.3));
+        const hw: hck.HcWeights = .{
+            .fn_w = try o.contiguous(try randomArr(&o, &.{ 8, 4 * cs.d }, .float32, seed + 6, 0.05)),
+            .scale = try o.contiguous(try randomArr(&o, &.{3}, .float32, seed + 7, 1)),
+            .base = try o.contiguous(try randomArr(&o, &.{8}, .float32, seed + 8, 1)),
+        };
+        const w = try o.contiguous(try randomArr(&o, &.{cs.d}, .bfloat16, seed + 9, 0.3));
+        const eps = try o.own(try hck.identityEps(1e-5, 1e-6, 2.0));
+        try testing.expect(applies(es, h, hw.fn_w, hw.scale));
+        try testing.expect(backApplies(es, h, pin, up, shared, wn, hw.fn_w, hw.scale));
+
+        const z = try o.own(try hck.mixTiled(es, h, hw, eps, hck.hc_mix_tile));
+        const want = try hck.normIdentity(es, z, h, w, eps);
+        _ = try o.own(want.pre);
+        const wp = try bytesOf(&o, try o.own(want.post));
+        const wh = try bytesOf(&o, try o.own(want.h));
+        const b0 = mlx.engine.stats().dispatches;
+        const got = try mixNorm(es, h, hw, eps, w);
+        const gp = try o.own(got.post);
+        const gh = try o.own(got.h);
+        try mlx.check(mlx.mlx_array_eval(gh));
+        try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - b0);
+        try testing.expectEqualSlices(u8, wp, try bytesOf(&o, gp));
+        try testing.expectEqualSlices(u8, wh, try bytesOf(&o, gh));
+
+        const ex = try hck.mixExpandIdentity(es, h, y, pin, hw, eps, hck.hc_mix_tile);
+        const em = try bytesOf(&o, try o.own(ex.m));
+        const wx = try hck.normIdentity(es, try o.own(ex.z), ex.m, w, eps);
+        _ = try o.own(wx.pre);
+        const xp = try bytesOf(&o, try o.own(wx.post));
+        const xh = try bytesOf(&o, try o.own(wx.h));
+        const b1 = mlx.engine.stats().dispatches;
+        const gx = try mixExpandNorm(es, h, y, pin, hw, eps, w);
+        const gxm = try o.own(gx.m.?);
+        const gxp = try o.own(gx.post);
+        const gxh = try o.own(gx.h);
+        try mlx.check(mlx.mlx_array_eval(gxh));
+        try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - b1);
+        try testing.expectEqualSlices(u8, xp, try bytesOf(&o, gxp));
+        try testing.expectEqualSlices(u8, xh, try bytesOf(&o, gxh));
+        try testing.expectEqualSlices(u8, em, try bytesOf(&o, gxm));
+
+        const bm = try o.own(try hy4_norm.rowsExpand(es, up, shared, wn, 1e-5, h, pin));
+        const bw = try mixNorm(es, bm, hw, eps, w);
+        const bwm = try bytesOf(&o, bm);
+        const bwp = try bytesOf(&o, try o.own(bw.post));
+        const bwh = try bytesOf(&o, try o.own(bw.h));
+        const b2 = mlx.engine.stats().dispatches;
+        const bg = try backMixNorm(es, h, pin, up, shared, wn, 1e-5, hw, eps, w);
+        const bgm = try o.own(bg.m.?);
+        const bgp = try o.own(bg.post);
+        const bgh = try o.own(bg.h);
+        try mlx.check(mlx.mlx_array_eval(bgh));
+        try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - b2);
+        try testing.expectEqualSlices(u8, bwm, try bytesOf(&o, bgm));
+        try testing.expectEqualSlices(u8, bwp, try bytesOf(&o, bgp));
+        try testing.expectEqualSlices(u8, bwh, try bytesOf(&o, bgh));
+    }
+}
+
+test "hy4 hc: expandNormMixNorm norms a single bf16 sublayer output, expands and mixes in one launch, byte for byte" {
+    try mlx.requireGpu();
+    const hy4_norm = @import("hy4_norm.zig");
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const t: c_int = 64;
+    const d: c_int = 3072;
+    const h = try o.contiguous(try randomArr(&o, &.{ t, 4, d }, .float32, 301, 1));
+    const y_raw = try o.contiguous(try randomArr(&o, &.{ t, d }, .bfloat16, 302, 0.8));
+    const pin = try o.contiguous(try randomArr(&o, &.{ t, 4 }, .float32, 303, 1));
+    const wn = try o.contiguous(try randomArr(&o, &.{d}, .bfloat16, 304, 0.3));
+    const hw: hck.HcWeights = .{
+        .fn_w = try o.contiguous(try randomArr(&o, &.{ 8, 4 * d }, .float32, 305, 0.05)),
+        .scale = try o.contiguous(try randomArr(&o, &.{3}, .float32, 306, 1)),
+        .base = try o.contiguous(try randomArr(&o, &.{8}, .float32, 307, 1)),
+    };
+    const w = try o.contiguous(try randomArr(&o, &.{d}, .bfloat16, 308, 0.3));
+    const eps = try o.own(try hck.identityEps(1e-5, 1e-6, 2.0));
+    try testing.expect(expandNormApplies(es, h, pin, y_raw, wn, hw.fn_w, hw.scale));
+
+    const y_norm = try o.own(try hy4_norm.rows(es, y_raw, null, wn, 1e-5, .float32));
+    const want = try mixExpandNorm(es, h, y_norm, pin, hw, eps, w);
+    const wm = try bytesOf(&o, try o.own(want.m.?));
+    const wp = try bytesOf(&o, try o.own(want.post));
+    const wh = try bytesOf(&o, try o.own(want.h));
+
+    try mlx.check(mlx.mlx_array_eval(y_raw));
+    const before = mlx.engine.stats().dispatches;
+    const got = try expandNormMixNorm(es, h, pin, y_raw, wn, 1e-5, hw, eps, w);
+    const gm = try o.own(got.m.?);
+    const gp = try o.own(got.post);
+    const gh = try o.own(got.h);
+    try mlx.check(mlx.mlx_array_eval(gh));
+    try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+    try testing.expectEqualSlices(u8, wm, try bytesOf(&o, gm));
+    try testing.expectEqualSlices(u8, wp, try bytesOf(&o, gp));
+    try testing.expectEqualSlices(u8, wh, try bytesOf(&o, gh));
 }
