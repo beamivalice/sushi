@@ -106,19 +106,23 @@ test "cooler contract: a second Cooler load beside a sealed one, of another arch
     var ran = false;
     inline for (comptime std.meta.tags(registry.Tag)) |ta| {
         if (comptime !@hasDecl(registry.Mod(ta), "cooler_contract")) continue;
-        inline for (comptime std.meta.tags(registry.Tag)) |tb| {
-            if (comptime ta == tb or !@hasDecl(registry.Mod(tb), "cooler_contract")) continue;
-            ran = (try besideSealed(registry.Mod(ta).cooler_contract, registry.Mod(tb).cooler_contract)) or ran;
-        }
+        ran = (try besideSealed(ta)) or ran;
     }
     if (!ran) return error.SkipZigTest;
 }
 
-/// A load of `A`'s first fixture, warmed and sealed, then a load of `B`'s beside it; false when either is missing. Beside a
-/// load on the ledger the second is refused by name.
-fn besideSealed(comptime A: type, comptime B: type) !bool {
+/// A load of `ta`'s first fixture, warmed and sealed, then a load of each other arch's beside it, one at a time; false
+/// when it ran none. Beside a load on the ledger each is refused by name.
+fn besideSealed(comptime ta: registry.Tag) !bool {
+    const A = registry.Mod(ta).cooler_contract;
+    // A run that names its fixtures takes the first loads that are one of them: across a landing's runs, one per
+    // fixture, each pair runs once.
+    const sel = contract.selection();
+    const chosen = for (A.fixtures) |f| {
+        if (contract.fixtureChosen(sel, f)) break true;
+    } else false;
+    if (!chosen) return false;
     const da = std.mem.span(std.c.getenv(A.fixtures[0]) orelse return false);
-    const db = std.mem.span(std.c.getenv(B.fixtures[0]) orelse return false);
     const Warm = struct {
         fn run(ld: *Load) !void {
             const turn = arch_handle.turnFor(ld.h, &ld.config);
@@ -131,20 +135,29 @@ fn besideSealed(comptime A: type, comptime B: type) !bool {
     defer _ = first.close();
     try Warm.run(&first);
     try testing.expect(mlx.engine.sealed());
-    const late = mlx.engine.latePipelines();
-    mlx.engine.late_names.clear();
-    var second: Load = undefined;
-    if (first.config.static_ledger != null) {
-        try contract.expectRefusedBesideLedger(B, db);
-        return true;
+    var ran = false;
+    inline for (comptime std.meta.tags(registry.Tag)) |tb| {
+        if (comptime ta == tb or !@hasDecl(registry.Mod(tb), "cooler_contract")) continue;
+        const B = registry.Mod(tb).cooler_contract;
+        if (std.c.getenv(B.fixtures[0])) |db_z| {
+            const db = std.mem.span(db_z);
+            ran = true;
+            if (first.config.static_ledger != null) {
+                try contract.expectRefusedBesideLedger(B, db);
+            } else {
+                const late = mlx.engine.latePipelines();
+                mlx.engine.late_names.clear();
+                var second: Load = undefined;
+                try second.open(B, db, true);
+                defer _ = second.close();
+                try Warm.run(&second);
+                errdefer std.debug.print("cooler contract: the second load's warm ({s} beside {s}) counted late:\n{s}", .{ B.fixtures[0], A.fixtures[0], mlx.engine.late_names.text() });
+                try testing.expectEqual(late, mlx.engine.latePipelines());
+                try testing.expect(mlx.engine.sealed());
+            }
+        }
     }
-    try second.open(B, db, true);
-    defer _ = second.close();
-    try Warm.run(&second);
-    errdefer std.debug.print("cooler contract: the second load's warm ({s} beside {s}) counted late:\n{s}", .{ B.fixtures[0], A.fixtures[0], mlx.engine.late_names.text() });
-    try testing.expectEqual(late, mlx.engine.latePipelines());
-    try testing.expect(mlx.engine.sealed());
-    return true;
+    return ran;
 }
 
 test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engine, and an MLX load's on MLX" {
@@ -389,44 +402,52 @@ test "cooler contract: two packs whose served warms have one shape and one bill 
     _ = mlx.takeError(&msg);
 }
 
-/// A process setting the served warm reads, flipped between the process that wrote the manifest and the one that loads
-/// from it. Returns the loading process's served warms and the kernels a full warm under its setting then compiles late
-/// (what a skipped warm left for requests), and whether the load drafts, as the warm's requests do.
-fn settingProbe(comptime C: type, dir: []const u8, comptime Setting: type, flip: bool) !struct { runs: u32, late: u64, drafts: bool } {
+const mtp_settings = .{ LookupSetting, MaxMtpCtxSetting, MtpMaxDepthSetting };
+
+/// Every MTP setting a warm reads at its `written` value, or at `loaded` for the one `flipped` names.
+fn setMtpSettings(comptime flipped: ?type) void {
+    inline for (mtp_settings) |Setting| Setting.set(if (flipped == Setting) Setting.loaded else Setting.written);
+}
+
+/// The files under `src`, copied into `dst`: a manifest's directory as one process left it.
+fn copyTree(src: std.Io.Dir, dst: std.Io.Dir) !void {
+    var walker = try src.walk(testing.allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |e| switch (e.kind) {
+        .directory => try dst.createDirPath(io, e.path),
+        .file => {
+            const bytes = try src.readFileAlloc(io, e.path, testing.allocator, .limited(1 << 30));
+            defer testing.allocator.free(bytes);
+            try dst.writeFile(io, .{ .sub_path = e.path, .data = bytes });
+        },
+        else => {},
+    };
+}
+
+/// A process that loads from a copy of `written`, the manifest a process wrote under every setting's `written` value,
+/// with `flipped`'s setting at `loaded` (none: the control); then a full warm under the same settings from no manifest.
+/// The warms its load ran, the kernels the full warm left late, and whether the load drafts.
+fn settingProbe(comptime C: type, dir: []const u8, written: std.Io.Dir, comptime flipped: ?type) !struct { runs: u32, late: u64, drafts: bool } {
     const shared = @import("arch/cooler_pipelines.zig");
     const cooler_warm = @import("cooler_warm.zig");
     const reg = mlx.engine.pipeline_registry;
-    var tmp1 = testing.tmpDir(.{ .iterate = true });
-    defer tmp1.cleanup();
-    var tmp2 = testing.tmpDir(.{ .iterate = true });
-    defer tmp2.cleanup();
+    var copy = testing.tmpDir(.{ .iterate = true });
+    defer copy.cleanup();
+    try copyTree(written, copy.dir);
+    var fresh = testing.tmpDir(.{ .iterate = true });
+    defer fresh.cleanup();
     defer shared.root_hook = null;
     defer shared.forget();
-    const was = Setting.get();
-    defer Setting.set(was);
-    // Process 1 writes the manifest under the setting's `written` value.
-    shared.root_hook = tmp1.dir;
+    shared.root_hook = copy.dir;
     reg.resetForTest();
-    Setting.set(Setting.written);
-    {
-        var first: Load = undefined;
-        try first.open(C, dir, true);
-        // A load with no drafter: its warm reads no MTP setting, so there is nothing for its marker to keep apart.
-        const drafts = @import("generate.zig").MtpHeadRef.fromModel(first.xfm, true, null) != null;
-        _ = first.close();
-        if (!drafts) return error.SkipZigTest;
-    }
-    // Process 2 loads from it, the setting flipped to `loaded` (or not, the control).
-    reg.resetForTest();
-    Setting.set(if (flip) Setting.loaded else Setting.written);
+    setMtpSettings(flipped);
     const before = cooler_warm.runs_for_test;
     var cooler: Load = undefined;
     try cooler.open(C, dir, true);
     defer _ = cooler.close();
     const runs = cooler_warm.runs_for_test - before;
     const drafts = @import("generate.zig").MtpHeadRef.fromModel(cooler.xfm, cooler.mtpOn(), null) != null;
-    // A full warm under process 2's setting from no manifest: what it compiles now, the skipped warm left out.
-    shared.root_hook = tmp2.dir;
+    shared.root_hook = fresh.dir;
     reg.settleMarkers(false);
     const late = mlx.engine.latePipelines();
     mlx.engine.late_names.clear();
@@ -437,7 +458,7 @@ fn settingProbe(comptime C: type, dir: []const u8, comptime Setting: type, flip:
         try model_load.warmLoad(io, testing.allocator, &cooler.config, cooler.xfm, verify_cap, null, cooler.xfm.cache.config);
     }
     const added = mlx.engine.latePipelines() - late;
-    if (added > 0) std.debug.print("{s} (flip={}) left {d} kernels late:\n{s}\n", .{ @typeName(Setting), flip, added, mlx.engine.late_names.text() });
+    if (added > 0) std.debug.print("{s} left {d} kernels late:\n{s}\n", .{ if (flipped) |F| @typeName(F) else "the control", added, mlx.engine.late_names.text() });
     return .{ .runs = runs, .late = added, .drafts = drafts };
 }
 
@@ -480,14 +501,34 @@ const MtpMaxDepthSetting = struct {
 test "cooler contract: a manifest's served-warm marker written under one MTP setting is not taken under another the warm reads" {
     try eachArch(struct {
         fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
-            inline for (.{ LookupSetting, MaxMtpCtxSetting, MtpMaxDepthSetting }) |Setting| {
-                // The control: no setting flipped, the manifest's warm skipped and nothing left late.
-                const control = try settingProbe(C, dir, Setting, false);
-                const flipped = try settingProbe(C, dir, Setting, true);
+            const shared = @import("arch/cooler_pipelines.zig");
+            const saved = .{ LookupSetting.get(), MaxMtpCtxSetting.get(), MtpMaxDepthSetting.get() };
+            defer LookupSetting.set(saved[0]);
+            defer MaxMtpCtxSetting.set(saved[1]);
+            defer MtpMaxDepthSetting.set(saved[2]);
+            // One process writes the manifest under every setting's `written` value; each later process loads a copy.
+            var written = testing.tmpDir(.{ .iterate = true });
+            defer written.cleanup();
+            {
+                defer shared.root_hook = null;
+                defer shared.forget();
+                shared.root_hook = written.dir;
+                mlx.engine.pipeline_registry.resetForTest();
+                setMtpSettings(null);
+                var first: Load = undefined;
+                try first.open(C, dir, true);
+                defer _ = first.close();
+                // A load with no drafter: its warm reads no MTP setting, so there is nothing for its marker to keep apart.
+                if (@import("generate.zig").MtpHeadRef.fromModel(first.xfm, true, null) == null) return error.SkipZigTest;
+            }
+            // The control: no setting flipped, the manifest's warm skipped and nothing left late.
+            const control = try settingProbe(C, dir, written.dir, null);
+            try testing.expectEqual(@as(u32, 0), control.runs);
+            try testing.expectEqual(@as(u64, 0), control.late);
+            inline for (mtp_settings) |Setting| {
+                const flipped = try settingProbe(C, dir, written.dir, Setting);
                 errdefer std.debug.print("{s}: drafts={}; control runs={d} late={d}; flipped runs={d} late={d}\n", .{ @typeName(Setting), flipped.drafts, control.runs, control.late, flipped.runs, flipped.late });
                 try testing.expectEqual(control.drafts, flipped.drafts);
-                try testing.expectEqual(@as(u32, 0), control.runs);
-                try testing.expectEqual(@as(u64, 0), control.late);
                 // Only a drafter's rounds read these settings (`cooler_warm.warmMarker`): a load with none takes its
                 // marker under any, and the warm's requests made nothing late under it.
                 try testing.expectEqual(@as(u32, if (flipped.drafts) 1 else 0), flipped.runs);
