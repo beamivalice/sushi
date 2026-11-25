@@ -328,6 +328,31 @@ test "hy4 sample plan: a served request's draws, greedy and sampled, under penal
     try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
 }
 
+test "hy4 sample plan: on a GPU that grants the draw fewer threads than its widest rung, the load plans the rung it serves at and a sampled request misses no draw (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const draw = @import("../sampler_draw.zig");
+    // A fresh process's ladder, under the grant an M1 gives this kernel.
+    draw.ladderForTest(512);
+    defer draw.ladderForTest(std.math.maxInt(usize));
+    const ids = try @import("hy4_contract.zig").prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try openMasked(&ld, dir);
+    defer _ = ld.close();
+    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    try core.closePool(.census);
+    defer core.closePool(.open) catch {};
+    const got = try serve(a, &ld, ids[0..24], .{ .temperature = 0.8, .seed = 11 }, .{}, true);
+    try testing.expect(got.n > 0);
+    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
+}
+
 test "hy4 sample plan: a request whose forced call ends in the think span samples on after the forced token with the pool's tokens, no draw missing (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
