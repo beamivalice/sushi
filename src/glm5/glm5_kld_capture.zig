@@ -32,7 +32,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (cfg.quant_bits != 0 or
         opts.tokens == 0 or opts.ssd_budget_bytes == 0 or opts.pick_tolerance != 0 or
         !opts.no_template or (opts.mtp orelse false) or
-        opts.kv_quant_config.scheme != .off or opts.wired_margin_bytes != 0)
+        opts.kv_quant_config.scheme != .off or (opts.wired_margin_bytes orelse 0) != 0)
         return error.NativeGlmTeacherRequiresLosslessStreaming;
     // A layer-major window ends with its prefill: no layer's cache outlives that layer.
     if (opts.layer_major and opts.tokens != 1) return error.GlmLayerMajorNeedsOneRow;
@@ -868,6 +868,12 @@ test "GLM native KLD capture rejects lossy options" {
     opts.pick_tolerance = 0.3;
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.pick_tolerance = 0;
+    // A wired margin is refused where one is given and is not zero; an omitted flag gives none.
+    opts.wired_margin_bytes = 0;
+    try std.testing.expect(try accepts(&cfg, opts));
+    opts.wired_margin_bytes = 1 << 30;
+    try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
+    opts.wired_margin_bytes = null;
     opts.kv_quant_config = @import("../trunk.zig").KVQuantConfig.affine(8);
     try std.testing.expectError(error.NativeGlmTeacherRequiresLosslessStreaming, accepts(&cfg, opts));
     opts.command = .compare;
