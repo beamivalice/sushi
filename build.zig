@@ -483,7 +483,7 @@ const test_domains = [_]TestDomain{
     .{
         .name = "cooler",
         .cut = true,
-        .compile_gib = 7,
+        .compile_gib = 8,
         .files = &.{
             "cooler_contract_test",     "cooler_late_test",     "cooler_load_test",    "cooler_pool_test",
             "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test", "cooler_held_requests_test",
