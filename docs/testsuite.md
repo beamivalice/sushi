@@ -72,7 +72,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 
   | binary | holds |
   |---|---|
-  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), one per family's fault sweeps (`cooler-load-fault`, `-requests-fault`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
+  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-manifest`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), one per family's fault sweeps (`cooler-load-fault`, `-requests-fault`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
   | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo`, `test-hy4` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, `src/hy4flash/`, less their prefix-cache files |
   | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, hyper-connections, MLX and Metal glue) |
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |

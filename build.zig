@@ -479,9 +479,12 @@ const test_domains = [_]TestDomain{
             "cooler_contract_test",     "cooler_late_test",     "cooler_load_test",    "cooler_pool_test",
             "cooler_prefill_bill_test", "cooler_requests_test", "cooler_restore_test", "cooler_held_requests_test",
             "cooler_held_restore_test", "cooler_load_fault_test",    "cooler_requests_fault_test", "hy4flash/hy4_late_test",
+            "cooler_manifest_test",
         },
         .steps = &.{
             .{ .name = "cooler-load", .files = &.{ "cooler_contract_test", "cooler_load_test" } },
+            // The manifest's cells warm whole loads: beside the load step, not after it.
+            .{ .name = "cooler-manifest", .files = &.{"cooler_manifest_test"} },
             .{ .name = "cooler-pool", .files = &.{"cooler_pool_test"} },
             .{ .name = "cooler-prefill-bill", .files = &.{"cooler_prefill_bill_test"} },
             .{ .name = "cooler-requests", .files = &.{"cooler_requests_test"} },

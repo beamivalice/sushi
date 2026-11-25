@@ -74,6 +74,7 @@ test {
     _ = @import("cooler_contract_test.zig");
     _ = @import("cooler_late_test.zig");
     _ = @import("cooler_load_test.zig");
+    _ = @import("cooler_manifest_test.zig");
     _ = @import("cooler_pool_test.zig");
     _ = @import("cooler_prefill_bill_test.zig");
     _ = @import("cooler_requests_test.zig");
