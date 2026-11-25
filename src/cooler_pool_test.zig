@@ -2045,6 +2045,10 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
         const status = @import("status.zig");
         const avail_was = status.available_mem_override;
         defer status.available_mem_override = avail_was;
+        // No declared wired limit, so the free RAM the override names is the live ceiling on every box.
+        const mb_was = bills.wired_limit_mb_override;
+        defer bills.wired_limit_mb_override = mb_was;
+        bills.wired_limit_mb_override = 0;
         const r0: u64 = 4 << 30;
         status.available_mem_override = r0;
         const a0 = bills.admissionAvailableNow(config);
