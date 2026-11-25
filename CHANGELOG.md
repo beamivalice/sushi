@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A Hy4-Flash prefill chunk deep in a long conversation runs in the region its load measured**: an 8,192-row chunk
+  at a middle depth could ask past it and fail the request (`WideFull`); a chunk past the first 2,048 tokens now runs
+  laid out as its class's deepest recording, which the load measures, and a load takes several seconds more to
+  measure them.
 - **Hy4-Flash prefills long prompts faster at the same output**: a chunk scores its indexer's groups in one tiled
   launch, byte for byte, the part of a chunk that grows with its context.
 - **Sushibar's loading icon moves while a model loads**: the fish's orange sweeps toward its top right and back as

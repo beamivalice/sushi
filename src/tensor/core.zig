@@ -422,22 +422,22 @@ var pool_peaks: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
 var held_peaks: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };
 
 pub fn poolPeak(which: Peak) u64 {
-    return pool_peaks[@intFromEnum(which)].load(.monotonic);
+    return pool_peaks[@backingInt(which)].load(.monotonic);
 }
 
 /// The high-water of what the pool holds, its free buffers included: what Metal counts against the device.
 pub fn poolHeldPeak(which: Peak) u64 {
-    return held_peaks[@intFromEnum(which)].load(.monotonic);
+    return held_peaks[@backingInt(which)].load(.monotonic);
 }
 
 /// Both high-waters start again from now: in use, and held.
 pub fn resetPoolPeak(which: Peak) void {
-    pool_peaks[@intFromEnum(which)].store(poolTotal() - poolFree(), .monotonic);
+    pool_peaks[@backingInt(which)].store(poolTotal() - poolFree(), .monotonic);
     if (which == .process) {
         peak_set.clearRetainingCapacity();
         peak_set_in_use = poolTotal() - poolFree();
     }
-    held_peaks[@intFromEnum(which)].store(poolTotal(), .monotonic);
+    held_peaks[@backingInt(which)].store(poolTotal(), .monotonic);
 }
 
 fn publishPool(s: *const State) void {
@@ -1686,7 +1686,18 @@ const Region = struct {
     begin: u64 = 0,
     replica: u32 = 0,
     ring_ready: bool = false,
+    /// The passes `beginWidePadded` pads to; the one followed, its next scratch ask, the choices met, and a choice no
+    /// pass took there, which refuses the next ask.
+    pad: ?[]const PadPass = null,
+    pass: usize = 0,
+    cursor: usize = 0,
+    met: usize = 0,
+    missed: bool = false,
 };
+
+/// One pass of a dry recording, as a padded wide execution follows it: each scratch ask's place in order
+/// (`plan.region.padOf`), and the choices it took (`plan.region.choicesAgree` says the passes may be mixed).
+pub const PadPass = struct { sizes: []const u64, choices: []const plan.TraceChoice = &.{} };
 var region: Region = .{};
 
 pub const WideRefusal = struct { asked: u64, room: u64, host: bool };
@@ -1717,6 +1728,38 @@ pub fn beginWide() Error!void {
     s.stats.wide_executions += 1;
 }
 
+/// `beginWide` with each scratch ask placed at the size its pass recorded for it, in order: first fit then places them
+/// as the recording did, so the execution tops out where its recording does whatever its own sizes. At each choice it
+/// follows a pass that took the same one there. An ask past its recorded size or past the sequence, or one after a
+/// choice no pass took there, is refused by name (`PlanMiss`). `passes` outlive the execution.
+pub fn beginWidePadded(passes: []const PadPass) Error!void {
+    try beginWide();
+    region.pad = passes;
+    region.pass = 0;
+    region.cursor = 0;
+    region.met = 0;
+    region.missed = false;
+    plan.session.on_choice = wideChoice;
+}
+
+fn wideChoice(site: plan.Site, value: u32) void {
+    const passes = region.pad orelse return;
+    const j = region.met;
+    region.met += 1;
+    const cur = passes[region.pass].choices;
+    if (j >= cur.len or cur[j].site != site or cur[j].at != region.cursor) {
+        region.missed = true;
+        return;
+    }
+    if (cur[j].value == value) return;
+    for (passes, 0..) |ps, q| if (j < ps.choices.len and ps.choices[j].site == site and ps.choices[j].value == value) {
+        region.pass = q;
+        region.cursor = ps.choices[j].at;
+        return;
+    };
+    region.missed = true;
+}
+
 /// The wide execution ended as it should: a store of it still alive is refused by name (`PlanEscape`), and escapes.
 pub fn endWide() Error!void {
     const ar = &arena.?;
@@ -1742,14 +1785,23 @@ fn leaveWide(ar: *Arena) void {
     plan.session = .{};
     into_next = null;
     into_taken = null;
+    region.pad = null;
 }
 
 fn wideStore(len: usize, for_host: bool) Error!*Store {
     const s = &state.?;
     const ar = &arena.?;
-    const place = std.mem.alignForward(u64, @max(len, 1), ar.layout.alignment);
+    var place = std.mem.alignForward(u64, @max(len, 1), ar.layout.alignment);
     var at: u64 = undefined;
     var after: u64 = region.begin;
+    if (!for_host) if (region.pad) |passes| {
+        const pad = passes[region.pass].sizes;
+        if (region.missed) return refusing("a wide execution's scratch ask after a choice no pass of its recording took there", error.PlanMiss);
+        if (region.cursor == pad.len) return refusing("a wide execution's scratch ask past the sequence its recording made", error.PlanMiss);
+        if (place > pad[region.cursor]) return refusing("a wide execution's scratch ask past the size its recording made", error.PlanMiss);
+        place = pad[region.cursor];
+        region.cursor += 1;
+    };
     if (for_host) {
         if (!region.ring_ready) {
             const seq = ar.ring_seq[region.replica];
@@ -3745,6 +3797,147 @@ test "wide: an execution gives the bytes of the pool, asks the pool for nothing,
     try t.expectEqual(before.pool_bytes, stats().pool_bytes);
     try t.expect(stats().wide_asks > before.wide_asks);
     try t.expectEqual(need.scratch, stats().wide_high);
+}
+
+test "wide: an execution padded to its recording asks each place at the recorded size, so it tops out where the recording's first fit does though its own asks are smaller; an ask past its size or past the sequence is refused by name" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
+    defer arenaRelease() catch {};
+    const u: c_int = 64 << 10;
+    const U: u64 = 64 << 10;
+    // First fit is not monotone: a smaller first ask leaves a gap the third no longer fits, so it goes on top.
+    for ([_]?[]const u64{ null, &.{ 2 * U, U, 2 * U } }, [_]u64{ 4 * U, 3 * U }) |pad, high| {
+        if (pad) |sizes| try beginWidePadded(&.{.{ .sizes = sizes }}) else try beginWide();
+        const a = try fresh(.uint8, &.{u});
+        const b = try fresh(.uint8, &.{u});
+        release(a);
+        const c = try fresh(.uint8, &.{2 * u});
+        release(b);
+        release(c);
+        try endWide();
+        try t.expectEqual(high, stats().wide_last_high);
+    }
+    try beginWidePadded(&.{.{ .sizes = &.{U} }});
+    try t.expectError(error.PlanMiss, fresh(.uint8, &.{2 * u}));
+    abortWide();
+    try beginWidePadded(&.{.{ .sizes = &.{U} }});
+    const a = try fresh(.uint8, &.{u});
+    try t.expectError(error.PlanMiss, fresh(.uint8, &.{u}));
+    release(a);
+    try endWide();
+}
+
+test "wide: a smaller execution padded to a larger one's recording runs as it would, refused nothing, and tops out at the recording's first fit" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    var r: TestRecording = undefined;
+    try r.begin(.zeros);
+    var big: [64]f32 = undefined;
+    {
+        defer endRecording() catch {};
+        try (SmallForward{ .n = 64, .out = &big }).go();
+    }
+    var tr = try r.recorder.end();
+    defer tr.deinit();
+    r.deinit();
+    const need = try plan.region.need(t.allocator, &tr, 256);
+    const pad = try plan.region.padOf(t.allocator, &tr, 256);
+    defer t.allocator.free(pad);
+    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
+    defer arenaRelease() catch {};
+    var out: [2][32]f32 = undefined;
+    try (SmallForward{ .n = 32, .out = &out[0] }).go();
+    try sync();
+    try beginWidePadded(&.{.{ .sizes = pad }});
+    try (SmallForward{ .n = 32, .out = &out[1] }).go();
+    try endWide();
+    try t.expectEqualSlices(f32, &out[0], &out[1]);
+    try t.expectEqual(need.scratch, stats().wide_last_high);
+}
+
+/// A forward that takes `picks.len` choices at one site: two pages at once, or one and then another; `leak` keeps the
+/// first choice's pages past it.
+const ChoiceForward = struct {
+    picks: []const bool,
+    leak: bool = false,
+
+    fn go(self: ChoiceForward) !void {
+        const u: c_int = 64 << 10;
+        const x = try fresh(.uint8, &.{u});
+        var kept: ?*Tensor = null;
+        for (self.picks, 0..) |real, i| {
+            if (plan.choose(@src(), bool, real)) {
+                const a = try fresh(.uint8, &.{2 * u});
+                if (self.leak and i == 0) kept = a else release(a);
+            } else {
+                const a = try fresh(.uint8, &.{u});
+                const b = try fresh(.uint8, &.{u});
+                release(a);
+                release(b);
+            }
+        }
+        if (kept) |k| release(k);
+        const y = try fresh(.uint8, &.{u});
+        release(y);
+        release(x);
+    }
+};
+
+/// Every pass of `run`'s dry recording, one trace each.
+fn passesOfTest(run: anytype) ![]plan.trace_mod.Trace {
+    var traces: std.ArrayList(plan.trace_mod.Trace) = .empty;
+    errdefer {
+        for (traces.items) |*tr| tr.deinit();
+        traces.deinit(std.testing.allocator);
+    }
+    var driver: plan.Driver = .{ .gpa = std.testing.allocator };
+    defer driver.deinit();
+    while (true) {
+        var rec = try plan.Recorder.begin(std.testing.allocator, .{ .site = 1 });
+        defer rec.deinit();
+        try beginRecording(.{ .dry = .{ .driver = &driver, .fill = .zeros } }, &rec);
+        {
+            defer endRecording() catch {};
+            try run.go();
+        }
+        try traces.append(std.testing.allocator, try rec.end());
+        if (!try driver.next()) break;
+    }
+    return traces.toOwnedSlice(std.testing.allocator);
+}
+
+test "wide: an execution padded to every pass of its recording follows its own choices from pass to pass, mixed as no pass took them, and tops out within the passes' first fit; passes whose choices leave the scratch apart are told" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const traces = try passesOfTest(ChoiceForward{ .picks = &.{ true, true } });
+    defer {
+        for (traces) |*tr| tr.deinit();
+        t.allocator.free(traces);
+    }
+    try t.expectEqual(@as(usize, 2), traces.len);
+    try t.expect(try plan.region.choicesAgree(t.allocator, traces, 256));
+    var passes: [2]PadPass = undefined;
+    var most: u64 = 0;
+    for (traces, &passes) |*tr, *ps| {
+        ps.* = .{ .sizes = try plan.region.padOf(t.allocator, tr, 256), .choices = tr.choices };
+        most = @max(most, (try plan.region.need(t.allocator, tr, 256)).scratch);
+    }
+    defer for (passes) |ps| t.allocator.free(ps.sizes);
+    try arenaFor(.{ .g = 1 << 20, .h = 64 << 10 });
+    defer arenaRelease() catch {};
+    for ([_][2]bool{ .{ true, false }, .{ false, true }, .{ false, false } }) |picks| {
+        try beginWidePadded(&passes);
+        try (ChoiceForward{ .picks = &picks }).go();
+        try endWide();
+        try t.expect(stats().wide_last_high <= most);
+    }
+    const apart = try passesOfTest(ChoiceForward{ .picks = &.{ true, true }, .leak = true });
+    defer {
+        for (apart) |*tr| tr.deinit();
+        t.allocator.free(apart);
+    }
+    try t.expect(!try plan.region.choicesAgree(t.allocator, apart, 256));
 }
 
 test "wide: a gap reused while its last tenant is still read in the open pass is written only after that read" {

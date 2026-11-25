@@ -258,8 +258,12 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     `W_o` are made at load (`warmSpanTails`); a width past the arm shares the GEMM's pipelines (`hy4 late` cells).
   - A wide span's core reads its keys where they are held, not gathered per span: a sliding layer's window rows, and a
     sparse layer's rows to the chunk's end, are read from kv8 to BF16 once a layer and chunk (`hy4_latent.rangeBf16`;
-    the region the load measures at its deepest reach holds the copy), and a row's picks are read from that copy by index in the kernel, never copied
-    (the chain gathered 2,048 rows a row, widened to f32, 134 MB a 32-row span).
+    the copy grows with depth, so a deep-zone chunk runs padded to its class's deepest recording: [D110](bill_redesign.md)),
+    and a row's picks are read from that copy by index in the kernel, never copied (the chain gathered 2,048 rows a
+    row, widened to f32, 134 MB a 32-row span).
+  - **A wide forward's structure turns with depth only through `Model.wideClass`**: an edge, an arm or a span width
+    that depth decides goes into it, or a chunk of one class asks unlike its recording and is refused by name (the
+    `hy4 plan: a load-width prefill chunk` cells sweep every residue and span-width edge).
   - A prefill chunk's glue runs in the launches beside it, each byte for byte: the iHC mix, expand and write-back and
     the router's pick take wide prefill rows in their fused kernels; `post_proj_norm` rides the expand's mix
     (`hy4_hc.expandNormMixNorm`); a span's gated rows land in the chunk's `W_o` block (`hy4_chain.gatedInto`); a

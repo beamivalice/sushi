@@ -961,7 +961,7 @@ pub const Model = struct {
                 const cut = thr - at;
                 const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0 + cut, r1), try o.slice(p.q_resid, 0, r0 + cut, r1), all, iw, ig, thr, n);
                 if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
-                const flat = try o.reshape(sel.rows, &.{ (rows - cut) * fwd.selectedWidth(sel.rows) });
+                const flat = try o.reshape(sel.rows, &.{(rows - cut) * fwd.selectedWidth(sel.rows)});
                 return fwd.attendStraddleGated(o, sin, qs, cut, try self.latentRange(o, &keys, 0, thr), try o.slice(keys.k_pe.?, 0, 0, thr), at, try self.latentAt(o, &keys, flat), try o.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry, tap);
             }
             const sel = if (sin.index != null and r0 >= sin.index.?.r0)
@@ -1818,6 +1818,39 @@ pub const Model = struct {
         };
     }
 
+    /// The rows a chunk's spans run at past its closed `groups` (`loop_span`): the widest halving of `span_rows` whose
+    /// indexer scores stay under 32 MB, else `span`.
+    fn spanWidth(self: *const Model, span: c_int, groups: c_int, p0: c_int) c_int {
+        var ws = self.span_rows;
+        while (ws > span and @as(i64, ws) * @as(i64, groups) * 4 > 32 * 1024 * 1024) ws = @divTrunc(ws, 2);
+        const ig = self.indexerGeometry();
+        const thr = ig.group_topk * ig.ratio;
+        if (ws > span and @rem(ws, span) == 0 and (p0 >= thr or @rem(thr - p0, ws) == 0)) return ws;
+        return span;
+    }
+
+    /// What decides the structure of a wide forward of `t` rows at `p0` read out by `readout`, past the selection
+    /// threshold and the window (`hy4_plan`'s classes): how its rows meet each kind of layer's edges, its spans' width
+    /// and whether its window reads the ring in one run. Two forwards of one class ask alike, the deeper no less.
+    pub fn wideClass(self: *const Model, p0: c_int, t: c_int, readout: anytype) u64 {
+        var h = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&h, t);
+        std.hash.autoHash(&h, readout);
+        var kinds: [2]bool = .{ false, false };
+        for (self.layers, 0..) |L, l| {
+            const kind = @intFromBool(L.indexer != null);
+            if (kinds[kind]) continue;
+            kinds[kind] = true;
+            var k = self.layerKey(l, p0, t);
+            k.layer = 0;
+            std.hash.autoHash(&h, k);
+        }
+        const ig = self.indexerGeometry();
+        std.hash.autoHash(&h, self.spanWidth(@min(self.span_rows, gathered_span), @divFloor(p0 + t, ig.ratio), p0));
+        std.hash.autoHash(&h, @rem(p0 + 1, @as(c_int, @intCast(self.config.window))) == 0);
+        return h.final();
+    }
+
     fn indexerGeometry(self: *const Model) fwd.IndexerGeometry {
         const c = self.config;
         return .{
@@ -1987,13 +2020,7 @@ pub const Model = struct {
         const span = if (pooled != null) @min(self.span_rows, gathered_span) else self.span_rows;
         const loop_span: c_int = blk: {
             if (pooled == null or core_keys == null or !mlx.engine.isStream(self.s) or !fwd.spans_share or self.span_rows <= span) break :blk span;
-            const groups = mlx.getShape(pooled.?)[0];
-            var ws = self.span_rows;
-            while (ws > span and @as(i64, ws) * @as(i64, groups) * 4 > 32 * 1024 * 1024) ws = @divTrunc(ws, 2);
-            const ig = self.indexerGeometry();
-            const thr = ig.group_topk * ig.ratio;
-            if (ws > span and @rem(ws, span) == 0 and (p0 >= thr or @rem(thr - p0, ws) == 0)) break :blk ws;
-            break :blk span;
+            break :blk self.spanWidth(span, mlx.getShape(pooled.?)[0], p0);
         };
         var held: Ops = .{ .s = self.s };
         defer held.deinit();

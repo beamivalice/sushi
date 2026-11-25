@@ -183,9 +183,16 @@ pub const Plans = struct {
     encode: plan.region.Need = .{},
     region_rows: usize = 0,
     measured: std.ArrayList(Measured) = .empty,
+    /// Where the deep zone starts (`deepZone`; 0: no class measured), and each class of a chunk width's forwards
+    /// past it (`Model.wideClass`), which runs padded to its recording (`core.beginWidePadded`).
+    deep: usize = 0,
+    pads: std.AutoHashMapUnmanaged(u64, Class) = .empty,
 
-    /// `probes`: the wide forwards recorded to measure it.
-    pub const Measured = struct { rows: usize, need: plan.region.Need, probes: u64 };
+    /// `probes`: the wide forwards recorded to measure it; `classes`: the deep zone's classes among them.
+    pub const Measured = struct { rows: usize, need: plan.region.Need, probes: u64, classes: u64 = 0 };
+
+    /// A class's deepest member, recorded: where it is, the scratch it tops out at, and each pass's asks and choices.
+    pub const Class = struct { at: usize, need: u64, passes: []core.PadPass };
 
     pub fn tables(p: *const Plans, probe: Probe) ?*const plan.pack.Tables {
         return p.book.tables(root(probe));
@@ -204,6 +211,9 @@ pub const Plans = struct {
         p.sample.deinit();
         p.book.deinit();
         p.measured.deinit(gpa);
+        var it = p.pads.valueIterator();
+        while (it.next()) |c| freeClass(gpa, c.*);
+        p.pads.deinit(gpa);
         gpa.destroy(p);
     }
 };
@@ -380,8 +390,8 @@ const shape_phase: u32 = 1;
 
 /// The third number: the handover's bit, then the KV width's scheme, bits and group size.
 pub fn shapeOf(p: Probe) plan_book.Shape {
-    const kv: u64 = @intFromBool(p.keep_hidden) | @as(u64, @intFromEnum(p.kv.scheme)) << 8 | @as(u64, p.kv.bits) << 16 | @as(u64, p.kv.group_size) << 24;
-    return .{ .phase = if (p.phase == .draft) draft_phase else shape_phase, .args = .{ p.rows, @intFromEnum(p.readout), kv, p.n } };
+    const kv: u64 = @intFromBool(p.keep_hidden) | @as(u64, @backingInt(p.kv.scheme)) << 8 | @as(u64, p.kv.bits) << 16 | @as(u64, p.kv.group_size) << 24;
+    return .{ .phase = if (p.phase == .draft) draft_phase else shape_phase, .args = .{ p.rows, @backingInt(p.readout), kv, p.n } };
 }
 
 /// A kept shape's phase: a draft (`draftProbe`).
@@ -391,7 +401,7 @@ const draft_phase: u32 = 2;
 fn probeOf(s: plan_book.Shape, reach: usize, drafter: ?*const Drafter, c: *const hy4_config.Config) ?Probe {
     if (s.phase == draft_phase) {
         const d = drafter orelse return null;
-        const fwd_probe = probeOf(.{ .phase = shape_phase, .args = .{ 1, @intFromEnum(Readout.last), s.args[2] & ~@as(u64, 0xff), s.args[3] } }, reach, null, c) orelse return null;
+        const fwd_probe = probeOf(.{ .phase = shape_phase, .args = .{ 1, @backingInt(Readout.last), s.args[2] & ~@as(u64, 0xff), s.args[3] } }, reach, null, c) orelse return null;
         if (s.args[3] == 0 or s.args[3] + c.dfly.draft + 1 > reach) return null;
         return draftProbe(d, c, fwd_probe.kv, s.args[3]);
     }
@@ -399,10 +409,10 @@ fn probeOf(s: plan_book.Shape, reach: usize, drafter: ?*const Drafter, c: *const
     const rows = s.args[0];
     if (rows == 0 or rows > @import("hy4_forward.zig").verify_rows_max or s.args[3] + rows > reach) return null;
     const readout: Readout = for (std.enums.values(Readout)) |r| {
-        if (@intFromEnum(r) == s.args[1]) break r;
+        if (@backingInt(r) == s.args[1]) break r;
     } else return null;
     const scheme = for (std.enums.values(@FieldType(KVQuantConfig, "scheme"))) |v| {
-        if (@intFromEnum(v) == (s.args[2] >> 8) & 0xff) break v;
+        if (@backingInt(v) == (s.args[2] >> 8) & 0xff) break v;
     } else return null;
     const kv: KVQuantConfig = .{ .scheme = scheme, .bits = @intCast((s.args[2] >> 16) & 0xff), .group_size = @intCast(s.args[2] >> 24) };
     return .{ .rows = rows, .readout = readout, .keep_hidden = s.args[2] & 1 == 1, .kv = kv, .n = s.args[3] };
@@ -604,10 +614,68 @@ pub fn regionAt(m: *Model, p: *Plans, rows: usize) !plan.region.Need {
             probes += 1;
         }
     }
-    try p.measured.append(gpa, .{ .rows = rows, .need = most, .probes = probes });
+    const classes = try measureClasses(m, p, rows, &most);
+    probes += 2 * classes;
+    try p.measured.append(gpa, .{ .rows = rows, .need = most, .probes = probes, .classes = classes });
     const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
-    log.info("[plan] a prefill of {d}-row chunks asks a region of {d} KB, host {d} KB; measured in {d} ms\n", .{ rows, most.scratch >> 10, most.host >> 10, ms });
+    log.info("[plan] a prefill of {d}-row chunks asks a region of {d} KB, host {d} KB, its {d} classes past {d} rows padded to their deepest; measured in {d} ms\n", .{ rows, most.scratch >> 10, most.host >> 10, classes, p.deep, ms });
     return most;
+}
+
+/// Where the deep zone starts: past it no row of a chunk meets the selection threshold or the window's first fill, so
+/// a few facts decide a chunk's structure (`Model.wideClass`).
+fn deepZone(c: *const hy4_config.Config) usize {
+    return @max(@as(usize, c.indexer.group_topk) * c.indexer.group, c.window);
+}
+
+/// Each class of `rows`-row forwards in the deep zone, recorded at its deepest member, whose asks are its largest,
+/// for both readouts: its scratch joins `most`, and a chunk of it runs padded to the recording. The classes found.
+/// First fit is not monotone, so a class's shallower members are padded to it rather than measured.
+fn measureClasses(m: *Model, p: *Plans, rows: usize, most: *plan.region.Need) !u64 {
+    const gpa = p.book.gpa;
+    const deep = deepZone(&m.config);
+    if (p.reach < rows or p.reach - rows < deep) return 0;
+    p.deep = deep;
+    var deepest: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+    defer deepest.deinit(gpa);
+    var at = deep;
+    while (at <= p.reach - rows) : (at += 1) try deepest.put(gpa, m.wideClass(@intCast(at), @intCast(rows), Readout.none), at);
+    var it = deepest.valueIterator();
+    while (it.next()) |n| for ([_]Readout{ .none, .last }) |readout| {
+        var passes = try recordChecked(m, gpa, .{ .rows = rows, .readout = readout, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = n.*, .phase = .wide }, p.reach);
+        defer passes.deinit();
+        if (!try plan.region.choicesAgree(gpa, passes.traces, p.book.alignment)) {
+            log.err("[plan] a forward of {d} rows at {d} leaves its scratch apart across the passes of its choices: a choice's asks outlive it\n", .{ rows, n.* });
+            return error.Hy4PlanChoicesApart;
+        }
+        var class: Plans.Class = .{ .at = n.*, .need = 0, .passes = try gpa.alloc(core.PadPass, passes.traces.len) };
+        var made: usize = 0;
+        errdefer {
+            class.passes = class.passes[0..made];
+            freeClass(gpa, class);
+        }
+        for (passes.traces, class.passes) |*t, *ps| {
+            const sizes = try plan.region.padOf(gpa, t, p.book.alignment);
+            errdefer gpa.free(sizes);
+            ps.* = .{ .sizes = sizes, .choices = try gpa.dupe(plan.TraceChoice, t.choices) };
+            made += 1;
+            const need = try plan.region.need(gpa, t, p.book.alignment);
+            class.need = @max(class.need, need.scratch);
+            most.* = most.max(need);
+        }
+        const got = try p.pads.getOrPut(gpa, m.wideClass(@intCast(n.*), @intCast(rows), readout));
+        if (got.found_existing) freeClass(gpa, got.value_ptr.*);
+        got.value_ptr.* = class;
+    };
+    return deepest.count();
+}
+
+fn freeClass(gpa: std.mem.Allocator, c: Plans.Class) void {
+    for (c.passes) |ps| {
+        gpa.free(ps.sizes);
+        gpa.free(ps.choices);
+    }
+    gpa.free(c.passes);
 }
 
 /// `most`, and what a wide forward of `rows` rows after `n` read out by `readout` asks.
@@ -653,7 +721,14 @@ pub fn run(m: *Model, ids: []const u32, vision: ?Model.VisionRows, readout: Read
 /// An ask past the region refuses the forward by name (`WideFull`).
 fn wide(m: *Model, p: *const Plans, ids: []const u32, vision: ?Model.VisionRows, readout: Readout) !mlx.mlx_array {
     const at = m.pos;
-    try core.beginWide();
+    // A load-width chunk in the deep zone runs padded to its class's recording, so it tops out where that did.
+    if (p.deep > 0 and vision == null and ids.len == p.region_rows and at >= p.deep) {
+        const class = p.pads.get(m.wideClass(@intCast(at), @intCast(ids.len), readout)) orelse {
+            log.err("[plan] a forward of {d} rows at {d} is of no class the load recorded\n", .{ ids.len, at });
+            return error.Hy4WidePlanMiss;
+        };
+        try core.beginWidePadded(class.passes);
+    } else try core.beginWide();
     const scope = GemmScope.begin() catch |e| {
         core.abortWide();
         return e;

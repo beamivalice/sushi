@@ -12,6 +12,7 @@ pub const siteOf = frame_mod.siteOf;
 pub const keyOf = frame_mod.keyOf;
 pub const Recorder = trace.Recorder;
 pub const Ref = trace.Ref;
+pub const TraceChoice = trace.Choice;
 pub const Binder = binder_mod.Binder;
 pub const binder = binder_mod;
 pub const trace_mod = trace;
@@ -45,6 +46,8 @@ pub const Session = struct {
     driver: ?*Driver = null,
     /// The engine's mark of all it has encoded so far (`plan_binder.zig`, "Order").
     mark: *const fn () u64 = noMark,
+    /// A padded wide execution follows each `choose` it takes (`core.beginWidePadded`).
+    on_choice: ?*const fn (Site, u32) void = null,
 };
 
 fn noMark() u64 {
@@ -105,11 +108,22 @@ fn open(site: Site, key: frame_mod.Key, kind: frame_mod.Kind) Error!Frame {
 /// a real execution, and in a dry recording the driver's value, each value of `T` in turn over its passes, so every one
 /// is planned. Its result belongs in the key of the frame it guards. A dry session always carries a driver.
 pub fn choose(comptime src: std.builtin.SourceLocation, comptime T: type, real: T) T {
+    const site = comptime siteOf(src);
+    if (session.mode == .wide) {
+        if (session.on_choice) |f| f(site, valueIndex(T, real));
+        return real;
+    }
     if (session.mode != .dry) return real;
     const driver = session.driver.?;
-    if (T == bool) return driver.pick(comptime siteOf(src), 2) == 1;
-    const values = comptime std.enums.values(T);
-    return values[driver.pick(comptime siteOf(src), values.len)];
+    const v: T = if (T == bool) driver.pick(site, 2) == 1 else (comptime std.enums.values(T))[driver.pick(site, std.enums.values(T).len)];
+    if (session.recorder) |r| r.noteChoice(site, valueIndex(T, v));
+    return v;
+}
+
+fn valueIndex(comptime T: type, v: T) u32 {
+    if (T == bool) return @intFromBool(v);
+    inline for (comptime std.enums.values(T), 0..) |x, i| if (x == v) return i;
+    unreachable;
 }
 
 /// A size that data decides, with the most the op's own math allows: a dry recording plans `max`, and a served size past
@@ -275,10 +289,10 @@ test "the driver records every value of a choice that only another choice leads 
         var c: u8 = 9;
         if (a == .routed) for (0..2) |_| {
             const route = choose(@src(), B, .cache);
-            b = @intFromEnum(route);
+            b = @backingInt(route);
             if (route == .spill) c = @intFromBool(choose(@src(), bool, false));
         };
-        try seen.put(t.allocator, .{ @intFromEnum(a), b, c }, {});
+        try seen.put(t.allocator, .{ @backingInt(a), b, c }, {});
         if (!try driver.next()) break;
     }
     for ([_][3]u8{ .{ 0, 9, 9 }, .{ 1, 0, 9 }, .{ 1, 1, 9 }, .{ 1, 2, 0 }, .{ 1, 2, 1 } }) |want| try t.expect(seen.contains(want));

@@ -1793,8 +1793,10 @@ test "hy4 plan: the region of a chunk is measured at each width's two ends and a
         for (p.measured.items) |r| {
             const span = @min(@as(usize, @import("../prefill_plan.zig").final_span_rows), r.rows);
             const widths: u64 = if (r.rows - 1 > span) 3 else 2;
-            // Each width: the state's start and its deepest, read out by none and by its last row, and the cut.
-            try testing.expectEqual(widths * 5, r.probes);
+            // Each width: the state's start and its deepest, read out by none and by its last row, and the cut; and each
+            // class of the deep zone at its deepest, read out both ways.
+            try testing.expect(r.classes > 0);
+            try testing.expectEqual(widths * 5 + 2 * r.classes, r.probes);
         }
     }
     if (!ran) return error.SkipZigTest;
@@ -1820,4 +1822,109 @@ test "hy4 plan: prefill ubench honours kv context and rolls back between iterati
     try testing.expectEqual(@as(usize, 3), res.iterations);
     try testing.expectEqual(kv, res.last_start_pos);
     try testing.expectEqual(kv + rows, res.last_end_pos);
+}
+
+test "hy4 plan: a load-width prefill chunk past the selection threshold and the window makes its class's asks in its class's order, none larger than at the class's deepest, at every depth and edge (HY4_STQ_TINY, HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    var ran = false;
+    for ([_][:0]const u8{ "HY4_STQ_TINY", "HY4_BF16_TINY" }) |env| {
+        const dir = std.mem.span(std.c.getenv(env) orelse continue);
+        ran = true;
+        var ld: contract.Load = undefined;
+        try ld.open(Resident, dir, true);
+        defer _ = ld.close();
+        const turn = hy4_contract.openTurn(ld.h, &ld.config);
+        defer turn.end();
+        defer @import("../arch/sched.zig").endRequest(&ld.config);
+        const m = ld.xfm.arch_state.hy4flash.model.?;
+        defer m.reset();
+        const p = m.plans.?;
+        const chunk = p.region_rows;
+        const deepest = p.reach - chunk;
+        const w: usize = m.config.window;
+        var depths: std.ArrayList(usize) = .empty;
+        defer depths.deinit(a);
+        // Every residue a class may turn on near the zone's start, each span width's edges, and the deepest.
+        for (0..2 * w + 8) |i| try depths.append(a, p.deep + i);
+        var g: usize = 1 << 12;
+        while (g * 4 < p.reach) : (g *= 2) for ([_]usize{ 0, 1, 3 }) |d| {
+            const at = (g * 4) -| (chunk + d);
+            if (at >= p.deep and at <= deepest) try depths.append(a, at);
+        };
+        try depths.append(a, deepest);
+        for (depths.items) |at| {
+            const class = p.pads.get(m.wideClass(@intCast(at), @intCast(chunk), @import("hy4_model.zig").Model.Readout.last)) orelse {
+                std.debug.print("{s}: a {d}-row chunk at {d} has no class its load recorded\n", .{ env, chunk, at });
+                return error.TestUnexpectedResult;
+            };
+            const asks = try scratchAsks(m, p, chunk, at);
+            defer a.free(asks);
+            const top = class.passes[0].sizes;
+            errdefer std.debug.print("{s}: a {d}-row chunk at {d} asks {d} scratch blocks, its class's deepest ({d}) {d}\n", .{ env, chunk, at, asks.len, class.at, top.len });
+            try testing.expectEqual(top.len, asks.len);
+            for (asks, top, 0..) |x, y, i| if (x > y) {
+                std.debug.print("{s}: ask {d} of a {d}-row chunk at {d} is {d} B, {d} B at its class's deepest ({d})\n", .{ env, i, chunk, at, x, y, class.at });
+                return error.TestUnexpectedResult;
+            };
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+test "hy4 plan: a load-width prefill chunk past the selection threshold tops out where its class's recording does, at any depth, within the region its load measured (HY4_STQ_TINY, HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    var ran = false;
+    for ([_][:0]const u8{ "HY4_STQ_TINY", "HY4_BF16_TINY" }) |env| {
+        const dir = std.mem.span(std.c.getenv(env) orelse continue);
+        ran = true;
+        var ld: contract.Load = undefined;
+        try ld.open(Resident, dir, true);
+        defer _ = ld.close();
+        const turn = hy4_contract.openTurn(ld.h, &ld.config);
+        defer turn.end();
+        defer @import("../arch/sched.zig").endRequest(&ld.config);
+        const m = ld.xfm.arch_state.hy4flash.model.?;
+        defer m.reset();
+        const p = m.plans.?;
+        const chunk = p.region_rows;
+        const ids = try spreadIds(a, &m.config, 4 * chunk);
+        defer a.free(ids);
+        for ([_]usize{ chunk, 2 * chunk + 1, 3 * chunk - 1 }) |at| {
+            if (at < p.deep) continue;
+            m.reset();
+            try m.reserveFor(at + chunk);
+            var done: usize = 0;
+            while (done < at) {
+                const n = @min(chunk, at - done);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[done .. done + n], .none));
+                done += n;
+            }
+            mlx.engine.close();
+            const lg = try hy4_plan.run(m, ids[at .. at + chunk], null, .last);
+            defer _ = mlx.mlx_array_free(lg);
+            try mlx.check(mlx.mlx_array_eval(lg));
+            const class = p.pads.get(m.wideClass(@intCast(at), @intCast(chunk), @import("hy4_model.zig").Model.Readout.last)).?;
+            errdefer std.debug.print("{s}: a {d}-row chunk at {d} tops out at {d} B, its class's recording at {d} B; the region {d} B\n", .{ env, chunk, at, core.stats().wide_last_high, class.need, p.region.scratch });
+            try testing.expectEqual(class.need, core.stats().wide_last_high);
+            try testing.expect(class.need <= p.region.scratch);
+        }
+    }
+    if (!ran) return error.SkipZigTest;
+}
+
+/// Each scratch ask's place in a dry `rows`-row wide forward at `n`, in the order an execution makes them, every pass's
+/// in turn (`plan.region.padOf`).
+fn scratchAsks(m: anytype, p: anytype, rows: usize, n: usize) ![]u64 {
+    var passes = try hy4_plan.recordChecked(m, testing.allocator, .{ .rows = rows, .readout = .last, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = n, .phase = .wide }, p.reach);
+    defer passes.deinit();
+    var out: std.ArrayList(u64) = .empty;
+    errdefer out.deinit(testing.allocator);
+    for (passes.traces) |*t| {
+        const pad = try plan.region.padOf(testing.allocator, t, p.book.alignment);
+        defer testing.allocator.free(pad);
+        try out.appendSlice(testing.allocator, pad);
+    }
+    return out.toOwnedSlice(testing.allocator);
 }

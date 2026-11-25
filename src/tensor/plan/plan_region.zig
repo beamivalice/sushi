@@ -78,24 +78,60 @@ pub const Fit = struct {
     }
 };
 
+/// The place of each scratch ask of `t` in the order an execution makes them, each rounded up to `alignment`: what
+/// `core.beginWidePadded` pads an execution of the same structure to. The caller frees it.
+pub fn padOf(gpa: std.mem.Allocator, t: *const Trace, alignment: u64) Error![]u64 {
+    var out: std.ArrayList(u64) = .empty;
+    errdefer out.deinit(gpa);
+    try padInstance(gpa, t, 0, alignment, &out);
+    return out.toOwnedSlice(gpa);
+}
+
+fn padInstance(gpa: std.mem.Allocator, t: *const Trace, i: u32, alignment: u64, out: *std.ArrayList(u64)) Error!void {
+    const inst = &t.instances[i];
+    for (inst.events.items) |e| switch (e) {
+        .ask => |o| {
+            const a = inst.asks.items[o];
+            if (!a.host and !a.external) try out.append(gpa, std.mem.alignForward(u64, @max(a.bytes, 1), alignment));
+        },
+        .child => |c| try padInstance(gpa, t, c, alignment, out),
+    };
+}
+
+/// Whether a padded execution may follow its own choices from one of `traces`' passes to another: every pass meets
+/// the same sites in the same order, and leaves first fit in one state at each, the frees before its next scratch ask
+/// taken. Then each stretch between two choices places as the pass it follows did, from the state that pass had.
+pub fn choicesAgree(gpa: std.mem.Allocator, traces: []const Trace, alignment: u64) Error!bool {
+    if (traces.len < 2) return true;
+    const first = try statesAt(gpa, &traces[0], alignment);
+    defer gpa.free(first);
+    for (traces[1..]) |*tr| {
+        if (tr.choices.len != traces[0].choices.len) return false;
+        for (tr.choices, traces[0].choices) |a, b| if (a.site != b.site) return false;
+        const got = try statesAt(gpa, tr, alignment);
+        defer gpa.free(got);
+        if (!std.mem.eql(u64, first, got)) return false;
+    }
+    return true;
+}
+
+/// A hash of first fit's state at each of `t`'s choices: before its next scratch ask, or at the end.
+fn statesAt(gpa: std.mem.Allocator, t: *const Trace, alignment: u64) Error![]u64 {
+    var w: Walk = .{ .gpa = gpa, .t = t, .alignment = alignment };
+    defer w.deinit();
+    w.states = try gpa.alloc(u64, t.choices.len);
+    errdefer gpa.free(w.states);
+    try w.run();
+    while (w.next_state < t.choices.len) : (w.next_state += 1) w.states[w.next_state] = w.fitHash();
+    return w.states;
+}
+
 /// The region `t` asks, each place rounded up to `alignment`. An ask `plan.into` named is its owner's bytes, never the
 /// region's.
 pub fn need(gpa: std.mem.Allocator, t: *const Trace, alignment: u64) Error!Need {
     var w: Walk = .{ .gpa = gpa, .t = t, .alignment = alignment };
     defer w.deinit();
-    // Each instance's asks by the index of the owner's event they die before.
-    w.dying = try gpa.alloc(std.AutoHashMapUnmanaged(u32, std.ArrayList(trace_mod.Ref)), t.instances.len);
-    for (w.dying) |*d| d.* = .empty;
-    for (t.instances, 0..) |inst, i| for (inst.asks.items, 0..) |a, o| {
-        if (a.death == trace_mod.none) continue;
-        var owner: u32 = @intCast(i);
-        for (0..a.lift) |_| owner = t.instances[owner].parent;
-        const got = try w.dying[owner].getOrPut(gpa, a.death);
-        if (!got.found_existing) got.value_ptr.* = .empty;
-        try got.value_ptr.append(gpa, .{ .instance = @intCast(i), .ordinal = @intCast(o) });
-    };
-    for (t.waits) |x| try w.waits.put(gpa, @as(u64, x.instance) << 32 | x.at, x.deaths);
-    try w.instance(0);
+    try w.run();
     return .{ .scratch = w.fit.high, .host = w.host_high };
 }
 
@@ -111,6 +147,38 @@ const Walk = struct {
     host_top: u64 = 0,
     host_high: u64 = 0,
     waits: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// `statesAt`: first fit's state as each choice is met, and the scratch asks placed so far.
+    states: []u64 = &.{},
+    next_state: usize = 0,
+    scratch: u32 = 0,
+
+    fn run(w: *Walk) Error!void {
+        const gpa = w.gpa;
+        const t = w.t;
+        // Each instance's asks by the index of the owner's event they die before.
+        w.dying = try gpa.alloc(std.AutoHashMapUnmanaged(u32, std.ArrayList(trace_mod.Ref)), t.instances.len);
+        for (w.dying) |*d| d.* = .empty;
+        for (t.instances, 0..) |inst, i| for (inst.asks.items, 0..) |a, o| {
+            if (a.death == trace_mod.none) continue;
+            var owner: u32 = @intCast(i);
+            for (0..a.lift) |_| owner = t.instances[owner].parent;
+            const got = try w.dying[owner].getOrPut(gpa, a.death);
+            if (!got.found_existing) got.value_ptr.* = .empty;
+            try got.value_ptr.append(gpa, .{ .instance = @intCast(i), .ordinal = @intCast(o) });
+        };
+        for (t.waits) |x| try w.waits.put(gpa, @as(u64, x.instance) << 32 | x.at, x.deaths);
+        try w.instance(0);
+    }
+
+    fn fitHash(w: *const Walk) u64 {
+        var h = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&h, w.fit.top);
+        for (w.fit.gaps.items) |g| {
+            std.hash.autoHash(&h, g.lo);
+            std.hash.autoHash(&h, g.hi);
+        }
+        return h.final();
+    }
 
     fn deinit(w: *Walk) void {
         for (w.dying) |*d| {
@@ -166,6 +234,8 @@ const Walk = struct {
             try w.host_live.put(w.gpa, key(ref), w.host_top);
             return;
         }
+        while (w.next_state < w.states.len and w.t.choices[w.next_state].at == w.scratch) : (w.next_state += 1) w.states[w.next_state] = w.fitHash();
+        w.scratch += 1;
         const got = w.fit.take(len);
         try w.places.put(w.gpa, key(ref), .{ got.at, got.at + len });
     }

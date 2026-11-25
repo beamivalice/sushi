@@ -1319,7 +1319,8 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   asks more for each row of a dense part that is a verify block), so each width is also probed at the one cut that
   leaves a verify block's most dense rows (`hy4_plan.straddleDepth`): the audit sweeps every depth a chunk of 512
   rows touches the threshold at, and none asks more. A probe is kept only where a sweep shows it can set the maximum.
-  Nothing matches a recorded structure, so no prefill shape can miss. The narrow phases keep their exact plans. A stack
+  Nothing matches a recorded structure, so no prefill shape can miss (D110 pads a deep-zone chunk to its class's
+  recording). The narrow phases keep their exact plans. A stack
   (bytes back only once every ask above is dead) was measured first and dropped:
   a 2,048-row chunk of the BF16 tiny topped at 511 MB against 65 MB packed by lifetimes, a layer's result pinning all
   below it; first fit took 67 MB, best fit 83 MB. The forward's own waste went first: a chunk's spans write the layer's
@@ -1427,6 +1428,20 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   request's refusal names the reply and context the terms fit (`requestContextRefusal`); the RAM tier's ask stands, its
   bytes what the model parks (`prefixCacheMemForLoad`). A static-bill load that does not warm is refused by name
   (`StaticBillLoadDoesNotWarm`), so the off-ledger chunk chooser is gone.
+- **D110. A load-width chunk in the deep zone runs padded to its class's recording** (2026-11-25; amends D97). First fit
+  is not monotone: a smaller ask leaves a gap a later one no longer fits, so it lands on top (pinned by the core cell
+  "padded to its recording"). D97 measured each width at the state's start and its deepest, taking the deepest for the
+  most, and the owner's live test on the release 2.25bpw pack failed `WideFull` with an 8,192-row chunk at 40,960
+  asking 4,296,592 KB against 4,293,236 KB measured. Past the selection threshold and the window (`deepZone`, 2,048
+  tokens on the release config) a chunk's structure turns on a few facts (`Model.wideClass`: each kind of layer's
+  edge key, the spans' width, a ring read in one run), and within a class every ask only grows with depth. The load
+  records each class at its deepest member for both readouts (`measureClasses`: 12 classes a width on the tiny), the
+  region takes their most, and a chunk of the class runs with each scratch ask placed at its recorded size
+  (`core.beginWidePadded`, `plan.region.padOf`): first fit then places it as the recording did, so it tops out exactly
+  there. At each `plan.choose` the execution follows a pass that took the same value, sound where every pass leaves
+  first fit in one state at each choice (`plan.region.choicesAgree`, checked at load). A chunk of no recorded class, an
+  ask past its recorded size or past the sequence is refused by name (`Hy4WidePlanMiss`, `PlanMiss`), never placed.
+  Chunks below the deep zone, other widths and an image's splice keep D97's measure.
 
 ## 15. Risks
 

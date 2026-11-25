@@ -31,6 +31,9 @@ pub const Ask = struct {
 /// host asks dead by then give their bytes back (`plan_region`).
 pub const Wait = struct { instance: u32, at: u32, deaths: u32 };
 
+/// A `plan.choose` a dry pass met: its site, the value it took, and how many scratch asks came before it.
+pub const Choice = struct { site: frame.Site, value: u32, at: u32 };
+
 pub const Event = union(enum) {
     /// The ask of this ordinal.
     ask: u32,
@@ -63,6 +66,7 @@ pub const Trace = struct {
     /// The root is 0; a child follows its parent.
     instances: []Instance,
     waits: []Wait = &.{},
+    choices: []Choice = &.{},
 
     pub fn deinit(t: *Trace) void {
         for (t.instances) |*i| {
@@ -71,6 +75,7 @@ pub const Trace = struct {
         }
         t.gpa.free(t.instances);
         t.gpa.free(t.waits);
+        t.gpa.free(t.choices);
         t.* = undefined;
     }
 
@@ -95,6 +100,10 @@ pub const Recorder = struct {
     deaths: u32 = 0,
     /// The ask `end` refused: alive when the execution ended, and no `plan.into` named it.
     escape: ?Ref = null,
+    choices: std.ArrayList(Choice) = .empty,
+    /// Scratch asks so far: neither host-filled nor an owner's bytes.
+    scratch: u32 = 0,
+    choice_oom: bool = false,
 
     pub fn begin(gpa: std.mem.Allocator, root: FrameId) Error!Recorder {
         var r: Recorder = .{ .gpa = gpa };
@@ -112,6 +121,7 @@ pub const Recorder = struct {
         r.instances.deinit(r.gpa);
         r.stack.deinit(r.gpa);
         r.waits.deinit(r.gpa);
+        r.choices.deinit(r.gpa);
         r.* = undefined;
     }
 
@@ -140,7 +150,15 @@ pub const Recorder = struct {
         const ordinal: u32 = @intCast(inst.asks.items.len);
         try inst.asks.append(r.gpa, .{ .bytes = bytes, .host = host, .external = external });
         try inst.events.append(r.gpa, .{ .ask = ordinal });
+        if (!host and !external) r.scratch += 1;
         return .{ .instance = home, .ordinal = ordinal };
+    }
+
+    /// A `plan.choose` at `site` took `value` here; `end` reports a note that could not be kept.
+    pub fn noteChoice(r: *Recorder, site: frame.Site, value: u32) void {
+        r.choices.append(r.gpa, .{ .site = site, .value = value, .at = r.scratch }) catch {
+            r.choice_oom = true;
+        };
     }
 
     /// The ask died now: its owner is the nearest frame still open at or above its home.
@@ -196,12 +214,15 @@ pub const Recorder = struct {
                 return error.PlanEscape;
             }
         };
+        if (r.choice_oom) return error.OutOfMemory;
         r.instances.items[0].open = false;
         const waits = try r.waits.toOwnedSlice(r.gpa);
         errdefer r.gpa.free(waits);
+        const choices = try r.choices.toOwnedSlice(r.gpa);
+        errdefer r.gpa.free(choices);
         const instances = try r.instances.toOwnedSlice(r.gpa);
         r.stack.clearRetainingCapacity();
-        return .{ .gpa = r.gpa, .instances = instances, .waits = waits };
+        return .{ .gpa = r.gpa, .instances = instances, .waits = waits, .choices = choices };
     }
 };
 
