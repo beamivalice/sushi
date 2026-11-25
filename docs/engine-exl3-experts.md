@@ -370,7 +370,7 @@ or from 1024 rows the decoded path below.
   `gemmNaxOn()` as read when the bank was bound; the latch is checked again on every launch.
 - **On a stream with a counter page a through launch of up to three rows finishes its own partials**
   (`trunk.matmulThruBf16`, `matmulThruBf16Normed`, `matmulThruBf16Stored`, `linear.linearCounted`,
-  `project_rows.launchRowsCounted`, `COUNTED_ROWS_MAX`, seam `trunk.self_finish_on`): the k-split partials leave by
+  `project_rows.launchRowsCounted`, `COUNTED_ROWS_MAX`): the k-split partials leave by
   relaxed device atomics and each 128-wide output block's last threadgroup to count in finishes it as `rows_finish_thru`
   does (f32 rows), as `rows_finish` does (bf16 rows of f32 rows read through bf16), or then, normed, the launch's last
   block to finish norms each row as `rows_finish_rms_thru` does: the same bytes in one dispatch. Past three rows the

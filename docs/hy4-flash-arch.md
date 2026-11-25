@@ -283,8 +283,7 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     spread over threadgroups (`rate_groups.groupWindowGrid`). Byte for byte; a 4,096-row chunk after 4,096: 1,986 to
     1,971 ms, 208 fewer dispatches (018502b3 on 5f6fb12e, M5 Ultra, STQ 4bpw, prefill meter, A B B A, GPU lock).
   - Pinned by `hy4 attention spans`: at the release's gate and `W_o` shapes (trellis K4 and BF16, spans of 256 and
-    32, short last spans), and on the tiny's BF16 and STQ trunks against the per-span order (`fwd.spans_share`, a
-    test seam), byte for byte over windowed, gathered and decode rows. The tiny's logits also matched the parent
+    32, short last spans) against each span's own launch, byte for byte. The tiny's logits also matched the parent
     commit's by file (366 rows, both trunks).
   - `sushi-ubench run hy4.span_linears` (9eee9eb3, M5 Ultra, 7 rounds, GPU lock, AC), a layer's gate and `W_o` through
     trellis banks, per span against whole, ms at 4,096 rows: sliding K4 12.02 / 11.47, K6 14.32 / 13.89; gathered
@@ -670,7 +669,7 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   weight's widening and the norm were three dispatches; they are one, with the bytes of the f32 norm after the launch.
 - **The attention's write-back rides the FFN mix's launch** (`fwd.expandMixNorm`, `hck.mixExpandIdentity`, kernel
   `hc_ident_mix_expand`): the mix kernel computes `post·y + h` as it reads the stream, the expand's two roundings, and
-  its x-0 tiles store it, so a layer's iHC is five launches, not six. Seam `fwd.mix_expand_on`. A resident STQ MoE's
+  its x-0 tiles store it, so a layer's iHC is five launches, not six. A resident STQ MoE's
   FFN write-back rides its combine norm's launch (`fwd.moeFinishBack`, `hy4_norm.rowsExpand`: the norm's value, then
   `post_k · y + h_k` as `hc_ident_expand` computes it), so `passLayer` gets the streams; the dense layer's, the BF16
   paths' and a layer-major run's still run alone.
@@ -719,9 +718,8 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - Ruled out: the finisher also leaving each block's sum of squares, so the mix skips its squares (no gain in the
     mix); plain partial stores (no faster than the atomics).
 - **On the engine's stream every trunk launch of up to three rows finishes its own partials** (`trunk.matmulThruBf16`,
-  `matmulThruBf16Normed`, `matmulThruBf16Stored`, `linear.linearCounted`, `project_rows.launchRowsCounted`, seam
-  `exl3.trunk.self_finish_on`): q_b, the gate (its f32 rows read through bf16, its rows stored bf16, so its cast goes
-  too), the shared expert's and the latents' linears, the dense layer's FFN, and at one row q_a, the dense down and W_o
+  `matmulThruBf16Normed`, `matmulThruBf16Stored`, `linear.linearCounted`, `project_rows.launchRowsCounted`): q_b,
+  the gate (its f32 rows read through bf16, its rows stored bf16, so its cast goes too), the shared expert's and the latents' linears, the dense layer's FFN, and at one row q_a, the dense down and W_o
   (where a tap reads it) through their norm, each as W_o's counted launch: the block's last threadgroup finishes it as
   `rows_finish_thru` stores it (`rows_finish` for the gate), and a normed launch's last block to finish norms every row
   as `rows_finish_rms_thru` does. One launch a site where there were two (three at the gate): 376 fewer a release decode
@@ -762,7 +760,7 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   verify 21.26 to 21.50 ms, 6 rows 29.90 to 30.80. A load's warm makes the STQ head's 2..8-row pipelines.
 - **The 2..8-row rule is one predicate, by the span's own width** (`fwd.isVerifyBlock`): every site that must give a
   verify row its one-row bytes (row linears, absorb and value-out with or without `hy4_absorb`, scores, the ring)
-  asks it, and a chunk's short last span decides by its own rows, so `spans_share` keeps its bytes.
+  asks it, and a chunk's short last span decides by its own rows, so the shared launch keeps each span's bytes.
 - **A layer's new kv8 latent rows are quantized into the store in one launch** (`hy4_latent.append`: MLX's affine
   quantize arithmetic, written in place through `kernel.launchInPlace`, rings wrapped): at 01871ac7 (M5 Ultra,
   fwd-ubench @4K) 16.019 to 15.982 ms a token, 168 dispatches fewer; a 3-row verify unchanged within 0.05 ms.
@@ -783,8 +781,6 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   about ten FFI calls a launch, and the engine finds the pipeline a kept config last named. A constant fixed by the
   geometry (ε, log2 θ, the rope step, the router's scale) rides as a template int of its f32 bits, not a host array
   a launch; only a position is made per launch.
-- `hy4_stq.thru_bf16_on` is the test seam: off, the forward takes the casts and the separate norm, and the tiny STQ
-  pack's logits are the same bytes either way (`hy4 stq: trunk linears whose launches round ...`).
 
 ## The state and the prefix cache
 

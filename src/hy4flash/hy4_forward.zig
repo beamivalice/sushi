@@ -104,10 +104,6 @@ pub var hc_kernels_on = true;
 /// (`sparse_select.zig`); the CPU stream takes the op chain. A test seam.
 pub var select_kernels_on = true;
 
-/// Whether a one-row forward's absorbed products and f32 linears read their BF16 weights as stored (`hy4_absorb`)
-/// rather than widened. A test seam.
-pub var absorb_kernels_on = true;
-
 fn hcKernels(o: *Ops) bool {
     return hc_kernels_on and mlx.streamIsGpu(o.s);
 }
@@ -136,10 +132,6 @@ pub fn mixNorm(o: *Ops, h: Arr, w: Mix, n: c_int, magnitude: f32, eps: f32, norm
 /// the identity norm. A test seam: both give the same bytes.
 pub var mix_norm_on = true;
 
-/// Whether a GPU stream expands a sublayer's output inside the next mix's launch (`hck.mixExpandIdentity`) rather than
-/// in a launch of its own. A test seam: both give the same bytes.
-pub var mix_expand_on = true;
-
 /// Whether a decode block's W_o leaves its partials for the iHC mix's launch to finish and norm (`expandMixNormParts`)
 /// rather than its own finish_rms launch. A test seam: both give the same bytes.
 pub var o_parts_on = true;
@@ -156,7 +148,7 @@ pub const o_rows_max = @import("sushi_exl3").project_rows.COUNTED_ROWS_MAX;
 /// Whether `expandMixNormParts` (or `expandMixNormRows`) will take W_o's partials (or rows) for the streams `h`
 /// [rows, n, D] and the mix `w`, with W_o's `attn.o` and its norm: a caller asks before it makes them.
 pub fn oPartsReady(o: *Ops, h: Arr, w: Mix, attn: Attn) bool {
-    if (!o_parts_on or !chain_kernels_on or !mix_expand_on or !mix_norm_on or !hcKernels(o)) return false;
+    if (!o_parts_on or !chain_kernels_on or !mix_norm_on or !hcKernels(o)) return false;
     const b = attn.o.stq orelse return false;
     const d = mlx.getShape(h)[mlx.getShape(h).len - 1];
     const nd = mlx.mlx_array_dtype(attn.post_norm);
@@ -184,7 +176,7 @@ pub fn expandMixNormRows(o: *Ops, h: Arr, post: Arr, y: Arr, attn: Attn, o_eps: 
 
 /// `expandMixNorm` with the attention's `post_proj_norm` of `y` in the same launch on a GPU stream (`hy4_hc.expandNormMixNorm`).
 pub fn expandNormMixNorm(o: *Ops, h: Arr, post: Arr, y: Arr, y_norm_w: Arr, y_eps: f32, w: Mix, n: c_int, magnitude: f32, eps: f32, norm_eps: f32, norm_w: Arr) !Expanded {
-    if (norm_kernel_on and mix_expand_on and mix_norm_on and hcKernels(o)) {
+    if (norm_kernel_on and mix_norm_on and hcKernels(o)) {
         const hf = try o.contiguous(try o.cast(h, .float32));
         const pf = try o.contiguous(try o.cast(post, .float32));
         if (hy4_hc.expandNormApplies(o.s, hf, pf, y, y_norm_w, w.fn_, w.scale)) {
@@ -202,7 +194,7 @@ pub const Expanded = struct { m: Arr, mixed: Mixed };
 
 /// `expand(h, post, y)`, then `mixNorm` of it: on a GPU stream the expand rides the mix's launch.
 pub fn expandMixNorm(o: *Ops, h: Arr, post: Arr, y: Arr, w: Mix, n: c_int, magnitude: f32, eps: f32, norm_eps: f32, norm_w: Arr) !Expanded {
-    if (!hcKernels(o) or !mix_expand_on) {
+    if (!hcKernels(o)) {
         const m = try expand(o, h, post, y);
         return .{ .m = m, .mixed = try mixNorm(o, m, w, n, magnitude, eps, norm_eps, norm_w) };
     }
@@ -397,26 +389,11 @@ fn mmHeadsAs(o: *Ops, a: Arr, b: Arr, rows_as: ?c_int) !Arr {
     return o.concat(&.{ whole, try mmHeadsByRow(o, try o.slice(a, 1, full, t), b) }, 1);
 }
 
-/// Whether a chunk's attention spans share one launch of the gate and of `W_o` (`linearSpans`) and one widened `W_kvb`,
-/// or each span makes its own (the per-span order, a test seam).
-pub var spans_share = true;
-
 /// `linearStored` of `x`'s rows as attention spans of `span` rows give each row its own span's launch: the whole spans
 /// in one launch, its product chosen as for one span, and a short last span in a launch of its own (a launch of a few
 /// rows takes the vector kernels, other sums).
 pub fn linearSpans(o: *Ops, x: Arr, lin: Lin, span: c_int) !Arr {
     const t = mlx.getShape(x)[0];
-    if (!spans_share and t > span) {
-        var parts: [512]Arr = undefined;
-        var count: usize = 0;
-        var r0: c_int = 0;
-        while (r0 < t) : (r0 += span) {
-            if (count == parts.len) return error.Hy4ChunkTooWide;
-            parts[count] = try linearStored(o, try o.slice(x, 0, r0, @min(t, r0 + span)), lin);
-            count += 1;
-        }
-        return o.concat(parts[0..count], 0);
-    }
     if (t <= span) return linearStored(o, x, lin);
     const full = t - @rem(t, span);
     if (full == t) return linearStoredAs(o, x, lin, span);
@@ -466,7 +443,7 @@ fn linearF32As(o: *Ops, x: Arr, w: Arr, rows_as: ?c_int) !Arr {
     const k: usize = @intCast(shape[1]);
     const x32 = try o.cast(x, .float32);
     // One row reads a BF16 weight as stored, with the widened product's bytes.
-    if (absorb_kernels_on and (rows_as == null or mlx.getShape(x32)[0] == 1) and hy4_row.applies(o.s, x32, w)) return o.own(try hy4_row.rowF32(o.s, try o.contiguous(x32), w));
+    if ((rows_as == null or mlx.getShape(x32)[0] == 1) and hy4_row.applies(o.s, x32, w)) return o.own(try hy4_row.rowF32(o.s, try o.contiguous(x32), w));
     var per: usize = @max(1, widen_block_bytes / (k * 4));
     if (per >= n) {
         var ob: Ops = .{ .s = o.s };
@@ -672,7 +649,7 @@ pub fn moeFinishBack(o: *Ops, x: Arr, w: Moe, g: MoeGeometry, routed: Arr, at: ?
     // The shared expert first: launches that finish themselves run in the order made, so it runs beside the routed
     // experts rather than after W_lat_up.
     const narrow = norm_kernel_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
-    if (back) |b| if (narrow and chain_kernels_on and mix_expand_on and hcKernels(o)) {
+    if (back) |b| if (narrow and chain_kernels_on and hcKernels(o)) {
         if (w.shared.down.stq) |db| if (w.lat_up.stq) |ub| if (hy4_stq.wideInnerApplies(routed, ub)) {
             if (try swigluPreparedDown(o, x, w.shared, at)) |prep| {
                 const shared_in = try hy4_stq.applyPreparedInner(o, prep, db);
@@ -692,7 +669,7 @@ pub fn moeFinishBack(o: *Ops, x: Arr, w: Moe, g: MoeGeometry, routed: Arr, at: ?
     };
     const shared = if (narrow and storedCheap(x, w.shared.down)) try swigluStored(o, x, w.shared, at) else try swiglu(o, x, w.shared, at);
     const up = if (narrow and storedCheap(routed, w.lat_up)) try linearStored(o, routed, w.lat_up) else try linear(o, routed, w.lat_up);
-    if (back) |b| if (norm_kernel_on and mix_expand_on and hcKernels(o)) {
+    if (back) |b| if (norm_kernel_on and hcKernels(o)) {
         const h = try o.contiguous(try o.cast(b.h, .float32));
         const post = try o.contiguous(try o.cast(b.post, .float32));
         if (b.next) |nx| if (back_mix_on and mix_norm_on and hy4_hc.backApplies(o.s, h, post, up, shared, w.combine, nx.mix.fn_, nx.mix.scale)) {
@@ -1466,7 +1443,7 @@ fn absorbGeometry(g: AttnGeometry) hy4_absorb.Geometry {
 }
 
 pub fn absorbServes(s: mlx.mlx_stream, kv_b: Arr, g: AttnGeometry, rows: c_int) bool {
-    return absorb_kernels_on and hy4_absorb.applies(s, kv_b, absorbGeometry(g), rows);
+    return hy4_absorb.applies(s, kv_b, absorbGeometry(g), rows);
 }
 
 /// The attended latent [H, T, latent] out through `W_v`, gated by `σ` of its rows' `gate` (as stored), as `W_o` reads it.
@@ -1708,7 +1685,7 @@ pub fn recalledAt(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: Ind
 pub fn indexPrepare(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: IndexerGeometry, p0: c_int, r0: c_int, span: c_int) !?IndexIn {
     const t = mlx.getShape(x)[0];
     const take = @min(g.group_topk - 1, mlx.getShape(pooled)[0]);
-    if (!spans_share or !index_kernel_on or !chain_kernels_on or !select_kernels_on or !rope_kernel_on) return null;
+    if (!index_kernel_on or !chain_kernels_on or !select_kernels_on or !rope_kernel_on) return null;
     if (!mlx.streamIsGpu(o.s) or !mlx.engine.isStream(o.s) or take <= 0 or span <= verify_rows_max or t - r0 <= span) return null;
     const rows = t - r0;
     const xs = if (r0 == 0) x else try o.slice(x, 0, r0, t);
@@ -2200,7 +2177,6 @@ test "hy4 attention spans: at the release's gate and W_o shapes the whole spans'
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    defer spans_share = true;
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
@@ -2247,13 +2223,23 @@ test "hy4 attention spans: at the release's gate and W_o shapes the whole spans'
         for (w_bits) |*v| v.* = @truncate(@as(u32, @bitCast(rnd.floatNorm(f32) * 0.02)) >> 16);
         const dense = Lin.dense(try o.own(mlx.mlx_array_new_data(w_bits.ptr, &[_]c_int{ c.out, c.in }, 2, .bfloat16)));
         for ([_]Lin{ .{ .w = dense.w, .stq = bank }, dense }) |lin| {
+            // Each span's own launch, then the spans' shared ones.
             var got: [2]Arr = undefined;
-            for (&got, [_]bool{ false, true }) |*g, share| {
-                spans_share = share;
+            {
                 var ob: Ops = .{ .s = es };
                 defer ob.deinit();
-                g.* = try o.own(try ob.result(try ob.contiguous(try linearSpans(&ob, x, lin, c.span))));
-                try mlx.check(mlx.mlx_array_eval(g.*));
+                var parts: std.ArrayList(Arr) = .empty;
+                defer parts.deinit(gpa);
+                var r0: c_int = 0;
+                while (r0 < c.rows) : (r0 += c.span) try parts.append(gpa, try linearStored(&ob, try ob.slice(x, 0, r0, @min(c.rows, r0 + c.span)), lin));
+                got[0] = try o.own(try ob.result(try ob.contiguous(try ob.concat(parts.items, 0))));
+                try mlx.check(mlx.mlx_array_eval(got[0]));
+            }
+            {
+                var ob: Ops = .{ .s = es };
+                defer ob.deinit();
+                got[1] = try o.own(try ob.result(try ob.contiguous(try linearSpans(&ob, x, lin, c.span))));
+                try mlx.check(mlx.mlx_array_eval(got[1]));
             }
             const n = mlx.mlx_array_size(got[0]);
             try testing.expectEqual(n, mlx.mlx_array_size(got[1]));

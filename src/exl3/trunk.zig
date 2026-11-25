@@ -70,15 +70,11 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.ml
     return matmulWith(s, x, w, suh, svh, dec, launchOpts(wide));
 }
 
-/// Whether a launch of up to `project_rows.countedRowsMax` rows on a stream with a counter page finishes its own
-/// partials (`selfFinished`) rather than leaving them to a finish dispatch. A test seam: both give the same bytes.
-pub var self_finish_on = true;
-
 /// `linear.linearCounted` of `x` where a trunk launch finishes its own partials: on a stream with a counter page, up to
 /// `countedRowsMax(c)` rows of f32. Null, with nothing launched, elsewhere.
 fn selfFinished(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, dec: format.Decode, opts: linear.Opts, c: project_rows.Counted) !?mlx.mlx_array {
     const sh = mlx.getShape(x);
-    if (!self_finish_on or sh.len != 2 or sh[0] > project_rows.countedRowsMax(c) or host_side.counters(s) == 0) return null;
+    if (sh.len != 2 or sh[0] > project_rows.countedRowsMax(c) or host_side.counters(s) == 0) return null;
     return linear.linearCounted(s, x, .{ .trellis = w, .suh = suh, .svh = svh }, dec, opts, c);
 }
 
@@ -109,7 +105,7 @@ pub fn matmulThruBf16Stored(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_arra
 /// SwiGLU as MLX's Sigmoid and Multiply give it. Null, with nothing launched, where `selfFinished` would not serve.
 pub fn matmulThruBf16Swiglu(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Triple, up: Triple, dec: format.Decode) !?mlx.mlx_array {
     const sh = mlx.getShape(x);
-    if (!self_finish_on or sh.len != 2 or sh[0] > project_rows.COUNTED_ROWS_MAX or host_side.counters(s) == 0) return null;
+    if (sh.len != 2 or sh[0] > project_rows.COUNTED_ROWS_MAX or host_side.counters(s) == 0) return null;
     var opts = launchOpts(false);
     opts.rows.thru_bf16 = true;
     return linear.linearPairCounted(s, x, .{ .trellis = gate.w, .suh = gate.s, .svh = gate.b }, .{ .trellis = up.w, .suh = up.s, .svh = up.b }, dec, opts);

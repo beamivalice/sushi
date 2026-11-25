@@ -549,125 +549,20 @@ fn expertBytes(io: std.Io, dir: []const u8) !u64 {
     return total;
 }
 
-test "hy4 attention spans: on Sushi Cooler a chunk's spans share one launch of the gate, of W_o and of the widened kv_b, with each span's own launches' bytes, BF16 and STQ, windowed, gathered and short last spans (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
+test "hy4 stq: an STQ load holds every layer's kv_b BF16, the weight the decode row's absorbed attention reads as stored (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
     const hy4_model = @import("hy4_model.zig");
     try mlx.requireGpu();
-    const a = testing.allocator;
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    defer fwd.spans_share = true;
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
-    // 300 rows: a sliding layer's spans 256 + 44, a sparse layer's past its selection threshold 9 x 32 + 12; then 64
-    // (two whole gathered spans) and two decode rows.
-    var ids: [366]u32 = undefined;
-    for ([_]bool{ false, true }) |stq| {
-        var logits: [2][]f32 = .{ &.{}, &.{} };
-        defer for (logits) |l| a.free(l);
-        var dispatches: [2]u64 = undefined;
-        for (&logits, &dispatches, [_]bool{ false, true }) |*out, *count, share| {
-            fwd.spans_share = share;
-            var p = try Packs.open(es);
-            defer p.close();
-            for (&ids, 0..) |*d, i| d.* = @intCast(1 + (i * 7919) % (p.config.vocab - 1));
-            const m = if (stq)
-                try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant })
-            else
-                try hy4_model.Model.init(a, p.config, &p.src, es);
-            defer m.deinit();
-            var o: Ops = .{ .s = es };
-            defer o.deinit();
-            var r0: usize = 0;
-            for ([_]usize{ 300, 64, 1, 1 }) |w| {
-                const before = mlx.engine.stats().dispatches;
-                const row = try hostRows(&o, try o.own(try m.forwardReadout(ids[r0 .. r0 + w], .all)));
-                if (r0 == 0) count.* = mlx.engine.stats().dispatches - before;
-                const grown = try a.realloc(out.*, out.len + row.len);
-                @memcpy(grown[out.len..], row);
-                out.* = grown;
-                r0 += w;
-            }
-        }
-        diag("spans (stq {}): a 300-row chunk's dispatches {d} each span alone, {d} shared\n", .{ stq, dispatches[0], dispatches[1] });
-        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(logits[0]), std.mem.sliceAsBytes(logits[1]));
-        // Each sparse layer's ten gathered spans launch the gate and W_o twice each (the whole spans, the short one).
-        try testing.expect(dispatches[0] >= dispatches[1] + 3 * 2 * (10 - 2));
-    }
-}
-
-test "hy4 stq: a decode row's absorbed attention and f32 linears read their BF16 weights as stored, kv_b held BF16, and answer the bytes of the products over their f32 widening, dense and past the selection (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
-    const hy4_model = @import("hy4_model.zig");
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    defer fwd.absorb_kernels_on = true;
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    var ids: [60]u32 = undefined;
-    var logits: [2][]f32 = .{ &.{}, &.{} };
-    defer for (logits) |l| a.free(l);
-    for (&logits, [_]bool{ false, true }) |*out, on| {
-        fwd.absorb_kernels_on = on;
-        // A load decodes and drops the pack's banks it reads by row: each load opens the pack anew.
-        var p = try Packs.open(es);
-        defer p.close();
-        for (&ids, 0..) |*d, i| d.* = @intCast(1 + (i * 7919) % (p.config.vocab - 1));
-        const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
-        defer m.deinit();
-        for (0..p.config.layers) |l| try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(m.layers[l].attn.kv_b));
-        var o: Ops = .{ .s = es };
-        defer o.deinit();
-        // A prompt wider than the kernels' verify widths (its products the same on both sides), then decode rows on
-        // both sides of the sparse layers' selection threshold.
-        _ = try hostRows(&o, try o.own(try m.forwardReadout(ids[0..12], .last)));
-        for (12..ids.len) |i| {
-            const row = try hostRows(&o, try o.own(try m.forwardReadout(ids[i .. i + 1], .last)));
-            const grown = try a.realloc(out.*, out.len + row.len);
-            @memcpy(grown[out.len..], row);
-            out.* = grown;
-        }
-    }
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(logits[0]), std.mem.sliceAsBytes(logits[1]));
-}
-
-test "hy4 stq: trunk linears whose launches round their rows and outputs through bf16, the norm after q_a, o and the dense down in their finish, answer the bytes of the casts around the bf16 launches and the f32 norm after, a prefill past the rows arm and decode rows (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
-    const hy4_model = @import("hy4_model.zig");
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    defer hy4_stq.thru_bf16_on = true;
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    var ids: [24]u32 = undefined;
-    var logits: [2][]f32 = .{ &.{}, &.{} };
-    defer for (logits) |l| a.free(l);
-    for (&logits, [_]bool{ false, true }) |*out, on| {
-        hy4_stq.thru_bf16_on = on;
-        var p = try Packs.open(es);
-        defer p.close();
-        for (&ids, 0..) |*d, i| d.* = @intCast(1 + (i * 7919) % (p.config.vocab - 1));
-        const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
-        defer m.deinit();
-        var o: Ops = .{ .s = es };
-        defer o.deinit();
-        // A 12-row prompt (past the multi-row arm's 8), then decode rows.
-        out.* = try a.dupe(f32, try hostRows(&o, try o.own(try m.forwardReadout(ids[0..12], .all))));
-        for (12..ids.len) |i| {
-            const row = try hostRows(&o, try o.own(try m.forwardReadout(ids[i .. i + 1], .last)));
-            const grown = try a.realloc(out.*, out.len + row.len);
-            @memcpy(grown[out.len..], row);
-            out.* = grown;
-        }
-    }
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(logits[0]), std.mem.sliceAsBytes(logits[1]));
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(testing.allocator, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    for (0..p.config.layers) |l| try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(m.layers[l].attn.kv_b));
 }
 
 test "hy4 stq: a decode row's trunk linear through a trellis bank is its one through-bf16 launch, the bytes of the casts around the bf16 launch (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
@@ -697,40 +592,6 @@ test "hy4 stq: a decode row's trunk linear through a trellis bank is its one thr
     try mlx.check(mlx.mlx_array_eval(got));
     try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
     try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want)), std.mem.sliceAsBytes(try hostRows(&o, got)));
-}
-
-test "hy4 stq: the attention's write-back expanded inside the FFN's mix launch answers the bytes of the expand on its own, a prefill and decode rows (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
-    const hy4_model = @import("hy4_model.zig");
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const was = mlx.engine.enabled;
-    mlx.engine.enabled = true;
-    defer @import("../test_support.zig").restoreEngine(was);
-    defer fwd.mix_expand_on = true;
-    const es = mlx.engine.stream();
-    const scope = mlx.engine.enter(es);
-    defer scope.end();
-    var ids: [20]u32 = undefined;
-    var logits: [2][]f32 = .{ &.{}, &.{} };
-    defer for (logits) |l| a.free(l);
-    for (&logits, [_]bool{ false, true }) |*out, on| {
-        fwd.mix_expand_on = on;
-        var p = try Packs.open(es);
-        defer p.close();
-        for (&ids, 0..) |*d, i| d.* = @intCast(1 + (i * 7919) % (p.config.vocab - 1));
-        const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
-        defer m.deinit();
-        var o: Ops = .{ .s = es };
-        defer o.deinit();
-        out.* = try a.dupe(f32, try hostRows(&o, try o.own(try m.forwardReadout(ids[0..8], .all))));
-        for (8..ids.len) |i| {
-            const row = try hostRows(&o, try o.own(try m.forwardReadout(ids[i .. i + 1], .last)));
-            const grown = try a.realloc(out.*, out.len + row.len);
-            @memcpy(grown[out.len..], row);
-            out.* = grown;
-        }
-    }
-    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(logits[0]), std.mem.sliceAsBytes(logits[1]));
 }
 
 /// The served path runs the model's own kernels, a route split into groups summing in f32: within rounding of the
@@ -1452,15 +1313,17 @@ test "hy4 stq: a decode block's iHC mix finishes and norms W_o's partials in its
             defer o.deinit();
             const c = try OSite.init(&o, arena.allocator(), prng.random(), sh.in, sh.d, t);
             try testing.expect(fwd.oPartsReady(&o, c.h, c.mix, c.attn));
-            // W_o's launch and its finish_rms, as a launch that does not finish its own partials makes them.
-            exl3.trunk.self_finish_on = false;
-            defer exl3.trunk.self_finish_on = true;
+            // W_o's launch and its finish_rms, as the trunk runs a launch that does not finish its own partials.
             const c0 = mlx.engine.stats().dispatches;
-            const y = try fwd.linearNormed(&o, c.gated, c.attn.o, c.attn.post_norm, 1e-5);
+            const bank = c.attn.o.stq.?;
+            const one: exl3.trunk.Shared = .{ .p = .{ .trellis = bank.w, .suh = bank.suh, .svh = bank.svh }, .cols = .{ 0, @intCast(bank.outDim()), 0, 0, 0 }, .count = 1 };
+            const eps = try o.own(try mlx.newData(&[_]f32{1e-5}, &.{1}, .float32));
+            var ys: [1]Arr = undefined;
+            try testing.expect(try exl3.linear.linearSharedNormed(es, c.gated, one, bank.dec, &ys, .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true }, .{ .w = c.attn.post_norm, .eps = eps, .cols = @intCast(bank.outDim()) }));
+            const y = try o.own(ys[0]);
             const want = try fwd.expandMixNorm(&o, c.h, c.post, y, c.mix, 4, 2.0, 1e-6, 1e-6, c.norm_w);
             try evalExpanded(want);
             const chain = mlx.engine.stats().dispatches - c0;
-            exl3.trunk.self_finish_on = true;
             const g0 = mlx.engine.stats().dispatches;
             const got = try c.parts(&o);
             try evalExpanded(got);
@@ -1572,13 +1435,12 @@ fn siteRows(o: *Ops, x: Arr, b: hy4_stq.Bank, kind: @FieldType(TrunkSite, "kind"
     return .{ .y = y, .launches = mlx.engine.stats().dispatches - c0 };
 }
 
-test "hy4 stq: on Sushi Cooler every trunk site a decode row reaches finishes its own partials in its launch at one to three rows (q_a and W_o through their norm at one, the gate stored bf16 from its f32 rows), the bytes of today's launch, finish and cast, at the release's shapes, one, three and eight rows, on the machine's arm and SIMD" {
+test "hy4 stq: on Sushi Cooler every trunk site a decode row reaches finishes its own partials in its launch at one to three rows (q_a and W_o through their norm at one, the gate stored bf16 from its f32 rows), the bytes of the launch, finish and cast it keeps past them, at the release's shapes, one, three and eight rows, on the machine's arm and SIMD" {
     const exl3 = @import("sushi_exl3");
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    defer exl3.trunk.self_finish_on = true;
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
@@ -1602,28 +1464,24 @@ test "hy4 stq: on Sushi Cooler every trunk site a decode row reaches finishes it
             const norm_w = try randomArr(&o, alloc, rnd, &.{@intCast(site.out)}, 0.5, 1, .bfloat16);
             for ([_]c_int{ 1, 3, 8 }) |t| {
                 const x = try randomArr(&o, alloc, rnd, &.{ t, @intCast(site.in) }, -2, 4, .float32);
-                exl3.trunk.self_finish_on = false;
-                const want = try siteRows(&o, x, bank, site.kind, norm_w, eps);
-                exl3.trunk.self_finish_on = true;
                 const got = try siteRows(&o, x, bank, site.kind, norm_w, eps);
-                try testing.expectEqual(mlx.mlx_array_dtype(want.y), mlx.mlx_array_dtype(got.y));
-                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want.y)), std.mem.sliceAsBytes(try hostRows(&o, got.y)));
                 const kind: exl3.project_rows.Counted = switch (site.kind) {
                     .thru => .thru,
                     .stored => .stored,
                     .normed => .{ .normed = .{ .w = norm_w, .eps = try o.own(try mlx.newData(&[_]f32{eps}, &.{1}, .float32)), .cols = @intCast(site.out) } },
                 };
-                // Today: the launch and its finish, the stored gate's cast before them. Up to three rows (a normed
-                // launch one): one launch.
-                try testing.expectEqual(@as(u64, if (site.kind == .stored) 3 else 2), want.launches);
-                try testing.expectEqual(if (t <= exl3.project_rows.countedRowsMax(kind)) @as(u64, 1) else want.launches, got.launches);
-                // The counted launch itself at three and eight rows too, where the trunk keeps the finish.
+                // Up to three rows (a normed launch one): one launch. Past them: the launch and its finish, the stored
+                // gate's cast before them.
+                try testing.expectEqual(if (t <= exl3.project_rows.countedRowsMax(kind)) @as(u64, 1) else @as(u64, if (site.kind == .stored) 3 else 2), got.launches);
+                // The counted launch itself at every row count, the served launch's bytes, where the trunk keeps the
+                // finish too.
                 const c0 = mlx.engine.stats().dispatches;
                 const direct = (try exl3.linear.linearCounted(es, x, .{ .trellis = bank.w, .suh = bank.suh, .svh = bank.svh }, dec, .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true }, kind)).?;
                 _ = try o.own(direct);
                 try mlx.check(mlx.mlx_array_eval(direct));
                 try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - c0);
-                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want.y)), std.mem.sliceAsBytes(try hostRows(&o, direct)));
+                try testing.expectEqual(mlx.mlx_array_dtype(got.y), mlx.mlx_array_dtype(direct));
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, got.y)), std.mem.sliceAsBytes(try hostRows(&o, direct)));
                 served += 1;
             }
         }
@@ -1639,13 +1497,12 @@ test "hy4 stq: on Sushi Cooler every trunk site a decode row reaches finishes it
     try testing.expect(try exl3.linear.linearCounted(mlx.gpuStream(), x, p, dec, .{ .rows = .{ .exact = true, .thru_bf16 = true } }, .thru) == null);
 }
 
-test "hy4 stq: on Sushi Cooler a SwiGLU's gate and up of up to three rows are one launch over their one input that finishes both banks and leaves the SwiGLU, the bytes of today's two launches, two finishes and hy4_chain.swiglu, at the release's shared expert and dense layer, one, three and eight rows, on the machine's arm and SIMD" {
+test "hy4 stq: on Sushi Cooler a SwiGLU's gate and up of up to three rows are one launch over their one input that finishes both banks and leaves the SwiGLU, the bytes of the two launches, two finishes and hy4_chain.swiglu it keeps past them, at the release's shared expert and dense layer, one, three and eight rows, on the machine's arm and SIMD" {
     const exl3 = @import("sushi_exl3");
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    defer exl3.trunk.self_finish_on = true;
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
@@ -1672,27 +1529,20 @@ test "hy4 stq: on Sushi Cooler a SwiGLU's gate and up of up to three rows are on
             const w: fwd.Swiglu = .{ .gate = .{ .w = undefined, .stq = banks[0] }, .up = .{ .w = undefined, .stq = banks[1] }, .down = undefined };
             for ([_]c_int{ 1, 3, 8 }) |t| {
                 const x = try randomArr(&o, alloc, rnd, &.{ t, @intCast(c.dim) }, -2, 4, .float32);
-                exl3.trunk.self_finish_on = false;
                 var c0 = mlx.engine.stats().dispatches;
-                const want = try fwd.swigluAct(&o, x, w, null);
-                try mlx.check(mlx.mlx_array_eval(want));
-                const today = mlx.engine.stats().dispatches - c0;
-                exl3.trunk.self_finish_on = true;
-                c0 = mlx.engine.stats().dispatches;
                 const got = try fwd.swigluAct(&o, x, w, null);
                 try mlx.check(mlx.mlx_array_eval(got));
                 const launches = mlx.engine.stats().dispatches - c0;
-                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want)), std.mem.sliceAsBytes(try hostRows(&o, got)));
-                // Today: gate and up, their finishes, the SwiGLU. Up to three rows: the pair alone.
-                try testing.expectEqual(@as(u64, 5), today);
-                try testing.expectEqual(if (t <= exl3.project_rows.COUNTED_ROWS_MAX) @as(u64, 1) else today, launches);
-                // The pair's launch itself at eight rows too, where the trunk keeps the five.
+                // Up to three rows: the pair alone. Past them: gate and up, their finishes, the SwiGLU.
+                try testing.expectEqual(@as(u64, if (t <= exl3.project_rows.COUNTED_ROWS_MAX) 1 else 5), launches);
+                // The pair's launch itself at every row count, the served launch's bytes, where the trunk keeps the five
+                // too.
                 c0 = mlx.engine.stats().dispatches;
                 const direct = (try exl3.linear.linearPairCounted(es, x, .{ .trellis = banks[0].w, .suh = banks[0].suh, .svh = banks[0].svh }, .{ .trellis = banks[1].w, .suh = banks[1].suh, .svh = banks[1].svh }, dec, .{ .rows = .{ .exact = true, .thru_bf16 = true }, .decoded_billed = true })).?;
                 _ = try o.own(direct);
                 try mlx.check(mlx.mlx_array_eval(direct));
                 try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - c0);
-                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want)), std.mem.sliceAsBytes(try hostRows(&o, direct)));
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, got)), std.mem.sliceAsBytes(try hostRows(&o, direct)));
                 served += 1;
             }
         }
@@ -1700,13 +1550,12 @@ test "hy4 stq: on Sushi Cooler a SwiGLU's gate and up of up to three rows are on
     try testing.expectEqual(@as(usize, 12), served);
 }
 
-test "hy4 stq: on Sushi Cooler an STQ MoE's latent leaves W_lat_down as stored bf16, one launch up to three rows, the bytes of today's f32 latent and the routed experts' cast of it, at the release's shape, one, three and eight rows, on the machine's arm and SIMD" {
+test "hy4 stq: on Sushi Cooler an STQ MoE's latent leaves W_lat_down as stored bf16, one launch up to three rows, the bytes of the f32 latent and the routed experts' cast of it, at the release's shape, one, three and eight rows, on the machine's arm and SIMD" {
     const exl3 = @import("sushi_exl3");
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("../test_support.zig").restoreEngine(was);
-    defer exl3.trunk.self_finish_on = true;
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
@@ -1727,13 +1576,11 @@ test "hy4 stq: on Sushi Cooler an STQ MoE's latent leaves W_lat_down as stored b
         const lin: fwd.Lin = .{ .w = undefined, .stq = .{ .w = try o.own(tr.w), .suh = try o.own(tr.s), .svh = try o.own(tr.b), .dec = exl3.format.Decode.tabled(.spec1, .w15) } };
         for ([_]c_int{ 1, 3, 8 }) |t| {
             const x = try randomArr(&o, alloc, rnd, &.{ t, @intCast(c.dim) }, -2, 4, .float32);
-            // Today: the latent's launch and finish, then the routed experts' cast of it.
-            exl3.trunk.self_finish_on = false;
+            // The f32 latent's launch (its finish past three rows), then the routed experts' cast of it.
             var c0 = mlx.engine.stats().dispatches;
             const want = try o.cast(try fwd.linear(&o, x, lin), .bfloat16);
             try mlx.check(mlx.mlx_array_eval(want));
-            try testing.expectEqual(@as(u64, 3), mlx.engine.stats().dispatches - c0);
-            exl3.trunk.self_finish_on = true;
+            try testing.expectEqual(@as(u64, if (t <= exl3.project_rows.COUNTED_ROWS_MAX) 2 else 3), mlx.engine.stats().dispatches - c0);
             c0 = mlx.engine.stats().dispatches;
             const got = try o.cast(try fwd.expertLatent(&o, x, lin, null), .bfloat16);
             try mlx.check(mlx.mlx_array_eval(got));
@@ -2034,56 +1881,12 @@ test "hy4 hc: a decode step and 3- and 4-row verify blocks make as many dispatch
     }
 }
 
-test "hy4 hc: a decode step makes one dispatch fewer a dense layer with every trunk launch finishing its own partials (the tiny's other trunk launches fold at its 128 width, W_o finishes itself already; a normed launch finishes itself at one row), 3- and 4-row verify blocks as many, and all give the same logits (HY4_STQ_TINY)" {
-    const contract = @import("../cooler_contract_test.zig");
-    const hy4_contract = @import("hy4_contract.zig");
-    const exl3 = @import("sushi_exl3");
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    var cooler: contract.Load = undefined;
-    try cooler.open(hy4_contract, dir, true);
-    defer _ = cooler.close();
-    const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
-    const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
-    defer turn.end();
-    defer exl3.trunk.self_finish_on = true;
-    // The dense layer's down and its norm (its 256-wide input splits k in two) is the only trunk launch past W_o that
-    // leaves partials.
-    try testing.expectEqual(@as(u32, 1), m.config.dense_layers);
-    var ids: [48]u32 = undefined;
-    var rng = std.Random.DefaultPrng.init(0x5e1f);
-    for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(m.config.vocab - 1)) + 1;
-    var got: [2][3][]u8 = undefined;
-    var made: usize = 0;
-    defer for (0..made) |i| a.free(got[i / 3][i % 3]);
-    var counts: [2][3]u64 = undefined;
-    for ([_]bool{ false, true }, 0..) |on, arm| {
-        exl3.trunk.self_finish_on = on;
-        m.reset();
-        _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..40], .none));
-        for ([_][2]usize{ .{ 40, 41 }, .{ 41, 44 }, .{ 44, 48 } }, 0..) |span, i| {
-            const before = mlx.engine.stats().dispatches;
-            const lg = try m.forwardReadout(ids[span[0]..span[1]], .all);
-            defer _ = mlx.mlx_array_free(lg);
-            counts[arm][i] = mlx.engine.stats().dispatches - before;
-            got[arm][i] = try copyF32Bytes(a, lg);
-            made += 1;
-        }
-    }
-    for (0..3) |i| try testing.expectEqualSlices(u8, got[0][i], got[1][i]);
-    try testing.expectEqual(counts[0][0] - m.config.dense_layers, counts[1][0]);
-    try testing.expectEqual(counts[0][1], counts[1][1]);
-    try testing.expectEqual(counts[0][2], counts[1][2]);
-}
-
-test "hy4 verify: 2..8-row blocks match one-row steps and absorb_kernels_on toggle when hy4_absorb does not serve (HY4_BF16_TINY, HY4_STQ_TINY_MIXED)" {
+test "hy4 verify: 2..8-row blocks match one-row steps (HY4_BF16_TINY)" {
     const contract = @import("../cooler_contract_test.zig");
     const hy4_contract = @import("hy4_contract.zig");
     const a = testing.allocator;
-    const saved_a = fwd.absorb_kernels_on;
-    defer fwd.absorb_kernels_on = saved_a;
     var ran: usize = 0;
-    for ([_][:0]const u8{ "HY4_BF16_TINY", "HY4_STQ_TINY_MIXED" }) |env| {
+    for ([_][:0]const u8{"HY4_BF16_TINY"}) |env| {
         const dir = std.mem.span(std.c.getenv(env) orelse continue);
         ran += 1;
         var cooler: contract.Load = undefined;
@@ -2124,97 +1927,6 @@ test "hy4 verify: 2..8-row blocks match one-row steps and absorb_kernels_on togg
                     errdefer std.debug.print("verify width diff on {s} pre={d} block={d} row={d}\n", .{ env, pre, block, r });
                     try testing.expectEqualSlices(u8, step_bytes[r], wide[r * row_bytes ..][0..row_bytes]);
                 }
-            }
-        }
-
-        fwd.absorb_kernels_on = true;
-        m.reset();
-        const p_on = try m.forwardReadout(ids[0..40], .last);
-        defer _ = mlx.mlx_array_free(p_on);
-        const pb_on = try copyF32Bytes(a, p_on);
-        defer a.free(pb_on);
-        const b_on = try m.forwardReadout(ids[40..46], .all);
-        defer _ = mlx.mlx_array_free(b_on);
-        const bb_on = try copyF32Bytes(a, b_on);
-        defer a.free(bb_on);
-        const d_on = try m.forwardReadout(ids[46..47], .last);
-        defer _ = mlx.mlx_array_free(d_on);
-        const db_on = try copyF32Bytes(a, d_on);
-        defer a.free(db_on);
-
-        fwd.absorb_kernels_on = false;
-        m.reset();
-        const p_off = try m.forwardReadout(ids[0..40], .last);
-        defer _ = mlx.mlx_array_free(p_off);
-        const pb_off = try copyF32Bytes(a, p_off);
-        defer a.free(pb_off);
-        const b_off = try m.forwardReadout(ids[40..46], .all);
-        defer _ = mlx.mlx_array_free(b_off);
-        const bb_off = try copyF32Bytes(a, b_off);
-        defer a.free(bb_off);
-        const d_off = try m.forwardReadout(ids[46..47], .last);
-        defer _ = mlx.mlx_array_free(d_off);
-        const db_off = try copyF32Bytes(a, d_off);
-        defer a.free(db_off);
-        fwd.absorb_kernels_on = true;
-
-        errdefer std.debug.print("absorb_kernels_on seam diff on {s}\n", .{env});
-        try testing.expectEqualSlices(u8, pb_on, pb_off);
-        try testing.expectEqualSlices(u8, bb_on, bb_off);
-        try testing.expectEqualSlices(u8, db_on, db_off);
-    }
-    if (ran == 0) return error.SkipZigTest;
-}
-
-test "hy4 attention spans: multi-span prefill chunks with 2, 4 and 8-row tails match spans_share off (HY4_STQ_TINY, HY4_BF16_TINY, HY4_STQ_TINY_MIXED)" {
-    const contract = @import("../cooler_contract_test.zig");
-    const hy4_contract = @import("hy4_contract.zig");
-    const a = testing.allocator;
-    const saved_share = fwd.spans_share;
-    const saved_prod = fwd.products;
-    defer {
-        fwd.spans_share = saved_share;
-        fwd.products = saved_prod;
-    }
-    var ran: usize = 0;
-    for ([_][:0]const u8{ "HY4_STQ_TINY", "HY4_BF16_TINY", "HY4_STQ_TINY_MIXED" }) |env| {
-        const dir = std.mem.span(std.c.getenv(env) orelse continue);
-        ran += 1;
-        // A load measures its region with the served seams, not the last fixture's arm.
-        fwd.spans_share = saved_share;
-        fwd.products = saved_prod;
-        var cooler: contract.Load = undefined;
-        try cooler.open(hy4_contract, dir, true);
-        defer _ = cooler.close();
-        const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
-        const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
-        defer turn.end();
-
-        const vocab = m.config.vocab;
-        var ids: [300]u32 = undefined;
-        var rng = std.Random.DefaultPrng.init(0x9a11);
-        for (&ids) |*t| t.* = rng.random().uintLessThan(u32, @intCast(vocab - 1)) + 1;
-
-        for ([_]fwd.Products{ .bf16, .f32 }) |prod| {
-            if (prod == .f32 and !std.mem.eql(u8, env, "HY4_BF16_TINY")) continue;
-            fwd.products = prod;
-            for ([_]usize{ 34, 36, 40, 264 }) |len| {
-                fwd.spans_share = true;
-                m.reset();
-                const lg_on = try m.forwardReadout(ids[0..len], .all);
-                defer _ = mlx.mlx_array_free(lg_on);
-                const b_on = try copyF32Bytes(a, lg_on);
-                defer a.free(b_on);
-
-                fwd.spans_share = false;
-                m.reset();
-                const lg_off = try m.forwardReadout(ids[0..len], .all);
-                defer _ = mlx.mlx_array_free(lg_off);
-                const b_off = try copyF32Bytes(a, lg_off);
-                defer a.free(b_off);
-
-                errdefer std.debug.print("spans_share diff on {s} prod={t} len={d}\n", .{ env, prod, len });
-                try testing.expectEqualSlices(u8, b_off, b_on);
             }
         }
     }

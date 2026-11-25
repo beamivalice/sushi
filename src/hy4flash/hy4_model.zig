@@ -2222,7 +2222,7 @@ pub const Model = struct {
         // and the spans' gated rows are held until W_o has read them; W_kvb is widened once for every span.
         const span = if (pooled != null) @min(self.span_rows, gathered_span) else self.span_rows;
         const loop_span: c_int = blk: {
-            if (pooled == null or core_keys == null or !mlx.engine.isStream(self.s) or !fwd.spans_share or self.span_rows <= span) break :blk span;
+            if (pooled == null or core_keys == null or !mlx.engine.isStream(self.s) or self.span_rows <= span) break :blk span;
             break :blk self.spanWidth(span, mlx.getShape(pooled.?)[0], p0);
         };
         var held: Ops = .{ .s = self.s };
@@ -2232,7 +2232,7 @@ pub const Model = struct {
             var o: Ops = .{ .s = self.s };
             defer o.deinit();
             in.gate = try held.own(try o.result(try fwd.linearSpans(&o, x_bf orelse x, L.attn.gate, span)));
-            in.kv_b32 = if (t > 1 and fwd.spans_share and !fwd.absorbServes(self.s, L.attn.kv_b, L.geometry, t)) try held.own(try o.result(try o.cast(L.attn.kv_b, .float32))) else null;
+            in.kv_b32 = if (t > 1 and !fwd.absorbServes(self.s, L.attn.kv_b, L.geometry, t)) try held.own(try o.result(try o.cast(L.attn.kv_b, .float32))) else null;
             in.whole = t <= span;
             in.index = null;
             if (L.indexer) |iw| if (pooled) |all| if (!in.whole) {
@@ -2264,9 +2264,9 @@ pub const Model = struct {
         // their offset, made before the spans: nothing holds every span's rows and their join at once (D76). MLX's
         // stream joins them, where a write would copy the block.
         const placed = !in.whole and mlx.engine.isStream(self.s);
-        const fuse_o_norm = mlx.streamIsGpu(self.s) and !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_expand_on and fwd.mix_norm_on and fwd.hc_kernels_on;
+        const fuse_o_norm = mlx.streamIsGpu(self.s) and !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_norm_on and fwd.hc_kernels_on;
         // A chunk whose W_o runs the sorted GEMM takes its rows prepared by the spans that write them.
-        const prep_o = placed and at == null and fuse_o_norm and fwd.chain_kernels_on and fwd.spans_share and L.attn.o.stq != null and
+        const prep_o = placed and at == null and fuse_o_norm and fwd.chain_kernels_on and L.attn.o.stq != null and
             @rem(t, span) == 0 and @rem(L.geometry.heads * L.geometry.v, 128) == 0 and exl3.trunk.gemmRows(@intCast(t), false);
         var rows_block: ?Arr = null;
         defer if (rows_block) |b| {

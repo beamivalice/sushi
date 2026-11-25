@@ -79,10 +79,6 @@ pub const Lin = struct {
     }
 };
 
-/// Whether `apply` rounds its rows and outputs inside the launch (`trunk_stq.matmulThruBf16`) rather than by cast
-/// dispatches around it. A test seam: both give the same bytes.
-pub var thru_bf16_on = true;
-
 /// Hy4's cap on a trunk bank decoded to f16 for one wide forward (128 MiB of f16): the sliding layers' gate and `W_o`
 /// and layer 0's dense FFN pass it; the head does not.
 pub const decoded_max_weights: usize = 1 << 26;
@@ -179,22 +175,20 @@ fn applyWideDecoded(o: *Ops, x: Arr, b: Bank) !?Arr {
 /// kernel's sums, the result rounded to BF16 and widened.
 pub fn apply(o: *Ops, x: Arr, b: Bank) !Arr {
     if (try applyWideDecoded(o, x, b)) |y| return o.cast(y, .float32);
-    if (thru_bf16_on) return o.own(try trunk_stq.matmulThruBf16(o.s, x, b.w, b.suh, b.svh, b.dec, false));
-    const y = try o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, false));
-    return o.cast(y, .float32);
+    return o.own(try trunk_stq.matmulThruBf16(o.s, x, b.w, b.suh, b.svh, b.dec, false));
 }
 
 /// `apply` before its widening: the kernel's BF16 rows, f32 rows read through bf16 in the launch where it serves.
 pub fn applyStored(o: *Ops, x: Arr, b: Bank) !Arr {
     if (try applyWideDecoded(o, x, b)) |y| return y;
-    if (thru_bf16_on and mlx.mlx_array_dtype(x) == .float32) return o.own(try trunk_stq.matmulThruBf16Stored(o.s, x, b.w, b.suh, b.svh, b.dec));
+    if (mlx.mlx_array_dtype(x) == .float32) return o.own(try trunk_stq.matmulThruBf16Stored(o.s, x, b.w, b.suh, b.svh, b.dec));
     return o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, false));
 }
 
 /// `RMSNorm_w(apply(x, b))` (`fwd.norm`'s f32 norm) with the bank's finish and the norm in one dispatch, `x` [T, in];
-/// null where one launch does not serve it (`thru_bf16_on` off, rows past the multi-row arm).
+/// null where one launch does not serve it (rows past the multi-row arm).
 pub fn applyNormed(o: *Ops, x: Arr, b: Bank, w: Arr, eps: f32) !?Arr {
-    if (!thru_bf16_on or mlx.getShape(x).len != 2) return null;
+    if (mlx.getShape(x).len != 2) return null;
     // A one-element array: a 0-d input reaches a kernel as a scalar, not the `eps[0]` it reads.
     const e = try o.own(try mlx.newData(&[_]f32{eps}, &.{1}, .float32));
     return if (try trunk_stq.matmulThruBf16Normed(o.s, x, b.w, b.suh, b.svh, b.dec, w, e)) |y| try o.own(y) else null;
@@ -203,7 +197,6 @@ pub fn applyNormed(o: *Ops, x: Arr, b: Bank, w: Arr, eps: f32) !?Arr {
 /// `apply(x, b)` of `x` [T, in] f32 left as its launch's k-split partials (`o` owns them), for a launch that finishes
 /// them where it reads them; null where `apply`'s launch folds its finish or does not serve the rows.
 pub fn applyParts(o: *Ops, x: Arr, b: Bank) !?trunk_stq.Parts {
-    if (!thru_bf16_on) return null;
     var p = (try trunk_stq.matmulThruBf16Parts(o.s, x, b.w, b.suh, b.svh, b.dec)) orelse return null;
     p.part = try o.own(p.part);
     return p;
@@ -212,7 +205,6 @@ pub fn applyParts(o: *Ops, x: Arr, b: Bank) !?trunk_stq.Parts {
 /// `apply(x, b)` of `x` [T, in] f32 in one launch that finishes its own partials (`trunk_stq.matmulThruBf16Counted`),
 /// on a stream with a counter page; null where `applyParts` is null or the stream has no page.
 pub fn applyFinished(o: *Ops, x: Arr, b: Bank) !?Arr {
-    if (!thru_bf16_on) return null;
     const y = (try trunk_stq.matmulThruBf16Counted(o.s, x, b.w, b.suh, b.svh, b.dec)) orelse return null;
     finished_launches += 1;
     return try o.own(y);
@@ -222,7 +214,7 @@ pub fn applyFinished(o: *Ops, x: Arr, b: Bank) !?Arr {
 /// finishes both (`trunk_stq.matmulThruBf16Swiglu`): the bytes of their launches and `hy4_chain.swiglu`. Null where it
 /// does not serve.
 pub fn applySwiglu(o: *Ops, x: Arr, gate: Bank, up: Bank) !?Arr {
-    if (!thru_bf16_on or !std.meta.eql(gate.dec, up.dec)) return null;
+    if (!std.meta.eql(gate.dec, up.dec)) return null;
     const y = (try trunk_stq.matmulThruBf16Swiglu(o.s, x, .{ .w = gate.w, .s = gate.suh, .b = gate.svh }, .{ .w = up.w, .s = up.suh, .b = up.svh }, gate.dec)) orelse return null;
     return try o.own(y);
 }
