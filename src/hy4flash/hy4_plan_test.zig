@@ -1205,11 +1205,12 @@ test "hy4 plan: a DSpark round's mark and replay ask nothing of a closed pool: a
         var arena: std.ArrayList(u8) = .empty;
         defer arena.deinit(a);
         const rows: usize = @intCast(@import("hy4_forward.zig").verify_rows_max);
-        // About the tiny's group of 4, window of 8, selection threshold of 16 and latent width of 128.
+        // Every depth whose block crosses the tiny's window (8), selection threshold (16) or latent width (128), each
+        // residue of its group (4) with it, and one depth between each pair of edges: a block that crosses none runs
+        // its class's code path again.
         var depths: std.ArrayList(usize) = .empty;
         defer depths.deinit(a);
-        for (1..25) |p| try depths.append(a, p);
-        for (116..ids.len - rows + 1) |p| try depths.append(a, p);
+        for ([_][2]usize{ .{ 1, 17 }, .{ 120, 129 } }) |r| for (r[0]..r[1]) |p| try depths.append(a, p);
         for (depths.items) |p| for (1..rows) |keep| {
             pool.clearRetainingCapacity();
             arena.clearRetainingCapacity();
