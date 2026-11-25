@@ -87,10 +87,18 @@ pub var thru_bf16_on = true;
 /// and layer 0's dense FFN pass it; the head does not.
 pub const decoded_max_weights: usize = 1 << 26;
 
-/// `applyStored` of rows already prepared for the bank (`prepareIndexed`'s f16 rows): the bank decoded to f16 and
+/// Whether a wide chunk's rows through the bank can take `applyInner`: past the multi-row arms, as wide as the bank,
+/// its output in whole 128-column tiles.
+pub fn wideInnerApplies(x: Arr, b: Bank) bool {
+    const sh = mlx.getShape(x);
+    return exl3.linear.force_arm == null and sh.len == 2 and sh[0] > @max(exl3.project_rows.NAX_ROWS_MAX, exl3.project_rows.PROJECT_ROWS_MAX) and
+        sh[1] == b.inDim() and @rem(b.outDim(), 128) == 0;
+}
+
+/// The bank's GEMM of rows already prepared (`prepareIndexed`'s f16 rows), before its finish: decoded to f16 and
 /// multiplied where that serves, in the sorted GEMM's K order (the fused arm where MLX would split K), else the sorted
-/// GEMM; then the finish.
-pub fn applyPreparedStored(o: *Ops, prepared: Arr, b: Bank) !Arr {
+/// GEMM.
+pub fn applyPreparedInner(o: *Ops, prepared: Arr, b: Bank) !Arr {
     const sh = mlx.getShape(prepared);
     const rows = sh[0];
     const in = sh[1];
@@ -103,7 +111,7 @@ pub fn applyPreparedStored(o: *Ops, prepared: Arr, b: Bank) !Arr {
     try b.dec.requireTable();
     exl3.kernels.setDecodeParams(b.dec);
     const inputs = try exl3.linear.gemmInputs(1, @intCast(rows), exl3.kernels.gemmWindowRows());
-    const inner = if (use_decoded) blk: {
+    if (use_decoded) {
         exl3.trunk_gemm.decoded_calls += 1;
         const w = try exl3.trunk_gemm.decodeDense(o.s, b.w);
         defer _ = mlx.mlx_array_free(w);
@@ -118,9 +126,27 @@ pub fn applyPreparedStored(o: *Ops, prepared: Arr, b: Bank) !Arr {
             const arm_m: usize = @max(1025, @as(usize, @intCast(@divTrunc(in, 3))) + 1);
             try mlx.check(mlx.engine.matmulRowsAs(&mm, prepared, wt, arm_m));
         }
-        break :blk mm;
-    } else try exl3.kernels.innerGemmSortedTable(o.s, prepared, b.w, inputs.slots, exl3.kernels.gemmWindowRows(), true, inputs.tab);
-    defer _ = mlx.mlx_array_free(inner);
+        return o.own(mm);
+    }
+    return o.own(try exl3.kernels.innerGemmSortedTable(o.s, prepared, b.w, inputs.slots, exl3.kernels.gemmWindowRows(), true, inputs.tab));
+}
+
+/// `applyPreparedInner` of `x` prepared for the bank: a launch that reads its unfinished rows finishes them.
+pub fn applyInner(o: *Ops, x: Arr, b: Bank) !Arr {
+    try b.dec.requireTable();
+    exl3.kernels.setDecodeParams(b.dec);
+    const xb = try o.cast(x, .bfloat16);
+    const rows = mlx.getShape(xb)[0];
+    const inputs = try exl3.linear.gemmInputs(1, @intCast(rows), exl3.kernels.gemmWindowRows());
+    const prepared = try exl3.kernels.prepareIndexed(o.s, xb, b.suh, inputs.slots);
+    defer _ = mlx.mlx_array_free(prepared);
+    return applyPreparedInner(o, prepared, b);
+}
+
+/// `applyPreparedInner` and its finish, BF16 rows.
+pub fn applyPreparedStored(o: *Ops, prepared: Arr, b: Bank) !Arr {
+    const inner = try applyPreparedInner(o, prepared, b);
+    const inputs = try exl3.linear.gemmInputs(1, @intCast(mlx.getShape(prepared)[0]), exl3.kernels.gemmWindowRows());
     return try o.own(try exl3.kernels.finishIndexedAs(o.s, inner, b.svh, inputs.slots, .bfloat16));
 }
 

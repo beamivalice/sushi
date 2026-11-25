@@ -1696,15 +1696,18 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
 /// per expert), the inverse sort order, and each sorted row's expert index inside its group.
 const GROUP_WINDOW_SOURCE: [:0]const u8 =
     \\const uint tid = uint(thread_index_in_threadgroup);
+    \\const uint tg = uint(threadgroup_position_in_grid.x);
     \\const uint n = uint(count[0]), groups = uint(count[1]), experts = uint(threads_per_threadgroup.x);
+    \\const uint idx = tg * experts + tid;
+    \\if (idx < n) {
+    \\  inverse[uint(order[idx])] = idx;
+    \\  local[idx] = meta[uint(eids[idx]) * 8u + 7u];
+    \\}
+    \\if (tg != 0u) return;
     \\const uint C = (n + uint(WIN) - 1u) / uint(WIN);
     \\const uint capacity = groups * C + experts;
     \\threadgroup uint counts[MAX_EXPERTS];
     \\for (uint i = tid; i < capacity; i += experts) { starts[i] = 0u; nlives[i] = 0u; }
-    \\for (uint i = tid; i < n; i += experts) {
-    \\  inverse[uint(order[i])] = i;
-    \\  local[i] = meta[uint(eids[i]) * 8u + 7u];
-    \\}
     \\uint lo = 0u, hi = n;
     \\while (lo < hi) { uint m = (lo + hi) >> 1u; if (uint(eids[m]) < tid) lo = m + 1u; else hi = m; }
     \\const uint first = lo;
@@ -1729,6 +1732,12 @@ var group_window_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const GroupWindows = struct { starts: mlx.mlx_array, nlives: mlx.mlx_array, inverse: mlx.mlx_array, local: mlx.mlx_array, per_all: c_int };
 
+/// The grid of a launch spreading `n` rows over threadgroups of `e` threads, whole threadgroups.
+fn groupWindowGrid(n: c_int, e: c_int) c_int {
+    const tgs: c_int = @max(1, @divTrunc(n + e - 1, e));
+    return tgs * e;
+}
+
 fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, order: mlx.mlx_array, n: c_int, win: c_int) !GroupWindows {
     if (rb.experts > PREFILL_MAX_EXPERTS) return error.Exl3RaggedPrefillExperts;
     const per_all = @divTrunc(n + win - 1, win);
@@ -1738,7 +1747,7 @@ fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, ord
     for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{capacity}, 1, .uint32));
     for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{n}, 1, .uint32));
     const e: c_int = @intCast(rb.experts);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, e, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, groupWindowGrid(n, e), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, e, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WIN", win));
     // The expert and group counts of a split bank change per chunk, so they ride in `count`, not the kernel name.
@@ -3566,6 +3575,81 @@ test "exl3 rate groups: adjacent shared rows use one weight walk and match indep
                 const span: usize = if (rows == 3 or rows == 5 or rows == 6) 3 else 2;
                 try t.expectEqual(@as(c_int, @intCast((rows + span - 1) / span)), shape[1]);
             }
+        }
+    }
+}
+
+test "exl3 rate groups: rg_windows fans inverse and local scatter across threadgroups with exact outputs" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    try t.expectEqual(@as(c_int, 65536), groupWindowGrid(65536, 512));
+    try t.expectEqual(@as(c_int, 1024), groupWindowGrid(600, 512));
+    try t.expectEqual(@as(c_int, 512), groupWindowGrid(1, 512));
+
+    const s = mlx.gpuStream();
+    const experts: usize = 512;
+    const n: usize = 4096 * 16;
+    const win: usize = 64;
+    var prng = std.Random.DefaultPrng.init(0x9a11);
+    const rnd = prng.random();
+    const slots_h = try t.allocator.alloc(u32, n);
+    defer t.allocator.free(slots_h);
+    const order_h = try t.allocator.alloc(i32, n);
+    defer t.allocator.free(order_h);
+    const sorted_h = try t.allocator.alloc(u32, n);
+    defer t.allocator.free(sorted_h);
+    var counts: [experts]u32 = @splat(0);
+    for (slots_h) |*v| {
+        const e = rnd.intRangeLessThan(u32, 0, experts);
+        v.* = e;
+        counts[e] += 1;
+    }
+    var offs: [experts]u32 = undefined;
+    var cur: u32 = 0;
+    for (counts, 0..) |c, e| {
+        offs[e] = cur;
+        cur += c;
+    }
+    var fill = offs;
+    for (slots_h, 0..) |e, i| {
+        const dst = fill[e];
+        fill[e] += 1;
+        sorted_h[dst] = e;
+        order_h[dst] = @intCast(i);
+    }
+    var meta_h: [experts * 8]u32 = @splat(0);
+    for (0..experts) |e| {
+        meta_h[e * 8 + 3] = 0;
+        meta_h[e * 8 + 7] = @intCast(e);
+    }
+    var rb: Ragged = .{ .count = 1, .experts = experts };
+    rb.meta = mlx.mlx_array_new_data(&meta_h, &[_]c_int{@intCast(meta_h.len)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(rb.meta);
+    const sorted = mlx.mlx_array_new_data(sorted_h.ptr, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(sorted);
+    const order = mlx.mlx_array_new_data(order_h.ptr, &[_]c_int{@intCast(n)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(order);
+
+    const w = try groupWindows(s, &rb, sorted, order, @intCast(n), @intCast(win));
+    defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    const inv = (mlx.mlx_array_data_uint32(w.inverse) orelse return error.Unreadable)[0..n];
+    const loc = (mlx.mlx_array_data_uint32(w.local) orelse return error.Unreadable)[0..n];
+    for (0..n) |i| {
+        try t.expectEqual(@as(u32, @intCast(i)), inv[@intCast(order_h[i])]);
+        try t.expectEqual(sorted_h[i], loc[i]);
+    }
+    const st = (mlx.mlx_array_data_uint32(w.starts) orelse return error.Unreadable)[0..mlx.mlx_array_size(w.starts)];
+    const nl = (mlx.mlx_array_data_uint32(w.nlives) orelse return error.Unreadable)[0..mlx.mlx_array_size(w.nlives)];
+    var wi: usize = 0;
+    for (0..experts) |e| {
+        var off: u32 = 0;
+        while (off < counts[e]) : (off += win) {
+            try t.expectEqual(offs[e] + off, st[wi]);
+            try t.expectEqual(@min(@as(u32, win), counts[e] - off), nl[wi]);
+            wi += 1;
         }
     }
 }

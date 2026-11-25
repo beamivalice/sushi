@@ -1230,7 +1230,8 @@ test "hy4 plan: a DSpark round's mark and replay ask nothing of a closed pool: a
 
 /// A served DSpark request of `n` tokens after `prompt`, every round drafted and verifying `rows` rows, on the arena when
 /// `planned`, else on the pool: its tokens and the state it leaves appended to `out`. Each round's executions are
-/// checked against what it ran: its draft, its verify and, where it kept fewer rows than it verified, its replay.
+/// checked against what it ran: its draft, its verify and its verdict's draw; a round that kept fewer rows than it
+/// verified keeps them in place (`Model.keepRows`), running no replay.
 fn servedRounds(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, n: u32, rows: u8, planned: bool, out: *std.ArrayList(u8)) !void {
     const Generator = @import("../generate.zig").Generator;
     const m = ld.xfm.arch_state.hy4flash.model.?;
@@ -1258,9 +1259,9 @@ fn servedRounds(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, n
             if (now != was) break w;
         } else return error.TestNoRound;
         rounds += 1;
-        // Rows forced past one draft every round, whatever the room left cuts the verify to: the draft, the verify, its
-        // verdict's draw (D24), and the replay where the draft was not all kept.
-        const want: u64 = 3 + @as(u64, @intFromBool(r.accepted_tokens + 1 < verified));
+        // Rows forced past one draft every round, whatever the room left cuts the verify to: the draft, the verify and
+        // its verdict's draw (D24).
+        const want: u64 = 3;
         errdefer std.debug.print("[hy4-plan] a served round of {d} rows kept {d}: {d} executions\n", .{ verified, r.accepted_tokens + 1, ran });
         try testing.expectEqual(if (planned) want else 0, ran);
     }
@@ -1268,7 +1269,7 @@ fn servedRounds(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, n
     try appendState(a, m, out);
 }
 
-test "hy4 plan: served DSpark rounds give the pool's tokens and state, each round's draft, verify and replay an execution on the arena, from prompts before the window and the threshold and across the latent width (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
+test "hy4 plan: served DSpark rounds give the pool's tokens and state, each round's draft and verify an execution on the arena and a rejected round's rows kept without a replay, from prompts before the window and the threshold and across the latent width (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     var ran = false;

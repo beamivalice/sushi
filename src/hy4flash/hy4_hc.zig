@@ -209,6 +209,61 @@ fn backNorm(comptime add: bool) []const u8 {
 
 const back_norm = backNorm(true);
 
+const back_inner_norm =
+    \\threadgroup float t_y[D], t_ls[32], t_inv[1];
+    \\{
+    \\#pragma clang fp contract(off)
+    \\  constexpr uint NB = uint(D) / 128u;
+    \\  const float psc = 0.08838834764831845f;
+    \\  for (uint blk = sg; blk < NB; blk += uint(TG) / 32u) {
+    \\    const uint col = blk * 128u + lane;
+    \\    const size_t xb = (size_t)l * uint(D) + col;
+    \\    float4 va = exl3_h128(float4(float(a[xb]), float(a[xb + 32u]), float(a[xb + 64u]), float(a[xb + 96u])), lane);
+    \\    float4 vb = exl3_h128(float4(float(b[xb]), float(b[xb + 32u]), float(b[xb + 64u]), float(b[xb + 96u])), lane);
+    \\    t_y[col] = float(bfloat16_t(va.x * psc * float(asvh[col]))) + float(bfloat16_t(vb.x * psc * float(bsvh[col])));
+    \\    t_y[col + 32u] = float(bfloat16_t(va.y * psc * float(asvh[col + 32u]))) + float(bfloat16_t(vb.y * psc * float(bsvh[col + 32u])));
+    \\    t_y[col + 64u] = float(bfloat16_t(va.z * psc * float(asvh[col + 64u]))) + float(bfloat16_t(vb.z * psc * float(bsvh[col + 64u])));
+    \\    t_y[col + 96u] = float(bfloat16_t(va.w * psc * float(asvh[col + 96u]))) + float(bfloat16_t(vb.w * psc * float(bsvh[col + 96u])));
+    \\  }
+    \\}
+    \\{
+    \\  constexpr uint axis_size = uint(D);
+    \\  constexpr int RG = 32 * ((((D + 3) / 4) + 31) / 32), RR = (RG + TG - 1) / TG;
+    \\  float thread_x[RR][4];
+    \\  if (sg == 0) t_ls[lane] = 0;
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int r = 0; r < RR; ++r) {
+    \\    const uint vt = tid + uint(r * TG);
+    \\    if (vt < uint(RG)) {
+    \\      float acc = 0;
+    \\      for (int i = 0; i < 4; i++) {
+    \\        uint c = vt * 4 + i;
+    \\        float v = c < axis_size ? t_y[c] : 0;
+    \\        thread_x[r][i] = v;
+    \\        acc += thread_x[r][i] * thread_x[r][i];
+    \\      }
+    \\      acc = simd_sum(acc);
+    \\      if (lane == 0) t_ls[vt / 32] = acc;
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  if (sg == 0) {
+    \\    float acc = simd_sum(t_ls[lane]);
+    \\    if (lane == 0) t_inv[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int r = 0; r < RR; ++r) {
+    \\    const uint vt = tid + uint(r * TG);
+    \\    for (int i = 0; i < 4; i++) {
+    \\      uint c = vt * 4 + i;
+    \\      if (vt < uint(RG) && c < axis_size) t_y[c] = static_cast<float>(wn[c]) * static_cast<float>(thread_x[r][i] * t_inv[0]);
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\
+;
+
 /// The expand form's `y` as `W_o`'s launch's finish and norm give it (`rows_finish_rms_thru`), from that launch's k-split
 /// partials `op` (`[L * OSPLIT, D]` f32), its `osvh` and the norm's `ow` and ε (`OEPS`, f32 bits): each simdgroup
 /// finishes its 128-blocks into `t_y` (the parts summed in order, H128, `psc · svh`, the bf16 rounding), squares four
@@ -307,9 +362,9 @@ const o_rows_norm =
 /// A launch's form: the plain mix, the mix of the stream expanded by a sublayer's output `y`, or by the combine norm of
 /// `a + b` it computes first (`back`: the layer boundary); or expanded by `y` finished and normed from W_o's partials
 /// in the launch (`expand_parts`), or normed from W_o's finished rows (`expand_rows`).
-pub const Form = enum { plain, expand, back, expand_norm, expand_parts, expand_rows };
+pub const Form = enum { plain, expand, back, back_inner, expand_norm, expand_parts, expand_rows };
 
-var kernels: [2][6]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
+var kernels: [2][7]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
 
 /// The form's kernel: one threadgroup a row, or `wide`, `2·HC` threadgroups a row that count into the counter page.
 fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
@@ -319,6 +374,7 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
         .plain => &.{ "x", "fn", "scale", "base", "eps", "w" },
         .expand => &.{ "x", "y", "pin", "fn", "scale", "base", "eps", "w" },
         .back => &.{ "x", "pin", "a", "b", "wn", "fn", "scale", "base", "eps", "w" },
+        .back_inner => &.{ "x", "pin", "a", "asvh", "b", "bsvh", "wn", "fn", "scale", "base", "eps", "w" },
         .expand_norm => &.{ "x", "pin", "a", "wn", "fn", "scale", "base", "eps", "w" },
         .expand_parts => &.{ "x", "op", "osvh", "ow", "pin", "fn", "scale", "base", "eps", "w" },
         .expand_rows => &.{ "x", "oy", "ow", "pin", "fn", "scale", "base", "eps", "w" },
@@ -341,11 +397,12 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
                 const stream = switch (f) {
                     .plain => "#define STREAM(o, k) float(x[o])\n#define STORE_M (void)0\n",
                     .expand => "#define STREAM(o, k) (pin[l * HC + (k) / D] * float(y[size_t(l) * D + (k) % D]) + float(x[o]))\n#define STORE_M m[o] = v\n",
-                    .back, .expand_norm, .expand_parts, .expand_rows => "#define STREAM(o, k) (pin[l * HC + (k) / D] * t_y[(k) % D] + float(x[o]))\n#define STORE_M m[o] = v\n",
+                    .back, .back_inner, .expand_norm, .expand_parts, .expand_rows => "#define STREAM(o, k) (pin[l * HC + (k) / D] * t_y[(k) % D] + float(x[o]))\n#define STORE_M m[o] = v\n",
                 };
                 const first = switch (f) {
                     .plain, .expand => "",
                     .back => back_norm,
+                    .back_inner => back_inner_norm,
                     .expand_norm => comptime backNorm(false),
                     .expand_parts => o_norm,
                     .expand_rows => o_rows_norm,
@@ -359,11 +416,12 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
                     .plain => "sushi_hy4_hc_mix_norm",
                     .expand => "sushi_hy4_hc_mix_expand_norm",
                     .back => "sushi_hy4_hc_back_mix_norm",
+                    .back_inner => "sushi_hy4_hc_back_inner_mix_norm",
                     .expand_norm => "sushi_hy4_hc_expand_norm_mix_norm",
                     .expand_parts => "sushi_hy4_hc_expand_parts_mix_norm",
                     .expand_rows => "sushi_hy4_hc_expand_rows_mix_norm",
                 } ++ (if (w) "_wide" else "");
-                break :blk mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, if (f == .expand_parts) exl3.project_rows.ROWS_HELPERS else "", true, false);
+                break :blk mlx.mlx_fast_metal_kernel_new(name, iv, ov, src, if (f == .expand_parts or f == .back_inner) exl3.project_rows.ROWS_HELPERS else "", true, false);
             },
         },
     };
@@ -417,7 +475,7 @@ fn build(k: Key) !kcfg.Config {
     inline for (.{ "TG", "HC", "MIXN", "D" }, .{ k.tg, k.hc, 2 * k.hc, k.d }) |n, v|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, v));
     if (k.wide) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "CTR", mlx.engine.counter_words));
-    if (k.form == .back or k.form == .expand_norm) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPS", k.eps));
+    if (k.form == .back or k.form == .back_inner or k.form == .expand_norm) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPS", k.eps));
     if (k.form == .expand_rows) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "OEPS", k.eps));
     if (k.form == .expand_parts) inline for (.{ "OSPLIT", "OEPS" }, .{ k.osplit, k.eps }) |n, v|
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, v));
@@ -463,7 +521,7 @@ fn runSplit(s: mlx.mlx_stream, inputs: []const Arr, x: Arr, w: Arr, base: Arr, f
 /// One wide launch's pipeline as the engine instantiates it: the form, the template values its config sets and its
 /// inputs' dtypes. A GPU grants each pipeline its own threads a group, so each holds its own grant.
 const Pipe = struct { form: Form, wide: bool, hc: c_int, d: c_int, tg: c_int, eps: c_int, osplit: c_int, dts: [max_ins]u8 };
-const max_ins = 10;
+const max_ins = 12;
 
 fn pipeOf(key: Key, inputs: []const Arr) Pipe {
     var p: Pipe = .{ .form = key.form, .wide = key.wide, .hc = key.hc, .d = key.d, .tg = key.tg, .eps = key.eps, .osplit = key.osplit, .dts = @splat(0xff) };
@@ -630,6 +688,31 @@ pub fn mixExpandNorm(s: mlx.mlx_stream, h: Arr, y: Arr, post_in: Arr, hw: hck.Hc
 /// next layer's. `a`, `b` [L, D] f32 or BF16, `wn` [D]; the rest as `mixExpandNorm`. The caller frees all three.
 pub fn backMixNorm(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, b: Arr, wn: Arr, combine_eps: f32, hw: hck.HcWeights, eps: Arr, norm_w: Arr) !Normed {
     return run(s, &.{ h, post_in, a, b, wn, hw.fn_w, hw.scale, hw.base, eps, norm_w }, h, norm_w, hw.base, .back, kcfg.bits(combine_eps));
+}
+
+/// `backMixNorm` reading the shared expert's down and `lat_up` as their unfinished GEMM rows and their `svh`: the two
+/// finishes ride the mix's launch, their bytes.
+pub fn backMixNormInner(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, a_svh: Arr, b: Arr, b_svh: Arr, wn: Arr, combine_eps: f32, hw: hck.HcWeights, eps: Arr, norm_w: Arr) !Normed {
+    return run(s, &.{ h, post_in, a, a_svh, b, b_svh, wn, hw.fn_w, hw.scale, hw.base, eps, norm_w }, h, norm_w, hw.base, .back_inner, kcfg.bits(combine_eps));
+}
+
+/// Whether `backMixNormInner` serves: `backMixNorm`'s shapes, `a` and `b` as [rows, D] unfinished rows with a D-wide
+/// `svh`.
+pub fn backInnerApplies(s: mlx.mlx_stream, h: Arr, post_in: Arr, a: Arr, a_svh: Arr, b: Arr, b_svh: Arr, wn: Arr, fn_w: Arr, scale: Arr) bool {
+    if (!applies(s, h, fn_w, scale)) return false;
+    const hs = mlx.getShape(h);
+    const d = hs[2];
+    const rows = [_]c_int{ hs[0], d };
+    const lanes = [_]c_int{ hs[0], hs[1] };
+    inline for (.{ a, b }) |r| {
+        if (!std.mem.eql(c_int, mlx.getShape(r), &rows) or mlx.mlx_array_dtype(r) != .float16) return false;
+    }
+    inline for (.{ a_svh, b_svh }) |sv| {
+        if (mlx.mlx_array_dtype(sv) != .float16 or mlx.mlx_array_size(sv) != @as(usize, @intCast(d))) return false;
+    }
+    const wd = mlx.mlx_array_dtype(wn);
+    return @rem(d, 128) == 0 and d <= 4096 and std.mem.eql(c_int, mlx.getShape(post_in), &lanes) and mlx.mlx_array_dtype(post_in) == .float32 and
+        mlx.getShape(wn).len == 1 and mlx.getShape(wn)[0] == d and (wd == .float32 or wd == .bfloat16);
 }
 
 /// The expand of `h` by the post mix and `a` normed by `wn`, then the next mix and its norm, in one launch: `a`'s norm
@@ -843,6 +926,8 @@ const FormCase = struct {
     pin: Arr,
     up: Arr,
     shared: Arr,
+    up_in: Arr,
+    shared_in: Arr,
     wn: Arr,
     op: Arr,
     osvh: Arr,
@@ -859,6 +944,8 @@ const FormCase = struct {
             .pin = try o.contiguous(try randomArr(o, &.{ t, 4 }, .float32, seed + 2, 1)),
             .up = try o.contiguous(try randomArr(o, &.{ t, d }, .float32, seed + 3, 0.7)),
             .shared = try o.contiguous(try randomArr(o, &.{ t, d }, .bfloat16, seed + 4, 0.4)),
+            .up_in = try o.contiguous(try randomArr(o, &.{ t, d }, .float16, seed + 13, 0.7)),
+            .shared_in = try o.contiguous(try randomArr(o, &.{ t, d }, .float16, seed + 14, 0.4)),
             .wn = try o.contiguous(try randomArr(o, &.{d}, .bfloat16, seed + 5, 0.3)),
             .op = try o.contiguous(try randomArr(o, &.{ t * osplit, d }, .float32, seed + 6, 1)),
             .osvh = try o.contiguous(try randomArr(o, &.{d}, .float16, seed + 7, 0.5)),
@@ -887,6 +974,8 @@ const FormCase = struct {
             .pin = try z(o, &.{ t, 4 }, .float32),
             .up = try z(o, &.{ t, d }, .float32),
             .shared = try z(o, &.{ t, d }, .bfloat16),
+            .up_in = try z(o, &.{ t, d }, .float16),
+            .shared_in = try z(o, &.{ t, d }, .float16),
             .wn = try z(o, &.{d}, .bfloat16),
             .op = try z(o, &.{ t * osplit, d }, .float32),
             .osvh = try z(o, &.{d}, .float16),
@@ -904,6 +993,7 @@ const FormCase = struct {
             .plain => try mixNorm(o.s, c.h, c.hw, c.eps, c.w),
             .expand => try mixExpandNorm(o.s, c.h, c.y, c.pin, c.hw, c.eps, c.w),
             .back => try backMixNorm(o.s, c.h, c.pin, c.up, c.shared, c.wn, 1e-5, c.hw, c.eps, c.w),
+            .back_inner => try backMixNormInner(o.s, c.h, c.pin, c.up_in, c.osvh, c.shared_in, c.osvh, c.wn, 1e-5, c.hw, c.eps, c.w),
             .expand_norm => try expandNormMixNorm(o.s, c.h, c.pin, c.y, c.wn, 1e-5, c.hw, c.eps, c.w),
             .expand_parts => try mixExpandNormParts(o.s, c.h, c.pin, c.op, c.osvh, c.osplit, c.ow, 1e-5, c.hw, c.eps, c.w),
             .expand_rows => try mixExpandNormRows(o.s, c.h, c.pin, c.y, c.ow, 1e-5, c.hw, c.eps, c.w),

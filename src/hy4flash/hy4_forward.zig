@@ -497,17 +497,34 @@ pub var chain_kernels_on = true;
 /// A SwiGLU block's three linears.
 pub const Swiglu = struct { gate: Lin, up: Lin, down: Lin };
 
+/// A wide chunk's trellis SwiGLU with its finishes, the SwiGLU and the down bank's prepare in one launch
+/// (`hy4_chain.swigluFinishPrepare`); null where it does not serve (a tap, a narrow chunk, a BF16 bank).
+fn swigluPreparedDown(o: *Ops, x: Arr, w: Swiglu, at: ?At) !?Arr {
+    // The stream query comes first: a reading tap makes the untapped forward's MLX calls.
+    if (!mlx.streamIsGpu(o.s) or at != null or !chain_kernels_on) return null;
+    const gb = w.gate.stq orelse return null;
+    const ub = w.up.stq orelse return null;
+    const db = w.down.stq orelse return null;
+    if (!hy4_stq.wideInnerApplies(x, gb) or !hy4_stq.wideInnerApplies(x, ub) or gb.outDim() != ub.outDim() or gb.outDim() != db.inDim()) return null;
+    const g_inner = try hy4_stq.applyInner(o, x, gb);
+    const u_inner = try hy4_stq.applyInner(o, x, ub);
+    return try o.own(try hy4_chain.swigluFinishPrepare(o.s, g_inner, gb.svh, u_inner, ub.svh, db.suh));
+}
+
 /// `down(silu(gate·x) ⊙ up·x)`: the dense layer's FFN and the shared expert (`HYV4FlashMLP`, before its norm).
 pub fn swiglu(o: *Ops, x: Arr, w: Swiglu, at: ?At) !Arr {
+    if (try swigluPreparedDown(o, x, w, at)) |prep| return o.cast(try hy4_stq.applyPreparedStored(o, prep, w.down.stq.?), .float32);
     return linear(o, try swigluActAs(o, x, w, if (at == null) linearInputDtype(w.down) else .float32, at), w.down);
 }
 
 fn swigluStored(o: *Ops, x: Arr, w: Swiglu, at: ?At) !Arr {
+    if (try swigluPreparedDown(o, x, w, at)) |prep| return hy4_stq.applyPreparedStored(o, prep, w.down.stq.?);
     return linearStored(o, try swigluActAs(o, x, w, if (at == null) linearInputDtype(w.down) else .float32, at), w.down);
 }
 
 /// `norm(swiglu(x, w), norm_w, eps)`: the dense layer's FFN and its `post_fc2_norm` (`linearNormed`).
 pub fn swigluNormed(o: *Ops, x: Arr, w: Swiglu, norm_w: Arr, eps: f32, at: ?At) !Arr {
+    if (norm_kernel_on) if (try swigluPreparedDown(o, x, w, at)) |prep| return normAs(o, try hy4_stq.applyPreparedStored(o, prep, w.down.stq.?), null, norm_w, eps, .float32);
     return linearNormed(o, try swigluActAs(o, x, w, if (at == null) linearInputDtype(w.down) else .float32, at), w.down, norm_w, eps);
 }
 
@@ -522,7 +539,7 @@ fn swigluActAs(o: *Ops, x: Arr, w: Swiglu, out_dt: mlx.mlx_dtype, at: ?At) !Arr 
         try At.input(at, .shared_act, act);
         return act;
     };
-    const narrow = at == null and chain_kernels_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
+    const narrow = chain_kernels_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1 and at == null;
     const stored = narrow and storedCheap(x, w.gate) and storedCheap(x, w.up);
     const g = if (stored) try linearStored(o, x, w.gate) else try linear(o, x, w.gate);
     const u = if (stored) try linearStored(o, x, w.up) else try linear(o, x, w.up);
@@ -655,6 +672,24 @@ pub fn moeFinishBack(o: *Ops, x: Arr, w: Moe, g: MoeGeometry, routed: Arr, at: ?
     // The shared expert first: launches that finish themselves run in the order made, so it runs beside the routed
     // experts rather than after W_lat_up.
     const narrow = norm_kernel_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
+    if (back) |b| if (narrow and chain_kernels_on and mix_expand_on and hcKernels(o)) {
+        if (w.shared.down.stq) |db| if (w.lat_up.stq) |ub| if (hy4_stq.wideInnerApplies(routed, ub)) {
+            if (try swigluPreparedDown(o, x, w.shared, at)) |prep| {
+                const shared_in = try hy4_stq.applyPreparedInner(o, prep, db);
+                const up_in = try hy4_stq.applyInner(o, routed, ub);
+                const h = try o.contiguous(try o.cast(b.h, .float32));
+                const post = try o.contiguous(try o.cast(b.post, .float32));
+                if (b.next) |nx| if (back_mix_on and mix_norm_on and hy4_hc.backInnerApplies(o.s, h, post, up_in, ub.svh, shared_in, db.svh, w.combine, nx.mix.fn_, nx.mix.scale)) {
+                    const k = try o.own(try hck.identityEps(nx.norm_eps, nx.eps, nx.magnitude));
+                    const hw: hck.HcWeights = .{ .fn_w = nx.mix.fn_, .scale = nx.mix.scale, .base = nx.mix.base };
+                    const r = try hy4_hc.backMixNormInner(o.s, h, post, up_in, ub.svh, shared_in, db.svh, w.combine, g.eps, hw, k, nx.norm_w);
+                    return .{ .y = try o.own(r.m.?), .expanded = true, .next = .{ .post = try o.own(r.post), .x = try o.own(r.h) } };
+                };
+                if (hy4_norm.expandInnerApplies(o.s, up_in, ub.svh, shared_in, db.svh, w.combine, h, post))
+                    return .{ .y = try o.own(try hy4_norm.rowsExpandInner(o.s, up_in, ub.svh, shared_in, db.svh, w.combine, g.eps, h, post)), .expanded = true };
+            }
+        };
+    };
     const shared = if (narrow and storedCheap(x, w.shared.down)) try swigluStored(o, x, w.shared, at) else try swiglu(o, x, w.shared, at);
     const up = if (narrow and storedCheap(routed, w.lat_up)) try linearStored(o, routed, w.lat_up) else try linear(o, routed, w.lat_up);
     if (back) |b| if (norm_kernel_on and mix_expand_on and hcKernels(o)) {

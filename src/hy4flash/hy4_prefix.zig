@@ -173,6 +173,9 @@ pub const Held = struct {
         for (m.state[0..m.config.layers]) |*st| for (hy4_model.stateArrays(st, &arrays)) |a| try self.take(a, true);
         if (m.hidden_fixed) |h| try self.take(h, true);
         for (m.picks_fixed[0..m.config.layers]) |pf| for (pf) |b| if (b) |a| try self.take(a, true);
+        for (m.picks_rows[0..m.config.layers]) |pf| for (pf) |b| if (b) |a| try self.take(a, true);
+        for (m.key_journal[0..m.config.layers]) |b| if (b) |a| try self.take(a, true);
+        if (m.rows_streams) |h| try self.take(h, true);
         try self.addPoint(m.mark_fixed[0..m.config.layers]);
         if (m.mark_hidden) |h| try self.take(h, true);
         try self.addPoints(m);

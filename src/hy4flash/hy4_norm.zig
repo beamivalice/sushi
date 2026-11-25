@@ -192,6 +192,144 @@ fn launch(s: mlx.mlx_stream, x: Arr, y: ?Arr, z: ?Arr, w: Arr, eps: f32, out_dt:
     return out;
 }
 
+const expand_inner_source: [:0]const u8 =
+    \\constexpr int N_READS = 4;
+    \\constexpr int SIMD_SIZE = 32;
+    \\uint gid = threadgroup_position_in_grid.x;
+    \\uint lid = thread_position_in_threadgroup.x;
+    \\uint simd_lane_id = thread_index_in_simdgroup;
+    \\uint simd_group_id = simdgroup_index_in_threadgroup;
+    \\constexpr uint axis_size = uint(D);
+    \\threadgroup float t_sum[D];
+    \\threadgroup float local_inv_mean[1];
+    \\threadgroup float local_sums[SIMD_SIZE];
+    \\{
+    \\#pragma clang fp contract(off)
+    \\  constexpr uint NB = uint(D) / 128u;
+    \\  const float psc = 0.08838834764831845f;
+    \\  for (uint blk = simd_group_id; blk < NB; blk += uint(TG) / 32u) {
+    \\    const uint col = blk * 128u + simd_lane_id;
+    \\    const size_t xb = (size_t)gid * uint(D) + col;
+    \\    float4 va = float4(float(a[xb]), float(a[xb + 32u]), float(a[xb + 64u]), float(a[xb + 96u]));
+    \\    for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\      const float4 p = simd_shuffle_xor(va, bit);
+    \\      va = (simd_lane_id & bit) == 0u ? va + p : p - va;
+    \\    }
+    \\    const float as0 = va.x + va.y, as1 = va.x - va.y, as2 = va.z + va.w, as3 = va.z - va.w;
+    \\    float4 vb = float4(float(b[xb]), float(b[xb + 32u]), float(b[xb + 64u]), float(b[xb + 96u]));
+    \\    for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\      const float4 p = simd_shuffle_xor(vb, bit);
+    \\      vb = (simd_lane_id & bit) == 0u ? vb + p : p - vb;
+    \\    }
+    \\    const float bs0 = vb.x + vb.y, bs1 = vb.x - vb.y, bs2 = vb.z + vb.w, bs3 = vb.z - vb.w;
+    \\    t_sum[col] = float(bfloat16_t((as0 + as2) * psc * float(asvh[col]))) + float(bfloat16_t((bs0 + bs2) * psc * float(bsvh[col])));
+    \\    t_sum[col + 32u] = float(bfloat16_t((as1 + as3) * psc * float(asvh[col + 32u]))) + float(bfloat16_t((bs1 + bs3) * psc * float(bsvh[col + 32u])));
+    \\    t_sum[col + 64u] = float(bfloat16_t((as0 - as2) * psc * float(asvh[col + 64u]))) + float(bfloat16_t((bs0 - bs2) * psc * float(bsvh[col + 64u])));
+    \\    t_sum[col + 96u] = float(bfloat16_t((as1 - as3) * psc * float(asvh[col + 96u]))) + float(bfloat16_t((bs1 - bs3) * psc * float(bsvh[col + 96u])));
+    \\  }
+    \\}
+    \\if (simd_group_id == 0) {
+    \\  local_sums[simd_lane_id] = 0;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float acc = 0;
+    \\float thread_x[N_READS];
+    \\for (int i = 0; i < N_READS; i++) {
+    \\  uint c = lid * N_READS + i;
+    \\  thread_x[i] = c < axis_size ? t_sum[c] : 0;
+    \\  acc += thread_x[i] * thread_x[i];
+    \\}
+    \\acc = simd_sum(acc);
+    \\if (simd_lane_id == 0) {
+    \\  local_sums[simd_group_id] = acc;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (simd_group_id == 0) {
+    \\  acc = simd_sum(local_sums[simd_lane_id]);
+    \\  if (simd_lane_id == 0) {
+    \\    local_inv_mean[0] = metal::precise::rsqrt(acc / axis_size + as_type<float>(EPS));
+    \\  }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\device float* o = out + (size_t)gid * (size_t)HC * (size_t)D;
+    \\for (int i = 0; i < N_READS; i++) {
+    \\  uint c = lid * N_READS + i;
+    \\  if (c < axis_size) {
+    \\    float v = static_cast<float>(w[c]) * static_cast<float>(thread_x[i] * local_inv_mean[0]);
+    \\    for (int k = 0; k < HC; ++k) {
+    \\      float py = static_cast<float>(post[(size_t)gid * HC + k]) * v;
+    \\      size_t at = (size_t)k * (size_t)D + c;
+    \\      o[at] = py + static_cast<float>(hs[(size_t)gid * HC * (size_t)D + at]);
+    \\    }
+    \\  }
+    \\}
+;
+
+var expand_inner_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const ExpandInnerKey = struct { rows: c_int, d: c_int, hc: c_int, eps: c_int };
+var expand_inner_cfgs: kcfg.Cache(ExpandInnerKey) = .{};
+
+fn buildExpandInner(k: ExpandInnerKey) !kcfg.Config {
+    const group = 32 * @divFloor(@divFloor(k.d + reads - 1, reads) + 31, 32);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, k.hc, k.d }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.rows * group, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, group, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", k.d));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TG", group));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", k.hc));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EPS", k.eps));
+    return cfg;
+}
+
+/// Whether `rowsExpandInner` serves: a GPU stream, up to 8 streams of f32 rows, `a` and `b` as [rows, D] unfinished
+/// rows with a D-wide `svh`.
+pub fn expandInnerApplies(s: mlx.mlx_stream, a: Arr, a_svh: Arr, b: Arr, b_svh: Arr, w: Arr, h: Arr, post: Arr) bool {
+    if (!mlx.streamIsGpu(s)) return false;
+    const hs = mlx.getShape(h);
+    const ps = mlx.getShape(post);
+    if (hs.len != 3 or ps.len != 2 or hs[1] > 8) return false;
+    const d = hs[2];
+    const rsh = [_]c_int{ hs[0], d };
+    const wd = mlx.mlx_array_dtype(w);
+    return d > 0 and d <= max_cols and @rem(d, 128) == 0 and
+        std.mem.eql(c_int, mlx.getShape(a), &rsh) and mlx.mlx_array_dtype(a) == .float16 and
+        std.mem.eql(c_int, mlx.getShape(b), &rsh) and mlx.mlx_array_dtype(b) == .float16 and
+        mlx.mlx_array_dtype(a_svh) == .float16 and mlx.mlx_array_size(a_svh) == @as(usize, @intCast(d)) and
+        mlx.mlx_array_dtype(b_svh) == .float16 and mlx.mlx_array_size(b_svh) == @as(usize, @intCast(d)) and
+        mlx.getShape(w).len == 1 and mlx.getShape(w)[0] == d and (wd == .bfloat16 or wd == .float32) and
+        ps[0] == hs[0] and ps[1] == hs[1] and mlx.mlx_array_dtype(h) == .float32 and mlx.mlx_array_dtype(post) == .float32;
+}
+
+/// `rowsExpand` of the sum of two banks' unfinished GEMM rows `a` and `b`, finished with their `svh` in the launch: the
+/// finishes and the expand's norm in one dispatch, their bytes.
+pub fn rowsExpandInner(s: mlx.mlx_stream, a: Arr, a_svh: Arr, b: Arr, b_svh: Arr, w: Arr, eps: f32, h: Arr, post: Arr) !Arr {
+    if (expand_inner_kernel == null) {
+        const ins = [_][*:0]const u8{ "a", "asvh", "b", "bsvh", "w", "hs", "post" };
+        const outs = [_][*:0]const u8{"out"};
+        const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const made = mlx.mlx_fast_metal_kernel_new("sushi_hy4_rms_expand_inner", iv, ov, expand_inner_source, "", true, false);
+        if (made.ctx == null) return error.MetalKernelCompileFailed;
+        expand_inner_kernel = made;
+    }
+    const hs = mlx.getShape(h);
+    const cfg = try expand_inner_cfgs.get(.{ .rows = hs[0], .d = hs[2], .hc = hs[1], .eps = kcfg.bits(eps) }, buildExpandInner);
+    const ins = [_]Arr{ a, a_svh, b, b_svh, w, h, post };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, expand_inner_kernel.?, iv, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+    return out;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

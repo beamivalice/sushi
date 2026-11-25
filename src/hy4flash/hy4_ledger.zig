@@ -111,6 +111,11 @@ pub fn pickBytes(c: *const hy4_config.Config) u64 {
     var s: Sum = .{};
     s.add(c.sparseCount(), width * 4);
     s.add(c.sparseCount(), width);
+    const rows: u64 = @intCast(@import("hy4_forward.zig").verify_rows_max);
+    s.add(c.sparseCount(), rows * width * 4);
+    s.add(c.sparseCount(), rows * width);
+    s.add(c.sparseCount(), rows * c.indexer.head_dim * f32b);
+    s.add(1, rows * c.hc_mult * c.dim * f32b);
     return s.total;
 }
 

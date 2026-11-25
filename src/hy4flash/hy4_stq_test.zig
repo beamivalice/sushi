@@ -1240,6 +1240,129 @@ test "hy4 stq: a verify block under the mark of a DFly2 draft at and under the s
     }
 }
 
+fn keepRowsFailed(e: anyerror, step: []const u8, at: [3]usize) anyerror {
+    std.debug.print("[keep rows] p0 {d} keep {d} in place {d}: {s} failed with {s}\n", .{ at[0], at[1], at[2], step, @errorName(e) });
+    return e;
+}
+
+const Seg = struct { start: usize, layer: usize, field: usize };
+
+var segs: [4096]Seg = undefined;
+var n_segs: usize = 0;
+
+fn markSeg(list: *const std.ArrayList(u8), layer: usize, field: usize) void {
+    if (n_segs < segs.len) segs[n_segs] = .{ .start = list.items.len, .layer = layer, .field = field };
+    n_segs += 1;
+}
+
+fn appendRaw(a: std.mem.Allocator, o: *Ops, list: *std.ArrayList(u8), arr: Arr) !void {
+    const c = try o.contiguous(arr);
+    try mlx.check(mlx.mlx_array_eval(c));
+    const n = mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c);
+    try list.appendSlice(a, (mlx.mlx_array_data_uint8(c) orelse return error.HostRead)[0..n]);
+}
+
+/// Every byte of the request's state and handover a round leaves: the point's arrays, the history, the hidden row and
+/// each layer's picks.
+fn appendRoundState(a: std.mem.Allocator, o: *Ops, m: *@import("hy4_model.zig").Model, list: *std.ArrayList(u8)) !void {
+    const hy4_model = @import("hy4_model.zig");
+    var arrays: [hy4_config.max_layers][hy4_model.Model.point_arrays]?Arr = undefined;
+    const n = m.config.layers;
+    try m.capturePoint(arrays[0..n]);
+    defer hy4_model.Model.freeArrays(arrays[0..n]);
+    n_segs = 0;
+    for (arrays[0..n], 0..) |row, l| for (row, 0..) |maybe, f| if (maybe) |arr| {
+        markSeg(list, l, f);
+        try appendRaw(a, o, list, arr);
+    };
+    markSeg(list, 0, 100);
+    try list.appendSlice(a, std.mem.sliceAsBytes(m.history.items));
+    try list.appendSlice(a, std.mem.asBytes(&m.pos));
+    markSeg(list, 0, 101);
+    if (m.last_hidden) |h| try appendRaw(a, o, list, h);
+    for (m.last_picks[0..n], 0..) |maybe, l| if (maybe) |pk| {
+        markSeg(list, l, 102);
+        try appendRaw(a, o, list, pk.rows);
+        markSeg(list, l, 103);
+        try appendRaw(a, o, list, pk.keep);
+    } else try list.append(a, 0xff);
+    markSeg(list, 0, 104);
+}
+
+test "hy4 verify: a 6-row verify block's first rows kept in place leave the state, the handover and the next draft as the replay leaves them, for every kept count across the groups, the window and the selection threshold (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    try loadInto(&p.stq, p.stq_dir, "model-dfly", es);
+    var d = try @import("hy4_dfly.zig").Drafter.init(a, m, &p.stq);
+    defer d.deinit();
+    var ids: [48]u32 = undefined;
+    var rng = std.Random.DefaultPrng.init(0x4b7);
+    for (&ids) |*x| x.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    const thr: usize = p.config.indexer.group_topk * p.config.indexer.group;
+    const starts = [_]usize{ 5, 11, thr - 3, thr - 1, thr, thr + 2, 27 };
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    var dispatches: [2]u64 = .{ 0, 0 };
+    for (starts) |p0| for (1..6) |keep| {
+        var want: std.ArrayList(u8) = .empty;
+        defer want.deinit(a);
+        var got: std.ArrayList(u8) = .empty;
+        defer got.deinit(a);
+        for ([_]bool{ false, true }) |in_place| {
+            const at: [3]usize = .{ p0, keep, @intFromBool(in_place) };
+            m.reset();
+            _ = mlx.mlx_array_free(m.forwardReadout(ids[0..p0], .none) catch |e| return keepRowsFailed(e, "prefill", at));
+            var mk = try m.mark();
+            defer m.dropMark(&mk);
+            _ = mlx.mlx_array_free(m.forwardReadout(ids[p0 .. p0 + 6], .all) catch |e| return keepRowsFailed(e, "verify", at));
+            const out = if (in_place) &got else &want;
+            const s0 = mlx.engine.stats();
+            if (in_place) {
+                if (!m.keepRowsApplies(&mk, keep)) return keepRowsFailed(error.Hy4PointMismatch, "applies", at);
+                m.keepRows(&mk, keep) catch |e| return keepRowsFailed(e, "keepRows", at);
+            } else m.rollbackTo(&mk, ids[p0 .. p0 + keep]) catch |e| return keepRowsFailed(e, "rollbackTo", at);
+            mlx.engine.close();
+            const s1 = mlx.engine.stats();
+            dispatches[@intFromBool(in_place)] += s1.dispatches - s0.dispatches;
+            {
+                var so: Ops = .{ .s = es };
+                defer so.deinit();
+                appendRoundState(a, &so, m, out) catch |e| return keepRowsFailed(e, "state", at);
+            }
+            var block = d.draft(m, 9) catch |e| return keepRowsFailed(e, "draft", at);
+            defer block.deinit();
+            try out.appendSlice(a, std.mem.sliceAsBytes(block.ids));
+            const lg = m.forwardReadout(ids[p0 + keep ..][0..1], .last) catch |e| return keepRowsFailed(e, "next row", at);
+            defer _ = mlx.mlx_array_free(lg);
+            var lo: Ops = .{ .s = es };
+            defer lo.deinit();
+            try appendRaw(a, &lo, out, lg);
+        }
+        if (!std.mem.eql(u8, want.items, got.items)) {
+            const at = std.mem.indexOfDiff(u8, want.items, got.items) orelse 0;
+            var which: Seg = .{ .start = 0, .layer = 0, .field = 999 };
+            for (segs[0..@min(n_segs, segs.len)]) |sg| if (sg.start <= at) {
+                which = sg;
+            };
+            std.debug.print("[keep rows] p0 {d} keep {d}: first difference at byte {d}, layer {d} field {d} (0-5 point arrays, 100 history, 101 hidden, 102 picks rows, 103 picks keep)\n", .{ p0, keep, at, which.layer, which.field });
+            return error.TestExpectedEqual;
+        }
+    };
+    errdefer std.debug.print("[keep rows] dispatches: replay {d}, in place {d}\n", .{ dispatches[0], dispatches[1] });
+    try testing.expect(dispatches[1] < dispatches[0]);
+}
+
 /// One site's W_o and the iHC mix after it, on random inputs: `rows` gated rows of `in` through a K6 bank to `d`, four
 /// streams of `d`, the mix's weights and both norms.
 const OSite = struct {
@@ -2522,4 +2645,167 @@ test "hy4 stq: wide-K fused NAX on Ultra picks bm128 bn64 swizzle 2 for L2 reuse
     try testing.expectEqual(@as(usize, 64), small.t.bm);
     try testing.expectEqual(@as(usize, 128), small.t.bn);
     try testing.expectEqual(@as(u5, 0), small.swizzle);
+}
+
+test "hy4 stq: wide SwiGLU fuses gate/up finish, swiglu and down prepare into one launch with exact bytes" {
+    const exl3 = @import("sushi_exl3");
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const was_chain = fwd.chain_kernels_on;
+    defer fwd.chain_kernels_on = was_chain;
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+
+    var prng = std.Random.DefaultPrng.init(0x5a19);
+    const rnd = prng.random();
+    const dec = exl3.format.Decode.tabled(.spec1, .w15);
+    const cases = [_]struct { rows: c_int, dim: usize, inter: usize }{
+        .{ .rows = 32, .dim = 512, .inter = 256 },
+        .{ .rows = exl3.trunk_gemm.DECODED_MIN_ROWS, .dim = 3072, .inter = 1536 },
+    };
+    for (cases) |cs| {
+        if (cs.rows >= exl3.trunk_gemm.DECODED_MIN_ROWS and !exl3.kernels.gemmNaxOn()) continue;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const bg = try exl3.trunk.TestBank.init(alloc, rnd, cs.dim, cs.inter, 64);
+        const bu = try exl3.trunk.TestBank.init(alloc, rnd, cs.dim, cs.inter, 64);
+        const bd = try exl3.trunk.TestBank.init(alloc, rnd, cs.inter, cs.dim, 64);
+        const tg = try bg.triple(es);
+        const tu = try bu.triple(es);
+        const td = try bd.triple(es);
+        const sw: fwd.Swiglu = .{
+            .gate = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(tg.w), .suh = try o.own(tg.s), .svh = try o.own(tg.b), .dec = dec } },
+            .up = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(tu.w), .suh = try o.own(tu.s), .svh = try o.own(tu.b), .dec = dec } },
+            .down = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(td.w), .suh = try o.own(td.s), .svh = try o.own(td.b), .dec = dec } },
+        };
+        const x = try randomArr(&o, alloc, rnd, &.{ cs.rows, @intCast(cs.dim) }, -1, 2, .bfloat16);
+        try mlx.check(mlx.mlx_array_eval(x));
+
+        fwd.chain_kernels_on = false;
+        const d0 = mlx.engine.stats().dispatches;
+        const want = try fwd.swiglu(&o, x, sw, null);
+        try mlx.check(mlx.mlx_array_eval(want));
+        const unfused_d = mlx.engine.stats().dispatches - d0;
+
+        fwd.chain_kernels_on = true;
+        const d1 = mlx.engine.stats().dispatches;
+        const got = try fwd.swiglu(&o, x, sw, null);
+        try mlx.check(mlx.mlx_array_eval(got));
+        const fused_d = mlx.engine.stats().dispatches - d1;
+
+        try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want)), std.mem.sliceAsBytes(try hostRows(&o, got)));
+        const decoded = cs.rows >= exl3.trunk_gemm.DECODED_MIN_ROWS and exl3.trunk_gemm.decodedCanServe();
+        const want_d: u64 = if (decoded) 11 else 8;
+        try testing.expect(unfused_d > fused_d);
+        try testing.expectEqual(want_d, fused_d);
+    }
+}
+
+test "hy4 stq: wide moeFinishBack fuses shared down and lat_up finish into backMixNorm and rowsExpand with exact bytes" {
+    const exl3 = @import("sushi_exl3");
+    const hck = @import("../hc_kernels.zig");
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const was_chain = fwd.chain_kernels_on;
+    defer fwd.chain_kernels_on = was_chain;
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+
+    var prng = std.Random.DefaultPrng.init(0x7c21);
+    const rnd = prng.random();
+    const dec = exl3.format.Decode.tabled(.spec1, .w15);
+    const cases = [_]struct { rows: c_int, dim: usize, inter: usize }{
+        .{ .rows = 32, .dim = 512, .inter = 256 },
+        .{ .rows = exl3.trunk_gemm.DECODED_MIN_ROWS, .dim = 3072, .inter = 1536 },
+    };
+    for (cases) |cs| {
+        if (cs.rows >= exl3.trunk_gemm.DECODED_MIN_ROWS and !exl3.kernels.gemmNaxOn()) continue;
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const bg = try exl3.trunk.TestBank.init(alloc, rnd, cs.dim, cs.inter, 64);
+        const bu = try exl3.trunk.TestBank.init(alloc, rnd, cs.dim, cs.inter, 64);
+        const bd = try exl3.trunk.TestBank.init(alloc, rnd, cs.inter, cs.dim, 64);
+        const bl = try exl3.trunk.TestBank.init(alloc, rnd, cs.inter, cs.dim, 64);
+        const tg = try bg.triple(es);
+        const tu = try bu.triple(es);
+        const td = try bd.triple(es);
+        const tl = try bl.triple(es);
+        const m: fwd.Moe = .{
+            .router = .{ .weight = mlx.mlx_array_new(), .bias = mlx.mlx_array_new() },
+            .gate_up = mlx.mlx_array_new(),
+            .down = mlx.mlx_array_new(),
+            .lat_down = .{ .w = mlx.mlx_array_new() },
+            .lat_up = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(tl.w), .suh = try o.own(tl.s), .svh = try o.own(tl.b), .dec = dec } },
+            .shared = .{
+                .gate = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(tg.w), .suh = try o.own(tg.s), .svh = try o.own(tg.b), .dec = dec } },
+                .up = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(tu.w), .suh = try o.own(tu.s), .svh = try o.own(tu.b), .dec = dec } },
+                .down = .{ .w = mlx.mlx_array_new(), .stq = .{ .w = try o.own(td.w), .suh = try o.own(td.s), .svh = try o.own(td.b), .dec = dec } },
+            },
+            .combine = try randomArr(&o, alloc, rnd, &.{@intCast(cs.dim)}, 0.5, 1.5, .bfloat16),
+        };
+        const x = try randomArr(&o, alloc, rnd, &.{ cs.rows, @intCast(cs.dim) }, -1, 2, .bfloat16);
+        const routed = try randomArr(&o, alloc, rnd, &.{ cs.rows, @intCast(cs.inter) }, -1, 2, .bfloat16);
+        const h = try randomArr(&o, alloc, rnd, &.{ cs.rows, 4, @intCast(cs.dim) }, -1, 2, .float32);
+        const post = try randomArr(&o, alloc, rnd, &.{ cs.rows, 4 }, 0.1, 1.0, .float32);
+        const fn_w = try randomArr(&o, alloc, rnd, &.{ 8, @intCast(4 * cs.dim) }, -0.05, 0.1, .float32);
+        const scale = try randomArr(&o, alloc, rnd, &.{3}, 0.5, 1.0, .float32);
+        const base = try randomArr(&o, alloc, rnd, &.{8}, -0.5, 1.0, .float32);
+        const norm_w = try randomArr(&o, alloc, rnd, &.{@intCast(cs.dim)}, 0.5, 1.5, .bfloat16);
+        _ = hck;
+        for ([_]Arr{ x, routed, h, post, fn_w, scale, base, norm_w, m.combine }) |a| try mlx.check(mlx.mlx_array_eval(a));
+        const g: fwd.MoeGeometry = .{ .top_k = 16, .inter = @intCast(cs.inter), .scale = 3.998, .swiglu_limit = 10, .eps = 1e-5 };
+        const decoded = cs.rows >= exl3.trunk_gemm.DECODED_MIN_ROWS and exl3.trunk_gemm.decodedCanServe();
+        const want_d: u64 = if (decoded) 13 else 9;
+
+        for ([_]bool{ true, false }) |with_next| {
+            const back: fwd.Back = .{
+                .h = h,
+                .post = post,
+                .next = if (with_next) .{
+                    .mix = .{ .fn_ = fn_w, .scale = scale, .base = base },
+                    .n = 4,
+                    .magnitude = 2.0,
+                    .eps = 1e-6,
+                    .norm_eps = 1e-5,
+                    .norm_w = norm_w,
+                } else null,
+            };
+            fwd.chain_kernels_on = false;
+            const want = try fwd.moeFinishBack(&o, x, m, g, routed, null, back);
+            try mlx.check(mlx.mlx_array_eval(want.y));
+            if (want.next) |nx| {
+                try mlx.check(mlx.mlx_array_eval(nx.x));
+                try mlx.check(mlx.mlx_array_eval(nx.post));
+            }
+
+            fwd.chain_kernels_on = true;
+            const d0 = mlx.engine.stats().dispatches;
+            const got = try fwd.moeFinishBack(&o, x, m, g, routed, null, back);
+            try mlx.check(mlx.mlx_array_eval(got.y));
+            if (got.next) |nx| {
+                try mlx.check(mlx.mlx_array_eval(nx.x));
+                try mlx.check(mlx.mlx_array_eval(nx.post));
+            }
+            const fused_d = mlx.engine.stats().dispatches - d0;
+
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want.y)), std.mem.sliceAsBytes(try hostRows(&o, got.y)));
+            if (with_next) {
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want.next.?.x)), std.mem.sliceAsBytes(try hostRows(&o, got.next.?.x)));
+                try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try hostRows(&o, want.next.?.post)), std.mem.sliceAsBytes(try hostRows(&o, got.next.?.post)));
+            }
+            try testing.expectEqual(want_d, fused_d);
+        }
+    }
 }

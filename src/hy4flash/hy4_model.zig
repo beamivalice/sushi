@@ -134,6 +134,15 @@ pub const Model = struct {
     last_picks: [max_layers]?struct { rows: Arr, keep: Arr } = @splat(null),
     /// The blocks each sparse layer's `last_picks` are written into in place, made at their first selection.
     picks_fixed: [max_layers][2]?Arr = @splat(.{ null, null }),
+    /// A 2..8-row verify's journal, for `keepRows`: each row's hc streams [8, hc, D], and each sparse layer's token
+    /// keys [8, head_dim]; fixed blocks made in `reserveFor`.
+    rows_streams: ?Arr = null,
+    key_journal: [max_layers]?Arr = @splat(null),
+    picks_rows: [max_layers][2]?Arr = @splat(.{ null, null }),
+    picks_cut: [max_layers]u8 = @splat(0),
+    picks_held: [max_layers]u8 = @splat(0),
+    journal_pos: usize = 0,
+    journal_rows: usize = 0,
     /// Every expert of one layer held in the stream's slots (`pin`): that layer's picks run as one group, no SSD read.
     pinned: ?Pinned = null,
     /// A calibration tap, called only when set: the default path makes no call of its.
@@ -429,6 +438,16 @@ pub const Model = struct {
             _ = mlx.mlx_array_free(a);
             b.* = null;
         };
+        for (&self.picks_rows) |*pf| for (pf) |*b| if (b.*) |a| {
+            _ = mlx.mlx_array_free(a);
+            b.* = null;
+        };
+        for (&self.key_journal) |*b| if (b.*) |a| {
+            _ = mlx.mlx_array_free(a);
+            b.* = null;
+        };
+        if (self.rows_streams) |h| _ = mlx.mlx_array_free(h);
+        self.rows_streams = null;
         freeArrays(&self.mark_fixed);
         if (self.mark_hidden) |h| _ = mlx.mlx_array_free(h);
         self.mark_hidden = null;
@@ -447,6 +466,8 @@ pub const Model = struct {
     }
 
     fn dropPicks(self: *Model) void {
+        self.picks_held = @splat(0);
+        self.journal_rows = 0;
         for (&self.last_picks) |*pk| if (pk.*) |p| {
             _ = mlx.mlx_array_free(p.rows);
             _ = mlx.mlx_array_free(p.keep);
@@ -454,12 +475,28 @@ pub const Model = struct {
         };
     }
 
+    /// Whether a forward of `t` rows journals what `keepRows` reads: a 2..8-row verify of a drafting load.
+    fn journals(self: *const Model, t: c_int) bool {
+        return self.keep_hidden and t >= 2 and t <= fwd.verify_rows_max;
+    }
+
     /// Keeps the last of `rows` [T, width] and `keep` [T, width] as layer `l`'s `last_picks`.
-    fn keepPicks(self: *Model, o: *Ops, l: usize, rows: Arr, keep: Arr) !void {
+    fn keepPicks(self: *Model, o: *Ops, l: usize, rows: Arr, keep: Arr, cut: c_int, journal: bool) !void {
         const t = mlx.getShape(rows)[0];
         const width = mlx.getShape(rows)[1];
+        if (journal) {
+            try writeFixed(&self.picks_rows[l][0], rows, &.{ fwd.verify_rows_max, width }, self.s);
+            try writeFixed(&self.picks_rows[l][1], keep, &.{ fwd.verify_rows_max, width }, self.s);
+            self.picks_cut[l] = @intCast(cut);
+            self.picks_held[l] = @intCast(t);
+        }
         const r = try o.contiguous(try o.reshape(try o.slice(rows, 0, t - 1, t), &.{width}));
         const k = try o.contiguous(try o.slice(keep, 0, t - 1, t));
+        try self.setPicks(l, r, k);
+    }
+
+    /// Layer `l`'s `last_picks` replaced by `r` and `k`.
+    fn setPicks(self: *Model, l: usize, r: Arr, k: Arr) !void {
         if (self.last_picks[l]) |old| {
             _ = mlx.mlx_array_free(old.rows);
             _ = mlx.mlx_array_free(old.keep);
@@ -482,6 +519,11 @@ pub const Model = struct {
         var o: Ops = .{ .s = self.s };
         defer o.deinit();
         const t = mlx.getShape(hs)[0];
+        if (self.journals(t)) {
+            try writeFixed(&self.rows_streams, hs, &.{ fwd.verify_rows_max, @intCast(c.hc_mult), @intCast(c.dim) }, self.s);
+            self.journal_pos = self.pos;
+            self.journal_rows = @intCast(t);
+        }
         const h = try o.contiguous(try fwd.head(&o, try o.slice(hs, 0, t - 1, t), self.head_mix, @intCast(c.hc_mult), c.hc_eps, c.eps));
         if (self.last_hidden) |old| _ = mlx.mlx_array_free(old);
         self.last_hidden = null;
@@ -960,15 +1002,15 @@ pub const Model = struct {
             if (at < thr) {
                 const cut = thr - at;
                 const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0 + cut, r1), try o.slice(p.q_resid, 0, r0 + cut, r1), all, iw, ig, thr, n);
-                if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
-                const flat = try o.reshape(sel.rows, &.{(rows - cut) * fwd.selectedWidth(sel.rows)});
+                if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep, cut, self.journals(n - p0));
+                const flat = try o.reshape(sel.rows, &.{ (rows - cut) * fwd.selectedWidth(sel.rows) });
                 return fwd.attendStraddleGated(o, sin, qs, cut, try self.latentRange(o, &keys, 0, thr), try o.slice(keys.k_pe.?, 0, 0, thr), at, try self.latentAt(o, &keys, flat), try o.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry, tap);
             }
             const sel = if (sin.index != null and r0 >= sin.index.?.r0)
                 try fwd.recalledPrepared(o, sin.index.?, r0, r1, mlx.getShape(all)[0], ig, at, n)
             else
                 try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
-            if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
+            if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep, 0, self.journals(n - p0));
             const flat = try o.reshape(sel.rows, &.{rows * fwd.selectedWidth(sel.rows)});
             return fwd.attendRowsGated(o, sin, qs, try self.latentAt(o, &keys, flat), try o.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry, tap);
         }
@@ -1003,14 +1045,14 @@ pub const Model = struct {
             if (at < thr) {
                 const cut = thr - at;
                 const sel = try fwd.recalledAt(o, try o.slice(x, 0, r0 + cut, r1), try o.slice(p.q_resid, 0, r0 + cut, r1), all, iw, ig, thr, n);
-                if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
+                if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep, cut, false);
                 return fwd.attendCoreGated(o, sin, qs, .{ .straddle = .{ .cut = cut, .range = .{ .keys = try self.keysTo(o, ck, 0, thr), .p0 = at, .window = 0 }, .picks = .{ .keys = ck, .rows = sel.rows, .keep = sel.keep } } }, L.attn, L.geometry, tap);
             }
             const sel = if (sin.index != null and r0 >= sin.index.?.r0)
                 try fwd.recalledPrepared(o, sin.index.?, r0, r1, mlx.getShape(all)[0], ig, at, n)
             else
                 try fwd.recalledAt(o, try o.slice(x, 0, r0, r1), try o.slice(p.q_resid, 0, r0, r1), all, iw, ig, at, n);
-            if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep);
+            if (self.keep_hidden and last == n) try self.keepPicks(o, l, sel.rows, sel.keep, 0, false);
             return fwd.attendCoreGated(o, sin, qs, .{ .picks = .{ .keys = ck, .rows = sel.rows, .keep = sel.keep } }, L.attn, L.geometry, tap);
         }
         const w: c_int = @intCast(self.config.window);
@@ -1161,6 +1203,14 @@ pub const Model = struct {
         for (self.picks_fixed[0..c.layers], 0..) |*pf, l| if (self.layers[l].indexer != null and pf[0] == null) {
             pf[0] = (try mlx_pages.ringBuffer(&.{width}, .uint32, self.s)).array;
             pf[1] = (try mlx_pages.ringBuffer(&.{ 1, width }, .bool_, self.s)).array;
+        };
+        if (self.rows_streams == null) self.rows_streams = (try mlx_pages.ringBuffer(&.{ fwd.verify_rows_max, @intCast(c.hc_mult), @intCast(c.dim) }, .float32, self.s)).array;
+        for (0..c.layers) |l| if (self.layers[l].indexer != null) {
+            if (self.key_journal[l] == null) self.key_journal[l] = (try mlx_pages.ringBuffer(&.{ fwd.verify_rows_max, @intCast(c.indexer.head_dim) }, .float32, self.s)).array;
+            if (self.picks_rows[l][0] == null) {
+                self.picks_rows[l][0] = (try mlx_pages.ringBuffer(&.{ fwd.verify_rows_max, width }, .uint32, self.s)).array;
+                self.picks_rows[l][1] = (try mlx_pages.ringBuffer(&.{ fwd.verify_rows_max, width }, .bool_, self.s)).array;
+            }
         };
         // A drafting request's round marks the state before its verify (`mark`).
         try self.smallBlocks(&self.mark_fixed);
@@ -1546,6 +1596,135 @@ pub const Model = struct {
         // A verify's rollback stays inside its request, whose reservation stands (`reach`): nothing to trim.
         try self.rollbackFrom(.{ .pos = mk.pos, .arrays = arrays[0..n], .hidden = if (mk.hidden) self.mark_hidden else null, .open_rows = mk.open[0..n] }, self.pos);
         if (replay.len > 0) _ = mlx.mlx_array_free(try @import("hy4_plan.zig").run(self, replay, null, .none));
+    }
+
+    /// Whether `keepRows` can keep `keep` rows of the verify past `mk`: the verify journaled them and nothing ran
+    /// since.
+    pub fn keepRowsApplies(self: *const Model, mk: *const Mark, keep: usize) bool {
+        const t = self.pos -| mk.pos;
+        const g: usize = self.config.indexer.group;
+        if (!self.marked or mk.epoch != self.epoch or !self.keep_hidden or self.rows_streams == null) return false;
+        if (keep < 1 or keep >= t or t > @as(usize, @intCast(fwd.verify_rows_max)) or t - keep >= self.config.window) return false;
+        if (self.journal_rows != t or self.journal_pos != mk.pos or self.history.items.len != self.pos) return false;
+        for (self.state[0..self.config.layers], 0..) |*st, l| if (self.layers[l].indexer != null) {
+            const rows = st.rows orelse return false;
+            if (rows.used != self.pos or (self.pos / g > 0 and (st.pooled == null or st.pooled.?.used != self.pos / g))) return false;
+            if (@as(usize, mk.open[l]) != mk.pos % g or self.key_journal[l] == null or self.picks_held[l] > 0 and self.picks_rows[l][0] == null) return false;
+        };
+        return true;
+    }
+
+    /// The state as a replay of the first `keep` rows past `mk` would leave it, without running them: the sparse rows
+    /// and pooled keys cut, the open group rebuilt from the key journal, the rejected ring slots restored from the
+    /// mark, the history cut, and row keep-1's hidden state and picks handed over. Its scratch is asked in a wide
+    /// phase.
+    pub fn keepRows(self: *Model, mk: *const Mark, keep: usize) !void {
+        if (!self.keepRowsApplies(mk, keep)) return error.Hy4PointMismatch;
+        const owned = mlx.engine.widePhase();
+        defer owned.end();
+        errdefer self.reset();
+        self.version += 1;
+        const n = self.config.layers;
+        const pk = mk.pos + keep;
+        const arrays = self.heldBlocks(&self.mark_fixed, &mk.held);
+        for (self.state[0..n], arrays[0..n], 0..) |*st, row, l| {
+            if (self.layers[l].indexer != null) try self.keepSparse(st, row, l, mk, keep) else try self.restoreRing(st, row, pk);
+        }
+        self.history.shrinkRetainingCapacity(pk);
+        self.pos = pk;
+        try self.keepHandover(keep);
+        var i: usize = 0;
+        while (i < self.live_points.items.len) {
+            if (self.live_points.items[i].pos > pk) {
+                const q = self.live_points.orderedRemove(i);
+                self.releasePoint(&q);
+            } else i += 1;
+        }
+    }
+
+    /// A sparse layer's rows, pooled keys and open group cut to `keep` rows past the mark.
+    fn keepSparse(self: *Model, st: *LayerState, row: [point_arrays]?Arr, l: usize, mk: *const Mark, keep: usize) !void {
+        const g: usize = self.config.indexer.group;
+        const pk = mk.pos + keep;
+        try st.rows.?.truncate(pk);
+        if (st.pooled) |*r| try r.truncate(pk / g);
+        const open0: usize = mk.open[l];
+        const rows = pk % g;
+        const same_group = pk / g == self.pos / g;
+        if (st.open) |o| _ = mlx.mlx_array_free(o);
+        st.open = null;
+        if (rows == 0) return;
+        if (!same_group) {
+            const first = pk / g * g - (mk.pos - open0);
+            var o: Ops = .{ .s = self.s };
+            defer o.deinit();
+            var parts: [2]Arr = undefined;
+            var np: usize = 0;
+            if (first < open0) {
+                parts[np] = try o.slice(row[5].?, 0, @intCast(first), @intCast(open0));
+                np += 1;
+            }
+            parts[np] = try o.slice(self.key_journal[l].?, 0, @intCast(if (first > open0) first - open0 else 0), @intCast(keep));
+            np += 1;
+            const value = if (np == 1) parts[0] else try o.concat(parts[0..np], 0);
+            try writeFixed(&st.open_buf, value, &.{ @as(c_int, @intCast(g)) - 1, mlx.getShape(value)[1] }, self.s);
+        }
+        st.open = try headRows(st.open_buf.?, rows, self.s);
+    }
+
+    /// The sliding ring's slots past `pk` written back from the mark's copy.
+    fn restoreRing(self: *Model, st: *LayerState, row: [point_arrays]?Arr, pk: usize) !void {
+        const w: usize = self.config.window;
+        inline for (.{ "c", "k_pe", "c_scales", "c_biases" }, 0..) |f, i| if (row[i]) |src| if (@field(st, f) != null) {
+            const cols = mlx.getShape(src)[1];
+            var at = pk;
+            while (at < self.pos) {
+                const slot: c_int = @intCast(at % w);
+                const run: c_int = @intCast(@min(self.pos - at, w - at % w));
+                var o: Ops = .{ .s = self.s };
+                defer o.deinit();
+                const rows = try o.slice(src, 0, slot, slot + run);
+                const next = blk: {
+                    var up = mlx.mlx_array_new();
+                    errdefer _ = mlx.mlx_array_free(up);
+                    break :blk try mlx_pages.InPlace.adopt(@field(st, f).?, .ring).write(&up, rows, &.{ slot, 0 }, &.{ slot + run, cols }, self.s);
+                };
+                _ = mlx.mlx_array_free(@field(st, f).?);
+                @field(st, f) = next.array;
+                try next.landed(self.s);
+                at += @intCast(run);
+            }
+        };
+        st.ring = @intCast(pk);
+    }
+
+    /// Row keep-1's hidden state and picks as the drafter's handover, run through the one-row head as the replay's last
+    /// row is.
+    fn keepHandover(self: *Model, keep: usize) !void {
+        var o: Ops = .{ .s = self.s };
+        defer o.deinit();
+        if (self.last_hidden) |h| _ = mlx.mlx_array_free(h);
+        self.last_hidden = null;
+        const c = self.config;
+        const h = try o.contiguous(try fwd.head(&o, try o.slice(self.rows_streams.?, 0, @intCast(keep - 1), @intCast(keep)), self.head_mix, @intCast(c.hc_mult), c.hc_eps, c.eps));
+        try writeFixed(&self.hidden_fixed, h, mlx.getShape(h), self.s);
+        try shareInto(&self.last_hidden, self.hidden_fixed);
+        for (0..self.config.layers) |l| {
+            if (self.layers[l].indexer == null) continue;
+            if (self.last_picks[l]) |old| {
+                _ = mlx.mlx_array_free(old.rows);
+                _ = mlx.mlx_array_free(old.keep);
+            }
+            self.last_picks[l] = null;
+            const cut: usize = self.picks_cut[l];
+            if (self.picks_held[l] == 0 or keep - 1 < cut) continue;
+            const j: c_int = @intCast(keep - 1 - cut);
+            const width = mlx.getShape(self.picks_rows[l][0].?)[1];
+            const last = try o.scalar(@floatFromInt(self.pos - 1), .float32);
+            const r = try o.contiguous(try o.cast(try o.binary(.min, try o.cast(try o.reshape(try o.slice(self.picks_rows[l][0].?, 0, j, j + 1), &.{width}), .float32), last), .uint32));
+            const k = try o.contiguous(try o.slice(self.picks_rows[l][1].?, 0, j, j + 1));
+            try self.setPicks(l, r, k);
+        }
     }
 
     /// The point's arrays as the request's state at `pos`, with an empty history (the caller fills it).
@@ -2015,7 +2194,9 @@ pub const Model = struct {
             }
             if (L.indexer) |iw| {
                 const ig = self.indexerGeometry();
-                try poolClosed(&o, st, try fwd.tokenKeys(&o, xx, iw, ig), iw, ig);
+                const keys = try fwd.tokenKeys(&o, xx, iw, ig);
+                if (self.journals(t)) try writeFixed(&self.key_journal[l], keys, &.{ fwd.verify_rows_max, mlx.getShape(keys)[1] }, self.s);
+                try poolClosed(&o, st, keys, iw, ig);
                 if (n > ig.group_topk * ig.ratio) pooled = try keep.slice(st.pooled.?.buf(0), 0, 0, @intCast(st.pooled.?.used));
             }
             h = try keep.own(try o.result(hh));
@@ -2083,7 +2264,7 @@ pub const Model = struct {
         // their offset, made before the spans: nothing holds every span's rows and their join at once (D76). MLX's
         // stream joins them, where a write would copy the block.
         const placed = !in.whole and mlx.engine.isStream(self.s);
-        const fuse_o_norm = !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_expand_on and fwd.mix_norm_on and fwd.hc_kernels_on and mlx.streamIsGpu(self.s);
+        const fuse_o_norm = mlx.streamIsGpu(self.s) and !in.whole and at == null and fwd.norm_kernel_on and fwd.mix_expand_on and fwd.mix_norm_on and fwd.hc_kernels_on;
         // A chunk whose W_o runs the sorted GEMM takes its rows prepared by the spans that write them.
         const prep_o = placed and at == null and fuse_o_norm and fwd.chain_kernels_on and fwd.spans_share and L.attn.o.stq != null and
             @rem(t, span) == 0 and @rem(L.geometry.heads * L.geometry.v, 128) == 0 and exl3.trunk.gemmRows(@intCast(t), false);

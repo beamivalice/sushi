@@ -277,6 +277,11 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     tile (`matmul.fusedNaxTileFor`); and a chunk's spans write `W_o`'s prepared rows (`hy4_chain.gatedPreparedInto`),
     so its sorted GEMM runs no prepare. Each keeps the sorted GEMM's bytes. A 4,096-row chunk after 4,096: 2,075 to
     2,012 ms (024543f7 on dff0cc49, M5 Ultra, STQ 4bpw, prefill meter, A B B A, GPU lock).
+  - A wide chunk's trellis SwiGLU finishes its gate and up, runs the SwiGLU and prepares the down bank in one launch
+    (`hy4_chain.swigluFinishPrepare`), and the shared expert's down and `lat_up` finish inside the iHC back-mix and the
+    expand's norm (`hy4_hc.backMixNormInner`, `hy4_norm.rowsExpandInner`); the routed windows' inverse and scatter
+    spread over threadgroups (`rate_groups.groupWindowGrid`). Byte for byte; a 4,096-row chunk after 4,096: 1,986 to
+    1,971 ms, 208 fewer dispatches (018502b3 on 5f6fb12e, M5 Ultra, STQ 4bpw, prefill meter, A B B A, GPU lock).
   - Pinned by `hy4 attention spans`: at the release's gate and `W_o` shapes (trellis K4 and BF16, spans of 256 and
     32, short last spans), and on the tiny's BF16 and STQ trunks against the per-span order (`fwd.spans_share`, a
     test seam), byte for byte over windowed, gathered and decode rows. The tiny's logits also matched the parent
@@ -815,6 +820,15 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - A verify block's mark (`mark`, `rollbackTo`, `dropMark`) keeps the same small state in the model's mark blocks,
     reserved with a drafting request's state and copied whole in place, so it asks for nothing; one stands at a time.
     `rollbackTo` runs the kept rows again through `hy4_plan.run`, on the arena where the load planned that replay.
+  - A DSpark round's finish keeps its accepted rows without running them again where the verify journaled them
+    (`Model.keepRows`, taken by `Hooks.finish` when `keepRowsApplies`): a 2..8-row verify of a drafting load writes
+    each row's hc streams and each sparse layer's token keys into fixed blocks made with the request's state
+    (`rows_streams`, `key_journal`, billed in `pickBytes`); the finish cuts the sparse rows and pooled keys, rebuilds
+    the open group from the journal, restores the rejected ring slots from the mark, clamps the kept row's picks as
+    the replay does and runs row keep-1's one-row head for the handover, all in a wide phase. Its state is the
+    replay's byte for byte (`hy4 verify: a 6-row verify block's first rows kept in place ...`). A round after a
+    rollback: about 17 to 4.3 ms; served DFly2 rounds 65.6 to 84.3 tok/s code, 64.4 to 79.2 prose, same text
+    (b6ad2b2f on 8dc89a86, M5 Ultra, STQ 4bpw, kv8, round meter, one arm each).
   - The prefill keeps one live point at each checkpoint and at the prompt's end, the newest `Model.live_point_cap`
     (4); a finished request hands them to the cache's live record (`hy4_prefix.Live`), which keeps the conversation's
     newest `record_point_cap` (8). A next turn continues the state where it stands, or rolls it back to the deepest

@@ -38,7 +38,7 @@ fn getKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []cons
 }
 
 /// Which launch a config is for, and its shape.
-const Kind = enum { swiglu, groups, rows, gated, gated_into, gated_prepared_into, sink_sm_causal, sink_sm_mask, ring_keys };
+const Kind = enum { swiglu, swiglu_finish_prepare, groups, rows, gated, gated_into, gated_prepared_into, sink_sm_causal, sink_sm_mask, ring_keys };
 const Key = struct { kind: Kind, a: c_int, b: c_int, c: c_int = 0, d: c_int = 0, e: c_int = 0 };
 var cfgs: kcfg.Cache(Key) = .{};
 
@@ -58,6 +58,12 @@ fn build(k: Key) !kcfg.Config {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.a * k.b, 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(k.a * k.b, 256), 1, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", out_dt));
+        },
+        .swiglu_finish_prepare => {
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b }, 2, .float16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(k.b, 128) * 32, k.a, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "DIM", k.b));
         },
         .groups => {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.a, k.b + 1 }, 2, .float32));
@@ -149,6 +155,106 @@ pub fn swigluAs(s: mlx.mlx_stream, g: Arr, u: Arr, out_dt: mlx.mlx_dtype) !Arr {
     errdefer _ = mlx.mlx_array_free(shaped);
     try mlx.check(mlx.mlx_reshape(&shaped, out[0], sh.ptr, sh.len, s));
     return shaped;
+}
+
+const swiglu_finish_prepare_source: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\uint block = uint(threadgroup_position_in_grid.x);
+    \\uint slot = uint(threadgroup_position_in_grid.y);
+    \\ushort lane = thread_index_in_simdgroup;
+    \\const uint base = block * 128u;
+    \\const size_t xb = (size_t)slot * (size_t)(DIM) + base;
+    \\const float sc = 0.08838834764831845f;
+    \\float4 vg = float4(
+    \\  float(g_inner[xb + lane]),
+    \\  float(g_inner[xb + lane + 32u]),
+    \\  float(g_inner[xb + lane + 64u]),
+    \\  float(g_inner[xb + lane + 96u]));
+    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\  const float p0 = simd_shuffle_xor(vg.x, bit);
+    \\  const float p1 = simd_shuffle_xor(vg.y, bit);
+    \\  const float p2 = simd_shuffle_xor(vg.z, bit);
+    \\  const float p3 = simd_shuffle_xor(vg.w, bit);
+    \\  const bool lower = (lane & bit) == 0u;
+    \\  vg.x = lower ? vg.x + p0 : p0 - vg.x;
+    \\  vg.y = lower ? vg.y + p1 : p1 - vg.y;
+    \\  vg.z = lower ? vg.z + p2 : p2 - vg.z;
+    \\  vg.w = lower ? vg.w + p3 : p3 - vg.w;
+    \\}
+    \\const float gs0 = vg.x + vg.y;
+    \\const float gs1 = vg.x - vg.y;
+    \\const float gs2 = vg.z + vg.w;
+    \\const float gs3 = vg.z - vg.w;
+    \\const float g0 = float(bfloat16_t((gs0 + gs2) * sc * float(g_svh[base + lane])));
+    \\const float g1 = float(bfloat16_t((gs1 + gs3) * sc * float(g_svh[base + lane + 32u])));
+    \\const float g2 = float(bfloat16_t((gs0 - gs2) * sc * float(g_svh[base + lane + 64u])));
+    \\const float g3 = float(bfloat16_t((gs1 - gs3) * sc * float(g_svh[base + lane + 96u])));
+    \\float4 vu = float4(
+    \\  float(u_inner[xb + lane]),
+    \\  float(u_inner[xb + lane + 32u]),
+    \\  float(u_inner[xb + lane + 64u]),
+    \\  float(u_inner[xb + lane + 96u]));
+    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\  const float p0 = simd_shuffle_xor(vu.x, bit);
+    \\  const float p1 = simd_shuffle_xor(vu.y, bit);
+    \\  const float p2 = simd_shuffle_xor(vu.z, bit);
+    \\  const float p3 = simd_shuffle_xor(vu.w, bit);
+    \\  const bool lower = (lane & bit) == 0u;
+    \\  vu.x = lower ? vu.x + p0 : p0 - vu.x;
+    \\  vu.y = lower ? vu.y + p1 : p1 - vu.y;
+    \\  vu.z = lower ? vu.z + p2 : p2 - vu.z;
+    \\  vu.w = lower ? vu.w + p3 : p3 - vu.w;
+    \\}
+    \\const float us0 = vu.x + vu.y;
+    \\const float us1 = vu.x - vu.y;
+    \\const float us2 = vu.z + vu.w;
+    \\const float us3 = vu.z - vu.w;
+    \\const float u0 = float(bfloat16_t((us0 + us2) * sc * float(u_svh[base + lane])));
+    \\const float u1 = float(bfloat16_t((us1 + us3) * sc * float(u_svh[base + lane + 32u])));
+    \\const float u2 = float(bfloat16_t((us0 - us2) * sc * float(u_svh[base + lane + 64u])));
+    \\const float u3 = float(bfloat16_t((us1 - us3) * sc * float(u_svh[base + lane + 96u])));
+    \\const float a0 = float(bfloat16_t((g0 * hy4_sigmoid(g0)) * u0));
+    \\const float a1 = float(bfloat16_t((g1 * hy4_sigmoid(g1)) * u1));
+    \\const float a2 = float(bfloat16_t((g2 * hy4_sigmoid(g2)) * u2));
+    \\const float a3 = float(bfloat16_t((g3 * hy4_sigmoid(g3)) * u3));
+    \\float4 v = float4(
+    \\  a0 * float(d_suh[base + lane]),
+    \\  a1 * float(d_suh[base + lane + 32u]),
+    \\  a2 * float(d_suh[base + lane + 64u]),
+    \\  a3 * float(d_suh[base + lane + 96u]));
+    \\for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+    \\  const float p0 = simd_shuffle_xor(v.x, bit);
+    \\  const float p1 = simd_shuffle_xor(v.y, bit);
+    \\  const float p2 = simd_shuffle_xor(v.z, bit);
+    \\  const float p3 = simd_shuffle_xor(v.w, bit);
+    \\  const bool lower = (lane & bit) == 0u;
+    \\  v.x = lower ? v.x + p0 : p0 - v.x;
+    \\  v.y = lower ? v.y + p1 : p1 - v.y;
+    \\  v.z = lower ? v.z + p2 : p2 - v.z;
+    \\  v.w = lower ? v.w + p3 : p3 - v.w;
+    \\}
+    \\const float s0 = v.x + v.y;
+    \\const float s1 = v.x - v.y;
+    \\const float s2 = v.z + v.w;
+    \\const float s3 = v.z - v.w;
+    \\out[xb + lane] = half((s0 + s2) * sc);
+    \\out[xb + lane + 32u] = half((s1 + s3) * sc);
+    \\out[xb + lane + 64u] = half((s0 - s2) * sc);
+    \\out[xb + lane + 96u] = half((s1 - s3) * sc);
+;
+
+var swiglu_finish_prepare_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// `silu(gate) · up` from the two banks' unfinished GEMM rows (`hy4_stq.applyInner`), finished with their `svh`, then
+/// prepared for the down bank (`suh`, Hadamard, f16): the finishes, the SwiGLU and the prepare in one launch, their
+/// bytes.
+pub fn swigluFinishPrepare(s: mlx.mlx_stream, g_inner: Arr, g_svh: Arr, u_inner: Arr, u_svh: Arr, d_suh: Arr) !Arr {
+    const k = try getKernel(&swiglu_finish_prepare_kernel, "sushi_hy4_swiglu_finish_prepare", &.{ "g_inner", "g_svh", "u_inner", "u_svh", "d_suh" }, swiglu_finish_prepare_source);
+    const sh = mlx.getShape(g_inner);
+    const cfg = try cfgs.get(.{ .kind = .swiglu_finish_prepare, .a = sh[0], .b = sh[1] }, build);
+    var out: [1]Arr = undefined;
+    try applyOuts(s, k, &.{ g_inner, g_svh, u_inner, u_svh, d_suh }, cfg, &out);
+    return out[0];
 }
 
 /// `recallAt`'s groups [T, take + 1] f32: the picks `order` [T, take] (int32) widened, then each row's own group

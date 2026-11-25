@@ -111,9 +111,13 @@ const Hooks = struct {
         const keep = 1 + accepted;
         if (keep > v.n) return error.SpecDecodeUnsupported;
         if (keep < v.n) {
-            if (xfm.expert_stream) |engine| engine.beginForward();
-            try m.rollbackTo(&v.mark.?, v.ids[0..keep]);
-            if (xfm.expert_stream) |engine| engine.finishForward(keep);
+            if (Hooks.widthExact(xfm) and m.keepRowsApplies(&v.mark.?, keep)) {
+                try m.keepRows(&v.mark.?, keep);
+            } else {
+                if (xfm.expert_stream) |engine| engine.beginForward();
+                try m.rollbackTo(&v.mark.?, v.ids[0..keep]);
+                if (xfm.expert_stream) |engine| engine.finishForward(keep);
+            }
         }
         ctx.cache.step = m.pos;
     }
