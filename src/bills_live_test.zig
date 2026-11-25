@@ -780,7 +780,7 @@ test "a Qwen request commits the cache its admitted width reserves, not the defa
     // A long prompt reserves its prompt, its reply and one chunk of the width it is admitted at.
     const seq: usize = 40_000;
     const bill = bills.prefillAdmissionBill(&cfg, null, seq, 4096, kv8, false, null, .{});
-    try testing.expect(bill.chunk < @import("settings_resolve.zig").prefill_chunk.value);
+    try testing.expect(bill.chunk < @import("settings_resolve.zig").chunk_rung_top);
     const nums = bills.prefillBillNumbersNow(&cfg, seq, 4096, kv8, false, false);
     try testing.expectEqual(bills.cacheCommitBytes(&cfg, seq, 4096, 8, bill.chunk, false), nums.commit);
 }

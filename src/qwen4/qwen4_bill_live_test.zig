@@ -672,7 +672,7 @@ fn refusedSplits(cfg: *const model_mod.ModelConfig, named: u64, budget: u64, war
     while (p < named) : (p = nextSplitPrompt(p, named)) {
         r.tried += 1;
         const reply: u32 = @intCast(named - p);
-        const pick = bills.chooseRequestPrefillChunk(&probe, p, reply, 8, budget, probe.pinned_prefill_chunk, 0, warm);
+        const pick = bills.chooseRequestPrefillChunk(&probe, p, reply, 8, budget, probe.pinned_prefill_chunk, warm);
         const n = bills.prefillNeededAtChunk(&probe, p, reply, 8, pick, warm);
         if (n <= budget) continue;
         r.refused += 1;
@@ -697,7 +697,7 @@ test "Flash-Next: the context the auto search names at a budget is admitted at e
             cfg.pinned_prefill_chunk = pin;
             const w: bills.WarmPrefix = .{ .mtp_on = bills.mtpHeadDefaultOn(cfg) };
             // A budget about a prompt of `target` tokens alone, at the width a request of it runs.
-            const base = bills.prefillNeededAtChunk(cfg, target, 0, 8, bills.chooseRequestPrefillChunk(cfg, target, 0, 8, std.math.maxInt(u64) / 4, pin, 0, w), w);
+            const base = bills.prefillNeededAtChunk(cfg, target, 0, 8, bills.chooseRequestPrefillChunk(cfg, target, 0, 8, std.math.maxInt(u64) / 4, pin, w), w);
             const budget: u64 = @intCast(@as(i64, @intCast(base)) + nudge * (1 << 20));
             const named = bills.maxSushiContextForBudget(cfg, 8, budget);
             if (named < 2) continue;
