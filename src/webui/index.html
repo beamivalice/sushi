@@ -3604,7 +3604,7 @@ init();
 <script id="adminScript">
 /* Thinking effort tables (GET/POST /v1/settings `effort`): one per family, edited on the Settings page. */
 const EFFORT_WORDS = ["off", "low", "medium", "high", "xhigh", "max"];
-const EFFORT_FAMILY_LABEL = { qwen4_exp: "Qwen", deepseek_v41: "DeepSeek", glm5_next: "GLM" };
+const EFFORT_FAMILY_LABEL = { qwen4_exp: "Qwen", deepseek_v41: "DeepSeek", glm5_next: "GLM", hy_v4_flash: "Hy4 Flash" };
 // A word the family has no level for (Qwen high/max, GLM medium/xhigh) that still uses a near one: accepted, served
 // as that word with a notice. Picking a value or a cap serves the word as itself; unticking refuses it.
 function effortIsFold(row, d) {
