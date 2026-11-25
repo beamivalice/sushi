@@ -6,6 +6,9 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **sushibar shows a prompt being read**: the menu bar's fish fills green as the prompt is read, with the time left
+  beside it once the read rate is known (Show Seconds Left turns the number off), and its green slot blinks while a
+  reply generates; the `prompt…` and `generating…` words are gone.
 - **A cache or settings folder linked to another volume works**: `~/.sushi/kv-cache` (or another folder Sushi makes)
   as a symlink to an external drive turned the SSD prompt cache off with `init failed: NotDir`; it now opens there.
 - **`--wired-margin-gib 0` keeps 512 MB unplanned**: where the GPU floor reads 0, a margin of 0 planned to the wired

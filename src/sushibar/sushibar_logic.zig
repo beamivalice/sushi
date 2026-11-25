@@ -68,11 +68,59 @@ pub const Link = enum {
 
 pub const Row = struct { request_id: u64, generated: u64 };
 
+/// A request's prompt read, as `/metrics.json` reports it while the request's phase is `prefill`: prompt tokens in
+/// all, those the prefix cache restored, those read so far (the restored included) and the ms spent reading.
+pub const Prefill = struct { total: u64 = 0, cache: u64 = 0, processed: u64 = 0, time_ms: u64 = 0 };
+
+/// What the menu bar shows of a prompt read: the fraction read, and the seconds left once a chunk has given the rate.
+pub const Read = struct { fraction: f32, seconds_left: ?u32 };
+
+pub fn readOf(p: Prefill) Read {
+    const done = @min(p.processed, p.total);
+    const fraction: f32 = if (p.total == 0) 0 else @floatCast(@as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(p.total)));
+    if (p.processed <= p.cache or p.time_ms == 0) return .{ .fraction = fraction, .seconds_left = null };
+    const per_ms = @as(f64, @floatFromInt(p.processed - p.cache)) / @as(f64, @floatFromInt(p.time_ms));
+    const left_ms = @as(f64, @floatFromInt(p.total - done)) / per_ms;
+    const left_s = @ceil(left_ms / 1000.0);
+    const most: f64 = @floatFromInt(std.math.maxInt(u32));
+    return .{ .fraction = fraction, .seconds_left = if (left_s >= most) std.math.maxInt(u32) else @intFromFloat(left_s) };
+}
+
+/// A row's `prefill` object, read field by field: a read only where each number is whole and not negative (a
+/// fractional millisecond count is floored), so a value the client cannot use costs it the read, never the answer.
+fn prefillOf(v: std.json.Value) ?Prefill {
+    const obj = switch (v) {
+        .object => |o| o,
+        else => return null,
+    };
+    var out: Prefill = .{};
+    inline for (.{ "total", "cache", "processed", "time_ms" }) |name| {
+        if (obj.get(name)) |n| @field(out, name) = switch (n) {
+            .integer => |i| std.math.cast(u64, i) orelse return null,
+            .float => |f| if (!(f >= 0) or f >= 0x1p64) return null else @intFromFloat(@floor(f)),
+            else => return null,
+        };
+    }
+    return out;
+}
+
+fn tokensLeft(p: Prefill) u64 {
+    return p.total - @min(p.processed, p.total);
+}
+
+/// A read under way shows before one still queued (no chunk timed yet), then the one with the most left.
+fn showsBefore(a: Prefill, b: Prefill) bool {
+    if ((a.time_ms > 0) != (b.time_ms > 0)) return a.time_ms > 0;
+    return tokensLeft(a) > tokensLeft(b);
+}
+
 /// One `/metrics.json?since=` answer, reduced to what the title needs.
 pub const Sample = struct {
     link: Link = .offline,
     decoding: []const Row = &.{},
     prefilling: bool = false,
+    /// The prompt read with the most tokens left, where the server reports reads.
+    read: ?Read = null,
     /// The newest finished request that generated tokens: `generated_tokens / decode_seconds`.
     finished_tps: ?f64 = null,
     /// The newest finished request's prompt speed: `prompt_tokens / prefill_seconds` (`prompt_tokens` excludes the restored).
@@ -94,7 +142,7 @@ const Wire = struct {
         gpu_clock_mhz: u64 = 0,
         gpu_utilization_pct: u64 = 0,
     } = .{},
-    sessions: []const struct { request_id: u64 = 0, phase: []const u8 = "", generated_tokens: u64 = 0 } = &.{},
+    sessions: []const struct { request_id: u64 = 0, phase: []const u8 = "", generated_tokens: u64 = 0, prefill: ?std.json.Value = null } = &.{},
     requests: []const struct {
         t_ms: i64 = 0,
         prompt_tokens: u64 = 0,
@@ -106,6 +154,11 @@ const Wire = struct {
     } = &.{},
     history: ?struct { fields: []const []const u8 = &.{}, samples: []const []const f64 = &.{} } = null,
 };
+
+/// The sample of an answer `parseMetrics` cannot read: the server answers, with nothing of it shown.
+pub fn unreadable(link: Link) Sample {
+    return .{ .link = link };
+}
 
 fn nonZero(v: u64) ?u64 {
     return if (v == 0) null else v;
@@ -121,10 +174,16 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
         .gpu_pct = if (wire.gauges.gpu_clock_mhz > 0 or wire.gauges.gpu_utilization_pct > 0) wire.gauges.gpu_utilization_pct else null,
     };
     var rows: std.ArrayList(Row) = .empty;
+    var longest: ?Prefill = null;
     for (wire.sessions) |s| {
         if (std.mem.eql(u8, s.phase, "decode")) try rows.append(arena, .{ .request_id = s.request_id, .generated = s.generated_tokens });
-        if (std.mem.eql(u8, s.phase, "prefill")) out.prefilling = true;
+        if (!std.mem.eql(u8, s.phase, "prefill")) continue;
+        out.prefilling = true;
+        const p = prefillOf(s.prefill orelse continue) orelse continue;
+        if (p.total == 0) continue;
+        if (longest == null or showsBefore(p, longest.?)) longest = p;
     }
+    if (longest) |p| out.read = readOf(p);
     out.decoding = rows.items;
     var newest_speed_ms: i64 = std.math.minInt(i64);
     var newest_prefill_ms: i64 = std.math.minInt(i64);
@@ -198,6 +257,9 @@ pub const View = struct {
     link: Link,
     decoding: bool = false,
     prefilling: bool = false,
+    read: ?Read = null,
+    /// The seconds switch: the title shows a prompt read's seconds left.
+    show_seconds: bool = true,
     live: ?f64 = null,
     last: ?f64 = null,
     update_waiting: bool = false,
@@ -212,6 +274,7 @@ pub const Tracker = struct {
     since_ms: i64 = 0,
     decoding: bool = false,
     prefilling: bool = false,
+    read: ?Read = null,
     live: ?f64 = null,
     last: ?f64 = null,
     last_prefill: ?f64 = null,
@@ -222,6 +285,7 @@ pub const Tracker = struct {
         self.live = null;
         self.decoding = sample.decoding.len > 0;
         self.prefilling = sample.prefilling;
+        self.read = sample.read;
         if (sample.link == .up) {
             self.since_ms = @max(sample.newest_finished_ms, now_ms);
             if (sample.finished_tps) |t| self.last = t;
@@ -253,6 +317,7 @@ pub const Tracker = struct {
             .link = link,
             .decoding = self.decoding,
             .prefilling = self.prefilling,
+            .read = self.read,
             .live = self.live,
             .last = self.last,
         };
@@ -275,14 +340,21 @@ pub fn title(buf: []u8, v: View) []const u8 {
     return buf[0 .. base.len + tail.len];
 }
 
+/// Seconds left as the title shows them: `45s`, `4:59` from a minute, `>1h` from an hour.
+fn secondsText(buf: []u8, s: u32) std.fmt.BufPrintError![]const u8 {
+    if (s >= 3600) return std.fmt.bufPrint(buf, ">1h", .{});
+    if (s >= 60) return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ s / 60, s % 60 });
+    return std.fmt.bufPrint(buf, "{d}s", .{s});
+}
+
 fn titleBase(buf: []u8, v: View) []const u8 {
     var num: [32]u8 = undefined;
     const text = switch (v.link) {
         .offline, .unauthorized, .metrics_off, .silent => std.fmt.bufPrint(buf, "", .{}),
-        .up => if (v.decoding)
-            (if (v.live) |t| std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, t)}) else std.fmt.bufPrint(buf, "generating…", .{}))
-        else if (v.prefilling)
-            std.fmt.bufPrint(buf, "prompt…", .{})
+        .up => if (v.decoding and v.live != null)
+            std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, v.live.?)})
+        else if (v.show_seconds and v.read != null and (v.read.?.seconds_left orelse 0) > 0)
+            secondsText(buf, v.read.?.seconds_left.?)
         else
             std.fmt.bufPrint(buf, "", .{}),
     };
@@ -323,6 +395,57 @@ pub fn loadingSvg(buf: []u8, svg: []const u8, i: usize) ![]const u8 {
     try w.writeAll(svg[stops + loading_stops.len .. slot]);
     try w.writeAll(if (f.lit) slot_lit else slot_dim);
     try w.writeAll(svg[slot + slot_lit.len ..]);
+    return w.buffered();
+}
+
+/// The generating icon: the ready sushi with its slot blinking, lit then dim, `generating_blink_s` each.
+pub const generating_blink_s: f64 = 0.5;
+
+pub fn generatingSvg(buf: []u8, svg: []const u8, lit: bool) ![]const u8 {
+    const slot = std.mem.indexOf(u8, svg, slot_lit) orelse return error.ReadyIconChanged;
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeAll(svg[0..slot]);
+    try w.writeAll(if (lit) slot_lit else slot_dim);
+    try w.writeAll(svg[slot + slot_lit.len ..]);
+    return w.buffered();
+}
+
+/// The reading icon: the ready sushi whose fish fills with green, left to right, as a prompt is read. A fraction maps
+/// to the step read so far, so the fill never runs ahead of the server's count.
+pub const reading_steps = 50;
+
+pub fn readingStep(fraction: f32) usize {
+    const f = std.math.clamp(fraction, 0, 1);
+    return @intFromFloat(@floor(f * reading_steps));
+}
+
+/// Where step `i`'s green ends, as a fraction of the fish's width.
+pub fn readingEdge(i: usize) f32 {
+    return @as(f32, @floatFromInt(@min(i, reading_steps))) / reading_steps;
+}
+
+const fish_gradient_start = "<linearGradient id=\"fish\"";
+const fish_fill = "fill=\"url(#fish)\" stroke=\"#b03f14\"";
+const fish_stripes_start = "<path d=\"M6.8 4.2";
+
+/// Step `i` of the reading icon, from the ready icon: the fish's gradient becomes a lit green up to the step's edge
+/// (deep at the tail, brightest at the edge, like an LED bar) and pale beyond it, its outline green, its stripes gone.
+pub fn readingSvg(buf: []u8, svg: []const u8, i: usize) ![]const u8 {
+    const grad = std.mem.indexOf(u8, svg, fish_gradient_start) orelse return error.ReadingIconChanged;
+    const grad_end = (std.mem.indexOfPos(u8, svg, grad, "</linearGradient>") orelse return error.ReadingIconChanged) + "</linearGradient>".len;
+    const fill = std.mem.indexOfPos(u8, svg, grad_end, fish_fill) orelse return error.ReadingIconChanged;
+    const stripes = std.mem.indexOfPos(u8, svg, fill, fish_stripes_start) orelse return error.ReadingIconChanged;
+    const stripes_end = (std.mem.indexOfPos(u8, svg, stripes, "/>") orelse return error.ReadingIconChanged) + 2;
+    const at = readingEdge(i);
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeAll(svg[0..grad]);
+    try w.print("<linearGradient id=\"read\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\"><stop offset=\"0\" stop-color=\"#0fa83a\"/>" ++
+        "<stop offset=\"{d:.3}\" stop-color=\"#6bff96\"/><stop offset=\"{d:.3}\" stop-color=\"#f2f4f6\"/>" ++
+        "<stop offset=\"1\" stop-color=\"#d9dde2\"/></linearGradient>", .{ at, at });
+    try w.writeAll(svg[grad_end..fill]);
+    try w.writeAll("fill=\"url(#read)\" stroke=\"#0b7a2e\"");
+    try w.writeAll(svg[fill + fish_fill.len .. stripes]);
+    try w.writeAll(svg[stripes_end..]);
     return w.buffered();
 }
 
@@ -1374,6 +1497,8 @@ pub const Saved = struct {
     port: ?u16 = null,
     ports: SavedPorts = .{},
     lan: bool = false,
+    /// The seconds switch: on unless the file says off.
+    seconds: bool = true,
     model_buf: [max_model]u8 = undefined,
     model_len: usize = 0,
 
@@ -1404,18 +1529,22 @@ pub fn parseSaved(text: []const u8) Saved {
     if (obj.get("lan")) |l| if (l == .bool) {
         out.lan = l.bool;
     };
+    if (obj.get("seconds")) |on| if (on == .bool) {
+        out.seconds = on.bool;
+    };
     return out;
 }
 pub const saved_max_bytes = 8192;
 var saved_scratch: [saved_max_bytes]u8 = undefined;
 
-pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8, lan: bool) []const u8 {
+pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8, lan: bool, seconds: bool) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print("{{\"port\":{d},\"ports\":[", .{watched}) catch return "";
     for (ports, 0..) |p, i| w.print("{s}{d}", .{ if (i > 0) "," else "", p }) catch return "";
     w.writeAll("]") catch return "";
     if (model.len > 0) w.print(",\"model\":{f}", .{json_text.Str{ .s = model }}) catch return "";
     if (lan) w.writeAll(",\"lan\":true") catch return "";
+    if (!seconds) w.writeAll(",\"seconds\":false") catch return "";
     w.writeAll("}\n") catch return "";
     return w.buffered();
 }
@@ -1676,7 +1805,7 @@ test "ports: an explicit --port beats the saved one, which beats the default" {
 
 test "ports: the saved file round-trips the watched port and the added ones, and refuses anything else" {
     var b: [320]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, "", false));
+    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, "", false, true));
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, got.ports.items());
     try std.testing.expectEqualStrings("", got.model());
@@ -1689,26 +1818,26 @@ test "ports: the saved file round-trips the watched port and the added ones, and
 
 test "last model: the saved file keeps the model the watched server had loaded, escaped, and old files have none" {
     var b: [320]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw", false));
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw", false, true));
     try std.testing.expectEqualStrings("Example-Flash-Next-Sushi-STQ-2.75bpw", got.model());
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{18803}, got.ports.items());
-    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c", false)).model());
+    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c", false, true)).model());
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5,\"ports\":[6]}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"model\":5}").model());
     const long: [max_model + 1]u8 = @splat('m');
     var jb: [max_model + 32]u8 = undefined;
     try std.testing.expectEqualStrings("", parseSaved(try std.fmt.bufPrint(&jb, "{{\"model\":\"{s}\"}}", .{&long})).model());
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false), "model") == null);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, true), "model") == null);
 }
 
 test "lan: the saved file keeps the switch, writes it only when on, and old files read as off" {
     var b: [320]u8 = undefined;
-    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 18802, &.{18803}, "M", true)).lan);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", true), "\"lan\":true") != null);
-    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false)).lan);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false), "lan") == null);
+    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 18802, &.{18803}, "M", true, true)).lan);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", true, true), "\"lan\":true") != null);
+    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false, true)).lan);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, true), "lan") == null);
     try std.testing.expectEqual(false, parseSaved("{\"port\":5}").lan);
     try std.testing.expectEqual(false, parseSaved("{\"lan\":false}").lan);
     try std.testing.expectEqual(false, parseSaved("{\"lan\":\"0.0.0.0\"}").lan);
@@ -2623,12 +2752,12 @@ test "speed: a rate that rounds to 100 reads as a whole number, in the title and
     try std.testing.expectEqualStrings("100", h.stats[0].value);
 }
 
-test "title: live, last, prompt, idle, offline, unauthorized, metrics off" {
+test "title: live, last, idle, offline, unauthorized, metrics off; no word while a prompt is read or a reply waits" {
     var b: [64]u8 = undefined;
     try std.testing.expectEqualStrings("103 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 102.7 }));
     try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 }));
-    try std.testing.expectEqualStrings("generating…", title(&b, .{ .link = .up, .decoding = true }));
-    try std.testing.expectEqualStrings("prompt…", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .decoding = true }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .last = 88 }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
     try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
@@ -3110,13 +3239,13 @@ test "log new lines: the pill shows once lines arrive while scrolled up, and goe
 test "last model: a 200-byte id round trips through the saved file, a file from before the wider bound loads unchanged" {
     const id: [200]u8 = @splat('x');
     var b: [saved_max_bytes]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id, false));
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id, false, true));
     try std.testing.expectEqualStrings(&id, got.model());
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     const edge: [max_model]u8 = @splat('e');
-    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge, false)).model());
+    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge, false, true)).model());
     const quoted: [max_model]u8 = @splat('"');
-    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted, false)).model());
+    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted, false, true)).model());
     const old = parseSaved("{\"port\":18802,\"ports\":[18803,18804],\"model\":\"Qwen-Sushi-STQ-2.75bpw\"}\n");
     try std.testing.expectEqualStrings("Qwen-Sushi-STQ-2.75bpw", old.model());
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, old.ports.items());
@@ -3207,4 +3336,171 @@ test "the loading icon: its first frame is the static icon, the orange sweeps to
         try std.testing.expect(std.mem.indexOf(u8, frame, if (f.lit) "#39ff6a" else "#1c6b30") != null);
     }
     try std.testing.expect(lit > 0 and lit < loading_frames);
+}
+
+test "reading: a prompt's read is its own numbers, the fraction read and the seconds left once a chunk gives the rate" {
+    // 64,530 tokens, none restored, 39,412 read in 20 s: 1,970.6 tok/s, 12.7 s left, shown as 13.
+    const r = readOf(.{ .total = 64530, .cache = 0, .processed = 39412, .time_ms = 20000 });
+    try std.testing.expectApproxEqAbs(@as(f32, 39412.0 / 64530.0), r.fraction, 1e-6);
+    try std.testing.expectEqual(@as(?u32, 13), r.seconds_left);
+    // A restored prefix starts the fill part-way and is not counted in the rate.
+    const hit = readOf(.{ .total = 64000, .cache = 40000, .processed = 48000, .time_ms = 4000 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), hit.fraction, 1e-6);
+    try std.testing.expectEqual(@as(?u32, 8), hit.seconds_left);
+    // Before the first chunk there is no rate: no seconds, never a guess.
+    try std.testing.expectEqual(@as(?u32, null), readOf(.{ .total = 64000, .cache = 40000, .processed = 40000, .time_ms = 0 }).seconds_left);
+    try std.testing.expectEqual(@as(?u32, null), readOf(.{ .total = 9000, .cache = 0, .processed = 0, .time_ms = 0 }).seconds_left);
+    try std.testing.expectEqual(@as(?u32, null), readOf(.{ .total = 9000, .cache = 0, .processed = 4096, .time_ms = 0 }).seconds_left);
+    // Read to the end: full, nothing left. A count past the total never fills past it.
+    try std.testing.expectEqual(@as(f32, 1), readOf(.{ .total = 100, .cache = 0, .processed = 100, .time_ms = 50 }).fraction);
+    try std.testing.expectEqual(@as(?u32, 0), readOf(.{ .total = 100, .cache = 0, .processed = 100, .time_ms = 50 }).seconds_left);
+    try std.testing.expectEqual(@as(f32, 1), readOf(.{ .total = 100, .cache = 0, .processed = 140, .time_ms = 50 }).fraction);
+    try std.testing.expectEqual(@as(f32, 0), readOf(.{ .total = 0, .cache = 0, .processed = 0, .time_ms = 0 }).fraction);
+}
+
+test "reading: of several prompts read at once one under way shows before a queued one, then the one with the most left; none without the server's numbers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const two =
+        \\{"gauges":{"requests_prefilling":2},"sessions":[
+        \\{"request_id":1,"phase":"prefill","generated_tokens":0,"prefill":{"total":10000,"cache":0,"processed":9000,"time_ms":4000}},
+        \\{"request_id":2,"phase":"prefill","generated_tokens":0,"prefill":{"total":80000,"cache":0,"processed":8000,"time_ms":4000}},
+        \\{"request_id":3,"phase":"decode","generated_tokens":12}]}
+    ;
+    const s = try parseMetrics(a, two);
+    try std.testing.expect(s.prefilling);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), s.read.?.fraction, 1e-6);
+    try std.testing.expectEqual(@as(?u32, 36), s.read.?.seconds_left);
+    try std.testing.expectEqual(@as(usize, 1), s.decoding.len);
+    const queued =
+        \\{"gauges":{"requests_prefilling":2},"sessions":[
+        \\{"request_id":1,"phase":"prefill","generated_tokens":0,"prefill":{"total":90000,"cache":0,"processed":0,"time_ms":0}},
+        \\{"request_id":2,"phase":"prefill","generated_tokens":0,"prefill":{"total":10000,"cache":0,"processed":9000,"time_ms":4000}}]}
+    ;
+    const q = try parseMetrics(a, queued);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), q.read.?.fraction, 1e-6);
+    // A server from before the numbers: prefilling, with no read to show.
+    const old = try parseMetrics(a, "{\"gauges\":{\"requests_prefilling\":1},\"sessions\":[{\"request_id\":1,\"phase\":\"prefill\"}]}");
+    try std.testing.expect(old.prefilling);
+    try std.testing.expectEqual(@as(?Read, null), old.read);
+    // A decode row never carries a read.
+    const dec = try parseMetrics(a, "{\"sessions\":[{\"request_id\":1,\"phase\":\"decode\",\"generated_tokens\":3}]}");
+    try std.testing.expectEqual(@as(?Read, null), dec.read);
+}
+
+test "title: a prompt read shows its seconds left while the switch is on, else nothing; no word while a reply waits" {
+    var b: [64]u8 = undefined;
+    const r: Read = .{ .fraction = 0.6, .seconds_left = 12 };
+    try std.testing.expectEqualStrings("12s", title(&b, .{ .link = .up, .prefilling = true, .read = r, .show_seconds = true }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .read = r, .show_seconds = false }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null }, .show_seconds = true }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
+    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .decoding = true }));
+    // A reply that generates while another prompt is read shows its speed.
+    try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = r, .show_seconds = true }));
+    try std.testing.expectEqualStrings("12s •", title(&b, .{ .link = .up, .prefilling = true, .read = r, .show_seconds = true, .update_waiting = true }));
+}
+
+test "the reading icon: green fills the ready fish up to the step read, and each step fills more" {
+    const svg = @embedFile("icon-online.svg");
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), readingStep(0));
+    try std.testing.expectEqual(@as(usize, reading_steps), readingStep(1));
+    try std.testing.expectEqual(@as(usize, reading_steps / 2), readingStep(0.5));
+    // A step is what has been read: 49.9% is not yet the half step.
+    try std.testing.expectEqual(@as(usize, reading_steps / 2 - 1), readingStep(0.499));
+    var prev: f32 = -1;
+    for (0..reading_steps + 1) |i| {
+        const frame = try readingSvg(&buf, svg, i);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "url(#fish)") == null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "url(#read)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "#ffe6d8") == null);
+        try std.testing.expect(std.mem.indexOf(u8, frame, "#39ff6a") != null);
+        const at = readingEdge(i);
+        try std.testing.expect(at > prev and at >= 0 and at <= 1);
+        prev = at;
+    }
+    try std.testing.expectError(error.ReadingIconChanged, readingSvg(&buf, @embedFile("icon-loading.svg"), 3));
+}
+
+test "seconds switch: on by default, saved only when off, and old files read as on" {
+    var b: [320]u8 = undefined;
+    try std.testing.expectEqual(true, parseSaved("{\"port\":5}").seconds);
+    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false, false)).seconds);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, false), "\"seconds\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, true), "seconds") == null);
+    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 1, &.{}, "", true, true)).seconds);
+    try std.testing.expectEqual(true, parseSaved("{\"seconds\":\"no\"}").seconds);
+}
+
+test "title: seconds left read as seconds under a minute, minutes and seconds under an hour, past an hour as >1h, nothing at 0" {
+    var b: [64]u8 = undefined;
+    const at = struct {
+        fn f(buf: []u8, s: ?u32) []const u8 {
+            return title(buf, .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.5, .seconds_left = s }, .show_seconds = true });
+        }
+    }.f;
+    try std.testing.expectEqualStrings("1s", at(&b, 1));
+    try std.testing.expectEqualStrings("59s", at(&b, 59));
+    try std.testing.expectEqualStrings("1:00", at(&b, 60));
+    try std.testing.expectEqualStrings("4:59", at(&b, 299));
+    try std.testing.expectEqualStrings("59:59", at(&b, 3599));
+    try std.testing.expectEqualStrings(">1h", at(&b, 3600));
+    try std.testing.expectEqualStrings(">1h", at(&b, 900_000));
+    try std.testing.expectEqualStrings("", at(&b, 0));
+    try std.testing.expectEqualStrings("", at(&b, null));
+}
+
+test "the generating icon: the ready sushi with its slot lit, then dim, at a steady beat" {
+    const svg = @embedFile("icon-online.svg");
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings(svg, try generatingSvg(&buf, svg, true));
+    const dim = try generatingSvg(&buf, svg, false);
+    try std.testing.expect(std.mem.indexOf(u8, dim, "#39ff6a") == null);
+    try std.testing.expect(std.mem.indexOf(u8, dim, "#1c6b30") != null);
+    try std.testing.expect(generating_blink_s >= 0.3 and generating_blink_s <= 1.0);
+    try std.testing.expectError(error.ReadyIconChanged, generatingSvg(&buf, "<svg/>", false));
+}
+
+test "reading: a prefill object whose numbers are not whole and non-negative is no read, and the rest of the answer reads" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bodies = [_][]const u8{
+        "{\"total\":-1,\"cache\":0,\"processed\":5,\"time_ms\":10}",
+        "{\"total\":100,\"cache\":0,\"processed\":50,\"time_ms\":-3}",
+        "[]",
+        "\"half\"",
+        "{\"total\":18446744073709551616,\"cache\":0,\"processed\":5,\"time_ms\":10}",
+        "{\"total\":\"100\",\"cache\":0,\"processed\":50,\"time_ms\":10}",
+        "{}",
+        "{\"total\":0,\"cache\":0,\"processed\":0,\"time_ms\":0}",
+    };
+    for (bodies) |p| {
+        const body = try std.fmt.allocPrint(a, "{{\"gauges\":{{\"memory_mb\":512}},\"sessions\":[{{\"request_id\":1,\"phase\":\"prefill\",\"prefill\":{s}}},{{\"request_id\":2,\"phase\":\"decode\",\"generated_tokens\":7}}]}}", .{p});
+        const s = try parseMetrics(a, body);
+        errdefer std.debug.print("body: {s}\n", .{p});
+        try std.testing.expectEqual(Link.up, s.link);
+        try std.testing.expect(s.prefilling);
+        try std.testing.expectEqual(@as(?Read, null), s.read);
+        try std.testing.expectEqual(@as(usize, 1), s.decoding.len);
+        try std.testing.expectEqual(@as(?u64, 512), s.mem_mb);
+    }
+    // A fractional count of milliseconds is a count all the same.
+    const frac = try parseMetrics(a, "{\"sessions\":[{\"request_id\":1,\"phase\":\"prefill\",\"prefill\":{\"total\":64530,\"cache\":0,\"processed\":39412,\"time_ms\":20000.5}}]}");
+    try std.testing.expectEqual(@as(?u32, 13), frac.read.?.seconds_left);
+}
+
+test "reading: a time left past any clock reads as the most a u32 holds, never a wrapped or undefined count" {
+    const far = readOf(.{ .total = 9_000_000_000_000_000, .cache = 0, .processed = 1, .time_ms = 1 });
+    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), far.seconds_left);
+    var b: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(">1h", title(&b, .{ .link = .up, .prefilling = true, .read = far, .show_seconds = true }));
+}
+
+test "metrics: an answer the client cannot read is a server that answers with nothing shown, never one that is offline" {
+    try std.testing.expectEqual(@as(?Read, null), unreadable(.up).read);
+    try std.testing.expect(!unreadable(.up).prefilling);
+    try std.testing.expectEqual(Link.up, unreadable(.up).link);
 }

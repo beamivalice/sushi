@@ -199,6 +199,8 @@ var g_default_port: u16 = logic.default_port;
 var g_saved: logic.SavedPorts = .{};
 /// The "Listen on LAN" switch: Start binds `lan_host` while it is on. The main thread's.
 var g_lan: bool = false;
+/// The seconds switch: the menu bar shows a prompt read's seconds left beside the icon. The main thread's.
+var g_seconds: bool = true;
 var g_home: []const u8 = "/tmp";
 var g_sushi_found = false;
 var g_sibling_brew = false;
@@ -833,7 +835,7 @@ fn pollLoop() void {
         }
 
         var sample: logic.Sample = .{ .link = reached };
-        if (reached == .up) sample = logic.parseMetrics(a, reply.?.body) catch .{};
+        if (reached == .up) sample = logic.parseMetrics(a, reply.?.body) catch logic.unreadable(reached);
         // A sushi that holds the port and does not answer is not a stopped one.
         if (sample.link == .offline and sushi_listening) sample.link = .silent;
         tracker.observe(now, sample);
@@ -943,7 +945,7 @@ fn pollLoop() void {
 fn writeSaved(p: u16) void {
     var text: [logic.saved_max_bytes]u8 = undefined;
     io_util.makeDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get(), g_lan) }) catch {};
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get(), g_lan, g_seconds) }) catch {};
 }
 
 fn readDefaultPort() u16 {
@@ -1331,6 +1333,15 @@ var note_mi: objc.id = null;
 var icons: [std.enums.values(logic.Icon).len]objc.id = @splat(null);
 var shown_icon: ?logic.Icon = null;
 var loading_icons: [logic.loading_frames]objc.id = @splat(null);
+var reading_icons: [logic.reading_steps + 1]objc.id = @splat(null);
+/// The ready icon with its slot dim: the off beat of the generating blink.
+var generating_dim: objc.id = null;
+var blink_timer: objc.id = null;
+var blink_button: objc.id = null;
+var blink_lit = true;
+/// The reading frame shown, while a prompt read shows; `showIcon` clears it.
+var shown_reading: ?usize = null;
+var seconds_mi: objc.id = null;
 var loading_frame: usize = 0;
 var loading_timer: objc.id = null;
 var loading_button: objc.id = null;
@@ -1350,11 +1361,43 @@ fn symbol(name: []const u8) objc.id {
 }
 
 fn showIcon(button: objc.id, icon: logic.Icon) void {
-    if (shown_icon == icon) return;
+    if (shown_icon == icon and shown_reading == null) return;
+    shown_reading = null;
+    blinkGenerating(button, false);
     if (shown_icon != null) objc.fadeNext(button, 0.3);
     shown_icon = icon;
     objc.msg(void, button, "setImage:", .{icons[@intFromEnum(icon)]});
     animateLoading(button, icon == .loading);
+}
+
+/// The reading icon at `step`: the ready sushi's fish filled green that far. A model reading a prompt is ready, so
+/// it replaces the ready icon, and `showIcon` puts that back when the read ends.
+fn showReading(button: objc.id, step: usize) void {
+    if (shown_reading == step) return;
+    if (shown_reading == null) objc.fadeNext(button, 0.3);
+    animateLoading(button, false);
+    blinkGenerating(button, false);
+    shown_reading = step;
+    shown_icon = .ready;
+    objc.msg(void, button, "setImage:", .{reading_icons[step]});
+}
+
+/// Blinks the ready icon's slot while a reply generates; under Reduce motion the slot stays lit.
+fn blinkGenerating(button: objc.id, on: bool) void {
+    if (on and blink_timer != null) return;
+    if (blink_timer != null) objc.msg(void, blink_timer, "invalidate", .{});
+    blink_timer = null;
+    if (!blink_lit) objc.msg(void, button, "setImage:", .{icons[@intFromEnum(logic.Icon.ready)]});
+    blink_lit = true;
+    if (!on or objc.reduceMotion()) return;
+    blink_button = button;
+    blink_timer = objc.addTimer(logic.generating_blink_s, menu_target, "blinkTick:");
+}
+
+fn blinkTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    if (objc.reduceMotion()) return blinkGenerating(blink_button, false);
+    blink_lit = !blink_lit;
+    objc.msg(void, blink_button, "setImage:", .{if (blink_lit) icons[@intFromEnum(logic.Icon.ready)] else generating_dim});
 }
 
 /// Runs the loading icon's frames while it shows; under Reduce motion it stays the static icon.
@@ -1746,9 +1789,17 @@ fn refresh() void {
 
     var tv = view;
     tv.update_waiting = uv.available;
+    tv.show_seconds = g_seconds;
     const title = logic.title(&last_title, tv);
     const button = objc.msg(objc.id, status_item, "button", .{});
-    showIcon(button, logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 }));
+    const icon = logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 });
+    if (icon == .ready and view.read != null) {
+        showReading(button, logic.readingStep(view.read.?.fraction));
+    } else {
+        showIcon(button, icon);
+        blinkGenerating(button, icon == .ready and view.decoding);
+    }
+    objc.msg(void, seconds_mi, "setState:", .{@as(isize, if (g_seconds) 1 else 0)});
     showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
     setButtonTitle(button, title);
     var status_buf: [200]u8 = undefined;
@@ -1945,6 +1996,12 @@ fn toggleLan() void {
 fn lanToggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     toggleLan();
 }
+
+fn secondsToggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    g_seconds = !g_seconds;
+    writeSaved(port());
+    refresh();
+}
 fn applyPortAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     applyPortText();
 }
@@ -2058,6 +2115,12 @@ fn loadIcons() void {
         const svg = logic.loadingSvg(&buf, @embedFile("sushibar/icon-loading.svg"), i) catch |e| std.debug.panic("loading icon frame {d}: {t}", .{ i, e });
         frame.* = objc.loadSvg(svg, false, icon_w, icon_h);
     }
+    const dim = logic.generatingSvg(&buf, @embedFile("sushibar/icon-online.svg"), false) catch |e| std.debug.panic("generating icon: {t}", .{e});
+    generating_dim = objc.loadSvg(dim, false, icon_w, icon_h);
+    for (&reading_icons, 0..) |*frame, i| {
+        const svg = logic.readingSvg(&buf, @embedFile("sushibar/icon-online.svg"), i) catch |e| std.debug.panic("reading icon step {d}: {t}", .{ i, e });
+        frame.* = objc.loadSvg(svg, false, icon_w, icon_h);
+    }
 }
 
 const find_show_interface: isize = 1;
@@ -2115,6 +2178,8 @@ fn runMenuBar() noreturn {
         .{ .selector = "flagsTick:", .imp = @ptrCast(&flagsTick), .types = "v@:@" },
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
         .{ .selector = "lanToggle:", .imp = @ptrCast(&lanToggleAction), .types = "v@:@" },
+        .{ .selector = "secondsToggle:", .imp = @ptrCast(&secondsToggleAction), .types = "v@:@" },
+        .{ .selector = "blinkTick:", .imp = @ptrCast(&blinkTick), .types = "v@:@" },
         .{ .selector = "pickRow:", .imp = @ptrCast(&pickRowAction), .types = "v@:@" },
         .{ .selector = "removeRow:", .imp = @ptrCast(&removeRowAction), .types = "v@:@" },
         .{ .selector = "applyPort:", .imp = @ptrCast(&applyPortAction), .types = "v@:@" },
@@ -2166,6 +2231,8 @@ fn runMenuBar() noreturn {
     port_field_mi = objc.new(objc.class("NSMenuItem"));
     objc.msg(void, port_field_mi, "setView:", .{port_field.create(menu_target)});
     objc.msg(void, port_menu, "addItem:", .{port_field_mi});
+    seconds_mi = addItem(menu, "Show Seconds Left", "secondsToggle:", 0, "", "timer");
+    setText(seconds_mi, "setToolTip:", "While a prompt is read, the fish fills green and the menu bar shows the seconds left beside it. Off, only the fish fills.");
     addSeparator(menu);
 
     open_mis[0] = addItem(menu, "Dashboard", "open:", @intFromEnum(logic.Page.dashboard), "1", "gauge.with.dots.needle.67percent");
@@ -2286,12 +2353,15 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
 /// The menu bar item in its states, on a plain button of the status button's shape over a menu-bar-like fill.
 fn renderBadge(dir: []const u8) void {
     loadIcons();
-    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", badge: bool = false };
+    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", badge: bool = false, reading: ?usize = null, dim: bool = false };
     const cases = [_]Case{
         .{ .name = "live", .icon = .ready, .title = "105 tok/s" },
         .{ .name = "last", .icon = .ready, .title = "88.0 tok/s" },
-        .{ .name = "generating", .icon = .ready, .title = "generating…" },
-        .{ .name = "reading", .icon = .ready, .title = "prompt…" },
+        .{ .name = "reading", .icon = .ready, .reading = logic.reading_steps * 3 / 5, .title = "12s" },
+        .{ .name = "reading-start", .icon = .ready, .reading = logic.reading_steps / 10 },
+        .{ .name = "reading-no-seconds", .icon = .ready, .reading = logic.reading_steps * 3 / 5 },
+        .{ .name = "reading-minutes", .icon = .ready, .reading = logic.reading_steps / 4, .title = "4:59" },
+        .{ .name = "generating-dim", .icon = .ready, .dim = true, .title = "105 tok/s" },
         .{ .name = "badge", .icon = .ready, .badge = true },
         .{ .name = "no-model", .icon = .empty },
         .{ .name = "loading", .icon = .loading },
@@ -2307,7 +2377,7 @@ fn renderBadge(dir: []const u8) void {
         const button = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSButton"), "alloc", .{}), "initWithFrame:", .{NSRect{ .x = 4, .y = 0, .w = 160, .h = 24 }});
         objc.msg(void, button, "setBordered:", .{false});
         objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
-        objc.msg(void, button, "setImage:", .{icons[@intFromEnum(c.icon)]});
+        objc.msg(void, button, "setImage:", .{if (c.reading) |step| reading_icons[step] else if (c.dim) generating_dim else icons[@intFromEnum(c.icon)]});
         // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
         objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
         shown_title_len = std.math.maxInt(usize);
@@ -2564,6 +2634,7 @@ pub fn main(init: std.process.Init) !void {
     const saved = logic.parseSaved(saved_text);
     g_saved = saved.ports;
     g_lan = saved.lan;
+    g_seconds = saved.seconds;
     g_last_model.set(saved.model());
     g_port.store(logic.choosePort(explicit, saved.port, g_default_port), .release);
 

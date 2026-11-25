@@ -1107,6 +1107,54 @@ async function dashboardV2(browser) {
   }
 }
 
+// Each prefilling row draws its own read when the server reports one, and the global percentage only where it has none.
+async function prefillRows(browser) {
+  const gauges = { requests_running: 2, requests_prefilling: 2, prefill_tokens_live: 25, prefill_tokens_expected: 100, gpu_utilization_pct: 55, memory_mb: 4096 };
+  {
+    const sessions = [
+      { request_id: 21, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 12000, cache: 0, processed: 3000, time_ms: 3000 } },
+      { request_id: 22, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 4000, cache: 1000, processed: 2000, time_ms: 2000 } },
+      { request_id: 23, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 31000, cache: 0, processed: 1000, time_ms: 10000 } },
+      { request_id: 24, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 400000, cache: 0, processed: 1000, time_ms: 10000 } },
+      { request_id: 25, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 5000, cache: 0, processed: 5000, time_ms: 2500 } },
+    ];
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions, specData: { gauges } });
+    await page.waitForFunction(() => document.querySelectorAll('#dashSessions tr').length === 5);
+    const rows = await page.$$eval('#dashSessions tr', (trs) => trs.map((tr) => {
+      const cell = tr.children[2], fill = cell.querySelector('.pbar-fill');
+      return {
+        chip: cell.querySelector('.phase')?.textContent ?? '',
+        fill: fill ? parseFloat(fill.style.width) : null,
+        left: cell.querySelector('.pbar-left')?.textContent ?? '',
+        percent: /\d\s*%/.test(cell.textContent),
+      };
+    }));
+    assert.deepEqual(rows.map((r) => r.chip), Array(5).fill('Reading prompt'), 'every row is reading');
+    // Seconds under a minute, minutes and seconds under an hour, past an hour as > 1 h, and no number once read.
+    assert.deepEqual(rows.map((r) => r.left), ['≈ 9 s', '≈ 4 s', '≈ 5:00', '> 1 h', ''], 'each row gives its own time left');
+    assert.ok(Math.abs(rows[0].fill - 25) < 0.2, `the first bar fills to what it read (${rows[0].fill})`);
+    assert.ok(Math.abs(rows[1].fill - 50) < 0.2, `the second starts part-way full from its cache (${rows[1].fill})`);
+    assert.deepEqual(rows.map((r) => r.percent), Array(5).fill(false), 'a row with its own numbers shows no global percentage');
+    // The chip keeps its fly-over help.
+    await page.hover('#dashSessions [data-phase="prefill"]');
+    await page.waitForFunction(() => document.getElementById('dashTip').style.display === 'block');
+    assert.match(await page.textContent('#dashTip'), /Technical name:\s*prefill/);
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
+    // A row without the server's own numbers keeps today's display: the global percentage when it is the only read.
+    const sessions = [{ request_id: 31, model: 'org/m', phase: 'prefill', context_length: 8192 }];
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions, specData: { gauges: { ...gauges, requests_running: 1, requests_prefilling: 1, prefill_tokens_live: 50 } } });
+    await page.waitForFunction(() => document.querySelector('#dashSessions tr')?.children[2]?.textContent.includes('%'));
+    const cell = await page.$eval('#dashSessions tr', (tr) => ({ text: tr.children[2].textContent, bars: tr.children[2].querySelectorAll('.pbar').length }));
+    assert.match(cell.text, /50\s*%/, 'the global percentage is today\'s display');
+    assert.equal(cell.bars, 0, 'and there is no bar to draw it with');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+}
+
 async function main() {
   const playwright = loadPlaywright();
   if (!playwright) { console.log('Web UI dashboard: skipped (Playwright is not installed)'); return; }
@@ -1119,6 +1167,7 @@ async function main() {
     await dashboardV2(browser);
     await expertCard(browser);
     await dashboardBugs(browser);
+    await prefillRows(browser);
     await chartPicker(browser);
     await chartExtras(browser);
     await chartAudit(browser);

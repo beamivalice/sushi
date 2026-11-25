@@ -125,7 +125,7 @@ and the page tooltip share them.
   is allowed; its tip spells it out.
   One concept, one label: a chart's name is the same in its title, its card and the Charts picker (guard: `chartAudit`),
   a request step reads Reading prompt / Generating / Cached in the Sessions chips and the compact status (which reads Waiting when requests are only queued), in sentence case.
-  sushibar's menu uses the same words (GEN TOK/S, PROMPT TOK/S, `generating…`, `reading prompt…`).
+  sushibar's menu uses the same words (GEN TOK/S, PROMPT TOK/S); its menu bar shows a prompt read as the fish filling green, with the seconds left beside it.
   Reply is no speed, length or state word: thinking and answer are the same generated tokens, so the page and sushibar say
   generation (Generation speed, Generating, Generated); "reply" stays only where it means the answer's text (guard:
   `RETIRED_REPLY` in the chat and dashboard tests, the retired list in sushibar's wording test).

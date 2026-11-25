@@ -743,6 +743,74 @@ test('after a click on Send the cursor is back in the prompt', async ({ browser 
   await context.close(); await stub.close();
 });
 
+test('a long prompt shows a filling bar and the seconds left until its text arrives', async ({ browser }) => {
+  const progress = (res, p) => sse(res, { choices: [{ delta: { role: 'assistant', content: null } }], prompt_progress: p });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const stub = await startStub({
+    chat: async (req, res) => {
+      head(res);
+      progress(res, { total: 12000, cache: 0, processed: 0, time_ms: 0 });
+      progress(res, { total: 12000, cache: 0, processed: 2000, time_ms: 2400 });
+      await gate;
+      delta(res, 'the answer');
+      finish(res);
+    },
+  });
+  const { page, context, errors } = await open(browser, stub);
+  await send(page, 'a very long prompt');
+  await page.waitForSelector('.msg.assistant .read-progress', { state: 'attached' });
+  const bar = page.locator('.msg.assistant .read-progress');
+  assert.equal(await bar.isVisible(), false, 'the read has not passed 2 s yet');
+  await page.waitForTimeout(2300);
+  assert.equal(await bar.isVisible(), true, 'the read is still going after 2 s');
+  const seen = await page.evaluate(() => {
+    const node = document.querySelector('.msg.assistant .read-progress');
+    return { fill: node.querySelector('.meter > span').style.width, left: node.textContent.trim(), bubble: document.querySelector('.msg.assistant').textContent };
+  });
+  assert.ok(Math.abs(parseFloat(seen.fill) - 100 * 2000 / 12000) < 0.2, `the bar fills to what was read (${seen.fill})`);
+  assert.equal(seen.left, '≈ 12 s', `the seconds left (${seen.left})`);
+  assert.doesNotMatch(seen.bubble, /Reading prompt|Generating/, 'the bubble carries no placeholder words');
+  assert.equal(JSON.parse(stub.posts()[0].body).return_progress, true, 'the stream asks for progress');
+  release();
+  await page.waitForFunction(() => /the answer/.test(document.getElementById('chatMessages').textContent));
+  assert.equal(await page.locator('.msg.assistant .read-progress').count(), 0, 'the bar gives way to the streaming text');
+  assert.deepEqual(errors, []);
+  await context.close(); await stub.close();
+});
+
+test('a read over before 2 s, or a server that sends no progress, shows no bar', async ({ browser }) => {
+  const progress = (res, p) => sse(res, { choices: [{ delta: { role: 'assistant', content: null } }], prompt_progress: p });
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const stub = await startStub({
+    chat: async (req, res) => {
+      head(res);
+      progress(res, { total: 1000, cache: 0, processed: 0, time_ms: 0 });
+      progress(res, { total: 1000, cache: 0, processed: 1000, time_ms: 900 });
+      await gate;
+      delta(res, 'ok');
+      finish(res);
+    },
+  });
+  const { page, context } = await open(browser, stub);
+  await send(page, 'short');
+  await page.waitForSelector('.msg.assistant .read-progress', { state: 'attached' });
+  await page.waitForTimeout(2300);
+  assert.equal(await page.locator('.msg.assistant .read-progress:visible').count(), 0, 'a read this short never flashes a bar');
+  release();
+  await page.waitForFunction(() => /ok/.test(document.getElementById('chatMessages').textContent));
+  await context.close(); await stub.close();
+
+  const plain = await startStub();
+  const other = await open(browser, plain);
+  await send(other.page, 'q');
+  await other.page.waitForSelector('.msg.assistant .content');
+  assert.equal(await other.page.locator('.msg.assistant .read-progress').count(), 0, 'no progress sent: no bar');
+  assert.equal(await other.page.textContent('.msg.assistant'), 'hello', 'and the bubble is as it is today');
+  await other.context.close(); await plain.close();
+});
+
 async function main() {
   const playwright = loadPlaywright();
   if (!playwright) { console.log('Web UI chat: skipped (Playwright is not installed)'); return; }

@@ -149,6 +149,10 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: var(--
 .msg.user { align-items: flex-end; }
 .msg.user .bubble { background: var(--surface-2); border: 1px solid var(--border); border-radius: 16px 16px 4px 16px; padding: 10px 16px; max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.assistant .content { font-size: var(--fs-base); overflow-wrap: anywhere; }
+.msg .read-progress { display: flex; align-items: center; gap: 10px; max-width: 320px; padding: 4px 0 2px; }
+.msg .read-progress[hidden] { display: none; }
+.msg .read-progress .meter { flex: 1; height: 6px; }
+.msg .read-progress .read-eta { color: var(--text-2); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .msg .msg-tools { display: flex; align-items: center; gap: 4px; margin-top: 4px; opacity: 0; transition: opacity var(--dur-2) var(--ease-out); }
 .msg:hover .msg-tools, .msg.last .msg-tools, .msg:focus-within .msg-tools { opacity: 1; }
 .msg.editing .bubble { border-color: var(--accent); }
@@ -651,6 +655,10 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
 #dashPanel .phase.decode { background: var(--ok-soft); color: var(--ok); }
 #dashPanel .phase.cached { background: var(--surface-2); color: var(--text-2); }
 #dashPanel .d-left { color: var(--info); font-size: var(--fs-sm); font-variant-numeric: tabular-nums; margin-left: 4px; cursor: help; }
+#dashPanel .pbar { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
+#dashPanel .pbar .pbar-track { flex: 1; min-width: 36px; height: 6px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+#dashPanel .pbar .pbar-fill { display: block; height: 100%; border-radius: 3px; background: var(--info); transition: width var(--dur-3) var(--ease-out); }
+#dashPanel .pbar .pbar-left { color: var(--info); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; white-space: nowrap; }
 #dashPanel #dashTip { position: fixed; display: none; z-index: 10; pointer-events: none; max-width: 280px; background: var(--tip-bg); color: var(--tip-text); border: 1px solid var(--tip-border); border-radius: var(--r-md); padding: var(--s2) 10px; font-size: var(--fs-sm); box-shadow: var(--shadow-pop); font-variant-numeric: tabular-nums; }
 #dashPanel #dashTip .t { color: var(--text-2); margin-bottom: 4px; }
 #dashPanel #dashTip .t span { opacity: .8; }
@@ -3114,7 +3122,7 @@ function chatNumber(id) {
   return { problem: max === Infinity ? `Enter ${noun} of ${min} or more` : `Enter ${noun} from ${min} to ${max}` };
 }
 function buildRequest(model, history, tools = null) {
-  const body = { model, messages: wireMessages(history), stream: true, stream_options: { include_usage: true } };
+  const body = { model, messages: wireMessages(history), stream: true, stream_options: { include_usage: true }, return_progress: true };
   // With no tools offered, the server bans call markup, so earlier calls cannot leak as text.
   if (tools?.length) body.tools = tools;
   else body.tool_choice = "none";
@@ -3128,12 +3136,33 @@ function buildRequest(model, history, tools = null) {
   }
   return body;
 }
+// Seconds left in a prompt read: the tokens still to read at the rate the server has read since the cache, rounded
+// up; known only once it has read past the cache and spent time doing it.
+function readEta(total, cache, processed, time_ms) {
+  const fresh = processed - cache;
+  if (!(fresh > 0) || !(time_ms > 0)) return null;
+  const left = Math.ceil((total - processed) * time_ms / fresh / 1000);
+  return left > 0 ? left : null;
+}
+// Time left as sushibar's menu bar reads it: seconds under a minute, minutes and seconds under an hour, then > 1 h.
+function etaText(left) {
+  if (left == null) return "";
+  if (left >= 3600) return "> 1 h";
+  if (left >= 60) return `≈ ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
+  return `≈ ${left} s`;
+}
 function createStreamingView() {
   $("chatEmpty").hidden = true;
   const node = el("div", "msg assistant last");
-  const state = { node, text: "", reasoning: "", thinkingEl: null, thinkingBody: null, contentEl: null, raf: 0 };
+  const state = { node, text: "", reasoning: "", thinkingEl: null, thinkingBody: null, contentEl: null, raf: 0, progress: null, bar: null, barFill: null, barMeter: null, barEta: null, barTimer: 0 };
   const flush = () => {
     state.raf = 0;
+    // The first thinking or content token ends the read: the bar gives way to the streaming text.
+    if (state.bar && (state.text || state.reasoning)) {
+      if (state.barTimer) { clearTimeout(state.barTimer); state.barTimer = 0; }
+      state.bar.remove();
+      state.bar = null;
+    }
     if (state.reasoning && !state.thinkingEl) {
       state.thinkingEl = el("details", "thinking streaming");
       const summary = el("summary");
@@ -3165,8 +3194,44 @@ function createStreamingView() {
   state.schedule = () => {
     if (!state.raf) state.raf = requestAnimationFrame(flush);
   };
+  // The prompt read before the first token: a thin bar and the seconds left, shown only once the read has
+  // outlasted 2 s, so a short prompt never flashes one.
+  state.promptProgress = (raw) => {
+    if (state.text || state.reasoning) return;
+    const total = Math.max(0, Number(raw?.total) || 0);
+    if (!total) return;
+    state.progress = {
+      total, cache: Math.max(0, Number(raw.cache) || 0),
+      processed: Math.min(total, Math.max(0, Number(raw.processed) || 0)),
+      time_ms: Math.max(0, Number(raw.time_ms) || 0),
+    };
+    if (!state.bar) {
+      state.bar = el("div", "read-progress");
+      state.bar.hidden = true;
+      state.barMeter = el("div", "meter");
+      state.barMeter.setAttribute("role", "progressbar");
+      state.barMeter.setAttribute("aria-label", "Prompt progress");
+      state.barMeter.setAttribute("aria-valuemin", "0");
+      state.barMeter.setAttribute("aria-valuemax", "100");
+      state.barFill = el("span");
+      state.barEta = el("span", "read-eta");
+      state.barMeter.appendChild(state.barFill);
+      state.bar.append(state.barMeter, state.barEta);
+      node.appendChild(state.bar);
+    }
+    const pct = 100 * state.progress.processed / total;
+    state.barFill.style.width = pct.toFixed(1) + "%";
+    state.barMeter.setAttribute("aria-valuenow", String(Math.round(pct)));
+    const left = readEta(state.progress.total, state.progress.cache, state.progress.processed, state.progress.time_ms);
+    state.barEta.textContent = etaText(left);
+    if (!state.barTimer) state.barTimer = setTimeout(() => {
+      state.barTimer = 0;
+      if (state.bar && state.progress.processed < state.progress.total && !state.text && !state.reasoning) state.bar.hidden = false;
+    }, 2000);
+  };
   state.finalize = () => {
     if (state.raf) cancelAnimationFrame(state.raf);
+    if (state.barTimer) clearTimeout(state.barTimer);
     node.remove();
   };
   $("chatMessages").appendChild(node);
@@ -3253,6 +3318,7 @@ async function streamReply(model, history, signal, tools = null) {
         }
         if (json.usage) usage = json.usage;
         if (json.timings) timings = json.timings;
+        if (json.prompt_progress) view.promptProgress(json.prompt_progress);
         if (typeof json.effort_notice === "string" && json.effort_notice) effortNotice = json.effort_notice;
         const choice = json.choices?.[0];
         if (!choice) return;
@@ -5561,6 +5627,14 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const prefilling = rows.filter(r => r.phase === 'prefill').length;
     const exp = g.prefill_tokens_expected || 0, done = Math.min(g.prefill_tokens_live || 0, exp);
     const prefillDone = prefilling === 1 && exp > 0 ? 100 * done / exp : null;
+    // A row the server reports its own read for draws that read: its bar and seconds, never the shared percentage.
+    const ownRead = p => {
+      const total = Math.max(0, Number(p?.total) || 0);
+      if (!total) return null;
+      const cache = Math.max(0, Number(p.cache) || 0), read = Math.min(total, Math.max(0, Number(p.processed) || 0));
+      const left = readEta(total, cache, read, Math.max(0, Number(p.time_ms) || 0));
+      return ` <span class="pbar" data-phase="progress" data-done="${read}" data-exp="${total}"><span class="pbar-track"><span class="pbar-fill" style="width:${(100 * read / total).toFixed(1)}%"></span></span>${left == null ? '' : `<span class="pbar-left">${etaText(left)}</span>`}</span>`;
+    };
     const tb = $('sessions');
     if (!rows.length) { setHtml(tb, '<tr><td colspan="11" class="empty">No requests running and no saved conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }
     const seen = new Set();
@@ -5579,10 +5653,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const cancelBtn = canCancel
         ? `<button class="btn xs danger" data-cancel="${esc(s.request_id)}" title="Cancel this in-flight request">Cancel</button>`
         : '';
+      const read = s.phase === 'prefill' ? ownRead(s.prefill) : null;
       return `<tr>
         <td class="rid"${s.request_id ? ` title="Request ${esc(s.request_id)}"` : ''}>${esc(s.request_id || '')}</td>
         <td title="${esc(s.model)}">${esc(String(s.model).split('/').pop())}</td>
-        <td><span class="phase ${esc(s.phase)}" data-phase="${esc(s.phase)}">${esc(PHASE_HELP[s.phase]?.[0] ?? s.phase)}</span>${s.phase === 'prefill' && prefillDone != null ? ` <span class="d-left" data-phase="progress" data-done="${done}" data-exp="${exp}">${fmt(prefillDone, 0)}%</span>` : ''}</td>
+        <td><span class="phase ${esc(s.phase)}" data-phase="${esc(s.phase)}">${esc(PHASE_HELP[s.phase]?.[0] ?? s.phase)}</span>${read ?? (s.phase === 'prefill' && prefillDone != null ? ` <span class="d-left" data-phase="progress" data-done="${done}" data-exp="${exp}">${fmt(prefillDone, 0)}%</span>` : '')}</td>
         <td>${fmtInt(ctx)}${len ? ' / ' + compact(len) : ''}</td>
         <td><div class="bar"><span class="cached" style="width:${cachePct.toFixed(1)}%"></span><span class="used" style="left:${cachePct.toFixed(1)}%;width:${Math.max(0, usedPct - cachePct).toFixed(1)}%"></span></div></td>
         <td>${fmtInt(s.cached_tokens)}</td>
