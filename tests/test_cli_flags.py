@@ -326,9 +326,13 @@ try:
         reply = read_response(s)
         check(reply.startswith(b"HTTP/1.1 400") and b"beamster only" in reply, "chunked body decoded", reply[:300])
     with connect() as s:
-        s.sendall(b"POST /v1/downloads HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
+        s.sendall(b"POST /v1/downloads HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")
         reply = read_response(s)
         check(reply.startswith(b"HTTP/1.1 501"), "an unsupported transfer coding is refused", reply[:100])
+    with connect() as s:
+        s.sendall(b"POST /v1/downloads HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip\r\n\r\n")
+        reply = read_response(s)
+        check(reply.startswith(b"HTTP/1.1 400"), "a coding the server cannot frame is a bad request", reply[:100])
 
     # Expect: 100-continue is answered before the body is sent.
     with connect() as s:
