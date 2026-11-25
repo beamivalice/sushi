@@ -153,7 +153,7 @@ pub fn build(b: *std.Build) void {
     linkApple(test_mod, macos_sdk_frameworks);
 
     const test_filter = b.option([]const []const u8, "test-filter", "Only run tests whose name contains this substring (repeat for several)");
-    const test_model = b.option(TestModel, "model", "Run one model folder's tests plus the shared ones (qwen4, mimo2, glm5, dsv41), or only the exl3 or encoder module's");
+    const test_model = b.option(TestModel, "model", "Make one model folder's test step (qwen4: test-qwen, mimo2: test-mimo, glm5: test-glm, dsv41: test-deepseek, hy4flash: test-hy4) and every shared step, which `zig build test` all runs (-Dtest-step=<step> runs one alone); or only the exl3 or encoder module's");
     const qwen_preprocess_fixture = b.option(
         []const u8,
         "qwen-preprocess-fixture",
@@ -166,6 +166,7 @@ pub fn build(b: *std.Build) void {
         .log = test_log,
         .fixture_cut = fixture_cut,
         .skip = b.option([]const []const u8, "test-skip-step", "Leave out this test run step (repeat for several): tests/gate.sh --continue reuses its tests' results") orelse &.{},
+        .only = b.option([]const []const u8, "test-step", "Run only this test run step (repeat for several), as zig-out/test-plan.json names it: -Dmodel=dsv41 -Dtest-step=test-deepseek runs the DeepSeek folder's tests and no shared step") orelse &.{},
     };
     if (test_log) |path| if (!std.fs.path.isAbsolute(path)) std.debug.panic("-Dtest-log={s} is not an absolute path", .{path});
     const test_build = b.step("test-build", "Compile unit tests without running them");
@@ -1294,6 +1295,8 @@ const TestRuns = struct {
     log: ?[]const u8,
     fixture_cut: bool,
     skip: []const []const u8,
+    /// `-Dtest-step`: when set, only these run steps run; every step made stays in the plan.
+    only: []const []const u8,
     plan: std.ArrayList(PlanRow) = .empty,
 
     const PlanRow = struct { step: []const u8, binary: []const u8, env: []const [2][]const u8 };
@@ -1309,6 +1312,9 @@ const TestRuns = struct {
         if (holds_cut) all.append(b.allocator, .{ "SUSHI_TEST_FIXTURE_CUT", if (self.fixture_cut) "1" else "0" }) catch @panic("OOM");
         self.plan.append(b.allocator, .{ .step = name, .binary = b.fmt("tests/{s}", .{compile.name}), .env = all.items }) catch @panic("OOM");
         for (self.skip) |s| if (std.mem.eql(u8, s, name)) return null;
+        if (self.only.len > 0) for (self.only) |s| {
+            if (std.mem.eql(u8, s, name)) break;
+        } else return null;
         const run = b.addRunArtifact(compile);
         runEveryTime(run);
         run.setName(b.fmt("run {s}", .{name}));
@@ -1320,14 +1326,14 @@ const TestRuns = struct {
         return run;
     }
 
-    /// Writes the plan for `zig build test-plan`; a `-Dtest-skip-step` that names no run step fails.
+    /// Writes the plan for `zig build test-plan`; a `-Dtest-skip-step` or `-Dtest-step` that names no run step fails.
     fn finish(self: *TestRuns) void {
         const b = self.b;
-        for (self.skip) |s| {
+        for ([_]struct { []const u8, []const []const u8 }{ .{ "test-skip-step", self.skip }, .{ "test-step", self.only } }) |opt| for (opt[1]) |s| {
             for (self.plan.items) |row| {
                 if (std.mem.eql(u8, row.step, s)) break;
-            } else std.debug.panic("-Dtest-skip-step={s} names no test run step", .{s});
-        }
+            } else std.debug.panic("-D{s}={s} names no test run step", .{ opt[0], s });
+        };
         const json = std.json.Stringify.valueAlloc(b.allocator, self.plan.items, .{}) catch @panic("OOM");
         const file = b.addWriteFiles().add("test-plan.json", json);
         const step = b.step("test-plan", "Write zig-out/test-plan.json: each test run step's name, binary and env");

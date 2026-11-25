@@ -363,7 +363,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 
 - Beside the code it tests, at the bottom of that file. Tests move with their code.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
-  `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
+  `-Dmodel=<arch>` makes one folder's step plus every shared step, and `zig build test` runs them all;
+  `-Dtest-step=<step>` (repeatable) runs only the steps it names (`zig-out/test-plan.json` lists them: `test-qwen`,
+  `test-mimo`, `test-glm`, `test-deepseek`, `test-hy4`), and a name that is no run step fails. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
   A source file with tests at its bottom is listed too: the domains select tests by listed file, so an unlisted
   file's tests never run (lint `arch-test-unlisted`). A shared file with tests is imported from `src/tests.zig`, or
@@ -430,7 +432,8 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | change | runs before commit |
 |---|---|
 | host files only (chat, parsers, grammar, tokenizer, pure planners) | `zig build test-host` |
-| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows) |
+| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41\|hy4flash>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows): the shared steps load the arch's fixtures, so its product code reaches them |
+| one arch's test files only (no product code) | its folder's step alone: `zig build test -Dmodel=<arch> -Dtest-step=test-<step>` (`test-deepseek` for `dsv41`); a single test, `-Dtest-filter=` beside it |
 | `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
 | a broad area | `-Dmodel=` (above); a narrow check names its tests with `-Dtest-filter=`, which stays parallel |
 | docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
