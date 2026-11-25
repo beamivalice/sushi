@@ -307,8 +307,8 @@ pub fn wiredLimitFloor(wired_limit: ?u64, total_ram: u64, margin: u64) ?u64 {
     return (if (total_ram > 0) @min(limit, total_ram) else limit) -| margin;
 }
 
-/// The refusal of a declared ceiling the unplanned bytes leave nothing of (`--wired-margin-gib`, or the GPU memory
-/// other processes hold, at or past the limit or the RAM); null when it has room.
+/// The refusal of a declared ceiling the unplanned bytes leave nothing of (`--wired-margin-gib`, the GPU memory other
+/// processes hold, or the 512 MB slack, at or past the limit or the RAM); null when it has room.
 pub fn wiredMarginRefusal(buf: []u8, c: Ceiling) ?[]const u8 {
     const declared = c.declared orelse return null;
     if (c.floor().? > 0) return null;
@@ -352,9 +352,9 @@ pub var gpu_floor_bytes = std.atomic.Value(u64).init(0);
 pub const GPU_FLOOR_SLACK_BYTES: u64 = 512 << 20;
 
 /// PURE: what stays unplanned under a declared wired limit: the operator's margin, or the
-/// measured floor plus the bill's slack when that is larger.
+/// measured floor plus the bill's slack when that is larger. The slack stays with a floor of 0
+/// (no reading yet), so a margin of 0 never plans to the limit itself.
 pub fn wiredUnplannedBytes(margin: u64, gpu_floor: u64) u64 {
-    if (gpu_floor == 0) return margin;
     return @max(margin, gpu_floor +| GPU_FLOOR_SLACK_BYTES);
 }
 
@@ -479,7 +479,8 @@ pub const Ceiling = struct {
 
     /// What sets the unplanned bytes, for a text that names it.
     pub fn unplannedName(c: Ceiling) []const u8 {
-        return if (c.unplanned > c.margin) "the GPU memory other processes hold, plus 512 MB," else "--wired-margin-gib";
+        if (c.unplanned <= c.margin) return "--wired-margin-gib";
+        return if (c.gpu_floor == 0) "the 512 MB slack" else "the GPU memory other processes hold, plus 512 MB,";
     }
 
     /// What a live check reads: a declared limit's floor, else the working set capped at MLX's `footprint` plus the
@@ -4133,7 +4134,7 @@ test "the declared ceiling reads the safety margin at call time: the saved value
     try t.expectEqual(limit - 4 * gib, ceilingNow().floor().?);
 }
 
-test "a margin of 0 plans to the declared limit less the GPU floor alone" {
+test "a margin of 0 plans to the declared limit less the floor and the 512 MB slack" {
     const t = std.testing;
     const gib: u64 = 1 << 30;
     const limit_was = wired_limit_mb_override;
@@ -4165,8 +4166,9 @@ test "a margin of 0 plans to the declared limit less the GPU floor alone" {
     launch_state.wired_margin_flag_bytes = 0;
     const c = ceilingNow();
     try t.expectEqual(@as(u64, 0), c.margin);
-    try t.expectEqual(@as(u64, 0), c.unplanned);
-    try t.expectEqual(limit, c.floor().?);
+    try t.expectEqual(GPU_FLOOR_SLACK_BYTES, c.unplanned);
+    try t.expectEqualStrings("the 512 MB slack", c.unplannedName());
+    try t.expectEqual(limit - GPU_FLOOR_SLACK_BYTES, c.floor().?);
     var buf: [192]u8 = undefined;
     try t.expect(wiredMarginRefusal(&buf, c) == null);
 
@@ -4177,6 +4179,23 @@ test "a margin of 0 plans to the declared limit less the GPU floor alone" {
 
     launch_state.wired_margin_flag_bytes = null;
     try t.expectEqual(@as(u64, 8 * gib), launch_state.wiredMarginBytes());
+}
+
+test "a GPU floor of 0 still keeps the 512 MB slack unplanned" {
+    const t = std.testing;
+    const gib: u64 = 1 << 30;
+    const mb: u64 = 1 << 20;
+    const cases = [_]struct { margin: u64, floor: u64, unplanned: u64 }{
+        .{ .margin = 0, .floor = 0, .unplanned = 512 * mb },
+        .{ .margin = 0, .floor = 300 * mb, .unplanned = 812 * mb },
+        .{ .margin = 0, .floor = 2 * gib, .unplanned = 2 * gib + 512 * mb },
+        .{ .margin = gib, .floor = 0, .unplanned = gib },
+        .{ .margin = gib, .floor = 300 * mb, .unplanned = gib },
+        .{ .margin = gib, .floor = 2 * gib, .unplanned = 2 * gib + 512 * mb },
+        .{ .margin = 8 * gib, .floor = 0, .unplanned = 8 * gib },
+        .{ .margin = 8 * gib, .floor = 2 * gib, .unplanned = 8 * gib },
+    };
+    for (cases) |c| try t.expectEqual(c.unplanned, wiredUnplannedBytes(c.margin, c.floor));
 }
 
 test "the bill plans the non-MLX GPU floor and the command-buffer size" {
