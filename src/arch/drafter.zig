@@ -451,7 +451,7 @@ test "the loaded arch decides whether a model takes a DFlash sidecar and how its
     }
 }
 
-test "each arch's drafter is its own: DeepSeek drafts with DSpark, Hy4-Flash with DFly2, GLM with DFlash2, and the two block drafters share only the rounds" {
+test "each arch's drafter kind is its own and names its own drafter, and only the two block drafters share the rounds" {
     const want = [_]struct { arch: []const u8, kind: []const u8, label: []const u8 }{
         .{ .arch = "dsv41", .kind = "dspark", .label = "DSpark" },
         .{ .arch = "hy4flash", .kind = "dfly2", .label = "DFly2" },
