@@ -16,9 +16,10 @@ earlier history is mlx-serve's, in that project's changelog.
   at most 4096, and its `[prefill]` line says so. The narrower arena leaves more memory for the context; on an M5 Max the
   2.25bpw pack prefills a 4k prompt at the same rate (1281 vs 1297 tok/s) and an 8k prompt's second 4k about 8% slower
   (1145 vs 1242 tok/s). `--prefill-chunk-max 8192` keeps the old width.
-- **sushibar shows a prompt being read**: the menu bar's fish fills green as the prompt is read, with the time left
-  beside it once the read rate is known (Show Seconds Left turns the number off), and its green slot blinks while a
-  reply generates; the `prompt…` and `generating…` words are gone.
+- **sushibar shows a prompt being read**: the menu bar's fish fills green as the prompt is read, and its green slot
+  blinks while a reply generates. Beside it a two-line readout shows READ over the time left or TOK/S over the speed,
+  and nothing between requests; a waiting update is a blue dot on the icon. The fill and the time left move on between the server's reports, in sushibar
+  and in the web UI's bars.
 - **A cache or settings folder linked to another volume works**: `~/.sushi/kv-cache` (or another folder Sushi makes)
   as a symlink to an external drive turned the SSD prompt cache off with `init failed: NotDir`; it now opens there.
 - **`--wired-margin-gib 0` keeps 512 MB unplanned**: where the GPU floor reads 0, a margin of 0 planned to the wired

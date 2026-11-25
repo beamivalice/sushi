@@ -393,7 +393,17 @@ pub fn noteAttributes() id {
     return attrs(msg(id, objc.class("NSFont"), "menuFontOfSize:", .{@as(f64, 0)}), color("systemOrangeColor"), clip, align_left);
 }
 
-/// The attributes of the menu bar button's title: 12 pt monospaced digits, dim for a past reading.
-pub fn titleAttributes() id {
-    return attrs(font(12, weight_regular, true), color("labelColor"), clip, align_left);
+/// The menu bar readout's caption and value fonts (diskglance's stacked readout: 7.6 pt medium over 11.5 pt semibold),
+/// the value with monospaced digits so its width does not jitter.
+pub fn readoutCaptionFont() id {
+    return font(7.6, weight_medium, false);
+}
+
+pub fn readoutValueFont() id {
+    return font(11.5, weight_semibold, true);
+}
+
+/// The attributes of the button title that reserves the readout's width: the value font, drawn clear.
+pub fn readoutSpacerAttributes() id {
+    return attrs(readoutValueFont(), color("clearColor"), clip, align_left);
 }

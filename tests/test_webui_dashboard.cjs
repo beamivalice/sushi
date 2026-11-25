@@ -1118,9 +1118,10 @@ async function prefillRows(browser) {
       { request_id: 24, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 400000, cache: 0, processed: 1000, time_ms: 10000 } },
       { request_id: 25, model: 'org/m', phase: 'prefill', context_length: 8192, prefill: { total: 5000, cache: 0, processed: 5000, time_ms: 2500 } },
     ];
-    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions, specData: { gauges } });
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', sessions, specData: { gauges } }, true);
+    await adv(page, 1000);
     await page.waitForFunction(() => document.querySelectorAll('#dashSessions tr').length === 5);
-    const rows = await page.$$eval('#dashSessions tr', (trs) => trs.map((tr) => {
+    const readRows = () => page.$$eval('#dashSessions tr', (trs) => trs.map((tr) => {
       const cell = tr.children[2], fill = cell.querySelector('.pbar-fill');
       return {
         chip: cell.querySelector('.phase')?.textContent ?? '',
@@ -1129,12 +1130,22 @@ async function prefillRows(browser) {
         percent: /\d\s*%/.test(cell.textContent),
       };
     }));
+    const rows = await readRows();
     assert.deepEqual(rows.map((r) => r.chip), Array(5).fill('Reading prompt'), 'every row is reading');
     // Seconds under a minute, minutes and seconds under an hour, past an hour as > 1 h, and no number once read.
     assert.deepEqual(rows.map((r) => r.left), ['≈ 9 s', '≈ 4 s', '≈ 5:00', '> 1 h', ''], 'each row gives its own time left');
     assert.ok(Math.abs(rows[0].fill - 25) < 0.2, `the first bar fills to what it read (${rows[0].fill})`);
     assert.ok(Math.abs(rows[1].fill - 50) < 0.2, `the second starts part-way full from its cache (${rows[1].fill})`);
     assert.deepEqual(rows.map((r) => r.percent), Array(5).fill(false), 'a row with its own numbers shows no global percentage');
+    // Polled again with the same report two seconds on, a bar moves on at its own rate (a token a ms for the first),
+    // never past where the next report can land: one step (its 3,000 tokens read so far) further.
+    await adv(page, 2000);
+    const later = await readRows();
+    assert.ok(Math.abs(later[0].fill - 41.7) < 0.2, `the first bar moved on two seconds at its rate (${later[0].fill})`);
+    assert.equal(later[0].left, '≈ 7 s', 'its time left counts down with it');
+    await adv(page, 60_000);
+    const held = await readRows();
+    assert.ok(Math.abs(held[0].fill - 50) < 0.2, `it stops one step on, where the next report lands (${held[0].fill})`);
     // The chip keeps its fly-over help.
     await page.hover('#dashSessions [data-phase="prefill"]');
     await page.waitForFunction(() => document.getElementById('dashTip').style.display === 'block');

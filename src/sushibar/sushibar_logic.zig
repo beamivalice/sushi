@@ -121,6 +121,9 @@ pub const Sample = struct {
     prefilling: bool = false,
     /// The prompt read with the most tokens left, where the server reports reads.
     read: ?Read = null,
+    /// That read's own numbers and request, which the tracker carries forward between the server's reports.
+    prefill: ?Prefill = null,
+    prefill_id: u64 = 0,
     /// The newest finished request that generated tokens: `generated_tokens / decode_seconds`.
     finished_tps: ?f64 = null,
     /// The newest finished request's prompt speed: `prompt_tokens / prefill_seconds` (`prompt_tokens` excludes the restored).
@@ -175,15 +178,23 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
     };
     var rows: std.ArrayList(Row) = .empty;
     var longest: ?Prefill = null;
+    var longest_id: u64 = 0;
     for (wire.sessions) |s| {
         if (std.mem.eql(u8, s.phase, "decode")) try rows.append(arena, .{ .request_id = s.request_id, .generated = s.generated_tokens });
         if (!std.mem.eql(u8, s.phase, "prefill")) continue;
         out.prefilling = true;
         const p = prefillOf(s.prefill orelse continue) orelse continue;
         if (p.total == 0) continue;
-        if (longest == null or showsBefore(p, longest.?)) longest = p;
+        if (longest == null or showsBefore(p, longest.?)) {
+            longest = p;
+            longest_id = s.request_id;
+        }
     }
-    if (longest) |p| out.read = readOf(p);
+    if (longest) |p| {
+        out.read = readOf(p);
+        out.prefill = p;
+        out.prefill_id = longest_id;
+    }
     out.decoding = rows.items;
     var newest_speed_ms: i64 = std.math.minInt(i64);
     var newest_prefill_ms: i64 = std.math.minInt(i64);
@@ -278,6 +289,10 @@ pub const Tracker = struct {
     live: ?f64 = null,
     last: ?f64 = null,
     last_prefill: ?f64 = null,
+    /// The shown read's last report from the server, when it came and how far the report before it moved.
+    anchor: ?Anchor = null,
+
+    pub const Anchor = struct { id: u64, p: Prefill, at_ms: i64, step: u64 };
 
     /// `now_ms` is read before the request went out, so the next `since` cannot skip a request.
     pub fn observe(self: *Tracker, now_ms: i64, sample: Sample) void {
@@ -286,6 +301,7 @@ pub const Tracker = struct {
         self.decoding = sample.decoding.len > 0;
         self.prefilling = sample.prefilling;
         self.read = sample.read;
+        self.anchor = if (sample.prefill) |p| reanchor(self.anchor, sample.prefill_id, p, now_ms) else null;
         if (sample.link == .up) {
             self.since_ms = @max(sample.newest_finished_ms, now_ms);
             if (sample.finished_tps) |t| self.last = t;
@@ -312,17 +328,41 @@ pub const Tracker = struct {
         self.prev_ms = now_ms;
     }
 
-    pub fn view(self: *const Tracker, link: Link) View {
+    /// The view at `now_ms`: the shown read carried forward from its last report (`carried`).
+    pub fn view(self: *const Tracker, link: Link, now_ms: i64) View {
         return .{
             .link = link,
             .decoding = self.decoding,
             .prefilling = self.prefilling,
-            .read = self.read,
+            .read = if (self.anchor) |a| readOf(carried(a, now_ms)) else self.read,
             .live = self.live,
             .last = self.last,
         };
     }
 };
+
+/// A new report moves the anchor, and the tokens it moved are the next step's size; the same numbers again keep it.
+fn reanchor(old: ?Tracker.Anchor, id: u64, p: Prefill, now_ms: i64) Tracker.Anchor {
+    if (old) |a| if (a.id == id) {
+        if (a.p.processed == p.processed and a.p.time_ms == p.time_ms) return a;
+        return .{ .id = id, .p = p, .at_ms = now_ms, .step = p.processed -| a.p.processed };
+    };
+    return .{ .id = id, .p = p, .at_ms = now_ms, .step = p.processed -| p.cache };
+}
+
+/// A read between the server's reports, which land once a chunk: its last report moved on at the report's own rate
+/// for the time since, never past where the next report can land (one step on) or the prompt's end.
+pub fn carried(a: Tracker.Anchor, now_ms: i64) Prefill {
+    var p = a.p;
+    if (p.time_ms == 0 or p.processed <= p.cache or a.step == 0 or now_ms <= a.at_ms) return p;
+    const since: u64 = @intCast(now_ms - a.at_ms);
+    const rate = @as(f64, @floatFromInt(p.processed - p.cache)) / @as(f64, @floatFromInt(p.time_ms));
+    const gained: u64 = @intFromFloat(@min(@floor(rate * @as(f64, @floatFromInt(since))), 0x1p63));
+    const cap = @min(p.total, p.processed +| a.step);
+    p.processed = @max(p.processed, @min(p.processed +| gained, cap));
+    p.time_ms +|= since;
+    return p;
+}
 
 fn speedText(buf: []u8, tps: f64) []const u8 {
     // Decided after rounding to one decimal, so 99.96 reads 100 and not 100.0.
@@ -332,33 +372,31 @@ fn speedText(buf: []u8, tps: f64) []const u8 {
         std.fmt.bufPrint(buf, "{d:.1}", .{tps})) catch "?";
 }
 
-/// The menu bar title; a dot follows it while an update waits.
-pub fn title(buf: []u8, v: View) []const u8 {
-    const base = titleBase(buf, v);
-    if (!v.update_waiting) return base;
-    const tail = std.fmt.bufPrint(buf[base.len..], "{s}•", .{if (base.len == 0) "" else " "}) catch return base;
-    return buf[0 .. base.len + tail.len];
+/// The menu bar's stacked readout beside the icon: `READ` over a prompt read's time left (an ellipsis until a chunk
+/// gives the rate, under 2 s, or with the seconds switch off), else `TOK/S` over the live speed; each line at most
+/// `readout_max` characters. Otherwise the icon stands alone.
+pub const Readout = struct { caption: []const u8, value: []const u8 };
+pub const readout_max = 6;
+/// No readout: the icon alone.
+pub const readout_none: Readout = .{ .caption = "", .value = "" };
+/// READ's value while the time left is not known.
+pub const readout_pending = "\u{2026}";
+
+pub fn readout(buf: *[2 * readout_max + 8]u8, v: View) Readout {
+    if (v.link != .up) return readout_none;
+    if (v.read != null or v.prefilling) {
+        const left = if (v.read) |r| r.seconds_left orelse 0 else 0;
+        return .{ .caption = "READ", .value = if (v.show_seconds and left >= 2) secondsText(buf, left) catch readout_pending else readout_pending };
+    }
+    if (v.decoding) if (v.live) |t| return .{ .caption = "TOK/S", .value = speedText(buf, t) };
+    return readout_none;
 }
 
-/// Seconds left as the title shows them: `45s`, `4:59` from a minute, `>1h` from an hour.
+/// Seconds left as the readout shows them: `45s`, `4:59` from a minute, `>1h` from an hour.
 fn secondsText(buf: []u8, s: u32) std.fmt.BufPrintError![]const u8 {
     if (s >= 3600) return std.fmt.bufPrint(buf, ">1h", .{});
     if (s >= 60) return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ s / 60, s % 60 });
     return std.fmt.bufPrint(buf, "{d}s", .{s});
-}
-
-fn titleBase(buf: []u8, v: View) []const u8 {
-    var num: [32]u8 = undefined;
-    const text = switch (v.link) {
-        .offline, .unauthorized, .metrics_off, .silent => std.fmt.bufPrint(buf, "", .{}),
-        .up => if (v.decoding and v.live != null)
-            std.fmt.bufPrint(buf, "{s} tok/s", .{speedText(&num, v.live.?)})
-        else if (v.show_seconds and v.read != null and (v.read.?.seconds_left orelse 0) > 0)
-            secondsText(buf, v.read.?.seconds_left.?)
-        else
-            std.fmt.bufPrint(buf, "", .{}),
-    };
-    return text catch "";
 }
 
 /// The menu bar icon: the outline template while no server answers; once one does, the colour box with its slot lit
@@ -2202,11 +2240,9 @@ test "update: sushibar relaunches only when the sushi beside it changed version"
     try std.testing.expect(!relaunchNeeded("", "1.6.0"));
 }
 
-test "update menu: a dot on the button while an update waits" {
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("•", title(&b, .{ .link = .up, .update_waiting = true }));
-    try std.testing.expectEqualStrings("•", title(&b, .{ .link = .up, .last = 88, .update_waiting = true }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .update_waiting = false }));
+test "update menu: the readout never carries the update dot, which sits on the icon" {
+    try expectReadout("", "", .{ .link = .up, .update_waiting = true });
+    try expectReadout("TOK/S", "88.0", .{ .link = .up, .decoding = true, .live = 88, .update_waiting = true });
 }
 
 test "header: the pill names the server's state" {
@@ -2742,38 +2778,46 @@ test "icon and link: outline while nothing answers; an answering server shows it
     try std.testing.expectEqual(Link.offline, linkFor(404));
 }
 
-test "speed: a rate that rounds to 100 reads as a whole number, in the title and the card" {
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("100 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 99.96 }));
-    try std.testing.expectEqualStrings("99.9 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 99.94 }));
+test "speed: a rate that rounds to 100 reads as a whole number, in the readout and the card" {
+    var b: [2 * readout_max + 8]u8 = undefined;
+    try std.testing.expectEqualStrings("100", readout(&b, .{ .link = .up, .decoding = true, .live = 99.96 }).value);
+    try std.testing.expectEqualStrings("99.9", readout(&b, .{ .link = .up, .decoding = true, .live = 99.94 }).value);
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const h = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .last = 99.96 });
     try std.testing.expectEqualStrings("100", h.stats[0].value);
 }
 
-test "title: live, last, idle, offline, unauthorized, metrics off; no word while a prompt is read or a reply waits" {
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("103 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 102.7 }));
-    try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .decoding = true }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .last = 88 }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .offline, .last = 5, .decoding = true }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .unauthorized, .last = 5 }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .metrics_off }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .silent }));
+fn expectReadout(caption: []const u8, value: []const u8, v: View) !void {
+    var b: [2 * readout_max + 8]u8 = undefined;
+    const r = readout(&b, v);
+    errdefer std.debug.print("readout {s} / {s}\n", .{ r.caption, r.value });
+    try std.testing.expectEqualStrings(caption, r.caption);
+    try std.testing.expectEqualStrings(value, r.value);
+}
+
+test "readout: TOK/S over the live speed; the icon alone when nothing runs, no number is known or no server answers" {
+    try expectReadout("TOK/S", "103", .{ .link = .up, .decoding = true, .live = 102.7 });
+    try expectReadout("TOK/S", "42.7", .{ .link = .up, .decoding = true, .live = 42.66, .last = 9 });
+    try expectReadout("", "", .{ .link = .up, .decoding = true });
+    try expectReadout("", "", .{ .link = .up, .last = 88 });
+    try expectReadout("", "", .{ .link = .up });
+    try expectReadout("", "", .{ .link = .offline, .last = 5, .decoding = true, .live = 40 });
+    try expectReadout("", "", .{ .link = .silent });
+    try expectReadout("", "", .{ .link = .unauthorized, .last = 5 });
+    try expectReadout("", "", .{ .link = .metrics_off });
 }
 
 test "wording: nothing the menu shows uses a retired engineering word" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const retired = [_][]const u8{ "decode", "prefill", "repl", "prefix cache", "guess" };
-    var b: [64]u8 = undefined;
+    var b: [2 * readout_max + 8]u8 = undefined;
     var shown: std.ArrayList([]const u8) = .empty;
     for ([_]Link{ .up, .offline, .unauthorized, .metrics_off, .silent }) |link| for ([_]bool{ false, true }) |dec| for ([_]bool{ false, true }) |pre| for ([_]?f64{ null, 12.5 }) |live| {
-        try shown.append(arena.allocator(), try arena.allocator().dupe(u8, title(&b, .{ .link = link, .decoding = dec, .prefilling = pre, .live = live, .last = 9 })));
+        const r = readout(&b, .{ .link = link, .decoding = dec, .prefilling = pre, .live = live, .last = 9 });
+        try shown.append(arena.allocator(), try arena.allocator().dupe(u8, r.caption));
+        try shown.append(arena.allocator(), try arena.allocator().dupe(u8, r.value));
     };
     for ([_]bool{ false, true }) |dec| {
         const h = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .decoding = dec, .live = 105, .last = 90, .last_prefill = 5000, .gpu_mhz = 1195, .gpu_pct = 62 });
@@ -3076,12 +3120,11 @@ test "log scroll: following resumes only at the bottom" {
     try std.testing.expect(atBottom(1200, 1000));
 }
 
-test "title: an idle server shows the icon only, the card keeps the last speed" {
+test "readout: an idle server shows the icon alone, the card keeps the last speed" {
     var t: Tracker = .{};
     t.observe(1_000, .{ .link = .up, .finished_tps = 42 });
-    var b: [64]u8 = undefined;
-    const idle = t.view(.up);
-    try std.testing.expectEqualStrings("", title(&b, idle));
+    const idle = t.view(.up, 1_000);
+    try expectReadout("", "", idle);
     try std.testing.expect(idle.last.? == 42);
 }
 
@@ -3216,15 +3259,13 @@ test "quit: plain Quit leaves a started server running and says so; with Option 
     try std.testing.expect(std.mem.indexOf(u8, quitButton(&b, true, 1).tip, "the server it started") != null);
 }
 
-test "speeds: one rounding rule in the title and the card, whole numbers from 100 up" {
+test "speeds: one rounding rule in the readout and the card, whole numbers from 100 up" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    var b: [64]u8 = undefined;
     for ([_]struct { tps: f64, text: []const u8 }{ .{ .tps = 105.27, .text = "105" }, .{ .tps = 99.94, .text = "99.9" }, .{ .tps = 7.25, .text = "7.3" } }) |c| {
         const h = try buildHeader(arena.allocator(), .{ .link = .up, .port = 1, .model = "m", .decoding = true, .live = c.tps });
         try std.testing.expectEqualStrings(c.text, h.stats[0].value);
-        const t = title(&b, .{ .link = .up, .decoding = true, .live = c.tps });
-        try std.testing.expectEqualStrings(c.text, t[0..std.mem.indexOfScalar(u8, t, ' ').?]);
+        try expectReadout("TOK/S", c.text, .{ .link = .up, .decoding = true, .live = c.tps });
     }
 }
 
@@ -3389,17 +3430,25 @@ test "reading: of several prompts read at once one under way shows before a queu
     try std.testing.expectEqual(@as(?Read, null), dec.read);
 }
 
-test "title: a prompt read shows its seconds left while the switch is on, else nothing; no word while a reply waits" {
-    var b: [64]u8 = undefined;
+test "readout: READ over a prompt read's seconds left, an ellipsis until they are known, before the speed of a reply beside it" {
     const r: Read = .{ .fraction = 0.6, .seconds_left = 12 };
-    try std.testing.expectEqualStrings("12s", title(&b, .{ .link = .up, .prefilling = true, .read = r, .show_seconds = true }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .read = r, .show_seconds = false }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null }, .show_seconds = true }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .prefilling = true, .last = 9 }));
-    try std.testing.expectEqualStrings("", title(&b, .{ .link = .up, .decoding = true }));
-    // A reply that generates while another prompt is read shows its speed.
-    try std.testing.expectEqualStrings("42.7 tok/s", title(&b, .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = r, .show_seconds = true }));
-    try std.testing.expectEqualStrings("12s •", title(&b, .{ .link = .up, .prefilling = true, .read = r, .show_seconds = true, .update_waiting = true }));
+    try expectReadout("READ", "12s", .{ .link = .up, .prefilling = true, .read = r, .show_seconds = true });
+    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .read = r, .show_seconds = false });
+    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null }, .show_seconds = true });
+    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .last = 9 });
+    // A prompt read beside a reply that generates shows, as the filling fish does.
+    try expectReadout("READ", "12s", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = r, .show_seconds = true });
+    try expectReadout("READ", "\u{2026}", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null }, .show_seconds = true });
+}
+
+test "readout: every caption and value fits its six characters" {
+    var b: [2 * readout_max + 8]u8 = undefined;
+    const reads = [_]?Read{ null, .{ .fraction = 0.5, .seconds_left = 3599 }, .{ .fraction = 0, .seconds_left = null } };
+    for ([_]Link{ .offline, .unauthorized, .metrics_off, .silent, .up }) |link| for (reads) |rd| for ([_]?f64{ null, 9999.4, 0.04 }) |live| {
+        const r = readout(&b, .{ .link = link, .decoding = live != null, .live = live, .prefilling = rd != null, .read = rd, .update_waiting = true });
+        try std.testing.expect(try std.unicode.utf8CountCodepoints(r.caption) <= readout_max);
+        try std.testing.expect(try std.unicode.utf8CountCodepoints(r.value) <= readout_max);
+    };
 }
 
 test "the reading icon: green fills the ready fish up to the step read, and each step fills more" {
@@ -3434,22 +3483,22 @@ test "seconds switch: on by default, saved only when off, and old files read as 
     try std.testing.expectEqual(true, parseSaved("{\"seconds\":\"no\"}").seconds);
 }
 
-test "title: seconds left read as seconds under a minute, minutes and seconds under an hour, past an hour as >1h, nothing at 0" {
-    var b: [64]u8 = undefined;
+test "readout: seconds left read as seconds under a minute, minutes and seconds under an hour, past an hour as >1h, an ellipsis under 2 s" {
     const at = struct {
-        fn f(buf: []u8, s: ?u32) []const u8 {
-            return title(buf, .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.5, .seconds_left = s }, .show_seconds = true });
+        fn f(s: ?u32) View {
+            return .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.5, .seconds_left = s }, .show_seconds = true };
         }
     }.f;
-    try std.testing.expectEqualStrings("1s", at(&b, 1));
-    try std.testing.expectEqualStrings("59s", at(&b, 59));
-    try std.testing.expectEqualStrings("1:00", at(&b, 60));
-    try std.testing.expectEqualStrings("4:59", at(&b, 299));
-    try std.testing.expectEqualStrings("59:59", at(&b, 3599));
-    try std.testing.expectEqualStrings(">1h", at(&b, 3600));
-    try std.testing.expectEqualStrings(">1h", at(&b, 900_000));
-    try std.testing.expectEqualStrings("", at(&b, 0));
-    try std.testing.expectEqualStrings("", at(&b, null));
+    try expectReadout("READ", "2s", at(2));
+    try expectReadout("READ", "59s", at(59));
+    try expectReadout("READ", "1:00", at(60));
+    try expectReadout("READ", "4:59", at(299));
+    try expectReadout("READ", "59:59", at(3599));
+    try expectReadout("READ", ">1h", at(3600));
+    try expectReadout("READ", ">1h", at(900_000));
+    try expectReadout("READ", "\u{2026}", at(1));
+    try expectReadout("READ", "\u{2026}", at(0));
+    try expectReadout("READ", "\u{2026}", at(null));
 }
 
 test "the generating icon: the ready sushi with its slot lit, then dim, at a steady beat" {
@@ -3495,12 +3544,49 @@ test "reading: a prefill object whose numbers are not whole and non-negative is 
 test "reading: a time left past any clock reads as the most a u32 holds, never a wrapped or undefined count" {
     const far = readOf(.{ .total = 9_000_000_000_000_000, .cache = 0, .processed = 1, .time_ms = 1 });
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), far.seconds_left);
-    var b: [64]u8 = undefined;
-    try std.testing.expectEqualStrings(">1h", title(&b, .{ .link = .up, .prefilling = true, .read = far, .show_seconds = true }));
+    try expectReadout("READ", ">1h", .{ .link = .up, .prefilling = true, .read = far, .show_seconds = true });
 }
 
 test "metrics: an answer the client cannot read is a server that answers with nothing shown, never one that is offline" {
     try std.testing.expectEqual(@as(?Read, null), unreadable(.up).read);
     try std.testing.expect(!unreadable(.up).prefilling);
     try std.testing.expectEqual(Link.up, unreadable(.up).link);
+}
+
+test "carried read: between reports a read moves on at its own rate, stops where the next report can land, and a new report re-anchors it" {
+    var t: Tracker = .{};
+    const at = struct {
+        fn sample(processed: u64, time_ms: u64) Sample {
+            return .{ .link = .up, .prefilling = true, .prefill = .{ .total = 16384, .cache = 0, .processed = processed, .time_ms = time_ms }, .prefill_id = 7 };
+        }
+    }.sample;
+    // First chunk: 4096 tokens in 4000 ms, so about a token a millisecond, and a step of 4096.
+    t.observe(10_000, at(4096, 4000));
+    try std.testing.expectEqual(@as(u64, 4096), carried(t.anchor.?, 10_000).processed);
+    try std.testing.expectEqual(@as(u64, 4096 + 1024), carried(t.anchor.?, 11_000).processed);
+    // Never past one step on, whatever the wait.
+    try std.testing.expectEqual(@as(u64, 8192), carried(t.anchor.?, 60_000).processed);
+    // The same report polled again keeps the anchor; the next one moves it and sizes the step.
+    t.observe(11_000, at(4096, 4000));
+    try std.testing.expectEqual(@as(i64, 10_000), t.anchor.?.at_ms);
+    t.observe(14_100, at(8192, 8000));
+    try std.testing.expectEqual(@as(i64, 14_100), t.anchor.?.at_ms);
+    try std.testing.expectEqual(@as(u64, 4096), t.anchor.?.step);
+    // The seconds left count down between reports.
+    const now = t.view(.up, 14_100).read.?.seconds_left.?;
+    const later = t.view(.up, 16_100).read.?.seconds_left.?;
+    try std.testing.expect(later < now);
+    // Another request starts its own anchor; no read drops it.
+    t.observe(15_000, .{ .link = .up, .prefilling = true, .prefill = .{ .total = 100, .cache = 0, .processed = 0, .time_ms = 0 }, .prefill_id = 8 });
+    try std.testing.expectEqual(@as(u64, 8), t.anchor.?.id);
+    try std.testing.expectEqual(@as(u64, 0), carried(t.anchor.?, 20_000).processed);
+    t.observe(16_000, .{ .link = .up });
+    try std.testing.expectEqual(@as(?Tracker.Anchor, null), t.anchor);
+}
+
+test "carried read: no rate, no move before the first chunk, and never past the prompt's end" {
+    const none: Tracker.Anchor = .{ .id = 1, .p = .{ .total = 1000, .cache = 200, .processed = 200, .time_ms = 0 }, .at_ms = 0, .step = 0 };
+    try std.testing.expectEqual(@as(u64, 200), carried(none, 5_000).processed);
+    const near: Tracker.Anchor = .{ .id = 1, .p = .{ .total = 1000, .cache = 0, .processed = 900, .time_ms = 900 }, .at_ms = 0, .step = 512 };
+    try std.testing.expectEqual(@as(u64, 1000), carried(near, 60_000).processed);
 }

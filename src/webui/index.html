@@ -3144,6 +3144,24 @@ function readEta(total, cache, processed, time_ms) {
   const left = Math.ceil((total - processed) * time_ms / fresh / 1000);
   return left > 0 ? left : null;
 }
+// A read between the server's reports, which land once a chunk: its last report moved on at the report's own rate
+// for the time since, never past where the next report can land (one step on) or the prompt's end.
+function carriedRead(a, now) {
+  const p = { total: a.total, cache: a.cache, processed: a.processed, time_ms: a.time_ms };
+  const fresh = a.processed - a.cache;
+  if (!(a.time_ms > 0) || !(fresh > 0) || !(a.step > 0) || !(now > a.at)) return p;
+  const since = now - a.at;
+  const cap = Math.min(a.total, a.processed + a.step);
+  p.processed = Math.max(a.processed, Math.min(cap, a.processed + Math.floor(fresh * since / a.time_ms)));
+  p.time_ms = a.time_ms + since;
+  return p;
+}
+// The anchor a report gives: a report that moved re-anchors and sizes the next step; the same numbers again keep it.
+function reanchorRead(old, p, now) {
+  if (old && old.processed === p.processed && old.time_ms === p.time_ms) return old;
+  const step = old ? Math.max(0, p.processed - old.processed) : Math.max(0, p.processed - p.cache);
+  return { ...p, at: now, step };
+}
 // Time left as sushibar's menu bar reads it: seconds under a minute, minutes and seconds under an hour, then > 1 h.
 function etaText(left) {
   if (left == null) return "";
@@ -3154,7 +3172,7 @@ function etaText(left) {
 function createStreamingView() {
   $("chatEmpty").hidden = true;
   const node = el("div", "msg assistant last");
-  const state = { node, text: "", reasoning: "", thinkingEl: null, thinkingBody: null, contentEl: null, raf: 0, progress: null, bar: null, barFill: null, barMeter: null, barEta: null, barTimer: 0 };
+  const state = { node, text: "", reasoning: "", thinkingEl: null, thinkingBody: null, contentEl: null, raf: 0, progress: null, anchor: null, bar: null, barFill: null, barMeter: null, barEta: null, barTimer: 0, barTick: 0 };
   const flush = () => {
     state.raf = 0;
     // The first thinking or content token ends the read: the bar gives way to the streaming text.
@@ -3219,19 +3237,31 @@ function createStreamingView() {
       state.bar.append(state.barMeter, state.barEta);
       node.appendChild(state.bar);
     }
-    const pct = 100 * state.progress.processed / total;
-    state.barFill.style.width = pct.toFixed(1) + "%";
-    state.barMeter.setAttribute("aria-valuenow", String(Math.round(pct)));
-    const left = readEta(state.progress.total, state.progress.cache, state.progress.processed, state.progress.time_ms);
-    state.barEta.textContent = etaText(left);
+    state.anchor = reanchorRead(state.anchor, state.progress, performance.now());
+    drawRead();
+    if (!state.barTick) state.barTick = setInterval(drawRead, 250);
     if (!state.barTimer) state.barTimer = setTimeout(() => {
       state.barTimer = 0;
       if (state.bar && state.progress.processed < state.progress.total && !state.text && !state.reasoning) state.bar.hidden = false;
     }, 2000);
   };
+  // The bar between reports: carried on at the read's rate, until the first token ends the read.
+  const drawRead = () => {
+    if (state.text || state.reasoning) {
+      clearInterval(state.barTick);
+      state.barTick = 0;
+      return;
+    }
+    const p = carriedRead(state.anchor, performance.now());
+    const pct = 100 * p.processed / p.total;
+    state.barFill.style.width = pct.toFixed(1) + "%";
+    state.barMeter.setAttribute("aria-valuenow", String(Math.round(pct)));
+    state.barEta.textContent = etaText(readEta(p.total, p.cache, p.processed, p.time_ms));
+  };
   state.finalize = () => {
     if (state.raf) cancelAnimationFrame(state.raf);
     if (state.barTimer) clearTimeout(state.barTimer);
+    if (state.barTick) clearInterval(state.barTick);
     node.remove();
   };
   $("chatMessages").appendChild(node);
@@ -5621,18 +5651,25 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   sess.addEventListener('pointerleave', () => { phasePtr = null; if (tipOwner === 'phase') hideTip(); });
 
 
+  // Each prefilling request's last report, carried on between polls (`carriedRead`).
+  const readAnchors = new Map();
   function sessions(rows, now, g = {}) {
+    const reading = new Set(rows.filter(r => r.phase === 'prefill').map(r => r.request_id));
+    for (const id of readAnchors.keys()) if (!reading.has(id)) readAnchors.delete(id);
     // The server tracks one in-flight prefill at a time, as two global gauges, so a
     // percentage can only be pinned to a row when exactly one row is prefilling.
     const prefilling = rows.filter(r => r.phase === 'prefill').length;
     const exp = g.prefill_tokens_expected || 0, done = Math.min(g.prefill_tokens_live || 0, exp);
     const prefillDone = prefilling === 1 && exp > 0 ? 100 * done / exp : null;
     // A row the server reports its own read for draws that read: its bar and seconds, never the shared percentage.
-    const ownRead = p => {
+    const ownRead = (p, id) => {
       const total = Math.max(0, Number(p?.total) || 0);
       if (!total) return null;
-      const cache = Math.max(0, Number(p.cache) || 0), read = Math.min(total, Math.max(0, Number(p.processed) || 0));
-      const left = readEta(total, cache, read, Math.max(0, Number(p.time_ms) || 0));
+      const reported = { total, cache: Math.max(0, Number(p.cache) || 0), processed: Math.min(total, Math.max(0, Number(p.processed) || 0)), time_ms: Math.max(0, Number(p.time_ms) || 0) };
+      const anchor = reanchorRead(readAnchors.get(id), reported, now);
+      readAnchors.set(id, anchor);
+      const c = carriedRead(anchor, now), cache = c.cache, read = c.processed;
+      const left = readEta(total, cache, read, c.time_ms);
       return ` <span class="pbar" data-phase="progress" data-done="${read}" data-exp="${total}"><span class="pbar-track"><span class="pbar-fill" style="width:${(100 * read / total).toFixed(1)}%"></span></span>${left == null ? '' : `<span class="pbar-left">${etaText(left)}</span>`}</span>`;
     };
     const tb = $('sessions');
@@ -5653,7 +5690,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const cancelBtn = canCancel
         ? `<button class="btn xs danger" data-cancel="${esc(s.request_id)}" title="Cancel this in-flight request">Cancel</button>`
         : '';
-      const read = s.phase === 'prefill' ? ownRead(s.prefill) : null;
+      const read = s.phase === 'prefill' ? ownRead(s.prefill, s.request_id) : null;
       return `<tr>
         <td class="rid"${s.request_id ? ` title="Request ${esc(s.request_id)}"` : ''}>${esc(s.request_id || '')}</td>
         <td title="${esc(s.model)}">${esc(String(s.model).split('/').pop())}</td>

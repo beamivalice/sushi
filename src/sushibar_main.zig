@@ -858,7 +858,7 @@ fn pollLoop() void {
         if (p == port()) {
             lock();
             shared.port = p;
-            shared.view = tracker.view(sample.link);
+            shared.view = tracker.view(sample.link, now);
             if (fetch_models or !answers) {
                 shared.model.set(models.ready orelse "");
                 shared.model_full_len = if (models.ready) |m| m.len else 0;
@@ -1346,9 +1346,11 @@ var loading_frame: usize = 0;
 var loading_timer: objc.id = null;
 var loading_button: objc.id = null;
 var tick_count: u32 = 0;
-var last_title: [128]u8 = undefined;
-var shown_title: [128]u8 = undefined;
-var shown_title_len: usize = std.math.maxInt(usize);
+var readout_buf: [2 * logic.readout_max + 8]u8 = undefined;
+var shown_readout: [2 * logic.readout_max + 8]u8 = undefined;
+var shown_readout_len: usize = std.math.maxInt(usize);
+var readout_caption: objc.id = null;
+var readout_value: objc.id = null;
 var port_sig: [1536]u8 = undefined;
 var port_sig_len: usize = std.math.maxInt(usize);
 
@@ -1420,14 +1422,71 @@ fn loadingTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     objc.msg(void, loading_button, "setImage:", .{loading_icons[loading_frame]});
 }
 
-/// The button title in monospaced digits, so its width does not jitter.
-fn setButtonTitle(button: objc.id, text: []const u8) void {
-    if (shown_title_len == text.len and std.mem.eql(u8, shown_title[0..text.len], text)) return;
-    shown_title_len = text.len;
-    @memcpy(shown_title[0..text.len], text);
-    const s = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(text), header_view.titleAttributes() });
-    defer objc.release(s);
-    objc.msg(void, button, "setAttributedTitle:", .{s});
+/// The title that reserves the readout's room while it shows: as wide as `readout_max - 1` digits of the value font,
+/// so a number that changes never moves the icon.
+const readout_spacer = blk: {
+    var spaces: []const u8 = "";
+    for (0..logic.readout_max - 1) |_| spaces = spaces ++ "\u{2007}";
+    break :blk spaces;
+};
+/// How far the value's line rises into the caption's, so the pair fits the bar as diskglance's does.
+const readout_overlap: f64 = 2;
+/// The room between the icon and the readout, beyond the title's own.
+const readout_gap: f64 = 2;
+
+/// The stacked readout right of the icon: two labels in the bar's text colour over a clear title of fixed width, shown
+/// only while there is one.
+fn makeReadout(button: objc.id) void {
+    readout_caption = readoutLabel(header_view.readoutCaptionFont());
+    readout_value = readoutLabel(header_view.readoutValueFont());
+    objc.msg(void, button, "addSubview:", .{readout_caption});
+    objc.msg(void, button, "addSubview:", .{readout_value});
+    shown_readout_len = std.math.maxInt(usize);
+}
+
+fn readoutLabel(f: objc.id) objc.id {
+    const l = objc.msg(objc.id, objc.class("NSTextField"), "labelWithString:", .{objc.nsString("")});
+    objc.msg(void, l, "setFont:", .{f});
+    objc.msg(void, l, "setTextColor:", .{objc.color("labelColor")});
+    return l;
+}
+
+fn setReadout(button: objc.id, r: logic.Readout) void {
+    const n = r.caption.len + 1 + r.value.len;
+    var key: [shown_readout.len]u8 = undefined;
+    const k = std.fmt.bufPrint(&key, "{s}\n{s}", .{ r.caption, r.value }) catch return;
+    if (shown_readout_len == n and std.mem.eql(u8, shown_readout[0..n], k)) return;
+    shown_readout_len = n;
+    @memcpy(shown_readout[0..n], k);
+    const shown = r.caption.len > 0;
+    const title = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSAttributedString"), "alloc", .{}), "initWithString:attributes:", .{ objc.nsText(if (shown) readout_spacer else ""), header_view.readoutSpacerAttributes() });
+    defer objc.release(title);
+    objc.msg(void, button, "setAttributedTitle:", .{title});
+    objc.msg(void, readout_caption, "setHidden:", .{!shown});
+    objc.msg(void, readout_value, "setHidden:", .{!shown});
+    objc.msg(void, readout_caption, "setStringValue:", .{objc.nsText(r.caption)});
+    objc.msg(void, readout_value, "setStringValue:", .{objc.nsText(r.value)});
+    objc.msg(void, readout_caption, "sizeToFit", .{});
+    objc.msg(void, readout_value, "sizeToFit", .{});
+    placeReadout(button);
+}
+
+/// The two lines stacked in the title's room, the pair centred on the bar's height a half point low.
+fn placeReadout(button: objc.id) void {
+    const bounds = objc.msg(objc.NSRect, button, "bounds", .{});
+    const t = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "titleRectForBounds:", .{bounds});
+    const cf = objc.msg(objc.NSRect, readout_caption, "frame", .{});
+    const vf = objc.msg(objc.NSRect, readout_value, "frame", .{});
+    const bottom = (bounds.h - (vf.h + cf.h - readout_overlap)) / 2 - 0.5;
+    const flipped = objc.msg(bool, button, "isFlipped", .{});
+    const at = struct {
+        fn y(fl: bool, h: f64, from_bottom: f64, height: f64) f64 {
+            return if (fl) h - from_bottom - height else from_bottom;
+        }
+    }.y;
+    const x = t.x + readout_gap;
+    objc.msg(void, readout_value, "setFrameOrigin:", .{objc.NSPoint{ .x = x, .y = at(flipped, bounds.h, bottom, vf.h) }});
+    objc.msg(void, readout_caption, "setFrameOrigin:", .{objc.NSPoint{ .x = x, .y = at(flipped, bounds.h, bottom + vf.h - readout_overlap, cf.h) }});
 }
 
 fn newItem(label: [*:0]const u8, action: ?[*:0]const u8, tag: isize, key: [*:0]const u8, sym: ?[]const u8) objc.id {
@@ -1518,6 +1577,34 @@ fn showBadge(button: objc.id, on: bool) void {
 }
 
 const badge_size: f64 = 7;
+
+var update_dot: objc.id = null;
+var shown_update_dot = false;
+const update_dot_size: f64 = 6;
+
+/// The blue dot on the menu bar icon's upper right while an update waits.
+fn makeUpdateDot(button: objc.id) void {
+    update_dot = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = update_dot_size, .h = update_dot_size }});
+    objc.msg(void, update_dot, "setWantsLayer:", .{true});
+    const layer = objc.msg(objc.id, update_dot, "layer", .{});
+    objc.msg(void, layer, "setBackgroundColor:", .{objc.msg(objc.id, objc.color("systemBlueColor"), "CGColor", .{})});
+    objc.msg(void, layer, "setCornerRadius:", .{update_dot_size / 2});
+    objc.msg(void, update_dot, "setHidden:", .{true});
+    objc.msg(void, button, "addSubview:", .{update_dot});
+    shown_update_dot = false;
+}
+
+fn showUpdateDot(button: objc.id, on: bool) void {
+    if (on == shown_update_dot) return;
+    objc.fadeNext(button, 0.25);
+    shown_update_dot = on;
+    if (on) {
+        const r = objc.msg(objc.NSRect, objc.msg(objc.id, button, "cell", .{}), "imageRectForBounds:", .{objc.msg(objc.NSRect, button, "bounds", .{})});
+        const flipped = objc.msg(bool, button, "isFlipped", .{});
+        objc.msg(void, update_dot, "setFrameOrigin:", .{objc.NSPoint{ .x = r.x + r.w - update_dot_size + 1, .y = if (flipped) r.y - 1 else r.y + r.h - update_dot_size + 1 }});
+    }
+    objc.msg(void, update_dot, "setHidden:", .{!on});
+}
 
 fn makeBadge(button: objc.id) void {
     badge_view = objc.msg(objc.id, objc.msg(objc.id, objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{objc.NSRect{ .x = 0, .y = 0, .w = badge_size, .h = badge_size }});
@@ -1790,7 +1877,7 @@ fn refresh() void {
     var tv = view;
     tv.update_waiting = uv.available;
     tv.show_seconds = g_seconds;
-    const title = logic.title(&last_title, tv);
+    const shown = logic.readout(&readout_buf, tv);
     const button = objc.msg(objc.id, status_item, "button", .{});
     const icon = logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 });
     if (icon == .ready and view.read != null) {
@@ -1801,7 +1888,8 @@ fn refresh() void {
     }
     objc.msg(void, seconds_mi, "setState:", .{@as(isize, if (g_seconds) 1 else 0)});
     showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
-    setButtonTitle(button, title);
+    setReadout(button, shown);
+    showUpdateDot(button, uv.available);
     var status_buf: [200]u8 = undefined;
     const status = logic.statusLine(&status_buf, state);
     setText(button, "setToolTip:", status);
@@ -1859,14 +1947,16 @@ fn refresh() void {
             const piece = std.fmt.bufPrint(ports_buf[pn..], "{s}{s};", .{ logic.portLabel(&lab, e), if (e.checked) "*" else "" }) catch break;
             pn += piece.len;
         }
+        var readout_line: [2 * logic.readout_max * 4 + 24]u8 = undefined;
+        const readout_text = std.fmt.bufPrint(&readout_line, "{s}|{s}\" update_dot={d}", .{ shown.caption, shown.value, @intFromBool(uv.available) }) catch "";
         var removable_buf: [128]u8 = undefined;
         var rn: usize = 0;
         for (port_entries) |e| if (e.removable) {
             const piece = std.fmt.bufPrint(removable_buf[rn..], "{d},", .{e.port}) catch break;
             rn += piece.len;
         };
-        std.debug.print("sushibar: poll {d} title=\"{s}\" status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\" stats=\"{s}|{s}|{s}\" a11y=\"{s}\" lan={d}\n", .{
-            tick_count,                 title,                 status,                 @intFromBool(on.start),
+        std.debug.print("sushibar: poll {d} readout=\"{s} status=\"{s}\" start={d} stop={d} server_pid={d} icon={s} ports=\"{s}\" version=\"{s}\" note=\"{s}\" problem={d} pill=\"{s}\" line1=\"{s}\" line2=\"{s}\" toggle=\"{s}\" field_invalid={d} pack=\"{s}\" packcopy=\"{s}\" button=\"{s}\" tip=\"{s}\" removable=\"{s}\" badge={d} models_link={d} last_model=\"{s}\" load=\"{s}\" load_on={d} why=\"{s}\" stats=\"{s}|{s}|{s}\" a11y=\"{s}\" lan={d}\n", .{
+            tick_count,                 readout_text,          status,                 @intFromBool(on.start),
             @intFromBool(on.stop),      if (own) |e| e.pid else 0,
             @tagName(shown_icon.?),     ports_buf[0..pn],      header.version,         note_shown,
             @intFromBool(note_problem and note_shown.len > 0), header.pill.label, header.line1, header.line2,
@@ -2167,6 +2257,8 @@ fn runMenuBar() noreturn {
     objc.msg(void, button, "setImagePosition:", .{@as(isize, 2)});
     showIcon(button, .outline);
     makeBadge(button);
+    makeUpdateDot(button);
+    makeReadout(button);
 
     const cls = objc.defineClass("SushiBarTarget", &.{
         .{ .selector = "tick:", .imp = @ptrCast(&tick), .types = "v@:@" },
@@ -2353,15 +2445,17 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
 /// The menu bar item in its states, on a plain button of the status button's shape over a menu-bar-like fill.
 fn renderBadge(dir: []const u8) void {
     loadIcons();
-    const Case = struct { name: []const u8, icon: logic.Icon, title: []const u8 = "", badge: bool = false, reading: ?usize = null, dim: bool = false };
+    const Case = struct { name: []const u8, icon: logic.Icon, readout: logic.Readout = logic.readout_none, badge: bool = false, update: bool = false, reading: ?usize = null, dim: bool = false };
     const cases = [_]Case{
-        .{ .name = "live", .icon = .ready, .title = "105 tok/s" },
-        .{ .name = "last", .icon = .ready, .title = "88.0 tok/s" },
-        .{ .name = "reading", .icon = .ready, .reading = logic.reading_steps * 3 / 5, .title = "12s" },
-        .{ .name = "reading-start", .icon = .ready, .reading = logic.reading_steps / 10 },
-        .{ .name = "reading-no-seconds", .icon = .ready, .reading = logic.reading_steps * 3 / 5 },
-        .{ .name = "reading-minutes", .icon = .ready, .reading = logic.reading_steps / 4, .title = "4:59" },
-        .{ .name = "generating-dim", .icon = .ready, .dim = true, .title = "105 tok/s" },
+        .{ .name = "live", .icon = .ready, .readout = .{ .caption = "TOK/S", .value = "105" } },
+        .{ .name = "live-slow", .icon = .ready, .readout = .{ .caption = "TOK/S", .value = "40.0" } },
+        .{ .name = "idle", .icon = .ready },
+        .{ .name = "update-waiting", .icon = .ready, .update = true },
+        .{ .name = "update-waiting-live", .icon = .ready, .update = true, .readout = .{ .caption = "TOK/S", .value = "40.0" } },
+        .{ .name = "reading", .icon = .ready, .reading = logic.reading_steps * 3 / 5, .readout = .{ .caption = "READ", .value = "12s" } },
+        .{ .name = "reading-start", .icon = .ready, .reading = logic.reading_steps / 10, .readout = .{ .caption = "READ", .value = logic.readout_pending } },
+        .{ .name = "reading-minutes", .icon = .ready, .reading = logic.reading_steps / 4, .readout = .{ .caption = "READ", .value = "59:59" } },
+        .{ .name = "generating-dim", .icon = .ready, .dim = true, .readout = .{ .caption = "TOK/S", .value = "105" } },
         .{ .name = "badge", .icon = .ready, .badge = true },
         .{ .name = "no-model", .icon = .empty },
         .{ .name = "loading", .icon = .loading },
@@ -2380,8 +2474,10 @@ fn renderBadge(dir: []const u8) void {
         objc.msg(void, button, "setImage:", .{if (c.reading) |step| reading_icons[step] else if (c.dim) generating_dim else icons[@intFromEnum(c.icon)]});
         // The status bar draws a template image in the bar's text colour; a plain button would draw it dimmed.
         objc.msg(void, button, "setContentTintColor:", .{objc.color("labelColor")});
-        shown_title_len = std.math.maxInt(usize);
-        setButtonTitle(button, c.title);
+        makeReadout(button);
+        setReadout(button, c.readout);
+        makeUpdateDot(button);
+        showUpdateDot(button, c.update);
         makeBadge(button);
         shown_badge = !c.badge;
         showBadge(button, c.badge);

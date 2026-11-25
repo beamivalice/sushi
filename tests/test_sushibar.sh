@@ -122,8 +122,8 @@ for _ in $(seq 1 60); do kill -0 "$BARPID" 2>/dev/null || break; sleep 0.5; done
 check "sushibar quit after its polls" "$(yes_if '! kill -0 "$BARPID" 2>/dev/null')"
 check "its pid file is gone" "$(yes_if '[ ! -f "$HOME/.sushi/sushibar.pid" ]')"
 check "the icon is the outline offline and the grey-fish no-model icon once the server answers with no model" "$(yes_if 'grep -q "poll 1 .*icon=outline" "$LOG" && grep -q "running, no model loaded.*icon=empty" "$LOG" && tail -n 1 "$LOG" | grep -q "icon=outline"')"
-check "the first poll reads not running with Start enabled, the port named" "$(yes_if 'grep -q "poll 1 title=\"\" status=\"Port '"$PORT"': not running\" start=1 stop=0" "$LOG"')"
-check "an idle server reads an icon-only title with Stop enabled" "$(yes_if 'grep -q "title=\"\" status=\"Port '"$PORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
+check "the first poll reads not running with Start enabled, the port named" "$(yes_if 'grep -q "poll 1 readout=\"|\" update_dot=0 status=\"Port '"$PORT"': not running\" start=1 stop=0" "$LOG"')"
+check "an idle server shows the icon alone with Stop enabled" "$(yes_if 'grep -q "readout=\"|\" update_dot=0 status=\"Port '"$PORT"': running, no model loaded\" start=0 stop=1" "$LOG"')"
 check "the header says Stopped with a Start toggle, then No model pointing at the Models page with a Stop toggle" "$(yes_if 'grep -q "poll 1 .*pill=\"Stopped\" line1=\"Ready to start · port '"$PORT"'\" line2=\"No model to load yet\" toggle=\"Start Server\"" "$LOG" && grep -q "pill=\"No model\" line1=\"Open Models to load one\".*toggle=\"Stop Server\"" "$LOG"')"
 check "Load is off with its reason before the server answers and with no model to load" "$(yes_if 'grep -q "poll 1 .*load=\"Load\" load_on=0 why=\"Start the server to load a model\"" "$LOG" && grep -q "pill=\"No model\".*load=\"Load\" load_on=0 why=\"No model to load yet: pick one in Models\"" "$LOG"')"
 check "the Port data lists the running server, checked" "$(yes_if 'grep -q "ports=\".*'"$PORT"' — no model\*;" "$LOG"')"
@@ -307,7 +307,7 @@ stage_install "$INST"
 run_bar "$INST/sushibar" 8 "check@2" --port "$UPORT"
 check "the menu shows the sushi beside sushibar by version" "$(yes_if 'grep -q "version=\"'"$CUR"'" "$LOG"')"
 check "a newer release shows the Update button, named in its tooltip" "$(yes_if 'grep -q "button=\"Update\" tip=\"Update to sushi 99.0.0\"" "$LOG"')"
-check "the button carries the dot while an update waits" "$(yes_if 'grep -q "title=\"•\"" "$LOG"')"
+check "the icon carries the update dot while an update waits" "$(yes_if 'grep -q "readout=\"|\" update_dot=1" "$LOG"')"
 check "no server on the port: the CLI path is chosen (the button is not a brew command)" "$(yes_if 'grep -q "button=\"Update\"" "$LOG" && ! grep -q "brew upgrade" "$LOG"')"
 
 KEG="$WORK/Cellar/sushi/1.0/libexec"
@@ -652,7 +652,7 @@ python3 "$WORK/stub_key.py" "$TPORT" > /dev/null 2>&1 &
 TPID=$!
 for _ in $(seq 1 40); do curl -s -o /dev/null "http://127.0.0.1:$TPORT/" && break; sleep 0.25; done
 TICK=$FAST run_bar "$BAR" 3 "" --port "$TPORT"
-check "a 401 reads Key needed with its cause in the header, a badge and no words in the title" "$(yes_if 'grep -q "poll 2 title=\"\" .*pill=\"Key needed\" line1=\"The server requires an API key\".*badge=1" "$LOG"')"
+check "a 401 reads Key needed with its cause in the header, a badge and the icon alone" "$(yes_if 'grep -q "poll 2 readout=\"|\" .*pill=\"Key needed\" line1=\"The server requires an API key\".*badge=1" "$LOG"')"
 kill "$TPID" 2>/dev/null; wait "$TPID" 2>/dev/null
 
 echo "== two sushibars launched at once leave one =="
