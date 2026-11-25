@@ -91,7 +91,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
     if (opts.imatrix_windows != 0) return error.Dsv41ImatrixWindowsUnsupported;
     if (opts.tokens != 1) return error.Dsv41LayerMajorNeedsOneRow;
-    if (!opts.no_template or opts.pick_tolerance != 0 or (opts.mtp orelse false) or opts.wired_margin_bytes != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
+    if (!opts.no_template or opts.pick_tolerance != 0 or (opts.mtp orelse false) or (opts.wired_margin_bytes orelse 0) != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
     return true;
 }
 
@@ -1804,6 +1804,12 @@ test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batc
     try testing.expect(try accepts(&cfg, bad));
     bad = ok;
     bad.pick_tolerance = 0.1;
+    try testing.expectError(error.Dsv41CaptureNeedsLosslessStreaming, accepts(&cfg, bad));
+    // A wired margin is refused where one is given and is not zero; an omitted flag gives none.
+    bad = ok;
+    bad.wired_margin_bytes = 0;
+    try testing.expect(try accepts(&cfg, bad));
+    bad.wired_margin_bytes = 1 << 30;
     try testing.expectError(error.Dsv41CaptureNeedsLosslessStreaming, accepts(&cfg, bad));
     bad = ok;
     bad.imatrix_out = "/x.safetensors";
