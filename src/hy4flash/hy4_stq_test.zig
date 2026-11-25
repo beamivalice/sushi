@@ -1061,6 +1061,13 @@ test "hy4 stq: the host embedding gather keeps the blocks it decoded to its byte
         try testing.expectEqual(st.decodes, hy4_stq.EmbedGather.blocks_decoded - before);
         try testing.expectEqualSlices(u32, @ptrCast(want), @ptrCast(got));
     }
+    // Dropped, a block the gather held decodes again.
+    g.dropBlocks();
+    const one = try a.alloc(f32, d);
+    defer a.free(one);
+    const before = hy4_stq.EmbedGather.blocks_decoded;
+    try g.rows(a, &.{129}, one);
+    try testing.expectEqual(@as(usize, 1), hy4_stq.EmbedGather.blocks_decoded - before);
 }
 
 test "hy4 stq served: a server's streamed load reads the STQ pack's rate-group banks as the stream's layout, not a refusal (HY4_STQ_TINY)" {

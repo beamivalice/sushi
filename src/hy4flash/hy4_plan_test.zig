@@ -171,12 +171,14 @@ test "hy4 plan: on the host embedding gather an M1 or M2 load takes, a dry decod
     defer driver.deinit();
     _ = try decodeAt(m, ids, p, .{ .dry = .{ .driver = &driver } }, &dry);
     try testing.expectEqual(@as(?plan_trace.Difference, null), plan_trace.firstDifference(real.instances.items, dry.instances.items));
-    // The blocks the recorded forward decodes, counted over it alone: `decodeAt`'s prefill to `p` runs for real.
+    // The blocks the recorded forward decodes, counted over it alone: `decodeAt`'s prefill to `p` runs for real, and
+    // the blocks it kept are dropped, so the real arm decodes its row's block.
     for ([_]bool{ false, true }) |is_dry| {
         m.reset();
         const pre = try m.forwardReadout(ids[0..p], .none);
         _ = mlx.mlx_array_free(pre);
         mlx.engine.close();
+        m.embed_gather.?.dropBlocks();
         var rec = try plan.Recorder.begin(a, .{ .site = 1 });
         defer rec.deinit();
         var d: plan.Driver = .{ .gpa = a };

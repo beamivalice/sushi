@@ -361,6 +361,13 @@ pub const EmbedGather = struct {
         }
     }
 
+    /// Test seam: the kept blocks emptied, so the next ask of any block decodes it.
+    pub fn dropBlocks(self: EmbedGather) void {
+        const c = self.cache orelse return;
+        @memset(c.block, Blocks.none);
+        @memset(c.used, 0);
+    }
+
     /// The bytes the gather holds: the bank's stored bytes, and its decoded blocks with their ids and last uses.
     pub fn bytes(self: EmbedGather) u64 {
         const kept: u64 = if (self.cache) |c| 4 * c.rows.len + 4 * c.block.len + 8 * c.used.len + @sizeOf(Blocks) else 0;
