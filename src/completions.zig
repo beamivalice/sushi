@@ -19,6 +19,7 @@ const LoadedModel = model_registry_mod.LoadedModel;
 const generation_stream = @import("generation_stream.zig");
 const EMPTY_PROMPT_MSG = generation_stream.EMPTY_PROMPT_MSG;
 const sendGenerationError = generation_stream.sendGenerationError;
+const sendCompletionProgressChunk = generation_stream.sendCompletionProgressChunk;
 const nonStreamingViaScheduler = generation_stream.nonStreamingViaScheduler;
 const StreamingTokenStream = generation_stream.StreamingTokenStream;
 const requestSpecModes = generation_stream.requestSpecModes;
@@ -222,6 +223,8 @@ pub fn handleCompletions(
     defer allocator.free(model_name);
 
     const include_usage = req.includeUsage();
+    // `return_progress`: prompt processing progress chunks on the stream.
+    const return_progress = req.returnProgress();
 
     // Spec-decode flags (mirror chat-completions).
     if (expert_stream_mod.mtpRefusal(config.expert_streaming, req.flag("enable_mtp") orelse false, lm.mtp != null)) |why| {
@@ -287,7 +290,7 @@ pub fn handleCompletions(
     sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, include_usage, enable_drafter, enable_mtp, allow_batch_mtp, cache_key, kv_quant_override) catch |err| {
+        handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, include_usage, return_progress, enable_drafter, enable_mtp, allow_batch_mtp, cache_key, kv_quant_override) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             sendGenerationError(allocator, stream, err, .completions) catch {};
         };
@@ -457,6 +460,9 @@ fn handleStreamingCompletion(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     include_usage: bool,
+    /// `return_progress`: ship llama.cpp-shaped `prompt_progress` chunks
+    /// while the prefill runs.
+    return_progress: bool,
     enable_drafter: bool,
     enable_mtp: bool,
     allow_batch_mtp: bool,
@@ -504,6 +510,16 @@ fn handleStreamingCompletion(
     // SSE headers
     try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
+    // `return_progress`: the 0% chunk llama.cpp ships as prompt processing
+    // starts; it names the whole prompt's token count at once.
+    var progress_sent_any = false;
+    var progress_sent_processed: u64 = 0;
+    var progress_sent_ms: u64 = 0;
+    if (return_progress) {
+        try sendCompletionProgressChunk(allocator, stream, cmpl_id, created_ts, model_name, prompt_ids.len, 0, 0, 0);
+        progress_sent_any = true;
+    }
+
     var stop_gate = stop_seq_mod.Gate{ .stops = stop_sequences };
     defer stop_gate.deinit(allocator);
     var tail_flush = false; // the generation ended: this turn delivers the gate's held tail
@@ -529,6 +545,26 @@ fn handleStreamingCompletion(
                     slot_handle.?.cancel();
                     client_gone = true;
                     break;
+                }
+                // `return_progress`: ship the chunk loop's new numbers when
+                // it moved since the last wake; nothing new keeps the
+                // plain keepalive.
+                if (return_progress and ts.delivered == 0) {
+                    const s = slot_handle.?;
+                    const processed = s.prefill_progress.processed.load(.monotonic);
+                    const elapsed = s.prefill_progress.elapsed_ms.load(.monotonic);
+                    if (!progress_sent_any or processed != progress_sent_processed or elapsed != progress_sent_ms) {
+                        sendCompletionProgressChunk(allocator, stream, cmpl_id, created_ts, model_name, s.full_prompt.len, s.prefill_progress.cache.load(.monotonic), processed, elapsed) catch {
+                            log.info("  [cancel] progress write failed (client disconnected) — cancelling slot\n", .{});
+                            slot_handle.?.cancel();
+                            client_gone = true;
+                            break;
+                        };
+                        progress_sent_any = true;
+                        progress_sent_processed = processed;
+                        progress_sent_ms = elapsed;
+                        continue;
+                    }
                 }
                 sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, slot_handle.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});

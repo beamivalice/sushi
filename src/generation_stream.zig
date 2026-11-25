@@ -1386,6 +1386,10 @@ pub fn handleStreamingGeneration(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     include_usage: bool,
+    /// `return_progress`: ship llama.cpp-shaped `prompt_progress` chunks
+    /// while the prefill runs. A non-streaming request ignores it, as
+    /// llama.cpp's server does.
+    return_progress: bool,
     has_tools: bool,
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
@@ -1488,6 +1492,17 @@ pub fn handleStreamingGeneration(
 
     // First chunk: role announcement
     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null, null);
+
+    // `return_progress`: llama.cpp ships a 0% progress chunk as soon as prompt
+    // processing starts; ours names the whole prompt's token count at once, so
+    // a client sizing the bar needs no later chunk to learn it.
+    var progress_sent_any = false;
+    var progress_sent_processed: u64 = 0;
+    var progress_sent_ms: u64 = 0;
+    if (return_progress) {
+        try sendSSEProgressChunk(allocator, stream, chat_id, model_name, prompt_ids.len, 0, 0, 0);
+        progress_sent_any = true;
+    }
 
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
@@ -1601,6 +1616,27 @@ pub fn handleStreamingGeneration(
                     ts.slot.?.cancel();
                     client_gone = true;
                     break;
+                }
+                // `return_progress`: the inference thread's chunk loop has
+                // published new numbers since the last wake (or the clock
+                // moved under a still-waiting prefill) — ship them. A wake
+                // with nothing new keeps the plain keepalive.
+                if (return_progress and ts.delivered == 0) {
+                    const s = ts.slot.?;
+                    const processed = s.prefill_progress.processed.load(.monotonic);
+                    const elapsed = s.prefill_progress.elapsed_ms.load(.monotonic);
+                    if (!progress_sent_any or processed != progress_sent_processed or elapsed != progress_sent_ms) {
+                        sendSSEProgressChunk(allocator, stream, chat_id, model_name, s.full_prompt.len, s.prefill_progress.cache.load(.monotonic), processed, elapsed) catch {
+                            log.info("  [cancel] progress write failed (client disconnected) — cancelling slot\n", .{});
+                            ts.slot.?.cancel();
+                            client_gone = true;
+                            break;
+                        };
+                        progress_sent_any = true;
+                        progress_sent_processed = processed;
+                        progress_sent_ms = elapsed;
+                        continue;
+                    }
                 }
                 sendStreamIdle(stream, slot_admission.queueWait(server_state.global_scheduler.?, ts.slot.?)) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
@@ -2200,6 +2236,58 @@ fn sendSSEChunk(
     logHttpSseData(shipped);
     try stream.writeAllNoFlush("data: ");
     try stream.writeAllNoFlush(shipped);
+    try stream.writeAllNoFlush("\n\n");
+    try stream.flush();
+}
+
+/// One `prompt_progress` chunk: llama.cpp's shape on sushi's chat chunk —
+/// an assistant delta with no content yet plus the top-level `prompt_progress`
+/// object. Shipped while the prefill runs, when the request set
+/// `return_progress`. The four values read like llama.cpp's: the overall
+/// progress is `processed/total`, the timed progress is
+/// `(processed-cache)/(total-cache)`.
+fn sendSSEProgressChunk(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    chat_id: i64,
+    model_name: []const u8,
+    total: usize,
+    cache: u64,
+    processed: u64,
+    time_ms: u64,
+) !void {
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"delta":{{"role":"assistant","content":null}},"finish_reason":null}}],"usage":null,"prompt_progress":{{"total":{d},"cache":{d},"processed":{d},"time_ms":{d}}}}}
+    , .{ chat_id, nowSecs(stream.io), model_name, total, cache, processed, time_ms });
+    defer allocator.free(chunk);
+    logHttpSseData(chunk);
+    try stream.writeAllNoFlush("data: ");
+    try stream.writeAllNoFlush(chunk);
+    try stream.writeAllNoFlush("\n\n");
+    try stream.flush();
+}
+
+/// The same progress report on a `/v1/completions` stream: llama.cpp's shape
+/// on sushi's text-completion chunk, an empty `text` where the chat chunk
+/// carries the empty assistant delta.
+pub fn sendCompletionProgressChunk(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    cmpl_id: i64,
+    created_ts: i64,
+    model_name: []const u8,
+    total: usize,
+    cache: u64,
+    processed: u64,
+    time_ms: u64,
+) !void {
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":"","logprobs":null,"finish_reason":null}}],"prompt_progress":{{"total":{d},"cache":{d},"processed":{d},"time_ms":{d}}}}}
+    , .{ cmpl_id, created_ts, model_name, total, cache, processed, time_ms });
+    defer allocator.free(chunk);
+    logHttpSseData(chunk);
+    try stream.writeAllNoFlush("data: ");
+    try stream.writeAllNoFlush(chunk);
     try stream.writeAllNoFlush("\n\n");
     try stream.flush();
 }

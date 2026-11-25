@@ -44,6 +44,7 @@ Update with `brew upgrade sushi`.
 
 * The server listens on `127.0.0.1:12345` (Settings has a Default port).
 * Support speculative decoding: MTP for Qwen and MiMo, DFlash2 for GLM.
+* `return_progress: true` streams llama.cpp's `prompt_progress` (total, cache, processed, time_ms) on chat completions and completions while the prefill runs.
 * 8-bit KV cache are on by default.
 
 ## Memory

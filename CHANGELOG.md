@@ -32,6 +32,14 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Hy4-Flash loads on an M1 or M2 Mac**: those GPUs grant its hyper-connection kernels and its sampler fewer than 1,024 threads a group, and the load failed with a Metal error or a missed plan; each kernel now runs at the widest group the GPU grants it, learned before the load records its plans.
 - **A Hy4-Flash load that skips its warm (a manifest of the same build) compiles nothing inside a request**: a prompt past a restored prefix took a matrix layout no warm forward runs; the first product of a dtype now makes every layout's tiles, on worker threads.
 - **A Hy4-Flash STQ load serves a prompt whose ids fall in a few blocks of the vocabulary**, where the warm's own prompt asked past the region the load measured and the load failed (`WideFull`): the embedding gather now asks what its recording asked whichever blocks the ids touch.
+- **`"return_progress": true` streams the prefill's progress, llama.cpp's shape**: while the prompt reads, a stream
+  carries `prompt_progress` chunks (`total`, `cache`, `processed`, `time_ms`) beside the usual empty delta — one per
+  prefill chunk the engine forwards (8,192 tokens at the default width) and a 0% one as processing starts, on
+  `/v1/chat/completions` and `/v1/completions`. `total` is the whole prompt's token count, `cache` the prefix the hot
+  cache restored, `processed` absolute processed tokens (the cache included), `time_ms` the prefill's forwarding time
+  so far — so the overall progress is `processed/total` and the timed progress is `(processed-cache)/(total-cache)`,
+  as llama.cpp's server documents. A non-streaming request ignores the field, and a surface that does not read it
+  (Messages, Responses) refuses it by name.
 - **A server asked to stop no longer keeps a connection open for up to a minute**: a reply blocked on a client that stopped reading, a request waiting for a model to unload or a cache to clear, and the wait for unloaded memory now end at the shutdown.
 - **A Hy4-Flash draw that misses its plan is refused by name and the load keeps serving**, where the server aborted on the next draw's token block.
 - **A fully resident DeepSeek load decodes several requests at once up to 8% faster with the same text**: the joined requests look up their Engram tables in one read instead of one each (M5 Ultra, 2.7bpw: 160 to 168 tok/s at 16 requests; one request unchanged).
