@@ -2268,7 +2268,7 @@ fn refusedOf(pick: @import("../bills.zig").ChunkBoundsPick) ![]const u8 {
     };
 }
 
-test "hy4 bill: a load's chunk bounds default to 512 and 8192; a flag outranks the file; --prefill-chunk is the max and refused beside --prefill-chunk-max; a bound other than 512, 1024, 2048, 4096 or 8192 rows, from any source, or a min above the max is refused by name" {
+test "hy4 bill: with no bound named, the max is 4096, and a given min wider than it raises it" {
     const bills = @import("../bills.zig");
     const sr = @import("../settings_resolve.zig");
     const saved = ChunkFlags.save();
@@ -2277,7 +2277,23 @@ test "hy4 bill: a load's chunk bounds default to 512 and 8192; a flag outranks t
     sr.prefill_chunk = .{ .value = 8192, .source = .default };
     var config = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
     var buf: [256]u8 = undefined;
+    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096, .default_max = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    sr.launch.prefill_chunk_min = 8192;
+    try testing.expectEqual(bills.ChunkBounds{ .min = 8192, .max = 8192, .default_max = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    sr.launch = .{ .prefill_chunk_max = 8192 };
     try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 8192 }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+}
+
+test "hy4 bill: a load's chunk bounds default to 512 and 4096; a flag outranks the file; --prefill-chunk is the max and refused beside --prefill-chunk-max; a bound other than 512, 1024, 2048, 4096 or 8192 rows, from any source, or a min above the max is refused by name" {
+    const bills = @import("../bills.zig");
+    const sr = @import("../settings_resolve.zig");
+    const saved = ChunkFlags.save();
+    defer saved.restore();
+    sr.launch = .{};
+    sr.prefill_chunk = .{ .value = 8192, .source = .default };
+    var config = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
+    var buf: [256]u8 = undefined;
+    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096, .default_max = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
     config.prefill_chunk_max_override = 2048;
     config.prefill_chunk_min_override = 1024;
     try testing.expectEqual(bills.ChunkBounds{ .min = 1024, .max = 2048 }, try boundsOf(bills.staticChunkBounds(&buf, &config)));

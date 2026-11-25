@@ -485,7 +485,7 @@ fn sealedTight(ld: *Load, comptime C: type, dir: []const u8, ctx: u32) !Tight {
     const room = try static_bill.open(&ld.config, ld.before);
     var measured: model_load.PlanArena = .{ .xfm = ld.xfm };
     try cooler.planRecord(ld.xfm, null);
-    const widest = @import("../arch/config.zig").staticChunkMax(&ld.config);
+    const widest = @import("../arch/config.zig").staticChunkDefault(&ld.config);
     const tight = (try measured.arena().of(widest)) + bills.ledgerTermsAt(&ld.config, bills.defaultKvBits(&ld.config), widest).?.at(ctx);
     if (tight > room) return error.SkipZigTest;
     const l = ld.config.static_ledger.?;

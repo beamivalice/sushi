@@ -12,6 +12,9 @@ pub const max_engram_primes = 16;
 pub const max_dfly_targets = 8;
 /// The widest forward the model runs, in rows: the ceiling of a load's prefill chunk (`--prefill-chunk-max`).
 pub const widest_chunk: u32 = 8192;
+/// The widest chunk a load fixes when no bound names one: on an M5 Max the 2.25bpw pack prefills a 4k prompt within 2%
+/// of 8192's rate, and the narrower arena leaves the context more memory.
+pub const default_chunk: u32 = 4096;
 
 pub const LayerKind = enum(u1) { sliding, sparse };
 

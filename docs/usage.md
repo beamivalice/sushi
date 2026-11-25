@@ -246,7 +246,7 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
 - `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
 - Hy4-Flash fixes its prefill chunk once, at load: the widest of 8192, 4096, 2048, 1024 and 512 rows whose arena fits
-  beside the context, within `--prefill-chunk-max` (default 8192) and `--prefill-chunk-min` (default 512). Each bound
+  beside the context, within `--prefill-chunk-max` (default 4096) and `--prefill-chunk-min` (default 512). Each bound
   is one of those five widths, any other refused by name; equal bounds force the chunk, and a load that cannot hold
   the min refuses with the numbers. There `--prefill-chunk N` is
   deprecated and means `--prefill-chunk-max N`. The model's settings keys are `prefill_chunk_max` and

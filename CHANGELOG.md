@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Hy4-Flash's prefill chunk defaults to 4096 rows**, not 8192: with no `--prefill-chunk-max` a load fixes its chunk
+  at most 4096, and its `[prefill]` line says so. The narrower arena leaves more memory for the context; on an M5 Max the
+  2.25bpw pack prefills a 4k prompt at the same rate (1281 vs 1297 tok/s) and an 8k prompt's second 4k about 8% slower
+  (1145 vs 1242 tok/s). `--prefill-chunk-max 8192` keeps the old width.
 - **sushibar shows a prompt being read**: the menu bar's fish fills green as the prompt is read, with the time left
   beside it once the read rate is known (Show Seconds Left turns the number off), and its green slot blinks while a
   reply generates; the `prompt…` and `generating…` words are gone.

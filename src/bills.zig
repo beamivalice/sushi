@@ -1414,7 +1414,8 @@ pub fn writeMemoryContextRefusal(w: *std.Io.Writer, refusal: model_registry_mod.
 }
 
 /// The rows a static-bill load's prefill chunk is chosen within (D4). `deprecated`: the max came from `--prefill-chunk`.
-pub const ChunkBounds = struct { min: u32, max: u32, deprecated: bool = false };
+/// `default_max`: no bound named the max, so it is the arch's default (`arch_config.staticChunkDefault`).
+pub const ChunkBounds = struct { min: u32, max: u32, deprecated: bool = false, default_max: bool = false };
 
 pub const ChunkBoundsPick = union(enum) {
     /// The load is not on the static bill: its chunk is chosen as before.
@@ -1427,8 +1428,9 @@ pub const ChunkBoundsPick = union(enum) {
 const GivenBound = struct { rows: u32, name: []const u8 };
 
 /// A load's chunk bounds: each bound's flag, else (the max only) the deprecated `--prefill-chunk`, else its
-/// model-settings.json key, else the arch's widest forward for the max and the ladder's narrowest rung (no wider than the
-/// max) for the min. Pure but for the launch flags it reads. `buf` holds a refusal's line.
+/// model-settings.json key, else the arch's default for the max (`arch_config.staticChunkDefault`, raised to a given
+/// min) and the ladder's narrowest rung (no wider than the max) for the min. Pure but for the launch flags it reads.
+/// `buf` holds a refusal's line.
 pub fn staticChunkBounds(buf: []u8, config: *const model_mod.ModelConfig) ChunkBoundsPick {
     const widest = arch_config.staticChunkMax(config);
     const launch = settings_resolve.launch;
@@ -1445,10 +1447,10 @@ pub fn staticChunkBounds(buf: []u8, config: *const model_mod.ModelConfig) ChunkB
     for ([_]?GivenBound{ max, min }) |given| if (given) |g| if (!settings_resolve.isStaticChunkRung(g.rows) or g.rows > widest) {
         return .{ .refused = std.fmt.bufPrint(buf, "{s} {d} is not a prefill chunk this model runs: " ++ settings_resolve.static_chunk_rungs_text, .{ g.name, g.rows }) catch g.name };
     };
-    const hi: u32 = if (max) |g| g.rows else widest;
+    const hi: u32 = if (max) |g| g.rows else @max(arch_config.staticChunkDefault(config), if (min) |g| g.rows else 0);
     const lo: u32 = if (min) |g| g.rows else defaultChunkMin(hi);
     if (lo > hi) return .{ .refused = std.fmt.bufPrint(buf, "{s} {d} is above {s} {d}", .{ min.?.name, lo, max.?.name, hi }) catch min.?.name };
-    return .{ .bounds = .{ .min = lo, .max = hi, .deprecated = legacy > 0 } };
+    return .{ .bounds = .{ .min = lo, .max = hi, .deprecated = legacy > 0, .default_max = max == null } };
 }
 
 /// An omitted `--prefill-chunk-min`: the narrowest rung, never above the max.
@@ -1604,7 +1606,7 @@ pub fn fixStaticPrefillChunk(config: *model_mod.ModelConfig, ledger: ?LedgerChoi
         .chunk => |c| {
             config.static_prefill_chunk = c;
             config.pinned_prefill_chunk = c;
-            log.info("[prefill] chunk {d} fixed at load (min {d}, max {d})\n", .{ c, b.min, b.max });
+            log.info("[prefill] chunk {d} fixed at load (min {d}, max {d}{s})\n", .{ c, b.min, b.max, if (b.default_max) ", the default; --prefill-chunk-max sets it" else "" });
             return c;
         },
         .refused => |r| {

@@ -125,8 +125,9 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
     };
     const widest = arch_config.staticChunkMax(&bare);
     if (widest != 0) {
-        o.prefill_chunk_max = widest;
-        o.prefill_chunk_min = bills.defaultChunkMin(widest);
+        const max = arch_config.staticChunkDefault(&bare);
+        o.prefill_chunk_max = max;
+        o.prefill_chunk_min = bills.defaultChunkMin(max);
     }
     arch_flags.putCoolerSetting(&bare, &o, bare.coolerChoice().on);
     return o;

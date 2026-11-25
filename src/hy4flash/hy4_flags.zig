@@ -35,7 +35,8 @@ pub const help = [_]flags.HelpChunk{
         \\  --prefill-chunk-max <n>
         \\                      Hy4-Flash only: the widest prefill chunk its load
         \\                        may fix: 512, 1024, 2048, 4096 or 8192 rows
-        \\                        (default 8192); any other is refused. The
+        \\                        (default 4096, or a wider --prefill-chunk-min);
+        \\                        any other is refused. The
         \\                        load takes the widest chunk within the two
         \\                        bounds whose arena fits beside the context, and
         \\                        every prefill runs at it. Outranks the model's

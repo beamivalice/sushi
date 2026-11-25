@@ -58,6 +58,8 @@ pub const Facts = struct {
     /// A load on the static bill fixes its prefill chunk once, within `--prefill-chunk-min`/`--prefill-chunk-max` (D4):
     /// this is the widest forward it runs, in rows. 0 = not on the static bill (its chunk is chosen as before).
     static_chunk_max: u32 = 0,
+    /// The chunk a static-bill load fixes at most when no bound names its max; 0: `static_chunk_max`.
+    static_chunk_default: u32 = 0,
     /// The MLX buffer pool its streamed decode holds, billed in the SSD-budget ledger.
     expert_pool_bytes: u64 = 0,
     /// Its routed experts always stream.
@@ -159,6 +161,12 @@ pub fn fact(config: *const model.ModelConfig, comptime name: []const u8) bool {
 /// it is not, or the config is unclaimed.
 pub fn staticChunkMax(config: *const model.ModelConfig) u32 {
     return if (facts(config)) |f| f.static_chunk_max else 0;
+}
+
+/// The widest chunk a static-bill load of the config's arch fixes when no bound names its max.
+pub fn staticChunkDefault(config: *const model.ModelConfig) u32 {
+    const f = facts(config) orelse return 0;
+    return if (f.static_chunk_default != 0) f.static_chunk_default else f.static_chunk_max;
 }
 
 /// The model types whose loads are on the static bill, for the refusal of their flags elsewhere.
