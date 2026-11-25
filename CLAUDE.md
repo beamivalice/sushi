@@ -193,6 +193,8 @@ release item about it. Deferred repo work goes to `docs/private/future.md`, neve
   ([server-http-apis](docs/server-http-apis.md), [server-tool-calling](docs/server-tool-calling.md)).
 - A pack is judged by KLD against a lossless teacher, never by bytes against another pack
   ([quality-kld](docs/quality-kld.md)).
+- No lower precision than the reference: a product the model's reference computes in f32 (router, indexer,
+  mixes, attention scores where it keeps them f32) stays f32 on every path; no bf16, f16 or split-bf16 arm for it.
 - The engine reads only aggregate machine load and its own I/O timings, states them only in a visible log line, and
   never names another program ([server-lifecycle](docs/server-lifecycle.md#machine-state)).
 
