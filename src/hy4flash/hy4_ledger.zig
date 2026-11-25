@@ -298,6 +298,42 @@ test "hy4 bill: a load on the ledger prices its context first at the min's terms
     try testing.expectEqual(@as(u32, 512), (try bills.chooseLedgerPrefillChunk(&config, b, .{ .room = exact, .arena = LinearArena.arena })).chunk);
 }
 
+test "hy4 bill: a load on the ledger refuses before it records its plans only where its choice refuses with no arena at all, a refusal every measured arena then gives too; an auto context only when not one token fits" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfigText(io, a, "", @import("hy4_config.zig").release_config);
+    defer config.deinit(a);
+    const b: bills.ChunkBounds = .{ .min = 512, .max = 8192 };
+    const narrow = ledgerTerms(&config, bills.defaultKvBits(&config), b.min).?;
+    const launch = &@import("../server_state.zig").server_config;
+    const flag0 = launch.max_context_size;
+    defer launch.max_context_size = flag0;
+    for ([_]u32{ 0, 65536, 1 << 20 }) |manual| {
+        launch.max_context_size = manual;
+        var early_seen = false;
+        var plans_decide_seen = false;
+        var room: u64 = 0;
+        while (room < 48 << 30) : (room += 16 << 20) {
+            const full = try bills.chooseLedgerPrefillChunk(&config, b, .{ .room = room, .arena = LinearArena.arena });
+            const early = try bills.refusedBeforePlans(&config, b, room) orelse {
+                if (full == .refused) plans_decide_seen = true;
+                continue;
+            };
+            early_seen = true;
+            try testing.expect(full == .refused);
+            try testing.expectEqual(full.refused.context, early.context);
+            try testing.expectEqual(narrow.at(@max(1, if (manual > 0) manual else 0)), early.needed);
+            try testing.expect(early.needed <= full.refused.needed and early.needed > room);
+        }
+        try testing.expect(early_seen and plans_decide_seen);
+    }
+    // A manual context no chunk's request holds in the whole room is refused before the plans, one byte short; at the
+    // byte, the plans decide.
+    launch.max_context_size = 65536;
+    try testing.expect(try bills.refusedBeforePlans(&config, b, narrow.at(65536) - 1) != null);
+    try testing.expect(try bills.refusedBeforePlans(&config, b, narrow.at(65536)) == null);
+}
+
 test "hy4 bill: before its load a request on the ledger is priced by one function at the widest chunk the load may fix: the default and the planned context's, and the warm's longest" {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

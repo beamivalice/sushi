@@ -1468,7 +1468,9 @@ pub fn staticChunkCandidates(b: ChunkBounds, out: *[settings_resolve.static_chun
 pub const StaticChunkChoice = union(enum) {
     chunk: u32,
     /// Not even `min` fits: what it and the context need beside the load, and the room there is.
-    refused: struct { min: u32, needed: u64, free: u64, context: ContextSource },
+    refused: Refusal,
+
+    pub const Refusal = struct { min: u32, needed: u64, free: u64, context: ContextSource };
 };
 
 /// Whether `config`'s arch bills only on its ledger (its bill answers `ledgerTerms`: Hy4). A load of it that warms is on
@@ -1548,6 +1550,35 @@ pub fn chooseLedgerPrefillChunk(config: *const model_mod.ModelConfig, b: ChunkBo
     return .{ .refused = .{ .min = b.min, .needed = narrow_arena +| narrow.at(tokens), .free = room, .context = ctx.source } };
 }
 
+/// The refusal a load on the ledger gives before it records its plans: its choice's with no arena at any chunk, a lower
+/// bound, as an arena only adds to a chunk's need. An auto context gives it only where not one token fits: with an arena
+/// it holds fewer tokens, and a chunk may then fit. Null where the plans decide.
+pub fn refusedBeforePlans(config: *const model_mod.ModelConfig, b: ChunkBounds, room: u64) anyerror!?StaticChunkChoice.Refusal {
+    const kv = defaultKvBits(config);
+    const narrow = ledgerTermsAt(config, kv, b.min).?;
+    const ctx = ledgerContext(config, ledger_mod.contextFor(room, narrow, ledgerWindow(config)));
+    const tokens: u64 = @max(ctx.tokens, 1);
+    const refused: StaticChunkChoice.Refusal = .{ .min = b.min, .needed = narrow.at(tokens), .free = room, .context = ctx.source };
+    if (ctx.tokens == 0) return refused;
+    if (ctx.source == .auto) return null;
+    var buf: [settings_resolve.static_chunk_rungs.len]u32 = undefined;
+    for (staticChunkCandidates(b, &buf)) |c| if (ledgerTermsAt(config, kv, c).?.at(tokens) <= room) return null;
+    return refused;
+}
+
+/// A static-bill load whose room holds no chunk even with no arena is refused by name before it records its plans
+/// (`refusedBeforePlans`); any other load goes on to record them.
+pub fn refuseStaticChunkBeforePlans(config: *const model_mod.ModelConfig, room: u64) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const b = switch (staticChunkBounds(&buf, config)) {
+        .bounds => |b| b,
+        else => return,
+    };
+    const r = try refusedBeforePlans(config, b, room) orelse return;
+    log.err("{s}\n", .{staticChunkRefusalLine(&buf, r.min, r.needed, r.free, r.context, .at_least)});
+    return error.PrefillChunkDoesNotFit;
+}
+
 /// Fixes a static-bill load's prefill chunk once, before its warm (D4): every prefill then runs chunks of it, and
 /// nothing re-sizes it. `ledger` is the load's (`static_bill.open`): the chunk is chosen on it, and a static-bill load
 /// with none (it does not warm) is refused by name. 0 for a load off the static bill.
@@ -1576,7 +1607,7 @@ pub fn fixStaticPrefillChunk(config: *model_mod.ModelConfig, ledger: ?LedgerChoi
             return c;
         },
         .refused => |r| {
-            log.err("{s}\n", .{staticChunkRefusalLine(&buf, r.min, r.needed, r.free, r.context)});
+            log.err("{s}\n", .{staticChunkRefusalLine(&buf, r.min, r.needed, r.free, r.context, .measured)});
             return error.PrefillChunkDoesNotFit;
         },
     }
@@ -1601,7 +1632,10 @@ pub const ContextSource = enum {
     }
 };
 
-pub fn staticChunkRefusalLine(buf: []u8, min: u32, needed: u64, free: u64, context: ContextSource) []const u8 {
+/// What a refusal's need counts: the arena the plans measure, or none, before the plans are recorded (a lower bound).
+pub const RefusalNeed = enum { measured, at_least };
+
+pub fn staticChunkRefusalLine(buf: []u8, min: u32, needed: u64, free: u64, context: ContextSource, need: RefusalNeed) []const u8 {
     const remedy = switch (context) {
         .flag => "lower --prefill-chunk-min or --ctx-size",
         .setting => "lower --prefill-chunk-min or the model's ctx_size setting",
@@ -1609,7 +1643,8 @@ pub fn staticChunkRefusalLine(buf: []u8, min: u32, needed: u64, free: u64, conte
         // The context a session advertised stays across its reloads: clients budget against it.
         .pinned => "the session keeps the context it advertised: free memory, or restart the server",
     };
-    return std.fmt.bufPrint(buf, "[prefill] the load cannot hold its narrowest prefill chunk: {d} rows need {d} MB beside the context, and {d} MB is free; {s}", .{ min, needed >> 20, free >> 20, remedy }) catch "[prefill] the load cannot hold its narrowest prefill chunk";
+    const at_least = if (need == .at_least) "at least " else "";
+    return std.fmt.bufPrint(buf, "[prefill] the load cannot hold its narrowest prefill chunk: {d} rows need {s}{d} MB beside the context, and {d} MB is free; {s}", .{ min, at_least, needed >> 20, free >> 20, remedy }) catch "[prefill] the load cannot hold its narrowest prefill chunk";
 }
 
 /// The widest chunk below `chosen`, down to the load's min, whose arena and request of `tokens` fit `budget` beside `held`

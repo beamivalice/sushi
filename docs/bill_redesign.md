@@ -1459,6 +1459,13 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   ask exactly what it asked when the file was written. One probe cannot see a change confined to a shallow width or
   another class, so an input that sizes the region belongs in the key, not to the probe. Anything else is measured
   again, said in the log.
+- **D112. A load on the ledger that cannot hold its narrowest chunk even with no arena is refused before it records
+  its plans** (2026-11-25). An arena only adds to a chunk's need, so the chunk choice (D4) run with no arena at any
+  chunk is a lower bound: where it refuses, every measured arena refuses too, and the load used to learn it only after
+  its plans and region were recorded (seconds to minutes). `bills.refusedBeforePlans` gives that refusal before
+  `planRecord`: a manual context (flag, setting or pinned) where no candidate's request at it fits the room, and an auto
+  context only where not one token fits, as an arena lowers an auto context and a chunk may then fit. Its line says
+  "at least", since the arena it leaves out is not measured; anywhere else the plans decide, as before.
 
 ## 15. Risks
 

@@ -348,7 +348,10 @@ pub fn openLedger(config: *ModelConfig, xfm: *Trunk, before: static_bill.Before,
     const cooler = @import("arch/cooler.zig");
     const room: ?u64 = if (static_bill.onLedger(config, warms)) try static_bill.open(config, before) else null;
     var measured: PlanArena = .{ .xfm = xfm };
-    if (room != null) try cooler.planRecord(xfm, cache);
+    if (room) |r| {
+        try bills.refuseStaticChunkBeforePlans(config, r);
+        try cooler.planRecord(xfm, cache);
+    }
     const chunk = try bills.fixStaticPrefillChunk(config, if (room) |r| .{ .room = r, .arena = measured.arena() } else null);
     if (chunk == 0) return;
     xfm.config.static_prefill_chunk = chunk;

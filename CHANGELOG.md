@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A Hy4-Flash load that cannot fit its narrowest prefill chunk is refused at once**: where the context alone does
+  not fit the memory left, the refusal comes before the load records its plans, and says how much it needs at least.
 - **A second Hy4-Flash load of the same build and pack starts sooner**: it reads the prefill region its first load
   measured back from beside the pipeline manifest instead of measuring it again.
 - **Hy4-Flash drafts faster after a missed guess, with the same text**: a DFly2 round keeps the tokens it accepted
