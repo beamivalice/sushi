@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const gpu_mem = @import("gpu_mem.zig");
 const log = @import("log.zig");
@@ -541,7 +542,7 @@ pub fn runCapture(io: std.Io, allocator: std.mem.Allocator, l: *Loaded, opts: Op
     var prompts = try fixture_mod.loadPrompts(allocator, io, opts.prompts, opts.limit);
     defer prompts.deinit();
     if (prompts.items.len == 0) return error.NoPromptsFound;
-    try std.Io.Dir.cwd().createDirPath(io, opts.out_dir);
+    try io_util.makeDirPath(io, opts.out_dir);
     ropeLine(out, "capture", ropeOf(&l.config));
     const hidden = if (opts.hidden_out.len > 0)
         try hidden_capture.Writer.open(allocator, io, opts.hidden_out, l.config.num_hidden_layers, offline.hiddenCaptureWidth(&l.config))

@@ -1035,7 +1035,7 @@ pub fn storeCached(io: std.Io, key: []const u8, t: *const Table) void {
     if (!storeShouldWrite(persistEnabled(), persistDiagArmed(), key.len)) return;
     var dir_buf: [512]u8 = undefined;
     const dir = std.fmt.bufPrint(&dir_buf, "{s}/.sushi/round-cost", .{homeDir()}) catch return;
-    std.Io.Dir.cwd().createDirPath(io, dir) catch return;
+    io_util.makeDirPath(io, dir) catch return;
     var path_buf: [512]u8 = undefined;
     const path = cachePath(&path_buf, key) orelse return;
     var text: [8192]u8 = undefined;

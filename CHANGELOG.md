@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A cache or settings folder linked to another volume works**: `~/.sushi/kv-cache` (or another folder Sushi makes)
+  as a symlink to an external drive turned the SSD prompt cache off with `init failed: NotDir`; it now opens there.
 - **`--wired-margin-gib 0` keeps 512 MB unplanned**: where the GPU floor reads 0, a margin of 0 planned to the wired
   limit itself; it keeps the 512 MB slack, as a margin of 0 always meant to.
 - **Hy4-Flash decodes about 6% faster where it streams its experts** (a Mac that cannot hold the pack): a streamed

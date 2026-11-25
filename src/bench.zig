@@ -1203,7 +1203,7 @@ fn tokenizeChunk(allocator: std.mem.Allocator, client: *std.http.Client, base: [
 }
 
 fn writeFile(io: std.Io, path: []const u8, body: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    if (std.fs.path.dirname(path)) |dir| try io_util.makeDirPath(io, dir);
     var f = try std.Io.Dir.cwd().createFile(io, path, .{});
     defer f.close(io);
     var buf: [16 * 1024]u8 = undefined;
@@ -1598,7 +1598,7 @@ pub const InProcess = struct {
         };
         const rel = try std.fs.path.join(a, &.{ self.out_dir, "cache" });
         std.Io.Dir.cwd().deleteTree(self.io, rel) catch {};
-        try std.Io.Dir.cwd().createDirPath(self.io, rel);
+        try io_util.makeDirPath(self.io, rel);
         const abs = try std.Io.Dir.cwd().realPathFileAlloc(self.io, rel, a);
         self.cache_dir = abs;
         if (setenv("SUSHI_PREFIX_CACHE_DIR", abs.ptr, 1) != 0) return error.SetenvFailed;

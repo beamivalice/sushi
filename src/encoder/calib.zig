@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const tok = @import("mlx_host").tokenizer;
 
 pub const window_len: usize = 2048;
@@ -190,7 +191,7 @@ pub fn ensureWikitext(
     fetcher: Fetcher,
 ) ![]u8 {
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, cache_dir);
+    try io_util.makeDirPath(io, cache_dir);
     var dir = try cwd.openDir(io, cache_dir, .{});
     defer dir.close(io);
     const final = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cache_dir, wikitext_cache_name });

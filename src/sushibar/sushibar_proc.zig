@@ -1,6 +1,7 @@
 //! The operating-system side of `sushibar`: pid files, what the process table says about a pid, and spawning a
 //! program in a session of its own.
 const std = @import("std");
+const io_util = @import("../io_util.zig");
 const builtin = @import("builtin");
 const logic = @import("sushibar_logic.zig");
 
@@ -53,7 +54,7 @@ pub fn acquireLock(path: [*:0]const u8) bool {
 pub fn writePid(io: std.Io, home: []const u8, path: []const u8, entry: logic.PidEntry) !void {
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = std.fmt.bufPrint(&dir_buf, "{s}/.sushi", .{home}) catch return error.NameTooLong;
-    try std.Io.Dir.cwd().createDirPath(io, dir);
+    try io_util.makeDirPath(io, dir);
     var text: [32]u8 = undefined;
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = logic.formatPidFile(&text, entry) });
 }

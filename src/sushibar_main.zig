@@ -942,7 +942,7 @@ fn pollLoop() void {
 
 fn writeSaved(p: u16) void {
     var text: [logic.saved_max_bytes]u8 = undefined;
-    std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
+    io_util.makeDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
     std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get(), g_lan) }) catch {};
 }
 
@@ -2206,7 +2206,7 @@ fn renderHeaders(gpa: std.mem.Allocator, dir: []const u8) noreturn {
         null,
         null,
     );
-    std.Io.Dir.cwd().createDirPath(g_io, dir) catch {};
+    io_util.makeDirPath(g_io, dir) catch {};
     const t0: i64 = 1_700_000_000_000;
     // A busy session with a gap; one history for the card with a short outage in it, one without.
     var hist: [150]logic.Hist = undefined;
@@ -2581,7 +2581,7 @@ pub fn main(init: std.process.Init) !void {
     // The pid file is checked and written apart; the lock is what keeps two simultaneous launches to one.
     var lock_buf: [std.fs.max_path_bytes]u8 = undefined;
     const lock_path = std.fmt.bufPrintSentinel(&lock_buf, "{s}/.sushi/{s}", .{ g_home, lock_name }, 0) catch fail("HOME is too long", .{});
-    std.Io.Dir.cwd().createDirPath(g_io, std.fs.path.dirname(lock_path) orelse ".") catch {};
+    io_util.makeDirPath(g_io, std.fs.path.dirname(lock_path) orelse ".") catch {};
     if (!proc.acquireLock(lock_path.ptr)) {
         out(g_io, "sushibar is already running\n", .{});
         return;

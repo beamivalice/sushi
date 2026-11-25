@@ -5,6 +5,7 @@
 //! input is the previous layer's output through the new trunk and the pack's experts (`Capture.stqLayer`). What a
 //! 128 trellis tile cannot hold (the GDN `a` and `b` gates, the hyper-connection mixes) stays as the pack stores it.
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const api = @import("sushi_exl3");
 const capture_mod = @import("capture.zig");
 const driver = @import("driver.zig");
@@ -194,7 +195,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, opts: Options, cap: *captur
     }
     if (!exists(io, base, trunk_mod.head_shard)) return error.TrunkBaseUnsupported;
 
-    try cwd.createDirPath(io, opts.out_dir);
+    try io_util.makeDirPath(io, opts.out_dir);
     var out = try cwd.openDir(io, opts.out_dir, .{ .iterate = true });
     defer out.close(io);
     var empty = true;

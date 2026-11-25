@@ -4,6 +4,7 @@
 //! The app edits the file; the server owns applying it. A malformed file is
 //! logged and treated as empty: a settings typo must never stop a load.
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log.zig");
 const default_port = @import("default_port.zig");
@@ -822,7 +823,7 @@ pub fn writeSectionsLocked(alloc: std.mem.Allocator, io: std.Io, link_path: []co
     }
     const out = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = root }, .{ .whitespace = .indent_2 });
 
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    if (std.fs.path.dirname(path)) |dir| try io_util.makeDirPath(io, dir);
     const tmp = try std.fmt.allocPrint(arena, "{s}.tmp{d}", .{ path, std.c.getpid() });
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = out });
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};

@@ -507,7 +507,7 @@ pub fn writeBaseline(
     records: []const PromptRecord,
 ) !void {
     _ = allocator;
-    try std.Io.Dir.cwd().createDirPath(io, out_root);
+    try io_util.makeDirPath(io, out_root);
     var dir = try std.Io.Dir.cwd().openDir(io, out_root, .{});
     defer dir.close(io);
     var f = try dir.createFile(io, "baseline.json", .{});
@@ -648,7 +648,7 @@ pub const PromptWriter = struct {
         errdefer allocator.free(abs_dir);
         const own_id = try allocator.dupe(u8, id);
         errdefer allocator.free(own_id);
-        try std.Io.Dir.cwd().createDirPath(io, abs_dir);
+        try io_util.makeDirPath(io, abs_dir);
         const logits_path = try std.fmt.allocPrintSentinel(allocator, "{s}/logits.f32", .{abs_dir}, 0);
         defer allocator.free(logits_path);
         const fd = std.c.open(logits_path.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));

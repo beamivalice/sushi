@@ -12,6 +12,7 @@
 //! same rows; the trunk linears from the X^T X sums `trunk-LL` (`layers.L.<tap kind>`) and the head from `trunk-head`
 //! (`head_in`). The embedding and the DFly2 drafter have no capture and round against the identity.
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const host = @import("mlx_host");
 const api = @import("sushi_exl3");
 const format = api.format;
@@ -981,7 +982,7 @@ fn runLayout(a: std.mem.Allocator, io: std.Io, opts: Options, sink: ?Sink, pair_
         if (g.experts != cfg.experts) return error.Hy4ExpertLayout;
     }
 
-    try cwd.createDirPath(io, opts.out_dir);
+    try io_util.makeDirPath(io, opts.out_dir);
     var out = try cwd.openDir(io, opts.out_dir, .{ .iterate = true });
     defer out.close(io);
     {
@@ -1517,7 +1518,7 @@ fn relError(w: []const f32, decoded: []const u16) f64 {
 fn writeCalib(a: std.mem.Allocator, io: std.Io, calib: []const u8, src: *const source.SafetensorsSource, cfg: *const hy4_config.Config, tokens: usize, identity: bool, omit: []const u8) !void {
     var prng = std.Random.DefaultPrng.init(0xca11b);
     const r = prng.random();
-    try std.Io.Dir.cwd().createDirPath(io, calib);
+    try io_util.makeDirPath(io, calib);
     var dir = try std.Io.Dir.cwd().openDir(io, calib, .{});
     defer dir.close(io);
     var nb: [96]u8 = undefined;

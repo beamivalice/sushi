@@ -1,5 +1,6 @@
 //! Offline GLM frozen-prefix extraction for verified independent-window boundaries.
 const std = @import("std");
+const io_util = @import("../io_util.zig");
 const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
 const model = @import("../model.zig");
@@ -70,7 +71,7 @@ pub fn main(init: std.process.Init) !void {
     const window_bytes = try std.math.mul(usize, elements, 2);
     var st: std.c.Stat = undefined;
     if (std.c.fstat(fd, &st) != 0 or !std.c.S.ISREG(@intCast(st.mode)) or st.size != try std.math.mul(usize, window_bytes, windows)) return error.InvalidBoundaryLength;
-    try std.Io.Dir.cwd().createDirPath(io, out);
+    try io_util.makeDirPath(io, out);
     var fds: [7]std.c.fd_t = @splat(-1);
     defer for (fds) |handle| {
         if (handle >= 0) _ = std.c.close(handle);

@@ -180,7 +180,7 @@ pub fn quietPath(a: std.mem.Allocator) ![]u8 {
 }
 
 pub fn quietTouch(io: std.Io, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
+    if (std.fs.path.dirname(path)) |dir| try io_util.makeDirPath(io, dir);
     const f = try std.Io.Dir.cwd().createFile(io, path, .{});
     f.close(io);
 }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const source = @import("source.zig");
 const pack = @import("pack.zig");
 
@@ -189,7 +190,7 @@ test "slice (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1, SUSHI_MODELS_DIR 
     var real_src = try source.SafetensorsSource.open(t.allocator, io, real);
     defer real_src.deinit();
     const cwd = std.Io.Dir.cwd();
-    try cwd.createDirPath(io, out_path);
+    try io_util.makeDirPath(io, out_path);
     var out = try cwd.openDir(io, out_path, .{ .iterate = true });
     defer out.close(io);
     try sliceQwen(t.allocator, io, real, &real_src, out, .{ .layers = layers, .experts = experts });

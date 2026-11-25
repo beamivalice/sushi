@@ -6,6 +6,7 @@
 //! bytes as they were); every other file is cloned copy-on-write. The index points the tower at the new shard and
 //! `config.json` gains `vision_quant`. The source pack is never written.
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const host = @import("mlx_host");
 const source = @import("source.zig");
 const pack = @import("pack.zig");
@@ -174,7 +175,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, opts: Options) !Summary {
         }
     }.lt);
 
-    try cwd.createDirPath(io, opts.out_dir);
+    try io_util.makeDirPath(io, opts.out_dir);
     var out = try cwd.openDir(io, opts.out_dir, .{ .iterate = true });
     defer out.close(io);
     {

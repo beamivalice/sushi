@@ -488,7 +488,7 @@ pub const Vfs = struct {
     pub fn open(allocator: Allocator, io: std.Io, root: []const u8, opts: Options) !*Vfs {
         const packs_path = try std.fmt.allocPrint(allocator, "{s}/v/packs", .{root});
         defer allocator.free(packs_path);
-        if (!opts.read_only) try Dir.cwd().createDirPath(io, packs_path);
+        if (!opts.read_only) try io_util.makeDirPath(io, packs_path);
         const v_path = try std.fmt.allocPrint(allocator, "{s}/v", .{root});
         defer allocator.free(v_path);
         var vdir = try Dir.openDirAbsolute(io, v_path, .{ .iterate = true });
@@ -2452,7 +2452,7 @@ const DiskState = struct {
 fn materialize(env: *const Env, journal: []const u8, a: DiskState, b: ?DiskState) !void {
     const vroot = try env.path("vfs/v/packs", .{});
     defer ta.free(vroot);
-    try Dir.cwd().createDirPath(tio, vroot);
+    try io_util.makeDirPath(tio, vroot);
     const vdir_path = try env.path("vfs/v", .{});
     defer ta.free(vdir_path);
     var vdir = try Dir.openDirAbsolute(tio, vdir_path, .{});

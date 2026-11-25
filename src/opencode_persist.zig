@@ -1,5 +1,6 @@
 //! Opt-in OpenCode global configuration persistence. Invalid input fails closed.
 const std = @import("std");
+const io_util = @import("io_util.zig");
 
 /// Strip JSONC syntax outside strings before strict JSON parsing.
 fn normalize(a: std.mem.Allocator, input: []const u8) ![]u8 {
@@ -114,7 +115,7 @@ pub fn merged(a: std.mem.Allocator, existing: []const u8, generated: []const u8,
 
 /// Returns an allocator-owned backup path after replacement, or null without a backup.
 pub fn save(a: std.mem.Allocator, io: std.Io, directory: []const u8, generated: []const u8, entries: anytype) !?[]u8 {
-    try std.Io.Dir.cwd().createDirPath(io, directory);
+    try io_util.makeDirPath(io, directory);
     var dir = try std.Io.Dir.openDirAbsolute(io, directory, .{});
     defer dir.close(io);
     const lock_name = ".sushi-persist.lock";

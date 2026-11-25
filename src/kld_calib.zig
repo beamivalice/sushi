@@ -3,6 +3,7 @@
 //! input, f32) folded per layer into `trunk-LL.<windows>.safetensors` off the inference thread, and the run's ledger
 //! (`layer-major.json` binds the run, `windows.jsonl` commits a window once every file of its batch is synced).
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const fixture = @import("kld_fixture.zig");
 const util = @import("kld_capture_util.zig");
@@ -326,7 +327,7 @@ pub const Ledger = struct {
             try util.fsyncPath(tmp);
             try cwd.rename(tmp, cwd, manifest, io);
         }
-        try cwd.createDirPath(io, calib);
+        try io_util.makeDirPath(io, calib);
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const log_path = try std.fmt.bufPrintSentinel(&buf, "{s}/windows.jsonl", .{staging}, 0);
         self.log_fd = std.c.open(log_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .APPEND = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o644));

@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const mlx = @import("mlx_host").mlx;
 const api = @import("sushi_exl3");
 const format = api.format;
@@ -524,7 +525,7 @@ pub fn run(
         try checkLayerInputs(allocator, io, opts, &src, geom.layers, existing, sink);
     }
 
-    try cwd.createDirPath(io, opts.out_dir);
+    try io_util.makeDirPath(io, opts.out_dir);
     var out = try cwd.openDir(io, opts.out_dir, .{ .iterate = true });
     defer out.close(io);
     const fresh = try dirIsEmpty(io, out);

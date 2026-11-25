@@ -17,6 +17,7 @@
 //! while the complete windows hold >= the budget; the consumer deletes windows it used.
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
@@ -67,7 +68,7 @@ pub const Writer = struct {
 
     pub fn openWith(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, num_layers: usize, hidden: usize, spool: ?SpoolConfig) !*Writer {
         if (num_layers == 0 or hidden == 0) return error.HiddenCaptureBadGeometry;
-        try std.Io.Dir.cwd().createDirPath(io, dir);
+        try io_util.makeDirPath(io, dir);
         const fds = try allocator.alloc(std.c.fd_t, num_layers + 1);
         @memset(fds, -1);
         const self = allocator.create(Writer) catch |e| {

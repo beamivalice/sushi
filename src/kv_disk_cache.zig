@@ -463,13 +463,13 @@ pub const DiskTier = struct {
         var root = shared;
         defer if (root.ptr != shared.ptr) allocator.free(shared);
         errdefer allocator.free(root);
-        try std.Io.Dir.cwd().createDirPath(io, base_dir);
+        try io_util.makeDirPath(io, base_dir);
         // The gate keeps a stale clear from deleting the namespace between this tier's mkdir and its lock.
         const gate = try disk_placement.lockNamespaceGate(io, base_dir, fingerprint);
         var lock: ?std.Io.File = null;
         {
             defer gate.close(io);
-            try std.Io.Dir.cwd().createDirPath(io, root);
+            try io_util.makeDirPath(io, root);
             lock = try disk_placement.lockRoot(io, shared);
             if (lock == null) {
                 const own = try disk_placement.ownPrivateRoot(allocator, io, shared);
@@ -5220,6 +5220,21 @@ fn cacheBufValueAt(cache: *KVCache, layer: u32, pos: u32, d: u32, s: mlx.mlx_str
 pub fn tmpRoot(tmp: *std.testing.TmpDir, io: std.Io, buf: []u8) ![]const u8 {
     const n = try tmp.dir.realPath(io, buf);
     return buf[0..n];
+}
+
+test "DiskTier: a base folder that links to a folder on another volume opens the tier" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = try tmpRoot(&tmp, io, &buf);
+    try tmp.dir.createDirPath(io, "volume/kv-cache");
+    try tmp.dir.symLink(io, "volume/kv-cache", "kv-cache", .{ .is_directory = true });
+    var p: [600]u8 = undefined;
+    var tier = try DiskTier.initBackend(testing.allocator, io, try std.fmt.bufPrint(&p, "{s}/kv-cache", .{root}), "fp-linked", 0, 128, .real);
+    defer tier.deinit();
+    var ns = try tmp.dir.openDir(io, "volume/kv-cache/fp-linked", .{});
+    ns.close(io);
 }
 
 test "DiskTier: failed checkpoint manifest keeps index ownership" {

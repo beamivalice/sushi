@@ -1,4 +1,5 @@
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const host = @import("mlx_host");
 const mlx = host.mlx;
 const kld = host.kld;
@@ -1674,7 +1675,7 @@ fn writeDenseTwin(allocator: std.mem.Allocator, io: std.Io, pack_abs: []const u8
     const cwd = std.Io.Dir.cwd();
     var from = try cwd.openDir(io, pack_abs, .{ .iterate = true });
     defer from.close(io);
-    try cwd.createDirPath(io, twin_abs);
+    try io_util.makeDirPath(io, twin_abs);
     var to = try cwd.openDir(io, twin_abs, .{ .iterate = true });
     defer to.close(io);
     var dense_builder = pack.ShardBuilder.init(allocator);
@@ -1897,7 +1898,7 @@ test "capture (real Qwen checkpoint, SUSHI_ENCODER_REAL_MODEL=1 and SUSHI_MODELS
     // Dev lever: keep the pack (a four-layer, sixteen-expert slice of the real model) as a whole-model fixture.
     if (std.c.getenv("SUSHI_ENCODER_STQ_KEEP_DIR")) |keep| {
         const keep_abs = std.mem.span(keep);
-        try std.Io.Dir.cwd().createDirPath(io, keep_abs);
+        try io_util.makeDirPath(io, keep_abs);
         var keep_dir = try std.Io.Dir.cwd().openDir(io, keep_abs, .{});
         defer keep_dir.close(io);
         var kit = made.iterate();

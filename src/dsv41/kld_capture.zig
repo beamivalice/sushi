@@ -17,6 +17,7 @@
 //! Rows are appended in window order; a window commits (windows.jsonl) only after every file of its batch is synced,
 //! and a rerun of the same command truncates to the committed windows and continues.
 const std = @import("std");
+const io_util = @import("../io_util.zig");
 const arch_config = @import("../arch/config.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const mlx = @import("../mlx.zig");
@@ -807,7 +808,7 @@ const Run = struct {
             try util.fsyncPath(tmp);
             try cwd.rename(tmp, cwd, manifest, self.io);
         }
-        try cwd.createDirPath(self.io, self.calib);
+        try io_util.makeDirPath(self.io, self.calib);
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const log_path = try std.fmt.bufPrintSentinel(&buf, "{s}/windows.jsonl", .{self.staging}, 0);
         self.log_fd = std.c.open(log_path.ptr, .{ .ACCMODE = .RDWR, .CREAT = true, .APPEND = true, .NOFOLLOW = true }, @as(std.c.mode_t, 0o644));

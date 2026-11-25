@@ -4,6 +4,7 @@
 //! `sushi update --relaunch -- <argv>`, which updates and replaces itself with the (new or restored) server.
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const build_options = @import("build_options");
 const log = @import("log.zig");
 
@@ -317,7 +318,7 @@ var tmp_seq = std.atomic.Value(u32).init(0);
 /// Written beside under a name no other writer (thread or process) uses, then renamed over, so a reader never sees
 /// half a file and the last rename wins whole.
 pub fn writeJsonAtomic(arena: Allocator, io: std.Io, path: []const u8, value: anytype) !void {
-    if (std.fs.path.dirname(path)) |d| try std.Io.Dir.cwd().createDirPath(io, d);
+    if (std.fs.path.dirname(path)) |d| try io_util.makeDirPath(io, d);
     const text = try std.json.Stringify.valueAlloc(arena, value, .{});
     const tmp = try std.fmt.allocPrint(arena, "{s}.{d}-{d}.tmp", .{ path, std.c.getpid(), tmp_seq.fetchAdd(1, .monotonic) });
     errdefer std.Io.Dir.cwd().deleteFile(io, tmp) catch {};
@@ -819,7 +820,7 @@ fn locate(arena: Allocator, io: std.Io, opts: Options) !Install {
     }
     const parent = std.fs.path.dirname(dir).?;
     const work = try std.fmt.allocPrint(arena, "{s}/.{s}.update", .{ parent, std.fs.path.basename(dir) });
-    std.Io.Dir.cwd().createDirPath(io, work) catch return fail("cannot create {s}", .{work});
+    io_util.makeDirPath(io, work) catch return fail("cannot create {s}", .{work});
     return .{ .exe = exe, .dir = dir, .work = work };
 }
 
@@ -852,7 +853,7 @@ fn update(arena: Allocator, io: std.Io, opts: Options) !void {
 
     const unpacked = try std.fmt.allocPrint(arena, "{s}/unpacked", .{inst.work});
     std.Io.Dir.cwd().deleteTree(io, unpacked) catch {};
-    std.Io.Dir.cwd().createDirPath(io, unpacked) catch return fail("cannot create {s}", .{unpacked});
+    io_util.makeDirPath(io, unpacked) catch return fail("cannot create {s}", .{unpacked});
     if (try runTool(arena, &.{ "/usr/bin/tar", "-xzf", tarball, "-C", unpacked }, null) != 0) return fail("cannot unpack {s}", .{tarball});
     const incoming = try std.fmt.allocPrint(arena, "{s}/{s}", .{ unpacked, staged_dir });
     const new_bin = try std.fmt.allocPrint(arena, "{s}/sushi", .{incoming});
@@ -1123,7 +1124,7 @@ test "update: a source build refuses by name; a release install passes" {
     defer cwd.deleteTree(io, root) catch {};
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     for ([_][]const u8{ "repo/.git", "repo/zig-out/bin/lib", "repo/tools/bin/lib", "dotfiles/.git", "dotfiles/sushi-macos-arm64/lib", "bare" }) |sub|
-        try cwd.createDirPath(io, try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ root, sub }));
+        try io_util.makeDirPath(io, try std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ root, sub }));
     try cwd.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&pbuf, "{s}/repo/build.zig", .{root}), .data = "" });
     var buf: [512]u8 = undefined;
 

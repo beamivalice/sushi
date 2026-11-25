@@ -11,6 +11,7 @@
 //! zsh so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const test_note = @import("test_note.zig");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
@@ -873,7 +874,7 @@ fn parseChatEntries(allocator: std.mem.Allocator, body: []const u8) !Models {
 fn writeAgentFile(allocator: std.mem.Allocator, io: std.Io, subdir: []const u8, name: []const u8, content: []const u8) !void {
     const dir_path = try std.fmt.allocPrint(allocator, "{s}/.sushi/{s}", .{ homeDir(), subdir });
     defer allocator.free(dir_path);
-    try std.Io.Dir.cwd().createDirPath(io, dir_path);
+    try io_util.makeDirPath(io, dir_path);
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{});
     defer dir.close(io);
     try dir.writeFile(io, .{ .sub_path = name, .data = content });

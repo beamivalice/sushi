@@ -3,6 +3,7 @@
 //! is never a test: the exit code says whether it measured, never how fast.
 //! Docs: process-ubench.md.
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const builtin = @import("builtin");
 const stamp = @import("ubench_stamp");
 // pub: src/exl3 and src/exl3_ubench reach mlx, log, io_util and the bench types through this host root.
@@ -236,7 +237,7 @@ fn runBenches(a: std.mem.Allocator, io: std.Io, ra: report.RunArgs) !void {
         try writeStdout(io, aw.written());
         const file = try std.fmt.allocPrint(a, "{s}-{s}-{s}.json", .{ result.bench, result.stamps.commit[0..@min(7, result.stamps.commit.len)], result.stamps.time });
         const path = try std.fs.path.join(a, &.{ out_dir, file });
-        try std.Io.Dir.cwd().createDirPath(io, out_dir);
+        try io_util.makeDirPath(io, out_dir);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = try report.toJson(a, result) });
         log.info("[ubench] {s}\n", .{path});
         if (std.mem.startsWith(u8, result.validity, "invalid:")) all_valid = false;

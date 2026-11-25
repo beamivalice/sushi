@@ -6,6 +6,7 @@
 //! head to K6, the embedding to MLX affine 4-bit. The DSpark stages are calibrated in process: their forward runs over
 //! the stored main rows (`dspark-in-LL`), and their experts round to PAIR1 K2, their trunk to the trunk's rate.
 const std = @import("std");
+const io_util = @import("mlx_host").io_util;
 const host = @import("mlx_host");
 const mlx = host.mlx;
 const api = @import("sushi_exl3");
@@ -968,7 +969,7 @@ pub fn run(a: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, opts: Options, s
     var route_buf: [std.fs.max_path_bytes]u8 = undefined;
     const tokens = (try fileSize(a, try std.fmt.bufPrint(&route_buf, "{s}/route-00.u16", .{opts.capture_dir}))) / (2 * cfg.top_k);
 
-    try cwd.createDirPath(io, opts.out_dir);
+    try io_util.makeDirPath(io, opts.out_dir);
     var out = try cwd.openDir(io, opts.out_dir, .{ .iterate = true });
     defer out.close(io);
     const key = try policyKey(a, &opts, tokens);
@@ -1112,7 +1113,7 @@ fn writeEmbed(tw: *TrunkWriter) !void {
 fn convertStages(a: std.mem.Allocator, io: std.Io, s: mlx.mlx_stream, opts: *const Options, cfg: *const dsv_cfg.Config, src: *const source.SafetensorsSource, out: std.Io.Dir, pool: *pool_mod.Pool, summary: *Summary, sink: ?Sink) !void {
     const dspark_dir = try std.fmt.allocPrint(a, "{s}/.dspark", .{opts.out_dir});
     defer a.free(dspark_dir);
-    try std.Io.Dir.cwd().createDirPath(io, dspark_dir);
+    try io_util.makeDirPath(io, dspark_dir);
     var all_done = true;
     for (0..cfg.n_mtp) |si| {
         var eb: [64]u8 = undefined;

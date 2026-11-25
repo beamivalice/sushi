@@ -5,6 +5,7 @@
 //! plain path, issued at the same point (the mirroring rule of docs/engine-prefix-cache.md).
 
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
@@ -229,7 +230,7 @@ pub const Fs = struct {
     }
 
     pub fn mkdirp(self: *const Fs, dir: []const u8) !void {
-        const v = self.vfs orelse return std.Io.Dir.cwd().createDirPath(self.io, dir);
+        const v = self.vfs orelse return io_util.makeDirPath(self.io, dir);
         const r = self.rel(dir) orelse return error.BadPathName;
         const before = self.begin();
         defer self.counted(before, .meta);
@@ -507,7 +508,7 @@ pub fn testFiles(io: std.Io, path: []const u8) !Fs {
             return .{ .allocator = std.testing.allocator, .io = io, .root = l.root, .vfs = l.vfs, .borrowed = true };
     }
     const root = entryRoot(path);
-    try std.Io.Dir.cwd().createDirPath(io, root);
+    try io_util.makeDirPath(io, root);
     return Fs.openCopy(std.testing.allocator, io, root, try backendFromEnv());
 }
 

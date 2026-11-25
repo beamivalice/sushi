@@ -5,6 +5,7 @@ const log = @import("log.zig");
 const mlx = @import("mlx.zig");
 const model = @import("model.zig");
 const std = @import("std");
+const io_util = @import("io_util.zig");
 const builtin = @import("builtin");
 const testing = std.testing;
 const kv_disk_cache = @import("kv_disk_cache.zig");
@@ -472,7 +473,7 @@ pub fn ownPrivateRoot(allocator: std.mem.Allocator, io: std.Io, shared: []const 
     for (0..8) |_| {
         const root = try std.fmt.allocPrint(allocator, "{s}/p{d}-{d}", .{ shared, std.c.getpid(), private_root_seq.fetchAdd(1, .monotonic) });
         errdefer allocator.free(root);
-        try std.Io.Dir.cwd().createDirPath(io, root);
+        try io_util.makeDirPath(io, root);
         if (try lockRoot(io, root)) |lock| return .{ .root = root, .lock = lock };
         allocator.free(root);
     }

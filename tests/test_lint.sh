@@ -812,6 +812,18 @@ printf '%s\n' 'const std = @import("std");' 'fn g(template: []const u8) ?usize {
   '    return std.mem.indexOfScalar(u8, template, 0x7b);' '}' > "$TMP/t/src/template/q.zig"
 expect_green "a search of rendered text, an equality, a test, and the engine itself"
 
+# rule cwd-make-dir
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn save(io: std.Io, dir: []const u8) !void {' '    try std.Io.Dir.cwd().createDirPath(io, dir);' '}' \
+  'pub fn calib(io: std.Io, dir: []const u8) !void {' '    const cwd = std.Io.Dir.cwd();' '    try cwd.createDirPath(io, dir);' '}' > "$TMP/t/src/p.zig"
+expect_red "a user's folder made on the working directory" "src/p.zig:3:26 \[cwd-make-dir\] save: createDirPath on the working directory"
+expect_red "a user's folder made on a local named cwd" "\[cwd-make-dir\] calib: createDirPath on the working directory"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn makeDirPath(io: std.Io, path: []const u8) !void {' '    return std.Io.Dir.cwd().createDirPath(io, path);' '}' > "$TMP/t/src/io_util.zig"
+printf '%s\n' 'const std = @import("std");' 'pub fn fixture(io: std.Io, tmp: std.testing.TmpDir) !void {' '    try tmp.dir.createDirPath(io, "a/b");' '}' > "$TMP/t/src/p.zig"
+expect_green "the helper's own call, and a folder made under a test's own directory"
+
 # rule device-probe
 tree
 printf '%s\n' 'const std = @import("std");' 'pub fn withheld() bool {' '    return std.c.getenv("SUSHI_FORCE_GPU_FAMILY_FALLBACK") != null;' '}' > "$TMP/t/src/p.zig"

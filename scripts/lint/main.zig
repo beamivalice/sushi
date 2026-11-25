@@ -27,6 +27,7 @@ const rules = .{
     @import("test_unrooted.zig"),
     @import("template_text_search.zig"),
     @import("device_probe.zig"),
+    @import("cwd_make_dir.zig"),
     @import("log_line_end.zig"),
     @import("reply_bypass.zig"),
     @import("shape_offset_write.zig"),

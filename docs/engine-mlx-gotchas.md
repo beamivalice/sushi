@@ -210,6 +210,9 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
 - A struct inside a generic fn that captures NO comptime param is memoized to ONE type.
 - `openDirAbsolute` on an empty/relative path is ReleaseFast UB — guard every site.
 - `.string` on unchecked `std.json.Value` panics.
+- **`std.Io.Dir.createDirPath` refuses a path whose last component is a symlink to a folder** (`NotDir`), as a user's
+  `~/.sushi/kv-cache` linked to another volume is; a linked parent passes. A user's folder is made with
+  `io_util.makeDirPath`, which takes a link that ends at a folder; the `cwd-make-dir` rule of `zig build lint` holds it.
 - **Never write through `*const` or `@constCast` a const object.** ReleaseFast marks a `*const T` param readonly, so LLVM
   may drop a store through `@constCast` of it, and state a first use fills (a lazy cell, an error flag set from a helper
   thread) then never sticks. No behavioural test sees it: it fails only when the optimizer exploits it. State a first

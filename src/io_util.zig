@@ -112,6 +112,20 @@ const IdBatch = struct {
     }
 };
 
+/// Makes the directory `path` and its missing parents. Unlike `std.Io.Dir.createDirPath`, which refuses a path whose last
+/// component is a symlink (`NotDir`), it takes one that leads to a directory as made: a user's `~/.sushi` or cache
+/// folder linked to another volume. A dangling link or a file there is still `NotDir`.
+pub fn makeDirPath(io: std.Io, path: []const u8) !void {
+    std.Io.Dir.cwd().createDirPath(io, path) catch |e| switch (e) {
+        error.NotDir => {
+            // Opening follows the link: only a folder at its end makes the path.
+            var dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return e;
+            dir.close(io);
+        },
+        else => return e,
+    };
+}
+
 test "tool call ids made by concurrent requests, in the same millisecond or not, never repeat" {
     var a: IdBatch = .{};
     var b: IdBatch = .{};
@@ -132,4 +146,23 @@ test "tool call ids made by concurrent requests, in the same millisecond or not,
             return error.ToolCallIdRepeated;
         }
     };
+}
+
+test "makeDirPath takes a path whose last component links to a directory as made, and refuses a dangling link or a file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    try tmp.dir.createDirPath(io, "volume/cache");
+    try tmp.dir.symLink(io, "volume/cache", "linked", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "volume/gone", "dangling", .{ .is_directory = true });
+    try tmp.dir.writeFile(io, .{ .sub_path = "file", .data = "" });
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    try makeDirPath(io, try std.fmt.bufPrint(&p, "{s}/linked", .{root}));
+    try makeDirPath(io, try std.fmt.bufPrint(&p, "{s}/linked/fp/e1", .{root}));
+    var made = try tmp.dir.openDir(io, "volume/cache/fp/e1", .{});
+    made.close(io);
+    try std.testing.expectError(error.NotDir, makeDirPath(io, try std.fmt.bufPrint(&p, "{s}/dangling", .{root})));
+    try std.testing.expectError(error.NotDir, makeDirPath(io, try std.fmt.bufPrint(&p, "{s}/file", .{root})));
 }
