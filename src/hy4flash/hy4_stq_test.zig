@@ -393,6 +393,121 @@ test "hy4 stq served: a decode row over resident experts (the pack's tensors, or
     try residentWaits(8);
 }
 
+/// HY4_STQ_TINY loaded with its experts streamed through `slots` cache slots a layer (the tiny has 8 experts a layer).
+const StreamedTiny = struct {
+    config: model_mod.ModelConfig,
+    xfm: @import("../trunk.zig").Trunk,
+
+    fn load(s: *StreamedTiny, dir: []const u8, slots: u64) !void {
+        const a = testing.allocator;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        s.config = try model_mod.parseConfig(io, a, dir);
+        errdefer s.config.deinit(a);
+        s.config.expert_streaming = true;
+        s.config.expert_source_dir = try a.dupe(u8, dir);
+        s.config.expert_cache_bytes = slots * s.config.num_hidden_layers * (try expertBytes(io, dir));
+        var weights = try model_mod.loadWeightsForConfig(io, a, dir, &s.config, false);
+        defer weights.deinit();
+        model_mod.resolveWeightPrefix(&s.config, &weights);
+        s.xfm = try @import("../trunk.zig").Trunk.init(io, a, s.config, &weights);
+    }
+
+    fn deinit(s: *StreamedTiny) void {
+        s.xfm.deinit();
+        s.config.deinit(testing.allocator);
+    }
+};
+
+/// Ids 1..1000 spread over a prompt.
+fn spreadIds(comptime n: usize) [n]u32 {
+    var ids: [n]u32 = undefined;
+    for (&ids, 0..) |*d, i| d.* = @intCast(1 + (i * 7919) % 1000);
+    return ids;
+}
+
+test "hy4 stq served: a one-group streamed decode row waits for the GPU at each streamed layer's picks and its slots' release, never at a layer's end, and at its readout (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    // 4 slots of the tiny's 8 experts a layer: no MoE layer is resident, a decode row's picks are one group.
+    var t: StreamedTiny = undefined;
+    try t.load(dir, 4);
+    defer t.deinit();
+    const e = t.xfm.expert_stream.?;
+    const m = t.xfm.arch_state.hy4flash.model.?;
+    var streamed: u64 = 0;
+    for (m.config.dense_layers..t.config.num_hidden_layers) |l| if (e.residentRoute(@intCast(l)) == null) {
+        streamed += 1;
+    };
+    try testing.expect(streamed > 0);
+    var o: Ops = .{ .s = t.xfm.s };
+    defer o.deinit();
+    var ids = spreadIds(41);
+    _ = try hostRows(&o, try o.own(try t.xfm.forward(try o.own(mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, 40 }, 2, .uint32)))));
+    const before = mlx.engine.stats().waits;
+    _ = try hostRows(&o, try o.own(try t.xfm.forward(try o.own(mlx.mlx_array_new_data(&ids[40], &[_]c_int{ 1, 1 }, 2, .uint32)))));
+    const waits = mlx.engine.stats().waits - before;
+    errdefer std.debug.print("a streamed decode row waited {d} times over {d} streamed layers\n", .{ waits, streamed });
+    try testing.expectEqual(2 * streamed + 1, waits);
+}
+
+test "hy4 stq served: a streamed prefill chunk read out as nothing, whose last layer nothing waits for, leaves the next chunk's logits a chunk read out whole leaves (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var t: StreamedTiny = undefined;
+    try t.load(dir, 4);
+    defer t.deinit();
+    const m = t.xfm.arch_state.hy4flash.model.?;
+    var o: Ops = .{ .s = t.xfm.s };
+    defer o.deinit();
+    const ids = spreadIds(40);
+    var got: [2][]f32 = undefined;
+    var made: usize = 0;
+    defer for (got[0..made]) |g| a.free(g);
+    for (0..2) |arm| {
+        m.reset();
+        const first = try o.own(try m.forwardReadout(ids[0..20], if (arm == 0) .none else .all));
+        if (arm == 1) _ = try hostRows(&o, first);
+        got[arm] = try a.dupe(f32, try hostRows(&o, try o.own(try m.forwardReadout(ids[20..40], .all))));
+        made += 1;
+    }
+    try testing.expectEqualSlices(f32, got[1], got[0]);
+}
+
+test "hy4 stq served: with the engine's pool poisoned a streamed decode row gives the clean row's logits (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var t: StreamedTiny = undefined;
+    try t.load(dir, 4);
+    defer t.deinit();
+    const m = t.xfm.arch_state.hy4flash.model.?;
+    var o: Ops = .{ .s = t.xfm.s };
+    defer o.deinit();
+    const ids = spreadIds(41);
+    var got: [2][]f32 = undefined;
+    var made: usize = 0;
+    defer for (got[0..made]) |g| a.free(g);
+    defer mlx.engine.poison.byte = null;
+    for (0..2) |arm| {
+        mlx.engine.poison.byte = if (arm == 0) null else 0x7f;
+        m.reset();
+        _ = try hostRows(&o, try o.own(try m.forwardReadout(ids[0..40], .all)));
+        got[arm] = try a.dupe(f32, try hostRows(&o, try o.own(try m.forwardReadout(ids[40..41], .all))));
+        made += 1;
+    }
+    try testing.expectEqualSlices(f32, got[0], got[1]);
+}
+
 /// The engine's waits over one decode row after a prompt: the row's forward and its logits read to the host.
 fn residentWaits(slots: ?u64) !void {
     const Trunk = @import("../trunk.zig").Trunk;

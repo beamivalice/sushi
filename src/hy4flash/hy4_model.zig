@@ -2694,9 +2694,8 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     }
     const acc = try o.own(routed.?);
     routed = null;
-    const y = try o.contiguous(try fwd.moeFinish(o, x, m, g, acc, at));
-    try mlx.check(mlx.mlx_array_eval(y));
-    return y;
+    // Nothing waits at the layer's end: the next streamed layer's picks read (`hostPicks`) waits for it.
+    return o.contiguous(try fwd.moeFinish(o, x, m, g, acc, at));
 }
 
 /// The most groups `picks` picks over `experts` experts can make (`expertGroups`): each group but the last holds `slots`

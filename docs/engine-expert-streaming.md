@@ -222,6 +222,9 @@ has no single slot size, so it keeps one slot pool per rate group instead of one
   submitted with `mlx_async_eval` as soon as it is built, and at decode widths (<= 16 rows) the shared expert is
   submitted between the ids and the blocking read, so the GPU runs it during the host round trip. Same ops, same
   order; output is bit-identical.
+- Hy4-Flash's streamed STQ layer (`moeStqStreamed`) waits for the GPU twice a group of its route: at its picks and
+  before its slots go back. Its end is not waited for: the next streamed layer's picks read waits for it, and that
+  wait gives the host ring back as an end wait would (the plan's arena and host ring are unchanged).
 - DeepSeek-V4.1 STQ (`dsv41_stream.StqStream`) at decode widths queues each layer's routed chain from its GPU map
   (`Engine.specGrouped`) and the host settles it one layer late, after the next layer is submitted: it reads the picks,
   resolves them in the pools (`prepareHost`: fills, LRU and stats move here only) and keeps the queued chain when
