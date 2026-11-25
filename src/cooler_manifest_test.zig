@@ -103,11 +103,11 @@ test "cooler contract: a Cooler load whose manifest holds a served warm of anoth
                 const before = cooler_warm.runs_for_test;
                 var cooler: Load = undefined;
                 try cooler.prepare(C, dir, true);
-                // A narrower `--prefill-chunk`: the same pack, another chunk for the warm's requests.
+                // A narrower `--prefill-chunk-max`: the same pack, another chunk for the warm's requests.
                 const settings = @import("settings_resolve.zig");
-                const was = settings.prefill_chunk;
-                if (i == 1) settings.prefill_chunk = .{ .value = 2048, .source = .flag };
-                defer settings.prefill_chunk = was;
+                const was = settings.launch;
+                if (i == 1) settings.launch = .{ .prefill_chunk_max = 2048, .prefill_chunk_min = 2048 };
+                defer settings.launch = was;
                 try cooler.loadServed(dir);
                 defer _ = cooler.close();
                 r.* = cooler_warm.runs_for_test - before;
@@ -136,9 +136,9 @@ fn warmRuns(comptime C: type, dir: []const u8, chunk: u32) !u32 {
     var cooler: Load = undefined;
     try cooler.prepare(C, dir, true);
     const settings = @import("settings_resolve.zig");
-    const was = settings.prefill_chunk;
-    if (chunk != 0) settings.prefill_chunk = .{ .value = chunk, .source = .flag };
-    defer settings.prefill_chunk = was;
+    const was = settings.launch;
+    if (chunk != 0) settings.launch = .{ .prefill_chunk_max = chunk, .prefill_chunk_min = chunk };
+    defer settings.launch = was;
     try cooler.loadServed(dir);
     defer _ = cooler.close();
     return cooler_warm.runs_for_test - before;

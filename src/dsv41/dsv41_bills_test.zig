@@ -35,12 +35,12 @@ test "DeepSeek: the streamed request bill brackets the prefill peaks measured on
         .{ .seq = 2048, .chunk = 2048, .peak_mb = 4_907 + 250 },
         .{ .seq = 225_000, .chunk = 2048, .peak_mb = 5_124 + 250 },
     };
-    // Each ran at `--prefill-chunk`, whose loop absorbs a tail under 512 rows.
+    // Each ran at its prefill chunk, whose loop absorbs a tail under 512 rows.
     const sr = @import("../settings_resolve.zig");
-    const saved_chunk = sr.prefill_chunk;
-    defer sr.prefill_chunk = saved_chunk;
+    const saved_launch = sr.launch;
+    defer sr.launch = saved_launch;
     for (measured) |m| {
-        sr.prefill_chunk = .{ .value = m.chunk, .source = .flag };
+        sr.launch = .{ .prefill_chunk_max = @intCast(m.chunk), .prefill_chunk_min = @intCast(m.chunk) };
         const bill = bills.prefillNeededAtChunk(&config, m.seq, 16, 16, m.chunk, .{});
         const peak = m.peak_mb * 1_000_000;
         // Under-billing is a Metal OOM: at least a tenth over the peak. The upper bar keeps the net small.
@@ -83,7 +83,7 @@ test "DeepSeek prices its chunk per request: 8192 while the bill fits, then each
     // What `--ssd-budget-gb 96` on the 128 GB M5 Max leaves to serve, as its pin measured it.
     const at96: u64 = 110_100 * MB - 97_080 * MB;
     // There, a short prompt's 8192 rows do not fit beside the load and 4096 do.
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, .{}));
     // Its attention scores only the picked keys, so a long prompt keeps each rung while that rung's bill fits.
     const long: u64 = 524_288;
     var wider: u64 = std.math.maxInt(u64);
@@ -91,9 +91,15 @@ test "DeepSeek prices its chunk per request: 8192 while the bill fits, then each
         const need = bills.prefillNeededAtChunk(&config, long, 2048, 16, rung, .{});
         try t.expect(need < wider);
         wider = need;
-        try t.expectEqual(rung, bills.chooseRequestPrefillChunk(&config, long, 2048, 16, need, 512, 0, .{}));
+        try t.expectEqual(rung, bills.chooseRequestPrefillChunk(&config, long, 2048, 16, need, 512, .{}));
     }
-    try t.expectEqual(@as(u32, 512), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, 512, .{}));
+    // A min == max pins the ladder to 512, whose bill does fit at 96 GB.
+    const sr = @import("../settings_resolve.zig");
+    const saved = sr.launch;
+    defer sr.launch = saved;
+    sr.launch = .{ .prefill_chunk_max = 512, .prefill_chunk_min = 512 };
+    try t.expectEqual(@as(u32, 512), bills.chooseRequestPrefillChunk(&config, 8192, 2048, 16, at96, 512, .{}));
+    sr.launch = .{};
     var buf: [256]u8 = undefined;
     try t.expectEqualStrings("Prefill chunk: per request, up to 8192 at a short prompt (the widest rung each request's bill admits); load-time fallback 512\n", bills.prefillChunkLoadLine(&buf, &config, 512, 8192).?);
     // The ladder never narrows the advertised context: it is priced at the 512 floor.
@@ -109,14 +115,11 @@ test "a DeepSeek load's served warm forwards at the widest width a served reques
     config.num_attention_heads = 64;
     try t.expectEqual(@as(u32, 8192), bills.widestServedRung(&config));
     try t.expectEqual(config.prefillStartWidth(), bills.widestServedRung(&config));
-    // An operator's --prefill-chunk is what served requests take, so the warm follows it.
+    // A given --prefill-chunk-max is what served requests take, so the warm follows it.
     const sr = @import("../settings_resolve.zig");
-    const saved_width = sr.prefill_chunk.value;
-    defer sr.prefill_chunk.value = saved_width;
-    const saved_source = sr.prefill_chunk.source;
-    defer sr.prefill_chunk.source = saved_source;
-    sr.prefill_chunk.value = 4096;
-    sr.prefill_chunk.source = .flag;
+    const saved_launch = sr.launch;
+    defer sr.launch = saved_launch;
+    sr.launch = .{ .prefill_chunk_max = 4096 };
     try t.expectEqual(@as(u32, 4096), bills.widestServedRung(&config));
 }
 
@@ -238,7 +241,7 @@ test "DeepSeek's request bill takes its prefill working set out of the decoder p
     }
     // The widest rung is then always affordable, and a chunk boundary never steps down for the working set.
     const MB: u64 = 1 << 20;
-    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, 0, .{}));
+    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&config, seq, 2048, 16, state + decode + config.expertPoolBytes(), 512, .{}));
     var st: mtp_plan.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), bills.adaptivePrefillWidth(&config, 16, seq, 64 * MB, 2048, 2048, &st));
     config.expert_borrow_bytes = 0;
@@ -484,17 +487,17 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     const cooler = @import("../cooler_side.zig").onEngine(config);
     const bits = bills.defaultKvBits(config);
     const pool = config.expertPoolBytes();
-    // `--prefill-chunk`, as admission reads it.
+    // `--prefill-chunk-max`, as admission reads it.
     const sr = @import("../settings_resolve.zig");
-    const saved_chunk = sr.prefill_chunk;
-    defer sr.prefill_chunk = saved_chunk;
-    if (explicit > 0) sr.prefill_chunk = .{ .value = explicit, .source = .flag };
+    const saved_chunk = sr.launch;
+    defer sr.launch = saved_chunk;
+    if (explicit > 0) sr.launch = .{ .prefill_chunk_max = explicit };
     var free: u64 = if (cooler) pool else 0;
     const available = bills.admissionAvailableFor(config, avail, 0, free);
-    const billed = bills.chooseRequestPrefillChunk(config, seq, max_tokens, bits, available, 0, explicit, .{});
+    const billed = bills.chooseRequestPrefillChunk(config, seq, max_tokens, bits, available, 0, .{});
     if (bills.prefillNeededAtChunk(config, seq, max_tokens, bits, billed, .{}) > available) return null;
     const adaptive = explicit == 0;
-    const cap: u32 = @min(prefill_plan.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, seq, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0), config.prefillStartWidth());
+    const cap: u32 = @intCast(@min(prefill_plan.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, seq, config.has_sliding_window, config.isMoe(), config.longCtxGated(), 0, bills.chunkBoundsOf(config).max, bills.chunkBoundsOf(config).max_given), bills.chunkBoundsOf(config).max));
     var cur: u32 = @intCast(prefill_plan.firstChunkWidth(config, billed, cap, adaptive));
     const loop_end = seq - 1;
     var st: mtp_plan.AdaptiveWidthState = .{ .width_min = @intCast(billed), .width_max = @intCast(billed), .loop_end = loop_end };
@@ -516,7 +519,7 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     return null;
 }
 
-test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at the default width or --prefill-chunk 512, whatever the decoder pools hold and the engine keeps free" {
+test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at the default width or a 512-row chunk, whatever the decoder pools hold and the engine keeps free" {
     const MiB: u64 = 1 << 20;
     for ([_]bool{ true, false }) |cooler| {
         var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
@@ -536,7 +539,7 @@ test "DeepSeek: an admitted prompt is never refused by a forward's borrow, at th
                         while (avail <= 8192 * MiB) : (avail += 16 * MiB) {
                             for ([_]u32{ 0, 512 }) |explicit| {
                                 const r = borrowRefusal(&config, seq, avail, explicit, max_tokens, free_pct) orelse continue;
-                                std.debug.print("{s}, {d} MB of decoder pools, the engine keeping {d}% free: a {d}-token prompt (max_tokens {d}) admitted with {d} MB free at --prefill-chunk {d} has its {d}-row forward ending at {d} refused {d} MB short\n", .{
+                                std.debug.print("{s}, {d} MB of decoder pools, the engine keeping {d}% free: a {d}-token prompt (max_tokens {d}) admitted with {d} MB free at a {d}-row chunk has its {d}-row forward ending at {d} refused {d} MB short\n", .{
                                     if (cooler) "Cooler" else "MLX", borrowable / 1_000_000, free_pct, seq, max_tokens, avail / MiB, explicit, r.rows, r.end, r.short / MiB,
                                 });
                                 return error.TestUnexpectedResult;
@@ -736,7 +739,7 @@ test "DeepSeek: a request at the advertised context is admitted at the readings 
                 for ([_][2]u64{ .{ adv - 1, 1 }, .{ 15, adv - 15 } }) |req| {
                     tried += 1;
                     const mt: u32 = @intCast(req[1]);
-                    const pick = bills.chooseRequestPrefillChunk(&probe, req[0], mt, bits, available, @intCast(pin), 0, .{});
+                    const pick = bills.chooseRequestPrefillChunk(&probe, req[0], mt, bits, available, @intCast(pin), .{});
                     const need = bills.prefillNeededAtChunk(&probe, req[0], mt, bits, pick, .{});
                     if (need <= available) continue;
                     if (bad < 6) std.debug.print("{s}, borrowable {d} MB, room {d} MB, pin {d}, engine free {d} MB: advertised {d}; prompt {d} + max_tokens {d} needs {d} MB at width {d}, admission has {d} MB\n", .{ if (cooler) "Cooler" else "MLX", borrow / MiB, room / MiB, pin, engine_free / MiB, adv, req[0], mt, need / MiB, pick, available / MiB });

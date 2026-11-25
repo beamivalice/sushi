@@ -1,6 +1,5 @@
 const std = @import("std");
 const dsv41_state = @import("dsv41_state.zig");
-const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const tokenizer_mod = @import("../tokenizer.zig");
@@ -2266,8 +2265,6 @@ test "dsv41 engine: a prompt's tokens and the logits after them do not depend on
     const long = try a.alloc(u32, 9000);
     defer a.free(long);
     for (long, 0..) |*t, i| t.* = fx.ids[(i * 5 + 3) % fx.ids.len];
-    const saved_chunk = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_chunk;
     // Each case's first width is its one chunk. A prompt longer than the served start width cut at every rung of the
     // served ladder; and a short one at the widths either side of the dense product's kernel switch at this fixture's
     // shapes (128 rows) and the narrowest. Not under 33, nor narrow on the long prompt: this fixture has two heads, which
@@ -2284,7 +2281,6 @@ test "dsv41 engine: a prompt's tokens and the logits after them do not depend on
         var want_logits: std.ArrayList(f32) = .empty;
         defer want_logits.deinit(a);
         for (case.widths, 0..) |width, run| {
-            settings_resolve.prefill_chunk.value = width;
             try fx.xfm.resetCache();
             var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, case.prompt, 8, .{ .temperature = 0.0 }, &.{}, .{
                 .skip_lazy_preforward = true,
@@ -3061,9 +3057,6 @@ test "dsv41 engine: a prompt prefilled in chunks on the engine of our own with s
     defer tok.deinit();
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_chunk;
-    settings_resolve.prefill_chunk.value = 256;
     var config = try model_mod.parseConfig(io, a, dir);
     defer config.deinit(a);
     config.expert_streaming = true;
@@ -3482,9 +3475,6 @@ test "dsv41 generator: under a write-through every restore point the tier takes 
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_chunk;
-    settings_resolve.prefill_chunk.value = 256;
     const base: Generator.InitOptions = .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = 256, .adaptive_chunk_width = false, .ssm_checkpoint_stride = 256, .ssm_checkpoint_max = 4 };
 
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
@@ -3617,9 +3607,6 @@ test "dsv41 generator: a prefill that skips the decoder tails nothing reads give
     defer tok.deinit();
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_chunk;
-    settings_resolve.prefill_chunk.value = 256;
     var weights = try model_mod.loadWeightsForConfig(io, a, dir, &config, false);
     defer weights.deinit();
     var xfm = try Trunk.init(io, a, config, &weights);
@@ -3676,9 +3663,6 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     const greedy = SamplingParams{ .temperature = 0.0 };
     var prompt: [1400]u32 = undefined;
     for (&prompt, 0..) |*t, i| t.* = ids[(i * 5 + 3) % ids.len];
-    const saved_chunk = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_chunk;
-    settings_resolve.prefill_chunk.value = 256;
 
     // The hook runs once a chunk and once more at the prompt end, before the final span.
     const Count = struct {

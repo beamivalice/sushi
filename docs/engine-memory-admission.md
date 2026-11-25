@@ -83,7 +83,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   streamed load on a quiet 32 GB box saw 27,936 MiB of ceiling where its requests saw 26,976, and proved an 86k context
   each request then refused.
 - **A load's served warm forwards at the widest width a served request takes** (`widestServedRung`, shared with the
-  load line): the arch's start width (DeepSeek's 8192) or `--prefill-chunk`, never the global default. The warm took the
+  load line): the model's `--prefill-chunk-max` (its start width by default: DeepSeek's 8192), never a global default. The warm took the
   generic 8192 on DeepSeek, a width no DeepSeek request forwards at, and at `--ssd-budget-gb 108` it reset the Mac.
 - **Every runtime ceiling is the wired limit alone, as on 1.6.0** (`currentGpuMemoryCeiling`, #110): under a declared
   `iogpu.wired_limit_mb` the limit less the unplanned margin, whatever free RAM other apps leave; with none declared,
@@ -152,7 +152,7 @@ bill function's output on the committed fixture configs of all served packs: a b
 - A memory refusal resets its entry to `.unloaded`, so every later request to the model runs its checks again and gets
   the whole refusal they write, re-read (server test "every request to a model whose load is refused for memory").
 - Every refusal a client reads, a fixed one included (a mid-request memory refusal, an image encode that does not fit, a model not loaded, a shutdown), says what can help its own bound, actions one per line: a setting by its Settings label and its flag, a launch-only flag said to be one, never an internal term (the engine's cap, a patch block) as the action.
-- A refusal that asks to change a setting names it as the user can reach it: its Settings label with the flag, or, when the launch flag set the value (it outranks the setting), a restart with the flag (`LoadMemoryRefusal.Knob.from_flag`); a flag with no setting (`--prefill-chunk`, `--max-resident-mem`) is said to be a launch flag.
+- A refusal that asks to change a setting names it as the user can reach it: its Settings label with the flag, or, when the launch flag set the value (it outranks the setting), a restart with the flag (`LoadMemoryRefusal.Knob.from_flag`); a flag with no setting (`--max-resident-mem`) is said to be a launch flag.
 - A refusal offers no action its bound cannot reach: no free-RAM action when this Mac can never give the GPU what the load needs (`wiredLimitThatFits` null), and points to the options below only when it lists one. A resident load of a pack that can stream names the ssd budget the streamed planner fits on the same reading (`LoadMemoryRefusal.stream_fits_gb`).
 - The ssd budget is admitted against the ceiling the preflight and admission read: a declared `iogpu.wired_limit_mb`'s floor (less the unplanned margin), else Metal's working set; never the raw declared limit. A refusal offers a smaller pack only when the build lists a smaller one of the model (`packs.smallerPack`), none for a pack it does not list, and a streaming budget that fits first. A request's refusal and an ssd budget refusal offer one only when the load's stamp of that fact (`ModelConfig.smaller_pack`) says one exists; one built without it offers none, and a fixed text that cannot know the pack (`PREFILL_NOFIT_MSG`, the fixed load messages, the user-wire warning) offers none: a text never names an action the server has not checked.
 - Every refusal text and its log line print memory through `bills.Mem` in one unit per text (`MemUnit.of` its largest figure: GB of 2^30 bytes with one decimal, whole MB under 1 GB): a need rounded up, what is available down, a shortfall as their printed difference.
@@ -300,7 +300,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   context, no 93% margin on top: the bill is the one reserve. Past it the 93% margin stays. Sizer and admission were
   two formulas: a 32 GB M1 Max advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
-  budget). `--prefill-chunk` pins it off the per-request ladder; on the ladder it is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
+  budget). `--prefill-chunk-max` caps it and `--prefill-chunk-min` floors it (`bills.loadChunkWithin`: a given min the sizer cannot reach refuses the load by name); on the per-request ladder the max is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - **A rate-grouped EXL3 MoE bills its combine** (`rateGroupedPrefillBytesPerRow`, the pack index's widest layer in
   `ModelConfig.expert_rate_groups`): at its down projection a layer holds one f16 plane per rate group, each as tall as
   every sorted row (rows x top_k), and the combined one, beside its gate and up inputs and planes; the MoE term is the
@@ -332,7 +332,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
 - The ungated hot-cache ask is zero when RAM retention is off, `--prefix-cache-entries 0`, or the model's hot cache
   never loads (`HotPrefixCache.shouldUse`); otherwise it is `--prefix-cache-mem`.
 - A per-request arch (`perRequestPrefillChunk`: qwen4_exp, the ringed mimo_v2, glm5_next, deepseek_v41) prefills every
-  request from its start width (`prefillStartWidth`: 4096, 2048, 2048, 8192; an explicit `--prefill-chunk` sets it instead). Each
+  request from its `--prefill-chunk-max` (default its start width, `prefillStartWidth`: 4096, 2048, 2048, 8192). Each
   chunk boundary steps down a rung, never up again, only where the next chunk's cost no longer fits the live
   headroom beside the KV (`adaptivePrefillWidth`). Admission bills the request's top at the widest rung whose whole
   bill fits (`chooseRequestPrefillChunk`), so a long prompt is never under-billed; the load-time pin is only the
@@ -651,8 +651,9 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
 - The generation bill uses the request's concrete `max_tokens` (the client's, else the filled default, never the
   rest of the window), cut to what the window leaves ([server-http-apis](server-http-apis.md)).
 - One `[admission] needed=… lendable=… available=… reclaimable=… width=… verdict=…` line per decision.
-- An explicit `--prefill-chunk N` caps the per-request ladder, never pins it: N if it fits, else the widest rung
-  below N that fits, down to 512; refused only when that floor does not fit. `requestPrefillPick` is the one rule for
+- `--prefill-chunk-max N` caps the per-request ladder and `--prefill-chunk-min M` floors it: N if it fits, else the
+  widest rung below N that fits, down to M (default 512); refused only when that floor does not fit. The per-chunk
+  adaptive width stays on within the bounds; equal bounds pin the width and turn it off. `requestPrefillPick` is the one rule for
   the bill and the scheduler, `prefill_plan.requestPrefillChunk` the width both run; the hot-cache clamp and a streamed
   load prove that floor (`perRequestFloorWidth`).
 - A long prefill evicts the hot cache on the INFERENCE thread to be admitted (`evictLruToAdmit`) on every arch where

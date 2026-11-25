@@ -188,7 +188,7 @@ pub fn neutralChunkWidth(config: *const model_mod.ModelConfig) ?u32 {
 pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pinned: u32, launch: usize) ?[]const u8 {
     _ = config;
     if (pinned >= launch or pinned != @import("glm5_forward.zig").prefill_chunk) return null;
-    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (GLM's numerics width; --prefill-chunk overrides)\n", .{pinned}) catch null;
+    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (GLM's numerics width; --prefill-chunk-max sets the most)\n", .{pinned}) catch null;
 }
 
 /// GLM warms T=1 and T=8, then resets; its KDA state, rings and first latent rows exist from then on.

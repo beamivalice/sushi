@@ -2,6 +2,8 @@
 //! outranks the default. A flag the operator did not pass is null, never a value beside a "given" bit.
 const std = @import("std");
 const model_settings = @import("model_settings.zig");
+const model_mod = @import("model.zig");
+const arch_config = @import("arch/config.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
 pub const Source = enum { flag, model_settings, default };
@@ -29,17 +31,15 @@ pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
 pub const Launch = struct {
     /// `--drafter` was given.
     drafter: bool = false,
-    /// `--prefill-chunk-max` / `--prefill-chunk-min` (an arch's flags): the rows a static-bill load's chunk is chosen
-    /// within (D4).
+    /// `--prefill-chunk-max` / `--prefill-chunk-min`: the rows every model's prefill chunk is chosen within.
     prefill_chunk_max: ?u32 = null,
     prefill_chunk_min: ?u32 = null,
 };
 
 pub var launch: Launch = .{};
 
-/// The widths a static-bill load's prefill chunk may take, widest first. Every bound of it (`--prefill-chunk-max`,
-/// `--prefill-chunk-min`, their model-settings keys, and `--prefill-chunk` where it means the max) is one of them, else
-/// it is refused by name.
+/// The widths a load's prefill chunk may take, widest first. Every bound of it (`--prefill-chunk-max`,
+/// `--prefill-chunk-min`, and their model-settings keys) is one of them, else it is refused by name.
 pub const static_chunk_rungs = [_]u32{ 8192, 4096, 2048, 1024, 512 };
 /// `static_chunk_rungs` as a refusal names them.
 pub const static_chunk_rungs_text = "512, 1024, 2048, 4096 or 8192 rows";
@@ -49,12 +49,65 @@ pub fn isStaticChunkRung(rows: u64) bool {
     return false;
 }
 
-/// The prefill width. `--prefill-chunk` outranks the per-model chunk the memory sizer pins
-/// (`ModelConfig.pinned_prefill_chunk`); without the flag 8192 is only the default.
-pub var prefill_chunk: Setting(usize) = .{ .value = 8192, .source = .default };
+/// The rows a model's prefill chunk is chosen within. `max_given` / `min_given`: a flag or a model-settings key named
+/// it; else it is the model's own default.
+pub const ChunkBounds = struct {
+    min: u32,
+    max: u32,
+    max_given: bool = false,
+    min_given: bool = false,
+    /// A given min above the model's default max raised the max to it.
+    raised_by_min: bool = false,
+};
+
+/// The widest chunk a model's prefill runs when no bound names its max: the static bill's own default (Hy4's 4096),
+/// else the widest ladder rung at or below the width the arch starts its prefill at.
+pub fn defaultChunkMax(config: *const model_mod.ModelConfig) u32 {
+    const widest = arch_config.staticChunkMax(config);
+    if (widest != 0) return arch_config.staticChunkDefault(config);
+    const start = config.prefillStartWidth();
+    for (static_chunk_rungs) |r| if (r <= start) return r;
+    return static_chunk_rungs[static_chunk_rungs.len - 1];
+}
+
+/// An omitted `--prefill-chunk-min`: the narrowest rung, never above the max.
+pub fn defaultChunkMin(max: u32) u32 {
+    return @min(static_chunk_rungs[static_chunk_rungs.len - 1], max);
+}
+
+/// A model's chunk bounds from the launch flag, else the model-settings.json key, else the defaults. The ONE decision:
+/// `bills` formats its refusal, and the forward and the bill read its `.bounds`. A given min above the model's DEFAULT max
+/// raises the max to the min (`raised_by_min`); above a GIVEN max it is refused by name.
+pub const ChunkBoundRefusal = union(enum) {
+    not_a_rung: struct { rows: u32, name: []const u8 },
+    min_above_given_max: struct { min: u32, min_name: []const u8, max: u32, max_name: []const u8 },
+};
+
+pub const BoundsPick = union(enum) {
+    bounds: ChunkBounds,
+    refused: ChunkBoundRefusal,
+};
+
+pub fn chunkBounds(config: *const model_mod.ModelConfig) BoundsPick {
+    const Bound = struct { rows: u32, name: []const u8 };
+    const max: ?Bound = if (launch.prefill_chunk_max) |v| .{ .rows = v, .name = "--prefill-chunk-max" } else if (config.prefill_chunk_max_override) |v| .{ .rows = v, .name = "model-settings.json prefill_chunk_max" } else null;
+    const min: ?Bound = if (launch.prefill_chunk_min) |v| .{ .rows = v, .name = "--prefill-chunk-min" } else if (config.prefill_chunk_min_override) |v| .{ .rows = v, .name = "model-settings.json prefill_chunk_min" } else null;
+    for ([_]?Bound{ max, min }) |given| if (given) |g| if (!isStaticChunkRung(g.rows)) {
+        return .{ .refused = .{ .not_a_rung = .{ .rows = g.rows, .name = g.name } } };
+    };
+    const default_max = defaultChunkMax(config);
+    const raised = max == null and min != null and min.?.rows > default_max;
+    const hi: u32 = if (max) |g| g.rows else if (raised) min.?.rows else default_max;
+    const lo: u32 = if (min) |g| g.rows else defaultChunkMin(hi);
+    if (lo > hi) return .{ .refused = .{ .min_above_given_max = .{ .min = lo, .min_name = min.?.name, .max = hi, .max_name = max.?.name } } };
+    return .{ .bounds = .{ .min = lo, .max = hi, .max_given = max != null or raised, .min_given = min != null, .raised_by_min = raised } };
+}
+
+/// The widest chunk a no-flag load ran with: the model's max where a bound named it, else the widest rung (8192, the
+/// old global default). A bound-free load keeps every figure it had, and the checkpoint stride it must cover.
+pub const chunk_rung_top: u32 = static_chunk_rungs[0];
 
 const testing = std.testing;
-const model_mod = @import("model.zig");
 const model_load = @import("model_load.zig");
 const kv_quant = @import("kv_quant.zig");
 const bills = @import("bills.zig");
@@ -211,11 +264,24 @@ test "settings precedence: the SSD ask names who set it" {
     }
 }
 
-test "settings precedence: --prefill-chunk outranks the pinned width only when given" {
-    const saved = prefill_chunk;
-    defer prefill_chunk = saved;
-    prefill_chunk = .{ .value = 4096, .source = .default };
-    try testing.expectEqual(@as(u32, 0), bills.explicitPrefillChunk());
-    prefill_chunk = .{ .value = 4096, .source = .flag };
-    try testing.expectEqual(@as(u32, 4096), bills.explicitPrefillChunk());
+test "settings precedence: the chunk bounds are flag > file > the model's defaults" {
+    const saved = launch;
+    defer launch = saved;
+    var config = model_mod.ModelConfig{};
+    config.arch = .{ .tag = null };
+    config.model_type = "qwen4_exp";
+    launch = .{};
+    const quiet = chunkBounds(&config).bounds;
+    try testing.expectEqual(defaultChunkMax(&config), quiet.max);
+    try testing.expectEqual(@as(u32, 512), quiet.min);
+    try testing.expect(!quiet.max_given and !quiet.min_given);
+    config.prefill_chunk_max_override = 2048;
+    try testing.expectEqual(@as(u32, 2048), chunkBounds(&config).bounds.max);
+    try testing.expect(chunkBounds(&config).bounds.max_given);
+    launch.prefill_chunk_max = 4096;
+    launch.prefill_chunk_min = 1024;
+    const picked = chunkBounds(&config).bounds;
+    try testing.expectEqual(@as(u32, 4096), picked.max);
+    try testing.expectEqual(@as(u32, 1024), picked.min);
+    try testing.expect(picked.max_given and picked.min_given);
 }

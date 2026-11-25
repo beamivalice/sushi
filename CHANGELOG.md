@@ -6,6 +6,10 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Every model takes `--prefill-chunk-max` and `--prefill-chunk-min`**, each one of 512, 1024, 2048, 4096 or 8192
+  rows, and their settings keys, which the web UI offers as a list of those five. A request starts at the max (by
+  default the model's own start width, so nothing changes without a flag) and steps down no lower than the min.
+  `--prefill-chunk` is removed: given, the launch refuses it and names the two flags.
 - **A prompt restored from the prompt cache shows how much is already read**: sushibar, the web UI and
   `return_progress` read 0% for a prompt mostly restored from the cache, and no prompt's progress reached 100% before
   its first token; it now starts at the restored share and ends at the whole prompt.

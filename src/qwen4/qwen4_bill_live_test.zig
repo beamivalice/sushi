@@ -33,13 +33,13 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     const available: u64 = 28_909 * MiB;
     const pin = cfg.pinned_prefill_chunk;
 
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 4096, 2048, kv_bits, available, pin, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, available, pin, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 384_000, 2048, kv_bits, available, pin, .{}));
     try t.expect(4096 > pin);
 
     // The full 1M context fits at 4096 on this box under the one-copy history bill.
-    const full = bills.chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, 0, .{});
+    const full = bills.chooseRequestPrefillChunk(&cfg, 1_048_576, 2048, kv_bits, available, pin, .{});
     try t.expectEqual(@as(u32, 4096), full);
     try t.expect(bills.prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 2048, .{}) <= available);
     try t.expect(bills.prefillNeededAtChunk(&cfg, 1_048_576, 2048, kv_bits, 4096, .{}) <= available);
@@ -49,7 +49,7 @@ test "chooseRequestPrefillChunk: an ordinary prompt buys the wide chunk a 1M ses
     var i: usize = 0;
     const seqs = [_]u64{ 1_048_576, 384_000, 300_000, 60_000, 4096 };
     while (i < seqs.len) : (i += 1) {
-        const w = bills.chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, 0, .{});
+        const w = bills.chooseRequestPrefillChunk(&cfg, seqs[i], 2048, kv_bits, available, pin, .{});
         try t.expect(w >= prev);
         prev = w;
     }
@@ -81,8 +81,8 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
             bill * (100 + bills.PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
         else
             bill;
-        try t.expectEqual(width, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed, pin, 0, .{}));
-        const under = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed - 1, pin, 0, .{});
+        try t.expectEqual(width, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed, pin, .{}));
+        const under = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, needed - 1, pin, .{});
         if (width == floor_width) {
             try t.expectEqual(floor_width, under);
         } else {
@@ -92,7 +92,7 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     try t.expect(distinct >= 4);
 
     // Nothing fits: the ladder floor, never 0 and never the load-time pin.
-    try t.expectEqual(floor_width, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{}));
+    try t.expectEqual(floor_width, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, .{}));
 }
 
 test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by the estimator's margin" {
@@ -111,14 +111,18 @@ test "chooseRequestPrefillChunk: the rung the gate widened clears its bill by th
     try t.expectEqual(@as(u32, 8192), bills.widthForRung(&cfg, seq, 8192));
     try t.expectEqual(@as(u64, 4096), bills.rungWidth(&cfg, seq, 8192, false));
 
-    // Only an explicit `--prefill-chunk 8192` offers the rung past the 4096 start width.
+    // Only a given `--prefill-chunk-max 8192` offers the rung past the 4096 start width.
     const with_margin = wide_bill * (100 + bills.PREFILL_WIDE_RUNG_MARGIN_PCT) / 100;
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 8192, .{}));
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, 8192, .{}));
-    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, 8192, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, .{}));
+    const sr = @import("../settings_resolve.zig");
+    const saved = sr.launch;
+    defer sr.launch = saved;
+    sr.launch = .{ .prefill_chunk_max = 8192 };
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin - 1, pin, .{}));
+    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, with_margin, pin, .{}));
     // The rungs the gate did not widen are still taken at their plain bill.
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, 8192, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, narrow_bill, pin, .{}));
 }
 
 test "chooseRequestPrefillChunk: on Sushi Cooler the widened rung clears its exact bill alone, no estimator margin" {
@@ -136,9 +140,13 @@ test "chooseRequestPrefillChunk: on Sushi Cooler the widened rung clears its exa
     const seq: u64 = 300_000;
     const pin = cfg.pinned_prefill_chunk;
     try t.expectEqual(@as(u64, 4096), bills.rungWidth(&cfg, seq, 8192, false));
+    const sr = @import("../settings_resolve.zig");
+    const saved = sr.launch;
+    defer sr.launch = saved;
+    sr.launch = .{ .prefill_chunk_max = 8192 };
     const wide_bill = bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, 8192, .{});
-    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, 8192, .{}));
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill - 1, pin, 8192, .{}));
+    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill, pin, .{}));
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, wide_bill - 1, pin, .{}));
 }
 
 test "prefillNeededAtChunk: the deployed pack's 8192 step is at least the measured peak step" {
@@ -168,24 +176,32 @@ test "chooseRequestPrefillChunk: the explicit flag caps it, the gate outranks it
     const roomy: u64 = 200 * (@as(u64, 1) << 30);
     const pin = cfg.pinned_prefill_chunk;
 
-    // An explicit `--prefill-chunk` sets the ladder's top: never wider however roomy, the floor when nothing fits.
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
-    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 8192, .{}));
-    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 4096, .{}));
-    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 2048, .{}));
-    try t.expectEqual(bills.widthForRung(&cfg, 300_000, 512), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, 2048, .{}));
+    // `--prefill-chunk-max` sets the ladder's top: never wider however roomy, the floor when nothing fits.
+    const sr = @import("../settings_resolve.zig");
+    const saved = sr.launch;
+    defer sr.launch = saved;
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, .{}));
+    sr.launch = .{ .prefill_chunk_max = 8192 };
+    try t.expectEqual(@as(u32, 8192), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, .{}));
+    sr.launch = .{ .prefill_chunk_max = 4096 };
+    try t.expectEqual(@as(u32, 4096), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, .{}));
+    // A given min is the floor a prompt that fits nothing runs at.
+    sr.launch = .{ .prefill_chunk_max = 4096, .prefill_chunk_min = 2048 };
+    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, 0, pin, .{}));
+    sr.launch = .{};
 
     // Kill switch: the load-time pin for every request.
     bills.per_request_chunk_override = false;
     defer bills.per_request_chunk_override = null;
-    try t.expectEqual(pin, bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(pin, bills.chooseRequestPrefillChunk(&cfg, 300_000, 2048, kv_bits, roomy, pin, .{}));
     bills.per_request_chunk_override = null;
 
     // Another arch keeps the load-time pin exactly.
     var other = fixtures.qwen4RequestTestConfig();
     other.model_type = "not_a_served_arch";
+    sr.launch = .{};
     try t.expect(!other.perRequestPrefillChunk());
-    try t.expectEqual(pin, bills.chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, 0, .{}));
+    try t.expectEqual(pin, bills.chooseRequestPrefillChunk(&other, 300_000, 2048, kv_bits, roomy, pin, .{}));
     try t.expect(cfg.perRequestPrefillChunk());
 }
 
@@ -210,27 +226,23 @@ test "admission tries the ladder DOWN before refusing: a prompt that fits only a
     // Exactly enough for the floor width and not a byte more.
     const available = at_floor;
 
-    try t.expectEqual(floor_width, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(floor_width, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, .{}));
     try t.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{}) <= available);
 
     // Gate off: the load-time pin does not fit.
     bills.per_request_chunk_override = false;
     defer bills.per_request_chunk_override = null;
-    try t.expectEqual(pin, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, 0, .{}));
+    try t.expectEqual(pin, bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available, pin, .{}));
     try t.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, pin_width, .{}) > available);
     bills.per_request_chunk_override = null;
 
-    // An explicit `--prefill-chunk` caps the ladder, it does not pin it: the same step down.
-    settings_resolve.prefill_chunk.value = 4096;
-    settings_resolve.prefill_chunk.source = .flag;
-    defer {
-        settings_resolve.prefill_chunk.value = 8192;
-        settings_resolve.prefill_chunk.source = .default;
-    }
-    // The flag's loop absorbs a tail under 512 rows, so the floor's bill is its own, not the adaptive width's.
+    // A given min == max pins the ladder to one width, which turns the per-chunk widening off: the pick is the floor.
+    const saved_launch = settings_resolve.launch;
+    defer settings_resolve.launch = saved_launch;
+    settings_resolve.launch = .{ .prefill_chunk_max = 512, .prefill_chunk_min = 512 };
     const available_flag = bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, floor_width, .{});
     try t.expect(available_flag > available);
-    const capped = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available_flag, pin, bills.explicitPrefillChunk(), .{});
+    const capped = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, available_flag, pin, .{});
     try t.expectEqual(floor_width, capped);
     try t.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, capped, .{}) <= available_flag);
 }
@@ -248,12 +260,12 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     const floor_width = bills.widthForRung(&cfg, seq, bills.PREFILL_CHUNK_LADDER[bills.PREFILL_CHUNK_LADDER.len - 1]);
 
     // Pre-eviction: nothing on the ladder fits, the chooser hands back the floor.
-    const admitted = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
+    const admitted = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, .{});
     try t.expectEqual(floor_width, admitted);
 
     // Post-eviction, with the cache's bytes returned: a wider rung fits.
     const roomy: u64 = bills.prefillNeededAtChunk(&cfg, seq, 2048, kv_bits, bills.widthForRung(&cfg, seq, 4096), .{});
-    const reasked = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    const reasked = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, .{});
     try t.expect(reasked > admitted);
     try t.expectEqual(reasked, slot_admission.postEvictionPrefillChunk(admitted, reasked).width);
 
@@ -265,16 +277,16 @@ test "the post-eviction re-ask never exceeds what live memory affords, and never
     // A non-qwen4 arch is untouched end to end.
     var other = fixtures.qwen4RequestTestConfig();
     other.model_type = "not_a_served_arch";
-    const other_pre = bills.chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, 0, .{});
-    const other_post = bills.chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    const other_pre = bills.chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, 0, pin, .{});
+    const other_post = bills.chooseRequestPrefillChunk(&other, seq, 2048, kv_bits, roomy, pin, .{});
     try t.expectEqual(pin, other_pre);
     try t.expectEqual(pin, other_post);
     try t.expectEqual(pin, slot_admission.postEvictionPrefillChunk(other_pre, other_post).width);
 
     bills.per_request_chunk_override = false;
     defer bills.per_request_chunk_override = null;
-    const off_pre = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, 0, .{});
-    const off_post = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, 0, .{});
+    const off_pre = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, 0, pin, .{});
+    const off_post = bills.chooseRequestPrefillChunk(&cfg, seq, 2048, kv_bits, roomy, pin, .{});
     try t.expectEqual(pin, slot_admission.postEvictionPrefillChunk(off_pre, off_post).width);
 }
 

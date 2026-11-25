@@ -62,8 +62,7 @@ arena, for the reason the doc gives.
 - [Decisions D1 to D17](bill_redesign.md#decisions) are the owner's, and all are ruled: the plan is recorded (S1
   and S2 passed); one buffer at offsets (S3 could reopen it); a load trusts its own cached
   recording, never a pin; `--prefill-chunk-max` and `--prefill-chunk-min` bound the load's choice and force the
-  chunk when equal, for a load on the static bill only (Hy4 for now; there `--prefill-chunk` is deprecated, and on
-  every other load it is unchanged and the new flags are refused); a served miss heals in process only within the
+  chunk when equal (since 2026-11-26 on every model, and `--prefill-chunk` is removed); a served miss heals in process only within the
   arena held, never by growing it; the stage 8 report is `sushi memory-bill <pack>`; the margin becomes a measured
   constant at each arch's cutover; after S1 and S2 (D8 to D11), a dry host ask holds a host scratch and its filler
   runs, the recorder's levels are the execution's, a readback is a read of bytes the execution's GPU work wrote, and

@@ -226,7 +226,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   as `?T` on `LoadParams`, the Scheduler and the cold-load `LoadRequest` (a SECOND site): `mtp: ?bool`,
   `kv_quant: ?KVQuantConfig`; read via `server.manualContext` / `kvCacheFor` / `mtpChoiceFor`. The process-wide one is
   `settings_resolve.prefill_chunk` (a `Setting`
-  whose source is `.flag` once `--prefill-chunk` is given); the prefix-cache asks carry a `Source`
+  whose source is `.flag` once `--prefill-chunk-max` or `--prefill-chunk-min` is given); the prefix-cache asks carry a `Source`
   (`server_state.prefix_cache_mem_source`, `prefix_cache_disk_source`: `.flag`, `.model_settings` for
   `server.prefix_cache_disk_gb`, or `.default`). Each load logs its resolved value and source (`[kv-cache] kv8
   (source); ctx N (source)`, `[mtp] on|off (source)`; `/props settings.mtp.source`). Guard: `tests/test_cold_load.sh`.

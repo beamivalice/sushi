@@ -25,6 +25,8 @@ const KEYS = [
   { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' }, { name: 'qwen_cooler', type: 'bool' },
   { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
   { name: 'expert_cache_bias', type: 'number', min: 0, max: 2 },
+  { name: 'prefill_chunk_max', type: 'choice', choices: ['512', '1024', '2048', '4096', '8192'] },
+  { name: 'prefill_chunk_min', type: 'choice', choices: ['512', '1024', '2048', '4096', '8192'] },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
 const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'preserve_thinking', 'think_penalty', 'max_tokens'];
@@ -1268,6 +1270,7 @@ async function main() {
     // A plain-worded setting or badge keeps its engineering name in the tooltip: the model-settings.json key and the launch flag.
     const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
       preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', ds41_cooler: '--ds41-mlx-engine', expert_cache_bias: '--expert-cache-bias', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
+      prefill_chunk_max: '--prefill-chunk-max', prefill_chunk_min: '--prefill-chunk-min',
       update_check: '--no-update-check', pack_update_check: '--no-update-check', skip_mem_preflight: '--skip-mem-preflight' };
     const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/, expert_cache_bias: /expert cache bias/ };
     // A label that is already the common term keeps only the key and flag in its technical name.
@@ -1711,8 +1714,7 @@ async function main() {
       assert.equal(server.count('/v1/settings', 'POST'), 0, 'a chat folder is not the models folder');
     });
 
-    const withYarn = (rope, file) => (s) => { Object.assign(s.state.models[0], { keys: [...BASE_KEYS, 'yarn_factor'], rope }); if (file) s.state.models[0].settings.yarn_factor = keyState({ file, source: 'file' }); };
-    await scenario('Context extension offers Model default, YaRN x2 and x4, and previews the resulting window before a load', { path: '/models#Qwen-A', setup: withYarn({ method: 'native', factor: 0, native: 262144, window: 262144 }) }, async ({ page, server }) => {
+    const withYarn = (rope, file) => (s) => { Object.assign(s.state.models[0], { keys: [...BASE_KEYS, 'yarn_factor'], rope }); if (file) s.state.models[0].settings.yarn_factor = keyState({ file, source: 'file' }); };    await scenario('Context extension offers Model default, YaRN x2 and x4, and previews the resulting window before a load', { path: '/models#Qwen-A', setup: withYarn({ method: 'native', factor: 0, native: 262144, window: 262144 }) }, async ({ page, server }) => {
       server.state.models[0].state = 'unloaded';
       await page.waitForSelector(`${row('yarn_factor')} select`);
       assert.match(await page.textContent(`${row('yarn_factor')} .lab`), /Context extension/);
@@ -1738,6 +1740,21 @@ async function main() {
       assert.equal(await page.isDisabled(`${row('yarn_factor')} select`), true);
       assert.match(await page.textContent(`${row('yarn_factor')} .help`), /--config-overrides.*outranks/);
       assert.match(await page.textContent(row('yarn_factor')), /Set at launch/);
+    });
+
+    // The prefill chunk bounds are a choice of five widths on every model, whatever its arch.
+    const withChunks = (s) => { s.state.models[0].keys = [...BASE_KEYS, 'prefill_chunk_max', 'prefill_chunk_min']; s.state.models[0].defaults = { ...(s.state.models[0].defaults ?? {}), prefill_chunk_max: 4096, prefill_chunk_min: 512 }; };
+    await scenario('the prefill chunk bounds are a select of the five widths every model takes', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: withChunks }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('prefill_chunk_max')} select`);
+      for (const [key, def] of [['prefill_chunk_max', '4096'], ['prefill_chunk_min', '512']]) {
+        const opts = await page.$$eval(`${row(key)} select option`, (o) => o.map((n) => n.textContent));
+        assert.deepEqual(opts, [`Default (${def})`, '512', '1024', '2048', '4096', '8192'], `${key} offers the five widths (${opts.join('|')})`);
+      }
+      await page.selectOption(`${row('prefill_chunk_max')} select`, '2048');
+      await page.selectOption(`${row('prefill_chunk_min')} select`, '512');
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForFunction(() => document.querySelector('.set[data-key="prefill_chunk_max"] .badges')?.textContent.includes('Saved'));
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1), { model: 'Qwen-A', set: { prefill_chunk_max: '2048', prefill_chunk_min: '512' } });
     });
 
     // One refresh rule: an action that moves server state re-reads what it moved, and every view shows the latest answer.

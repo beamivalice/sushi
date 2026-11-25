@@ -2,7 +2,6 @@ const std = @import("std");
 const cache_stats = @import("cache_stats.zig");
 const test_note = @import("test_note.zig");
 const sched_policy = @import("sched_policy.zig");
-const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const http = @import("http.zig");
 const gpu_mem = @import("gpu_mem.zig");
@@ -19,6 +18,7 @@ const slot_admission = @import("slot_admission.zig");
 const model_load = @import("model_load.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
+const bills = @import("bills.zig");
 const model_settings = @import("model_settings.zig");
 const metrics = @import("status.zig");
 const arch_chat = @import("arch/chat.zig");
@@ -846,7 +846,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .kv_quant = kv.wireName(),
         .kv_cache = kv_cache,
         // A static-bill load runs the chunk it fixed (D4).
-        .prefill_chunk = if (config.static_prefill_chunk != 0) config.static_prefill_chunk else settings_resolve.prefill_chunk.value,
+        .prefill_chunk = if (config.static_prefill_chunk != 0) config.static_prefill_chunk else @as(usize, bills.checkpointStrideBase(config)),
         .prefill_decode_share = scheduler_mod.prefillDecodeShare(),
         .mtp_loaded = mtpCapable(lm),
         .mtp_default_on = defaultEnableMtpForStreaming(lm.mtp != null, config.isMoe(), forceMtpFor(config), nativeMeasuredMoeHead(lm), model_mod.isServedArch(config.model_type), config.expert_streaming and !config.stream_mtp_head),

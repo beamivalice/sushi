@@ -16,7 +16,7 @@ exec "$binary" serve \
   --host 127.0.0.1 \
   --port 12345 \
   --ctx-size 1048576 \
-  --prefill-chunk 8192 \
+  --prefill-chunk-max 8192 \
   --max-concurrent 1 \
   --kv-quant 8 \
   --max-tokens 64000 \

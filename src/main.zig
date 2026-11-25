@@ -549,10 +549,9 @@ fn runCli(init: std.process.Init) !void {
             server_state.host_managed = true;
         } else if (std.mem.eql(u8, args[i], "--no-update-check")) {
             no_update_check = true;
-        } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and flag_value.follows(args, i)) {
-            i += 1;
-            // `explicit` disables the machine-sized pin, so only a real width earns it.
-            settings_resolve.prefill_chunk = .{ .value = flagInt(usize, "--prefill-chunk", args[i], 1), .source = .flag };
+        } else if (removedFlagRefusal(args[i])) |line| {
+            log.err("{s}\n", .{line});
+            std.process.exit(1);
         } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and flag_value.follows(args, i)) {
             i += 1;
             prefix_cache_entries_flag = flagInt(u32, "--prefix-cache-entries", args[i], 0);
@@ -1549,6 +1548,11 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 }
 
 /// A flag's whole-number value, or a named error and exit: a bad value never falls back to a default.
+/// The line a removed launch flag refuses with, naming both replacements and their values; null for any other argument.
+pub fn removedFlagRefusal(arg: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, arg, "--prefill-chunk") and !std.mem.startsWith(u8, arg, "--prefill-chunk=")) return null;
+    return "--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (" ++ settings_resolve.static_chunk_rungs_text ++ ")";
+}
 /// Records which launch flags were given, so the settings API shows their keys locked: a flag outranks the file.
 fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bool, vision: ?bool, models_dir: ?[]const u8, no_update_check: bool, skip_mem_preflight: bool = false, no_continue_after_thought: bool = false, port: ?u16 = null }) void {
     const locks = &model_settings_mod.launch_locks;
@@ -1563,8 +1567,7 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
     if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (model_settings_mod.expert_cache_bias_flag) |b| locks.modelMut("expert_cache_bias").pin("{d}", .{b});
-    // `--prefill-chunk` means `--prefill-chunk-max` on a static-bill load (D4) and outranks the key as that flag would.
-    if (settings_resolve.launch.prefill_chunk_max) |n| locks.modelMut("prefill_chunk_max").pin("{d}", .{n}) else if (settings_resolve.prefill_chunk.source == .flag) locks.modelMut("prefill_chunk_max").pin("{d}", .{settings_resolve.prefill_chunk.value});
+    if (settings_resolve.launch.prefill_chunk_max) |n| locks.modelMut("prefill_chunk_max").pin("{d}", .{n});
     if (settings_resolve.launch.prefill_chunk_min) |n| locks.modelMut("prefill_chunk_min").pin("{d}", .{n});
     if (serve_default_max_tokens > 0) locks.modelMut("max_tokens").pin("{d}", .{serve_default_max_tokens});
     if (given.vision) |v| locks.modelMut("vision").pin("{s}", .{if (v) "on" else "off"});
@@ -1644,18 +1647,27 @@ test "both boot modes build their server defaults from the same launch flags" {
     try std.testing.expectEqual(@as(?u32, null), none.default_top_k);
 }
 
-test "launch flags: --prefill-chunk pins prefill_chunk_max, which it means on a static-bill load, and no flag leaves it free" {
+test "launch flags: --prefill-chunk is gone and refuses by name, naming both replacements and their values" {
+    try std.testing.expectEqualStrings("--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (512, 1024, 2048, 4096 or 8192 rows)", removedFlagRefusal("--prefill-chunk").?);
+    try std.testing.expectEqualStrings("--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (512, 1024, 2048, 4096 or 8192 rows)", removedFlagRefusal("--prefill-chunk=4096").?);
+    try std.testing.expect(removedFlagRefusal("--prefill-chunk-max") == null);
+    try std.testing.expect(removedFlagRefusal("--prefill-chunk-min") == null);
+}
+
+test "launch flags: --prefill-chunk-max and --prefill-chunk-min pin their keys, and no flag leaves them free" {
     const saved = model_settings_mod.launch_locks;
     defer model_settings_mod.launch_locks = saved;
-    const chunk_was = settings_resolve.prefill_chunk;
-    defer settings_resolve.prefill_chunk = chunk_was;
+    const launch_was = settings_resolve.launch;
+    defer settings_resolve.launch = launch_was;
     model_settings_mod.launch_locks = .{};
-    settings_resolve.prefill_chunk = .{ .value = 2048, .source = .default };
+    settings_resolve.launch = .{};
     pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expect(!model_settings_mod.launch_locks.model("prefill_chunk_max").?.set);
-    settings_resolve.prefill_chunk = .{ .value = 2048, .source = .flag };
+    try std.testing.expect(!model_settings_mod.launch_locks.model("prefill_chunk_min").?.set);
+    settings_resolve.launch = .{ .prefill_chunk_max = 4096, .prefill_chunk_min = 512 };
     pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
-    try std.testing.expectEqualStrings("2048", model_settings_mod.launch_locks.model("prefill_chunk_max").?.text());
+    try std.testing.expectEqualStrings("4096", model_settings_mod.launch_locks.model("prefill_chunk_max").?.text());
+    try std.testing.expectEqualStrings("512", model_settings_mod.launch_locks.model("prefill_chunk_min").?.text());
 }
 
 test "launch flags: --port pins server.port as typed, and no flag leaves it free" {

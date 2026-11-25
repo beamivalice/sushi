@@ -422,7 +422,7 @@ Prefill width:
   growth and decode scores, and (SSD-first) the restore points in flight to the tier, so `--ssd-budget-gb 96` (13020
   MiB to serve) advertises 974848 (1M raw, less the auto margin) where the whole-scores bill advertised ~740k. With the
   borrow, budget 117 still advertises it on wired 124000 ([borrow](dsv41-memory.md#borrow)).
-- An explicit `--prefill-chunk` outranks both.
+- A named `--prefill-chunk-max` / `--prefill-chunk-min` outranks both.
 - A wider chunk does not pay on an STQ pack: the GPU time of a prompt row is flat in the width (a7242135, `sushi bench`
   4k-32k, one boot each, `--drop-expert 128 --ssd-budget-gb 108` resident: 623 / 628 / 641 ms per 1k rows at 2048 / 4096 / 8192,
   code windows within 3%), since the routed trellis GEMM is bound per row, not by its weight decode (wider windows lose, [engine-exl3-experts](engine-exl3-experts.md)). Streamed at

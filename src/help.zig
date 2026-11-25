@@ -208,15 +208,19 @@ const shared =
     \\                          model's model-settings.json `kv_quant`.
     \\                          Per-request override via the `kv_quant`
     \\                          body field.
-    \\  --prefill-chunk <n> Maximum tokens forwarded per prefill chunk
-    \\                        (default: 8192). Auto-capped further per model
-    \\                        so one layer's attention scores stay within
-    \\                        budget; this flag is the ceiling, not a floor.
-    \\                        When a request does not fit at <n>, it runs
-    \\                        at the widest narrower width that fits (down
-    \\                        to 512) instead of being refused. Deprecated on
-    \\                        a Hy4-Flash load, where it means
-    \\                        --prefill-chunk-max <n>.
+    \\  --prefill-chunk-max <n>
+    \\                      The widest prefill chunk any forward of this model runs:
+    \\                        512, 1024, 2048, 4096 or 8192 rows (default: the
+    \\                        width the model's own prefill starts at; Hy4-Flash
+    \\                        fixes 4096 at load). Any other value is refused. It
+    \\                        outranks the model's prefill_chunk_max setting.
+    \\  --prefill-chunk-min <n>
+    \\                      The narrowest width a prompt may run at, one of the same
+    \\                        widths (default 512). A prompt that does not fit at a
+    \\                        wider rung steps down to this floor instead of being
+    \\                        refused. Equal to the max, it pins every prompt to it
+    \\                        and turns the per-chunk adaptive width off. Outranks
+    \\                        the model's prefill_chunk_min setting.
     \\  --max-concurrent <n>  Sizes the submit queue (n + 32). Requests batch at
     \\                        any value, at least 1 (default: 1). Above the
     \\                        default prefix-cache entry count it raises that

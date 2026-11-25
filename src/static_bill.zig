@@ -132,12 +132,12 @@ pub fn seal(config: *ModelConfig, b: Before, arena: bills.ArenaAt) !void {
         var rung: ?u32 = null;
         var chunks_buf: [256]u8 = undefined;
         var min: u32 = 0;
-        switch (bills.staticChunkBounds(&chunks_buf, config)) {
+        switch (bills.prefillChunkBounds(&chunks_buf, config)) {
             .bounds => |bounds| {
                 min = bounds.min;
                 rung = try bills.chunkHoldingContext(config, bounds, config.static_prefill_chunk, @max(ctx.tokens, 1), bill.sum() - bill.arena, l.budget(), arena);
             },
-            .none, .refused => {},
+            .refused => {},
         }
         var line: [640]u8 = undefined;
         log.err("{s}\n", .{contextRefusalLine(&line, .{ .context = ctx, .needed = terms.at(@max(ctx.tokens, 1)), .bill = bill.sum(), .budget = l.budget(), .room = room, .fits = fits, .chunk = config.static_prefill_chunk, .min = min, .rung = rung })});

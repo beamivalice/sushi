@@ -532,7 +532,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. A failed write is released too: not a
   restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
 - **Restore points sit on an 8192-token grid and at each prompt's end, to 1M tokens, on every arch** (Qwen: the
-  checkpoint stride is `prefill_plan.effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
+  checkpoint stride is `prefill_plan.effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless a named `--prefill-chunk-max` sets it, which
   coarsens the grid; GLM: `glm_capture_stride`, [glm5-prefix-cache](glm5-prefix-cache.md); DeepSeek and Hy4-Flash:
   `row_span`, [hy4-flash-arch](hy4-flash-arch.md#the-state-and-the-prefix-cache)). The SSD
   tier keeps 160 per entry (`SSM_DISK_MAX_PER_ENTRY`), so no count thins a conversation below 1M tokens.

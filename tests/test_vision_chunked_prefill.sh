@@ -6,8 +6,8 @@
 # hit a 400 no flag can fix).
 #
 # Two arms, same binary: SUSHI_VISION_CHUNKED=0 (old whole-prompt forward)
-# vs default-on, both at --prefill-chunk 32 so chunk boundaries land
-# INSIDE the image's placeholder span (the image splices at prompt start; the
+# vs default-on, both pinned at 512-row chunks with an 896 px image (~784 image tokens) so a chunk boundary
+# lands INSIDE the image's placeholder span (the image splices at prompt start; the
 # prompt is padded past nextChunkEnd's TAIL_MERGE_MAX so chunking actually
 # engages). Asserts: [1] the on arm logs "[vision] chunked prefill" and the
 # off arm doesn't (silent-no-op class); [2] BOTH arms name all four quadrant
@@ -36,7 +36,7 @@ python3 - "$WORK" <<'PYEOF'
 import base64, json, struct, sys, zlib
 
 work = sys.argv[1]
-W = H = 224
+W = H = 896
 rows = b""
 for y in range(H):
     row = b"\x00"
@@ -73,7 +73,7 @@ PYEOF
 
 run_arm() {
     local arm="$1" env_val="$2"
-    SUSHI_VISION_CHUNKED="$env_val" sushi_boot "vision-$arm" "$MODEL" --prefill-chunk 32 --prefix-cache-entries 0 --log-level debug || exit $?
+    SUSHI_VISION_CHUNKED="$env_val" sushi_boot "vision-$arm" "$MODEL" --prefill-chunk-max 512 --prefill-chunk-min 512 --prefix-cache-entries 0 --log-level debug || exit $?
     sushi_require vision
     curl -sf -m 300 "$SUSHI_URL/v1/chat/completions" \
         -H 'Content-Type: application/json' \

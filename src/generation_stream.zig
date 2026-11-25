@@ -110,7 +110,7 @@ const TRANSIENT_CAP_MSG = "This request ran out of GPU memory while it ran and w
 pub const PREFILL_NOFIT_MSG = "This request does not fit in GPU memory, even with the prefix cache emptied; nothing ran.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Lower max_tokens or shorten the prompt.";
 
 /// The message `error.PrefillChunkDoesNotFit` sends when the arch left no text of its own.
-pub const PREFILL_CHUNK_NOFIT_MSG = "This prompt ran out of GPU memory partway through reading it.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Shorten the prompt.\n- Restart sushi with a smaller --prefill-chunk (a launch flag; Settings has none): a narrower chunk needs less memory.";
+pub const PREFILL_CHUNK_NOFIT_MSG = "This prompt ran out of GPU memory partway through reading it.\nTo serve it:\n- Quit other apps or unload another model on the Models page, then retry.\n- Shorten the prompt.\n- Restart sushi with a smaller --prefill-chunk-max, or lower the model's prefill chunk max in Settings: a narrower chunk needs less memory.";
 
 /// The message `error.EmptyPrompt` sends: generation continues from the prompt's last token.
 pub const EMPTY_PROMPT_MSG = "The prompt tokenizes to zero tokens; send non-empty text to continue.";
@@ -2579,7 +2579,7 @@ test "a request refused for memory with no text of its own gets the actions that
 }
 
 test "a prefill chunk refused mid-request for memory answers 503 with the arch's whole text, not the admission refusal" {
-    const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk to 1024: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to 4096 tokens or fewer: the chunks up to there fit.";
+    const text = "This prompt ran out of GPU memory partway through its prefill.\nIts 2048-token chunk, tokens 4096 to 6144, needs 5.00 GB, and the free memory with every expert-cache pool the prefill can borrow holds 4.50 GB: about 0.5 GB short. The chunks before it ran.\nTo serve it:\n- Lower --prefill-chunk-max to 1024, or the model's prefill chunk max in Settings: a narrower chunk needs less memory at this length.\n- Retry when other requests finish or other apps quit: the memory they hold comes back.\n- Shorten the prompt to 4096 tokens or fewer: the chunks up to there fit.";
     forward_refusal_mod.record(text);
     server_state.slot_forward_refusal = forward_refusal_mod.take();
     const a = std.testing.allocator;

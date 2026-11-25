@@ -340,6 +340,12 @@ pub fn warmLoadWith(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig
     if (plan) |p| p.store() else cooler_pipelines.rewriteLate();
 }
 
+/// The SSD tier's hold grid: the checkpoint stride's base, so a point the checkpoint grid made is never off the hold grid
+/// (a named `--prefill-chunk-max 2048` holds 2048-grid points; a bound-free load keeps the 8192 it always had).
+pub fn ssdHoldStride(config: *const model_mod.ModelConfig, stride: u32) u32 {
+    return @intCast(@import("prefill_plan.zig").effectiveSsmCheckpointStride(stride, @import("bills.zig").checkpointStrideBase(config)));
+}
+
 /// The arena a load on the ledger holds at a candidate chunk, from the plans it recorded (`arch/cooler.zig` `planArena`).
 /// A load that warms, of an arch on the ledger (`static_bill.onLedger`): its ledger opens with its budget, read once, its
 /// plans are recorded, its prefill chunk is fixed on the arena they measure (D98), and that arena is made, so its warm
@@ -426,12 +432,10 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .drafter = settings_resolve.launch.drafter,
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
-        .prefill_chunk_max = settings_resolve.launch.prefill_chunk_max != null,
-        .prefill_chunk_min = settings_resolve.launch.prefill_chunk_min != null,
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
-    switch (bills.staticChunkBounds(buf, config)) {
+    switch (bills.prefillChunkBounds(buf, config)) {
         .refused => |line| return .{ .err = error.LaunchFlagUnsupported, .line = line },
-        .bounds, .none => {},
+        .bounds => {},
     }
     if (contextWindowRefusal(buf, config, ctx_flag)) |line| return .{ .err = error.ContextSizeAboveWindow, .line = line };
     return null;
@@ -2032,7 +2036,7 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
             if (prefix_arch.holdsOffGridPoints(config))
-                entry.prefix_cache.?.disk.?.hold_stride = @intCast(@import("prefill_plan.zig").effectiveSsmCheckpointStride(p.ssm_checkpoint_stride, settings_resolve.prefill_chunk.value));
+                entry.prefix_cache.?.disk.?.hold_stride = ssdHoldStride(config, p.ssm_checkpoint_stride);
             // Startup sweep of strays + root-wide LRU across sibling fingerprints.
             entry.prefix_cache.?.disk.?.sweepSiblings();
         }
@@ -2814,6 +2818,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try warmLoadWith(sch.io, sch.allocator, params.config, xfm_ptr, verify_cap, aux_head, kv_quant_config, if (pipelines) |*p| p else null);
     }
     settleLoadLatch(had_error_at_start);
+    try bills.refuseLoadChunkBelowMin(params.config);
     try sealLedger(params.config, xfm_ptr, engine_before);
 
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes

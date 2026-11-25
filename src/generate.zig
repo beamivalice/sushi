@@ -1,6 +1,5 @@
 const std = @import("std");
 const test_note = @import("test_note.zig");
-const settings_resolve = @import("settings_resolve.zig");
 const mlx = @import("mlx.zig");
 const gpu_mem = @import("gpu_mem.zig");
 const model_handle = @import("model_handle.zig");
@@ -1358,8 +1357,6 @@ pub const Generator = struct {
         // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
         // Vision requests skip chunking since image token positions must be visible
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
-        // PREFILL_CHUNK comes from the module-level `settings_resolve.prefill_chunk`
-        // (set by --prefill-chunk in main.zig).
         //
         // Safety cap: on unfused head dims (>128)
         // the composed SDPA materializes [heads, chunk, total_kv] scores per
@@ -1412,12 +1409,18 @@ pub const Generator = struct {
         // above must not densify checkpoint spacing (16× more captures at
         // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
         // on stride boundaries, so a capped chunk stays compatible.
+        // The stride covers the base a load ran with: the named max, else 8192 (a bound-free load keeps its old grid),
+        // for every load. Only a per-request loop that cannot widen (its option off) needs no more than its chunk.
+        const cp_stride_base: usize = if (@import("bills.zig").perRequestPrefillChunkEnabled(&xfm.config) and !options.adaptive_chunk_width)
+            PREFILL_CHUNK
+        else
+            @max(PREFILL_CHUNK, @import("bills.zig").checkpointStrideBase(&xfm.config));
         const ssm_cp_stride: usize = if (!want_ssm_cp)
             0
         else if (arch_request != null)
             prefix_arch.requestCheckpointStride()
         else
-            prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, settings_resolve.prefill_chunk.value));
+            prefill_plan.effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), cp_stride_base);
         // Where a checkpoint is captured: GLM chunks on its chunk grid but keeps points only on the wider
         // restore-point grid.
         const cp_grid: usize = if (arch_request != null and want_ssm_cp) prefix_arch.requestCaptureStride() else ssm_cp_stride;
@@ -1531,6 +1534,7 @@ pub const Generator = struct {
             // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
             // (installed process-wide).
             const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
+            const bounds = @import("bills.zig").chunkBoundsOf(&xfm.config);
             const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(@min(prefill_plan.effectivePrefillChunk(
                 xfm.config.prefillScoreHeadDim(),
                 xfm.config.num_attention_heads,
@@ -1539,7 +1543,9 @@ pub const Generator = struct {
                 xfm.config.isMoe(),
                 xfm.config.longCtxGated(),
                 0,
-            ), @as(usize, xfm.config.prefillStartWidth())));
+                bounds.max,
+                bounds.max_given,
+            ), @as(usize, bounds.max)));
             adapt_state.width_min = @intCast(default_chunk);
             adapt_state.width_max = @intCast(default_chunk);
             adapt_state.loop_end = ssm_cp_offset + loop_end;

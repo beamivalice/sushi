@@ -83,7 +83,7 @@ test "cooler contract: a Cooler prefill chunk, the widest on the load's first re
             // The widest is the load's first request; a narrower width, then the widest again, run after another ended.
             for ([_]usize{ top, 1024, top }, 0..) |pin, at| {
                 const prompt = long[0 .. pin + 1];
-                const width = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, prompt.len, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pin);
+                const width = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, prompt.len, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), pin, @import("bills.zig").checkpointStrideBase(cfg), @import("bills.zig").chunkBoundsOf(cfg).max_given);
                 // The request's own hold on the cache's growth, which a chunk at the prompt's end regrows from full.
                 const hold: @import("kv_cache.zig").Hold = .{ .reserve = prefill_plan.reservedPrefillTokens(&ld.config, prompt.len, 1, width, 0), .end = prompt.len + 1 };
                 const bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
@@ -309,7 +309,7 @@ fn requestWithinBillOn(comptime Q: type, dir: []const u8, spec: bool) !void {
     const c = &ld.config;
     const kv = bills.configuredKvQuantFor(c);
     const kv_bits: u64 = if (kv.scheme == .off) 16 else kv.bits;
-    const chunk = @import("prefill_plan.zig").requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+    const chunk = @import("prefill_plan.zig").requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0, bills.checkpointStrideBase(c), bills.chunkBoundsOf(c).max_given);
     // The pool parks free buffers up to the cap of the load's sizing, which prices the head where the load runs it: a request's
     // held bytes are under the bill of the request as the load sizes it.
     const bill = bills.prefillNeededAtChunk(c, len, n, kv_bits, chunk, .{ .mtp_on = spec or bills.mtpHeadDefaultOn(c) });
@@ -575,7 +575,7 @@ test "cooler contract: a cold prompt admitted at its 512-row bill holds no more 
     const bits = bills.defaultKvBits(c);
     // Admission at the edge: the memory it reads is the 512-row bill, and the width it picks there.
     const bill = bills.prefillNeededAtChunk(c, len, n, bits, 512, .{});
-    const picked = bills.chooseRequestPrefillChunk(c, len, n, bits, bill, 0, 0, .{});
+    const picked = bills.chooseRequestPrefillChunk(c, len, n, bits, bill, 0, .{});
     const turn = arch_handle.turnFor(ld.h, c);
     defer turn.end();
     defer arch_sched.endRequest(c);
@@ -652,7 +652,7 @@ test "cooler contract: a Cooler request's bill is its larger phase, the prefill'
         const prompt = try a.alloc(u32, req.len);
         defer a.free(prompt);
         for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
-        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0, bills.checkpointStrideBase(c), bills.chunkBoundsOf(c).max_given);
         const warm: bills.WarmPrefix = .{ .mtp_on = spec };
         const phases = bills.requestPhasesFor(c, req.len, req.n, kv_bits, chunk, warm);
         const terms = bills.prefillRequestTerms(c, req.len, req.n, kv_bits, chunk, warm);
@@ -758,7 +758,7 @@ test "cooler contract: a Cooler request reserves its last row before its first c
         defer a.free(prompt);
         for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
         const warm: bills.WarmPrefix = .{ .mtp_on = spec };
-        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0, bills.checkpointStrideBase(c), bills.chunkBoundsOf(c).max_given);
         const billed = bills.cacheCapacityTokens(c, req.len, req.n, chunk, bills.getEffectiveContextLength(c), bills.speculativeRowsPastEnd(c, warm), kv_bits);
         const turn = arch_handle.turnFor(ld.h, c);
         defer turn.end();
@@ -812,7 +812,7 @@ test "cooler contract: a commit hands its checkpoint the QSA history's own rows,
         defer a.free(prompt);
         for (prompt, 0..) |*t, i| t.* = ids[i % ids.len];
         const warm: bills.WarmPrefix = .{ .mtp_on = spec };
-        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0);
+        const chunk = prefill_plan.requestPrefillChunk(c.prefillScoreHeadDim(), c.num_attention_heads, req.len, c.has_sliding_window, c.isMoe(), c.longCtxGated(), 0, bills.checkpointStrideBase(c), bills.chunkBoundsOf(c).max_given);
         var wide = c.*;
         wide.pinned_context = 1 << 20;
         const turn = arch_handle.turnFor(ld.h, c);

@@ -9,7 +9,6 @@ const hy4_config = @import("hy4_config.zig");
 const hy4_model = @import("hy4_model.zig");
 const pool_class = @import("../tensor/pool_class.zig");
 const prefill_plan = @import("../prefill_plan.zig");
-const settings_resolve = @import("../settings_resolve.zig");
 
 pub const Terms = ledger.RequestTerms;
 
@@ -132,7 +131,8 @@ pub fn hiddenBytes(c: *const hy4_config.Config) u64 {
 /// is taken.
 pub fn checkpointCap(config: *const model_mod.ModelConfig, chunk: u64) u64 {
     const base = bills.effectiveSsmCheckpointStride(bills.launch_state.ssm_checkpoint_stride, bills.launch_state.prefix_cache_capacity, bills.launch_state.prefix_cache_ram_enabled, bills.diskBytesFor(config));
-    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
+    const widen_cap: usize = if (bills.adaptivePrefillChunkEnabled(config)) bills.checkpointStrideBase(config) else 0;
+    const stride: u64 = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), widen_cap));
     if (stride == 0 or bills.launch_state.prefix_cache_ram_enabled or bills.diskBytesFor(config) == 0) return 0;
     return bills.launch_state.disk_writer_permit_bytes;
 }

@@ -20,7 +20,7 @@ for f in "$F1" "$F2"; do [ -f "$f" ] || { echo "SKIP $(basename "$0"): fixture $
 MODEL=$(sushi_pack qwen4) || exit $?
 # The restore rows land on 1024-token chunk checkpoints, so the boot pins the chunk and the checkpoint bank.
 sushi_boot vision-prefix "$MODEL" --log-level debug --prefix-cache-entries 4 --prefix-cache-mem 2GB \
-    --prefill-chunk 1024 --ssm-checkpoint-max 8 || exit $?
+    --prefill-chunk-max 1024 --prefill-chunk-min 1024 --ssm-checkpoint-max 8 || exit $?
 sushi_require vision
 U="$SUSHI_URL"
 export SUSHI_NONCE=vpc

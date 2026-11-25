@@ -359,7 +359,7 @@ fn indexRowBytes(width: u64) u64 {
     return width / 2 + width / 32;
 }
 /// The prefill chunk a request starts at on the GPU named `chip` (`chip.chipBrand()`), stepping down where its bill does
-/// not fit (an explicit `--prefill-chunk` outranks it): with CED the bulk of a chunk is the encoder's 20 layers, whose
+/// not fit (a named `--prefill-chunk-max` replaces it): with CED the bulk of a chunk is the encoder's 20 layers, whose
 /// experts a wider chunk reads once for more rows. One width for every chip until a chip measures another.
 pub fn prefillWidthFor(chip: []const u8) u32 {
     _ = chip;

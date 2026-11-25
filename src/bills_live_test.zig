@@ -68,21 +68,21 @@ test "GLM requests prefill at 2048 and step down a rung only where a chunk stops
     const cfg = try fixtures.glmAssistantFixture();
     const kv_bits: u64 = 8;
     try t.expect(cfg.perRequestPrefillChunk());
-    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&cfg, 4096, 256, kv_bits, 1 << 40, 2048, 0, .{}));
-    const unpinned = bills.explicitPrefillChunk() == 0;
+    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&cfg, 4096, 256, kv_bits, 1 << 40, 2048, .{}));
+    const unpinned = !bills.chunkBoundsOf(&cfg).max_given;
     try t.expectEqual(unpinned, bills.adaptivePrefillChunkEnabled(&cfg));
 
     // Release defaults: a 1M request is admitted with a 2048-row tail, and 2048 still fits there.
     const available: u64 = 115_904 * 1024 * 1024 - 104_350_000_000;
     const top: u64 = 1_048_576 - 256;
-    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, available, 2048, 0, .{}));
+    try t.expectEqual(@as(u32, 2048), bills.chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, available, 2048, .{}));
     var st: mtp_plan.AdaptiveWidthState = .{};
     const kv_top = bills.sessionBytesPerToken(&cfg, kv_bits) * top;
     try t.expectEqual(@as(u32, 2048), bills.adaptivePrefillWidth(&cfg, kv_bits, top, available - kv_top, 2048, 2048, &st));
 
     // A tighter box: the top only fits at 1024 rows, and that tail's bill is what admits it.
     const at_2048 = bills.prefillNeededAtChunk(&cfg, top, 256, kv_bits, 2048, .{});
-    try t.expectEqual(@as(u32, 1024), bills.chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, at_2048 - 1, 2048, 0, .{}));
+    try t.expectEqual(@as(u32, 1024), bills.chooseRequestPrefillChunk(&cfg, top, 256, kv_bits, at_2048 - 1, 2048, .{}));
     try t.expect(bills.prefillNeededAtChunk(&cfg, top, 256, kv_bits, 1024, .{}) <= at_2048 - 1);
     // Early chunks keep 2048; the chunk that no longer fits beside the KV steps down one rung.
     st = .{};
@@ -129,7 +129,7 @@ test "GLM near the top of its context keeps fewer checkpoints at the start width
     try std.testing.expect(bills.prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = cap }) > probe.available);
     try std.testing.expectEqual(@as(?u32, 1), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));
     // The checkpoints yield to the width: the prefill still starts at the start width.
-    try std.testing.expectEqual(@as(u32, @intCast(width)), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, 8, probe.available, cfg.pinned_prefill_chunk, 0, .{ .checkpoints = cap }));
+    try std.testing.expectEqual(@as(u32, @intCast(width)), bills.chooseRequestPrefillChunk(&cfg, seq, 2048, 8, probe.available, cfg.pinned_prefill_chunk, .{ .checkpoints = cap }));
     // Room for the prompt alone keeps none; less than that is refused for the prompt, not the hold.
     probe.available = bills.prefillNeededAtChunk(&cfg, seq, 2048, 8, width, .{ .checkpoints = 0 });
     try std.testing.expectEqual(@as(?u32, 0), slot_admission.fewerCheckpointsToAdmit(cap, &probe, Fits.at));

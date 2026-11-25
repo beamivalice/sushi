@@ -1,6 +1,5 @@
 //! DeepSeek-V4.1's own terms of the bill: the compressed state, the restore points and the forward cap.
 const std = @import("std");
-const settings_resolve = @import("../settings_resolve.zig");
 const model_mod = @import("../model.zig");
 const bills = @import("../bills.zig");
 const dsv41_borrow = @import("dsv41_borrow.zig");
@@ -21,7 +20,8 @@ comptime {
 pub fn checkpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: u64) u64 {
     const c = config.dsv41 orelse return 0;
     const base = bills.launchCheckpointStride(config);
-    const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
+    const widen_cap: usize = if (bills.adaptivePrefillChunkEnabled(config)) bills.checkpointStrideBase(config) else 0;
+    const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), widen_cap));
     if (stride == 0) return 0;
     const one = c.stateFixedBytes(config.drafterOn()) +| seq *| c.stateBytesPerToken();
     // SSD-first, a point the tier takes shares the request's rows and leaves RAM as the writer copies it: what is in
@@ -142,8 +142,8 @@ pub fn prefillChunkLoadLine(config: *const model_mod.ModelConfig, buf: []u8, pin
     const start = config.prefillStartWidth();
     if (launch <= start) return null;
     if (pinned == start)
-        return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (DeepSeek's default width; --prefill-chunk overrides)\n", .{pinned}) catch null;
-    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk overrides)\n", .{ pinned, start }) catch null;
+        return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (DeepSeek's default width; --prefill-chunk-max sets the most)\n", .{pinned}) catch null;
+    return std.fmt.bufPrint(buf, "Prefill chunk: {d} tokens (memory-sized down from DeepSeek's {d}; --prefill-chunk-max sets the most)\n", .{ pinned, start }) catch null;
 }
 
 /// `dsv41_borrow.headroom_fn`: the live headroom of the lessee of the pools it releases (`bills.leaseHolderHeadroomNow`).

@@ -106,7 +106,7 @@ coarse lm_head) stays resident; with no budget a pack loads resident.
   An explicit launch flag always beats `model-settings.json` ([server-lifecycle](server-lifecycle.md#settings)).
 - The load's fit check prices serving at the per-request ladder's floor rung (512), since a request picks its own
   rung against free memory; a pinned chunk is priced as given; an explicit
-  `--prefill-chunk` only lowers the floor the load proves.
+  `--prefill-chunk-min` sets the floor the load proves.
 - **A streamed Flash-Next bills no expert fill peak** (`model_load.billedFillPeakBytes`); MiMo and GLM keep theirs. The
   fill peak (`fillPeakBytes`: two union workspaces, a cache layer, a batch) rode on top of a budget that already holds
   the union workspace and the bounce. M1 Max, `--ssd-budget-gb 23`, kv8, lean: a cold 8k prompt peaked 1,224 MiB over

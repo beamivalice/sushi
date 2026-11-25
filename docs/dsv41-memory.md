@@ -379,7 +379,7 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   pools cannot cover is refused (`PrefillDoesNotFit`) with nothing released. The planned pools go, the forward waits for
   the kernel to unwire them, and only then is the live headroom re-read: freed pages count in it once unwired, so a
   reading inside the release loop stays flat and released every pool (issue 105). Still short, one more pool goes and
-  is waited for (`releaseUntil`). A refused forward names the widest `--prefill-chunk` whose rerun of the prompt fits
+  is waited for (`releaseUntil`). A refused forward names the widest `--prefill-chunk-max` whose rerun of the prompt fits
   (`chunkThatFits`): every forward that width makes, priced where it ends with the state grown to there, its tail merged
   only where the prompt has the rows (a full 511-row tail on every width offered a short prompt no width at all). A first
   chunk's refusal says it ran out at the first chunk: no chunk before it ran, and no shorter prompt is offered.

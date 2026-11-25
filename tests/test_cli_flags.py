@@ -72,6 +72,11 @@ refusals = [
     (("serve", "--max-concurrent", "4", "--prefix-cache-entries", "2"), "--prefix-cache-entries 2 is below --max-concurrent 4"),
     (("serve", "--prefill-decode-share", "0.95"), "--prefill-decode-share: expected a number from 0 to 0.9"),
     (("serve", "--prefill-decode-share", "inf"), "--prefill-decode-share: expected a number from 0 to 0.9"),
+    (("serve", "--prefill-chunk", "4096"), "--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (512, 1024, 2048, 4096 or 8192 rows)"),
+    (("serve", "--prefill-chunk=4096"), "--prefill-chunk is removed"),
+    (("serve", "--prefill-chunk-max", "3000"), "--prefill-chunk-max: expected 512, 1024, 2048, 4096 or 8192 rows"),
+    (("serve", "--prefill-chunk-min", "256"), "--prefill-chunk-min: expected 512, 1024, 2048, 4096 or 8192 rows"),
+    (("serve", "--prefill-chunk-min", "2048", "--prefill-chunk-max", "1024"), "--prefill-chunk-min 2048 is above --prefill-chunk-max 1024"),
     (("repack",), "a pack is required"),
 ]
 for args, message in refusals:

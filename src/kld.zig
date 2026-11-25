@@ -327,6 +327,14 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         return error.LaunchFlagUnsupported;
     }
     model_load.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
+    var bounds_buf: [256]u8 = undefined;
+    switch (bills.prefillChunkBounds(&bounds_buf, &self.config)) {
+        .refused => |line| {
+            log.err("{s}\n", .{line});
+            return error.LaunchFlagUnsupported;
+        },
+        .bounds => {},
+    }
     if (exactTeacherLine(opts.command, &self.config)) |line| log.info("{s}\n", .{line});
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
 

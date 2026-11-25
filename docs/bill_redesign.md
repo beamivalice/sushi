@@ -490,6 +490,7 @@ Shared owners live in `src/tensor/state/`; an arch's state module composes them.
   - On a static-bill load `--prefill-chunk N` is deprecated. It is still parsed and listed in `--help` as such,
     means `--prefill-chunk-max N` (a ceiling is what it is today), and says so once at launch; given beside
     `--prefill-chunk-max` it is an error. Its removal is a later release's call.
+  - Superseded (owner, 2026-11-26): both flags and keys apply to every model, and `--prefill-chunk` is removed.
 - **Admission**: `ledger.committed + request bill <= B`, then the allocation itself. Free RAM is read as a second
   gate that can only refuse (another program took the memory): the engine states it in the refusal and never names
   the program. A request that does not fit gets today's outcomes (wait behind running requests, release parked state,

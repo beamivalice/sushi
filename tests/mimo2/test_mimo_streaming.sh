@@ -26,7 +26,7 @@ grep -Eq 'expert-swap\] swapped [1-9][0-9]* of [0-9]+ routed ids' "$SUSHI_LOG"
 sushi_stop 0
 
 sushi_boot mimo-stream "$MODEL" --ssd-budget-gb "$BUDGET" --no-mtp --no-vision --kv-quant off \
-    --ctx-size 4096 --prefill-chunk 512 --prefix-cache-entries 0 --metrics --log-level debug || exit $?
+    --ctx-size 4096 --prefill-chunk-max 512 --prefill-chunk-min 512 --prefix-cache-entries 0 --metrics --log-level debug || exit $?
 BASE="$SUSHI_URL"
 curl --max-time 10 -fsS "$BASE/v1/models" > "$OUT/models.json"
 ID=$(jq -er '.data[] | select(.loaded == true and .streaming == true and .input_modalities == ["text"]) | .id' "$OUT/models.json")

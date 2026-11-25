@@ -419,7 +419,7 @@ pub fn beforeForward(engine: *stream.Engine, config: *const ModelConfig, c: *con
     if (r.have < need) return refuse(c, cooler_side.onEngine(config), rows, seq, rest, need, r.have);
 }
 
-/// The widest `--prefill-chunk` below the refused forward's whose forwards fit `have` to the prompt's end, `rest` tokens
+/// The widest `--prefill-chunk-max` below the refused forward's whose forwards fit `have` to the prompt's end, `rest` tokens
 /// past `seq`, beside the state those tokens grow; halving to 64, 0 when none does. An explicit width's forward takes up
 /// to a whole merged tail beside it (`prefill_plan.TAIL_MERGE_MAX`), and its cap grows with the position it ends at.
 pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, rest: u64, have: u64) u64 {
@@ -429,7 +429,7 @@ pub fn chunkThatFits(c: *const Config, engine: bool, rows: u64, seq: u64, rest: 
     return 0;
 }
 
-/// The dearest forward of the prompt's prefill rerun at `--prefill-chunk w` (`prefill_plan.nextChunkEnd`, with and
+/// The dearest forward of the prompt's prefill rerun at a `w`-row chunk (`prefill_plan.nextChunkEnd`, with and
 /// without the checkpoint stride, the tail merged as the loop merges it), each at the position it ends with the state
 /// grown past `seq` to there: a tail merges only where the prompt has the rows.
 fn widestAt(c: *const Config, engine: bool, w: u64, seq: u64, rest: u64) u64 {
@@ -464,7 +464,7 @@ fn writeRefusal(w: *std.Io.Writer, rows: u64, seq: u64, need: u64, have: u64, ch
         rows, seq -| rows, seq, Mem.need(need, u), Mem.have(have, u), Mem.short(need, have, u), if (first) "" else " The chunks before it ran.",
     });
     try w.print("To serve it:\n", .{});
-    if (chunk_fits > 0) try w.print("- Restart sushi with --prefill-chunk {d} (a launch flag; Settings has none): a narrower chunk needs less memory at this length.\n", .{chunk_fits});
+    if (chunk_fits > 0) try w.print("- Restart sushi with --prefill-chunk-max {d}, or lower the model's prefill chunk max in Settings: a narrower chunk needs less memory at this length.\n", .{chunk_fits});
     try w.print("- Quit other apps or unload another model on the Models page, then retry: the memory they hold comes back.", .{});
     if (!first) try w.print("\n- Shorten the prompt to {d} tokens or fewer: the chunks up to there fit.", .{seq - rows});
 }
@@ -1356,14 +1356,14 @@ test "dsv41 borrow: a forward refused mid-prefill names its chunk, the shortfall
         "This prompt ran out of GPU memory partway through its prefill.\n",
         "Its 2048-token chunk, tokens 4096 to 6144, needs 5.0 GB",
         "holds 4.5 GB: 0.5 GB short. The chunks before it ran.\n",
-        "To serve it:\n- Restart sushi with --prefill-chunk 1024 (a launch flag; Settings has none)",
+        "To serve it:\n- Restart sushi with --prefill-chunk-max 1024, or lower the model's prefill chunk max in Settings",
         "- Quit other apps or unload another model on the Models page, then retry",
         "- Shorten the prompt to 4096 tokens or fewer",
     }) |part| {
         errdefer std.debug.print("missing \"{s}\" in:\n{s}\n", .{ part, text });
         try testing.expect(std.mem.indexOf(u8, text, part) != null);
     }
-    try testing.expect(std.mem.indexOf(u8, refusalText(&buf, rows, seq, 5 * gib, 0, 0), "--prefill-chunk") == null);
+    try testing.expect(std.mem.indexOf(u8, refusalText(&buf, rows, seq, 5 * gib, 0, 0), "--prefill-chunk-max") == null);
 }
 
 test "dsv41 borrow: a mid-prefill refusal a byte short shows its need above what the borrow holds, in one unit" {
@@ -1388,7 +1388,7 @@ test "dsv41 borrow: a first chunk refused mid-request says it ran out at its fir
     try testing.expect(std.mem.endsWith(u8, text, "the memory they hold comes back."));
 }
 
-test "dsv41 borrow: the --prefill-chunk a mid-prefill refusal names fits the prompt's later chunks, not only the one it refused" {
+test "dsv41 borrow: the --prefill-chunk-max a mid-prefill refusal names fits the prompt's later chunks, not only the one it refused" {
     const c = try cfg_mod.parseText(cfg_mod.release_config);
     const tail: u64 = @import("../prefill_plan.zig").TAIL_MERGE_MAX - 1;
     const MiB: u64 = 1 << 20;
@@ -1399,7 +1399,7 @@ test "dsv41 borrow: the --prefill-chunk a mid-prefill refusal names fits the pro
     const have = prefillNeed(&c, true, 1024 + tail, seq) + MiB;
     const w = chunkThatFits(&c, true, rows, seq, prompt - seq, have);
     try testing.expect(w > 0);
-    // At --prefill-chunk w the same request's last forward ends at the prompt's end; the state between grows too.
+    // At a w-row chunk the same request's last forward ends at the prompt's end; the state between grows too.
     const growth = (prompt - seq) * c.stateBytesPerToken();
     // Its last forward: the prompt's chunks at `w`, the tail merged as the loop merges it.
     var pos: usize = 0;
@@ -1409,13 +1409,13 @@ test "dsv41 borrow: the --prefill-chunk a mid-prefill refusal names fits the pro
         last = end - pos;
         pos = end;
     }
-    errdefer std.debug.print("named --prefill-chunk {d}: its last forward of {d} rows at {d} needs {d} MB beside {d} MB of state growth, {d} MB free\n", .{ w, last, prompt, prefillNeed(&c, true, last, prompt) / MiB, growth / MiB, have / MiB });
+    errdefer std.debug.print("named --prefill-chunk-max {d}: its last forward of {d} rows at {d} needs {d} MB beside {d} MB of state growth, {d} MB free\n", .{ w, last, prompt, prefillNeed(&c, true, last, prompt) / MiB, growth / MiB, have / MiB });
     try testing.expect(prefillNeed(&c, true, last, prompt) + growth <= have);
 }
 
-test "dsv41 borrow: a short prompt refused mid-prefill is offered the narrower --prefill-chunk its own remaining rows fit" {
+test "dsv41 borrow: a short prompt refused mid-prefill is offered the narrower --prefill-chunk-max its own remaining rows fit" {
     const c = try cfg_mod.parseText(cfg_mod.release_config);
-    // An 1,100-token prompt's whole forward refused; at --prefill-chunk 512 its prefill runs 512 rows, then the 588
+    // An 1,100-token prompt's whole forward refused; at a 512-row chunk its prefill runs 512 rows, then the 588
     // left as one forward (its 76-row tail merged): never the 1,023 a full tail past 512 would make.
     const rows: u64 = 1100;
     const seq: u64 = 1100;

@@ -2241,16 +2241,12 @@ test "hy4 bill: a load's preflight prices its explicit context on the room the w
 
 const ChunkFlags = struct {
     launch: @import("../settings_resolve.zig").Launch,
-    legacy: @import("../settings_resolve.zig").Setting(usize),
 
     fn save() ChunkFlags {
-        const sr = @import("../settings_resolve.zig");
-        return .{ .launch = sr.launch, .legacy = sr.prefill_chunk };
+        return .{ .launch = @import("../settings_resolve.zig").launch };
     }
     fn restore(self: ChunkFlags) void {
-        const sr = @import("../settings_resolve.zig");
-        sr.launch = self.launch;
-        sr.prefill_chunk = self.legacy;
+        @import("../settings_resolve.zig").launch = self.launch;
     }
 };
 
@@ -2274,70 +2270,70 @@ test "hy4 bill: with no bound named, the max is 4096, and a given min wider than
     const saved = ChunkFlags.save();
     defer saved.restore();
     sr.launch = .{};
-    sr.prefill_chunk = .{ .value = 8192, .source = .default };
     var config = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
     var buf: [256]u8 = undefined;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096, .default_max = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096 }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
+    // A given min above the model's default max raises the max to it (no max was named).
     sr.launch.prefill_chunk_min = 8192;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 8192, .max = 8192, .default_max = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 8192, .max = 8192, .max_given = true, .min_given = true, .raised_by_min = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
+    // Above a GIVEN max it is the launch error by name.
+    sr.launch = .{ .prefill_chunk_max = 4096, .prefill_chunk_min = 8192 };
+    try testing.expectEqualStrings("--prefill-chunk-min 8192 is above --prefill-chunk-max 4096", try refusedOf(bills.prefillChunkBounds(&buf, &config)));
+    // A bound-free Hy4 load takes the 8192 base it always had, for the checkpoint stride and the bills.
+    sr.launch = .{};
+    try testing.expectEqual(@as(u32, 8192), bills.checkpointStrideBase(&config));
+    try testing.expectEqual(@as(u32, 8192), @import("../model_load.zig").ssdHoldStride(&config, 256));
+    // A named max moves both, so a 2048-grid point is on the SSD tier's hold grid.
+    sr.launch = .{ .prefill_chunk_max = 2048 };
+    try testing.expectEqual(@as(u32, 2048), bills.checkpointStrideBase(&config));
+    try testing.expectEqual(@as(u32, 2048), @import("../model_load.zig").ssdHoldStride(&config, 256));
     sr.launch = .{ .prefill_chunk_max = 8192 };
-    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 8192 }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 8192, .max_given = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
 }
 
-test "hy4 bill: a load's chunk bounds default to 512 and 4096; a flag outranks the file; --prefill-chunk is the max and refused beside --prefill-chunk-max; a bound other than 512, 1024, 2048, 4096 or 8192 rows, from any source, or a min above the max is refused by name" {
+test "hy4 bill: a load's chunk bounds default to 512 and 4096; a flag outranks the file; a bound other than 512, 1024, 2048, 4096 or 8192 rows, from any source, or a min above the max is refused by name" {
     const bills = @import("../bills.zig");
     const sr = @import("../settings_resolve.zig");
     const saved = ChunkFlags.save();
     defer saved.restore();
     sr.launch = .{};
-    sr.prefill_chunk = .{ .value = 8192, .source = .default };
     var config = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
     var buf: [256]u8 = undefined;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096, .default_max = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096 }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
     config.prefill_chunk_max_override = 2048;
     config.prefill_chunk_min_override = 1024;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 1024, .max = 2048 }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 1024, .max = 2048, .max_given = true, .min_given = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
     sr.launch.prefill_chunk_max = 4096;
     sr.launch.prefill_chunk_min = 4096;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 4096, .max = 4096 }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
-    // `--prefill-chunk` is the max, deprecated; the min the file keeps still binds.
-    sr.launch = .{};
-    sr.prefill_chunk = .{ .value = 2048, .source = .flag };
-    try testing.expectEqual(bills.ChunkBounds{ .min = 1024, .max = 2048, .deprecated = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 4096, .max = 4096, .max_given = true, .min_given = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
+    // A flag min under the file's max still binds the max the load takes.
+    sr.launch = .{ .prefill_chunk_min = 2048 };
+    try testing.expectEqual(bills.ChunkBounds{ .min = 2048, .max = 2048, .max_given = true, .min_given = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
     config.prefill_chunk_min_override = null;
     config.prefill_chunk_max_override = null;
-    sr.prefill_chunk.value = 512;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 512, .deprecated = true }, try boundsOf(bills.staticChunkBounds(&buf, &config)));
-    sr.prefill_chunk.value = 3000;
-    try testing.expectEqualStrings("--prefill-chunk 3000 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.staticChunkBounds(&buf, &config)));
-    sr.prefill_chunk.value = 256;
-    try testing.expectEqualStrings("--prefill-chunk 256 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.staticChunkBounds(&buf, &config)));
-    sr.prefill_chunk.value = 512;
-    sr.launch.prefill_chunk_max = 2048;
-    try testing.expectEqualStrings("--prefill-chunk is deprecated on this model and means --prefill-chunk-max: give --prefill-chunk-max alone", try refusedOf(bills.staticChunkBounds(&buf, &config)));
+    sr.launch = .{ .prefill_chunk_max = 3000 };
+    try testing.expectEqualStrings("--prefill-chunk-max 3000 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.prefillChunkBounds(&buf, &config)));
+    sr.launch = .{ .prefill_chunk_min = 256 };
+    try testing.expectEqualStrings("--prefill-chunk-min 256 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.prefillChunkBounds(&buf, &config)));
     sr.launch = .{};
-    sr.prefill_chunk.value = 16384;
-    try testing.expectEqualStrings("--prefill-chunk 16384 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.staticChunkBounds(&buf, &config)));
-    sr.prefill_chunk.value = 16;
-    try testing.expectEqualStrings("--prefill-chunk 16 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.staticChunkBounds(&buf, &config)));
-    sr.prefill_chunk = .{ .value = 8192, .source = .default };
     config.prefill_chunk_max_override = 9000;
-    try testing.expectEqualStrings("model-settings.json prefill_chunk_max 9000 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqualStrings("model-settings.json prefill_chunk_max 9000 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.prefillChunkBounds(&buf, &config)));
     config.prefill_chunk_max_override = 4096;
-    sr.launch.prefill_chunk_min = 1000;
-    try testing.expectEqualStrings("--prefill-chunk-min 1000 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.staticChunkBounds(&buf, &config)));
-    sr.launch = .{};
+    config.prefill_chunk_min_override = 1000;
+    try testing.expectEqualStrings("model-settings.json prefill_chunk_min 1000 is not a prefill chunk this model runs: 512, 1024, 2048, 4096 or 8192 rows", try refusedOf(bills.prefillChunkBounds(&buf, &config)));
+    config.prefill_chunk_min_override = null;
     config.prefill_chunk_max_override = 1024;
     sr.launch.prefill_chunk_min = 2048;
-    try testing.expectEqualStrings("--prefill-chunk-min 2048 is above model-settings.json prefill_chunk_max 1024", try refusedOf(bills.staticChunkBounds(&buf, &config)));
+    try testing.expectEqualStrings("--prefill-chunk-min 2048 is above model-settings.json prefill_chunk_max 1024", try refusedOf(bills.prefillChunkBounds(&buf, &config)));
 }
 
-test "hy4 bill: a load whose chunk is fixed runs and prices exactly that chunk: no per-request chooser, no adaptive width, no merged tail, whatever --prefill-chunk says" {
+test "hy4 bill: a load whose chunk is fixed runs and prices exactly that chunk: no per-request chooser, no adaptive width, no merged tail" {
     const bills = @import("../bills.zig");
     const prefill_plan = @import("../prefill_plan.zig");
     const sr = @import("../settings_resolve.zig");
     const saved = ChunkFlags.save();
     defer saved.restore();
+    sr.launch = .{};
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfigText(io, a, "", hy4_config.release_config);
@@ -2346,7 +2342,6 @@ test "hy4 bill: a load whose chunk is fixed runs and prices exactly that chunk: 
     try testing.expect(config.perRequestPrefillChunk());
     config.static_prefill_chunk = 2048;
     config.pinned_prefill_chunk = 2048;
-    sr.prefill_chunk = .{ .value = 4096, .source = .flag };
     try testing.expect(!config.perRequestPrefillChunk());
     try testing.expect(!bills.perRequestPrefillChunkEnabled(&config));
     try testing.expect(!bills.adaptivePrefillChunkEnabled(&config));

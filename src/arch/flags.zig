@@ -18,6 +18,7 @@ const registry = @import("registry.zig");
 const arch_config = @import("config.zig");
 const admission = @import("admission.zig");
 const flag_value = @import("../flag_value.zig");
+const settings_resolve = @import("../settings_resolve.zig");
 
 /// The launch flags a load can be refused for, as the process was started.
 pub const LaunchFlagUse = struct {
@@ -31,9 +32,6 @@ pub const LaunchFlagUse = struct {
     /// `--mtp-min-depth` / `--mtp-max-depth` as given; 0 = not given.
     mtp_min_depth: u32 = 0,
     mtp_max_depth: u32 = 0,
-    /// `--prefill-chunk-max` / `--prefill-chunk-min` given.
-    prefill_chunk_max: bool = false,
-    prefill_chunk_min: bool = false,
 };
 
 /// `--help` text for one arch-only flag, written as the lines it prints, inserted before the line of shared flag `before`.
@@ -77,7 +75,26 @@ fn flagsOf(comptime tag: registry.Tag) type {
 /// `--drop-expert`, which any arch whose streamed experts carry a usage list takes (`ExpertStreamTraits.drop_expert`).
 const shared_options = [_]Option{
     .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
+    .{ .name = "--prefill-chunk-max", .takes_value = true, .apply = setChunkMax, .expected = chunk_expected },
+    .{ .name = "--prefill-chunk-min", .takes_value = true, .apply = setChunkMin, .expected = chunk_expected },
 };
+
+const chunk_expected = "expected " ++ settings_resolve.static_chunk_rungs_text;
+
+fn chunkRows(value: []const u8) ?u32 {
+    const n = std.fmt.parseInt(u32, value, 10) catch return null;
+    return if (settings_resolve.isStaticChunkRung(n)) n else null;
+}
+
+fn setChunkMax(value: []const u8) bool {
+    settings_resolve.launch.prefill_chunk_max = chunkRows(value) orelse return false;
+    return true;
+}
+
+fn setChunkMin(value: []const u8) bool {
+    settings_resolve.launch.prefill_chunk_min = chunkRows(value) orelse return false;
+    return true;
+}
 
 fn setDropExpert(value: []const u8) bool {
     model.drop_expert = @import("../expert_usage.zig").parseCount(value) orelse return false;
@@ -135,10 +152,6 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
     const traits = admission.expertStream(config);
     if (use.drop_expert and !traits.drop_expert) return "--drop-expert has no effect on this model: only a quantized pack whose experts stream drops them; drop the flag";
     if (use.ssd_prefetch and !traits.prefetch) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
-    if (arch_config.staticChunkMax(config) == 0) {
-        if (use.prefill_chunk_max) return staticChunkRefusal("--prefill-chunk-max");
-        if (use.prefill_chunk_min) return staticChunkRefusal("--prefill-chunk-min");
-    }
     const tag = arch_config.tagOf(config) orelse return null;
     switch (tag) {
         inline else => |t| {
@@ -146,11 +159,6 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
             return coolerRefusal(t, config, use);
         },
     }
-}
-
-/// A chunk bound is a load's on the static bill only (D4); elsewhere the chunk is chosen as before.
-fn staticChunkRefusal(comptime flag: []const u8) []const u8 {
-    return flag ++ " has no effect on this model: only a load on the static bill (" ++ arch_config.static_bill_types ++ ") fixes its prefill chunk; drop the flag";
 }
 
 /// What a Cooler load serves, whatever its arch: no DFlash2, which runs on MLX only. A flag that asks otherwise is
@@ -243,7 +251,6 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .context_cap = config.contextCap(),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
         .cooler_setting = coolerSettingName(config),
-        .static_chunk_max = arch_config.staticChunkMax(config),
     };
 }
 
@@ -585,13 +592,7 @@ test "--qwen-mlx-engine takes no value and keeps Flash-Next loads on MLX; a mode
     }
 }
 
-test "flags: the prefill chunk bounds parse as 512, 1024, 2048, 4096 or 8192 rows and refuse any other; a load off the static bill refuses each by name, a load on it takes them" {
-    const static_type: []const u8 = comptime blk: {
-        for (std.meta.tags(registry.Tag)) |t| if (registry.Mod(t).config_facts.static_chunk_max != 0) break :blk registry.Mod(t).model_types[0];
-        break :blk "";
-    };
-    if (static_type.len == 0) return error.SkipZigTest;
-    const settings_resolve = @import("../settings_resolve.zig");
+test "flags: --prefill-chunk-max and --prefill-chunk-min parse 512, 1024, 2048, 4096 or 8192 rows on every model and refuse any other" {
     const saved = settings_resolve.launch;
     defer settings_resolve.launch = saved;
     settings_resolve.launch = .{};
@@ -609,19 +610,13 @@ test "flags: the prefill chunk bounds parse as 512, 1024, 2048, 4096 or 8192 row
     };
     i = 0;
     try testing.expect(parseOption(&.{"--prefill-chunk-min"}, &i) == null);
-    const both = LaunchFlagUse{ .prefill_chunk_max = true, .prefill_chunk_min = true };
-    try testing.expect(archFlagRefusal(&model.ModelConfig{ .model_type = static_type }, both) == null);
-    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41" }) |arch| {
+    // Every served model takes them, its settings page offers them, and no arch refuses them.
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41", "hy_v4_flash" }) |arch| {
         if (!built(arch)) continue;
         const cfg = model.ModelConfig{ .model_type = arch };
         try testing.expect(archFlagRefusal(&cfg, .{}) == null);
-        try testing.expectEqualStrings("--prefill-chunk-max has no effect on this model: only a load on the static bill (" ++ arch_config.static_bill_types ++ ") fixes its prefill chunk; drop the flag", archFlagRefusal(&cfg, .{ .prefill_chunk_max = true }) orelse return error.TestExpectedRefusal);
-        try testing.expectEqualStrings("--prefill-chunk-min has no effect on this model: only a load on the static bill (" ++ arch_config.static_bill_types ++ ") fixes its prefill chunk; drop the flag", archFlagRefusal(&cfg, .{ .prefill_chunk_min = true }) orelse return error.TestExpectedRefusal);
-        // The model's own keys say the same: they reach the settings page and the load only on the static bill.
-        try testing.expect(!model_settings.applies("prefill_chunk_max", settingsFit(&cfg)));
-        try testing.expect(!model_settings.applies("prefill_chunk_min", settingsFit(&cfg)));
+        try testing.expect(model_settings.applies("prefill_chunk_max", settingsFit(&cfg)));
+        try testing.expect(model_settings.applies("prefill_chunk_min", settingsFit(&cfg)));
+        try testing.expectEqual(@as([]const []const u8, &model_settings.chunk_choices), model_settings.findKey(&model_settings.model_keys, "prefill_chunk_max").?.choices);
     }
-    const fit = settingsFit(&model.ModelConfig{ .model_type = static_type });
-    try testing.expect(model_settings.applies("prefill_chunk_max", fit) and model_settings.applies("prefill_chunk_min", fit));
-    try testing.expectEqual(@as(u32, 8192), model_settings.limit("prefill_chunk_max", fit).max);
 }

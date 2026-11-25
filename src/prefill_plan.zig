@@ -57,11 +57,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     // any context past ~256k — measures nothing. What still scales with the
     // chunk is the MoE gather and the ringed-SWA staging, and those are what
     // `server.resolvePrefillChunk` prices against this machine; the 4096 cap
-    // is the measured MoE lesson carried over as a ceiling only.
-    // 2048 is the default (a 64k prompt prefills within noise of 4096); an
-    // explicit `--prefill-chunk` may raise it to that ceiling.
+    // is the measured MoE lesson carried over as a ceiling only
+    // (`effectivePrefillChunk` holds the 2048 width a load takes with no bound named).
     if (head_dim == 192 and trunk.prefillHeadDimFused(head_dim)) {
-        return @min(base_chunk, @as(usize, if (settings_resolve.prefill_chunk.source == .flag) 4096 else 2048));
+        return @min(base_chunk, @as(usize, 4096));
     }
     // Non-sliding hd-256 archs under FUSED causal (the default since the
     // budgeted-dispatch flip): no score tensor exists, so the scores-budget
@@ -98,30 +97,30 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
     return @intCast(@min(floored, @as(u64, causal_cap)));
 }
 
-/// The prefill chunk `initWithOptions` will actually use for a request:
-/// --prefill-chunk / default, capped by boundedPrefillChunk. Exported so server.zig's admission guard
-/// (checkAttentionMemory) models the SAME chunk the prefill will run with —
+/// The prefill chunk `initWithOptions` will actually use for a request: the model's max, capped by boundedPrefillChunk.
+/// Exported so server.zig's admission guard (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
-pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
-    // `pinned_chunk` is the machine-sized cap frozen at load
-    // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
-    // the widest chunk whose one-off transient reserve still leaves this box a
-    // real KV budget. It NARROWS, never raises, and an explicit
-    // `--prefill-chunk` outranks it — the operator asked for a width.
-    const base: usize = if (settings_resolve.prefill_chunk.source == .flag or pinned_chunk == 0)
-        settings_resolve.prefill_chunk.value
-    else
-        @min(settings_resolve.prefill_chunk.value, pinned_chunk);
-    return boundedPrefillChunk(base, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize, base: usize, max_given: bool) usize {
+    // `pinned_chunk` is the width the request or the load picked
+    // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`): the widest chunk whose one-off transient
+    // reserve still leaves this box a real KV budget. It NARROWS, never raises, and never past the model's max.
+    var chunk: usize = if (pinned_chunk == 0) base else @min(base, pinned_chunk);
+    // qk 192 fused keeps the measured 2048 MoE width unless a bound named a wider max.
+    if (head_dim == 192 and !max_given and trunk.prefillHeadDimFused(head_dim)) chunk = @min(chunk, @as(usize, 2048));
+    return boundedPrefillChunk(chunk, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated);
 }
 
 /// The width a request forwards at, and the width its admission bills: `effectivePrefillChunk`,
-/// never wider than the width handed in (0 = none). An explicit width outranks only the load-time pin.
-/// The width a prefill of a prompt whose KV ends at `total_ctx` runs its chunks at: the one the forward runs and the
-/// bill prices. A static-bill load runs the chunk it fixed (D4) whatever the prompt: its arena is planned for it.
+/// never wider than the width handed in (0 = none). A static-bill load runs the chunk it fixed (D4) whatever the prompt:
+/// its arena is planned for it.
 pub fn prefillWidth(config: *const model_mod.ModelConfig, total_ctx: usize, pinned_prefill_chunk: usize) usize {
     if (config.static_prefill_chunk != 0) return config.static_prefill_chunk;
-    return requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, total_ctx, config.has_sliding_window, config.isMoe(), config.longCtxGated(), pinned_prefill_chunk);
+    const b = switch (settings_resolve.chunkBounds(config)) {
+        .bounds => |b| b,
+        .refused => @panic("a prefill chunk bound was refused before the load checked it"),
+    };
+    const base: usize = if (b.max_given) b.max else settings_resolve.chunk_rung_top;
+    return requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, total_ctx, config.has_sliding_window, config.isMoe(), config.longCtxGated(), pinned_prefill_chunk, base, b.max_given);
 }
 
 /// The widest chunk any prefill of the load runs: its fixed chunk, else the width no context has narrowed yet.
@@ -129,8 +128,8 @@ pub fn widestPrefillWidth(config: *const model_mod.ModelConfig) usize {
     return prefillWidth(config, 0, config.pinned_prefill_chunk);
 }
 
-pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_prefill_chunk: usize) usize {
-    const width = effectivePrefillChunk(head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated, pinned_prefill_chunk);
+pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_prefill_chunk: usize, base: usize, max_given: bool) usize {
+    const width = effectivePrefillChunk(head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated, pinned_prefill_chunk, base, max_given);
     return if (pinned_prefill_chunk == 0) width else @min(width, pinned_prefill_chunk);
 }
 
@@ -301,7 +300,7 @@ pub fn adaptiveForwardRows(pos: usize, loop_end: usize, width: usize) usize {
 
 test "the widest forward is the chunk loop's own: a tail it absorbs widens the forward before it" {
     const t = testing;
-    // --prefill-chunk 512: a 1023-row prefix runs as one forward, and no prompt runs a wider one.
+    // A 512-row chunk: a 1023-row prefix runs as one forward, and no prompt runs a wider one.
     try t.expectEqual(@as(usize, 1023), widestForward(1023, 512, false));
     try t.expectEqual(@as(usize, 1023), widestForward(100_000, 512, false));
     // The adaptive width absorbs at most an eighth: a 575-row prefix runs as one forward.
@@ -615,7 +614,7 @@ test "the held-state cap thins only states in memory: restore points already on 
 
 test "every ladder rung the adaptive width can take divides the checkpoint stride" {
     const t = testing;
-    const stride = effectiveSsmCheckpointStride(256, settings_resolve.prefill_chunk.value);
+    const stride = effectiveSsmCheckpointStride(256, settings_resolve.static_chunk_rungs[0]);
     try t.expect(stride > 0);
     for ([_]usize{ 8192, 4096, 2048, 1024, PREFILL_CHUNK_FLOOR }) |rung| {
         try t.expect(rung <= stride);
@@ -752,17 +751,13 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
     // formula measures nothing and the chunk keeps its default at every
     // context. Without this the formula pins the 512 floor past ~256k.
     attn_kernels.fused256_override = true;
-    const saved_source = settings_resolve.prefill_chunk.source;
-    defer settings_resolve.prefill_chunk.source = saved_source;
-    settings_resolve.prefill_chunk.source = .default;
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 8192, false, true, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 192, 32, 1_048_576, false, true, false));
-    // An explicit `--prefill-chunk` raises it as far as the MoE ceiling.
-    settings_resolve.prefill_chunk.source = .flag;
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 192, 32, 8192, false, true, false));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
+    // A load with no bound named takes the measured 2048 MoE width; a wider max raises it to the ceiling.
+    try testing.expectEqual(@as(usize, 2048), effectivePrefillChunk(192, 32, 1_048_576, false, true, false, 0, 8192, false));
+    try testing.expectEqual(@as(usize, 4096), effectivePrefillChunk(192, 32, 1_048_576, false, true, false, 0, 8192, true));
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 192, 32, 262_144, false, true, false));
     try testing.expectEqual(@as(usize, 3072), boundedPrefillChunk(3072, 192, 32, 262_144, false, true, false));
-    settings_resolve.prefill_chunk.source = .default;
     // Never raises a caller-lowered base.
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(512, 192, 32, 1_048_576, false, true, false));
     // A real hd-256 MoE keeps its own measured 4096 branch.
@@ -784,7 +779,7 @@ test "boundedPrefillChunk: qk 192 is fused; the kill switch restores its score b
 }
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
-    // --prefill-chunk 1024 with headroom for 4096: the explicit lower value wins.
+    // A 1024 max with headroom for 4096: the lower bound wins.
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true, false, false));
     // Even the floor never raises a tiny explicit base.
     try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true, false, false));
@@ -981,4 +976,14 @@ test "prefill plan: the chunk loop returns MLX's pool after each chunk and the e
     for ([_]bool{ false, true }) |last| try std.testing.expect(clearsPoolAfterChunk(false, last));
     try std.testing.expect(!clearsPoolAfterChunk(true, false));
     try std.testing.expect(clearsPoolAfterChunk(true, true));
+}
+
+test "a given min above the model's default max raises the width the forward runs, past MiMo's qk-192 default cap" {
+    const t = testing;
+    var cfg = @import("bills_fixtures_test.zig").mimoV2BillConfig();
+    cfg.pinned_prefill_chunk = 0;
+    const saved = settings_resolve.launch;
+    defer settings_resolve.launch = saved;
+    settings_resolve.launch = .{ .prefill_chunk_min = 4096 };
+    try t.expectEqual(@as(usize, 4096), widestPrefillWidth(&cfg));
 }

@@ -125,7 +125,7 @@ each). 96 GB and up keep the f32 default. Context is set explicitly because auto
 ```bash
 sushi pull qwen3.8-flash-next:4bpw
 sushi serve --model ~/.sushi/models/beamster/Qwen3.8-Flash-Next-Sushi-4bpw \
-  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk 2048 \
+  --mtp --kv-quant 8 --mtp-head-kv-quant --ctx-size 500000 --prefill-chunk-max 2048 \
   --max-tokens 64000 --prefix-cache-disk 20GB --prefix-cache-entries 1 --temp 1
 ```
 
@@ -244,13 +244,14 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
   The page at `/` has Chat, Dashboard, Models and Settings views: the SSD prefix cache's size, per-model disk use and
   clear buttons are edited in Settings; the models folder and each model's `model-settings.json` keys in Models.
 - `--preserve-thinking off` keeps only the latest turn's thinking in the prompt.
-- `--prefill-chunk 2048` caps the prompt step per forward; a request that does not fit steps down.
-- Hy4-Flash fixes its prefill chunk once, at load: the widest of 8192, 4096, 2048, 1024 and 512 rows whose arena fits
-  beside the context, within `--prefill-chunk-max` (default 4096) and `--prefill-chunk-min` (default 512). Each bound
-  is one of those five widths, any other refused by name; equal bounds force the chunk, and a load that cannot hold
-  the min refuses with the numbers. There `--prefill-chunk N` is
-  deprecated and means `--prefill-chunk-max N`. The model's settings keys are `prefill_chunk_max` and
-  `prefill_chunk_min`; every other model refuses the two flags and keys by name.
+- `--prefill-chunk-max` and `--prefill-chunk-min` bound the prompt step per forward on every model, each one of 512,
+  1024, 2048, 4096 or 8192 rows (any other refused by name; the model's settings keys `prefill_chunk_max` and
+  `prefill_chunk_min`, a list of those five in the web UI). The max defaults to the model's own start width (Qwen 4096,
+  GLM and MiMo 2048, DeepSeek 8192, Hy4-Flash 4096), the min to 512. A request starts at the max and steps down a rung,
+  never under the min, only where the next chunk no longer fits beside its KV; equal bounds pin the width. The last
+  chunk may absorb a tail of up to about half a chunk. `--prefill-chunk` is removed and refused by name.
+- Hy4-Flash fixes its prefill chunk once, at load: the widest rung within the two bounds whose arena fits beside the
+  context; a load that cannot hold the min refuses with the numbers.
 
 ## Coding agents
 

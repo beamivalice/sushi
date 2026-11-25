@@ -26,6 +26,7 @@ const update_mod = @import("update.zig");
 const pack_update = @import("pack_update.zig");
 const effort_mod = @import("effort.zig");
 const bills = @import("bills.zig");
+const settings_resolve = @import("settings_resolve.zig");
 const status_mod = @import("status.zig");
 
 const Edit = model_settings.Edit;
@@ -123,12 +124,9 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
         .max_tokens = request_policy.filledMaxTokensWith(0, bare.defaultMaxTokens()),
         .expert_cache_bias = 0,
     };
-    const widest = arch_config.staticChunkMax(&bare);
-    if (widest != 0) {
-        const max = arch_config.staticChunkDefault(&bare);
-        o.prefill_chunk_max = max;
-        o.prefill_chunk_min = bills.defaultChunkMin(max);
-    }
+    const widest = settings_resolve.defaultChunkMax(&bare);
+    o.prefill_chunk_max = widest;
+    o.prefill_chunk_min = settings_resolve.defaultChunkMin(widest);
     arch_flags.putCoolerSetting(&bare, &o, bare.coolerChoice().on);
     return o;
 }
@@ -1686,6 +1684,16 @@ test "settings api: a ready model reports the default each key resolves to; an u
     try testing.expect(d.get("ctx_size") == null);
     try testing.expect(d.get("ssd_budget_gb") == null);
     try testing.expect(models[1].object.get("defaults").? == .null);
+    // Every model's prefill chunk keys are a choice of five widths, defaulting to the model's own.
+    const keys = parsed.value.object.get("model_keys").?.array.items;
+    for (keys) |k| {
+        const key = k.object;
+        if (!std.mem.startsWith(u8, key.get("name").?.string, "prefill_chunk_")) continue;
+        try testing.expectEqualStrings("choice", key.get("type").?.string);
+        try testing.expectEqual(@as(usize, 5), key.get("choices").?.array.items.len);
+    }
+    try testing.expectEqual(@as(i64, @intCast(settings_resolve.defaultChunkMax(&dsv41))), d.get("prefill_chunk_max").?.integer);
+    try testing.expectEqual(@as(i64, 512), d.get("prefill_chunk_min").?.integer);
 }
 
 test "settings api: the resolved defaults ignore the file's values the config was stamped with" {

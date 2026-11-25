@@ -400,7 +400,7 @@ pub const ModelConfig = struct {
     /// 1024-token context and the admission guard refused prompts whose real
     /// peak was a third of the bill. The sizer, `checkAttentionMemory` and
     /// `prefill_plan.effectivePrefillChunk` all read THIS field, so the bill and the
-    /// forward can never disagree. Explicit `--prefill-chunk` still wins.
+    /// forward can never disagree. It never exceeds the model's `--prefill-chunk-max`.
     pinned_prefill_chunk: u32 = 0,
     /// The prefill chunk a load on the static bill fixed (`bills.fixStaticPrefillChunk`, D4): every prefill runs chunks
     /// of exactly these rows and one shorter tail, and the arena is planned for it. 0 = not fixed: the chunk is chosen

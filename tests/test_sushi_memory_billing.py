@@ -43,7 +43,7 @@ def main():
     models = Path(os.environ.get("SUSHI_MODELS_DIR", str(Path.home() / ".sushi/models")))
     packs = [p for p in (b.pack("qwen4"), b.pack("mimo2", required=False)) if p is not None]
     out = b.run_dir()
-    common = ["--prefill-chunk", "512", "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-drafter"]
+    common = ["--prefill-chunk-max", "512", "--prefill-chunk-min", "512", "--max-tokens", "8", "--prefix-cache-entries", "0", "--no-drafter"]
 
     def settle():
         time.sleep(2)  # Metal unwires buffers asynchronously after a process exits

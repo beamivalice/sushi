@@ -24,7 +24,7 @@ const expertStreamingLoadFits = bills.expertStreamingLoadFits;
 const expertStreamingPlannedKvBytes = bills.expertStreamingPlannedKvBytes;
 const expertStreamingPlannedSeq = bills.expertStreamingPlannedSeq;
 const expertStreamingServingBytes = bills.expertStreamingServingBytes;
-const explicitPrefillChunk = bills.explicitPrefillChunk;
+const chunkBoundsOf = bills.chunkBoundsOf;
 const fixtures = @import("../bills_fixtures_test.zig");
 const forceMtpFor = bills.forceMtpFor;
 const getEffectiveContextLength = bills.getEffectiveContextLength;
@@ -267,15 +267,11 @@ test "a streamed load bills the narrowest rung the per-request ladder can take" 
     const saved_kv = launch_state.configured_kv_quant;
     defer launch_state.configured_kv_quant = saved_kv;
     launch_state.configured_kv_quant = trunk.KVQuantConfig.affine(8);
-    const saved_source = settings_resolve.prefill_chunk.source;
-    const saved_chunk = settings_resolve.prefill_chunk.value;
-    defer {
-        settings_resolve.prefill_chunk.source = saved_source;
-        settings_resolve.prefill_chunk.value = saved_chunk;
-    }
+    const saved_launch = settings_resolve.launch;
+    defer settings_resolve.launch = saved_launch;
     const saved_per_request = bills.per_request_chunk_override;
     defer bills.per_request_chunk_override = saved_per_request;
-    settings_resolve.prefill_chunk.source = .default;
+    settings_resolve.launch = .{};
     bills.per_request_chunk_override = true;
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
     const at = struct {
@@ -285,18 +281,14 @@ test "a streamed load bills the narrowest rung the per-request ladder can take" 
     }.bill;
     try std.testing.expectEqual(at(&config, floor), expertStreamingServingBytes(&config));
     try std.testing.expect(at(&config, floor) < at(&config, 8192));
-    // An explicit width caps the ladder, so the load proves the floor, or a narrower flag.
-    settings_resolve.prefill_chunk.source = .flag;
-    settings_resolve.prefill_chunk.value = 4096;
-    try std.testing.expectEqual(at(&config, floor), expertStreamingServingBytes(&config));
-    settings_resolve.prefill_chunk.value = 256;
-    try std.testing.expectEqual(at(&config, 256), expertStreamingServingBytes(&config));
-    // With the ladder off the flag is a pin again.
-    settings_resolve.prefill_chunk.value = 4096;
+    // A given min is the floor the load proves.
+    settings_resolve.launch = .{ .prefill_chunk_max = 4096, .prefill_chunk_min = 1024 };
+    try std.testing.expectEqual(at(&config, 1024), expertStreamingServingBytes(&config));
+    // With the ladder off the pin is the width, inside the bounds.
     bills.per_request_chunk_override = false;
     try std.testing.expectEqual(at(&config, 4096), expertStreamingServingBytes(&config));
     bills.per_request_chunk_override = true;
-    settings_resolve.prefill_chunk.source = .default;
+    settings_resolve.launch = .{};
     config.pinned_prefill_chunk = 1024;
     try std.testing.expectEqual(at(&config, 1024), expertStreamingServingBytes(&config));
     config.pinned_prefill_chunk = 0;
@@ -320,9 +312,6 @@ test "Flash-Next's request bill brackets the peaks measured on the M1 Max, with 
     const saved_ctx = launch_state.server_config.max_context_size;
     defer launch_state.server_config.max_context_size = saved_ctx;
     launch_state.server_config.max_context_size = 100000;
-    const saved_width = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_width;
-    settings_resolve.prefill_chunk.value = 512;
     const cfg = fixtures.qwen4MeasuredTestConfig();
     // Live `peak_bytes - active_bytes` after one prompt per boot (512 rung, kv8, no MTP, SSD tier on, 16 new
     // tokens), with each landed checkpoint already moved to the SSD.
@@ -557,19 +546,19 @@ test "clampReserveWidth: the load-time reserve is a promise to the FIRST request
         prev = p.budget;
     }
 
-    // An explicit --prefill-chunk caps the ladder, so the clamp still reserves the floor.
-    settings_resolve.prefill_chunk.value = 4096;
-    settings_resolve.prefill_chunk.source = .flag;
-    const capped = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
+    // A given max caps the ladder, so the clamp still reserves the floor.
+    const launch_was = settings_resolve.launch;
+    defer settings_resolve.launch = launch_was;
+    settings_resolve.launch = .{ .prefill_chunk_max = 4096 };
+    const capped = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, 4096);
     try t.expectEqual(@as(u32, 4096), capped.chunk);
     try t.expectEqual(floor_rung, capped.reserve_chunk);
     try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, floor_rung), capped.reserve);
     // With the ladder off it is a pin, billed as-is.
     bills.per_request_chunk_override = false;
-    const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, explicitPrefillChunk());
+    const pinned = planHotCache(&cfg, kv_bits, weights + 43_000 * MiB, weights, ctx_tokens, 0, 10 * GiB, 4096);
     bills.per_request_chunk_override = null;
-    settings_resolve.prefill_chunk.value = 8192;
-    settings_resolve.prefill_chunk.source = .default;
+    settings_resolve.launch = .{};
     try t.expectEqual(@as(u32, 4096), pinned.reserve_chunk);
     try t.expectEqual(prefillTransientReserve(&cfg, kv_bits, 4096), pinned.reserve);
 
@@ -883,11 +872,10 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     defer bills.per_request_chunk_override = null;
     bills.adaptive_chunk_override = true;
     defer bills.adaptive_chunk_override = null;
-    const unpinned = explicitPrefillChunk() == 0;
-    try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
     try t.expectEqual(@as(usize, 64), prefill_plan.tailMergeMaxFor(512, true));
     try t.expectEqual(@as(usize, 512), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, true));
-    // An operator pin turns the scaling back off.
+    // An operator's kill switch turns the scaling back off.
     bills.adaptive_chunk_override = false;
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
     try t.expectEqual(prefill_plan.TAIL_MERGE_MAX, prefill_plan.tailMergeMaxFor(512, adaptivePrefillChunkEnabled(&cfg)));
@@ -1039,13 +1027,12 @@ test "adaptivePrefillChunkEnabled: the arch, both kill switches, and any pinned 
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
     bills.adaptive_chunk_override = null;
 
-    // An operator who pinned a width pinned every forward.
-    settings_resolve.prefill_chunk.value = 4096;
-    settings_resolve.prefill_chunk.source = .flag;
-    defer {
-        settings_resolve.prefill_chunk.value = 8192;
-        settings_resolve.prefill_chunk.source = .default;
-    }
+    // Only min == max pins every forward and turns the widening off; a bound alone leaves it on.
+    const saved_launch = settings_resolve.launch;
+    defer settings_resolve.launch = saved_launch;
+    settings_resolve.launch = .{ .prefill_chunk_max = 4096 };
+    try t.expect(adaptivePrefillChunkEnabled(&cfg));
+    settings_resolve.launch = .{ .prefill_chunk_max = 4096, .prefill_chunk_min = 4096 };
     try t.expect(!adaptivePrefillChunkEnabled(&cfg));
 }
 
@@ -1278,9 +1265,9 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
     cfg.pinned_context = 0;
     bills.per_request_chunk_override = true;
     defer bills.per_request_chunk_override = null;
-    const orig_source = settings_resolve.prefill_chunk.source;
-    defer settings_resolve.prefill_chunk.source = orig_source;
-    settings_resolve.prefill_chunk.source = .default;
+    const orig_launch = settings_resolve.launch;
+    defer settings_resolve.launch = orig_launch;
+    settings_resolve.launch = .{};
 
     // The pure chunk resolver: `pinPrefillChunk` reads live memory.
     const chunk: u32 = @intCast(prefill_plan.effectivePrefillChunk(
@@ -1291,6 +1278,8 @@ test "the SSD-first budget bills the FLOOR reserve, at the deployed pack's live 
         cfg.isMoe(),
         cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
+        chunkBoundsOf(&cfg).max,
+        chunkBoundsOf(&cfg).max_given,
     ));
     try t.expect(perRequestPrefillChunkEnabled(&cfg));
     const floor_w = clampReserveWidth(&cfg, chunk);
@@ -1347,6 +1336,8 @@ test "an auto boot advertises the session the SSD-first budget floor was billed 
         cfg.isMoe(),
         cfg.longCtxGated(),
         cfg.pinned_prefill_chunk,
+        chunkBoundsOf(&cfg).max,
+        chunkBoundsOf(&cfg).max_given,
     ));
     const per_tok: u64 = kvBytesPerTokenAtBits(cfg.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(&cfg);
     const transient: u64 = prefillTransientReserve(&cfg, kv_bits, chunk);
@@ -1618,9 +1609,8 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     defer bills.per_request_chunk_override = null;
     bills.adaptive_chunk_override = true;
     defer bills.adaptive_chunk_override = null;
-    const unpinned = explicitPrefillChunk() == 0;
-    try t.expectEqual(unpinned, slot_admission.adaptiveChunkWidthFor(&cfg));
-    if (unpinned) {
+    try t.expectEqual(true, slot_admission.adaptiveChunkWidthFor(&cfg));
+    if (true) {
         try t.expectEqual(@as(usize, 64), prefill_plan.tailMergeMaxFor(512, slot_admission.adaptiveChunkWidthFor(&cfg)));
         try t.expectEqual(@as(usize, 512), prefill_plan.nextChunkEnd(0, 812, 512, false, 0, 0, slot_admission.adaptiveChunkWidthFor(&cfg)));
     }
@@ -1886,6 +1876,46 @@ test "prefillRequestTerms: MTP head KV bills the boot scheme, not a request kv_q
     try t.expectEqual(reserved * 1088, on.mtp_head_kv_bytes);
 }
 
+test "no flag keeps the width base and the pinned width it ran with (8192), and a named max moves both" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    cfg.head_dim = 128; // fused dim: boundedPrefillChunk returns its base untouched
+    const launch_was = settings_resolve.launch;
+    defer settings_resolve.launch = launch_was;
+    settings_resolve.launch = .{};
+    try t.expectEqual(@as(u32, 8192), bills.checkpointStrideBase(&cfg));
+    // A bound-free load's sizer may pin 8192, and the forward prices it at that width (no max narrowed it).
+    try t.expectEqual(@as(u32, 8192), switch (bills.loadChunkWithin(bills.chunkBoundsOf(&cfg), 8192)) {
+        .chunk => |c| c,
+        .refused => unreachable,
+    });
+    try t.expectEqual(@as(usize, 8192), prefill_plan.effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, 40_000, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), 8192, bills.checkpointStrideBase(&cfg), false));
+    // A named max moves the base and the pin's ceiling.
+    settings_resolve.launch = .{ .prefill_chunk_max = 2048 };
+    try t.expectEqual(@as(u32, 2048), bills.checkpointStrideBase(&cfg));
+    try t.expectEqual(@as(u32, 2048), switch (bills.loadChunkWithin(bills.chunkBoundsOf(&cfg), 8192)) {
+        .chunk => |c| c,
+        .refused => unreachable,
+    });
+    settings_resolve.launch = .{};
+}
+
+test "the checkpoint stride's base is the width a no-flag load ran with (8192), and a named max" {
+    if (!archBuilt("qwen4")) return error.SkipZigTest;
+    const t = std.testing;
+    const cfg = fixtures.qwen4ExpLive364kConfig();
+    const launch_was = settings_resolve.launch;
+    defer settings_resolve.launch = launch_was;
+    settings_resolve.launch = .{};
+    try t.expectEqual(@as(u32, 8192), bills.checkpointStrideBase(&cfg));
+    try t.expectEqual(@as(usize, 8192), prefill_plan.effectiveSsmCheckpointStride(256, bills.checkpointStrideBase(&cfg)));
+    settings_resolve.launch = .{ .prefill_chunk_max = 2048 };
+    try t.expectEqual(@as(u32, 2048), bills.checkpointStrideBase(&cfg));
+    try t.expectEqual(@as(usize, 2048), prefill_plan.effectiveSsmCheckpointStride(256, bills.checkpointStrideBase(&cfg)));
+    settings_resolve.launch = .{};
+}
+
 test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     // These pins price a cache with no SSD tier behind it: every checkpoint stays in RAM.
@@ -1905,12 +1935,9 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
     const seq: u64 = 368_208;
     const matched: u64 = 364_478;
     const chunk: u64 = 512;
-    // The stride follows the uncapped base chunk (`settings_resolve.prefill_chunk`), not the adaptive width.
-    const saved_override = settings_resolve.prefill_chunk.value;
-    defer settings_resolve.prefill_chunk.value = saved_override;
-    settings_resolve.prefill_chunk.value = 8192;
-    const stride: u64 = 8192;
-    try t.expectEqual(stride, prefill_plan.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, 8192));
+    // The stride follows the base a no-flag load ran with (8192), not the adaptive width.
+    const stride: u64 = @import("../settings_resolve.zig").defaultChunkMax(&cfg);
+    try t.expectEqual(stride, prefill_plan.effectiveSsmCheckpointStride(launch_state.ssm_checkpoint_stride, stride));
 
     // Cold: `seq / stride` saturates at --ssm-checkpoint-max as before.
     try t.expectEqual(@as(u64, launch_state.ssm_checkpoint_max) * per_cp, retainedSsmCheckpointBytes(&cfg, seq, 0, chunk));
@@ -2183,7 +2210,7 @@ test "a request whose tail the chunk loop absorbs is billed at the merged forwar
         // The per-chunk width absorbs at most an eighth of the chunk.
         bills.adaptive_chunk_override = true;
         const split = bills.requestHeldBytes(&cfg, 1024, 16, 8, 512, .{});
-        // Without it (`--prefill-chunk`) the loop absorbs a tail under 512 rows: one 1023-row forward.
+        // Without it (min == max pins the width) the loop absorbs a tail under 512 rows: one 1023-row forward.
         bills.adaptive_chunk_override = false;
         const merged = bills.requestHeldBytes(&cfg, 1024, 16, 8, 512, .{});
         const rows: u64 = if (cooler) bills.coolerPrefillRowBytes(&cfg) else 0;
@@ -2611,7 +2638,7 @@ test "Flash-Next: a resident load the free-RAM preflight admits at its edge leav
 /// `requestPrefillPick` chooses at `available`, then the bill at that width.
 fn connBillAt(cfg: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, available: u64, warm: WarmPrefix) bills.AdmissionBill {
     const chosen = bills.requestPrefillPick(cfg, seq, max_tokens, kv_bits, available, false, warm);
-    const chunk: u64 = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, @intCast(seq), cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), chosen);
+    const chunk: u64 = prefill_plan.requestPrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, @intCast(seq), cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), chosen, chunkBoundsOf(cfg).max, chunkBoundsOf(cfg).max_given);
     return bills.creditedAdmissionBill(cfg, prefillNeededAtChunk(cfg, seq, max_tokens, kv_bits, chunk, warm), available, 0, 0, chunk);
 }
 
@@ -2701,7 +2728,7 @@ test "Flash-Next on Cooler: a drafted request's growth commit holds the MTP head
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const t = std.testing;
     const cfg = coolerFlashNext();
-    const chunk: u64 = @import("../settings_resolve.zig").prefill_chunk.value;
+    const chunk: u64 = @import("../settings_resolve.zig").chunk_rung_top;
     for ([_]u64{ 100, 4_000, 40_000 }) |seq| for ([_]u32{ 4_096, 32_768 }) |n| {
         const terms = prefillRequestTerms(&cfg, seq, n, 8, chunk, .{ .mtp_on = true });
         // Every row the bill prices that grows after admission: the trunk's KV past the prompt's raw rows, the
@@ -2759,7 +2786,7 @@ fn preflightAt(cfg: *const model_mod.ModelConfig, weights: u64, a: bills.SushiAv
 /// Whether a request of `prompt` + `reply` tokens is admitted at `available`, at the width admission picks.
 fn admittedAt(cfg: *const model_mod.ModelConfig, prompt: u64, reply: u32, available: u64) bool {
     const w: WarmPrefix = .{ .mtp_on = bills.mtpHeadDefaultOn(cfg) };
-    const pick = bills.chooseRequestPrefillChunk(cfg, prompt, reply, 8, available, cfg.pinned_prefill_chunk, 0, w);
+    const pick = bills.chooseRequestPrefillChunk(cfg, prompt, reply, 8, available, cfg.pinned_prefill_chunk, w);
     return prefillNeededAtChunk(cfg, prompt, reply, 8, pick, w) <= available;
 }
 

@@ -1,7 +1,6 @@
 const std = @import("std");
 const testTrunk = @import("../test_support.zig").testTrunk;
 const cost_profile = @import("qwen4_cost_profile.zig");
-const settings_resolve = @import("../settings_resolve.zig");
 const mlx = @import("../mlx.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const trunk = @import("../trunk.zig");
@@ -43,7 +42,7 @@ const MtpRoundOpen = mtp_round.MtpRoundOpen;
 
 test "a 40k Qwen prefill checkpoints every 8192 tokens at any chunk width the ladder takes" {
     for ([_]usize{ 8192, 4096, 2048, 512 }) |width| {
-        const stride = effectiveSsmCheckpointStride(256, @max(width, settings_resolve.prefill_chunk.value));
+        const stride = effectiveSsmCheckpointStride(256, @max(width, @import("../settings_resolve.zig").static_chunk_rungs[0]));
         try testing.expectEqual(@as(usize, kv_disk_cache_mod.POINT_GRID), stride);
         var buf: [128]usize = undefined;
         const ends = walkChunkEnds(&buf, 39969, &.{width}, true, stride, 0);

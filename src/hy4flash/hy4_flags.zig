@@ -1,55 +1,7 @@
-//! Hy4-Flash's launch face (the `flags` slot of `arch.zig`): the chunk bounds of its static bill, its words for
-//! `--think`, and the KV widths its latent cache stores.
+//! Hy4-Flash's launch face (the `flags` slot of `arch.zig`): its words for `--think`, and the KV widths its latent cache
+//! stores.
 const std = @import("std");
 const kv_quant = @import("../kv_quant.zig");
-const flags = @import("../arch/flags.zig");
-const settings_resolve = @import("../settings_resolve.zig");
-const widest_chunk = @import("hy4_config.zig").widest_chunk;
-
-/// The rows the load's prefill chunk is chosen within (D4); a load of another arch refuses them by name
-/// (`flags.archFlagRefusal`).
-pub const options = [_]flags.Option{
-    .{ .name = "--prefill-chunk-max", .takes_value = true, .apply = setChunkMax, .expected = chunk_expected },
-    .{ .name = "--prefill-chunk-min", .takes_value = true, .apply = setChunkMin, .expected = chunk_expected },
-};
-
-const chunk_expected = "expected " ++ settings_resolve.static_chunk_rungs_text;
-
-fn chunkRows(value: []const u8) ?u32 {
-    const n = std.fmt.parseInt(u32, value, 10) catch return null;
-    return if (settings_resolve.isStaticChunkRung(n) and n <= widest_chunk) n else null;
-}
-
-fn setChunkMax(value: []const u8) bool {
-    settings_resolve.launch.prefill_chunk_max = chunkRows(value) orelse return false;
-    return true;
-}
-
-fn setChunkMin(value: []const u8) bool {
-    settings_resolve.launch.prefill_chunk_min = chunkRows(value) orelse return false;
-    return true;
-}
-
-pub const help = [_]flags.HelpChunk{
-    .{ .before = "  --max-concurrent", .text =
-        \\  --prefill-chunk-max <n>
-        \\                      Hy4-Flash only: the widest prefill chunk its load
-        \\                        may fix: 512, 1024, 2048, 4096 or 8192 rows
-        \\                        (default 4096, or a wider --prefill-chunk-min);
-        \\                        any other is refused. The
-        \\                        load takes the widest chunk within the two
-        \\                        bounds whose arena fits beside the context, and
-        \\                        every prefill runs at it. Outranks the model's
-        \\                        prefill_chunk_max setting. Other models refuse it.
-        \\  --prefill-chunk-min <n>
-        \\                      Hy4-Flash only: the narrowest chunk its load may
-        \\                        fix, one of the same widths (default 512).
-        \\                        Equal to the max, it forces the chunk; a load that
-        \\                        cannot hold it refuses with the numbers. Outranks
-        \\                        prefill_chunk_min. Other models refuse it.
-        \\
-    },
-};
 
 pub const think_rank = 1;
 pub const think_help = "Hy4 off|high|max;\n";

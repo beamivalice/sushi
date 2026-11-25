@@ -510,7 +510,7 @@ test "hy4 ledger: a fixed context the seal's lines no longer hold refuses the lo
             try testing.expectEqual(@as(u32, 0), l.context.load(.acquire));
             try testing.expectError(error.ContextDoesNotFit, t.sealed);
             var buf: [256]u8 = undefined;
-            const b = switch (bills.staticChunkBounds(&buf, &ld.config)) {
+            const b = switch (bills.prefillChunkBounds(&buf, &ld.config)) {
                 .bounds => |b| b,
                 else => return error.TestExpectedBounds,
             };
