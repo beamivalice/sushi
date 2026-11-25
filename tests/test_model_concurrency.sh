@@ -18,6 +18,13 @@ fail=0
 check() { if [ "$1" = 1 ]; then echo "PASS: $2"; else echo "FAIL: $2 ($3)"; fail=1; fi; }
 
 props=$(curl -sf "$SUSHI_URL/props")
+# A load that decodes one row at a time holds every request to 1 whatever the cap, so it cannot test the caps.
+served=$(python3 -I -c 'import json, sys; print(json.loads(sys.argv[1])["settings"]["max_concurrent"])' "$props")
+if [ "$served" -lt 2 ]; then
+    echo "SKIP: this load serves $served request at a time ($(grep -m1 '\[concurrency\]' "$SUSHI_LOG" || echo 'no [concurrency] line')); the caps need a load that batches"
+    sushi_stop
+    exit 3
+fi
 check "$(python3 -I -c 'import json, sys; s = json.loads(sys.argv[1])["settings"]; print(int(s["max_concurrent"] == 2 and s["max_kv_tokens"] == int(sys.argv[2])))' "$props" "$CAP")" \
     "/props reports the model's max_concurrent 2 and max_kv_tokens $CAP" "$(echo "$props" | head -c 300)"
 
