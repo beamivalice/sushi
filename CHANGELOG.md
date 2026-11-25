@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Sushibar's loading icon moves while a model loads**: the fish's orange sweeps toward its top right and back as
+  the green slot blinks; under Reduce motion it stays still.
 - **Sushibar's menu bar icon lights its disk slot green whenever a server answers**: a dark-set green bar replaces the
   black slot on the no-model, loading and ready icons, and the no-model icon draws the striped fish of the offline one.
 - **Hy4-Flash loads on an M1 or M2 Mac**: those GPUs grant its hyper-connection kernels and its sampler fewer than 1,024 threads a group, and the load failed with a Metal error or a missed plan; each kernel now runs at the widest group the GPU grants it, learned before the load records its plans.

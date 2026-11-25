@@ -1330,6 +1330,10 @@ var port_field_mi: objc.id = null;
 var note_mi: objc.id = null;
 var icons: [std.enums.values(logic.Icon).len]objc.id = @splat(null);
 var shown_icon: ?logic.Icon = null;
+var loading_icons: [logic.loading_frames]objc.id = @splat(null);
+var loading_frame: usize = 0;
+var loading_timer: objc.id = null;
+var loading_button: objc.id = null;
 var tick_count: u32 = 0;
 var last_title: [128]u8 = undefined;
 var shown_title: [128]u8 = undefined;
@@ -1350,6 +1354,27 @@ fn showIcon(button: objc.id, icon: logic.Icon) void {
     if (shown_icon != null) objc.fadeNext(button, 0.3);
     shown_icon = icon;
     objc.msg(void, button, "setImage:", .{icons[@intFromEnum(icon)]});
+    animateLoading(button, icon == .loading);
+}
+
+/// Runs the loading icon's frames while it shows; under Reduce motion it stays the static icon.
+fn animateLoading(button: objc.id, on: bool) void {
+    if (loading_timer != null) objc.msg(void, loading_timer, "invalidate", .{});
+    loading_timer = null;
+    if (!on or objc.reduceMotion()) return;
+    loading_button = button;
+    loading_frame = 0;
+    loading_timer = objc.addTimer(logic.loading_frame_s, menu_target, "loadingTick:");
+}
+
+fn loadingTick(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
+    if (objc.reduceMotion()) {
+        objc.msg(void, loading_button, "setImage:", .{icons[@intFromEnum(logic.Icon.loading)]});
+        animateLoading(loading_button, false);
+        return;
+    }
+    loading_frame = (loading_frame + 1) % logic.loading_frames;
+    objc.msg(void, loading_button, "setImage:", .{loading_icons[loading_frame]});
 }
 
 /// The button title in monospaced digits, so its width does not jitter.
@@ -2028,6 +2053,11 @@ fn loadIcons() void {
     icons[@intFromEnum(logic.Icon.empty)] = objc.loadSvg(@embedFile("sushibar/icon-empty.svg"), false, icon_w, icon_h);
     icons[@intFromEnum(logic.Icon.loading)] = objc.loadSvg(@embedFile("sushibar/icon-loading.svg"), false, icon_w, icon_h);
     icons[@intFromEnum(logic.Icon.ready)] = objc.loadSvg(@embedFile("sushibar/icon-online.svg"), false, icon_w, icon_h);
+    var buf: [4096]u8 = undefined;
+    for (&loading_icons, 0..) |*frame, i| {
+        const svg = logic.loadingSvg(&buf, @embedFile("sushibar/icon-loading.svg"), i) catch |e| std.debug.panic("loading icon frame {d}: {t}", .{ i, e });
+        frame.* = objc.loadSvg(svg, false, icon_w, icon_h);
+    }
 }
 
 const find_show_interface: isize = 1;
@@ -2092,6 +2122,7 @@ fn runMenuBar() noreturn {
         .{ .selector = "updateButton:", .imp = @ptrCast(&updateButtonAction), .types = "v@:@" },
         .{ .selector = "showLog:", .imp = @ptrCast(&showLogAction), .types = "v@:@" },
         .{ .selector = "logTick:", .imp = @ptrCast(&logTick), .types = "v@:@" },
+        .{ .selector = "loadingTick:", .imp = @ptrCast(&loadingTick), .types = "v@:@" },
         .{ .selector = "openModels:", .imp = @ptrCast(&openModelsAction), .types = "v@:@" },
         .{ .selector = "openRelease:", .imp = @ptrCast(&openReleaseNotes), .types = "v@:@" },
         .{ .selector = "copyPack:", .imp = @ptrCast(&copyPackAction), .types = "v@:@" },

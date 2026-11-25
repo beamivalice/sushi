@@ -290,8 +290,41 @@ fn titleBase(buf: []u8, v: View) []const u8 {
 }
 
 /// The menu bar icon: the outline template while no server answers; once one does, the colour box with its slot lit
-/// green and a grey striped fish (no model), an orange-outlined fish (a model loading) or the whole sushi (a model ready).
+/// green and a grey striped fish (no model), a fish filling orange from its lower left (a model loading) or the whole
+/// sushi (a model ready).
 pub const Icon = enum { outline, empty, loading, ready };
+
+/// The loading icon's animation: its orange sweeps toward the top right and back while the slot blinks.
+pub const loading_frames = 12;
+pub const loading_frame_s: f64 = 0.1;
+
+/// Where a frame's orange gives way to white, as the gradient's two stops, and whether its slot is lit.
+pub const LoadingFrame = struct { orange_at: f32, white_at: f32, lit: bool };
+
+pub fn loadingFrame(i: usize) LoadingFrame {
+    const half = loading_frames / 2;
+    const k = i % loading_frames;
+    const t = @as(f32, @floatFromInt(if (k <= half) k else loading_frames - k)) / half;
+    return .{ .orange_at = 0.05 + 0.4 * t, .white_at = 0.60 + 0.4 * t, .lit = (k / 3) % 2 == 0 };
+}
+
+const loading_stops = "<stop offset=\"0.05\" stop-color=\"#ff7a3a\"/><stop offset=\"0.60\" stop-color=\"#fff\"/>";
+const slot_lit = "fill=\"#39ff6a\"";
+const slot_dim = "fill=\"#1c6b30\"";
+
+/// Frame `i` of the loading icon, from the static icon (frame 0) with its gradient stops and slot colour replaced.
+pub fn loadingSvg(buf: []u8, svg: []const u8, i: usize) ![]const u8 {
+    const stops = std.mem.indexOf(u8, svg, loading_stops) orelse return error.LoadingIconChanged;
+    const slot = std.mem.indexOfPos(u8, svg, stops, slot_lit) orelse return error.LoadingIconChanged;
+    const f = loadingFrame(i);
+    var w: std.Io.Writer = .fixed(buf);
+    try w.writeAll(svg[0..stops]);
+    try w.print("<stop offset=\"{d:.2}\" stop-color=\"#ff7a3a\"/><stop offset=\"{d:.2}\" stop-color=\"#fff\"/>", .{ f.orange_at, f.white_at });
+    try w.writeAll(svg[stops + loading_stops.len .. slot]);
+    try w.writeAll(if (f.lit) slot_lit else slot_dim);
+    try w.writeAll(svg[slot + slot_lit.len ..]);
+    return w.buffered();
+}
 
 /// What `/v1/models` says of the watched server's model, as the header card reads it.
 pub const ModelSeen = struct { ready: bool = false, loading: bool = false };
@@ -3155,4 +3188,23 @@ test "started servers: one that answered on a port that is not watched reads exi
     try std.testing.expectEqualStrings("Port 18801: server did not start (exit 1)", startedExitNote(&b, table[0], .{ .code = 1 }));
     table[0] = .{};
     try std.testing.expectEqual(@as(usize, 0), unansweredPorts(&table, &out).len);
+}
+
+test "the loading icon: its first frame is the static icon, the orange sweeps toward the top right and back, and the slot blinks" {
+    const svg = @embedFile("icon-loading.svg");
+    var buf: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings(svg, try loadingSvg(&buf, svg, 0));
+    const half = loading_frames / 2;
+    for (1..half + 1) |i| try std.testing.expect(loadingFrame(i).orange_at > loadingFrame(i - 1).orange_at);
+    for (half + 1..loading_frames + 1) |i| try std.testing.expect(loadingFrame(i).orange_at < loadingFrame(i - 1).orange_at);
+    try std.testing.expectEqual(loadingFrame(0), loadingFrame(loading_frames));
+    var lit: usize = 0;
+    for (0..loading_frames) |i| {
+        const f = loadingFrame(i);
+        try std.testing.expect(f.white_at <= 1 and f.white_at > f.orange_at);
+        if (f.lit) lit += 1;
+        const frame = try loadingSvg(&buf, svg, i);
+        try std.testing.expect(std.mem.indexOf(u8, frame, if (f.lit) "#39ff6a" else "#1c6b30") != null);
+    }
+    try std.testing.expect(lit > 0 and lit < loading_frames);
 }
