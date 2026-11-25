@@ -201,11 +201,11 @@ pub fn build(b: *std.Build) void {
         if (runs.add(host_tests, host_tests.name, &.{}, false, 1)) |run_host_tests| {
             test_host_step.dependOn(&run_host_tests.step);
             test_step.dependOn(&run_host_tests.step);
-        }
-        if (test_filter == null) {
-            const host_count = countGuard(b, count_guard, host_tests);
-            test_host_step.dependOn(host_count);
-            test_step.dependOn(host_count);
+            if (test_filter == null) {
+                const host_count = countGuard(b, count_guard, host_tests);
+                test_host_step.dependOn(host_count);
+                test_step.dependOn(host_count);
+            }
         }
     }
     const domains: []const DomainBuild = if (test_model == .exl3 or test_model == .enc)
@@ -214,6 +214,7 @@ pub fn build(b: *std.Build) void {
         addTestDomains(b, test_mod, test_model, test_filter);
     for (domains) |domain| {
         test_build.dependOn(&b.addInstallArtifact(domain.compile, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        var runs_any = false;
         for (domain.steps) |step| {
             var env: std.ArrayList([2][]const u8) = .empty;
             env.append(b.allocator, .{ "SUSHI_TEST_SELECT", step.select }) catch @panic("OOM");
@@ -226,8 +227,10 @@ pub fn build(b: *std.Build) void {
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
             }
             test_step.dependOn(&run.step);
+            runs_any = true;
         }
-        test_step.dependOn(countGuard(b, count_guard, domain.compile));
+        // A binary none of whose steps runs (`-Dtest-step`, `-Dtest-skip-step`) is not compiled for its guard alone.
+        if (runs_any) test_step.dependOn(countGuard(b, count_guard, domain.compile));
     }
 
     // Zig collects tests from an artifact's root module only, so src/exl3 is its own.
@@ -240,8 +243,10 @@ pub fn build(b: *std.Build) void {
         const area = for (exl3_test_bins) |area| {
             if (std.mem.eql(u8, exl3_test.name, b.fmt("test-exl3-{s}", .{area.area}))) break area;
         } else unreachable;
-        if (runs.add(exl3_test, exl3_test.name, &.{}, area.cut, area.run_gib)) |run_exl3| test_step.dependOn(&run_exl3.step);
-        test_step.dependOn(countGuard(b, count_guard, exl3_test));
+        if (runs.add(exl3_test, exl3_test.name, &.{}, area.cut, area.run_gib)) |run_exl3| {
+            test_step.dependOn(&run_exl3.step);
+            test_step.dependOn(countGuard(b, count_guard, exl3_test));
+        }
     }
 
     const encoder_tests = b.addTest(.{
@@ -253,8 +258,10 @@ pub fn build(b: *std.Build) void {
     });
     if ((test_model == null or test_model == .enc) and encoderSelected(b, test_filter)) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 7)) |run_encoder| test_step.dependOn(&run_encoder.step);
-        test_step.dependOn(countGuard(b, count_guard, encoder_tests));
+        if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 7)) |run_encoder| {
+            test_step.dependOn(&run_encoder.step);
+            test_step.dependOn(countGuard(b, count_guard, encoder_tests));
+        }
     }
 
     if (test_model == null) if (sushibarFilters(b, test_filter)) |filters| {
@@ -266,8 +273,10 @@ pub fn build(b: *std.Build) void {
             .filters = filters,
         });
         test_build.dependOn(&b.addInstallArtifact(bar_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
-        if (runs.add(bar_tests, bar_tests.name, &.{}, false, 1)) |run_bar| test_step.dependOn(&run_bar.step);
-        test_step.dependOn(countGuard(b, count_guard, bar_tests));
+        if (runs.add(bar_tests, bar_tests.name, &.{}, false, 1)) |run_bar| {
+            test_step.dependOn(&run_bar.step);
+            test_step.dependOn(countGuard(b, count_guard, bar_tests));
+        }
     };
 
     runs.finish();

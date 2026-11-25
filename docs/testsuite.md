@@ -364,7 +364,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - Beside the code it tests, at the bottom of that file. Tests move with their code.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
   `-Dmodel=<arch>` makes one folder's step plus every shared step, and `zig build test` runs them all;
-  `-Dtest-step=<step>` (repeatable) runs only the steps it names (`zig-out/test-plan.json` lists them: `test-qwen`,
+  `-Dtest-step=<step>` (repeatable) runs only the steps it names and compiles only their binaries (`zig-out/test-plan.json` lists them: `test-qwen`,
   `test-mimo`, `test-glm`, `test-deepseek`, `test-hy4`), and a name that is no run step fails. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
   A source file with tests at its bottom is listed too: the domains select tests by listed file, so an unlisted

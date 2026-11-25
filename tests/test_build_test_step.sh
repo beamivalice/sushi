@@ -1,6 +1,6 @@
 #!/bin/bash
 # sushi-test: tier=hermetic
-# test_build_test_step.sh — `-Dtest-step=<run step>` runs that test run step alone: `-Dmodel=<arch>` makes the folder's
+# test_build_test_step.sh — `-Dtest-step=<run step>` runs that test run step alone and compiles only its binary: `-Dmodel=<arch>` makes the folder's
 # step and every shared one, and `zig build test` runs all it makes. A name that is no run step fails by name.
 #
 # Usage: ./tests/test_build_test_step.sh
@@ -29,6 +29,10 @@ if ! "$ZIG" build test -Doptimize=ReleaseFast "${F[@]}" -Dtest-step=test-host -D
 else
   ran=$(cut -f2 "$TMP/log" | sort -u | tr '\n' ' ')
   [ "$ran" = "test-host " ] || { echo "  FAIL: -Dtest-step=test-host ran: $ran"; FAIL=$((FAIL + 1)); }
+  # A binary none of whose steps runs is not compiled, not even for its count guard.
+  if grep -q "compile test test-sushibar" "$TMP/out"; then
+    echo "  FAIL: -Dtest-step=test-host compiled test-sushibar, whose step it leaves out"; FAIL=$((FAIL + 1))
+  fi
 fi
 
 [ "$FAIL" -eq 0 ] && echo "PASS: test_build_test_step" || { echo "FAIL: test_build_test_step ($FAIL)"; exit 1; }
