@@ -4133,6 +4133,52 @@ test "the declared ceiling reads the safety margin at call time: the saved value
     try t.expectEqual(limit - 4 * gib, ceilingNow().floor().?);
 }
 
+test "a margin of 0 plans to the declared limit less the GPU floor alone" {
+    const t = std.testing;
+    const gib: u64 = 1 << 30;
+    const limit_was = wired_limit_mb_override;
+    const floor_was = gpu_floor_bytes.load(.monotonic);
+    const logged_was = wired_floor_logged.load(.monotonic);
+    const flag_was = launch_state.wired_margin_flag_bytes;
+    defer {
+        wired_limit_mb_override = limit_was;
+        gpu_floor_bytes.store(floor_was, .monotonic);
+        wired_floor_logged.store(logged_was, .monotonic);
+        launch_state.wired_margin_flag_bytes = flag_was;
+        launch_state.setWiredMarginFile(null);
+    }
+    wired_limit_mb_override = 120_000;
+    gpu_floor_bytes.store(0, .monotonic);
+    wired_floor_logged.store(true, .monotonic);
+    const status = @import("status.zig");
+    const total_was = status.total_mem_override;
+    const static_was = static_ceiling_override;
+    defer {
+        status.total_mem_override = total_was;
+        static_ceiling_override = static_was;
+    }
+    status.total_mem_override = 128 * gib;
+    static_ceiling_override = 100 * gib;
+    const limit = wiredLimitBytes();
+
+    launch_state.setWiredMarginFile(8);
+    launch_state.wired_margin_flag_bytes = 0;
+    const c = ceilingNow();
+    try t.expectEqual(@as(u64, 0), c.margin);
+    try t.expectEqual(@as(u64, 0), c.unplanned);
+    try t.expectEqual(limit, c.floor().?);
+    var buf: [192]u8 = undefined;
+    try t.expect(wiredMarginRefusal(&buf, c) == null);
+
+    gpu_floor_bytes.store(620 << 20, .monotonic);
+    const c2 = ceilingNow();
+    try t.expectEqual(@as(u64, (620 << 20) + GPU_FLOOR_SLACK_BYTES), c2.unplanned);
+    try t.expectEqual(limit - ((620 << 20) + GPU_FLOOR_SLACK_BYTES), c2.floor().?);
+
+    launch_state.wired_margin_flag_bytes = null;
+    try t.expectEqual(@as(u64, 8 * gib), launch_state.wiredMarginBytes());
+}
+
 test "the bill plans the non-MLX GPU floor and the command-buffer size" {
     const t = std.testing;
     const mb: u64 = 1 << 20;

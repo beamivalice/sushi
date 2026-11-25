@@ -1706,6 +1706,20 @@ test "launch flags: --wired-margin-gib pins server.wired_margin_gib to the flag'
     try std.testing.expectEqualStrings("5", model_settings_mod.launch_locks.wired_margin_gib.text());
 }
 
+test "a launch margin of 0 pins the saved setting instead of leaving it free" {
+    const saved = model_settings_mod.launch_locks;
+    const flag_was = server_state.wired_margin_flag_bytes;
+    defer {
+        model_settings_mod.launch_locks = saved;
+        server_state.wired_margin_flag_bytes = flag_was;
+    }
+    model_settings_mod.launch_locks = .{};
+    server_state.wired_margin_flag_bytes = 0;
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(model_settings_mod.launch_locks.wired_margin_gib.set);
+    try std.testing.expectEqualStrings("0", model_settings_mod.launch_locks.wired_margin_gib.text());
+}
+
 test "launch flags: --config-overrides pins yarn_factor only when it names the RoPE or the window" {
     const saved = model_settings_mod.launch_locks;
     defer model_settings_mod.launch_locks = saved;

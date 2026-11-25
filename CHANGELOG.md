@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi kld --help` and `/metrics` say what they serve**: kld's help states the wired margin's 0..32 GiB range its
+  parser takes, and `sushi:spec_rows_total`'s help names both block drafters (`dspark, dfly2`), not DSpark alone.
 - **Hy4-Flash's speculative decoding reports as DFly2, its own drafter**: `[spec-stats]`, the metrics' `mode` label, the bench and the dashboard said `dspark`, DeepSeek's unrelated drafter, for a Hy4-Flash request. The shared rounds both drafters use carry generic drafter names (`drafter_round.zig`, `[drafter-round]` log lines), and Hy4-Flash's round-width diagnostic is `SUSHI_HY4_DFLY2_ROWS`.
 - **A Hy4-Flash load that cannot fit its narrowest prefill chunk is refused at once**: where the context alone does
   not fit the memory left, the refusal comes before the load records its plans, and says how much it needs at least.

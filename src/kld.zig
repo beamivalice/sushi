@@ -254,7 +254,8 @@ pub const USAGE =
     \\  --no-mtp              do not keep it (the default; the teacher runs without a head)
     \\  --expert-pick-tolerance <n>  compare only, LOSSY: swap a missed streamed expert for a cached one within n (0..0.6)
     \\  --expert-cache-bias <n>  compare only, LOSSY, DeepSeek-V4.1, Qwen3.8 and Hy4-Flash: score an uncached expert n lower at decode widths (0..2)
-    \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers 1..32)
+    \\  --wired-margin-gib <n>  headroom under iogpu.wired_limit_mb (integers
+    ++ std.fmt.comptimePrint(" {d}..{d})\n", .{ model_settings_mod.wired_margin_gib_min, model_settings_mod.wired_margin_gib_max }) ++
     \\  --layer-major         native GLM BF16 teacher or a streamed checkpoint's calibration capture, --tokens 1:
     \\                        batches of windows run layer by layer, each layer's experts read once per batch;
     \\                        resumable by rerunning
@@ -1024,6 +1025,15 @@ test "kld: --help lists every flag the parser accepts" {
     for (value_flags) |row| try testing.expect(std.mem.indexOf(u8, USAGE, row[0]) != null);
     for ([_][]const u8{ "--no-template", "--mtp", "--no-mtp", "--layer-major" }) |name|
         try testing.expect(std.mem.indexOf(u8, USAGE, name) != null);
+}
+
+test "kld: --help states the wired margin range its parser takes" {
+    const lo = model_settings_mod.wired_margin_gib_min;
+    const hi = model_settings_mod.wired_margin_gib_max;
+    try testing.expect(std.mem.indexOf(u8, USAGE, std.fmt.comptimePrint("(integers {d}..{d})", .{ lo, hi })) != null);
+    _ = try bills.parseWiredMarginGib(std.fmt.comptimePrint("{d}", .{lo}));
+    _ = try bills.parseWiredMarginGib(std.fmt.comptimePrint("{d}", .{hi}));
+    try testing.expectError(error.InvalidWiredMargin, bills.parseWiredMarginGib(std.fmt.comptimePrint("{d}", .{hi + 1})));
 }
 
 test "kld: compare memory report serializes aggregate MLX byte counters" {

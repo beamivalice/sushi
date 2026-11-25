@@ -282,7 +282,7 @@ Options:
                         (--prefix-cache-disk sizes them).
   --wired-margin-gib <n>
                       How far under iogpu.wired_limit_mb a plan may
-                        reach (default: 1, integers 1..32).
+                        reach (default: 1, integers 0..32).
   --expert-pick-tolerance <n>
                       LOSSY, streamed packs only (default: 0 = off,
                         exact routing). A routed expert missing from the

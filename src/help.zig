@@ -4,6 +4,7 @@ const std = @import("std");
 const registry = @import("arch/registry.zig");
 const flags = @import("arch/flags.zig");
 const packs = @import("arch/packs.zig");
+const model_settings = @import("model_settings.zig");
 
 /// Where `--think`'s words go; the marker line's indent is the paragraph's.
 const think_marker = "@@think@@";
@@ -256,7 +257,8 @@ const shared =
     \\                        (--prefix-cache-disk sizes them).
     \\  --wired-margin-gib <n>
     \\                      How far under iogpu.wired_limit_mb a plan may
-    \\                        reach (default: 1, integers 0..32).
+    \\                        reach (default:
+    ++ std.fmt.comptimePrint(" {d}, integers {d}..{d}).\n", .{ model_settings.default_wired_margin_gib, model_settings.wired_margin_gib_min, model_settings.wired_margin_gib_max }) ++
     \\  --expert-pick-tolerance <n>
     \\                      LOSSY, streamed packs only (default: 0 = off,
     \\                        exact routing). A routed expert missing from the

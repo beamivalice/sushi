@@ -21,6 +21,16 @@ pub const Mode = enum {
 const exported = @typeInfo(Mode).@"enum".field_names[1..];
 const mode_count = exported.len;
 
+const block_drafter_names: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (@typeInfo(Mode).@"enum".field_names, 0..) |name, value| {
+        if (!@as(Mode, @enumFromInt(value)).block()) continue;
+        if (out.len != 0) out = out ++ ", ";
+        out = out ++ name;
+    }
+    break :blk out;
+};
+
 /// Verifier rows a round can carry: the largest block draft plus the always-committed token, plus a zero bucket.
 pub const rows_cap = 18;
 
@@ -62,7 +72,7 @@ pub const ModeSnapshot = struct {
     drafted: u64 = 0,
     accepted: u64 = 0,
     plain: u64 = 0,
-    /// Rounds by verifier rows (DSpark only).
+    /// Rounds by verifier rows (the block drafters only: `Mode.block()`).
     rows: [rows_cap]u64 = @splat(0),
 };
 
@@ -116,7 +126,7 @@ pub fn writePrometheus(snap: Snapshot, w: *std.Io.Writer) !void {
         inline for (exported, 0..) |name, i| try w.print("{s}{{mode=\"{s}\"}} {d}\n", .{ m[0], name, @field(snap.modes[i], m[2]) });
         try w.writeAll("\n");
     }
-    try w.writeAll("# HELP sushi:spec_rows_total Speculative rounds by verifier rows carried (DSpark)\n# TYPE sushi:spec_rows_total counter\n");
+    try w.print("# HELP sushi:spec_rows_total Speculative rounds by verifier rows carried ({s})\n# TYPE sushi:spec_rows_total counter\n", .{block_drafter_names});
     inline for (exported, 0..) |name, i| {
         for (snap.modes[i].rows, 0..) |n, r| if (n > 0) try w.print("sushi:spec_rows_total{{mode=\"{s}\",rows=\"{d}\"}} {d}\n", .{ name, r, n });
     }
@@ -201,6 +211,17 @@ test "the Prometheus and JSON renderings carry every counter of every mode" {
     try testing.expect(mtp.get("rows") == null);
     try testing.expectEqual(@as(i64, 42), spec.get("dspark").?.object.get("rows").?.object.get("3").?.integer);
     try testing.expectEqual(@as(i64, 9), spec.get("dfly2").?.object.get("rows").?.object.get("5").?.integer);
+}
+
+test "the rows metric's help names both block drafters" {
+    var snap: Snapshot = .{};
+    snap.modes[@intFromEnum(Mode.dfly2) - 1].rows[2] = 5;
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writePrometheus(snap, &w);
+    const prom = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, prom, "sushi:spec_rows_total{mode=\"dfly2\",rows=\"2\"} 5") != null);
+    try testing.expect(std.mem.indexOf(u8, prom, "carried (dspark, dfly2)\n") != null);
 }
 
 test "proposed: the counted drafts when there are any, else the rounds at their cap" {

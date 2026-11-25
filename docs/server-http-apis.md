@@ -608,7 +608,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   unloads (use `model`); `stale` keeps those namespaces, and `all` lists a loading or unloading model as busy. A load
   publishes its tier's namespace when it attaches the tier, and the disk-stats publisher leaves a loading or unloading
   model's snapshot as it is, so that model owns its namespace until it is unloaded.
-- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.max_request_mb` (`file`, `default: 128`, `min: 1`, `max: 1024`, `source`, `locked: false`, `applies`; null resets to the default), `server.wired_margin_gib` (the same shape with `default: 1`, `min: 1`, `max: 32`, and `flag`, `locked: true` when `--wired-margin-gib` is given), `server.models_dir`,
+- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.max_request_mb` (`file`, `default: 128`, `min: 1`, `max: 1024`, `source`, `locked: false`, `applies`; null resets to the default), `server.wired_margin_gib` (the same shape with `default: 1`, `min: 0`, `max: 32`, and `flag`, `locked: true` when `--wired-margin-gib` is given), `server.models_dir`,
   `server.update_check` and `server.pack_update_check` (booleans, `default: true`, `file`, `flag`, `source`, `locked`;
   `--no-update-check` pins both and reports `flag: "--no-update-check"`; a change reaches the check loops at once, no
   restart), `server.skip_mem_preflight` (the same fields, `default: false`; `--skip-mem-preflight` pins it and reports

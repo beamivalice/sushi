@@ -1407,6 +1407,43 @@ test "settings api: a saved safety margin reaches the margin the ceiling reads a
     try testing.expectEqual(@as(u64, 3) << 30, server_state.wiredMarginBytes());
 }
 
+test "a saved margin of 0 is 0 in the file, the readback and a fresh process" {
+    const globals = SavedGlobals.take();
+    defer globals.restore();
+    server_state.wired_margin_flag_bytes = null;
+    model_settings.launch_locks = .{};
+    server_state.setWiredMarginFile(null);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, null);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var host: TestHost = .{ .io = testing.io, .path = path };
+    try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, "{\"server\":{\"wired_margin_gib\":0}}").ok, "", null) == .saved);
+    try testing.expectEqual(@as(u64, 0), server_state.wiredMarginBytes());
+    const text = try tmp.dir.readFileAlloc(testing.io, "model-settings.json", a, .limited(1 << 16));
+    const on_disk = try std.json.parseFromSlice(std.json.Value, a, text, .{});
+    defer on_disk.deinit();
+    try testing.expectEqual(@as(i64, 0), on_disk.value.object.get("server").?.object.get("wired_margin_gib").?.integer);
+    var reloaded = try model_settings.parse(a, text);
+    defer reloaded.deinit();
+    try testing.expectEqual(@as(?u32, 0), model_settings.server(&reloaded).wired_margin_gib);
+    server_state.setWiredMarginFile(null);
+    try testing.expectEqual(@as(u64, 1) << 30, server_state.wiredMarginBytes());
+    server_state.setWiredMarginFile(model_settings.server(&reloaded).wired_margin_gib);
+    try testing.expectEqual(@as(u64, 0), server_state.wiredMarginBytes());
+    const body = try render(a, path, &reloaded, &.{}, &model_settings.launch_locks, .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 });
+    defer a.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object.get("server").?.object.get("wired_margin_gib").?.object;
+    try testing.expectEqual(@as(i64, 0), o.get("file").?.integer);
+    try testing.expectEqualStrings("file", o.get("source").?.string);
+    try testing.expectEqual(@as(i64, 0), o.get("min").?.integer);
+}
+
 test "settings api: render reports the safety margin from the file, the default or the launch flag that pins it" {
     const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
     var locks: model_settings.LaunchLocks = .{};
@@ -1427,9 +1464,9 @@ test "settings api: render reports the safety margin from the file, the default 
         const o = parsed.value.object.get("server").?.object.get("wired_margin_gib").?.object;
         try testing.expectEqualStrings(c.source, o.get("source").?.string);
         try testing.expectEqual(c.flag != null, o.get("locked").?.bool);
-        try testing.expectEqual(@as(i64, 1), o.get("default").?.integer);
-        try testing.expectEqual(@as(i64, 1), o.get("min").?.integer);
-        try testing.expectEqual(@as(i64, 32), o.get("max").?.integer);
+        try testing.expectEqual(@as(i64, model_settings.default_wired_margin_gib), o.get("default").?.integer);
+        try testing.expectEqual(@as(i64, model_settings.wired_margin_gib_min), o.get("min").?.integer);
+        try testing.expectEqual(@as(i64, model_settings.wired_margin_gib_max), o.get("max").?.integer);
         if (c.flag) |f| try testing.expectEqualStrings(f, o.get("flag").?.string) else try testing.expect(o.get("flag").? == .null);
         if (std.mem.eql(u8, c.source, "default")) try testing.expect(o.get("file").? == .null) else try testing.expectEqual(@as(i64, 8), o.get("file").?.integer);
         try testing.expectEqualStrings(if (c.flag != null) "set by --wired-margin-gib until a start without it" else "applies at once: the next request and the next load use it", o.get("applies").?.string);
