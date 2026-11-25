@@ -133,6 +133,29 @@ pub fn warmUbench(allocator: std.mem.Allocator, xfm: *@import("../trunk.zig").Tr
     dflyProbe(allocator, xfm, kv, std.mem.sliceTo(raw, 0), tok) catch |err| log.warn("[dfly-probe] failed: {s}\n", .{@errorName(err)});
 }
 
+pub fn ubenchMark(xfm: *@import("../trunk.zig").Trunk) !bool {
+    const st = &xfm.arch_state.hy4flash;
+    const m = st.model orelse return false;
+    st.ubench_mark = try m.mark();
+    return true;
+}
+
+pub fn ubenchRollback(xfm: *@import("../trunk.zig").Trunk, ctx: *@import("../trunk.zig").ForwardCtx) !void {
+    const st = &xfm.arch_state.hy4flash;
+    const m = st.model orelse return error.Hy4ModelMissing;
+    const mk = &(st.ubench_mark orelse return error.Hy4PointMismatch);
+    try m.rollbackTo(mk, &.{});
+    ctx.cache.step = m.pos;
+}
+
+pub fn ubenchDropMark(xfm: *@import("../trunk.zig").Trunk) void {
+    const st = &xfm.arch_state.hy4flash;
+    if (st.ubench_mark) |*mk| {
+        if (st.model) |m| m.dropMark(mk);
+        st.ubench_mark = null;
+    }
+}
+
 fn dflyProbe(gpa: std.mem.Allocator, xfm: *@import("../trunk.zig").Trunk, kv: @import("../kv_quant.zig").KVQuantConfig, spec: []const u8, tok: *@import("../tokenizer.zig").Tokenizer) !void {
     const dfly = @import("hy4_dfly.zig");
     const st = &xfm.arch_state.hy4flash;

@@ -15,6 +15,7 @@ pub const State = struct {
     drafter: ?hy4_dfly.Drafter = null,
     /// A DSpark round's open verify: the state before the block and the block's ids (`hy4_dspark`).
     verify: ?Verify = null,
+    ubench_mark: ?hy4_model.Model.Mark = null,
 
     pub const Verify = struct { mark: ?hy4_model.Model.Mark = null, ids: [16]u32, n: usize };
 
@@ -25,6 +26,10 @@ pub const State = struct {
 
     pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
         dropVerify(self, false);
+        if (self.ubench_mark) |*mk| {
+            if (self.model) |m| m.dropMark(mk);
+            self.ubench_mark = null;
+        }
         if (self.drafter) |*d| {
             d.deinit();
             self.drafter = null;

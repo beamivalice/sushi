@@ -3137,14 +3137,19 @@ test "waitForUnwire returns at once when shutdown_requested is set" {
 /// The decode meter's context: `tokens` ids through the model in chunks of 2048, as a served prefill runs them. No
 /// row of a chunk is sampled, so none reads out its logits (`skip_lm_head`).
 pub fn meterPrefill(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("model_handle.zig").ForwardCtx, tokens: usize) !usize {
-    const ids = try allocator.alloc(i32, 2048);
+    return meterPrefillChunk(allocator, xfm, ctx, tokens, 2048);
+}
+
+fn meterPrefillChunk(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("model_handle.zig").ForwardCtx, tokens: usize, chunk_max: usize) !usize {
+    const stride = @max(1, chunk_max);
+    const ids = try allocator.alloc(i32, @min(stride, @max(1, tokens)));
     defer allocator.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
     ctx.skip_lm_head = true;
     defer ctx.skip_lm_head = false;
     var done: usize = 0;
     while (done < tokens) {
-        const n_chunk = @min(2048, tokens - done);
+        const n_chunk = @min(stride, tokens - done);
         const shape = [_]c_int{ 1, @intCast(n_chunk) };
         const ti = try mlx.newData(ids.ptr, &shape, .int32);
         defer _ = mlx.mlx_array_free(ti);
@@ -3161,89 +3166,154 @@ pub fn meterPrefill(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("mo
 /// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
 /// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body, or with
 /// `_LEVER=decoded` 0 on the trunk's sorted GEMM instead of its decoded path.
+pub const PrefillUbenchOpts = struct {
+    n: usize = 3,
+    rows: usize = 2025,
+    kv: usize = 0,
+    arms: []const ?bool = &.{null},
+    decoded_lever: bool = false,
+    text_path: ?[]const u8 = null,
+    quiet: bool = false,
+};
+
+pub const PrefillUbenchResult = struct {
+    last_start_pos: usize = 0,
+    last_end_pos: usize = 0,
+    iterations: usize = 0,
+};
+
 fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig, tok: *Tokenizer) void {
-    const tio = std.Io.Threaded.global_single_threaded.io();
     const n = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0), 10) catch 3);
     const asked: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ROWS")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 2025 else 2025;
+    const kv: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_KV")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
     const pick = scheduler_mod.prefill_ubench_chunk orelse {
         log.warn("[prefill-ubench] skipped: no admission hook to size the chunk\n", .{});
         return;
     };
     // A wider forward than admission would run allocates outside the load's memory bill.
     const rows = @max(1, @min(asked, pick(cfg, asked + 1, 1, xfm.cache.config, false, 0, 0, false, false)));
-    const ids = alloc.alloc(i32, rows) catch return;
+    var arms: [16]?bool = @splat(null);
+    const n_arms = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ARMS")) |r| parseUbenchArms(std.mem.sliceTo(r, 0), &arms) else 1;
+    const decoded_lever = if (std.c.getenv("SUSHI_PREFILL_UBENCH_LEVER")) |l| std.mem.eql(u8, std.mem.sliceTo(l, 0), "decoded") else false;
+    const text_path: ?[]const u8 = if (std.c.getenv("SUSHI_PREFILL_UBENCH_TEXT")) |path| std.mem.sliceTo(path, 0) else null;
+    _ = runPrefillUbench(alloc, xfm, tok, .{
+        .n = n,
+        .rows = rows,
+        .kv = kv,
+        .arms = arms[0..n_arms],
+        .decoded_lever = decoded_lever,
+        .text_path = text_path,
+    }) catch |err| {
+        log.warn("[prefill-ubench] failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+pub fn runPrefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, tok: ?*Tokenizer, opts: PrefillUbenchOpts) !PrefillUbenchResult {
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const n = @max(1, opts.n);
+    const rows = @max(1, opts.rows);
+    const ids = try alloc.alloc(i32, rows);
     defer alloc.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
-    if (std.c.getenv("SUSHI_PREFILL_UBENCH_TEXT")) |path| blk: {
-        const text = std.Io.Dir.cwd().readFileAlloc(tio, std.mem.sliceTo(path, 0), alloc, .limited(64 << 20)) catch break :blk;
+    if (opts.text_path) |path| if (tok) |tk| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(tio, path, alloc, .limited(64 << 20)) catch break :blk;
         defer alloc.free(text);
-        const enc = tok.encode(alloc, text) catch break :blk;
+        const enc = tk.encode(alloc, text) catch break :blk;
         defer alloc.free(enc);
         if (enc.len == 0) break :blk;
         for (ids, 0..) |*v, i| v.* = @intCast(enc[i % enc.len]);
-    }
-    var arms: [16]?bool = @splat(null);
-    const n_arms = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ARMS")) |r| parseUbenchArms(std.mem.sliceTo(r, 0), &arms) else 1;
+    };
     defer exl3_kernels.nax_reference_override = false;
     defer @import("sushi_exl3").trunk_gemm.enabled = true;
-    const decoded_lever = if (std.c.getenv("SUSHI_PREFILL_UBENCH_LEVER")) |l| std.mem.eql(u8, std.mem.sliceTo(l, 0), "decoded") else false;
     const had_error = mlx.errorPending();
     defer xfm.resetCache() catch {};
     const shape = [_]c_int{ 1, @intCast(rows) };
-    const times = alloc.alloc(f64, n) catch return;
+    const times = try alloc.alloc(f64, n);
     defer alloc.free(times);
     var first_ms: f64 = 0;
-    for (arms[0..n_arms]) |arm| {
-        if (decoded_lever)
+    var res: PrefillUbenchResult = .{};
+    var ctx = xfm.defaultCtx();
+    var marked = false;
+    defer if (marked) arch_load.ubenchDropMark(xfm);
+    if (opts.kv > 0) {
+        try xfm.resetCache();
+        xfm.bindOwnRows(opts.kv + rows);
+        ctx = xfm.defaultCtx();
+        ctx.cache.end_tokens = opts.kv + rows;
+        const done_pre = try meterPrefillChunk(alloc, xfm, &ctx, opts.kv, rows);
+        if (!opts.quiet) log.info("[prefill-ubench] prefilled {d} tokens\n", .{done_pre});
+        marked = try arch_load.ubenchMark(xfm);
+    }
+    for (opts.arms) |arm| {
+        if (opts.decoded_lever)
             @import("sushi_exl3").trunk_gemm.enabled = if (arm) |a| a else true
         else
             exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
         var engine0 = mlx.engine.stats();
         for (0..n + 1) |iter| {
+            if (opts.kv == 0) {
+                try xfm.resetCache();
+                xfm.bindOwnRows(rows);
+                ctx = xfm.defaultCtx();
+                ctx.cache.end_tokens = rows;
+            } else if (ctx.cache.step != opts.kv) {
+                if (marked) {
+                    try arch_load.ubenchRollback(xfm, &ctx);
+                } else {
+                    try xfm.resetCache();
+                    xfm.bindOwnRows(opts.kv + rows);
+                    ctx = xfm.defaultCtx();
+                    ctx.cache.end_tokens = opts.kv + rows;
+                    _ = try meterPrefillChunk(alloc, xfm, &ctx, opts.kv, rows);
+                }
+            }
             if (iter == 1) {
                 mlx.engine.resetKernelProfile();
                 engine0 = mlx.engine.stats();
             }
-            xfm.resetCache() catch return;
-            xfm.bindOwnRows(rows);
-            var ctx = xfm.defaultCtx();
             ctx.skip_lm_head = true;
-            const ti = mlx.newData(ids.ptr, &shape, .int32) catch return;
+            res.last_start_pos = ctx.cache.step;
+            const ti = try mlx.newData(ids.ptr, &shape, .int32);
             defer _ = mlx.mlx_array_free(ti);
             var sw = io_util.Stopwatch.init(tio);
             const out = xfm.forwardWith(&ctx, ti) catch |err| {
                 mlx.dropLatchedErrorUnless(had_error);
-                log.warn("[prefill-ubench] forward failed: {s}\n", .{@errorName(err)});
-                return;
+                if (!opts.quiet) log.warn("[prefill-ubench] forward failed: {s}\n", .{@errorName(err)});
+                return err;
             };
             defer _ = mlx.mlx_array_free(out);
             mlx.check(mlx.mlx_array_eval(out)) catch |err| {
                 mlx.dropLatchedErrorUnless(had_error);
-                log.warn("[prefill-ubench] eval failed: {s}\n", .{@errorName(err)});
-                return;
+                if (!opts.quiet) log.warn("[prefill-ubench] eval failed: {s}\n", .{@errorName(err)});
+                return err;
             };
+            res.last_end_pos = ctx.cache.step;
+            res.iterations += 1;
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
             if (iter > 0) times[iter - 1] = ms else first_ms = ms;
         }
         std.mem.sortUnstable(f64, times, {}, std.sort.asc(f64));
-        log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s), untimed first {d:.2} ms\n", .{
-            if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
-            @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0, first_ms,
-        });
-        const engine1 = mlx.engine.stats();
-        if (engine1.dispatches > engine0.dispatches) {
-            const chunks: f64 = @floatFromInt(n);
-            log.info("[prefill-ubench] engine: {d:.1} dispatches, {d:.1} barriers, {d:.1} command buffers, {d:.1} waits, {d:.3} ms GPU busy, {d:.3} ms idle between passes per chunk\n", .{
-                @as(f64, @floatFromInt(engine1.dispatches - engine0.dispatches)) / chunks,
-                @as(f64, @floatFromInt(engine1.barriers - engine0.barriers)) / chunks,
-                @as(f64, @floatFromInt(engine1.submits - engine0.submits)) / chunks,
-                @as(f64, @floatFromInt(engine1.waits - engine0.waits)) / chunks,
-                @as(f64, @floatFromInt(engine1.gpu_busy_ns - engine0.gpu_busy_ns)) / 1e6 / chunks,
-                @as(f64, @floatFromInt(engine1.gpu_gap_ns - engine0.gpu_gap_ns)) / 1e6 / chunks,
+        if (!opts.quiet) {
+            log.info("[prefill-ubench] arm={s} rows={d} kv={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s), untimed first {d:.2} ms\n", .{
+                if (arm) |a| (if (a) "1" else "0") else "shipped", rows, opts.kv, n, times[n / 2], times[0], times[n - 1],
+                @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0, first_ms,
             });
-            mlx.engine.logKernelProfile(chunks);
+            const engine1 = mlx.engine.stats();
+            if (engine1.dispatches > engine0.dispatches) {
+                const chunks: f64 = @floatFromInt(n);
+                log.info("[prefill-ubench] engine: {d:.1} dispatches, {d:.1} barriers, {d:.1} command buffers, {d:.1} waits, {d:.3} ms GPU busy, {d:.3} ms idle between passes per chunk\n", .{
+                    @as(f64, @floatFromInt(engine1.dispatches - engine0.dispatches)) / chunks,
+                    @as(f64, @floatFromInt(engine1.barriers - engine0.barriers)) / chunks,
+                    @as(f64, @floatFromInt(engine1.submits - engine0.submits)) / chunks,
+                    @as(f64, @floatFromInt(engine1.waits - engine0.waits)) / chunks,
+                    @as(f64, @floatFromInt(engine1.gpu_busy_ns - engine0.gpu_busy_ns)) / 1e6 / chunks,
+                    @as(f64, @floatFromInt(engine1.gpu_gap_ns - engine0.gpu_gap_ns)) / 1e6 / chunks,
+                });
+                mlx.engine.logKernelProfile(chunks);
+            }
         }
     }
+    return res;
 }
 
 /// `_ARMS` list: each comma-separated entry is an arm, `0` the reference, anything else the shipped one.

@@ -216,6 +216,24 @@ pub fn warmUbench(allocator: std.mem.Allocator, xfm: *Trunk, kv: trunk.KVQuantCo
     }
 }
 
+pub fn ubenchMark(xfm: *Trunk) !bool {
+    switch (xfm.arch) {
+        inline else => |t| return if (comptime has(t, "ubenchMark")) try L(t).ubenchMark(xfm) else false,
+    }
+}
+
+pub fn ubenchRollback(xfm: *Trunk, ctx: *trunk.ForwardCtx) !void {
+    switch (xfm.arch) {
+        inline else => |t| if (comptime has(t, "ubenchRollback")) try L(t).ubenchRollback(xfm, ctx),
+    }
+}
+
+pub fn ubenchDropMark(xfm: *Trunk) void {
+    switch (xfm.arch) {
+        inline else => |t| if (comptime has(t, "ubenchDropMark")) L(t).ubenchDropMark(xfm),
+    }
+}
+
 test "an arch that declares no load module takes every default" {
     var config = model.ModelConfig{ .model_type = "not_a_served_arch" };
     try std.testing.expect((try weights(std.testing.io, std.testing.allocator, "", &config, false)) == null);

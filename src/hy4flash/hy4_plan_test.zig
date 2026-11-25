@@ -1732,3 +1732,25 @@ test "hy4 plan: the region of a chunk is measured at each width's two ends and a
     }
     if (!ran) return error.SkipZigTest;
 }
+
+test "hy4 plan: prefill ubench honours kv context and rolls back between iterations (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.open(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const kv: usize = 24;
+    const rows: usize = 8;
+    const res = try @import("../model_load.zig").runPrefillUbench(testing.allocator, ld.xfm, null, .{
+        .n = 2,
+        .rows = rows,
+        .kv = kv,
+        .quiet = true,
+    });
+    try testing.expectEqual(@as(usize, 3), res.iterations);
+    try testing.expectEqual(kv, res.last_start_pos);
+    try testing.expectEqual(kv + rows, res.last_end_pos);
+}

@@ -1595,7 +1595,10 @@ fn indexLogits(o: *Ops, x: Arr, q_rows: Arr, pooled: Arr, w: Indexer, g: Indexer
     // The kernel counts the groups row l sees as (meta0 + l + 1) / ratio: from p0 - 1 that is the row's own group,
     // which the indexer never scores (it is forced in below).
     const qt = try o.contiguous(try o.transpose(try o.cast(q, .float32), &.{ 1, 0, 2 }));
-    return o.own(try sparse.indexScores(o.s, qt, try rotateGroupKeys(o, pooled, g), hw, scale, p0 - 1, @intCast(g.ratio)));
+    const k_rot = try rotateGroupKeys(o, pooled, g);
+    if (index_kernel_on and hy4_index.wideScoresApply(o.s, qt, k_rot, hw))
+        return o.own(try hy4_index.wideScores(o.s, qt, k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
+    return o.own(try sparse.indexScores(o.s, qt, k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
 }
 
 /// Whether the selection of the rows at `p0..p0+t` splits its top-k over the groups closed by then
@@ -1659,7 +1662,10 @@ pub fn recalledPrepared(o: *Ops, idx: IndexIn, r0: c_int, r1: c_int, pooled_grou
     const scale = std.math.pow(f32, @floatFromInt(g.heads * g.dim), -0.5);
     const qt = try o.slice(idx.qt, 0, s0, s1);
     const hw = try o.slice(idx.hw, 0, s0, s1);
-    const logits = try o.own(try sparse.indexScores(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
+    const logits = if (hy4_index.wideScoresApply(o.s, qt, idx.k_rot, hw))
+        try o.own(try hy4_index.wideScores(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)))
+    else
+        try o.own(try sparse.indexScores(o.s, qt, idx.k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
     if (hy4_index.pickApplies(o.s, logits, take)) {
         const r = try hy4_index.pick(o.s, logits, take, p0, n, g.ratio);
         _ = try o.own(r.groups);

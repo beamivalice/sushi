@@ -264,6 +264,151 @@ pub fn pick(s: mlx.mlx_stream, scores_: Arr, k: c_int, p0: c_int, n: c_int, rati
     return .{ .groups = out[0], .rows = out[1], .keep = out[2] };
 }
 
+pub var wide_scores_on = true;
+
+const wide_score_source: [:0]const u8 =
+    \\constexpr int QL = 8, KN = 32, BK = 16, TG = 256, BK4 = BK / 4, IH4 = IH / 4;
+    \\const int l0 = int(threadgroup_position_in_grid.y) * QL;
+    \\const int n0 = int(threadgroup_position_in_grid.x) * KN;
+    \\const uint tid = thread_index_in_threadgroup;
+    \\const uint sg = simdgroup_index_in_threadgroup;
+    \\const uint lane = thread_index_in_simdgroup;
+    \\const int L = q_shape[0], nb = keys_shape[0];
+    \\const int l = l0 + int(sg);
+    \\const int n = n0 + int(lane);
+    \\const int max_l = metal::min(l0 + QL - 1, L - 1);
+    \\const int max_seen = (meta[0] + max_l + 1) / meta[1];
+    \\if (n0 >= max_seen) {
+    \\  if (l < L && n < nb) scores[size_t(l) * nb + n] = -INFINITY;
+    \\  return;
+    \\}
+    \\threadgroup float qs[QL * BK * IH];
+    \\threadgroup float ks[BK * KN];
+    \\float dots[IH];
+    \\#pragma clang loop unroll(full)
+    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
+    \\for (int k0 = 0; k0 < IHD; k0 += BK) {
+    \\  for (int e = int(tid); e < QL * IH * BK4; e += TG) {
+    \\    const int d4 = e % BK4;
+    \\    const int tmp = e / BK4;
+    \\    const int h = tmp % IH;
+    \\    const int ql = tmp / IH;
+    \\    const int row = l0 + ql;
+    \\    float4 v = float4(0.0f);
+    \\    if (row < L) {
+    \\      const device float* qp = q + (size_t(row) * IH + h) * IHD + k0 + d4 * 4;
+    \\      v = float4(qp[0], qp[1], qp[2], qp[3]);
+    \\    }
+    \\    qs[(ql * BK + d4 * 4 + 0) * IH + h] = v.x;
+    \\    qs[(ql * BK + d4 * 4 + 1) * IH + h] = v.y;
+    \\    qs[(ql * BK + d4 * 4 + 2) * IH + h] = v.z;
+    \\    qs[(ql * BK + d4 * 4 + 3) * IH + h] = v.w;
+    \\  }
+    \\  if (int(tid) < KN * BK4) {
+    \\    const int kn = int(tid) / BK4;
+    \\    const int d4 = int(tid) % BK4;
+    \\    const int key_idx = n0 + kn;
+    \\    float4 v = float4(0.0f);
+    \\    if (key_idx < nb) {
+    \\      const device float* kp = keys + size_t(key_idx) * IHD + k0 + d4 * 4;
+    \\      v = float4(kp[0], kp[1], kp[2], kp[3]);
+    \\    }
+    \\    ks[(d4 * 4 + 0) * KN + kn] = v.x;
+    \\    ks[(d4 * 4 + 1) * KN + kn] = v.y;
+    \\    ks[(d4 * 4 + 2) * KN + kn] = v.z;
+    \\    ks[(d4 * 4 + 3) * KN + kn] = v.w;
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  const threadgroup float4* qrow4 = (const threadgroup float4*)(qs + int(sg) * BK * IH);
+    \\  #pragma clang loop unroll(full)
+    \\  for (int j = 0; j < BK; ++j) {
+    \\    const float kv = ks[j * KN + lane];
+    \\    #pragma clang loop unroll(full)
+    \\    for (int h4 = 0; h4 < IH4; ++h4) {
+    \\      const float4 qv = qrow4[j * IH4 + h4];
+    \\      dots[h4 * 4 + 0] += qv.x * kv;
+    \\      dots[h4 * 4 + 1] += qv.y * kv;
+    \\      dots[h4 * 4 + 2] += qv.z * kv;
+    \\      dots[h4 * 4 + 3] += qv.w * kv;
+    \\    }
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\}
+    \\if (l < L && n < nb) {
+    \\  const int seen = (meta[0] + l + 1) / meta[1];
+    \\  if (n < seen) {
+    \\    float s = 0.0f;
+    \\    for (int h = 0; h < IH; ++h) s += (float(w[size_t(l) * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
+    \\    scores[size_t(l) * nb + n] = s;
+    \\  } else {
+    \\    scores[size_t(l) * nb + n] = -INFINITY;
+    \\  }
+    \\}
+;
+
+var wide_score_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn wideScoreKernel() !mlx.mlx_fast_metal_kernel {
+    if (wide_score_kernel) |k| return k;
+    const ins = [_][*:0]const u8{ "q", "keys", "w", "meta", "wsc" };
+    const outs = [_][*:0]const u8{"scores"};
+    const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_hy4_index_wide", iv, ov, wide_score_source, "", true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    wide_score_kernel = k;
+    return k;
+}
+
+const WideKey = struct { l: c_int, nb: c_int, ih: c_int, ihd: c_int };
+var wide_cfgs: kcfg.Cache(WideKey) = .{};
+
+fn buildWide(k: WideKey) !kcfg.Config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.l, k.nb }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(k.nb + 31, 32) * 256, @divTrunc(k.l + 7, 8), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IH", k.ih));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "IHD", k.ihd));
+    return cfg;
+}
+
+pub fn wideScoresApply(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr) bool {
+    if (!wide_scores_on or !mlx.streamIsGpu(s)) return false;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(keys);
+    const ws = mlx.getShape(w);
+    if (qs.len != 3 or ks.len != 2 or ws.len != 2) return false;
+    if (qs[0] <= 0 or ks[0] <= 0 or qs[1] <= 0 or qs[1] > 32 or @rem(qs[1], 4) != 0 or qs[2] <= 0 or @rem(qs[2], 16) != 0) return false;
+    if (ks[1] != qs[2] or ws[0] != qs[0] or ws[1] != qs[1]) return false;
+    return mlx.mlx_array_dtype(q) == .float32 and mlx.mlx_array_dtype(keys) == .float32 and mlx.mlx_array_dtype(w) == .float32;
+}
+
+pub fn wideScores(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, wscale: f32, p0: i32, ratio: usize) !Arr {
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(keys);
+    const cfg = try wide_cfgs.get(.{ .l = qs[0], .nb = ks[0], .ih = qs[1], .ihd = qs[2] }, buildWide);
+    const mv = [_]i32{ p0, @intCast(ratio) };
+    const meta = try mlx.newData(&mv, &.{2}, .int32);
+    defer _ = mlx.mlx_array_free(meta);
+    const sv = [_]f32{wscale};
+    const wsc = try mlx.newData(&sv, &.{1}, .float32);
+    defer _ = mlx.mlx_array_free(wsc);
+    const ins = [_]Arr{ q, keys, w, meta, wsc };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try wideScoreKernel(), iv, cfg, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
+    return out;
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -388,4 +533,39 @@ test "hy4 index: a decode row's group picks written as their key rows and keep m
         try testing.expectEqualSlices(u8, wr, try valueBytes(&o, gr));
         try testing.expectEqualSlices(u8, wk, try valueBytes(&o, gk));
     };
+}
+
+test "hy4 index: wide prefill scores match sparse.indexScores byte for byte across release and tiny shapes" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const Case = struct { h: c_int, d: c_int, g: c_int, t: c_int };
+    const cases = [_]Case{
+        .{ .h = 16, .d = 128, .g = 1024, .t = 256 },
+        .{ .h = 16, .d = 128, .g = 1001, .t = 37 },
+        .{ .h = 4, .d = 32, .g = 150, .t = 19 },
+    };
+    const ratio: c_int = 4;
+    for (cases, 0..) |c, ci| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const seed: u64 = 101 * ci + 7;
+        const q = try randomArr(&o, &.{ c.t, c.h, c.d }, seed, 0.6);
+        const keys = try randomArr(&o, &.{ c.g, c.d }, seed + 1, 1);
+        const w = try randomArr(&o, &.{ c.t, c.h }, seed + 2, 0.5);
+        const scale = std.math.pow(f32, @floatFromInt(c.h * c.d), -0.5);
+        const p0: c_int = ratio * c.g - c.t + 1;
+        const want = try o.own(try sparse.indexScores(es, q, keys, w, scale, p0 - 1, @intCast(ratio)));
+        const wb = try bytesOf(&o, want);
+        try testing.expect(wideScoresApply(es, q, keys, w));
+        const before = mlx.engine.stats().dispatches;
+        const got = try o.own(try wideScores(es, q, keys, w, scale, p0 - 1, @intCast(ratio)));
+        try mlx.check(mlx.mlx_array_eval(got));
+        try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+        try testing.expectEqualSlices(u8, wb, try bytesOf(&o, got));
+    }
 }
