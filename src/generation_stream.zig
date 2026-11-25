@@ -2859,7 +2859,8 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
 
 test "a slot the transient cap failed answers a named 503, not the memory 503" {
     const t = std.testing;
-    var slot: scheduler_mod.Slot = undefined;
+    var slot = scheduler_mod.Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel());
+    slot.bindCtxForTest();
     slot.io = t.io;
     slot.out_mu = .init;
     slot.memory_context_refusal = null;
@@ -3062,10 +3063,11 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try tok.id_to_token.put(1, "S");
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = io;
     sch.queue_mu = .init;
-    var slot: scheduler_mod.Slot = undefined;
+    var slot = scheduler_mod.Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel());
+    slot.bindCtxForTest();
     slot.io = io;
     slot.allocator = a;
     slot.out_mu = .init;
@@ -3103,10 +3105,11 @@ fn expectSettledAfterEarlyStop(published: u32) !void {
 test "a streamed stop reports the tokens it delivered, not the speculative block decoded past it" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = io;
     sch.queue_mu = .init;
-    var slot: scheduler_mod.Slot = undefined;
+    var slot = scheduler_mod.Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel());
+    slot.bindCtxForTest();
     slot.io = io;
     slot.allocator = a;
     slot.out_mu = .init;
@@ -3160,10 +3163,11 @@ test "a reply the cancel API ends mid-decode says cancelled and counts the token
     const a = std.testing.allocator;
     const io = std.testing.io;
     for ([_]bool{ false, true }) |streamed| {
-        var sch: scheduler_mod.Scheduler = undefined;
+        var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
         sch.io = io;
         sch.queue_mu = .init;
-        var slot: scheduler_mod.Slot = undefined;
+        var slot = scheduler_mod.Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel());
+        slot.bindCtxForTest();
         slot.io = io;
         slot.allocator = a;
         slot.out_mu = .init;
@@ -3340,7 +3344,7 @@ fn answerOf(id: []const u8, err: anyerror, report: *const scheduler_mod.LoadRepo
     defer _ = std.c.close(sv[1]);
     var conn: Conn = undefined;
     Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.testing.io);
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     try std.testing.expect(try sendNamedLoadRefusal(std.testing.allocator, &conn, &sch, id, err, report));
     _ = std.posix.system.shutdown(sv[1], std.posix.SHUT.WR);

@@ -685,7 +685,7 @@ pub fn testSlot(xfm: *Trunk, lm: *model_registry.LoadedModel, config: ModelConfi
     xfm.config = config;
     lm.handle = arch_handle.fixtureHandle(xfm);
     lm.config = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, lm);
     slot.model = lm;
     slot.request = null;
     slot.legacy_gen = null;
@@ -712,7 +712,8 @@ test "a slot's own request state is billed, released and culled with no config t
     var lm: model_registry.LoadedModel = undefined;
     lm.handle = null;
     lm.config = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &lm);
+    slot.bindCtxForTest();
     slot.model = &lm;
     slot.request = null;
     try std.testing.expectEqual(@as(u64, 0), requestBytes(&slot));

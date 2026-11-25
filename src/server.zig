@@ -3235,7 +3235,7 @@ test "metrics enable: POST /metrics/enable turns the feeds on, idempotently" {
 
 test "an unknown endpoint is a 404 that never reaches model resolution" {
     const t = std.testing;
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     const prev_sch = server_state.global_scheduler;
     defer server_state.global_scheduler = prev_sch;
     server_state.global_scheduler = &sch;
@@ -4026,7 +4026,7 @@ test "settingsPropsJson: /props reports the prefill decode share" {
 
 test "liveSessions copies the queue snapshot and stamps the effective context limit" {
     const t = std.testing;
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = t.io;
     sch.queue_mu = .init;
     sch.live_sessions = undefined;

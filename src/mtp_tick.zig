@@ -917,9 +917,10 @@ test "a plain batched tick checks the thinking budget before its rows forward" {
     gen.timeout_ns = 0;
     gen.stall = .{};
     gen.timer = io_util.Stopwatch.init(testing.io);
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel());
+    slot.bindCtxForTest();
     slot.legacy_gen = gen;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     var active = [_]*Slot{&slot};
     var live: [1]*Slot = undefined;
     try testing.expectEqual(@as(usize, 1), try batchedTickRows(&sch, &active, &live));
@@ -946,8 +947,10 @@ test "scheduler prices each shared execution once and preserves row sampling geo
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
     model.handle = arch_handle.fixtureHandle(&xfm);
-    var a: Slot = undefined;
-    var b: Slot = undefined;
+    var a = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    a.bindCtxForTest();
+    var b = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    b.bindCtxForTest();
     a.model = &model;
     b.model = &model;
     const slots = [_]*Slot{ &a, &b };
@@ -981,9 +984,10 @@ test "planner pools recurring head histories without mixing the cold first histo
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
     model.handle = arch_handle.fixtureHandle(&xfm);
-    var slots_storage: [4]Slot = undefined;
+    var slots_storage: [4]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &model));
     var slots: [4]*Slot = undefined;
     for (&slots_storage, 0..) |*slot, i| {
+        slot.bindCtxForTest();
         slot.model = &model;
         slots[i] = slot;
     }
@@ -1038,9 +1042,10 @@ test "mean cost pooling retains differences between histories and both worst-cas
     xfm.mtp_group_cost = .{};
     var model: LoadedModel = undefined;
     model.handle = arch_handle.fixtureHandle(&xfm);
-    var storage: [2]Slot = undefined;
+    var storage: [2]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &model));
     var slots: [2]*Slot = undefined;
     for (&storage, 0..) |*slot, i| {
+        slot.bindCtxForTest();
         slot.model = &model;
         slots[i] = slot;
     }

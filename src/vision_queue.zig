@@ -755,7 +755,7 @@ test "a submit that fails before its slot exists hands the vision array to the i
         }
         /// One connection-thread submit that must fail, then the inference thread's drain.
         fn expectHandedOver(allocator: std.mem.Allocator, model: *LoadedModel, kv: trunk.KVQuantConfig, want: ?anyerror) !void {
-            var sch: Scheduler = undefined;
+            var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
             sch.allocator = allocator;
             sch.io = testing.io;
             sch.kv_quant = kv;
@@ -845,7 +845,7 @@ test "a queued vision encode is refused when its bill no longer fits, and an ear
             return req;
         }
     };
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
     var model: LoadedModel = undefined;
@@ -953,7 +953,7 @@ test "a restored prefix lets the encode skip its images, and the rest match a fu
             return mlx.mlx_array_data_float32(arr).?[0 .. @as(usize, @intCast(shape[1])) * 4];
         }
     };
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0, .qv_heads = 1 };
@@ -1025,7 +1025,7 @@ test "an encoder on the engine's stream joins its tower's spans there, with no M
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
@@ -1086,7 +1086,7 @@ test "undecoded images are decoded a window at a time, freed after their tower c
             return mlx.mlx_array_data_float32(arr).?[0 .. @as(usize, @intCast(shape[1])) * 4];
         }
     };
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
@@ -1165,7 +1165,7 @@ test "an encode refused for headroom after the restore names the bill of what it
             return error.TowerMustNotRun;
         }
     };
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0, .qv_heads = 1 };
@@ -1213,7 +1213,7 @@ test "an encode the engine or MLX refused settles its error: the request gets th
     mlx.engine.enabled = true;
     defer mlx.engine.enabled = was_enabled;
     defer mlx.engine.fault.disarm();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
@@ -1271,7 +1271,7 @@ test "a refused encode logs its failure, never an encoded count" {
         log.closeFile();
         _ = std.c.unlink(path);
     }
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0 };
@@ -1345,7 +1345,7 @@ test "a media encode yields to other requests after each image and frame group, 
             _ = mlx.mlx_array_free(arr);
         }
     };
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.allocator = testing.allocator;
     var cfg = ModelConfig{ .num_hidden_layers = 0 };

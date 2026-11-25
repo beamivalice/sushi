@@ -651,9 +651,10 @@ test "a resident MiMo batches decode in groups of the FP8 GEMV's row-identical w
 }
 
 test "the batched group is capped by padding waste: the longest slot sorts last and falls out" {
-    var slots: [3]Slot = undefined;
+    var slots: [3]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel()));
     var group: [3]*Slot = undefined;
     for (&slots, &group, [_]usize{ 90_000, 1_000, 1_200 }) |*slot, *g, step| {
+        slot.bindCtxForTest();
         slot.cache = .{ .entries = &.{}, .step = step, .allocator = testing.allocator, .config = .dense };
         g.* = slot;
     }
@@ -732,10 +733,14 @@ test "a cancelled or queued-for-cleanup slot still blocks exclusive admission un
         }
     };
     var model: LoadedModel = undefined;
-    var live: Slot = undefined;
-    var cancelled: Slot = undefined;
-    var queued: Slot = undefined;
-    var finished: Slot = undefined;
+    var live = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    live.bindCtxForTest();
+    var cancelled = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    cancelled.bindCtxForTest();
+    var queued = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    queued.bindCtxForTest();
+    var finished = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    finished.bindCtxForTest();
     for ([_]*Slot{ &live, &cancelled, &queued, &finished }) |s| {
         s.model = &model;
         s.finished = false;
@@ -818,7 +823,8 @@ test "a staggered admission waits for the growth an earlier request was admitted
     var model: LoadedModel = undefined;
     model.config = &cfg;
     model.handle = arch_handle.fixtureHandle(&xfm);
-    var a: Slot = undefined;
+    var a = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    a.bindCtxForTest();
     a.model = &model;
     a.full_prompt = &.{};
     a.max_tokens = 1;
@@ -832,7 +838,7 @@ test "a staggered admission waits for the growth an earlier request was admitted
     a.error_code = null;
     a.growth_commit = 0;
     var b = a;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.pending = .empty;
     sch.decoding = .empty;
     sch.live_hold = .{};
@@ -872,7 +878,7 @@ test "a commitment is released as the cache allocates it" {
 
 /// A slot reduced to the fields the queue report reads; no mlx state.
 fn queueTestSlot(prompt_len: usize, generated: u32, max: u32, decode_s: u64) Slot {
-    var s: Slot = undefined;
+    var s = Slot.initForTest(std.testing.io, std.testing.allocator, scheduler_mod.testSlotModel());
     s.full_prompt = scheduler_mod.queue_test_prompt[0..prompt_len];
     s.completion_tokens = generated;
     s.max_tokens = max;
@@ -1111,7 +1117,7 @@ test "the caps pick the candidates and memory admits from them: two that fit alo
 }
 
 fn kvCapSlot(model: *model_registry_mod.LoadedModel, prompt: []u32, max_tokens: u32, restored_entry: u64) Slot {
-    var s: Slot = undefined;
+    var s = Slot.initForTest(std.testing.io, testing.allocator, model);
     s.model = model;
     s.full_prompt = prompt;
     s.max_tokens = max_tokens;

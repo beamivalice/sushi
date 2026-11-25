@@ -1312,7 +1312,7 @@ test "dsv41 borrow: a DeepSeek load on MLX that fails after its plan capped the 
             model_mod.cooler_off = .full;
             var config = try model_mod.parseConfig(io, a, dir);
             defer config.deinit(a);
-            var sch: @import("../scheduler.zig").Scheduler = undefined;
+            var sch = @import("../scheduler.zig").Scheduler.initForTest(io, a);
             sch.io = io;
             sch.allocator = a;
             sch.ctx_size_flag = 0;

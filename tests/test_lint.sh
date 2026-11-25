@@ -862,8 +862,29 @@ expect_red "a field-by-field Scheduler given a submit" "src/p.zig:3:9 \[schedule
 
 tree
 printf '%s\n' 'const scheduler_mod = @import("scheduler.zig");' 'test "t" {' '    var sch = scheduler_mod.submitTestScheduler(a, 2);' \
-  '    _ = try sch.submit(.{});' '    var bare: scheduler_mod.Scheduler = undefined;' '    _ = bare.cancelSlotById(1);' '}' > "$TMP/t/src/p.zig"
-expect_green "a Scheduler from submitTestScheduler, and a bare one that never submits"
+  '    _ = try sch.submit(.{});' '}' > "$TMP/t/src/p.zig"
+expect_green "a Scheduler from submitTestScheduler"
+
+# rule undefined-scheduler-slot
+tree
+printf '%s\n' 'const scheduler_mod = @import("scheduler.zig");' 'test "t" {' '    var sch: scheduler_mod.Scheduler = undefined;' \
+  '    sch.queue_cap = 2;' '}' > "$TMP/t/src/p.zig"
+expect_red "an undefined Scheduler" "src/p.zig:3:9 \[undefined-scheduler-slot\] t: Scheduler 'sch' is undefined: start it from Scheduler.initForTest"
+
+tree
+printf '%s\n' 'const sched = @import("scheduler.zig");' 'test "t" {' '    var slot: sched.Slot = undefined;' \
+  '    slot.request_id = 1;' '}' > "$TMP/t/src/p.zig"
+expect_red "an undefined Slot" "src/p.zig:3:9 \[undefined-scheduler-slot\] t: Slot 'slot' is undefined: start it from Slot.initForTest"
+
+tree
+printf '%s\n' 'test "t" {' '    var sch: @import("scheduler.zig").Scheduler = undefined;' \
+  '    sch.queue_cap = 2;' '}' > "$TMP/t/src/p.zig"
+expect_red "an undefined Scheduler through an @import" "src/p.zig:2:9 \[undefined-scheduler-slot\] t: Scheduler 'sch' is undefined: start it from Scheduler.initForTest"
+
+tree
+printf '%s\n' 'const sched = @import("scheduler.zig");' 'test "t" {' '    var p: *sched.Scheduler = undefined;' \
+  '    var slots: [4]sched.Slot = undefined;' '    var o: ?sched.Slot = undefined;' '    _ = .{ p, slots, o };' '}' > "$TMP/t/src/p.zig"
+expect_green "a Scheduler pointer, a Slot array and an optional Slot"
 
 # rule conn-read-unbounded
 tree

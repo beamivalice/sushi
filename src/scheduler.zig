@@ -907,6 +907,132 @@ pub const Slot = struct {
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
     }
+
+    pub fn initForTest(io: std.Io, allocator: std.mem.Allocator, model: *LoadedModel) Slot {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .model = model,
+            .cache = .{ .entries = &.{}, .step = 0, .allocator = allocator, .config = .dense },
+            .moe_seq_offset = 0,
+            .ssm_entries = null,
+            .request = null,
+            .facts = .{},
+            .cancelled_prefill = .{},
+            .ring_cps = .{},
+            .vision_embeddings = null,
+            .deferred_media = null,
+            .media_refusal = null,
+            .forward_refusal = null,
+            .vision_key = 0,
+            .cache_key = 0,
+            .restored_entry = 0,
+            .restored_disk = null,
+            .skip_prefix_cache = false,
+            .media_start = null,
+            .media_chain = &.{},
+            .mrope_pos = null,
+            .mrope_total = 0,
+            .mrope_delta = 0,
+            .ctx = .{
+                .cache = &SlotTestCtx.cache,
+                .moe_seq_offset = &SlotTestCtx.offset,
+                .ssm_entries = null,
+                .vision_embeddings = null,
+                .capture_hidden = null,
+            },
+            .legacy_gen = null,
+            .prompt_ids = &.{},
+            .full_prompt = &.{},
+            .sampling = .{},
+            .eos_token_ids = &.{},
+            .max_tokens = 0,
+            .timeout_ns = 0,
+            .has_tools = false,
+            .enable_thinking = false,
+            .enable_drafter = false,
+            .dflash = null,
+            .drafter_block_size = 0,
+            .enable_mtp = false,
+            .allow_batch_mtp = false,
+            .return_progress = false,
+            .mtp = null,
+            .mtp_depth = 0,
+            .cached_tokens = 0,
+            .serial_reason_logged = false,
+            .memory_hold_logged = false,
+            .queue_logged = false,
+            .growth_commit = 0,
+            .admitted_held = 0,
+            .ledger = null,
+            .hold_counted = false,
+            .mtp_plain_tick = false,
+            .planner_plain_transition = false,
+            .planner_price_transition = false,
+            .planner_last_width = 255,
+            .planner_force_plain = false,
+            .mtp_publish_ns = 0,
+            .mtp_publish_gap_ms = 0,
+            .state = .pending_prefill,
+            .out_mu = .init,
+            .out_cond = .init,
+            .out_event = .unset,
+            .out_buf = .empty,
+            .out_idx = 0,
+            .finished = false,
+            .error_code = null,
+            .memory_context_refusal = null,
+            .finish_reason = "length",
+            .finish_details = null,
+            .loop_trim_start = null,
+            .handover_token = null,
+            .stop_token = null,
+            .stop_path = "",
+            .end_turn_at_cap_for_test = false,
+            .cancelled = std.atomic.Value(bool).init(false),
+            .shutdown_cancelled = std.atomic.Value(bool).init(false),
+            .committed_at_cull = false,
+            .metrics_recorded = false,
+            .stop_hit = std.atomic.Value(bool).init(false),
+            .in_pass = std.atomic.Value(u32).init(0),
+            .constraint_payload_at = std.atomic.Value(u32).init(std.math.maxInt(u32)),
+            .constraint_payload_offset = std.atomic.Value(u32).init(0),
+            .prompt_tokens = 0,
+            .completion_tokens = 0,
+            .prefill_tps = 0,
+            .decode_tps = 0,
+            .request_id = 0,
+            .abandoned_next = null,
+            .request_start_ts = std.Io.Timestamp.now(io, .boot),
+            .first_token_ns = 0,
+            .prefill_ns = 0,
+            .restore_ns = null,
+            .spec_mode = .none,
+            .spec_totals = .{},
+            .restore_tier = null,
+            .prefill_computed = 0,
+            .spec_recorded = false,
+            .prefill_interleaved_ns = 0,
+            .decode_ns = 0,
+            .generated_ids = null,
+            .was_pad_only = false,
+            .prefill_progress = .{},
+        };
+    }
+
+    pub fn bindCtxForTest(self: *Slot) void {
+        self.ctx.cache = &self.cache;
+        self.ctx.moe_seq_offset = &self.moe_seq_offset;
+        self.ctx.ssm_entries = self.ssm_entries;
+        self.ctx.vision_embeddings = self.vision_embeddings;
+        self.ctx.capture_hidden = null;
+        arch_state.setMrope(&self.ctx.arch_ctx, self.mrope_pos, self.mrope_total, self.mrope_delta);
+    }
+};
+
+const SlotTestCtx = struct {
+    var cache: KVCache = .{ .entries = &.{}, .step = 0, .allocator = std.heap.page_allocator, .config = .dense };
+    var offset: usize = 0;
 };
 
 /// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
@@ -2219,7 +2345,107 @@ pub const Scheduler = struct {
             .model_batches = if (slot.model.handle) |h| sched.modelBatches(arch_handle.trunk(h)) else null,
         });
     }
+
+    pub fn initForTest(io: std.Io, allocator: std.mem.Allocator) Scheduler {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .registry = testSchedulerRegistry(io),
+            .current_model = null,
+            .drafter_block_size = 0,
+            .kv_quant = null,
+            .ctx_size_flag = 0,
+            .prefix_cache_capacity = 0,
+            .prefix_cache_ram_enabled = false,
+            .prefix_cache_mem_bytes = 0,
+            .prefix_cache_mem_resolver = null,
+            .prefix_cache_disk_resolver = null,
+            .ssd_budget_bytes = 0,
+            .expert_cache_fit_resolver = null,
+            .ssm_checkpoint_stride = 0,
+            .ssm_checkpoint_max = 0,
+            .mtp = null,
+            .mtp_head_kv_quant = false,
+            .mtp_depth = 0,
+            .no_drafter = false,
+            .drafter_dir = "",
+            .primary_model_dir = "",
+            .drafter_path = "",
+            .resident_live_kv_bytes = std.atomic.Value(u64).init(0),
+            .live_sessions = @splat(metrics_mod.Session.init("", .prefill, 0, 0, 0, 0)),
+            .live_session_count = 0,
+            .live_unflushed = std.atomic.Value(bool).init(false),
+            .req_seq = first_request_id,
+            .cached_sessions = @splat(metrics_mod.Session.init("", .prefill, 0, 0, 0, 0)),
+            .cached_session_count = 0,
+            .budget_revise_sw = null,
+            .digest_mu = .init,
+            .max_concurrent = 1,
+            .force_batched = false,
+            .queue_mu = .init,
+            .queue_cond = .init,
+            .pending = .empty,
+            .decoding = .empty,
+            .load_queue = .empty,
+            .unload_queue = .empty,
+            .prefix_clear_queue = .empty,
+            .rearm_forced = std.atomic.Value(bool).init(false),
+            .tiers_declined = std.atomic.Value(u32).init(0),
+            .rearm_sw = io_util.Stopwatch.init(io),
+            .rearm_wait_ns = 0,
+            .cleanup_queue = .empty,
+            .abandoned = null,
+            .orphan_vision = @splat(.{}),
+            .orphan_vision_n = 0,
+            .prefilling = .empty,
+            .live_hold = .{},
+            .metrics = null,
+            .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_expected = std.atomic.Value(u64).init(0),
+            .requests_prefilling = std.atomic.Value(u64).init(0),
+            .in_flight = 0,
+            .queue_cap = 1,
+            .submit_cond = .init,
+            .inference_thread = null,
+            .test_on_cooler = null,
+            .test_skip_warm = false,
+            .budget_revise_gen = std.atomic.Value(u64).init(0),
+            .shutdown = std.atomic.Value(bool).init(false),
+            .draining = false,
+            .started = std.atomic.Value(bool).init(false),
+            .started_mu = .init,
+            .started_cond = .init,
+            .load_failed = std.atomic.Value(bool).init(false),
+            .load_error_name = null,
+            .prechecked = false,
+            .startup_pin = null,
+        };
+    }
 };
+
+fn testSchedulerRegistry(io: std.Io) *ModelRegistry {
+    const One = struct {
+        var registry: ?*ModelRegistry = null;
+    };
+    if (One.registry == null) One.registry = ModelRegistry.init(std.heap.page_allocator, io, null, 1, 0, null) catch unreachable;
+    return One.registry.?;
+}
+
+pub fn testSlotModel() *LoadedModel {
+    const One = struct {
+        var model: LoadedModel = undefined;
+        var ready: bool = false;
+    };
+    if (!One.ready) {
+        One.model.id = "";
+        One.model.path = "";
+        One.model.config = null;
+        One.model.handle = null;
+        One.model.prefix_cache = null;
+        One.ready = true;
+    }
+    return &One.model;
+}
 
 var kv_skew_split_logged: bool = false; // one-shot log guard
 
@@ -4944,8 +5170,9 @@ test "a decode-phase cancel that never passed the cull commits at the cleanup dr
             commits += 1;
         }
     };
-    var sch: Scheduler = undefined;
-    var slot: Slot = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, testSlotModel());
+    slot.bindCtxForTest();
     slot.committed_at_cull = false;
     Hook.commits = 0;
     commitCancelledAtCleanup(&sch, &slot, Hook.commit);
@@ -4960,7 +5187,7 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
     const s = mlx.gpuStream();
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
     defer reg.deinit();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
@@ -4982,7 +5209,8 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
         .{ .forwarded = prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS - 1, .hybrid = false, .committed = false },
     }) |c| {
         const before = model.prefix_cache.?.entries.items.len;
-        var slot: Slot = undefined;
+        var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+        slot.bindCtxForTest();
         slot.model = &model;
         slot.error_code = null;
         slot.legacy_gen = null;
@@ -5342,7 +5570,7 @@ test "a live MTP slot never ticks regular, an unarmed one always does" {
 }
 
 test "a saved SSD-cache setting makes the re-arm check due at once, a declined tier otherwise waits its minute" {
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.queue_mu = .init;
     sch.queue_cond = .init;
@@ -5508,7 +5736,8 @@ test "a speculative block ending on EOS records the stop token and leaves it out
     gen.mtp = null;
     gen.sampling = .{};
     gen.completion_tokens = 0;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, testSlotModel());
+    slot.bindCtxForTest();
     slot.io = testing.io;
     slot.allocator = testing.allocator;
     slot.out_mu = .init;
@@ -5617,7 +5846,8 @@ test "single MTP slot reaches the round entry through runDecodeTick, and its ref
     // A forced tool call is a request a draft round cannot honour: the round entry refuses it.
     var forced = generate_mod.CallForce{ .forced = &.{1}, .call_at = 0, .closer_id = null, .phase = .answer, .last = 0 };
     gen.sampling = .{ .call_force = &forced };
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.io = testing.io;
     slot.allocator = testing.allocator;
     slot.out_mu = .init;
@@ -5634,7 +5864,7 @@ test "single MTP slot reaches the round entry through runDecodeTick, and its ref
     defer if (slot.error_code) |code| testing.allocator.free(code);
     slot.cancelled = std.atomic.Value(bool).init(false);
     slot.completion_tokens = 0;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.force_batched = false;
     sch.metrics = null;
     var active = [_]*Slot{&slot};
@@ -5753,9 +5983,10 @@ test "a slot the batched tick hands back to the serial path counts its pending p
     gen.done = false;
     gen.finish_reason = "length";
     gen.ctx.ssm_entries = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, testSlotModel());
+    slot.bindCtxForTest();
     slot.legacy_gen = gen;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     var active = [_]*Slot{&slot};
 
     Serial.calls = 0;
@@ -5782,30 +6013,9 @@ test "firstMediaPlaceholder: a placeholder id in ORDINARY TEXT is not a media bo
 }
 
 pub fn submitTestScheduler(allocator: std.mem.Allocator, queue_cap: u32) Scheduler {
-    var sch: Scheduler = undefined;
-    sch.allocator = allocator;
-    sch.io = testing.io;
+    var sch = Scheduler.initForTest(testing.io, allocator);
     sch.kv_quant = .dense;
-    sch.queue_mu = .init;
-    sch.queue_cond = .init;
-    sch.submit_cond = .init;
-    sch.shutdown = .init(false);
-    sch.draining = false;
     sch.queue_cap = queue_cap;
-    sch.in_flight = 0;
-    sch.req_seq = first_request_id;
-    sch.pending = .empty;
-    sch.decoding = .empty;
-    sch.cleanup_queue = .empty;
-    sch.prefilling = .empty;
-    sch.live_hold = .{};
-    sch.load_queue = .empty;
-    sch.unload_queue = .empty;
-    sch.abandoned = null;
-    sch.orphan_vision_n = 0;
-    sch.prefix_clear_queue = .empty;
-    sch.rearm_forced = .init(false);
-    sch.current_model = null;
     return sch;
 }
 
@@ -5967,7 +6177,7 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
     const slot = try sch.submit(.{ .model = &model, .prompt_ids = &.{1}, .sampling = .{}, .eos_token_ids = &.{}, .max_tokens = 1 });
     // The inference thread's admission step, as `inferenceLoop` runs it.
     sch.queue_mu.lockUncancelable(sch.io);
-    const taken = admitForPrefillLocked(&sch, 0);
+    const taken = admitForPrefillLocked(&sch, slot);
     _ = sch.pending.orderedRemove(0);
     sch.queue_mu.unlock(sch.io);
     try testing.expectEqual(slot, taken);
@@ -5980,7 +6190,7 @@ test "shutdown cancels a slot whose prefill is running, so the prefill stops at 
 }
 
 test "cancelSlotById cancels the slot with that id in any queue and no other" {
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.io = testing.io;
     sch.queue_mu = .init;
     sch.pending = .empty;
@@ -5989,8 +6199,9 @@ test "cancelSlotById cancels the slot with that id in any queue and no other" {
     defer sch.pending.deinit(testing.allocator);
     defer sch.prefilling.deinit(testing.allocator);
     defer sch.decoding.deinit(testing.allocator);
-    var slots: [4]Slot = undefined;
+    var slots: [4]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, testSlotModel()));
     for (&slots, 1..) |*slot, id| {
+        slot.bindCtxForTest();
         slot.io = testing.io;
         slot.request_id = id;
         slot.cancelled = .init(false);
@@ -6140,7 +6351,8 @@ test "MTP handover: t1 streams at the prefill handover unless it ends the answer
 }
 
 test "MTP handover: the first block's echo of the streamed t1 is swallowed once, anything else is published" {
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, testSlotModel());
+    slot.bindCtxForTest();
     slot.handover_token = 42;
     try testing.expect(slot.takeHandoverEcho(42));
     try testing.expectEqual(@as(?u32, null), slot.handover_token);
@@ -6153,7 +6365,7 @@ test "MTP handover: the first block's echo of the streamed t1 is swallowed once,
 test "an error whose name cannot be copied still ends the consumer and leaves scheduling" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     var mm = metrics_mod.Metrics.init();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
@@ -6168,7 +6380,8 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     model.prefix_cache = null;
     model.handle = null;
     model.config = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.io = testing.io;
     slot.allocator = failing.allocator();
     slot.model = &model;
@@ -6205,7 +6418,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
 
 test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" {
     var mm = metrics_mod.Metrics.init();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     sch.io = testing.io;
     sch.metrics = &mm;
@@ -6217,7 +6430,8 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     model.prefix_cache = null;
     model.handle = null;
     model.config = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     // Only the fields the publish path reads: rows are value copies.
     slot.model = &model;
     slot.legacy_gen = null;
@@ -6300,7 +6514,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
 
 test "publishLiveKvResidency gives each prefilling slot its own prompt_progress numbers in the live rows" {
     var mm = metrics_mod.Metrics.init();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     sch.io = testing.io;
     sch.metrics = &mm;
@@ -6317,8 +6531,9 @@ test "publishLiveKvResidency gives each prefilling slot its own prompt_progress 
         .{ 7, 8, 9, 10 },
         .{ 7, 8, 9, 10 },
     };
-    var slots: [2]Slot = undefined;
+    var slots: [2]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &model));
     for (&slots, 0..) |*slot, i| {
+        slot.bindCtxForTest();
         slot.model = &model;
         slot.legacy_gen = null;
         slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
@@ -6389,7 +6604,7 @@ test "publishLiveKvResidency gives each prefilling slot its own prompt_progress 
 test "the live KV bill counts ring restore points and nets out a donated checkout the hot cache bills" {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     sch.io = testing.io;
     sch.metrics = null;
@@ -6415,7 +6630,8 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     cp_entries[0].initialized = true;
     const cp_bytes: u64 = 2 * (8 * 4) * 2;
 
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.model = &model;
     slot.legacy_gen = null;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
@@ -6478,7 +6694,7 @@ test "ensureLoaded: a load refused because every other resident model is pinned 
     reg.mutex.unlock(io);
     _ = resident.refcount.fetchAdd(1, .acq_rel); // an in-flight request
 
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = io;
     sch.allocator = testing.allocator;
@@ -6524,7 +6740,7 @@ test "ensureLoadedFresh: a model whose load failed is tried again, not answered 
     reg.mutex.unlock(io);
     _ = resident.refcount.fetchAdd(1, .acq_rel);
 
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = io;
     sch.allocator = testing.allocator;
@@ -6765,7 +6981,7 @@ test "ensureLoaded: a streamed pack with no ssd budget is gated at its RAM-tier 
     reg.mutex.unlock(io);
     _ = resident.refcount.fetchAdd(1, .acq_rel);
 
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = io;
     sch.allocator = testing.allocator;
@@ -6796,7 +7012,7 @@ test "the hot-tier bytes gauge sums the RAM tier of every ready model, and each 
         entry.prefix_cache.?.current_kv_bytes = bytes;
         e.* = entry;
     }
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = testing.io;
     try testing.expectEqual(@as(u64, 120), publishModelGauges(&sch));
@@ -6840,7 +7056,8 @@ test "a slot that fails names its error in the log, whichever path latched it" {
         _ = std.c.unlink(path);
     }
 
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, testSlotModel());
+    slot.bindCtxForTest();
     slot.io = testing.io;
     slot.allocator = testing.allocator;
     slot.request_id = 77;
@@ -7319,7 +7536,7 @@ test "the disk-stats publisher keeps the namespace of a model that is loading or
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
     defer reg.deinit();
     const entry = try reg.registerStub("m", "/m", 1);
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = testing.io;
     sch.tiers_declined = std.atomic.Value(u32).init(0);

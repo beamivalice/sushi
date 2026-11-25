@@ -316,7 +316,8 @@ test "outcome: a real Slot's fields satisfy the recorder, and a cancelled GLM sl
     var m = metrics_mod.Metrics.init();
     var model: model_registry_mod.LoadedModel = undefined;
     model.id = "org/glm";
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.io = std.testing.io;
     slot.model = &model;
     slot.request_id = 0;
@@ -422,8 +423,11 @@ test "a drafting GLM slot rides plain rows only in company of its own model" {
         m.handle = null;
         m.config = &cfg;
     }
-    var slots: [4]Slot = undefined;
-    for (&slots, 0..) |*s, i| s.model = if (i == 3) &glm_b else &glm_a;
+    var slots: [4]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &glm_a));
+    for (&slots, 0..) |*s, i| {
+        s.bindCtxForTest();
+        s.model = if (i == 3) &glm_b else &glm_a;
+    }
     try testing.expect(!sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{}));
     try testing.expect(!sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[3]}));
     try testing.expect(sched.rowsInCompany(&slots[0], &.{&slots[0]}, &.{&slots[1]}));
@@ -483,7 +487,7 @@ test "a GLM slot submitted with a kv4 override is refused by the same name admis
 test "culling an errored or cancelled GLM slot releases its native state, a live one keeps it" {
     if (comptime !@hasField(arch_state.Ctx, "glm5")) return error.SkipZigTest;
     var mm = metrics_mod.Metrics.init();
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
@@ -499,8 +503,9 @@ test "culling an errored or cancelled GLM slot releases its native state, a live
     model.handle = null;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     model.config = &cfg;
-    var slots: [3]Slot = undefined;
+    var slots: [3]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &model));
     for (&slots, 0..) |*slot, i| {
+        slot.bindCtxForTest();
         slot.model = &model;
         slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
         slot.ssm_entries = null;
@@ -546,7 +551,7 @@ test "a GLM cancel landing between the cull passes is committed once before its 
             slots[1].cancelled.store(true, .release);
         }
     };
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     sch.io = testing.io;
     sch.allocator = testing.allocator;
@@ -561,8 +566,9 @@ test "a GLM cancel landing between the cull passes is committed once before its 
     model.handle = null;
     var cfg = ModelConfig{ .model_type = "glm5_next" };
     model.config = &cfg;
-    var slots: [2]Slot = undefined;
+    var slots: [2]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &model));
     for (&slots, 0..) |*slot, i| {
+        slot.bindCtxForTest();
         slot.model = &model;
         slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
         slot.ssm_entries = null;
@@ -614,9 +620,10 @@ test "postPrefillTerminal commits a cancelled GLM slot before it releases its na
         }
     };
     Hook.commits = 0;
-    var sch: Scheduler = undefined;
-    var slots: [3]Slot = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
+    var slots: [3]Slot = @splat(Slot.initForTest(std.testing.io, std.testing.allocator, &model));
     for (&slots) |*slot| {
+        slot.bindCtxForTest();
         slot.model = &model;
         slot.state = .decoding;
         slot.finished = false;

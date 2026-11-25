@@ -263,6 +263,7 @@ fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xf
     model.id = "org/dsv41-cull";
     model.prefix_cache = null;
     model.handle = arch_handle.fixtureHandle(xfm);
+    model.config = null;
     slot.model = model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
@@ -291,12 +292,13 @@ test "a cancelled DeepSeek slot commits when it is culled and not again at the c
         }
     };
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
     try sch.decoding.append(testing.allocator, &slot);
@@ -320,12 +322,13 @@ test "a finished DeepSeek slot is not committed again by the cull" {
         }
     };
     if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.current_model = null;
     var model: model_registry_mod.LoadedModel = undefined;
     var xfm = testTrunk("deepseek_v41");
     xfm.arch_state.dsv41.model = @ptrFromInt(@alignOf(@import("dsv41_model.zig").Model));
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     dsv41CullScaffold(&sch, &model, &xfm, &slot);
     defer sch.decoding.deinit(testing.allocator);
     try sch.decoding.append(testing.allocator, &slot);
@@ -337,9 +340,10 @@ test "a finished DeepSeek slot is not committed again by the cull" {
 }
 
 test "a DSpark round that finished the slot leaves the thought point to the commit" {
-    var slot: Slot = undefined;
     var model: model_registry_mod.LoadedModel = undefined;
     model.prefix_cache = null;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.model = &model;
     slot.error_code = null;
     var gen: Generator = undefined;
@@ -385,7 +389,8 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);
     try dsv41_prefix.liveOf(hc).keep(a, m, &cp, null);
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.model = &model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
     slot.ssm_entries = null;
@@ -399,7 +404,7 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     try testing.expectEqual(rows_and_windows + dsv41_prefix.liveOf(hc).bytes(), slotStateBytes(&slot));
 
     // The request ended: its slot is culled, and the model keeps its state for the next one.
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.allocator = a;
     sch.io = testing.io;
     sch.queue_mu = .init;

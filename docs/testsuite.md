@@ -328,6 +328,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   have left the MLX latch, which `mlx.settledErrorName(e)` takes; a `checkError*` call's own error passes.
   `scheduler-hand-built` flags a `Scheduler` declared `undefined` that reaches `.submit(`: submit reads fields such a
   fixture leaves unset (`draining`), so it reads an earlier test's stack and can refuse; start from `submitTestScheduler`.
+  `undefined-scheduler-slot` flags any `var x: Scheduler = undefined` or `var x: Slot = undefined` (any spelling whose
+  last field is the type: an `@import`, an alias); a field added later is garbage the cull path reads: start from
+  `Scheduler.initForTest` or `Slot.initForTest`, which set every field.
   `entry-checkout` flags a write of a hot-cache entry's `checkout` (assigned, set in a literal, captured by pointer,
   written through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
   `error-body-literal` flags an error envelope spelled outside `src/http.zig` (an `error` key whose object holds a

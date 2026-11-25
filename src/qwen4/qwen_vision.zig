@@ -2334,7 +2334,7 @@ test "qwen vision: a video the scheduler encodes a frame group a step, yielding 
             return 0;
         }
     };
-    var sch: @import("../scheduler.zig").Scheduler = undefined;
+    var sch = @import("../scheduler.zig").Scheduler.initForTest(std.testing.io, a);
     sch.io = std.testing.io;
     sch.allocator = a;
     var model: @import("../model_registry.zig").LoadedModel = undefined;

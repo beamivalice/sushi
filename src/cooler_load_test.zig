@@ -374,7 +374,7 @@ test "cooler contract: a resident load beside buffers already past a declared wi
     reg.mutex.lockUncancelable(io);
     try testing.expect(reg.tryBeginLoadLocked(entry));
     reg.mutex.unlock(io);
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = io;
     sch.allocator = a;
@@ -471,7 +471,7 @@ fn evictMlxModel(new_on_engine: bool) !usize {
     @import("cooler_side.zig").forTest(&other_config, true);
     try testing.expectEqual(new_on_engine, arch_handle.onEngine(null, &other_config));
     var victims = [_]*registry_mod.LoadedModel{victim};
-    var sch: scheduler_mod.Scheduler = undefined;
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = io;
     sch.allocator = a;

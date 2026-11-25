@@ -3471,7 +3471,7 @@ test "a failed cold load drops the MLX error it latched and keeps one latched be
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
     defer reg.deinit();
     const entry = try reg.registerStub("m", "/m", 1);
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = testing.io;
     var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "" };
@@ -3493,7 +3493,7 @@ test "a failed cold load hands its error over as it is, a refusal for memory or 
     var reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
     defer reg.deinit();
     const entry = try reg.registerStub("m", "/m", 1);
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.registry = reg;
     sch.io = testing.io;
     var req = LoadRequest{ .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = "" };

@@ -79,7 +79,8 @@ test "MiMo crowded MTP takes an eligible slot" {
     gen.mtp_serial_left = 0;
     gen.mtp_serial_exit = .none;
     gen.dflash = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;
@@ -102,7 +103,8 @@ test "a penalised MTP slot never joins a plain batched tick, which samples no pe
     gen.mtp_serial_left = 0;
     gen.mtp_serial_exit = .none;
     gen.dflash = null;
-    var slot: Slot = undefined;
+    var slot = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    slot.bindCtxForTest();
     slot.model = &model;
     slot.legacy_gen = gen;
     slot.enable_mtp = true;

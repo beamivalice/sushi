@@ -48,6 +48,7 @@ const rules = .{
     @import("array_unowned_across_try.zig"),
     @import("caught_error_unsettled.zig"),
     @import("scheduler_hand_built.zig"),
+    @import("undefined_scheduler_slot.zig"),
     @import("entry_checkout.zig"),
     @import("error_body_literal.zig"),
     @import("conn_read_unbounded.zig"),

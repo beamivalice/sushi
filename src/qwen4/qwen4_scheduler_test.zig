@@ -393,7 +393,8 @@ test "admission combines Qwen and MiMo reservations in either order" {
     var mimo: LoadedModel = undefined;
     mimo.config = &mimo_cfg;
     mimo.handle = arch_handle.fixtureHandle(&xfm);
-    var a: Slot = undefined;
+    var a = Slot.initForTest(std.testing.io, std.testing.allocator, &qwen);
+    a.bindCtxForTest();
     a.model = &qwen;
     a.full_prompt = &.{};
     a.max_tokens = 1;
@@ -403,7 +404,7 @@ test "admission combines Qwen and MiMo reservations in either order" {
     a.memory_hold_logged = true;
     var b = a;
     b.model = &mimo;
-    var sch: Scheduler = undefined;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
     sch.pending = .empty;
     sch.decoding = .empty;
     sch.live_hold = .{};
