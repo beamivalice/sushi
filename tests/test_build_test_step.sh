@@ -20,6 +20,12 @@ elif ! grep -q "Dtest-step=no-such-step names no test run step" "$TMP/out"; then
   echo "  FAIL: -Dtest-step=no-such-step failed without naming it"; tail -3 "$TMP/out" | sed 's/^/    /'; FAIL=$((FAIL + 1))
 fi
 
+if "$ZIG" build test-plan -Doptimize=ReleaseFast -Dtest-step=test-host -Dtest-skip-step=test-host >"$TMP/out" 2>&1; then
+  echo "  FAIL: -Dtest-step=test-host -Dtest-skip-step=test-host was accepted"; FAIL=$((FAIL + 1))
+elif ! grep -q "Dtest-step=test-host is also named by -Dtest-skip-step" "$TMP/out"; then
+  echo "  FAIL: a step named by both -Dtest-step and -Dtest-skip-step failed without naming it"; tail -3 "$TMP/out" | sed 's/^/    /'; FAIL=$((FAIL + 1))
+fi
+
 "$ZIG" build test-plan -Doptimize=ReleaseFast "${F[@]}" >"$TMP/out" 2>&1 || { echo "  FAIL: test-plan"; tail -3 "$TMP/out"; exit 1; }
 steps=$(python3 -I -c 'import json; print(" ".join(sorted(r["step"] for r in json.load(open("zig-out/test-plan.json")))))')
 [ "$steps" = "test-host test-sushibar" ] || { echo "  FAIL: the filters plan '$steps', not test-host and test-sushibar"; exit 1; }

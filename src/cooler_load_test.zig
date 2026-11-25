@@ -114,13 +114,10 @@ test "cooler contract: a second Cooler load beside a sealed one, of another arch
 /// when it ran none. Beside a load on the ledger each is refused by name.
 fn besideSealed(comptime ta: registry.Tag) !bool {
     const A = registry.Mod(ta).cooler_contract;
-    // A run that names its fixtures takes the first loads that are one of them: across a landing's runs, one per
-    // fixture, each pair runs once.
+    // A run that names its fixtures takes each ordered pair either of whose arches it names (`pairChosen`); each first
+    // arch still loads once, for every pair it starts.
     const sel = contract.selection();
-    const chosen = for (A.fixtures) |f| {
-        if (contract.fixtureChosen(sel, f)) break true;
-    } else false;
-    if (!chosen) return false;
+    if (!pairsWith(ta, sel)) return false;
     const da = std.mem.span(std.c.getenv(A.fixtures[0]) orelse return false);
     const Warm = struct {
         fn run(ld: *Load) !void {
@@ -138,8 +135,9 @@ fn besideSealed(comptime ta: registry.Tag) !bool {
     inline for (comptime std.meta.tags(registry.Tag)) |tb| {
         if (comptime ta == tb or !@hasDecl(registry.Mod(tb), "cooler_contract")) continue;
         const B = registry.Mod(tb).cooler_contract;
-        if (std.c.getenv(B.fixtures[0])) |db_z| {
-            const db = std.mem.span(db_z);
+        const db_z = std.c.getenv(B.fixtures[0]);
+        if (db_z != null and contract.pairChosen(sel, &A.fixtures, &B.fixtures, true, true)) {
+            const db = std.mem.span(db_z.?);
             ran = true;
             if (first.config.static_ledger != null) {
                 try contract.expectRefusedBesideLedger(B, db);
@@ -157,6 +155,17 @@ fn besideSealed(comptime ta: registry.Tag) !bool {
         }
     }
     return ran;
+}
+
+fn pairsWith(comptime ta: registry.Tag, sel: ?[]const u8) bool {
+    const A = registry.Mod(ta).cooler_contract;
+    const a_set = std.c.getenv(A.fixtures[0]) != null;
+    inline for (comptime std.meta.tags(registry.Tag)) |tb| {
+        if (comptime ta == tb or !@hasDecl(registry.Mod(tb), "cooler_contract")) continue;
+        const B = registry.Mod(tb).cooler_contract;
+        if (contract.pairChosen(sel, &A.fixtures, &B.fixtures, a_set, std.c.getenv(B.fixtures[0]) != null)) return true;
+    }
+    return false;
 }
 
 test "cooler contract: a Cooler load's prefix cache keeps its arrays on the engine, and an MLX load's on MLX" {

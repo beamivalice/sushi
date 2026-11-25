@@ -1338,9 +1338,12 @@ const TestRuns = struct {
         return run;
     }
 
-    /// Writes the plan for `zig build test-plan`; a `-Dtest-skip-step` or `-Dtest-step` that names no run step fails.
+    /// Writes the plan for `zig build test-plan`; a `-Dtest-skip-step` or `-Dtest-step` that names no run step fails, and
+    /// so does a step both name.
     fn finish(self: *TestRuns) void {
         const b = self.b;
+        for (self.only) |s| for (self.skip) |k| if (std.mem.eql(u8, s, k))
+            std.debug.panic("-Dtest-step={s} is also named by -Dtest-skip-step", .{s});
         for ([_]struct { []const u8, []const []const u8 }{ .{ "test-skip-step", self.skip }, .{ "test-step", self.only } }) |opt| for (opt[1]) |s| {
             for (self.plan.items) |row| {
                 if (std.mem.eql(u8, row.step, s)) break;

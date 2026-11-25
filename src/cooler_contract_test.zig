@@ -380,6 +380,17 @@ pub fn fixtureChosen(sel: ?[]const u8, env: []const u8) bool {
     return false;
 }
 
+/// Whether an ordered pair of arches runs: both first fixtures set, and the selection names a fixture of either.
+pub fn pairChosen(sel: ?[]const u8, first: []const [:0]const u8, second: []const [:0]const u8, first_set: bool, second_set: bool) bool {
+    if (!first_set or !second_set) return false;
+    return anyChosen(sel, first) or anyChosen(sel, second);
+}
+
+fn anyChosen(sel: ?[]const u8, envs: []const [:0]const u8) bool {
+    for (envs) |env| if (fixtureChosen(sel, env)) return true;
+    return false;
+}
+
 /// Whether a cell skips before any load: with no selection, the gate's rule that every fixture is set, so a cell never
 /// pays for the fixtures present only to report a skip. A selection skips per named fixture instead (`Tally`).
 fn skipsUpFront(sel: ?[]const u8, set: []const bool) bool {
@@ -549,6 +560,20 @@ test "cooler contract runner: SUSHI_CONTRACT_FIXTURE names the fixtures a run ta
     var named_unset: Tally = .{};
     named_unset.absent();
     try testing.expectError(error.SkipZigTest, named_unset.verdict());
+}
+
+test "cooler contract runner: a pair runs when the selection names either arch's fixture, and only where both fixtures are set" {
+    const dsv41 = [_][:0]const u8{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" };
+    const qwen4 = [_][:0]const u8{ "QWEN4_STQ_TINY", "QWEN4_TEST_MODEL", "QWEN4_BF16_TINY" };
+    const hy4 = [_][:0]const u8{ "HY4_BF16_TINY", "HY4_STQ_TINY" };
+    try testing.expect(pairChosen(null, &dsv41, &hy4, true, true));
+    try testing.expect(!pairChosen(null, &dsv41, &hy4, true, false));
+    try testing.expect(!pairChosen(null, &dsv41, &hy4, false, true));
+    try testing.expect(pairChosen("HY4_STQ_TINY", &dsv41, &hy4, true, true));
+    try testing.expect(pairChosen("HY4_STQ_TINY", &hy4, &dsv41, true, true));
+    try testing.expect(!pairChosen("HY4_STQ_TINY", &dsv41, &qwen4, true, true));
+    try testing.expect(pairChosen("DSV41_STQ_TINY_PM", &dsv41, &qwen4, true, true));
+    try testing.expect(!pairChosen("HY4_STQ_TINY", &dsv41, &hy4, true, false));
 }
 
 test "cooler contract: test_skip_warm skips the warm on a light load and never reaches a served load; a light load on the ledger opens, plans and seals it" {
