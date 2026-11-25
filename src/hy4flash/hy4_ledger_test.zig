@@ -575,11 +575,7 @@ test "hy4 ledger: a cold prompt that spans chunks reports the whole prompt proce
             const a = testing.allocator;
             const sr = @import("../settings_resolve.zig");
             const saved_launch = sr.launch;
-            const saved_legacy = sr.prefill_chunk;
-            defer {
-                sr.launch = saved_launch;
-                sr.prefill_chunk = saved_legacy;
-            }
+            defer sr.launch = saved_launch;
             sr.launch.prefill_chunk_max = 512;
             sr.launch.prefill_chunk_min = 512;
             var ld: Load = undefined;

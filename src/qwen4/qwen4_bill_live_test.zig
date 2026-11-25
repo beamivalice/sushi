@@ -70,7 +70,7 @@ test "chooseRequestPrefillChunk: WIDEST that fits, at the boundary" {
     var prev_width: u32 = 0;
     var distinct: usize = 0;
     for (bills.PREFILL_CHUNK_LADDER) |rung| {
-        if (rung > bills.ladderTop(&cfg, 0)) continue; // above the arch's start width
+        if (rung > bills.ladderTop(&cfg)) continue; // above the arch's start width
         const width = bills.widthForRung(&cfg, seq, rung);
         if (width == prev_width) continue; // a rung this arch narrows onto a width already walked
         prev_width = width;
