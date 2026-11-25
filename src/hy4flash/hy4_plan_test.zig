@@ -1794,9 +1794,9 @@ test "hy4 plan: the region of a chunk is measured at each width's two ends and a
             const span = @min(@as(usize, @import("../prefill_plan.zig").final_span_rows), r.rows);
             const widths: u64 = if (r.rows - 1 > span) 3 else 2;
             // Each width: the state's start and its deepest, read out by none and by its last row, and the cut; and each
-            // class of the deep zone at its deepest, read out both ways.
+            // class of the deep zone at its deepest, read out by its last row as a served chunk is.
             try testing.expect(r.classes > 0);
-            try testing.expectEqual(widths * 5 + 2 * r.classes, r.probes);
+            try testing.expectEqual(widths * 5 + r.classes, r.probes);
         }
     }
     if (!ran) return error.SkipZigTest;

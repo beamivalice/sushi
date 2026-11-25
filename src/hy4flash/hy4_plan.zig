@@ -615,7 +615,7 @@ pub fn regionAt(m: *Model, p: *Plans, rows: usize) !plan.region.Need {
         }
     }
     const classes = try measureClasses(m, p, rows, &most);
-    probes += 2 * classes;
+    probes += classes;
     try p.measured.append(gpa, .{ .rows = rows, .need = most, .probes = probes, .classes = classes });
     const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
     log.info("[plan] a prefill of {d}-row chunks asks a region of {d} KB, host {d} KB, its {d} classes past {d} rows padded to their deepest; measured in {d} ms\n", .{ rows, most.scratch >> 10, most.host >> 10, classes, p.deep, ms });
@@ -629,7 +629,8 @@ fn deepZone(c: *const hy4_config.Config) usize {
 }
 
 /// Each class of `rows`-row forwards in the deep zone, recorded at its deepest member, whose asks are its largest,
-/// for both readouts: its scratch joins `most`, and a chunk of it runs padded to the recording. The classes found.
+/// read out by its last row as a served chunk is: its scratch joins `most`, and a chunk of it runs padded to the
+/// recording. The classes found.
 /// First fit is not monotone, so a class's shallower members are padded to it rather than measured.
 fn measureClasses(m: *Model, p: *Plans, rows: usize, most: *plan.region.Need) !u64 {
     const gpa = p.book.gpa;
@@ -639,10 +640,13 @@ fn measureClasses(m: *Model, p: *Plans, rows: usize, most: *plan.region.Need) !u
     var deepest: std.AutoHashMapUnmanaged(u64, usize) = .empty;
     defer deepest.deinit(gpa);
     var at = deep;
-    while (at <= p.reach - rows) : (at += 1) try deepest.put(gpa, m.wideClass(@intCast(at), @intCast(rows), Readout.none), at);
+    while (at <= p.reach - rows) : (at += 1) try deepest.put(gpa, m.wideClass(@intCast(at), @intCast(rows), Readout.last), at);
     var it = deepest.valueIterator();
-    while (it.next()) |n| for ([_]Readout{ .none, .last }) |readout| {
-        var passes = try recordChecked(m, gpa, .{ .rows = rows, .readout = readout, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = n.*, .phase = .wide }, p.reach);
+    while (it.next()) |n| {
+        const readout: Readout = .last;
+        // One input: the start's and the deepest's probes (`recordChecked`) and the class cells hold that data steers
+        // no structure; a chunk whose asks part from its class's is refused by name, never placed.
+        var passes = try recordPasses(m, gpa, .{ .rows = rows, .readout = readout, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = n.*, .phase = .wide }, p.reach, .zeros, .zeros);
         defer passes.deinit();
         if (!try plan.region.choicesAgree(gpa, passes.traces, p.book.alignment)) {
             log.err("[plan] a forward of {d} rows at {d} leaves its scratch apart across the passes of its choices: a choice's asks outlive it\n", .{ rows, n.* });
@@ -666,7 +670,7 @@ fn measureClasses(m: *Model, p: *Plans, rows: usize, most: *plan.region.Need) !u
         const got = try p.pads.getOrPut(gpa, m.wideClass(@intCast(n.*), @intCast(rows), readout));
         if (got.found_existing) freeClass(gpa, got.value_ptr.*);
         got.value_ptr.* = class;
-    };
+    }
     return deepest.count();
 }
 
@@ -721,9 +725,9 @@ pub fn run(m: *Model, ids: []const u32, vision: ?Model.VisionRows, readout: Read
 /// An ask past the region refuses the forward by name (`WideFull`).
 fn wide(m: *Model, p: *const Plans, ids: []const u32, vision: ?Model.VisionRows, readout: Readout) !mlx.mlx_array {
     const at = m.pos;
-    // A load-width chunk in the deep zone read out as the load recorded its classes runs padded to its class's
-    // recording, so it tops out where that did; another readout (a capture's hidden row) keeps D97's measure.
-    if (p.deep > 0 and vision == null and ids.len == p.region_rows and at >= p.deep and (readout == .none or readout == .last)) {
+    // A load-width chunk in the deep zone read out by its last row, as a served chunk is and as the load recorded its
+    // classes, runs padded to its class's recording, so it tops out where that did; another readout keeps D97's measure.
+    if (p.deep > 0 and vision == null and ids.len == p.region_rows and at >= p.deep and readout == .last) {
         const class = p.pads.get(m.wideClass(@intCast(at), @intCast(ids.len), readout)) orelse {
             log.err("[plan] a forward of {d} rows at {d} is of no class the load recorded\n", .{ ids.len, at });
             return error.Hy4WidePlanMiss;

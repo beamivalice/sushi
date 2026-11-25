@@ -1435,14 +1435,15 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   asking 4,296,592 KB against 4,293,236 KB measured. Past the selection threshold and the window (`deepZone`, 2,048
   tokens on the release config) a chunk's structure turns on a few facts (`Model.wideClass`: each kind of layer's
   edge key, the spans' width, a ring read in one run), and within a class every ask only grows with depth. The load
-  records each class at its deepest member for both readouts (`measureClasses`: 12 classes a width on the tiny), the
+  records each class at its deepest member, read out by its last row as a served chunk is (`measureClasses`: 12
+  classes a width on the tiny), the
   region takes their most, and a chunk of the class runs with each scratch ask placed at its recorded size
   (`core.beginWidePadded`, `plan.region.padOf`): first fit then places it as the recording did, so it tops out exactly
   there. At each `plan.choose` the execution follows a pass that took the same value, sound where every pass leaves
   first fit in one state at each choice (`plan.region.choicesAgree`, checked at load). A chunk of no recorded class, an
   ask past its recorded size or past the sequence is refused by name (`Hy4WidePlanMiss`, `PlanMiss`), never placed.
-  Chunks below the deep zone, other widths, an image's splice and a readout other than none or the last row (a
-  capture's hidden row) keep D97's measure.
+  Chunks below the deep zone, other widths, an image's splice and a readout other than the last row (a capture's
+  hidden row) keep D97's measure.
 
 ## 15. Risks
 
