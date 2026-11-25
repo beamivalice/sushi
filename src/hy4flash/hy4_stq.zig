@@ -460,15 +460,10 @@ pub const EmbedGather = struct {
         return 2 * (self.words.len + self.suh.len + self.svh.len) + kept;
     }
 
-    /// Each id's row into `out` [ids.len · dim], f32. An id past the vocabulary is refused. A dry recording reads no
-    /// value: its rows are zeros, and no block is decoded on the host.
+    /// Each id's row into `out` [ids.len · dim], f32. An id past the vocabulary is refused.
     pub fn rows(self: EmbedGather, gpa: std.mem.Allocator, ids: []const u32, out: []f32) !void {
         const d = self.dim;
         if (out.len != ids.len * d) return error.BadExl3Shape;
-        if (mlx.engine.dryOn()) {
-            for (ids) |id| if (id >= self.vocab) return error.TokenOutOfRange;
-            return @memset(out, 0);
-        }
         const order = try gpa.alloc(u32, ids.len);
         defer gpa.free(order);
         for (order, 0..) |*o, i| o.* = @intCast(i);

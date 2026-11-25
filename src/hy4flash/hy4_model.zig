@@ -258,9 +258,9 @@ pub const Model = struct {
         };
         errdefer m.freeStq();
         if (src.quant.synthetic) std.log.warn("hy_v4_flash: this pack's codes are synthetic (random): the format is real, the weights are not", .{});
-        // A trellis embedding is gathered by 128-id block: on the GPU from its bank where the trellis decode kernel
-        // runs, else from the gather's own host copy at its stored bytes, the pack's tensors dropped.
-        if (mlx.streamIsGpu(s) and exl3.kernels.gemmNaxOn()) {
+        // A trellis embedding is gathered by 128-id block: on the GPU from its bank, else from the gather's own host
+        // copy at its stored bytes, the pack's tensors dropped.
+        if (mlx.streamIsGpu(s)) {
             if (try m.bankOf(weights, "model.embed_tokens")) |b| m.embed_gpu = .{ .bank = b };
         }
         if (m.embed_gpu == null) {

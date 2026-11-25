@@ -65,9 +65,9 @@ pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
 }
 
 /// The decoded blocks a load keeps beside its embedding bank where it gathers that bank on the host
-/// (`hy4_stq.EmbedGather`): a GPU without the NAX decode, as `Model` chooses.
+/// (`hy4_stq.EmbedGather`): no GPU, as `Model` chooses.
 fn embedCacheBytes(config: *const ModelConfig, embed_bank: bool) u64 {
-    if (!embed_bank or @import("sushi_exl3").kernels.gemmNaxOn()) return 0;
+    if (!embed_bank or !@import("../mlx.zig").noGpuBackend()) return 0;
     const stq = @import("hy4_stq.zig");
     return stq.EmbedGather.cacheBytes(config.hy4flash.?.dim, stq.EmbedGather.block_cache_bytes);
 }

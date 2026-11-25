@@ -131,12 +131,12 @@ activation dtype before the weight multiplies.
 - **Pinned by**: transformers `HYV4FlashTextModel.forward` (`inputs_embeds.unsqueeze(2).expand(..., hc_mult, ...)`);
   llama.cpp `graph::graph` (`hc_init`).
 - **Cooler**: reused as is. That is the trunk embedding gather of the BF16 table and the vision splice. An STQ pack's
-  K6 embedding bank ([pack-format](pack-format.md#hy4-stq)) is gathered on the GPU where the trellis decode kernel runs
-  (`hy4_embed`): the chunk's 128-id blocks decoded (`trunk_gemm.decodeDense`), then two kernels take the Hadamard down
+  K6 embedding bank ([pack-format](pack-format.md#hy4-stq)) is gathered on the GPU on every Mac (`hy4_embed`): the chunk's 128-id blocks decoded (`trunk_gemm.decodeDense`), then two kernels take the Hadamard down
   each 128-row chunk and along the token's column and scale by `suh·svh`, in the host decode's f32 order, so a row is
-  `EmbedGather.rows`' bytes (the host gather stays the fallback: an M1 or M2, which has no NAX decode, takes it; under a
-  dry recording it writes zeros and decodes no block, since a dry pass reads no value; it keeps the blocks it decoded
-  last, to `EmbedGather.block_cache_bytes` (64 MiB, 42 blocks at dim 3072), billed with its copy (`hy4_load.embedCacheBytes`)). A group launches at a power-of-two block count (`launchBlocks`):
+  `EmbedGather.rows`' bytes. The decode needs only NAX's fragment layout, not its matrix units, so an M1 or M2 runs it
+  too (a host gather made the DSpark draft read each slot's token back to the CPU: five waits a draft, not one). The host
+  gather serves only off the GPU; it keeps the blocks it decoded last, to `EmbedGather.block_cache_bytes` (64 MiB, 42
+  blocks at dim 3072), billed with its copy (`hy4_load.embedCacheBytes`). A group launches at a power-of-two block count (`launchBlocks`):
   the decode is templated on its width, so its six widths are made at load (`warmKernels`), never inside a request, with
   a second group's join and its take back into the ids' order (a prompt's ids are in no block order). Its
   buffers are a forward's. On the engine the last group is not evaluated: host data is
