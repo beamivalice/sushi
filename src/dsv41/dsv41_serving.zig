@@ -66,7 +66,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // The pools a route makes follow the plan this load runs under, whatever the config said before it.
     var own_cfg = config.dsv41.?;
     own_cfg.spill_pools = !engine.plan.resident;
-    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, own_cfg, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.dsparkOn(), .drop = engine.geometry.drop, .on_engine = own_decode });
+    var mdl_mine: ?*dsv41_model.Model = try dsv41_model.init(allocator, own_cfg, weights, config.expert_source_dir orelse return error.MissingExpertSourceDir, model_stream, .{ .experts = false, .dspark = config.drafterOn(), .drop = engine.geometry.drop, .on_engine = own_decode });
     errdefer if (mdl_mine) |m| m.deinit();
     const mdl = mdl_mine.?;
     dsv41_model.logMemory(mdl);

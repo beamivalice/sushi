@@ -33,8 +33,8 @@ const SSMCheckpoint = trunk.SSMCheckpoint;
 const captureSsmCheckpoint = trunk.captureSsmCheckpoint;
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
-const dspark_rows = @import("dspark_rows.zig");
-const arch_dspark = @import("arch/dspark.zig");
+const drafter_rows = @import("drafter_rows.zig");
+const arch_drafter_rounds = @import("arch/drafter_rounds.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const arch_config = @import("arch/config.zig");
 const DflashModel = dflash_mod.DflashModel;
@@ -164,7 +164,8 @@ pub const Constraint = struct {
     /// The loaded model's drafter verifies rows under per-row masks (`row_grammar`), so this request may speculate.
     row_masks: bool = false,
 
-    /// Whether DSpark rounds can serve this constraint: the protocol never reaches a channel header or an opener choice.
+    /// Whether drafter rounds can serve this constraint: the protocol never reaches a channel header or an opener
+    /// choice.
     pub fn rowsDraftable(self: *const Constraint) bool {
         if (!self.row_masks) return false;
         const proto = self.proto orelse return true;
@@ -582,17 +583,18 @@ pub const Generator = struct {
     dflash_attempted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
-    /// deepseek_v41: this request drafts with DSpark (`nextDspark`) over the model's own state.
-    dspark: bool = false,
+    /// This request drafts in drafter rounds (`nextDrafterRound`) over the model's own state (DeepSeek's DSpark,
+    /// Hy4-Flash's DFly2).
+    drafter_on: bool = false,
     /// Forces the verify width (the `SUSHI_DSV41_DSPARK_ROWS` diagnostic, and the tests).
-    dspark_diag: dspark_rows.Diag = .off,
-    dspark_policy: dspark_rows.Policy = .{},
-    /// Test builds only: this cost's modelled ms stand in for every measured DSpark draft and verify, so an injected
+    drafter_diag: drafter_rows.Diag = .off,
+    drafter_policy: drafter_rows.Policy = .{},
+    /// Test builds only: this cost's modelled ms stand in for every measured drafter draft and verify, so an injected
     /// cost holds while the gate still decides.
-    dspark_timing: ?dspark_rows.Cost = null,
-    /// A DSpark round commits through the first draft with this id and no further, so the request's state
+    drafter_timing: ?drafter_rows.Cost = null,
+    /// A drafter round commits through the first draft with this id and no further, so the request's state
     /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
-    dspark_round_ends_at: ?u32 = null,
+    drafter_round_ends_at: ?u32 = null,
     /// Armed by the scheduler for a hybrid thinking request with tools; the restore point it takes is the last
     /// of `ssm_checkpoints` while `state` is `.taken`.
     thought_point: ?mtp_plan.ThoughtPoint = null,
@@ -601,19 +603,19 @@ pub const Generator = struct {
     end_point_armed: bool = false,
     /// The absolute position the last speculative round left the state at.
     spec_round_end: ?usize = null,
-    /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
-    /// and `pending` is null. Serial decode (`next`) emits it first.
-    dspark_pending: bool = false,
+    /// A constrained drafter-round request: `next_token_id` is sampled under the grammar but not yet emitted or in the
+    /// cache, and `pending` is null. Serial decode (`next`) emits it first.
+    drafter_pending: bool = false,
     /// One verify mask per row (`row_grammar.plan`), reused across rounds.
-    dspark_masks: std.ArrayList(bool) = .empty,
-    dspark_serial_logged: bool = false,
-    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dspark_rows.max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0, copy_rounds: u64 = 0, copy_drafted: u64 = 0, copy_accepted: u64 = 0 } = .{},
+    drafter_masks: std.ArrayList(bool) = .empty,
+    drafter_serial_logged: bool = false,
+    drafter_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [drafter_rows.max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0, copy_rounds: u64 = 0, copy_drafted: u64 = 0, copy_accepted: u64 = 0 } = .{},
     /// Whether adaptive rounds may draft from the context (`mtp_lookup.matchBest`) ahead of the stage block; a test turns it off.
-    dspark_copy: bool = true,
+    drafter_copy: bool = true,
     /// Rows a copy round verifies at most.
     /// Null: the widest exactly verified block.
-    dspark_copy_rows: ?usize = null,
-    dspark_copy_backoff: mtp_lookup.CopyBackoff = .{},
+    drafter_copy_rows: ?usize = null,
+    drafter_copy_backoff: mtp_lookup.CopyBackoff = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -864,7 +866,7 @@ pub const Generator = struct {
 
     /// The mode `logSpecStats` reports: the first that drafted.
     pub fn specMode(self: *const Generator) SpecMode {
-        if (self.dspark and self.dspark_stats.rounds > 0) return if (drafter.Drafter.blockKindOf(self.xfm) == .dfly2) .dfly2 else .dspark;
+        if (self.drafter_on and self.drafter_stats.rounds > 0) return if (drafter.Drafter.blockKindOf(self.xfm) == .dfly2) .dfly2 else .dspark;
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) return .mtp;
         if (self.dflash != null and self.dflash_attempted > 0) return .dflash;
         return .none;
@@ -874,7 +876,7 @@ pub const Generator = struct {
     pub fn specTotals(self: *const Generator) spec_stats.Totals {
         return switch (self.specMode()) {
             .none => .{},
-            .dspark, .dfly2 => .{ .rounds = self.dspark_stats.rounds, .drafted = self.dspark_stats.drafted, .accepted = self.dspark_stats.accepted, .plain = self.dspark_stats.plain },
+            .dspark, .dfly2 => .{ .rounds = self.drafter_stats.rounds, .drafted = self.drafter_stats.drafted, .accepted = self.drafter_stats.accepted, .plain = self.drafter_stats.plain },
             // A prompt-lookup round is a verify forward too; `[spec-stats]` prints it apart, as `lookup=`.
             .mtp => .{
                 .rounds = self.mtp_attempted + self.mtp_lookup_rounds,
@@ -897,8 +899,8 @@ pub const Generator = struct {
 
     /// Rounds by verifier rows, for the modes that keep it (the block drafters).
     pub fn specRows(self: *const Generator) []const u32 {
-        comptime std.debug.assert(@typeInfo(@FieldType(@FieldType(Generator, "dspark_stats"), "rows_hist")).array.len <= spec_stats.rows_cap);
-        return if (self.specMode().block()) &self.dspark_stats.rows_hist else &.{};
+        comptime std.debug.assert(@typeInfo(@FieldType(@FieldType(Generator, "drafter_stats"), "rows_hist")).array.len <= spec_stats.rows_cap);
+        return if (self.specMode().block()) &self.drafter_stats.rows_hist else &.{};
     }
 
     pub fn logSpecStats(self: *const Generator) void {
@@ -907,7 +909,7 @@ pub const Generator = struct {
         const mode = self.specMode();
         logEngineStats();
         if (mode.block()) {
-            const st = self.dspark_stats;
+            const st = self.drafter_stats;
             const rounds: f64 = @floatFromInt(st.rounds);
             const round_ms = @as(f64, @floatFromInt(st.draft_ns + st.verify_ns)) / rounds / 1e6;
             const per_round = @as(f64, @floatFromInt(st.accepted)) / rounds;
@@ -1139,9 +1141,9 @@ pub const Generator = struct {
         /// behavior to the regular sampling path. Has no effect when
         /// `drafter_enabled` is true.
         skip_lazy_preforward: bool = false,
-        /// deepseek_v41: decode with DSpark rounds (`dsparkEligible`); the pending token is
+        /// Decode with drafter rounds (`drafterEligible`); the pending token is
         /// then not in the cache, as after a skipped lazy pre-forward.
-        dspark_enabled: bool = false,
+        drafter_enabled: bool = false,
         /// Phase 1 (performance-plan): during prefill, capture an SSM
         /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
         /// Snapshots land in `Generator.ssm_checkpoints` for the caller to
@@ -2049,9 +2051,9 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
-                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling),
-                .dspark_diag = arch_dspark.dsparkDiag(xfm),
-                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
+                .drafter_on = options.drafter_enabled and drafter_rows.eligible(sampling),
+                .drafter_diag = arch_drafter_rounds.drafterDiag(xfm),
+                .drafter_policy = drafter_rows.Policy.init(depth_bounds.active, arch_drafter_rounds.stageBlock(xfm)),
             };
             gen.pending = .{ .logits = logits };
             held = .{ .ctx = null };
@@ -2160,7 +2162,7 @@ pub const Generator = struct {
         // in cache — matches `forwardBatchedDecode`'s expectation and
         // the drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
-        if (options.skip_lazy_preforward or options.dspark_enabled) {
+        if (options.skip_lazy_preforward or options.drafter_enabled) {
             const sample_lazy = try firstSample(xfm, logits, sampling);
             defer _ = mlx.mlx_array_free(sample_lazy);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -2196,9 +2198,9 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
-                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling),
-                .dspark_diag = arch_dspark.dsparkDiag(xfm),
-                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
+                .drafter_on = options.drafter_enabled and drafter_rows.eligible(sampling),
+                .drafter_diag = arch_drafter_rounds.drafterDiag(xfm),
+                .drafter_policy = drafter_rows.Policy.init(depth_bounds.active, arch_drafter_rounds.stageBlock(xfm)),
             };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
@@ -2366,7 +2368,7 @@ pub const Generator = struct {
                 return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint) };
             },
             .reasoning, .header => {
-                self.dspark_pending = false;
+                self.drafter_pending = false;
                 self.dropPending();
                 if (!constraint.pstate.recovering) {
                     var planned: [rp_mod.MAX_TRANSITION_TOKENS]u32 = undefined;
@@ -2428,7 +2430,7 @@ pub const Generator = struct {
         self.sampling.think_penalty.deinitPrepared();
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         self.dropPending();
-        self.dspark_masks.deinit(allocator);
+        self.drafter_masks.deinit(allocator);
         if (self.has_last_hidden) {
             _ = mlx.mlx_array_free(self.last_hidden);
             self.has_last_hidden = false;
@@ -2979,9 +2981,9 @@ pub const Generator = struct {
         accepted_tokens: u32,
     };
 
-    pub const dsparkEmitPending = arch_dspark.dsparkEmitPending;
-    pub const dsparkResumeAfterForced = arch_dspark.dsparkResumeAfterForced;
-    pub const nextDspark = arch_dspark.nextDspark;
+    pub const drafterEmitPending = arch_drafter_rounds.drafterEmitPending;
+    pub const drafterResumeAfterForced = arch_drafter_rounds.drafterResumeAfterForced;
+    pub const nextDrafterRound = arch_drafter_rounds.nextDrafterRound;
 
     /// One DFlash2 round, answered by the loaded arch's drafter.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -3249,7 +3251,7 @@ pub const Generator = struct {
         var tick_prof = TickProf.begin();
         defer tick_prof.finish();
         if (self.done) return null;
-        if (self.sampling.constraint != null) return if (self.dspark_pending) self.dsparkEmitPending(allocator) else self.nextConstrained(allocator);
+        if (self.sampling.constraint != null) return if (self.drafter_pending) self.drafterEmitPending(allocator) else self.nextConstrained(allocator);
 
         // Transition shim: speculative-decode paths may exit with
         // `next_token_id` set but `pending.logits` unset (drafter's exit
@@ -4438,7 +4440,7 @@ test "gpuShareLine: a request's GPU time reads as busy, idle and a share; a requ
 test "specTotals: the prompt-lookup rounds of an MTP request count beside its head rounds" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     var g: Generator = undefined;
-    g.dspark = false;
+    g.drafter_on = false;
     g.dflash = null;
     g.mtp = MtpHeadRef.of("qwen4", undefined);
     g.mtp_depth = 3;
@@ -4461,7 +4463,7 @@ test "specTotals: the prompt-lookup rounds of an MTP request count beside its he
 test "specTotals: a DFlash2 request reports the ticks it ran without a draft as plain rounds" {
     var g: Generator = undefined;
     var model: DflashModel = undefined;
-    g.dspark = false;
+    g.drafter_on = false;
     g.mtp = null;
     g.dflash = &model;
     g.native_dflash = true;

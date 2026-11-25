@@ -1,6 +1,7 @@
-//! DSpark's rounds, shared by every arch that drafts with them: a block drafted from the pending token, a verify chunk
-//! `[t1, drafts]` read through the trunk, the longest prefix of drafts the trunk agrees with kept, and the model cut
-//! back to the kept rows. The arch supplies the model's side as hooks (`Rounds(A)`):
+//! The drafter rounds, shared by every arch whose drafter drafts a block (DeepSeek's DSpark, Hy4-Flash's DFly2): a
+//! block drafted from the pending token, a verify chunk `[t1, drafts]` read through the trunk, the longest prefix of
+//! drafts the trunk agrees with kept, and the model cut back to the kept rows. The arch supplies the model's side as
+//! hooks (`Rounds(A)`):
 //! - `Draft` (`ids` with the pending token first, `conf` a draft, `deinit`), `draft(xfm, ctx, t1)`,
 //!   `verify(xfm, ctx, ids)` (the rows' logits), `finish(xfm, ctx, accepted)` (keep the first `accepted + 1` rows);
 //! - `verdictStream(xfm, s)`, `sampledDraws(sampling, logits, rows, s)`, `vocab(xfm)`, `stageBlock(xfm)`,
@@ -8,7 +9,7 @@
 //! - optional: `draftMeasured(xfm, ctx, t1, limit, meter)`, a draft cut to the policy's `limit` drafts and marked on the
 //!   round's meter.
 const std = @import("std");
-const dspark_rows = @import("dspark_rows.zig");
+const drafter_rows = @import("drafter_rows.zig");
 const generate_mod = @import("generate.zig");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
@@ -34,54 +35,55 @@ pub const CopyArm = struct { exact_rows: usize, block: usize };
 
 pub fn Rounds(comptime A: type) type {
     return struct {
-        /// Rows a DSpark round may verify so it emits at most `room` tokens and the bound fires at the
+        /// Rows a drafter round may verify so it emits at most `room` tokens and the bound fires at the
         /// token serial decode fires at. A round always verifies its t1 row.
-        pub fn dsparkRowsForRoom(rows: usize, room: ?u32) usize {
+        pub fn drafterRowsForRoom(rows: usize, room: ?u32) usize {
             const r = room orelse return rows;
             return @max(1, @min(rows, r));
         }
 
-        /// The width every DSpark round verifies at where a row's bytes move with the width: the one most rounds chose on the
-        /// shipped pack, the median of its adaptive widths (2 to 3 rows at ~70% per-draft acceptance), where the round-cost model
-        /// also puts the best tokens per ms.
-        const dspark_fixed_rows: u32 = 3;
+        /// The width every drafter round verifies at where a row's bytes move with the width: the one most rounds chose
+        /// on the shipped pack, the median of its adaptive widths (2 to 3 rows at ~70% per-draft acceptance), where the
+        /// round-cost model also puts the best tokens per ms.
+        const drafter_fixed_rows: u32 = 3;
 
-        /// The fixed width a request's DSpark rounds verify at, or null for the adaptive policy. Where a row's bytes move with
-        /// the verify width, a request whose text repeats must not take its width from measured ms, or its text would follow the
-        /// timings: a greedy one on a layout that is not width-exact (`layout_exact`, the arch's `widthExact`: the route keeps
-        /// greedy rows exact on an STQ layout), and a seeded sampled one where its draws are not (`exact_rows`: on the engine
-        /// and that layout). An unseeded sampled request repeats nothing and keeps the policy.
-        pub fn dsparkFixedRows(sampling: sampler.SamplingParams, range: dspark_rows.Range, exact_rows: bool, layout_exact: bool) ?usize {
+        /// The fixed width a request's drafter rounds verify at, or null for the adaptive policy. Where a row's bytes
+        /// move with the verify width, a request whose text repeats must not take its width from measured ms, or its
+        /// text would follow the timings: a greedy one on a layout that is not width-exact (`layout_exact`, the arch's
+        /// `widthExact`: the route keeps greedy rows exact on an STQ layout), and a seeded sampled one where its draws
+        /// are not (`exact_rows`: on the engine and that layout). An unseeded sampled request repeats nothing and keeps
+        /// the policy.
+        pub fn drafterFixedRows(sampling: sampler.SamplingParams, range: drafter_rows.Range, exact_rows: bool, layout_exact: bool) ?usize {
             const exact = if (sampler.isGreedyTemperature(sampling.temperature)) layout_exact else if (sampling.seed != null) exact_rows else true;
             if (exact) return null;
-            return std.math.clamp(dspark_fixed_rows, range.min_rows, range.max_rows);
+            return std.math.clamp(drafter_fixed_rows, range.min_rows, range.max_rows);
         }
 
-        pub const max_drafts = dspark_rows.max_drafts;
+        pub const max_drafts = drafter_rows.max_drafts;
 
         /// The widest verify the arch's `verify` accepts.
         pub const max_verify_rows: u8 = A.max_verify_rows;
 
-        /// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `dspark_sweep_rows`, a number forces
-        /// it (rows past the block repeat its last draft, so only their cost means anything), `log` keeps the policy; each
-        /// round logs a `[dspark-round]` line.
-        pub const DsparkDiag = dspark_rows.Diag;
+        /// `SUSHI_DSV41_DSPARK_ROWS` (diagnostic): `sweep` cycles the verify width over `drafter_sweep_rows`, a number
+        /// forces it (rows past the block repeat its last draft, so only their cost means anything), `log` keeps the
+        /// policy; each round logs a `[drafter-round]` line.
+        pub const DrafterDiag = drafter_rows.Diag;
 
         // Odd length: the forwards alternate between a fast and a slow state, and an even cycle would pair one with each width.
-        const dspark_sweep_rows = [_]u8{ 1, 2, 3, 4, 5, 6, 8 };
+        const drafter_sweep_rows = [_]u8{ 1, 2, 3, 4, 5, 6, 8 };
 
-        var dspark_diag_cache: ?DsparkDiag = null;
+        var drafter_diag_cache: ?DrafterDiag = null;
 
-        pub fn parseDsparkDiag(v: []const u8) DsparkDiag {
+        pub fn parseDrafterDiag(v: []const u8) DrafterDiag {
             if (std.mem.eql(u8, v, "sweep")) return .sweep;
             if (std.mem.eql(u8, v, "log")) return .log;
             return if (std.fmt.parseInt(u8, v, 10)) |n| .{ .rows = std.math.clamp(n, 1, max_verify_rows) } else |_| .off;
         }
 
-        pub fn dsparkDiag() DsparkDiag {
-            if (dspark_diag_cache) |d| return d;
-            const d: DsparkDiag = if (std.c.getenv(A.diag_env)) |r| parseDsparkDiag(std.mem.span(r)) else .off;
-            dspark_diag_cache = d;
+        pub fn drafterDiag() DrafterDiag {
+            if (drafter_diag_cache) |d| return d;
+            const d: DrafterDiag = if (std.c.getenv(A.diag_env)) |r| parseDrafterDiag(std.mem.span(r)) else .off;
+            drafter_diag_cache = d;
             return d;
         }
 
@@ -95,11 +97,11 @@ pub fn Rounds(comptime A: type) type {
 
         /// The copy arm: the context's continuation after `t1` into `drafts`, as many as a copy round verifies, or 0 for a stage
         /// round. Adaptive rounds only; a forced or seeded width keeps its rows.
-        fn dsparkCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
+        fn drafterCopyDrafts(self: *Generator, allocator: std.mem.Allocator, t1: u32, drafts: []u32) !usize {
             const arm = A.copyArm(self.xfm) orelse return 0;
             const remaining = self.max_tokens - self.completion_tokens;
             // A copy round is as wide as a verify whose rows are the serial step's; adaptive rounds stay inside the block.
-            const rows = self.dspark_copy_rows orelse @min(max_verify_rows, arm.exact_rows);
+            const rows = self.drafter_copy_rows orelse @min(max_verify_rows, arm.exact_rows);
             const cap = @min(drafts.len, remaining -| 1, rows - 1);
             const block: usize = arm.block;
             if (cap <= block) return 0;
@@ -107,8 +109,8 @@ pub fn Rounds(comptime A: type) type {
             const match = idx.matchBest(t1, @intCast(cap)) orelse return 0;
             const available = idx.copyAvailable(t1, match, block);
             const width_cap = if (match.suffix >= mtp_lookup.STRONG_SUFFIX) cap else @min(cap, copy_narrow);
-            const n = @min(available, self.dspark_copy_backoff.width(width_cap, copy_narrow));
-            if (n == 0 or !self.dspark_copy_backoff.take()) return 0;
+            const n = @min(available, self.drafter_copy_backoff.width(width_cap, copy_narrow));
+            if (n == 0 or !self.drafter_copy_backoff.take()) return 0;
             @memcpy(drafts[0..n], match.draft[0..n]);
             return n;
         }
@@ -117,10 +119,10 @@ pub fn Rounds(comptime A: type) type {
         /// many rows again at most, inside the widest serial-exact verify. Adaptive stage rounds of an arch with copy
         /// rounds only.
         fn extendStage(self: *Generator, allocator: std.mem.Allocator, ids: []u32, rows: usize) !usize {
-            if (!self.dspark_copy or self.spec_disabled_runtime or @import("mtp_depth_bounds.zig").active.explicit()) return rows;
+            if (!self.drafter_copy or self.spec_disabled_runtime or @import("mtp_depth_bounds.zig").active.explicit()) return rows;
             const arm = A.copyArm(self.xfm) orelse return rows;
             if (rows != arm.block + 1 or rows <= mtp_lookup.NGRAM) return rows;
-            const cap = @min(ids.len, self.dspark_copy_rows orelse max_verify_rows, arm.exact_rows, self.max_tokens - self.completion_tokens);
+            const cap = @min(ids.len, self.drafter_copy_rows orelse max_verify_rows, arm.exact_rows, self.max_tokens - self.completion_tokens);
             const extra = @min(cap -| rows, rows - 1);
             if (extra == 0) return rows;
             const idx = try self.mtpLookupIndex(allocator);
@@ -130,21 +132,21 @@ pub fn Rounds(comptime A: type) type {
             return rows + match.draft.len;
         }
 
-        /// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
-        /// rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the request
-        /// decodes serially.
-        pub const dsparkEligible = dspark_rows.eligible;
+        /// A block drafter drafts argmax tokens, a point mass the verify rows accept exactly at any temperature.
+        /// Penalties shift the rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`),
+        /// after which the request decodes serially.
+        pub const drafterEligible = drafter_rows.eligible;
 
         fn plainAfter(self: *const Generator, fixed_rows: ?usize, steps: u32) bool {
             if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) return true;
-            return switch (self.dspark_diag) {
-                .off, .log => fixed_rows == null and self.dspark_policy.nextIsPlainAfter(steps),
+            return switch (self.drafter_diag) {
+                .off, .log => fixed_rows == null and self.drafter_policy.nextIsPlainAfter(steps),
                 .rows => |n| n == 1,
                 .sweep => false,
             };
         }
 
-        fn dsparkPlainPipelineRun(
+        fn drafterPlainPipelineRun(
             self: *Generator,
             allocator: std.mem.Allocator,
             timer: *io_util.Stopwatch,
@@ -168,21 +170,21 @@ pub fn Rounds(comptime A: type) type {
             const verify_ns = timer.read();
             const tokens = try allocator.dupe(u32, &.{tok});
             errdefer allocator.free(tokens);
-            self.dspark_pending = false;
-            const st = &self.dspark_stats;
+            self.drafter_pending = false;
+            const st = &self.drafter_stats;
             st.rounds += 1;
             st.plain += 1;
             st.rows_hist[1] += 1;
             st.verify_ns += verify_ns;
-            if (self.dspark_diag == .off or self.dspark_diag == .log) {
+            if (self.drafter_diag == .off or self.drafter_diag == .log) {
                 const ms: f32 = @floatCast(@as(f64, @floatFromInt(verify_ns)) / 1e6);
-                self.dspark_copy_backoff.observeStage(1, ms);
-                self.dspark_policy.observePipelinedPlain(ms);
+                self.drafter_copy_backoff.observeStage(1, ms);
+                self.drafter_policy.observePipelinedPlain(ms);
             }
-            if (dsparkDiag() != .off) log.info("  [dspark-round] ctx={d} rows=1 accepted=0 draft_ms=0.0 verify_ms={d:.1} gate={s} conf={{}}\n", .{
+            if (drafterDiag() != .off) log.info("  [drafter-round] ctx={d} rows=1 accepted=0 draft_ms=0.0 verify_ms={d:.1} gate={s} conf={{}}\n", .{
                 ctx_before,
                 @as(f64, @floatFromInt(verify_ns)) / 1e6,
-                @tagName(self.dspark_policy.gate.mode),
+                @tagName(self.drafter_policy.gate.mode),
             });
             if (self.completion_tokens >= self.max_tokens) {
                 self.done = true;
@@ -191,12 +193,12 @@ pub fn Rounds(comptime A: type) type {
             return .{ .tokens = tokens, .accepted_tokens = 0 };
         }
 
-        fn dsparkPlainPipelineTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        fn drafterPlainPipelineTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
             const xfm = self.xfm;
             const s = xfm.outStream();
             var timer = io_util.Stopwatch.init(self.timer.io);
             if (!self.spec_disabled_runtime and !mtp_mod.mtpCtxWithinLimit(self.opts.max_mtp_ctx, self.mtpKvLen())) {
-                log.info("  dspark=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), self.opts.max_mtp_ctx });
+                log.info("  drafter=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), self.opts.max_mtp_ctx });
                 self.spec_disabled_runtime = true;
                 self.spec_disable_reason = .max_ctx;
             }
@@ -205,37 +207,37 @@ pub fn Rounds(comptime A: type) type {
                 break :room tb.room();
             } else null;
             const layout_exact = if (comptime @hasDecl(A, "widthExact")) A.widthExact(xfm) else false;
-            const fixed_rows = dsparkFixedRows(self.sampling, self.dspark_policy.range, mlx.engine.isStream(s) and layout_exact, layout_exact);
+            const fixed_rows = drafterFixedRows(self.sampling, self.drafter_policy.range, mlx.engine.isStream(s) and layout_exact, layout_exact);
             const policy_plain = if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx)
                 true
-            else switch (self.dspark_diag) {
-                .off, .log => fixed_rows == null and self.dspark_policy.next() == .plain,
+            else switch (self.drafter_diag) {
+                .off, .log => fixed_rows == null and self.drafter_policy.next() == .plain,
                 .rows => |n| n == 1,
                 .sweep => false,
             };
             const ctx_before = self.ctx.cache.step;
             const can_continue = policy_plain and !self.samplesSync() and self.sampling.call_force == null and
-                self.dspark_round_ends_at == null and
+                self.drafter_round_ends_at == null and
                 (think_room == null or think_room.? > 1) and
                 self.step + 1 < self.max_tokens and
                 plainAfter(self, fixed_rows, 1);
             const keep_after_next = !plainAfter(self, fixed_rows, 2) or self.step + 2 >= self.max_tokens or (think_room != null and think_room.? <= 2);
-            return dsparkPlainPipelineRun(self, allocator, &timer, ctx_before, !can_continue, keep_after_next);
+            return drafterPlainPipelineRun(self, allocator, &timer, ctx_before, !can_continue, keep_after_next);
         }
 
-        /// One DSpark round (deepseek_v41, greedy): the stages draft a block from the pending token, a verify chunk
-        /// `[t1, drafts]` reads it through the trunk, and the longest prefix of drafts the trunk's own argmax agrees with
-        /// stays, with the trunk's token after it pending. The model cuts its state back to the kept rows.
-        pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
-            if (dsparkDiag() == .off) return measuredRound(self, allocator, null);
+        /// One drafter round (greedy): the stages draft a block from the pending token, a verify chunk `[t1, drafts]`
+        /// reads it through the trunk, and the longest prefix of drafts the trunk's own argmax agrees with stays, with
+        /// the trunk's token after it pending. The model cuts its state back to the kept rows.
+        pub fn nextDrafterRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+            if (drafterDiag() == .off) return measuredRound(self, allocator, null);
             var meter = RoundMeter.init(self.timer.io);
             return measuredRound(self, allocator, &meter);
         }
 
-        /// `nextDspark` with each phase of the round marked on `meter`.
+        /// `nextDrafterRound` with each phase of the round marked on `meter`.
         pub fn measuredRound(self: *Generator, allocator: std.mem.Allocator, meter: ?*RoundMeter) !?DrafterStepResult {
             if (self.done) return null;
-            if (!self.dspark) return error.SpecDecodeUnsupported;
+            if (!self.drafter_on) return error.SpecDecodeUnsupported;
             if (self.completion_tokens >= self.max_tokens) {
                 self.dropPending();
                 self.done = true;
@@ -244,25 +246,25 @@ pub fn Rounds(comptime A: type) type {
             }
             const constraint = self.sampling.constraint;
             if (constraint) |c| {
-                switch (try dsparkConstrainedEntry(self, allocator, c)) {
+                switch (try drafterConstrainedEntry(self, allocator, c)) {
                     .proceed => {},
                     .stop => return null,
                     .served => |r| return r,
                 }
             } else if (comptime @hasDecl(A, "setPlainKeepHidden")) {
-                if (self.pending != null) return try dsparkPlainPipelineTick(self, allocator);
+                if (self.pending != null) return try drafterPlainPipelineTick(self, allocator);
                 if (try self.checkStop()) return null;
             } else if (try self.checkStop()) return null;
             const xfm = self.xfm;
             const s = xfm.outStream();
             const t1 = self.next_token_id;
-            const diag = self.dspark_diag;
+            const diag = self.drafter_diag;
             var timer = io_util.Stopwatch.init(self.timer.io);
 
-            const policy = &self.dspark_policy;
+            const policy = &self.drafter_policy;
             // `--max-mtp-ctx` against prompt + generated, as `mtpRoundBegin` checks it; context only grows, so it is sticky.
             if (!self.spec_disabled_runtime and !mtp_mod.mtpCtxWithinLimit(self.opts.max_mtp_ctx, self.mtpKvLen())) {
-                log.info("  dspark=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), self.opts.max_mtp_ctx });
+                log.info("  drafter=off (ctx {d} > --max-mtp-ctx {d})\n", .{ self.mtpKvLen(), self.opts.max_mtp_ctx });
                 self.spec_disabled_runtime = true;
                 self.spec_disable_reason = .max_ctx;
             }
@@ -271,17 +273,17 @@ pub fn Rounds(comptime A: type) type {
                 break :room tb.room();
             } else null;
             const layout_exact = if (comptime @hasDecl(A, "widthExact")) A.widthExact(xfm) else false;
-            const fixed_rows = dsparkFixedRows(self.sampling, policy.range, mlx.engine.isStream(s) and layout_exact, layout_exact);
+            const fixed_rows = drafterFixedRows(self.sampling, policy.range, mlx.engine.isStream(s) and layout_exact, layout_exact);
             const adaptive = (diag == .off or diag == .log) and fixed_rows == null;
             var ids_buf: [max_drafts + 1]u32 = undefined;
-            const copied: usize = if (self.dspark_copy and adaptive and !self.spec_disabled_runtime and (think_room orelse 2) > 1)
-                try dsparkCopyDrafts(self, allocator, t1, ids_buf[1..])
+            const copied: usize = if (self.drafter_copy and adaptive and !self.spec_disabled_runtime and (think_room orelse 2) > 1)
+                try drafterCopyDrafts(self, allocator, t1, ids_buf[1..])
             else
                 0;
             const policy_rows: ?usize = if (copied > 0) copied + 1 else if (self.spec_disabled_runtime and self.spec_disable_reason == .max_ctx) 1 else switch (diag) {
                 .off, .log => fixed_rows orelse if (policy.next() == .plain) 1 else null,
                 .rows => |n| n,
-                .sweep => dspark_sweep_rows[self.dspark_stats.rounds % dspark_sweep_rows.len],
+                .sweep => drafter_sweep_rows[self.drafter_stats.rounds % drafter_sweep_rows.len],
             };
             const forced: ?usize = if (think_room != null and think_room.? <= 1) 1 else policy_rows;
             ids_buf[0] = t1;
@@ -310,27 +312,27 @@ pub fn Rounds(comptime A: type) type {
             const wanted = forced orelse try extendStage(self, allocator, &ids_buf, policy.rows(conf_buf[0 .. block_len - 1]));
             // Nothing past an end-of-turn draft is published: the round ends on it, where the reply's restore point stands.
             const turn = ids_buf[0..mtp_plan.rowsThroughAny(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.eos_token_ids)];
-            var rows: usize = dsparkRowsForRoom(mtp_plan.rowsThroughId(turn, self.dspark_round_ends_at), think_room);
+            var rows: usize = drafterRowsForRoom(mtp_plan.rowsThroughId(turn, self.drafter_round_ends_at), think_room);
             const vocab: usize = A.vocab(xfm);
             var rows_masked = false;
             if (constraint) |c| {
                 var mask_timer = io_util.Stopwatch.init(self.timer.io);
-                try self.dspark_masks.resize(allocator, rows * vocab);
-                const planned = try A.row_grammar.plan(rowView(self, c), t1, ids_buf[1..rows], self.dspark_masks.items, vocab);
+                try self.drafter_masks.resize(allocator, rows * vocab);
+                const planned = try A.row_grammar.plan(rowView(self, c), t1, ids_buf[1..rows], self.drafter_masks.items, vocab);
                 rows = planned.rows;
                 rows_masked = planned.masked;
-                self.dspark_stats.mask_ns += mask_timer.read();
+                self.drafter_stats.mask_ns += mask_timer.read();
             }
             if (meter) |m| m.mark(.plan);
             const ctx_before = self.ctx.cache.step;
             const next_plain = rows == 1 and block == null and copied == 0 and plainAfter(self, fixed_rows, 1);
             if (comptime @hasDecl(A, "setPlainKeepHidden")) {
                 if (next_plain and constraint == null and !self.samplesSync() and self.sampling.call_force == null and
-                    self.dspark_round_ends_at == null and (think_room == null or think_room.? > 1) and
+                    self.drafter_round_ends_at == null and (think_room == null or think_room.? > 1) and
                     self.step + 1 < self.max_tokens)
                 {
                     const keep_after_next = !plainAfter(self, fixed_rows, 2) or self.step + 2 >= self.max_tokens or (think_room != null and think_room.? <= 2);
-                    return dsparkPlainPipelineRun(self, allocator, &timer, ctx_before, false, keep_after_next);
+                    return drafterPlainPipelineRun(self, allocator, &timer, ctx_before, false, keep_after_next);
                 }
             }
             const logits = if (comptime @hasDecl(A, "verifyPlain"))
@@ -342,7 +344,7 @@ pub fn Rounds(comptime A: type) type {
             // An arch whose open verify holds state until `finish` gives it up if the round fails before then.
             var finished = false;
             errdefer if (!finished) if (comptime @hasDecl(A, "abort")) A.abort(xfm, &self.ctx);
-            const verdict = try sampleVerdict(self, logits, ids_buf[0..rows], if (rows_masked) self.dspark_masks.items[0 .. rows * vocab] else null);
+            const verdict = try sampleVerdict(self, logits, ids_buf[0..rows], if (rows_masked) self.drafter_masks.items[0 .. rows * vocab] else null);
             const accepted = verdict.accepted;
             const pending = verdict.pending;
             if (meter) |m| m.mark(.verdict);
@@ -354,12 +356,12 @@ pub fn Rounds(comptime A: type) type {
             const n_commit: usize = 1 + accepted;
             const tokens = try allocator.dupe(u32, ids_buf[0..n_commit]);
             errdefer allocator.free(tokens);
-            if (constraint) |c| for (tokens, self.generated_ids.items.len..) |t, index| try dsparkObserve(self, c, index, t);
+            if (constraint) |c| for (tokens, self.generated_ids.items.len..) |t, index| try drafterObserve(self, c, index, t);
             try self.generated_ids.appendSlice(allocator, tokens);
             self.advanceStep(@intCast(n_commit));
             self.next_token_id = pending;
-            self.dspark_pending = constraint != null;
-            const st = &self.dspark_stats;
+            self.drafter_pending = constraint != null;
+            const st = &self.drafter_stats;
             st.rounds += 1;
             st.plain += @intFromBool(rows == 1);
             st.rows_hist[rows] += 1;
@@ -377,26 +379,26 @@ pub fn Rounds(comptime A: type) type {
                     }
                 }.of;
                 const draft_ms: f32 = if (comptime @import("builtin").is_test)
-                    if (self.dspark_timing) |c| (if (block != null) c.draft_ms else 0) else ms(draft_ns)
+                    if (self.drafter_timing) |c| (if (block != null) c.draft_ms else 0) else ms(draft_ns)
                 else
                     ms(draft_ns);
                 const verify_ms: f32 = if (comptime @import("builtin").is_test)
-                    if (self.dspark_timing) |c| c.verifyMs(@intCast(rows)) else ms(verify_ns)
+                    if (self.drafter_timing) |c| c.verifyMs(@intCast(rows)) else ms(verify_ns)
                 else
                     ms(verify_ns);
                 if (copied > 0) {
                     // The stage policy learns from stage blocks only: a wide copy verify would move its fitted row price.
-                    self.dspark_copy_backoff.observeCopy(rows - 1, accepted, draft_ms + verify_ms, copy_narrow);
+                    self.drafter_copy_backoff.observeCopy(rows - 1, accepted, draft_ms + verify_ms, copy_narrow);
                 } else {
-                    self.dspark_copy_backoff.observeStage(n_commit, draft_ms + verify_ms);
+                    self.drafter_copy_backoff.observeStage(n_commit, draft_ms + verify_ms);
                     if (block == null) policy.observePlain(verify_ms) else policy.observeRound(conf_buf[0 .. block_len - 1], @intCast(rows), accepted, draft_ms, verify_ms);
                 }
             }
             if (meter) |m| {
                 m.mark(.publish);
-                if (dsparkDiag() != .off) m.report(ctx_before, rows, accepted, if (copied > 0) "copy" else if (block != null) "stage" else "plain");
+                if (drafterDiag() != .off) m.report(ctx_before, rows, accepted, if (copied > 0) "copy" else if (block != null) "stage" else "plain");
             }
-            if (dsparkDiag() != .off) log.info("  [dspark-round] ctx={d} rows={d} accepted={d} draft_ms={d:.1} verify_ms={d:.1} gate={s} conf={any}\n", .{
+            if (drafterDiag() != .off) log.info("  [drafter-round] ctx={d} rows={d} accepted={d} draft_ms={d:.1} verify_ms={d:.1} gate={s} conf={any}\n", .{
                 ctx_before,
                 rows,
                 accepted,
@@ -420,15 +422,15 @@ pub fn Rounds(comptime A: type) type {
             return .{ .grammar = c.grammar, .token_bytes = c.token_bytes, .proto = c.proto, .pstate = &c.pstate, .eos_ids = self.eos_token_ids };
         }
 
-        pub fn dsparkNoteSerial(self: *Generator, why: []const u8) void {
-            if (self.dspark_serial_logged) return;
-            self.dspark_serial_logged = true;
-            log.info("  [spec] dspark: this request decodes serially while {s}\n", .{why});
+        pub fn drafterNoteSerial(self: *Generator, why: []const u8) void {
+            if (self.drafter_serial_logged) return;
+            self.drafter_serial_logged = true;
+            log.info("  [spec] drafter: this request decodes serially while {s}\n", .{why});
         }
 
         /// The start of a constrained round: serial ticks where the constraint cannot be verified in rows, else the
         /// pending token (sampled here from the serial state's logits on the first round) judged as serial decode would.
-        pub fn dsparkConstrainedEntry(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !ConstrainedEntry {
+        pub fn drafterConstrainedEntry(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !ConstrainedEntry {
             if (self.checkBudgetStop()) return .stop;
             const phase = c.pstate.phase;
             const vocab: usize = A.vocab(self.xfm);
@@ -441,13 +443,13 @@ pub fn Rounds(comptime A: type) type {
             else
                 null;
             if (why) |w| {
-                dsparkNoteSerial(self, w);
-                self.dspark_stats.serial += 1;
+                drafterNoteSerial(self, w);
+                self.drafter_stats.serial += 1;
                 const token = (try self.next(allocator)) orelse return .stop;
                 return .{ .served = .{ .tokens = try allocator.dupe(u32, &.{token}), .accepted_tokens = 0 } };
             }
-            if (self.pending != null) try dsparkSamplePending(self, c);
-            return switch (try dsparkJudgePending(self, allocator, c)) {
+            if (self.pending != null) try drafterSamplePending(self, c);
+            return switch (try drafterJudgePending(self, allocator, c)) {
                 .commit => .proceed,
                 .stop => .stop,
                 .forced => |t| .{ .served = .{ .tokens = try allocator.dupe(u32, &.{t}), .accepted_tokens = 0 } },
@@ -455,7 +457,7 @@ pub fn Rounds(comptime A: type) type {
         }
 
         /// The serial state's pending logits become a pending token, sampled under the mask of the committed state.
-        pub fn dsparkSamplePending(self: *Generator, c: *Constraint) !void {
+        pub fn drafterSamplePending(self: *Generator, c: *Constraint) !void {
             const logits = try self.takeLogits();
             defer _ = mlx.mlx_array_free(logits);
             const kind = try A.row_grammar.maskFor(rowView(self, c), c.mask_buf);
@@ -465,12 +467,12 @@ pub fn Rounds(comptime A: type) type {
             var val: i32 = 0;
             try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
             self.next_token_id = @intCast(val);
-            self.dspark_pending = true;
+            self.drafter_pending = true;
         }
 
         /// What serial decode does with the token it just sampled before committing it: an EOS stops (inside the
         /// reasoning it forces the boundary instead), and so do three pad tokens in a row.
-        pub fn dsparkJudgePending(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !Pending {
+        pub fn drafterJudgePending(self: *Generator, allocator: std.mem.Allocator, c: *Constraint) !Pending {
             const t = self.next_token_id;
             const eos = isEosId(t, self.eos_token_ids);
             const pad_run = t == 0 and self.consecutive_pad + 1 >= 3;
@@ -478,7 +480,7 @@ pub fn Rounds(comptime A: type) type {
                 const proto = c.proto.?;
                 const closes = eos and proto.closer_atomic != null and t == proto.closer_atomic.?;
                 if ((eos and !closes) or pad_run) {
-                    self.dspark_pending = false;
+                    self.drafter_pending = false;
                     switch (try self.forceConstraintTransition(allocator)) {
                         .committed => |forced| {
                             log.info("[grammar] reasoning boundary forced after {s}\n", .{if (eos) "premature EOS" else "terminal padding"});
@@ -494,7 +496,7 @@ pub fn Rounds(comptime A: type) type {
                     }
                 }
             } else if (eos or pad_run) {
-                self.dspark_pending = false;
+                self.drafter_pending = false;
                 self.done = true;
                 self.finish_reason = "stop";
                 self.stop_token = t;
@@ -505,7 +507,7 @@ pub fn Rounds(comptime A: type) type {
         }
 
         /// Commits `token`, the generated token at `index`, to the constraint as serial decode does after sampling it.
-        pub fn dsparkObserve(self: *Generator, c: *Constraint, index: usize, token: u32) !void {
+        pub fn drafterObserve(self: *Generator, c: *Constraint, index: usize, token: u32) !void {
             const adv = try A.row_grammar.advance(rowView(self, c), token);
             if (!adv.crossed) return;
             const bytes = if (token < c.token_bytes.bytes.len) c.token_bytes.bytes[token] else null;
@@ -517,18 +519,18 @@ pub fn Rounds(comptime A: type) type {
             log.info("[grammar] reasoning boundary reached; enforcing final-answer schema\n", .{});
         }
 
-        /// Serial decode taking over from a DSpark round: emit the pending token, then forward it for the next sample.
-        pub fn dsparkEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        /// Serial decode taking over from a drafter round: emit the pending token, then forward it for the next sample.
+        pub fn drafterEmitPending(self: *Generator, allocator: std.mem.Allocator) !?u32 {
             const c = self.sampling.constraint.?;
             if (self.checkBudgetStop()) return null;
-            switch (try dsparkJudgePending(self, allocator, c)) {
+            switch (try drafterJudgePending(self, allocator, c)) {
                 .stop => return null,
                 .forced => |t| return t,
                 .commit => {},
             }
-            self.dspark_pending = false;
+            self.drafter_pending = false;
             const token = self.next_token_id;
-            try dsparkObserve(self, c, self.generated_ids.items.len, token);
+            try drafterObserve(self, c, self.generated_ids.items.len, token);
             self.advanceStep(1);
             try self.generated_ids.append(allocator, token);
             if (self.step >= self.max_tokens) {
@@ -648,17 +650,17 @@ pub fn Rounds(comptime A: type) type {
             return .{ .accepted = accepted, .pending = @intCast(drawn[accepted]) };
         }
 
-        pub const DsparkResume = dspark_rows.Resume;
+        pub const DrafterResume = drafter_rows.Resume;
 
-        /// A forced commit left the shim-seeded state; drain it to DSpark's round entry (the closer published, its
+        /// A forced commit left the shim-seeded state; drain it to the drafter round's entry (the closer published, its
         /// successor sampled and not in the cache). The stage windows already hold the forced rows, since every
         /// forward commits its main rows. The thought is closed, so its restore-point cut is disarmed.
-        pub fn dsparkResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !DsparkResume {
-            if (!self.dspark or self.spec_disabled_runtime or self.sampling.constraint != null) return .refused;
+        pub fn drafterResumeAfterForced(self: *Generator, allocator: std.mem.Allocator) !DrafterResume {
+            if (!self.drafter_on or self.spec_disabled_runtime or self.sampling.constraint != null) return .refused;
             switch (try self.drainPipelineForSpec(allocator)) {
                 .drained => |closer| {
-                    self.dspark_round_ends_at = null;
-                    log.info("  [dspark] resumed after the forced thought close at {d} generated tokens\n", .{self.generated_ids.items.len});
+                    self.drafter_round_ends_at = null;
+                    log.info("  [drafter] resumed after the forced thought close at {d} generated tokens\n", .{self.generated_ids.items.len});
                     return .{ .resumed = closer };
                 },
                 .stopped => return .stopped,

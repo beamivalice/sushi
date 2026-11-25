@@ -173,7 +173,7 @@ fn logStop(slot: *Slot, reason: []const u8) void {
     const after_text: []const u8 = if (tok != null and after != null) (tok.?.decode(fba.allocator(), &.{after.?}) catch "") else "";
     var path = slot.stop_path;
     if (path.len == 0) {
-        path = if (gen) |g| (if (specTickMode(slot.enable_mtp, g.mtp != null or g.dspark, slot.enable_drafter, g.dflash != null) == .regular) "serial" else "spec") else "serial";
+        path = if (gen) |g| (if (specTickMode(slot.enable_mtp, g.mtp != null or g.drafter_on, slot.enable_drafter, g.dflash != null) == .regular) "serial" else "spec") else "serial";
     }
     var buf: [384]u8 = undefined;
     log.info("{s}\n", .{formatStop(&buf, .{
@@ -192,7 +192,7 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     const gen = if (slot.legacy_gen) |*g| g else return;
     const mode = specTickMode(
         slot.enable_mtp,
-        gen.mtp != null or gen.dspark,
+        gen.mtp != null or gen.drafter_on,
         slot.enable_drafter,
         gen.dflash != null,
     );

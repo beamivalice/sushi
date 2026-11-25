@@ -366,7 +366,7 @@ fn parseDfly(root: std.json.ObjectMap, c: Config) Error!Dfly {
     d.draft = try uint(u32, spec, "num_speculative_tokens");
     if (d.layers == 0 or d.draft == 0 or d.mask_id >= c.vocab) return refuse("DFly geometry (layers {d}, draft {d})", .{ d.layers, d.draft });
     // A round holds at most this many drafts (its buffers, the verify block's rows).
-    if (d.draft > @import("../dspark_rows.zig").max_drafts) return refuse("num_speculative_tokens {d} past the {d} a round drafts", .{ d.draft, @import("../dspark_rows.zig").max_drafts });
+    if (d.draft > @import("../drafter_rows.zig").max_drafts) return refuse("num_speculative_tokens {d} past the {d} a round drafts", .{ d.draft, @import("../drafter_rows.zig").max_drafts });
     return d;
 }
 

@@ -1081,10 +1081,10 @@ fn appendState(a: std.mem.Allocator, m: anytype, out: *std.ArrayList(u8)) !void 
     if (m.last_hidden) |h| try appendHost(a, h, out);
 }
 
-/// A DSpark round at `p` as `hy4_dspark` runs it, after a real prefill of the rows before it: the mark, a verify block of
-/// `rows` rows, the state rolled back to the mark and its first `keep` rows run again; on the arena when `planned`, else
-/// on the pool. The verify's logits and the state the round leaves appended to `out`; the executions, and the asks of a
-/// closed pool the mark and the rollback made.
+/// A DFly2 round at `p` as `hy4_drafter` runs it, after a real prefill of the rows before it: the mark, a verify block
+/// of `rows` rows, the state rolled back to the mark and its first `keep` rows run again; on the arena when `planned`,
+/// else on the pool. The verify's logits and the state the round leaves appended to `out`; the executions, and the asks
+/// of a closed pool the mark and the rollback made.
 fn oneRound(a: std.mem.Allocator, m: anytype, ids: []const u32, p: usize, rows: usize, keep: usize, planned: bool, out: *std.ArrayList(u8)) !struct { executions: u64, mark_asks: u64, back_asks: u64 } {
     const saved = m.plans;
     if (!planned) m.plans = null;
@@ -1108,7 +1108,7 @@ fn oneRound(a: std.mem.Allocator, m: anytype, ids: []const u32, p: usize, rows: 
     return .{ .executions = s3.executions - s0.executions, .mark_asks = s1.closed_asks - s0.closed_asks, .back_asks = s3.closed_asks - s2.closed_asks };
 }
 
-test "hy4 plan: a DSpark round's mark and replay ask nothing of a closed pool: at depths across the window, the selection threshold and the latent width, every kept count leaves the pool's logits and state, its verify and replay one execution each (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
+test "hy4 plan: a DFly2 round's mark and replay ask nothing of a closed pool: at depths across the window, the selection threshold and the latent width, every kept count leaves the pool's logits and state, its verify and replay one execution each (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     var ran = false;
@@ -1161,8 +1161,8 @@ test "hy4 plan: a DSpark round's mark and replay ask nothing of a closed pool: a
     if (!ran) return error.SkipZigTest;
 }
 
-/// A served DSpark request of `n` tokens after `prompt`, every round drafted and verifying `rows` rows, on the arena when
-/// `planned`, else on the pool: its tokens and the state it leaves appended to `out`. Each round's executions are
+/// A served DFly2 request of `n` tokens after `prompt`, every round drafted and verifying `rows` rows, on the arena
+/// when `planned`, else on the pool: its tokens and the state it leaves appended to `out`. Each round's executions are
 /// checked against what it ran: its draft, its verify and its verdict's draw; a round that kept fewer rows than it
 /// verified keeps them in place (`Model.keepRows`), running no replay.
 fn servedRounds(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, n: u32, rows: u8, planned: bool, out: *std.ArrayList(u8)) !void {
@@ -1174,21 +1174,21 @@ fn servedRounds(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, n
     var tok = @import("../tokenizer.zig").Tokenizer.initEmpty(a);
     defer tok.deinit();
     try ld.xfm.resetCache();
-    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, ld.xfm, &tok, prompt, n, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, ld.xfm, &tok, prompt, n, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    gen.dspark_diag = .{ .rows = rows };
+    gen.drafter_diag = .{ .rows = rows };
     var rounds: u64 = 0;
     while (true) {
-        const hist = gen.dspark_stats.rows_hist;
-        const plain = gen.dspark_stats.plain;
+        const hist = gen.drafter_stats.rows_hist;
+        const plain = gen.drafter_stats.plain;
         const before = core.stats();
-        const r = (try gen.nextDspark(a)) orelse break;
+        const r = (try gen.nextDrafterRound(a)) orelse break;
         defer a.free(r.tokens);
         const ran = core.stats().executions - before.executions;
         try out.appendSlice(a, std.mem.sliceAsBytes(r.tokens));
         // A plain step (the generator's pending token) is decode's, not a round's.
-        if (gen.dspark_stats.plain != plain) continue;
-        const verified = for (gen.dspark_stats.rows_hist, hist, 0..) |now, was, w| {
+        if (gen.drafter_stats.plain != plain) continue;
+        const verified = for (gen.drafter_stats.rows_hist, hist, 0..) |now, was, w| {
             if (now != was) break w;
         } else return error.TestNoRound;
         rounds += 1;
@@ -1202,7 +1202,7 @@ fn servedRounds(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, n
     try appendState(a, m, out);
 }
 
-test "hy4 plan: served DSpark rounds give the pool's tokens and state, each round's draft and verify an execution on the arena and a rejected round's rows kept without a replay, from prompts before the window and the threshold and across the latent width (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
+test "hy4 plan: served DFly2 rounds give the pool's tokens and state, each round's draft and verify an execution on the arena and a rejected round's rows kept without a replay, from prompts before the window and the threshold and across the latent width (HY4_BF16_TINY, HY4_STQ_TINY, where they ship DFly2)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     var ran = false;

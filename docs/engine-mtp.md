@@ -40,7 +40,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 - A DFlash2 round is `Generator.nextDflash`, which calls the loaded arch's `drafter.nextDflash`: GLM's native round
   (`glm5_generate.nextGlmDflash`), or `dflash_round.zig`, the generic round Flash-Next and MiMo list. An arch whose
   `kinds` lacks `.dflash2` refuses a DFlash sidecar at load (`DrafterUnsupported`) and the round returns the same
-  error. DSpark rounds are `dsv41_drafter.nextDspark`. The gate every block drafter shares (`DFLASH_GATE_WARMUP`,
+  error. DSpark rounds are `dsv41_drafter.nextDrafterRound`. The gate every block drafter shares (`DFLASH_GATE_WARMUP`,
   `DflashGateWindow`, `dflashSerialPrice`) is in `dflash_policy.zig`.
 - The launch settings a round reads (`--no-mtp-lookup`, `--max-mtp-ctx`) are copied into `Generator.opts`
   (`spec_types.RoundOpts`, a field every start path must set) when a request starts; no round reads
@@ -66,7 +66,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
   (`loadWeightsFromOpenDirMode`'s `drop_mtp`), so a head stored as its own shard (`mtp-0.safetensors`, 1.18 GiB on Sushi-STQ-2.75bpw)
   costs no transient and the bill (`indexedResidentSplit`, `mtp_on`) matches. Nothing turns the head on afterwards: a request's
   `enable_mtp:true` is ignored without a loaded head, and the launch flag outranks `model-settings.json`. MiMo's heads
-  (`mimo2_load.loadHead`, through `arch/load.zig`) and DeepSeek's DSpark stages (`dsparkOn`) already load only when MTP is on.
+  (`mimo2_load.loadHead`, through `arch/load.zig`) and DeepSeek's DSpark stages (`drafterOn`) already load only when MTP is on.
 
 ## MiMo's three heads
 
@@ -84,7 +84,7 @@ Moved to [mimo2-mtp](mimo2-mtp.md).
   drafts are capped, the last room token runs serial, so the closer lands where serial decode lands it. Grouped rounds
   take the same per-slot cap (`plannerRowCap`, `capMtpRoundToThinkBound`; room 1 is a plain planner row), and a
   planner-owned slot rejoins the planner after the close instead of the serial ramp. DSpark takes the same cut
-  (`dsparkRowsForRoom`) and resumes by draining the commit (`dsparkResumeAfterForced`); DFlash2 still decodes the answer plain.
+  (`drafterRowsForRoom`) and resumes by draining the commit (`drafterResumeAfterForced`); DFlash2 still decodes the answer plain.
 - A verify's per-position SSM capture sits on the request's own entries and only the round's finish frees it: a round
   that fails before the finish frees it on its way out (`mtpRoundVerify`, `nextDflash`, the grouped `verify_ctx`), and
   `Slot.deinit` frees it with every other entry field. A grouped verify hands every row its outputs before any row's

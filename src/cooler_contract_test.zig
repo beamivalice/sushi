@@ -938,7 +938,7 @@ pub fn servedDrafts(sv: *Served, prompt: []const u32, n: u32, sampling: @import(
         return error.RequestFailed;
     }
     const g = slot.legacy_gen.?;
-    drafted.* = g.mtp_drafted_tokens + g.dspark_stats.drafted;
+    drafted.* = g.mtp_drafted_tokens + g.drafter_stats.drafted;
     var got: std.ArrayList(u32) = .empty;
     errdefer got.deinit(a);
     try got.appendSlice(a, g.generated_ids.items);

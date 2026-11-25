@@ -140,7 +140,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     // lookup, a two-chunk round) run in the long request.
     for (ids, 0..) |*t, i| t.* = @intCast((1000 + 7 * (i % 61)) % c.vocab_size);
     const dspark = if (drafter) |d| d.kind().blockDrafter() else false;
-    const spec: Spec = .{ .drafter = if (dspark) null else drafter, .dspark = dspark, .chunk = chunk };
+    const spec: Spec = .{ .drafter = if (dspark) null else drafter, .drafter_on = dspark, .chunk = chunk };
     for (1..narrow_max + 1) |n| try request(io, a, xfm, ids[0..n], spec, .{ .temperature = 0 }, 2, 0);
     for (wide) |n| try request(io, a, xfm, ids[0..n], spec, .{ .temperature = 0 }, 2, 0);
     // Split where a served prompt is, at its prefix-cache restore point: its tail and the drafter's history take the
@@ -156,7 +156,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         // that the pool refuses, is refused here by name, not deep in a kernel on a served request. What the pool keeps
         // free up to its cap is not a bill's. The bill lends no decoder pool: the warm's chunk fits the headroom
         // (`warmChunkAdmitted` lends none either), so it releases none and takes its whole cap from the pool.
-        const billed = bills.warmRequestBill(c, bits, chunk, spec.drafter != null or spec.dspark);
+        const billed = bills.warmRequestBill(c, bits, chunk, spec.drafter != null or spec.drafter_on);
         const bill = if (@import("builtin").is_test) bill_for_test orelse billed else billed;
         mlx.engine.close();
         const in_use0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
@@ -415,8 +415,8 @@ fn joinedRound(a: std.mem.Allocator, gens: []const *generate.Generator) !void {
 }
 
 fn drain(a: std.mem.Allocator, gen: *generate.Generator) !void {
-    if (gen.dspark) {
-        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+    if (gen.drafter_on) {
+        while (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
     } else if (gen.mtp != null) {
         while (try gen.nextMtp(a)) |r| a.free(r.tokens);
     } else {
@@ -456,7 +456,7 @@ fn archWarmPackedGather(xfm: *Trunk) !void {
 
 const Spec = struct {
     drafter: ?generate.MtpHeadRef = null,
-    dspark: bool = false,
+    drafter_on: bool = false,
     /// The prefill chunk the warm's widest fits (`warmChunkAdmitted`).
     chunk: usize = 0,
 };
@@ -470,8 +470,8 @@ fn request(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, spec
         .mtp = spec.drafter,
         .mtp_enabled = spec.drafter != null,
         .model_has_mtp = spec.drafter != null,
-        .dspark_enabled = spec.dspark,
-        .skip_lazy_preforward = spec.drafter == null and !spec.dspark,
+        .drafter_enabled = spec.drafter_on,
+        .skip_lazy_preforward = spec.drafter == null and !spec.drafter_on,
         .ssm_checkpoint_stride = stride,
         .pinned_prefill_chunk = spec.chunk,
         // The load's acceptance rule and tail, as the scheduler hands every request: each is its own graph.

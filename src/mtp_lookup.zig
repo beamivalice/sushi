@@ -380,7 +380,7 @@ test "lookup best: the earlier site that agrees furthest back wins over a later 
     try testing.expect(tie.matchBest(9, 2) == null);
 }
 
-test "dspark copy: only a long agreement whose draft outruns the stage block is copied" {
+test "drafter copy: only a long agreement whose draft outruns the stage block is copied" {
     const draft: [15]u32 = @splat(0);
     try testing.expectEqual(@as(usize, 15), copyLen(.{ .draft = &draft, .suffix = COPY_SUFFIX }, 15, 5, COPY_SUFFIX));
     try testing.expectEqual(@as(usize, 9), copyLen(.{ .draft = &draft, .suffix = COPY_SUFFIX }, 9, 5, COPY_SUFFIX));
@@ -390,7 +390,7 @@ test "dspark copy: only a long agreement whose draft outruns the stage block is 
     try testing.expectEqual(@as(usize, 0), copyLen(.{ .draft = &draft, .suffix = COPY_SUFFIX }, 5, 5, COPY_SUFFIX));
 }
 
-test "dspark copy backoff: copies that lose to stage rounds are skipped for a doubling stretch; a winning copy clears it" {
+test "drafter copy backoff: copies that lose to stage rounds are skipped for a doubling stretch; a winning copy clears it" {
     var b = CopyBackoff{};
     for (0..10) |_| b.observeStage(3, 30);
     try testing.expect(b.take());
@@ -411,7 +411,7 @@ test "dspark copy backoff: copies that lose to stage rounds are skipped for a do
     try testing.expectEqual(@as(u32, 1), b.period);
 }
 
-test "dspark copy backoff: a round verifies what copies have landed plus 2, a narrow pass after one landed whole, the cap after two" {
+test "drafter copy backoff: a round verifies what copies have landed plus 2, a narrow pass after one landed whole, the cap after two" {
     var b = CopyBackoff{};
     try testing.expectEqual(@as(usize, 7), b.width(15, 7));
     b.observeCopy(7, 7, 50, 7);
@@ -429,7 +429,7 @@ test "dspark copy backoff: a round verifies what copies have landed plus 2, a na
     try testing.expectEqual(@as(usize, 6), c.width(6, 7));
 }
 
-test "dspark copy backoff: a wide round that misses doubles the whole rounds the next one waits for, and one that lands whole takes them back to 2" {
+test "drafter copy backoff: a wide round that misses doubles the whole rounds the next one waits for, and one that lands whole takes them back to 2" {
     var b = CopyBackoff{};
     for (0..2) |_| b.observeCopy(7, 7, 60, 7);
     try testing.expectEqual(@as(usize, 15), b.width(15, 7));

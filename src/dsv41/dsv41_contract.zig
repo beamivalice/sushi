@@ -279,12 +279,12 @@ pub fn specTokensWith(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u3
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try xfm.resetCache();
-    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, xfm, &tok, ids, n, sampling, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, xfm, &tok, ids, n, sampling, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    gen.dspark_diag = .sweep;
+    gen.drafter_diag = .sweep;
     var got: std.ArrayList(u32) = .empty;
     errdefer got.deinit(a);
-    while (try gen.nextDspark(a)) |r| {
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try got.appendSlice(a, r.tokens);
     }

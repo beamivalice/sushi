@@ -251,7 +251,7 @@ const Served = struct {
     closed: u64 = 0,
 };
 
-/// A request of `prompt` for 16 tokens under `sampling` and `opts`, its rounds DSpark's where `opts` drafts, on the
+/// A request of `prompt` for 16 tokens under `sampling` and `opts`, its rounds DFly2's where `opts` drafts, on the
 /// load's plans or, `planned` false, on the pool.
 fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling: sampler.SamplingParams, opts: Generator.InitOptions, planned: bool) !Served {
     const m = ld.xfm.arch_state.hy4flash.model.?;
@@ -267,8 +267,8 @@ fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling
     const draws = if (saved) |p| p.sample.draws else 0;
     const before = core.stats().closed_asks;
     while (out.n < out.tokens.len) {
-        if (opts.dspark_enabled) {
-            const r = (try gen.nextDspark(a)) orelse break;
+        if (opts.drafter_enabled) {
+            const r = (try gen.nextDrafterRound(a)) orelse break;
             defer a.free(r.tokens);
             for (r.tokens) |t| if (out.n < out.tokens.len) {
                 out.tokens[out.n] = t;
@@ -284,7 +284,7 @@ fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling
     return out;
 }
 
-test "hy4 sample plan: a served request's draws, greedy and sampled, under penalties and the think penalty, plain and in DSpark rounds, give the pool's tokens, each draw an execution (HY4_STQ_TINY)" {
+test "hy4 sample plan: a served request's draws, greedy and sampled, under penalties and the think penalty, plain and in DFly2 rounds, give the pool's tokens, each draw an execution (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
@@ -310,9 +310,9 @@ test "hy4 sample plan: a served request's draws, greedy and sampled, under penal
         .{ .sampling = .{ .temperature = 0.8, .seed = 11, .repeat_penalty = 1.2, .presence_penalty = 0.4 } },
         .{ .sampling = .{ .temperature = 0, .think_penalty = think } },
         .{ .sampling = .{ .temperature = 0.8, .seed = 5, .think_penalty = think } },
-        .{ .sampling = .{ .temperature = 0 }, .opts = .{ .dspark_enabled = true } },
-        .{ .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .dspark_enabled = true } },
-        .{ .sampling = .{ .temperature = 0.8, .seed = 7, .repeat_penalty = 1.2, .think_penalty = think }, .opts = .{ .dspark_enabled = true } },
+        .{ .sampling = .{ .temperature = 0 }, .opts = .{ .drafter_enabled = true } },
+        .{ .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .drafter_enabled = true } },
+        .{ .sampling = .{ .temperature = 0.8, .seed = 7, .repeat_penalty = 1.2, .think_penalty = think }, .opts = .{ .drafter_enabled = true } },
     };
     for (cases, 0..) |c, i| {
         errdefer std.debug.print("hy4 sample plan: request {d} differs\n", .{i});
@@ -320,8 +320,8 @@ test "hy4 sample plan: a served request's draws, greedy and sampled, under penal
         const got = try serve(a, &ld, prompt, c.sampling, c.opts, true);
         try testing.expectEqual(want.n, got.n);
         try testing.expectEqualSlices(u32, want.tokens[0..want.n], got.tokens[0..got.n]);
-        // A plain request draws a token a step; a DSpark request, a verdict a round.
-        try testing.expect(got.draws >= (if (c.opts.dspark_enabled) 2 else got.n));
+        // A plain request draws a token a step; a DFly2 request, a verdict a round.
+        try testing.expect(got.draws >= (if (c.opts.drafter_enabled) 2 else got.n));
         // A served request's decode asks the pool nothing, the serial draw's (penalties) too: its next forward
         // takes its id from the load's input block (`Model.idsInput`).
         try testing.expectEqual(@as(u64, 0), got.closed);

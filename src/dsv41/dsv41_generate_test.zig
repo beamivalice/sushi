@@ -28,23 +28,23 @@ const SpecDisableReason = mtp_plan.SpecDisableReason;
 const ThinkBound = mtp_plan.ThinkBound;
 const generate = @import("../generate.zig");
 const dsv41_dspark = @import("dsv41_dspark.zig");
-const DsparkDiag = dsv41_dspark.DsparkDiag;
+const DrafterDiag = dsv41_dspark.DrafterDiag;
 const Generator = generate.Generator;
 const SchemaConstraint = generate.SchemaConstraint;
-const dsparkEligible = dsv41_dspark.dsparkEligible;
-const dsparkRowsForRoom = dsv41_dspark.dsparkRowsForRoom;
+const drafterEligible = dsv41_dspark.drafterEligible;
+const drafterRowsForRoom = dsv41_dspark.drafterRowsForRoom;
 const dsv41_max_drafts = dsv41_dspark.dsv41_max_drafts;
 const dsv41_max_verify_rows = dsv41_dspark.dsv41_max_verify_rows;
-const parseDsparkDiag = dsv41_dspark.parseDsparkDiag;
+const parseDrafterDiag = dsv41_dspark.parseDrafterDiag;
 
 test "SUSHI_DSV41_DSPARK_ROWS never forces a verify wider than dsv41VerifyImpl accepts" {
     const limit = dsv41_max_verify_rows;
-    try testing.expectEqual(DsparkDiag{ .rows = limit }, parseDsparkDiag("17"));
-    try testing.expectEqual(DsparkDiag{ .rows = limit }, parseDsparkDiag("255"));
-    try testing.expectEqual(DsparkDiag{ .rows = 7 }, parseDsparkDiag("7"));
-    try testing.expectEqual(DsparkDiag{ .rows = 1 }, parseDsparkDiag("0"));
-    try testing.expectEqual(DsparkDiag.sweep, parseDsparkDiag("sweep"));
-    try testing.expectEqual(DsparkDiag.off, parseDsparkDiag("wide"));
+    try testing.expectEqual(DrafterDiag{ .rows = limit }, parseDrafterDiag("17"));
+    try testing.expectEqual(DrafterDiag{ .rows = limit }, parseDrafterDiag("255"));
+    try testing.expectEqual(DrafterDiag{ .rows = 7 }, parseDrafterDiag("7"));
+    try testing.expectEqual(DrafterDiag{ .rows = 1 }, parseDrafterDiag("0"));
+    try testing.expectEqual(DrafterDiag.sweep, parseDrafterDiag("sweep"));
+    try testing.expectEqual(DrafterDiag.off, parseDrafterDiag("wide"));
 }
 
 test "dsv41 generator: DSpark rounds through the Generator keep the budget, the stats and the first token (DSV41_TINY)" {
@@ -88,11 +88,11 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
 
     var spec: std.ArrayList(u32) = .empty;
     defer spec.deinit(a);
-    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    try testing.expect(gen.dspark);
+    try testing.expect(gen.drafter_on);
     var accepted_sum: u64 = 0;
-    while (try gen.nextDspark(a)) |r| {
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try testing.expectEqual(@as(usize, r.accepted_tokens) + 1, r.tokens.len);
         accepted_sum += r.accepted_tokens;
@@ -102,27 +102,27 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     // identity with serial is pinned on the exact stream in dsv41_model.zig and on a real pack by the live check.
     try testing.expectEqual(serial.items.len, spec.items.len);
     try testing.expectEqual(serial.items[0], spec.items[0]);
-    try testing.expect(gen.dspark_stats.rounds > 0);
-    try testing.expectEqual(accepted_sum, gen.dspark_stats.accepted);
-    try testing.expect(gen.dspark_stats.accepted <= gen.dspark_stats.drafted);
+    try testing.expect(gen.drafter_stats.rounds > 0);
+    try testing.expectEqual(accepted_sum, gen.drafter_stats.accepted);
+    try testing.expect(gen.drafter_stats.accepted <= gen.drafter_stats.drafted);
     try testing.expectEqualStrings("length", gen.finish_reason);
 
     // A forced verify width keeps the budget and the first token; one row is the serial decode step itself.
     for ([_]u8{ 1, 6 }) |width| {
         try xfm.resetCache();
-        var w = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var w = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer w.deinit(a);
-        w.dspark_diag = .{ .rows = width };
+        w.drafter_diag = .{ .rows = width };
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
-        while (try w.nextDspark(a)) |r| {
+        while (try w.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try testing.expect(r.tokens.len <= width);
             try got.appendSlice(a, r.tokens);
         }
         try testing.expectEqual(serial.items.len, got.items.len);
         try testing.expectEqual(serial.items[0], got.items[0]);
-        try testing.expect(w.dspark_stats.drafted <= w.dspark_stats.rounds * (width - 1));
+        try testing.expect(w.drafter_stats.drafted <= w.drafter_stats.rounds * (width - 1));
         if (width == 1) try testing.expectEqualSlices(u32, serial.items, got.items);
     }
 
@@ -132,21 +132,21 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
         defer depth_bounds.active = saved;
         depth_bounds.active = .{ .min = 2, .max = 2 };
         try xfm.resetCache();
-        var pin = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var pin = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer pin.deinit(a);
-        try testing.expectEqual(@as(u32, 3), pin.dspark_policy.range.min_rows);
-        try testing.expectEqual(@as(u32, 3), pin.dspark_policy.range.max_rows);
-        while (try pin.nextDspark(a)) |r| a.free(r.tokens);
-        try testing.expect(pin.dspark_stats.rounds > 0);
+        try testing.expectEqual(@as(u32, 3), pin.drafter_policy.range.min_rows);
+        try testing.expectEqual(@as(u32, 3), pin.drafter_policy.range.max_rows);
+        while (try pin.nextDrafterRound(a)) |r| a.free(r.tokens);
+        try testing.expect(pin.drafter_stats.rounds > 0);
         // Only the closing round, cut to the tokens the budget still allows, may verify fewer rows.
-        try testing.expect(pin.dspark_stats.plain <= 1);
-        for (pin.dspark_stats.rows_hist, 0..) |n, rows| if (rows > 3) try testing.expectEqual(@as(u32, 0), n);
+        try testing.expect(pin.drafter_stats.plain <= 1);
+        for (pin.drafter_stats.rows_hist, 0..) |n, rows| if (rows > 3) try testing.expectEqual(@as(u32, 0), n);
         depth_bounds.active = .{ .max = 1 };
         try xfm.resetCache();
-        var cap = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var cap = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer cap.deinit(a);
-        while (try cap.nextDspark(a)) |r| a.free(r.tokens);
-        try testing.expect(cap.dspark_stats.drafted <= cap.dspark_stats.rounds);
+        while (try cap.nextDrafterRound(a)) |r| a.free(r.tokens);
+        try testing.expect(cap.drafter_stats.drafted <= cap.drafter_stats.rounds);
     }
 
     // A repeat penalty shifts the verify rows by the ids before them, as a serial tick does: no id repeats.
@@ -159,14 +159,14 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
         defer g.deinit(a);
         while (try g.next(a)) |t| try distinct[0].append(a, t);
         try xfm.resetCache();
-        var d = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, penalized_params, &.{}, .{ .dspark_enabled = true });
+        var d = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, penalized_params, &.{}, .{ .drafter_enabled = true });
         defer d.deinit(a);
-        try testing.expect(d.dspark);
-        while (try d.nextDspark(a)) |r| {
+        try testing.expect(d.drafter_on);
+        while (try d.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try distinct[1].appendSlice(a, r.tokens);
         }
-        try testing.expect(d.dspark_stats.rounds > 0);
+        try testing.expect(d.drafter_stats.rounds > 0);
     }
     for (distinct) |list| {
         try testing.expectEqual(@as(usize, want), list.items.len);
@@ -178,11 +178,11 @@ test "dsv41 generator: DSpark rounds through the Generator keep the budget, the 
     defer single.deinit(a);
     {
         try xfm.resetCache();
-        var one = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .seed = 7 }, &.{}, .{ .dspark_enabled = true });
+        var one = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .seed = 7 }, &.{}, .{ .drafter_enabled = true });
         defer one.deinit(a);
-        try testing.expect(one.dspark);
-        one.dspark_diag = .{ .rows = 1 };
-        while (try one.nextDspark(a)) |r| {
+        try testing.expect(one.drafter_on);
+        one.drafter_diag = .{ .rows = 1 };
+        while (try one.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try single.appendSlice(a, r.tokens);
         }
@@ -224,10 +224,10 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
     defer serial.deinit(a);
     {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = 1 };
-        while (try gen.nextDspark(a)) |r| {
+        gen.drafter_diag = .{ .rows = 1 };
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try serial.appendSlice(a, r.tokens);
         }
@@ -266,24 +266,24 @@ test "dsv41 generator: copy rounds keep greedy text the serial decode's, whole o
         }
         @memcpy(ctx[ctx.len - prompt.len ..], prompt);
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true, .lookup_prompt = ctx });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true, .lookup_prompt = ctx });
         defer gen.deinit(a);
-        gen.dspark_copy = true;
-        gen.dspark_copy_backoff.kept = case.kept;
-        gen.dspark_copy_backoff.whole = case.whole;
+        gen.drafter_copy = true;
+        gen.drafter_copy_backoff.kept = case.kept;
+        gen.drafter_copy_backoff.whole = case.whole;
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             if (got.items.len == 0) if (case.first_drafts) |n| {
-                try testing.expectEqual(@as(u32, @intFromBool(n > 0)), gen.dspark_stats.copy_rounds);
-                try testing.expectEqual(n, gen.dspark_stats.copy_drafted);
+                try testing.expectEqual(@as(u32, @intFromBool(n > 0)), gen.drafter_stats.copy_rounds);
+                try testing.expectEqual(n, gen.drafter_stats.copy_drafted);
                 if (n > 0) try testing.expectEqual(@as(u32, 1), r.accepted_tokens);
             };
             try got.appendSlice(a, r.tokens);
         }
         try testing.expectEqualSlices(u32, serial.items, got.items);
-        const st = gen.dspark_stats;
+        const st = gen.drafter_stats;
         if (case.suffix == null) try testing.expect(st.copy_rounds > 0);
         try testing.expect(st.copy_accepted <= st.copy_drafted);
         try testing.expect(wrong_every > 0 or st.copy_accepted == st.copy_drafted);
@@ -329,17 +329,17 @@ test "dsv41 generator: with exact DSpark rounds greedy text is the same at every
     var first: std.ArrayList(u32) = .empty;
     defer first.deinit(a);
 
-    // One width, a cycle through every width (`dspark_sweep_rows`), and the adaptive policy.
-    const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep, null };
+    // One width, a cycle through every width (`drafter_sweep_rows`), and the adaptive policy.
+    const modes = [_]?DrafterDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep, null };
     for (modes, 0..) |mode, i| {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        try testing.expect(gen.dspark);
-        if (mode) |d| gen.dspark_diag = d;
+        try testing.expect(gen.drafter_on);
+        if (mode) |d| gen.drafter_diag = d;
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try got.appendSlice(a, r.tokens);
         }
@@ -371,15 +371,15 @@ test "dsv41 engine: a seeded sampled DSpark request under a suppress mask repeat
     // A seeded draw is keyed by its position, so every round mix says the same tokens.
     var first: std.ArrayList(u32) = .empty;
     defer first.deinit(a);
-    for ([_]?DsparkDiag{ .{ .rows = 1 }, .sweep, null }, 0..) |mode, i| {
+    for ([_]?DrafterDiag{ .{ .rows = 1 }, .sweep, null }, 0..) |mode, i| {
         try fx.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, fx.ids[0..30], want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 }, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, fx.ids[0..30], want, .{ .temperature = 0.8, .top_k = 40, .top_p = 0.95, .seed = 7 }, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
         gen.sampling.suppress_mask = mask;
-        if (mode) |d| gen.dspark_diag = d;
+        if (mode) |d| gen.drafter_diag = d;
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try got.appendSlice(a, r.tokens);
         }
@@ -422,37 +422,37 @@ test "dsv41 generator: on MLX's route a seeded sampled request verifies at one w
     defer base_tokens.deinit(a);
     for ([_]Perturb{ .none, .dear, .cheap, .owed }) |perturb| {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .seed = 7 }, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8, .seed = 7 }, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        try testing.expect(gen.dspark);
+        try testing.expect(gen.drafter_on);
         switch (perturb) {
             .none => {},
             .dear => {
-                gen.dspark_policy.cost = .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 };
-                gen.dspark_timing = gen.dspark_policy.cost;
+                gen.drafter_policy.cost = .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 };
+                gen.drafter_timing = gen.drafter_policy.cost;
             },
             .cheap => {
-                gen.dspark_policy.cost = .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
-                gen.dspark_timing = gen.dspark_policy.cost;
+                gen.drafter_policy.cost = .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+                gen.drafter_timing = gen.drafter_policy.cost;
             },
             .owed => {
-                gen.dspark_policy.owed = 6;
-                gen.dspark_policy.period = 8;
+                gen.drafter_policy.owed = 6;
+                gen.drafter_policy.period = 8;
             },
         }
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try got.appendSlice(a, r.tokens);
         }
         try testing.expectEqual(@as(usize, want), got.items.len);
         if (perturb == .none) {
-            base_hist = gen.dspark_stats.rows_hist;
+            base_hist = gen.drafter_stats.rows_hist;
             try base_tokens.appendSlice(a, got.items);
             continue;
         }
-        try testing.expectEqualSlices(u32, &base_hist, &gen.dspark_stats.rows_hist);
+        try testing.expectEqualSlices(u32, &base_hist, &gen.drafter_stats.rows_hist);
         try testing.expectEqualSlices(u32, base_tokens.items, got.items);
     }
 
@@ -460,12 +460,12 @@ test "dsv41 generator: on MLX's route a seeded sampled request verifies at one w
     var widths: [2][dsv41_max_drafts + 2]u32 = undefined;
     for ([_]Perturb{ .dear, .cheap }, 0..) |perturb, i| {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8 }, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, .{ .temperature = 0.8 }, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_policy.cost = if (perturb == .dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
-        gen.dspark_timing = gen.dspark_policy.cost;
-        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
-        widths[i] = gen.dspark_stats.rows_hist;
+        gen.drafter_policy.cost = if (perturb == .dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+        gen.drafter_timing = gen.drafter_policy.cost;
+        while (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
+        widths[i] = gen.drafter_stats.rows_hist;
     }
     try testing.expect(!std.mem.eql(u32, &widths[0], &widths[1]));
 }
@@ -503,25 +503,25 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
         defer plain.deinit(a);
         try xfm.resetCache();
         {
-            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+            var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
             defer gen.deinit(a);
-            gen.dspark_diag = .{ .rows = width };
-            while (try gen.nextDspark(a)) |r| {
+            gen.drafter_diag = .{ .rows = width };
+            while (try gen.nextDrafterRound(a)) |r| {
                 defer a.free(r.tokens);
                 try plain.appendSlice(a, r.tokens);
             }
         }
         const end_id = plain.items[9];
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = width };
-        gen.dspark_round_ends_at = end_id;
+        gen.drafter_diag = .{ .rows = width };
+        gen.drafter_round_ends_at = end_id;
         var total: usize = 0;
         var ended_rounds: usize = 0;
         while (true) {
-            const armed = gen.dspark_round_ends_at != null;
-            const r = (try gen.nextDspark(a)) orelse break;
+            const armed = gen.drafter_round_ends_at != null;
+            const r = (try gen.nextDrafterRound(a)) orelse break;
             defer a.free(r.tokens);
             total += r.tokens.len;
             // No round runs past the id, and the state stands on the committed tokens, so a restore point can be taken there.
@@ -530,7 +530,7 @@ test "dsv41 generator: a DSpark round ends right behind the id it is told to, at
                 var cp = try dsv41_prefix.capture(a, dsv41_state.modelOf(&xfm).?, prompt.len + total);
                 cp.deinit(a);
                 ended_rounds += 1;
-                gen.dspark_round_ends_at = null;
+                gen.drafter_round_ends_at = null;
             };
         }
         try testing.expectEqual(@as(usize, 1), ended_rounds);
@@ -570,13 +570,13 @@ test "dsv41 generator: a DSpark round verifies an end-of-turn draft and nothing 
         try xfm.resetCache();
         // The end-of-turn id is read through this slice, so the test names it one round ahead: that round's first draft.
         var eos = [_]u32{std.math.maxInt(u32)};
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &eos, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, want, greedy, &eos, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = width };
+        gen.drafter_diag = .{ .rows = width };
         var total: usize = 0;
         errdefer std.debug.print("[end-draft] width {d}: {d} tokens in, end id {d}\n", .{ width, total, eos[0] });
         for (0..2) |_| {
-            const r = (try gen.nextDspark(a)) orelse return error.TurnEndedEarly;
+            const r = (try gen.nextDrafterRound(a)) orelse return error.TurnEndedEarly;
             defer a.free(r.tokens);
             total += r.tokens.len;
         }
@@ -586,12 +586,12 @@ test "dsv41 generator: a DSpark round verifies an end-of-turn draft and nothing 
             try testing.expect(block.ids.len >= 3 and block.ids[1] != block.ids[0]);
             eos[0] = block.ids[1];
         }
-        const drafted = gen.dspark_stats.drafted;
-        const r = (try gen.nextDspark(a)) orelse return error.TurnEndedEarly;
+        const drafted = gen.drafter_stats.drafted;
+        const r = (try gen.nextDrafterRound(a)) orelse return error.TurnEndedEarly;
         defer a.free(r.tokens);
         total += r.tokens.len;
         // The round verified the end-of-turn draft and no row past it, so the state stands on what it committed.
-        try testing.expectEqual(drafted + 1, gen.dspark_stats.drafted);
+        try testing.expectEqual(drafted + 1, gen.drafter_stats.drafted);
         if (std.mem.indexOfScalar(u32, r.tokens, eos[0])) |at| try testing.expectEqual(r.tokens.len - 1, at);
         var cp = try dsv41_prefix.capture(a, dsv41_state.modelOf(&xfm).?, prompt.len + total);
         cp.deinit(a);
@@ -637,10 +637,10 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
     var plain: std.ArrayList(u32) = .empty;
     defer plain.deinit(a);
     {
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = 4 };
-        while (try gen.nextDspark(a)) |r| {
+        gen.drafter_diag = .{ .rows = 4 };
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try plain.appendSlice(a, r.tokens);
         }
@@ -663,11 +663,11 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
         var ctx = xfm.defaultCtx();
         ctx.cache = &cache;
         ctx.moe_seq_offset = &off;
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .ctx = ctx, .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .ctx = ctx, .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = 4 };
-        gen.dspark_round_ends_at = end_id;
-        while (try gen.nextDspark(a)) |r| {
+        gen.drafter_diag = .{ .rows = 4 };
+        gen.drafter_round_ends_at = end_id;
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             if (r.tokens[r.tokens.len - 1] != end_id) continue;
             point = prompt.len + gen.generated_ids.items.len;
@@ -706,17 +706,17 @@ test "dsv41 generator: the restore point behind a thought's closer, written mid-
         var ctx = xfm.defaultCtx();
         ctx.cache = &cache;
         ctx.moe_seq_offset = &off;
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .ctx = ctx, .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, &prompt, want, greedy, &.{}, .{ .ctx = ctx, .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .{ .rows = 4 };
-        gen.dspark_round_ends_at = end_id;
+        gen.drafter_diag = .{ .rows = 4 };
+        gen.drafter_round_ends_at = end_id;
         var written = false;
         while (true) {
-            const armed = gen.dspark_round_ends_at != null;
-            const r = (try gen.nextDspark(a)) orelse break;
+            const armed = gen.drafter_round_ends_at != null;
+            const r = (try gen.nextDrafterRound(a)) orelse break;
             defer a.free(r.tokens);
             if (!armed or r.tokens[r.tokens.len - 1] != end_id) continue;
-            gen.dspark_round_ends_at = null;
+            gen.drafter_round_ends_at = null;
             try testing.expectEqual(point, prompt.len + gen.generated_ids.items.len);
             try dsv41_prefix.writeDecodePointDsv41(&hc, &cache, dsv41_state.modelOf(&xfm).?, next[0..point], false, .{});
             written = true;
@@ -788,8 +788,8 @@ test "dsv41 generator: DSpark requests leave the MLX active memory flat (DSV41_T
     var active: usize = 0;
     for (0..12) |i| {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
-        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
+        while (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         gen.deinit(a);
         if (i == 3) try mlx.check(mlx.mlx_get_active_memory(&baseline));
     }
@@ -1448,9 +1448,9 @@ fn censusOf(dir: []const u8, work: *[9]u64, throwaway: bool) ![9]Asked {
             try f.xfm.resetCache();
             var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), al, &f.xfm, t, ids, 12, sampling, &.{}, opts);
             defer gen.deinit(al);
-            if (opts.dspark_enabled) {
-                gen.dspark_diag = .sweep;
-                while (try gen.nextDspark(al)) |r| al.free(r.tokens);
+            if (opts.drafter_enabled) {
+                gen.drafter_diag = .sweep;
+                while (try gen.nextDrafterRound(al)) |r| al.free(r.tokens);
             } else while (try gen.next(al)) |_| {}
         }
     };
@@ -1458,17 +1458,17 @@ fn censusOf(dir: []const u8, work: *[9]u64, throwaway: bool) ![9]Asked {
     const greedy: SamplingParams = .{ .temperature = 0.0 };
     const seeded: SamplingParams = .{ .temperature = 0.8, .top_p = 0.95, .seed = 5 };
     const penalized: SamplingParams = .{ .temperature = 0.0, .presence_penalty = 0.5 };
-    try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
-    try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
+    try Request.run(&fx, &tok, prompt, greedy, .{ .drafter_enabled = true });
+    try Request.run(&fx, &tok, prompt, seeded, .{ .drafter_enabled = true });
     try Request.run(&fx, &tok, prompt, penalized, .{ .skip_lazy_preforward = true });
 
     c = try Census.begin();
-    try Request.run(&fx, &tok, prompt, greedy, .{ .dspark_enabled = true });
+    try Request.run(&fx, &tok, prompt, greedy, .{ .drafter_enabled = true });
     asked[0] = try c.end("greedy rounds: a 40-row prefill and 12 tokens");
     work[0] = c.dispatched;
 
     c = try Census.begin();
-    try Request.run(&fx, &tok, prompt, seeded, .{ .dspark_enabled = true });
+    try Request.run(&fx, &tok, prompt, seeded, .{ .drafter_enabled = true });
     asked[1] = try c.end("seeded rounds");
     work[1] = c.dispatched;
 
@@ -2081,7 +2081,7 @@ test "dsv41 engine: a Cooler model beside a model on MLX, in phases: the wired l
         const Variant = struct { sampling: SamplingParams, opts: Generator.InitOptions };
         const variants = [_]Variant{
             .{ .sampling = greedy, .opts = .{} },
-            .{ .sampling = greedy, .opts = .{ .dspark_enabled = true } },
+            .{ .sampling = greedy, .opts = .{ .drafter_enabled = true } },
         };
         for (variants) |v| {
             {
@@ -3158,11 +3158,11 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
     for ([_]?u64{ 7, null }) |seed| for ([_]bool{ false, true }) |masked| for ([_][2]f32{ .{ 0, 1 }, .{ 40, 1 }, .{ 0, 0.95 }, .{ 40, 0.95 } }) |filter| {
         const sampled = SamplingParams{ .temperature = 0.8, .top_k = @intFromFloat(filter[0]), .top_p = filter[1], .seed = seed };
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, sampled, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, sampled, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
         if (masked) gen.sampling.suppress_mask = mask;
-        gen.dspark_diag = .sweep;
-        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        gen.drafter_diag = .sweep;
+        while (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         try testing.expectEqual(late, mlx.engine.latePipelines());
     };
     // The serial tick, the first token and a round with penalties launch no pipeline the warm did not make.
@@ -3189,10 +3189,10 @@ test "dsv41 engine: after the load's warm a sampled DSpark request, seeded or no
         .{ .temperature = 0.0, .presence_penalty = 0.5, .frequency_penalty = 0.3 },
     }) |c| {
         try xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, c, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &xfm, &tok, ids[0..30], 30, c, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .sweep;
-        while (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        gen.drafter_diag = .sweep;
+        while (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         try testing.expectEqual(late, mlx.engine.latePipelines());
     }
 }
@@ -3205,7 +3205,7 @@ test "a DSpark round never verifies past the position serial decode closes the t
                 var tb = ThinkBound{ .budget = budget, .opener_id = null, .closer_id = 99, .forced = &.{99}, .in_think = true };
                 var emitted: u32 = 0;
                 while (!tb.due()) {
-                    const rows = dsparkRowsForRoom(width, tb.room());
+                    const rows = drafterRowsForRoom(width, tb.room());
                     try testing.expect(rows >= 1);
                     emitted += 1 + @min(@as(u32, @intCast(rows - 1)), accept_every);
                     tb.count = emitted;
@@ -3215,13 +3215,13 @@ test "a DSpark round never verifies past the position serial decode closes the t
             }
         }
     }
-    try testing.expectEqual(@as(usize, 5), dsparkRowsForRoom(5, null));
-    try testing.expectEqual(@as(usize, 1), dsparkRowsForRoom(5, 0));
-    try testing.expectEqual(@as(usize, 2), dsparkRowsForRoom(5, 2));
+    try testing.expectEqual(@as(usize, 5), drafterRowsForRoom(5, null));
+    try testing.expectEqual(@as(usize, 1), drafterRowsForRoom(5, 0));
+    try testing.expectEqual(@as(usize, 2), drafterRowsForRoom(5, 2));
 }
 
 /// `tail`: DSpark rounds up to the bound, then the old behavior (the forced commit, serial ticks after it).
-const ThinkBoundMode = union(enum) { serial, tail, spark: DsparkDiag };
+const ThinkBoundMode = union(enum) { serial, tail, spark: DrafterDiag };
 
 const ThinkBoundOutcome = struct {
     tokens: std.ArrayList(u32) = .empty,
@@ -3258,28 +3258,28 @@ fn thinkBoundRun(
     sampling.think_bound = &bound;
     var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, want, sampling, &.{}, switch (mode) {
         .serial => .{ .skip_lazy_preforward = true },
-        .tail, .spark => .{ .dspark_enabled = true },
+        .tail, .spark => .{ .drafter_enabled = true },
     });
     defer gen.deinit(a);
     if (mode != .serial) {
-        try testing.expect(gen.dspark);
-        gen.dspark_diag = if (mode == .spark) mode.spark else .{ .rows = 1 };
+        try testing.expect(gen.drafter_on);
+        gen.drafter_diag = if (mode == .spark) mode.spark else .{ .rows = 1 };
     }
     var out = ThinkBoundOutcome{};
     errdefer out.deinit(a);
-    var at_fire = gen.dspark_stats;
+    var at_fire = gen.drafter_stats;
     while (true) {
         bound.observe(gen.generated_ids.items);
         if (bound.due()) {
             bound.fired = true;
             out.fired_at = gen.generated_ids.items.len;
-            at_fire = gen.dspark_stats;
+            at_fire = gen.drafter_stats;
             out.rows_before = at_fire.rows_hist;
             const r = try gen.commitForcedTokens(a, forced);
             defer a.free(r.emitted);
             try out.tokens.appendSlice(a, r.emitted);
             if (r.stopped) break;
-            if (mode == .spark) switch (try gen.dsparkResumeAfterForced(a)) {
+            if (mode == .spark) switch (try gen.drafterResumeAfterForced(a)) {
                 .resumed => |closer| {
                     try out.tokens.append(a, closer);
                     out.resumed = true;
@@ -3292,7 +3292,7 @@ fn thinkBoundRun(
             continue;
         }
         if (mode != .serial and (!bound.fired or out.resumed)) {
-            const r = (try gen.nextDspark(a)) orelse break;
+            const r = (try gen.nextDrafterRound(a)) orelse break;
             defer a.free(r.tokens);
             try out.tokens.appendSlice(a, r.tokens);
         } else {
@@ -3300,8 +3300,8 @@ fn thinkBoundRun(
             try out.tokens.append(a, t);
         }
     }
-    out.rounds_after = gen.dspark_stats.rounds - at_fire.rounds;
-    out.drafted_after = gen.dspark_stats.drafted - at_fire.drafted;
+    out.rounds_after = gen.drafter_stats.rounds - at_fire.rounds;
+    out.drafted_after = gen.drafter_stats.drafted - at_fire.drafted;
     return out;
 }
 
@@ -3356,7 +3356,7 @@ test "dsv41 generator: a thinking bound that fires mid-round cuts it at the seri
         var base = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = .{ .rows = 1 } }, .{ .temperature = 0.0 });
         defer base.deinit(a);
         try testing.expectEqual(@as(?usize, budget), base.fired_at);
-        for ([_]DsparkDiag{ .{ .rows = 6 }, .sweep, .off }) |diag| {
+        for ([_]DrafterDiag{ .{ .rows = 6 }, .sweep, .off }) |diag| {
             var got = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = diag }, .{ .temperature = 0.0 });
             defer got.deinit(a);
             try testing.expectEqual(base.fired_at, got.fired_at);
@@ -3371,7 +3371,7 @@ test "dsv41 generator: a thinking bound that fires mid-round cuts it at the seri
         const sampled = SamplingParams{ .temperature = 0.8, .seed = 7 };
         var seeded = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = .{ .rows = 1 } }, sampled);
         defer seeded.deinit(a);
-        for ([_]DsparkDiag{ .sweep, .off }) |diag| {
+        for ([_]DrafterDiag{ .sweep, .off }) |diag| {
             var got = try thinkBoundRun(a, io, &xfm, &tok, prompt, want, budget, &forced, .{ .spark = diag }, sampled);
             defer got.deinit(a);
             try testing.expect(got.resumed and got.rounds_after > 0);
@@ -3381,12 +3381,12 @@ test "dsv41 generator: a thinking bound that fires mid-round cuts it at the seri
 }
 
 test "dspark eligibility: sampled, penalized and thinking-bound requests draft" {
-    try testing.expect(dsparkEligible(.{ .temperature = 0.0 }));
-    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .top_p = 0.9, .top_k = 40 }));
-    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .repeat_penalty = 1.1 }));
-    try testing.expect(dsparkEligible(.{ .temperature = 0.0, .presence_penalty = 0.5 }));
+    try testing.expect(drafterEligible(.{ .temperature = 0.0 }));
+    try testing.expect(drafterEligible(.{ .temperature = 1.0, .top_p = 0.9, .top_k = 40 }));
+    try testing.expect(drafterEligible(.{ .temperature = 1.0, .repeat_penalty = 1.1 }));
+    try testing.expect(drafterEligible(.{ .temperature = 0.0, .presence_penalty = 0.5 }));
     var bound = ThinkBound{ .budget = 10, .opener_id = null, .closer_id = 1, .forced = &.{}, .in_think = true };
-    try testing.expect(dsparkEligible(.{ .temperature = 1.0, .think_bound = &bound }));
+    try testing.expect(drafterEligible(.{ .temperature = 1.0, .think_bound = &bound }));
 }
 
 test "dsv41 generator: a chat prompt's snapshot sits before its last assistant opener, and a restore there runs the two-row tail to the cold tokens (DSV41_TINY)" {
@@ -3749,16 +3749,16 @@ test "dsv41 DSpark: --max-mtp-ctx ends drafting once the context passes it (DSV4
     defer generate.max_mtp_ctx = saved;
     // The prompt is admitted (30 <= 34); the ceiling is crossed a few tokens into the reply.
     generate.max_mtp_ctx = 34;
-    var g = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 30, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    var g = try Generator.initWithOptions(io, a, &xfm, &tok, prompt, 30, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
     defer g.deinit(a);
-    g.dspark_diag = .{ .rows = 3 };
+    g.drafter_diag = .{ .rows = 3 };
     var drafted_past: u64 = 0;
     while (true) {
         const ctx_before = prompt.len + g.generated_ids.items.len;
-        const drafted_before = g.dspark_stats.drafted;
-        const r = (try g.nextDspark(a)) orelse break;
+        const drafted_before = g.drafter_stats.drafted;
+        const r = (try g.nextDrafterRound(a)) orelse break;
         a.free(r.tokens);
-        if (ctx_before > generate.max_mtp_ctx) drafted_past += g.dspark_stats.drafted - drafted_before;
+        if (ctx_before > generate.max_mtp_ctx) drafted_past += g.drafter_stats.drafted - drafted_before;
     }
     if (drafted_past > 0) {
         std.debug.print("DSpark drafted {d} rows past --max-mtp-ctx {d}\n", .{ drafted_past, generate.max_mtp_ctx });
@@ -3777,9 +3777,9 @@ test "dsv41 DSpark: a drafted image-token id rides the verify chunk as a plain t
     defer xfm.deinit();
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
-    var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
     defer g.deinit(a);
-    g.dspark_diag = .{ .rows = 4 };
+    g.drafter_diag = .{ .rows = 4 };
 
     // The draft heads score the whole vocabulary, so the image id is one of their possible picks; this pack's
     // image id is made an id the draft already holds past row 1.
@@ -3790,9 +3790,9 @@ test "dsv41 DSpark: a drafted image-token id rides the verify chunk as a plain t
         if (d.ids[i] != d.ids[0] and d.ids[i] != d.ids[1]) break i;
     } else return error.NoDistinctDraft;
     dsv.cfg.image_token_id = d.ids[k];
-    const r = (try g.nextDspark(a)) orelse return error.NoRound;
+    const r = (try g.nextDrafterRound(a)) orelse return error.NoRound;
     defer a.free(r.tokens);
-    try testing.expectEqual(@as(u64, 3), g.dspark_stats.drafted);
+    try testing.expectEqual(@as(u64, 3), g.drafter_stats.drafted);
     try testing.expectEqual(@as(usize, r.accepted_tokens) + 1, r.tokens.len);
 }
 
@@ -3812,7 +3812,7 @@ fn grammarTestBytes(a: std.mem.Allocator, vocab: usize, closer: u32, eos: u32) !
     return token_mask.TokenBytes.init(arena, bytes, eos);
 }
 
-const GrammarMode = union(enum) { serial, spark: ?DsparkDiag };
+const GrammarMode = union(enum) { serial, spark: ?DrafterDiag };
 
 const GrammarOutcome = struct {
     tokens: std.ArrayList(u32) = .empty,
@@ -3863,7 +3863,7 @@ fn grammarRun(
     try xfm.resetCache();
     var gen = try Generator.initWithOptions(io, a, xfm, tok, prompt, want, sampling, &.{eos}, switch (mode) {
         .serial => .{ .skip_lazy_preforward = true },
-        .spark => .{ .dspark_enabled = true },
+        .spark => .{ .drafter_enabled = true },
     });
     defer gen.deinit(a);
     var out = GrammarOutcome{};
@@ -3871,9 +3871,9 @@ fn grammarRun(
     switch (mode) {
         .serial => while (try gen.next(a)) |t| try out.tokens.append(a, t),
         .spark => |diag| {
-            try testing.expect(gen.dspark);
-            if (diag) |d| gen.dspark_diag = d;
-            blocks: while (try gen.nextDspark(a)) |r| {
+            try testing.expect(gen.drafter_on);
+            if (diag) |d| gen.drafter_diag = d;
+            blocks: while (try gen.nextDrafterRound(a)) |r| {
                 defer a.free(r.tokens);
                 for (r.tokens) |t| {
                     if (t == eos) break :blocks;
@@ -3883,9 +3883,9 @@ fn grammarRun(
         },
     }
     out.finish = gen.finish_reason;
-    out.rounds = gen.dspark_stats.rounds;
-    out.drafted = gen.dspark_stats.drafted;
-    out.serial = gen.dspark_stats.serial;
+    out.rounds = gen.drafter_stats.rounds;
+    out.drafted = gen.drafter_stats.drafted;
+    out.serial = gen.drafter_stats.serial;
     var payload: std.ArrayList(u8) = .empty;
     errdefer payload.deinit(a);
     var lead: usize = 0;
@@ -3972,7 +3972,7 @@ test "dsv41 generator: DSpark rounds under a grammar emit serial decode's tokens
 
     // Exact rounds give a row the same bytes at every width: any mix equals the one-row stream.
     dsv41_model.setDsparkExact(dsv41_state.modelOf(&xfm).?, true);
-    const modes = [_]?DsparkDiag{ .sweep, null };
+    const modes = [_]?DrafterDiag{ .sweep, null };
     for ([_]?u32{ closer, null }) |c| {
         var base = try grammarRun(a, io, &xfm, &tok, prompt, want, &tb, c, 1, greedy, .{ .spark = .{ .rows = 1 } });
         defer base.deinit(a);
@@ -4291,7 +4291,7 @@ test "every generator start path copies the launch round options (DSV41_TINY)" {
     }
     generate.mtp_lookup_disabled = true;
     generate.max_mtp_ctx = 77;
-    const starts = [_]Generator.InitOptions{ .{}, .{ .skip_lazy_preforward = true }, .{ .dspark_enabled = true } };
+    const starts = [_]Generator.InitOptions{ .{}, .{ .skip_lazy_preforward = true }, .{ .drafter_enabled = true } };
     for (starts) |opts| {
         var g = try Generator.initWithOptions(io, a, &xfm, &tok, st.ids[0..30], 8, .{ .temperature = 0.0 }, &.{}, opts);
         defer g.deinit(a);
@@ -4409,14 +4409,14 @@ test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit b
     };
     for (cases) |c| {
         try fx.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 30, c, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 30, c, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_diag = .sweep;
-        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        gen.drafter_diag = .sweep;
+        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         const before = mlx.engine.mlx_ops;
         var rounds: usize = 0;
         while (rounds < 5) : (rounds += 1) {
-            const r = (try gen.nextDspark(a)) orelse break;
+            const r = (try gen.nextDrafterRound(a)) orelse break;
             a.free(r.tokens);
         }
         try testing.expect(rounds > 0);
@@ -4434,20 +4434,20 @@ fn engineIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32
     const opts: Generator.InitOptions = switch (mode) {
         .serial => .{ .skip_lazy_preforward = true },
         .serial_lazy => .{},
-        else => .{ .dspark_enabled = true },
+        else => .{ .drafter_enabled = true },
     };
     var gen = try Generator.initWithOptions(io, a, &fx.xfm, tok, prompt, want, sampling, &.{}, opts);
     defer gen.deinit(a);
     switch (mode) {
         .serial, .serial_lazy => while (try gen.next(a)) |t| try out.append(a, t),
         else => {
-            gen.dspark_diag = switch (mode) {
+            gen.drafter_diag = switch (mode) {
                 .rows1 => .{ .rows = 1 },
                 .rows3 => .{ .rows = 3 },
                 .sweep => .sweep,
                 else => .off,
             };
-            while (try gen.nextDspark(a)) |r| {
+            while (try gen.nextDrafterRound(a)) |r| {
                 defer a.free(r.tokens);
                 try out.appendSlice(a, r.tokens);
             }
@@ -4484,20 +4484,20 @@ test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy 
     for ([_]bool{ true, false }, &widths, &drafted, &plain_steps) |dear, *hist, *d, *plain| {
         checked = if (dear) "tokens under a dear cost model" else "tokens under a cheap cost model";
         try fx.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
-        gen.dspark_timing = gen.dspark_policy.cost;
+        gen.drafter_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+        gen.drafter_timing = gen.drafter_policy.cost;
         var got: std.ArrayList(u32) = .empty;
         defer got.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try got.appendSlice(a, r.tokens);
         }
         try testing.expectEqualSlices(u32, fixed.items, got.items);
-        hist.* = gen.dspark_stats.rows_hist;
-        d.* = gen.dspark_stats.drafted;
-        plain.* = gen.dspark_policy.gate.plain_tokens;
+        hist.* = gen.drafter_stats.rows_hist;
+        d.* = gen.drafter_stats.drafted;
+        plain.* = gen.drafter_policy.gate.plain_tokens;
     }
     checked = "the widths move with the cost model";
     try testing.expect(!std.mem.eql(u32, &widths[0], &widths[1]));
@@ -4513,17 +4513,17 @@ test "dsv41 engine: a seeded sampled request takes the adaptive widths and copy 
     @memcpy(ctx[prompt.len..][0..fixed.items.len], fixed.items);
     @memcpy(ctx[prompt.len + fixed.items.len ..], prompt);
     try fx.xfm.resetCache();
-    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .dspark_enabled = true, .lookup_prompt = ctx });
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, want, seeded, &.{}, .{ .drafter_enabled = true, .lookup_prompt = ctx });
     defer gen.deinit(a);
-    gen.dspark_copy = true;
+    gen.drafter_copy = true;
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(a);
-    while (try gen.nextDspark(a)) |r| {
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try got.appendSlice(a, r.tokens);
     }
     try testing.expectEqualSlices(u32, fixed.items, got.items);
-    try testing.expect(gen.dspark_stats.copy_rounds > 0);
+    try testing.expect(gen.drafter_stats.copy_rounds > 0);
 }
 
 test "dsv41 engine: a seeded request gives the same tokens, the first one included, at every serial mix and in DSpark rounds, streamed or not (DSV41_STQ_TINY)" {
@@ -4587,11 +4587,11 @@ fn mlxRouteIds(fx: *EngineFixture, sampling: SamplingParams, rounds: bool, out: 
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..30];
     try fx.xfm.resetCache();
-    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 12, sampling, &.{}, if (rounds) .{ .dspark_enabled = true } else .{ .skip_lazy_preforward = true });
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, 12, sampling, &.{}, if (rounds) .{ .drafter_enabled = true } else .{ .skip_lazy_preforward = true });
     defer gen.deinit(a);
-    if (rounds) gen.dspark_diag = .{ .rows = 3 };
+    if (rounds) gen.drafter_diag = .{ .rows = 3 };
     if (rounds) {
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try out.appendSlice(a, r.tokens);
         }
@@ -4668,9 +4668,9 @@ fn runRequest(f: *EngineFixture, t: *Tokenizer, ids: []const u32, sampling: Samp
     var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), al, &f.xfm, t, ids, n, sampling, &.{}, opts);
     defer gen.deinit(al);
     var done: usize = 0;
-    if (opts.dspark_enabled) {
-        gen.dspark_diag = .sweep;
-        while (try gen.nextDspark(al)) |r| {
+    if (opts.drafter_enabled) {
+        gen.drafter_diag = .sweep;
+        while (try gen.nextDrafterRound(al)) |r| {
             defer al.free(r.tokens);
             if (out) |o| try o.appendSlice(al, r.tokens);
             done += 1;
@@ -4745,7 +4745,7 @@ test "dsv41 engine: a request dropped after any round or step leaks nothing, and
     const greedy: SamplingParams = .{ .temperature = 0.0 };
     const seeded: SamplingParams = .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 };
     for ([_]SamplingParams{ greedy, seeded }) |sampling| for ([_]bool{ true, false }) |spark| {
-        const opts: Generator.InitOptions = .{ .dspark_enabled = spark };
+        const opts: Generator.InitOptions = .{ .drafter_enabled = spark };
         var want: std.ArrayList(u32) = .empty;
         defer want.deinit(a);
         try runRequest(&fx, &tok, prompt, sampling, opts, 16, null, &want);
@@ -4874,15 +4874,15 @@ test "dsv41 engine: a DSpark round refused at any of its pool buffers leaks noth
         fn third(q: @This(), point: ?mlx.FaultSites.SitePoint) !bool {
             const al = testing.allocator;
             try q.fx.xfm.resetCache();
-            var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), al, &q.fx.xfm, q.tok, q.prompt, 64, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true, .skip_lazy_preforward = true });
+            var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), al, &q.fx.xfm, q.tok, q.prompt, 64, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true, .skip_lazy_preforward = true });
             defer gen.deinit(al);
-            gen.dspark_diag = .{ .rows = q.width };
+            gen.drafter_diag = .{ .rows = q.width };
             for (0..2) |_| {
-                const r = (try gen.nextDspark(al)) orelse return error.TurnEndedEarly;
+                const r = (try gen.nextDrafterRound(al)) orelse return error.TurnEndedEarly;
                 al.free(r.tokens);
             }
             if (point) |pt| mlx.engine.fault.armAt(pt) else mlx.engine.fault.arm(0);
-            const r = gen.nextDspark(al);
+            const r = gen.nextDrafterRound(al);
             const fired = point != null and !mlx.engine.fault.armed();
             mlx.engine.fault.disarm();
             if (r) |maybe| {
@@ -5917,14 +5917,14 @@ test "dsv41 engine: at the filters' edges a sampled token is one the filters all
     };
 }
 
-fn roundIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32, sampling: SamplingParams, diag: DsparkDiag, out: *std.ArrayList(u32)) !void {
+fn roundIds(fx: *EngineFixture, tok: *Tokenizer, prompt: []const u32, want: u32, sampling: SamplingParams, diag: DrafterDiag, out: *std.ArrayList(u32)) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     try fx.xfm.resetCache();
-    var gen = try Generator.initWithOptions(io, a, &fx.xfm, tok, prompt, want, sampling, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, tok, prompt, want, sampling, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    gen.dspark_diag = diag;
-    while (try gen.nextDspark(a)) |r| {
+    gen.drafter_diag = diag;
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try out.appendSlice(a, r.tokens);
     }
@@ -5947,7 +5947,7 @@ test "dsv41 sampled rounds: a request stopped by max_tokens inside a round is th
         .{ .temperature = 0.8, .repeat_penalty = 1.3, .presence_penalty = 0.5, .frequency_penalty = 0.3, .seed = 9 },
     };
     // A fixed width, and the sweep through every width.
-    const diags = [_]DsparkDiag{ .{ .rows = 5 }, .sweep };
+    const diags = [_]DrafterDiag{ .{ .rows = 5 }, .sweep };
     const block: usize = fx.model().cfg.dspark.block;
     for (cases) |sampling| {
         var base: std.ArrayList(u32) = .empty;
@@ -6094,16 +6094,16 @@ test "dsv41 engine: the trunk bill is what the release layout's load holds, on S
 }
 
 /// `want` greedy DSpark tokens over `prompt` at `mode`.
-fn dsparkTokens(a: std.mem.Allocator, fx: *EngineFixture, prompt: []const u32, want: u32, mode: ?DsparkDiag) !std.ArrayList(u32) {
+fn dsparkTokens(a: std.mem.Allocator, fx: *EngineFixture, prompt: []const u32, want: u32, mode: ?DrafterDiag) !std.ArrayList(u32) {
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try fx.xfm.resetCache();
-    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, &tok, prompt, want, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &fx.xfm, &tok, prompt, want, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    if (mode) |d| gen.dspark_diag = d;
+    if (mode) |d| gen.drafter_diag = d;
     var got: std.ArrayList(u32) = .empty;
     errdefer got.deinit(a);
-    while (try gen.nextDspark(a)) |r| {
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try got.appendSlice(a, r.tokens);
     }
@@ -6119,7 +6119,7 @@ test "dsv41 engine: the release's layout (FP8 trunk, MXFP4 experts) on Sushi Coo
     const small = 3 * 8 * try @import("../expert_stream.zig").mxfp4ExpertBytes(128, 128);
     // A verify wider than a row takes other product plans than a one-row step: each mix is held to the cached load's at
     // the same mix.
-    const modes = [_]?DsparkDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep };
+    const modes = [_]?DrafterDiag{ .{ .rows = 1 }, .{ .rows = 3 }, .sweep };
     var buf: [48]u32 = undefined;
     var want_logits: std.ArrayList(u8) = .empty;
     defer want_logits.deinit(a);
@@ -6189,11 +6189,11 @@ fn expectOneTextAtEveryCost(fx: *EngineFixture, sampling: SamplingParams) !void 
         defer for (&said) |*s| s.deinit(a);
         for ([_]bool{ true, false }, &said) |dear, *got| {
             try fx.xfm.resetCache();
-            var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, &buf, 40, sampling, &.{}, .{ .dspark_enabled = true });
+            var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, &buf, 40, sampling, &.{}, .{ .drafter_enabled = true });
             defer gen.deinit(a);
-            gen.dspark_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
-            gen.dspark_timing = gen.dspark_policy.cost;
-            while (try gen.nextDspark(a)) |r| {
+            gen.drafter_policy.cost = if (dear) .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 } else .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
+            gen.drafter_timing = gen.drafter_policy.cost;
+            while (try gen.nextDrafterRound(a)) |r| {
                 defer a.free(r.tokens);
                 try got.appendSlice(a, r.tokens);
             }
@@ -6672,7 +6672,7 @@ test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum, a resid
             const chunk: usize = 2048;
             // The pool rounds each array the state holds up to its page: a layer's window ring, a compressor's open group
             // (kv and gate), the codes and scales of a KV source's rows and of an owner's keys, a DSpark stage's ring.
-            var arrays: u64 = if (fx.config.dsparkOn()) c.n_mtp else 0;
+            var arrays: u64 = if (fx.config.drafterOn()) c.n_mtp else 0;
             for (0..c.layers) |l| {
                 arrays += 1;
                 if (c.isKvSource(l)) arrays += if (c.ratios[l] > 1) 4 else 2;
@@ -6698,7 +6698,7 @@ test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum, a resid
                     mlx.engine.close();
                     const s = mlx.engine.stats();
                     const held = s.pool_bytes - s.pool_free - in0;
-                    const billed = seq * c.stateBytesPerToken() + c.stateFixedBytes(fx.config.dsparkOn());
+                    const billed = seq * c.stateBytesPerToken() + c.stateFixedBytes(fx.config.drafterOn());
                     // The rows' slack a grow leaves, which the forward cap's growth term bills.
                     const growth = seq * c.stateBytesPerToken() / dsv41_config.rows_grow_div;
                     errdefer std.debug.print("{s} after {d} rows: the pool holds {d}, the state bills {d} (growth {d})\n", .{ env, seq, held, billed, growth });
@@ -6722,10 +6722,10 @@ test "dsv41 engine: the round meter accounts for the served dispatches and waits
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const io = std.Io.Threaded.global_single_threaded.io();
-    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, fx.prompt(&buf)[0..40], 32, .{ .temperature = 0 }, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, fx.prompt(&buf)[0..40], 32, .{ .temperature = 0 }, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
     for ([_]u8{ 1, 3, 3 }, [_]bool{ false, false, true }) |width, fence| {
-        gen.dspark_diag = .{ .rows = width };
+        gen.drafter_diag = .{ .rows = width };
         var meter = dsv41_dspark.RoundMeter.init(io);
         meter.fence_draft = fence;
         const before = mlx.engine.stats();
@@ -6786,24 +6786,24 @@ test "dsv41 engine: consecutive low acceptance shortens the stage draft and a re
     const io = std.Io.Threaded.global_single_threaded.io();
     var serial: [18]u32 = undefined;
     {
-        var plain = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, .{ .temperature = 0 }, &.{}, .{ .dspark_enabled = true });
+        var plain = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, .{ .temperature = 0 }, &.{}, .{ .drafter_enabled = true });
         defer plain.deinit(a);
-        plain.dspark_diag = .{ .rows = 1 };
+        plain.drafter_diag = .{ .rows = 1 };
         for (&serial) |*t| {
-            const round = (try plain.nextDspark(a)).?;
+            const round = (try plain.nextDrafterRound(a)).?;
             defer a.free(round.tokens);
             t.* = round.tokens[0];
         }
     }
     try fx.xfm.resetCache();
-    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, .{ .temperature = 0 }, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, .{ .temperature = 0 }, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    gen.dspark_copy = false;
+    gen.drafter_copy = false;
     var offset: usize = 0;
     var full_dispatches: u64 = 0;
     const late = mlx.engine.latePipelines();
     for (0..3) |phase| {
-        const policy = &gen.dspark_policy;
+        const policy = &gen.drafter_policy;
         if (phase == 1) for (0..3) |_| policy.observeRound(&.{ 0, 0, 0, 0 }, 2, 0, 1, 1);
         if (phase == 2) policy.observeRound(&.{ 0, 0 }, 3, 2, 1, 1);
         policy.owed = 0;
@@ -6841,16 +6841,16 @@ test "dsv41 engine: a full stage block found in history verifies its continuatio
     const greedy = SamplingParams{ .temperature = 0 };
     var serial: [24]u32 = undefined;
     {
-        var probe = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, greedy, &.{}, .{ .dspark_enabled = true });
+        var probe = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, greedy, &.{}, .{ .drafter_enabled = true });
         defer probe.deinit(a);
         var draft = try dsv41_serving.dsv41DraftImpl(&fx.xfm, &probe.ctx, probe.next_token_id);
         defer draft.deinit();
         @memcpy(lookup[0..block], draft.ids[1..]);
         for (lookup[block..][0..block], 0..) |*t, i| t.* = @intCast(47 + i);
         @memcpy(lookup[block * 2 ..][0..3], &[_]u32{ 250, 249, 248 });
-        probe.dspark_diag = .{ .rows = 1 };
+        probe.drafter_diag = .{ .rows = 1 };
         for (&serial) |*t| {
-            const r = (try probe.nextDspark(a)).?;
+            const r = (try probe.nextDrafterRound(a)).?;
             defer a.free(r.tokens);
             t.* = r.tokens[0];
         }
@@ -6863,21 +6863,21 @@ test "dsv41 engine: a full stage block found in history verifies its continuatio
         .{ .allow = true, .shallow = true, .drafts = 1 },
     }) |case| {
         try fx.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, greedy, &.{}, .{ .dspark_enabled = true, .lookup_prompt = lookup[0 .. 2 * block + 3] });
+        var gen = try Generator.initWithOptions(io, a, &fx.xfm, &tok, prompt, serial.len, greedy, &.{}, .{ .drafter_enabled = true, .lookup_prompt = lookup[0 .. 2 * block + 3] });
         defer gen.deinit(a);
-        gen.dspark_copy = case.allow;
+        gen.drafter_copy = case.allow;
         if (case.shallow) {
-            gen.dspark_policy.cost = .{ .plain_ms = 15, .step_ms = 3.3, .draft_ms = 2.7 };
-            gen.dspark_policy.calib = .{ .hit = @splat(400), .seen = @splat(1000) };
-        } else gen.dspark_policy.calib.hit = @splat(1000);
-        const result = (try gen.nextDspark(a)).?;
+            gen.drafter_policy.cost = .{ .plain_ms = 15, .step_ms = 3.3, .draft_ms = 2.7 };
+            gen.drafter_policy.calib = .{ .hit = @splat(400), .seen = @splat(1000) };
+        } else gen.drafter_policy.calib.hit = @splat(1000);
+        const result = (try gen.nextDrafterRound(a)).?;
         defer a.free(result.tokens);
-        try testing.expectEqual(@as(u32, 0), gen.dspark_stats.copy_rounds);
-        try testing.expectEqual(case.drafts, gen.dspark_stats.drafted);
+        try testing.expectEqual(@as(u32, 0), gen.drafter_stats.copy_rounds);
+        try testing.expectEqual(case.drafts, gen.drafter_stats.drafted);
         try testing.expectEqualSlices(u32, serial[0..result.tokens.len], result.tokens);
-        gen.dspark_diag = .{ .rows = 1 };
+        gen.drafter_diag = .{ .rows = 1 };
         for (serial[result.tokens.len..]) |expected| {
-            const r = (try gen.nextDspark(a)).?;
+            const r = (try gen.nextDrafterRound(a)).?;
             defer a.free(r.tokens);
             try testing.expectEqual(expected, r.tokens[0]);
         }

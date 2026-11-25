@@ -434,7 +434,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     to the original checkpoint layout. The release itself is MIT, Copyright (c) 2023
     DeepSeek.
   * The DSpark speculative decoder of that arm (`dspark`, `draft`, `verify` and `finishVerify`
-    in `src/dsv41/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `deepseek_v41.zig`
+    in `src/dsv41/dsv41_model.zig`, `Generator.nextDrafterRound`), from mlx-serve's `deepseek_v41.zig`
     at 49bb6be0 (`dsparkDraft`, `dsparkBeginWith`, `dsparkFinish` and their rollback of a
     verify chunk) by David Dalcu. Modifications: the stages and heads load from the original
     `mtp.*` tensors with resident mxfp4 experts, the draft attention and the attention-output

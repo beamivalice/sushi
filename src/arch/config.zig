@@ -395,10 +395,10 @@ comptime {
 }
 
 /// Whether this load keeps the arch's DSpark drafter stages resident.
-pub fn dsparkOn(config: *const model.ModelConfig) bool {
+pub fn drafterOn(config: *const model.ModelConfig) bool {
     const tag = tagOf(config) orelse return false;
     return switch (tag) {
-        inline else => |t| if (@hasDecl(registry.Mod(t), "dsparkOn")) registry.Mod(t).dsparkOn(config) else false,
+        inline else => |t| if (@hasDecl(registry.Mod(t), "drafterOn")) registry.Mod(t).drafterOn(config) else false,
     };
 }
 

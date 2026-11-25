@@ -213,7 +213,7 @@ Each is optional; shared code asks through the dispatch file named, never the ar
   (`arch_config.releaseOwn`, `releaseServeDefaults`; its config text is the chat face's `fixtures.config`, `arch_config.fixtureConfig`), and a
   test that needs it skips where the arch is not built.
 - `Facts.prefill_start_width` (or `.prefill_start_width_of`, the width by the GPU's `chip.chipBrand()`), `.expert_pool_bytes`, `.streams_experts` and `.reads_own_source` (its weight loader checks the pack, so the
-  shared EXL3 pack index check does not apply); `kvBytesPerToken`, `cacheLayoutNamespace` and `dsparkOn`, `config`-keyed through
+  shared EXL3 pack index check does not apply); `kvBytesPerToken`, `cacheLayoutNamespace` and `drafterOn`, `config`-keyed through
   `arch/config.zig`. The arch's own weights and whether its pack ships its drafting head are the `load` slot's `weights` and `shipsHead`
   (`arch/load.zig`).
 - `streamedResidentExtra(config)` (`arch/admission.zig`): bytes a streamed load keeps resident beside the trunk. `ExpertStreamTraits.stq_experts`
@@ -224,9 +224,9 @@ Each is optional; shared code asks through the dispatch file named, never the ar
 - The `bill` slot adds `prefillChunkLoadLine(config, buf, pinned, launch)`.
 - The `flags` slot's `serve` part adds `poolCapped(prev)`, `unloadModel`, `enterVision`/`leaveVision`, `plannedBorrowBytes` and
   `loadLines(config, LoadLog)` (`arch/serve.zig`).
-- The `drafter` slot's `dspark_rounds` (`nextDspark`, `dsparkResumeAfterForced`, `dsparkEmitPending`, `dsparkDiag`, `stageBlock`):
-  `arch/dspark.zig` binds them for the generator and the scheduler, or a stand-in that refuses in a build without such an arch. The
-  generator's DSpark types are the shared `dspark_rows.zig`.
+- The `drafter` slot's `drafter_rounds` (`nextDrafterRound`, `drafterResumeAfterForced`, `drafterEmitPending`, `drafterDiag`, `stageBlock`):
+  `arch/drafter_rounds.zig` binds them for the generator and the scheduler, or a stand-in that refuses in a build without such an arch. The
+  generator's DSpark types are the shared `drafter_rows.zig`.
 - `ubench` in `arch.zig`: the arch's microbench module, whose `benches` `ubench_main.zig` lists. It may also declare
   `sharedFold(run, stream, layouts)`, the arch's arm of `shared.shared_expert_fold` (`glm5` does).
 - A `State` may declare `specRollsBack` (`arch_state.zig`): its decode state rewinds across a speculative verify.
@@ -311,7 +311,7 @@ A drop is one commit that removes:
 - arch-specific strings in the web UI.
 
 What a DeepSeek drop leaves behind, by design: `src/expert_usage.zig` (the pack's `expert_usage.json` and the `--drop-expert` set; no arch
-declares the trait, so the flag is refused at load), `src/dspark_rows.zig` (DSpark is a drafting method, like DFlash) and
+declares the trait, so the flag is refused at load), `src/drafter_rows.zig` (the drafter rounds, which Hy4-Flash's DFly2 also takes) and
 `src/weights_where.zig`; `ModelConfig.dsv41` (an empty struct without the arch); and, in `src/fixtures/`, the DeepSeek chat template
 and its cases, which 30-odd shared template tests embed (a drop skips them through `arch_chat.pinOf`).
 

@@ -2133,7 +2133,7 @@ pub const Scheduler = struct {
         // dispatches what it was going to dispatch anyway.
         return gen.spec_disabled_runtime or sched_policy.specTickMode(
             slot.enable_mtp,
-            gen.mtp != null or gen.dspark,
+            gen.mtp != null or gen.drafter_on,
             slot.enable_drafter,
             gen.dflash != null,
         ) == .regular;
@@ -3739,8 +3739,8 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     // A block drafter's head (DeepSeek's DSpark, Hy4-Flash's DFly2): no head cache, no hidden capture; the model holds
     // its own state.
     const use_mtp = wiring.use_mtp;
-    const use_dspark = use_mtp and if (slot.mtp) |h| h.kind().blockDrafter() else false;
-    const use_head_mtp = use_mtp and !use_dspark;
+    const use_drafter_rounds = use_mtp and if (slot.mtp) |h| h.kind().blockDrafter() else false;
+    const use_head_mtp = use_mtp and !use_drafter_rounds;
     const use_dflash = wiring.use_dflash or sched.nativeDflashArmed(slot);
     log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
         use_mtp,             use_dflash,
@@ -4128,7 +4128,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             // transition shim sync-forwards [t1] on the first decode call.
             // DFlash/MTP init paths already skip preforward unconditionally.
             .skip_lazy_preforward = !use_head_mtp and !use_dflash,
-            .dspark_enabled = use_dspark,
+            .drafter_enabled = use_drafter_rounds,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -4567,7 +4567,7 @@ fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick; an MTP or DSpark slot goes back to speculating, any other spec mode
+/// through the model this tick; an MTP or drafter-round slot goes back to speculating, any other spec mode
 /// decodes the answer regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
@@ -4595,7 +4595,7 @@ fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []c
         slot_outcome.finishSlot(sch, slot, gen.finish_reason);
         return true;
     }
-    if (gen.dspark) switch (try gen.dsparkResumeAfterForced(slot.allocator)) {
+    if (gen.drafter_on) switch (try gen.drafterResumeAfterForced(slot.allocator)) {
         .resumed => |closer| {
             pushForcedToken(slot, closer);
             std.debug.assert(slot.completion_tokens == gen.completion_tokens);
@@ -4634,7 +4634,7 @@ fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
 /// at or below it) is a restore point the next prompt shares (docs/engine-prefix-cache.md#thought-points).
 fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     if (!thoughtPointWanted(slot, checkpoints_on)) return;
-    const grid: u32 = sched.thoughtGrid(slot, gen) orelse if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
+    const grid: u32 = sched.thoughtGrid(slot, gen) orelse if (gen.mtp != null and !gen.drafter_on and slot.ssm_entries != null)
         1
     else
         return;
@@ -4649,7 +4649,7 @@ fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
 /// (docs/engine-prefix-cache.md#decode-end-points).
 fn armDecodeEndPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     if (!checkpoints_on or slot.ssm_entries == null) return;
-    if (gen.mtp_cache == null or gen.dspark or gen.dflash != null) return;
+    if (gen.mtp_cache == null or gen.drafter_on or gen.dflash != null) return;
     gen.end_point_armed = true;
 }
 
@@ -4712,9 +4712,9 @@ fn thinkBoundFired(gen: *const Generator) bool {
     return tb.fired;
 }
 
-/// A fired bound decodes plain unless an MTP head or DSpark resumed behind it (DFlash2 still decodes plain).
+/// A fired bound decodes plain unless an MTP head or a block drafter resumed behind it (DFlash2 still decodes plain).
 pub fn thinkBoundForcesPlain(gen: *const Generator) bool {
-    return thinkBoundFired(gen) and (gen.spec_disable_reason == .think_bound or (gen.mtp == null and !gen.dspark));
+    return thinkBoundFired(gen) and (gen.spec_disable_reason == .think_bound or (gen.mtp == null and !gen.drafter_on));
 }
 
 /// Drafts a thinking bound lets the slot's next MTP round carry, so it accepts no further than serial decode
@@ -4770,12 +4770,12 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // generators handle the disabled fallback internally.
     const tick_mode: sched_policy.SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundForcesPlain(gen)) .regular else sched_policy.specTickMode(
         slot.enable_mtp,
-        gen.mtp != null or gen.dspark,
+        gen.mtp != null or gen.drafter_on,
         slot.enable_drafter,
         gen.dflash != null,
     );
-    if (tick_mode == .mtp and gen.dspark) {
-        const result = try gen.nextDspark(slot.allocator);
+    if (tick_mode == .mtp and gen.drafter_on) {
+        const result = try gen.nextDrafterRound(slot.allocator);
         if (result == null) {
             slot_outcome.finishSlot(sch, slot, gen.finish_reason);
             return;
@@ -5540,7 +5540,7 @@ test "single MTP slot reaches the round entry through runDecodeTick, and its ref
     var gen: Generator = undefined;
     gen.xfm = &xfm;
     gen.loop_guard = .{};
-    gen.dspark = false;
+    gen.drafter_on = false;
     gen.mtp_planner_owned = false;
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;

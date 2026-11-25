@@ -933,7 +933,7 @@ fn dsparkCompany(ld: *Load, dir: []const u8, prompts: []const []const u32, max: 
     const n = prompts.len;
     const roundsOf = struct {
         fn f(s: *scheduler.Slot) u64 {
-            return s.legacy_gen.?.dspark_stats.rounds;
+            return s.legacy_gen.?.drafter_stats.rounds;
         }
     }.f;
     var ticks: usize = 0;
@@ -1311,7 +1311,7 @@ test "cooler contract: a served Hy4 STQ request with DFly2 says its serial token
                 return error.RequestFailed;
             }
             const g = slot.legacy_gen.?;
-            hist.* = g.dspark_stats.rows_hist;
+            hist.* = g.drafter_stats.rows_hist;
             var got: std.ArrayList(u32) = .empty;
             errdefer got.deinit(a);
             try got.appendSlice(a, g.generated_ids.items);

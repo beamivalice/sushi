@@ -3745,8 +3745,8 @@ fn warmOwnFills(m: *Model, t1: u32) !void {
         try warmBudget(m, 1);
         var d = try draftHeads(m, t1, .conf);
         d.deinit();
-        if (m.cfg.dspark.block > @import("../dspark_rows.zig").Policy.short_drafts) {
-            var short = try draftMeasured(m, t1, .conf, @import("../dspark_rows.zig").Policy.short_drafts, null);
+        if (m.cfg.dspark.block > @import("../drafter_rows.zig").Policy.short_drafts) {
+            var short = try draftMeasured(m, t1, .conf, @import("../drafter_rows.zig").Policy.short_drafts, null);
             short.deinit();
         }
     }
@@ -3910,7 +3910,7 @@ fn warmOwn(m: *Model, t1: u32, schedules: enum { both, queued }) !void {
 /// as a copy round's rows are whatever the context held.
 fn warmRound(m: *Model, t1: u32, w: usize) !void {
     try warmBudget(m, w);
-    const short = @import("../dspark_rows.zig").Policy.short_drafts;
+    const short = @import("../drafter_rows.zig").Policy.short_drafts;
     var d = try draftMeasured(m, t1, .conf, if (w == short + 1) short else null, null);
     defer d.deinit();
     var round: [cfg_mod.ring_slack]u32 = undefined;

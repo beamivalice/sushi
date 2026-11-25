@@ -95,7 +95,7 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("spec_cost_gate.zig");
-    _ = @import("dspark_rows.zig");
+    _ = @import("drafter_rows.zig");
     _ = @import("row_grammar.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("prefix_policy.zig");

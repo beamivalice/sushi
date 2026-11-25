@@ -36,8 +36,8 @@ pub const sched = @import("hy4_sched.zig"); // slot:sched (S2b)
 pub const chat = @import("hy4_chat.zig"); // slot:chat (S2g)
 pub const prefix = @import("hy4_prefix.zig"); // slot:prefix (S2c)
 pub const bill = @import("hy4_ledger.zig"); // slot:bill (S2d)
-/// DFly2 drafts DSpark rounds over the model's own state (`hy4_dspark`).
-pub const drafter = @import("hy4_dspark.zig"); // slot:drafter
+/// DFly2 drafts in the shared drafter rounds over the model's own state (`hy4_drafter`).
+pub const drafter = @import("hy4_drafter.zig"); // slot:drafter
 pub const media = @import("hy4_media.zig"); // slot:media (S2f)
 pub const load = @import("hy4_load.zig");
 pub const kld = @import("hy4_kld_capture.zig");
@@ -108,8 +108,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
         _ = mlx.mlx_array_free(shell.lm_head_w);
         shell.lm_head_w = .{ .ctx = null };
     }
-    // DFly2, when the load keeps it: DSpark rounds over the model's own state (`hy4_dspark`).
-    if (dsparkOn(&config)) st.drafter = try @import("hy4_dfly.zig").Drafter.init(allocator, st.model.?, st.weights.?);
+    // DFly2, when the load keeps it: the shared drafter rounds over the model's own state (`hy4_drafter`).
+    if (drafterOn(&config)) st.drafter = try @import("hy4_dfly.zig").Drafter.init(allocator, st.model.?, st.weights.?);
     return shell;
 }
 
@@ -124,7 +124,7 @@ pub const streamed_mtp_head = struct {
 
 /// Whether this load keeps DFly2: the load resolved its MTP on and the pack ships the layers (`stream_mtp_head`, set by
 /// the loader on a resident load and a streamed one alike).
-pub fn dsparkOn(config: *const Config) bool {
+pub fn drafterOn(config: *const Config) bool {
     const c = config.hy4flash orelse return false;
     return config.stream_mtp_head and c.dfly.layers > 0;
 }
@@ -160,7 +160,7 @@ pub fn coolerPipelineScope(config: *const Config) [16]u8 {
         .{ "index heads", c.indexer.heads },                     .{ "experts", c.experts },
         .{ "top k", c.top_k },                                   .{ "expert width", c.moe_inter },
         .{ "expert layout", @backingInt(config.expert_layout) }, .{ "tile order", @intFromEnum(config.expert_tile_order) },
-        .{ "streamed", @intFromBool(config.expert_streaming) },  .{ "dspark", @intFromBool(dsparkOn(config)) },
+        .{ "streamed", @intFromBool(config.expert_streaming) },  .{ "dfly2", @intFromBool(drafterOn(config)) },
         .{ "start width", config.prefillStartWidth() },
     }) |f| d.addInt(f[0], f[1]);
     @import("../arch/cooler_pipelines.zig").addRecipeEnv(&d);

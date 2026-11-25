@@ -11,9 +11,9 @@ pub const State = struct {
     /// The loader's map, which keeps the vision tower's tensors (`takeWeights`) for as long as the model: the plans
     /// record the encode over them (`hy4_encode_plan`).
     loader_weights: ?*const model_mod.Weights = null,
-    /// DFly2, when the load keeps it (`dsparkOn`).
+    /// DFly2, when the load keeps it (`drafterOn`).
     drafter: ?hy4_dfly.Drafter = null,
-    /// A DSpark round's open verify: the state before the block and the block's ids (`hy4_dspark`).
+    /// A DFly2 round's open verify: the state before the block and the block's ids (`hy4_drafter`).
     verify: ?Verify = null,
     /// The prefill meter's mark (`SUSHI_PREFILL_UBENCH_KV`), each timed chunk rolled back to it.
     ubench_mark: ?hy4_model.Model.Mark = null,

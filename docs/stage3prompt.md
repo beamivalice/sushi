@@ -151,7 +151,7 @@ Where the code stands:
   in `row_store.put`. No lint rule covers this class yet.
 - **The served forward reserves `@max(end_tokens, pos + rows)`.** A cache's end binding can be short of a forward's
   rows; a load's warm is one case.
-- **DSpark's verify does not pass through `arch.forward`.** `hy4_dspark.verify` calls `forwardReadout` directly, so
+- **DSpark's verify does not pass through `arch.forward`.** `hy4_drafter.verify` calls `forwardReadout` directly, so
   nothing reserves there. The reservation from the request's earlier forwards covers it (`Model.reach`).
 - **A frame's key must carry every fact that decides its structure:**
   - the groups a layer closes, because the pool takes their rows one at a time from two (`fwd.mmByRow`);

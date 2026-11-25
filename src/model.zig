@@ -910,8 +910,8 @@ pub const ModelConfig = struct {
     }
 
     /// Does this load keep deepseek_v41's DSpark stages resident? They are its MTP head: `--mtp` under streaming.
-    pub fn dsparkOn(self: *const ModelConfig) bool {
-        return arch_config.dsparkOn(self);
+    pub fn drafterOn(self: *const ModelConfig) bool {
+        return arch_config.drafterOn(self);
     }
 
     /// Streaming is a CAPABILITY of the checkpoint's routed-expert banks, not of

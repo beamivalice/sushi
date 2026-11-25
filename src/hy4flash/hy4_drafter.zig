@@ -1,12 +1,12 @@
-//! Hy4-Flash's drafter slot: DSpark rounds (`dspark_round.Rounds`) over DFly2 (`hy4_dfly`). A round drafts a block
-//! `[t1, mask × draft]` from the model's own state, verifies `[t1, drafts]` through the trunk with a mark taken before
-//! it (`Model.mark`), and keeps the first `accepted + 1` rows by rolling back to the mark and running them again
+//! Hy4-Flash's drafter slot: DFly2 (`hy4_dfly`) in the shared drafter rounds (`drafter_round.Rounds`). A round drafts a
+//! block `[t1, mask × draft]` from the model's own state, verifies `[t1, drafts]` through the trunk with a mark taken
+//! before it (`Model.mark`), and keeps the first `accepted + 1` rows by rolling back to the mark and running them again
 //! (`Model.rollbackTo`). There is no head to step: `arch/drafter.zig` answers every head operation with its default.
 const mlx = @import("../mlx.zig");
 const trunk_mod = @import("../trunk.zig");
 const spec_types = @import("../spec_types.zig");
 const sampler = @import("../sampler.zig");
-const dspark_round = @import("../dspark_round.zig");
+const drafter_round = @import("../drafter_round.zig");
 const hy4_dfly = @import("hy4_dfly.zig");
 const Trunk = trunk_mod.Trunk;
 const ForwardCtx = trunk_mod.ForwardCtx;
@@ -28,7 +28,7 @@ const Hooks = struct {
     pub const Draft = hy4_dfly.Drafter.Draft;
     pub const row_grammar = @import("../row_grammar.zig");
     pub const max_verify_rows: u8 = max_rows;
-    pub const diag_env = "SUSHI_HY4_DSPARK_ROWS";
+    pub const diag_env = "SUSHI_HY4_DFLY2_ROWS";
     /// No copy rounds (`copyArm` is null).
     pub const copy_narrow: usize = 0;
 
@@ -159,14 +159,14 @@ const Hooks = struct {
     }
 
     pub fn stageBlock(xfm: *Trunk) u32 {
-        return if (xfm.arch_state.hy4flash.model) |m| m.config.dfly.draft else @import("../arch/dspark.zig").default_block;
+        return if (xfm.arch_state.hy4flash.model) |m| m.config.dfly.draft else @import("../arch/drafter_rounds.zig").default_block;
     }
 
-    pub fn copyArm(_: *Trunk) ?dspark_round.CopyArm {
+    pub fn copyArm(_: *Trunk) ?drafter_round.CopyArm {
         return null;
     }
 };
 
-pub const rounds = dspark_round.Rounds(Hooks);
-pub const dspark_rounds = rounds;
-pub const nextDspark = rounds.nextDspark;
+pub const rounds = drafter_round.Rounds(Hooks);
+pub const drafter_rounds = rounds;
+pub const nextDrafterRound = rounds.nextDrafterRound;

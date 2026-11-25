@@ -1791,7 +1791,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     var served: StqServed = undefined;
     var d = try model.testDrop(8);
     defer d.deinit();
-    try served.initDrop(dir, .bfloat16, true, config.dsparkOn(), 8, s, &d, true);
+    try served.initDrop(dir, .bfloat16, true, config.drafterOn(), 8, s, &d, true);
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
@@ -1875,7 +1875,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
 
     var served: StqServed = undefined;
-    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
 
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
@@ -2013,7 +2013,7 @@ fn borrowCase(cache_bytes: u64) !void {
     config.expert_cache_bytes = cache_bytes;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
     var served: StqServed = undefined;
-    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
@@ -2275,7 +2275,7 @@ test "dsv41 borrow: a layer left released with no union workspace is healed befo
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
     var served: StqServed = undefined;
-    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();

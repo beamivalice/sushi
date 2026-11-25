@@ -8116,7 +8116,7 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
 pub fn warmNeedBytes(config: *const model_mod.ModelConfig) u64 {
     if (ledgerRequestBeforeLoad(config, warmReach(config, chunkBeforeLoad(config)))) |bill| return if (cooler_side.onEngine(config)) bill else 0;
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
-    const request = if (cooler_side.onEngine(config)) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config) or config.dsparkOn()) else 0;
+    const request = if (cooler_side.onEngine(config)) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config) or config.drafterOn()) else 0;
     return @max(warmFloorChunkBytes(config), request);
 }
 

@@ -713,7 +713,7 @@ pub const Model = struct {
     /// a view of it and nothing of the forward's own. A caller holds at most one view across the next forward: one still
     /// held when its block is written again makes the write copy, an ask no plan recorded, and that forward misses.
     pub fn forwardServed(self: *Model, ids: []const u32, image: ?VisionRows, readout: Readout) !Arr {
-        // The blocks hold `verify_rows_max` rows: a round that reads out more (a forced `SUSHI_HY4_DSPARK_ROWS`, or a
+        // The blocks hold `verify_rows_max` rows: a round that reads out more (a forced `SUSHI_HY4_DFLY2_ROWS`, or a
         // drafter of more drafts) has nowhere to write its logits on a load that plans.
         if (self.logits_fixed[0] != null and readout == .all and ids.len > fwd.verify_rows_max and plan.planned()) {
             @import("../log.zig").err("[plan] a round of {d} rows reads out more than the {d} rows the planned load's logits blocks hold\n", .{ ids.len, fwd.verify_rows_max });

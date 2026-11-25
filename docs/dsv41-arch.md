@@ -562,7 +562,7 @@ tests at the output.
 | slab experts vs resident experts | identical logits |
 | DSpark draft: ids, Markov-biased logits, confidence, main rows | QAT off 1e-4 / 2e-3 of the peak; QAT on cosine > 0.99 from the reference's rows |
 | DSpark verify rollback at every accepted count, a second round, the next draft | serial logits 2e-3, serial draft |
-| `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against a `--no-mtp` load's serial decode (DSpark rows are the same at every width; a serial step beside a drafter takes the rounds' arm, one without a drafter the SIMD one-row arm) (the exact-stream rows above pin the identity) |
+| `nextDrafterRound` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against a `--no-mtp` load's serial decode (DSpark rows are the same at every width; a serial step beside a drafter takes the rounds' arm, one without a drafter the SIMD one-row arm) (the exact-stream rows above pin the identity) |
 | DSpark bills | resident bytes equal the held arrays; window and slack bytes equal the bill |
 | `Transformer.forward` through the shell | identical to the model's own, across prefill and decode chunks |
 | chat template | 14 cases byte for byte with `encode_messages` |
@@ -700,7 +700,7 @@ expert, so only the logits' direction is held (`dsv41 fused`).
 
 The release's drafter: three sliding-window stages (`mtp.0..2`, window 128, rope theta 10000 and no YaRN, 128 routed
 experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries a forced call
-(`dsv41_dspark.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
+(`dsv41_dspark.drafterEligible`, MTP's rule); those decode serially (`gen.drafter_on` is false and its ticks are plain). A grammar or JSON schema drafts too
 ([below](#dspark-grammar)). A repeat or
 presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
 (Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, and a round verifies at most the thought
@@ -733,7 +733,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   itself, and destroys the streams without a `deinit` of their own (a `Stream` holds no resource; the engine is the
   trunk's `expert_stream`): both are intended. DeepSeek has no draft head: `lmHeadForDraft` refuses by name, and no
   caller reaches it (DFlash2 is not one of its drafters).
-- **A round** (`Generator.nextDspark`): draft from the pending token, verify `[t1, drafts]` as one chunk through the
+- **A round** (`Generator.nextDrafterRound`): draft from the pending token, verify `[t1, drafts]` as one chunk through the
   normal forward and the streamed experts (`dsv41_model.verify`), keep the longest prefix the trunk's own masked argmax
   agrees with plus the argmax after it (`finishVerify`). The chunk is cut to the tokens the budget still allows.
 - **Rollback** (the model's own state, no capture): the backbone rings hold 16 rows of slack (`ring_slack`), so a rejected
@@ -750,17 +750,17 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.
 
-- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `dsv41_dspark.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
+- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `dsv41_dspark.drafterConstrainedEntry`). Each verify row takes the mask serial decode builds
   after the drafts before it (`row_grammar.plan` walks a scratch copy of the JSON grammar and reasoning state over the drafts), so the
   masked argmax of a row is the serial token and a greedy request emits serial's tokens; a sampled one draws from the masked, filtered
   row. A draft its row's mask forbids ends the chunk there, and so does one serial decode answers by forcing the boundary (EOS or pad
   inside the reasoning). While a schema waits behind the reasoning close the rows carry only the reasoning mask (it excludes the
   tokens that would close with a payload the schema rejects); past the close, the JSON mask. The pending token is judged at the next
-  round's start as serial decode judges a sampled one (`dsparkJudgePending`), and a serial tick (`next`, the loop guard's forced
-  boundary) first emits it (`dsparkEmitPending`). `[spec-stats]` adds the host `mask_ms` per round and the serial ticks. A channel-header
+  round's start as serial decode judges a sampled one (`drafterJudgePending`), and a serial tick (`next`, the loop guard's forced
+  boundary) first emits it (`drafterEmitPending`). `[spec-stats]` adds the host `mask_ms` per round and the serial ticks. A channel-header
   protocol or an opener choice keeps the request serial (`Constraint.rowsDraftable`).
 
-- **Verify width** (`src/dspark_rows.zig`, `Generator.nextDspark`, bound by `arch/dspark.zig` to the DeepSeek drafter's `dspark_rounds`). A round verifies the first R rows of its 6-row block (t1 and R-1
+- **Verify width** (`src/drafter_rows.zig`, `Generator.nextDrafterRound`, bound by `arch/drafter_rounds.zig` to the DeepSeek drafter's `drafter_rounds`). A round verifies the first R rows of its 6-row block (t1 and R-1
   drafts; the draft is greedy, so a shorter verify keeps exactly the tokens a longer one would have kept up to R) and R=1 is a plain
   step with no draft. R maximizes expected tokens per ms, `E[tokens(R)] = 1 + sum_i prod_{j<=i} p_j`, over the cost of the round
   (`dflash_policy.chooseRows`). `p_j` is the confidence head's logit through a sigmoid and the per-bin calibration of
@@ -863,7 +863,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   ran 2x slower), trunk weight prefetch under the small stages gained nothing in a process bench, and the rows geometry
   policy is within 2-5% of the best of a sweep.
 
-- **Copy rounds** (`nextDspark`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
+- **Copy rounds** (`nextDrafterRound`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
   plus t1 matches 16 or more tokens earlier in the prompt or output (the best of the last 8 occurrences) and the continuation
   outruns the stage block, the round verifies the copy and skips the stage draft. A copy round is as wide as the widest
   verify whose rows are the one-row step's bits (`Model.exactVerifyRows`): 16 rows on a machine with matrix units
@@ -1278,7 +1278,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (`dsv41_thought_point.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the
   generated tokens through the closer and the 5-20k tokens of a long thought need no re-prefill. A round that would
-  commit past the closer is cut to end on it (`Generator.dspark_round_ends_at`: fewer verify rows, the pending token
+  commit past the closer is cut to end on it (`Generator.drafter_round_ends_at`: fewer verify rows, the pending token
   still the trunk's own), so the state stands exactly behind it; the point is taken like an SSD-first prefill point
   (`HotPrefixCache.writeDecodePointDsv41`: shared rows, released before the next forward) and, being off the segment
   grid, is kept live and written only by the flush below (`[dsv41-prefix] restore points to SSD at P: 0.00 GB staged, decode held T ms`).
@@ -1287,7 +1287,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   prompt-end snapshot's re-prefill is cheaper) and for one whose first or last token is `\n` or a space, which the
   server trims off the delivered `reasoning_content`. A client must send `reasoning_content` back verbatim, as the
   server delivered it. A reasoning budget (or loop-recovery close) keeps DSpark on for the answer: a round before the bound
-  verifies at most the thought room, and after the forced closer `Generator.dsparkResumeAfterForced` publishes the closer
+  verifies at most the thought room, and after the forced closer `Generator.drafterResumeAfterForced` publishes the closer
   and samples its successor (the stage windows already hold the forced rows, since every forward commits its main rows), so
   the next round enters as after prefill; a thought point is not written behind a forced close. Serial decode (no DSpark) leaves the state one
   token ahead of the emitted ones and a RAM tier keeps points on the commit's list, so neither writes it.
@@ -1338,10 +1338,10 @@ another job:
 | copy | 100% | 4.93 | 12.2-13.0 | 5.5 | identical |
 
 On an STQ pack (`Model.widthExact`: trellis trunk and experts) greedy DSpark text is the same at every round-width mix on the same hardware (exact greedy): the same request gives the same
-bytes whatever plain and drafted rounds the policy (`dspark_rows.Policy`) picks from measured timings, and at any forced width
+bytes whatever plain and drafted rounds the policy (`drafter_rows.Policy`) picks from measured timings, and at any forced width
 (`SUSHI_DSV41_DSPARK_ROWS`). The release's own layout (FP8 trunk, MXFP4 experts) is not width-exact: MLX's quantized products
 pick their plan by row count, so a greedy or seeded DSpark request there verifies at the fixed R=3 on either route
-(`dsparkFixedRows`; the `[spec] ... decodes with DSpark` boot line ends `fixed width: this layout is not width-exact`):
+(`drafterFixedRows`; the `[spec] ... decodes with DSpark` boot line ends `fixed width: this layout is not width-exact`):
 the same request gives the same text whatever the timings, at the cost of the adaptive width's speed and the copy rounds
 on the release checkpoint (STQ packs keep both). An unseeded sampled request repeats nothing and keeps the adaptive width. A row's bytes depend on the arm of each linear it passes through, so each linear has one arm at
 every width. The trunk linears (`projectRows`) were the only arms that changed with the width: the one-row step took the SIMD

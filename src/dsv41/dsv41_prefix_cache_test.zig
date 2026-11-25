@@ -1586,7 +1586,7 @@ test "DeepSeek SSD tier: the namespace names the layout and another layout's ent
     defer cfg.deinit(testing.allocator);
     cfg.stream_mtp_head = true;
     const tag = cfg.cacheLayoutNamespace() orelse return error.TestUnexpectedResult;
-    try testing.expectEqualStrings(dsv41_prefix.namespaceTag(cfg.dsparkOn()), tag);
+    try testing.expectEqualStrings(dsv41_prefix.namespaceTag(cfg.drafterOn()), tag);
     try testing.expect(!std.mem.eql(u8, dsv41_prefix.namespaceTag(true), dsv41_prefix.namespaceTag(false)));
     const a = try disk_placement.modelFingerprintWithLayout(testing.allocator, io, dir, dsv41_prefix.namespaceTag(true));
     defer testing.allocator.free(a);

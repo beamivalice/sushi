@@ -149,15 +149,15 @@ pub fn blockPositions(gpa: std.mem.Allocator, m: *const Model, reach: usize, row
     return kept.toOwnedSlice(gpa);
 }
 
-/// The verify blocks a load that drafts plans (D18): a DSpark round's `[t1, drafts...]`, 2 to `verify_rows_max` rows,
+/// The verify blocks a load that drafts plans (D18): a DFly2 round's `[t1, drafts...]`, 2 to `verify_rows_max` rows,
 /// every row read out, the handover kept for the drafter. A wider round is a prefill block, on the pool.
 fn verifyRoot(rows: usize, kv: KVQuantConfig) Probe {
     return .{ .rows = rows, .readout = .all, .keep_hidden = true, .kv = kv };
 }
 
-/// The replay a DSpark round's rollback runs (`Model.rollbackTo`): the 1 to `verify_rows_max - 1` rows it keeps, from the
-/// mark, read out by none, the handover kept. Its state is a plain forward's at the mark: the rows cut back, the rings
-/// and open groups written back in place into the blocks they were made in.
+/// The replay a DFly2 round's rollback runs (`Model.rollbackTo`): the 1 to `verify_rows_max - 1` rows it keeps, from
+/// the mark, read out by none, the handover kept. Its state is a plain forward's at the mark: the rows cut back, the
+/// rings and open groups written back in place into the blocks they were made in.
 fn replayRoot(rows: usize, kv: KVQuantConfig) Probe {
     return .{ .rows = rows, .readout = .none, .keep_hidden = true, .kv = kv };
 }

@@ -1325,7 +1325,7 @@ const Recorder = struct {
     mlp: []std.ArrayList(u8),
     ids: []std.ArrayList(u8),
     weights: []std.ArrayList(u8),
-    dspark_rows: [64]std.ArrayList(u8) = @splat(.empty),
+    drafter_rows: [64]std.ArrayList(u8) = @splat(.empty),
     /// The head's input rows, bf16, in the order the forward made them.
     head: std.ArrayList(u8) = .empty,
     /// Per layer, the sum of the squared down-projection inputs of each expert, `[experts * inter]`.
@@ -1353,7 +1353,7 @@ const Recorder = struct {
         for (self.sums) |row| for (row) |x| if (x) |v| self.a.free(v);
         self.a.free(self.sums);
         self.a.free(self.rows);
-        for (&self.dspark_rows) |*l| l.deinit(self.a);
+        for (&self.drafter_rows) |*l| l.deinit(self.a);
         self.head.deinit(self.a);
         for (self.down) |d| self.a.free(d);
         self.a.free(self.down);
@@ -1378,7 +1378,7 @@ const Recorder = struct {
         if (kind == .ffn_in or kind == .dspark_in) {
             const bytes = try hostBytes(self.a, self.s, x);
             defer self.a.free(bytes);
-            try (if (kind == .ffn_in) &self.mlp[layer] else &self.dspark_rows[layer]).appendSlice(self.a, bytes);
+            try (if (kind == .ffn_in) &self.mlp[layer] else &self.drafter_rows[layer]).appendSlice(self.a, bytes);
             if (kind == .dspark_in) return;
         }
         var sc = Scope.plain(self.a, self.s);
@@ -1683,7 +1683,7 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
                 const got = try readFile(a, io, root, "{s}/calib/dspark-in-{d:0>2}.bf16", .{ name, t });
                 defer a.free(got);
                 try testing.expect(got.len > 0);
-                try testing.expectEqualSlices(u8, rec.dspark_rows[t].items, got);
+                try testing.expectEqualSlices(u8, rec.drafter_rows[t].items, got);
             }
             const calib = try std.fmt.allocPrint(a, "{s}/{s}/calib", .{ root, name });
             defer a.free(calib);

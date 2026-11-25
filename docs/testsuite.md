@@ -414,7 +414,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A test client's read limit only guards against a hang: it budgets a cold first load (its kernel compiles too), and
   a read past it fails by name, never as a short answer.
 - Deterministic: no dependence on scheduler timing, machine memory or test order. Global overrides restore in `defer`.
-  A DSpark test that injects `dspark_policy.cost` also sets `Generator.dspark_timing`: the live draft and verify ms
+  A DSpark test that injects `drafter_policy.cost` also sets `Generator.drafter_timing`: the live draft and verify ms
   otherwise refit the cost, and the widths follow the machine.
 - A number a load or the GPU's class decides is pinned by the test that reads it: DeepSeek's wide-forward shape sum
   reads the arms of the config it prices (`Config.wide_arms`), the served kernels' from `parseText`, never a global.

@@ -350,7 +350,7 @@ test "DeepSeek's request bill on a Cooler load is its exact state and one forwar
     for ([_]u64{ 9_000, 225_000, 1_000_000 }) |seq| {
         // What the request stores: its state rows and fixed state, and the checkpoints its prefill keeps.
         // The request's row stores, made at its last row: MLX's at their rows, the engine's at pool size classes.
-        const kept = c.stateFixedBytes(config.dsparkOn()) + dsv41_bill.checkpointReserve(&config, seq, 2048);
+        const kept = c.stateFixedBytes(config.drafterOn()) + dsv41_bill.checkpointReserve(&config, seq, 2048);
         const stored_off = c.stateReservedBytes(false, seq + 2048) + kept;
         config.cooler_for_test = false;
         const off = bills.prefillNeededAtChunk(&config, seq, 2048, 16, 2048, .{});
@@ -374,7 +374,7 @@ test "DeepSeek: a request's decode state is billed as growth after admission onl
     try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
     config.cooler_for_test = true;
     const c = &config.dsv41.?;
-    const state = c.stateReservedBytes(true, 4096 + 512) + c.stateFixedBytes(config.dsparkOn());
+    const state = c.stateReservedBytes(true, 4096 + 512) + c.stateFixedBytes(config.drafterOn());
     try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
 }
 
@@ -500,7 +500,7 @@ fn borrowRefusal(config: *const model_mod.ModelConfig, seq: u64, avail: u64, exp
     var st: mtp_plan.AdaptiveWidthState = .{ .width_min = @intCast(billed), .width_max = @intCast(billed), .loop_end = loop_end };
     var pos: u64 = 0;
     // The request's row stores are made at its last row before its first chunk, so they are all resident from the start.
-    const grown = c.stateFixedBytes(config.dsparkOn()) + c.stateReservedBytes(cooler, seq + max_tokens);
+    const grown = c.stateFixedBytes(config.drafterOn()) + c.stateReservedBytes(cooler, seq + max_tokens);
     while (pos < loop_end) {
         if (adaptive) {
             const next = bills.adaptivePrefillWidth(config, bits, pos, bills.headroomFrom(config, avail, grown, 0, free).bound(), cur, cap, &st);
@@ -560,7 +560,7 @@ test "DeepSeek's Cooler request bill carries its one margin once, not once in th
     config.cooler_for_test = true;
     const c = &config.dsv41.?;
     for ([_]u64{ 100, 9_000, 225_000, 1_000_000 }) |seq| for ([_]u64{ 512, 2048 }) |chunk| {
-        const stored = c.stateReservedBytes(true, seq + 2048) + c.stateFixedBytes(config.dsparkOn()) + dsv41_bill.checkpointReserve(&config, seq, chunk);
+        const stored = c.stateReservedBytes(true, seq + 2048) + c.stateFixedBytes(config.drafterOn()) + dsv41_bill.checkpointReserve(&config, seq, chunk);
         const cap = @max(c.forwardCap(dsv41_config.verify_rows, seq + 2048 + dsv41_config.verify_rows), c.forwardCapOn(true, bills.requestForwardRows(&config, seq, chunk, 0), seq));
         const exact = stored + cap - bills.BILL_MARGIN_BYTES;
         const bill = bills.prefillNeededAtChunk(&config, seq, 2048, 16, chunk, .{});
@@ -581,7 +581,7 @@ test "DeepSeek's request bill prices its decode forward at the reply's end, not 
     const c = &config.dsv41.?;
     const seq: u64 = 64;
     const reply: u32 = 1_000_000;
-    const stored = c.stateReservedBytes(true, seq + reply) + c.stateFixedBytes(config.dsparkOn());
+    const stored = c.stateReservedBytes(true, seq + reply) + c.stateFixedBytes(config.drafterOn());
     const decode = c.forwardCap(dsv41_config.verify_rows, seq + reply + dsv41_config.verify_rows);
     try t.expect(bills.prefillNeededAtChunk(&config, seq, reply, 16, 2048, .{}) >= stored + decode);
 }

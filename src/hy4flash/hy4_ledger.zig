@@ -148,7 +148,7 @@ fn heldRate(rate: u64) u64 {
 /// for another arch. `chunk` is the load's prefill chunk, which decides where its restore points are written.
 pub fn ledgerTerms(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) ?Terms {
     const c = config.hy4flash orelse return null;
-    const drafts = @import("arch.zig").dsparkOn(config) and bills.mtpHeadDefaultOn(config);
+    const drafts = @import("arch.zig").drafterOn(config) and bills.mtpHeadDefaultOn(config);
     const rate = heldRate(stateBytesPerToken(&c, kv_bits));
     // Each sparse layer's stores (latent parts, rope rows, pooled keys): their 64-row floor and the one-row grow of a
     // short reach, a pooled row a group of tokens, and a page apiece.
@@ -158,7 +158,7 @@ pub fn ledgerTerms(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u6
     // A speculative round writes up to a verify block's rows past the reply, and keeps its mark and handover.
     const spec_rows: u64 = if (drafts) @import("../sampler_draw.zig").max_rows - 1 else 0;
     // The handover, the mark and each point's hidden row are held by every request of a load that drafts (D56).
-    const holds = @import("arch.zig").dsparkOn(config);
+    const holds = @import("arch.zig").drafterOn(config);
     const handover = if (holds) pickBytes(&c) +| hiddenBytes(&c) +| markBytes(&c, kv_bits) else 0;
     return .{
         .per_token = rate,
@@ -379,7 +379,7 @@ test "hy4 bill: a request's copy of its state is billed at its own size up to th
     try testing.expectEqual(bills.launch_state.disk_writer_permit_bytes, terms.copy_cap);
     // A short request's copy is as short as its state; the points are the Points slots alone, whatever the reach.
     const state_4k = terms.per_token * 4096 + terms.fixed;
-    try testing.expectEqual(pointsBytes(&c, kv, @import("arch.zig").dsparkOn(&config)), terms.points);
+    try testing.expectEqual(pointsBytes(&c, kv, @import("arch.zig").drafterOn(&config)), terms.points);
     try testing.expectEqual(2 * state_4k + terms.points, terms.at(4096));
     try testing.expectEqual(terms.per_token * 900_000 + terms.fixed + terms.copy_cap + terms.points, terms.at(900_000));
     // Where no checkpoint is written there is no copy.

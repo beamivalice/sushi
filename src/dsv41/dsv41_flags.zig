@@ -5,7 +5,7 @@ const model = @import("../model.zig");
 const flags = @import("../arch/flags.zig");
 const borrow = @import("dsv41_borrow.zig");
 const dsv41_bill = @import("dsv41_bill.zig");
-const dspark_rows = @import("../dspark_rows.zig");
+const drafter_rows = @import("../drafter_rows.zig");
 const source = @import("dsv41_source.zig");
 const arch_serve = @import("../arch/serve.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
@@ -54,10 +54,10 @@ pub const serve = struct {
     pub fn loadLines(config: *const model.ModelConfig, ctx: arch_serve.LoadLog) void {
         const c = config.dsv41 orelse return;
         log.info("[dsv41] {d} bytes/token of compressed state\n", .{config.kvBytesPerToken()});
-        if (config.dsparkOn()) {
+        if (config.drafterOn()) {
             log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s}{s})\n", .{ c.n_mtp, c.dspark.block, ctx.mtp_source, if (c.widthExactLayout()) "" else "; fixed width: this layout is not width-exact" });
             if (depth_bounds.active.explicit()) {
-                const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
+                const range = drafter_rows.Range.of(depth_bounds.active, c.dspark.block);
                 log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth)\n", .{ range.min_rows, range.max_rows });
             }
         } else {

@@ -417,7 +417,7 @@ pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, 
 /// Gives the SSD tier this model's split of its restore points.
 pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, disk: *kv_disk_cache.DiskTier) !void {
     const c = config.dsv41 orelse return;
-    const divs = try rowDivisors(allocator, &c, config.dsparkOn());
+    const divs = try rowDivisors(allocator, &c, config.drafterOn());
     defer allocator.free(divs);
     try disk.setGrownSpec(row_span, divs, c.stateBytesPerToken());
 }
@@ -447,7 +447,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../mo
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
     const m = xfm.arch_state.dsv41.model.?;
-    const key = try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
+    const key = try layoutKey(allocator, config.drafterOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
     if (m.token_map.len == 0) return key;
     defer allocator.free(key);
     return try std.fmt.allocPrint(allocator, "{s}-map{x:0>16}", .{ key, std.hash.XxHash64.hash(0, std.mem.sliceAsBytes(m.token_map)) });

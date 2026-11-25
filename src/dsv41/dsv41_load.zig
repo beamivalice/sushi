@@ -16,7 +16,7 @@ pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, 
         return error.ExpertLayoutUnsupported;
     }
     pipelines_before = mlx.engine.pipelinesMade().count;
-    return try source.loadResident(io, allocator, model_dir, .{ .dspark = arch.dsparkOn(config), .vision = load_vision and config.has_vision });
+    return try source.loadResident(io, allocator, model_dir, .{ .dspark = arch.drafterOn(config), .vision = load_vision and config.has_vision });
 }
 
 /// The engine's pipelines before this load wrapped its first weight: the load's own ops on its weights make some, and

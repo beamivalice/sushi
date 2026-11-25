@@ -223,20 +223,20 @@ test "hy4 dfly: a plain round of a DFly2 request makes no more launches, waits o
         var tok = Tokenizer.initEmpty(a);
         defer tok.deinit();
         try ld.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_policy.gate.mode = .plain;
-        gen.dspark_policy.gate.plain_tokens = 4;
-        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
-        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        gen.drafter_policy.gate.mode = .plain;
+        gen.drafter_policy.gate.plain_tokens = 4;
+        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
+        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         const s0 = mlx.engine.stats();
         var t: u32 = 0;
         for (0..4) |_| {
-            const r = (try gen.nextDspark(a)).?;
+            const r = (try gen.nextDrafterRound(a)).?;
             t = r.tokens[0];
             a.free(r.tokens);
         }
-        try testing.expectEqual(@as(u64, 6), gen.dspark_stats.plain);
+        try testing.expectEqual(@as(u64, 6), gen.drafter_stats.plain);
         const s1 = mlx.engine.stats();
         break :blk .{
             .dispatches = s1.dispatches - s0.dispatches,
@@ -281,22 +281,22 @@ test "hy4 dfly: a plain stretch hands over fresh hidden and picks to the retrial
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try ld.xfm.resetCache();
-    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    gen.dspark_policy.gate.mode = .plain;
-    gen.dspark_policy.gate.retrial = 6;
-    gen.dspark_policy.gate.plain_tokens = 0;
-    gen.dspark_policy.gate.ms = 1000;
-    gen.dspark_policy.gate.tokens = 1;
+    gen.drafter_policy.gate.mode = .plain;
+    gen.drafter_policy.gate.retrial = 6;
+    gen.drafter_policy.gate.plain_tokens = 0;
+    gen.drafter_policy.gate.ms = 1000;
+    gen.drafter_policy.gate.tokens = 1;
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(a);
-    while (try gen.nextDspark(a)) |r| {
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try got.appendSlice(a, r.tokens);
     }
     try testing.expectEqualSlices(u32, want.items, got.items);
-    try testing.expect(gen.dspark_stats.plain >= 6);
-    try testing.expect(gen.dspark_stats.rounds > gen.dspark_stats.plain);
+    try testing.expect(gen.drafter_stats.plain >= 6);
+    try testing.expect(gen.drafter_stats.rounds > gen.drafter_stats.plain);
 }
 
 test "hy4 dfly: a plain stretch pipelines one step in flight like plain decode (HY4_STQ_TINY)" {
@@ -350,22 +350,22 @@ test "hy4 dfly: a plain stretch pipelines one step in flight like plain decode (
         var tok = Tokenizer.initEmpty(a);
         defer tok.deinit();
         try ld.xfm.resetCache();
-        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+        var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, p, 12, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
-        gen.dspark_policy.gate.mode = .plain;
-        gen.dspark_policy.gate.plain_tokens = 4;
-        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
-        if (try gen.nextDspark(a)) |r| a.free(r.tokens);
+        gen.drafter_policy.gate.mode = .plain;
+        gen.drafter_policy.gate.plain_tokens = 4;
+        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
+        if (try gen.nextDrafterRound(a)) |r| a.free(r.tokens);
         const s0 = mlx.engine.stats();
         var toks: [4]u32 = undefined;
         var in_flight: usize = 0;
         for (&toks) |*t| {
-            const r = (try gen.nextDspark(a)).?;
+            const r = (try gen.nextDrafterRound(a)).?;
             t.* = r.tokens[0];
             a.free(r.tokens);
             if (gen.pending != null and gen.ctx.cache.step == p.len + gen.completion_tokens + 1) in_flight += 1;
         }
-        try testing.expectEqual(@as(u64, 6), gen.dspark_stats.plain);
+        try testing.expectEqual(@as(u64, 6), gen.drafter_stats.plain);
         const s1 = mlx.engine.stats();
         break :blk .{ .waits = s1.waits - s0.waits, .submits = s1.submits - s0.submits, .in_flight = in_flight, .toks = toks };
     };
@@ -400,11 +400,11 @@ test "hy4 dfly: a resident load keeps DFly2 by default where the pack ships it a
     const ships = hy4_load.shipsHead(io, a, dir);
     var load_cfg = cfg;
     load_cfg.stream_mtp_head = (try model_load.residentHead(mtp, ships)).kept;
-    try testing.expect(arch.dsparkOn(&load_cfg));
+    try testing.expect(arch.drafterOn(&load_cfg));
     var off_cfg = cfg;
     off_cfg.mtp_override = false;
     off_cfg.stream_mtp_head = (try model_load.residentHead(model_load.mtpChoiceFor(null, &off_cfg), ships)).kept;
-    try testing.expect(!arch.dsparkOn(&off_cfg));
+    try testing.expect(!arch.drafterOn(&off_cfg));
     var w = try model_mod.loadWeightsForConfig(io, a, dir, &load_cfg, false);
     defer w.deinit();
     var xfm = try trunk_mod.Trunk.init(io, a, load_cfg, &w);
@@ -482,7 +482,7 @@ test "hy4 bill: on a load that drafts, the closed-form terms at a request's reac
         defer turn.end();
         defer arch_sched.endRequest(&ld.config);
         const m = ld.xfm.arch_state.hy4flash.model.?;
-        try testing.expect(arch.dsparkOn(&ld.config));
+        try testing.expect(arch.drafterOn(&ld.config));
         try testing.expect(m.keep_hidden);
         m.reset();
         m.kv = if (kv == 8) .engine_default else .dense;

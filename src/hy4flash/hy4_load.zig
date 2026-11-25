@@ -14,7 +14,7 @@ const expert_io = @import("../expert_io.zig");
 const Keep = struct { config: *const ModelConfig, vision: bool, dfly: bool, unknown: usize = 0 };
 
 pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !?model.Weights {
-    var k: Keep = .{ .config = config, .vision = load_vision and config.has_vision, .dfly = @import("arch.zig").dsparkOn(config) };
+    var k: Keep = .{ .config = config, .vision = load_vision and config.has_vision, .dfly = @import("arch.zig").drafterOn(config) };
     var w = try weights_where.loadWhere("hy4", io, allocator, model_dir, &k, keeps);
     errdefer w.deinit();
     if (k.unknown > 0) return error.Hy4TensorUnknown;
@@ -121,7 +121,7 @@ pub fn kept(c: *const @import("hy4_config.zig").Config, streamed: bool, vision: 
     return keptWith(c, streamed, vision, false, key);
 }
 
-/// `kept`, with DFly2's tensors kept when the load drafts with it (`dsparkOn`).
+/// `kept`, with DFly2's tensors kept when the load drafts with it (`drafterOn`).
 pub fn keptWith(c: *const @import("hy4_config.zig").Config, streamed: bool, vision: bool, dfly: bool, key: []const u8) !bool {
     // The zero tensors a repack lays between pair-major trellises (docs/pack-format.md#tile-order): never loaded or billed.
     if (std.mem.startsWith(u8, key, pad_prefix)) return false;

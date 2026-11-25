@@ -67,7 +67,7 @@ pub fn begin(m: *Model, mix: Mix) !bool {
     const st = &p.sample;
     if (!st.planned) return false;
     try remakeTokens(st, m.s);
-    // A verdict wider than a verify block (a forced DSpark width, D42) draws on the pool past the seal by design (D64).
+    // A verdict wider than a verify block (a forced DFly2 width, D42) draws on the pool past the seal by design (D64).
     if (mix.rows > @max(st.rows_max, 1)) {
         st.wide = core.widePhase();
         return true;
@@ -351,7 +351,7 @@ pub const Drawn = union(enum) {
     }
 };
 
-const Verdict = @import("hy4_dspark.zig").rounds.Verdict;
+const Verdict = @import("hy4_drafter.zig").rounds.Verdict;
 
 /// A draw of `mix` over `in`, as a served draw of its mix runs it (a step's token kept in its block, the execution, if
 /// any, left open).
@@ -370,7 +370,7 @@ pub fn draw(m: *Model, st: *State, in: *const Inputs, mix: Mix) !Drawn {
             return .{ .sync = try sampler.sampleToken(in.logits, in.sampling, in.generated, shift, s) };
         },
         .verdict => {
-            const rounds = @import("hy4_dspark.zig").rounds;
+            const rounds = @import("hy4_drafter.zig").rounds;
             const v: rounds.VerdictIn = .{ .logits = in.logits, .ids = in.ids[0..mix.rows], .sampling = in.sampling, .think = in.shift(mix, think_mask), .committed = if (mix.repeat or mix.additive) in.generated else null, .masks = if (in.masks) |b| b else null, .streams = .{ .ops = s, .greedy = s, .draws = s } };
             if (!std.meta.eql(v.mix(), mix)) return error.Hy4SampleProbeMix;
             return .{ .verdict = try rounds.verdictOf(v) };

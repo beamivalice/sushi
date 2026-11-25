@@ -81,13 +81,13 @@ pub fn headLoaded(xfm: *Trunk) bool {
     return xfm.arch_state.hy4flash.drafter != null;
 }
 
-/// `n` greedy tokens over `ids` in DSpark rounds over DFly2, every round width swept: the spec path a request takes.
+/// `n` greedy tokens over `ids` in DFly2 rounds, every round width swept: the spec path a request takes.
 pub fn specTokens(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32) !std.ArrayList(u32) {
     return specTokensWith(a, xfm, ids, n, .{ .temperature = 0.0 });
 }
 
-/// Whether a verify row is its serial step's bytes, so a greedy round says greedy's tokens: not yet (`hy4_dspark` serves a
-/// fixed width until the forward is width-exact).
+/// Whether a verify row is its serial step's bytes, so a greedy round says greedy's tokens: not yet (`hy4_drafter`
+/// serves a fixed width until the forward is width-exact).
 pub fn specIsGreedy(config: *const model_mod.ModelConfig) bool {
     return config.trunk_quant_rate != null and config.expert_layout == .exl3_k4;
 }
@@ -102,17 +102,17 @@ pub fn specTokensAt(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32,
     return specRounds(a, xfm, ids, n, sampling, if (depth == 0) .off else .{ .rows = @intCast(depth + 1) });
 }
 
-fn specRounds(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32, sampling: @import("../sampler.zig").SamplingParams, diag: @import("../dspark_rows.zig").Diag) !std.ArrayList(u32) {
+fn specRounds(a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, n: u32, sampling: @import("../sampler.zig").SamplingParams, diag: @import("../drafter_rows.zig").Diag) !std.ArrayList(u32) {
     if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try xfm.resetCache();
-    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, xfm, &tok, ids, n, sampling, &.{}, .{ .dspark_enabled = true });
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, xfm, &tok, ids, n, sampling, &.{}, .{ .drafter_enabled = true });
     defer gen.deinit(a);
-    gen.dspark_diag = diag;
+    gen.drafter_diag = diag;
     var got: std.ArrayList(u32) = .empty;
     errdefer got.deinit(a);
-    while (try gen.nextDspark(a)) |r| {
+    while (try gen.nextDrafterRound(a)) |r| {
         defer a.free(r.tokens);
         try got.appendSlice(a, r.tokens);
     }

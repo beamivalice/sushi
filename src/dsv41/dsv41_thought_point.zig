@@ -164,22 +164,22 @@ fn writeEndPoint(hc: *prefix_cache_mod.HotPrefixCache, dsv: *dsv41_model.Model, 
 /// `</think>` is a restore point the next turn's prompt shares (docs/dsv41-arch.md#prefix-cache). Only a DSpark round
 /// leaves the state on the emitted tokens, and only an SSD-first prefill has a tier to hand the point to.
 pub fn armDsv41ThoughtPoint(slot: *Slot, gen: *Generator, tier_takes_points: bool) void {
-    if (!tier_takes_points or !gen.dspark or !slot.has_tools or !slot.enable_thinking) return;
+    if (!tier_takes_points or !gen.drafter_on or !slot.has_tools or !slot.enable_thinking) return;
     if (slot.full_prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
     const tok = slot.model.tokenizer orelse return;
     const open = tok.specialTokenId("<think>") orelse return;
     const close = tok.specialTokenId("</think>") orelse return;
     if (slot.full_prompt[slot.full_prompt.len - 1] != open) return;
-    gen.dspark_round_ends_at = close;
+    gen.drafter_round_ends_at = close;
 }
 
 /// The round that committed `</think>` ended right behind it: its state goes to the SSD tier as one restore point.
 pub fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) void {
     // The round's own finish committed and published the live record; a point written now would clear it.
     if (slot.finished or slot.error_code != null) return;
-    const close = gen.dspark_round_ends_at orelse return;
+    const close = gen.drafter_round_ends_at orelse return;
     if (block.len == 0 or block[block.len - 1] != close) return;
-    gen.dspark_round_ends_at = null;
+    gen.drafter_round_ends_at = null;
     const generated = gen.generated_ids.items;
     const thought = generated.len - 1;
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
@@ -217,12 +217,12 @@ test "a fired thinking bound keeps a DSpark slot in DSpark ticks, unless the clo
     gen.sampling = .{ .think_bound = &tb };
     gen.think_closed_by_loop = false;
     gen.mtp = null;
-    gen.dspark = true;
-    // What commitThoughtClose leaves behind after `dsparkResumeAfterForced` drained the commit.
+    gen.drafter_on = true;
+    // What commitThoughtClose leaves behind after `drafterResumeAfterForced` drained the commit.
     gen.spec_disabled_runtime = false;
     gen.spec_disable_reason = .none;
     try testing.expect(!thinkBoundForcesPlain(&gen));
-    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, gen.mtp != null or gen.dspark, false, false));
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, gen.mtp != null or gen.drafter_on, false, false));
     // A refused resume (a grammar, `--max-mtp-ctx`) disables the slot at the close: plain.
     gen.spec_disabled_runtime = true;
     gen.spec_disable_reason = .think_bound;
@@ -350,13 +350,13 @@ test "a DSpark round that finished the slot leaves the thought point to the comm
 
     // The round's finish already committed and published the live record, which a point written now would clear.
     slot.finished = true;
-    gen.dspark_round_ends_at = 9;
+    gen.drafter_round_ends_at = 9;
     writeDsv41ThoughtPoint(&slot, &gen, &block);
-    try testing.expectEqual(@as(?u32, 9), gen.dspark_round_ends_at);
+    try testing.expectEqual(@as(?u32, 9), gen.drafter_round_ends_at);
 
     slot.finished = false;
     writeDsv41ThoughtPoint(&slot, &gen, &block);
-    try testing.expectEqual(@as(?u32, null), gen.dspark_round_ends_at);
+    try testing.expectEqual(@as(?u32, null), gen.drafter_round_ends_at);
 }
 
 test "a DeepSeek slot's state bytes hold the model's rows and windows and the live points, and with no request on it they stay in the live KV bill (DSV41_TINY)" {

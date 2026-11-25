@@ -26,7 +26,7 @@ test "dsv41 bills: a prefill holds its restore points beside the state with a RA
     launch_state.prefix_cache_capacity = 32;
     const c = cfg.dsv41.?;
     const seq: u64 = 20_000;
-    const one = c.stateFixedBytes(cfg.dsparkOn()) + seq * c.stateBytesPerToken();
+    const one = c.stateFixedBytes(cfg.drafterOn()) + seq * c.stateBytesPerToken();
     launch_state.prefix_cache_ram_enabled = false;
     launch_state.prefix_cache_disk_bytes = 0;
     const off = bills.prefillNeededAtChunk(&cfg, seq, 0, 8, 512, .{});
@@ -38,13 +38,13 @@ test "dsv41 bills: a prefill holds its restore points beside the state with a RA
         try t.expectEqual(@as(u64, 4) * one, bills.checkpointReserve(&cfg, seq, 512));
         try t.expectEqual(off + 4 * one * 5 / 4, bills.prefillNeededAtChunk(&cfg, seq, 0, 8, 512, .{}));
         // The list is capped, whatever the prompt.
-        try t.expectEqual(@as(u64, 5) * (c.stateFixedBytes(cfg.dsparkOn()) + 1_000_000 * c.stateBytesPerToken()), bills.checkpointReserve(&cfg, 1_000_000, 512));
+        try t.expectEqual(@as(u64, 5) * (c.stateFixedBytes(cfg.drafterOn()) + 1_000_000 * c.stateBytesPerToken()), bills.checkpointReserve(&cfg, 1_000_000, 512));
     }
     // SSD-first: each point goes to the tier as it is taken, so the bill is the writer's bounded host buffer and one
     // point's fixed rings, whatever the prompt; under the tier's floor the points wait for the commit in RAM.
     launch_state.prefix_cache_ram_enabled = false;
     launch_state.prefix_cache_disk_bytes = 20 << 30;
-    const rings = c.stateFixedBytes(cfg.dsparkOn());
+    const rings = c.stateFixedBytes(cfg.drafterOn());
     // The rollback points the next turn keeps in RAM are billed with it: each is one set of fixed rings.
     const kept = @as(u64, dsv41_prefix.live_point_cap) * rings;
     try t.expectEqual(one + rings + kept, bills.checkpointReserve(&cfg, seq, 512));

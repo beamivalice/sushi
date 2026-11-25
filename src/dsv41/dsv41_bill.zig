@@ -23,12 +23,12 @@ pub fn checkpointReserve(config: *const model_mod.ModelConfig, seq: u64, chunk: 
     const base = bills.launchCheckpointStride(config);
     const stride = prefill_plan.effectiveSsmCheckpointStride(base, @max(@as(usize, @intCast(chunk)), settings_resolve.prefill_chunk.value));
     if (stride == 0) return 0;
-    const one = c.stateFixedBytes(config.dsparkOn()) +| seq *| c.stateBytesPerToken();
+    const one = c.stateFixedBytes(config.drafterOn()) +| seq *| c.stateBytesPerToken();
     // SSD-first, a point the tier takes shares the request's rows and leaves RAM as the writer copies it: what is in
     // flight is the writer's bounded host buffer, and the fixed rings each point copies; the deepest few of those
     // stay in RAM as the next turn's rollback points (`dsv41_prefix.Live`).
     if (seq >= kv_disk_cache.MIN_PERSIST_TOKENS and prefix_cache_mod.ssdFirstActive(config, bills.diskTierOn(config), bills.launch_state.prefix_cache_ram_enabled))
-        return @min(bills.launch_state.disk_writer_permit_bytes, one) +| (1 + @as(u64, dsv41_prefix.live_point_cap)) *| c.stateFixedBytes(config.dsparkOn());
+        return @min(bills.launch_state.disk_writer_permit_bytes, one) +| (1 + @as(u64, dsv41_prefix.live_point_cap)) *| c.stateFixedBytes(config.drafterOn());
     const held = @min(@as(u64, dsv41_prefix.checkpointMax(bills.launch_state.ssm_checkpoint_max)), seq / stride + 1) + 1;
     return held *| one;
 }
@@ -40,7 +40,7 @@ pub fn requestBill(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u
     const c = config.dsv41 orelse return null;
     // The row stores are made at the request's last row, so it holds them whole from its first chunk on.
     const engine_side = @import("../cooler_side.zig").onEngine(config);
-    const held = c.stateReservedBytes(engine_side, @as(u64, seq) +| max_tokens) +| c.stateFixedBytes(config.dsparkOn());
+    const held = c.stateReservedBytes(engine_side, @as(u64, seq) +| max_tokens) +| c.stateFixedBytes(config.drafterOn());
     // The cap a forward runs under (`Config.forwardCap`) is its bill. The prefill's comes out of the decoder pools it
     // may release or already holds lent (`bills.lendableBytes`, `dsv41_borrow`); a decode forward's never does, and the
     // last runs at the reply's end, its verify block past it. On MLX the decode pool is parked beside either. On a
@@ -65,7 +65,7 @@ pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_
     const c = config.dsv41 orelse return null;
     // As `dsv41_sched.coolerRows`: rows are a resident load's on Sushi Cooler.
     if (!config.expert_resident or !@import("../cooler_side.zig").onEngine(config)) return null;
-    return c.stateReservedBytes(true, @as(u64, prompt_len) +| max_tokens) +| c.stateFixedBytes(config.dsparkOn());
+    return c.stateReservedBytes(true, @as(u64, prompt_len) +| max_tokens) +| c.stateFixedBytes(config.drafterOn());
 }
 
 pub fn transientReserve(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, seq: u64) ?u64 {
@@ -116,7 +116,7 @@ pub fn sessionBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
 pub fn slotRing(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
-    return c.stateFixedBytes(config.dsparkOn());
+    return c.stateFixedBytes(config.drafterOn());
 }
 
 pub fn neutralChunkWidth(config: *const model_mod.ModelConfig) ?u32 {
@@ -126,7 +126,7 @@ pub fn neutralChunkWidth(config: *const model_mod.ModelConfig) ?u32 {
 pub fn diskTokenBytes(config: *const model_mod.ModelConfig, kv_bits: u64) ?u64 {
     _ = kv_bits;
     const c = config.dsv41 orelse return null;
-    return dsv41_prefix.diskBytesPerToken(&c, config.dsparkOn());
+    return dsv41_prefix.diskBytesPerToken(&c, config.drafterOn());
 }
 
 /// DeepSeek's request bill grows with the prompt (the indexer's scores), so its context is the longest that bill admits.

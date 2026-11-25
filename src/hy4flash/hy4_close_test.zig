@@ -56,8 +56,8 @@ fn generated(ld: *contract.Load, prompt: []const u32, n: u32, sampling: sampler.
     errdefer out.deinit();
     var gen = try Generator.initWithOptions(io, a, ld.xfm, &tok, prompt, n, sampling, &.{}, opts);
     defer gen.deinit(a);
-    if (opts.dspark_enabled) {
-        while (try gen.nextDspark(a)) |r| {
+    if (opts.drafter_enabled) {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try out.tokens.appendSlice(a, r.tokens);
         }
@@ -80,7 +80,7 @@ fn conversation(a: std.mem.Allocator, ids: []const u32, n: usize, seed: usize) !
     return p;
 }
 
-test "hy4 close: past the seal, served text requests greedy, sampled, under penalties and in DSpark rounds ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_STQ_TINY)" {
+test "hy4 close: past the seal, served text requests greedy, sampled, under penalties and in DFly2 rounds ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
@@ -94,8 +94,8 @@ test "hy4 close: past the seal, served text requests greedy, sampled, under pena
         .{ .what = "greedy", .sampling = .{ .temperature = 0 } },
         .{ .what = "sampled", .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.9, .seed = 11 } },
         .{ .what = "penalties", .sampling = .{ .temperature = 0.8, .seed = 11, .repeat_penalty = 1.2, .presence_penalty = 0.4 } },
-        .{ .what = "DSpark greedy", .sampling = .{ .temperature = 0 }, .opts = .{ .dspark_enabled = true } },
-        .{ .what = "DSpark sampled", .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .dspark_enabled = true } },
+        .{ .what = "DFly2 greedy", .sampling = .{ .temperature = 0 }, .opts = .{ .drafter_enabled = true } },
+        .{ .what = "DFly2 sampled", .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .drafter_enabled = true } },
     };
     for (cases) |c| {
         var want = try generated(&ld, ids[0..24], 16, c.sampling, c.opts, false);

@@ -102,7 +102,7 @@ pub fn kvBytesPerToken(config: *const Config) ?u64 {
 }
 
 pub fn cacheLayoutNamespace(config: *const Config) ?[]const u8 {
-    return dsv41_prefix.namespaceTag(dsparkOn(config));
+    return dsv41_prefix.namespaceTag(drafterOn(config));
 }
 
 pub const cooler: @import("../arch/config.zig").Cooler = .{ .opt_out = .{
@@ -114,7 +114,7 @@ pub const cooler: @import("../arch/config.zig").Cooler = .{ .opt_out = .{
 pub const cooler_contract = @import("dsv41_contract.zig");
 
 /// Does this load keep the DSpark stages resident? They are its MTP head: `--mtp` under streaming.
-pub fn dsparkOn(config: *const Config) bool {
+pub fn drafterOn(config: *const Config) bool {
     const c = config.dsv41 orelse return false;
     return config.stream_mtp_head and c.dspark.block > 0;
 }

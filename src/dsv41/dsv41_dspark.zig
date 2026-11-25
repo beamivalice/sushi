@@ -1,11 +1,11 @@
-//! DeepSeek-V4.1's DSpark rounds: the shared round body (`dspark_round`) over DeepSeek's model, its stages drafting a
+//! DeepSeek-V4.1's DSpark rounds: the shared round body (`drafter_round`) over DeepSeek's model, its stages drafting a
 //! block and its trunk verifying and cutting back (`dsv41_serving`).
-const dspark_round = @import("../dspark_round.zig");
+const drafter_round = @import("../drafter_round.zig");
 const dsv41_config = @import("dsv41_config.zig");
 const dsv41_model = @import("dsv41_model.zig");
 const dsv41_serving = @import("dsv41_serving.zig");
 const dsv41_state = @import("dsv41_state.zig");
-const arch_dspark = @import("../arch/dspark.zig");
+const arch_drafter_rounds = @import("../arch/drafter_rounds.zig");
 const Trunk = @import("../trunk.zig").Trunk;
 
 const Hooks = struct {
@@ -35,36 +35,36 @@ const Hooks = struct {
 
     /// The policy's default where DeepSeek's model is not loaded.
     pub fn stageBlock(xfm: *Trunk) u32 {
-        return if (dsv41_state.modelOf(xfm)) |m| m.cfg.dspark.block else arch_dspark.default_block;
+        return if (dsv41_state.modelOf(xfm)) |m| m.cfg.dspark.block else arch_drafter_rounds.default_block;
     }
 
-    pub fn copyArm(xfm: *Trunk) ?dspark_round.CopyArm {
+    pub fn copyArm(xfm: *Trunk) ?drafter_round.CopyArm {
         const m = dsv41_state.modelOf(xfm) orelse return null;
         return .{ .exact_rows = m.exactVerifyRows(), .block = m.cfg.dspark.block };
     }
 };
 
-const R = dspark_round.Rounds(Hooks);
-pub const dsparkRowsForRoom = R.dsparkRowsForRoom;
-pub const dsparkFixedRows = R.dsparkFixedRows;
+const R = drafter_round.Rounds(Hooks);
+pub const drafterRowsForRoom = R.drafterRowsForRoom;
+pub const drafterFixedRows = R.drafterFixedRows;
 pub const dsv41_max_drafts = R.max_drafts;
 pub const dsv41_max_verify_rows = R.max_verify_rows;
-pub const DsparkDiag = R.DsparkDiag;
-pub const parseDsparkDiag = R.parseDsparkDiag;
-pub const dsparkDiag = R.dsparkDiag;
+pub const DrafterDiag = R.DrafterDiag;
+pub const parseDrafterDiag = R.parseDrafterDiag;
+pub const drafterDiag = R.drafterDiag;
 pub const stageBlock = R.stageBlock;
-pub const dsparkEligible = R.dsparkEligible;
-pub const nextDspark = R.nextDspark;
+pub const drafterEligible = R.drafterEligible;
+pub const nextDrafterRound = R.nextDrafterRound;
 pub const measuredRound = R.measuredRound;
-pub const RoundMeter = dspark_round.RoundMeter;
+pub const RoundMeter = drafter_round.RoundMeter;
 pub const ConstrainedEntry = R.ConstrainedEntry;
 pub const Pending = R.Pending;
 pub const rowView = R.rowView;
-pub const dsparkNoteSerial = R.dsparkNoteSerial;
-pub const dsparkConstrainedEntry = R.dsparkConstrainedEntry;
-pub const dsparkSamplePending = R.dsparkSamplePending;
-pub const dsparkJudgePending = R.dsparkJudgePending;
-pub const dsparkObserve = R.dsparkObserve;
-pub const dsparkEmitPending = R.dsparkEmitPending;
-pub const DsparkResume = R.DsparkResume;
-pub const dsparkResumeAfterForced = R.dsparkResumeAfterForced;
+pub const drafterNoteSerial = R.drafterNoteSerial;
+pub const drafterConstrainedEntry = R.drafterConstrainedEntry;
+pub const drafterSamplePending = R.drafterSamplePending;
+pub const drafterJudgePending = R.drafterJudgePending;
+pub const drafterObserve = R.drafterObserve;
+pub const drafterEmitPending = R.drafterEmitPending;
+pub const DrafterResume = R.DrafterResume;
+pub const drafterResumeAfterForced = R.drafterResumeAfterForced;

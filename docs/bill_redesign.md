@@ -904,7 +904,7 @@ history.
   - As built, sample (D24, `hy4flash/hy4_sample_plan.zig`): every draw of a served request, from the logits to its token,
     is one execution of a root keyed by its mix (`sampler.Mix`, D34). The seam is `arch/cooler.zig` `Sample`: the
     generator (`Generator.sampleMasked`, `sampleSync`, the first token, a forced token's logprobs) and DFly2's verdict
-    (`dspark_round.sampleVerdict`) begin a sample with its mix, run the shared sampler, and end it; an arch that declares
+    (`drafter_round.sampleVerdict`) begin a sample with its mix, run the shared sampler, and end it; an arch that declares
     `sampleBegin` answers, every other load samples as before. A step's token outlives its execution in one of two
     token blocks written in turn (D36). The load records each mix it can take dry (`mixes`: 1,233 at the release, two
     value sets a mix under both fills), packs them into the forwards' book after `hy4_plan.build` and makes the arena
@@ -1185,7 +1185,7 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   block's rows where today a serial run of the kept rows writes them: on a load whose verify rows are not its one-row
   steps' bytes (BF16, `widthExact` false) the state would change. The replay costs a forward of 1 to 7 rows a round
   whose draft is not all accepted; removing it is a speed lever for the stage 3 gate to size, not this landing.
-- **D42. A round wider than `verify_rows_max`** (only a forced width, `SUSHI_HY4_DSPARK_ROWS`) is refused by name on a
+- **D42. A round wider than `verify_rows_max`** (only a forced width, `SUSHI_HY4_DFLY2_ROWS`) is refused by name on a
   load that plans (`Hy4ReadoutPastBlock`): its logits have no block (D19) and a wide execution leaves none behind. Its
   replay of the kept rows reads out none and runs wide as D97 says; the request bill had no replay term of its own, so
   nothing leaves it. The arena's bound holds a planned replay within the verify of its rows (`forwardBytes` is
@@ -1212,7 +1212,7 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   512 rows), and the install that follows asks nothing.
 - **D56. The bill follows the allocation's predicate: a load that drafts bills the drafting blocks for every request.**
   `reserveFor` makes the mark, the handover, the selections and each point's hidden state whenever `keep_hidden` is set,
-  which a load that ships DFly2 does once at load (`arch.dsparkOn`); a request that does not run a round holds them
+  which a load that ships DFly2 does once at load (`arch.drafterOn`); a request that does not run a round holds them
   all the same. `hy4_bill.reservedBytes` bills them on that load whatever `warm.mtp_on` says; only the round's own
   terms (the reply's rows past its end, the verify block, the draft) follow the request.
 - **D57. A point takes a free slot no stored point still reads** (stage 4c, decided under the owner's standing word to
