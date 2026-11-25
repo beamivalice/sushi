@@ -1214,14 +1214,13 @@ pub const Generator = struct {
         /// Total tokens this prefill will forward (post-cache tail, same scale
         /// as `prefill_progress`), published once; null on the bypass engines.
         prefill_expected: ?*std.atomic.Value(u64) = null,
-        /// Per-slot live prefill progress a `return_progress` stream reads
-        /// (`scheduler.Slot.PrefillProgress`), stored once per chunk like
-        /// `prefill_progress` above. Absolute prompt tokens processed (the
-        /// restored prefix included, so it climbs to the whole prompt) and
-        /// the prefill's forwarding milliseconds so far. Null = nobody
-        /// watches this slot's prefill.
+        /// Per-slot live prefill progress (`scheduler.Slot.PrefillProgress`), stored once per chunk like
+        /// `prefill_progress` above: absolute prompt tokens processed (the restored prefix included, so it climbs to
+        /// the whole prompt) and the prefill's forwarding milliseconds so far. Null unless a `return_progress` stream
+        /// or the metrics' live rows read it, so an unwatched prefill stores nothing.
         prefill_progress_abs: ?*std.atomic.Value(u64) = null,
         prefill_progress_ms: ?*std.atomic.Value(u64) = null,
+        prefill_wake: ?PrefillWake = null,
 
         /// Called once per completed prefill chunk boundary (chunk state
         /// evaluated, allocator cache cleared), except the final one. The
@@ -1246,6 +1245,12 @@ pub const Generator = struct {
     };
 
     pub const InterleaveHook = struct {
+        ctx: *anyopaque,
+        call: *const fn (ctx: *anyopaque) void,
+    };
+
+    /// Wakes a reader parked on the slot's live prefill progress, once per chunk right after its stores.
+    pub const PrefillWake = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque) void,
     };
@@ -1787,6 +1792,7 @@ pub const Generator = struct {
                 if (options.prefill_computed) |c| c.* = @intCast(pos);
                 if (options.prefill_progress_abs) |p| p.store(@intCast(pos + ssm_cp_offset), .monotonic);
                 if (options.prefill_progress_ms) |p| p.store(prefill_sw.read() / std.time.ns_per_ms, .monotonic);
+                if (options.prefill_wake) |w| w.call(w.ctx);
                 // Persist this chunk now: the KV bytes for [0, pos) are final.
                 if (options.write_through_hook) |wt| {
                     wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);

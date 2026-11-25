@@ -213,6 +213,10 @@ answers while the weights load:
   (chat and completions `cancelled`, Messages `end_turn`, Responses `completed`) and counts the tokens it returned.
 - **`stream_options.include_usage` chunk ships `"choices": []`** (`sendSSEUsageChunk`); the ending appears on exactly
   ONE chunk; a client cannot time our stream — use the final chunk's server `timings`.
+- **`"return_progress": true`** on a streaming `/v1/chat/completions` or `/v1/completions` request (llama.cpp's
+  field; Messages and Responses refuse it by name): while the prompt reads, chunks with the usual empty delta carry a
+  top-level `prompt_progress` {`total`, `cache`, `processed`, `time_ms`}: a 0% one at once, one as each prefill chunk
+  finishes (the reader is woken at the chunk's store, at most once per 250 ms), and a 100% one before the first token.
 - Liveness is a property of the SOCKET: `beatStreamKeepalive` at the bottom of every streaming loop, emit on 5 s
   byte-silence. SSE comments keep the transport alive but are no event to a client that counts parsed events.
   While a stream waits in the queue behind another request, the comment reads `: queued behind N
@@ -557,7 +561,9 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
   `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),
-  `phase`, `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
+  `phase`, `prefill` on a prefill row only (`total`, `cache`, `processed`, `time_ms`, the numbers a `return_progress`
+  stream's `prompt_progress` carries: a client reads the share read as `processed / total` and the time left as
+  `(total - processed)` at `(processed - cache) / time_ms`), `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
   effective limit, 0 = not ready/unknown), `cached_tokens`, `generated_tokens`, `max_tokens` (the request's own
   output cap), `elapsed_seconds` (age since arrival, refreshed every publish) and `state_bytes` (GPU bytes of the
   slot's own KV + SSM buffers; a restored share stays billed to the hot-cache entry, never to the row; a DeepSeek

@@ -2912,6 +2912,178 @@ test "server: return_progress streams llama.cpp's prompt_progress on chat comple
     }.run);
 }
 
+/// The numbers of the LAST `prompt_progress` event of an SSE body and that event's index, or null when it carries none.
+/// The body may be partial: an event that does not parse is not a progress event.
+const ProgressSeen = struct { total: u64, cache: u64, processed: u64, time_ms: u64, event: usize };
+
+fn lastPromptProgress(body: []const u8) ?ProgressSeen {
+    const evs = sseEvents(body) catch return null;
+    defer gpa.free(evs);
+    var found: ?ProgressSeen = null;
+    for (evs, 0..) |e, i| {
+        if (std.mem.indexOf(u8, e.data, "prompt_progress") == null) continue;
+        var p = std.json.parseFromSlice(std.json.Value, gpa, e.data, .{}) catch continue;
+        defer p.deinit();
+        if (p.value != .object) continue;
+        const prog = p.value.object.get("prompt_progress") orelse continue;
+        if (prog != .object) continue;
+        const o = prog.object;
+        const total = o.get("total") orelse continue;
+        const cache = o.get("cache") orelse continue;
+        const processed = o.get("processed") orelse continue;
+        const time = o.get("time_ms") orelse continue;
+        if (total != .integer or cache != .integer or processed != .integer or time != .integer) continue;
+        found = .{ .total = @intCast(total.integer), .cache = @intCast(cache.integer), .processed = @intCast(processed.integer), .time_ms = @intCast(time.integer), .event = i };
+    }
+    return found;
+}
+
+/// The index of the first SSE event whose assistant delta carries any of the reply's own bytes, or null: a
+/// reasoning delta is a reply token too, so the check does not depend on the model leaving its thought.
+fn firstReplyEvent(body: []const u8) ?usize {
+    const evs = sseEvents(body) catch return null;
+    defer gpa.free(evs);
+    for (evs, 0..) |e, i| {
+        if (std.mem.indexOf(u8, e.data, "\"delta\"") == null) continue;
+        var p = std.json.parseFromSlice(std.json.Value, gpa, e.data, .{}) catch continue;
+        defer p.deinit();
+        if (p.value != .object) continue;
+        const choices = p.value.object.get("choices") orelse continue;
+        if (choices != .array or choices.array.items.len == 0) continue;
+        const choice = choices.array.items[0];
+        if (choice != .object) continue;
+        const delta = choice.object.get("delta") orelse continue;
+        if (delta != .object) continue;
+        var it = delta.object.iterator();
+        while (it.next()) |kv| {
+            if (std.mem.eql(u8, kv.key_ptr.*, "role")) continue;
+            switch (kv.value_ptr.*) {
+                .string => |str| if (str.len > 0) return i,
+                .array => |arr| if (arr.items.len > 0) return i,
+                else => {},
+            }
+        }
+    }
+    return null;
+}
+
+test "server: a return_progress stream wakes its reader at a prefill chunk's store and ships 100% before the first content token" {
+    try eachArch(2, .{}, struct {
+        fn run() !void {
+            const body = "{\"model\":\"tiny\",\"max_tokens\":4,\"stream\":true,\"return_progress\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+            // A tiny fixture's prompt is one chunk, so the test stores a chunk's numbers on the held slot and wakes it as
+            // the chunk loop does: the report must reach the client long before the 5 s keepalive could carry it.
+            try PrefillHold.install();
+            defer PrefillHold.uninstall();
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            PrefillHold.arm();
+            try send(fd, "POST", "/v1/chat/completions", body);
+            try PrefillHold.waitHeld();
+
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(gpa);
+            var buf: [16 * 1024]u8 = undefined;
+            while (lastPromptProgress(bodyOf(out.items)) == null) {
+                const n = try readSome(fd, &buf, out.items);
+                if (n == 0) return error.NoZeroReport;
+                try out.appendSlice(gpa, buf[0..n]);
+            }
+            const zero = lastPromptProgress(bodyOf(out.items)).?;
+            try testing.expectEqual(@as(u64, 0), zero.processed);
+
+            const slot = heldSlot() orelse return error.NoHeldSlot;
+            const total = zero.total;
+            slot.prefill_progress.processed.store(total / 2, .monotonic);
+            slot.prefill_progress.elapsed_ms.store(40, .monotonic);
+            const t0 = nowMsMonotonic(io);
+            slot.notePrefillProgress();
+            var mid: ?ProgressSeen = null;
+            while (mid == null) {
+                const n = try readSome(fd, &buf, out.items);
+                if (n == 0) break;
+                try out.appendSlice(gpa, buf[0..n]);
+                if (lastPromptProgress(bodyOf(out.items))) |p| if (p.processed > 0) {
+                    mid = p;
+                };
+            }
+            const waited = nowMsMonotonic(io) - t0;
+            const m = mid orelse return error.NoMidReport;
+            try testing.expectEqual(total / 2, m.processed);
+            try testing.expectEqual(@as(u64, 40), m.time_ms);
+            errdefer std.debug.print("the chunk's report took {d} ms\n", .{waited});
+            try testing.expect(waited < @divTrunc(http_conn.Conn.STREAM_KEEPALIVE_MS, 2));
+            PrefillHold.release();
+
+            while (true) {
+                const n = try readSome(fd, &buf, out.items);
+                if (n == 0) break;
+                try out.appendSlice(gpa, buf[0..n]);
+            }
+            const stream = bodyOf(out.items);
+            const last = lastPromptProgress(stream) orelse return error.NoFinalProgress;
+            try testing.expectEqual(last.total, last.processed);
+            const content = firstReplyEvent(stream) orelse return error.NoReplyToken;
+            try testing.expect(last.event < content);
+        }
+    }.run);
+}
+
+/// The one slot the scheduler is prefilling, held by `PrefillHold`; null unless exactly one.
+fn heldSlot() ?*scheduler_mod.Slot {
+    const sch = server_state.global_scheduler.?;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    if (sch.prefilling.items.len != 1) return null;
+    return sch.prefilling.items[0];
+}
+
+/// The live `prompt_progress` of the one slot in a scheduler list, read under the queue lock: null unless exactly one.
+fn listProgress(comptime list: []const u8) ?SlotProgress {
+    const sch = server_state.global_scheduler.?;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    const items = @field(sch, list).items;
+    if (items.len != 1) return null;
+    const s = items[0];
+    return .{
+        .cache = s.prefill_progress.cache.load(.monotonic),
+        .processed = s.prefill_progress.processed.load(.monotonic),
+        .time_ms = s.prefill_progress.elapsed_ms.load(.monotonic),
+    };
+}
+
+const SlotProgress = struct { cache: u64, processed: u64, time_ms: u64 };
+
+test "server: a prefill no return_progress stream and no metrics watch stores no prompt_progress" {
+    try eachArch(2, .{}, struct {
+        fn run() !void {
+            const body = "{\"model\":\"tiny\",\"prompt\":\"The quick brown fox jumps over the lazy dog, twice, and then sits down to rest beside the river bank.\",\"max_tokens\":2,\"temperature\":0,\"stream\":false}";
+            // A first request leaves the prompt a hot-cache entry the next one restores: that restore's count is the
+            // store this cell reads, published before the request's prefill width is asked.
+            const warm = try request("POST", "/v1/completions", body);
+            defer gpa.free(warm);
+
+            try PrefillHold.install();
+            defer PrefillHold.uninstall();
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            PrefillHold.arm();
+            try send(fd, "POST", "/v1/completions", body);
+            try PrefillHold.waitHeld();
+
+            const seen = listProgress("prefilling") orelse return error.NoPrefillingSlot;
+            PrefillHold.release();
+            try testing.expectEqual(@as(u64, 0), seen.cache);
+            try testing.expectEqual(@as(u64, 0), seen.processed);
+            try testing.expectEqual(@as(u64, 0), seen.time_ms);
+
+            const rest = try readUntil(fd, null);
+            defer gpa.free(rest);
+        }
+    }.run);
+}
+
 /// The Anthropic non-stream reply's joined text blocks and its stop_reason.
 fn anthropicTextAndReason(resp: []const u8, out_reason: *[64]u8) ![]u8 {
     const p = try parseBody(bodyOf(resp));

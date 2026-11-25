@@ -1031,6 +1031,9 @@ pub const StreamingTokenStream = struct {
     cancelled: bool = false,
     /// Continues a turn that ends inside its thought (`armThought`); `slot` is then the part generating now.
     thought: ?ThoughtArm = null,
+    /// The slot's prefill progress wakes this reader (`return_progress`): an idle with nothing to read may be a
+    /// chunk's store, so it re-reads the numbers instead of waiting out the keepalive.
+    progress_wake: bool = false,
 
     const ThoughtArm = struct {
         sch: *scheduler_mod.Scheduler,
@@ -1059,6 +1062,7 @@ pub const StreamingTokenStream = struct {
             .slot = slot,
             .mode = mode,
             .eos_token_ids = eos,
+            .progress_wake = slot.return_progress,
         };
     }
 
@@ -1166,7 +1170,7 @@ pub const StreamingTokenStream = struct {
                 return .{ .token = t.bridge[t.bridge_at - 1] };
             };
             if (self.finished) return .done;
-            const nr = s.waitNextTimeout(timeout_ms) orelse return .idle;
+            const nr = (if (self.progress_wake) s.waitNextProgressTimeout(timeout_ms) else s.waitNextTimeout(timeout_ms)) orelse return .idle;
             switch (nr) {
                 .token => |t| {
                     self.delivered += 1;
@@ -1473,6 +1477,7 @@ pub fn handleStreamingGeneration(
         .enable_mtp = stream_mode == .mtp,
         .mtp = if (stream_mode == .mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
+        .return_progress = return_progress,
         .deferred_media = slot_ve_s,
         .vision_key = prefix_cache_mod.chainKey(media_chain),
         .media_chain = media_chain,
@@ -1496,12 +1501,15 @@ pub fn handleStreamingGeneration(
     // `return_progress`: llama.cpp ships a 0% progress chunk as soon as prompt
     // processing starts; ours names the whole prompt's token count at once, so
     // a client sizing the bar needs no later chunk to learn it.
-    var progress_sent_any = false;
-    var progress_sent_processed: u64 = 0;
-    var progress_sent_ms: u64 = 0;
+    const progress_total = slot_handle.?.full_prompt.len;
+    var progress_sent: ?PrefillNumbers = null;
+    var progress_sent_at: i64 = 0;
+    var progress_window = false;
+    var progress_final = false;
     if (return_progress) {
-        try sendSSEProgressChunk(allocator, stream, chat_id, model_name, prompt_ids.len, 0, 0, 0);
-        progress_sent_any = true;
+        try sendSSEProgressChunk(allocator, stream, chat_id, model_name, progress_total, 0, 0, 0);
+        progress_sent = .{ .cache = 0, .processed = 0, .time_ms = 0 };
+        progress_sent_at = nowMsMonotonic(stream.io);
     }
 
     // Buffer for stop sequence and tool call detection
@@ -1618,23 +1626,25 @@ pub fn handleStreamingGeneration(
                     break;
                 }
                 // `return_progress`: the inference thread's chunk loop has
-                // published new numbers since the last wake (or the clock
-                // moved under a still-waiting prefill) — ship them. A wake
-                // with nothing new keeps the plain keepalive.
-                if (return_progress and ts.delivered == 0) {
+                // published new numbers and woken this reader — ship the
+                // latest, at most one chunk per interval. A wake with
+                // nothing new keeps the plain keepalive.
+                if (return_progress and !progress_final and ts.delivered == 0) {
                     const s = ts.slot.?;
-                    const processed = s.prefill_progress.processed.load(.monotonic);
-                    const elapsed = s.prefill_progress.elapsed_ms.load(.monotonic);
-                    if (!progress_sent_any or processed != progress_sent_processed or elapsed != progress_sent_ms) {
-                        sendSSEProgressChunk(allocator, stream, chat_id, model_name, s.full_prompt.len, s.prefill_progress.cache.load(.monotonic), processed, elapsed) catch {
-                            log.info("  [cancel] progress write failed (client disconnected) — cancelling slot\n", .{});
-                            ts.slot.?.cancel();
-                            client_gone = true;
-                            break;
-                        };
-                        progress_sent_any = true;
-                        progress_sent_processed = processed;
-                        progress_sent_ms = elapsed;
+                    const n = PrefillNumbers.of(s);
+                    if (n.movedFrom(progress_sent.?)) {
+                        const now = nowMsMonotonic(stream.io);
+                        if (!progress_window or now - progress_sent_at >= PROGRESS_INTERVAL_MS) {
+                            sendSSEProgressChunk(allocator, stream, chat_id, model_name, progress_total, n.cache, n.processed, n.time_ms) catch {
+                                log.info("  [cancel] progress write failed (client disconnected) — cancelling slot\n", .{});
+                                ts.slot.?.cancel();
+                                client_gone = true;
+                                break;
+                            };
+                            progress_sent = n;
+                            progress_sent_at = now;
+                            progress_window = true;
+                        }
                         continue;
                     }
                 }
@@ -1647,6 +1657,20 @@ pub fn handleStreamingGeneration(
                 continue;
             },
         };
+        if (return_progress and !progress_final) {
+            progress_final = true;
+            if (progress_sent.?.processed != progress_total) {
+                const n = PrefillNumbers.of(ts.slot.?);
+                sendSSEProgressChunk(allocator, stream, chat_id, model_name, progress_total, n.cache, progress_total, n.time_ms) catch {
+                    log.info("  [cancel] progress write failed (client disconnected) — cancelling slot\n", .{});
+                    ts.slot.?.cancel();
+                    client_gone = true;
+                    break;
+                };
+                progress_sent = .{ .cache = n.cache, .processed = progress_total, .time_ms = n.time_ms };
+                progress_sent_at = nowMsMonotonic(stream.io);
+            }
+        }
         if (stream.peerClosed()) {
             ts.slot.?.cancel();
             client_gone = true;
@@ -2246,6 +2270,29 @@ fn sendSSEChunk(
 /// `return_progress`. The four values read like llama.cpp's: the overall
 /// progress is `processed/total`, the timed progress is
 /// `(processed-cache)/(total-cache)`.
+/// How often a `return_progress` stream may ship a chunk while the prefill runs: a fast prefill's per-chunk wakes
+/// report the latest numbers at this cadence instead of flooding the stream.
+pub const PROGRESS_INTERVAL_MS: i64 = 250;
+
+/// The numbers one `prompt_progress` chunk carries, read off a slot's atomics.
+pub const PrefillNumbers = struct {
+    cache: u64,
+    processed: u64,
+    time_ms: u64,
+
+    pub fn of(slot: *const scheduler_mod.Slot) PrefillNumbers {
+        return .{
+            .cache = slot.prefill_progress.cache.load(.monotonic),
+            .processed = slot.prefill_progress.processed.load(.monotonic),
+            .time_ms = slot.prefill_progress.elapsed_ms.load(.monotonic),
+        };
+    }
+
+    pub fn movedFrom(self: PrefillNumbers, seen: PrefillNumbers) bool {
+        return self.processed != seen.processed or self.time_ms != seen.time_ms or self.cache != seen.cache;
+    }
+};
+
 fn sendSSEProgressChunk(
     allocator: std.mem.Allocator,
     stream: *Conn,

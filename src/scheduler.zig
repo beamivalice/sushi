@@ -122,6 +122,7 @@ pub const SubmitParams = struct {
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
     allow_batch_mtp: bool = true,
+    return_progress: bool = false,
     mtp: ?Drafter = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
@@ -252,12 +253,11 @@ pub const NextResult = union(enum) {
     err: void,
 };
 
-/// Live prefill progress a `return_progress` stream reads. The inference
-/// thread's chunk loop writes once per chunk (`generate.InitOptions`
-/// `prefill_progress_abs` / `prefill_progress_ms`); the connection thread
-/// reads it between keepalive wakes (`waitNextTimeout`) and ships a
-/// llama.cpp-shaped `prompt_progress` chunk. Atomic because the two threads
-/// meet here without any lock the prefill could wait on.
+/// Live prefill progress, written only while someone reads it: a `return_progress` stream or the metrics' live rows.
+/// The inference thread's chunk loop stores it once per chunk (`generate.InitOptions` `prefill_progress_abs` /
+/// `prefill_progress_ms`) and wakes a `return_progress` reader (`notePrefillProgress`), which ships a llama.cpp-shaped
+/// `prompt_progress` chunk at most every `PROGRESS_INTERVAL_MS`. Atomic because the two threads meet here without any
+/// lock the prefill could wait on.
 pub const PrefillProgress = struct {
     /// Absolute prompt tokens processed: the restored prefix plus the tail the
     /// chunk loop has forwarded so far.
@@ -365,6 +365,7 @@ pub const Slot = struct {
     drafter_block_size: u32,
     enable_mtp: bool,
     allow_batch_mtp: bool,
+    return_progress: bool,
     mtp: ?Drafter,
     mtp_depth: u32,
     cached_tokens: u32,
@@ -598,6 +599,7 @@ pub const Slot = struct {
             .drafter_block_size = params.drafter_block_size,
             .enable_mtp = params.enable_mtp,
             .allow_batch_mtp = params.allow_batch_mtp,
+            .return_progress = params.return_progress,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
             .cached_tokens = params.cached_tokens,
@@ -816,6 +818,16 @@ pub const Slot = struct {
     /// piled up serially behind every client retry (the server looked dead
     /// while the GPU ground ghosts).
     pub fn waitNextTimeout(self: *Slot, timeout_ms: i64) ?NextResult {
+        return self.waitNextTimed(timeout_ms, false);
+    }
+
+    /// `waitNextTimeout` for a reader that watches this slot's `prefill_progress`: a wake that leaves no token,
+    /// terminator or error to read (a chunk's progress store) comes back as an idle, never re-armed away.
+    pub fn waitNextProgressTimeout(self: *Slot, timeout_ms: i64) ?NextResult {
+        return self.waitNextTimed(timeout_ms, true);
+    }
+
+    fn waitNextTimed(self: *Slot, timeout_ms: i64, progress_wake: bool) ?NextResult {
         while (true) {
             self.out_mu.lockUncancelable(self.io);
             if (self.out_idx < self.out_buf.items.len) {
@@ -850,7 +862,24 @@ pub const Slot = struct {
                 .raw = .fromMilliseconds(timeout_ms),
                 .clock = .awake,
             } }) catch return null;
+            if (progress_wake and !self.hasReadableState()) return null;
         }
+    }
+
+    fn hasReadableState(self: *Slot) bool {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        return self.out_idx < self.out_buf.items.len or
+            self.error_code != null or
+            self.finished or
+            self.cancelled.load(.acquire);
+    }
+
+    /// Inference thread: this chunk's prefill progress is stored; wake a reader parked in `waitNextProgressTimeout`.
+    pub fn notePrefillProgress(self: *Slot) void {
+        self.out_mu.lockUncancelable(self.io);
+        self.out_event.set(self.io);
+        self.out_mu.unlock(self.io);
     }
 
     fn cancelledResult(self: *Slot) NextResult {
@@ -2931,7 +2960,7 @@ pub fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) v
             _ = sch.decoding.orderedRemove(i);
         } else i += 1;
     }
-    publishLiveKvResidency(sch, null);
+    publishLiveKvResidency(sch);
     sch.queue_mu.unlock(sch.io);
     // A GLM decode-phase cancel commits before its native state is released; the cleanup drain's
     // commit would read a reset request and add nothing.
@@ -3004,15 +3033,15 @@ pub fn releaseNativeState(slot: *Slot) void {
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
 /// `prefilling` is the slot mid-prefill, which is not in `decoding` yet.
 /// The byte total feeds `/props` and is always published; the rows only with a `--metrics` sink.
-fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot) void {
+fn publishLiveKvResidency(sch: *Scheduler) void {
     const observe = sch.metrics != null;
     sch.live_session_count = 0;
     var bytes: u64 = 0;
     var current_billed = false;
-    if (prefilling) |p| {
+    for (sch.prefilling.items) |p| {
         const b = slotStateBytes(p);
         bytes += b -| slotDonatedBytes(p);
-        current_billed = p.model == sch.current_model;
+        current_billed = current_billed or p.model == sch.current_model;
         if (observe) recordLiveSession(sch, p, .prefill, b);
     }
     for (sch.decoding.items) |s| {
@@ -3041,6 +3070,12 @@ fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session
     const age_ns = s.request_start_ts.untilNow(sch.io, .boot).nanoseconds;
     session.elapsed_seconds = @as(f64, @floatFromInt(age_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
     session.entry_id = s.restored_entry;
+    if (phase == .prefill) session.prefill = .{
+        .total = @intCast(@min(s.full_prompt.len, std.math.maxInt(u32))),
+        .cache = s.prefill_progress.cache.load(.monotonic),
+        .processed = s.prefill_progress.processed.load(.monotonic),
+        .time_ms = s.prefill_progress.elapsed_ms.load(.monotonic),
+    };
     sch.live_sessions[sch.live_session_count] = session;
     sch.live_session_count += 1;
 }
@@ -3592,7 +3627,7 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         // and inside a long prefill this is the only point that republishes them.
         ic.sch.queue_mu.lockUncancelable(ic.sch.io);
         defer ic.sch.queue_mu.unlock(ic.sch.io);
-        publishLiveKvResidency(ic.sch, ic.slot);
+        publishLiveKvResidency(ic.sch);
     }
     ic.chunk_sw.reset();
 }
@@ -3699,6 +3734,11 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     try mlx.checkLatch();
 }
 
+fn prefillProgressWake(ctx: *anyopaque) void {
+    const slot: *Slot = @ptrCast(@alignCast(ctx));
+    slot.notePrefillProgress();
+}
+
 fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
     defer turn.end();
@@ -3718,7 +3758,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         // for the whole (possibly multi-minute) prefill.
         sch.queue_mu.lockUncancelable(sch.io);
         defer sch.queue_mu.unlock(sch.io);
-        publishLiveKvResidency(sch, slot);
+        publishLiveKvResidency(sch);
     }
     defer if (observe) {
         _ = sch.requests_prefilling.fetchSub(1, .monotonic);
@@ -3727,10 +3767,11 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     };
     // A load on the ledger admits the request on its lines before it allocates anything.
     try @import("static_bill.zig").admit(slot);
-    // A fresh count for the `return_progress` reader: this slot's prefill runs once, but
-    // a slot whose pass failed and is re-entered must not keep the failed run's numbers.
-    slot.prefill_progress.processed.store(0, .monotonic);
-    slot.prefill_progress.elapsed_ms.store(0, .monotonic);
+    const watch_prefill = slot.return_progress or observe;
+    if (watch_prefill) {
+        slot.prefill_progress.processed.store(0, .monotonic);
+        slot.prefill_progress.elapsed_ms.store(0, .monotonic);
+    }
 
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
@@ -3866,7 +3907,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             }
             // The `return_progress` reader counts from the restored prefix on;
             // published once, before the chunk loop stores its first chunk.
-            slot.prefill_progress.cache.store(hot_matched, .monotonic);
+            if (watch_prefill) slot.prefill_progress.cache.store(hot_matched, .monotonic);
             // The entry this request restored off may be evicted before it commits, so the fork
             // keeps its own restore point; a full reuse is covered by the prompt end.
             if (hot_matched >= prefix_cache_mod.RING_RESTORE_MIN_TOKENS and !lookup.full_match and slot.ring_cps.fork == null) {
@@ -4178,8 +4219,9 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             .prefill_computed = &slot.prefill_computed,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
-            .prefill_progress_abs = &slot.prefill_progress.processed,
-            .prefill_progress_ms = &slot.prefill_progress.elapsed_ms,
+            .prefill_progress_abs = if (watch_prefill) &slot.prefill_progress.processed else null,
+            .prefill_progress_ms = if (watch_prefill) &slot.prefill_progress.elapsed_ms else null,
+            .prefill_wake = if (slot.return_progress) .{ .ctx = slot, .call = prefillProgressWake } else null,
             .interleave_hook = if (prefillInterleaveEnabled())
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else
@@ -6202,8 +6244,9 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     var ptrs = [_]*Slot{&slot};
     sch.decoding.items = &ptrs;
     sch.decoding.capacity = ptrs.len;
+    sch.prefilling = .empty;
 
-    publishLiveKvResidency(&sch, null);
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(@as(usize, 1), sch.live_session_count);
     const d = &sch.live_sessions[0];
     try testing.expectEqualStrings("org/live-test", d.model());
@@ -6224,14 +6267,17 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     // A republish (the next poll) carries the SAME request_id — the row
     // identity a per-request downstream key needs — and a non-decreasing age.
     const first_elapsed = d.elapsed_seconds;
-    publishLiveKvResidency(&sch, null);
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(@as(u64, 42), sch.live_sessions[0].request_id);
     try testing.expect(sch.live_sessions[0].elapsed_seconds >= first_elapsed);
 
     // Prefilling slot (not in `decoding` yet) gets its own row: two live rows.
     var prompt_ids: [64]u32 = undefined;
     slot.full_prompt = &prompt_ids;
-    publishLiveKvResidency(&sch, &slot);
+    var pre = [_]*Slot{&slot};
+    sch.prefilling.items = &pre;
+    sch.prefilling.capacity = pre.len;
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(@as(usize, 2), sch.live_session_count);
     try testing.expectEqual(metrics_mod.Session.Phase.prefill, sch.live_sessions[0].phase);
     // The prefill row bills the FULL prompt (the decode row's `prompt_tokens`
@@ -6241,20 +6287,110 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
 
     // The step-5 cull republishes without the prefilling row; the slot still
     // decoding keeps only its decode row.
-    publishLiveKvResidency(&sch, null);
+    sch.prefilling.items = &.{};
+    sch.prefilling.capacity = 0;
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(@as(usize, 1), sch.live_session_count);
     // Culling the slot empties the snapshot: a poll must never resurrect a
     // finished row.
     _ = sch.decoding.orderedRemove(0);
-    publishLiveKvResidency(&sch, null);
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(@as(usize, 0), sch.live_session_count);
 
     // Zero-when-off: with no sink the publish is a single reset — no rows.
     var ptrs2 = [_]*Slot{&slot};
     sch.decoding.items = &ptrs2;
     sch.metrics = null;
-    publishLiveKvResidency(&sch, &slot);
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(@as(usize, 0), sch.live_session_count);
+}
+
+test "publishLiveKvResidency gives each prefilling slot its own prompt_progress numbers in the live rows" {
+    var mm = metrics_mod.Metrics.init();
+    var sch: Scheduler = undefined;
+    sch.current_model = null;
+    sch.io = testing.io;
+    sch.metrics = &mm;
+    sch.live_sessions = undefined;
+    sch.live_session_count = 0;
+    sch.decoding = .empty;
+    sch.prefilling = .empty;
+    var model: model_registry_mod.LoadedModel = undefined;
+    model.id = "org/prefill-two";
+    model.prefix_cache = null;
+    model.handle = null;
+    model.config = null;
+    var prompts = [_][4]u32{
+        .{ 7, 8, 9, 10 },
+        .{ 7, 8, 9, 10 },
+    };
+    var slots: [2]Slot = undefined;
+    for (&slots, 0..) |*slot, i| {
+        slot.model = &model;
+        slot.legacy_gen = null;
+        slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+        slot.ssm_entries = null;
+        slot.request = null;
+        slot.ring_cps = .{};
+        slot.restored_entry = 0;
+        slot.restored_disk = null;
+        slot.full_prompt = prompts[i][0 .. if (i == 0) 4 else 2];
+        slot.prompt_tokens = 0;
+        slot.completion_tokens = 0;
+        slot.cached_tokens = 0;
+        slot.request_id = @intCast(i + 1);
+        slot.max_tokens = 8;
+        slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
+        slot.prefill_progress = .{};
+    }
+    slots[0].prefill_progress.cache.store(2, .monotonic);
+    slots[0].prefill_progress.processed.store(3, .monotonic);
+    slots[0].prefill_progress.elapsed_ms.store(120, .monotonic);
+    slots[1].prefill_progress.processed.store(1, .monotonic);
+    slots[1].prefill_progress.elapsed_ms.store(35, .monotonic);
+    var ptrs = [_]*Slot{ &slots[0], &slots[1] };
+    sch.prefilling.items = &ptrs;
+    sch.prefilling.capacity = ptrs.len;
+
+    // Two requests prefilling at once: each row carries its own numbers, never one shared reading.
+    publishLiveKvResidency(&sch);
+    try testing.expectEqual(@as(usize, 2), sch.live_session_count);
+    try testing.expectEqual(metrics_mod.Session.Phase.prefill, sch.live_sessions[0].phase);
+    const first = sch.live_sessions[0].prefill.?;
+    try testing.expectEqual(@as(u32, 4), first.total);
+    try testing.expectEqual(@as(u64, 2), first.cache);
+    try testing.expectEqual(@as(u64, 3), first.processed);
+    try testing.expectEqual(@as(u64, 120), first.time_ms);
+    try testing.expectEqual(metrics_mod.Session.Phase.prefill, sch.live_sessions[1].phase);
+    const second = sch.live_sessions[1].prefill.?;
+    try testing.expectEqual(@as(u32, 2), second.total);
+    try testing.expectEqual(@as(u64, 0), second.cache);
+    try testing.expectEqual(@as(u64, 1), second.processed);
+    try testing.expectEqual(@as(u64, 35), second.time_ms);
+
+    // The feed renders each as its own `prefill` object, in `prompt_progress`'s shape.
+    var w: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer w.deinit();
+    try metrics_mod.renderJson(&mm, sch.live_sessions[0..sch.live_session_count], &w.writer);
+    const json = w.written();
+    for ([_][]const u8{
+        "\"prefill\":{\"total\":4,\"cache\":2,\"processed\":3,\"time_ms\":120}",
+        "\"prefill\":{\"total\":2,\"cache\":0,\"processed\":1,\"time_ms\":35}",
+    }) |member| if (std.mem.indexOf(u8, json, member) == null) {
+        std.debug.print("no {s} in: {s}\n", .{ member, json });
+        return error.NoPrefillMember;
+    };
+
+    // A row of another phase carries none.
+    sch.prefilling.items = ptrs[0..1];
+    sch.prefilling.capacity = 1;
+    var dec = [_]*Slot{&slots[1]};
+    sch.decoding.items = &dec;
+    sch.decoding.capacity = dec.len;
+    publishLiveKvResidency(&sch);
+    try testing.expectEqual(@as(usize, 2), sch.live_session_count);
+    try testing.expect(sch.live_sessions[0].prefill != null);
+    try testing.expect(sch.live_sessions[1].prefill == null);
 }
 
 test "the live KV bill counts ring restore points and nets out a donated checkout the hot cache bills" {
@@ -6307,7 +6443,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     sch.decoding.capacity = ptrs.len;
 
     // `/props` reads the bill without `--metrics`: no rows, but the bytes are published.
-    publishLiveKvResidency(&sch, null);
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(cp_bytes, sch.resident_live_kv_bytes.load(.monotonic));
     try testing.expectEqual(@as(usize, 0), sch.live_session_count);
 
@@ -6322,7 +6458,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     });
     var mm = metrics_mod.Metrics.init();
     sch.metrics = &mm;
-    publishLiveKvResidency(&sch, null);
+    publishLiveKvResidency(&sch);
     try testing.expectEqual(cp_bytes - 48, sch.resident_live_kv_bytes.load(.monotonic));
     const row = &sch.live_sessions[0];
     try testing.expectEqual(cp_bytes, row.state_bytes);

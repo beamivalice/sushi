@@ -382,6 +382,11 @@ pub const Session = struct {
     /// Hot-cache entry id: the entry a live row restored from, or a cached row's own; 0 = none.
     /// Not rendered: it only lets `appendUnclaimedCached` list a conversation once.
     entry_id: u64 = 0,
+    /// The prompt-processing numbers a `prefill` row carries, in `prompt_progress`'s own terms; null on every other
+    /// phase's row, so no other row renders the member.
+    prefill: ?Prefill = null,
+
+    pub const Prefill = struct { total: u32, cache: u64, processed: u64, time_ms: u64 };
 
     pub fn init(model_id: []const u8, phase: Phase, context_tokens: u32, cached_tokens: u32, generated_tokens: u32, state_bytes: u64) Session {
         var s: Session = .{
@@ -518,9 +523,11 @@ pub fn renderJsonWith(m: *const Metrics, sessions: []const Session, history: ?[]
         if (i > 0) try w.print(",", .{});
         try w.print("{{\"model\":", .{});
         try std.json.Stringify.encodeJsonString(s.model(), .{}, w);
-        try w.print(",\"request_id\":{d},\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"max_tokens\":{d},\"elapsed_seconds\":{d},\"state_bytes\":{d}}}", .{
+        try w.print(",\"request_id\":{d},\"phase\":\"{s}\",\"context_tokens\":{d},\"context_length\":{d},\"cached_tokens\":{d},\"generated_tokens\":{d},\"max_tokens\":{d},\"elapsed_seconds\":{d},\"state_bytes\":{d}", .{
             s.request_id, @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.max_tokens, s.elapsed_seconds, s.state_bytes,
         });
+        if (s.prefill) |p| try w.print(",\"prefill\":{{\"total\":{d},\"cache\":{d},\"processed\":{d},\"time_ms\":{d}}}", .{ p.total, p.cache, p.processed, p.time_ms });
+        try w.print("}}", .{});
     }
     try w.writeAll("]");
     if (history) |h| try w.print(",{s}", .{h});
