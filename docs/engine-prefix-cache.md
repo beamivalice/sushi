@@ -50,9 +50,10 @@ and golden strings (`zig build test-host`, no GPU, no lock).
   from it, so the file imports no arch.
 - Entry walks in `HotPrefixCache` are bounded by the entries its memory holds and none grows with the context, so
   they stay walks.
-- **The RAM hot cache has no entry count** (`--prefix-cache-entries` is removed and refused by name): it keeps finished
-  conversations until the `--prefix-cache-mem` budget or admission's reclaim drops them, never fewer than a model's
-  `max_concurrent`. Where a model sets `max_kv_tokens`, its retained entries count in that token pool and a request
+- **The RAM hot cache's entry count is the model's resolved `max_concurrent`** (default 1; `--prefix-cache-entries` is
+  removed and refused by name): past it the oldest conversation goes, and the `--prefix-cache-mem` budget and admission's
+  reclaim can drop one sooner. A load sets the count, so a reload takes a changed `max_concurrent`; the SSD tier keeps
+  its byte budget. Where a model sets `max_kv_tokens`, its retained entries count in that token pool and a request
   that needs the room evicts them oldest-first; an entry a live request holds or restores from counts once, in that
   request's reservation.
 

@@ -897,9 +897,9 @@ pub fn serve(
             log.info("Prefix cache: SSD ONLY (RAM retention off)\n", .{});
         } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (mem-cap={d:.1} MB)\n", .{cap_mb});
+            log.info("Hot prefix cache: ENABLED (mem-cap={d:.1} MB, {d} conversations = max_concurrent)\n", .{ cap_mb, config.max_concurrent });
         } else {
-            log.info("Hot prefix cache: ENABLED (mem-cap=unlimited)\n", .{});
+            log.info("Hot prefix cache: ENABLED (mem-cap=unlimited, {d} conversations = max_concurrent)\n", .{config.max_concurrent});
         }
     } else if (server_state.prefix_cache_capacity > 0) {
         var line_buf: [192]u8 = undefined;
@@ -920,8 +920,7 @@ pub fn serve(
     // at every value so a default boot does not read as "one at a time".
     const startup_entry = scheduler.registry.resolveEntry("") catch null;
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
-    const concurrency_source = if (server_state.max_concurrent_flag != null) "--max-concurrent" else if (config.max_concurrent_override != null) "model-settings.json" else "no limit";
-    log.info("Concurrency: max_concurrent={d} ({s}), {s} (arch: {s})\n", .{ config.max_concurrent, concurrency_source, concurrencyClause(verdict), config.model_type });
+    log.info("Concurrency: max_concurrent={d} ({s}), {s} (arch: {s})\n", .{ config.max_concurrent, model_load.concurrencySourceText(config.max_concurrent_source), concurrencyClause(verdict), config.model_type });
     // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },

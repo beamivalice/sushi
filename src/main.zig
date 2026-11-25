@@ -876,6 +876,7 @@ fn runCli(init: std.process.Init) !void {
         scheduler_mod.setSkipMemPreflight(model_settings_mod.skipMemPreflight(skip_mem_preflight, srv.skip_mem_preflight).value);
         server_state.setMaxRequestMb(srv.max_request_mb);
         server_state.setWiredMarginFile(srv.wired_margin_gib);
+        server_state.setMaxConcurrentFile(srv.max_concurrent);
         server_state.setContinueAfterThought(model_settings_mod.continueAfterThought(no_continue_after_thought, srv.continue_after_thought).value);
         const serving = serve_mode and prompt == null and bench_run == null;
         if (serving) update_mod.startDailyCheck(io, no_update_check, srv.update_check);
@@ -1539,7 +1540,7 @@ fn configOverridesJsonValid(raw: []const u8) bool {
 /// The line a removed launch flag refuses with, naming both replacements and their values; null for any other argument.
 pub fn removedFlagRefusal(arg: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, arg, "--prefix-cache-entries") or std.mem.startsWith(u8, arg, "--prefix-cache-entries="))
-        return "--prefix-cache-entries is removed: a model's prefix cache keeps as many finished conversations as its memory holds, never fewer than its max_concurrent; set --prefix-cache-mem or the model's max_kv_tokens";
+        return "--prefix-cache-entries is removed: a model's RAM prefix cache keeps as many finished conversations as its max_concurrent; set max_concurrent (--max-concurrent), and --prefix-cache-mem or the model's max_kv_tokens to bound its memory";
     if (!std.mem.eql(u8, arg, "--prefill-chunk") and !std.mem.startsWith(u8, arg, "--prefill-chunk=")) return null;
     return "--prefill-chunk is removed: use --prefill-chunk-max <n> and --prefill-chunk-min <n> (" ++ settings_resolve.static_chunk_rungs_text ++ ")";
 }
@@ -1567,6 +1568,10 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
         locks.prefix_cache_disk_gb.pin("{s}", .{model_settings_mod.sizeText(&size_buf, server_state.prefix_cache_disk_bytes)});
     }
     if (server_state.wired_margin_flag_bytes) |b| locks.wired_margin_gib.pin("{d}", .{b >> 30});
+    if (server_state.max_concurrent_flag) |n| {
+        locks.max_concurrent.pin("{d}", .{n});
+        locks.modelMut("max_concurrent").pin("{d}", .{n});
+    }
     if (given.models_dir) |d| locks.models_dir.pin("{s}", .{d});
     if (given.port) |p| locks.port.pin("{d}", .{p});
     if (given.skip_mem_preflight) locks.skip_mem_preflight.pin("--skip-mem-preflight", .{});
@@ -1645,7 +1650,7 @@ test "launch flags: --prefill-chunk is gone and refuses by name, naming both rep
 }
 
 test "launch flags: --prefix-cache-entries is gone and refuses by name, naming what replaces it" {
-    const want = "--prefix-cache-entries is removed: a model's prefix cache keeps as many finished conversations as its memory holds, never fewer than its max_concurrent; set --prefix-cache-mem or the model's max_kv_tokens";
+    const want = "--prefix-cache-entries is removed: a model's RAM prefix cache keeps as many finished conversations as its max_concurrent; set max_concurrent (--max-concurrent), and --prefix-cache-mem or the model's max_kv_tokens to bound its memory";
     try std.testing.expectEqualStrings(want, removedFlagRefusal("--prefix-cache-entries").?);
     try std.testing.expectEqualStrings(want, removedFlagRefusal("--prefix-cache-entries=32").?);
     try std.testing.expect(removedFlagRefusal("--prefix-cache-mem") == null);
@@ -1713,6 +1718,24 @@ test "launch flags: --wired-margin-gib pins server.wired_margin_gib to the flag'
     server_state.wired_margin_flag_bytes = 5 << 30;
     pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
     try std.testing.expectEqualStrings("5", model_settings_mod.launch_locks.wired_margin_gib.text());
+}
+
+test "launch flags: --max-concurrent pins the saved server key and every model's own key, and no flag leaves both free" {
+    const saved = model_settings_mod.launch_locks;
+    const flag_was = server_state.max_concurrent_flag;
+    defer {
+        model_settings_mod.launch_locks = saved;
+        server_state.max_concurrent_flag = flag_was;
+    }
+    model_settings_mod.launch_locks = .{};
+    server_state.max_concurrent_flag = null;
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expect(!model_settings_mod.launch_locks.max_concurrent.set);
+    try std.testing.expect(!model_settings_mod.launch_locks.model("max_concurrent").?.set);
+    server_state.max_concurrent_flag = 4;
+    pinLaunchFlags(.{ .ctx_size = 0, .kv_quant = null, .mtp = null, .vision = null, .models_dir = null, .no_update_check = false });
+    try std.testing.expectEqualStrings("4", model_settings_mod.launch_locks.max_concurrent.text());
+    try std.testing.expectEqualStrings("4", model_settings_mod.launch_locks.model("max_concurrent").?.text());
 }
 
 test "a launch margin of 0 pins the saved setting instead of leaving it free" {

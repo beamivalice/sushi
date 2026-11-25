@@ -281,7 +281,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   when no flag is given); `max_request_mb` (1-1024 MiB, default 128: the HTTP request and `/v1/responses` WebSocket message cap, no flag; read at start and
   set at once by a Settings save, so the next request reads it); and `port`
   (1-65535, the bind when `--port` is absent, also read by `sushi launch` and sushibar; flag > file > 12345, read at start,
-  so a running server keeps its port; `--port` pins it and the API reports it locked); and `wired_margin_gib` (0-32 GiB, default 1, the safety margin under `iogpu.wired_limit_mb`: `--wired-margin-gib` > file > default through `server_state.wiredMarginBytes`, read where each plan is made, so a save applies to the next request and the next load).
+  so a running server keeps its port; `--port` pins it and the API reports it locked); and `wired_margin_gib` (0-32 GiB, default 1, the safety margin under `iogpu.wired_limit_mb`: `--wired-margin-gib` > file > default through `server_state.wiredMarginBytes`, read where each plan is made, so a save applies to the next request and the next load); and `max_concurrent` (1 to the
+  batch group, every model's default for requests at once: `--max-concurrent` > the model's key > this key > 1, read at
+  each load, which names the source in its `[concurrency]` line; the flag pins this key and each model's).
   The order is the same: `--prefix-cache-disk` / `--model-dir` outrank the file, which
   outranks the default; a file value counts as the operator's own number (no formula sizing). `main.zig` records which
   flags were given (`model_settings.launch_locks`), and `GET /v1/settings` reports those keys locked. The web UI edits the

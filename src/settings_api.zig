@@ -5,6 +5,7 @@ const std = @import("std");
 const http = @import("http.zig");
 const log = @import("log.zig");
 const model_settings = @import("model_settings.zig");
+const sched_policy = @import("sched_policy.zig");
 const scheduler = @import("scheduler.zig");
 const default_port = @import("default_port.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -382,6 +383,16 @@ pub fn render(
         model_settings.default_wired_margin_gib, model_settings.wired_margin_gib_min, model_settings.wired_margin_gib_max,
         if (margin_pinned) "flag" else if (srv.wired_margin_gib != null) "file" else "default",
         margin_pinned, if (margin_pinned) wired_margin_flag_applies else wired_margin_applies,
+    });
+    const concurrent_pinned = locks.max_concurrent.set;
+    try w.writeAll(",\"max_concurrent\":{\"file\":");
+    try writeJson(w, srv.max_concurrent);
+    try w.writeAll(",\"flag\":");
+    if (concurrent_pinned) try writeJson(w, locks.max_concurrent.text()) else try w.writeAll("null");
+    try w.print(",\"default\":{d},\"min\":1,\"max\":{d},\"source\":\"{s}\",\"locked\":{},\"applies\":\"{s}\"}}", .{
+        default_max_concurrent,                                                           sched_policy.MAX_BATCH_GROUP,
+        if (concurrent_pinned) "flag" else if (srv.max_concurrent != null) "file" else "default", concurrent_pinned,
+        if (concurrent_pinned) max_concurrent_flag_applies else max_concurrent_applies,
     });
     const port_pinned = locks.port.set;
     try w.writeAll(",\"port\":{\"file\":");
@@ -879,6 +890,7 @@ fn serverKeyMoves(locks: *const model_settings.LaunchLocks, was: model_settings.
     if (eql(u8, e.key, "skip_mem_preflight")) return !locks.skip_mem_preflight.set and differs(bool, was.skip_mem_preflight, if (e.value) |v| v.bool else null, false);
     if (eql(u8, e.key, "max_request_mb")) return differs(u32, was.max_request_mb, now_int, model_settings.default_max_request_mb);
     if (eql(u8, e.key, "wired_margin_gib")) return !locks.wired_margin_gib.set and differs(u32, was.wired_margin_gib, now_int, model_settings.default_wired_margin_gib);
+    if (eql(u8, e.key, "max_concurrent")) return !locks.max_concurrent.set and differs(u32, was.max_concurrent, now_int, default_max_concurrent);
     return false;
 }
 
@@ -906,6 +918,7 @@ fn applyServerEdit(host: anytype, arena: std.mem.Allocator, locks: *const model_
     }
     if (eql(u8, e.key, "wired_margin_gib")) return applyWiredMargin(locks, e.value, moved);
     if (eql(u8, e.key, "port")) return portMessage(locks);
+    if (eql(u8, e.key, "max_concurrent")) return applyMaxConcurrent(locks, e.value);
     return host.modelsDir(arena);
 }
 
@@ -1074,6 +1087,16 @@ fn applyWiredMargin(locks: *const model_settings.LaunchLocks, value: ?std.json.V
     server_state.setWiredMarginFile(if (value) |v| std.math.cast(u32, v.integer) else null);
     if (moved) bills.relogCeiling();
     return if (locks.wired_margin_gib.set) "saved; --wired-margin-gib still sets the margin until a start without it" else wired_margin_applies;
+}
+
+const default_max_concurrent: u32 = 1;
+const max_concurrent_applies = "applies to each model's next load; a model's own value outranks it";
+const max_concurrent_flag_applies = "set by --max-concurrent until a start without it";
+
+/// The launch flag outranks the saved value inside `resolveConcurrency`, so a save under it is kept and not applied.
+fn applyMaxConcurrent(locks: *const model_settings.LaunchLocks, value: ?std.json.Value) []const u8 {
+    server_state.setMaxConcurrentFile(if (value) |v| std.math.cast(u32, v.integer) else null);
+    return if (locks.max_concurrent.set) "saved; --max-concurrent still sets it until a start without it" else max_concurrent_applies;
 }
 
 fn portMessage(locks: *const model_settings.LaunchLocks) []const u8 {
@@ -1449,6 +1472,69 @@ test "a saved margin of 0 is 0 in the file, the readback and a fresh process" {
     try testing.expectEqual(@as(i64, 0), o.get("min").?.integer);
 }
 
+test "settings api: render reports server.max_concurrent from the file, the default of 1 or the launch flag that pins it" {
+    const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
+    var locks: model_settings.LaunchLocks = .{};
+    const cases = [_]struct { file: []const u8, flag: ?[]const u8, source: []const u8 }{
+        .{ .file = "{\"server\": {\"max_concurrent\": 3}}", .flag = null, .source = "file" },
+        .{ .file = "{}", .flag = null, .source = "default" },
+        .{ .file = "{\"server\": {\"max_concurrent\": 3}}", .flag = "4", .source = "flag" },
+    };
+    for (cases) |c| {
+        locks.max_concurrent = .{};
+        if (c.flag) |f| locks.max_concurrent.pin("{s}", .{f});
+        var file = try model_settings.parse(testing.allocator, c.file);
+        defer file.deinit();
+        const body = try render(testing.allocator, "/h/s.json", &file, &.{}, &locks, view);
+        defer testing.allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+        defer parsed.deinit();
+        const o = parsed.value.object.get("server").?.object.get("max_concurrent").?.object;
+        try testing.expectEqualStrings(c.source, o.get("source").?.string);
+        try testing.expectEqual(c.flag != null, o.get("locked").?.bool);
+        try testing.expectEqual(@as(i64, 1), o.get("default").?.integer);
+        try testing.expectEqual(@as(i64, 1), o.get("min").?.integer);
+        try testing.expectEqual(@as(i64, sched_policy.MAX_BATCH_GROUP), o.get("max").?.integer);
+        if (c.flag) |f| try testing.expectEqualStrings(f, o.get("flag").?.string) else try testing.expect(o.get("flag").? == .null);
+        if (std.mem.eql(u8, c.source, "file")) try testing.expectEqual(@as(i64, 3), o.get("file").?.integer) else try testing.expect(o.get("file").? == .integer or o.get("file").? == .null);
+    }
+}
+
+test "settings api: a saved server.max_concurrent reaches the next load and ends a stored load failure; the launch flag keeps it from moving anything" {
+    const globals = SavedGlobals.take();
+    defer globals.restore();
+    const flag_was = server_state.max_concurrent_flag;
+    defer server_state.max_concurrent_flag = flag_was;
+    server_state.wired_margin_flag_bytes = null;
+    server_state.max_concurrent_flag = null;
+    server_state.setMaxConcurrentFile(null);
+    model_settings.launch_locks = .{};
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, null);
+    var host: TestHost = .{ .io = testing.io, .path = path };
+    try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, "{\"server\":{\"max_concurrent\":3}}").ok, "", null) == .saved);
+    try testing.expectEqualSlices(TestHost.Event, &.{ .write, .forget_all }, host.events[0..host.n_events]);
+    try testing.expectEqual(@as(?u32, 3), server_state.maxConcurrentFile());
+
+    var held: TestHost = .{ .io = testing.io, .path = path };
+    model_settings.launch_locks.max_concurrent.pin("4", .{});
+    const kept = try save(&held, a, testing.io, path, parseRequest(a, "{\"server\":{\"max_concurrent\":2}}").ok, "", null);
+    try testing.expect(kept == .saved);
+    try testing.expect(std.mem.startsWith(u8, kept.saved[0], "saved; --max-concurrent still"));
+    try testing.expectEqual(@as(usize, 0), held.count(.forget_all));
+    model_settings.launch_locks = .{};
+
+    var cleared: TestHost = .{ .io = testing.io, .path = path };
+    try testing.expect(try save(&cleared, a, testing.io, path, parseRequest(a, "{\"server\":{\"max_concurrent\":null}}").ok, "", null) == .saved);
+    try testing.expectEqual(@as(?u32, null), server_state.maxConcurrentFile());
+    try testing.expectEqual(@as(usize, 1), cleared.count(.forget_all));
+}
+
 test "settings api: render reports the safety margin from the file, the default or the launch flag that pins it" {
     const view: ServerView = .{ .default_models_dir = "/h", .boot_roots = &.{}, .ask_bytes = 20 << 30 };
     var locks: model_settings.LaunchLocks = .{};
@@ -1731,8 +1817,8 @@ test "settings api: max_concurrent and max_kv_tokens are offered with their defa
     }
     try testing.expect(seen_concurrent and seen_kv);
     const d = root.get("models").?.array.items[0].object.get("defaults").?.object;
-    // No flag and no key: the count gate is absent (0), not 1.
-    try testing.expectEqual(@as(i64, 0), d.get("max_concurrent").?.integer);
+    // No flag, no key and no saved server key: one request at a time.
+    try testing.expectEqual(@as(i64, 1), d.get("max_concurrent").?.integer);
     try testing.expectEqual(@as(i64, 0), d.get("max_kv_tokens").?.integer);
 
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
@@ -1755,6 +1841,20 @@ test "settings api: max_concurrent and max_kv_tokens are offered with their defa
     const cap_why = refusalMessage(arena_state.allocator(), qfit, null, &.{.{ .key = "max_concurrent", .value = .{ .integer = 9 } }}).?;
     try testing.expect(std.mem.indexOf(u8, cap_why, "joins at most this many") != null);
     try testing.expect(refusalMessage(arena_state.allocator(), qfit, null, &.{.{ .key = "max_concurrent", .value = .{ .integer = 8 } }}) == null);
+}
+
+test "settings api: a model's default max_concurrent is the value it inherits from the launch flag or the saved server key" {
+    const flag_was = server_state.max_concurrent_flag;
+    defer server_state.max_concurrent_flag = flag_was;
+    defer server_state.setMaxConcurrentFile(null);
+    server_state.max_concurrent_flag = null;
+    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_concurrent_override = 2 };
+    server_state.setMaxConcurrentFile(null);
+    try testing.expectEqual(@as(?u32, 1), resolvedDefaults(&qwen).max_concurrent);
+    server_state.setMaxConcurrentFile(3);
+    try testing.expectEqual(@as(?u32, 3), resolvedDefaults(&qwen).max_concurrent);
+    server_state.max_concurrent_flag = 4;
+    try testing.expectEqual(@as(?u32, 4), resolvedDefaults(&qwen).max_concurrent);
 }
 
 test "settings api: the removed prefix-cache entry key is refused by name" {
@@ -2229,6 +2329,7 @@ const SavedGlobals = struct {
         server_state.max_request_bytes.store(self.max_request, .monotonic);
         server_state.wired_margin_flag_bytes = self.flag;
         server_state.setWiredMarginFile(null);
+        server_state.setMaxConcurrentFile(null);
         model_settings.launch_locks = self.locks;
     }
 };

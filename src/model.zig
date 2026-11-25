@@ -53,6 +53,9 @@ const arch_load = @import("arch/load.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
+/// Who decided a model's `max_concurrent`: the launch flag, the model's own key, the global `server.max_concurrent`, or the built-in 1.
+pub const ConcurrencySource = enum { flag, model_key, server_key, default };
+
 /// MLX quantization mode from config.json's `quantization.mode`. All
 /// non-affine modes store NO `.biases` tensors (per-group fp8-encoded uint8
 /// scales only) but share the packed-u32 weight layout, so supporting them is
@@ -388,13 +391,14 @@ pub const ModelConfig = struct {
     /// The per-model `prefill_chunk_max` / `prefill_chunk_min`; null = unset.
     prefill_chunk_max_override: ?u32 = null,
     prefill_chunk_min_override: ?u32 = null,
-    /// The per-model `max_concurrent`; null = the launch `--max-concurrent`, else 1.
+    /// The per-model `max_concurrent`; null = the launch `--max-concurrent`, else the saved `server.max_concurrent`, else 1.
     max_concurrent_override: ?u32 = null,
     /// The per-model `max_kv_tokens`; null/0 = no cap.
     max_kv_tokens_override: ?u64 = null,
     /// Resolved at load: requests of this model that run at once, and the token pool they share with its retained
     /// prefix-cache entries (0 = no cap).
     max_concurrent: u32 = 1,
+    max_concurrent_source: ConcurrencySource = .default,
     max_kv_tokens: u64 = 0,
 
     /// The prefill chunk this model was sized for, FROZEN at load

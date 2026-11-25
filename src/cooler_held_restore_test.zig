@@ -377,6 +377,10 @@ test "cooler contract: a served Qwen turn whose partial share fits once an idle 
         fn run(comptime Q: type, dir: []const u8, ids: []const u32) !void {
             const a = testing.allocator;
             const ld = try heldLoad(Q, dir);
+            // The hot cache keeps max_concurrent conversations: this cell needs an idle one beside the shared one.
+            const was = ld.config.max_concurrent;
+            ld.config.max_concurrent = 2;
+            defer ld.config.max_concurrent = was;
             var sv: Served = undefined;
             try sv.initTiers(ld, dir, 1 << 30);
             defer sv.deinit();

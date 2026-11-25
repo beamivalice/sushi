@@ -1929,6 +1929,7 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) model_load.freeCpuState(self.allocator, &owned);
         model_load.applyModelSettings(owned.config, settings);
+        log.info("[concurrency] {s}: max_concurrent {d} ({s})\n", .{ owned.config.model_type, owned.config.max_concurrent, model_load.concurrencySourceText(owned.config.max_concurrent_source) });
         if (comptime @import("builtin").is_test) if (self.test_on_cooler) |on| @import("cooler_side.zig").forTest(owned.config, on);
         var launch_buf: [384]u8 = undefined;
         if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant, self.ctx_size_flag)) |r| {

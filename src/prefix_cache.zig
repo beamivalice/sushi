@@ -642,13 +642,13 @@ pub const HotCacheGauge = struct {
     }
 };
 
-/// A served cache keeps no entry-count limit; a finished conversation is withheld only by the byte budget or admission.
+/// A count of this keeps every entry the byte budget and admission allow; a served cache's count is its model's `max_concurrent`.
 pub const unlimited_entries: u32 = std.math.maxInt(u32);
 
 pub const HotPrefixCache = struct {
     entries: std.ArrayList(Entry),
-    /// Kept for the tests that exercise the old count machinery; a served cache passes `unlimited_entries`, so a
-    /// finished conversation is retained until `max_kv_bytes` or admission says otherwise.
+    /// Conversations kept, oldest evicted past it; `unlimited_entries` keeps all. A served cache holds its model's
+    /// `max_concurrent`, on top of `max_kv_bytes` and admission's reclaim.
     max_entries: u32,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
@@ -10811,6 +10811,33 @@ test "a hot cache with no count limit keeps the 33rd conversation where the old 
         }));
     }
     try testing.expectEqual(@as(usize, 33), cache.entries.items.len);
+}
+
+fn retainConversation(cache: *HotPrefixCache, id: u32) !bool {
+    const tokens = [_]u32{ id, id + 100 };
+    return cache.retainNewEntry(.{
+        .tokens = try testing.allocator.dupe(u32, &tokens),
+        .has_tools = false,
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk_mod.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk_mod.KVQuantConfig.dense },
+        .last_used = id,
+        .quant_config = kv_quant.KVQuantConfig.dense,
+        .kv_bytes = 20,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+}
+
+test "a hot cache counted at the model's max_concurrent evicts the oldest conversation past it" {
+    for ([_]u32{ 1, 3 }) |count| {
+        var cache = HotPrefixCache.initWithMem(testing.allocator, count, 0);
+        defer cache.deinit();
+        for (1..count + 1) |i| try testing.expect(try retainConversation(&cache, @intCast(i)));
+        try testing.expectEqual(@as(usize, count), cache.entries.items.len);
+        try testing.expect(try retainConversation(&cache, count + 1));
+        try testing.expectEqual(@as(usize, count), cache.entries.items.len);
+        for (cache.entries.items) |e| try testing.expect(e.tokens[0] != 1);
+        try testing.expectEqual(count + 1, cache.entries.items[cache.entries.items.len - 1].tokens[0]);
+    }
 }
 
 test "retained tokens count every entry in RAM, and eviction takes the oldest first" {

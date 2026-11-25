@@ -236,9 +236,10 @@ authors recommend; `--ctx-size` and `--max-tokens` still override them.
 ### Common flags
 
 - `--prefix-cache-disk 20GB` sizes the SSD prefix cache (on by default, capped at 20 GB); `--prefix-cache-mem 1GB` also
-  keeps prefixes in RAM, as many conversations as fit.
-- Each model's settings take `max_concurrent` (requests that run at once; empty is no limit, and a value is held
-  to the model's own batch width: Qwen 8, GLM and MiMo 4, Hy4-Flash 1; `--max-concurrent N` sets it for every model) and
+  keeps prefixes in RAM, as many conversations as the model's `max_concurrent` within that budget.
+- Each model's settings take `max_concurrent` (requests that run at once, default 1; empty takes the server Settings' Requests at once, else
+  1; `--max-concurrent N` outranks both; a value is held to the model's own batch width: Qwen 8, GLM and MiMo 4,
+  Hy4-Flash 1; its RAM prefix cache keeps that many conversations) and
   `max_kv_tokens` (a shared token budget for that model's running requests and its kept conversations; empty is no
   cap). A request reserves its prompt plus its `max_tokens`; one that does not fit beside the others waits, one that
   can never fit alone is refused with the numbers.

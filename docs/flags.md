@@ -22,7 +22,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--api-key-env` | none → read the key from a named env var so argv does not carry it; an unset or empty variable exits with an error before anything loads (main.zig:734) | operator | help, envvar; 0 tests | keep: the only way to keep the key out of the process table |
 | `--no-metrics` | off → turns off Prometheus `/metrics` and `/metrics.json`, which are ON by default; `POST /metrics/enable` turns them back on at runtime | operator | help, server-http-apis, usage | keep |
 | `--metrics` | accepted and does nothing (metrics are on by default); kept so existing launch lines still start | operator | help | keep as a no-op alias; cut at the next major version |
-| `--max-concurrent` | unset → every model's `max_concurrent`: the requests of that model that run at once (the next waits in the queue); unset, no count limit (as before); a value above a model's own batch width (`arch_sched.rowCap`) is held to it with a load line, and a model that owns its decode state serves one at a time whatever the value; outranks the `max_concurrent` settings key | user | help, usage, server-lifecycle | keep |
+| `--max-concurrent` | unset → every model's `max_concurrent`: the requests of that model that run at once (the next waits in the queue), and the conversations its RAM prefix cache keeps; unset, the model's key, else the settings file's `server.max_concurrent`, else 1; given, it pins both keys; a value above a model's own batch width (`arch_sched.rowCap`) is held to it with a load line, and a model that owns its decode state serves one at a time whatever the value; outranks the `max_concurrent` settings key | user | help, usage, server-lifecycle | keep |
 | `--parent-pid` | none → exit when that pid dies (main.zig:811) | operator | help, server-http-apis; 1 test | keep: for a host that embeds the engine |
 | `--timeout` | `300` → stall timeout in seconds, 0 = none (main.zig:690) | operator | help, server-http-apis; 1 test | keep |
 | `--no-prevent-sleep` | off → allow idle sleep during inference (main.zig:697) | operator | help; 1 test | keep |
@@ -205,7 +205,7 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 Delete the flag, its parse arm, its help line and the code only its off arm reaches. Where a test needs the arm, that test gets a temporary env knob or a test seam first ([envvar](envvar.md)).
 
 - **Serving**
-  - `--max-concurrent`: only sizes a submit queue (`n + 32`) and a prefix-cache floor; decode batching is decided by the model. 21 tests and 2 scripts pass it, so drop the argument there in the same landing; `/props max_concurrent` and the boot line go with it.
+  - `--max-concurrent`: only sizes a submit queue (`n + 32`) and the RAM prefix cache's count; decode batching is decided by the model. 21 tests and 2 scripts pass it, so drop the argument there in the same landing; `/props max_concurrent` and the boot line go with it.
   - `--no-tool-autocorrect`: kill switch of the schema-coercion default, no test, no measurement.
 - **Speculation**
   - `--no-mtp-lookup`: kill switch of an adopted default; a bench that wants one arm per boot needs an env knob, not a flag.
@@ -220,7 +220,7 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | flag | what replaced it |
 |---|---|
 | `--prefill-chunk` | `--prefill-chunk-max` and `--prefill-chunk-min` on every model; it now refuses by name, naming both |
-| `--prefix-cache-entries` | nothing: the RAM hot cache keeps what its memory holds, never fewer than a model's `max_concurrent`; `--prefix-cache-mem off --prefix-cache-disk off` turns reuse off. It refuses by name |
+| `--prefix-cache-entries` | a model's `max_concurrent`: the RAM hot cache keeps that many conversations, within `--prefix-cache-mem`; `--prefix-cache-mem off --prefix-cache-disk off` turns reuse off. It refuses by name |
 | `--no-safety` | nothing; it was accepted and ignored |
 | `--warmup-eager`, `--no-warmup-eager` | the boot warmup always runs; test boots no longer shorten it |
 | `--kv-attn-mode` | nothing: no arm read it. The per-request `kv_attn_mode` field and the `SUSHI_KV_ATTN_*` env vars are gone with it; a request still sending the field is served as if it were absent |

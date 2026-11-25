@@ -56,6 +56,7 @@ function makeServer(opts = {}) {
       continue_after_thought: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
       wired_margin_gib: { file: null, flag: null, default: 1, min: 0, max: 32, source: 'default', locked: false, applies: 'applies at once: the next request and the next load use it' },
+      max_concurrent: { file: null, flag: null, default: 1, min: 1, max: 32, source: 'default', locked: false, applies: "applies to each model's next load; a model's own value outranks it" },
       max_request_mb: { file: null, default: 128, min: 1, max: 1024, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
     },
     cache: {
@@ -1759,10 +1760,10 @@ async function main() {
     });
 
     // Concurrency and the KV token pool are plain fields on every model; an exclusive model's max_concurrent is fixed at 1.
-    const withCaps = (s) => { s.state.models[0].keys = [...BASE_KEYS, 'max_concurrent', 'max_kv_tokens']; s.state.models[0].defaults = { ...(s.state.models[0].defaults ?? {}), max_concurrent: 0, max_kv_tokens: 0 }; };
+    const withCaps = (s) => { s.state.models[0].keys = [...BASE_KEYS, 'max_concurrent', 'max_kv_tokens']; s.state.models[0].defaults = { ...(s.state.models[0].defaults ?? {}), max_concurrent: 1, max_kv_tokens: 0 }; };
     await scenario('concurrency and the KV token budget render, show their defaults, and save', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: withCaps }, async ({ page, server }) => {
       await page.waitForSelector(`${row('max_concurrent')} input`);
-      assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'No limit');
+      assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'Default (1)');
       assert.equal(await page.getAttribute(`${row('max_kv_tokens')} input`, 'placeholder'), 'No cap');
       await page.fill(`${row('max_concurrent')} input`, '4');
       await page.fill(`${row('max_kv_tokens')} input`, '65536');
@@ -1770,6 +1771,29 @@ async function main() {
       await page.waitForFunction(() => document.querySelector('.set[data-key="max_concurrent"] .badges')?.textContent.includes('Saved'));
       const posted = server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1);
       assert.deepEqual(posted, { model: 'Qwen-A', set: { max_concurrent: 4, max_kv_tokens: 65536 } });
+    });
+    await scenario('a model without its own max_concurrent shows the value it inherits as its placeholder', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => { withCaps(s); s.state.models[0].defaults.max_concurrent = 3; } }, async ({ page }) => {
+      await page.waitForSelector(`${row('max_concurrent')} input`);
+      assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'Default (3)');
+    });
+    await scenario('the server Settings page sets every model\'s max_concurrent, saves it, and shows a launch flag read-only', { path: '/settings' }, async ({ page, server }) => {
+      const set = '.set[data-key="max_concurrent"]';
+      await page.waitForSelector(`${set} input`);
+      assert.equal(await page.getAttribute(`${set} input`, 'placeholder'), 'Default (1)');
+      assert.match(await page.textContent(`${set} .help`), /model's own value/);
+      await page.fill(`${set} input`, '0');
+      assert.equal(await page.textContent(`${set} .bad`), 'Enter a whole number from 1 to 32.');
+      await page.fill(`${set} input`, '3');
+      await page.click(`${set} button:text-is("Save")`);
+      await page.waitForFunction((sel) => document.querySelector(`${sel} .badges`).textContent.includes('Saved'), set);
+      assert.deepEqual(server.calls.find((c) => c.method === 'POST' && c.path === '/v1/settings').body, { server: { max_concurrent: 3 } });
+    });
+    await scenario('a launch flag --max-concurrent locks the server field and shows its value', { path: '/settings', setup: (s) => { Object.assign(s.state.server.max_concurrent, { file: 2, flag: '4', source: 'flag', locked: true, applies: 'set by --max-concurrent until a start without it' }); } }, async ({ page }) => {
+      const set = '.set[data-key="max_concurrent"]';
+      await page.waitForSelector(`${set} input`);
+      assert.equal(await page.inputValue(`${set} input`), '4');
+      assert.equal(await page.isDisabled(`${set} input`), true);
+      assert.match(await page.textContent(`${set} .hint`), /--max-concurrent 4 at launch/);
     });
     await scenario('an exclusive model shows max_concurrent disabled at 1 with its reason', { path: '/models#Qwen-A', open: { mode: 'advanced' }, serverOpts: { limits: true }, setup: (s) => {
       s.state.models[0].keys = [...BASE_KEYS, 'max_concurrent'];

@@ -261,27 +261,36 @@ pub fn maxConcurrentCapFor(config: *const ModelConfig) u32 {
     return @intCast(arch_sched.rowCap(config) orelse @import("sched_policy.zig").MAX_BATCH_GROUP);
 }
 
-/// Resolves `max_concurrent` onto the config. No flag and no key leave it absent (0): no count gate at all, the
-/// behaviour before the key existed. A given value is held to the model's own batched width and named when over it.
-/// An arch whose decode state can never batch (config-time `exclusiveDecode`, Hy4-Flash) is fixed at 1; a model that
-/// owns its state only at runtime (DeepSeek when it does not serve rows, a streamed GLM) is left to the admission
-/// gate's runtime `ownsModuleDecodeState` answer.
+/// The label a load line gives for who decided `max_concurrent`.
+pub fn concurrencySourceText(source: model_mod.ConcurrencySource) []const u8 {
+    return switch (source) {
+        .flag => "--max-concurrent",
+        .model_key => "the model's max_concurrent in model-settings.json",
+        .server_key => "server.max_concurrent in model-settings.json",
+        .default => "the default",
+    };
+}
+
+/// Resolves `max_concurrent` onto the config: `--max-concurrent`, else the model's key, else the saved
+/// `server.max_concurrent`, else 1. A value is held to the model's own batched width and named when over it. An arch
+/// whose decode state can never batch (config-time `exclusiveDecode`, Hy4-Flash) is fixed at 1; a model that owns its
+/// state only at runtime (DeepSeek when it does not serve rows, a streamed GLM) is left to the admission gate's runtime
+/// `ownsModuleDecodeState` answer.
 pub fn resolveConcurrency(config: *ModelConfig) void {
     const cap = maxConcurrentCapFor(config);
     const never_batches = arch_config.exclusiveDecode(config);
-    const given: ?u32 = server_state.max_concurrent_flag orelse config.max_concurrent_override;
+    const Source = model_mod.ConcurrencySource;
+    const pick: struct { value: u32, source: Source } =
+        if (server_state.max_concurrent_flag) |v| .{ .value = v, .source = .flag } else if (config.max_concurrent_override) |v| .{ .value = v, .source = .model_key } else if (server_state.maxConcurrentFile()) |v| .{ .value = v, .source = .server_key } else .{ .value = 1, .source = .default };
     config.max_kv_tokens = config.max_kv_tokens_override orelse 0;
+    config.max_concurrent_source = pick.source;
     if (never_batches) {
-        if (given) |v| if (v > 1) log.info("[concurrency] {s} serves one request at a time: max_concurrent {d} is fixed at 1\n", .{ config.model_type, v });
+        if (pick.value > 1) log.info("[concurrency] {s} serves one request at a time: max_concurrent {d} ({s}) is fixed at 1\n", .{ config.model_type, pick.value, concurrencySourceText(pick.source) });
         config.max_concurrent = 1;
         return;
     }
-    const v = given orelse {
-        config.max_concurrent = 0;
-        return;
-    };
-    if (v > cap) log.info("[concurrency] {s}: max_concurrent {d} is above its {d}-row decode limit; serving {d}\n", .{ config.model_type, v, cap, cap });
-    config.max_concurrent = @min(v, cap);
+    if (pick.value > cap) log.info("[concurrency] {s}: max_concurrent {d} ({s}) is above its {d}-row decode limit; serving {d}\n", .{ config.model_type, pick.value, concurrencySourceText(pick.source), cap, cap });
+    config.max_concurrent = @min(pick.value, cap);
 }
 
 /// A saved `yarn_factor` the parse did not apply is ignored with this one line, never a refusal: the file outlives the arch it was saved for.
@@ -2037,7 +2046,7 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
             }
             entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
                 allocator,
-                if (ram_prefix_cache) prefix_cache_mod.unlimited_entries else 0,
+                if (ram_prefix_cache) config.max_concurrent else 0,
                 clamped_prefix_mem,
             );
             entry.prefix_cache.?.qsa_history_required = config.indexer_budget != 0 and !arch_config.fact(config, "latent_kv");
@@ -2047,6 +2056,7 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
             entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
             entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(config, "state_beside_kv");
         }
+        if (ram_prefix_cache) entry.prefix_cache.?.max_entries = config.max_concurrent;
         if (disk_tier) |tier| {
             entry.prefix_cache.?.disk = tier;
             // Published at attach: a model owns its namespace while it loads, before the publisher reads it ready.
@@ -3624,6 +3634,18 @@ test "attachPrefixCache: RAM beside the tier keeps the RAM cache and the legacy 
     try testing.expect(!hc.ssd_first);
 }
 
+test "attachPrefixCache: the RAM cache keeps as many conversations as the model's max_concurrent, and a reload takes the new count" {
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
+    try testing.expectEqual(@as(u32, 1), f.entry.prefix_cache.?.max_entries);
+
+    f.config.max_concurrent = 3;
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
+    try testing.expectEqual(@as(u32, 3), f.entry.prefix_cache.?.max_entries);
+}
+
 test "attachPrefixCache: a tier the resolver refuses is recorded as declined, and SSD-only then builds no cache" {
     const Refuse = struct {
         fn resolve(_: *model_mod.ModelConfig, _: []const u8, _: u64, _: bool) ?disk_placement.DefaultDiskBudget {
@@ -3854,27 +3876,37 @@ test "a model of no served arch is refused as such before any launch flag it can
     try testing.expect(std.mem.startsWith(u8, r.line, "model_type \"mistral\" is not served by this build ("));
 }
 
-test "model settings: max_concurrent is the launch flag, else the model key, else absent; a given value is held to the batch width, and a never-batching arch is fixed at 1" {
+test "model settings: max_concurrent is the launch flag, else the model key, else the saved server key, else 1; a value is held to the batch width, and a never-batching arch is fixed at 1" {
     const saved = server_state.max_concurrent_flag;
     defer server_state.max_concurrent_flag = saved;
+    defer server_state.setMaxConcurrentFile(server_state.maxConcurrentFile());
     server_state.max_concurrent_flag = null;
+    server_state.setMaxConcurrentFile(null);
 
     var qwen = ModelConfig{ .model_type = "qwen4_exp" };
     applyModelSettings(&qwen, .{});
-    try testing.expectEqual(@as(u32, 0), qwen.max_concurrent);
-    applyModelSettings(&qwen, .{ .max_concurrent = 4 });
-    try testing.expectEqual(@as(u32, 4), qwen.max_concurrent);
+    try testing.expectEqual(@as(u32, 1), qwen.max_concurrent);
+    try testing.expectEqual(model_mod.ConcurrencySource.default, qwen.max_concurrent_source);
 
-    // A resident DeepSeek load batches rows, so the config does not call it exclusive.
+    server_state.setMaxConcurrentFile(3);
+    applyModelSettings(&qwen, .{});
+    try testing.expectEqual(@as(u32, 3), qwen.max_concurrent);
+    try testing.expectEqual(model_mod.ConcurrencySource.server_key, qwen.max_concurrent_source);
+
+    applyModelSettings(&qwen, .{ .max_concurrent = 2 });
+    try testing.expectEqual(@as(u32, 2), qwen.max_concurrent);
+    try testing.expectEqual(model_mod.ConcurrencySource.model_key, qwen.max_concurrent_source);
+
+    // A model that owns its state only at runtime is not fixed by the config.
     try testing.expect(!arch_config.exclusiveDecode(&ModelConfig{ .model_type = "deepseek_v41" }));
     try testing.expect(arch_config.exclusiveDecode(&ModelConfig{ .model_type = "hy_v4_flash" }));
 
-    // An explicit launch flag outranks the model's key.
-    server_state.max_concurrent_flag = 6;
-    applyModelSettings(&qwen, .{ .max_concurrent = 4 });
-    try testing.expectEqual(@as(u32, 6), qwen.max_concurrent);
+    // An explicit launch flag outranks the model's key and the saved server key.
+    server_state.max_concurrent_flag = 4;
+    applyModelSettings(&qwen, .{ .max_concurrent = 2 });
+    try testing.expectEqual(@as(u32, 4), qwen.max_concurrent);
+    try testing.expectEqual(model_mod.ConcurrencySource.flag, qwen.max_concurrent_source);
 
-    // A model that owns its decode state at runtime is not fixed by the config.
     server_state.max_concurrent_flag = null;
     var ds = ModelConfig{ .model_type = "deepseek_v41" };
     applyModelSettings(&ds, .{ .max_concurrent = 4 });
@@ -3882,12 +3914,21 @@ test "model settings: max_concurrent is the launch flag, else the model key, els
     var hy4 = ModelConfig{ .model_type = "hy_v4_flash" };
     applyModelSettings(&hy4, .{ .max_concurrent = 8 });
     try testing.expectEqual(@as(u32, 1), hy4.max_concurrent);
+    applyModelSettings(&hy4, .{});
+    try testing.expectEqual(@as(u32, 1), hy4.max_concurrent);
 
-    // A model runs no more rows than its batched tick carries (qwen4 joins 8).
-    server_state.max_concurrent_flag = null;
+    // A model runs no more rows than its batched tick carries (qwen4 joins 8), whoever asked for more.
     var batched = ModelConfig{ .model_type = "qwen4_exp" };
     applyModelSettings(&batched, .{ .max_concurrent = 12 });
     try testing.expectEqual(@as(u32, 8), batched.max_concurrent);
+    server_state.setMaxConcurrentFile(12);
+    applyModelSettings(&batched, .{});
+    try testing.expectEqual(@as(u32, 8), batched.max_concurrent);
+    server_state.max_concurrent_flag = 12;
+    applyModelSettings(&batched, .{});
+    try testing.expectEqual(@as(u32, 8), batched.max_concurrent);
+    server_state.max_concurrent_flag = null;
+    server_state.setMaxConcurrentFile(null);
 
     // max_kv_tokens is the key alone; unset is no cap.
     applyModelSettings(&qwen, .{ .max_kv_tokens = 65_536 });

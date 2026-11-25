@@ -192,7 +192,7 @@ pub const Override = struct {
     /// The rows a static-bill load's prefill chunk is chosen within (`--prefill-chunk-max` / `--prefill-chunk-min`).
     prefill_chunk_max: ?u32 = null,
     prefill_chunk_min: ?u32 = null,
-    /// How many requests of this model run at once; null takes the launch `--max-concurrent`, else 1.
+    /// How many requests of this model run at once; null takes the launch `--max-concurrent`, else `server.max_concurrent`, else 1.
     max_concurrent: ?u32 = null,
     /// The most prompt + max_tokens this model's live and retained slots may hold; null/0 = no cap.
     max_kv_tokens: ?u64 = null,
@@ -360,7 +360,7 @@ pub fn warnRejected(section: []const u8, obj: std.json.ObjectMap, specs: []const
 pub const removed_model_keys = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "mtp_acceptance", .why = "MTP accepts drafts by the exact rule only" },
     .{ .name = "mtp_greedy_tail", .why = "MTP accepts drafts by the exact rule only" },
-    .{ .name = "prefix_cache_entries", .why = "the hot cache keeps as many finished conversations as its memory holds, never fewer than the model's max_concurrent; set prefix_cache_mem or max_kv_tokens" },
+    .{ .name = "prefix_cache_entries", .why = "the hot cache keeps as many finished conversations as the model's max_concurrent; set max_concurrent, and max_kv_tokens to bound its memory" },
 };
 
 /// Why `key` is no longer a setting; null when it never was one or still is.
@@ -530,6 +530,7 @@ pub const server_keys = [_]KeySpec{
     .{ .name = "max_request_mb", .kind = .int, .min = 1, .max = max_request_mb_limit },
     .{ .name = "wired_margin_gib", .kind = .int, .min = wired_margin_gib_min, .max = wired_margin_gib_max },
     .{ .name = "continue_after_thought", .kind = .bool },
+    .{ .name = "max_concurrent", .kind = .int, .min = 1, .max = sched_policy.MAX_BATCH_GROUP },
 };
 
 pub const server_section = "server";
@@ -883,6 +884,8 @@ pub const Server = struct {
     wired_margin_gib: ?u32 = null,
     /// Continue once a reply whose turn ends inside its thought; null = the file says nothing (on).
     continue_after_thought: ?bool = null,
+    /// Requests of one model that run at once, for every model without a `max_concurrent` of its own.
+    max_concurrent: ?u32 = null,
 };
 
 /// An automatic network look is on unless `--no-update-check` or the file turns it off.
@@ -936,6 +939,9 @@ pub fn server(self: *const Settings) Server {
     };
     if (sec.get("continue_after_thought")) |v| if (v == .bool) {
         out.continue_after_thought = v.bool;
+    };
+    if (sec.get("max_concurrent")) |v| if (v == .integer and v.integer >= 1 and v.integer <= sched_policy.MAX_BATCH_GROUP) {
+        out.max_concurrent = @intCast(v.integer);
     };
     return out;
 }
@@ -1028,6 +1034,7 @@ pub const LaunchLocks = struct {
     port: Lock = .{},
     wired_margin_gib: Lock = .{},
     continue_after_thought: Lock = .{},
+    max_concurrent: Lock = .{},
 
     pub fn model(self: *const LaunchLocks, name: []const u8) ?*const Lock {
         for (model_keys, 0..) |k, i| if (std.mem.eql(u8, k.name, name)) return &self.models[i];
@@ -1394,6 +1401,31 @@ test "model_settings: server.wired_margin_gib reads an integer from the lowest t
         try t.expectEqual(c.want, server(&file).wired_margin_gib);
         try t.expectEqual(c.want != null, if (validate(spec, file.parsed.?.value.object.get("server").?.object.get("wired_margin_gib").?)) true else |_| false);
     }
+}
+
+test "model_settings: server.max_concurrent reads a whole number from 1 to the batch width, the default of every model without its own" {
+    const t = std.testing;
+    for ([_]struct { value: []const u8, want: ?u32 }{
+        .{ .value = "1", .want = 1 },
+        .{ .value = "3", .want = 3 },
+        .{ .value = "0", .want = null },
+        .{ .value = "-1", .want = null },
+        .{ .value = "2.5", .want = null },
+        .{ .value = "\"4\"", .want = null },
+        .{ .value = std.fmt.comptimePrint("{d}", .{sched_policy.MAX_BATCH_GROUP}), .want = sched_policy.MAX_BATCH_GROUP },
+        .{ .value = std.fmt.comptimePrint("{d}", .{sched_policy.MAX_BATCH_GROUP + 1}), .want = null },
+    }) |c| {
+        const text = try std.fmt.allocPrint(t.allocator, "{{\"server\":{{\"max_concurrent\":{s}}}}}", .{c.value});
+        defer t.allocator.free(text);
+        var file = try parse(t.allocator, text);
+        defer file.deinit();
+        try t.expectEqual(c.want, server(&file).max_concurrent);
+        const spec = findKey(&server_keys, "max_concurrent").?;
+        try t.expectEqual(c.want != null, if (validate(spec, file.parsed.?.value.object.get("server").?.object.get("max_concurrent").?)) true else |_| false);
+    }
+    var model_only = try parse(t.allocator, "{\"/m/a\":{\"max_concurrent\":2}}");
+    defer model_only.deinit();
+    try t.expectEqual(@as(?u32, null), server(&model_only).max_concurrent);
 }
 
 test "model_settings: server.skip_mem_preflight is a boolean read from the file, off when absent or mistyped" {

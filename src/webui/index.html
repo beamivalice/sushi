@@ -1049,7 +1049,7 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     </section>
     <section class="card" id="requestCard" hidden>
       <div class="card-h">HTTP requests</div>
-      <div class="card-b"><div id="requestSet"></div></div>
+      <div class="card-b"><div id="requestSet"></div><div id="concurrentSet"></div></div>
     </section>
     <section class="card" id="repliesCard" hidden>
       <div class="card-h">Replies</div>
@@ -3850,7 +3850,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Lower it if a long prompt runs out of memory. It takes effect the next time the model loads.", "prefill chunk max (prefill_chunk_max)"],
     prefill_chunk_min: ["Narrowest prompt step (rows)", "The fewest tokens the model reads at once while it reads a prompt, for a step that does not fit wider. Equal to the widest, it pins every step.", "--prefill-chunk-min",
       "Raise it only when a prompt that fails to fit should be refused instead of read in smaller steps. It takes effect the next time the model loads.", "prefill chunk min (prefill_chunk_min)"],
-    max_concurrent: ["Requests at once", "How many requests of this model run at the same time. The next one waits in the queue until one finishes.", "--max-concurrent",
+    max_concurrent: ["Requests at once", "How many requests of this model run at the same time. The next one waits in the queue until one finishes. Empty uses the Requests at once value of the server settings.", "--max-concurrent",
       "One suits almost every model: a later request waits its turn. Raise it only when the model can answer several chats at once without slowing down. It takes effect the next time the model loads.", "max concurrent requests"],
     max_kv_tokens: ["Token budget for memory of past chats", "The most prompt and reply tokens this model may hold across its running requests and the conversations it keeps for reuse. Empty means no limit.", "",
       "Set it only to bound how much a long-lived server keeps for reuse. A request that would pass it waits; one larger than the whole budget is refused. It takes effect the next time the model loads.", "max KV tokens"],
@@ -3862,7 +3862,6 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   const defaultLabel = (m, spec) => {
     if (spec.name === "yarn_factor") return "Model default";
     if (spec.name === "max_kv_tokens" && !Number(m.defaults?.[spec.name] ?? 0)) return "No cap";
-    if (spec.name === "max_concurrent" && !Number(m.defaults?.[spec.name] ?? 0)) return "No limit";
     const v = m.defaults?.[spec.name];
     if (v == null) return "Default";
     if (spec.type === "bool") return `Default (${v ? "On" : "Off"})`;
@@ -3894,7 +3893,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     get cache() { return this.stores.cache.value; },
     // The cache's failure counts only while the page wants the cache.
     get error() { const e = this.stores.settings.error ?? (needCache() ? this.stores.cache.error : null); return e && adminErrorText(e); },
-    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, wiredText: null, requestText: null, marginText: null, serr: {}, timer: null, retry: null, tbody: "",
+    sel: null, auto: null, leaving: false, passNav: false, form: null, per: new Map(), cacheText: null, dirText: null, portText: null, wiredText: null, requestText: null, concurrentText: null, marginText: null, serr: {}, timer: null, retry: null, tbody: "",
     busy: new Set(), wsample: null, rates: new Map() };
   const per = (id) => { if (!A.per.has(id)) A.per.set(id, { texts: {}, errors: {}, refused: {}, moreOpen: null, saveError: "" }); return A.per.get(id); };
 
@@ -4538,6 +4537,17 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   requestRow.ctl.append(h("div", { class: "row-in" }, requestIn, h("span", { class: "muted", text: "MiB" }), requestSave), requestRow.bad);
   q("requestSet").replaceWith(requestRow.row);
 
+  // Every model's default for Requests at once; a model's own value outranks it, and --max-concurrent outranks both.
+  const concurrentSpec = (p) => ({ type: "int", min: p.min, max: p.max });
+  const concurrentRow = setRow("max_concurrent", "Requests at once", "concurrentN", "How many requests of one model run at the same time, for every model that has no value of its own.", keyTerm("max_concurrent", "max concurrent requests"));
+  const concurrentIn = h("input", { id: "concurrentN", type: "text", inputmode: "numeric", autocomplete: "off", placeholder: "Default (1)", "aria-label": "Requests of one model that run at once", oninput: () => { A.concurrentText = concurrentIn.value; typed("max_concurrent"); renderConcurrent(A.settings.server.max_concurrent); }, onkeydown: (e) => enterTo(concurrentSave)(e) });
+  const concurrentSave = h("button", { class: "btn sm primary", id: "concurrentSave", type: "button", text: "Save", onclick: () => {
+    const v = adminControlValue(concurrentSpec(A.settings.server.max_concurrent), concurrentIn.value);
+    if (v.ok) saveServer("max_concurrent", v.value, "Saved.", concurrentSave, "Saving…");
+  } });
+  concurrentRow.ctl.append(h("div", { class: "row-in" }, concurrentIn, concurrentSave), concurrentRow.hint, concurrentRow.bad);
+  q("concurrentSet").replaceWith(concurrentRow.row);
+
   // The on/off server keys: Default, On or Off. A file value of null is the default, shown as "Default (On)".
   const TOGGLE_KEYS = [
     ["update_check", "updateSet", "sushi releases", "Look for a newer sushi release on GitHub once a day. Off stops automatic checks; a check you start yourself still runs.", "When a newer sushi is out, a banner offers it. Nothing installs without you."],
@@ -4722,7 +4732,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
         const r = await postJson("/v1/settings", { server: { [key]: value } });
         typed(key);
         toast(typeof r.applied?.[key] === "string" && r.applied[key] ? sentence(r.applied[key]) : text);
-        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null; else if (key === "max_request_mb") A.requestText = null; else if (key === "wired_margin_gib") A.marginText = null;
+        if (key === "port") A.portText = null; else if (key === "prefix_cache_disk_gb") A.cacheText = null; else if (key === "max_request_mb") A.requestText = null; else if (key === "max_concurrent") A.concurrentText = null; else if (key === "wired_margin_gib") A.marginText = null;
         saved = true;
       } catch (e) { A.serr[key] = adminErrorText(e); }
     });
@@ -4749,6 +4759,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (c) renderCache(c, s.server.prefix_cache_disk_gb);
     if (s.server.port) renderPort(s.server.port);
     if (s.server.max_request_mb) renderRequestLimit(s.server.max_request_mb);
+    if (s.server.max_concurrent) renderConcurrent(s.server.max_concurrent);
     renderToggles(s.server);
   }
   function renderCache(c, gb) {
@@ -4856,6 +4867,22 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (!busy) setText(requestSave, text === "" ? "Use default" : "Save");
     setText(requestRow.bad, (dirty && text && !parsed.ok ? `Enter a whole number from ${p.min} to ${p.max} MiB.` : "") || A.serr.max_request_mb || "");
     requestIn.setAttribute("aria-invalid", String(!!requestRow.bad.textContent));
+  }
+  function renderConcurrent(p) {
+    const locked = !!p.locked, file = adminFileText(p.file), shown = locked ? adminFileText(p.flag) : file;
+    badges(concurrentRow.badge, p, p.applies);
+    if (A.concurrentText === shown) A.concurrentText = null;
+    if ((locked || A.concurrentText === null) && concurrentIn.value !== shown) concurrentIn.value = shown;
+    concurrentIn.placeholder = `Default (${p.default})`;
+    setText(concurrentRow.help, "How many requests of one model run at the same time; the next waits in the queue. A model's own value outranks it. One suits almost every model: raise it only when the model can answer several chats at once without slowing down. A model never runs more than its own batch width, and some run one at a time. It takes effect the next time each model loads.");
+    setText(concurrentRow.hint, locked ? flagHelp("max_concurrent", p.flag) : "");
+    const text = concurrentIn.value.trim(), parsed = adminControlValue(concurrentSpec(p), text), dirty = !locked && text !== file, busy = concurrentSave.getAttribute("aria-busy") === "true";
+    concurrentIn.disabled = locked;
+    setHidden(concurrentSave, !dirty);
+    concurrentSave.disabled = !dirty || !parsed.ok || busy;
+    if (!busy) setText(concurrentSave, text === "" ? "Use default" : "Save");
+    setText(concurrentRow.bad, (dirty && text && !parsed.ok ? `Enter a whole number from ${p.min} to ${p.max}.` : "") || A.serr.max_concurrent || "");
+    concurrentIn.setAttribute("aria-invalid", String(!!concurrentRow.bad.textContent));
   }
   function renderPort(p) {
     const locked = !!p.locked, file = adminFileText(p.file), shown = locked ? adminFileText(p.flag) : file;

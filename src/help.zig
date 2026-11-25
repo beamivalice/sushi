@@ -222,12 +222,14 @@ const shared =
     \\                        and turns the per-chunk adaptive width off. Outranks
     \\                        the model's prefill_chunk_min setting.
     \\  --max-concurrent <n>  How many requests of each model run at once, at
-    \\                        least 1 (default: no limit; a value you set is
-    \\                        held to the model's own batch width). The next
-    \\                        one waits in the queue until a slot frees. It
-    \\                        outranks the model's max_concurrent setting; a
-    \\                        model that owns its decode state always serves
-    \\                        one at a time.
+    \\                        least 1 (default: 1, or the settings file's
+    \\                        server max_concurrent; a value you set is held to
+    \\                        the model's own batch width). The next one waits
+    \\                        in the queue until a slot frees. It outranks the
+    \\                        model's own max_concurrent setting; a model that
+    \\                        owns its decode state always serves one at a
+    \\                        time. Each model's prefix cache keeps this many
+    \\                        conversations in RAM.
     \\  --prefill-decode-share <s>
     \\                      Target decode wall-time share during another
     \\                        request's prefill (0..0.9); never narrows

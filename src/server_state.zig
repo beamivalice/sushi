@@ -283,8 +283,23 @@ pub var ssm_checkpoint_max: u32 = 16;
 /// (handler refactor + per-connection threads), which the `serve()` startup
 /// guard checks before enabling.
 pub var max_concurrent: u32 = 1;
-/// `--max-concurrent` as given; null = the flag was not passed, so a model's own key (else 1) decides.
+/// `--max-concurrent` as given; null = the flag was not passed, so a model's own key, else the saved
+/// `server.max_concurrent`, else 1 decides.
 pub var max_concurrent_flag: ?u32 = null;
+
+const no_max_concurrent_file = std.math.maxInt(u32);
+var max_concurrent_file = std.atomic.Value(u32).init(no_max_concurrent_file);
+
+/// The saved `server.max_concurrent`, the default of every model without a key of its own; the settings API sets it
+/// while serving, and a load reads it.
+pub fn setMaxConcurrentFile(n: ?u32) void {
+    max_concurrent_file.store(n orelse no_max_concurrent_file, .monotonic);
+}
+
+pub fn maxConcurrentFile() ?u32 {
+    const n = max_concurrent_file.load(.monotonic);
+    return if (n == no_max_concurrent_file) null else n;
+}
 
 /// How far under the enforced wired limit a plan may reach: past the limit Metal returns
 /// zeros before an uncatchable abort, so a real transient's worth of margin stays unplanned.
