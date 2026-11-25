@@ -734,6 +734,18 @@ async function chartExtras(browser) {
     await context.close();
   }
   {
+    // A Hy4-Flash server drafts with DFly2, its own drafter: its rows name DFly2, never DSpark.
+    const zero = { requests: 0, rounds: 0, drafted: 0, accepted: 0, plain_rounds: 0 };
+    const specData = { speculative: { mtp: zero, dflash: zero, dspark: zero, dfly2: { requests: 2, rounds: 20, drafted: 100, accepted: 60, plain_rounds: 5, rows: { 1: 5, 4: 15 } } } };
+    const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData, storage: ALL_ON });
+    await page.waitForFunction(() => document.getElementById('dashSpecModes').textContent.includes('DFly2'), null, { timeout: 15000 });
+    const rows = (id) => page.evaluate((i) => [...document.querySelectorAll(`#${i} .hb`)].map((r) => [r.querySelector('span').textContent, r.querySelector('b').textContent]), id);
+    assert.deepEqual(await rows('dashSpecModes'), [['DFly2', '60%, 3.0 per round'], ['DFly2 rounds without a draft', '25%']], 'DFly2 acceptance under its own name');
+    assert.deepEqual(await rows('dashSpecRows'), [['1 token (no draft)', '5'], ['4 tokens', '15']], 'DFly2 rounds by tokens verified');
+    assert.deepEqual(errors, []);
+    await context.close();
+  }
+  {
     // An older server that exports no drafting counters is not read as one where nothing drafted.
     const { page, errors, context } = await openPage(browser, '/dashboard', { mode: 'advanced', storage: ALL_ON });
     await page.waitForFunction(() => /Live/.test(document.getElementById('dashStatus').textContent));
@@ -750,7 +762,7 @@ async function chartExtras(browser) {
     const { page, context } = await openPage(browser, '/dashboard', { mode: 'advanced', specData: { speculative: { mtp: zero, dflash: zero, dspark: zero } }, storage: ALL_ON });
     await page.waitForFunction(() => (window.__axis.dashCSpec ?? []).some((t) => /No request used speculative decoding/.test(t)));
     assert.equal(await textOf(page, 'dashSpecModes'), '', 'and draws no empty method rows');
-    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark round yet/);
+    assert.match(await textOf(page, 'dashSpecRows'), /No DSpark or DFly2 round yet/);
     await context.close();
   }
 }

@@ -3736,9 +3736,10 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         slot.enable_drafter,
         slot.dflash != null,
     );
-    // deepseek_v41's head is DSpark: no head cache, no hidden capture; the model holds its own state.
+    // A block drafter's head (DeepSeek's DSpark, Hy4-Flash's DFly2): no head cache, no hidden capture; the model holds
+    // its own state.
     const use_mtp = wiring.use_mtp;
-    const use_dspark = use_mtp and if (slot.mtp) |h| h.kind() == .dspark else false;
+    const use_dspark = use_mtp and if (slot.mtp) |h| h.kind().blockDrafter() else false;
     const use_head_mtp = use_mtp and !use_dspark;
     const use_dflash = wiring.use_dflash or sched.nativeDflashArmed(slot);
     log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{

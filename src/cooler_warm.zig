@@ -88,7 +88,7 @@ pub var bill_for_test: ?u64 = null;
 pub const Longest = struct { asked: u64, held: u64, bill: u64 };
 pub var longest_for_test: ?Longest = null;
 
-/// `drafter`: the load's drafter, if it drafts; a DSpark one drafts in its own rounds, as the scheduler arms it. The warm
+/// `drafter`: the load's drafter, if it drafts; a block drafter (DSpark, DFly2) drafts in its own rounds, as the scheduler arms it. The warm
 /// ends by recording its marker; a load whose manifest holds that marker skips the requests, and still refuses by name a
 /// load no chunk fits.
 pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?generate.MtpHeadRef) !void {
@@ -125,7 +125,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     else
         log.info("[warm] the widest chunk is {d} rows of {d}: headroom {d} MB\n", .{ chunk, top, headroom >> 20 });
     const longest: usize = @intCast(bills.warmLongestPrompt(c, chunk));
-    const drafts = if (drafter) |d| (if (d.kind() == .dspark) "DSpark" else "the MTP head") else "no drafter";
+    const drafts = if (drafter) |d| d.kind().label() else "no drafter";
     // A manifest that holds the marker of a warm that ran whole under this shape has every pipeline these requests
     // make, already made from it: they are skipped, the fit above still holds. A load with no manifest has no marker.
     const marker: ?[16]u8 = if (@import("arch/cooler_pipelines.zig").settledScope()) |scope| warmMarker(scope, c, drafter, chunk, top, longest, kv) else null;
@@ -139,7 +139,7 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
     // A repeated span: a model continues it, so its drafts are accepted and the round shapes acceptance unlocks (prompt
     // lookup, a two-chunk round) run in the long request.
     for (ids, 0..) |*t, i| t.* = @intCast((1000 + 7 * (i % 61)) % c.vocab_size);
-    const dspark = if (drafter) |d| d.kind() == .dspark else false;
+    const dspark = if (drafter) |d| d.kind().blockDrafter() else false;
     const spec: Spec = .{ .drafter = if (dspark) null else drafter, .dspark = dspark, .chunk = chunk };
     for (1..narrow_max + 1) |n| try request(io, a, xfm, ids[0..n], spec, .{ .temperature = 0 }, 2, 0);
     for (wide) |n| try request(io, a, xfm, ids[0..n], spec, .{ .temperature = 0 }, 2, 0);

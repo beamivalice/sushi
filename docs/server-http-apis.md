@@ -542,11 +542,11 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
     unload empties the model's cache, so `bytes` counts resident models only.
     `/metrics`: `sushi:token_cache_bytes`, `sushi:token_cache_hits_total`, `sushi:token_cache_misses_total`,
     `sushi:token_cache_evictions_total` ([server-tool-calling](server-tool-calling.md)).
-  - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...}}`, one object per drafting mode (MTP: Qwen and MiMo heads;
-    DFlash2: GLM; DSpark: DeepSeek) with `requests` (that ran a round), `rounds` (one verify forward each), `drafted`,
+  - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...},"dfly2":{...}}`, one object per drafting mode (MTP: Qwen
+    and MiMo heads; DFlash2: GLM; DSpark: DeepSeek; DFly2: Hy4-Flash, two unrelated drafters) with `requests` (that ran a round), `rounds` (one verify forward each), `drafted`,
     `accepted` (drafted tokens the verifier kept, not the always-committed first token of a round) and `plain_rounds`
-    (DSpark: rounds that carried one verifier row, already inside `rounds`; MTP: planner ticks that ran without a draft,
-    outside `rounds`; DFlash2: the same, GLM's ticks that ran without a draft, outside `rounds`). DSpark adds `rows`, `{<verifier rows>:
+    (DSpark and DFly2: rounds that carried one verifier row, already inside `rounds`; MTP: planner ticks that ran without a draft,
+    outside `rounds`; DFlash2: the same, GLM's ticks that ran without a draft, outside `rounds`). DSpark and DFly2 add `rows`, `{<verifier rows>:
     rounds}`. They are the sums of the figures `[spec-stats]` logs, added once when a request ends
     ([engine-mtp](engine-mtp.md)), also for a request that errors mid-decode (`finishSpecAtCleanup`, once: `Slot.spec_recorded`). Acceptance % is `accepted / drafted`, mean accepted per round `accepted / rounds`.
     MTP's figures include its prompt-lookup rounds (head + lookup), as DFlash2's do; the `[spec-stats]` `per_draft_pct`
@@ -808,8 +808,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   (the share of prompt tokens restored, cached vs computed tokens per request, requests that reused, hits by tier),
   storage (hot and SSD use, evictions per tier), writes by kind, request outcomes, response time (the average request as
   one bar of waiting, prefill and decode, then TTFT and end-to-end per bucket), prompt and output length side by side per
-  bucket, serial-decode reasons and DSpark rows per round. The draft acceptance card is one dot per request whose log row
-  carries `spec`, with a row per drafting mode under it (acceptance and mean accepted per round, DSpark plain-round
+  bucket, serial-decode reasons and the block drafters' (DSpark, DFly2) rows per round. The draft acceptance card is one dot per request whose log row
+  carries `spec`, with a row per drafting mode under it (acceptance and mean accepted per round, DSpark and DFly2 plain-round
   share); the dots alone say when nothing drafted or the server does not report it. Each bar row prints its exact value and has a tip (`data-tip` text). A card's bar
   rows (and the cached-vs-computed columns) are one Tab stop the arrow keys, Home and End walk; a poll that changes them
   updates the same nodes when the content keeps its shape, else hands the focus to the same place (`setHtml`, `rove`). A histogram takes the focus and the arrow keys step its buckets.
@@ -823,7 +823,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   down (config mode): tick charts on or off, Reset, Done. While it is open each chart shows a strip: drag it onto another
   chart (pointer events, so a finger works too; `touch-action: none` on the strip) or use its arrow buttons, which keep
   the focus ([server-webui](server-webui.md#dashboard-config-mode)). The choice is `localStorage` `sushi-dash:charts` (`{order, hidden}`), a browser preference and no server
-  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all but DSpark rows per round.
+  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all but the block drafters' rows per round.
   A stored choice that names a card since merged (`memsplit`, `specmodes`, `cachetok`, `ttft`, `e2e`, `ptok`, `otok`)
   reads as the card that replaced it, at the first place of any of its parts, hidden only when all of them were; the
   migrated choice is stored back (`migrateLayout`). The hot tier's bytes are

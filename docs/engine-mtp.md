@@ -29,8 +29,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [qwen4-arch](qwen4-arch.md
 ## The drafter seam
 
 - `Drafter` (`generate.MtpHeadRef`) wraps a union the registry builds: one prong per registered arch whose
-  `drafter` declares a `Head` (Flash-Next's in-checkpoint head, MiMo's trained heads, DeepSeek's DSpark, which has
-  no head to step). `Drafter.Cache` (`MtpCacheRef`) is the per-request committed history of the arches that
+  `drafter` declares a `Head` (Flash-Next's in-checkpoint head, MiMo's trained heads, and the block drafters, DeepSeek's
+  DSpark and Hy4-Flash's DFly2, unrelated drafters with no head to step). `Drafter.Cache` (`MtpCacheRef`) is the per-request committed history of the arches that
   declare a `Cache`. Each operation (`forward`, `appendHistory`, `canRerankDrafts`, `draftSelect`, `draftShortlist`,
   `costProfile`, `evSeed`, `setEvSeed`, `moduleOwned`, `makeCache`, `destroyHead`) is answered by the arch's
   `src/<arch>/<arch>_drafter.zig`, published as `drafter` in its `arch.zig`; an operation the module omits has the

@@ -11,8 +11,8 @@ const hy4_dfly = @import("hy4_dfly.zig");
 const Trunk = trunk_mod.Trunk;
 const ForwardCtx = trunk_mod.ForwardCtx;
 
-pub const kinds = [_]spec_types.Kind{.dspark};
-pub const head_kind: spec_types.Kind = .dspark;
+pub const kinds = [_]spec_types.Kind{.dfly2};
+pub const head_kind: spec_types.Kind = .dfly2;
 
 /// DFly2 drafts over the model's own state, so a request that drafts with it holds the model exclusively.
 pub const Head = *Trunk;

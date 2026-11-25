@@ -15,9 +15,30 @@ pub const RoundOpts = struct {
     max_mtp_ctx: u32 = 0,
 };
 
-/// How an arch drafts. `mtp` and `dspark` run from a `Drafter` head; `dflash2` runs from the generator's block
-/// drafter state.
-pub const Kind = enum { mtp, dspark, dflash2 };
+/// How an arch drafts, each its own drafter: `mtp` (Qwen's and MiMo's heads), `dspark` (DeepSeek's DSpark) and `dfly2`
+/// (Hy4-Flash's DFly2) run from a `Drafter` head; `dflash2` (GLM's DFlash2) from the generator's block drafter state.
+/// DSpark and DFly2 are unrelated drafters that share only the generic block rounds (`blockDrafter`).
+pub const Kind = enum {
+    mtp,
+    dspark,
+    dfly2,
+    dflash2,
+
+    /// Drafts a block from the pending token and verifies it in the shared drafter rounds.
+    pub fn blockDrafter(k: Kind) bool {
+        return k == .dspark or k == .dfly2;
+    }
+
+    /// The drafter's name in a log line.
+    pub fn label(k: Kind) []const u8 {
+        return switch (k) {
+            .mtp => "the MTP head",
+            .dspark => "DSpark",
+            .dfly2 => "DFly2",
+            .dflash2 => "DFlash2",
+        };
+    }
+};
 
 /// A scalar in the array's own dtype, so a masked bf16 block is not widened to
 /// f32 by its own `-inf`.

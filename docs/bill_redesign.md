@@ -820,7 +820,7 @@ history.
     to 600, then denser to sparser to 8,200, either side of each power of two to 1M, 100 seeded) replays against it
     with no miss. On the release pack, the bytes to 8,192 positions. Both were one-off runs; their env-gated cells,
     which no gate set, are gone.
-- As built, verify (stage 3b): a load that drafts plans a DSpark round's block of 2 to `verify_rows_max` (8) rows,
+- As built, verify (stage 3b): a load that drafts plans a DFly2 round's block of 2 to `verify_rows_max` (8) rows,
   every row read out and the handover kept (`hy4_plan.verifyRoot`); a wider round is a prefill block, on the pool, and
   its term stays in the request bill until stage 4. A block's probes are candidates either side of every edge its
   layers' keys turn at (a block's own split count, the window's second wrap, the end's last window), and of those that
@@ -843,7 +843,7 @@ history.
   - A dry recording's host asks of 64 KB or more take zeroed pages, backed only as touched, and a dry `zeros` writes
     nothing: every probe had zeroed the state reserved for the whole reach twice. The release's build went from
     50.5 s to 2.0 s.
-- As built, the rest of a DSpark round (D40 to D43): its mark and its rollback's replay. Measured on the STQ tiny past
+- As built, the rest of a DFly2 round (D40 to D43): its mark and its rollback's replay. Measured on the STQ tiny past
   the seal (`core.closePool(.census)`), a round asked the pool 16 times for its mark and 348 for its rollback.
   - The mark is storage-owned (D40): `Model.mark` copies each sliding layer's ring, each sparse layer's open block
     (whole, its rows a count) and the handover into the model's mark blocks (`mark_fixed`, `mark_hidden`), in place;
@@ -903,7 +903,7 @@ history.
   at the seal for Hy4.
   - As built, sample (D24, `hy4flash/hy4_sample_plan.zig`): every draw of a served request, from the logits to its token,
     is one execution of a root keyed by its mix (`sampler.Mix`, D34). The seam is `arch/cooler.zig` `Sample`: the
-    generator (`Generator.sampleMasked`, `sampleSync`, the first token, a forced token's logprobs) and DSpark's verdict
+    generator (`Generator.sampleMasked`, `sampleSync`, the first token, a forced token's logprobs) and DFly2's verdict
     (`dspark_round.sampleVerdict`) begin a sample with its mix, run the shared sampler, and end it; an arch that declares
     `sampleBegin` answers, every other load samples as before. A step's token outlives its execution in one of two
     token blocks written in turn (D36). The load records each mix it can take dry (`mixes`: 1,233 at the release, two
@@ -937,7 +937,7 @@ history.
     encode probes, 43 roots, the build 2.36 s to 2.57 s; the arena 72.7 MB to 2.44 GiB (scratch 2.39 GiB, host ring
     27.3 MB x 2).
   - As built, the close (D57 to D63; `hy4flash/hy4_close_test.zig`): past the seal, under `core.closePool(.census)`,
-    served text requests on the STQ tiny (greedy, sampled, logprobs and penalties, DSpark greedy and sampled), an image
+    served text requests on the STQ tiny (greedy, sampled, logprobs and penalties, DFly2 greedy and sampled), an image
     request on the BF16 tiny (its encode into Media and its prompt) and a scheduler restore from the live record each
     give the plans-off tokens and ask the pool nothing outside the named sites (D63). Not yet closed: a RAM entry's
     restore in the served path, and Metal's bytes: a restore request's prefill tail on the pool moved the engine's
@@ -946,7 +946,7 @@ history.
     forward's cap never overwrites): `warmEnded` sets it to `.refuse` for a load that serves on its plans (an arch's
     `arch/cooler.zig` `plansForwards`: an arch on the ledger), a turn of that model (`turnToModel`) puts it in force, and every turn's end
     gives back the gate it found; a turn of MLX's side, of another model or of no model runs open, so other archs in the
-    process keep their pool (D17). The open sites are D63's, and a DSpark verdict wider than a verify block
+    process keep their pool (D17). The open sites are D63's, and a DFly2 verdict wider than a verify block
     (`hy4_sample_plan.begin`, a forced width) draws in a wide phase of its own. A warm opens its load's gate until its
     seal (`arch_cooler.warmBegins`), so a test that warms a sealed load again runs its warm as the first. A test's
     plans-off arm opens the pool by `widePhase` for that arm; a test that drives a load's internals past its seal
@@ -1243,7 +1243,7 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   (`generate.idsArray`: a prefill chunk's, the last prompt row's, a serial draw's next token, a forced or spec-exit
   token's) are written into it in place by the host (`arch_cooler.forwardIds`, `Model.idsInput`) and handed to the
   forward as a view; a wider input is refused by name (`Hy4IdsPastBlock`). Every other load makes its own array as
-  before. A DSpark round's blocks are Hy4's own host ids and ask nothing.
+  before. A DFly2 round's blocks are Hy4's own host ids and ask nothing.
 - **D63. The pool's open sites past Hy4's seal are named**: a forward no root holds (`hy4_plan.unplanned`: a prefill
   chunk, an image's splice, a round wider than a verify block, a request at another KV width) and the request's state
   reservation (`Model.reserveFor`, the state owner's own, billed with the request) each open it by `core.widePhase()`.
@@ -1251,7 +1251,7 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
 - **D64. The pool closes per model's turn** (stage 4c, the coordinator's): a load that plans gets `.refuse` when its
   turn begins and the previous gate back at `Turn.end`; the gate lives in the model's turn slot, set at its seal
   (`arch_cooler.warmEnded`). The open sites stay named: D63's (`hy4_plan.unplanned`, `Model.reserveFor`, the state
-  allocated at admission and billed on the ledger's state line) and a DSpark verdict wider than a verify block.
+  allocated at admission and billed on the ledger's state line) and a DFly2 verdict wider than a verify block.
 - **D65. A restore from SSD reads into the request's state, no array made** (stage 4c, closing D54): the tier hands each
   tensor of a point's file and of its row segments to its caller with the row it starts at, and Hy4 writes it into the
   block that holds it, reserved at the request's end before the lookup (D61). No staging copy and no segment join at any

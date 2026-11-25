@@ -1,16 +1,27 @@
 //! Speculative-decoding totals the metrics endpoints export: per drafting mode, the rounds run, tokens
-//! drafted and accepted, rounds that drafted nothing, and (DSpark) how many verifier rows each round
+//! drafted and accepted, rounds that drafted nothing, and (a block drafter) how many verifier rows each round
 //! carried. They are the sums of the per-request figures `[spec-stats]` logs, added once when a request
 //! ends, so the decode loop pays nothing. One `process` for the server; counting does not need `--metrics`.
 
 const std = @import("std");
 
-/// What drafted for a request: DeepSeek's DSpark, the MTP heads (Qwen, MiMo), or DFlash2 (GLM).
-pub const Mode = enum { none, dspark, mtp, dflash };
+/// What drafted for a request: DeepSeek's DSpark, Hy4-Flash's DFly2, the MTP heads (Qwen, MiMo), or DFlash2 (GLM).
+pub const Mode = enum {
+    none,
+    dspark,
+    mtp,
+    dflash,
+    dfly2,
+
+    /// A block drafter's mode (DSpark, DFly2): its rounds keep the verifier rows they carried.
+    pub fn block(m: Mode) bool {
+        return m == .dspark or m == .dfly2;
+    }
+};
 const exported = @typeInfo(Mode).@"enum".field_names[1..];
 const mode_count = exported.len;
 
-/// Verifier rows a round can carry: the largest DSpark draft plus the always-committed token, plus a zero bucket.
+/// Verifier rows a round can carry: the largest block draft plus the always-committed token, plus a zero bucket.
 pub const rows_cap = 18;
 
 /// One request's speculative figures.
@@ -20,7 +31,7 @@ pub const Totals = struct {
     drafted: u64 = 0,
     /// Drafted tokens the verifier kept; the always-committed first token of a round is not counted.
     accepted: u64 = 0,
-    /// DSpark: rounds with one verifier row (inside `rounds`). MTP: planner ticks that ran without a draft (outside it).
+    /// A block drafter: rounds with one verifier row (inside `rounds`). MTP: planner ticks that ran without a draft (outside it).
     plain: u64 = 0,
 
     pub fn acceptance(self: Totals) f64 {
@@ -157,7 +168,8 @@ test "the Prometheus and JSON renderings carry every counter of every mode" {
     var snap: Snapshot = .{};
     for (&snap.modes, 1..) |*m, i| m.* = .{ .requests = i, .rounds = 10 * i, .drafted = 100 * i, .accepted = 1000 * i, .plain = 7 * i };
     snap.modes[@intFromEnum(Mode.dspark) - 1].rows[3] = 42;
-    var buf: [4096]u8 = undefined;
+    snap.modes[@intFromEnum(Mode.dfly2) - 1].rows[5] = 9;
+    var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     try writePrometheus(snap, &w);
     const prom = w.buffered();
@@ -168,9 +180,12 @@ test "the Prometheus and JSON renderings carry every counter of every mode" {
         "sushi:spec_accepted_tokens_total{mode=\"mtp\"} 2000\n",
         "sushi:spec_plain_rounds_total{mode=\"dspark\"} 7\n",
         "sushi:spec_rows_total{mode=\"dspark\",rows=\"3\"} 42\n",
+        // Hy4-Flash's DFly2 under its own mode, never DSpark's.
+        "sushi:spec_requests_total{mode=\"dfly2\"} 4\n",
+        "sushi:spec_rows_total{mode=\"dfly2\",rows=\"5\"} 9\n",
     }) |want| try testing.expect(std.mem.indexOf(u8, prom, want) != null);
     try testing.expect(std.mem.indexOf(u8, prom, "rows=\"2\"") == null);
-    var json_buf: [2048]u8 = undefined;
+    var json_buf: [4096]u8 = undefined;
     var jw: std.Io.Writer = .fixed(&json_buf);
     try jw.writeAll("{");
     try writeJson(snap, &jw);
@@ -185,6 +200,7 @@ test "the Prometheus and JSON renderings carry every counter of every mode" {
     try testing.expectEqual(@as(i64, 14), mtp.get("plain_rounds").?.integer);
     try testing.expect(mtp.get("rows") == null);
     try testing.expectEqual(@as(i64, 42), spec.get("dspark").?.object.get("rows").?.object.get("3").?.integer);
+    try testing.expectEqual(@as(i64, 9), spec.get("dfly2").?.object.get("rows").?.object.get("5").?.integer);
 }
 
 test "proposed: the counted drafts when there are any, else the rounds at their cap" {

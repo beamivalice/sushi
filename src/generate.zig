@@ -864,7 +864,7 @@ pub const Generator = struct {
 
     /// The mode `logSpecStats` reports: the first that drafted.
     pub fn specMode(self: *const Generator) SpecMode {
-        if (self.dspark and self.dspark_stats.rounds > 0) return .dspark;
+        if (self.dspark and self.dspark_stats.rounds > 0) return if (drafter.Drafter.blockKindOf(self.xfm) == .dfly2) .dfly2 else .dspark;
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) return .mtp;
         if (self.dflash != null and self.dflash_attempted > 0) return .dflash;
         return .none;
@@ -874,7 +874,7 @@ pub const Generator = struct {
     pub fn specTotals(self: *const Generator) spec_stats.Totals {
         return switch (self.specMode()) {
             .none => .{},
-            .dspark => .{ .rounds = self.dspark_stats.rounds, .drafted = self.dspark_stats.drafted, .accepted = self.dspark_stats.accepted, .plain = self.dspark_stats.plain },
+            .dspark, .dfly2 => .{ .rounds = self.dspark_stats.rounds, .drafted = self.dspark_stats.drafted, .accepted = self.dspark_stats.accepted, .plain = self.dspark_stats.plain },
             // A prompt-lookup round is a verify forward too; `[spec-stats]` prints it apart, as `lookup=`.
             .mtp => .{
                 .rounds = self.mtp_attempted + self.mtp_lookup_rounds,
@@ -895,10 +895,10 @@ pub const Generator = struct {
         return spec_stats.proposed(self.mtp_drafted_tokens, self.mtp_attempted, self.mtp_depth);
     }
 
-    /// Rounds by verifier rows, for the modes that keep it (DSpark).
+    /// Rounds by verifier rows, for the modes that keep it (the block drafters).
     pub fn specRows(self: *const Generator) []const u32 {
         comptime std.debug.assert(@typeInfo(@FieldType(@FieldType(Generator, "dspark_stats"), "rows_hist")).array.len <= spec_stats.rows_cap);
-        return if (self.specMode() == .dspark) &self.dspark_stats.rows_hist else &.{};
+        return if (self.specMode().block()) &self.dspark_stats.rows_hist else &.{};
     }
 
     pub fn logSpecStats(self: *const Generator) void {
@@ -906,7 +906,7 @@ pub const Generator = struct {
         var lookup_buf: [256]u8 = undefined;
         const mode = self.specMode();
         logEngineStats();
-        if (mode == .dspark) {
+        if (mode.block()) {
             const st = self.dspark_stats;
             const rounds: f64 = @floatFromInt(st.rounds);
             const round_ms = @as(f64, @floatFromInt(st.draft_ns + st.verify_ns)) / rounds / 1e6;
@@ -915,8 +915,9 @@ pub const Generator = struct {
             var rows_w = std.Io.Writer.fixed(&rows_buf);
             for (st.rows_hist, 0..) |n, r| if (n > 0) rows_w.print("{s}{d}:{d}", .{ if (rows_w.end > 0) "," else "", r, n }) catch break;
             log.info(
-                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% drafted={d} draft_ms={d:.1} verify_ms={d:.1} round_ms={d:.1} tok_s={d:.2} plain={d} rows={s}\n",
+                "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% drafted={d} draft_ms={d:.1} verify_ms={d:.1} round_ms={d:.1} tok_s={d:.2} plain={d} rows={s}\n",
                 .{
+                    @tagName(mode),
                     st.rounds,
                     st.accepted,
                     per_round,
@@ -930,8 +931,8 @@ pub const Generator = struct {
                     rows_w.buffered(),
                 },
             );
-            if (st.copy_rounds > 0) log.info("  [spec-stats] mode=dspark copy_rounds={d} copy_drafted={d} copy_accepted={d}\n", .{ st.copy_rounds, st.copy_drafted, st.copy_accepted });
-            if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
+            if (st.copy_rounds > 0) log.info("  [spec-stats] mode={s} copy_rounds={d} copy_drafted={d} copy_accepted={d}\n", .{ @tagName(mode), st.copy_rounds, st.copy_drafted, st.copy_accepted });
+            if (self.sampling.constraint != null) log.info("  [spec-stats] mode={s} grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @tagName(mode), @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
             return;
         }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());

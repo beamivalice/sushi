@@ -944,12 +944,12 @@ details.more-set > summary { cursor: pointer; padding: var(--s3) 0 var(--s1) var
     <div class="card chart" data-chart="memory"><h2><span class="tip-u" tabindex="0" data-term="process footprint: MLX active, MLX cache, other" data-tip="Memory sushi held over time, split into what is in use (the model and its working memory), freed memory kept as a reusable cache, and the rest. The top edge is all of it; the dashed line is the machine's memory. Close to the line, long requests may be refused.">Memory (GiB)</span><span class="legend"><span><i style="background:var(--c2)"></i>in use</span><span><i style="background:var(--c4)"></i>reusable cache</span><span><i style="background:var(--c1)"></i>other</span><span style="color:var(--text-2)"><i class="dash"></i><span id="dashCmCeilL">machine memory</span></span></span></h2><canvas id="dashCMem" role="img" aria-label="Memory split into in use, reusable cache and other"></canvas></div>
     <div class="card chart" data-chart="cachereuse"><h2><span class="tip-u" tabindex="0" data-term="prefix cache reuse: restored (hit) vs computed (prefill) prompt tokens, hits by tier" data-tip="How much prompt text came from the prompt cache instead of being read again. Each column is a recent request: the part reused from the cache (fast) under the part the model read now.">Prompt cache reuse</span><span class="legend"><span><i style="background:var(--c2)"></i>reused from cache</span><span><i style="background:var(--c1)"></i>read now</span></span></h2><div class="vis reuse" id="dashReuse"><div class="hero" id="dashReuseHero" tabindex="0">-</div><div class="stk" id="dashStk"></div><div class="foot" id="dashStkFoot">&nbsp;</div><div class="hbs" id="dashReuseBars"></div></div></div>
     <div class="card chart" data-chart="cachetiers"><h2><span class="tip-u" tabindex="0" data-term="prefix cache storage: hot (memory) and SSD tiers, evictions" data-tip="How full the cache is in memory and on the SSD, the free disk space, and how many saved conversations were dropped to make room.">Prompt cache storage</span><span class="sub">memory and SSD</span></h2><div class="vis" id="dashTiers"></div><div class="foot" id="dashTiersFoot">&nbsp;</div></div>
-    <div class="card chart" data-chart="specaccept"><h2><span class="tip-u" tabindex="0" data-term="draft acceptance (speculative decoding): accepted / drafted, per request and per mode (MTP, DFlash2, DSpark)" data-tip="To generate faster, the model drafts a few tokens ahead and verifies them in one step (speculative decoding). Each dot is the share of drafted tokens one request kept; each row below is a drafting method since the server started. Higher means faster generation.">Draft acceptance</span><span class="sub">one point per request that drafted</span></h2><canvas id="dashCSpec" role="img" aria-label="Share of drafted tokens each request kept"></canvas><div class="hbs" id="dashSpecModes"></div><div class="foot" id="dashSpecModesFoot">&nbsp;</div></div>
+    <div class="card chart" data-chart="specaccept"><h2><span class="tip-u" tabindex="0" data-term="draft acceptance (speculative decoding): accepted / drafted, per request and per mode (MTP, DFlash2, DSpark, DFly2)" data-tip="To generate faster, the model drafts a few tokens ahead and verifies them in one step (speculative decoding). Each dot is the share of drafted tokens one request kept; each row below is a drafting method since the server started. Higher means faster generation.">Draft acceptance</span><span class="sub">one point per request that drafted</span></h2><canvas id="dashCSpec" role="img" aria-label="Share of drafted tokens each request kept"></canvas><div class="hbs" id="dashSpecModes"></div><div class="foot" id="dashSpecModesFoot">&nbsp;</div></div>
     <div class="card chart" data-chart="length"><h2><span class="tip-u" tabindex="0" data-term="prompt_tokens and output_tokens histograms" data-tip="How many requests sent a prompt, and generated tokens (thinking included), of each length, since the server started. A token is about three quarters of a word.">Prompt and generated length</span><span class="legend"><span><i style="background:var(--c2)"></i>prompt</span><span><i style="background:var(--c1)"></i>generated</span></span></h2><div class="vis"><div class="hist" id="dashHLen" tabindex="0" role="img" aria-label="Requests per length bucket, prompt and generated. The arrow keys step through the buckets."></div><div class="histlabels" id="dashHlLen"></div></div><div class="foot" id="dashLenFoot">&nbsp;</div></div>
     <div class="card chart" data-chart="outcomes"><h2><span class="tip-u" tabindex="0" data-term="requests_success_total, cancelled, failed, rejected" data-tip="How requests ended since the server started: answered, cancelled, failed or refused.">Request outcomes</span><span class="sub">since the server started</span></h2><div class="vis" id="dashOutcomes"></div></div>
     <div class="card chart" data-chart="serial"><h2><span class="tip-u" tabindex="0" data-term="serial decode reasons (decode_serial)" data-tip="Sushi can answer several requests in one shared pass (batching). These are the reasons a request was not batched and took its own pass instead, which is slower when many are running.">Why requests weren't batched</span><span class="sub">steps a request ran alone while others ran</span></h2><div class="vis" id="dashSerial"></div></div>
     <div class="card chart" data-chart="cachewrites"><h2><span class="tip-u" tabindex="0" data-term="prefix cache writes (SSD)" data-tip="How much the cache has written to the SSD, by kind of data.">Prompt cache writes</span><span class="sub">SSD, since the server started</span></h2><div class="vis" id="dashWrites"></div><div class="foot" id="dashWritesFoot">A file written again counts again; this does not measure SSD wear.</div></div>
-    <div class="card chart" data-chart="specrows"><h2><span class="tip-u" tabindex="0" data-term="verifier rows per round (DSpark)" data-tip="For DSpark: how many tokens each verification round covered. One is the model's own next token; each extra one is a drafted token.">Tokens verified per round</span><span class="sub">DSpark, rounds by tokens verified</span></h2><div class="vis" id="dashSpecRows"></div></div>
+    <div class="card chart" data-chart="specrows"><h2><span class="tip-u" tabindex="0" data-term="verifier rows per round (DSpark, DFly2)" data-tip="For DSpark and DFly2: how many tokens each verification round covered. One is the model's own next token; each extra one is a drafted token.">Tokens verified per round</span><span class="sub">DSpark and DFly2, rounds by tokens verified</span></h2><div class="vis" id="dashSpecRows"></div></div>
     <div class="card chart" data-chart="experts"><h2><span class="tip-u" tabindex="0" data-term="expert cache hits (streamed experts)" data-tip="For a model that streams its experts from the SSD: how often a routed expert was already in memory, and what reading the rest cost.">Expert streaming</span><span class="sub">routed experts, since the server started</span></h2><div class="vis" id="dashExperts"></div><div class="foot" id="dashExpertsFoot">Counts each layer's distinct experts once per forward.</div></div>
   </section>
   </div>
@@ -5273,7 +5273,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     if (on('cachereuse')) { stacked(); reuse(c, tc); }
     if (on('cachetiers')) tiers(d.sessions || [], tc);
     if (on('specaccept')) specModes(d.speculative);
-    if (on('specrows')) specRows(d.speculative && (d.speculative.dspark?.rows || {}));
+    if (on('specrows')) specRows(d.speculative && blockRows(d.speculative));
     if (on('cachewrites')) {
       const share = v => writes.total ? ` (${fmt(100 * v / writes.total, 0)}%)` : '';
       const rows = writes ? [...Object.entries(writes.kinds).map(([k, v]) => [WRITE_KINDS[k] || k, v, bytes(v), '--c4', tip(WRITE_KINDS[k] || k, [['Written', bytes(v) + share(v)]], 'Bytes the prompt cache wrote to the SSD for this kind since the server started.', WRITE_TERMS[k])]),
@@ -5356,7 +5356,11 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     put($('tiers-foot'), t.cap ? cacheVolumeText(t.volume) : '');
   }
 
-  const SPEC_MODES = [['mtp', 'MTP'], ['dflash', 'DFlash2'], ['dspark', 'DSpark']];
+  const SPEC_MODES = [['mtp', 'MTP'], ['dflash', 'DFlash2'], ['dspark', 'DSpark'], ['dfly2', 'DFly2']];
+  // The block drafters, each its own model's: DeepSeek's DSpark, Hy4-Flash's DFly2.
+  const BLOCK_MODES = [['dspark', 'DSpark'], ['dfly2', 'DFly2']];
+  // The verifier rows of the block drafter that ran, else the first one's (empty).
+  const blockRows = (sp) => (BLOCK_MODES.map(([k]) => sp[k]).find((m) => m?.rounds) || sp.dspark)?.rows || {};
   // Share of drafted tokens the verifier kept, per drafting mode, with the mean it accepted per round.
   function specModes(sp) {
     if (!sp) { setHtml($('spec-modes'), ''); put($('spec-modes-foot'), ''); return; }
@@ -5366,8 +5370,10 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const acc = m.drafted ? m.accepted / m.drafted : 0, per = m.accepted / m.rounds;
       rows.push([name, acc, `${fmt(100 * acc, 0)}%, ${fmt(per, 1)} per round`, '--c3', { t: name, rows: [['Acceptance', `${fmt(100 * acc, 1)}%`], ['Accepted / drafted', `${fmtInt(m.accepted)} / ${fmtInt(m.drafted)}`], ['Rounds', fmtInt(m.rounds)], ['Kept per round', fmt(per, 2)], ['Requests', fmtInt(m.requests)]], h: 'Drafted tokens the model kept after verifying them. Each round also writes one token of its own, which is not counted here.', term: `${k} draft acceptance (accepted / drafted, per round)` }]);
     }
-    const ds = sp.dspark;
-    if (ds?.rounds) rows.push(['DSpark rounds without a draft', ds.plain_rounds / ds.rounds, `${fmt(100 * ds.plain_rounds / ds.rounds, 0)}%`, '--warn', { t: 'DSpark rounds without a draft', rows: [['Without a draft / rounds', `${fmtInt(ds.plain_rounds)} / ${fmtInt(ds.rounds)}`]], h: 'Rounds that wrote one token the normal way, with no draft to verify.', term: 'plain_rounds (rounds without a draft)' }]);
+    for (const [k, name] of BLOCK_MODES) {
+      const ds = sp[k];
+      if (ds?.rounds) rows.push([`${name} rounds without a draft`, ds.plain_rounds / ds.rounds, `${fmt(100 * ds.plain_rounds / ds.rounds, 0)}%`, '--warn', { t: `${name} rounds without a draft`, rows: [['Without a draft / rounds', `${fmtInt(ds.plain_rounds)} / ${fmtInt(ds.rounds)}`]], h: 'Rounds that wrote one token the normal way, with no draft to verify.', term: 'plain_rounds (rounds without a draft)' }]);
+    }
     if (rows.length) bars('spec-modes', rows, '', 1); else setHtml($('spec-modes'), ''); // the chart above says nothing drafted
     const mtp = sp.mtp;
     put($('spec-modes-foot'), mtp?.plain_rounds ? `MTP: ${fmtInt(mtp.plain_rounds)} rounds ran without a draft.` : '');
@@ -5375,7 +5381,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   function specRows(rows) {
     if (!rows) { bars('spec-rows', [], NOT_REPORTED); return; }
     const list = Object.entries(rows).map(([r, n]) => [+r, n]).sort((a, b) => a[0] - b[0]), total = list.reduce((a, [, n]) => a + n, 0);
-    bars('spec-rows', list.map(([r, n]) => [r === 1 ? '1 token (no draft)' : `${r} tokens`, n, fmtInt(n), '--c4', { t: r === 1 ? '1 token verified (no draft)' : `${r} tokens verified`, rows: [['Rounds', `${fmtInt(n)} (${fmt(100 * n / total, 0)}%)`]], h: "One token is the model's own; every extra one is a drafted token being verified.", term: 'verifier rows per round' }]), 'No DSpark round yet');
+    bars('spec-rows', list.map(([r, n]) => [r === 1 ? '1 token (no draft)' : `${r} tokens`, n, fmtInt(n), '--c4', { t: r === 1 ? '1 token verified (no draft)' : `${r} tokens verified`, rows: [['Rounds', `${fmtInt(n)} (${fmt(100 * n / total, 0)}%)`]], h: "One token is the model's own; every extra one is a drafted token being verified.", term: 'verifier rows per round' }]), 'No DSpark or DFly2 round yet');
   }
 
   // Acceptance of each request that drafted: accepted over drafted, one dot per request at the time it finished.
@@ -6009,7 +6015,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
   matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', themeChanged);
 
   // Which charts show and in what order is a preference of this browser. Until one is made, Compact shows four and
-  // Advanced all but the DSpark-only card.
+  // Advanced all but the block drafters' card.
   const CHARTS = [['prefill', 'Prompt speed'], ['decode', 'Generation speed'], ['requests', 'Requests'], ['latency', 'Response time'], ['gpu', 'GPU speed and load'], ['memory', 'Memory'],
     ['cachereuse', 'Prompt cache reuse'], ['cachetiers', 'Prompt cache storage'], ['specaccept', 'Draft acceptance'], ['length', 'Prompt and generated length'], ['outcomes', 'Request outcomes'],
     ['serial', "Why requests weren't batched"], ['cachewrites', 'Prompt cache writes'], ['specrows', 'Tokens verified per round'], ['experts', 'Expert streaming']];

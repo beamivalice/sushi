@@ -116,7 +116,7 @@ Sushi reads the checkpoint's own names, as DeepSeek's loader does.
 | chat template, tool calls | the Zig Jinja engine; GLM's `arg_key` tool-call family | reused as is; tool calls with a parameter (the `:opensource` tag spelling) |
 | prefix cache restore point | DeepSeek's whole-state checkpoint and row segments | reused with a parameter |
 | 8-bit KV latent (default) | the attention core and the row writes | the engine's affine kv8 (group 64), as Qwen's and GLM's latent rows; rope dims BF16 ([KV width](#kv-width)) |
-| DFly2 drafter | DSpark's block rounds (`dspark_rows.zig`, the drafter slot's `dspark_rounds`) | round machinery reused with a parameter (block 6, a mask token for the noise rows); the drafter's forward is new arch code |
+| DFly2 drafter | the shared block-drafter rounds (still `dspark_rows.zig` and the drafter slot's `dspark_rounds`, until they take a generic name) | round machinery reused with a parameter (block 6, a mask token for the noise rows); the drafter's forward is new arch code |
 
 ## The forward, component by component
 
@@ -134,9 +134,9 @@ activation dtype before the weight multiplies.
   K6 embedding bank ([pack-format](pack-format.md#hy4-stq)) is gathered on the GPU on every Mac (`hy4_embed`): the chunk's 128-id blocks decoded (`trunk_gemm.decodeDense`), then two kernels take the Hadamard down
   each 128-row chunk and along the token's column and scale by `suh·svh`, in the host decode's f32 order, so a row is
   `EmbedGather.rows`' bytes. The decode needs only NAX's fragment layout, not its matrix units, so an M1 or M2 runs it
-  too (a host gather made the DSpark draft read each slot's token back to the CPU: five waits a draft, not one). On the
+  too (a host gather made the DFly2 draft read each slot's token back to the CPU: five waits a draft, not one). On the
   M1 Max 32 GB, STQ 2.25bpw, `--ctx-size 200000 --prefill-chunk-max 1024 --ssd-budget-gb 20 --expert-cache-bias 0.2`,
-  a cold 4k code request, GPU lock, one run each: DSpark decode 16.5 tok/s against 13.5 on the host gather, prefill 61
+  a cold 4k code request, GPU lock, one run each: DFly2 decode 16.5 tok/s against 13.5 on the host gather, prefill 61
   against 55 tok/s (afc846e2 against 25739537), and the load's two region measures 2.4 and 2.8 s against 5.3 and 5.2. The host
   gather serves only off the GPU; it keeps the blocks it decoded last, to `EmbedGather.block_cache_bytes` (64 MiB, 42
   blocks at dim 3072), billed with its copy (`hy4_load.embedCacheBytes`). A group launches at a power-of-two block count (`launchBlocks`):
@@ -516,7 +516,7 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - The README says the drafter is not involved in prefill: the prefill-to-decode handover is the last layer's hidden
     state.
 - **Pinned by**: README, `config.json` (`speculative_config`, `dfly_*`), the index, and the drafter's training code,
-  [Tencent/AngelSpec](https://github.com/Tencent/AngelSpec) at 0505773a (`DFly2DraftModel`: DSpark with no Markov
+  [Tencent/AngelSpec](https://github.com/Tencent/AngelSpec) at 0505773a (`DFly2DraftModel`, a block drafter with no Markov
   head; `angelspec/config/dfly2_hy_v4_flash_draft_config.json`). transformers ignores the keys
   (`_keys_to_ignore_on_load_unexpected`). llama.cpp#32517 drives a one-layer `model.mtp_layers.*` block instead,
   which the released checkpoint does not carry.
@@ -547,8 +547,8 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     drafts, so it stayed off until then.
   - Acceptance on a real pack: `SUSHI_HY4_DFLY_PROBE` ([parity](#dfly2-parity)).
   - The forward is new arch code.
-  - The rounds are DeepSeek's DSpark rounds, which already draft a block `[t, noise…]` in one pass on Sushi Cooler,
-    with verify, rollback and the adaptive row policy. Here the noise rows become mask rows and the block is 6.
+  - The rounds are the shared block-drafter rounds (written first for DeepSeek's DSpark, an unrelated drafter), which
+    already draft a block `[t, noise…]` in one pass on Sushi Cooler, with verify, rollback and the adaptive row policy. Here the noise rows become mask rows and the block is 6.
   - The drafter adds no KV bytes: its attention reads the target's rows and picks of the shared layers. Its block
     rows live for one round. Past the indexer's threshold a draft layer reads its target layer's selection for the
     last row the target ran (`Model.last_picks`, taken by every forward when DFly2 is loaded), never every row.
@@ -821,7 +821,7 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - A verify block's mark (`mark`, `rollbackTo`, `dropMark`) keeps the same small state in the model's mark blocks,
     reserved with a drafting request's state and copied whole in place, so it asks for nothing; one stands at a time.
     `rollbackTo` runs the kept rows again through `hy4_plan.run`, on the arena where the load planned that replay.
-  - A DSpark round's finish keeps its accepted rows without running them again where the verify journaled them
+  - A DFly2 round's finish keeps its accepted rows without running them again where the verify journaled them
     (`Model.keepRows`, taken by `Hooks.finish` when `keepRowsApplies`): a 2..8-row verify of a drafting load writes
     each row's hc streams and each sparse layer's token keys into fixed blocks made with the request's state
     (`rows_streams`, `key_journal`, billed in `pickBytes`); the finish cuts the sparse rows and pooled keys, rebuilds
@@ -1096,7 +1096,7 @@ A decode token at 8014b557 is about 31 ms of GPU work and the rest host time the
 - **Exactness (the tiny)**:
   - Greedy rounds give the serial greedy tokens byte for byte, at every accepted count, text and image.
   - Seeded sampled rounds give the seeded serial request's tokens under the exact accept rule.
-  - A partial accept rolls the target's rows, open groups and Engram history back as DSpark's verify does.
+  - A partial accept rolls the target's rows, open groups and Engram history back as a block drafter's verify does.
   - The drafter's reads of the shared layers' rows and picks equal the target's own, row for row.
   - These hold whatever the drafter's weights are, so a random tiny proves them.
 - **Acceptance (the release)**: `SUSHI_HY4_DFLY_PROBE=<tokens>[,<every>]` (read once at load, with `--mtp`) is
@@ -1174,5 +1174,5 @@ first (TDD), then the subset of the suite its diff reaches.
 | 1y | dev2 | KV width: the 8-bit affine latent (the engine's kv8, group 64, rope dims BF16) as the default, BF16 also served | 1u, 1r3 | both widths serve; a row's 8-bit round trip equals the engine's affine quantize/dequantize; KLD of 8-bit against BF16 KV recorded (16x512 fixture, BF16 teacher); bills pinned for both widths (9,600 and 15,360 B a token); the prefix-cache namespace names the width and a restore never crosses it |
 | 1v | dev2 | vision: tower parameters (tanh GELU), merger, consecutive image positions | 1q1 | merger output and the first image row's logits within the bars against the oracle's image case |
 | 1w | dev3 | pack format, STQ only: the `pack-format` section, STQ experts and trunk, the Engram table forms | 1r3 | a tiny STQ pack loads and serves; served against its dense twin within DeepSeek's STQ bars; KLD measured against the BF16 teacher |
-| 1x | dev3 | DFly2 on the tiny: the loader (`model.dfly_layers.*`), the forward over the shared layers' rows and picks, DSpark's rounds with a mask block of 6 | 1u | greedy rounds equal serial greedy byte for byte at every accepted count, text and image; seeded sampled rounds equal the seeded serial request; rollback restores rows, open groups and Engram history; the drafter's reads equal the target's rows and picks; its bill adds weights and one round's block rows, no KV |
+| 1x | dev3 | DFly2 on the tiny: the loader (`model.dfly_layers.*`), the forward over the shared layers' rows and picks, the shared block-drafter rounds with a mask block of 6 | 1u | greedy rounds equal serial greedy byte for byte at every accepted count, text and image; seeded sampled rounds equal the seeded serial request; rollback restores rows, open groups and Engram history; the drafter's reads equal the target's rows and picks; its bill adds weights and one round's block rows, no KV |
 | 1z | dev3 | DFly2 on the release checkpoint: the open wiring settled, the adaptive round policy | 1x, 1r1 | each wiring choice's accepted tokens a round recorded with its margin; every spec-named component lowers acceptance when switched off; confidence ranks the slots as they verify; the round policy never loses to serial decode on the prompt set |

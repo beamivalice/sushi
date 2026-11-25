@@ -87,6 +87,17 @@ pub const Drafter = struct {
         };
     }
 
+    /// The block drafter (DSpark, DFly2) the loaded model's arch drafts with, or null.
+    pub fn blockKindOf(model: *trunk.Trunk) ?spec_types.Kind {
+        return switch (registry.handleOf(model)) {
+            inline else => |_, t| comptime blk: {
+                if (!@hasDecl(registry.Mod(t), "drafter") or !@hasDecl(registry.Mod(t).drafter, "kinds")) break :blk null;
+                for (registry.Mod(t).drafter.kinds) |k| if (k.blockDrafter()) break :blk k;
+                break :blk null;
+            },
+        };
+    }
+
     /// Is this head's decode state module-owned (one per model) rather than per-request? Both the scheduler and the
     /// sticky-serial arm ask this.
     pub fn moduleOwned(self: Drafter) bool {
@@ -391,7 +402,7 @@ test "an arch has a head prong exactly when its drafter runs from a head" {
     inline for (comptime std.meta.fieldNames(registry.Tag)) |name| {
         const M = drafterOf(name);
         const from_head = comptime blk: {
-            for (M.kinds) |k| if (k == .mtp or k == .dspark) break :blk true;
+            for (M.kinds) |k| if (k == .mtp or k.blockDrafter()) break :blk true;
             break :blk false;
         };
         try std.testing.expectEqual(from_head, @hasDecl(M, "Head"));
@@ -437,5 +448,21 @@ test "the loaded arch decides whether a model takes a DFlash sidecar and how its
     if (registry.ofModelType("deepseek_v41")) |tag| {
         t.arch = tag;
         try std.testing.expect(!supportsDflash(&t));
+    }
+}
+
+test "each arch's drafter is its own: DeepSeek drafts with DSpark, Hy4-Flash with DFly2, GLM with DFlash2, and the two block drafters share only the rounds" {
+    const want = [_]struct { arch: []const u8, kind: []const u8, label: []const u8 }{
+        .{ .arch = "dsv41", .kind = "dspark", .label = "DSpark" },
+        .{ .arch = "hy4flash", .kind = "dfly2", .label = "DFly2" },
+        .{ .arch = "glm5", .kind = "dflash2", .label = "DFlash2" },
+    };
+    inline for (want) |w| {
+        if (comptime !@hasField(registry.Tag, w.arch)) continue;
+        const kinds = drafterOf(w.arch).kinds;
+        try std.testing.expectEqual(@as(usize, 1), kinds.len);
+        try std.testing.expectEqualStrings(w.kind, @tagName(kinds[0]));
+        try std.testing.expectEqualStrings(w.label, kinds[0].label());
+        try std.testing.expectEqual(std.mem.eql(u8, w.kind, "dspark") or std.mem.eql(u8, w.kind, "dfly2"), kinds[0].blockDrafter());
     }
 }

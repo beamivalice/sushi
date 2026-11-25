@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Hy4-Flash's speculative decoding reports as DFly2, its own drafter**: `[spec-stats]`, the metrics' `mode` label, the bench and the dashboard said `dspark`, DeepSeek's unrelated drafter, for a Hy4-Flash request.
 - **A Hy4-Flash load that cannot fit its narrowest prefill chunk is refused at once**: where the context alone does
   not fit the memory left, the refusal comes before the load records its plans, and says how much it needs at least.
 - **A second Hy4-Flash load of the same build and pack starts sooner**: it reads the prefill region its first load
@@ -25,7 +26,7 @@ earlier history is mlx-serve's, in that project's changelog.
   black slot on the no-model, loading and ready icons, and the no-model icon draws the striped fish of the offline one.
 - **`--wired-margin-gib` takes 0**: the Cooler bill holds the exact bytes a load and its requests use, so a raised `iogpu.wired_limit_mb` can be planned to without a spare gibibyte; the default stays 1, as does `server.wired_margin_gib`'s.
 - **A Hy4-Flash load with `--ctx-size` plans only to that context**: its plans and the prefill region it measures were recorded to the model's 1M-token cap whatever the context, holding arena and load time no request could use.
-- **Hy4-Flash on an M1 or M2 Mac gathers its STQ embedding on the GPU, as newer Macs do**: a DSpark draft no longer waits on the GPU once for every slot, and the load no longer decodes the embedding on the CPU for each dry plan recording, with the same output.
+- **Hy4-Flash on an M1 or M2 Mac gathers its STQ embedding on the GPU, as newer Macs do**: a DFly2 draft no longer waits on the GPU once for every slot, and the load no longer decodes the embedding on the CPU for each dry plan recording, with the same output.
 - **Hy4-Flash loads on an M1 or M2 Mac**: those GPUs grant its hyper-connection kernels and its sampler fewer than 1,024 threads a group, and the load failed with a Metal error or a missed plan; each kernel now runs at the widest group the GPU grants it, learned before the load records its plans.
 - **A Hy4-Flash load that skips its warm (a manifest of the same build) compiles nothing inside a request**: a prompt past a restored prefix took a matrix layout no warm forward runs; the first product of a dtype now makes every layout's tiles, on worker threads.
 - **A Hy4-Flash STQ load serves a prompt whose ids fall in a few blocks of the vocabulary**, where the warm's own prompt asked past the region the load measured and the load failed (`WideFull`): the embedding gather now asks what its recording asked whichever blocks the ids touch.
@@ -40,7 +41,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **A Hy4-Flash load refused by its memory budget is no longer stored as the pack's failure**: a `--ctx-size` or chunk the budget does not hold (`ContextDoesNotFit`, `ModelBillPastBudget`, `PrefillChunkDoesNotFit`, and `WarmChunkDoesNotFit` on any load) answered every later request from the stored failure, where it now goes back to `unloaded` and the next load re-reads `model-settings.json`.
 - **A streamed Hy4-Flash load whose expert cache holds fewer slots a layer than a prefill chunk has experts no longer runs a group per pick**: its groups followed the picks' order, so a chunk of thousands of rows made thousands of groups, each a whole routed chain over every pick, and a load's warm never ended; a group now holds each of its experts' picks whole, so a chunk's groups are its experts over the slots.
 - **A Hy4-Flash load in a process that ran a `sushi kld` load no longer keeps its f32 products**: a capture set them process-wide and nothing put them back, so a later load measured a larger region and ran at f32.
-- **A Hy4-Flash DSpark round forced past eight rows (`SUSHI_HY4_DSPARK_ROWS`) is refused by name on a load that plans** (`Hy4ReadoutPastBlock`) instead of failing in MLX on a logits write.
+- **A Hy4-Flash DFly2 round forced past eight rows (`SUSHI_HY4_DSPARK_ROWS`) is refused by name on a load that plans** (`Hy4ReadoutPastBlock`) instead of failing in MLX on a logits write.
 - **`sushi kld capture --layer-major` on Hy4-Flash bills a window by the pieces it runs**: a window past 8,192 rows was refused (`Hy4ChunkTooWide`) though its pieces of the prompt chunk run, and one past a chunk was billed a forward wider than any piece.
 - **A Hy4-Flash prefill chunk that crosses the selection threshold no longer asks more host memory than its load measured**: the region probed the state's start and its deepest only, and a chunk whose span the threshold cuts asks more of the host ring in between and was refused (`WideFull`), so the load now probes the cut too.
 - **A forced tool call on Hy4-Flash no longer fails the draw after its last forced token under the think penalty**: that token reached the next draw as a host array, which its planned sample refused (`PlanMiss`) in every think-penalty kind that reads ids.

@@ -212,9 +212,10 @@ pub fn mtpCapable(lm: *LoadedModel) bool {
     return lm.mtp != null;
 }
 
-/// DSpark verifies each row under that row's grammar mask, so a constrained request may speculate with it.
+/// A block drafter (DSpark, DFly2) verifies each row under that row's grammar mask, so a constrained request may
+/// speculate with it.
 pub fn rowMaskedDrafter(lm: *LoadedModel) bool {
-    return if (lm.mtp) |head| head.kind() == .dspark else false;
+    return if (lm.mtp) |head| head.kind().blockDrafter() else false;
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
