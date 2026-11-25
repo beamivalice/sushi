@@ -126,6 +126,7 @@ pub const rows = [_]Row{
     .{ .key = "enable_drafter", .kind = .flag, .on = &all },
     .{ .key = "enable_batch_mtp", .kind = .flag, .on = &all },
     .{ .key = "stream", .kind = .flag, .on = &all },
+    .{ .key = "return_progress", .kind = .flag, .on = &chat_completions },
     .{ .key = "stream_options", .kind = .{ .shaped = streamOptionsFault }, .on = &chat_completions, .carried = &.{.responses} },
     .{ .key = "enable_thinking", .kind = .flag, .on = &chat_responses },
     .{ .key = "reasoning_budget_tokens", .kind = .{ .whole = .{ .min = std.math.minInt(i32), .max = std.math.maxInt(i32) } }, .on = &chat_responses },
@@ -347,6 +348,13 @@ pub fn Checked(comptime surface: Surface) type {
             const key = comptime if (surface == .messages) "stop_sequences" else "stop";
             comptime expectKind(surface, key, .stop);
             try stop_sequences.append(allocator, list, self.root.get(key));
+        }
+
+        /// `return_progress`: llama.cpp's prompt processing progress chunks on a
+        /// stream. Off unless set true; only a stream reads it.
+        pub fn returnProgress(self: Self) bool {
+            comptime _ = rowFor(surface, "return_progress");
+            return self.flag("return_progress") orelse false;
         }
 
         /// `stream_options.include_usage`: off unless set true.
@@ -834,6 +842,13 @@ test "a field a surface does not read is refused by name, never dropped" {
         .{ .surface = .completions, .body = "{\"enable_thinking\":false}", .field = "enable_thinking" },
         .{ .surface = .completions, .body = "{\"response_format\":{\"type\":\"text\"}}", .field = "response_format" },
         .{ .surface = .completions, .body = "{\"reasoning_effort\":\"low\"}", .field = "reasoning_effort" },
+        // `return_progress` reads on the two OpenAI completion surfaces only.
+        .{ .surface = .messages, .body = "{\"return_progress\":true}", .field = "return_progress" },
+        .{ .surface = .responses, .body = "{\"return_progress\":true}", .field = "return_progress" },
+        .{ .surface = .chat, .body = "{\"return_progress\":\"yes\"}", .field = "return_progress" },
+        .{ .surface = .chat, .body = "{\"return_progress\":true}", .field = null },
+        .{ .surface = .chat, .body = "{\"return_progress\":false}", .field = null },
+        .{ .surface = .completions, .body = "{\"return_progress\":true}", .field = null },
         // A null field is absent on every surface.
         .{ .surface = .completions, .body = "{\"messages\":null,\"tools\":null,\"enable_thinking\":null}", .field = null },
         // A field of the surface's own API the server serves without acting on is type-checked, not refused.
@@ -1043,6 +1058,17 @@ test "the readers give the values the check accepted" {
     try testing.expectEqual(@as(i64, 9), wholeNumber(req.requestedMaxTokens().?).?);
     try testing.expect(req.includeUsage());
     try testing.expectEqual(@as(?i32, -1), req.reasoningBudget());
+
+    // `return_progress` reads as the bool the client sent, on both completion surfaces.
+    var progress = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"return_progress\":true}", .{});
+    defer progress.deinit();
+    const chat_progress = check(.chat, &buf, progress.value.object).ok;
+    try testing.expect(chat_progress.returnProgress());
+    const cmpl_progress = check(.completions, &buf, progress.value.object).ok;
+    try testing.expect(cmpl_progress.returnProgress());
+    var off = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{}", .{});
+    defer off.deinit();
+    try testing.expect(!check(.chat, &buf, off.value.object).ok.returnProgress());
 
     var responses = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"max_tool_calls\":3.0,\"truncation\":\"auto\",\"service_tier\":\"flex\"}", .{});
     defer responses.deinit();

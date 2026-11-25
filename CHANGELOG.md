@@ -6,6 +6,14 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`"return_progress": true` streams the prefill's progress, llama.cpp's shape**: while the prompt reads, a stream
+  carries `prompt_progress` chunks (`total`, `cache`, `processed`, `time_ms`) beside the usual empty delta — one per
+  prefill chunk the engine forwards (8,192 tokens at the default width) and a 0% one as processing starts, on
+  `/v1/chat/completions` and `/v1/completions`. `total` is the whole prompt's token count, `cache` the prefix the hot
+  cache restored, `processed` absolute processed tokens (the cache included), `time_ms` the prefill's forwarding time
+  so far — so the overall progress is `processed/total` and the timed progress is `(processed-cache)/(total-cache)`,
+  as llama.cpp's server documents. A non-streaming request ignores the field, and a surface that does not read it
+  (Messages, Responses) refuses it by name.
 - **A server asked to stop no longer keeps a connection open for up to a minute**: a reply blocked on a client that stopped reading, a request waiting for a model to unload or a cache to clear, and the wait for unloaded memory now end at the shutdown.
 - **A fully resident DeepSeek load decodes several requests at once up to 8% faster with the same text**: the joined requests look up their Engram tables in one read instead of one each (M5 Ultra, 2.7bpw: 160 to 168 tok/s at 16 requests; one request unchanged).
 

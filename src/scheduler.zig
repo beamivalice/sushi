@@ -252,6 +252,23 @@ pub const NextResult = union(enum) {
     err: void,
 };
 
+/// Live prefill progress a `return_progress` stream reads. The inference
+/// thread's chunk loop writes once per chunk (`generate.InitOptions`
+/// `prefill_progress_abs` / `prefill_progress_ms`); the connection thread
+/// reads it between keepalive wakes (`waitNextTimeout`) and ships a
+/// llama.cpp-shaped `prompt_progress` chunk. Atomic because the two threads
+/// meet here without any lock the prefill could wait on.
+pub const PrefillProgress = struct {
+    /// Absolute prompt tokens processed: the restored prefix plus the tail the
+    /// chunk loop has forwarded so far.
+    processed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Wall-clock milliseconds the prefill has spent forwarding, as of `processed`.
+    elapsed_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Prompt tokens the prefix lookup restored, published once before the
+    /// chunk loop starts.
+    cache: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
 fn firstMediaPlaceholder(
     has_media: bool,
     tokens: []const u32,
@@ -478,6 +495,9 @@ pub const Slot = struct {
     /// pad-only flag: set by inference thread when the entire generation was
     /// token id 0. Server-level cache invalidation reads this after complete.
     was_pad_only: bool,
+
+    /// Live prefill progress a `return_progress` stream reads (see `PrefillProgress`).
+    prefill_progress: PrefillProgress = .{},
 
     /// Initialize but do NOT take ownership of caches — those are allocated
     /// inside `init` from the slot's allocator.
@@ -3699,6 +3719,10 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         sch.inflight_prefill_tokens.store(0, .monotonic);
         sch.inflight_prefill_expected.store(0, .monotonic);
     };
+    // A fresh count for the `return_progress` reader: this slot's prefill runs once, but
+    // a slot whose pass failed and is re-entered must not keep the failed run's numbers.
+    slot.prefill_progress.processed.store(0, .monotonic);
+    slot.prefill_progress.elapsed_ms.store(0, .monotonic);
 
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
@@ -3831,6 +3855,9 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
                 slot.restored_disk = lookup.disk_restore;
                 slot.restore_tier = hc.lastRestoredTier();
             }
+            // The `return_progress` reader counts from the restored prefix on;
+            // published once, before the chunk loop stores its first chunk.
+            slot.prefill_progress.cache.store(hot_matched, .monotonic);
             // The entry this request restored off may be evicted before it commits, so the fork
             // keeps its own restore point; a full reuse is covered by the prompt end.
             if (hot_matched >= prefix_cache_mod.RING_RESTORE_MIN_TOKENS and !lookup.full_match and slot.ring_cps.fork == null) {
@@ -4142,6 +4169,8 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             .prefill_computed = &slot.prefill_computed,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
+            .prefill_progress_abs = &slot.prefill_progress.processed,
+            .prefill_progress_ms = &slot.prefill_progress.elapsed_ms,
             .interleave_hook = if (prefillInterleaveEnabled())
                 .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
             else

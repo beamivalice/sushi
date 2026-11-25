@@ -2862,6 +2862,56 @@ test "server: request fields: chat and completions refuse a field of the wrong s
     }.run);
 }
 
+test "server: return_progress streams llama.cpp's prompt_progress on chat completions and completions, and a stream without it carries none" {
+    try eachArch(2, .{}, struct {
+        /// The first chunk of a `return_progress` stream is the 0% report: the whole
+        /// prompt's total, nothing processed yet, and the delta llama.cpp ships.
+        fn firstProgress(body: []const u8) !std.json.Parsed(std.json.Value) {
+            const evs = try sseEvents(body);
+            defer gpa.free(evs);
+            for (evs) |e| {
+                const p = parseBody(e.data) catch continue;
+                if (p.value.object.get("prompt_progress") == null) {
+                    p.deinit();
+                    continue;
+                }
+                return p;
+            }
+            std.debug.print("no prompt_progress chunk in: {s}\n", .{body[0..@min(body.len, 800)]});
+            return error.NoProgressChunk;
+        }
+        fn run() !void {
+            // Chat: the 0% chunk carries the four values and llama.cpp's delta shape.
+            const chat = try request("POST", "/v1/chat/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"return_progress\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+            defer gpa.free(chat);
+            const cp = try firstProgress(bodyOf(chat));
+            defer cp.deinit();
+            const prog = cp.value.object.get("prompt_progress").?.object;
+            try testing.expect(prog.get("total").?.integer > 0);
+            try testing.expectEqual(@as(i64, 0), prog.get("processed").?.integer);
+            try testing.expectEqual(@as(i64, 0), prog.get("cache").?.integer);
+            try testing.expectEqual(@as(i64, 0), prog.get("time_ms").?.integer);
+            const delta = cp.value.object.get("choices").?.array.items[0].object.get("delta").?.object;
+            try testing.expectEqualStrings("assistant", delta.get("role").?.string);
+            try testing.expect(delta.get("content").? == .null);
+
+            // Completions: the same report on the text-completion chunk.
+            const cmpl = try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"return_progress\":true,\"prompt\":\"hi\"}");
+            defer gpa.free(cmpl);
+            const mp = try firstProgress(bodyOf(cmpl));
+            defer mp.deinit();
+            try testing.expect(mp.value.object.get("prompt_progress").?.object.get("total").?.integer > 0);
+            const text_choice = mp.value.object.get("choices").?.array.items[0].object;
+            try testing.expectEqualStrings("", text_choice.get("text").?.string);
+
+            // A stream that does not ask for progress carries none, before or after the reply.
+            const plain = try request("POST", "/v1/chat/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}");
+            defer gpa.free(plain);
+            try testing.expect(std.mem.indexOf(u8, bodyOf(plain), "prompt_progress") == null);
+        }
+    }.run);
+}
+
 /// The Anthropic non-stream reply's joined text blocks and its stop_reason.
 fn anthropicTextAndReason(resp: []const u8, out_reason: *[64]u8) ![]u8 {
     const p = try parseBody(bodyOf(resp));

@@ -2616,6 +2616,8 @@ pub fn handleChatCompletions(
 
     // Parse stream_options
     const include_usage = req.includeUsage();
+    // `return_progress`: prompt processing progress chunks on the stream.
+    const return_progress = req.returnProgress();
 
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
     // vendor `enable_thinking` bool (top-level, or nested in `chat_template_kwargs`).
@@ -2875,7 +2877,7 @@ pub fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
+        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, return_progress, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
