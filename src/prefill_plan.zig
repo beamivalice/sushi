@@ -117,6 +117,18 @@ pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, slid
 
 /// The width a request forwards at, and the width its admission bills: `effectivePrefillChunk`,
 /// never wider than the width handed in (0 = none). An explicit width outranks only the load-time pin.
+/// The width a prefill of a prompt whose KV ends at `total_ctx` runs its chunks at: the one the forward runs and the
+/// bill prices. A static-bill load runs the chunk it fixed (D4) whatever the prompt: its arena is planned for it.
+pub fn prefillWidth(config: *const model_mod.ModelConfig, total_ctx: usize, pinned_prefill_chunk: usize) usize {
+    if (config.static_prefill_chunk != 0) return config.static_prefill_chunk;
+    return requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, total_ctx, config.has_sliding_window, config.isMoe(), config.longCtxGated(), pinned_prefill_chunk);
+}
+
+/// The widest chunk any prefill of the load runs: its fixed chunk, else the width no context has narrowed yet.
+pub fn widestPrefillWidth(config: *const model_mod.ModelConfig) usize {
+    return prefillWidth(config, 0, config.pinned_prefill_chunk);
+}
+
 pub fn requestPrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_prefill_chunk: usize) usize {
     const width = effectivePrefillChunk(head_dim, n_heads, total_ctx, sliding_band_arch, is_moe, long_ctx_gated, pinned_prefill_chunk);
     return if (pinned_prefill_chunk == 0) width else @min(width, pinned_prefill_chunk);
@@ -232,6 +244,13 @@ pub fn nextChunkEnd(
     return end;
 }
 
+/// `nextChunkEnd` where the load fixed its chunk (`ModelConfig.static_prefill_chunk`, D4): no tail is merged, so every
+/// forward is the chunk or the one shorter tail its arena is planned for.
+pub fn chunkEndFor(fixed: bool, pos: usize, prefix_len: usize, default_chunk: usize, want_ssm_cp: bool, ssm_cp_stride: usize, ssm_cp_offset: usize, adaptive_width: bool) usize {
+    const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width);
+    return if (fixed) @min(end, pos + default_chunk) else end;
+}
+
 /// One prefill's forwards as the chunk loop cuts them (`nextChunkEnd`), each `next` the next forward's rows.
 pub const ForwardWalk = struct {
     pos: usize = 0,
@@ -322,6 +341,10 @@ test "the widest forward is the chunk loop's own: a tail it absorbs widens the f
 /// (the final forward pays its full weight sweep for ONE token anyway).
 /// Warm restores re-forward ≤ backoff+1 tokens.
 pub const SSM_SNAPSHOT_BACKOFF: usize = 30;
+
+/// The rows a prompt's final forward may run (the backoff and the logits row): a fixed chunk narrower would leave it
+/// a forward wider than the load planned and billed.
+pub const final_span_rows: u32 = SSM_SNAPSHOT_BACKOFF + 1;
 
 /// How many trailing prompt tokens the final (logits) forward covers: the
 /// held-back snapshot window plus the last token itself. Pure so the

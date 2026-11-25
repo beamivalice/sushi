@@ -45,13 +45,16 @@ const hermes_closers = [_][]const u8{ "</tool_call>", "</tool_calls>", "</tool>"
 /// Every dialect `parseToolCallsAs` reads.
 pub const families = [_]Family{
     .{ .openers = &.{"<|tool_call"}, .closers = &.{"<tool_call|>"}, .body_reads = gemmaReadsAsCall, .values = .gemma },
-    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{"<tool_call|>"}, .body_reads = wrapperReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
+    .{ .openers = &.{"<tool_call"}, .closers = &hermes_closers, .not_openers = &.{ "<tool_call|>", "<tool_calls:opensource>", "<tool_call:opensource>" }, .body_reads = wrapperReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
     .{ .openers = &.{ "<tool>", "<tool ", "<tool\t", "<tool\n", "<tool_request" }, .closers = &hermes_closers, .reads_as_call = genericToolTagReadsAsCall, .values = .wrapper, .body_closers = &.{"</function>"} },
     .{ .openers = &.{"<｜DSML｜tool_calls"}, .closers = &.{"</｜DSML｜tool_calls>"}, .values = .dsml, .container = true },
     .{ .openers = &.{ "<｜DSML｜invoke", "<｜DSML｜ invoke" }, .closers = &.{ "</｜DSML｜invoke>", "</｜DSML｜ invoke>" }, .body_reads = dsmlInvokeReadsAsCall, .values = .dsml },
     .{ .openers = &.{FUNCTION_CALLS_TAG}, .closers = &.{"</function_calls>"}, .values = .invoke, .container = true },
     .{ .openers = &.{BARE_INVOKE.invoke}, .closers = &.{BARE_INVOKE.invoke_close}, .reads_as_call = invokeReadsAsCall, .values = .invoke },
     .{ .openers = &.{"<function"}, .closers = &.{"</function>"}, .reads_as_call = functionReadsAsCall, .cut_reads = functionCutReads, .values = .function_tag },
+    // Hy4-Flash: GLM's calls in a `<tool_calls:opensource>` wrapper, a tag spelled `<tool_call:opensource>` where its pack
+    // decodes no plain one. Hermes' `<tool_call` opener gives these up (`not_openers`).
+    .{ .openers = &.{ "<tool_calls:opensource>", "<tool_call:opensource>" }, .closers = &.{ "</tool_call:opensource>", "</tool_call>" }, .body_reads = wrapperReadsAsCall, .values = .wrapper },
 };
 
 /// `<|tool_call>call:name{…`: the body starts with `call:`, or has not got that far.
@@ -657,7 +660,7 @@ pub fn isDsmlCall(_: []const u8, call: Call) bool {
 /// A call of GLM's `<tool_call>NAME<arg_key>…` dialect: a bare `<tool_call>` whose body is neither JSON nor a
 /// `<function=` tag.
 pub fn isArgKeyCall(text: []const u8, call: Call) bool {
-    if (call.family != &families[1]) return false;
+    if (call.family != &families[1] and call.family != &families[families.len - 1]) return false;
     const gt = std.mem.indexOfScalarPos(u8, text, call.start, '>') orelse return true;
     const body = std.mem.trimStart(u8, text[gt + 1 ..], " \t\r\n");
     return !(std.mem.startsWith(u8, body, "{") or std.mem.startsWith(u8, body, "<function="));

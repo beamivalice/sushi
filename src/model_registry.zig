@@ -563,8 +563,12 @@ pub const LoadedModel = struct {
         // wider than a bill the guard already issued, so the re-resolve rides
         // the reload: clear it here and the next load's `server.pinPrefillChunk`
         // re-pins from then-current memory. `pinned_context` stays — clients
-        // budget against it for the whole session.
-        if (self.config) |c| c.pinned_prefill_chunk = 0;
+        // budget against it for the whole session. A static-bill load's fixed chunk is the next load's to fix too.
+        if (self.config) |c| {
+            c.pinned_prefill_chunk = 0;
+            c.static_prefill_chunk = 0;
+            @import("static_bill.zig").close(c);
+        }
     }
 };
 
@@ -597,7 +601,7 @@ pub const ModelStatus = struct {
 
 /// Load failures a setting or the memory limit decides: the entry goes back to `.unloaded`, so the next load re-reads
 /// model-settings.json. Every other failure is the pack's and is stored.
-pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "GlmKvQuantUnsupported" };
+pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "GlmKvQuantUnsupported", "ContextDoesNotFit", "ModelBillPastBudget", "PrefillChunkDoesNotFit", "WarmChunkDoesNotFit" };
 
 /// The name of the stored failure a request was refused with, copied while the registry held it: by the time the answer
 /// is written an explicit retry may have claimed the entry.
@@ -1826,7 +1830,7 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ContextSizeAboveWindow, LaunchFlagUnsupported, GlmKvQuantUnsupported, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ContextSizeAboveWindow, LaunchFlagUnsupported, GlmKvQuantUnsupported, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, MtpHeadMissing, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ContextSizeAboveWindow")) return error.ContextSizeAboveWindow;
@@ -1835,12 +1839,15 @@ pub const ModelRegistry = struct {
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
             if (std.mem.eql(u8, n, "ModelFormatUnsupported")) return error.ModelFormatUnsupported;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
+            // What a load's budget refuses: a load on the ledger at its chunk or seal, any load at its warm's chunk.
+            if (std.mem.eql(u8, n, "ContextDoesNotFit") or std.mem.eql(u8, n, "ModelBillPastBudget") or std.mem.eql(u8, n, "PrefillChunkDoesNotFit") or std.mem.eql(u8, n, "WarmChunkDoesNotFit")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ExpertCacheDoesNotFit")) return error.ExpertCacheDoesNotFit;
             if (std.mem.eql(u8, n, "ExpertStreamingRequired")) return error.ExpertStreamingRequired;
             if (std.mem.eql(u8, n, "SsdBudgetBelowResident")) return error.SsdBudgetBelowResident;
             if (std.mem.eql(u8, n, "SsdBudgetBelowVision")) return error.SsdBudgetBelowVision;
             if (std.mem.eql(u8, n, "SsdBudgetExceedsWiredLimit")) return error.SsdBudgetExceedsWiredLimit;
             if (std.mem.eql(u8, n, "ExpertStreamingMtpUnsupported")) return error.ExpertStreamingMtpUnsupported;
+            if (std.mem.eql(u8, n, "MtpHeadMissing")) return error.MtpHeadMissing;
             if (std.mem.eql(u8, n, "ExpertStreamingUnsupportedLayout")) return error.ExpertStreamingUnsupportedLayout;
             if (std.mem.eql(u8, n, "ExpertSlabImportCopied")) return error.ExpertSlabImportCopied;
             if (std.mem.eql(u8, n, "ExpertLayoutUnsupported")) return error.ExpertLayoutUnsupported;
@@ -1881,6 +1888,7 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.SsdBudgetBelowVision, loadErrorFromName("SsdBudgetBelowVision"));
         try std.testing.expectEqual(error.SsdBudgetExceedsWiredLimit, loadErrorFromName("SsdBudgetExceedsWiredLimit"));
         try std.testing.expectEqual(error.ExpertStreamingMtpUnsupported, loadErrorFromName("ExpertStreamingMtpUnsupported"));
+        try std.testing.expectEqual(error.MtpHeadMissing, loadErrorFromName("MtpHeadMissing"));
         try std.testing.expectEqual(error.ExpertStreamingUnsupportedLayout, loadErrorFromName("ExpertStreamingUnsupportedLayout"));
         try std.testing.expectEqual(error.ExpertSlabImportCopied, loadErrorFromName("ExpertSlabImportCopied"));
         try std.testing.expectEqual(error.ExpertLayoutUnsupported, loadErrorFromName("ExpertLayoutUnsupported"));
@@ -2325,11 +2333,13 @@ test "unloadResident resets the prefill-chunk pin but never the context pin" {
     const cfg = try testing.allocator.create(ModelConfig);
     cfg.* = .{};
     cfg.pinned_prefill_chunk = 512;
+    cfg.static_prefill_chunk = 512;
     cfg.pinned_context = 8192;
     lm.config = cfg;
 
     lm.unloadResident();
     try testing.expectEqual(@as(u32, 0), cfg.pinned_prefill_chunk);
+    try testing.expectEqual(@as(u32, 0), cfg.static_prefill_chunk);
     try testing.expectEqual(@as(u32, 8192), cfg.pinned_context);
 }
 
@@ -4143,4 +4153,20 @@ test "ModelRegistry: waitForRefcountZeroLocked ends with error.Shutdown on begin
         return error.WaitOutlivedShutdown;
     }
     try testing.expectError(error.Shutdown, w.got);
+}
+
+test "ModelRegistry: a load a memory budget refuses at its chunk or seal is a refusal, not the pack's stored failure, and a request answers it as insufficient memory" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("m", "/path/to/m", 1024);
+    inline for (.{ "ContextDoesNotFit", "ModelBillPastBudget", "PrefillChunkDoesNotFit", "WarmChunkDoesNotFit" }) |name| {
+        var attempt = reg.beginAttempt(stub);
+        reg.mutex.lockUncancelable(reg.io);
+        try attempt.claimLocked();
+        reg.mutex.unlock(reg.io);
+        attempt.outcome = .{ .failed = @field(anyerror, name) };
+        attempt.end();
+        try testing.expectEqual(LoadState.unloaded, stub.state);
+        try testing.expectEqual(error.InsufficientMemory, ModelRegistry.loadErrorFromName(name));
+    }
 }

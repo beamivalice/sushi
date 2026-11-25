@@ -1,8 +1,11 @@
 const std = @import("std");
 
 pub const tiles = aligned(@embedFile("fixtures/exl3_encode_tiles.safetensors"));
+pub const pinpass = aligned(@embedFile("fixtures/exl3_encode_pinpass.safetensors"));
 pub const tensor = aligned(@embedFile("fixtures/exl3_encode_tensor.safetensors"));
 pub const sources = aligned(@embedFile("fixtures/exl3_encode_sources.safetensors"));
+pub const gptq = aligned(@embedFile("fixtures/gptq_affine8.safetensors"));
+pub const dsv41_expert = aligned(@embedFile("fixtures/dsv41_expert.safetensors"));
 
 fn aligned(comptime raw: []const u8) *align(8) const [raw.len]u8 {
     const holder = struct {

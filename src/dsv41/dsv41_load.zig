@@ -15,9 +15,8 @@ pub fn weights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, 
         log.err("deepseek_v41: model.safetensors.index.json does not list every routed expert (layout {s}); the download is incomplete\n", .{@tagName(config.expert_layout)});
         return error.ExpertLayoutUnsupported;
     }
-    try source.validateTileOrder(io, allocator, model_dir, config.expert_tile_order, config.hidden_size, config.moe_intermediate_size);
     pipelines_before = mlx.engine.pipelinesMade().count;
-    return try source.loadResident(io, allocator, model_dir, .{ .dspark = arch.dsparkOn(config), .vision = load_vision and config.has_vision });
+    return try source.loadResident(io, allocator, model_dir, .{ .dspark = arch.drafterOn(config), .vision = load_vision and config.has_vision });
 }
 
 /// The engine's pipelines before this load wrapped its first weight: the load's own ops on its weights make some, and

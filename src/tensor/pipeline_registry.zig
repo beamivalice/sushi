@@ -97,6 +97,10 @@ pub fn putStock(r: Recipe, pipeline: metal.Pipeline) !bool {
     return true;
 }
 
+pub fn inStock(key: []const u8) bool {
+    return stock.contains(key);
+}
+
 pub fn takeStock(key: []const u8) ?metal.Pipeline {
     const e = stock.get(key) orelse return null;
     record(e.recipe);

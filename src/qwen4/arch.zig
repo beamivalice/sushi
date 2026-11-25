@@ -109,10 +109,10 @@ pub fn deinit(xfm: Model) void {
 const qwen4_cooler = @import("qwen4_cooler.zig");
 
 /// What the shared Sushi Cooler contract suite asks of this arch (`src/cooler_contract_test.zig`).
-pub const cooler_opt_out: @import("../arch/config.zig").CoolerOptOut = .{
+pub const cooler: @import("../arch/config.zig").Cooler = .{ .opt_out = .{
     .flag = "--qwen-mlx-engine",
     .setting = "qwen_cooler",
-};
+} };
 
 pub const cooler_contract = @import("qwen4_contract.zig");
 

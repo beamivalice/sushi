@@ -26,6 +26,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   about 1 us of its 9.7, inside the noise of a forward: it lands in the stack, it would not have been built alone.
 - **Small bytes-equal folds are built as a stack and measured once**, arms alternating every 8 forwards in one load:
   one fold reads 0.2 to 0.5% and drowns in heat, seven read 3.3% and 3.7% the same way three loads running.
+- **A kernel of one thread a row of work fills few cores at decode; split each row over lanes that keep its order.**
+  The indexer's scores ran a key a thread (4 threadgroups at 1,024 keys, each thread 2,048 products);
+  `hy4_index.scores` gives a key 16 lanes, a head each, and its first lane sums the heads in order: the same bytes.
 - **A threadgroup is one GPU core's work.** A kernel that reduces a whole row in one group (1024 threads, its limit)
   pays 24 to 33 us for every walk of a 129k-wide row whatever the walk computes (127 ids a thread), and about 2 us a
   barrier: such a kernel is sized by its walks. The sampled draw (`sampler_draw.zig`) went from 70 walks (a bit of
@@ -95,6 +98,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - The decode meter splits eval into `mlx_async_eval` wall time and thread CPU. Wall far above CPU means the encoder is
   blocked on in-flight buffers. Host work still counts: the GPU starts each buffer when the host has encoded it, and
   cutting 2 ms of host CPU from a 17 ms forward made it 1.5 ms faster ([qwen4-perf](qwen4-perf.md#host-cpu)).
+- **A chain of small ops becomes one kernel that repeats each op's arithmetic in order**, so its bytes are the chain's
+  (Hy4's rope: MLX's `rope.metal` pair math over a strided view, the passthrough copied, the output at the dtype the
+  next cast wanted; its norm: `rms_single_row` with the BF16 weight widened in the register and an add folded in). Its unit cell compares it against the chain behind the seam and pins its one dispatch.
 - The meter's `process CPU` is every thread of the process per forward: the inference thread and Metal's submit and
   completion queues. It is the number to judge a host-side change by; `command buffers/forward` is what the queues'
   share follows.
@@ -250,6 +256,19 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   1.6-1.7 to 1.5-1.6 ms (span 256), 0.9-1.0 to 0.9 (span 128), the same heads byte for byte (64 rows x 64 heads x 512 in f32,
   512 picks with gaps, compared at the landing).
   The trial is the probe-and-decline pattern above: a failed one is recorded by not setting the arm, never re-run per call. A Metal type name (`half`) as a loop variable fails the JIT compile and surfaces only as a failed test.
+- `hy4_attn` (Hy4-Flash's wide-span core, `src/hy4flash/hy4_attn.zig`) is that tiling on a 576-wide key row whose first 512
+  channels are the values: 8 simdgroups own 64 latent channels (one affine group) and a ninth the 64 rope channels, 16
+  heads a threadgroup (a layer's heads padded to a block), a row a threadgroup, 32 keys a tile and two barriers. The query
+  is f32 and the keys bf16, so the scores split the query into three bf16 parts (f32's range and 24 bits) and the value
+  sum splits P, which sits in [0, 1], into two. A
+  split's error is the kernel's error: two bf16 parts (2^-18) sat 4 to 10 times off the f64 truth beyond the op chain's,
+  and a model amplified it (a tiny's logits KL 1e-2 to 1e-1 off the chain's); `hy4 attn` holds the heads to the truth,
+  not to the chain. **An f16 part never carries an activation**: an f16 low part of the query (times 512) overflows at
+  |q| of 32,752, the absorbed query reaches it, and the head silently collapses onto its sink (finite: the softmax
+  starts at the sink), which put the real pack's KLD 16.7% over the chain's while every synthetic cell passed. The
+  kernel is bound by its matrix-unit passes: P at two parts instead of three is 6.4% less prefill time a chunk. Dequantizing a kv8 key row inside the kernel
+  costs more than its dot (a layer's 2,048 picks a row: 35 ms against 17): the store is read to bf16 once a layer
+  and chunk (`hy4_latent.rangeBf16`) and picks index into that copy.
 - Both kernels take an `Epilogue` (`attnEpilogueFits`: head width a multiple of 256): the store does what `attnOut` did to the
   heads, in the same order, so the bytes are the op chain's: round to the activation dtype, the tail's inverse rotation
   (`ropeTail`'s math, `meta[4] + row` the position), the fp8 / 32 / ue8m0 round trip over each 32 channels (four lanes of
@@ -287,7 +306,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   `tests/dsv41/test_g13_rehearsal.sh`).
 - **A kernel's threadgroup is a `ThreadLadder`** where a GPU may grant it fewer threads than it asks (an M1 grants the
   sampler's draw 768): a launch the GPU refuses for size steps the process down one rung, and the kernel gives the rule's
-  answer at every rung (`sampler_draw`; the hyper-connection kernels keep `hc_tg`'s own halving).
+  answer at every rung (`sampler_draw`; the hyper-connection kernels keep `hc_tg`'s own halving, and Hy4's
+  one-threadgroup mixes halve per pipeline, `hy4_hc.applyNarrow`). A load that records its plans settles each rung first
+  (`sampler_draw.settle`, `Model.probeWide`): a recording keeps the rung it met, so a later step-down misses the plan.
 - **A probe that provokes a size refusal declares it** (`mlx.expected_refusal`): MLX's raise is logged at debug, and the
   probe names the rung it settled on in one info line; only the last rung's refusal logs as an error.
 - The name is MLX's: `MLX_METAL_GPU_ARCH` when set, else the system GPU's, so the profile and MLX's dispatch agree.
@@ -307,6 +328,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   time (`project_rows.dyn_rows`: two pipelines, at eight rows and at the cap, past eight decided at compile time on the
   first); a plain group's total, its row count, stays a template value, since the warm joins every count and a run-time
   count costs a plain tick about 3%.
+- **The engine cuts a Metal compile error at 400 characters** (`tensor/route.zig`), the source line it names long gone:
+  assemble the kernel's source into a `[[kernel]]` wrapper and compile it offline with
+  `xcrun -sdk macosx metal -std=metal4.0 -c`, which names the line. A Zig `\\` string joins its lines with no final
+  newline, so a `#define` or `#pragma` at a snippet's end swallows the next snippet's first line: join snippets with `"\n"`.
 - **A cooperative-tensor template arg is `metal::remove_addrspace_t<decltype(t)>`**, never `decltype(t)` (the
   macOS 27 MPP header rejects the `thread` qualifier).
 - Metal JIT-compiles at first EVAL, not at apply, so an optional NAX arm is PROBED on a one-tile problem before it
@@ -328,6 +353,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   M3 and later grant every kernel 1024, so an M5 never sees it; M1/M2 grant 1024 up to 52 GPRs, down to 384 at 128.
   A group above 384 threads probes and declines (`sushi_gdn_verify_fold`), or its GPRs come from a `metal-tt` G13 build.
   mlx-c exposes no per-pipeline limit; the encoder's launches read it off that throw and retry below it ([engine-exl3-encoder](engine-exl3-encoder.md#search)).
+- **Threadgroups that meet at one counter order their partials by device atomics and fences, never by waiting**: relaxed
+  atomic stores of the partials, `atomic_thread_fence(mem_device, seq_cst, thread_scope_device)` before and after the
+  counter's `atomic_fetch_add`, then atomic loads in the last threadgroup ([counter page](engine-own-forward.md#metal-rules-the-engine-follows)).
+  Metal promises no forward progress to a threadgroup another spins on.
+- **On the M5 Ultra keep each counter's threadgroups inside one half of the grid**: Hy4's wide iHC mix (eight threadgroups
+  a row) ran 3 to 8 us a launch slower at 3, 5 and 7 rows than at 2, 4, 6 and 8 until the grid took an even row count,
+  its padding row returning at once (`hy4_hc`; in-process chained launches, GPU busy a launch, the change on 01871ac7).
 - **A custom kernel whose source fails to compile kills the process** at its first eval (mlx-c `array.cpp:352`, exit
   255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
   custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and
@@ -370,6 +402,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   truncates the operands the same way and is bit-identical (DeepSeek's `hcExpand`, `dsv41_hc_expand`); a fma chain, a
   sequential sum or round-to-nearest operands differ in 9% of bf16 and every f32 element. A true-f32 GPU (M1) does not
   match, so the fused arm is gated by a load probe against the chain.
+- A kernel that reproduces MLX's single-row reduction inside a wider (or narrower) threadgroup runs MLX's threads as
+  virtual lanes, `tid + r·TG`, so each `simd_sum` sees the same 32 values in the same lanes (`hy4_hc` back form).
 - `mlx_fast_rope` is not the composed rope: it keeps cos/sin in f32 and rounds once; the chain rounds the bf16 table,
   each product and the sum.
 
@@ -388,7 +422,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - A Metal System Trace: `xcrun xctrace record --template 'Metal System Trace' --instrument 'Metal GPU Counters'
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
 - Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
-  `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served bodies in one boot).
+  `_KV=<n>` for a chunk after n tokens; `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX
+  reference and served bodies in one boot).
 - Time MiMo's prefill attention for one chunk with `sushi-ubench run mimo2.prefill_attn` (`--rungs ql=...`, `--rungs kl=...`;
   kL = qL is the chunk alone): a global layer's served chain against pre-dequantized K/V, and a sliding layer's fused band
   kernel against the composed SDPA. MiMo's global decode attention (dense, dequant rebuild, matmul2d, split-K, kv 2k to

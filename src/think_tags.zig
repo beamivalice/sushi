@@ -52,6 +52,13 @@ pub fn tagLenAt(text: []const u8, comptime base: []const u8) ?usize {
     return base.len + 1;
 }
 
+/// `tagLenAt`, or the `base:opensource>` spelling Hy4-Flash gives a call's tags.
+pub fn callTagLenAt(text: []const u8, comptime base: []const u8) ?usize {
+    if (tagLenAt(text, base)) |n| return n;
+    const spelled = ":opensource>";
+    return if (text.len > base.len and std.mem.startsWith(u8, text, base) and std.mem.startsWith(u8, text[base.len..], spelled)) base.len + spelled.len else null;
+}
+
 /// True when `text` could still GROW into `full` with more streamed bytes
 /// (strict prefix: "<th", "<think").
 fn isPartialTag(text: []const u8, comptime full: []const u8) bool {

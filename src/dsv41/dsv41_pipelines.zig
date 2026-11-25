@@ -38,7 +38,7 @@ pub fn scopeKey(a: std.mem.Allocator, io: std.Io, config: *const ModelConfig, en
     d.addInt("window", c.window);
     d.addInt("yarn", @bitCast(c.yarn_factor));
     d.addInt("candidate blocks", c.cand_blocks);
-    d.addInt("dspark", @intFromBool(config.dsparkOn()));
+    d.addInt("dspark", @intFromBool(config.drafterOn()));
     d.addInt("tile order", @intFromEnum(config.expert_tile_order));
     d.addInt("expert cache", config.expert_cache_bytes);
     d.addInt("ssd budget", config.expert_ssd_budget_bytes);
@@ -135,11 +135,11 @@ const Served = struct {
     fn tokens(self: *Served) ![]u32 {
         const a = self.a;
         try self.xfm.resetCache();
-        var gen = try generate.Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &self.xfm, &self.tok, self.ids[0..30], 24, .{ .temperature = 0.0 }, &.{}, .{ .dspark_enabled = true });
+        var gen = try generate.Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, &self.xfm, &self.tok, self.ids[0..30], 24, .{ .temperature = 0.0 }, &.{}, .{ .drafter_enabled = true });
         defer gen.deinit(a);
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(a);
-        while (try gen.nextDspark(a)) |r| {
+        while (try gen.nextDrafterRound(a)) |r| {
             defer a.free(r.tokens);
             try out.appendSlice(a, r.tokens);
         }

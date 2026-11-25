@@ -77,7 +77,7 @@ PACKS = {
                          "ssd": (SSD, ["ssd"])}),
     "dsv41": dict(dir="DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", ids="dsv41", n_ids=2,
                   slots=["--ssd-budget-gb", "48", "--max-concurrent", "1"],
-                  captures={"streamed": ["--ssd-budget-gb", "110"]},
+                  captures={"generic": []},
                   blocks={"serial": (EXACT + ["--no-mtp"], ["serial", "raw"]),
                           "spec": (EXACT + ["--mtp-min-depth", "2", "--mtp-max-depth", "2"], ["spec"]),
                           "hot": (HOT + ["--vision"], ["hot", "image", "think"]),

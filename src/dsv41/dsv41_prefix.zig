@@ -22,6 +22,7 @@ const prefix_arch = @import("../arch/prefix.zig");
 const restore_dump = @import("../restore_dump.zig");
 const dsv41_state = @import("dsv41_state.zig");
 const cfg_mod = @import("dsv41_config.zig");
+const live_points = @import("../live_points.zig");
 
 /// Tokens a prompt's chunk loop holds back for its last forward: those after the last assistant opener (`opener`
 /// its id), so the prompt-end snapshot sits before that opener. The pinned template renders everything before it the
@@ -282,26 +283,9 @@ pub const Live = struct {
         self.base = cp.pos;
     }
 
-    /// Records the tier entry `id` on each point it now holds.
-    fn markOnDisk(self: *Live, disk: *const kv_disk_cache.DiskTier, id: u64) void {
-        for (self.points.items) |*p| {
-            if (disk.holdsPoint(id, p.pos)) p.disk_id = id;
-        }
-    }
-
-    /// Whether the tier holds `p`'s state where it was put.
-    fn onDisk(p: *const LivePoint, disk: ?*const kv_disk_cache.DiskTier) bool {
-        const id = p.disk_id orelse return false;
-        return (disk orelse return false).holdsPoint(id, p.pos);
-    }
-
     /// Whether a point of the record is still only here, not on `disk`.
     pub fn unflushed(self: *const Live, disk: ?*const kv_disk_cache.DiskTier) bool {
-        if (!self.ready) return false;
-        for (self.points.items) |*p| {
-            if (!onDisk(p, disk)) return true;
-        }
-        return false;
+        return self.ready and live_points.anyUnflushed(self.points.items, disk);
     }
 
     /// The request over the state finished with `tokens` as its history: its points become what the next one may roll back to.
@@ -371,9 +355,13 @@ pub fn markRows(cache: *transformer.KVCache, s: mlx.mlx_stream) !void {
     const slots = [_]*mlx_pages.InPlace{ &e.keys, &e.values, &e.keys_scales, &e.keys_biases, &e.values_scales, &e.values_biases };
     for (slots[0 .. if (cache.config.scheme == .off) 2 else 6]) |slot| {
         slot.deinit();
-        var zeros = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(zeros);
-        try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, s));
+        const zeros = blk: {
+            var made = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(made);
+            try mlx.check(mlx.mlx_zeros(&made, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, s));
+            break :blk made;
+        };
+        // The slot holds the zeros from here: an eval that fails leaves them the slot's to release.
         slot.* = mlx_pages.InPlace.adopt(zeros, .paged);
         try mlx.check(mlx.mlx_array_eval(slot.array));
     }
@@ -426,11 +414,10 @@ pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *transformer.Trunk, 
     return if (to_ssd and pos >= kv_disk_cache.MIN_PERSIST_TOKENS) try captureShared(allocator, m, pos) else try capture(allocator, m, pos);
 }
 
-
 /// Gives the SSD tier this model's split of its restore points.
 pub fn setDiskGrownSpec(allocator: std.mem.Allocator, config: *const @import("../model.zig").ModelConfig, disk: *kv_disk_cache.DiskTier) !void {
     const c = config.dsv41 orelse return;
-    const divs = try rowDivisors(allocator, &c, config.dsparkOn());
+    const divs = try rowDivisors(allocator, &c, config.drafterOn());
     defer allocator.free(divs);
     try disk.setGrownSpec(row_span, divs, c.stateBytesPerToken());
 }
@@ -460,7 +447,7 @@ pub fn diskLayoutKey(allocator: std.mem.Allocator, config: *const @import("../mo
     var drop: ?expert_usage.Drop = if (config.drop_expert == 0) null else try expert_usage.load(allocator, model_dir, config.expertDropRequest());
     defer if (drop) |*d| d.deinit();
     const m = xfm.arch_state.dsv41.model.?;
-    const key = try layoutKey(allocator, config.dsparkOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
+    const key = try layoutKey(allocator, config.drafterOn(), m.attn_nax, m.fused, m.dspark_exact, if (drop) |*d| d else null, @import("../expert_stream.zig").pick_tolerance, m.hc_mix_nax, config.expertCacheBias());
     if (m.token_map.len == 0) return key;
     defer allocator.free(key);
     return try std.fmt.allocPrint(allocator, "{s}-map{x:0>16}", .{ key, std.hash.XxHash64.hash(0, std.mem.sliceAsBytes(m.token_map)) });
@@ -537,7 +524,7 @@ fn rollbackLiveInPlace(
     ram_match: ?pc.RamMatch,
 ) ?pc.LookupResult {
     const live = liveOf(self);
-    const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
+    const cap = media_limits.ceilingFor(live.vision_key, live.media_start);
     const idx = (live.pick(m, prompt_ids, has_tools, cap) catch |e| {
         log.err("[dsv41-prefix] no rollback: {s}\n", .{@errorName(e)});
         return null;
@@ -661,18 +648,13 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
     // the last segment in its own file. At one row such a point stays live, and reaches the tier at the handover.
     if (!m.serves_rows) {
         keepLive(self, m, cps);
-        const span: usize = if (self.disk.?.grown) |g| g.span else 0;
-        for (cps) |*cp| if (!cp.isReleased() and span != 0 and cp.pos % span != 0) cp.release();
+        _ = live_points.releaseOffGrid(&self.disk.?, cps);
     }
-    const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    self.disk.?.rows_base = @intCast(restoredBase(self, m));
-    defer self.disk.?.rows_base = std.math.maxInt(u32);
-    self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, null, cps, &.{}, std.math.maxInt(u64), s);
-    if (self.disk.?.last_store_id) |id| liveOf(self).markOnDisk(&self.disk.?, id);
-    const bytes = self.disk.?.point_bytes_written - staged_before;
+    const w = live_points.write(self, cache.entries, cache.config, prompt, has_tools, media, null, cps, restoredBase(self, m), s);
+    if (w.id) |id| live_points.markOnDisk(liveOf(self).points.items, &self.disk.?, id);
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
-    log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
+    log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(w.bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
 }
 
 /// Rows below this position are the running request's restore, taken from a stored entry: the live record's at one
@@ -762,41 +744,26 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
     if (live.vision_key != 0 and live.media_start == null) return;
     const handled = Handled.begin();
     defer handled.drop();
-    var cps: std.ArrayList(SSMCheckpoint) = .empty;
-    defer {
-        for (cps.items) |*cp| cp.deinit(self.allocator);
-        cps.deinit(self.allocator);
-    }
-    for (live.points.items) |*p| {
-        if (Live.onDisk(p, &self.disk.?) or p.pos < kv_disk_cache.MIN_PERSIST_TOKENS or p.pos > @min(live.tokens.len, st.n)) continue;
-        var cp = captureLive(self.allocator, m, p) catch |err| {
-            log.warn("  [dsv41-prefix] live point at {d} not flushed: {s}\n", .{ p.pos, @errorName(err) });
-            continue;
-        };
-        cps.append(self.allocator, cp) catch {
-            cp.deinit(self.allocator);
-            continue;
-        };
-    }
-    if (cps.items.len == 0) return;
-    const top = cps.items[cps.items.len - 1].pos;
-    var cache = KVCache.initWithConfig(self.allocator, m.cfg.layers, live.quant) catch return;
-    defer cache.deinit();
-    cache.step = top;
-    markRows(&cache, s) catch |err| {
-        log.warn("  [dsv41-prefix] live points not flushed, rows not marked: {s}\n", .{@errorName(err)});
-        return;
-    };
-    const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    self.disk.?.rows_base = @intCast(live.base);
-    defer self.disk.?.rows_base = std.math.maxInt(u32);
-    const media = pc.truncatedMediaKey(&.{}, live.vision_key, if (live.media_start) |v| @as(usize, v) else null, top);
-    self.writeThroughHybrid(cache.entries, cache.config, live.tokens[0..top], live.has_tools, media, null, cps.items, &.{}, std.math.maxInt(u64), s);
-    if (self.disk.?.last_store_id) |id| live.markOnDisk(&self.disk.?, id);
-    const bytes = self.disk.?.point_bytes_written - staged_before;
-    log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, cps.items.len, top, @as(f64, @floatFromInt(bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
+    const rec: live_points.Record = .{ .tokens = live.tokens, .has_tools = live.has_tools, .vision_key = live.vision_key, .media_start = if (live.media_start) |v| @as(usize, v) else null, .base = live.base };
+    const f = live_points.flush(FlushCtx{ .m = m, .s = s }, self, live.points.items, rec, @min(live.tokens.len, st.n), m.cfg.layers, live.quant, s, "[dsv41-prefix]");
+    if (f.points == 0) return;
+    log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, f.points, f.top, @as(f64, @floatFromInt(f.bytes)) / 1e9, sw.read() / std.time.ns_per_ms });
 }
+
+/// How `flushLiveDsv41` captures a kept point and readies the rows marker the tier indexes it by.
+const FlushCtx = struct {
+    m: *dsv41_model.Model,
+    s: mlx.mlx_stream,
+
+    pub fn capture(self: FlushCtx, allocator: std.mem.Allocator, p: *const LivePoint) !SSMCheckpoint {
+        return captureLive(allocator, self.m, p);
+    }
+
+    pub fn prepare(self: FlushCtx, cache: *KVCache) !void {
+        try markRows(cache, self.s);
+    }
+};
 
 test "snapshotBackoff: the last forward starts at the prompt's last assistant opener when it fits a decode-width pass" {
     const A = 900;

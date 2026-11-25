@@ -27,7 +27,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   healthy inputs = MEMORY symptom.
 - `currentGpuMemoryCeiling` must see EXTERNAL pressure; under-billing is a Metal OOM, so a bill goes down only where
   the bytes are gone.
-- `--wired-margin-gib` (default 1, integers 1..32) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
+- `--wired-margin-gib` (default 1, integers 0..32; 0 plans to the limit less the GPU floor alone) is how far under a raised `iogpu.wired_limit_mb` a plan may reach.
   `server.wired_margin_gib` (Settings > GPU memory, same range) saves it; the flag outranks it. Every reader asks
   `server_state.wiredMarginBytes()` as it plans, never a boot copy, so a save reaches the next request and the next load.
   It binds only under a declared GPU limit; with none set it only moves the default SSD budget, and the Settings row says so.
@@ -132,6 +132,8 @@ bill function's output on the committed fixture configs of all served packs: a b
   start at the widest held up to ~2 GB past the bill. DeepSeek and GLM grow row by row and keep the wide start, which
   the hook checks at the first position. The hook widens at the earliest at the third chunk, after
   `PREFILL_WIDEN_PROBES` (2) supporting probes.
+- **A warm is billed as it runs**: every Cooler load's `warmNeedBytes` holds the warm's request bill, and a DSpark or DFly2
+  warm is billed and keyed with drafting on.
 - **A load's preflight proves its served warm** (`warmNeedBytes`, read by the resident and the streamed requirement and
   the cold-load gate): a resident Cooler load bills the larger of its warmup and that need beside its weights (a Flash-Next
   27.4 GB load admitted at its edge failed its warm).
@@ -184,6 +186,10 @@ bill function's output on the committed fixture configs of all served packs: a b
   until the load ends (0.89 GiB), which `loadWarmupBytes` adds through `dflash_load_transient_bytes` (stamped with the
   other drafter terms). Measured on the real drafter: resident 760.8 MB, peak over before 1712.4 MB; the formula is
   never under either, within 0.04%.
+- **An arch's own `requestBill` restates every term of `bills.requestTerms` that is not zero for it**: the shared bill is
+  a struct of named terms (`RequestTerms`), and the arch's bill test walks its fields over the arch's configs, so a new shared
+  term that is nonzero for the arch fails there by name instead of being dropped (`hy4 bill: every term the shared request
+  bill sums ...`).
 - **A request bills the MTP head only when it runs MTP** (`requestBillsMtpHead`, the `requestSpecModes` verdict): a
   DFlash2 request never builds the head's cache, state or QSA ring. `enable_drafter:false` hands the request back to MTP
   and bills the head. The head weights and coarse lm_head stay billed at load for that hand-back. The load-time and
@@ -569,6 +575,76 @@ Under a declared limit it does not: `a 64 GB Mac at a declared 59,000 MB serves 
 the pack's 124K-token request at kv8 (9241 of 9473 MiB at the default 1 GiB margin), the advertised context and a 1536x1536 image encode (1633 MiB)
 at 131,072 and 262,144 as admitted at every free-RAM reading, 5.8 GB to 256 MB (`gpu_mem.active_bytes_override` stands
 in for the booted pack's bytes).
+
+## The ledger: a load on the static bill
+
+A load whose arch answers `ledgerTerms` (it plans its phases: every Hy4 load) and that warms is on
+the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bills read no allocator after the load.
+- **Budget `B`**, read once (`static_bill.open`) with the weights resident, before the chunk is chosen: the planning
+  ceiling (`Ceiling.planning`: a declared wired limit's floor, else the working set) less what the process held before
+  the load (MLX at rest and its cache, the other resident models with the engine's free buffers, each load on the
+  ledger at its whole budget, lent decoder pools). The load's `Ledger` owns it from there.
+- **Model bill** at the seal (`static_bill.seal`, after the warm and the plans), from the engine's own counts since the
+  load began: `weights` (the regions the loader mapped, whole pages), `slots` (the expert slabs), `static` (what the
+  pool keeps), `arena` (the plan's `G + D·H`), `pipelines` (what Metal allocated for the load past every buffer the engine and MLX
+  count, after the warm compiled them), `host` (0 for Hy4), and
+  `margin` (`BILL_MARGIN_BYTES`, D7, until one is measured per GPU class). Committed whole or the load refuses
+  (`ModelBillPastBudget`).
+- **Context, closed form**: `ctx = (B - model bill - fixed - points - forward) / per_token`, capped by the model's
+  default context, else its window (`ledger.contextFor`, `bills.ledgerContext`). The arch states the terms as upper
+  bounds of its request bill at every reach (`hy4_ledger.ledgerTerms`: the state's rate as its stores hold it, both the
+  grow slack and the pool's size class counted; the fixed blocks; the restore points; the prefill forward the pool still
+  runs). The seal computes the context once and keeps it on the ledger (`Ledger.context`, which `memoryContextAtChunk`
+  returns). An explicit `--ctx-size`, the model's `ctx_size` or a context a session pinned that the seal's lines no longer
+  hold (the warm's static and pipelines were unknown to the chunk's choice) refuses the load there (`ContextDoesNotFit`),
+  naming its source, the numbers, the context that fits and the widest narrower chunk that holds it (measured dry from
+  the plans). The auto context is pinned at the seal.
+- **Chunk** (D4): the context first at the narrowest candidate's terms, then the widest candidate whose arena bound
+  and request at that context fit the room (`bills.chooseLedgerPrefillChunk`, the arena priced in whole pages, as
+  Metal allocates it); none refuses the load with the numbers.
+- **The request terms live on the ledger** (`Ledger.terms`, set when the load fixes its chunk, at its KV width): every
+  reader of a request's bill on a load takes them from there, never a chunk or a width passed in.
+- **One `Reservation`** (`static_bill.reservation`): the terms at the request's reach (`reach`), the rows its images'
+  encode writes (`encode`, device) and their decoded f32 pixels (`media`, host). `state() = reach + encode` goes on the
+  `state` line, the pixels on the `media` line; `host` is the load's. Every reader prices a request through it, at the
+  load's KV width (a request naming another is refused by name, `static_bill.kvRefusal`, D103), and one rule,
+  `ledger.decide`, decides on the lines: `committed + bill <= B` admits; it fits once the parked state goes
+  (`release_parked`: the model's live record reaches SSD and its state is released, `sched.releaseParked`); it fits once
+  the running request ends (`wait`: it frees its `state` and `media`); else it is refused.
+  - **Admission** (`static_bill.admit`, inference thread, before the request allocates, its encode included): a `wait`
+    or `refuse` is a 400 by name, the two in different words; then the reservation is taken, and free RAM is read as a
+    second gate that only refuses (`ledger.freeRamRefuses`: memory is held outside this server, never by whom). A slot
+    holds one reservation: a prefill run again (a retry) releases the first before it is admitted again.
+  - **The connection thread** (`server.checkAttentionMemory` takes the request's deferred media; `static_bill.check`):
+    admit, release and wait proceed, the scheduler holds a wait (`slot_admission.memoryAdmitCount`, which prices a
+    pending slot from the slot itself, `static_bill.holdBill`); a refusal names the room a wait would free
+    (`Snapshot.roomAfter(.running)`), the maximum context that room holds past the encode and the pixels
+    (`ledger.contextFor`) and the max_tokens that follows from it: a re-send at it is admitted or held.
+  - The evict-to-admit pass (`slot_admission.admissionPassArmed`) never runs for a load on the ledger, and it unloads no
+    idle model: unloading another model frees no ledger room (D90).
+- **A request's end** (`static_bill.requestEnded`, where the inference thread finishes the slot: `releaseNativeState`,
+  on finish, error, cull and cancel; and at slot cleanup for a client that left mid-decode): its reservation and the
+  state it took over become what the model parks (`parked`, `sched.parkedStateBytes`) in one step (`Ledger.replace`);
+  held past the bill is logged by name. A slot that holds no reservation (never admitted, or ended already) changes
+  nothing, so the cleanup of a connection that completes after the next request began moves no line of it. The pool
+  keeps no free buffer past the request (`cooler.restCap` is 0): what it kept would be held outside every line.
+- **C1**: on both Hy4 tinies the device lines equal the engine's own count of what the load holds (pool buffers free
+  ones included, arena, mapped regions in whole pages, slabs) after the load and after each request
+  (`hy4_ledger_test.zig`).
+- **The budget is held whole** (D90): every reading outside the ledger (another model's preflight and its free RAM,
+  an off-ledger admission or headroom, the max-context search) counts the load's `B` as taken through
+  `bills.promisedActive`, which adds `B` less what the active count holds of the load (its model bill as counted at
+  the seal, its parked state; a running request's allocations err high, D91); the load's own readings read its lines.
+  A new model loads only where it fits beside `B`, else its preflight refuses it by name. `B` counts MLX's cache and the
+  engine's free buffers held before the load as other models'.
+- Observability: `[ledger] budget …` at the chunk choice, `[ledger] model bill … context … chunk …` at the seal, one
+  `[admission] needed=… committed=… budget=… verdict=…` line per decision; `/props` `memory.ledger`
+  (`{"lines":{…},"budget":…,"committed":…}`) and `memory.active_bytes` is the ledger's sum.
+- Its forwards run on the load's plans or in its measured region (D97, D98): the model bill's `arena`, never a request
+  term, and no forward of the load runs under a pool cap. A request refused there for its connection thread's numbers is
+  told the reply and the context its closed form fits (`static_bill.check`). Before the load, the
+  preflight, the streamed fit and the RAM-tier default price a request by the same terms (D105); the arena is the
+  ledger's, chosen with the chunk.
 
 ## Admission
 

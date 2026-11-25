@@ -1450,6 +1450,9 @@ const LentSweep = struct {
     step: Step = .release,
     /// A host allocation index that strands the last layer: its workspace fails and its take-back too.
     strands_at: ?usize = null,
+    /// The refusing allocator a step runs on. What the step makes keeps it (`PageSlab.allocator`) and is freed through
+    /// it after the step, so it lives as long as the sweep, never a step's frame.
+    failing: testing.FailingAllocator = undefined,
 
     const Step = enum { release, release_beside, read_back, heal };
 
@@ -1484,8 +1487,8 @@ const LentSweep = struct {
         while (true) : (k += 1) {
             if (k > 10_000) return error.NeverStranded;
             try self.toRest();
-            var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = k });
-            e.allocator = failing.allocator();
+            self.failing = testing.FailingAllocator.init(gpa, .{ .fail_index = k });
+            e.allocator = self.failing.allocator();
             _ = e.borrowLayer(self.layer[0]) catch 0;
             e.allocator = gpa;
             if (e.isBorrowed(self.layer[0]) and e.grouped_union.len == 0) break;
@@ -1559,12 +1562,12 @@ const LentSweep = struct {
         var k: usize = 0;
         while (true) : (k += 1) {
             try self.start();
-            var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = k });
-            e.allocator = failing.allocator();
+            self.failing = testing.FailingAllocator.init(gpa, .{ .fail_index = k });
+            e.allocator = self.failing.allocator();
             const r = self.run();
             e.allocator = gpa;
             try self.check("every host allocation from", k);
-            if (!failing.has_induced_failure) return r;
+            if (!self.failing.has_induced_failure) return r;
         }
     }
 };
@@ -1880,9 +1883,11 @@ test "cooler contract: a DeepSeek layer left released with no union workspace is
     const gpa = engine.allocator;
     defer engine.allocator = gpa;
     var fail_index: usize = 0;
+    // What a refused borrow makes keeps this allocator and is freed through it later: it outlives the loop.
+    var failing: testing.FailingAllocator = undefined;
     while (!engine.isBorrowed(last) or engine.grouped_union.len != 0) : (fail_index += 1) {
         if (engine.isBorrowed(last)) try engine.restoreLayer(last);
-        var failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
+        failing = testing.FailingAllocator.init(gpa, .{ .fail_index = fail_index });
         engine.allocator = failing.allocator();
         _ = engine.borrowLayer(last) catch 0;
         engine.allocator = gpa;
@@ -2045,6 +2050,10 @@ test "cooler contract: a DeepSeek request admitted while an earlier borrower's p
         const status = @import("status.zig");
         const avail_was = status.available_mem_override;
         defer status.available_mem_override = avail_was;
+        // No declared wired limit, so the free RAM the override names is the live ceiling on every box.
+        const mb_was = bills.wired_limit_mb_override;
+        defer bills.wired_limit_mb_override = mb_was;
+        bills.wired_limit_mb_override = 0;
         const r0: u64 = 4 << 30;
         status.available_mem_override = r0;
         const a0 = bills.admissionAvailableNow(config);

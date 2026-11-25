@@ -30,6 +30,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const calib = @import("kld_calib.zig");
 const offline = @import("arch/offline.zig");
 
 pub const ENV_VAR = "SUSHI_IMATRIX_OUT";
@@ -376,30 +377,136 @@ pub const Collector = struct {
         slot.rows += rows;
     }
 
+    const TensorEntry = struct {
+        name: []u8,
+        dtype: []const u8,
+        shape: [2]usize,
+        ndim: usize,
+        bytes: []u8,
+
+        fn deinit(self: *TensorEntry, allocator: std.mem.Allocator) void {
+            allocator.free(self.name);
+            allocator.free(self.bytes);
+        }
+    };
+
+    fn appendArrayEntry(self: *Collector, entries: *std.ArrayList(TensorEntry), name: []const u8, dtype: []const u8, arr: mlx.mlx_array) !void {
+        const shape_raw = mlx.getShape(arr);
+        if (shape_raw.len == 0 or shape_raw.len > 2) return error.ImatrixBadShape;
+        var shape: [2]usize = .{ 0, 0 };
+        for (shape_raw, 0..) |d, i| {
+            if (d < 0) return error.ImatrixBadShape;
+            shape[i] = @intCast(d);
+        }
+        const owned_name = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(owned_name);
+        const bytes = try calib.hostBytes(self.allocator, self.s, arr);
+        errdefer self.allocator.free(bytes);
+        try entries.ensureUnusedCapacity(self.allocator, 1);
+        entries.appendAssumeCapacity(.{
+            .name = owned_name,
+            .dtype = dtype,
+            .shape = shape,
+            .ndim = shape_raw.len,
+            .bytes = bytes,
+        });
+    }
+
+    fn writeSafetensors(allocator: std.mem.Allocator, path: []const u8, entries: []const TensorEntry, meta: []const [2][]const u8) !void {
+        var header: std.Io.Writer.Allocating = .init(allocator);
+        defer header.deinit();
+        const w = &header.writer;
+        try w.writeByte('{');
+        var first = true;
+        if (meta.len > 0) {
+            try w.writeAll("\"__metadata__\":{");
+            for (meta, 0..) |kv, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print("{f}:{f}", .{ std.json.fmt(kv[0], .{}), std.json.fmt(kv[1], .{}) });
+            }
+            try w.writeByte('}');
+            first = false;
+        }
+        var offset: u64 = 0;
+        for (entries) |e| {
+            if (!first) try w.writeByte(',');
+            first = false;
+            try w.print("{f}:{{\"dtype\":\"{s}\",\"shape\":[", .{ std.json.fmt(e.name, .{}), e.dtype });
+            for (e.shape[0..e.ndim], 0..) |d, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.print("{d}", .{d});
+            }
+            const end = offset + e.bytes.len;
+            try w.print("],\"data_offsets\":[{d},{d}]}}", .{ offset, end });
+            offset = end;
+        }
+        try w.writeByte('}');
+        while (header.written().len % 8 != 0) try w.writeByte(' ');
+
+        const path_z = try std.fmt.allocPrintSentinel(allocator, "{s}", .{path}, 0);
+        defer allocator.free(path_z);
+        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return error.ImatrixWriteFailed;
+        defer _ = std.c.close(fd);
+        var len_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &len_buf, header.written().len, .little);
+        try calib.writeAll(fd, &len_buf);
+        try calib.writeAll(fd, header.written());
+        for (entries) |e| try calib.writeAll(fd, e.bytes);
+    }
+
+    const ParsedTensor = struct {
+        dtype: []const u8,
+        shape: [2]c_int,
+        ndim: usize,
+        lo: usize,
+        hi: usize,
+    };
+
+    fn parseTensor(root: std.json.ObjectMap, name: []const u8, body_len: usize) !ParsedTensor {
+        const tv = root.get(name) orelse return error.ImatrixStateCorrupt;
+        if (tv != .object) return error.ImatrixStateCorrupt;
+        const dv = tv.object.get("dtype") orelse return error.ImatrixStateCorrupt;
+        const sv = tv.object.get("shape") orelse return error.ImatrixStateCorrupt;
+        const ov = tv.object.get("data_offsets") orelse return error.ImatrixStateCorrupt;
+        if (dv != .string or sv != .array or ov != .array or ov.array.items.len != 2) return error.ImatrixStateCorrupt;
+        if (sv.array.items.len == 0 or sv.array.items.len > 2) return error.ImatrixStateCorrupt;
+        var shape: [2]c_int = .{ 0, 0 };
+        for (sv.array.items, 0..) |d, i| {
+            if (d != .integer) return error.ImatrixStateCorrupt;
+            shape[i] = std.math.cast(c_int, d.integer) orelse return error.ImatrixStateCorrupt;
+            if (shape[i] < 0) return error.ImatrixStateCorrupt;
+        }
+        if (ov.array.items[0] != .integer or ov.array.items[1] != .integer) return error.ImatrixStateCorrupt;
+        const lo = std.math.cast(usize, ov.array.items[0].integer) orelse return error.ImatrixStateCorrupt;
+        const hi = std.math.cast(usize, ov.array.items[1].integer) orelse return error.ImatrixStateCorrupt;
+        if (lo > hi or hi > body_len) return error.ImatrixStateCorrupt;
+        return .{ .dtype = dv.string, .shape = shape, .ndim = sv.array.items.len, .lo = lo, .hi = hi };
+    }
+
     /// `name` = sum / rows beside `name.rows`; nothing for a linear that never ran.
-    fn putDense(self: *Collector, map: mlx.mlx_map_string_to_array, held: *std.ArrayList(mlx.mlx_array), name: []const u8, d: *const Dense) !usize {
+    fn putDense(self: *Collector, entries: *std.ArrayList(TensorEntry), name: []const u8, d: *const Dense) !usize {
         if (d.rows == 0 or d.acc.ctx == null) return 0;
         var key_buf: [192]u8 = undefined;
         const denom = try mlx.newFloat(@floatFromInt(d.rows));
         defer _ = mlx.mlx_array_free(denom);
         var mean = mlx.mlx_array_new();
-        mlx.check(mlx.mlx_divide(&mean, d.acc, denom, self.s)) catch |e| {
-            _ = mlx.mlx_array_free(mean);
-            return e;
-        };
-        held.append(self.allocator, mean) catch |e| {
-            _ = mlx.mlx_array_free(mean);
-            return e;
-        };
-        try mlx.check(mlx.mlx_array_eval(mean));
-        try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}", .{name}, 0), mean));
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_divide(&mean, d.acc, denom, self.s));
+        try self.appendArrayEntry(entries, name, "F32", mean);
         const count: f32 = @floatFromInt(d.rows);
-        const rows = try mlx.newData(&count, &[_]c_int{1}, .float32);
-        held.append(self.allocator, rows) catch |e| {
-            _ = mlx.mlx_array_free(rows);
-            return e;
-        };
-        try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}.rows", .{name}, 0), rows));
+        const rows_name = try self.allocator.dupe(u8, try std.fmt.bufPrint(&key_buf, "{s}.rows", .{name}));
+        errdefer self.allocator.free(rows_name);
+        const rows_bytes = try self.allocator.dupe(u8, std.mem.asBytes(&count));
+        errdefer self.allocator.free(rows_bytes);
+        try entries.ensureUnusedCapacity(self.allocator, 1);
+        entries.appendAssumeCapacity(.{
+            .name = rows_name,
+            .dtype = "F32",
+            .shape = .{ 1, 0 },
+            .ndim = 1,
+            .bytes = rows_bytes,
+        });
         return 2;
     }
 
@@ -418,8 +525,11 @@ pub const Collector = struct {
     /// The raw accumulators of every expert layer (no normalization), so a capture that resumes continues the sums.
     /// `path` must end in `.safetensors`: MLX appends the suffix otherwise.
     pub fn saveState(self: *Collector, path: []const u8) !void {
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
+        var entries: std.ArrayList(TensorEntry) = .empty;
+        defer {
+            for (entries.items) |*e| e.deinit(self.allocator);
+            entries.deinit(self.allocator);
+        }
         const tokens = try self.allocator.alloc(u32, self.layers.len);
         defer self.allocator.free(tokens);
         var key_buf: [64]u8 = undefined;
@@ -427,46 +537,62 @@ pub const Collector = struct {
             t.* = @intCast(slot.tokens);
             if (slot.tokens == 0) continue;
             inline for (.{ .{ "gu", &slot.gu }, .{ "down", &slot.down }, .{ "rows", &slot.rows } }) |entry| {
-                try mlx.check(mlx.mlx_array_eval(entry[1].*));
-                try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}.{d}", .{ entry[0], li }, 0), entry[1].*));
+                const key = try std.fmt.bufPrint(&key_buf, "{s}.{d}", .{ entry[0], li });
+                try self.appendArrayEntry(&entries, key, "F32", entry[1].*);
             }
         }
-        const count = try mlx.newData(tokens.ptr, &[_]c_int{@intCast(tokens.len)}, .uint32);
-        defer _ = mlx.mlx_array_free(count);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(map, "tokens", count));
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{path}, 0);
-        defer self.allocator.free(path_z);
-        try mlx.check(mlx.mlx_save_safetensors(path_z.ptr, map, meta));
+        const tok_name = try self.allocator.dupe(u8, "tokens");
+        errdefer self.allocator.free(tok_name);
+        const tok_bytes = try self.allocator.dupe(u8, std.mem.sliceAsBytes(tokens));
+        errdefer self.allocator.free(tok_bytes);
+        try entries.ensureUnusedCapacity(self.allocator, 1);
+        entries.appendAssumeCapacity(.{
+            .name = tok_name,
+            .dtype = "U32",
+            .shape = .{ tokens.len, 0 },
+            .ndim = 1,
+            .bytes = tok_bytes,
+        });
+        try writeSafetensors(self.allocator, path, entries.items, &.{});
     }
 
     /// Replaces every accumulator with the ones `saveState` wrote; a file for other geometry is refused.
     pub fn loadState(self: *Collector, path: []const u8) !void {
-        var loaded = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(loaded);
-        var meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{path}, 0);
-        defer self.allocator.free(path_z);
-        const cpu = mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(cpu);
-        try mlx.check(mlx.mlx_load_safetensors(&loaded, &meta, path_z.ptr, cpu));
-        var count = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(count);
-        try mlx.check(mlx.mlx_map_string_to_array_get(&count, loaded, "tokens"));
-        try mlx.check(mlx.mlx_array_eval(count));
-        const tokens = mlx.mlx_array_data_uint32(count) orelse return error.ImatrixStateCorrupt;
-        if (mlx.mlx_array_size(count) != self.layers.len) return error.ImatrixStateGeometry;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const raw = try std.Io.Dir.cwd().readFileAlloc(io, path, self.allocator, .limited(16 << 30));
+        defer self.allocator.free(raw);
+        if (raw.len < 8) return error.ImatrixStateCorrupt;
+        const hlen = std.mem.readInt(u64, raw[0..8], .little);
+        if (hlen > raw.len - 8) return error.ImatrixStateCorrupt;
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, raw[8 .. 8 + hlen], .{}) catch return error.ImatrixStateCorrupt;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.ImatrixStateCorrupt;
+        const body = raw[8 + hlen ..];
+
+        const tok_meta = try parseTensor(parsed.value.object, "tokens", body.len);
+        if (!std.mem.eql(u8, tok_meta.dtype, "U32") or tok_meta.ndim != 1) return error.ImatrixStateCorrupt;
+        if (@as(usize, @intCast(tok_meta.shape[0])) != self.layers.len) return error.ImatrixStateGeometry;
+        if (tok_meta.hi - tok_meta.lo != self.layers.len * 4) return error.ImatrixStateCorrupt;
+        const tok_bytes = body[tok_meta.lo..tok_meta.hi];
+
         var key_buf: [64]u8 = undefined;
         for (self.layers, 0..) |*slot, li| {
             slot.deinit();
-            slot.tokens = tokens[li];
+            slot.tokens = std.mem.readInt(u32, tok_bytes[li * 4 ..][0..4], .little);
             if (slot.tokens == 0) continue;
-            inline for (.{ .{ "gu", &slot.gu, @as(c_int, 1) }, .{ "down", &slot.down, @as(c_int, 1) }, .{ "rows", &slot.rows, @as(c_int, 1) } }) |entry| {
-                try mlx.check(mlx.mlx_map_string_to_array_get(entry[1], loaded, try std.fmt.bufPrintSentinel(&key_buf, "{s}.{d}", .{ entry[0], li }, 0)));
-                try mlx.check(mlx.mlx_array_eval(entry[1].*));
-                if (mlx.getShape(entry[1].*)[0] != self.experts) return error.ImatrixStateGeometry;
+            inline for (.{ .{ "gu", &slot.gu }, .{ "down", &slot.down }, .{ "rows", &slot.rows } }) |entry| {
+                const key = try std.fmt.bufPrint(&key_buf, "{s}.{d}", .{ entry[0], li });
+                const tm = try parseTensor(parsed.value.object, key, body.len);
+                if (!std.mem.eql(u8, tm.dtype, "F32")) return error.ImatrixStateCorrupt;
+                if (tm.shape[0] != self.experts) return error.ImatrixStateGeometry;
+                var elems: usize = 1;
+                for (tm.shape[0..tm.ndim]) |d| elems = try std.math.mul(usize, elems, @intCast(d));
+                if (tm.hi - tm.lo != elems * 4) return error.ImatrixStateCorrupt;
+                const vals = try self.allocator.alloc(f32, elems);
+                defer self.allocator.free(vals);
+                const slice = body[tm.lo..tm.hi];
+                for (vals, 0..) |*v, i| v.* = @bitCast(std.mem.readInt(u32, slice[i * 4 ..][0..4], .little));
+                entry[1].* = try mlx.newData(vals.ptr, tm.shape[0..tm.ndim], .float32);
             }
         }
     }
@@ -474,56 +600,50 @@ pub const Collector = struct {
     /// Write the safetensors file. Returns its byte count.
     pub fn flush(self: *Collector) !u64 {
         if (self.path.len == 0) return 0;
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        var held: std.ArrayList(mlx.mlx_array) = .empty;
+        var entries: std.ArrayList(TensorEntry) = .empty;
         defer {
-            for (held.items) |a| _ = mlx.mlx_array_free(a);
-            held.deinit(self.allocator);
+            for (entries.items) |*e| e.deinit(self.allocator);
+            entries.deinit(self.allocator);
         }
         var key_buf: [192]u8 = undefined;
-        var entries: usize = 0;
+        var count: usize = 0;
         for (self.layers, 0..) |*slot, li| {
             if (slot.tokens == 0 or slot.gu.ctx == null or slot.down.ctx == null) continue;
             const denom = try mlx.newFloat(@floatFromInt(slot.tokens));
             defer _ = mlx.mlx_array_free(denom);
             const gu = try self.scaledFlat(slot.gu, denom);
-            try held.append(self.allocator, gu);
+            defer _ = mlx.mlx_array_free(gu);
             const down = try self.scaledFlat(slot.down, denom);
-            try held.append(self.allocator, down);
-            try mlx.check(mlx.mlx_array_eval(slot.rows));
+            defer _ = mlx.mlx_array_free(down);
             const prefix = self.naming.layer_prefix;
-            const gu_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj", .{ prefix, li, self.naming.experts_infix }, 0);
-            try mlx.check(mlx.mlx_map_string_to_array_insert(map, gu_key.ptr, gu));
-            const rows_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}gate_up_proj.rows", .{ prefix, li, self.naming.experts_infix }, 0);
-            try mlx.check(mlx.mlx_map_string_to_array_insert(map, rows_key.ptr, slot.rows));
-            const down_key = try std.fmt.bufPrintSentinel(&key_buf, "{s}{d}{s}down_proj", .{ prefix, li, self.naming.experts_infix }, 0);
-            try mlx.check(mlx.mlx_map_string_to_array_insert(map, down_key.ptr, down));
-            entries += 3;
+            const gu_key = try std.fmt.bufPrint(&key_buf, "{s}{d}{s}gate_up_proj", .{ prefix, li, self.naming.experts_infix });
+            try self.appendArrayEntry(&entries, gu_key, "F32", gu);
+            const rows_key = try std.fmt.bufPrint(&key_buf, "{s}{d}{s}gate_up_proj.rows", .{ prefix, li, self.naming.experts_infix });
+            try self.appendArrayEntry(&entries, rows_key, "F32", slot.rows);
+            const down_key = try std.fmt.bufPrint(&key_buf, "{s}{d}{s}down_proj", .{ prefix, li, self.naming.experts_infix });
+            try self.appendArrayEntry(&entries, down_key, "F32", down);
+            count += 3;
         }
         var name_buf: [192]u8 = undefined;
         for (self.o_proj, 0..) |*d, li| {
             const name = try std.fmt.bufPrint(&name_buf, "{s}{d}.self_attn.o_proj.weight", .{ self.naming.layer_prefix, li });
-            entries += try self.putDense(map, &held, name, d);
+            count += try self.putDense(&entries, name, d);
         }
-        entries += try self.putDense(map, &held, "lm_head.weight", &self.lm_head);
-        if (entries == 0) return error.ImatrixNothingCaptured;
+        count += try self.putDense(&entries, "lm_head.weight", &self.lm_head);
+        if (count == 0) return error.ImatrixNothingCaptured;
 
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        _ = mlx.mlx_map_string_to_string_insert(meta, "keys", "SOURCE checkpoint weight names");
-        _ = mlx.mlx_map_string_to_string_insert(meta, "values", "experts: sum(x^2)/layer tokens, per expert concatenated; dense linears: sum(x^2)/rows");
-        _ = mlx.mlx_map_string_to_string_insert(meta, "producer", "sushi " ++ ENV_VAR);
-
-        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{self.path}, 0);
-        defer self.allocator.free(path_z);
-        try mlx.check(mlx.mlx_save_safetensors(path_z.ptr, map, meta));
+        const meta = [_][2][]const u8{
+            .{ "keys", "SOURCE checkpoint weight names" },
+            .{ "values", "experts: sum(x^2)/layer tokens, per expert concatenated; dense linears: sum(x^2)/rows" },
+            .{ "producer", "sushi " ++ ENV_VAR },
+        };
+        try writeSafetensors(self.allocator, self.path, entries.items, &meta);
         const io = std.Io.Threaded.global_single_threaded.io();
         const stat = std.Io.Dir.cwd().statFile(io, self.path, .{}) catch |e| {
             log.warn("[imatrix] wrote {s}: size unavailable ({s})\n", .{ self.path, @errorName(e) });
             return 0;
         };
-        log.info("[imatrix] wrote {s}: {d} entries, {d} bytes\n", .{ self.path, entries, stat.size });
+        log.info("[imatrix] wrote {s}: {d} entries, {d} bytes\n", .{ self.path, count, stat.size });
         return stat.size;
     }
 };

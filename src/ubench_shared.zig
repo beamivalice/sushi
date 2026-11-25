@@ -3,6 +3,8 @@
 //! kernels, folded into the routed launches, and absent, for Flash-Next, GLM and DeepSeek-V4.1. Run by `sushi-ubench`,
 //! never by a test; the bytes of every arm are asserted by the tests beside the folds. `shared.exl3_trunk_prefill` times
 //! one Flash-Next trunk projection at prefill width on the sorted GEMM and the decoded path against affine 8.
+//! `shared.read_bandwidth` and `shared.gemm_peak` measure the box's own ceilings: the GPU's sustained streaming read and
+//! MLX's dense matmul at Hy4-Flash's prefill shapes.
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const io_util = @import("io_util.zig");
@@ -15,7 +17,7 @@ const kernels = api.kernels;
 const exl3_ubench = @import("sushi_exl3_ubench");
 const bench = exl3_ubench.bench_util;
 
-pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch, trunk_prefill };
+pub const benches = [_]report.Bench{ shared_expert_fold, kernel_launch, trunk_prefill, read_bandwidth, gemm_peak };
 
 pub const alloc = std.heap.page_allocator;
 pub const max_layers = 32;
@@ -331,6 +333,173 @@ fn runTrunkPrefill(run: *report.Run) anyerror!void {
                     if (run.hasArm(arm)) try run.metric(arm, "TFLOP/s", "TFLOP/s", flop / run.lastMedianNs(arm) / 1e3);
                 }
             }
+        }
+    }
+}
+
+// ---- shared.read_bandwidth: the GPU's sustained streaming read over a buffer far past the system cache ----
+
+pub const read_bandwidth: report.Bench = .{
+    .name = "shared.read_bandwidth",
+    .scope = .shared,
+    .what = "the GPU's sustained streaming read: one kernel reading a 1, 8 or 16 GB buffer once by coalesced 16-byte loads, 16 per thread, as GB/s",
+    .unit = .us,
+    .steps = 4,
+    .axes = &.{.{ .name = "gb", .values = &.{ "1", "8", "16" } }},
+    .arms = &.{"read"},
+    .ref = "read",
+    .run = runReadBandwidth,
+};
+
+const read_loads = 16;
+var read_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const READ_SOURCE: [:0]const u8 =
+    \\const ulong tid = ulong(thread_position_in_grid.x);
+    \\const ulong total = ulong(threads_per_grid.x);
+    \\const device uint4 *p = (const device uint4 *)w;
+    \\uint v = 0u;
+    \\for (uint j = 0u; j < LOADS; ++j) { const uint4 a = p[tid + ulong(j) * total]; v += a.x ^ a.y ^ a.z ^ a.w; }
+    \\if (tid == 0u && float(xin[0]) == 1.5e30f) v = 0u;
+    \\v = simd_sum(v);
+    \\if ((tid & 31u) == 0u) y[tid >> 5u] = v;
+;
+
+const ReadCtx = struct { w: Arr, bytes: usize, link_ns: f64 };
+
+fn readStep(c: *const ReadCtx, s: mlx.mlx_stream, _: usize, x: Arr) anyerror!Arr {
+    const nthreads: c_int = @intCast(c.bytes / 16 / read_loads);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{@divExact(nthreads, 32)}, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, nthreads, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LOADS", read_loads));
+    const k = try kernels.getNamedKernel(&read_kernel, "sushi_ubench_read", &.{ "w", "xin" }, &.{"y"}, READ_SOURCE, "");
+    const ov = try kernels.applyOuts(s, k, &.{ c.w, x }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    return y;
+}
+
+const ReadSample = struct { c: *const ReadCtx, x0: Arr, steps: usize };
+
+fn readSample(smp: ReadSample, _: usize) anyerror!f64 {
+    const ns = try bench.chainNs(mlx.gpuStream(), smp.x0, smp.steps, smp.c, readStep);
+    return (@as(f64, @floatFromInt(ns)) - smp.c.link_ns) / @as(f64, @floatFromInt(smp.steps));
+}
+
+fn runReadBandwidth(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    var one = [_]f32{0.5};
+    const x0 = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32);
+    defer _ = mlx.mlx_array_free(x0);
+    const steps = run.steps(4);
+    for (run.axis("gb")) |gb_text| {
+        const gb = try std.fmt.parseInt(usize, gb_text, 10);
+        const bytes = gb << 30;
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        // Written by the GPU, so every page is backed (an untouched buffer reads the shared zero page).
+        try mlx.check(mlx.mlx_full(&w, &[_]c_int{ @intCast(gb * 1024), 1 << 18 }, 2, mlx.mlx_array_new_float(7.0), .uint32, s));
+        try eval(w);
+        var t: [5]u64 = undefined;
+        for (&t) |*v| v.* = try bench.chainNs(s, x0, steps, {}, bench.linkOnly);
+        const c: ReadCtx = .{ .w = w, .bytes = bytes, .link_ns = bench.median(&t) };
+        const label = try std.fmt.allocPrint(run.a, "read {d} GiB", .{gb});
+        try run.interleave(label, ReadSample{ .c = &c, .x0 = x0, .steps = steps }, readSample);
+        try run.metric("read", "GB/s", "GB/s", @as(f64, @floatFromInt(bytes)) / run.lastMedianNs("read"));
+    }
+}
+
+// ---- shared.gemm_peak: MLX's dense matmul at Hy4-Flash's prefill shapes ----
+
+const GemmShape = struct { name: []const u8, out: usize, in: usize };
+
+const GEMM_SHAPES = [_]GemmShape{
+    .{ .name = "square8192", .out = 8192, .in = 8192 },
+    .{ .name = "hy4_q_a", .out = 1024, .in = 3072 },
+    .{ .name = "hy4_q_b", .out = 16384, .in = 1024 },
+    .{ .name = "hy4_gate", .out = 16384, .in = 3072 },
+    .{ .name = "hy4_o", .out = 3072, .in = 16384 },
+    .{ .name = "hy4_kv_b", .out = 28672, .in = 512 },
+    .{ .name = "hy4_shared_gate", .out = 1536, .in = 3072 },
+    .{ .name = "hy4_shared_down", .out = 3072, .in = 1536 },
+    .{ .name = "hy4_expert", .out = 1536, .in = 1536 },
+};
+
+const gemm_shape_names = blk: {
+    var names: [GEMM_SHAPES.len][]const u8 = undefined;
+    for (GEMM_SHAPES, 0..) |sh, i| names[i] = sh.name;
+    break :blk names;
+};
+
+pub const gemm_peak: report.Bench = .{
+    .name = "shared.gemm_peak",
+    .scope = .shared,
+    .what = "MLX's dense matmul (x Wᵀ, the NAX tiles where the GPU has them) at Hy4-Flash's prefill shapes and a square 8192, bf16 and f16, as TFLOP/s",
+    .unit = .us,
+    .steps = 8,
+    .axes = &.{
+        .{ .name = "shape", .values = &gemm_shape_names, .numeric = false },
+        .{ .name = "rows", .values = &.{ "512", "2048", "4096", "8192" } },
+    },
+    .arms = &.{ "bf16", "f16" },
+    .ref = "bf16",
+    .run = runGemmPeak,
+};
+
+const GemmCtx = struct { w: [2][2]Arr, x0: [2]Arr, link_ns: f64 };
+
+fn gemmStep(c: GemmArm, s: mlx.mlx_stream, i: usize, x: Arr) anyerror!Arr {
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_transpose(&wt, c.c.w[c.arm][i % 2], s));
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_matmul(&y, x, wt, s));
+    return y;
+}
+
+const GemmArm = struct { c: *const GemmCtx, arm: usize };
+const GemmSample = struct { c: *const GemmCtx, steps: usize };
+
+fn gemmSample(smp: GemmSample, arm: usize) anyerror!f64 {
+    const ns = try bench.chainNs(mlx.gpuStream(), smp.c.x0[arm], smp.steps, GemmArm{ .c = smp.c, .arm = arm }, gemmStep);
+    return (@as(f64, @floatFromInt(ns)) - smp.c.link_ns) / @as(f64, @floatFromInt(smp.steps));
+}
+
+fn runGemmPeak(run: *report.Run) anyerror!void {
+    const s = mlx.gpuStream();
+    for (GEMM_SHAPES) |sh| {
+        if (!listed(run.axis("shape"), sh.name)) continue;
+        var c: GemmCtx = .{ .w = .{ .{ mlx.mlx_array_new(), mlx.mlx_array_new() }, .{ mlx.mlx_array_new(), mlx.mlx_array_new() } }, .x0 = undefined, .link_ns = 0 };
+        defer for (c.w) |pair| for (pair) |w| {
+            _ = mlx.mlx_array_free(w);
+        };
+        for (0..2) |arm| for (0..2) |ci| {
+            try mlx.check(mlx.mlx_random_normal(&c.w[arm][ci], &[_]c_int{ @intCast(sh.out), @intCast(sh.in) }, 2, if (arm == 0) .bfloat16 else .float16, 0, 0.02, .{ .ctx = null }, s));
+            try eval(c.w[arm][ci]);
+        };
+        for (run.axis("rows")) |rows_text| {
+            const rows = try std.fmt.parseInt(usize, rows_text, 10);
+            c.x0 = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+            defer for (c.x0) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            for (0..2) |arm| {
+                try mlx.check(mlx.mlx_random_normal(&c.x0[arm], &[_]c_int{ @intCast(rows), @intCast(sh.in) }, 2, if (arm == 0) .bfloat16 else .float16, 0, 1, .{ .ctx = null }, s));
+                try eval(c.x0[arm]);
+            }
+            const steps = run.steps(8);
+            var t: [5]u64 = undefined;
+            for (&t) |*v| v.* = try bench.chainNs(s, c.x0[0], steps, {}, bench.linkOnly);
+            c.link_ns = bench.median(&t);
+            const label = try std.fmt.allocPrint(run.a, "{s} [{d}x{d}] rows {d}", .{ sh.name, sh.out, sh.in, rows });
+            try run.interleave(label, GemmSample{ .c = &c, .steps = steps }, gemmSample);
+            const flop: f64 = 2.0 * @as(f64, @floatFromInt(rows * sh.in * sh.out));
+            for ([_][]const u8{ "bf16", "f16" }) |arm| if (run.hasArm(arm)) try run.metric(arm, "TFLOP/s", "TFLOP/s", flop / run.lastMedianNs(arm) / 1e3);
         }
     }
 }

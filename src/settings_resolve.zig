@@ -29,9 +29,25 @@ pub fn sourceLabel(source: Source, flag_name: []const u8) []const u8 {
 pub const Launch = struct {
     /// `--drafter` was given.
     drafter: bool = false,
+    /// `--prefill-chunk-max` / `--prefill-chunk-min` (an arch's flags): the rows a static-bill load's chunk is chosen
+    /// within (D4).
+    prefill_chunk_max: ?u32 = null,
+    prefill_chunk_min: ?u32 = null,
 };
 
 pub var launch: Launch = .{};
+
+/// The widths a static-bill load's prefill chunk may take, widest first. Every bound of it (`--prefill-chunk-max`,
+/// `--prefill-chunk-min`, their model-settings keys, and `--prefill-chunk` where it means the max) is one of them, else
+/// it is refused by name.
+pub const static_chunk_rungs = [_]u32{ 8192, 4096, 2048, 1024, 512 };
+/// `static_chunk_rungs` as a refusal names them.
+pub const static_chunk_rungs_text = "512, 1024, 2048, 4096 or 8192 rows";
+
+pub fn isStaticChunkRung(rows: u64) bool {
+    for (static_chunk_rungs) |r| if (rows == r) return true;
+    return false;
+}
 
 /// The prefill width. `--prefill-chunk` outranks the per-model chunk the memory sizer pins
 /// (`ModelConfig.pinned_prefill_chunk`); without the flag 8192 is only the default.

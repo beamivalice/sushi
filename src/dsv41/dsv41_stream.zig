@@ -215,14 +215,9 @@ pub const StqStream = struct {
         }, .penalty = penaltyOpaque, .all_resident = allResident };
     }
 
-    /// Every active expert layer routes through its resident map (`Engine.residentRoute`): no route fills a slab from
-    /// the host.
     fn allResident(ctx: *anyopaque) bool {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
-        for (self.engine.layers, 0..) |*layer, li| {
-            if (layer.active and self.engine.residentRoute(@intCast(li)) == null) return false;
-        }
-        return true;
+        return self.engine.allResident();
     }
 
     fn penaltyOpaque(ctx: *anyopaque, layer: usize) anyerror!?A {
@@ -1796,7 +1791,7 @@ test "dsv41 drop: the transformer loads the pack's usage list, bills the smaller
     var served: StqServed = undefined;
     var d = try model.testDrop(8);
     defer d.deinit();
-    try served.initDrop(dir, .bfloat16, true, config.dsparkOn(), 8, s, &d, true);
+    try served.initDrop(dir, .bfloat16, true, config.drafterOn(), 8, s, &d, true);
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
@@ -1880,7 +1875,7 @@ test "dsv41 stq shell: the transformer loads an STQ pack through the one loader 
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
 
     var served: StqServed = undefined;
-    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
 
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
@@ -2018,7 +2013,7 @@ fn borrowCase(cache_bytes: u64) !void {
     config.expert_cache_bytes = cache_bytes;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
     var served: StqServed = undefined;
-    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
@@ -2280,7 +2275,7 @@ test "dsv41 borrow: a layer left released with no union workspace is healed befo
     config.expert_cache_bytes = 64 << 20;
     config.expert_source_dir = try testing.allocator.dupe(u8, dir);
     var served: StqServed = undefined;
-    try served.init(dir, .bfloat16, true, config.dsparkOn(), 8, s);
+    try served.init(dir, .bfloat16, true, config.drafterOn(), 8, s);
     defer served.deinit();
     var weights = try model_mod.loadWeightsForConfig(io, testing.allocator, dir, &config, false);
     defer weights.deinit();
@@ -2946,7 +2941,7 @@ test "dsv41 pair-major: `sushi repack` of a copy of the tiny pack gives a pack t
         defer testing.allocator.free(bytes);
         try tmp.dir.writeFile(io, .{ .sub_path = entry.name, .data = bytes });
     }
-    try testing.expectEqual(@import("repack.zig").Outcome.repacked, try @import("repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
+    try testing.expectEqual(@import("../repack.zig").Outcome.repacked, try @import("../repack.zig").repackPack(testing.allocator, io, copy, .{ .workers = 2 }));
     // At the budget alone: an evicting budget is the plain pair-major pack's.
     try expectPmParity(dir, copy, 0, &.{8});
 }

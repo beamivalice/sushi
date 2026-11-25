@@ -169,9 +169,49 @@ const testing = std.testing;
 const weather_tools =
     \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"notes":{"type":"string"}},"required":["city"]}}}]
 ;
-const call_head = "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n<parameter=notes>\n";
-const call_tail = "\n</parameter>\n</function>\n</tool_call>";
-const first_call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>\n";
+
+/// One call of the same tool in each dialect a request is served in, cut where a long value starts: `head` up to the
+/// second argument's value, `tail` after it, `first_call` a whole call of another value, and `unsettled` texts whose
+/// tool name is not whole or not declared.
+const Shape = struct {
+    name: []const u8,
+    head: []const u8,
+    tail: []const u8,
+    first_call: []const u8,
+    unsettled: []const []const u8,
+};
+
+const shapes = [_]Shape{
+    .{
+        .name = "function tag",
+        .head = "Let me check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n<parameter=notes>\n",
+        .tail = "\n</parameter>\n</function>\n</tool_call>",
+        .first_call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nOslo\n</parameter>\n</function>\n</tool_call>\n",
+        .unsettled = &.{ "Let me check.\n<tool_call>\n<function=", "<tool_call>\n<function=get_stock>\n<parameter=symbol>\nAAPL" },
+    },
+    .{
+        .name = "Hy4 wrapper, arg_key",
+        .head = "Let me check.\n<tool_calls:opensource><tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value><arg_key>notes</arg_key><arg_value>",
+        .tail = "</arg_value></tool_call></tool_calls:opensource>",
+        .first_call = "<tool_calls:opensource><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call></tool_calls:opensource>\n",
+        .unsettled = &.{ "Let me check.\n<tool_calls:opensource>", "Let me check.\n<tool_calls:opensource><tool_call>", "<tool_calls:opensource><tool_call>get_wea", "<tool_calls:opensource><tool_call>get_stock<arg_key>symbol</arg_key><arg_value>AAPL" },
+    },
+    .{
+        .name = "Hy4 wrapper, every tag :opensource",
+        .head = "Let me check.\n<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tokyo</arg_value:opensource><arg_key:opensource>notes</arg_key:opensource><arg_value:opensource>",
+        .tail = "</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+        .first_call = "<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource></tool_call:opensource></tool_calls:opensource>\n",
+        .unsettled = &.{ "Let me check.\n<tool_calls:opensource><tool_call:opensource>", "<tool_calls:opensource><tool_call:opensource>get_wea", "<tool_calls:opensource><tool_call:opensource>get_stock<arg_key:opensource>symbol</arg_key:opensource><arg_value:opensource>AAPL" },
+    },
+};
+
+/// The head of a `write_file` call in each dialect a request is served in, up to its `content` value: what the surfaces'
+/// beat cells stream.
+pub const write_file_heads = [_][]const u8{
+    "<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n",
+    "<tool_calls:opensource><tool_call>write_file<arg_key>path</arg_key><arg_value>report.md</arg_value><arg_key>content</arg_key><arg_value>",
+    "<tool_calls:opensource><tool_call:opensource>write_file<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>report.md</arg_value:opensource><arg_key:opensource>content</arg_key:opensource><arg_value:opensource>",
+};
 
 /// What an OpenAI client holds of the calls it is streamed, by index: `id` and `name` from the delta that has them,
 /// the arguments as the concatenation of every fragment.
@@ -220,130 +260,144 @@ fn freeCalls(allocator: std.mem.Allocator, calls: []tool_schema.ParsedToolCall) 
     allocator.free(calls);
 }
 
-test "tool progress: a call that takes longer than the beat interval yields data events at the interval, and the client assembles the non-stream call" {
+test "tool progress: a call that takes longer than the beat interval yields data events at the interval, and the client assembles the non-stream call, in every dialect" {
     const allocator = testing.allocator;
     const interval_ms: i64 = 5000;
     const token_ms: i64 = 100;
-    var progress = Progress{};
-    defer progress.deinit(allocator);
-    var client = Client{};
-    defer client.deinit(allocator);
-    var buffered = std.ArrayList(u8).empty;
-    defer buffered.deinit(allocator);
-
-    // One token every 100 ms for 23 s: the head, then the file the call writes.
-    var tokens: std.ArrayList([]const u8) = .empty;
-    defer tokens.deinit(allocator);
-    try tokens.append(allocator, call_head);
-    for (0..229) |_| try tokens.append(allocator, "line of the file \n");
-    var now: i64 = 0;
-    var last_write: i64 = 0;
-    var comments: usize = 0;
-    var gaps_over: usize = 0;
-    for (tokens.items) |tok| {
-        now += token_ms;
-        try buffered.appendSlice(allocator, tok);
-        if (now - last_write < interval_ms) continue;
-        if (try progress.beat(allocator, testing.io, buffered.items, .{ .dialect = null }, weather_tools, .{})) |beat| {
-            const delta = try chatBeat(allocator, &progress, beat);
-            defer allocator.free(delta);
-            try client.take(allocator, delta);
-        } else comments += 1;
-        if (now - last_write > interval_ms + token_ms) gaps_over += 1;
-        last_write = now;
-    }
-    try buffered.appendSlice(allocator, call_tail);
-
-    // 23 s of silence: four beats, every one an event the client counts.
-    try testing.expectEqual(@as(usize, 0), comments);
-    try testing.expectEqual(@as(usize, 4), client.events);
-    try testing.expectEqual(@as(usize, 0), gaps_over);
-    try testing.expectEqualStrings("get_weather", client.calls.items[0].name.?);
-    try testing.expectEqualStrings("", client.calls.items[0].arguments.items);
-
-    const calls = (try reply.parseToolCallsForRequest(allocator, buffered.items, weather_tools, true, .{ .dialect = null })).?;
-    defer freeCalls(allocator, calls);
-    progress.settle(calls[0]);
-    const end = try chatEnd(allocator, testing.io, &progress, 0, calls[0]);
-    defer allocator.free(end);
-    try client.take(allocator, end);
-    const got = client.calls.items[0];
-    try testing.expectEqualStrings(calls[0].name, got.name.?);
-    try testing.expectEqualStrings(calls[0].arguments, got.arguments.items);
-    try testing.expectEqualStrings(progress.opened.?.id, got.id.?);
-    try testing.expect(progress.cut() == null);
-    const valid = try std.json.parseFromSlice(std.json.Value, allocator, got.arguments.items, .{});
-    valid.deinit();
-}
-
-test "tool progress: a call opened and then ended inside is cut, and the calls of the reply follow it" {
-    const allocator = testing.allocator;
-    var progress = Progress{};
-    defer progress.deinit(allocator);
-    _ = (try progress.beat(allocator, testing.io, call_head, .{ .dialect = null }, weather_tools, .{})).?;
-    // The reply holds no call: the opened one stays as sent.
-    progress.settle(null);
-    try testing.expectEqualStrings("get_weather", progress.cut().?.name);
-    try testing.expect(progress.cutEnding() == null);
-    // A reply whose first call is another tool's: it goes after the opened one, at its own index.
-    var other = Progress{};
-    defer other.deinit(allocator);
-    _ = (try other.beat(allocator, testing.io, call_head, .{ .dialect = null }, weather_tools, .{})).?;
-    const call: tool_schema.ParsedToolCall = .{ .name = "get_stock", .arguments = "{\"symbol\":\"AAPL\"}" };
-    other.settle(call);
-    try testing.expect(other.cut() != null);
-    const end = try chatEnd(allocator, testing.io, &other, 0, call);
-    defer allocator.free(end);
-    var client = Client{};
-    defer client.deinit(allocator);
-    try client.take(allocator, end);
-    try testing.expectEqual(@as(usize, 2), client.calls.items.len);
-    try testing.expectEqualStrings("get_stock", client.calls.items[1].name.?);
-}
-
-test "tool progress: a call after a finished one is never sent early" {
-    const allocator = testing.allocator;
-    var progress = Progress{};
-    defer progress.deinit(allocator);
-    try testing.expect((try progress.beat(allocator, testing.io, first_call ++ call_head, .{ .dialect = null }, weather_tools, .{})) == null);
-    try testing.expect(progress.opened == null);
-}
-
-test "tool progress: no beat names a call before its name is settled and declared" {
-    const allocator = testing.allocator;
-    const texts = [_][]const u8{
-        "",
-        "Let me think about the weather.",
-        "Let me check.\n<tool_call>\n<function=",
-        // A tool the request does not declare.
-        "<tool_call>\n<function=get_stock>\n<parameter=symbol>\nAAPL",
-    };
-    for (texts) |text| {
+    for (shapes) |shape| {
+        errdefer std.debug.print("shape: {s}\n", .{shape.name});
         var progress = Progress{};
         defer progress.deinit(allocator);
-        errdefer std.debug.print("text: {f}\n", .{std.zig.fmtString(text)});
+        var client = Client{};
+        defer client.deinit(allocator);
+        var buffered = std.ArrayList(u8).empty;
+        defer buffered.deinit(allocator);
+
+        // One token every 100 ms for 23 s: the head, then the file the call writes.
+        var tokens: std.ArrayList([]const u8) = .empty;
+        defer tokens.deinit(allocator);
+        try tokens.append(allocator, shape.head);
+        for (0..229) |_| try tokens.append(allocator, "line of the file \n");
+        var now: i64 = 0;
+        var last_write: i64 = 0;
+        var comments: usize = 0;
+        var gaps_over: usize = 0;
+        for (tokens.items) |tok| {
+            now += token_ms;
+            try buffered.appendSlice(allocator, tok);
+            if (now - last_write < interval_ms) continue;
+            if (try progress.beat(allocator, testing.io, buffered.items, .{ .dialect = null }, weather_tools, .{})) |beat| {
+                const delta = try chatBeat(allocator, &progress, beat);
+                defer allocator.free(delta);
+                try client.take(allocator, delta);
+            } else comments += 1;
+            if (now - last_write > interval_ms + token_ms) gaps_over += 1;
+            last_write = now;
+        }
+        try buffered.appendSlice(allocator, shape.tail);
+
+        // 23 s of silence: four beats, every one an event the client counts.
+        try testing.expectEqual(@as(usize, 0), comments);
+        try testing.expectEqual(@as(usize, 4), client.events);
+        try testing.expectEqual(@as(usize, 0), gaps_over);
+        try testing.expectEqualStrings("get_weather", client.calls.items[0].name.?);
+        try testing.expectEqualStrings("", client.calls.items[0].arguments.items);
+
+        const calls = (try reply.parseToolCallsForRequest(allocator, buffered.items, weather_tools, true, .{ .dialect = null })).?;
+        defer freeCalls(allocator, calls);
+        progress.settle(calls[0]);
+        const end = try chatEnd(allocator, testing.io, &progress, 0, calls[0]);
+        defer allocator.free(end);
+        try client.take(allocator, end);
+        const got = client.calls.items[0];
+        try testing.expectEqualStrings(calls[0].name, got.name.?);
+        try testing.expectEqualStrings(calls[0].arguments, got.arguments.items);
+        try testing.expectEqualStrings(progress.opened.?.id, got.id.?);
+        try testing.expect(progress.cut() == null);
+        const valid = try std.json.parseFromSlice(std.json.Value, allocator, got.arguments.items, .{});
+        valid.deinit();
+    }
+}
+
+test "tool progress: a call opened and then ended inside is cut, and the calls of the reply follow it, in every dialect" {
+    const allocator = testing.allocator;
+    for (shapes) |shape| {
+        errdefer std.debug.print("shape: {s}\n", .{shape.name});
+        var progress = Progress{};
+        defer progress.deinit(allocator);
+        _ = (try progress.beat(allocator, testing.io, shape.head, .{ .dialect = null }, weather_tools, .{})).?;
+        // The reply holds no call: the opened one stays as sent.
+        progress.settle(null);
+        try testing.expectEqualStrings("get_weather", progress.cut().?.name);
+        try testing.expect(progress.cutEnding() == null);
+        // A reply whose first call is another tool's: it goes after the opened one, at its own index.
+        var other = Progress{};
+        defer other.deinit(allocator);
+        _ = (try other.beat(allocator, testing.io, shape.head, .{ .dialect = null }, weather_tools, .{})).?;
+        const call: tool_schema.ParsedToolCall = .{ .name = "get_stock", .arguments = "{\"symbol\":\"AAPL\"}" };
+        other.settle(call);
+        try testing.expect(other.cut() != null);
+        const end = try chatEnd(allocator, testing.io, &other, 0, call);
+        defer allocator.free(end);
+        var client = Client{};
+        defer client.deinit(allocator);
+        try client.take(allocator, end);
+        try testing.expectEqual(@as(usize, 2), client.calls.items.len);
+        try testing.expectEqualStrings("get_stock", client.calls.items[1].name.?);
+    }
+}
+
+test "tool progress: a call after a finished one is never sent early, in every dialect" {
+    const allocator = testing.allocator;
+    for (shapes) |shape| {
+        errdefer std.debug.print("shape: {s}\n", .{shape.name});
+        var progress = Progress{};
+        defer progress.deinit(allocator);
+        const text = try std.mem.concat(allocator, u8, &.{ shape.first_call, shape.head });
+        defer allocator.free(text);
+        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .dialect = null }, weather_tools, .{})) == null);
+        try testing.expect(progress.opened == null);
+    }
+}
+
+test "tool progress: no beat names a call before its name is settled and declared, in every dialect" {
+    const allocator = testing.allocator;
+    const common = [_][]const u8{ "", "Let me think about the weather." };
+    for (common) |text| {
+        var progress = Progress{};
+        defer progress.deinit(allocator);
         try testing.expect((try progress.beat(allocator, testing.io, text, .{ .dialect = null }, weather_tools, .{})) == null);
     }
-}
-
-test "tool progress: a thought stands in the way of the opening, a closed one only where the surface sends it first" {
-    const allocator = testing.allocator;
-    const closed = "<think>I will call it.</think>\n\n" ++ call_head;
-    const open = "<think>I will call it. " ++ call_head;
-    const cases = [_]struct { text: []const u8, opens: bool, first: bool, goes: bool }{
-        .{ .text = call_head, .opens = false, .first = false, .goes = true },
-        .{ .text = closed, .opens = false, .first = false, .goes = false },
-        .{ .text = closed, .opens = false, .first = true, .goes = true },
-        .{ .text = open, .opens = false, .first = true, .goes = false },
-        // The prompt opened the thought: the call before any close stands inside it.
-        .{ .text = call_head, .opens = true, .first = true, .goes = false },
-    };
-    for (cases, 0..) |c, i| {
+    for (shapes) |shape| for (shape.unsettled) |text| {
         var progress = Progress{};
         defer progress.deinit(allocator);
-        errdefer std.debug.print("case {d}\n", .{i});
-        const got = try progress.beat(allocator, testing.io, c.text, .{ .dialect = null, .opens_think = c.opens }, weather_tools, .{ .closed_thought_first = c.first });
-        try testing.expectEqual(c.goes, got != null);
+        errdefer std.debug.print("[{s}] text: {f}\n", .{ shape.name, std.zig.fmtString(text) });
+        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .dialect = null }, weather_tools, .{})) == null);
+    };
+}
+
+test "tool progress: a thought stands in the way of the opening, a closed one only where the surface sends it first, in every dialect" {
+    const allocator = testing.allocator;
+    for (shapes) |shape| {
+        const closed = try std.mem.concat(allocator, u8, &.{ "<think>I will call it.</think>\n\n", shape.head });
+        defer allocator.free(closed);
+        const open = try std.mem.concat(allocator, u8, &.{ "<think>I will call it. ", shape.head });
+        defer allocator.free(open);
+        const cases = [_]struct { text: []const u8, opens: bool, first: bool, goes: bool }{
+            .{ .text = shape.head, .opens = false, .first = false, .goes = true },
+            .{ .text = closed, .opens = false, .first = false, .goes = false },
+            .{ .text = closed, .opens = false, .first = true, .goes = true },
+            .{ .text = open, .opens = false, .first = true, .goes = false },
+            // The prompt opened the thought: the call before any close stands inside it.
+            .{ .text = shape.head, .opens = true, .first = true, .goes = false },
+        };
+        for (cases, 0..) |c, i| {
+            var progress = Progress{};
+            defer progress.deinit(allocator);
+            errdefer std.debug.print("[{s}] case {d}\n", .{ shape.name, i });
+            const got = try progress.beat(allocator, testing.io, c.text, .{ .dialect = null, .opens_think = c.opens }, weather_tools, .{ .closed_thought_first = c.first });
+            try testing.expectEqual(c.goes, got != null);
+        }
     }
 }
 

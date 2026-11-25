@@ -9,6 +9,17 @@ pub const tokenizer = @import("tokenizer.zig");
 pub const kld = @import("kld.zig");
 pub const imatrix = @import("imatrix.zig");
 pub const model_handle = @import("model_handle.zig");
+pub const trunk = @import("trunk.zig");
+// pub: the encoder's converters read the engine's model, loader and calibration capture.
+pub const dsv41_model = @import("dsv41/dsv41_model.zig");
+pub const dsv41_config = @import("dsv41/dsv41_config.zig");
+pub const dsv41_source = @import("dsv41/dsv41_source.zig");
+pub const dsv41_scope = @import("dsv41/dsv41_scope.zig");
+pub const dsv41_kld_capture = @import("dsv41/kld_capture.zig");
+pub const hy4_config = @import("hy4flash/hy4_config.zig");
+pub const hy4_census = @import("hy4flash/hy4_census.zig");
+pub const expert_io = @import("expert_io.zig");
+pub const model = @import("model.zig");
 
 const std = @import("std");
 const registry = @import("arch/registry.zig");
@@ -30,6 +41,9 @@ test {
     _ = @import("arch/registry_test.zig");
     _ = @import("expert_io.zig");
     _ = @import("pack_index.zig");
+    _ = @import("repack.zig");
+    _ = @import("repack_stamp.zig");
+    _ = @import("repack_stamp_test.zig");
     _ = @import("imatrix.zig");
     _ = @import("hidden_capture.zig");
     _ = @import("expert_store.zig");
@@ -60,6 +74,7 @@ test {
     _ = @import("cooler_contract_test.zig");
     _ = @import("cooler_late_test.zig");
     _ = @import("cooler_load_test.zig");
+    _ = @import("cooler_manifest_test.zig");
     _ = @import("cooler_pool_test.zig");
     _ = @import("cooler_prefill_bill_test.zig");
     _ = @import("cooler_requests_test.zig");
@@ -68,6 +83,8 @@ test {
     _ = @import("cooler_held_restore_test.zig");
     _ = @import("cooler_load_fault_test.zig");
     _ = @import("cooler_requests_fault_test.zig");
+    _ = @import("cooler_side.zig");
+    _ = @import("engram.zig");
     _ = @import("effort.zig");
     _ = @import("exl3_flat_layout_test.zig");
     _ = @import("generate.zig");
@@ -85,6 +102,7 @@ test {
     _ = @import("vision.zig");
     _ = @import("vision_common.zig");
     _ = @import("ssm_cache.zig");
+    _ = @import("row_store.zig");
     _ = @import("nax_gate.zig");
     _ = @import("attn_kernels.zig");
     _ = @import("verify_qmm.zig");
@@ -97,6 +115,8 @@ test {
     _ = @import("kv_cache.zig");
     _ = @import("mlx_pages.zig");
     _ = @import("hc_prefill.zig");
+    _ = @import("hc_kernels.zig");
+    _ = @import("sparse_select.zig");
     _ = @import("mrope.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");

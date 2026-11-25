@@ -922,6 +922,14 @@
 "python_error": null
 },
 {
+"covers": "method format",
+"label": "method format #1",
+"template": "{{ '<{}|{}>'.format('a', 1) }} {{ '{1}{0}{1}'.format(none, true) }} {{ '{{{}}}'.format([1]) }}",
+"extra": "{}",
+"python": "<a|1> TrueNoneTrue {[1]}",
+"python_error": null
+},
+{
 "covers": "method get",
 "label": "method get #1",
 "template": "{{ d.get('a') }} {{ d.get('zz') }} {{ d.get('zz', 9) }}",

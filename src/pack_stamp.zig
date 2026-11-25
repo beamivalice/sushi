@@ -82,7 +82,7 @@ pub fn verify(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, r
 }
 
 /// The index's shards (MTP included) when it names any on disk, else every `.safetensors` one folder deep.
-fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out: *std.ArrayList([]u8)) !void {
+pub fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out: *std.ArrayList([]u8)) !void {
     if (dir.readFileAlloc(io, "model.safetensors.index.json", allocator, .limited(16 * 1024 * 1024))) |raw| {
         defer allocator.free(raw);
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch null;

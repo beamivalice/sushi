@@ -52,7 +52,7 @@ function makeServer(opts = {}) {
       skip_mem_preflight: { file: null, flag: null, default: false, source: 'default', locked: false, applies: 'applies at once' },
       continue_after_thought: { file: null, flag: null, default: true, source: 'default', locked: false, applies: 'applies at once' },
       port: { file: null, flag: null, default: 12345, source: 'default', locked: false, applies: 'the next start; a running server keeps its port' },
-      wired_margin_gib: { file: null, flag: null, default: 1, min: 1, max: 32, source: 'default', locked: false, applies: 'applies at once: the next request and the next load use it' },
+      wired_margin_gib: { file: null, flag: null, default: 1, min: 0, max: 32, source: 'default', locked: false, applies: 'applies at once: the next request and the next load use it' },
       max_request_mb: { file: null, default: 128, min: 1, max: 1024, source: 'default', locked: false, applies: 'applies at once to new requests; uploads already in progress keep their limit' },
     },
     cache: {
@@ -1180,10 +1180,14 @@ async function main() {
       assert.equal(await page.getAttribute('#marginGib', 'placeholder'), 'Default (1)');
       assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .help'), /macOS, the window server and your other apps/, 'the row says who the margin protects');
       assert.match(await page.textContent('.set[data-key="wired_margin_gib"] .help'), /Raise it if your Mac stutters or apps misbehave while sushi works\. It applies once a GPU limit is set with the command above\.$/, 'the row says the margin binds only under a declared GPU limit');
-      for (const value of ['0', '33', '1.5', 'abc']) {
+      for (const value of ['33', '1.5', 'abc']) {
         await page.fill('#marginGib', value);
         assert.equal(await page.isDisabled('#marginSave'), true);
-        assert.equal(await page.textContent('.set[data-key="wired_margin_gib"] .bad'), 'Enter a whole number from 1 to 32 GB.');
+        assert.equal(await page.textContent('.set[data-key="wired_margin_gib"] .bad'), 'Enter a whole number from 0 to 32 GB.');
+      }
+      for (const value of ['0', '32']) {
+        await page.fill('#marginGib', value);
+        assert.equal(await page.isDisabled('#marginSave'), false, `${value} is inside 0-32`);
       }
       await page.fill('#marginGib', '6');
       await page.click('#marginSave');

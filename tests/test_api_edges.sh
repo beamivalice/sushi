@@ -223,7 +223,6 @@ req POST /v1/responses '{"model":"m","input":"hi","background":true}';  expect_s
 req POST /v1/responses '{"model":"m","input":"hi","previous_response_id":"resp_nope"}'; expect_status 404 "responses: unknown previous_response_id"
 req POST /v1/responses '{"model":"m","input":"'"$N"' Give a person with name and age.","text":{"format":{"type":"json_schema","name":"p","schema":{"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"}},"required":["name","age"]}}},"max_output_tokens":120,"temperature":0,'"$NT_RESP"'}'
 echo "$BODY" | python3 -c 'import sys,json; d=json.load(sys.stdin); t=[c["text"] for o in d["output"] if o["type"]=="message" for c in o["content"]][0]; j=json.loads(t); assert isinstance(j["age"],int)' 2>/dev/null && ok "responses: text.format json_schema enforced" || bad "responses json_schema" "${BODY:0:160}"
-req POST /v1/messages "{\"model\":\"m\",\"messages\":[$U]}";           expect_status 400 "messages: max_tokens required"
 
 echo "=== alive ==="
 req GET /health; expect_status 200 "server alive after every edge"

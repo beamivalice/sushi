@@ -849,6 +849,10 @@ test "repetition-loop cuts decline tool-call parsing" {
 
 const testing = std.testing;
 
+/// Hy4-Flash's wrapper around the calls its served model writes (GLM's `arg_key` calls inside it).
+const hy4_open = "<tool_calls:opensource>";
+const hy4_close = "</tool_calls:opensource>";
+
 const test_tools =
     \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}},
     \\{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
@@ -926,6 +930,8 @@ test "a call the model finished before a cut stays and the open one after it is 
         .{ .done = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>", .open = "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>line one\n" },
         .{ .done = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>", .open = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n<｜DSML｜parameter name=\"path\" string=\"true\">notes.md</｜DSML｜parameter>\n<｜DSML｜parameter name=\"content\" string=\"true\">line one\n" },
         .{ .done = "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>", .open = "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>line one\n" },
+        .{ .done = hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>", .open = "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>line one\n" },
+        .{ .done = hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tokyo</arg_value:opensource></tool_call:opensource>", .open = "<tool_call:opensource>write_file<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>notes.md</arg_value:opensource><arg_key:opensource>content</arg_key:opensource><arg_value:opensource>line one\n" },
     };
     for (pairs) |p| {
         const text = try std.mem.concat(testing.allocator, u8, &.{ p.done, "\n", p.open });
@@ -1047,6 +1053,8 @@ test "an unfinished call of every dialect the parse chain reads is declined and 
         "<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tok",
         "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}",
         "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
+        hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
+        hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tok",
     };
     const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
     for (open) |call| for ([_][]const u8{ "", "Let me check.\n" }) |lead| for ([_][]const u8{ "stop", "length" }) |finish| {
@@ -1118,6 +1126,8 @@ test "a closer spelled inside a parameter value does not close the call: the gen
         .{ .text = "<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nprint(\"</function>\")" },
         .{ .text = "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.md\", \"content\": \"a </tool_call> b" },
         .{ .text = "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>a </tool_call> b" },
+        .{ .text = hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>a </tool_call> b" },
+        .{ .text = hy4_open ++ "<tool_call:opensource>write_file<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>notes.md</arg_value:opensource><arg_key:opensource>content</arg_key:opensource><arg_value:opensource>a </tool_call:opensource> b" },
         .{ .text = "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>a <tool_call|> b" },
         .{ .text = "<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">a </\u{ff5c}DSML\u{ff5c}invoke> b" },
         .{ .text = "<invoke name=\"write_file\">\n<parameter name=\"path\">notes.md</parameter>\n<parameter name=\"content\">a </invoke> b" },
@@ -1229,6 +1239,7 @@ test "r173-f-foreign-opener: served dialects: a finished call whose value spells
     const cases = [_]Case{
         .{ .dialect = .function_tag, .text = "<tool_call>\n<function=write_file>\n<parameter=path>\nparse.py\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>" },
         .{ .dialect = .arg_key, .text = "<tool_call>write_file<arg_key>path</arg_key><arg_value>parse.py</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>" },
+        .{ .dialect = .arg_key, .text = hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>parse.py</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>" ++ hy4_close },
         .{ .dialect = .dsml, .text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">parse.py</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">" ++ value ++ "</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>" },
     };
     var bad: usize = 0;
@@ -1396,6 +1407,7 @@ test "r173-f-foreign-opener: a finished call whose value spells its own dialect'
         .{ .dialect = .function_tag, .text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\nsee <tool_call> tag\n</parameter>\n</function>\n</tool_call>", .want = "see <tool_call> tag" },
         .{ .dialect = .function_tag, .text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\nuse <function=x> then\n</parameter>\n</function>\n</tool_call>", .want = "use <function=x> then" },
         .{ .dialect = .arg_key, .text = "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see <tool_call> tag</arg_value></tool_call>", .want = "see <tool_call> tag" },
+        .{ .dialect = .arg_key, .text = hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>see <tool_call> tag</arg_value></tool_call>" ++ hy4_close, .want = "see <tool_call> tag" },
         .{ .dialect = .dsml, .text = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">a.md</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">see <\u{ff5c}DSML\u{ff5c}invoke name=\"y\"> tag</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>", .want = "see <\u{ff5c}DSML\u{ff5c}invoke name=\"y\"> tag" },
         .{ .dialect = null, .text = "<|tool_call>call:write_file{path:<|\"|>a.md<|\"|>,content:<|\"|>see <|tool_call> tag<|\"|>}<tool_call|>", .want = "see <|tool_call> tag" },
     };
@@ -1446,6 +1458,7 @@ test "r173-f-foreign-opener: a finished arg_key call whose value spells a whole 
     const texts = [_][]const u8{
         "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>wrap: <tool_call>x</tool_call> done</arg_value></tool_call>",
         "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>end </tool_call> done</arg_value></tool_call>",
+        hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>wrap: <tool_call>x</tool_call> done</arg_value></tool_call>" ++ hy4_close,
     };
     var bad: usize = 0;
     for (texts) |text| for ([_][]const u8{ "stop", "length" }) |finish| {
@@ -1549,6 +1562,8 @@ test "r173-f-foreign-opener: a declined call's markup never reaches content, str
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nTok",
         "<|tool_call>call:get_weather{city:<|\"|>Tok",
         "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
+        hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
+        hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tok",
     };
     var bad: usize = 0;
     for (open) |call| {
@@ -1582,6 +1597,8 @@ test "r173-f-foreign-opener: the preamble of a finished call holds no markup, in
         "<invoke name=\"get_weather\">\n<parameter name=\"city\">Tokyo</parameter>\n</invoke>",
         "<tool name=\"get_weather\">{\"city\": \"Tokyo\"}</tool>",
         "<tool_request>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}</tool_request>",
+        hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>" ++ hy4_close,
+        hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tokyo</arg_value:opensource></tool_call:opensource>" ++ hy4_close,
     };
     var bad: usize = 0;
     for (calls) |call| {
@@ -1701,6 +1718,7 @@ test "r173-f-cut-think-tag: a think tag inside a cut call's value is that call's
         "<tool_call>\n<function=write_file>\n<parameter=path>\nnotes.md\n</parameter>\n<parameter=content>\nuse </think> tags\nline one\n",
         "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.md\", \"content\": \"use </think> tags, line",
         "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>use </think> tags\nline",
+        hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>notes.md</arg_value><arg_key>content</arg_key><arg_value>use </think> tags\nline",
         "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">notes.md</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">use </think> tags\nline",
         "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>use </think> tags\nline",
         "<tool_call>{\"name\": \"write_file\", \"arguments\": {\"path\": \"notes.md\", \"content\": \"use <think>x</think> tags, line",

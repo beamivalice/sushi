@@ -1,0 +1,57 @@
+//! The test files of `src/hy4flash/`, read by `src/tests.zig` and `src/tests_host.zig` through the registry. One
+//! `@import("<file>.zig"),` a line: build.zig reads `host_tests` as text.
+
+/// The test files the MLX root `src/tests.zig` runs for this arch.
+pub const tests = .{
+    @import("arch.zig"),
+    @import("hy4_config.zig"),
+    @import("hy4_forward.zig"),
+    @import("hy4_model.zig"),
+    @import("hy4_state.zig"),
+    @import("hy4_prefix.zig"),
+    @import("hy4_load.zig"),
+    @import("hy4_contract.zig"),
+    @import("hy4_ledger.zig"),
+    @import("hy4_ledger_test.zig"),
+    @import("hy4_oracle_test.zig"),
+    @import("hy4_stq_test.zig"),
+    @import("hy4_dfly.zig"),
+    @import("hy4_pm_pack_test.zig"),
+    @import("hy4_dfly_test.zig"),
+    @import("hy4_kld_capture.zig"),
+    @import("hy4_vision_test.zig"),
+    @import("hy4_late_test.zig"),
+    @import("hy4_layer_major.zig"),
+    @import("hy4_expert_mv.zig"),
+    @import("hy4_absorb.zig"),
+    @import("hy4_rope.zig"),
+    @import("hy4_norm.zig"),
+    @import("hy4_chain.zig"),
+    @import("hy4_engram_gate.zig"),
+    @import("hy4_route.zig"),
+    @import("hy4_kcfg.zig"),
+    @import("hy4_gemv.zig"),
+    @import("hy4_row.zig"),
+    @import("hy4_hc.zig"),
+    @import("hy4_index.zig"),
+    @import("hy4_front.zig"),
+    @import("hy4_latent.zig"),
+    @import("hy4_attn.zig"),
+    @import("hy4_repack_test.zig"),
+    @import("hy4_plan.zig"),
+    @import("hy4_plan_test.zig"),
+    @import("hy4_plan_audit_test.zig"),
+    @import("hy4_sample_plan.zig"),
+    @import("hy4_sample_plan_test.zig"),
+    @import("hy4_points_test.zig"),
+    @import("hy4_encode_plan.zig"),
+    @import("hy4_encode_plan_test.zig"),
+    @import("hy4_close_test.zig"),
+};
+
+/// The MLX-free test files `src/tests_host.zig` runs for this arch.
+pub const host_tests = .{
+    @import("hy4_chat.zig"),
+    @import("hy4_census.zig"),
+    @import("hy4_flags.zig"),
+};

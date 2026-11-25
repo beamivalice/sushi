@@ -34,6 +34,11 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - A parity test between two engines (Sushi Cooler against MLX, a kernel against its replaced kernel) once the new
   one is proven: it proves a fact, then repeats it on every run and catches nothing. It goes in the landing that
   proves it, with its numbers in the commit; the oracle tests against a reference model stay.
+  A fused kernel's cell against the MLX op chain at release shapes stays (owner, 2026-11-25): the op chain is its
+  reference, it costs milliseconds, and no tiny fixture reaches release shapes.
+- A reference parity test of a part that changes speed and never text (a drafter, an MTP head) once it is proven:
+  its error costs acceptance, which the bench reads, and the spec-equals-serial test holds the output. Nor a
+  fixture whose reference ran on a state our own engine dumped: it pins that code's past rounding, not the truth.
 - A repetition: the same check over fixtures, prompt lengths, arms or sweep points that run the same code path.
   One input per distinct path is the test; more catch no new error. A fault sweep refuses one point per distinct
   error path, not every site at every ask.
@@ -59,17 +64,19 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   The host binary is filtered to the tests of those files (`hostFilters` in build.zig); its module is built with
   `build_options.host_tier`, under which a live GPU read (`gpu_mem.zig`) panics and the NAX probe answers false.
   Every `<arch>/<arch>_bill.zig` is a host file too, by its `_bill` stem; `bills.zig` reaches the enabled archs' through the registry.
+  A host file's stem must not end another file's stem: the binary keeps a test by `<stem>.test.`, so a host
+  `plan.zig` kept `prefill_plan`'s and `mtp_plan`'s MLX tests and the link failed on `_mlx_array_free`.
   A bill test that needs the live GPU lives in `bills_live_test.zig` (or `<arch>_bill_test.zig`) in the MLX tier.
 - `zig build test` runs the host tier, the MLX domains, the exl3 binaries and the encoder binary, `test-encoder`.
   **The MLX domains** (`test_domains` in build.zig) are one binary each, named by what its tests prove:
 
   | binary | holds |
   |---|---|
-  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), one per family's fault sweeps (`cooler-load-fault`, `-requests-fault`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
-  | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, less their prefix-cache files |
-  | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, MLX and Metal glue) |
+  | `test-cooler` | the Sushi Cooler contract: a run step per family file (`cooler-load`, `-manifest`, `-pool`, `-prefill-bill`, `-requests`, `-restore`), one per family's fault sweeps (`cooler-load-fault`, `-requests-fault`), two for the cells on held loads (`cooler-held-requests`, `-held-restore`) and one per late cell |
+  | `test-deepseek`, `test-qwen`, `test-glm`, `test-mimo`, `test-hy4` | `src/dsv41/`, `src/qwen4/`, `src/glm5/`, `src/mimo2/`, `src/hy4flash/`, less their prefix-cache files |
+  | `test-kernels` | `src/tensor/` and the shared kernels (attention, verify, MoE, FP8, MTP, DFlash, hyper-connections, MLX and Metal glue) |
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
-  | `test-load` | `src/arch/`, the model and its loader, registry, discovery, owned weights, expert I/O, imatrix, KLD, live bills |
+  | `test-load` | `src/arch/`, the model and its loader, registry, discovery, owned weights, expert I/O, Engram tables, the Cooler side, imatrix, KLD, live bills |
   | `test-server` | the HTTP server and its APIs, the CLI, launch and main |
   | `test-prefix-cache` | the prefix cache and its SSD tier, run twice: `test-prefix-cache` and, on a run with no `-Dtest-filter`, `test-prefix-cache (SUSHI_PREFIX_FS=real)` |
 
@@ -177,6 +184,14 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   changed config, other weights' mappings or a dispatch open; the step's end unloads them and asks for an empty pool.
   Pool bytes in use are not read: a model keeps caches its longest request grew. A cell that measures the pool or
   makes a speculative request's first-use state keeps its own load.
+  A load on the ledger holds its whole budget (D90): `heldLoad` unloads the held loads on it before any other opens,
+  so a cell's load is made again where it asks for one.
+  An arch's contract `prompt` makes no MLX op: it runs while the step's held loads stand, where the engine refuses an
+  MLX stream.
+- **A load on the ledger in a contract cell**: its pool is closed to a served request (D64) and its forwards run under no cap,
+  so a cell of the pool-cap regime skips it with `requirePoolCap`, naming the ledger test that holds the same property; a
+  cell's own raw ops past the seal take `test_support.openTurn`, a warm step the warm's gate (`warmBegins`), and a second
+  load beside it is refused by name (`expectRefusedBesideLedger`).
 - **Tests that run alone** (`alone_tests` in build.zig): each is a run step of its own, a fresh process, left out of its
   file's step. Every test that proves nothing compiles after a load's warm or seal is one (the contract's late cells,
   DeepSeek's, Qwen's GDN, QSA and vision warms, the engine route's first uses): an earlier test's compiles in the same
@@ -184,7 +199,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **Another GPU's arms** are tested by running the binaries as that GPU: `MLX_METAL_GPU_ARCH=applegpu_g13s` makes MLX, the device
   profile and the engine dispatch as an M1 Max (`tests/dsv41/test_g13_rehearsal.sh`). A test about one arm's bytes names it
   (`device.current().has(.matrix_g17)`), never a chip.
-- The pack tier's envs: `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
+- The pack tier's envs: `HY4_BF16_TINY` (the Hy4-Flash tiny in the release's layout and its transformers oracle, `${SUSHI_MODELS_DIR}/tiny-models/hy4-bf16-tiny`; `tests/dump_hy4_fixtures.py`; its GPU tests run with `MLX_ENABLE_TF32=0`, which the `test-hy4` and `hy4-late-*` steps set themselves (`hy4_tf32_off` in `build.zig`), else TF32 products move the logits past the oracle's bar), `DSV41_TINY` (the default-geometry dump WITH DSpark stages, `${SUSHI_MODELS_DIR}/tiny-models/dsv41-dspark-tiny`), `DSV41_STQ_TINY`, `DSV41_STQ_TINY_PM` (its pair-major copy), `DSV41_EPI_TINY` (tiny DeepSeek fixtures), `DSV41_INDEX_SCANS` (a
   folder of `L<layer>-pos<n>.safetensors` one-row index scans saved from a live decode: `q`, `w`, `codes`, `scales`, `meta`
   `{p0, ratio, keys, group}`, `wscale` and the kernel's `scores`; the test skips without it), `QWEN4_TEST_MODEL`,
   `MIMO_V2_MODEL`, `SUSHI_MODELS_DIR`, `SUSHI_DSV41_REAL_PACK` (the DeepSeek width probe: every row of a verify is its one-row round's bits on the real pack;
@@ -256,7 +271,9 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   call counter sits ([engine-own-forward](engine-own-forward.md#the-seam)).
   `undefined-nested-write` flags, in a test block, `v.a.b = ...` on a `var v: T = undefined` before `v.a = ...`, `v = ...`
   or a `v.method()` call; its allowlist key is the test name with every non-alphanumeric character as `_`.
-  `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again.
+  `double-free` flags a handle that an `errdefer` frees and a later `defer` frees again. `errdefer-handover` flags a
+  `try` after a store hands an MLX array or engine tensor to an owner (`buf.* = next`, `self.x = h`, `InPlace.adopt(h)`,
+  the value made through `&h` included) while the `errdefer` that frees it is still armed: end its block before the store.
   `scope-state` flags a hand write of `engine.active` (anywhere outside `src/tensor/`) or of `engine.enabled`
   (outside tests): the guards of [the seam](engine-own-forward.md#the-seam) are the only writers.
   `engine-hold-end` flags a call of `engine.unhold` outside `arch_handle.engineHoldEnd` and `src/tensor/`: the last
@@ -346,7 +363,9 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 
 - Beside the code it tests, at the bottom of that file. Tests move with their code.
 - A test's model is its file's folder (`src/qwen4/`, `src/mimo2/`, `src/glm5/`, `src/dsv41/`); the `src/` root is shared.
-  `-Dmodel=<arch>` runs one folder's tests plus the shared ones. A new test file of an arch is listed in that
+  `-Dmodel=<arch>` makes one folder's step plus every shared step, and `zig build test` runs them all;
+  `-Dtest-step=<step>` (repeatable) runs only the steps it names and compiles only their binaries (`zig-out/test-plan.json` lists them: `test-qwen`,
+  `test-mimo`, `test-glm`, `test-deepseek`, `test-hy4`), and a name that is no run step fails. A new test file of an arch is listed in that
   arch's `arch_tests.zig` (`pub const tests`, or `host_tests` for an MLX-free file), never in `src/tests.zig`.
   A source file with tests at its bottom is listed too: the domains select tests by listed file, so an unlisted
   file's tests never run (lint `arch-test-unlisted`). A shared file with tests is imported from `src/tests.zig`, or
@@ -395,7 +414,7 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 - A test client's read limit only guards against a hang: it budgets a cold first load (its kernel compiles too), and
   a read past it fails by name, never as a short answer.
 - Deterministic: no dependence on scheduler timing, machine memory or test order. Global overrides restore in `defer`.
-  A DSpark test that injects `dspark_policy.cost` also sets `Generator.dspark_timing`: the live draft and verify ms
+  A DSpark test that injects `drafter_policy.cost` also sets `Generator.drafter_timing`: the live draft and verify ms
   otherwise refit the cost, and the widths follow the machine.
 - A number a load or the GPU's class decides is pinned by the test that reads it: DeepSeek's wide-forward shape sum
   reads the arms of the config it prices (`Config.wide_arms`), the served kernels' from `parseText`, never a global.
@@ -413,11 +432,12 @@ Timing code still inside a `SUSHI_*_UBENCH` test block moves there.
 | change | runs before commit |
 |---|---|
 | host files only (chat, parsers, grammar, tokenizer, pure planners) | `zig build test-host` |
-| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows) |
+| one arch's files only | `zig build test -Dmodel=<qwen4\|mimo2\|glm5\|dsv41\|hy4flash>`, plus `tests/run.sh --tier live --model <arch>` for the scripts it touches (`--only <glob>` narrows): the shared steps load the arch's fixtures, so its product code reaches them |
+| one arch's test files only (no product code) | its folder's step alone: `zig build test -Dmodel=<arch> -Dtest-step=test-<step>` (`test-deepseek` for `dsv41`); a single test, `-Dtest-filter=` beside it |
 | `src/exl3` or `src/encoder` only | `zig build test -Dmodel=exl3` or `-Dmodel=enc` |
 | a broad area | `-Dmodel=` (above); a narrow check names its tests with `-Dtest-filter=`, which stays parallel |
 | docs only, or test scripts only | nothing in Zig; `tests/run.sh --check` and the scripts it touched |
-| a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `python3 tests/suite_guards.py` and the touched area's scripts |
+| a landing on main | the row above that fits its change, with the tiny-fixture envs set, plus `zig build -Doptimize=ReleaseFast` (code only the binary reaches, such as the in-process bench, is analysed by no test binary), `python3 tests/suite_guards.py` and the touched area's scripts |
 | the end of a series of landings (shared files, `build.zig`, `mlx.zig`, several areas stacked) | `zig build test` with the tiny-fixture envs set |
 | a version bump (release step 1) | `tests/gate.sh` on the pushed bump commit (below) |
 | an architecture joins the family, or one is dropped for real | `tests/test_arch_drop.sh` (the only time it runs) |

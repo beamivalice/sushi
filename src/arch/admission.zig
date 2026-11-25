@@ -14,7 +14,7 @@ pub const ExpertStreamTraits = struct {
     prefetch: bool = false,
     /// The expert slabs are read tile-major.
     tile_major: bool = false,
-    /// The routed experts are STQ rate groups, which the prefetcher reads.
+    /// The routed experts are STQ rate groups.
     stq_experts: bool = false,
     /// The router takes `--expert-cache-bias` on the STQ experts it streams.
     cache_bias: bool = false,
@@ -72,8 +72,8 @@ test "a streamed MTP head is an arch's own declaration, and the refusal names th
     }
     const m = model.ModelConfig{ .model_type = "mimo_v2" };
     try std.testing.expect(!streamedMtpHead(&m, .exl3_k4));
-    if (registry.ofModelType("qwen4_exp") != null and registry.ofModelType("deepseek_v41") != null)
-        try std.testing.expectEqualStrings("MTP under expert streaming needs --mtp on a Sushi EXL3 Qwen3.8-Flash-Next pack or DeepSeek-V4.1-Flash", mtp_unsupported);
+    if (registry.ofModelType("qwen4_exp") != null and registry.ofModelType("deepseek_v41") != null and registry.ofModelType("hy_v4_flash") != null)
+        try std.testing.expectEqualStrings("MTP under expert streaming needs --mtp on a Sushi EXL3 Qwen3.8-Flash-Next pack or DeepSeek-V4.1-Flash or a Hy4-Flash pack that ships DFly2", mtp_unsupported);
 }
 
 test "expert-stream traits per model type and layout" {
@@ -81,6 +81,8 @@ test "expert-stream traits per model type and layout" {
     const rows = [_]struct { model_type: []const u8, layout: @TypeOf(@as(model.ModelConfig, .{}).expert_layout), want: T }{
         .{ .model_type = "deepseek_v41", .layout = .exl3_k4, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = true, .cache_bias = true } },
         .{ .model_type = "deepseek_v41", .layout = .mxfp4_w123, .want = .{ .drop_expert = true, .prefetch = true, .tile_major = false, .cache_bias = true } },
+        .{ .model_type = "hy_v4_flash", .layout = .exl3_k4, .want = .{ .stq_experts = true, .tile_major = true, .cache_bias = true } },
+        .{ .model_type = "hy_v4_flash", .layout = .bf16_fused, .want = .{ .cache_bias = true } },
         .{ .model_type = "glm5_next", .layout = .exl3_k4, .want = .{} },
         .{ .model_type = "qwen4_exp", .layout = .exl3_k4, .want = .{ .drop_expert = true, .stq_experts = true, .cache_bias = true } },
         .{ .model_type = "qwen4_exp", .layout = .bf16_fused, .want = .{} },

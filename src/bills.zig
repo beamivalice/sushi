@@ -28,6 +28,7 @@ const testing = std.testing;
 const expert_stream_mod = @import("expert_stream.zig");
 const mtp_mod = @import("mtp.zig");
 const gpu_mem = @import("gpu_mem.zig");
+const ledger_mod = @import("ledger.zig");
 const fixtures = @import("bills_fixtures_test.zig");
 const arch_spec = @import("arch/spec.zig");
 const arch_registry = @import("arch/registry.zig");
@@ -100,6 +101,17 @@ pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) trunk.KVQuantC
 /// 0 = auto. Every reader of the manual context goes through here, never `server_config.max_context_size`.
 pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
     return model_settings.contextPick(launch_state.server_config.max_context_size, config.ctx_override).value;
+}
+
+/// The context a load plans its forwards to: a manual context, which caps every request, else the model's cap (auto
+/// context is solved on the ledger after the plans, so it cannot bound them). A manual context narrower than the load's
+/// own served warm is planned to the warm's reach at the widest chunk the ledger may fix, a verify block past it.
+pub fn planReach(config: *const model_mod.ModelConfig) u32 {
+    const cap = config.contextCap();
+    const manual = manualContext(config);
+    if (manual == 0 or manual >= cap) return cap;
+    const warm = warmReach(config, arch_config.staticChunkMax(config)) + @import("mtp_policy.zig").mtpVerifyDraftsMax(config) + 1;
+    return @intCast(@min(cap, @max(manual, warm)));
 }
 
 /// What the hot cache was actually given for the loaded model, after `clampedPrefixCacheMem`.
@@ -617,6 +629,7 @@ pub fn defaultBudgetLimits() model_load.BudgetLimits {
 /// What a request at the model's default context bills beside the ssd budget with its prefill borrowed from the decoder
 /// pools (`dsv41-memory`): the state, the restore points in flight and a decode block's working set.
 pub fn defaultRequestBill(config: *const model_mod.ModelConfig) u64 {
+    if (ledgerRequestBeforeLoad(config, config.defaultContext())) |bill| return bill;
     var probe = config.*;
     probe.expert_streaming = false;
     probe.expert_borrow_bytes = std.math.maxInt(u64) / 2;
@@ -680,12 +693,14 @@ pub fn expertStreamingPlannedSeq(config: *const model_mod.ModelConfig) u64 {
 /// The KV a streamed load plans to hold: the second term of the
 /// budget-vs-wired-limit admission.
 pub fn expertStreamingPlannedKvBytes(config: *const model_mod.ModelConfig) u64 {
+    if (ledgerRequestBeforeLoad(config, expertStreamingPlannedSeq(config))) |bill| return bill;
     const kv_bits = defaultKvBits(config);
     return sessionBytesPerToken(config, kv_bits) *| expertStreamingPlannedSeq(config) +| slotRingBytes(config, kv_bits);
 }
 
 pub fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
     const seq: u64 = expertStreamingPlannedSeq(config);
+    if (ledgerRequestBeforeLoad(config, seq)) |bill| return bill;
     const explicit = explicitPrefillChunk();
     // A request picks its own rung against free memory, and an unpinned arch's load-time pin is memory-sized after
     // this check, so the load must only prove the ladder's floor fits.
@@ -698,7 +713,8 @@ pub fn expertStreamingServingBytes(config: *const model_mod.ModelConfig) u64 {
 /// What a streamed load must leave under its ceiling beside what it holds: a request's working set at the planned
 /// context, the served warm's narrowest chunk (which lends no decoder pool), and an image encode.
 fn expertStreamingBesideLoadBytes(config: *const model_mod.ModelConfig) u64 {
-    return @max(@max(expertStreamingServingBytes(config), warmFloorChunkBytes(config)), config.expert_vision_encode_bytes);
+    const warm = if (ledgerArch(config)) 0 else warmFloorChunkBytes(config);
+    return @max(@max(expertStreamingServingBytes(config), warm), config.expert_vision_encode_bytes);
 }
 
 /// What a streamed load holds beside its ssd budget: the planned KV and, under `--vision`, its largest image encode.
@@ -718,15 +734,16 @@ pub const FitReadings = struct {
     proc_free: u64 = 0,
 
     pub fn now() FitReadings {
-        // The lent decoder pools are in use for a load (`promisedActive`), and not the free RAM their pages show as.
-        const lent = gpu_mem.lentBytes();
-        const active: u64 = promisedActive(gpu_mem.activeBytes());
+        // The lent decoder pools are in use for a load (`promisedActive`), and not the free RAM their pages show as; nor
+        // is what the loads on the ledger hold of their budgets unallocated (D90).
+        const held = gpu_mem.lentBytes() +| ledger_mod.unseenBeside(null);
+        const active: u64 = promisedActive(gpu_mem.activeBytes(), null);
         return .{
             .ceiling = ceilingNow(),
             .active = active,
             .cache = gpu_mem.cacheBytes(),
-            .free = metrics.getAvailableMemBytes() -| lent,
-            .proc_free = metrics.getProcAvailableMemBytes() -| lent,
+            .free = metrics.getAvailableMemBytes() -| held,
+            .proc_free = metrics.getProcAvailableMemBytes() -| held,
         };
     }
 
@@ -1227,6 +1244,7 @@ fn sushiContextBytesAt(config: *const model_mod.ModelConfig, context: u32, kv_bi
 
 /// The width the max-context search prices a context at: an explicit `--prefill-chunk`, else the per-request floor rung.
 pub fn sushiContextWidth(config: *const model_mod.ModelConfig, context: u32) u64 {
+    if (config.static_prefill_chunk != 0) return config.static_prefill_chunk;
     const explicit = explicitPrefillChunk();
     const rung: u32 = if (explicit > 0) explicit else perRequestFloorWidth(config) orelse
         (if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else 8192);
@@ -1394,6 +1412,255 @@ pub fn writeMemoryContextRefusal(w: *std.Io.Writer, refusal: model_registry_mod.
     if (refusal.smaller_pack) try w.print("\n- Use a smaller pack of this model.", .{});
 }
 
+/// The rows a static-bill load's prefill chunk is chosen within (D4). `deprecated`: the max came from `--prefill-chunk`.
+pub const ChunkBounds = struct { min: u32, max: u32, deprecated: bool = false };
+
+pub const ChunkBoundsPick = union(enum) {
+    /// The load is not on the static bill: its chunk is chosen as before.
+    none,
+    bounds: ChunkBounds,
+    /// The line the launch refuses with.
+    refused: []const u8,
+};
+
+const GivenBound = struct { rows: u32, name: []const u8 };
+
+/// A load's chunk bounds: each bound's flag, else (the max only) the deprecated `--prefill-chunk`, else its
+/// model-settings.json key, else the arch's widest forward for the max and the ladder's narrowest rung (no wider than the
+/// max) for the min. Pure but for the launch flags it reads. `buf` holds a refusal's line.
+pub fn staticChunkBounds(buf: []u8, config: *const model_mod.ModelConfig) ChunkBoundsPick {
+    const widest = arch_config.staticChunkMax(config);
+    const launch = settings_resolve.launch;
+    if (widest == 0) {
+        // The flags are refused by name in `arch/flags.zig`; the model's own keys here.
+        if (config.prefill_chunk_max_override != null) return .{ .refused = "[model-settings] prefill_chunk_max has no effect on this model: only a load on the static bill fixes its prefill chunk; remove it" };
+        if (config.prefill_chunk_min_override != null) return .{ .refused = "[model-settings] prefill_chunk_min has no effect on this model: only a load on the static bill fixes its prefill chunk; remove it" };
+        return .none;
+    }
+    const legacy = explicitPrefillChunk();
+    if (legacy > 0 and launch.prefill_chunk_max != null) return .{ .refused = "--prefill-chunk is deprecated on this model and means --prefill-chunk-max: give --prefill-chunk-max alone" };
+    const max: ?GivenBound = if (launch.prefill_chunk_max) |v| .{ .rows = v, .name = "--prefill-chunk-max" } else if (legacy > 0) .{ .rows = legacy, .name = "--prefill-chunk" } else if (config.prefill_chunk_max_override) |v| .{ .rows = v, .name = "model-settings.json prefill_chunk_max" } else null;
+    const min: ?GivenBound = if (launch.prefill_chunk_min) |v| .{ .rows = v, .name = "--prefill-chunk-min" } else if (config.prefill_chunk_min_override) |v| .{ .rows = v, .name = "model-settings.json prefill_chunk_min" } else null;
+    for ([_]?GivenBound{ max, min }) |given| if (given) |g| if (!settings_resolve.isStaticChunkRung(g.rows) or g.rows > widest) {
+        return .{ .refused = std.fmt.bufPrint(buf, "{s} {d} is not a prefill chunk this model runs: " ++ settings_resolve.static_chunk_rungs_text, .{ g.name, g.rows }) catch g.name };
+    };
+    const hi: u32 = if (max) |g| g.rows else widest;
+    const lo: u32 = if (min) |g| g.rows else defaultChunkMin(hi);
+    if (lo > hi) return .{ .refused = std.fmt.bufPrint(buf, "{s} {d} is above {s} {d}", .{ min.?.name, lo, max.?.name, hi }) catch min.?.name };
+    return .{ .bounds = .{ .min = lo, .max = hi, .deprecated = legacy > 0 } };
+}
+
+/// An omitted `--prefill-chunk-min`: the narrowest rung, never above the max.
+pub fn defaultChunkMin(max: u32) u32 {
+    return @min(settings_resolve.static_chunk_rungs[settings_resolve.static_chunk_rungs.len - 1], max);
+}
+
+/// The widths a static-bill load tries, widest first: every rung from the max down to the min.
+pub fn staticChunkCandidates(b: ChunkBounds, out: *[settings_resolve.static_chunk_rungs.len]u32) []const u32 {
+    var n: usize = 0;
+    for (settings_resolve.static_chunk_rungs) |r| if (r <= b.max and r >= b.min) {
+        out[n] = r;
+        n += 1;
+    };
+    return out[0..n];
+}
+
+pub const StaticChunkChoice = union(enum) {
+    chunk: u32,
+    /// Not even `min` fits: what it and the context need beside the load, and the room there is.
+    refused: Refusal,
+
+    pub const Refusal = struct { min: u32, needed: u64, free: u64, context: ContextSource };
+};
+
+/// Whether `config`'s arch bills only on its ledger (its bill answers `ledgerTerms`: Hy4). A load of it that warms is on
+/// the ledger (`static_bill.onLedger`), whose arena its forwards run in under no pool cap; before its load a request is
+/// priced by the closed-form terms (D105); a load of it that serves no request (`sushi kld`) runs uncapped.
+pub fn ledgerArch(config: *const model_mod.ModelConfig) bool {
+    const claimed = arch_spec.of(config) orelse return false;
+    switch (claimed) {
+        inline else => |_, tag| return comptime @hasDecl(arch_registry.Mod(tag).bill, "ledgerTerms"),
+    }
+}
+
+/// A load on the ledger: what its requests hold at `chunk` (the arch's `ledgerTerms`); null for any other.
+pub fn ledgerTermsAt(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) ?ledger_mod.RequestTerms {
+    return archHook("ledgerTerms", ledger_mod.RequestTerms, config, .{ kv_bits, chunk });
+}
+
+/// What a request reaching `reach` tokens bills before its load, for an arch on the ledger (D105): its closed-form terms
+/// at the chunk the load fixed, else the widest it may fix (`staticChunkMax`), and at the load's KV width (D103). Every
+/// pre-load estimate of such an arch returns from this one price: its forwards run in the arena its ledger sizes with
+/// the chunk, which narrows the chunk or refuses the load by name where none fits. Null for an arch off the ledger.
+fn ledgerRequestBeforeLoad(config: *const model_mod.ModelConfig, reach: u64) ?u64 {
+    return (ledgerTermsAt(config, defaultKvBits(config), chunkBeforeLoad(config)) orelse return null).at(reach);
+}
+
+fn chunkBeforeLoad(config: *const model_mod.ModelConfig) u64 {
+    return if (config.static_prefill_chunk != 0) config.static_prefill_chunk else arch_config.staticChunkMax(config);
+}
+
+/// The longest context a load on the ledger serves: the model's default where it has one, else its window.
+pub fn ledgerWindow(config: *const model_mod.ModelConfig) u32 {
+    return if (config.defaultContext() > 0) config.defaultContext() else config.contextCap();
+}
+
+pub const LedgerContext = struct { tokens: u32, source: ContextSource };
+
+/// The context a load on the ledger serves, beside lines that hold `fits` tokens (`ledger.contextFor` over the room its
+/// model bill leaves, computed once by the caller): `--ctx-size`, else the model's `ctx_size` setting, else the context a
+/// session pinned, else `fits`.
+pub fn ledgerContext(config: *const model_mod.ModelConfig, fits: u32) LedgerContext {
+    const manual = model_settings.contextPick(launch_state.server_config.max_context_size, config.ctx_override);
+    if (manual.value > 0) return .{ .tokens = manual.value, .source = if (manual.source == .flag) .flag else .setting };
+    if (config.pinned_context > 0) return .{ .tokens = config.pinned_context, .source = .pinned };
+    return .{ .tokens = fits, .source = .auto };
+}
+
+/// The arena a load on the ledger holds with prefill chunks of a candidate's rows, measured from its recorded plans and
+/// the region the chunk asks (D98, `arch/cooler.zig` `planArena`).
+pub const ArenaAt = struct {
+    ctx: *anyopaque,
+    at: *const fn (ctx: *anyopaque, chunk: u32) anyerror!u64,
+
+    pub fn of(a: ArenaAt, chunk: u32) anyerror!u64 {
+        return a.at(a.ctx, chunk);
+    }
+};
+
+/// A load on the ledger's choice: the room it is made in (`static_bill.open`) and its arena at each candidate.
+pub const LedgerChoice = struct { room: u64, arena: ArenaAt };
+
+/// The chunk a load on the ledger fixes (D4, docs/bill_redesign.md part 9): the context first, at the narrowest
+/// candidate's terms (`ledgerContext` over the room its arena leaves), then the widest candidate whose arena and request
+/// at that context fit `room`, the load's budget less what it holds now and its margin. An auto context of no token
+/// refuses as a min that does not fit.
+pub fn chooseLedgerPrefillChunk(config: *const model_mod.ModelConfig, b: ChunkBounds, choice: LedgerChoice) anyerror!StaticChunkChoice {
+    const kv = defaultKvBits(config);
+    const room = choice.room;
+    const narrow = ledgerTermsAt(config, kv, b.min).?;
+    const narrow_arena = try choice.arena.of(b.min);
+    const ctx = ledgerContext(config, ledger_mod.contextFor(room -| narrow_arena, narrow, ledgerWindow(config)));
+    const tokens: u64 = @max(ctx.tokens, 1);
+    var buf: [settings_resolve.static_chunk_rungs.len]u32 = undefined;
+    if (ctx.tokens > 0) for (staticChunkCandidates(b, &buf)) |c| {
+        const t = ledgerTermsAt(config, kv, c).?;
+        if ((try choice.arena.of(c)) +| t.at(tokens) <= room) return .{ .chunk = c };
+    };
+    return .{ .refused = .{ .min = b.min, .needed = narrow_arena +| narrow.at(tokens), .free = room, .context = ctx.source } };
+}
+
+/// The refusal a load on the ledger gives before it records its plans: its choice's with no arena at any chunk, a lower
+/// bound, as an arena only adds to a chunk's need. An auto context gives it only where not one token fits: with an arena
+/// it holds fewer tokens, and a chunk may then fit. Null where the plans decide.
+pub fn refusedBeforePlans(config: *const model_mod.ModelConfig, b: ChunkBounds, room: u64) anyerror!?StaticChunkChoice.Refusal {
+    const kv = defaultKvBits(config);
+    const narrow = ledgerTermsAt(config, kv, b.min).?;
+    const ctx = ledgerContext(config, ledger_mod.contextFor(room, narrow, ledgerWindow(config)));
+    const tokens: u64 = @max(ctx.tokens, 1);
+    const refused: StaticChunkChoice.Refusal = .{ .min = b.min, .needed = narrow.at(tokens), .free = room, .context = ctx.source };
+    if (ctx.tokens == 0) return refused;
+    if (ctx.source == .auto) return null;
+    var buf: [settings_resolve.static_chunk_rungs.len]u32 = undefined;
+    for (staticChunkCandidates(b, &buf)) |c| if (ledgerTermsAt(config, kv, c).?.at(tokens) <= room) return null;
+    return refused;
+}
+
+/// A static-bill load whose room holds no chunk even with no arena is refused by name before it records its plans
+/// (`refusedBeforePlans`); any other load goes on to record them.
+pub fn refuseStaticChunkBeforePlans(config: *const model_mod.ModelConfig, room: u64) anyerror!void {
+    var buf: [256]u8 = undefined;
+    const b = switch (staticChunkBounds(&buf, config)) {
+        .bounds => |b| b,
+        else => return,
+    };
+    const r = try refusedBeforePlans(config, b, room) orelse return;
+    log.err("{s}\n", .{staticChunkRefusalLine(&buf, r.min, r.needed, r.free, r.context, .at_least)});
+    return error.PrefillChunkDoesNotFit;
+}
+
+/// Fixes a static-bill load's prefill chunk once, before its warm (D4): every prefill then runs chunks of it, and
+/// nothing re-sizes it. `ledger` is the load's (`static_bill.open`): the chunk is chosen on it, and a static-bill load
+/// with none (it does not warm) is refused by name. 0 for a load off the static bill.
+pub fn fixStaticPrefillChunk(config: *model_mod.ModelConfig, ledger: ?LedgerChoice) anyerror!u32 {
+    var buf: [256]u8 = undefined;
+    const b = switch (staticChunkBounds(&buf, config)) {
+        .none => return 0,
+        .refused => |line| {
+            log.err("{s}\n", .{line});
+            return error.LaunchFlagUnsupported;
+        },
+        .bounds => |b| b,
+    };
+    if (b.deprecated) log.warn("[prefill] --prefill-chunk is deprecated on this model: it means --prefill-chunk-max {d}; pass --prefill-chunk-max and --prefill-chunk-min\n", .{b.max});
+    // The ledger a load joins at its warm prices the chunk: a load that does not warm has none to fix it on.
+    const l = ledger orelse {
+        log.err("[prefill] this model fixes its prefill chunk on the ledger a load joins at its warm, and this load does not warm\n", .{});
+        return error.StaticBillLoadDoesNotWarm;
+    };
+    const choice = try chooseLedgerPrefillChunk(config, b, l);
+    switch (choice) {
+        .chunk => |c| {
+            config.static_prefill_chunk = c;
+            config.pinned_prefill_chunk = c;
+            log.info("[prefill] chunk {d} fixed at load (min {d}, max {d})\n", .{ c, b.min, b.max });
+            return c;
+        },
+        .refused => |r| {
+            log.err("{s}\n", .{staticChunkRefusalLine(&buf, r.min, r.needed, r.free, r.context, .measured)});
+            return error.PrefillChunkDoesNotFit;
+        },
+    }
+}
+
+/// Where the context a chunk is priced beside came from, which decides what the refusal can tell the user to lower.
+pub const ContextSource = enum {
+    flag,
+    /// The model's `ctx_size` in model-settings.json.
+    setting,
+    pinned,
+    auto,
+
+    /// What names the source in a refusal.
+    pub fn label(source: ContextSource) []const u8 {
+        return switch (source) {
+            .flag => "--ctx-size",
+            .setting => "the model's ctx_size setting",
+            .pinned => "the context this session advertised",
+            .auto => "the auto context",
+        };
+    }
+};
+
+/// What a refusal's need counts: the arena the plans measure, or none, before the plans are recorded (a lower bound).
+pub const RefusalNeed = enum { measured, at_least };
+
+pub fn staticChunkRefusalLine(buf: []u8, min: u32, needed: u64, free: u64, context: ContextSource, need: RefusalNeed) []const u8 {
+    const remedy = switch (context) {
+        .flag => "lower --prefill-chunk-min or --ctx-size",
+        .setting => "lower --prefill-chunk-min or the model's ctx_size setting",
+        .auto => "lower --prefill-chunk-min",
+        // The context a session advertised stays across its reloads: clients budget against it.
+        .pinned => "the session keeps the context it advertised: free memory, or restart the server",
+    };
+    const at_least = if (need == .at_least) "at least " else "";
+    return std.fmt.bufPrint(buf, "[prefill] the load cannot hold its narrowest prefill chunk: {d} rows need {s}{d} MB beside the context, and {d} MB is free; {s}", .{ min, at_least, needed >> 20, free >> 20, remedy }) catch "[prefill] the load cannot hold its narrowest prefill chunk";
+}
+
+/// The widest chunk below `chosen`, down to the load's min, whose arena and request of `tokens` fit `budget` beside `held`
+/// (the model bill less its arena): the rung that holds a context the seal's lines no longer hold at the chosen chunk.
+/// Null when none does.
+pub fn chunkHoldingContext(config: *const model_mod.ModelConfig, b: ChunkBounds, chosen: u32, tokens: u64, held: u64, budget: u64, arena: ArenaAt) anyerror!?u32 {
+    const kv = defaultKvBits(config);
+    var buf: [settings_resolve.static_chunk_rungs.len]u32 = undefined;
+    for (staticChunkCandidates(b, &buf)) |c| {
+        if (c >= chosen) continue;
+        const t = ledgerTermsAt(config, kv, c).?;
+        if (held +| (try arena.of(c)) +| t.at(tokens) <= budget) return c;
+    }
+    return null;
+}
+
 /// `budget`: the room a request has beside the weights once they are resident (`model_load.preflightServing`).
 pub fn loadServingBill(config: *const model_mod.ModelConfig, budget: u64) ?model_load.LoadServingBill {
     if (!model_mod.usesSushiQuantMemoryBill(config)) return null;
@@ -1420,7 +1687,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         const active_now: usize = gpu_mem.activeBytes();
         const ceiling = currentGpuMemoryCeiling(active_now);
         // A pin outlives any lease: the lent decoder pools are in use (`promisedActive`).
-        const active_mem: usize = promisedActive(active_now);
+        const active_mem: usize = promisedActive(active_now, config);
         const kv_bits: u64 = defaultKvBits(config);
         // Which ask: the gated arch reads the resolved budget; every other arch reads the raw
         // ask as before (the accessor would pin a second model against the first's budget).
@@ -1775,9 +2042,15 @@ fn logOneSessionAsk(ask: u64, ctx_tokens: u64, one: OneSession) void {
 pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, revise: scheduler_mod.BudgetRevise, idle_out: *u64) u64 {
     // RAM-first default: no idle allowance. Written first so every early return carries it.
     idle_out.* = 0;
-    var active_mem: usize = promisedActive(gpu_mem.activeBytes());
+    var active_mem: usize = promisedActive(gpu_mem.activeBytes(), config);
     active_mem -|= @as(usize, @intCast(@min(revise.exclude_bytes, std.math.maxInt(usize))));
     const kv_bits: u64 = defaultKvBits(config);
+    // A load on the ledger: what its RAM tier keeps is what the model parks on the ledger's lines, which admission
+    // releases before a request that does not fit beside it (`static_bill.admit`); the ask stands as given.
+    if (config.static_ledger != null) {
+        publishResolvedPrefixCacheMem(requested);
+        return requested;
+    }
     // Arch gate: the budget resolver changed three inputs at once (static ceiling, the
     // load-time context resolver, the floor-width reserve), all measured on qwen4_exp alone.
     // Ungated is the previous `prefixCacheMemForLoad`.
@@ -1904,13 +2177,13 @@ pub fn widthForRung(cfg: *const model_mod.ModelConfig, seq: u64, rung: u32) u32 
 /// A context pinned at load outlives any lease: the lent decoder pools are in use (`promisedActive`).
 pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return memoryContextAt(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem));
+    return memoryContextAt(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem, config));
 }
 
 /// `computeMemoryContext` at one reading of the ceiling and MLX's active memory.
 pub fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, active_mem: u64) u32 {
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
-    const chunk: u64 = @intCast(prefill_plan.effectivePrefillChunk(
+    const chunk: u64 = if (config.static_prefill_chunk != 0) config.static_prefill_chunk else @intCast(prefill_plan.effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
         0,
@@ -1925,6 +2198,8 @@ pub fn memoryContextAt(config: *const model_mod.ModelConfig, ceiling: u64, activ
 /// `memoryContextAt` for a given prefill width, before the checkpoint's position cap.
 pub fn memoryContextAtChunk(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u64) u32 {
     if (config.num_attention_heads == 0) return 16384;
+    // A load on the ledger reads no allocator: the context its seal fixed in closed form (0 before it).
+    if (config.static_ledger) |l| if (ledgerArch(config)) return l.context.load(.acquire);
     // Flash-Next advertises the context its own request bill admits at the floor rung, from the
     // headroom admission reads (the writers' host bytes included), so the two cannot disagree.
     if (config.longCtxGated()) {
@@ -2393,6 +2668,18 @@ pub fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
 
 /// Sushi Cooler: the bytes each prefill row holds at a chunk's peak, from the arch's own buffers; 0 where the arch has
 /// no such account (its fitted envelope stands).
+/// Whether the arch's Cooler bill is exact (the held bytes, nothing fitted): an arch that prices prefill rows on the
+/// engine (`coolerPrefillRowBytes`), or one that declares `cooler_bill_exact` for a bill of its own. An exact bill
+/// carries the one margin (`BILL_MARGIN_BYTES`), never an estimator's uplift.
+pub fn coolerBillExact(config: *const model_mod.ModelConfig) bool {
+    if (!cooler_side.onEngine(config)) return false;
+    if (coolerPrefillRowBytes(config) > 0) return true;
+    const tag = arch_registry.ofModelType(config.model_type) orelse return false;
+    switch (tag) {
+        inline else => |t| return comptime @hasDecl(arch_registry.Mod(t), "cooler_bill_exact") and arch_registry.Mod(t).cooler_bill_exact,
+    }
+}
+
 pub fn coolerPrefillRowBytes(config: *const model_mod.ModelConfig) u64 {
     if (!cooler_side.onEngine(config)) return 0;
     const rows = archHook("coolerPrefillRowBytes", u64, config, .{}) orelse return 0;
@@ -2406,14 +2693,14 @@ pub var cooler_rows_for_test: ?u64 = null;
 /// What the adaptive sizer asks the headroom for a chunk of `cost`: an exact Cooler cost and the margin, else the quarter
 /// the fitted terms were measured under.
 fn chunkAsk(config: *const model_mod.ModelConfig, cost: u64) u64 {
-    return if (coolerPrefillRowBytes(config) > 0) cost +| BILL_MARGIN_BYTES else cost *| 5 / 4;
+    return if (coolerBillExact(config)) cost +| BILL_MARGIN_BYTES else cost *| 5 / 4;
 }
 
 /// The most a prefill chunk may grow the engine's pool: its cost, and where that cost is exact the one margin, which
 /// the forward's cap (`cooler.forwardCap`) lets the pool keep in free buffers.
 pub fn prefillChunkHeldMax(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room) u64 {
     const cost = prefillChunkCost(config, kv_bits, width, kv_len, room);
-    return if (coolerPrefillRowBytes(config) > 0) cost +| BILL_MARGIN_BYTES else cost;
+    return if (coolerBillExact(config)) cost +| BILL_MARGIN_BYTES else cost;
 }
 
 /// Bytes per prefill row an EXL3 MoE layer holds at its down projection (`rate_groups.moePrefill`), f16 over every
@@ -2874,10 +3161,10 @@ pub const AdmissionBill = struct {
     }
 };
 
-/// Unloads idle resident models, least recently used first, until `fits` holds; false when
-/// nothing idle is left. An idle model is memory its next request reloads.
-pub fn fitAfterUnloadingIdle(ctx: anytype, fits: fn (@TypeOf(ctx)) bool, unloadOne: fn (@TypeOf(ctx)) bool) bool {
-    while (!fits(ctx)) if (!unloadOne(ctx)) return false;
+/// Unloads idle resident models, least recently used first, until `bill` fits after its eviction (`unloadOne` bills
+/// it again after each); false when nothing idle is left. An idle model is memory its next request reloads.
+pub fn fitAfterUnloadingIdle(bill: *const AdmissionBill, ctx: anytype, unloadOne: fn (@TypeOf(ctx)) bool) bool {
+    while (!bill.fitsAfterEviction()) if (!unloadOne(ctx)) return false;
     return true;
 }
 
@@ -2913,7 +3200,8 @@ pub fn prefillNeededAtChunkUnlent(
 }
 
 /// What a request holds at its peak, its storage and its widest forward's transients: exact on Sushi Cooler (the bill
-/// adds `billMargin`), with the calibrated net on MLX.
+/// adds `billMargin`), with the calibrated net on MLX. An arch's own `requestBill` replaces `requestPhasesFor`, so
+/// it restates every term of it that is not zero for the arch (each arch's bill test holds it to that).
 pub fn requestHeldBytes(
     config: *const model_mod.ModelConfig,
     seq: u64,
@@ -2960,7 +3248,7 @@ pub fn requestPhasesFor(
 /// What a forward of `fwd` rows over `keys` holds past `prefillMemoryNeeded`'s terms: the QSA select's mask, a ringed arch's
 /// band sheet, the FP8 and trellis weight copies and the forward's moments (the dense KV rebuild among them on Cooler).
 /// The prefill chunk and the decode step are priced by it alike.
-fn forwardWidthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, keys: u64, head: bool) u64 {
+pub fn forwardWidthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, fwd: u64, keys: u64, head: bool) u64 {
     return qsaMaskBilled(config, fwd, keys) +
         slidingBandScoreBytes(config, fwd) +
         fp8DequantScratchBytes(config, fwd) +
@@ -2976,6 +3264,8 @@ fn decodeForwardRows(config: *const model_mod.ModelConfig, warm: WarmPrefix) u64
 /// the chunk loop's own cut, a tail it absorbs included), never under the chunk: the rows every forward-width term of
 /// its bill prices.
 pub fn requestForwardRows(config: *const model_mod.ModelConfig, seq: u64, chunk: u64, matched: u64) u64 {
+    // A fixed chunk merges no tail (`prefill_plan.chunkEndFor`).
+    if (config.static_prefill_chunk != 0) return @min(chunk, @max(seq, 1));
     const widest = prefill_plan.widestForward(@intCast(seq -| matched -| 1), @intCast(@max(chunk, 1)), adaptivePrefillChunkEnabled(config));
     return @max(@min(chunk, @max(seq, 1)), widest);
 }
@@ -3019,7 +3309,7 @@ pub fn chooseRequestPrefillChunk(
         const width: u64 = rungWidth(config, seq, rung, config.longCtxGated());
         const bill = prefillNeededAtChunk(config, seq, max_tokens, kv_bits, width, rung_warm);
         // An exact Cooler bill under-bills nothing, so it carries its one margin and no estimator's.
-        const needed = if (width > rungWidth(config, seq, rung, false) and coolerPrefillRowBytes(config) == 0)
+        const needed = if (width > rungWidth(config, seq, rung, false) and !coolerBillExact(config))
             bill *| (100 + PREFILL_WIDE_RUNG_MARGIN_PCT) / 100
         else
             bill;
@@ -3035,6 +3325,7 @@ fn cappedRung(rung: u32, cap: u32) u32 {
 /// The widest width a served request's ladder forwards at a short prompt: the arch's start width (DeepSeek's 2048) or
 /// `--prefill-chunk`, bounded as a request's rung is. A load's served warm takes this width, not the global default.
 pub fn widestServedRung(config: *const model_mod.ModelConfig) u32 {
+    if (config.static_prefill_chunk != 0) return config.static_prefill_chunk;
     return @intCast(rungWidth(config, 1, cappedRung(PREFILL_CHUNK_LADDER[0], ladderTop(config, explicitPrefillChunk())), config.longCtxGated()));
 }
 
@@ -3065,6 +3356,7 @@ pub fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long
 /// connection thread's bill and the scheduler's pick. Off the ladder (the vision kill switch, an
 /// arch that does not pick per request) an explicit width outranks the load-time pin.
 pub fn requestPrefillPick(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u32, kv_bits: u64, available: u64, unchunked_prefill: bool, warm: WarmPrefix) u32 {
+    if (config.static_prefill_chunk != 0) return config.static_prefill_chunk;
     const explicit = explicitPrefillChunk();
     if (unchunked_prefill or !perRequestPrefillChunkEnabled(config))
         return if (explicit > 0) explicit else config.pinned_prefill_chunk;
@@ -3165,7 +3457,7 @@ fn chunkGrowth(config: *const model_mod.ModelConfig, width: u64, kv_len: u64, ro
 /// what the chunk takes. A cache with the rows to spare grows nothing.
 pub fn chunkGrowthBytes(config: *const model_mod.ModelConfig, kv_bits: u64, width: u64, kv_len: u64, room: trunk.Room) u64 {
     // An arch whose rows are not the KV cache's grows them by its own rule, from the capacity it holds.
-    if (archHook("chunkGrowthBytes", u64, config, .{ width, kv_len, room })) |bytes| return bytes;
+    if (archHook("chunkGrowthBytes", u64, config, .{ kv_bits, width, kv_len, room })) |bytes| return bytes;
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const state_tok = statePerTokenBilled(config);
     if (!cooler_side.onEngine(config)) return width *| (kv_tok +| state_tok);
@@ -3317,14 +3609,15 @@ fn parkedBytes(config: *const model_mod.ModelConfig, engine_free: u64) u64 {
 /// scheduler runs the request at (`requestPrefillChunkNow`) read this one number.
 pub fn admissionAvailableNow(config: *const model_mod.ModelConfig) u64 {
     const active_mem: usize = gpu_mem.activeBytes();
-    return admissionAvailableFor(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem), gpu_mem.engineFree());
+    return admissionAvailableFor(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem, config), gpu_mem.engineFree());
 }
 
-/// What a reading whose promise outlives a lease counts in use: the active bytes and the decoder pools lent out of
-/// them, which their lessee's read-back takes back. Only the lessee's own reading (`leaseHolderHeadroomNow`) counts
-/// them free. The ceiling is read from the active bytes alone: the lent pages are the system's until the read-back.
-fn promisedActive(active: u64) u64 {
-    return active +| gpu_mem.lentBytes();
+/// What a reading whose promise outlives a lease counts in use: the active bytes, the decoder pools lent out of
+/// them, which their lessee's read-back takes back, and each load on the ledger at its whole budget but `reader`'s own
+/// (D90: `ledger.unseenBeside`). Only the lessee's own reading (`leaseHolderHeadroomNow`) counts the lent pools free.
+/// The ceiling is read from the active bytes alone: the lent pages are the system's until the read-back.
+pub fn promisedActive(active: u64, reader: ?*const model_mod.ModelConfig) u64 {
+    return active +| gpu_mem.lentBytes() +| ledger_mod.unseenBeside(if (reader) |c| c.static_ledger else null);
 }
 
 /// One reading of the memory a forward, an encode or a pool's read-back may take now. `live` is the ceiling less the
@@ -3356,7 +3649,7 @@ pub fn headroomFrom(config: *const model_mod.ModelConfig, ceiling: u64, active: 
 /// `headroomFrom` over the live readings, the lent decoder pools held off (`promisedActive`).
 pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headroom {
     const active_mem: usize = gpu_mem.activeBytes();
-    return headroomFrom(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem), staged_host, gpu_mem.engineFree());
+    return headroomFrom(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem, config), staged_host, gpu_mem.engineFree());
 }
 
 /// The one reading that counts lent decoder pools free: their lessee's (DeepSeek's borrow, for its prefill's releases
@@ -3365,7 +3658,7 @@ pub fn headroomNow(config: *const model_mod.ModelConfig, staged_host: u64) Headr
 pub fn leaseHolderHeadroomNow(config: *const model_mod.ModelConfig) Headroom {
     const active_mem: usize = gpu_mem.activeBytes();
     const own = @atomicLoad(u64, &config.expert_lent_bytes, .monotonic);
-    return headroomFrom(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem) -| own, 0, gpu_mem.engineFree());
+    return headroomFrom(config, currentGpuMemoryCeiling(active_mem), promisedActive(active_mem, config) -| own, 0, gpu_mem.engineFree());
 }
 
 /// PURE half of `prefillHeadroomNow`.
@@ -3461,6 +3754,8 @@ pub fn admissionAvailable(total_limit: u64, active_mem: u64) u64 {
 /// The hot cache is read once, as the published evictable atomic, never billed on top.
 /// `model` is the requested model, whose own hot cache alone is credited; null credits none.
 pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, model: ?*model_registry_mod.LoadedModel, prompt_len: usize, max_tokens: u32, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, prompt_tokens: ?[]const u32, warm: WarmPrefix) AdmissionBill {
+    // A load on the ledger prices a request by `static_bill.reservation`, never here.
+    std.debug.assert(config.static_ledger == null);
     const heads = config.num_attention_heads;
     if (heads == 0) return .{ .needed = 0, .available = std.math.maxInt(u64) };
     const seq: u64 = @intCast(prompt_len);
@@ -3483,7 +3778,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, model: ?*model
     const chunk: u64 = if (unchunked_prefill)
         @max(seq, 1)
     else
-        @intCast(prefill_plan.requestPrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
+        @intCast(prefill_plan.prefillWidth(config, prompt_len, chosen));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
     // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full
@@ -3831,8 +4126,57 @@ test "the declared ceiling reads the safety margin at call time: the saved value
     try t.expectEqual(limit - 8 * gib, ceilingNow().floor().?);
     launch_state.setWiredMarginFile(2);
     try t.expectEqual(limit - 2 * gib, ceilingNow().floor().?);
+    // A saved margin of 0 is a margin of 0, not the default.
+    launch_state.setWiredMarginFile(0);
+    try t.expectEqual(@as(u64, 0), launch_state.wiredMarginBytes());
     launch_state.wired_margin_flag_bytes = 4 * gib;
     try t.expectEqual(limit - 4 * gib, ceilingNow().floor().?);
+}
+
+test "a margin of 0 plans to the declared limit less the GPU floor alone" {
+    const t = std.testing;
+    const gib: u64 = 1 << 30;
+    const limit_was = wired_limit_mb_override;
+    const floor_was = gpu_floor_bytes.load(.monotonic);
+    const logged_was = wired_floor_logged.load(.monotonic);
+    const flag_was = launch_state.wired_margin_flag_bytes;
+    defer {
+        wired_limit_mb_override = limit_was;
+        gpu_floor_bytes.store(floor_was, .monotonic);
+        wired_floor_logged.store(logged_was, .monotonic);
+        launch_state.wired_margin_flag_bytes = flag_was;
+        launch_state.setWiredMarginFile(null);
+    }
+    wired_limit_mb_override = 120_000;
+    gpu_floor_bytes.store(0, .monotonic);
+    wired_floor_logged.store(true, .monotonic);
+    const status = @import("status.zig");
+    const total_was = status.total_mem_override;
+    const static_was = static_ceiling_override;
+    defer {
+        status.total_mem_override = total_was;
+        static_ceiling_override = static_was;
+    }
+    status.total_mem_override = 128 * gib;
+    static_ceiling_override = 100 * gib;
+    const limit = wiredLimitBytes();
+
+    launch_state.setWiredMarginFile(8);
+    launch_state.wired_margin_flag_bytes = 0;
+    const c = ceilingNow();
+    try t.expectEqual(@as(u64, 0), c.margin);
+    try t.expectEqual(@as(u64, 0), c.unplanned);
+    try t.expectEqual(limit, c.floor().?);
+    var buf: [192]u8 = undefined;
+    try t.expect(wiredMarginRefusal(&buf, c) == null);
+
+    gpu_floor_bytes.store(620 << 20, .monotonic);
+    const c2 = ceilingNow();
+    try t.expectEqual(@as(u64, (620 << 20) + GPU_FLOOR_SLACK_BYTES), c2.unplanned);
+    try t.expectEqual(limit - ((620 << 20) + GPU_FLOOR_SLACK_BYTES), c2.floor().?);
+
+    launch_state.wired_margin_flag_bytes = null;
+    try t.expectEqual(@as(u64, 8 * gib), launch_state.wiredMarginBytes());
 }
 
 test "the bill plans the non-MLX GPU floor and the command-buffer size" {
@@ -4435,31 +4779,27 @@ test "admissionVerdict names the same three arms the guard acts on" {
 test "a prompt that does not fit unloads idle models, oldest first, until it fits" {
     const t = std.testing;
     const Fake = struct {
-        needed: u64,
-        available: u64,
+        bill: AdmissionBill,
         idle: []const u64, // resident bytes, least recently used first
         unloaded: usize = 0,
-        fn fits(f: *@This()) bool {
-            return f.needed <= f.available;
-        }
         fn unloadOne(f: *@This()) bool {
             if (f.unloaded == f.idle.len) return false;
-            f.available += f.idle[f.unloaded];
+            f.bill.available += f.idle[f.unloaded];
             f.unloaded += 1;
             return true;
         }
     };
     // Already fits: nothing is unloaded.
-    var a = Fake{ .needed = 5, .available = 9, .idle = &.{ 15, 3 } };
-    try t.expect(fitAfterUnloadingIdle(&a, Fake.fits, Fake.unloadOne));
+    var a = Fake{ .bill = .{ .needed = 5, .available = 9 }, .idle = &.{ 15, 3 } };
+    try t.expect(fitAfterUnloadingIdle(&a.bill, &a, Fake.unloadOne));
     try t.expectEqual(@as(usize, 0), a.unloaded);
     // One idle model is enough: the second stays resident.
-    var b = Fake{ .needed = 10_558, .available = 9_466, .idle = &.{ 14_730, 8_000 } };
-    try t.expect(fitAfterUnloadingIdle(&b, Fake.fits, Fake.unloadOne));
+    var b = Fake{ .bill = .{ .needed = 10_558, .available = 9_466 }, .idle = &.{ 14_730, 8_000 } };
+    try t.expect(fitAfterUnloadingIdle(&b.bill, &b, Fake.unloadOne));
     try t.expectEqual(@as(usize, 1), b.unloaded);
     // Every idle model goes and it still does not fit: refused.
-    var c = Fake{ .needed = 50, .available = 9, .idle = &.{ 15, 3 } };
-    try t.expect(!fitAfterUnloadingIdle(&c, Fake.fits, Fake.unloadOne));
+    var c = Fake{ .bill = .{ .needed = 50, .available = 9 }, .idle = &.{ 15, 3 } };
+    try t.expect(!fitAfterUnloadingIdle(&c.bill, &c, Fake.unloadOne));
     try t.expectEqual(@as(usize, 2), c.unloaded);
 }
 
@@ -4566,14 +4906,14 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
     try testing.expect(with_reserve > 1024);
 }
 
-test "parseWiredMarginGib accepts 1..32 and names a bad value" {
+test "parseWiredMarginGib accepts 0..32 and names a bad value" {
     const t = std.testing;
     try t.expectEqual(@as(u64, 1) << 30, try parseWiredMarginGib("1"));
     try t.expectEqual(@as(u64, 8) << 30, try parseWiredMarginGib("8"));
     try t.expectEqual(@as(u64, 6) << 30, try parseWiredMarginGib("6"));
     try t.expectEqual(@as(u64, 2) << 30, try parseWiredMarginGib("2"));
     try t.expectEqual(@as(u64, 32) << 30, try parseWiredMarginGib("32"));
-    try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("0"));
+    try t.expectEqual(@as(u64, 0), try parseWiredMarginGib("0"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("33"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib("nope"));
     try t.expectError(error.InvalidWiredMargin, parseWiredMarginGib(""));
@@ -7820,18 +8160,26 @@ pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
 /// (`warmFloorChunkBytes`). The resident and the streamed
 /// requirement read it, and through them the cold-load gate (`residentColdLoadBillBytes`) and a refusal.
 pub fn warmNeedBytes(config: *const model_mod.ModelConfig) u64 {
+    if (ledgerRequestBeforeLoad(config, warmReach(config, chunkBeforeLoad(config)))) |bill| return if (cooler_side.onEngine(config)) bill else 0;
     const floor: u64 = PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1];
-    const request = if (coolerPrefillRowBytes(config) > 0) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config)) else 0;
+    const request = if (cooler_side.onEngine(config)) warmRequestBill(config, defaultKvBits(config), floor, mtpHeadDefaultOn(config) or config.drafterOn()) else 0;
     return @max(warmFloorChunkBytes(config), request);
 }
 
 /// The reply of the served warm's longest request (`cooler_warm.warmServed`).
 pub const WARM_REPLY_TOKENS: u32 = 96;
 
+/// The tokens the served warm's longest request reaches at `chunk`-row chunks: its prompt and its reply.
+fn warmReach(config: *const model_mod.ModelConfig, chunk: u64) u64 {
+    return warmLongestPrompt(config, chunk) +| WARM_REPLY_TOKENS;
+}
+
 /// The bill the served warm's longest request is held to at `chunk`-row chunks, its drafter's round with it when
-/// `mtp_on`: the whole request, its storage and its dearest phase, lending no decoder pool.
+/// `mtp_on`: the whole request, its storage and its dearest phase, lending no decoder pool. An arch on the ledger holds it
+/// to its closed-form terms at the request's reach (`ledgerTermsAt`): its forwards run on its plans and in its region.
 pub fn warmRequestBill(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64, mtp_on: bool) u64 {
     const longest = warmLongestPrompt(config, chunk);
+    if (ledgerTermsAt(config, kv_bits, chunk)) |t| return t.at(warmReach(config, chunk));
     // A load's preflight runs before its auto context is pinned: the warm's request is billed as the context it fills.
     var probe = config.*;
     if (manualContext(config) == 0 and config.pinned_context == 0) probe.pinned_context = @intCast(longest + WARM_REPLY_TOKENS);
@@ -7847,10 +8195,11 @@ pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_
 /// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
 /// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
-    if (config.expert_streaming) return streamedLoadRequirementBytes(weights_bytes, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmNeedBytes(config));
+    const held = weights_bytes;
+    if (config.expert_streaming) return streamedLoadRequirementBytes(held, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmNeedBytes(config));
     // A load on Sushi Cooler runs its served warm once the load's own transient is gone.
     const warm = if (@import("cooler_side.zig").onEngine(config)) warmNeedBytes(config) else 0;
-    return weights_bytes +| @max(@max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill), warm);
+    return held +| @max(@max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill), warm);
 }
 
 
@@ -8823,4 +9172,30 @@ test "a --wired-margin-gib at or past the declared limit never gives back the wh
     }
     var buf: [192]u8 = undefined;
     try t.expect(wiredMarginRefusal(&buf, .{ .declared = null, .total_ram = ram, .margin = 32 * GiB, .unplanned = 32 * GiB, .working_set = limit }) == null);
+}
+
+fn refusedPick(pick: ChunkBoundsPick) ![]const u8 {
+    return switch (pick) {
+        .refused => |line| line,
+        else => error.TestExpectedRefusal,
+    };
+}
+
+test "prefill: a load off the static bill takes no chunk bounds, refuses its own chunk keys by name, and keeps its chunk logic" {
+    const saved = settings_resolve.launch;
+    defer settings_resolve.launch = saved;
+    settings_resolve.launch = .{ .prefill_chunk_max = 4096 };
+    var buf: [256]u8 = undefined;
+    for ([_][]const u8{ "qwen4_exp", "mimo_v2", "glm5_next", "deepseek_v41" }) |model_type| {
+        if (arch_registry.ofModelType(model_type) == null) continue;
+        var config = model_mod.ModelConfig{ .model_type = model_type };
+        const per_request = config.perRequestPrefillChunk();
+        // The flags are refused in `arch/flags.zig`; here the bounds do not exist.
+        try testing.expect(staticChunkBounds(&buf, &config) == .none);
+        config.prefill_chunk_min_override = 512;
+        try testing.expectEqualStrings("[model-settings] prefill_chunk_min has no effect on this model: only a load on the static bill fixes its prefill chunk; remove it", try refusedPick(staticChunkBounds(&buf, &config)));
+        config.prefill_chunk_max_override = 512;
+        try testing.expectEqualStrings("[model-settings] prefill_chunk_max has no effect on this model: only a load on the static bill fixes its prefill chunk; remove it", try refusedPick(staticChunkBounds(&buf, &config)));
+        try testing.expectEqual(per_request, config.perRequestPrefillChunk());
+    }
 }

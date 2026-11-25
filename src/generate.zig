@@ -33,8 +33,8 @@ const SSMCheckpoint = trunk.SSMCheckpoint;
 const captureSsmCheckpoint = trunk.captureSsmCheckpoint;
 const dflash_mod = @import("dflash.zig");
 const dflash_policy = @import("dflash_policy.zig");
-const dspark_rows = @import("dspark_rows.zig");
-const arch_dspark = @import("arch/dspark.zig");
+const drafter_rows = @import("drafter_rows.zig");
+const arch_drafter_rounds = @import("arch/drafter_rounds.zig");
 const prefix_arch = @import("arch/prefix.zig");
 const arch_config = @import("arch/config.zig");
 const DflashModel = dflash_mod.DflashModel;
@@ -48,6 +48,7 @@ const mtp_round = @import("mtp_round.zig");
 const drafter = @import("arch/drafter.zig");
 const spec_types = @import("spec_types.zig");
 const registry = @import("arch/registry.zig");
+const arch_cooler = @import("arch/cooler.zig");
 
 /// `--no-mtp-lookup`: no prompt-lookup drafts in MTP rounds or GLM DFlash2 chains .
 pub var mtp_lookup_disabled: bool = false;
@@ -163,7 +164,8 @@ pub const Constraint = struct {
     /// The loaded model's drafter verifies rows under per-row masks (`row_grammar`), so this request may speculate.
     row_masks: bool = false,
 
-    /// Whether DSpark rounds can serve this constraint: the protocol never reaches a channel header or an opener choice.
+    /// Whether drafter rounds can serve this constraint: the protocol never reaches a channel header or an opener
+    /// choice.
     pub fn rowsDraftable(self: *const Constraint) bool {
         if (!self.row_masks) return false;
         const proto = self.proto orelse return true;
@@ -581,17 +583,18 @@ pub const Generator = struct {
     dflash_attempted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
-    /// deepseek_v41: this request drafts with DSpark (`nextDspark`) over the model's own state.
-    dspark: bool = false,
+    /// This request drafts in drafter rounds (`nextDrafterRound`) over the model's own state (DeepSeek's DSpark,
+    /// Hy4-Flash's DFly2).
+    drafter_on: bool = false,
     /// Forces the verify width (the `SUSHI_DSV41_DSPARK_ROWS` diagnostic, and the tests).
-    dspark_diag: dspark_rows.Diag = .off,
-    dspark_policy: dspark_rows.Policy = .{},
-    /// Test builds only: this cost's modelled ms stand in for every measured DSpark draft and verify, so an injected
+    drafter_diag: drafter_rows.Diag = .off,
+    drafter_policy: drafter_rows.Policy = .{},
+    /// Test builds only: this cost's modelled ms stand in for every measured drafter draft and verify, so an injected
     /// cost holds while the gate still decides.
-    dspark_timing: ?dspark_rows.Cost = null,
-    /// A DSpark round commits through the first draft with this id and no further, so the request's state
+    drafter_timing: ?drafter_rows.Cost = null,
+    /// A drafter round commits through the first draft with this id and no further, so the request's state
     /// stands right behind it for the scheduler to checkpoint. The scheduler clears it once taken.
-    dspark_round_ends_at: ?u32 = null,
+    drafter_round_ends_at: ?u32 = null,
     /// Armed by the scheduler for a hybrid thinking request with tools; the restore point it takes is the last
     /// of `ssm_checkpoints` while `state` is `.taken`.
     thought_point: ?mtp_plan.ThoughtPoint = null,
@@ -600,19 +603,19 @@ pub const Generator = struct {
     end_point_armed: bool = false,
     /// The absolute position the last speculative round left the state at.
     spec_round_end: ?usize = null,
-    /// A constrained DSpark request: `next_token_id` is sampled under the grammar but not yet emitted or in the cache,
-    /// and `pending` is null. Serial decode (`next`) emits it first.
-    dspark_pending: bool = false,
+    /// A constrained drafter-round request: `next_token_id` is sampled under the grammar but not yet emitted or in the
+    /// cache, and `pending` is null. Serial decode (`next`) emits it first.
+    drafter_pending: bool = false,
     /// One verify mask per row (`row_grammar.plan`), reused across rounds.
-    dspark_masks: std.ArrayList(bool) = .empty,
-    dspark_serial_logged: bool = false,
-    dspark_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [dspark_rows.max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0, copy_rounds: u64 = 0, copy_drafted: u64 = 0, copy_accepted: u64 = 0 } = .{},
+    drafter_masks: std.ArrayList(bool) = .empty,
+    drafter_serial_logged: bool = false,
+    drafter_stats: struct { rounds: u64 = 0, plain: u64 = 0, drafted: u64 = 0, accepted: u64 = 0, draft_ns: u64 = 0, verify_ns: u64 = 0, rows_hist: [drafter_rows.max_drafts + 2]u32 = @splat(0), mask_ns: u64 = 0, serial: u64 = 0, copy_rounds: u64 = 0, copy_drafted: u64 = 0, copy_accepted: u64 = 0 } = .{},
     /// Whether adaptive rounds may draft from the context (`mtp_lookup.matchBest`) ahead of the stage block; a test turns it off.
-    dspark_copy: bool = true,
+    drafter_copy: bool = true,
     /// Rows a copy round verifies at most.
     /// Null: the widest exactly verified block.
-    dspark_copy_rows: ?usize = null,
-    dspark_copy_backoff: mtp_lookup.CopyBackoff = .{},
+    drafter_copy_rows: ?usize = null,
+    drafter_copy_backoff: mtp_lookup.CopyBackoff = .{},
     /// Per-phase wall-time trace (SUSHI_DFLASH_TRACE=1; else untouched).
     /// Unlike the MTP trace this one INSERTS eval barriers to attribute a
     /// fully-lazy round — a traced round is slower than a real one by
@@ -863,7 +866,15 @@ pub const Generator = struct {
 
     /// The mode `logSpecStats` reports: the first that drafted.
     pub fn specMode(self: *const Generator) SpecMode {
-        if (self.dspark and self.dspark_stats.rounds > 0) return .dspark;
+        if (self.drafter_on and self.drafter_stats.rounds > 0) {
+            // `arch/drafter_rounds.zig` refuses to build an arch whose rounds have no block-drafter kind.
+            const kind = drafter.Drafter.blockKindOf(self.xfm) orelse @panic("drafter rounds ran on an arch with no block drafter");
+            return switch (kind) {
+                .dspark => .dspark,
+                .dfly2 => .dfly2,
+                .mtp, .dflash2 => @panic("drafter rounds ran under a drafter that drafts no block"),
+            };
+        }
         if (self.mtp != null and (self.mtp_attempted > 0 or self.mtp_lookup_rounds > 0)) return .mtp;
         if (self.dflash != null and self.dflash_attempted > 0) return .dflash;
         return .none;
@@ -873,7 +884,7 @@ pub const Generator = struct {
     pub fn specTotals(self: *const Generator) spec_stats.Totals {
         return switch (self.specMode()) {
             .none => .{},
-            .dspark => .{ .rounds = self.dspark_stats.rounds, .drafted = self.dspark_stats.drafted, .accepted = self.dspark_stats.accepted, .plain = self.dspark_stats.plain },
+            .dspark, .dfly2 => .{ .rounds = self.drafter_stats.rounds, .drafted = self.drafter_stats.drafted, .accepted = self.drafter_stats.accepted, .plain = self.drafter_stats.plain },
             // A prompt-lookup round is a verify forward too; `[spec-stats]` prints it apart, as `lookup=`.
             .mtp => .{
                 .rounds = self.mtp_attempted + self.mtp_lookup_rounds,
@@ -894,10 +905,10 @@ pub const Generator = struct {
         return spec_stats.proposed(self.mtp_drafted_tokens, self.mtp_attempted, self.mtp_depth);
     }
 
-    /// Rounds by verifier rows, for the modes that keep it (DSpark).
+    /// Rounds by verifier rows, for the modes that keep it (the block drafters).
     pub fn specRows(self: *const Generator) []const u32 {
-        comptime std.debug.assert(@typeInfo(@FieldType(@FieldType(Generator, "dspark_stats"), "rows_hist")).array.len <= spec_stats.rows_cap);
-        return if (self.specMode() == .dspark) &self.dspark_stats.rows_hist else &.{};
+        comptime std.debug.assert(@typeInfo(@FieldType(@FieldType(Generator, "drafter_stats"), "rows_hist")).array.len <= spec_stats.rows_cap);
+        return if (self.specMode().block()) &self.drafter_stats.rows_hist else &.{};
     }
 
     pub fn logSpecStats(self: *const Generator) void {
@@ -905,8 +916,8 @@ pub const Generator = struct {
         var lookup_buf: [256]u8 = undefined;
         const mode = self.specMode();
         logEngineStats();
-        if (mode == .dspark) {
-            const st = self.dspark_stats;
+        if (mode.block()) {
+            const st = self.drafter_stats;
             const rounds: f64 = @floatFromInt(st.rounds);
             const round_ms = @as(f64, @floatFromInt(st.draft_ns + st.verify_ns)) / rounds / 1e6;
             const per_round = @as(f64, @floatFromInt(st.accepted)) / rounds;
@@ -914,8 +925,9 @@ pub const Generator = struct {
             var rows_w = std.Io.Writer.fixed(&rows_buf);
             for (st.rows_hist, 0..) |n, r| if (n > 0) rows_w.print("{s}{d}:{d}", .{ if (rows_w.end > 0) "," else "", r, n }) catch break;
             log.info(
-                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% drafted={d} draft_ms={d:.1} verify_ms={d:.1} round_ms={d:.1} tok_s={d:.2} plain={d} rows={s}\n",
+                "  [spec-stats] mode={s} attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% drafted={d} draft_ms={d:.1} verify_ms={d:.1} round_ms={d:.1} tok_s={d:.2} plain={d} rows={s}\n",
                 .{
+                    @tagName(mode),
                     st.rounds,
                     st.accepted,
                     per_round,
@@ -929,8 +941,8 @@ pub const Generator = struct {
                     rows_w.buffered(),
                 },
             );
-            if (st.copy_rounds > 0) log.info("  [spec-stats] mode=dspark copy_rounds={d} copy_drafted={d} copy_accepted={d}\n", .{ st.copy_rounds, st.copy_drafted, st.copy_accepted });
-            if (self.sampling.constraint != null) log.info("  [spec-stats] mode=dspark grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
+            if (st.copy_rounds > 0) log.info("  [spec-stats] mode={s} copy_rounds={d} copy_drafted={d} copy_accepted={d}\n", .{ @tagName(mode), st.copy_rounds, st.copy_drafted, st.copy_accepted });
+            if (self.sampling.constraint != null) log.info("  [spec-stats] mode={s} grammar mask_ms={d:.2} per round, serial_ticks={d}\n", .{ @tagName(mode), @as(f64, @floatFromInt(st.mask_ns)) / rounds / 1e6, st.serial });
             return;
         }
         const table_bucket = self.xfm.round_cost.bucketOf(self.mtpKvLen());
@@ -1137,9 +1149,9 @@ pub const Generator = struct {
         /// behavior to the regular sampling path. Has no effect when
         /// `drafter_enabled` is true.
         skip_lazy_preforward: bool = false,
-        /// deepseek_v41: decode with DSpark rounds (`dsparkEligible`); the pending token is
+        /// Decode with drafter rounds (`drafterEligible`); the pending token is
         /// then not in the cache, as after a skipped lazy pre-forward.
-        dspark_enabled: bool = false,
+        drafter_enabled: bool = false,
         /// Phase 1 (performance-plan): during prefill, capture an SSM
         /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
         /// Snapshots land in `Generator.ssm_checkpoints` for the caller to
@@ -1351,15 +1363,7 @@ pub const Generator = struct {
         // start at ssm_checkpoint_pos_offset, so the final KV length is that
         // offset plus everything we're about to forward.
         const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-        const PREFILL_CHUNK: usize = prefill_plan.requestPrefillChunk(
-            xfm.config.prefillScoreHeadDim(),
-            xfm.config.num_attention_heads,
-            total_ctx_for_chunk,
-            xfm.config.has_sliding_window,
-            xfm.config.isMoe(),
-            xfm.config.longCtxGated(),
-            options.pinned_prefill_chunk,
-        );
+        const PREFILL_CHUNK: usize = prefill_plan.prefillWidth(&xfm.config, total_ctx_for_chunk, options.pinned_prefill_chunk);
         // Where cold prefill time goes (chunked-forward vs eval vs last-token-forward), at debug level.
         const trace_enabled = log.isDebug();
         const chunk_peak = trace_enabled and trunk.diagEnvOn("SUSHI_PREFILL_CHUNK_PEAK");
@@ -1609,12 +1613,12 @@ pub const Generator = struct {
                 const end = if (arch_request != null)
                     prefix_arch.requestChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                 else
-                    prefill_plan.nextChunkEnd(pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                    prefill_plan.chunkEndFor(xfm.config.static_prefill_chunk != 0, pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 // The model reads the next forward's Engram rows while this chunk runs: the next chunk, or the final span.
                 if (prefix_arch.restorePointModel(xfm)) {
                     const ahead_end = if (end < loop_end)
-                        prefill_plan.nextChunkEnd(end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                        prefill_plan.chunkEndFor(xfm.config.static_prefill_chunk != 0, end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                     else
                         prompt_ids.len;
                     ctx.ahead_ids = ids_i32[end..ahead_end];
@@ -2065,9 +2069,9 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
-                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling),
-                .dspark_diag = arch_dspark.dsparkDiag(),
-                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
+                .drafter_on = options.drafter_enabled and drafter_rows.eligible(sampling),
+                .drafter_diag = arch_drafter_rounds.drafterDiag(xfm),
+                .drafter_policy = drafter_rows.Policy.init(depth_bounds.active, arch_drafter_rounds.stageBlock(xfm)),
             };
             gen.pending = .{ .logits = logits };
             held = .{ .ctx = null };
@@ -2095,7 +2099,7 @@ pub const Generator = struct {
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
         if (sampling.call_force == null and (mtp_active or dflash_active)) {
-            const sample_lazy = try sampler.firstTokenSample(xfm, logits, sampling, xfm.outStream());
+            const sample_lazy = try firstSample(xfm, logits, sampling);
             defer _ = mlx.mlx_array_free(sample_lazy);
             _ = mlx.mlx_array_free(logits);
             held = .{ .ctx = null };
@@ -2176,8 +2180,8 @@ pub const Generator = struct {
         // in cache — matches `forwardBatchedDecode`'s expectation and
         // the drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
-        if (options.skip_lazy_preforward or options.dspark_enabled) {
-            const sample_lazy = try sampler.firstTokenSample(xfm, logits, sampling, xfm.outStream());
+        if (options.skip_lazy_preforward or options.drafter_enabled) {
+            const sample_lazy = try firstSample(xfm, logits, sampling);
             defer _ = mlx.mlx_array_free(sample_lazy);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
@@ -2212,16 +2216,16 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
-                .dspark = options.dspark_enabled and dspark_rows.eligible(sampling),
-                .dspark_diag = arch_dspark.dsparkDiag(),
-                .dspark_policy = dspark_rows.Policy.init(depth_bounds.active, arch_dspark.stageBlock(xfm)),
+                .drafter_on = options.drafter_enabled and drafter_rows.eligible(sampling),
+                .drafter_diag = arch_drafter_rounds.drafterDiag(xfm),
+                .drafter_policy = drafter_rows.Policy.init(depth_bounds.active, arch_drafter_rounds.stageBlock(xfm)),
             };
             attachCp(&gen, &ssm_checkpoints, allocator, ssm_cp_peak);
             return gen;
         }
 
         // Regular path: sample first token lazily, then build the next forward pass
-        const lazy_token = try sampler.firstTokenSample(xfm, logits, sampling, xfm.outStream());
+        const lazy_token = try firstSample(xfm, logits, sampling);
         defer _ = mlx.mlx_array_free(lazy_token);
 
         const next_logits = try lazyForward(xfm, &ctx, lazy_token, ctx.argmax_only);
@@ -2382,7 +2386,7 @@ pub const Generator = struct {
                 return .{ .committed = try self.commitForcedConstraintToken(allocator, constraint) };
             },
             .reasoning, .header => {
-                self.dspark_pending = false;
+                self.drafter_pending = false;
                 self.dropPending();
                 if (!constraint.pstate.recovering) {
                     var planned: [rp_mod.MAX_TRANSITION_TOKENS]u32 = undefined;
@@ -2444,7 +2448,7 @@ pub const Generator = struct {
         self.sampling.think_penalty.deinitPrepared();
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         self.dropPending();
-        self.dspark_masks.deinit(allocator);
+        self.drafter_masks.deinit(allocator);
         if (self.has_last_hidden) {
             _ = mlx.mlx_array_free(self.last_hidden);
             self.has_last_hidden = false;
@@ -2575,14 +2579,28 @@ pub const Generator = struct {
     /// The ONE lazy sampler for a slot's own draws: advances the seed draw index. `after` says
     /// what precedes the sampled position, which decides the think penalty there.
     pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array, after: ThinkAfter) !mlx.mlx_array {
-        const shifted = try self.thinkShifted(logits, after);
-        defer if (shifted.ctx != logits.ctx) {
-            _ = mlx.mlx_array_free(shifted);
-        };
+        return self.sampleMasked(logits, null, after);
+    }
+
+    /// `sampleLazy` under the grammar's `mask` (true keeps an id), when given.
+    pub fn sampleMasked(self: *Generator, logits: mlx.mlx_array, mask: ?[]const bool, after: ThinkAfter) !mlx.mlx_array {
+        const shift = self.thinkShift(after);
         defer self.sampling.draw +%= 1;
         // A penalised slot reaches here only from the constrained steps and a forced call's
         // name choice, whose logits follow `generated_ids` (`samplesSync`, `draftsRefused`).
-        return sampler.penalizedSampleLazy(std.heap.page_allocator, shifted, self.sampling, self.generated_ids.items, self.xfm.outStream());
+        return sampleRun(self.xfm, .{ .logits = logits, .sampling = self.sampling, .generated = self.generated_ids.items, .grammar = mask, .shift = shift });
+    }
+
+    /// `sampleToken` after the committed ids, the serial draw that reads its token back.
+    fn sampleSync(self: *Generator, logits: mlx.mlx_array) !sampler.SampleResult {
+        const shift = self.markerShiftCommitted();
+        const run = try arch_cooler.beginSample(self.xfm, sampler.syncMix(self.sampling, self.generated_ids.items, shift));
+        const r = sampler.sampleToken(logits, self.sampling, self.generated_ids.items, shift, self.xfm.outStream()) catch |e| {
+            try run.fail();
+            return e;
+        };
+        try run.end();
+        return r;
     }
 
     /// This slot samples on the synchronous serial path (`sampleToken`), never the lazy pipeline.
@@ -2604,42 +2622,46 @@ pub const Generator = struct {
     /// `logits` under the think penalty where the span is open; the input itself when nothing
     /// shifts, else a new handle the caller frees.
     pub fn thinkShifted(self: *Generator, logits: mlx.mlx_array, after: ThinkAfter) !mlx.mlx_array {
+        const sh = self.thinkShift(after) orelse return logits;
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try sampler.applyShift(&out, logits, sh, self.xfm.outStream());
+        return out;
+    }
+
+    /// The think penalty's shift of a sample at `after`, or null where nothing shifts.
+    fn thinkShift(self: *Generator, after: ThinkAfter) ?sampler.Shift {
         const tp = &self.sampling.think_penalty;
-        if (!tp.active() or after == .none) return logits;
+        if (!tp.active() or after == .none) return null;
         tp.observe(self.generated_ids.items);
         var state = tp.*;
         switch (after) {
             .decided => |ids| state.phase = tp.phaseAfter(ids),
             else => {},
         }
-        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or state.phase == .after or (after != .pending and state.phase != .inside))) return logits;
-        const s = self.xfm.outStream();
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        if (after == .pending) {
-            var ids = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(ids);
-            try mlx.check(mlx.mlx_reshape(&ids, after.pending, &[_]c_int{ 1, 1 }, 2, s));
-            try think_penalty.shiftScoped(&out, logits, self.xfm.think_marker_mask, state, ids, s);
-        } else {
-            try think_penalty.shiftScoped(&out, logits, self.xfm.think_marker_mask, state, null, s);
-        }
-        return out;
+        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or state.phase == .after or (after != .pending and state.phase != .inside))) return null;
+        return .{ .mask = self.xfm.think_marker_mask, .state = state, .ids = if (after == .pending) after.pending else null };
     }
 
     /// Shift a verify block in place: row j follows the committed ids, then `ids[0..j]`
     /// (`[1, L]`, the rows the forward ran). True = the block changed.
     pub fn thinkShiftRows(self: *Generator, logits: *mlx.mlx_array, ids: mlx.mlx_array) !bool {
-        const tp = &self.sampling.think_penalty;
-        if (!tp.active()) return false;
-        tp.observe(self.generated_ids.items);
-        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return false;
+        const sh = self.rowsShift() orelse return false;
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
-        try think_penalty.shiftScoped(&out, logits.*, self.xfm.think_marker_mask, tp.*, ids, self.xfm.outStream());
+        try think_penalty.shiftScoped(&out, logits.*, sh.mask, sh.state, ids, self.xfm.outStream());
         _ = mlx.mlx_array_free(logits.*);
         logits.* = out;
         return true;
+    }
+
+    /// The think penalty's shift of a verify block's rows after the committed ids, or null where nothing shifts.
+    pub fn rowsShift(self: *Generator) ?sampler.Shift {
+        const tp = &self.sampling.think_penalty;
+        if (!tp.active()) return null;
+        tp.observe(self.generated_ids.items);
+        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return null;
+        return .{ .mask = self.xfm.think_marker_mask, .state = tp.* };
     }
 
     /// Row j of a verify block under the request's repeat, presence and frequency penalties, over the committed
@@ -2683,10 +2705,7 @@ pub const Generator = struct {
         for (ids) |id| {
             if (id < mask.len) mask[id] = true;
         }
-        var masked = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(masked);
-        try sampler.applyGrammarMask(allocator, &masked, logits, mask, self.xfm.outStream());
-        return self.sampleLazy(masked, .committed);
+        return self.sampleMasked(logits, mask, .committed);
     }
 
     /// While a forced call is armed every successor is decided AFTER its
@@ -2980,9 +2999,9 @@ pub const Generator = struct {
         accepted_tokens: u32,
     };
 
-    pub const dsparkEmitPending = arch_dspark.dsparkEmitPending;
-    pub const dsparkResumeAfterForced = arch_dspark.dsparkResumeAfterForced;
-    pub const nextDspark = arch_dspark.nextDspark;
+    pub const drafterEmitPending = arch_drafter_rounds.drafterEmitPending;
+    pub const drafterResumeAfterForced = arch_drafter_rounds.drafterResumeAfterForced;
+    pub const nextDrafterRound = arch_drafter_rounds.nextDrafterRound;
 
     /// One DFlash2 round, answered by the loaded arch's drafter.
     pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
@@ -3250,7 +3269,7 @@ pub const Generator = struct {
         var tick_prof = TickProf.begin();
         defer tick_prof.finish();
         if (self.done) return null;
-        if (self.sampling.constraint != null) return if (self.dspark_pending) self.dsparkEmitPending(allocator) else self.nextConstrained(allocator);
+        if (self.sampling.constraint != null) return if (self.drafter_pending) self.drafterEmitPending(allocator) else self.nextConstrained(allocator);
 
         // Transition shim: speculative-decode paths may exit with
         // `next_token_id` set but `pending.logits` unset (drafter's exit
@@ -3349,7 +3368,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(step_logits);
             const t_sample = tick_prof.mark();
             const result: sampler.SampleResult = switch (self.forcedNext()) {
-                .sample => try sampler.sampleToken(step_logits, self.sampling, self.generated_ids.items, self.markerShiftCommitted(), self.xfm.outStream()),
+                .sample => try self.sampleSync(step_logits),
                 .force => |id| .{ .token_id = id },
                 .choose => |ids| blk: {
                     const lazy = try self.sampleAmong(allocator, step_logits, ids);
@@ -3374,7 +3393,7 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(step_logits);
             break :blk switch (self.forcedNext()) {
                 .sample => try self.sampleLazy(step_logits, .committed),
-                .force => |id| try tokenArray(id),
+                .force => |id| try forcedToken(self.xfm, id),
                 .choose => |ids| try self.sampleAmong(allocator, step_logits, ids),
             };
         };
@@ -3438,13 +3457,7 @@ pub const Generator = struct {
         // suffix the schema rejects is masked out here, never sampled and
         // degraded afterwards.
         const invalid_crossers = try rp_mod.applyReasoningMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf);
-        const lazy = blk: {
-            if (invalid_crossers == 0) break :blk try self.sampleLazy(step_logits, .committed);
-            var masked_logits = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(masked_logits);
-            try sampler.applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, self.xfm.outStream());
-            break :blk try self.sampleLazy(masked_logits, .committed);
-        };
+        const lazy = try self.sampleMasked(step_logits, if (invalid_crossers == 0) null else constraint.mask_buf, .committed);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -3548,8 +3561,6 @@ pub const Generator = struct {
     /// are in flight only opener continuations remain. The JSON grammar never
     /// consumes protocol bytes.
     fn nextChoiceStep(self: *Generator, allocator: std.mem.Allocator, constraint: *Constraint, proto: *const rp_mod.Protocol) !?u32 {
-        const s = self.xfm.outStream();
-
         const allowed = if (constraint.pstate.phase == .header)
             try rp_mod.applyHeaderMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf)
         else
@@ -3561,11 +3572,7 @@ pub const Generator = struct {
         const step_logits = try self.takeLogits();
         defer _ = mlx.mlx_array_free(step_logits);
 
-        var masked_logits = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(masked_logits);
-        try sampler.applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
-
-        const lazy = try self.sampleLazy(masked_logits, .committed);
+        const lazy = try self.sampleMasked(step_logits, constraint.mask_buf, .committed);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -3674,7 +3681,6 @@ pub const Generator = struct {
         if (constraint.proto) |proto| {
             if (constraint.pstate.phase != .json_body) return self.nextReasoningStep(allocator, constraint, proto);
         }
-        const s = self.xfm.outStream();
 
         var allowed = (try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf)).allowed;
         // The tokenizer's EOS is not necessarily the model's only stop id.
@@ -3702,15 +3708,11 @@ pub const Generator = struct {
         const step_logits = try self.takeLogits();
         defer _ = mlx.mlx_array_free(step_logits);
 
-        var masked_logits = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(masked_logits);
-        try sampler.applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
-
         // The next forward is built on the still-lazy sample so the CPU graph
         // build overlaps this step's GPU work; the token is realized after
         // dispatch and only then advances the grammar (the mask for the next
         // logits is built on the next call, off the realized state).
-        const lazy = try self.sampleLazy(masked_logits, .committed);
+        const lazy = try self.sampleMasked(step_logits, constraint.mask_buf, .committed);
         defer _ = mlx.mlx_array_free(lazy);
         var next_logits: ?mlx.mlx_array = null;
         if (self.step + 1 < self.max_tokens) {
@@ -3856,6 +3858,22 @@ pub const Generator = struct {
     }
 };
 
+/// `step`'s token, lazy: on a load that plans its samples, one execution of the root its mix names (D24).
+fn sampleRun(xfm: *Trunk, step: sampler.Step) !mlx.mlx_array {
+    const run = try arch_cooler.beginSample(xfm, step.mix());
+    const lazy = sampler.sampleStep(std.heap.page_allocator, step, xfm.outStream()) catch |e| {
+        try run.fail();
+        return e;
+    };
+    return run.token(lazy);
+}
+
+/// Prefill's first token: a forced call's when it owns token 0, else a draw (`sampler.firstTokenSample`).
+fn firstSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: sampler.SamplingParams) !mlx.mlx_array {
+    if (sampler.firstForced(sampling)) |id| return try tokenArray(id);
+    return sampleRun(xfm, sampler.firstStep(xfm, logits, sampling));
+}
+
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
 fn lazyForward(xfm: *Trunk, ctx: *ForwardCtx, lazy_token: mlx.mlx_array, lazy_logits: bool) !mlx.mlx_array {
@@ -3931,11 +3949,18 @@ fn clearPool(xfm: *const Trunk) void {
 }
 
 /// Token ids as the `[1, n]` int32 array a forward takes, made on the side its output is on (`Trunk.outStream`): the
-/// engine's own array for a model that forwards there, with no array of MLX's to take in.
-pub fn idsArray(xfm: *const Trunk, ids: [*]const i32, shape: *const [2]c_int) mlx.HostArrayRefused!mlx.mlx_array {
+/// engine's own array for a model that forwards there, with no array of MLX's to take in; on a load whose arch holds its
+/// forward input (`arch_cooler.forwardIds`), that block's.
+pub fn idsArray(xfm: *Trunk, ids: [*]const i32, shape: *const [2]c_int) !mlx.mlx_array {
+    if (try @import("arch/cooler.zig").forwardIds(xfm, ids[0..@intCast(shape[1])])) |a| return a;
     const host = mlx.engine.enter(xfm.outStream());
     defer host.end();
     return mlx.newData(ids, shape, .int32);
+}
+
+/// A forced call's token, as the in-flight token the next draw reads (`Generator.ThinkAfter.pending`).
+pub fn forcedToken(xfm: *Trunk, id: u32) !mlx.mlx_array {
+    return (try arch_cooler.forcedToken(xfm, id)) orelse tokenArray(id);
 }
 
 /// A committed token as the `[1]` int32 array a sample would be.
@@ -4433,7 +4458,7 @@ test "gpuShareLine: a request's GPU time reads as busy, idle and a share; a requ
 test "specTotals: the prompt-lookup rounds of an MTP request count beside its head rounds" {
     if (comptime !@import("arch/drafter.zig").Drafter.has("qwen4")) return error.SkipZigTest;
     var g: Generator = undefined;
-    g.dspark = false;
+    g.drafter_on = false;
     g.dflash = null;
     g.mtp = MtpHeadRef.of("qwen4", undefined);
     g.mtp_depth = 3;
@@ -4456,7 +4481,7 @@ test "specTotals: the prompt-lookup rounds of an MTP request count beside its he
 test "specTotals: a DFlash2 request reports the ticks it ran without a draft as plain rounds" {
     var g: Generator = undefined;
     var model: DflashModel = undefined;
-    g.dspark = false;
+    g.drafter_on = false;
     g.mtp = null;
     g.dflash = &model;
     g.native_dflash = true;

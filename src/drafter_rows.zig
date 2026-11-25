@@ -1,8 +1,9 @@
-//! DSpark verify width: how many of a drafted block's rows a round verifies, and when a request stops drafting. Pure
-//! data, no MLX; the generator's DSpark state is typed by it, the rounds themselves are the drafting arch's.
+//! A drafter round's verify width: how many of a drafted block's rows a round verifies, and when a request stops
+//! drafting. Pure data, no MLX; the generator's drafter-round state is typed by it, the rounds themselves are the
+//! drafting arch's.
 //!
-//! The row choice and the confidence calibration are `dflash_policy`'s, the stop switch is `spec_cost_gate`'s.
-//! DSpark's own part is the price of a verify, which grows with context and with every added row (each row's routed
+//! The row choice and the confidence calibration are `dflash_policy`'s, the stop switch is `spec_cost_gate`'s. The
+//! drafter's own part is the price of a verify, which grows with context and with every added row (each row's routed
 //! experts are their own GEMVs), so it is fitted from the rounds the request runs.
 const std = @import("std");
 const dflash_policy = @import("dflash_policy.zig");
@@ -13,24 +14,24 @@ const sampler = @import("sampler.zig");
 
 const max_rows = dflash_policy.MAX_ROWS;
 
-/// Drafts a sampled DSpark round can verify, with room past a stage block.
+/// Drafts a sampled drafter round can verify, with room past a stage block.
 pub const max_drafts = 16;
 
 /// Forces the verify width of a request's rounds (the arch's diagnostic switch, and the tests).
 pub const Diag = union(enum) { off, log, sweep, rows: u8 };
 
-/// How a forced commit leaves a DSpark request.
+/// How a forced commit leaves a drafter-round request.
 pub const Resume = union(enum) {
-    /// The slot decodes plain: not a DSpark slot, DSpark already off, or a grammar owns the ticks.
+    /// The slot decodes plain: not a drafter-round slot, its rounds already off, or a grammar owns the ticks.
     refused,
     stopped,
-    /// The closer `commitForcedTokens` left pending, published now: DSpark rounds follow.
+    /// The closer `commitForcedTokens` left pending, published now: drafter rounds follow.
     resumed: u32,
 };
 
-/// DSpark drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties shift the
-/// rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the request
-/// decodes serially.
+/// A block drafter drafts argmax tokens, a point mass the verify rows accept exactly at any temperature. Penalties
+/// shift the rows as in an MTP round, and a thinking bound fires between rounds (`thinkBoundTick`), after which the
+/// request decodes serially.
 pub fn eligible(sampling: sampler.SamplingParams) bool {
     return !mtp_plan.mtpUnsupported(sampling);
 }
@@ -41,6 +42,8 @@ pub fn eligible(sampling: sampler.SamplingParams) bool {
 /// is measuring it, so a bad estimate cannot keep every wider verify out of reach.
 pub const Cost = struct {
     plain_ms: f32 = 28,
+    verify_overhead_ms: ?f32 = null,
+    pipelined_plain: bool = false,
     step_ms: f32 = prior_step,
     draft_ms: f32 = 6,
     /// The step `tick` drifts back to.
@@ -55,18 +58,49 @@ pub const Cost = struct {
         return ema * old + (1 - ema) * std.math.clamp(sample, old * 0.7, old * 1.5);
     }
 
+    pub fn verifyBase(self: *const Cost) f32 {
+        return self.plain_ms + (self.verify_overhead_ms orelse 0);
+    }
+
     /// A one-row step's wall ms.
     pub fn observePlain(self: *Cost, ms: f32) void {
         if (!std.math.isFinite(ms) or ms <= 0) return;
+        if (self.pipelined_plain) {
+            self.observeVerifyBase(ms);
+            return;
+        }
         self.plain_ms = bounded(self.plain_ms, ms);
+    }
+
+    pub fn observePipelinedPlain(self: *Cost, ms: f32) void {
+        if (!std.math.isFinite(ms) or ms <= 0) return;
+        self.plain_ms = bounded(self.plain_ms, ms);
+        self.pipelined_plain = true;
+    }
+
+    pub fn observeVerifyBase(self: *Cost, ms: f32) void {
+        if (!std.math.isFinite(ms) or ms <= 0) return;
+        if (!self.pipelined_plain) {
+            self.plain_ms = bounded(self.plain_ms, ms);
+            return;
+        }
+        const overhead = @min(@max(ms - self.plain_ms, 0), self.plain_ms * 0.5);
+        self.verify_overhead_ms = if (self.verify_overhead_ms) |old|
+            ema * old + (1 - ema) * overhead
+        else
+            overhead;
     }
 
     /// A drafted round that verified `rows` rows in `verify_ms` after a draft of `draft_ms`.
     pub fn observeRound(self: *Cost, rows: u32, verify_ms: f32, draft_ms: f32) void {
         if (std.math.isFinite(draft_ms) and draft_ms > 0) self.draft_ms = bounded(self.draft_ms, draft_ms);
-        if (rows < 2 or !std.math.isFinite(verify_ms) or verify_ms <= 0) return;
-        const step = (verify_ms - self.plain_ms) / @as(f32, @floatFromInt(rows - 1));
-        self.step_ms = std.math.clamp(bounded(self.step_ms, @max(step, 1)), 3, 40);
+        if (!std.math.isFinite(verify_ms) or verify_ms <= 0) return;
+        if (rows < 2) {
+            self.observeVerifyBase(verify_ms);
+            return;
+        }
+        const step = (verify_ms - self.verifyBase()) / @as(f32, @floatFromInt(rows - 1));
+        self.step_ms = std.math.clamp(bounded(self.step_ms, @max(step, 1)), 1, 40);
     }
 
     /// Any tick: the step moves back toward its prior.
@@ -80,13 +114,14 @@ pub const Cost = struct {
         var out: dflash_policy.Costs = undefined;
         out[0] = 0;
         out[1] = self.plain_ms + self.draft_ms;
-        for (2..max_rows + 1) |r| out[r] = self.draft_ms + self.plain_ms + self.step_ms * @as(f32, @floatFromInt(r - 1));
+        const base = self.verifyBase();
+        for (2..max_rows + 1) |r| out[r] = self.draft_ms + base + self.step_ms * @as(f32, @floatFromInt(r - 1));
         return out;
     }
 
     /// The ms of a `rows`-row verify forward, as this cost models it.
     pub fn verifyMs(self: *const Cost, rows: u32) f32 {
-        return self.plain_ms + self.step_ms * @as(f32, @floatFromInt(rows -| 1));
+        return self.verifyBase() + self.step_ms * @as(f32, @floatFromInt(rows -| 1));
     }
 };
 
@@ -174,7 +209,7 @@ pub const Policy = struct {
         for (conf[0..n], p[0..n]) |c, *o| o.* = sigmoid(c);
         self.low_stages = if (accepted < short_drafts) self.low_stages +| 1 else 0;
         self.calib.observeRound(p[0..n], verified - 1, accepted);
-        if (verified == 1) self.cost.observePlain(verify_ms) else self.cost.observeRound(verified, verify_ms, draft_ms);
+        self.cost.observeRound(verified, verify_ms, draft_ms);
         self.gate.observeRound(draft_ms + verify_ms, 1 + accepted);
         const saved = @as(f32, @floatFromInt(1 + accepted)) * self.cost.plain_ms - (draft_ms + verify_ms);
         if (std.math.isFinite(saved)) self.edge = edge_keep * self.edge + (1 - edge_keep) * saved;
@@ -189,6 +224,23 @@ pub const Policy = struct {
         self.cost.observePlain(ms);
         self.gate.observePlain(ms);
         self.reprice(ms);
+    }
+
+    pub fn observePipelinedPlain(self: *Policy, ms: f32) void {
+        self.cost.observePipelinedPlain(ms);
+        self.gate.observePlain(ms);
+        self.reprice(ms);
+    }
+
+    pub fn nextIsPlainAfter(self: *const Policy, steps: u32) bool {
+        if (self.range.floored()) return false;
+        if (self.owed >= steps) return true;
+        if (self.gate.mode == .plain and self.gate.plain_tokens < 3 and self.gate.plain_tokens + steps >= 3) return false;
+        return self.gate.nextIsPlainAfter(steps);
+    }
+
+    pub fn nextIsPlainAfterPlain(self: *const Policy) bool {
+        return self.nextIsPlainAfter(1);
     }
 
     /// A trip into the retrial stretch measures the plain step afresh: the probe that priced it was taken once, early,
@@ -221,19 +273,19 @@ fn sigmoid(x: f32) f32 {
 
 const testing = std.testing;
 
-test "dspark rows: sure drafts buy the whole block, doubtful ones none" {
+test "drafter rows: sure drafts buy the whole block, doubtful ones none" {
     const p = Policy{};
     try testing.expectEqual(@as(u32, 6), p.rows(&.{ 5, 5, 5, 5, 5 }));
     try testing.expectEqual(@as(u32, 1), p.rows(&.{ -2, -2, -2, -2, -2 }));
     try testing.expectEqual(@as(u32, 1), p.rows(&.{}));
 }
 
-test "dspark rows: a doubt mid-block cuts the verify there" {
+test "drafter rows: a doubt mid-block cuts the verify there" {
     const p = Policy{};
     try testing.expectEqual(@as(u32, 3), p.rows(&.{ 5, 5, -3, 5, 5 }));
 }
 
-test "dspark rows: a dearer row verifies fewer drafts" {
+test "drafter rows: a dearer row verifies fewer drafts" {
     var cheap = Policy{};
     var dear = Policy{};
     for (0..40) |_| cheap.cost.observeRound(4, 60, 6);
@@ -242,7 +294,7 @@ test "dspark rows: a dearer row verifies fewer drafts" {
     try testing.expect(cheap.rows(&conf) > dear.rows(&conf));
 }
 
-test "dspark rows: the cost follows the rounds, a row at a time" {
+test "drafter rows: the cost follows the rounds, a row at a time" {
     var c = Cost{};
     for (0..200) |i| {
         c.observePlain(30);
@@ -253,7 +305,7 @@ test "dspark rows: the cost follows the rounds, a row at a time" {
     try testing.expectApproxEqAbs(@as(f32, 6 + 30 + 30), costs[4], 3);
 }
 
-test "dspark rows: a cold step moves the cost by a bounded share, and an unmeasured step drifts back" {
+test "drafter rows: a cold step moves the cost by a bounded share, and an unmeasured step drifts back" {
     var c = Cost{};
     c.observePlain(2000);
     c.observeRound(6, 2400, 900);
@@ -265,14 +317,14 @@ test "dspark rows: a cold step moves the cost by a bounded share, and an unmeasu
     try testing.expect(p.cost.step_ms < high and p.cost.step_ms < 16);
 }
 
-test "dspark rows: the confidence is a probability until the rounds say otherwise" {
+test "drafter rows: the confidence is a probability until the rounds say otherwise" {
     var p = Policy{};
     try testing.expectApproxEqAbs(@as(f32, 0.88), p.calib.probability(0.88), 0.04);
     for (0..60) |_| p.calib.observe(0.88, false);
     try testing.expect(p.calib.probability(0.88) < 0.3);
 }
 
-test "dspark rows: drafts that keep losing back the next ones off, doubling to a cap, and a paying block clears it" {
+test "drafter rows: drafts that keep losing back the next ones off, doubling to a cap, and a paying block clears it" {
     var p = Policy{};
     var owed_seen: [12]u32 = undefined;
     for (&owed_seen) |*o| {
@@ -290,7 +342,7 @@ test "dspark rows: drafts that keep losing back the next ones off, doubling to a
     try testing.expect(cleared);
 }
 
-test "dspark rows: one dismissed block among paying ones owes no plain step" {
+test "drafter rows: one dismissed block among paying ones owes no plain step" {
     var p = Policy{};
     for (0..30) |i| {
         while (p.next() == .plain) p.observePlain(25);
@@ -299,7 +351,7 @@ test "dspark rows: one dismissed block among paying ones owes no plain step" {
     }
 }
 
-test "dspark rows: a request whose drafts never pay is sent to plain steps, and a paying one is not" {
+test "drafter rows: a request whose drafts never pay is sent to plain steps, and a paying one is not" {
     var dry = Policy{};
     var plain_after: ?usize = null;
     for (0..200) |i| {
@@ -344,7 +396,7 @@ fn logit(a: f32) f32 {
     return @log(a / (1 - a));
 }
 
-test "dspark rows: at the cheap verify costs a block with 80-88% drafts verifies three rows or more" {
+test "drafter rows: at the cheap verify costs a block with 80-88% drafts verifies three rows or more" {
     for ([_]f32{ 0.8, 0.88 }) |a| {
         var p = Policy{};
         warm(&p);
@@ -389,7 +441,7 @@ const Sim = struct {
     }
 };
 
-test "dspark rows: mostly paying blocks with a dismissed one now and then keep drafting, as fast as the cheap verify allows" {
+test "drafter rows: mostly paying blocks with a dismissed one now and then keep drafting, as fast as the cheap verify allows" {
     var cur = Policy{};
     var a = Sim{};
     a.run(&cur, 0.75, 0.88, -3, 3000);
@@ -397,7 +449,7 @@ test "dspark rows: mostly paying blocks with a dismissed one now and then keep d
     try testing.expect(a.tokPerS() > 1.15 * 1000 / verify_table[1]);
 }
 
-test "dspark rows: novel text, where drafts are worth what their rows cost, stays on plain steps" {
+test "drafter rows: novel text, where drafts are worth what their rows cost, stays on plain steps" {
     var p = Policy{};
     var s = Sim{};
     s.run(&p, 1.0, 0.3, -3, 3000);
@@ -438,7 +490,7 @@ const fresh_prompt = [_]Logged{
     .{ 3, 2, 4.8, 45.4 }, .{ 3, 2, 4.8, 35.3 }, .{ 2, 1, 4.8, 31.1 }, .{ 2, 0, 4.9, 25.8 }, .{ 2, 0, 4.7, 25.7 },
 };
 
-test "dspark rows: a stretch of plain steps ends after the three that price the step afresh when the tripping window pays against them" {
+test "drafter rows: a stretch of plain steps ends after the three that price the step afresh when the tripping window pays against them" {
     var p = Policy{};
     const conf: [5]f32 = @splat(0);
     for (fresh_prompt) |r| {
@@ -455,7 +507,7 @@ test "dspark rows: a stretch of plain steps ends after the three that price the 
     try testing.expectEqual(spec_cost_gate.Action.round, p.next());
 }
 
-test "dspark rows: rounds dearer per token than the plain step it measures stop drafting for the whole stretch" {
+test "drafter rows: rounds dearer per token than the plain step it measures stop drafting for the whole stretch" {
     var p = Policy{};
     const conf: [5]f32 = @splat(0);
     // Rounds of 35.5 ms for one or two tokens (21.3 ms a token) against a measured plain step of 18.5 ms.
@@ -472,7 +524,7 @@ test "dspark rows: rounds dearer per token than the plain step it measures stop 
     try testing.expect(plain >= 60);
 }
 
-test "dspark rows: the depth flags give a verify width of depth + 1, clamped to the block" {
+test "drafter rows: the depth flags give a verify width of depth + 1, clamped to the block" {
     const r = Range.of;
     try testing.expectEqual(Range{ .min_rows = 1, .max_rows = 6 }, r(.{}, 5));
     try testing.expectEqual(Range{ .min_rows = 1, .max_rows = 4 }, r(.{ .max = 3 }, 5));
@@ -485,7 +537,7 @@ test "dspark rows: the depth flags give a verify width of depth + 1, clamped to 
     try testing.expectEqual(Range{ .min_rows = 6, .max_rows = 6, .clamped = true }, r(.{ .min = 7, .max = 7 }, 5));
 }
 
-test "dspark rows: a max depth caps the verify width, a min depth floors it, equal values pin it" {
+test "drafter rows: a max depth caps the verify width, a min depth floors it, equal values pin it" {
     const sure = [_]f32{ 5, 5, 5, 5, 5 };
     const doubtful = [_]f32{ -3, -3, -3, -3, -3 };
     const capped = Policy.init(.{ .max = 2 }, 5);
@@ -499,7 +551,7 @@ test "dspark rows: a max depth caps the verify width, a min depth floors it, equ
     try testing.expectEqual(@as(u32, 3), pinned.rows(&doubtful));
 }
 
-test "dspark rows: a floored width never schedules a plain step, however badly the drafts lose" {
+test "drafter rows: a floored width never schedules a plain step, however badly the drafts lose" {
     var p = Policy.init(.{ .min = 2 }, 5);
     for (0..200) |_| {
         try testing.expectEqual(spec_cost_gate.Action.round, p.next());
@@ -519,14 +571,14 @@ test "dspark rows: a floored width never schedules a plain step, however badly t
     try testing.expect(plain > 100);
 }
 
-test "dspark rows: confidence distinguishes cheap second rows from unlikely proposals within a calibration bin" {
+test "drafter rows: confidence distinguishes cheap second rows from unlikely proposals within a calibration bin" {
     var p = Policy{};
     p.cost = .{ .plain_ms = 15, .step_ms = 3.3, .draft_ms = 2.7 };
     try testing.expectEqual(@as(u32, 1), p.rows(&.{logit(0.05)}));
     try testing.expectEqual(@as(u32, 2), p.rows(&.{logit(0.4)}));
 }
 
-test "dspark rows: modelled timings keep the injected cost fixed while the gate still decides rounds vs plain" {
+test "drafter rows: modelled timings keep the injected cost fixed while the gate still decides rounds vs plain" {
     const dear_cost: Cost = .{ .plain_ms = 900, .step_ms = 3, .draft_ms = 1, .prior = 3 };
     const cheap_cost: Cost = .{ .plain_ms = 5, .step_ms = 40, .draft_ms = 1, .prior = 40 };
     const conf = [_]f32{ 0, 0, 0, 0, 0 };
@@ -570,4 +622,136 @@ test "dspark rows: modelled timings keep the injected cost fixed while the gate 
     try testing.expectEqual(@as(u32, 1), cheap.rows(&conf));
     try testing.expect(cheap_plain > 0);
     try testing.expect(cheap.gate.plain_tokens > 0);
+}
+
+test "drafter rows: nextIsPlainAfterPlain is true only when the following tick is guaranteed plain" {
+    var p = Policy{};
+    p.gate.mode = .probe;
+    p.gate.probe_seen = 0;
+    try testing.expectEqual(spec_cost_gate.Action.plain, p.next());
+    try testing.expect(p.nextIsPlainAfterPlain());
+    p.observePlain(20);
+    try testing.expectEqual(spec_cost_gate.Action.plain, p.next());
+    try testing.expect(p.nextIsPlainAfterPlain());
+    p.observePlain(20);
+    try testing.expectEqual(spec_cost_gate.Action.plain, p.next());
+    try testing.expect(!p.nextIsPlainAfterPlain());
+    p.observePlain(20);
+    try testing.expectEqual(spec_cost_gate.Action.round, p.next());
+
+    var q = Policy{};
+    q.gate.mode = .plain;
+    q.gate.retrial = 6;
+    q.gate.plain_tokens = 0;
+    q.gate.ms = 1000;
+    q.gate.tokens = 1;
+    const want = [_]bool{ true, true, false, true, true, false };
+    for (want) |w| {
+        try testing.expectEqual(spec_cost_gate.Action.plain, q.next());
+        try testing.expectEqual(w, q.nextIsPlainAfterPlain());
+        q.observePlain(20);
+    }
+    try testing.expectEqual(spec_cost_gate.Action.round, q.next());
+
+    var r = Policy{};
+    r.owed = 2;
+    try testing.expectEqual(spec_cost_gate.Action.plain, r.next());
+    try testing.expect(r.nextIsPlainAfterPlain());
+    r.observePlain(20);
+    try testing.expectEqual(spec_cost_gate.Action.plain, r.next());
+    try testing.expect(!r.nextIsPlainAfterPlain());
+    r.observePlain(20);
+    try testing.expectEqual(spec_cost_gate.Action.round, r.next());
+}
+
+test "drafter rows: nextIsPlainAfter(2) is false one tick before any probe, reprice, retrial or owed boundary" {
+    var p = Policy{};
+    p.gate.mode = .probe;
+    p.gate.probe_seen = 0;
+    const want_probe = [_]bool{ true, false, false };
+    for (want_probe) |w| {
+        try testing.expectEqual(spec_cost_gate.Action.plain, p.next());
+        try testing.expectEqual(w, p.nextIsPlainAfter(2));
+        p.observePlain(20);
+    }
+
+    var q = Policy{};
+    q.gate.mode = .plain;
+    q.gate.retrial = 6;
+    q.gate.plain_tokens = 0;
+    q.gate.ms = 1000;
+    q.gate.tokens = 1;
+    const want_plain = [_]bool{ true, false, false, true, false, false };
+    for (want_plain) |w| {
+        try testing.expectEqual(spec_cost_gate.Action.plain, q.next());
+        try testing.expectEqual(w, q.nextIsPlainAfter(2));
+        q.observePlain(20);
+    }
+
+    var r = Policy{};
+    r.owed = 3;
+    const want_owed = [_]bool{ true, false, false };
+    for (want_owed) |w| {
+        try testing.expectEqual(spec_cost_gate.Action.plain, r.next());
+        try testing.expectEqual(w, r.nextIsPlainAfter(2));
+        r.observePlain(20);
+    }
+}
+
+test "drafter rows: pipelined plain ticks do not inflate serial verify step_ms or cut drafted rows" {
+    var p = Policy{};
+    const hi = logit(0.85);
+    for (0..40) |_| {
+        p.observePipelinedPlain(15.4);
+        p.observePipelinedPlain(15.4);
+        p.observePipelinedPlain(15.4);
+        p.observeRound(&.{ -3, -3, -3, -3, -3 }, 1, 0, 3.6, 17.9);
+        p.observeRound(&.{ hi, hi, hi, hi, hi }, 3, 2, 3.6, 22.6);
+    }
+    const l = logit(0.75);
+    const chosen = p.rows(&.{ l, l, l, l, l });
+    errdefer std.debug.print("drafter rows cost: plain_ms={d:.3} step_ms={d:.3} chosen={d}\n", .{ p.cost.plain_ms, p.cost.step_ms, chosen });
+    try testing.expect(p.cost.step_ms < 2.8);
+    try testing.expect(chosen >= 5);
+    try testing.expectApproxEqAbs(@as(f32, 15.4), p.cost.plain_ms, 0.1);
+    try testing.expectApproxEqAbs(@as(f32, 17.9), p.cost.verifyBase(), 0.1);
+}
+
+test "drafter rows: serial plain growth keeps verifyBase equal to plain_ms so doubtful blocks stay 1-row" {
+    var p = Policy{};
+    const hi = logit(0.85);
+    const doubtful = [_]f32{ -5, -5, -5, -5, -5 };
+    for (0..80) |_| p.calib.observe(sigmoid(-5), false);
+    for (0..20) |_| {
+        p.observePlain(20);
+        p.observeRound(&doubtful, 1, 0, 6, 20);
+        p.observeRound(&.{ hi, hi, hi, hi, hi }, 3, 2, 6, 38);
+    }
+    for (0..40) |_| p.observePlain(55);
+    const costs = p.cost.costs();
+    const chosen = p.rows(&doubtful);
+    errdefer std.debug.print("serial growth: plain_ms={d:.2} verify_base={d:.2} costs[1]={d:.2} costs[2]={d:.2} chosen={d}\n", .{ p.cost.plain_ms, p.cost.verifyBase(), costs[1], costs[2], chosen });
+    try testing.expectEqual(p.cost.plain_ms, p.cost.verifyBase());
+    try testing.expect(costs[2] > costs[1]);
+    try testing.expectEqual(@as(u32, 1), chosen);
+}
+
+test "drafter rows: pipelined plain growth keeps verifyBase at least plain_ms so doubtful blocks stay 1-row" {
+    var p = Policy{};
+    const hi = logit(0.85);
+    const doubtful = [_]f32{ -5, -5, -5, -5, -5 };
+    for (0..80) |_| p.calib.observe(sigmoid(-5), false);
+    for (0..40) |_| {
+        p.observePipelinedPlain(15.4);
+        p.observeRound(&doubtful, 1, 0, 3.6, 17.9);
+        p.observeRound(&.{ hi, hi, hi, hi, hi }, 3, 2, 3.6, 22.6);
+    }
+    for (0..40) |_| p.observePipelinedPlain(55);
+    const costs = p.cost.costs();
+    const chosen = p.rows(&doubtful);
+    errdefer std.debug.print("pipelined growth: plain_ms={d:.2} verify_base={d:.2} costs[1]={d:.2} costs[2]={d:.2} chosen={d}\n", .{ p.cost.plain_ms, p.cost.verifyBase(), costs[1], costs[2], chosen });
+    try testing.expectApproxEqAbs(p.cost.plain_ms + 2.5, p.cost.verifyBase(), 0.2);
+    try testing.expect(p.cost.verifyBase() >= p.cost.plain_ms);
+    try testing.expect(costs[2] > costs[1]);
+    try testing.expectEqual(@as(u32, 1), chosen);
 }

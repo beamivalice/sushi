@@ -103,6 +103,13 @@ pub const InPlace = struct {
         return .{ .array = out.*, .capacity_bytes = self.capacity_bytes, .grid = self.grid };
     }
 
+    /// The write landed now, on the engine of our own: called once the caller freed the old array, so the rows go into
+    /// the buffer's own bytes at once and no pending write holds the forward's scratch past it (an owner's append is
+    /// eager, docs/bill_redesign.md part 8). MLX's own stream keeps its lazy graph.
+    pub fn landed(self: InPlace, s: mlx.mlx_stream) !void {
+        if (mlx.engine.isStream(s) and mlx.engine.isOurs(self.array)) try mlx.engine.settleNow(self.array);
+    }
+
     /// The buffer as another launch leaves it: `array` is this buffer's own shape (a ring a kernel wrote), so its record
     /// stands. The caller frees the old array.
     pub fn replaced(self: InPlace, array: mlx.mlx_array) InPlace {

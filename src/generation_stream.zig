@@ -191,7 +191,8 @@ pub fn mapGenerationError(allocator: std.mem.Allocator, err: anyerror) !GenError
             .code = 400,
             .openai_type = "invalid_request_error",
             .anthropic_type = "invalid_request_error",
-            .message = if (context_refusal) |r| blk: {
+            // A load on the ledger refuses with its own text (`static_bill.admit`).
+            .message = if (forward_refusal) |*r| r.text() else if (context_refusal) |r| blk: {
                 try bills_mod.writeMemoryContextRefusal(&said.writer, r);
                 break :blk said.written();
             } else PREFILL_NOFIT_MSG,
@@ -2338,6 +2339,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "SsdBudgetBelowVision",
         "SsdBudgetExceedsWiredLimit",
         "ExpertStreamingMtpUnsupported",
+        "MtpHeadMissing",
         "ExpertStreamingUnsupportedLayout",
         "ExpertSlabImportCopied",
         "ExpertLayoutUnsupported",
@@ -2444,6 +2446,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
         error.ExpertCacheDoesNotFit => .{ .type = "expert_cache_does_not_fit", .message = "Not enough memory to load this model: its SSD streaming memory and what serving needs beside it do not fit under the GPU memory limit. Lower Memory for SSD streaming (GiB) in its settings (--ssd-budget-gb), or quit other apps or unload another model." },
         error.ExpertStreamingMtpUnsupported => .{ .type = "expert_streaming_mtp_unsupported", .message = expert_stream_mod.MTP_UNSUPPORTED },
+        error.MtpHeadMissing => .{ .type = "mtp_head_missing", .message = "--mtp, or this model's saved mtp, asks for a drafting head this pack does not ship. Restart with --no-mtp." },
         error.ExpertStreamingRequired => .{ .type = "expert_streaming_required", .message = model_load_mod.budget_required_message },
         error.ExpertStreamingUnsupportedLayout => .{ .type = "expert_streaming_unsupported_layout", .message = arch_load.refusalText("ExpertStreamingUnsupportedLayout") orelse "This checkpoint has no complete expert-bank layout this build can stream. Check the pack and all indexed shards." },
         error.ExpertSlabImportCopied => .{ .type = "expert_slab_import_copied", .message = "MLX copied the expert slab instead of aliasing it, so this machine cannot stream experts zero-copy. Report the Mac model and macOS version." },
@@ -2463,7 +2466,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.Exl3GateUpRateMismatch => .{ .type = "exl3_gate_up_rate_mismatch", .message = "The EXL3 gate and up trellises must use the same packed rate." },
         error.Exl3TrellisGeometry => .{ .type = "exl3_trellis_geometry", .message = "This EXL3 pack has a routed-expert trellis this build cannot decode, or one that disagrees with the expert count, shape or k its config.json names. Re-convert the pack." },
         error.Exl3WindowUnsupported => .{ .type = "exl3_window_unsupported", .message = "This EXL3 pack names a codeword window this build cannot decode: expert_quant.window must be an integer from 8 to 16, or absent for 16." },
-        error.Exl3TileOrderUnsupported => .{ .type = "exl3_tile_order_unsupported", .message = "This pack's expert_quant.tile_order is not one this model reads: pair_major is read by one architecture only (docs/pack-format.md#tile-order)." },
+        error.Exl3TileOrderUnsupported => .{ .type = "exl3_tile_order_unsupported", .message = "This pack's routed experts are stored in a tile order this model does not read: pair_major is read by DeepSeek-V4.1-Flash and Hy4-Flash only, and Hy4-Flash reads nothing else, so a pack-order Hy4-Flash pack is migrated by `sushi repack <pack>` (docs/pack-format.md#tile-order)." },
         error.Exl3TileOrderMixed => .{ .type = "exl3_tile_order_mixed", .message = "This pack stores some routed trellis tensors as trellis and some as trellis_pm. Re-convert the pack." },
         error.Exl3TileOrderMismatch => .{ .type = "exl3_tile_order_mismatch", .message = "This pack's routed trellis tensor names do not match the tile_order its config.json names. Re-convert the pack, or fix expert_quant to match." },
         error.Exl3TileOrderNeedsGroups => .{ .type = "exl3_tile_order_needs_groups", .message = "A pair_major pack stores every routed layer as rate groups (gN); this layer is not." },
@@ -3393,13 +3396,19 @@ test "a continued thought keeps the request's forced tool_choice: the call is co
     }
 }
 
-/// A tool whose call the cells below stream; `tool_call_head` is the text up to the first argument's value.
+/// A tool whose call the cells below stream.
 const stream_cell_tools =
     \\[{"type":"function","function":{"name":"write_file","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
 ;
-const stream_cell_head = "Writing it.\n<tool_call>\n<function=write_file>\n<parameter=path>\nreport.md\n</parameter>\n<parameter=content>\n";
 
-test "tool stream: a chat call that buffers for 23 s sends a data event within every beat interval, never only a comment" {
+test "tool stream: a chat call that buffers for 23 s sends a data event within every beat interval, never only a comment, in every dialect" {
+    for (tool_progress.write_file_heads) |head| {
+        errdefer std.debug.print("head: {f}\n", .{std.zig.fmtString(head)});
+        try chatCallBuffers(head);
+    }
+}
+
+fn chatCallBuffers(call_head: []const u8) !void {
     const a = std.testing.allocator;
     var wire: http_conn.TestWire = undefined;
     try wire.init();
@@ -3410,10 +3419,12 @@ test "tool stream: a chat call that buffers for 23 s sends a data event within e
     defer buffered.deinit(a);
     var since: i64 = 0;
     var worst: i64 = 0;
+    const head = try std.mem.concat(a, u8, &.{ "Writing it.\n", call_head });
+    defer a.free(head);
     for (0..230) |i| {
         wire.advance(100);
         since += 100;
-        try buffered.appendSlice(a, if (i == 0) stream_cell_head else "- item: pending review\n");
+        try buffered.appendSlice(a, if (i == 0) head else "- item: pending review\n");
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;

@@ -5,7 +5,7 @@
 const std = @import("std");
 const fx = @import("ubench_report_fixtures_test.zig");
 
-pub const Scope = enum { qwen4, mimo2, glm5, dsv41, enc, shared };
+pub const Scope = enum { qwen4, mimo2, glm5, dsv41, hy4, enc, shared };
 pub const Kind = enum { kernel, pack };
 pub const Unit = enum {
     ns,

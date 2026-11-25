@@ -40,7 +40,7 @@ pub const help = [_]flags.HelpChunk{
     },
 };
 
-pub const think_rank = 1;
+pub const think_rank = 2;
 pub const think_help = "Qwen off|low|medium|xhigh; ";
 pub const think_refusal = "Qwen off|low|medium|xhigh";
 

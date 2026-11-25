@@ -19,11 +19,11 @@ admitted rate and is always on for eligible shapes ([glm5-arch](glm5-arch.md)).
   differently, so a MiMo kernel is never a GLM oracle. Gate and up share one dispatch (grid Z picks the projection).
 - **Decode** keeps slots in top-k order and prepares both gate/up input planes from token rows in one kernel, stored
   in GEMV lane order (tile rows 2q, 2q+1, 2q+8, 2q+9) so each lane loads one `half4` (rows 1–16, equal-shaped MCG,
-  std1 or spec1 banks at any window; component −17% at 1 row, −29% at 16). The middle is prepared separately in lane order and the down reads it
-  by `half4` (`downLanePrepare` + `downLaneCoop`: every admitted n, MCG, std1 or spec1 at any window, pair1 at w16, BF16 out; −10–15% against the fused
+  alpha, std1 or spec1 banks at any window; component −17% at 1 row, −29% at 16). The middle is prepared separately in lane order and the down reads it
+  by `half4` (`downLanePrepare` + `downLaneCoop`: every admitted n, MCG, alpha, std1 or spec1 at any window, pair1 at w16, BF16 out; −10–15% against the fused
   middle/down, which now serves only what the lane path declines).
 - **One-row decode GEMVs carry two output tiles per threadgroup and two k-tiles per simdgroup iteration**
-  (`ONE_ROW_COOP_SOURCE`, gate/up and down at rows == 1, every admitted n, MCG, std1 or spec1 at any window, pair1 at w16): four tile reads are in
+  (`ONE_ROW_COOP_SOURCE`, gate/up and down at rows == 1, every admitted n, MCG, alpha, std1 or spec1 at any window, pair1 at w16): four tile reads are in
   flight and one input quad feeds both tiles; each cell keeps its tile order sg, sg+4, ... and the epilogue its
   r-then-simdgroup sum, so the bytes are the lane kernels'. Chain meter, n36 / n40: 178.6 / 179.9 → 140.5 / 144.8
   µs per layer (gate/up 108.8 → 82.7, down 59.5 → 47.0). It serves rows 1 only (the lane kernels keep rows 2–16) and

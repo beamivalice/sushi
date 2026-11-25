@@ -497,13 +497,36 @@ fn qmvWide(pr: *const Product) Error!void {
 
 /// `qmm_splitk`: K cut into parts that write a `[split, M, N]` buffer, summed over the parts; one part is `qmm`. A
 /// split-K product has one batch, so `out` is those `M x N` rows whatever axes the caller gave them.
+/// The K split `qmm_splitk` takes for one `n` x `k` weight at `group` over `m` rows; 1 for none.
+fn splitOf(m: usize, n: usize, k: usize, group: usize) usize {
+    const n_tiles = (n + 31) / 32;
+    const m_tiles = (m + 31) / 32;
+    var split = @max(1, 512 / (n_tiles * m_tiles));
+    const k_align = if (group > 32) group else 32;
+    split = @min(split, k / k_align);
+    while (split > 1 and k % (split * k_align) != 0) split -= 1;
+    return @max(split, 1);
+}
+
+/// What one product of a single `n` x `k` weight over `m` rows makes and frees beside its output: split-K's partials
+/// `[split, m, n]` of x's dtype (`x_bytes` a value), or 0 where it takes no split. A bill of the product reads it.
+/// The split-K partials a product of `m` rows may ask on any GPU: as `partialsBytesHere` but for the vector kernels'
+/// limit, which only this device knows, so a bill made without the device never falls short.
+pub fn partialsBytesMost(m: usize, n: usize, k: usize, group: usize, x_bytes: usize) usize {
+    const split = splitOf(m, n, k, group);
+    return if (split > 1) split * m * n * x_bytes else 0;
+}
+
+pub fn partialsBytesHere(m: usize, n: usize, k: usize, group: usize, x_bytes: usize) Error!usize {
+    if (m < try vectorLimitHere(k, n)) return 0;
+    const split = splitOf(m, n, k, group);
+    return if (split > 1) split * m * n * x_bytes else 0;
+}
+
 fn qmmSplitK(pr: *const Product, g: matmul.Gpu) Error!void {
     const n_tiles = (pr.n + 31) / 32;
     const m_tiles = (pr.m + 31) / 32;
-    var split = @max(1, 512 / (n_tiles * m_tiles));
-    const k_align = if (pr.group > 32) pr.group else 32;
-    split = @min(split, pr.k / k_align);
-    while (split > 1 and pr.k % (split * k_align) != 0) split -= 1;
+    const split = splitOf(pr.m, pr.n, pr.k, pr.group);
     if (split <= 1) return qmm(pr, g);
 
     std.debug.assert(pr.b == 1);

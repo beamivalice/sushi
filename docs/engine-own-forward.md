@@ -383,10 +383,26 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **An untracked buffer needs a fence between passes.** Our buffers are untracked, as MLX's are. Each pass waits the
   fence of the pass before it and of any unfinished pass that wrote a store it binds; without that a pass reads
   stale bytes, or never completes.
-- **Inside a pass, a barrier where MLX puts one**: before a dispatch that reads what an earlier dispatch of the pass
-  wrote, or writes what one read. Launches that write disjoint rows of one tensor (`kernel.launchInto`,
-  `launchDisjoint`: a rate-grouped bank's groups into one plane) bind it as writes only (`core.bindOutDisjoint`), so
-  they run side by side and the first reader after waits for them all.
+- **A pass encodes its dispatches by dependency level** (`metal.Recorder`): each dispatch is held with its bindings at
+  its level in the pass (after the writes it reads; a write after the reads and writes before it), and each hand-over,
+  kicks included, encodes them level by level with one barrier between levels, so work made later runs beside earlier
+  work it does not touch. Launches that write disjoint rows of one tensor (`kernel.launchInto`, `launchDisjoint`: a
+  rate-grouped bank's groups into one plane) bind it as writes only (`core.bindOutDisjoint`): they order after its
+  reads and whole writes, not after each other, and the first reader after waits for them all. Levels trust the binds
+  alone: a kernel binds what it reads with `bind` and what it writes with `bindOut`. A slot set as bytes after a buffer
+  (or the reverse) drops the other from the snapshot. MLX's rule, a barrier before any dispatch that meets the bytes of
+  one since the last barrier, serialized by encode order: a Hy4 decode token on the tiny STQ pack made 518 barriers
+  against a critical path of 308 (317 by level). Hy4-Flash STQ 4bpw, M5 Ultra, all experts resident, decode forward
+  at 4096 keys (`SUSHI_DECODE_FWD_UBENCH=64`, off/on/on/off, on 13c8fa96): 25.24 / 19.84 / 19.97 / 25.23 ms, GPU busy
+  24.91 / 19.58 / 19.55 / 24.96 ms, 3,779 barriers to 2,124, idle between passes ~0.3 ms in both; logits equal on the
+  Hy4, DeepSeek and Qwen tinies.
+- **A last-arrival counter lives in the engine's counter page** (`core.counterPage`, `kernel.launchCounted`,
+  `mlx.kernelApplyCounted`): 8,192 words Metal zeroes, held for the process outside the pool. A counted launch's last
+  output is the page, bound read and write, so counted launches run in the order made; its first 256 words are counters
+  each launch leaves zero (a failed pass zeroes them), the rest its scratch. No threadgroup waits for another: the last to
+  count itself in does the rest, so nothing rests on forward progress across threadgroups, which Metal does not promise.
+  MLX's stream has no page (`kernelApplyCounted` is null there). Hy4's iHC mix (`hy4_hc`) and its trunk launches of up
+  to three rows (`project_rows.launchRowsCounted`) count in.
 - **A host read waits for the pass that wrote the bytes, not for the queue.** Waiting for everything in flight loses
   the layer the forward queued ahead (25.5 against 20.4 ms per forward).
 - The pool never hands out a store the open pass binds.
@@ -418,6 +434,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   launch. A cached array lives in a `sushi_exl3.side_cache.SideCache`: kept per side, chosen by the stream of the op
   that takes it, an empty handle refused at `put`, and enrolled by its first `put` in the list
   `sushi_exl3.dropHostArrays(side)` drops when that side's last model goes, so no cache is left off by hand.
+  A model never drops a side itself while it is served (Hy4's `Sources.served`): another model of the side shares it.
 - **The engine runs each op as it is built; MLX runs it at the eval.** A leaf MLX lets a caller fill after the graph is
   built (Qwen's deferred n-gram gather) is read empty on the engine: on the engine's stream it is filled first
   (`qwen4_hc.pleEmbedding`).
@@ -649,10 +666,16 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **A synthetic prompt stays inside the vocabulary; `Generator` refuses an id past it** (`PromptTokenOutOfVocab`): the
   embedding gather reads past its table, and on a tiny fixture (vocab 96) the warm's ids up to 1420 fed the router
   whatever an earlier load left there, so a DeepSeek warm failed `ExpertOutOfRange` one run in two.
-- **A tiled product's first launch before the seal makes what every row count picks** (`matmul.completeRows`): the
-  rows choose split-K or fused, the tile and its K step, so a warm width of 2346 rows took split-K and a 4096-row chunk
-  then compiled its fused tile inside the request. Every row count to 16384 is prepared, in every alignment, once per
-  operand shape; so are a matrix-vector product's tiles by output length and each elementwise op's two sizes.
+- **A tiled product's first launch before the seal makes every tile its dtype takes, in every layout** (`matmul.completeFamily`):
+  M, N and K choose split-K or fused, the tile and its K step, so a warm width of 2346 rows took split-K and a 4096-row
+  chunk then compiled its fused tile inside the request. Row counts alone were not enough: on the real Hy4 4bpw pack at
+  8192-row chunks a 4096-token request compiled an f16 tile whose K step turns where K passes M + N, which no warm
+  product took. Every tile any M, N and K pick is prepared, in every alignment, once per dtype (sizes on both sides of
+  each chooser's turn), in all four layouts, batched and not: a layout no warm forward runs, a prefix's restored keys
+  taken transposed, made its first pipeline inside the request on a load that skipped its warm. The kernels not made
+  yet are noted first and made on worker threads, as a manifest's are. A dry recording (the plans', the region's)
+  makes no pipeline and completes no dtype: the warm's first real product does. So are a matrix-vector product's tiles by
+  output length and each elementwise op's two sizes.
 - **The warm verifies as wide as a round can** (`Generator.mtpWarmVerifyCap`): a prompt-lookup chain drafts past the
   MTP head's depth cap (8 drafts against 6 on an M5 Max), so the warm's verify cap is the wider of the two, and the
   contract pins every such width past a sparse indexer's budget on the served-geometry cut.
@@ -684,7 +707,8 @@ rebuilds one.
   requests skipped`: 14.6 s of the real Qwen pack's load, DeepSeek's repeat start and every reload alike); the chunk's fit
   against the live headroom still runs. The marker's key is the manifest's scope plus what the requests are made of:
   widths, KV scheme and group, drafter, the MTP settings its rounds read (`--no-mtp-lookup`, `--max-mtp-ctx`,
-  `--mtp-min-depth`, `--mtp-max-depth`), its bill and the pool settings; a load of another key warms in full. A marker is
+  `--mtp-min-depth`, `--mtp-max-depth`; keyed only for a load with a drafter, so a load with none, Hy4-Flash until DFly2, takes
+  its marker under any of them), its bill and the pool settings; a load of another key warms in full. A marker is
   one manifest's: each settle (trusted or not, even when its workers did not start) replaces the markers the process
   holds with that manifest's own, and a manifest is written with its load's markers only. Two packs of one scope share
   their manifest's marker; the skipped warm's measure (`WarmOverBill`) and its kernels are the scope's.
@@ -723,11 +747,17 @@ rebuilds one.
 - **Every request states its own GPU time at info**: `[engine] GPU busy N ms, idle between passes M ms (P% busy) in
   this request`, the union of its command buffers' spans as Metal timed them (`engine.gpuTimeTaken`, reset when the
   load seals). It is the engine's own reading: the dashboard's "busy" is the whole Mac's GPU as IOKit reports it.
-- **`SUSHI_ENGINE_KERNEL_PROF=1` prices each kernel**: every op's pass is committed and waited for before the next op
-  begins, so its command buffer's GPU times are that kernel's (an op of several dispatches is one row, its kernel names
-  joined by ` + `). The `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` lines (debug; the top 40
-  by total GPU time and one remainder line) follow `[engine] since load:` and the decode meter's `[fwd-ubench] engine:`
-  line, the latter per forward. The forward runs slower under it; read the table's shares, not the forward's wall time.
+- **`SUSHI_ENGINE_KERNEL_PROF=1` prices each kernel**: every op's pass is handed over as its own command buffer when
+  the next op begins, without a wait, so the GPU stays fed and an op's time runs from the end of the buffer before to
+  the end of its own (an op of several dispatches is one row, its kernel names joined by ` + `). A row is a kernel at
+  one site: the return addresses of the code that made it, logged as the executable's own addresses for
+  `atos -i -o <binary>`, with the bytes its dispatches bind to read and to write (each store once a dispatch; a
+  gather's whole table counts). The `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each, reads <r> B,
+  writes <w> B a forward; at <addresses>` lines (debug; the top 40 by total GPU time and one remainder line) follow
+  `[engine] since load:` and the decode meter's `[fwd-ubench] engine:` line, the latter per forward. Each buffer
+  carries Metal's few microseconds of start, so a small op reads high; read shares and large kernels, not the
+  forward's wall time. Waiting per op, as it did before, let the clock fall between ops (one untouched kernel read
+  57 to 207 us across three loads).
 - **`SUSHI_ENGINE_KERNEL_DOUBLE=<text>` prices a kernel inside the forward**: every dispatch whose pipeline name holds
   the text runs a second time behind a barrier (`stats.doubled` counts them), so the decode meter's difference against a
   load without it is what that kernel costs where it runs, overlap and all, at the forward's own clock. The profile above
@@ -749,8 +779,7 @@ rebuilds one.
   load; the one-row 4096 and 131k loads sat at different clocks (144 and 55 us), so only the three-row ratios are steady.
 - **Fusing a dependent pair needs the consumer to read only what its own threadgroup wrote.** `gate` into `route_split` (48 threadgroups
   into one), `attn_split` into `attn_merge` (the S partials), `rows` into `rows_finish` (the k-split partials) and each stage of the
-  routed chain fail that test; a last-arrival counter would pass it with bytes equal, but needs a zeroed, mutable, hazard-tracked
-  scratch the launch seam does not offer (outputs are fresh and unzeroed, inputs are const).
+  routed chain fail that test; a last-arrival counter passes it with bytes equal, through a counted launch (Metal rules, above).
 - **GPU busy and idle are read from the command buffers** (`GPUStartTime`, `GPUEndTime`), which Metal fills after
   the completion signal: a finished buffer is read at a later prune, in order.
 - **The round's verdict stays on the engine** (`dsv41_serving.verdictStream`): the masked argmax over the verify's
@@ -821,3 +850,7 @@ rebuilds one.
   21.1 to 21.2 ms against 21.0 to 21.1, and prose tok/s stayed inside noise at every rung (M5 Max, AC, STQ 1.75bpw,
   in-process `sushi bench --prose-only --tokens 128`, the change on 537e8e91). The pause between one-row rounds is
   not where prose is won: a one-row verify is 20 to 21 ms on both sides, so it needs less GPU work in the forward.
+- **`matmulInto` writes a product into a slice of a larger buffer** (`freshArray` makes the buffer unwritten): the
+  kernel and bytes are `matmul`'s at that shape; Hy4's verify rows fill one block result this way instead of a concat.
+- **`launchInPlace` writes a custom kernel's outputs into existing tensors** (an arch's store): it settles a pending
+  update first and copies a shared or strided destination before writing, so no other holder sees the write.

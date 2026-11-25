@@ -103,9 +103,15 @@ pub fn pinOf(model_type: []const u8) ?Pin {
 fn pretokNames() []const []const u8 {
     comptime var names: []const []const u8 = &.{"gpt2"};
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
-        if (@hasDecl(faceOf(t), "pretokenizer")) names = names ++ &[_][]const u8{faceOf(t).pretokenizer.name};
+        // Archs whose tokenizer.json spells one grammar share its face (DeepSeek's: DeepSeek-V4.1 and Hy4-Flash).
+        if (@hasDecl(faceOf(t), "pretokenizer") and !hasName(names, faceOf(t).pretokenizer.name)) names = names ++ &[_][]const u8{faceOf(t).pretokenizer.name};
     }
     return names;
+}
+
+fn hasName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 /// The pre-tokenizer grammars: `gpt2` (the shared rules in tokenizer.zig) and one per arch that brings its own.

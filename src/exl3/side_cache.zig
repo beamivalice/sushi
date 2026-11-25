@@ -52,7 +52,12 @@ pub fn SideCache(comptime K: type, comptime n: usize) type {
         }
 
         /// Keeps `arr` for `key` on `side` and hands it back, or refuses an empty handle and keeps nothing.
-        pub fn put(self: *Self, side: u1, key: K, arr: mlx.mlx_array) error{HostArrayRefused}!mlx.mlx_array {
+        pub fn put(self: *Self, side: u1, key: K, arr: mlx.mlx_array) error{ HostArrayRefused, CacheFillDry }!mlx.mlx_array {
+            // A miss while a forward records dry: the entry is made at load instead (docs/bill_redesign.md#caches).
+            if (host_side.dry()) {
+                _ = mlx.mlx_array_free(arr);
+                return error.CacheFillDry;
+            }
             const kept = try host_side.made(arr);
             if (!self.node.enrolled) {
                 self.node.next = enrolled;
@@ -105,7 +110,7 @@ pub fn SideCache(comptime K: type, comptime n: usize) type {
 var ints: SideCache(c_int, 16) = .{};
 
 /// A 0-d int32 scalar of `v` on `side`, the cache's.
-pub fn int(side: u1, v: c_int) error{HostArrayRefused}!mlx.mlx_array {
+pub fn int(side: u1, v: c_int) error{ HostArrayRefused, CacheFillDry }!mlx.mlx_array {
     return ints.get(side, v) orelse ints.put(side, v, mlx.mlx_array_new_int(v));
 }
 

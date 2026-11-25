@@ -8,9 +8,11 @@ const builtin = @import("builtin");
 const metal = @import("../metal.zig");
 const mlx = @import("../mlx.zig");
 const core = @import("core.zig");
+const plan_api = @import("plan/plan_api.zig");
 const device = @import("sushi_exl3").device;
 const ops = @import("ops.zig");
 const stock = @import("stock.zig");
+const log = @import("../log.zig");
 
 const Tensor = core.Tensor;
 const Error = core.Error;
@@ -30,6 +32,25 @@ fn atoi(text: []const u8) i64 {
     return std.fmt.parseInt(i64, text[0..end], 10) catch 0;
 }
 
+/// Inside `exactF32`, an f32 product takes MLX's f32 tiles whatever its TF32 reading (what `MLX_ENABLE_TF32=0` gives).
+var exact_f32: bool = false;
+
+/// For a forward whose f32 products are held to f32: every product, gathered product and attention of f32 operands
+/// the engine runs until `ExactF32.end` keeps f32 tiles.
+pub fn exactF32() ExactF32 {
+    const was = exact_f32;
+    exact_f32 = true;
+    return .{ .was = was };
+}
+
+pub const ExactF32 = struct {
+    was: bool,
+
+    pub fn end(self: ExactF32) void {
+        exact_f32 = self.was;
+    }
+};
+
 /// The GPU as the profile gives it, so a withheld unit or a test's profile is the engine's too.
 pub fn gpu() Error!Gpu {
     const p = device.current();
@@ -41,7 +62,24 @@ pub fn gpu() Error!Gpu {
         }
         tf32_known = tf32;
     }
-    return .{ .class = p.class, .gen = p.generation, .nax = p.has(.matrix_g17), .tf32 = tf32_known.? };
+    return .{ .class = p.class, .gen = p.generation, .nax = p.has(.matrix_g17), .tf32 = tf32_known.? and !exact_f32 };
+}
+
+/// In a test: what MLX's own reading answers (`mlxTf32`), and the engine's cached reading.
+pub var mlx_tf32_for_test: ?bool = null;
+
+pub fn cacheTf32ForTest(v: ?bool) void {
+    tf32_known = v;
+}
+
+/// Reads TF32 again, from MLX itself on a chip with the units: a process that changed the variable before MLX's first
+/// product gets the new value, one whose MLX already multiplied keeps MLX's first reading. True when f32 products run
+/// on TF32 tiles (only a chip with the units has them).
+pub fn rereadTf32() Error!bool {
+    const p = device.current();
+    tf32_known = if (p.chip.contains(.matrix_g17)) try mlxTf32() else if (std.c.getenv("MLX_ENABLE_TF32")) |v| atoi(std.mem.span(v)) != 0 else true;
+    const g = try gpu();
+    return g.nax and g.tf32;
 }
 
 /// Whether the GPU has the matrix units MLX's NAX kernels run on.
@@ -60,6 +98,7 @@ pub fn tf32Units() bool {
 /// process, so a test that changes the variable around an MLX product leaves MLX on a value the environment no
 /// longer shows, and every test after it that holds the engine to MLX's bytes would fail by the order they ran in.
 fn mlxTf32() !bool {
+    if (builtin.is_test) if (mlx_tf32_for_test) |v| return v;
     const n = 64;
     const values: [n * n]f32 = @splat(1.0 + 1.0 / 4096.0);
     const x = mlx.raw.mlx_array_new_data(&values, &[_]c_int{ n, n }, 2, .float32);
@@ -164,6 +203,17 @@ fn letter(yes: bool) u8 {
 /// `a @ b` as MLX's `matmul` gives it: a 1-D operand is a row or a column for the product, batch axes broadcast,
 /// and a batched `a` against one matrix is flattened into rows.
 pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
+    return matmulImpl(a_in, b_in, null);
+}
+
+/// `matmul` written into `dst`, a contiguous region of a larger buffer (a verify row's slice of its block's result):
+/// the same kernel, tile and bytes as `matmul` at that shape, with no copy of the result.
+pub fn matmulInto(a_in: *Tensor, b_in: *Tensor, dst: *Tensor) Error!void {
+    const out = try matmulImpl(a_in, b_in, dst);
+    core.release(out);
+}
+
+fn matmulImpl(a_in: *Tensor, b_in: *Tensor, dst_in: ?*Tensor) Error!*Tensor {
     if (a_in.ndim == 0 or b_in.ndim == 0) return error.TensorShape;
     if (a_in.dtype != b_in.dtype) return core.refusing("a matmul of operands of two dtypes", error.TensorDtype);
     switch (a_in.dtype) {
@@ -207,8 +257,24 @@ pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
         b = wide_b;
     }
 
-    var out = try product(a, b, null);
+    if (dst_in) |d| {
+        if (d.store == a_in.store or d.store == b_in.store) return core.refusing("matmulInto with dst aliasing an operand", error.TensorShape);
+        var want: core.Dims = .{};
+        if (flattened) {
+            try want.appendSlice(a_in.shape[0 .. a_in.ndim - 1]);
+            if (b_in.ndim != 1) try want.append(n);
+        } else {
+            try want.appendSlice(a.shape[0 .. a.ndim - 2]);
+            if (a_in.ndim != 1) try want.append(a.shape[a.ndim - 2]);
+            if (b_in.ndim != 1) try want.append(n);
+        }
+        if (d.dtype != a_in.dtype or !d.rowContiguous() or d.ndim != want.len) return error.TensorShape;
+        for (d.shape[0..d.ndim], want.slice()) |x, y| if (x != y) return error.TensorShape;
+    }
+
+    var out = try product(a, b, null, dst_in);
     errdefer core.release(out);
+    if (dst_in != null) return out;
     if (flattened) {
         var shape: [core.max_dims]c_int = undefined;
         const lead = a_in.ndim - 1;
@@ -239,15 +305,16 @@ pub fn matmul(a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
 /// beside it; a caller whose rows must not depend on their company fixes the count. The rows are computed as they are:
 /// nothing is padded.
 pub fn matmulRowsAs(a: *Tensor, b: *Tensor, rows_as: usize) Error!*Tensor {
-    if (a.ndim != 2 or b.ndim != 2 or a.dtype != b.dtype) return error.TensorShape;
+    if (a.ndim < 2 or a.ndim != b.ndim or a.dtype != b.dtype) return error.TensorShape;
     if (a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return core.refusing("a matmul in a dtype other than f32, f16 and bf16", error.TensorDtype);
-    if (a.shape[1] != b.shape[0]) return error.TensorShape;
+    if (!std.mem.eql(c_int, a.shape[0 .. a.ndim - 2], b.shape[0 .. b.ndim - 2])) return error.TensorShape;
+    if (a.shape[a.ndim - 1] != b.shape[b.ndim - 2]) return error.TensorShape;
     if (a.size() == 0 or b.size() == 0 or rows_as < 2) return core.refusing("a rows-as matmul of an empty operand or under two rows", error.TensorUnsupported);
-    return product(a, b, rows_as);
+    return product(a, b, rows_as, null);
 }
 
 /// `Matmul::eval_gpu`: operands of one rank whose batch axes agree. `rows_as` fixes the row count the arm is chosen for.
-fn product(a_pre: *Tensor, b_pre: *Tensor, rows_as: ?usize) Error!*Tensor {
+fn product(a_pre: *Tensor, b_pre: *Tensor, rows_as: ?usize, dst_in: ?*Tensor) Error!*Tensor {
     var m: usize = @intCast(a_pre.shape[a_pre.ndim - 2]);
     const n: usize = @intCast(b_pre.shape[b_pre.ndim - 1]);
     const k: usize = @intCast(a_pre.shape[a_pre.ndim - 1]);
@@ -271,12 +338,15 @@ fn product(a_pre: *Tensor, b_pre: *Tensor, rows_as: ?usize) Error!*Tensor {
         batch_out = 1;
         batches = .one;
     }
-    if (rows_as == null and m == 1 and n == 1 and batch_out == 1 and a.t.rowContiguous() and b.t.rowContiguous()) return dot(a.t, b.t, k, shape[0..a_pre.ndim]);
+    if (rows_as == null and m == 1 and n == 1 and batch_out == 1 and a.t.rowContiguous() and b.t.rowContiguous()) return dot(a.t, b.t, k, shape[0..a_pre.ndim], dst_in);
 
-    const out = try core.fresh(a_pre.dtype, shape[0..a_pre.ndim]);
+    const out = if (dst_in) |d| blk: {
+        if (d.dtype != a_pre.dtype or !d.rowContiguous() or d.size() != batch_out * m * n) return error.TensorShape;
+        break :blk try core.share(d);
+    } else try core.fresh(a_pre.dtype, shape[0..a_pre.ndim]);
     errdefer core.release(out);
     const g = try gpu();
-    const call: Call = .{ .g = g, .a = a, .b = b, .out = out, .m = m, .n = n, .k = k, .batch_out = batch_out, .batches = batches, .arm_m = rows_as orelse m };
+    const call: Call = .{ .g = g, .a = a, .b = b, .out = out, .m = m, .n = n, .k = k, .batch_out = batch_out, .batches = batches, .arm_m = rows_as orelse m, .disjoint = dst_in != null };
     // A fixed row count asks for the tiled kernels' sum: the vector kernels are other arithmetic.
     if (rows_as == null) {
         if (!a.transposed and b.transposed and try gemvWide(call)) return out;
@@ -290,7 +360,7 @@ fn product(a_pre: *Tensor, b_pre: *Tensor, rows_as: ?usize) Error!*Tensor {
 }
 
 /// MLX's `dot_product`: partial sums in f32 per block of 512 threads, summed by MLX's all-reduce, then cast.
-fn dot(a: *Tensor, b: *Tensor, k: usize, shape: []const c_int) Error!*Tensor {
+fn dot(a: *Tensor, b: *Tensor, k: usize, shape: []const c_int, dst_in: ?*Tensor) Error!*Tensor {
     const group = 512;
     const blocks = ((k + 31) / 32 + group - 1) / group;
     const partials = try core.fresh(.float32, &.{@intCast(blocks)});
@@ -304,6 +374,11 @@ fn dot(a: *Tensor, b: *Tensor, k: usize, shape: []const c_int) Error!*Tensor {
     p.constant(@as(c_int, @intCast(k)), 3);
     core.dispatch(p, .{ .x = blocks * group }, .{ .x = group });
 
+    if (dst_in) |d| {
+        if (a.dtype != .float32) return core.refusing("matmulInto of a 1x1 non-f32 dot product", error.TensorUnsupported);
+        try @import("reduce.zig").all(.sum, partials, d);
+        return core.share(d);
+    }
     const sum = try core.fresh(.float32, shape);
     errdefer core.release(sum);
     try @import("reduce.zig").all(.sum, partials, sum);
@@ -325,6 +400,7 @@ const Call = struct {
     batches: Batches,
     /// The row count the kernel, its tile and its k split are chosen for: `m` unless the caller fixed it.
     arm_m: usize,
+    disjoint: bool = false,
 
     fn int(v: usize) c_int {
         return @intCast(v);
@@ -362,7 +438,7 @@ fn gemvWide(c: Call) Error!bool {
     p.pipeline(kern);
     core.bind(p, mat.t, 0);
     core.bind(p, vec.t, 1);
-    core.bindOut(p, c.out, 3);
+    if (c.disjoint) core.bindOutDisjoint(p, c.out, 3) else core.bindOut(p, c.out, 3);
     p.constant(Call.int(c.k), 4);
     p.constant(Call.int(c.n), 5);
     p.constant(Call.int(c.m), 6);
@@ -450,7 +526,7 @@ fn gemv(c: Call) Error!void {
     p.pipeline(kern);
     core.bind(p, mat.t, 0);
     core.bind(p, vec.t, 1);
-    core.bindOut(p, c.out, 3);
+    if (c.disjoint) core.bindOutDisjoint(p, c.out, 3) else core.bindOut(p, c.out, 3);
     p.constant(Call.int(c.k), 4);
     p.constant(Call.int(out_len), 5);
     p.constant(@as(c_int, @intCast(mat.ld)), 6);
@@ -473,10 +549,24 @@ fn steelPath(c: Call) SteelPath {
     return if (use_nax) .fused_nax else .fused;
 }
 
+/// PURE: for a product of `k` x `n`, the row counts at which `steelPath` may turn, on any GPU class: a path holds every
+/// row count up to one of them. A plan probes each, so each path's variant holds its largest instance.
+pub fn steelRowEdges(k: usize, n: usize) [6]usize {
+    const tiles_n = (n + 15) / 16;
+    return .{ 16 * (1024 / tiles_n), 16 * (2048 / tiles_n), k, k / 3, (k -| 1) / 2, 1024 };
+}
+
 /// MLX's `steel_matmul`: two matrices, by the tiled kernels.
 fn steel(c: Call) Error!void {
-    if (!core.sealed and c.arm_m == c.m) completeRows(c);
-    return switch (steelPath(c)) {
+    // A dry recording makes no pipeline: the dtype stays open for the first real product (the warm's).
+    if (!core.sealed and !core.dryOn()) completeFamily(c);
+    const path = steelPath(c);
+    // The path follows the product's sizes: under a plan each is a variant of its own.
+    const f = try plan_api.frame(@src(), .{});
+    defer f.end();
+    const v = if (plan_api.planned()) try plan_api.each(@src(), path) else plan_api.Frame.none;
+    defer v.end();
+    return switch (path) {
         .split_k => splitK(c),
         .split_k_nax => splitKNax(c),
         .fused => fused(c),
@@ -487,34 +577,68 @@ fn steel(c: Call) Error!void {
 /// The widest product a request's rows make: a prefill chunk at its widest.
 const rows_ceiling: usize = 16384;
 
-/// The operands' shapes, layouts and dtype whose kernels for every row count are made (`completeRows`).
-const RowsKey = struct { n: usize, k: usize, a_t: bool, b_t: bool, dtype: core.Dtype, batch_out: usize, batched: bool };
-var rows_done: std.AutoHashMapUnmanaged(RowsKey, void) = .empty;
+/// The dtypes whose every tiled kernel is made (`completeFamily`).
+const FamilyKey = struct { dtype: core.Dtype };
+var families_done: std.AutoHashMapUnmanaged(FamilyKey, void) = .empty;
 
-/// Until the load seals the pipelines, the first product of an operand pair makes the kernels every row count up to
-/// `rows_ceiling` takes: the row count picks the path, its tile and its K step, and only the warm's few widths run.
-fn completeRows(c: Call) void {
-    const key: RowsKey = .{ .n = c.n, .k = c.k, .a_t = c.a.transposed, .b_t = c.b.transposed, .dtype = c.out.dtype, .batch_out = c.batch_out, .batched = c.batches.n > 1 };
-    const seen = rows_done.getOrPut(std.heap.c_allocator, key) catch return;
-    if (seen.found_existing) return;
-    var m: usize = 2;
-    while (m <= rows_ceiling) : (m = @max(m + 1, m + m / 8)) prepareAt(c, m);
-    for ([_]usize{ c.k / 3, c.k / 2, c.k -| c.n, c.n, (1 << 20) / @max(c.n, 1) }) |edge| for ([_]usize{ edge, edge + 1 }) |e| {
-        if (e >= 2 and e <= rows_ceiling) prepareAt(c, e);
-    };
+/// A test that asserts a family is made from its first product starts from none made.
+pub fn forgetFamiliesForTest() void {
+    families_done.clearRetainingCapacity();
 }
 
-fn prepareAt(c: Call, m: usize) void {
-    var at = c;
-    at.m = m;
-    at.arm_m = m;
-    prepare(at);
+/// Sizes on both sides of every turn the path and tile choosers take, on any GPU class: products at every triple of
+/// them take every tile a product of one layout and dtype can.
+const family_sizes = [_]usize{ 16, 39, 40, 512, 1024, 2048, 2049, 4096, 4097, 8192, 8193, 16384, 1 << 20 };
+
+/// Until the load seals the pipelines, the first tiled product of a dtype makes every kernel any layout, batching, M, N
+/// and K of it take: the sizes pick the path, its tile and its K step, a request's sizes (a context's keys, a narrower
+/// chunk) are not the warm's, and a request may take a layout no warm forward does (a restored prefix's keys).
+fn completeFamily(c: Call) void {
+    const seen = families_done.getOrPut(std.heap.c_allocator, .{ .dtype = c.out.dtype }) catch return;
+    if (seen.found_existing) return;
+    // The kernels not made yet are noted, made on worker threads as a manifest's are, then taken from the stock.
+    var notes: stock.Notes = .{};
+    defer notes.deinit();
+    stock.noting = &notes;
+    prepareFamily(c);
+    stock.noting = null;
+    if (notes.recipes.items.len > 0) {
+        const cache = @import("pipeline_cache.zig");
+        const threads = @min(std.Thread.getCpuCount() catch 1, 8);
+        if (cache.start(notes.recipes.items, threads)) |job| {
+            const report = cache.finish(job);
+            if (report.failed > 0) log.warn("[engine] {d} of {d} matrix kernels did not make on the workers ({s}); the first product makes them\n", .{ report.failed, notes.recipes.items.len, report.firstError() });
+        } else |e| log.warn("[engine] the matrix kernels' workers did not start ({s}); the first product makes them\n", .{@errorName(e)});
+    }
+    prepareFamily(c);
+}
+
+/// `prepare` of every layout, batching and size triple of `c`'s dtype.
+fn prepareFamily(c: Call) void {
+    var batched = Batches.one;
+    batched.push(2, 0, 0);
+    for ([_]bool{ false, true }) |a_t| for ([_]bool{ false, true }) |b_t| for ([_]bool{ false, true }) |many| {
+        var layout = c;
+        layout.a.transposed = a_t;
+        layout.b.transposed = b_t;
+        layout.batches = if (many) batched else Batches.one;
+        layout.batch_out = if (many) 2 else 1;
+        for (family_sizes) |m| for (family_sizes) |n| for (family_sizes) |k| {
+            var at = layout;
+            at.m = m;
+            at.arm_m = m;
+            at.n = n;
+            at.k = k;
+            prepare(at);
+        };
+    };
 }
 
 /// Makes, without launching, the kernels `steel` launches for `c` in every alignment a request's lengths pick.
 fn prepare(c: Call) void {
     switch (steelPath(c)) {
         .split_k => {
+            _ = accumulateKernel(c) catch {};
             const t = splitKTile(c);
             for (0..16) |bits| {
                 const other: Tile = .{ .bm = if (bits & 4 != 0) 32 else 16, .bn = if (bits & 8 != 0) 32 else 16, .bk = t.bk, .wm = t.wm, .wn = t.wn };
@@ -522,6 +646,7 @@ fn prepare(c: Call) void {
             }
         },
         .split_k_nax => {
+            _ = accumulateKernel(c) catch {};
             const t = splitKNaxTile(c).t;
             for (0..8) |bits| _ = splitKNaxKernel(c, t, bits & 1 != 0, bits & 2 != 0, bits & 4 != 0) catch continue;
         },
@@ -611,19 +736,29 @@ fn fusedNax(c: Call) Error!void {
     return fusedLaunch(c, "steel_gemm_fused_nax", ts.t, ts.swizzle);
 }
 
-fn fusedNaxTile(c: Call) struct { t: Tile, swizzle: u5 } {
+/// A fused NAX launch's tile and swizzle.
+pub const FusedNaxTile = struct { t: Tile, swizzle: u5 };
+
+fn fusedNaxTile(c: Call) FusedNaxTile {
+    return fusedNaxTileFor(c.g.class, c.m, c.arm_m, c.n, c.k);
+}
+
+/// The fused NAX tile of an m x n x k product on GPU class `class`. On class d a wide K (12,288 or more, both other
+/// sides past 1,024) takes the 128 x 64 tile, swizzled, which reuses a large weight from cache; a tile never moves a
+/// sum's K order, so the bytes are the other tile's.
+pub fn fusedNaxTileFor(class: device.Class, m: usize, arm_m: usize, n: usize, k: usize) FusedNaxTile {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
-    const class = c.g.class;
+    const wide_k_d = class == .d and k >= 12288 and m >= 1024 and n >= 1024;
     if (class == .s or class == .c) {
-        t.bk = if (c.k >= 8192 and c.k > c.arm_m + c.n) 64 else 256;
+        t.bk = if (k >= 8192 and k > arm_m + n) 64 else 256;
         t.bm = 64;
         t.wm = 2;
     } else if (class == .d) {
-        t = if (c.n > c.arm_m) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
+        t = if (n > arm_m or wide_k_d) .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 } else .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
     }
-    const tiles_m = (c.m + t.bm - 1) / t.bm;
+    const tiles_m = (m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;
-    if (class == .s or class == .c) swizzle = 2 else if (class == .d) swizzle = if (c.m > c.n) 0 else 2;
+    if (class == .s or class == .c) swizzle = 2 else if (class == .d) swizzle = if (m > n and !wide_k_d) 0 else 2;
     return .{ .t = t, .swizzle = swizzle };
 }
 
@@ -649,7 +784,6 @@ fn fusedKernel(comptime family: []const u8, c: Call, t: Tile, align_m: bool, ali
 fn fusedLaunch(c: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error!void {
     const has_batch = c.batches.n > 1;
     const kern = try fusedKernel(family, c, t, c.m % t.bm == 0, c.n % t.bn == 0, c.k % t.bk == 0);
-    if (!core.sealed and c.arm_m != c.m) prepare(c);
     var tiles_n = (c.n + t.bn - 1) / t.bn;
     var tiles_m = (c.m + t.bm - 1) / t.bm;
     const params: GemmParams = .{
@@ -676,7 +810,7 @@ fn fusedLaunch(c: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error
     p.pipeline(kern);
     core.bind(p, c.a.t, 0);
     core.bind(p, c.b.t, 1);
-    core.bindOut(p, c.out, 3);
+    if (c.disjoint) core.bindOutDisjoint(p, c.out, 3) else core.bindOut(p, c.out, 3);
     p.constant(params, 4);
     if (has_batch) {
         var strides: [2 * max_batch]i64 = undefined;
@@ -708,16 +842,20 @@ fn blockDims(dims: [3]usize) metal.Size {
 
 /// The f32 parts of a split product summed into `out`.
 fn accumulate(c: Call, parts: *Tensor, count: usize) Error!void {
-    var buf: [96]u8 = undefined;
-    const kern = try stock.kernel(try stock.named(&buf, "steel_gemm_splitk_accum_{s}_float32", .{try stock.typeName(c.out.dtype)}));
+    const kern = try accumulateKernel(c);
     const p = try core.pass();
     p.pipeline(kern);
     core.bind(p, parts, 0);
-    core.bindOut(p, c.out, 1);
+    if (c.disjoint) core.bindOutDisjoint(p, c.out, 1) else core.bindOut(p, c.out, 1);
     p.constant(Call.int(count), 2);
     p.constant(Call.int(c.m * c.n), 3);
     p.constant(Call.int(c.n), 4);
     core.dispatch(p, .{ .x = c.n, .y = c.m, .z = 1 }, blockDims(.{ c.n, c.m, 1 }));
+}
+
+fn accumulateKernel(c: Call) Error!metal.Pipeline {
+    var buf: [96]u8 = undefined;
+    return stock.kernel(try stock.named(&buf, "steel_gemm_splitk_accum_{s}_float32", .{try stock.typeName(c.out.dtype)}));
 }
 
 fn nextPowerOfTwo(v: usize) usize {
@@ -733,18 +871,22 @@ fn splitKTile(c: Call) Tile {
     return .{ .bm = if (c.arm_m < 40) 16 else 32, .bn = if (c.n < 40) 16 else 32, .bk = 16, .wm = 2, .wn = 2 };
 }
 
+const split_k_parts_max = 32;
+
 /// `steel_gemm_splitk_axpby`: a long inner axis cut into parts, each a product into f32, then summed.
 fn splitK(c: Call) Error!void {
     const tm = (c.arm_m + 31) / 32;
     const tn = (c.n + 31) / 32;
     const tk = c.k / 16;
     const t = splitKTile(c);
-    const parts_n = @min(@max(2, nextPowerOfTwo(tk / (tm * tn))), 32);
+    const parts_n = @min(@max(2, nextPowerOfTwo(tk / (tm * tn))), split_k_parts_max);
     const iterations = (c.k / t.bk) / parts_n;
-    const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
+    // The count steps with the tiles, so its bytes do not grow with the product's sizes: under a plan the partials take
+    // the most there can be, and the largest product a probe records holds every smaller one.
+    const held = if (plan_api.planned()) split_k_parts_max else parts_n;
+    const parts = try core.fresh(.float32, &.{ Call.int(held), Call.int(c.m), Call.int(c.n) });
     defer core.release(parts);
     const kern = try splitKKernel(c, t, c.m % t.bm == 0 and c.n % t.bn == 0, c.k % t.bk == 0);
-    if (!core.sealed and c.arm_m != c.m) prepare(c);
     const tiles_n = (c.n + t.bn - 1) / t.bn;
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     const params: SplitKParams = .{
@@ -772,21 +914,28 @@ fn splitK(c: Call) Error!void {
     try accumulate(c, parts, parts_n);
 }
 
-fn splitKNaxTile(c: Call) struct { t: Tile, part_size: usize } {
+const SplitKNaxTile = struct { t: Tile, part_size: usize };
+
+fn splitKNaxTile(c: Call) SplitKNaxTile {
+    return splitKNaxTileFor(c.g.class, c.arm_m, c.n, c.k);
+}
+
+/// PURE: the NAX split-K tile and inner-axis part a product takes on a GPU class (the Ultra cuts smaller parts).
+pub fn splitKNaxTileFor(class: device.Class, arm_m: usize, n: usize, k: usize) SplitKNaxTile {
     var t: Tile = .{ .bm = 128, .bn = 128, .bk = 512, .wm = 4, .wn = 4 };
     var part_size: usize = 4096;
-    if (c.g.class == .d) {
-        if (c.arm_m <= 2048 and c.n <= 2048) {
+    if (class == .d) {
+        if (arm_m <= 2048 and n <= 2048) {
             t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
             part_size = 2048;
-        } else if (c.n > c.arm_m) {
+        } else if (n > arm_m) {
             t = .{ .bm = 128, .bn = 64, .bk = 512, .wm = 4, .wn = 2 };
         } else {
             t = .{ .bm = 64, .bn = 128, .bk = 512, .wm = 2, .wn = 4 };
         }
     }
-    if ((c.arm_m + c.n) / 2 < 512 or c.k <= 4096) t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
-    if (c.k <= 1024) part_size = c.k / 2 else if (c.k <= 2048) part_size = 1024 else if (c.k <= 4096) part_size = 2048;
+    if ((arm_m + n) / 2 < 512 or k <= 4096) t = .{ .bm = 64, .bn = 64, .bk = 256, .wm = 2, .wn = 2 };
+    if (k <= 1024) part_size = k / 2 else if (k <= 2048) part_size = 1024 else if (k <= 4096) part_size = 2048;
     return .{ .t = t, .part_size = part_size };
 }
 
@@ -798,6 +947,8 @@ fn splitKNaxKernel(c: Call, t: Tile, align_m: bool, align_n: bool, align_k: bool
     return stock.kernelFlags(name, hash, &.{ .{ .index = 200, .value = align_m }, .{ .index = 201, .value = align_n } });
 }
 
+pub const split_k_nax_parts_least = 3;
+
 /// `steel_gemm_splitk_axpby_nax`.
 fn splitKNax(c: Call) Error!void {
     const tp = splitKNaxTile(c);
@@ -805,10 +956,12 @@ fn splitKNax(c: Call) Error!void {
     const part_size = tp.part_size;
     const ultra = c.g.class == .d;
     const parts_n = (c.k + part_size - 1) / part_size;
-    const parts = try core.fresh(.float32, &.{ Call.int(parts_n), Call.int(c.m), Call.int(c.n) });
+    // An odd inner axis to 1,024 halves into 3 parts, a longer one to 8,192 into 2: under a plan the partials take at
+    // least 3, so their bytes never fall as the inner axis grows.
+    const held = if (plan_api.planned()) @max(parts_n, split_k_nax_parts_least) else parts_n;
+    const parts = try core.fresh(.float32, &.{ Call.int(held), Call.int(c.m), Call.int(c.n) });
     defer core.release(parts);
     const kern = try splitKNaxKernel(c, t, c.m % t.bm == 0, c.n % t.bn == 0, c.k % t.bk == 0);
-    if (!core.sealed and c.arm_m != c.m) prepare(c);
     const tiles_n = (c.n + t.bn - 1) / t.bn;
     const tiles_m = (c.m + t.bm - 1) / t.bm;
     var swizzle: u5 = if (tiles_m <= 3) 0 else 1;

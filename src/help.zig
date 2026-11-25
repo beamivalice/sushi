@@ -4,6 +4,7 @@ const std = @import("std");
 const registry = @import("arch/registry.zig");
 const flags = @import("arch/flags.zig");
 const packs = @import("arch/packs.zig");
+const model_settings = @import("model_settings.zig");
 
 /// Where `--think`'s words go; the marker line's indent is the paragraph's.
 const think_marker = "@@think@@";
@@ -61,6 +62,20 @@ const shared =
     \\                      GLM-5.3-Flash source checkpoint into a Sushi pack
     \\                      (routed experts as EXL3). `sushi convert --help`
     \\                      for options
+    \\  repack <pack>       Rewrite an STQ pack in place into the
+    \\                      pair-major layout. A shard is replaced only after
+    \\                      its rewrite reads back equal; a cut-off run
+    \\                      resumes when repeated. Stop any server using the
+    \\                      pack first. Never downloads. Options:
+    \\                      --pack-revision <id>  stamp the pack with a
+    \\                        revision (config.json and every shard header)
+    \\                      --shards <name-or-glob>  stamp only these shards
+    \\                        (repeatable; a pattern matching nothing is
+    \\                        refused)
+    \\                      --unstamped <shard>  leave this shard without a
+    \\                        stamp (repeatable; a symlinked shard needs it)
+    \\                      --check  read only: every shard not unstamped
+    \\                        carries the config's revision
     \\  update              Replace this install with the newest release,
     \\                      after checking its SHA-256, its signature and
     \\                      that it runs; the old one stays as
@@ -199,7 +214,9 @@ const shared =
     \\                        budget; this flag is the ceiling, not a floor.
     \\                        When a request does not fit at <n>, it runs
     \\                        at the widest narrower width that fits (down
-    \\                        to 512) instead of being refused.
+    \\                        to 512) instead of being refused. Deprecated on
+    \\                        a Hy4-Flash load, where it means
+    \\                        --prefill-chunk-max <n>.
     \\  --max-concurrent <n>  Sizes the submit queue (n + 32). Requests batch at
     \\                        any value, at least 1 (default: 1). Above the
     \\                        default prefix-cache entry count it raises that
@@ -240,7 +257,8 @@ const shared =
     \\                        (--prefix-cache-disk sizes them).
     \\  --wired-margin-gib <n>
     \\                      How far under iogpu.wired_limit_mb a plan may
-    \\                        reach (default: 1, integers 1..32).
+    \\                        reach (default:
+    ++ std.fmt.comptimePrint(" {d}, integers {d}..{d}).\n", .{ model_settings.default_wired_margin_gib, model_settings.wired_margin_gib_min, model_settings.wired_margin_gib_max }) ++
     \\  --expert-pick-tolerance <n>
     \\                      LOSSY, streamed packs only (default: 0 = off,
     \\                        exact routing). A routed expert missing from the
@@ -250,20 +268,21 @@ const shared =
     \\                        0.3 is a mild setting. A sigmoid router (MiMo)
     \\                        compares sigmoid probabilities.
     \\  --expert-cache-bias <n>
-    \\                      LOSSY, DeepSeek-V4.1 and Qwen3.8 streamed STQ packs only
-    \\                        (default: 0 = off, exact routing). At decode widths
-    \\                        the router scores an expert the layer's cache lacks
-    \\                        n lower, so a cached expert within n of it wins the
-    \\                        pick; the weights stay the unbiased scores. A bigger
-    \\                        n is more lossy and, when streaming, faster. 0..2,
-    \\                        0.2 suggested; each model reads n in its own router
-    \\                        units, so a value does not carry from one to the
-    \\                        other. Ignored when --expert-pick-tolerance is set.
+    \\                      LOSSY, DeepSeek-V4.1, Qwen3.8 and Hy4-Flash streamed STQ
+    \\                        packs only (default: 0 = off, exact routing). At
+    \\                        decode widths the router scores an expert the layer's
+    \\                        cache lacks n lower, so a cached expert within n of it
+    \\                        wins the pick; the weights stay the unbiased scores. A
+    \\                        bigger n is more lossy and, when streaming, faster.
+    \\                        0..2, 0.2 suggested; each model reads n in its own
+    \\                        router units, so a value does not carry from one to
+    \\                        another. Ignored when --expert-pick-tolerance is set.
     \\  --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
-    \\                        source checkpoint) with a
-    \\                        TOTAL resident target of <n> GiB; the expert
-    \\                        cache is what is left after the trunk, the
-    \\                        prefill union and the fill buffers.
+    \\                        source checkpoint) within a weights budget of
+    \\                        <n> GiB: the trunk, the MTP head and the routed
+    \\                        experts with their stream buffers; the expert
+    \\                        cache is what is left. The KV cache and the
+    \\                        prefill's memory are beside it.
     \\  --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 0, off).
     \\                        The share, in percent (0..100), of this Mac's SSD
     \\                        read rate (measured at load) that the expert
@@ -388,7 +407,7 @@ pub const list_usage =
 pub const think_values = thinkParts("think_refusal", ", ");
 
 /// The commands the launcher takes: its own, the archs', and the rest.
-pub const known_commands = "run, pull, list, launch, kld, bench, convert, " ++ archCommands() ++ "update, or serve";
+pub const known_commands = "run, pull, list, launch, kld, bench, convert, repack, " ++ archCommands() ++ "update, or serve";
 
 fn archCommands() []const u8 {
     comptime {
@@ -411,7 +430,7 @@ pub const text = blk: {
 };
 
 test "--help is byte for byte what it has always printed, every arch built" {
-    if (registry.served_model_types.len != 4) return error.SkipZigTest;
+    if (registry.served_model_types.len != 5) return error.SkipZigTest;
     try std.testing.expectEqualStrings(@embedFile("fixtures/help.txt"), text);
 }
 
@@ -452,12 +471,12 @@ test "the --think words follow each arch's effort offer" {
 }
 
 test "the arch gate order and the packs' product names make the refusal lists" {
-    if (registry.served_model_types.len != 4) return error.SkipZigTest;
+    if (registry.served_model_types.len != 5) return error.SkipZigTest;
     try std.testing.expectEqualStrings(
-        "qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), glm5_next (GLM-5.3-Flash), and deepseek_v41 (DeepSeek-V4.1-Flash)",
+        "qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), glm5_next (GLM-5.3-Flash), deepseek_v41 (DeepSeek-V4.1-Flash), and hy_v4_flash (Hy4-Flash)",
         packs.served_list,
     );
-    try std.testing.expectEqualStrings("qwen4_exp, mimo_v2, glm5_next or deepseek_v41", packs.served_types_or);
-    try std.testing.expectEqualStrings("GLM low|high|max, Qwen off|low|medium|xhigh, MiMo off or any level (on)", think_values);
+    try std.testing.expectEqualStrings("qwen4_exp, mimo_v2, glm5_next, deepseek_v41 or hy_v4_flash", packs.served_types_or);
+    try std.testing.expectEqualStrings("GLM low|high|max, Hy4 off|high|max, Qwen off|low|medium|xhigh, MiMo off or any level (on)", think_values);
     try std.testing.expectEqualStrings("run, pull, list, launch, kld, bench, convert, repack, update, or serve", known_commands);
 }

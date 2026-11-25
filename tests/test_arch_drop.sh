@@ -31,7 +31,7 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 ROOT=$(pwd -P)
 
-DROPPABLE=(mimo2 dsv41 glm5 qwen4)
+DROPPABLE=(mimo2 dsv41 glm5 qwen4 hy4flash)
 
 REGISTRY=src/arch/registry.zig
 ZIG=${ZIG:-$ROOT/.zig-toolchain/zig}

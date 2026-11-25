@@ -292,6 +292,19 @@ serves, and the names only jinja.cpp has (the `strip` filter, `str.indent`,
 `list.append`) with jinja.cpp's result, read from its `value.cpp`. The engine
 is a fresh Zig design; no jinja.cpp source is vendored or linked.
 
+--------------------------------------------------------------------------------
+AngelSpec
+https://github.com/Tencent/AngelSpec
+Copyright (C) 2026 Tencent. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+Hy4-Flash's DFly2 drafter forward in src/hy4flash/hy4_dfly.zig follows the
+released drafter's training code at commit 0505773a
+(`angelspec/models/draft/dflash.py`, `hy4_mla.py`, `dspark.py`, and
+`angelspec/models/dflash.py`): the slot-0 MTP fusion, the block-causal mask,
+the hidden correction's served chain and the confidence head over its output.
+It is reimplemented in Zig on Sushi Cooler.
+
 
 ================================================================================
 MIT License
@@ -361,6 +374,10 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
   * The DeepSeek-V4.1 fused attention kernel's matrix-unit arm (`dsv41_attn_nax` in `src/dsv41/dsv41_kernels.zig`: the
     `matmul2d` fragment helpers and the tiling of both products), from CommunityServe/plugins #6 by Samuel Reed (@STRML), MIT.
     Modifications: the epilogue store and the packed FP4 row load run on the fragment layout.
+  * The Hy4-Flash prefill attention core (`src/hy4flash/hy4_attn.zig`: the same fragment layout and tiling of both products,
+    keys the scores' left operand and the values' right operand, an f32 operand split into bf16 parts), after the
+    kernel above by Samuel Reed (@STRML), MIT. Modifications: Hy4's 576-wide key row whose first 512 channels are the
+    values, f32 queries split in three, row ranges and picks read where they lie, one simdgroup for the rope channels.
   * The DeepSeek-V4.1 DSpark copy round (`Index.matchBest`, `copyLen` and `CopyBackoff` in `src/mtp_lookup.zig`, the copy arm in
     `src/dsv41/dsv41_dspark.zig`), from CommunityServe/plugins #15 by Samuel Reed (@STRML), MIT. Modifications: the index and
     match code are the MTP lookup's, copies stop at eight verify rows, and the generator keeps the backoff per request.
@@ -417,7 +434,7 @@ Ported after the 2026-09-17 detach; each site names its upstream pull request:
     to the original checkpoint layout. The release itself is MIT, Copyright (c) 2023
     DeepSeek.
   * The DSpark speculative decoder of that arm (`dspark`, `draft`, `verify` and `finishVerify`
-    in `src/dsv41/dsv41_model.zig`, `Generator.nextDspark`), from mlx-serve's `deepseek_v41.zig`
+    in `src/dsv41/dsv41_model.zig`, `Generator.nextDrafterRound`), from mlx-serve's `deepseek_v41.zig`
     at 49bb6be0 (`dsparkDraft`, `dsparkBeginWith`, `dsparkFinish` and their rollback of a
     verify chunk) by David Dalcu. Modifications: the stages and heads load from the original
     `mtp.*` tensors with resident mxfp4 experts, the draft attention and the attention-output
@@ -539,6 +556,38 @@ The row-identical dense projection kernels in `src/mtp_dense_rows.zig`
 adapt MLX v0.32.2 `backend/metal/kernels/gemv.h` and `dot.h`.
 Modifications: independent activation rows share a dispatch, with the
 serial BF16 router and scalar-gate reduction trees preserved.
+
+The Hy4-Flash rope kernel in `src/hy4flash/hy4_rope.zig` adapts
+`rope_single_impl` and the frequency of `rope_single` and `rope` from MLX
+`backend/metal/kernels/rope.metal` (Copyright 2023-2024 Apple Inc.).
+Modifications: the rotation covers a row's trailing dims, the leading dims are
+copied beside it, the input is read through its strides and the output is
+written at the dtype the caller asks for. The indexer score kernel in
+`src/hy4flash/hy4_index.zig` adapts the same rotation, applied to the query's
+and the pooled keys' trailing dims as they are staged in threadgroup memory.
+The attention front kernel in `src/hy4flash/hy4_front.zig` adapts the same
+rotation and `rms_single_row` (below), the latent's norm and its key's rotation
+in one launch.
+
+The Hy4-Flash RMS norm kernel in `src/hy4flash/hy4_norm.zig` adapts
+`rms_single_row` from MLX `backend/metal/kernels/rms_norm.metal` (Copyright
+2024 Apple Inc.). Modifications: the weight is read at its own dtype and
+widened, the rows are read through their strides and may be the sum of two
+inputs, and the output is written at the dtype the caller asks for. The
+Engram head-norm kernel in `src/hy4flash/hy4_engram_gate.zig` adapts the same
+`rms_single_row`, one row per hash head with that head's weight. The
+layer-boundary form of the hyper-connection kernel in
+`src/hy4flash/hy4_hc.zig` adapts it too, its threads run as lanes of the mix's
+threadgroup and the normed row kept in threadgroup memory.
+
+The Hy4-Flash one-row BF16 product in `src/hy4flash/hy4_gemv.zig` adapts
+`GEMVKernel` from MLX `backend/metal/kernels/gemv.h` (Copyright 2023-2024
+Apple Inc.) at its 4 x 4 rows-a-simdgroup tile. Modifications: the f32 row is
+rounded to BF16 as it is read, and the sum is rounded to BF16 and written f32.
+The Hy4-Flash one-row f32 product in `src/hy4flash/hy4_row.zig` adapts the same
+`GEMVKernel` at its 4 x 4 rows-a-simdgroup tile and at its bm1 bn8 tile.
+Modifications: the BF16 weight is widened as it is read, and the first tile's
+rows are spread over more simdgroups.
 
 Several other kernels of ours deliberately reproduce the exact arithmetic of
 MLX ops (reduction order, accumulator dtype, `fast::exp`, the `precise::rsqrt`
@@ -742,3 +791,23 @@ Dual-licensed under Apache-2.0 OR MPL-2.0; used here under Apache-2.0.
 The minified production bundle is vendored inline in src/webui/index.html
 (with only the source-map comment removed). Full upstream license text:
 src/webui/DOMPurify.LICENSE.
+
+================================================================================
+Tencent Hy License, Version 1.0
+================================================================================
+
+--------------------------------------------------------------------------------
+Hy4-Flash release files
+https://huggingface.co/tencent/Hy4-flash
+Copyright (c) Tencent
+Licensed under the Tencent Hy License, Version 1.0 (derived from the Apache
+License, Version 2.0), shipped with the release as LICENSE.
+
+src/hy4flash/fixtures/hy_v4_flash.json is the release's `config.json`, unmodified;
+src/hy4flash/fixtures/hy4_tensors.txt lists the release's tensor names, dtypes and
+shapes as its safetensors shard headers give them; hy4_chat_template.jinja is the
+release's `chat_template.jinja` and hy4_pre_tokenizer.json its tokenizer.json's
+`pre_tokenizer`, both unmodified. The
+Hy4-Flash forward in src/hy4flash/ follows the release's modeling code in
+huggingface/transformers (`models/hy_v4_flash`) and the llama.cpp graph of
+ggml-org/llama.cpp pull request 32517, implemented in Zig on Sushi Cooler.

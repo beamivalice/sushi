@@ -3,7 +3,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const think_tags = @import("think_tags.zig");
 const tool_reading = @import("tool_reading.zig");
-const tagLenAt = think_tags.tagLenAt;
+const tagLenAt = think_tags.callTagLenAt;
 const streamShouldBufferForTools = think_tags.streamShouldBufferForTools;
 const testing = std.testing;
 const chat = @import("chat.zig");
@@ -42,6 +42,32 @@ const loadChatConfig = chat.loadChatConfig;
 const replayTurn = chat.replayTurn;
 const synthesizeToolFallbackMessages = chat.synthesizeToolFallbackMessages;
 const toolNameIsDeclared = tool_schema.toolNameIsDeclared;
+
+/// Hy4's spelling of GLM's calls: `<tool_calls:opensource>` around `<tool_call:opensource>NAME<arg_key:opensource>K
+/// </arg_key:opensource><arg_value:opensource>V</arg_value:opensource></tool_call:opensource>`. The copy in GLM's
+/// plain tags with the wrapper dropped, or null when the text has none.
+fn opensourceTagRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, text, ":opensource>") == null) return null;
+    const pairs = [_][2][]const u8{
+        .{ "<tool_calls:opensource>", "" },           .{ "</tool_calls:opensource>", "" },
+        .{ "<tool_call:opensource>", "<tool_call>" }, .{ "</tool_call:opensource>", "</tool_call>" },
+        .{ "<arg_key:opensource>", "<arg_key>" },     .{ "</arg_key:opensource>", "</arg_key>" },
+        .{ "<arg_value:opensource>", "<arg_value>" }, .{ "</arg_value:opensource>", "</arg_value>" },
+    };
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    outer: while (i < text.len) {
+        if (text[i] == '<') for (pairs) |p| if (std.mem.startsWith(u8, text[i..], p[0])) {
+            try out.appendSlice(allocator, p[1]);
+            i += p[0].len;
+            continue :outer;
+        };
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    return try out.toOwnedSlice(allocator);
+}
 
 /// `<tool_call>` followed by a special token spelled where `<` belongs
 /// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none.
@@ -106,6 +132,10 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
 
+    const opensource_fixed = try opensourceTagRepair(allocator, effective_text);
+    defer if (opensource_fixed) |r| allocator.free(r);
+    if (opensource_fixed) |r| effective_text = r;
+
     const special_fixed = try hermesSpecialOpenerRepair(allocator, effective_text);
     defer if (special_fixed) |r| allocator.free(r);
     if (special_fixed) |r| effective_text = r;
@@ -166,10 +196,7 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
         }
         // Gemma 4 close marker: `<tool_call|>`. Detected when after `<tool`
         // we see `_call|`. Let the Gemma 4 branch below pick this up.
-        if (next == '_'
-            and after_tool + 6 <= effective_text.len
-            and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|"))
-        {
+        if (next == '_' and after_tool + 6 <= effective_text.len and std.mem.eql(u8, effective_text[after_tool .. after_tool + 6], "_call|")) {
             search_pos = after_tool + 6;
             continue;
         }
@@ -729,7 +756,7 @@ fn parseSelfClosingToolTag(slice: []const u8) ?struct { name: []const u8, argume
         var w: usize = k + 1;
         while (w < slice.len and (slice[w] == ' ' or slice[w] == '\t' or slice[w] == '\n' or slice[w] == '\r')) w += 1;
         const close_markers = [_][]const u8{
-            "</tool_call>",   "</tool_calls>",
+            "</tool_call>",    "</tool_calls>",
             "</tool_request>", "</tool_requests>",
             "</tool>",
         };
@@ -4938,7 +4965,7 @@ test "parseToolCalls: <tool_call>{JSON} truncated before </tool_call>" {
     const allocator = testing.allocator;
     const text = "\n\n<tool_call>\n" ++
         \\{"name": "writeFile", "arguments": {"path": "vite.config.js", "content": "ok"}}
-        ++ "\n</tool_cal";
+    ++ "\n</tool_cal";
     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
@@ -4961,7 +4988,7 @@ test "parseToolCalls: mismatched </tool_action> close still parses" {
     const allocator = testing.allocator;
     const text = "<tool_call>\n" ++
         \\{"name": "edit", "arguments": {"path":"mlx.html", "edits":[{"oldText": "  </ul>\n</body>", "newText": "  </ul>\n  <button onclick=\"alert('Hello from MLX')\">Click me</button>\n</body>"}]}
-        ++ "\n</tool_action>";
+    ++ "\n</tool_action>";
     const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
@@ -5200,6 +5227,30 @@ test "parseToolCalls: NO path emits invalid JSON args (final safety net)" {
 }
 
 // ── GLM arg_key/arg_value tag-format tool calls ──
+
+test "parseToolCalls arg_key: Hy4's :opensource spelling inside its <tool_calls:opensource> wrapper, two calls" {
+    const raw = "<tool_calls:opensource><tool_call:opensource>write_file" ++
+        "<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>jfk.txt</arg_value:opensource>" ++
+        "<arg_key:opensource>count</arg_key:opensource><arg_value:opensource>3</arg_value:opensource>" ++
+        "</tool_call:opensource><tool_call:opensource>get_time</tool_call:opensource></tool_calls:opensource>";
+    const calls = (try parseToolCallsAs(testing.allocator, raw, .arg_key)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("jfk.txt", parsed.value.object.get("path").?.string);
+    // Untyped here, as GLM's: the declared schema types a value later.
+    try testing.expectEqualStrings("3", parsed.value.object.get("count").?.string);
+    try testing.expectEqualStrings("get_time", calls[1].name);
+    try testing.expectEqualStrings("{}", calls[1].arguments);
+}
 
 test "parseToolCalls arg_key/arg_value format (single call, hostile value bytes)" {
     const raw = "<tool_call>write_file\n" ++

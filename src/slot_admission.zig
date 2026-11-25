@@ -18,6 +18,7 @@ const Slot = scheduler_mod.Slot;
 const submitTestScheduler = scheduler_mod.submitTestScheduler;
 const sched = @import("arch/sched.zig");
 const sched_policy = @import("sched_policy.zig");
+const static_bill = @import("static_bill.zig");
 
 pub const PostEvictionWidth = struct {
     /// The width the prefill runs at. Always the re-ask.
@@ -59,10 +60,11 @@ pub fn fewerCheckpointsToAdmit(cap: u32, ctx: ?*anyopaque, fits: *const fn (?*an
 }
 
 /// Does the inference thread run the evict-to-admit pass for this model? The connection
-/// thread's credits (`server.creditedAdmissionBill`) read the same predicate.
+/// thread's credits (`server.creditedAdmissionBill`) read the same predicate. A load on the ledger runs none: its
+/// admission releases the parked state itself (`static_bill.admit`).
 pub fn admissionPassArmed(cfg: ?*const ModelConfig) bool {
     const c = cfg orelse return false;
-    return c.admissionEvictsHotCache();
+    return c.static_ledger == null and c.admissionEvictsHotCache();
 }
 
 /// What `Generator.InitOptions.adaptive_chunk_width` gets for a slot.
@@ -336,7 +338,7 @@ pub fn releaseHoldLocked(sch: *Scheduler, freed: LiveHold) void {
 
 /// `admitsWithinMemory` over this tick's admits; called under `queue_mu`.
 pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
-    const numbers_fn = scheduler_mod.prefill_admission_numbers orelse return admit_idx.len;
+    const numbers_fn = scheduler_mod.prefill_admission_numbers;
     // A finished request whose slot is not freed yet still holds its memory: it is company too.
     var live = sch.live_hold.requests > 0;
     var outstanding: u64 = 0;
@@ -352,7 +354,10 @@ pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         const s = sch.pending.items[idx];
         const cfg = s.model.config orelse continue;
         if (s.model.handle == null) continue;
-        bills[i] = numbers_fn(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, prefill_plan.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp);
+        bills[i] = static_bill.holdBill(cfg, s.full_prompt.len, s.max_tokens, s.deferred_media) orelse if (numbers_fn) |f|
+            f(cfg, s.full_prompt.len, s.max_tokens, s.cache.config, prefill_plan.visionPrefillUnchunked(s.vision_embeddings != null or s.deferred_media != null), s.enable_mtp)
+        else
+            null;
     }
     const admitted = admitsWithinMemory(bills[0..n], live, outstanding);
     for (admit_idx[0..admitted], bills[0..admitted]) |idx, bill| {

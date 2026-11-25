@@ -56,6 +56,8 @@ const gpu_clock_live = @import("gpu_clock_live.zig");
 const json_text = @import("json_text.zig");
 const settings_api = @import("settings_api.zig");
 const bills = @import("bills.zig");
+const static_bill = @import("static_bill.zig");
+const vision_queue = @import("vision_queue.zig");
 const arch_fx = @import("arch_fixtures_test.zig");
 const media_fx = @import("request_media_fixtures_test.zig");
 const fixtures = @import("bills_fixtures_test.zig");
@@ -210,9 +212,10 @@ pub fn mtpCapable(lm: *LoadedModel) bool {
     return lm.mtp != null;
 }
 
-/// DSpark verifies each row under that row's grammar mask, so a constrained request may speculate with it.
+/// A block drafter (DSpark, DFly2) verifies each row under that row's grammar mask, so a constrained request may
+/// speculate with it.
 pub fn rowMaskedDrafter(lm: *LoadedModel) bool {
-    return if (lm.mtp) |head| head.kind() == .dspark else false;
+    return if (lm.mtp) |head| head.kind().blockDrafter() else false;
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
@@ -1694,10 +1697,6 @@ const IdleUnloadFit = struct {
     unchunked_prefill: bool,
     enable_mtp: bool,
 
-    fn fits(self: *IdleUnloadFit) bool {
-        return self.bill.fitsAfterEviction();
-    }
-
     fn unloadOne(self: *IdleUnloadFit) bool {
         const gone = self.sch.unloadLruIdleModel(if (self.model) |m| m.id else "") orelse return false;
         log.info("  prompt {d} tokens does not fit: unloaded idle model {s} ({d} MB)\n", .{ self.prompt_ids.len, gone.id, gone.bytes / (1024 * 1024) });
@@ -1707,8 +1706,10 @@ const IdleUnloadFit = struct {
 };
 
 /// `model` is the requested model (null in a test with none), whose hot cache alone is credited and which stays loaded.
-pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, model: ?*LoadedModel, is_anthropic: bool, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool) !bool {
-    if (arch_flags.kvQuantRequestRefusal(config, kv_override orelse configuredKvQuantFor(config))) |msg| {
+/// `media` is the request's deferred images, which a load on the ledger bills with the request.
+pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, model: ?*LoadedModel, is_anthropic: bool, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool, media: ?*const vision_queue.DeferredMedia) !bool {
+    const kv = kv_override orelse configuredKvQuantFor(config);
+    if (arch_flags.kvQuantRequestRefusal(config, kv) orelse static_bill.kvRefusal(config, kv)) |msg| {
         if (is_anthropic) {
             try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -1717,6 +1718,20 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         return false;
     }
     const prompt_len: usize = prompt_ids.len;
+    if (config.static_ledger != null) switch (static_bill.check(config, prompt_len, max_tokens, media)) {
+        .proceed => return true,
+        .refused => |r| {
+            const msg = try bills.memoryContextRefusalMessage(allocator, r);
+            defer allocator.free(msg);
+            countRejected();
+            if (is_anthropic) {
+                try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+            } else {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+            }
+            return false;
+        },
+    };
     if (config.num_attention_heads == 0) return true; // unknown architecture, skip check
     // The connection thread has no slot and no cache: it bills cold and defers a warm prompt.
     var bill = prefillAdmissionBill(config, model, prompt_len, max_tokens, kv_override, unchunked_prefill, prompt_ids, .{ .mtp_on = enable_mtp });
@@ -1746,7 +1761,7 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
     // them, least recently used first, before it refuses.
     if (needed > available) if (server_state.global_scheduler) |sch| {
         var unloading = IdleUnloadFit{ .sch = sch, .model = model, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked_prefill = unchunked_prefill, .enable_mtp = enable_mtp };
-        if (fitAfterUnloadingIdle(&unloading, IdleUnloadFit.fits, IdleUnloadFit.unloadOne)) return true;
+        if (fitAfterUnloadingIdle(&bill, &unloading, IdleUnloadFit.unloadOne)) return true;
     };
     // Running requests give back what they hold when they finish. A prompt that fits then waits in the queue, which
     // holds it beside them (`memoryAdmitCount`); alone, the prefill evicts or refuses it by name.
@@ -1769,7 +1784,6 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Con
         // is evictable here by construction (the withheld case took the deferral arm). Where a refusal can name the
         // max_tokens and context that fit, it is the inference thread's text; else the cache clause is only true
         // where the bill carries the cache.
-        const kv = kv_override orelse configuredKvQuantFor(config);
         const refusal = bills.requestContextRefusal(config, prompt_len, max_tokens, kv, bill, .{ .mtp_on = enable_mtp });
         const msg = if (refusal) |r|
             try bills.memoryContextRefusalMessage(allocator, r)
@@ -2782,7 +2796,7 @@ pub fn handleChatCompletions(
 
     // Check if attention computation would exceed GPU memory.
     const bill_head = requestBillsMtpHead(enable_drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), .{ .repeat_penalty = repeat_penalty, .presence_penalty = presence_penalty, .frequency_penalty = frequency_penalty });
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, prefill_plan.visionPrefillUnchunked(req_media.deferred != null), bill_head, req_media.deferred)) return;
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
@@ -4191,7 +4205,7 @@ test "a request a non-Sushi bill refuses for its max_tokens names the max_tokens
     defer _ = std.c.close(sv[1]);
     var conn: http_conn.Conn = undefined;
     http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
-    const admitted = try checkAttentionMemory(a, &conn, &prompt, 1_000_000, &cfg, null, false, null, false, false);
+    const admitted = try checkAttentionMemory(a, &conn, &prompt, 1_000_000, &cfg, null, false, null, false, false, null);
     _ = std.c.close(sv[0]);
     var buf: [8192]u8 = undefined;
     const raw = readAllFromPair(sv[1], &buf);
@@ -4232,7 +4246,7 @@ test "a request whose max_tokens alone does not fit is refused on the connection
     defer _ = std.c.close(sv[1]);
     var conn: http_conn.Conn = undefined;
     http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
-    const admitted = try checkAttentionMemory(a, &conn, &prompt, asked, &cfg, null, false, null, false, false);
+    const admitted = try checkAttentionMemory(a, &conn, &prompt, asked, &cfg, null, false, null, false, false, null);
     _ = std.c.close(sv[0]);
     var buf: [8192]u8 = undefined;
     const raw = readAllFromPair(sv[1], &buf);
@@ -4291,7 +4305,7 @@ test "admission: a prompt that fits once the running requests finish waits in th
         defer _ = std.c.close(sv[1]);
         var conn: http_conn.Conn = undefined;
         http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
-        const admitted = try checkAttentionMemory(a, &conn, &prompt, asked, &cfg, null, false, null, false, false);
+        const admitted = try checkAttentionMemory(a, &conn, &prompt, asked, &cfg, null, false, null, false, false, null);
         _ = std.c.close(sv[0]);
         var buf: [8192]u8 = undefined;
         const raw = readAllFromPair(sv[1], &buf);
@@ -4321,7 +4335,7 @@ test "a kv_quant the arch refuses ends a Responses WebSocket turn in its error f
     var conn: http_conn.Conn = undefined;
     conn.ws_mode = &bridge;
     const cfg = try fixtures.glmAssistantFixture();
-    try std.testing.expect(!try checkAttentionMemory(a, &conn, &.{ 1, 2, 3 }, 8, &cfg, null, false, trunk.KVQuantConfig.affine(4), false, false));
+    try std.testing.expect(!try checkAttentionMemory(a, &conn, &.{ 1, 2, 3 }, 8, &cfg, null, false, trunk.KVQuantConfig.affine(4), false, false, null));
     try std.testing.expect(std.mem.startsWith(u8, frames.out.items, "{\"type\":\"error\",\"status\":400,"));
 }
 

@@ -2,6 +2,7 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const convert = @import("convert.zig");
 const source = @import("source.zig");
+const stages_mod = @import("stages.zig");
 
 pub const Error = error{ HessianBadShape, HessianExpertOutOfRange } || std.mem.Allocator.Error;
 
@@ -13,8 +14,16 @@ pub const RowsHessians = struct {
     mtp: bool,
     geom: convert.Geometry,
     x: mlx.mlx_array,
+    /// The same tokens' rows on the BF16 path, for the compensated target (`target.zig`); routing stays `x`'s.
+    xf: ?mlx.mlx_array = null,
+    /// The down projections' own rows and routing, when they differ from gate/up's.
+    down_rows: ?*RowsHessians = null,
     starts: []usize,
     order: []i32,
+    /// The checkpoint the source experts come from, and its SwiGLU clamp (0 = none): gate capped at the limit,
+    /// up clipped to +-limit, as DeepSeek-V4.1 runs them.
+    arch: source.Arch = .qwen4_exp,
+    limit: f32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -55,10 +64,15 @@ pub const RowsHessians = struct {
     }
 
     pub fn hessianSource(self: *RowsHessians) convert.HessianSource {
+        if (self.xf != null) return .{ .ctx = self, .gate_up = gateUp, .down = down, .gate_up_target = gateUpTarget, .down_target = downTarget };
         return .{ .ctx = self, .gate_up = gateUp, .down = down };
     }
 
     fn routedRows(self: *RowsHessians, expert: usize) !mlx.mlx_array {
+        return self.routedRowsOf(self.x, expert);
+    }
+
+    fn routedRowsOf(self: *RowsHessians, from: mlx.mlx_array, expert: usize) !mlx.mlx_array {
         if (expert >= self.geom.experts) return error.HessianExpertOutOfRange;
         const lo = self.starts[expert];
         const hi = self.starts[expert + 1];
@@ -66,8 +80,131 @@ pub const RowsHessians = struct {
         defer _ = mlx.mlx_array_free(idx);
         var rows = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(rows);
-        try mlx.check(mlx.mlx_take_axis(&rows, self.x, idx, 0, self.s));
-        return rows;
+        try mlx.check(mlx.mlx_take_axis(&rows, from, idx, 0, self.s));
+        if (mlx.mlx_array_dtype(rows) == .float32) return rows;
+        var wide = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(wide);
+        try mlx.check(mlx.mlx_astype(&wide, rows, .float32, self.s));
+        _ = mlx.mlx_array_free(rows);
+        return wide;
+    }
+
+    /// a' b into `out`.
+    fn crossInto(self: *RowsHessians, a: mlx.mlx_array, b: mlx.mlx_array, out: []f32) !void {
+        var at = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(at);
+        try mlx.check(mlx.mlx_transpose(&at, a, self.s));
+        var g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g);
+        try mlx.check(mlx.mlx_matmul(&g, at, b, self.s));
+        try evalWaited(g);
+        const data = mlx.mlx_array_data_float32(g) orelse return error.HessianBadShape;
+        @memcpy(out, data[0..out.len]);
+    }
+
+    fn matmulHost(self: *RowsHessians, rows: mlx.mlx_array, w: []const f32, in: usize, out: usize) !mlx.mlx_array {
+        const wa = mlx.mlx_array_new_data(w.ptr, &[_]c_int{ @intCast(in), @intCast(out) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(wa);
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_matmul(&y, rows, wa, self.s));
+        return y;
+    }
+
+    fn swiglu(self: *RowsHessians, g_in: mlx.mlx_array, u_in: mlx.mlx_array) !mlx.mlx_array {
+        var g = g_in;
+        var u = u_in;
+        var capped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(capped);
+        var clipped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(clipped);
+        if (self.limit > 0) {
+            const hi = mlx.mlx_array_new_float(self.limit);
+            defer _ = mlx.mlx_array_free(hi);
+            const lo = mlx.mlx_array_new_float(-self.limit);
+            defer _ = mlx.mlx_array_free(lo);
+            try mlx.check(mlx.mlx_minimum(&capped, g, hi, self.s));
+            try mlx.check(mlx.mlx_clip(&clipped, u, lo, hi, self.s));
+            g = capped;
+            u = clipped;
+        }
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        try mlx.check(mlx.mlx_sigmoid(&sig, g, self.s));
+        var silu = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(silu);
+        try mlx.check(mlx.mlx_multiply(&silu, g, sig, self.s));
+        var act = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(act);
+        try mlx.check(mlx.mlx_multiply(&act, silu, u, self.s));
+        return act;
+    }
+
+    /// Gate/up: X~'X~ into `h`, and X~'X [Wg | Wu] into `cw` ([hidden, 2 inter], each row gate then up).
+    fn gateUpTarget(ctx: *anyopaque, expert: usize, h: []f32, cw: []f32) anyerror!u64 {
+        const self: *RowsHessians = @ptrCast(@alignCast(ctx));
+        const hid = self.geom.hidden;
+        const i = self.geom.inter;
+        if (h.len != hid * hid or cw.len != hid * 2 * i) return error.HessianBadShape;
+        const m = self.starts[expert + 1] - self.starts[expert];
+        if (m == 0) return 0;
+        const xq = try self.routedRows(expert);
+        defer _ = mlx.mlx_array_free(xq);
+        const xf = try self.routedRowsOf(self.xf.?, expert);
+        defer _ = mlx.mlx_array_free(xf);
+        try self.gram(xq, h);
+        const w = try self.allocator.alloc(f32, hid * 2 * i);
+        defer self.allocator.free(w);
+        const part = try self.allocator.alloc(f32, hid * i);
+        defer self.allocator.free(part);
+        for ([_]source.ProjRole{ .gate, .up }, 0..) |role, side| {
+            try self.src.readExpertPublic(self.allocator, self.arch, self.layer, self.mtp, role, expert, hid, i, part);
+            for (0..hid) |r| @memcpy(w[r * 2 * i + side * i ..][0..i], part[r * i ..][0..i]);
+        }
+        const p = try self.matmulHost(xf, w, hid, 2 * i);
+        defer _ = mlx.mlx_array_free(p);
+        try self.crossInto(xq, p, cw);
+        return m;
+    }
+
+    /// Down: over the SwiGLU activations, X~ through this expert's quantized gate/up (`gate_q`, `up_q`, public
+    /// [hidden, inter]) and X through the source's; X~'X~ into `h`, X~'X Wd into `cw` ([inter, hidden]).
+    fn downOf(ctx: *anyopaque) *RowsHessians {
+        const self: *RowsHessians = @ptrCast(@alignCast(ctx));
+        return self.down_rows orelse self;
+    }
+
+    fn downTarget(ctx: *anyopaque, expert: usize, gate_q: []const f32, up_q: []const f32, h: []f32, cw: []f32) anyerror!u64 {
+        const self = downOf(ctx);
+        const hid = self.geom.hidden;
+        const i = self.geom.inter;
+        if (h.len != i * i or cw.len != i * hid or gate_q.len != hid * i or up_q.len != hid * i) return error.HessianBadShape;
+        const m = self.starts[expert + 1] - self.starts[expert];
+        if (m == 0) return 0;
+        const xq = try self.routedRows(expert);
+        defer _ = mlx.mlx_array_free(xq);
+        const xf = try self.routedRowsOf(self.xf.?, expert);
+        defer _ = mlx.mlx_array_free(xf);
+        const gq = try self.matmulHost(xq, gate_q, hid, i);
+        defer _ = mlx.mlx_array_free(gq);
+        const uq = try self.matmulHost(xq, up_q, hid, i);
+        defer _ = mlx.mlx_array_free(uq);
+        const act_q = try self.swiglu(gq, uq);
+        defer _ = mlx.mlx_array_free(act_q);
+        const gf = try self.projected(xf, expert, .gate);
+        defer _ = mlx.mlx_array_free(gf);
+        const uf = try self.projected(xf, expert, .up);
+        defer _ = mlx.mlx_array_free(uf);
+        const act_f = try self.swiglu(gf, uf);
+        defer _ = mlx.mlx_array_free(act_f);
+        try self.gram(act_q, h);
+        const wd = try self.allocator.alloc(f32, i * hid);
+        defer self.allocator.free(wd);
+        try self.src.readExpertPublic(self.allocator, self.arch, self.layer, self.mtp, .down, expert, i, hid, wd);
+        const p = try self.matmulHost(act_f, wd, i, hid);
+        defer _ = mlx.mlx_array_free(p);
+        try self.crossInto(act_q, p, cw);
+        return m;
     }
 
     fn gram(self: *RowsHessians, a: mlx.mlx_array, out: []f32) !void {
@@ -77,7 +214,7 @@ pub const RowsHessians = struct {
         var g = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(g);
         try mlx.check(mlx.mlx_matmul(&g, at, a, self.s));
-        try mlx.check(mlx.mlx_array_eval(g));
+        try evalWaited(g);
         const data = mlx.mlx_array_data_float32(g) orelse return error.HessianBadShape;
         @memcpy(out, data[0..out.len]);
     }
@@ -98,18 +235,18 @@ pub const RowsHessians = struct {
         const i = self.geom.inter;
         const w = try self.allocator.alloc(f32, h * i);
         defer self.allocator.free(w);
-        try self.src.readExpertPublic(self.allocator, .qwen4_exp, self.layer, self.mtp, role, expert, h, i, w);
+        try self.src.readExpertPublic(self.allocator, self.arch, self.layer, self.mtp, role, expert, h, i, w);
         const wa = mlx.mlx_array_new_data(w.ptr, &[_]c_int{ @intCast(h), @intCast(i) }, 2, .float32);
         defer _ = mlx.mlx_array_free(wa);
         var y = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_matmul(&y, rows, wa, self.s));
-        try mlx.check(mlx.mlx_array_eval(y));
+        try evalWaited(y);
         return y;
     }
 
     fn down(ctx: *anyopaque, expert: usize, out: []f32) anyerror!u64 {
-        const self: *RowsHessians = @ptrCast(@alignCast(ctx));
+        const self = downOf(ctx);
         if (out.len != self.geom.inter * self.geom.inter) return error.HessianBadShape;
         const m = self.starts[expert + 1] - self.starts[expert];
         if (m == 0) return 0;
@@ -119,19 +256,18 @@ pub const RowsHessians = struct {
         defer _ = mlx.mlx_array_free(g);
         const u = try self.projected(rows, expert, .up);
         defer _ = mlx.mlx_array_free(u);
-        var sig = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sig);
-        try mlx.check(mlx.mlx_sigmoid(&sig, g, self.s));
-        var silu = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(silu);
-        try mlx.check(mlx.mlx_multiply(&silu, g, sig, self.s));
-        var act = mlx.mlx_array_new();
+        const act = try self.swiglu(g, u);
         defer _ = mlx.mlx_array_free(act);
-        try mlx.check(mlx.mlx_multiply(&act, silu, u, self.s));
         try self.gram(act, out);
         return m;
     }
 };
+
+fn evalWaited(a: mlx.mlx_array) !void {
+    const t0 = stages_mod.nowNs();
+    defer stages_mod.waitedSince(t0);
+    try mlx.check(mlx.mlx_array_eval(a));
+}
 
 fn expectGramClose(want: []const f64, got: []const f32, n: usize) !void {
     for (0..n) |i| for (0..n) |j| {

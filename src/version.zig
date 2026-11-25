@@ -270,8 +270,9 @@ test "version: the guest manifest lists exactly the (format, codebook) pairs the
         const raw = try std.fmt.bufPrint(&buf, "{{\"expert_quant\":{{\"format\":\"{s}\",\"k\":2,\"codebook\":\"{s}\"}}}}", .{ entry.format, @tagName(cb) });
         const config = try std.json.parseFromSlice(std.json.Value, t.allocator, raw, .{});
         defer config.deinit();
-        // A table-keyed config without its table is still refused, but past the format gate.
-        const admitted = if (@import("sushi_exl3").parseExpertQuant(config.value.object)) |_| true else |err| err != error.ExpertLayoutUnsupported;
+        // A table-keyed config without its table is still refused, but past the format gate; a tabled codebook under
+        // `exl3` is refused at the gate, as a legacy config.
+        const admitted = if (@import("sushi_exl3").parseExpertQuant(config.value.object)) |_| true else |err| err != error.ExpertLayoutUnsupported and err != error.Exl3CodebookTableLegacyConfig;
         var in_manifest = false;
         if (block.get(entry.key)) |list| for (list.array.items) |name| {
             if (std.mem.eql(u8, name.string, @tagName(cb))) in_manifest = true;

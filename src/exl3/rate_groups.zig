@@ -1170,18 +1170,7 @@ const REDUCE_EXPAND_STORE: [:0]const u8 =
     \\}
 ;
 
-const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
-    REDUCE_FUSED_SOURCE,
-    "const float scv = 0.08838834764831845f;",
-    REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"),
-    "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));",
-    REDUCE_EXPAND_STORE),
-    "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));",
-    ""),
-    "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));",
-    ""),
-    "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));",
-    "");
+const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const float scv = 0.08838834764831845f;", REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", REDUCE_EXPAND_STORE), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", ""), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", ""), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "");
 
 /// One for MLX's streams and one for the engine's: an array belongs to the side that made it.
 var unit_score: @import("side_cache.zig").SideCache(void, 1) = .{};
@@ -1636,8 +1625,8 @@ pub var prefill_chains: u64 = 0;
 
 fn logEngaged(arm: enum { decode, prefill }, rb: *const Ragged, pair: usize, down: usize) void {
     if (arm == .prefill) prefill_chains += 1;
-    if (engaged[@intFromEnum(arm)]) return;
-    engaged[@intFromEnum(arm)] = true;
+    if (engaged[@backingInt(arm)]) return;
+    engaged[@backingInt(arm)] = true;
     if (@import("builtin").is_test) return;
     switch (arm) {
         .decode => log.info("[exl3-groups] decode engaged groups={d} pair classes={d} down classes={d}\n", .{ rb.count, pair, down }),
@@ -1707,15 +1696,18 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
 /// per expert), the inverse sort order, and each sorted row's expert index inside its group.
 const GROUP_WINDOW_SOURCE: [:0]const u8 =
     \\const uint tid = uint(thread_index_in_threadgroup);
+    \\const uint tg = uint(threadgroup_position_in_grid.x);
     \\const uint n = uint(count[0]), groups = uint(count[1]), experts = uint(threads_per_threadgroup.x);
+    \\const uint idx = tg * experts + tid;
+    \\if (idx < n) {
+    \\  inverse[uint(order[idx])] = idx;
+    \\  local[idx] = meta[uint(eids[idx]) * 8u + 7u];
+    \\}
+    \\if (tg != 0u) return;
     \\const uint C = (n + uint(WIN) - 1u) / uint(WIN);
     \\const uint capacity = groups * C + experts;
     \\threadgroup uint counts[MAX_EXPERTS];
     \\for (uint i = tid; i < capacity; i += experts) { starts[i] = 0u; nlives[i] = 0u; }
-    \\for (uint i = tid; i < n; i += experts) {
-    \\  inverse[uint(order[i])] = i;
-    \\  local[i] = meta[uint(eids[i]) * 8u + 7u];
-    \\}
     \\uint lo = 0u, hi = n;
     \\while (lo < hi) { uint m = (lo + hi) >> 1u; if (uint(eids[m]) < tid) lo = m + 1u; else hi = m; }
     \\const uint first = lo;
@@ -1740,6 +1732,12 @@ var group_window_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 const GroupWindows = struct { starts: mlx.mlx_array, nlives: mlx.mlx_array, inverse: mlx.mlx_array, local: mlx.mlx_array, per_all: c_int };
 
+/// The grid of a launch spreading `n` rows over threadgroups of `e` threads, whole threadgroups.
+fn groupWindowGrid(n: c_int, e: c_int) c_int {
+    const tgs: c_int = @max(1, @divTrunc(n + e - 1, e));
+    return tgs * e;
+}
+
 fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, order: mlx.mlx_array, n: c_int, win: c_int) !GroupWindows {
     if (rb.experts > PREFILL_MAX_EXPERTS) return error.Exl3RaggedPrefillExperts;
     const per_all = @divTrunc(n + win - 1, win);
@@ -1749,7 +1747,7 @@ fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, ord
     for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{capacity}, 1, .uint32));
     for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &.{n}, 1, .uint32));
     const e: c_int = @intCast(rb.experts);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, e, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, groupWindowGrid(n, e), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, e, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WIN", win));
     // The expert and group counts of a split bank change per chunk, so they ride in `count`, not the kernel name.
@@ -2058,15 +2056,22 @@ pub fn moePrefillClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged,
 
 /// `moePrefillClamped`, keeping each pool's gate and up planes in `early`.
 pub fn moePrefillEarly(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, early: ?*EarlyPlanes) !mlx.mlx_array {
-    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit);
+    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit, null);
+}
+
+/// `moePrefillEarly` returning its routed sum in `out_dtype` (the finish's reduce writes it, as the decode chain's
+/// does): f32 lets a caller that adds several routes' sums (a route split into expert groups) round once.
+pub fn moePrefillEarlyTo(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, early: ?*EarlyPlanes, out_dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    return moePrefillFrom(s, x, .{ .filled = .{ .rb = rb, .early = early } }, slots, scores, topk, limit, out_dtype);
 }
 
 /// `moePrefillEarly` with the fill read group by group (`FillStages`), as `moePrefillSharedFusedStaged`.
 pub fn moePrefillStaged(s: mlx.mlx_stream, x: mlx.mlx_array, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, stages: FillStages) !mlx.mlx_array {
-    return moePrefillFrom(s, x, .{ .staged = stages }, slots, scores, topk, limit);
+    return moePrefillFrom(s, x, .{ .staged = stages }, slots, scores, topk, limit, null);
 }
 
-fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int) !mlx.mlx_array {
+/// `out_dtype` null: the routed sum in x's dtype.
+fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: mlx.mlx_array, scores: mlx.mlx_array, topk: c_int, limit: c_int, out_dtype: ?mlx.mlx_dtype) !mlx.mlx_array {
     const rb = try src.bank();
     const rows = mlx.getShape(x)[0];
     const n = rows * topk;
@@ -2095,7 +2100,7 @@ fn moePrefillFrom(s: mlx.mlx_stream, x: mlx.mlx_array, src: PlaneSource, slots: 
     defer _ = mlx.mlx_array_free(mid);
     const d = try groupedGemm(s, mid, rb, 2, sorted, &w, win, null);
     defer _ = mlx.mlx_array_free(d);
-    return sorted_windows.finishSortedInverse(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, mlx.mlx_array_dtype(x));
+    return sorted_windows.finishSortedInverse(s, d, w.inverse, rb.svh[2], slots, scores, rb.hidden, rows, topk, out_dtype orelse mlx.mlx_array_dtype(x));
 }
 
 // ---- Prefill with the shared expert riding the routed launches ----
@@ -2130,36 +2135,13 @@ const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalR
     kernels.MID_SOURCE,
     "const uint eid = uint(slots[slot]);",
     "",
-), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"),
-    "v = float4(float(iu[xb + lane]),",
-    "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"),
-    "if constexpr (CLAMP_LIMIT > 0) {",
-    "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"),
-    "const float h0 = silu0 * u0;",
-    "const float h0 = float(bfloat16_t(silu0 * u0));"),
-    "const float h1 = silu1 * u1;",
-    "const float h1 = float(bfloat16_t(silu1 * u1));"),
-    "const float h2 = silu2 * u2;",
-    "const float h2 = float(bfloat16_t(silu2 * u2));"),
-    "const float h3 = silu3 * u3;",
-    "const float h3 = float(bfloat16_t(silu3 * u3));");
+), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"), "v = float4(float(iu[xb + lane]),", "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"), "if constexpr (CLAMP_LIMIT > 0) {", "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"), "const float h0 = silu0 * u0;", "const float h0 = float(bfloat16_t(silu0 * u0));"), "const float h1 = silu1 * u1;", "const float h1 = float(bfloat16_t(silu1 * u1));"), "const float h2 = silu2 * u2;", "const float h2 = float(bfloat16_t(silu2 * u2));"), "const float h3 = silu3 * u3;", "const float h3 = float(bfloat16_t(silu3 * u3));");
 
 const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
 
 /// `REDUCE_FUSED_SOURCE` over a sorted down plane: the routed slot's row is `inverse[slot]`, and the sum is the f32 add
 /// of the routed bf16 sum and the shared bf16 result, stored f32 (the add the forward makes after both).
-const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
-    REDUCE_FUSED_SOURCE,
-    "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;",
-    "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"),
-    "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));",
-    "y[yb + lane] = float(T(a0)) + float(ST(b0));"),
-    "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));",
-    "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"),
-    "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));",
-    "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"),
-    "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));",
-    "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
+const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;", "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", "y[yb + lane] = float(T(a0)) + float(ST(b0));"), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
 
 /// `PREFILL_REDUCE_SOURCE` reading a routed row from the plane of its rate group (`inner0..`).
 const PREFILL_REDUCE_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
@@ -2227,7 +2209,7 @@ fn prefillFused(stage: PrefillStage, g: PrefillGeo) !PrefillFused {
     defer arena.deinit();
     const alloc = arena.allocator();
     const p = try prefillParts(alloc, stage, g);
-    const slot = &prefill_fused_kernels[@intFromEnum(stage)];
+    const slot = &prefill_fused_kernels[@backingInt(stage)];
     const kernel = slot.* orelse blk: {
         const src = try fuse.sourceRuntime(alloc, p.a, p.b);
         const head = try fuse.header(alloc, p.a, p.b);
@@ -2749,6 +2731,7 @@ fn toF32(s: mlx.mlx_stream, a: mlx.mlx_array, out: *mlx.mlx_array) ![]const f32 
 /// The served codebooks at their pack windows; PAIR1's rates are its rows.
 const CODEBOOKS = [_]exl3.Decode{
     .{ .codebook = .mcg, .window = .w16 },
+    .{ .codebook = .alpha, .window = .w15 },
     exl3.Decode.tabled(.spec1, .w15),
     exl3.Decode.tabled(.std1, .w15),
     .{ .codebook = .pair1, .window = .w16 },
@@ -2794,7 +2777,7 @@ test "exl3 rate groups: a slot's planes keep their bytes at the rates outside K1
     const t = std.testing;
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
-    kernels.setDecodeParams(exl3.Decode.tabled(.spec1, .w15));
+    kernels.setDecodeParams(.{ .codebook = .alpha, .window = .w15 });
     defer kernels.setDecodeParams(.mul1);
     var arena = std.heap.ArenaAllocator.init(t.allocator);
     defer arena.deinit();
@@ -3592,6 +3575,81 @@ test "exl3 rate groups: adjacent shared rows use one weight walk and match indep
                 const span: usize = if (rows == 3 or rows == 5 or rows == 6) 3 else 2;
                 try t.expectEqual(@as(c_int, @intCast((rows + span - 1) / span)), shape[1]);
             }
+        }
+    }
+}
+
+test "exl3 rate groups: rg_windows fans inverse and local scatter across threadgroups with exact outputs" {
+    try mlx.requireGpu();
+    const t = std.testing;
+    try t.expectEqual(@as(c_int, 65536), groupWindowGrid(65536, 512));
+    try t.expectEqual(@as(c_int, 1024), groupWindowGrid(600, 512));
+    try t.expectEqual(@as(c_int, 512), groupWindowGrid(1, 512));
+
+    const s = mlx.gpuStream();
+    const experts: usize = 512;
+    const n: usize = 4096 * 16;
+    const win: usize = 64;
+    var prng = std.Random.DefaultPrng.init(0x9a11);
+    const rnd = prng.random();
+    const slots_h = try t.allocator.alloc(u32, n);
+    defer t.allocator.free(slots_h);
+    const order_h = try t.allocator.alloc(i32, n);
+    defer t.allocator.free(order_h);
+    const sorted_h = try t.allocator.alloc(u32, n);
+    defer t.allocator.free(sorted_h);
+    var counts: [experts]u32 = @splat(0);
+    for (slots_h) |*v| {
+        const e = rnd.intRangeLessThan(u32, 0, experts);
+        v.* = e;
+        counts[e] += 1;
+    }
+    var offs: [experts]u32 = undefined;
+    var cur: u32 = 0;
+    for (counts, 0..) |c, e| {
+        offs[e] = cur;
+        cur += c;
+    }
+    var fill = offs;
+    for (slots_h, 0..) |e, i| {
+        const dst = fill[e];
+        fill[e] += 1;
+        sorted_h[dst] = e;
+        order_h[dst] = @intCast(i);
+    }
+    var meta_h: [experts * 8]u32 = @splat(0);
+    for (0..experts) |e| {
+        meta_h[e * 8 + 3] = 0;
+        meta_h[e * 8 + 7] = @intCast(e);
+    }
+    var rb: Ragged = .{ .count = 1, .experts = experts };
+    rb.meta = mlx.mlx_array_new_data(&meta_h, &[_]c_int{@intCast(meta_h.len)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(rb.meta);
+    const sorted = mlx.mlx_array_new_data(sorted_h.ptr, &[_]c_int{@intCast(n)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(sorted);
+    const order = mlx.mlx_array_new_data(order_h.ptr, &[_]c_int{@intCast(n)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(order);
+
+    const w = try groupWindows(s, &rb, sorted, order, @intCast(n), @intCast(win));
+    defer for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for ([_]mlx.mlx_array{ w.starts, w.nlives, w.inverse, w.local }) |a| try mlx.check(mlx.mlx_array_eval(a));
+    const inv = (mlx.mlx_array_data_uint32(w.inverse) orelse return error.Unreadable)[0..n];
+    const loc = (mlx.mlx_array_data_uint32(w.local) orelse return error.Unreadable)[0..n];
+    for (0..n) |i| {
+        try t.expectEqual(@as(u32, @intCast(i)), inv[@intCast(order_h[i])]);
+        try t.expectEqual(sorted_h[i], loc[i]);
+    }
+    const st = (mlx.mlx_array_data_uint32(w.starts) orelse return error.Unreadable)[0..mlx.mlx_array_size(w.starts)];
+    const nl = (mlx.mlx_array_data_uint32(w.nlives) orelse return error.Unreadable)[0..mlx.mlx_array_size(w.nlives)];
+    var wi: usize = 0;
+    for (0..experts) |e| {
+        var off: u32 = 0;
+        while (off < counts[e]) : (off += win) {
+            try t.expectEqual(offs[e] + off, st[wi]);
+            try t.expectEqual(@min(@as(u32, win), counts[e] - off), nl[wi]);
+            wi += 1;
         }
     }
 }

@@ -315,7 +315,8 @@ pub fn payloadBytes(meta: TensorMeta, expected_dtype: ?DType) !u64 {
 }
 
 pub fn validateExl3Layer(source: *const SourceIndex, allocator: Allocator, config: *const model.ModelConfig, layer_prefix: []const u8) !@import("sushi_exl3").GroupLayout {
-    var plan = @import("sushi_exl3").GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
+    // The experts' own width (`expertGeometry`): Hy4-Flash's run in a latent narrower than the model.
+    var plan = @import("sushi_exl3").GroupLayout.init(config.expertGeometry().hidden, config.moe_intermediate_size, config.expert_quant_rate);
     plan.rates = config.expert_quant_rates;
     const layout = arch_config.packLayout(config);
     plan.streams_groups = layout.streams_groups;
@@ -463,6 +464,57 @@ test "EXL3 shard stamp rejects invalid and nonfinite rates" {
     for ([_][]const u8{ "1", "1.5", "2", "2.125", "2.5", "3", "4" }) |k| {
         try source.stamps.put("expert.safetensors", .{ .k = k });
         try validateShardStamps(&source, &config);
+    }
+}
+
+/// Refuses a pack whose routed trellis tensors disagree with the config's tile order: mixed orders, a grid off its
+/// projection's, or a shard's `tile_order` stamp missing or another order.
+pub fn validateTileOrder(io: std.Io, allocator: Allocator, dir_path: []const u8, order: @import("sushi_exl3").format.TileOrder, hidden: u32, inter: u32) !void {
+    const exl3 = @import("sushi_exl3");
+    const expert_io = @import("expert_io.zig");
+    const marker = ".mlp.switch_mlp.";
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var shards: std.ArrayList([]u8) = .empty;
+    defer {
+        for (shards.items) |n| allocator.free(n);
+        shards.deinit(allocator);
+    }
+    try @import("pack_stamp.zig").shardNames(io, allocator, dir, &shards);
+    var seen_pack = false;
+    var seen_major = false;
+    for (shards.items) |name| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
+        defer allocator.free(path);
+        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
+        defer _ = std.c.close(fd);
+        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+        defer header.deinit();
+        if (header.parsed.value != .object) return error.InvalidSafetensorsHeader;
+        var holds = false;
+        var tensors = header.parsed.value.object.iterator();
+        while (tensors.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const at = std.mem.indexOf(u8, key, marker) orelse continue;
+            const parsed = exl3.group_layout.Name.parse(key[at + marker.len ..]) catch continue;
+            if (parsed.part != 0) continue;
+            holds = true;
+            if (parsed.pair_major) seen_major = true else seen_pack = true;
+            if (seen_major and seen_pack) return error.Exl3TileOrderMixed;
+            if (parsed.tileOrder() != order) return error.Exl3TileOrderMismatch;
+            if (entry.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            const shape_val = entry.value_ptr.object.get("shape") orelse return error.InvalidSafetensorsHeader;
+            if (shape_val != .array) return error.InvalidSafetensorsHeader;
+            const dims = shape_val.array.items;
+            var shape: [5]u64 = undefined;
+            if (dims.len > shape.len) return error.Exl3GroupGeometry;
+            for (dims, 0..) |d, i| {
+                if (d != .integer) return error.InvalidSafetensorsHeader;
+                shape[i] = std.math.cast(u64, d.integer) orelse return error.InvalidSafetensorsHeader;
+            }
+            _ = try exl3.group_layout.trellisRate(order, shape[0..dims.len], if (parsed.projection == 2) inter else hidden, if (parsed.projection == 2) hidden else inter);
+        }
+        if (holds) try exl3.shardTileOrderAgrees(order, expert_io.metadataString(header.parsed.value.object, "tile_order"));
     }
 }
 

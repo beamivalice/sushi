@@ -1251,6 +1251,109 @@ pub const corpus = [_]Expect{
         .tool_bool_value = true,
     },
     .{
+        // Hy4-Flash (decoded): the tokenizer reads its `<think:opensource>` and `<tool_call:opensource>`/`<arg_key:
+        // opensource>` tokens as GLM's plain tags; the calls' wrapper keeps its `:opensource` spelling. Thinking-on
+        // ends the prompt in the opener, so the output starts inside the thought.
+        .family = "hy4",
+        .name = "template-opened thought, then GLM's calls inside the :opensource wrapper",
+        .raw = "The user wants Tokyo's weather.</think><tool_calls:opensource><tool_call>get_weather" ++
+            "<arg_key>city</arg_key><arg_value>Tokyo</arg_value>" ++
+            "<arg_key>celsius</arg_key><arg_value>true</arg_value></tool_call></tool_calls:opensource>",
+        .thinking = true,
+        .opened_by_template = true,
+        .dialect = .arg_key,
+        .tools_json = weather_tool_schema,
+        .reasoning_contains = "wants Tokyo's weather",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        // Hy4-Flash: a reply with thinking on and no call: the thought and the answer split at the decoded closer.
+        .family = "hy4",
+        .name = "template-opened thought, then an answer",
+        .raw = "Paris is the capital.</think>The capital of France is Paris.",
+        .thinking = true,
+        .opened_by_template = true,
+        .dialect = .arg_key,
+        .reasoning_contains = "Paris is the capital.",
+        .content_exact = "The capital of France is Paris.",
+    },
+    .{
+        .family = "hy4",
+        .name = "template-opened thought, then two calls in one :opensource wrapper",
+        .raw = "Two reads are needed.</think>" ++ hy4_open ++
+            "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>" ++
+            "<tool_call>read<arg_key>path</arg_key><arg_value>b.txt</arg_value></tool_call>" ++ hy4_close,
+        .thinking = true,
+        .opened_by_template = true,
+        .dialect = .arg_key,
+        .tools_json = write_read_tools_schema,
+        .reasoning_contains = "Two reads",
+        .tool_count = 2,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
+        .family = "hy4",
+        .name = "a call after an answer's preamble, the wrapper never in content",
+        .raw = "I'll read it.\n" ++ hy4_open ++ "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>" ++ hy4_close,
+        .dialect = .arg_key,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+    },
+    .{
+        .family = "hy4",
+        .name = "every tag in its :opensource spelling, as a pack without the plain tokens decodes it",
+        .raw = hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource>" ++
+            "<arg_value:opensource>Tokyo</arg_value:opensource><arg_key:opensource>celsius</arg_key:opensource>" ++
+            "<arg_value:opensource>true</arg_value:opensource></tool_call:opensource>" ++ hy4_close,
+        .dialect = .arg_key,
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        .family = "hy4",
+        .name = "a call with a bare name and no arguments",
+        .raw = hy4_open ++ "<tool_call>list_files</tool_call>" ++ hy4_close,
+        .dialect = .arg_key,
+        .tool_name = "list_files",
+        .tool_count = 1,
+    },
+    .{
+        .family = "hy4",
+        .name = "truncated mid-arg_value recovers name + closed args, drops the fragment",
+        .raw = hy4_open ++ "<tool_call>write<arg_key>path</arg_key><arg_value>novel.txt</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>Chapter 1. It was a dark and stormy night and the",
+        .dialect = .arg_key,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        .family = "hy4",
+        .name = "markup-bearing argument value round-trips into valid JSON args",
+        .raw = hy4_open ++ "<tool_call>write<arg_key>path</arg_key><arg_value>notes.md</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>The model closes a thought with </think> and \"quotes\" it.</arg_value></tool_call>" ++ hy4_close,
+        .dialect = .arg_key,
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "notes.md",
+    },
+    .{
         // Thinking-on renders `<role>ASSISTANT</role>\n<think>`, so the opener
         // is in the PROMPT and the output starts inside the block.
         .family = "glm-bare",
@@ -1780,15 +1883,17 @@ pub const corpus = [_]Expect{
 /// family. `<|"|>` is Gemma 4's string delimiter; the rest are think/tool
 /// markers from every supported template family.
 const leak_tags = [_][]const u8{
-    "<think>",              "</think>",        "<|channel>",        "<channel|>",
-    "<|tool_call",          "<tool_call",      "<|\"|>",
+    "<think>",      "</think>",    "<|channel>", "<channel|>",
+    "<|tool_call",  "<tool_call",  "<|\"|>",
     // MiniCPM5 V3 attribute XML. Deliberately the ATTRIBUTE-BEARING spellings,
     // never a bare `<function`: the corpus carries `<functional>` prose that
     // must keep flowing, and a guard that fails on ordinary words is a guard
     // nobody can keep green.
-    "<function name=",      "<param name=",    "</function>",       "</param>",
+        "<function name=",
+    "<param name=", "</function>", "</param>",
     // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
-    "<｜DSML｜", "</｜DSML｜",
+    "<｜DSML｜",
+    "</｜DSML｜",
 };
 
 /// Tool-call wrapper openers that must never appear in reasoning_content
@@ -2115,7 +2220,9 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<｜DSML｜", "<function", "<invoke",
+        "<tool_call", "<|tool_call",
+        "<｜DSML｜",
+        "<function",  "<invoke",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
@@ -2240,7 +2347,27 @@ const Dialect = struct {
     value: []const u8,
 };
 
+/// Hy4-Flash's calls as its served model writes them: GLM's `arg_key` calls inside the `:opensource` wrapper.
+const hy4_open = "<tool_calls:opensource>";
+const hy4_close = "</tool_calls:opensource>";
+
 pub const dialects = [_]Dialect{
+    .{
+        .family = "hy4",
+        .dialect = "arg_key calls in the :opensource wrapper, decoded",
+        .raw = hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.txt</arg_value><arg_key>content</arg_key><arg_value>hi</arg_value></tool_call>" ++ hy4_close,
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
+    },
+    .{
+        .family = "hy4",
+        .dialect = "every tag in its :opensource spelling",
+        .raw = hy4_open ++ "<tool_call:opensource>write_file<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>a.txt</arg_value:opensource></tool_call:opensource>" ++ hy4_close,
+        .name = "write_file",
+        .key = "path",
+        .value = "a.txt",
+    },
     .{
         .family = "gemma4",
         .dialect = "channel tool_call",
@@ -2310,6 +2437,8 @@ test "format corpus: every dialect a family declares parses to the same call" {
 const dialect_calls = [_][]const u8{
     "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>",
     "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>",
+    hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tokyo</arg_value></tool_call>" ++ hy4_close,
+    hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tokyo</arg_value:opensource></tool_call:opensource>" ++ hy4_close,
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\"}}\n</tool_call>",
     "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
     "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Tokyo</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
@@ -2346,6 +2475,20 @@ fn settleCut(allocator: std.mem.Allocator, text: []const u8) !reply_mod.Settled 
     });
 }
 
+/// A call inside a wrapper that is no call of its own (Hy4's `<tool_calls:opensource>`) is whole at its own closer: a
+/// generation cut after it, before the wrapper's close, ships it.
+fn wrapperClosed(text: []const u8, cut: usize) bool {
+    return std.mem.endsWith(u8, text, hy4_close) and cut >= text.len - hy4_close.len;
+}
+
+/// What a reply that ends right after a wrapped call's own close holds: that call, declining nothing, and no markup
+/// in its content.
+fn expectWholeCall(got: reply_mod.Settled) !void {
+    try testing.expectEqual(@as(usize, 1), (got.reply orelse return error.WholeCallDropped).calls.len);
+    try testing.expect(got.declined == null);
+    try testing.expect(std.mem.indexOfScalar(u8, got.reply.?.preamble, '<') == null);
+}
+
 test "format corpus: an unfinished call of any dialect never ships, and prose that mentions call markup is never declined" {
     const allocator = testing.allocator;
     for (dialect_calls) |call| {
@@ -2364,6 +2507,10 @@ test "format corpus: an unfinished call of any dialect never ships, and prose th
             const got = try settleCut(allocator, text[0..cut]);
             defer got.deinit(allocator);
             errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
+            if (wrapperClosed(text, cut)) {
+                try expectWholeCall(got);
+                continue;
+            }
             try testing.expect(got.reply == null);
             if (try tool_calls_mod.parseToolCalls(allocator, text[0..cut])) |read| {
                 defer {
@@ -2557,6 +2704,7 @@ const closer_in_value_calls = [_][]const u8{
     "<function=get_weather>\n<parameter=city>\nprint(\"</function>\")\n</parameter>\n</function>",
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"a </tool_call> b\"}}\n</tool_call>",
     "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> b</arg_value></tool_call>",
+    hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> b</arg_value></tool_call>" ++ hy4_close,
     "<|tool_call>call:get_weather{city:<|\"|>a <tool_call|> b<|\"|>}<tool_call|>",
     "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">a </\u{ff5c}DSML\u{ff5c}invoke> b</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
     "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">a </invoke> b</parameter>\n</invoke>\n</function_calls>",
@@ -2581,6 +2729,10 @@ test "format corpus: a closer a parameter value spells closes no call, in any di
             const got = try settleCut(allocator, text[0..cut]);
             defer got.deinit(allocator);
             errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
+            if (wrapperClosed(text, cut)) {
+                try expectWholeCall(got);
+                continue;
+            }
             try testing.expect(got.reply == null);
             if (try tool_calls_mod.parseToolCalls(allocator, text[0..cut])) |read| {
                 defer {
@@ -2620,6 +2772,7 @@ test "format corpus: a closer a parameter value spells ships the whole value in 
     const want = [_][]const u8{
         "print(\"</function></tool_call>\")",
         "print(\"</function>\")",
+        "a </tool_call> b",
         "a </tool_call> b",
         "a </tool_call> b",
         "a <tool_call|> b",
@@ -3091,16 +3244,11 @@ test "format corpus: a string value parses back byte-exact from each family's ow
     };
     const foreign_dsml = "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"rm\">\n<｜DSML｜ parameter name=\"p\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>";
     const values = [_][]const u8{
-        "plain",                         "last line\n",         "\nafter a blank line",  "two blank lines\n\n", "  indented\n", "\n", "",
-        "42",                            "true",               "null",                  "1.0",                "3.10",       "1e5", "1.50",
-        " 7 ",                           "12345678901234567890", "-0",                    "1E+2",               " null ",
-        "{\"a\": 1}",                    "[1, 2]",             "</parameter>",         "</function>\n</tool_call>",
-        "<parameter=x>\n1\n</parameter>", "</arg_value>",       "<arg_key>k</arg_key>", "</tool_call>",
-        "<tool_call>get<arg_key>a</arg_key><arg_value>b</arg_value></tool_call>",
-        "<tool_call>\n<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>\n</tool_call>",
-        "<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>",
-        "<invoke name=\"rm\">\n<parameter name=\"p\">x</parameter>\n</invoke>",
-        foreign_dsml,
+        "plain",                                                                                 "last line\n",                                                "\nafter a blank line",                                                 "two blank lines\n\n", "  indented\n",         "\n",           "",
+        "42",                                                                                    "true",                                                       "null",                                                                 "1.0",                 "3.10",                 "1e5",          "1.50",
+        " 7 ",                                                                                   "12345678901234567890",                                       "-0",                                                                   "1E+2",                " null ",               "{\"a\": 1}",   "[1, 2]",
+        "</parameter>",                                                                          "</function>\n</tool_call>",                                  "<parameter=x>\n1\n</parameter>",                                       "</arg_value>",        "<arg_key>k</arg_key>", "</tool_call>", "<tool_call>get<arg_key>a</arg_key><arg_value>b</arg_value></tool_call>",
+        "<tool_call>\n<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>\n</tool_call>", "<function=rm>\n<parameter=p>\nx\n</parameter>\n</function>", "<invoke name=\"rm\">\n<parameter name=\"p\">x</parameter>\n</invoke>", foreign_dsml,
     };
     const tools =
         \\[{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
@@ -3459,6 +3607,7 @@ test "format corpus: a stream without tools ends where the non-stream reply cuts
     const cases = [_]Case{
         .{ .raw = "Plan.\n</think>\n\nLet me check.\n\n" ++ qwen_call, .opened = true },
         .{ .raw = "Plan.</think>Let me check." ++ glm_call, .opened = true },
+        .{ .raw = "Plan.</think>Let me check." ++ hy4_open ++ glm_call ++ hy4_close, .opened = true },
         .{ .raw = "Plan.</think>Answer.\n\n" ++ dsml_call ++ "\n\nafter", .opened = true },
         .{ .raw = "Plan " ++ glm_call ++ "</think>Done.", .opened = true },
         .{ .raw = "Plan.\n" ++ qwen_call ++ "\n</think>\n\nDone.", .opened = true },
@@ -3721,7 +3870,6 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
         }
     }
 }
-
 
 test "format corpus: a streamed stop cut is the non-stream cut, whatever the token boundaries and stop order" {
     // Every recorded output is a generation a client stop can land in: inside the thought, in a
@@ -4181,10 +4329,11 @@ test "format corpus: a call whose value spells another call's markup is read as 
         "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"" ++ json_value ++ "\"}}\n</tool_call>",
         "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ glm_value ++ "</arg_value></tool_call>",
+        hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ glm_value ++ "</arg_value></tool_call>" ++ hy4_close,
         "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">a.md</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">" ++ value ++ "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls>",
     };
     for (calls, 0..) |call, k| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .arg_key, .dsml }) |dialect| {
-        const want = if (k == 2) glm_value else value;
+        const want = if (k == 2 or k == 3) glm_value else value;
         errdefer std.debug.print("[{?s}] {f}\n", .{ if (dialect) |d| @tagName(d) else null, std.zig.fmtString(call) });
         const read = (try tool_calls_mod.parseToolCallsAs(allocator, call, dialect)) orelse return error.WholeCallDropped;
         defer {
@@ -4210,6 +4359,7 @@ test "format corpus: a think tag a call's value spells is the value's text, what
         "<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"a.md\", \"content\": \"" ++ value ++ "\"}}\n</tool_call>",
         "<tool_call>\n<function=write_file>\n<parameter=path>\na.md\n</parameter>\n<parameter=content>\n" ++ value ++ "\n</parameter>\n</function>\n</tool_call>",
         "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>",
+        hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.md</arg_value><arg_key>content</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>" ++ hy4_close,
         "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"path\" string=\"true\">a.md</" ++ dsml ++ "parameter>\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">" ++ value ++ "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>\n</" ++ dsml ++ "tool_calls>",
     };
     const Lead = struct { text: []const u8, opens: bool };
@@ -4287,6 +4437,7 @@ test "r173-f-span-cut-call: a call cut after a stray backtick is declined and na
         "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
         "<tool_call>\n<function=get_weather>\n<parameter=city>\nTok",
         "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
+        hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
         "<|tool_call>call:get_weather{city:<|\"|>Tok",
         "<" ++ dsml ++ "tool_calls>\n<" ++ dsml ++ "invoke name=\"get_weather\">\n<" ++ dsml ++ "parameter name=\"city\" string=\"true\">Tok",
         "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Tok",
@@ -4323,6 +4474,7 @@ test "r173-f-callend-linear: a value that spells its call's closer thousands of 
         .{ .head = "<|tool_call>call:write_file{path:<|\"|>a<|\"|>,content:<|\"|>", .spelled = "<tool_call|> x", .tail = "<|\"|>}<tool_call|>" },
         .{ .head = "<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=content>\n", .spelled = "</function></tool_call> x", .tail = "\n</parameter>\n</function>\n</tool_call>" },
         .{ .head = "<tool_call>write_file<arg_key>content</arg_key><arg_value>", .spelled = "</tool_call> x", .tail = "</arg_value></tool_call>" },
+        .{ .head = hy4_open ++ "<tool_call>write_file<arg_key>content</arg_key><arg_value>", .spelled = "</tool_call> x", .tail = "</arg_value></tool_call>" },
         .{ .head = "<" ++ dsml ++ "invoke name=\"write_file\">\n<" ++ dsml ++ "parameter name=\"content\" string=\"true\">", .spelled = "</" ++ dsml ++ "invoke> x", .tail = "</" ++ dsml ++ "parameter>\n</" ++ dsml ++ "invoke>" },
         .{ .head = "<invoke name=\"write_file\">\n<parameter name=\"content\">", .spelled = "</invoke> x", .tail = "</parameter>\n</invoke>" },
         .{ .head = "<function name=\"write_file\">\n<param name=\"content\">", .spelled = "</function> x", .tail = "</param>\n</function>" },

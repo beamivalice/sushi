@@ -800,8 +800,8 @@ Adjacent pairs, change of the first over the second (decode / 4k / 32k decode, 4
 - Prefill is within ~5% for c over b, not resolved (-9.1/-6.8 in one pair, +1.0/-0.7 in the other).
 
 Bills (default flags, kv8, `--mtp`, a 6000-token prompt sent twice, an empty SSD base per boot, `794b4bb0`):
-- The f32 state (arm c) adds 54.0 MB per persisted checkpoint: b `persisted 6008/6008 tokens (1 ssm-cp, 67.4 MB)`, resident 147.8 MB; c
-  `1 ssm-cp, 121.4 MB`, resident 201.8 MB.
+- The f32 state (arm c) adds 54.0 MB per persisted checkpoint: b `persisted 6008/6008 tokens (1 ssm-cp, 67.4 MB)`, on SSD 147.8 MB; c
+  `1 ssm-cp, 121.4 MB`, on SSD 201.8 MB.
 - The admission bill at that request rises 4549 → 4616 MB (+67 MB).
 - Auto context stays 1,048,576 tokens and the boot `active_bytes` stay 47.51 GB on this 128 GB box.
 

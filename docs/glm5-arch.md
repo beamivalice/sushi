@@ -195,7 +195,7 @@ inside 1.46% drift) because verification per round grew 20.6%. The verify now ru
   prefill also holds up to 9 KDA checkpoints (141 MiB each) and one assistant window, fewer where they do not fit;
   under SSD-only storage the prefill writes each checkpoint through and frees its RAM copy, so it holds 2
   ([prefix cache](glm5-prefix-cache.md#glm)).
-- Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`glmPrefillChunk`), with
+- Advertised context: billed at the widest rung up to 2048 that advertises as much as 512 (`contextNeutralChunk`), with
   the engine's 93% margin: GLM's admission bills each request exactly and refuses past it. Sushi-2.5bpw +
   vision + A4 at its measured 104.35 GB active advertises 1,048,576 at a 2048 bill (1,144,691 tokens by the bill).
   The prefix cache reserves nothing here: admission evicts its RAM tier and bills a request's checkpoints, keeping

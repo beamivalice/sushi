@@ -46,6 +46,7 @@ pub const Family = enum {
     qwen4_exp,
     deepseek_v41,
     glm5_next,
+    hy_v4_flash,
 
     pub fn of(model_type: []const u8) ?Family {
         const offer = arch_chat.effortOffer(model_type) orelse return null;
@@ -146,6 +147,11 @@ pub const Row = struct { offered: bool, sends: Sends = .none, cap: ?i32 = null, 
 pub const Table = struct {
     rows: [table_words.len]Row,
     default: Effort,
+    /// Words outside the table a request may still name, each served at an offered row's arm (Hy4: minimal takes
+    /// low's, on takes high's); they follow that row as merged, operator edits included.
+    aliases: []const Alias = &.{},
+
+    pub const Alias = struct { word: Effort, takes: Effort };
 
     pub fn row(self: Table, e: Effort) Row {
         return self.rows[rowIndex(e).?];
@@ -169,6 +175,12 @@ pub const Table = struct {
             out.buf[out.len] = .{ .effort = w, .fold_to = to };
             out.len += 1;
         };
+        for (self.aliases) |al| {
+            const r = self.row(al.takes);
+            if (!r.offered) continue;
+            out.buf[out.len] = .{ .effort = al.word, .budget = r.cap, .sends = r.sends };
+            out.len += 1;
+        }
         return out;
     }
 };
@@ -190,7 +202,7 @@ pub fn builtin(f: Family) Table {
 
 const builtin_arms = blk: {
     var out: [all_families.len]Arms = @splat(.{});
-    for (families) |f| out[@intFromEnum(f)] = builtin(f).offeredArms();
+    for (families) |f| out[@backingInt(f)] = builtin(f).offeredArms();
     break :blk out;
 };
 
@@ -198,7 +210,7 @@ const builtin_arms = blk: {
 pub fn effortArms(model_type: []const u8) ?[]const EffortArm {
     const offer = arch_chat.effortOffer(model_type) orelse return null;
     return switch (offer.*) {
-        .table => builtin_arms[@intFromEnum(Family.of(model_type).?)].slice(),
+        .table => builtin_arms[@backingInt(Family.of(model_type).?)].slice(),
         .fixed => |arms| arms,
     };
 }
@@ -210,7 +222,7 @@ pub fn servedArms(model_type: []const u8) ?Arms {
 }
 
 pub fn servedArmsIn(snap: *const Snapshot, model_type: []const u8) ?Arms {
-    if (Family.of(model_type)) |f| return merge(f, snap[@intFromEnum(f)]).offeredArms();
+    if (Family.of(model_type)) |f| return merge(f, snap[@backingInt(f)]).offeredArms();
     const built = effortArms(model_type) orelse return null;
     var out: Arms = .{ .len = built.len };
     @memcpy(out.buf[0..built.len], built);
@@ -445,13 +457,13 @@ fn lockStore() void {
 pub fn publish(f: Family, edits: Edits) void {
     lockStore();
     defer store_lock.unlock();
-    store[@intFromEnum(f)] = edits;
+    store[@backingInt(f)] = edits;
 }
 
 pub fn publishedEdits(f: Family) Edits {
     lockStore();
     defer store_lock.unlock();
-    return store[@intFromEnum(f)];
+    return store[@backingInt(f)];
 }
 
 /// Every family's edits in one read: a request resolves against one table throughout while a save publishes another.
@@ -474,11 +486,11 @@ pub fn fileDefault(model_type: []const u8) ?Effort {
 }
 
 pub fn fileDefaultIn(snap: *const Snapshot, model_type: []const u8) ?Effort {
-    return snap[@intFromEnum(Family.of(model_type) orelse return null)].default;
+    return snap[@backingInt(Family.of(model_type) orelse return null)].default;
 }
 
-/// `none` is an alias of off. No served table lists `minimal`; inherited arches
-/// keep its legacy budget (`responses.effortBudget`).
+/// `none` is an alias of off. `minimal` is listed only where a table aliases it (Hy4-Flash: to `low`); inherited
+/// arches keep its legacy budget (`responses.effortBudget`).
 pub fn parseEffort(word: []const u8) ?Effort {
     if (std.mem.eql(u8, word, "none")) return .off;
     return std.meta.stringToEnum(Effort, word);
@@ -489,28 +501,61 @@ pub fn findEffortArm(arms: []const EffortArm, effort: Effort) ?EffortArm {
     return null;
 }
 
-/// The effort `e` selects on a model offering `offered`; null = refused.
+/// The effort a word selects (`selectEffortPick`).
 pub const EffortPick = struct {
     effort: Effort,
     /// Set when the asked word was re-routed. MiMo's on-fold leaves this null.
     rerouted_from: ?Effort = null,
 };
 
-pub fn selectEffortPick(offered: []const Effort, e: Effort) ?EffortPick {
-    if (std.mem.indexOfScalar(Effort, offered, e) != null) return .{ .effort = e };
-    if ((e == .high or e == .max) and std.mem.indexOfScalar(Effort, offered, .xhigh) != null)
-        return .{ .effort = .xhigh, .rerouted_from = e };
-    if (e == .medium and std.mem.indexOfScalar(Effort, offered, .high) != null)
-        return .{ .effort = .high, .rerouted_from = e };
-    if (e == .xhigh and std.mem.indexOfScalar(Effort, offered, .max) != null)
-        return .{ .effort = .max, .rerouted_from = e };
-    if (e != .off and std.mem.indexOfScalar(Effort, offered, .on) != null) return .{ .effort = .on };
-    return null;
+/// The arms a client sees for the words a server lists (`offered`), with the served table's budgets and folds where
+/// it knows `model_type`, so the client resolves a word as the server does (`resolve`). An unknown model's arms send
+/// their own word, or nothing when it lists only off and on.
+pub fn armsForOffered(model_type: ?[]const u8, offered: []const Effort) Arms {
+    var out: Arms = .{};
+    if (model_type) |mt| if (effortArms(mt)) |base| {
+        for (offered) |w| {
+            if (out.len >= out.buf.len) break;
+            if (findEffortArm(base, w)) |a| {
+                out.buf[out.len] = .{ .effort = w, .budget = a.budget, .sends = a.sends };
+            } else {
+                out.buf[out.len] = .{ .effort = w, .sends = .{ .word = w } };
+            }
+            out.len += 1;
+        }
+        for (base) |a| {
+            const to = a.fold_to orelse continue;
+            if (std.mem.indexOfScalar(Effort, offered, a.effort) != null) continue;
+            if (std.mem.indexOfScalar(Effort, offered, to) == null) continue;
+            if (out.len >= out.buf.len) break;
+            out.buf[out.len] = a;
+            out.len += 1;
+        }
+        return out;
+    };
+    var binary_only = offered.len > 0;
+    for (offered) |w| if (w != .off and w != .on) {
+        binary_only = false;
+        break;
+    };
+    for (offered) |w| {
+        if (out.len >= out.buf.len) break;
+        out.buf[out.len] = .{ .effort = w, .sends = if (binary_only) .none else .{ .word = w } };
+        out.len += 1;
+    }
+    return out;
 }
 
-pub fn selectEffort(offered: []const Effort, e: Effort) ?Effort {
-    const pick = selectEffortPick(offered, e) orelse return null;
-    return pick.effort;
+/// The arm `e` selects among `arms` and the word it was re-routed from; null = refused. The server's rule (`resolve`).
+pub fn selectEffortPick(arms: []const EffortArm, e: Effort) ?EffortPick {
+    const r = resolve(arms, e) orelse return null;
+    return .{ .effort = r.arm.effort, .rerouted_from = r.rerouted_from };
+}
+
+/// The effort `e` selects among `arms` (`selectEffortPick` without the re-route); null = refused.
+pub fn selectEffort(arms: []const EffortArm, e: Effort) ?Effort {
+    const r = resolve(arms, e) orelse return null;
+    return r.arm.effort;
 }
 
 /// `{model} has no `{asked}` effort; served at `{served}`.
@@ -530,7 +575,9 @@ pub fn resolve(arms: []const EffortArm, e: Effort) ?Resolved {
         const target = findEffortArm(arms, to) orelse return null;
         return if (isListed(target)) .{ .arm = target, .rerouted_from = e } else null;
     }
-    if (e != .off) if (findEffortArm(arms, .on)) |a| return .{ .arm = a };
+    // A fixed on arm (MiMo's: no word sent) takes any thinking word; a graded table's `on` alias never stands in for
+    // a word the operator left unoffered.
+    if (e != .off) if (findEffortArm(arms, .on)) |a| if (a.sends == .none) return .{ .arm = a };
     return null;
 }
 
@@ -551,62 +598,60 @@ pub fn listedWords(arms: []const EffortArm, buf: []Effort) []const Effort {
 
 test "DeepSeek-V4.1 serves medium and xhigh as their own words, without a re-route" {
     const arms = effortArms("deepseek_v41") orelse return;
-    var offered: [std.enums.values(Effort).len]Effort = undefined;
-    for (arms, 0..) |a, i| offered[i] = a.effort;
     for ([_]Effort{ .off, .low, .medium, .high, .xhigh, .max }) |e| {
-        const pick = selectEffortPick(offered[0..arms.len], e).?;
+        const pick = selectEffortPick(arms, e).?;
         try testing.expectEqual(e, pick.effort);
         try testing.expect(pick.rerouted_from == null);
     }
 }
 
 test "selectEffort: Qwen high and max re-route to xhigh; other unknowns stay refused" {
-    const qwen = [_]Effort{ .off, .low, .medium, .xhigh };
-    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(&qwen, .high));
-    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(&qwen, .max));
-    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(&qwen, .xhigh));
-    try testing.expectEqual(@as(?Effort, null), selectEffort(&qwen, .minimal));
-    const glm = [_]Effort{ .low, .high, .max };
-    try testing.expectEqual(@as(?Effort, .high), selectEffort(&glm, .high));
-    try testing.expectEqual(@as(?Effort, .max), selectEffort(&glm, .max));
-    try testing.expectEqual(@as(?Effort, .high), selectEffort(&glm, .medium));
-    try testing.expectEqual(@as(?Effort, .max), selectEffort(&glm, .xhigh));
-    const mimo = [_]Effort{ .off, .on };
-    try testing.expectEqual(@as(?Effort, .on), selectEffort(&mimo, .high));
-    try testing.expectEqual(@as(?Effort, .on), selectEffort(&mimo, .max));
-    try testing.expectEqual(@as(?Effort, .off), selectEffort(&mimo, .off));
+    const qwen = effortArms("qwen4_exp") orelse return;
+    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(qwen, .high));
+    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(qwen, .max));
+    try testing.expectEqual(@as(?Effort, .xhigh), selectEffort(qwen, .xhigh));
+    try testing.expectEqual(@as(?Effort, null), selectEffort(qwen, .minimal));
+    const glm = effortArms("glm5_next") orelse return;
+    try testing.expectEqual(@as(?Effort, .high), selectEffort(glm, .high));
+    try testing.expectEqual(@as(?Effort, .max), selectEffort(glm, .max));
+    try testing.expectEqual(@as(?Effort, .high), selectEffort(glm, .medium));
+    try testing.expectEqual(@as(?Effort, .max), selectEffort(glm, .xhigh));
+    const mimo = effortArms("mimo_v2") orelse return;
+    try testing.expectEqual(@as(?Effort, .on), selectEffort(mimo, .high));
+    try testing.expectEqual(@as(?Effort, .on), selectEffort(mimo, .max));
+    try testing.expectEqual(@as(?Effort, .off), selectEffort(mimo, .off));
 }
 
 test "selectEffort: GLM medium re-routes to high and xhigh to max; other missing words stay refused" {
-    const glm = [_]Effort{ .low, .high, .max };
-    try testing.expectEqual(@as(?Effort, .high), selectEffort(&glm, .medium));
-    try testing.expectEqual(@as(?Effort, .max), selectEffort(&glm, .xhigh));
-    try testing.expectEqual(Effort.medium, selectEffortPick(&glm, .medium).?.rerouted_from.?);
-    try testing.expectEqual(Effort.xhigh, selectEffortPick(&glm, .xhigh).?.rerouted_from.?);
-    try testing.expect(selectEffortPick(&glm, .high).?.rerouted_from == null);
-    try testing.expect(selectEffortPick(&glm, .max).?.rerouted_from == null);
-    try testing.expect(selectEffort(&glm, .off) == null);
-    try testing.expect(selectEffort(&glm, .minimal) == null);
-    try testing.expect(selectEffort(&glm, .on) == null);
-    const mimo = [_]Effort{ .off, .on };
-    try testing.expect(selectEffortPick(&mimo, .medium).?.rerouted_from == null);
-    try testing.expect(selectEffortPick(&mimo, .xhigh).?.rerouted_from == null);
+    const glm = effortArms("glm5_next") orelse return;
+    try testing.expectEqual(@as(?Effort, .high), selectEffort(glm, .medium));
+    try testing.expectEqual(@as(?Effort, .max), selectEffort(glm, .xhigh));
+    try testing.expectEqual(Effort.medium, selectEffortPick(glm, .medium).?.rerouted_from.?);
+    try testing.expectEqual(Effort.xhigh, selectEffortPick(glm, .xhigh).?.rerouted_from.?);
+    try testing.expect(selectEffortPick(glm, .high).?.rerouted_from == null);
+    try testing.expect(selectEffortPick(glm, .max).?.rerouted_from == null);
+    try testing.expect(selectEffort(glm, .off) == null);
+    try testing.expect(selectEffort(glm, .minimal) == null);
+    try testing.expect(selectEffort(glm, .on) == null);
+    const mimo = effortArms("mimo_v2") orelse return;
+    try testing.expect(selectEffortPick(mimo, .medium).?.rerouted_from == null);
+    try testing.expect(selectEffortPick(mimo, .xhigh).?.rerouted_from == null);
 }
 
 test "selectEffortPick: only Qwen high and max carry a re-route; MiMo's on-fold stays quiet" {
-    const qwen = [_]Effort{ .off, .low, .medium, .xhigh };
-    const high = selectEffortPick(&qwen, .high).?;
+    const qwen = effortArms("qwen4_exp") orelse return;
+    const high = selectEffortPick(qwen, .high).?;
     try testing.expectEqual(Effort.xhigh, high.effort);
     try testing.expectEqual(Effort.high, high.rerouted_from.?);
-    try testing.expect(selectEffortPick(&qwen, .xhigh).?.rerouted_from == null);
-    try testing.expect(selectEffortPick(&qwen, .minimal) == null);
-    const mimo = [_]Effort{ .off, .on };
-    try testing.expect(selectEffortPick(&mimo, .max).?.rerouted_from == null);
-    try testing.expectEqual(Effort.on, selectEffortPick(&mimo, .max).?.effort);
-    const glm = [_]Effort{ .low, .high, .max };
-    try testing.expect(selectEffortPick(&glm, .high).?.rerouted_from == null);
-    try testing.expectEqual(Effort.max, selectEffortPick(&glm, .xhigh).?.effort);
-    try testing.expectEqual(Effort.xhigh, selectEffortPick(&glm, .xhigh).?.rerouted_from.?);
+    try testing.expect(selectEffortPick(qwen, .xhigh).?.rerouted_from == null);
+    try testing.expect(selectEffortPick(qwen, .minimal) == null);
+    const mimo = effortArms("mimo_v2") orelse return;
+    try testing.expect(selectEffortPick(mimo, .max).?.rerouted_from == null);
+    try testing.expectEqual(Effort.on, selectEffortPick(mimo, .max).?.effort);
+    const glm = effortArms("glm5_next") orelse return;
+    try testing.expect(selectEffortPick(glm, .high).?.rerouted_from == null);
+    try testing.expectEqual(Effort.max, selectEffortPick(glm, .xhigh).?.effort);
+    try testing.expectEqual(Effort.xhigh, selectEffortPick(glm, .xhigh).?.rerouted_from.?);
     const notice = try formatEffortRerouteNotice(testing.allocator, "Qwen3.8-Flash-Next", .high, .xhigh);
     defer testing.allocator.free(notice);
     try testing.expectEqualStrings("Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`", notice);
@@ -824,6 +869,7 @@ test "every served model type offers the effort arms it always did" {
         .{ .model_type = "deepseek_v41", .arms = "off low:=50 medium:=62 high:=75 xhigh:=87 max:=100 ", .section = "deepseek_v41" },
         .{ .model_type = "glm5_next", .arms = "low:=low medium:->high high:=high xhigh:->max max:=max ", .section = "glm5_next" },
         .{ .model_type = "mimo_v2", .arms = "off on ", .section = null },
+        .{ .model_type = "hy_v4_flash", .arms = "off low:cap2048:=high medium:cap16384:=high high:=high xhigh:=max max:=max minimal:cap2048:=high on:=high ", .section = "hy_v4_flash" },
     }) |c| {
         const arms = effortArms(c.model_type) orelse continue;
         const text = try armsText(testing.allocator, arms);
@@ -839,4 +885,52 @@ test "every served model type offers the effort arms it always did" {
     }
     try testing.expect(effortArms("mistral") == null);
     try testing.expect(Family.of("mistral") == null);
+}
+
+test "effort table: an alias on a graded table does not catch unoffered words" {
+    if (!Family.hy_v4_flash.built()) return;
+    var e: Edits = .{};
+    e.rows[rowIndex(.low).?].offered = false;
+    const arms = merge(.hy_v4_flash, e).offeredArms();
+    try testing.expect(resolve(arms.slice(), .low) == null);
+    try testing.expect(resolve(arms.slice(), .minimal) == null);
+    const on = resolve(arms.slice(), .on).?;
+    try testing.expectEqual(Effort.on, on.arm.effort);
+    try testing.expectEqualDeep(Sends{ .word = .high }, on.arm.sends);
+    try testing.expect(on.rerouted_from == null);
+}
+
+test "effort table: CLI effort selection matches resolve on edited Hy4 tables with on alias and unoffered words" {
+    if (!Family.hy_v4_flash.built()) return;
+    const cli = @import("cli.zig");
+    var e: Edits = .{};
+    e.rows[rowIndex(.low).?].offered = false;
+    const arms = merge(.hy_v4_flash, e).offeredArms();
+    var buf: [std.enums.values(Effort).len]Effort = undefined;
+    const listed = listedWords(arms.slice(), &buf);
+    const from_arch = armsForOffered("hy_v4_flash", listed);
+    const from_words = armsForOffered(null, listed);
+    for ([_][]const EffortArm{ arms.slice(), from_arch.slice(), from_words.slice() }) |a| {
+        try testing.expectEqual(@as(?Effort, null), cli.acceptedEffort(.low, a));
+        try testing.expectEqual(@as(?Effort, null), cli.acceptedEffort(.minimal, a));
+        try testing.expectEqual(@as(?Effort, .on), cli.acceptedEffort(.on, a));
+    }
+    var e_hi: Edits = .{};
+    e_hi.rows[rowIndex(.high).?].offered = false;
+    e_hi.rows[rowIndex(.medium).?].offered = false;
+    const arms_hi = merge(.hy_v4_flash, e_hi).offeredArms();
+    const listed_hi = listedWords(arms_hi.slice(), &buf);
+    const from_hi = armsForOffered("hy_v4_flash", listed_hi);
+    try testing.expect(resolve(arms_hi.slice(), .high) == null);
+    try testing.expect(resolve(arms_hi.slice(), .medium) == null);
+    try testing.expectEqual(@as(?Effort, null), cli.acceptedEffort(.high, from_hi.slice()));
+    try testing.expectEqual(@as(?Effort, null), cli.acceptedEffort(.medium, from_hi.slice()));
+
+    const info = try cli.parseModelEfforts(testing.allocator,
+        \\{"object":"list","data":[{"id":"Hy4","reasoning_efforts":["off","medium","high","xhigh","max","on"],"meta":{"architecture":"hy_v4_flash"}}]}
+    );
+    defer info.deinit(testing.allocator);
+    try testing.expectEqual(@as(?Effort, null), cli.acceptedEffort(.low, info.arms.slice()));
+    try testing.expectEqual(@as(?Effort, null), cli.acceptedEffort(.minimal, info.arms.slice()));
+    try testing.expectEqual(@as(?Effort, .on), cli.acceptedEffort(.on, info.arms.slice()));
 }

@@ -1035,7 +1035,11 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 
     var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch {
-        if (!online) try w.print("no models yet (looked in {s})\ntry: sushi pull {s}\n", .{ root, packs.aliases[0].name });
+        if (!online) {
+            try w.print("no models yet (looked in {s})\n", .{root});
+            // A build whose archs ship no pack yet (Hy4-Flash alone) has no name to suggest.
+            if (packs.aliases.len > 0) try w.print("try: sushi pull {s}\n", .{packs.aliases[0].name});
+        }
         return;
     };
     defer dir.close(io);
@@ -1069,7 +1073,9 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             count += 1;
         }
     }
-    if (count == 0 and !online) try w.print("(none) — try: sushi pull {s}\n", .{packs.aliases[0].name});
+    if (count == 0 and !online) {
+        if (packs.aliases.len > 0) try w.print("(none) — try: sushi pull {s}\n", .{packs.aliases[0].name}) else try w.writeAll("(none)\n");
+    }
 }
 
 fn printLocalHeader(w: *std.Io.Writer, count: usize) !void {
@@ -1285,7 +1291,7 @@ pub const ThinkCommand = union(enum) { show, set: Think, refuse: []const u8 };
 
 /// `/think [effort]`; null when the line is not that command. An empty
 /// `accepted` (the server listed none) leaves the whole vocabulary to the server.
-pub fn parseThinkCommand(line: []const u8, accepted: []const effort_mod.Effort) ?ThinkCommand {
+pub fn parseThinkCommand(line: []const u8, accepted: []const effort_mod.EffortArm) ?ThinkCommand {
     if (!std.mem.startsWith(u8, line, "/think")) return null;
     const rest = line["/think".len..];
     if (rest.len > 0 and rest[0] != ' ') return null;
@@ -1296,7 +1302,7 @@ pub fn parseThinkCommand(line: []const u8, accepted: []const effort_mod.Effort) 
 }
 
 /// The effort `e` selects among the server's listed words (`effort_mod.selectEffort`); null = refused.
-pub fn acceptedEffort(e: effort_mod.Effort, accepted: []const effort_mod.Effort) ?effort_mod.Effort {
+pub fn acceptedEffort(e: effort_mod.Effort, accepted: []const effort_mod.EffortArm) ?effort_mod.Effort {
     if (accepted.len == 0) return e;
     return effort_mod.selectEffort(accepted, e);
 }
@@ -1314,7 +1320,7 @@ pub fn writeEffortRefusal(w: *std.Io.Writer, word: []const u8, model_id: []const
 }
 
 /// The server's `[effort]` line, when `/think` re-routed `asked`. False when the word was accepted as itself.
-pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: effort_mod.Effort, accepted: []const effort_mod.Effort) !bool {
+pub fn writeEffortReroute(w: *std.Io.Writer, model_id: []const u8, asked: effort_mod.Effort, accepted: []const effort_mod.EffortArm) !bool {
     if (accepted.len == 0) return false;
     const pick = effort_mod.selectEffortPick(accepted, asked) orelse return false;
     const from = pick.rerouted_from orelse return false;
@@ -1349,6 +1355,7 @@ pub const ModelEfforts = struct {
     id: []u8,
     /// Empty when the row lists none.
     efforts: []effort_mod.Effort,
+    arms: effort_mod.Arms = .{},
     /// The row lists the `vision` capability.
     vision: bool = false,
 
@@ -1372,13 +1379,18 @@ pub fn parseModelEfforts(allocator: std.mem.Allocator, body: []const u8) !ModelE
         if (v != .string) continue;
         if (effort_mod.parseEffort(v.string)) |e| try efforts.append(allocator, e);
     };
+    const arch: ?[]const u8 = blk: {
+        if (row.get("meta")) |mv| if (mv == .object) if (mv.object.get("architecture")) |av| if (av == .string and av.string.len > 0) break :blk av.string;
+        if (row.get("architecture")) |av| if (av == .string and av.string.len > 0) break :blk av.string;
+        break :blk null;
+    };
     var vision = false;
     if (row.get("capabilities")) |caps| if (caps == .array) for (caps.array.items) |v| {
         if (v == .string and std.mem.eql(u8, v.string, "vision")) vision = true;
     };
     const efforts_owned = try efforts.toOwnedSlice(allocator);
     errdefer allocator.free(efforts_owned);
-    return .{ .id = try allocator.dupe(u8, id), .efforts = efforts_owned, .vision = vision };
+    return .{ .id = try allocator.dupe(u8, id), .efforts = efforts_owned, .arms = effort_mod.armsForOffered(arch, efforts_owned), .vision = vision };
 }
 
 /// /v1/chat/completions request body for the REPL conversation so far;
@@ -1753,16 +1765,17 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         null;
     defer if (models_info) |m| m.deinit(allocator);
     const accepted: []const effort_mod.Effort = if (models_info) |m| m.efforts else &.{};
+    const arms: []const effort_mod.EffortArm = if (models_info) |m| m.arms.slice() else &.{};
     var think = opts.think;
     if (think == .effort) {
         const asked = think.effort;
-        think = .{ .effort = acceptedEffort(asked, accepted) orelse {
+        think = .{ .effort = acceptedEffort(asked, arms) orelse {
             try writeEffortRefusal(w, @tagName(asked), if (models_info) |m| m.id else "this model", accepted);
             try w.writeAll("\n");
             try w.flush();
             return error.ReplThinkUnsupported;
         } };
-        _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
+        _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, arms);
     }
     // /health answers 200 only once the launch model is loaded and its boot is
     // done, so an ok /health is the post-load moment. `run` quieted the log to warn on a TTY,
@@ -1815,14 +1828,14 @@ pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16, launch: Repl
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
         if (std.mem.eql(u8, trimmed, "/bye") or std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) break;
-        if (parseThinkCommand(trimmed, accepted)) |cmd| {
+        if (parseThinkCommand(trimmed, arms)) |cmd| {
             switch (cmd) {
                 .show => try writeThinkSetting(w, think, accepted),
                 .set => |t| {
                     think = t;
                     try writeThinkSetting(w, think, accepted);
                     const word = std.mem.trim(u8, trimmed["/think".len..], " \t");
-                    if (effort_mod.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, accepted);
+                    if (effort_mod.parseEffort(word)) |asked| _ = try writeEffortReroute(w, if (models_info) |m| m.id else "this model", asked, arms);
                 },
                 .refuse => |word| try writeEffortRefusal(w, word, if (models_info) |m| m.id else "this model", accepted),
             }
@@ -2573,44 +2586,46 @@ test "cli: --think requires an effort word" {
 }
 
 test "cli: /think shows, sets an accepted word, and refuses the rest" {
-    const qwen = [_]effort_mod.Effort{ .off, .low, .medium, .xhigh };
-    try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("/thinking about it", &qwen));
+    const qwen = effort_mod.effortArms("qwen4_exp") orelse return;
+    const glm = effort_mod.effortArms("glm5_next") orelse return;
+    const mimo = effort_mod.effortArms("mimo_v2") orelse return;
+    const qwen_listed = [_]effort_mod.Effort{ .off, .low, .medium, .xhigh };
+    try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("/thinking about it", qwen));
     var notice: [160]u8 = undefined;
     var nw: std.Io.Writer = .fixed(&notice);
-    try testing.expect(try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .high, &qwen));
+    try testing.expect(try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .high, qwen));
     try testing.expectEqualStrings("[effort] Qwen3.8-Flash-Next has no `high` effort; served at `xhigh`\n", nw.buffered());
     nw = .fixed(&notice);
-    try testing.expect(!try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .low, &qwen));
-    try testing.expect(!try writeEffortReroute(&nw, "MiMo", .high, &.{ .off, .on }));
-    const glm = [_]effort_mod.Effort{ .low, .high, .max };
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .high } }), parseThinkCommand("/think medium", &glm));
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think xhigh", &glm));
+    try testing.expect(!try writeEffortReroute(&nw, "Qwen3.8-Flash-Next", .low, qwen));
+    try testing.expect(!try writeEffortReroute(&nw, "MiMo", .high, mimo));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .high } }), parseThinkCommand("/think medium", glm));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think xhigh", glm));
     nw = .fixed(&notice);
-    try testing.expect(try writeEffortReroute(&nw, "GLM-5.3-Flash", .medium, &glm));
+    try testing.expect(try writeEffortReroute(&nw, "GLM-5.3-Flash", .medium, glm));
     try testing.expectEqualStrings("[effort] GLM-5.3-Flash has no `medium` effort; served at `high`\n", nw.buffered());
     nw = .fixed(&notice);
-    try testing.expect(try writeEffortReroute(&nw, "GLM-5.3-Flash", .xhigh, &glm));
+    try testing.expect(try writeEffortReroute(&nw, "GLM-5.3-Flash", .xhigh, glm));
     try testing.expectEqualStrings("[effort] GLM-5.3-Flash has no `xhigh` effort; served at `max`\n", nw.buffered());
-    try testing.expect(!try writeEffortReroute(&nw, "GLM-5.3-Flash", .off, &glm));
-    try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("hello", &qwen));
-    try testing.expectEqual(@as(?ThinkCommand, .show), parseThinkCommand("/think", &qwen));
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .medium } }), parseThinkCommand("/think medium", &qwen));
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think  off ", &qwen));
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", &qwen));
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &qwen));
-    try testing.expectEqualStrings("hgih", parseThinkCommand("/think hgih", &qwen).?.refuse);
+    try testing.expect(!try writeEffortReroute(&nw, "GLM-5.3-Flash", .off, glm));
+    try testing.expectEqual(@as(?ThinkCommand, null), parseThinkCommand("hello", qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .show), parseThinkCommand("/think", qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .medium } }), parseThinkCommand("/think medium", qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think  off ", qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", qwen));
+    try testing.expectEqualStrings("hgih", parseThinkCommand("/think hgih", qwen).?.refuse);
     // A server that lists no efforts leaves the whole vocabulary to it.
     try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .max } }), parseThinkCommand("/think max", &.{}));
 
     var buf: [256]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
-    try writeEffortRefusal(&w, "high", "Qwen3.8-Flash-Next-EXL3-K4", &qwen);
+    try writeEffortRefusal(&w, "high", "Qwen3.8-Flash-Next-EXL3-K4", &qwen_listed);
     try testing.expectEqualStrings("reasoning effort 'high' is not supported by Qwen3.8-Flash-Next-EXL3-K4; use one of: off, low, medium, xhigh", w.buffered());
     w = .fixed(&buf);
-    try writeThinkSetting(&w, .{ .effort = .low }, &qwen);
+    try writeThinkSetting(&w, .{ .effort = .low }, &qwen_listed);
     try testing.expectEqualStrings("thinking: low (options: off, low, medium, xhigh)", w.buffered());
     w = .fixed(&buf);
-    try writeThinkSetting(&w, .model_default, &qwen);
+    try writeThinkSetting(&w, .model_default, &qwen_listed);
     try testing.expectEqualStrings("thinking: model default (options: off, low, medium, xhigh)", w.buffered());
 }
 
@@ -3255,20 +3270,22 @@ test "cli: one-shot and REPL omission keep the model default" {
 
 
 test "thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words" {
+    const mimo = effort_mod.effortArms("mimo_v2") orelse return;
+    const glm = effort_mod.effortArms("glm5_next") orelse return;
+    const qwen = effort_mod.effortArms("qwen4_exp") orelse return;
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .on }, .consumed = true }, try parseThinkFlag("on"));
     try testing.expectEqual(ThinkFlag{ .think = .{ .effort = .minimal }, .consumed = true }, try parseThinkFlag("minimal"));
-    const mimo = [_]effort_mod.Effort{ .off, .on };
     for ([_][]const u8{ "/think on", "/think minimal", "/think low", "/think medium", "/think high", "/think xhigh", "/think max" }) |line| {
-        try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .on } }), parseThinkCommand(line, &mimo));
+        try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .on } }), parseThinkCommand(line, mimo));
     }
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think none", &mimo));
-    try testing.expectEqual(@as(?effort_mod.Effort, .on), acceptedEffort(.high, &mimo));
-    try testing.expect(parseThinkCommand("/think off", &.{ .low, .high, .max }).? == .refuse);
-    try testing.expect(parseThinkCommand("/think minimal", &.{ .low, .high, .max }).? == .refuse);
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", &.{ .off, .low, .medium, .xhigh }));
-    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", &.{ .off, .low, .medium, .xhigh }));
-    try testing.expect(parseThinkCommand("/think minimal", &.{ .off, .low, .medium, .xhigh }).? == .refuse);
-    try testing.expectEqual(@as(?effort_mod.Effort, null), acceptedEffort(.on, &.{ .off, .low, .medium, .xhigh }));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .off } }), parseThinkCommand("/think none", mimo));
+    try testing.expectEqual(@as(?effort_mod.Effort, .on), acceptedEffort(.high, mimo));
+    try testing.expect(parseThinkCommand("/think off", glm).? == .refuse);
+    try testing.expect(parseThinkCommand("/think minimal", glm).? == .refuse);
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think high", qwen));
+    try testing.expectEqual(@as(?ThinkCommand, .{ .set = .{ .effort = .xhigh } }), parseThinkCommand("/think max", qwen));
+    try testing.expect(parseThinkCommand("/think minimal", qwen).? == .refuse);
+    try testing.expectEqual(@as(?effort_mod.Effort, null), acceptedEffort(.on, qwen));
 }
 
 test "list: a downloaded pack with a newer published revision gets an update line under its row" {

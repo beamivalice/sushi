@@ -20,20 +20,93 @@ pub const Windows = struct {
     allocator: std.mem.Allocator,
     ids: []u32,
     count: usize,
+    /// Token offset of each window in `ids`, `count + 1` entries.
+    starts: []usize,
     sha256: [64]u8,
 
     pub fn deinit(self: *Windows) void {
         self.allocator.free(self.ids);
+        self.allocator.free(self.starts);
     }
 
     pub fn window(self: *const Windows, i: usize) []const u32 {
-        return self.ids[i * window_len ..][0..window_len];
+        return self.ids[self.starts[i]..self.starts[i + 1]];
     }
 
     pub fn tokens(self: *const Windows) usize {
-        return self.count * window_len;
+        return self.ids.len;
     }
 };
+
+fn uniformStarts(allocator: std.mem.Allocator, count: usize) ![]usize {
+    const starts = try allocator.alloc(usize, count + 1);
+    for (starts, 0..) |*v, i| v.* = i * window_len;
+    return starts;
+}
+
+/// Windows of the given lengths over `ids`, in order. The digest covers the lengths too, so the same
+/// tokens cut differently are a different calibration: sha256 of the ids as little-endian i32 followed by
+/// the lengths as little-endian i64, the digest other tools record for the same windows.
+pub fn fromLengths(allocator: std.mem.Allocator, ids: []const u32, lengths: []const u32) !Windows {
+    if (lengths.len == 0) return error.CalibTooShort;
+    const starts = try allocator.alloc(usize, lengths.len + 1);
+    errdefer allocator.free(starts);
+    starts[0] = 0;
+    for (lengths, 0..) |n, i| {
+        if (n == 0) return error.CalibTooShort;
+        starts[i + 1] = starts[i] + n;
+    }
+    if (starts[lengths.len] > ids.len) return error.CalibTooShort;
+    const owned = try allocator.dupe(u32, ids[0..starts[lengths.len]]);
+    errdefer allocator.free(owned);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (owned) |v| {
+        var le: [4]u8 = undefined;
+        std.mem.writeInt(u32, &le, v, .little);
+        h.update(&le);
+    }
+    for (lengths) |v| {
+        var le: [8]u8 = undefined;
+        std.mem.writeInt(u64, &le, v, .little);
+        h.update(&le);
+    }
+    var raw: [32]u8 = undefined;
+    h.final(&raw);
+    return .{ .allocator = allocator, .ids = owned, .count = lengths.len, .starts = starts, .sha256 = std.fmt.bytesToHex(raw, .lower) };
+}
+
+/// Windows from a token-id file (little-endian u32) and a JSON file of window `lengths` (and optionally their
+/// `starts`, which must then lay the windows end to end from 0).
+pub fn idsFileWindows(allocator: std.mem.Allocator, io: std.Io, ids_path: []const u8, windows_path: []const u8) !Windows {
+    const cwd = std.Io.Dir.cwd();
+    const raw = try cwd.readFileAlloc(io, ids_path, allocator, .limited(1 << 34));
+    defer allocator.free(raw);
+    if (raw.len % 4 != 0) return error.CalibIdsInvalid;
+    const ids = try allocator.alloc(u32, raw.len / 4);
+    defer allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = std.mem.readInt(u32, raw[i * 4 ..][0..4], .little);
+    const text = try cwd.readFileAlloc(io, windows_path, allocator, .limited(1 << 26));
+    defer allocator.free(text);
+    return windowsFromJson(allocator, ids, text);
+}
+
+fn windowsFromJson(allocator: std.mem.Allocator, ids: []const u32, text: []const u8) !Windows {
+    const parsed = std.json.parseFromSlice(struct { lengths: []const u32, starts: ?[]const u64 = null }, allocator, text, .{ .ignore_unknown_fields = true }) catch return error.CalibWindowsInvalid;
+    defer parsed.deinit();
+    const v = parsed.value;
+    if (v.starts) |starts| {
+        if (starts.len != v.lengths.len) return error.CalibWindowsInvalid;
+        var at: u64 = 0;
+        for (starts, v.lengths) |s0, n| {
+            if (s0 != at) return error.CalibWindowsInvalid;
+            at += n;
+        }
+    }
+    var total: usize = 0;
+    for (v.lengths) |n| total += n;
+    if (total != ids.len) return error.CalibWindowsInvalid;
+    return fromLengths(allocator, ids, v.lengths);
+}
 
 fn idsDigest(ids: []const u32) [64]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -62,14 +135,15 @@ pub fn assemble(allocator: std.mem.Allocator, wiki_ids: []const u32, code_ids: [
     errdefer allocator.free(ids);
     @memcpy(ids[0 .. wiki_n * window_len], wiki_ids[0 .. wiki_n * window_len]);
     @memcpy(ids[wiki_n * window_len ..], code_ids[0 .. code_n * window_len]);
-    return .{ .allocator = allocator, .ids = ids, .count = wiki_n + code_n, .sha256 = idsDigest(ids) };
+    return .{ .allocator = allocator, .ids = ids, .count = wiki_n + code_n, .starts = try uniformStarts(allocator, wiki_n + code_n), .sha256 = idsDigest(ids) };
 }
 
 pub fn fromTokens(allocator: std.mem.Allocator, ids: []const u32, total_tokens: usize) !Windows {
     const total = @min(total_tokens, ids.len) / window_len;
     if (total == 0) return error.CalibTooShort;
     const owned = try allocator.dupe(u32, ids[0 .. total * window_len]);
-    return .{ .allocator = allocator, .ids = owned, .count = total, .sha256 = idsDigest(owned) };
+    errdefer allocator.free(owned);
+    return .{ .allocator = allocator, .ids = owned, .count = total, .starts = try uniformStarts(allocator, total), .sha256 = idsDigest(owned) };
 }
 
 pub const Fetcher = struct {
@@ -250,6 +324,27 @@ test "calib: windows split the tokens half and half, spill to prose when code ru
     try t.expectError(error.CalibTooShort, fromTokens(t.allocator, wiki[0 .. window_len - 1], window_len));
 }
 
+test "calib: windows of mixed lengths slice in order, and the same tokens cut differently hash differently" {
+    const t = std.testing;
+    const ids = try tinyIds(t.allocator, window_len * 2, 0);
+    defer t.allocator.free(ids);
+    var mixed = try fromLengths(t.allocator, ids, &.{ 1024, 512, 512, 2048 });
+    defer mixed.deinit();
+    try t.expectEqual(@as(usize, 4), mixed.count);
+    try t.expectEqual(@as(usize, 512), mixed.window(1).len);
+    try t.expectEqual(@as(u32, 1536), mixed.window(2)[0]);
+    try t.expectEqual(@as(u32, 2048), mixed.window(3)[0]);
+    try t.expectEqual(@as(usize, window_len * 2), mixed.tokens());
+    var other = try fromLengths(t.allocator, ids, &.{ 512, 1024, 512, 2048 });
+    defer other.deinit();
+    try t.expect(!std.mem.eql(u8, &mixed.sha256, &other.sha256));
+    var uniform = try fromTokens(t.allocator, ids, window_len * 2);
+    defer uniform.deinit();
+    try t.expectEqual(@as(usize, window_len), uniform.window(1).len);
+    try t.expectError(error.CalibTooShort, fromLengths(t.allocator, ids, &.{ 4096, 1 }));
+    try t.expectError(error.CalibTooShort, fromLengths(t.allocator, ids, &.{ 8, 0 }));
+}
+
 const FakeFetch = struct {
     body: []const u8,
     calls: usize = 0,
@@ -269,6 +364,22 @@ fn hexOf(bytes: []const u8) [64]u8 {
     var raw: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &raw, .{});
     return std.fmt.bytesToHex(raw, .lower);
+}
+
+test "calib: windows from a lengths file lay end to end, refuse gaps or a short id file, and hash as i32 ids then i64 lengths" {
+    const t = std.testing;
+    const ids = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    var w = try windowsFromJson(t.allocator, &ids, "{\"lengths\":[4,2,2],\"starts\":[0,4,6]}");
+    defer w.deinit();
+    try t.expectEqual(@as(usize, 3), w.count);
+    try t.expectEqualSlices(u32, &.{ 4, 5 }, w.window(1));
+    try t.expectEqualStrings("30ef987aec2e7c5593512b5a33310b72ff4604d077545c515005105c8220b561", &w.sha256);
+    var bare = try windowsFromJson(t.allocator, &ids, "{\"lengths\":[4,2,2]}");
+    defer bare.deinit();
+    try t.expectEqualSlices(u8, &w.sha256, &bare.sha256);
+    try t.expectError(error.CalibWindowsInvalid, windowsFromJson(t.allocator, &ids, "{\"lengths\":[4,2,2],\"starts\":[0,5,6]}"));
+    try t.expectError(error.CalibWindowsInvalid, windowsFromJson(t.allocator, &ids, "{\"lengths\":[4,2]}"));
+    try t.expectError(error.CalibWindowsInvalid, windowsFromJson(t.allocator, &ids, "{\"lengths\":[4,2,4]}"));
 }
 
 test "calib: the WikiText archive is fetched once, checked against its sha256, and a bad copy is refused or replaced" {

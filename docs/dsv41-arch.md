@@ -68,7 +68,8 @@ mixes, sinks and the gate bias f32. Each backbone layer sits in its own shard (~
   into slabs (layout `mxfp4_w123`, `layers.L.ffn.experts.E.w1|w3|w2.{weight,scale}`; w1 gate, w3 up, w2 down) and the
   layer gathers them as `mxfp4`. The slab path gives the resident path's logits bit for bit on a tiny pack, with a cache
   that holds every expert and one that does not.
-- **Engram tables** (`src/dsv41/dsv41_engram.zig`): never resident. Each lookup `pread`s its rows from the shard that holds the
+- **Engram tables** (the shared `src/engram.zig`: hash, table reader, row cache, read-ahead; DeepSeek's table names and
+  token map in `src/dsv41/dsv41_engram.zig`): never resident. Each lookup `pread`s its rows from the shard that holds the
   table (page cache on, read-ahead off, `F_RDADVISE` first so a batch costs about one SSD latency) and dequantizes them
   as `mxfp8`. A row cache per table (`RowCache`, 8-way set-associative, least recent out) keeps 1M rows; on 1M
   tokens of documents in turn it serves 31% of reads at 64k rows, 42% at 1M and 47% at 4M
@@ -276,7 +277,7 @@ against the reference's own kernels on a midpoint-rich fixture.
 ## Tokenizer
 
 The release's pre-tokenizer is a `Sequence` of three isolating Splits (`\p{N}{1,3}`, a CJK class, a punctuation grammar)
-and a ByteLevel that does not split. `src/dsv41/tokenizer_deepseek.zig` runs it exactly, each Split on the pieces the one before
+and a ByteLevel that does not split. `src/tokenizer_deepseek.zig` (shared: Hy4-Flash spells the same grammar) runs it exactly, each Split on the pieces the one before
 left, so a whitespace run at a piece's edge stays whole; it is selected (`pretokenizer` in `src/dsv41/dsv41_chat.zig`) only when the tokenizer.json spells those three
 regexes verbatim. It needs `\p{P}` and `\p{S}`, which `scripts/gen-tokenizer-unicode.py` now emits beside letters, marks and
 numbers. Pinned to HF `tokenizers` by `deepseek pre-tokenizer` (21 inputs, hermetic) and by the real-pack parity in
@@ -296,7 +297,7 @@ A bill follows the storage in the same commit; every term below is an ESTIMATE u
 | Fill peak | none: slabs are filled in place, the union workspace (a layer's 384 experts) is billed once at load beside the cache and bounce (`model_load.loadStagingBytes`) and sits in active memory after |
 | Indexer peak by context | `sushi-ubench run dsv41.index_peak`, `dsv41.index_block_peak`, `dsv41.rows_growth`: MLX `peak - active` of one span at the release shapes (32 heads x 128, top-512, blocks of 8). 256 rows at ratio 2: whole scores 12 / 58 / 211 / 415 / 823 MB at 16k / 64k / 256k / 512k / 1M context, streamed 13 / 58 / 81 / 81 / 81 MB. The 128-row CED tail at ratio 1: whole 13 / 62 / 239 / 476 / 948 MB, streamed 13 / 44 / 44 / 44 / 44 MB. A 16-row decode block over the packed keys: 4 / 16 / 32 / 64 MB, 9 / 36 / 72 / 144 MB with a candidate mask. A row store's growth holds 1.06 x its bytes beyond them (306 MB for 1M compressed rows, 72 MB for 1M index keys; 1.25 x at the old quarter). Synthetic keys, no model; the live per-chunk peak on the pack is the check |
 | Measured transient | Per-chunk MLX `peak - active` (`SUSHI_PREFILL_CHUNK_PEAK`) of the CED prefill on an STQ pack: 2.63 GB at 512 rows, 3.56 GB at 1024, 4.05 GB at a 1507-row last chunk, nearly flat in the context (512 rows: 2.64 GB at 18k, 2.60 GB at 108k, about 0.6 KB a context token). The bill uses `chunk + 511` rows, 400 B a row per hidden channel (2.0 MB a row) and 3 score copies per context token; the bracket test pins bill >= 1.1x each measurement and <= 4x. Before the per-span scopes and CED: ~6.2-6.9 MB a row and 33 KB a context token. These per-chunk numbers predate the streamed top-k; the bill is refitted from the indexer table above, so re-measure the live peak before trusting a margin |
-| Engram | each table's row cache (`dsv41_engram.cacheBytes`: 1M rows at 272 B, 0.57 GB for both), billed with the trunk, so the expert cache gives it up; the page cache carries the rest |
+| Engram | each table's row cache (`engram.cacheBytes`: 1M rows at 272 B, 0.57 GB for both), billed with the trunk, so the expert cache gives it up; the page cache carries the rest |
 
 `kvBytesPerToken`, `sessionBytesPerToken`, `slotRingBytes`, `prefillTransientReserveAtKv` and `prefillNeededAtChunk` answer
 these for `deepseek_v41`, so auto context, the prefill chunk ladder and admission read one set of numbers.
@@ -465,9 +466,9 @@ Other pieces:
 - Attention runs each span and each attention or FFN block in its own scope, so MLX frees the f32 gathers and logits
   copies between spans.
 
-Measured on an STQ pack, M5 Max, `--ssd-budget-gb 94 --prefill-chunk 1024`, one A then one B after 180 s idle:
+Measured on `dsv41-stq-d4`, M5 Max, `--ssd-budget-gb 94 --prefill-chunk 1024`, one A then one B after 180 s idle:
 
-| prompt | full forward | CED |
+| prompt | fe360c53 (full forward) | 174e2863 (CED) |
 |---|---|---|
 | 8.7k tokens, cold | 179 tok/s | 286 tok/s |
 | 8.7k tokens, warm | 258 tok/s | 482 tok/s |
@@ -482,7 +483,7 @@ routed experts (fill and grouped GEMM) 52-55%, attention core 16%, Engram host r
 3.5-9%, the rest under 3% each. The trellis trunk GEMM runs at the speed of MLX's mxfp8 and affine4 GEMMs at 512 rows
 ([engine-exl3-experts](engine-exl3-experts.md#dsv41-stq)).
 
-After CED and the fused gather-attention (budget 96, chunk 1024, synced stage profile, ms per chunk):
+After CED and the fused gather-attention (5ce8d3a1, budget 96, chunk 1024, synced stage profile, ms per chunk):
 
 | stage | warm encoder (rows 0-19, 1024 rows) | cold encoder | decoder (rows 20-39, 128 rows) |
 |---|---|---|---|
@@ -561,7 +562,7 @@ tests at the output.
 | slab experts vs resident experts | identical logits |
 | DSpark draft: ids, Markov-biased logits, confidence, main rows | QAT off 1e-4 / 2e-3 of the peak; QAT on cosine > 0.99 from the reference's rows |
 | DSpark verify rollback at every accepted count, a second round, the next draft | serial logits 2e-3, serial draft |
-| `nextDspark` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against a `--no-mtp` load's serial decode (DSpark rows are the same at every width; a serial step beside a drafter takes the rounds' arm, one without a drafter the SIMD one-row arm) (the exact-stream rows above pin the identity) |
+| `nextDrafterRound` through the Generator on the GPU in bf16 | the budget, the stats and the first token; the later tokens may break a near-tie against a `--no-mtp` load's serial decode (DSpark rows are the same at every width; a serial step beside a drafter takes the rounds' arm, one without a drafter the SIMD one-row arm) (the exact-stream rows above pin the identity) |
 | DSpark bills | resident bytes equal the held arrays; window and slack bytes equal the bill |
 | `Transformer.forward` through the shell | identical to the model's own, across prefill and decode chunks |
 | chat template | 14 cases byte for byte with `encode_messages` |
@@ -670,7 +671,7 @@ kernels), AC, pack `DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw`:
 - Resident 32K prefill (`--drop-expert 128 --ssd-budget-gb 94`, one boot an arm, same binary, `taskpolicy -a`, fans max, QUIET): profiled
   1294.1 to 1494.2 tok/s, last full chunk (pos 28672) `core` 536.4 to 320.2 ms and total 1530.3 to 1335.1 ms (mean of the 12 full chunks
   `core` 482.7 to 278.8); unprofiled 1407.6 to 1604.4 tok/s (+14.0%).
-- KLD (`sushi kld compare`, 8-category fixture, `--tokens 512 --top-k 10 --kv-quant 16 --no-mtp --ctx-size 8192 --ssd-budget-gb 100`,
+- KLD (`sushi kld compare`, 8-category fixture, `--tokens 512 --ctx-size 8192`,
   `MLX_ENABLE_TF32=0`): to-first-EOS 0.18575 (88.51% top-1, 7775 positions) against the recorded 0.1843 (published) and
   0.1853 (same-binary live check); per category code 0.0352, math 0.0593, reasoning 0.1158, design 0.1651, wikitext 0.2815,
   multilingual 0.2736, story 0.4878, stem 0.0963.
@@ -699,7 +700,7 @@ expert, so only the logits' direction is held (`dsv41 fused`).
 
 The release's drafter: three sliding-window stages (`mtp.0..2`, window 128, rope theta 10000 and no YaRN, 128 routed
 experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries a forced call
-(`dsv41_dspark.dsparkEligible`, MTP's rule); those decode serially (`gen.dspark` is false and its ticks are plain). A grammar or JSON schema drafts too
+(`dsv41_dspark.drafterEligible`, MTP's rule); those decode serially (`gen.drafter_on` is false and its ticks are plain). A grammar or JSON schema drafts too
 ([below](#dspark-grammar)). A repeat or
 presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
 (Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, and a round verifies at most the thought
@@ -732,7 +733,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   itself, and destroys the streams without a `deinit` of their own (a `Stream` holds no resource; the engine is the
   trunk's `expert_stream`): both are intended. DeepSeek has no draft head: `lmHeadForDraft` refuses by name, and no
   caller reaches it (DFlash2 is not one of its drafters).
-- **A round** (`Generator.nextDspark`): draft from the pending token, verify `[t1, drafts]` as one chunk through the
+- **A round** (`Generator.nextDrafterRound`): draft from the pending token, verify `[t1, drafts]` as one chunk through the
   normal forward and the streamed experts (`dsv41_model.verify`), keep the longest prefix the trunk's own masked argmax
   agrees with plus the argmax after it (`finishVerify`). The chunk is cut to the tokens the budget still allows.
 - **Rollback** (the model's own state, no capture): the backbone rings hold 16 rows of slack (`ring_slack`), so a rejected
@@ -749,17 +750,17 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   The boot line reads `[spec] DeepSeek-V4.1-Flash decodes with DSpark (...)` or `... plain ticks (...)`, and a request that
   drafted logs `[spec-stats] mode=dspark` with acceptance, draft and verify ms.
 
-- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `dsv41_dspark.dsparkConstrainedEntry`). Each verify row takes the mask serial decode builds
+- <a id="dspark-grammar"></a>**Grammar** (`row_grammar.zig`, `dsv41_dspark.drafterConstrainedEntry`). Each verify row takes the mask serial decode builds
   after the drafts before it (`row_grammar.plan` walks a scratch copy of the JSON grammar and reasoning state over the drafts), so the
   masked argmax of a row is the serial token and a greedy request emits serial's tokens; a sampled one draws from the masked, filtered
   row. A draft its row's mask forbids ends the chunk there, and so does one serial decode answers by forcing the boundary (EOS or pad
   inside the reasoning). While a schema waits behind the reasoning close the rows carry only the reasoning mask (it excludes the
   tokens that would close with a payload the schema rejects); past the close, the JSON mask. The pending token is judged at the next
-  round's start as serial decode judges a sampled one (`dsparkJudgePending`), and a serial tick (`next`, the loop guard's forced
-  boundary) first emits it (`dsparkEmitPending`). `[spec-stats]` adds the host `mask_ms` per round and the serial ticks. A channel-header
+  round's start as serial decode judges a sampled one (`drafterJudgePending`), and a serial tick (`next`, the loop guard's forced
+  boundary) first emits it (`drafterEmitPending`). `[spec-stats]` adds the host `mask_ms` per round and the serial ticks. A channel-header
   protocol or an opener choice keeps the request serial (`Constraint.rowsDraftable`).
 
-- **Verify width** (`src/dspark_rows.zig`, `Generator.nextDspark`, bound by `arch/dspark.zig` to the DeepSeek drafter's `dspark_rounds`). A round verifies the first R rows of its 6-row block (t1 and R-1
+- **Verify width** (`src/drafter_rows.zig`, `Generator.nextDrafterRound`, bound by `arch/drafter_rounds.zig` to the DeepSeek drafter's `drafter_rounds`). A round verifies the first R rows of its 6-row block (t1 and R-1
   drafts; the draft is greedy, so a shorter verify keeps exactly the tokens a longer one would have kept up to R) and R=1 is a plain
   step with no draft. R maximizes expected tokens per ms, `E[tokens(R)] = 1 + sum_i prod_{j<=i} p_j`, over the cost of the round
   (`dflash_policy.chooseRows`). `p_j` is the confidence head's logit through a sigmoid and the per-bin calibration of
@@ -812,7 +813,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
 - **Exact greedy costs nothing measurable** (base `1aececf3` + the exact route, the knob on against off in one binary; the shipped
   STQ 1.75bpw, `--ssd-budget-gb 108 --ctx-size 65536`, `taskpolicy -a`, GPU lock, QUIET, fans max, die under 50 C at each boot, one
   boot per arm and kind, A then B; a ~4.9k-token code prompt (a Zig source review) and a ~4.0k-token prose prompt, 600 greedy
-  tokens, second pass of each; forced `SUSHI_DSV41_DSPARK_ROWS=sweep`, verify ms trimmed means of `[dspark-round]`, ~30-40 rounds a
+  tokens, second pass of each; forced `SUSHI_DSV41_DSPARK_ROWS=sweep`, verify ms trimmed means of `[drafter-round]`, ~30-40 rounds a
   width). A = arms that sum by width (`SUSHI_DSV41_DSPARK_EXACT=0`), B = exact (the default):
 
 | R | code A | code B | delta | prose A | prose B | delta |
@@ -862,7 +863,7 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   ran 2x slower), trunk weight prefetch under the small stages gained nothing in a process bench, and the rows geometry
   policy is within 2-5% of the best of a sweep.
 
-- **Copy rounds** (`nextDspark`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
+- **Copy rounds** (`nextDrafterRound`, `mtp_lookup.matchBest` / `copyLen` / `CopyBackoff`, the MTP lookup's index): when the committed tail
   plus t1 matches 16 or more tokens earlier in the prompt or output (the best of the last 8 occurrences) and the continuation
   outruns the stage block, the round verifies the copy and skips the stage draft. A copy round is as wide as the widest
   verify whose rows are the one-row step's bits (`Model.exactVerifyRows`): 16 rows on a machine with matrix units
@@ -1039,13 +1040,13 @@ the tiny pack the test covers the rounds before the first tie.
 
 <a id="host-queries"></a>
 **Host queries a decode token** (`mlx.query_count`: shape, size and dtype reads, each an FFI call; test builds only;
-`dsv41_query_count_test.zig`, ReleaseFast on the tiny fixtures, one decode row, every expert resident; 0d621106, and
-the bound counts on the l-qwen4b tree over `3d4b4277`):
+`dsv41_query_count_test.zig`, ReleaseFast on the tiny fixtures, one decode row, every expert resident; 0d621106; the bound
+column is the test's pins):
 
 | path | 0d621106 | bound |
 |---|---|---|
-| a token, `DSV41_TINY` (mxfp8 trunk, FP4 experts, 8 layers) | 1169 / 1218, alternating | 1169 / 1218 |
-| a token, `DSV41_STQ_TINY` (trellis trunk, 8 layers) | 2703 / 2774, alternating | 2373 / 2429 |
+| a token, `DSV41_TINY` (mxfp8 trunk, FP4 experts, 8 layers) | 1169 / 1218, alternating | 1160 / 1209 |
+| a token, `DSV41_STQ_TINY` (trellis trunk, 8 layers) | 2703 / 2774, alternating | 2250 / 2306 |
 | mxfp8 trunk linear (`Lin.apply`) | 0 | 0 |
 | trellis trunk linear (`Stq.apply`), 1 row (plain decode) / 5 rows (verify, exact mode) | 22 / 22 | 7 / 22 |
 | grouped trellis `wo_a` (`applyGrouped`), 1 / 5 rows | 19 / 19 | 19 / 19 |
@@ -1057,6 +1058,8 @@ the bound counts on the l-qwen4b tree over `3d4b4277`):
   dtype read their operands' shapes per call (`linearWith`, `projectRows`). Bytes are unchanged.
 - A layer holds its trellis shared bank's lane shapes (`Layer.shared_lane`, `rate_groups.SharedLane.of` at load), which
   `sharedBank` hands the chain; `sharedRate` checks them against `rb.hidden` and `rb.inter`. Bytes are unchanged.
+- A shared kernel's wrapper reads each operand fact once and hands it down (`hck.stage` takes `x`'s dtype, which the wrapper read to
+  cast `y`: one dtype query a stage), and a row write (`row_store.put`) reads its shape once, not a dim a side: two queries a write.
 - A gate added to a per-layer step reads the shapes the step already reads: the router reads its row count once for
   the cache-bias gate and the logits kernel, where a second read cost 16 queries a token on the 8-layer fixtures.
 - At 43 layers what is left is a few thousand queries a token, an estimate of tens of microseconds against a GPU-bound
@@ -1081,7 +1084,7 @@ line counts them); one that leaves every group an expert is the plain ranking's 
   A drop that would empty a rate group of some layer is refused by name (`DropEmptiesRateGroup`).
 - **Resident mode.** `StoreShape.all_bytes` counts the kept experts and their meta rows only, so a budget that holds every
   kept expert engages the resident mode (pools of the kept count, the GPU expert-to-slot map carries -1 for a dropped id).
-  On an STQ pack at `--ssd-budget-gb 116` the whole pack is not resident; with `--drop-expert 8` or `16` it is (plan only,
+  On the 6p pack at `--ssd-budget-gb 116` the whole pack is not resident; with `--drop-expert 8` or `16` it is (plan only,
   headers read, no weights).
 - **Why a multiple of 8.** No kernel needs a multiple: the route kernel pads to 32 lanes with a bound check, the ragged pools
   and meta table take any slot count, and the window kernel holds up to 512 experts. The one expert-count tile left is the
@@ -1093,6 +1096,9 @@ line counts them); one that leaves every group an expert is the plain ranking's 
   experts dropped gives the logits of the full-pool engine under the same mask bit for bit, caches no dropped expert and
   refuses one by name; greedy DSpark rounds emit the serial tokens of the same mask; the transformer loads the list, the
   plan bills the smaller set. KLD capture refuses the flag; `sushi kld compare --drop-expert n` scores a pruned student.
+- **Measured on the tune corpus** (245,760 tokens of the 6p corpus, `coverage.npy` of the DeepSeek tune): n=8 re-routes
+  0.18% of picks and frees 2.1 GB of expert trellis; n=16 re-routes 0.52% (worst layer 0.78%) and frees 4.3 GB. No rate
+  group of the tuned pack empties at either.
 
 <a id="prefix-cache"></a>
 ## Prefix cache
@@ -1272,7 +1278,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   (`dsv41_thought_point.writeDsv41ThoughtPoint`; DSpark rounds and an SSD-first tier only). With tools the template re-renders an
   earlier assistant turn as `reasoning_content</think>content` plus the call block, so the next prompt repeats the
   generated tokens through the closer and the 5-20k tokens of a long thought need no re-prefill. A round that would
-  commit past the closer is cut to end on it (`Generator.dspark_round_ends_at`: fewer verify rows, the pending token
+  commit past the closer is cut to end on it (`Generator.drafter_round_ends_at`: fewer verify rows, the pending token
   still the trunk's own), so the state stands exactly behind it; the point is taken like an SSD-first prefill point
   (`HotPrefixCache.writeDecodePointDsv41`: shared rows, released before the next forward) and, being off the segment
   grid, is kept live and written only by the flush below (`[dsv41-prefix] restore points to SSD at P: 0.00 GB staged, decode held T ms`).
@@ -1281,7 +1287,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
   prompt-end snapshot's re-prefill is cheaper) and for one whose first or last token is `\n` or a space, which the
   server trims off the delivered `reasoning_content`. A client must send `reasoning_content` back verbatim, as the
   server delivered it. A reasoning budget (or loop-recovery close) keeps DSpark on for the answer: a round before the bound
-  verifies at most the thought room, and after the forced closer `Generator.dsparkResumeAfterForced` publishes the closer
+  verifies at most the thought room, and after the forced closer `Generator.drafterResumeAfterForced` publishes the closer
   and samples its successor (the stage windows already hold the forced rows, since every forward commits its main rows), so
   the next round enters as after prefill; a thought point is not written behind a forced close. Serial decode (no DSpark) leaves the state one
   token ahead of the emitted ones and a RAM tier keeps points on the commit's list, so neither writes it.
@@ -1322,7 +1328,7 @@ retention off unless `--prefix-cache-mem` names a size. With no flags every turn
 - Every request logs `[dsv41-prefix] reused N of M prompt tokens from RAM|SSD|nothing, prefilling K; lookup and restore X ms`; every other arch logs the same line tagged `[prefix]`.
 
 **Real pack.** `DeepSeek-V4.1-Flash-1017`, M5 Max, `--ssd-budget-gb 76` (100, 92 and 84 are refused with `ExpertCacheDoesNotFit`: the
-stages' 8 GB sit beside the serving bytes the load check adds), bf16 KV, 160 greedy tokens, no GPU lock held by
+stages' 8 GB sit beside the serving bytes the load check adds), bf16 KV, binary 6e4ddf08, 160 greedy tokens, no GPU lock held by
 another job:
 
 | prompt | per-draft acceptance | accepted per round | DSpark tok/s | serial tok/s | bytes vs serial |
@@ -1332,10 +1338,10 @@ another job:
 | copy | 100% | 4.93 | 12.2-13.0 | 5.5 | identical |
 
 On an STQ pack (`Model.widthExact`: trellis trunk and experts) greedy DSpark text is the same at every round-width mix on the same hardware (exact greedy): the same request gives the same
-bytes whatever plain and drafted rounds the policy (`dspark_rows.Policy`) picks from measured timings, and at any forced width
+bytes whatever plain and drafted rounds the policy (`drafter_rows.Policy`) picks from measured timings, and at any forced width
 (`SUSHI_DSV41_DSPARK_ROWS`). The release's own layout (FP8 trunk, MXFP4 experts) is not width-exact: MLX's quantized products
 pick their plan by row count, so a greedy or seeded DSpark request there verifies at the fixed R=3 on either route
-(`dsparkFixedRows`; the `[spec] ... decodes with DSpark` boot line ends `fixed width: this layout is not width-exact`):
+(`drafterFixedRows`; the `[spec] ... decodes with DSpark` boot line ends `fixed width: this layout is not width-exact`):
 the same request gives the same text whatever the timings, at the cost of the adaptive width's speed and the copy rounds
 on the release checkpoint (STQ packs keep both). An unseeded sampled request repeats nothing and keeps the adaptive width. A row's bytes depend on the arm of each linear it passes through, so each linear has one arm at
 every width. The trunk linears (`projectRows`) were the only arms that changed with the width: the one-row step took the SIMD

@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 158 vars. By kind: tradeoff levers 14, diagnostics 60, microbenches 19, test-only seams 55, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 159 vars. By kind: tradeoff levers 14, diagnostics 61, microbenches 19, test-only seams 55, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -26,12 +26,13 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (65)
+## Diagnostics (68)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
 | var | where | default → effect | read | documented |
 |---|---|---|---|---|
+| `SUSHI_ENCODER_HY4_LAYERS` | `encoder/cli.zig` (`convertHy4`) | `<L,L,...>` writes only those layers' expert and trunk shards of a Hy4-Flash convert, each timed (a one-layer encode timing), no config or index | once | yes: encoder |
 | `QWEN4_DEBUG_SCORES` | `qwen4_qsa.zig:1334, 1383` | prints QSA pooled shapes and score rows | once | no |
 | `QWEN4_DUMP_QSA_BLOCKS` | `qwen4_qsa.zig:627` | `<path>` dumps the selected QSA block indices | once | no |
 | `QWEN4_FIXTURE_ROWS` | `qwen4_fixture_test.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
@@ -54,16 +55,19 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DSV41_ENGRAM_REUSE` | `dsv41_engram.zig` (test) | `<u32 tokens file>`: the Engram row cache's hit rate by capacity over a token stream | test | yes: dsv41-arch |
 | `MLX_ENABLE_TF32`, `MLX_METAL_GPU_ARCH` | `tensor/matmul.zig`, `exl3/device.zig` | MLX's own variables, read as MLX reads them so the engine's matmul takes the kernel MLX takes: f32 on the NAX tiles (default on), and a GPU architecture name in place of the device's, which the [device profile](engine-kernels.md#the-device-profile) takes for every gate | once | yes: engine-own-forward, engine-kernels |
 | `SUSHI_DSV41_NO_DECODE_ENGRAM_AHEAD` | `dsv41_serving.zig` | TEMPORARY A/B: decode-width passes read their Engram rows at the layer; deleted after the live measurement | load | no |
-| `SUSHI_ENGINE_KERNEL_PROF` | `tensor/core.zig` (`kernelProfOn`) | `1` hands every engine op over as its own command buffer and waits for it, so the GPU times are per kernel; logs `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each` at debug level, top 40 kernels by GPU time (`all`: every kernel), in `[engine] since load:` and the decode meter (the forward runs slower: one wait per op) | once | yes: engine-own-forward |
+| `SUSHI_ENGINE_KERNEL_PROF` | `tensor/core.zig` (`kernelProfOn`) | `1` hands every engine op over as its own command buffer, no wait between, so the GPU times are per kernel and site; logs `[engine-prof] <name>: <n> dispatches, <ms> ms total, <us> us each, reads <r> B, writes <w> B a forward; at <addresses>` at debug level (addresses for `atos -i`), top 40 rows by GPU time (`all`: every row), in `[engine] since load:` and the decode meter (the forward runs slower: one command buffer per op) | once | yes: engine-own-forward |
 | `SUSHI_ENGINE_KERNEL_DOUBLE` | `tensor/core.zig` (`doubleSwitch`, `kernelDoubled`) | `<text>` encodes every engine dispatch whose pipeline name holds the text twice, behind a barrier; the forward meter's difference against a load without it is the kernel's cost inside the forward. `0`, `off` or empty is off; a bare number or other characters fail the engine's start | boot | yes: engine-own-forward |
 | `SUSHI_ENGINE_POOL_PEAK_TRACE` | `tensor/core.zig` (`peakTraceOn`) | `1` keeps every engine pool ask in use with its caller's return addresses and, at each new high-water since the process peak's reset, the set in use; logs `[engine-peak] <KB> in <n> tensors from:` and the symbolized stack, by call site, largest first, after `[engine] since load:` (how a bill's terms are proven against the forward's own buffers; one stack walk per ask) | once | yes: engine-memory-admission |
 | `SUSHI_ENGINE_REFUSAL_TRACE` | `tensor/route.zig` (`traceRefusal`), `mlx.zig` | `1` prints the stack of every op the engine fails or refuses (an MLX stream inside a forward of ours included), to find the call that reached it | once | yes: engine-own-forward |
 | `SUSHI_DSV41_READ_DIAG` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` counts the blocking host reads of decode-width DeepSeek forwards by site (route-spec settle, settle before a successor, waiting-schedule picks, Engram rows, DSpark state, logits) and logs `[dsv41] reads/forward <site>` per 64 forwards at debug level | load | yes: engine-expert-streaming |
 | `SUSHI_DSV41_COMPOSED` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` runs deepseek_v41 on the op chains instead of the fused kernels (the KLD A/B's teacher arm; the load logs `[dsv41] fused kernels on\|off`) | load | yes: dsv41-arch |
-| `SUSHI_DSV41_DSPARK_ROWS` | `dsv41_dspark.zig` | deepseek_v41 DSpark diagnostic: `sweep` cycles the verify width 1..8 per round, `<n>` forces it, `log` keeps the policy; each round logs `[dspark-round]` (ctx, rows, draft and verify ms, confidence logits) | request | yes: dsv41-arch |
+| `SUSHI_DSV41_DSPARK_ROWS` | `dsv41_dspark.zig` | deepseek_v41 DSpark diagnostic: `sweep` cycles the verify width 1..8 per round, `<n>` forces it, `log` keeps the policy; each round logs `[drafter-round]` (ctx, rows, draft and verify ms, confidence logits) | request | yes: dsv41-arch |
+| `SUSHI_HY4_DFLY2_ROWS` | `hy4_drafter.zig` (`diag_env`) | hy_v4_flash DFly2 diagnostic, as `SUSHI_DSV41_DSPARK_ROWS` reads: `sweep`, `<n>` or `log`; a forced width past a load's planned verify blocks is refused by name (`Hy4ReadoutPastBlock`) | request | no (this row) |
 | `SUSHI_DSV41_VERIFY_PROFILE` | `dsv41_serving.zig`, `dsv41_model.zig` | `1` times every stage of decode-width chunks (a verify) as `[dsv41-prof]` lines, each stage evaluated before the next (the absolute ms inflate about 2x) | load | yes: dsv41-arch |
 | `SUSHI_DSV41_CAPTURE_LEAN` | `kld_capture.zig` | `1` (only with `SUSHI_DSV41_HEAD_ROWS`) the layer-major capture writes only tokens, windows, fixture, layout and the head rows | once | yes: quality-kld |
 | `SUSHI_DSV41_HEAD_ROWS` | `kld_capture.zig` | `1` the layer-major capture also writes `calib/head-in.bf16`, the head's input for every row | once | yes: quality-kld |
+| `SUSHI_HY4_CAPTURE_LEAN` | `hy4_layer_major.zig` (`modeFromEnv`) | `1` (only with `SUSHI_HY4_HEAD_ROWS`) the Hy4-Flash layer-major capture writes only tokens, windows, fixture, layout and the head rows, and skips the rows, routes and sums and their GPU work; binds the run to it | once | yes: quality-kld |
+| `SUSHI_HY4_HEAD_ROWS` | `hy4_layer_major.zig` (`modeFromEnv`) | `1` the Hy4-Flash layer-major capture also writes `calib/head-in.f32`, the head's input for every row, and binds the run to it (a resume without it is refused) | once | yes: quality-kld, hy4-flash-arch |
 | `SUSHI_DFLASH_TRACE` | `generate.zig:4016` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `trunk.zig:4334` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_RESTORE_TAPE` | `restore_tape.zig` | `<abs file>` appends a JSONL row per lookup (what was restored, a SHA-256 per state family), per SSD flush (the tier's records) and per finished request (generated ids); the proof two builds restore the same bytes (`tests/diff_restore_tape.py`, `tests/replay_ssd_writes.py`) | once | yes: engine-prefix-cache, tests/CLAUDE |
@@ -79,6 +83,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_MLX_CALLS_TRACE` | `mlx.zig` (`callNamesTraced`) | `1` tallies every call into mlx-c by entry point, each custom kernel launched on MLX's side as `kernel <name>`, and each attention call MLX runs as `sdpa <route> <mask> D<dim> q<rows> ...` (the route `attention.routeOf` gives it), and prints the tally as `[mlx-calls]` debug lines after each request's end | once | yes: engine-own-forward |
 | `SUSHI_KVQ_PARITY_TRACE`, `SUSHI_MIMO_VISION_DIAG`, `SUSHI_EXL3_PARITY_TRACE` | `test_support.zig`, `mimo_forward.zig`, `mimo_vision.zig`, `mimo_fixture_test.zig`, `exl3/trunk_gemm.zig` | prints extra parity / vision diagnostics inside a test (the EXL3 one: the MiMo EXL3 tests' relative RMS, and the trunk GEMM's differing outputs per real-pack shape) | test | yes: CLAUDE |
 | `SUSHI_DSV41_CENSUS_TRACE` | `dsv41/dsv41_generate_test.zig` | prints, inside the census test, each phase's calls into mlx-c by entry point (a Sushi Cooler load asks nothing; a row that is not zero names what does) | test | yes: engine-own-forward |
+| `SUSHI_PLAN_AUDIT` | `hy4flash/hy4_plan_audit_test.zig` | `<abs file>`: the audit's table, one TSV row a dry recording of the release (phase, rows, keys, the arena packed with and without the level rule, and the host ring) | test | yes: bill_redesign |
 | `SUSHI_LAYER_CAP` | `forward_diag.zig:63` | `<n>` runs only the first n layers so a ms-vs-layers slope is measurable (`tests/fwd_ubench.sh`) | once | yes: tests/CLAUDE |
 | `SUSHI_LMHEAD_SHORTLIST_AUDIT` | `trunk.zig:1622` | `1` re-reads the full head on every shortlist row and counts disagreements | once | yes: engine-mtp, mimo2-perf |
 | `SUSHI_MOE_DUMP` | `forward_diag.zig:168` | `<dir>` writes one forward's MoE tensors as raw f32 | once | no |
@@ -95,7 +100,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_QSA_NAX` | `qwen4_qsa_gather.zig:356, 432` | `0` runs the stock QSA arm instead of the NAX path (dev A/B lever; `tests/qwen4/test_qsa_nax_prefill.py` runs the default NAX arm) | once | no |
 | `SUSHI_VISION_CHUNKED` | `prefill_plan.zig:329` | `0` restores the whole-prompt vision prefill and its full-width bill; `tests/test_vision_chunked_prefill.sh` boots both arms | once | yes: tests/CLAUDE |
 
-## Microbenches (19)
+## Microbenches (21)
 
 In-process meters. Load-time meters run on the served binary; the rest are tests that skip when unset.
 
@@ -105,10 +110,11 @@ In-process meters. Load-time meters run on the served binary; the rest are tests
 | `SUSHI_DECODE_FWD_UBENCH_S`, `SUSHI_DECODE_FWD_UBENCH_KV` | `model_load.zig` | `<rows>[,...]` verify widths to time; `<tokens>` prefill before timing | load | yes: perf-baselines |
 | `SUSHI_DECODE_FWD_UBENCH_PROFILE` | `model_load.zig` | one extra profiled pass per width | load | no |
 | `SUSHI_DECODE_TICK_UBENCH` | `generate.zig:70, exl3/expert_exl3_kernels.zig:1080` | `<n>` times n decode ticks end to end | once | no |
+| `SUSHI_HY4_DFLY_PROBE`, `SUSHI_HY4_DFLY_PROBE_TEXT` | `hy4_load.zig` (`warmUbench`), `hy4_dfly.zig` (`probe`) | `<tokens>[,<every>]` on a Hy4-Flash load with `--mtp`: DFly2's teacher-forced acceptance at load, each prompt decoded greedily with a block drafted at every `every`-th position, logged as `[dfly-probe]`; `<file>` one chat-formatted prompt in place of the built-in code and prose pair | load | yes: hy4-flash-arch |
 | `SUSHI_GLM_ROUND_UBENCH`, `SUSHI_GLM_ROUND_UBENCH_CTX`, `SUSHI_GLM_ROUND_UBENCH_TEXT` | `glm5_rows_tick.zig`, `model_load.zig` | `<n>` greedy DFlash2 rounds per arm at load; context list in tokens; `<file>` text prompt | load | yes: glm5-perf |
 | `SUSHI_GLM_ROWS_UBENCH`, `SUSHI_GLM_ROWS_UBENCH_CTX`, `SUSHI_GLM_ROWS_UBENCH_TEXT` | `glm5_rows_tick.zig`, `model_load.zig` | `<n>` rounds per width B in 1..4 of plain decode at load, then one request's 1..8-row chain verify (ms, and bit-equality of every row against serial decode) and a routed layer's feed-forward at 1..8 rows; context list; `<file>` text prompt | load | yes: glm5-kernels, mlx-serve-sync, perf-baselines |
 | `SUSHI_VISION_Q8_REPORT`, `SUSHI_QWEN_VISION_UBENCH` | `dsv41_vision.zig`, `dsv41_thought_point.zig`, `qwen_vision.zig` | requantized-tower report (cosine, time) on a real tower, Qwen vision encoder meter (`<reps>`) | test | yes: mimo2-perf, tests/CLAUDE |
-| `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_LEVER`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load, the untimed first one logged; arm list; `decoded`: arm 0 keeps the trunk on the sorted GEMM instead of the NAX reference body; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
+| `SUSHI_PREFILL_UBENCH`, `SUSHI_PREFILL_UBENCH_ARMS`, `SUSHI_PREFILL_UBENCH_KV`, `SUSHI_PREFILL_UBENCH_LEVER`, `SUSHI_PREFILL_UBENCH_ROWS`, `SUSHI_PREFILL_UBENCH_TEXT` | `model_load.zig` | `<n>` cold one-chunk prefills per arm at load, the untimed first one logged; arm list; `<n>` tokens before each timed chunk (Hy4 rolls back to a mark, another arch prefills them again); `decoded`: arm 0 keeps the trunk on the sorted GEMM instead of the NAX reference body; chunk rows (capped at the admitted chunk, default 2025); `<file>` real text | load | yes: engine-kernels, mimo2-perf, qwen4-perf |
 | `SUSHI_QSA_PREFILL_UBENCH`, `SUSHI_QSA_WIDE_UBENCH` | `qwen4_qsa_gather.zig` | QSA prefill/wide meters | test | no |
 
 ## Test-only seams (59)

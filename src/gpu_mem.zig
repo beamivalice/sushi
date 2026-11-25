@@ -17,7 +17,8 @@ fn liveRead() noreturn {
 /// Tests only: stand in for the bytes a loaded pack holds, which a test never loads.
 pub var active_bytes_override: ?usize = null;
 
-/// Bytes MLX has in use plus the engine's: its pool buffers bound to live tensors and the mappings it wraps (weights).
+/// Bytes MLX has in use plus the engine's: its pool buffers bound to live tensors, the mappings it wraps (weights) and
+/// the static bill's arena, held from a planned load's end.
 /// Safe off the inference thread: the engine's side is atomics, and a tensor lent to MLX is in both counters, so the
 /// sum errs high, never low.
 pub fn activeBytes() usize {
@@ -59,7 +60,7 @@ pub fn peakBytes() usize {
     if (host_tier) return liveRead();
     var peak: usize = 0;
     _ = mlx.mlx_get_peak_memory(&peak);
-    return peak + mlx.engine.poolHeldPeak(.process) + mlx.engine.mappedTotal();
+    return peak + mlx.engine.poolHeldPeak(.process) + mlx.engine.mappedTotal() + mlx.engine.arenaTotal();
 }
 
 pub fn resetPeak() void {
@@ -69,7 +70,36 @@ pub fn resetPeak() void {
 }
 
 fn engineInUse() usize {
-    return (mlx.engine.poolTotal() -| mlx.engine.poolFree()) + mlx.engine.mappedTotal();
+    return engineHeld().total();
+}
+
+/// The engine's own count of what it holds, by kind: its pool's buffers in use, the mappings it wraps, the arena; and
+/// the pool's free buffers, which Metal holds too.
+pub const EngineHeld = struct {
+    pool: u64,
+    mapped: u64,
+    arena: u64,
+    free: u64 = 0,
+
+    pub fn total(h: EngineHeld) u64 {
+        return h.pool + h.mapped + h.arena;
+    }
+};
+
+/// What Metal has allocated for the process on the device, and what MLX holds of it (active and cached).
+pub fn metalAllocated() struct { metal: u64, mlx: u64 } {
+    if (host_tier) return liveRead();
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    var cache: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cache);
+    const dev = @import("metal.zig").device() catch return .{ .metal = 0, .mlx = active + cache };
+    return .{ .metal = dev.currentAllocatedSize(), .mlx = active + cache };
+}
+
+pub fn engineHeld() EngineHeld {
+    if (host_tier) return liveRead();
+    return .{ .pool = mlx.engine.poolTotal() -| mlx.engine.poolFree(), .mapped = mlx.engine.mappedTotal(), .arena = mlx.engine.arenaTotal(), .free = mlx.engine.poolFree() };
 }
 
 /// Read once on the main thread in `resolveMlxCadence`: the limit is static per device, and a

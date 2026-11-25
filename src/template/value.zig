@@ -387,6 +387,8 @@ pub const Method = enum {
     split,
     rsplit,
     replace,
+    /// Python's, for automatic and numbered fields only.
+    format,
     /// jinja.cpp's, not Python's.
     indent,
     // dict

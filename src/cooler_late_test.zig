@@ -44,14 +44,14 @@ const every_length = struct {
                 if (first_late == null and mlx.engine.latePipelines() != late) first_late = len;
                 continue;
             }
-            if (@hasDecl(C, "specTokens")) {
+            if (@hasDecl(C, "specTokens") and C.headLoaded(cooler.xfm)) {
                 const turn = arch_handle.turnFor(cooler.h, &cooler.config);
                 defer turn.end();
                 defer arch_sched.endRequest(&cooler.config);
                 var spec = try C.specTokens(testing.allocator, cooler.xfm, prompt, 6);
                 spec.deinit(testing.allocator);
             }
-            if (@hasDecl(C, "specTokensWith")) {
+            if (@hasDecl(C, "specTokensWith") and C.headLoaded(cooler.xfm)) {
                 const turn = arch_handle.turnFor(cooler.h, &cooler.config);
                 defer turn.end();
                 defer arch_sched.endRequest(&cooler.config);

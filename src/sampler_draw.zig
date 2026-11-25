@@ -29,6 +29,28 @@ var ladder: device.ThreadLadder = .{ .rungs = &.{ 1024, 512, 256 } };
 /// A test's grant: a launch of more threads than this is refused as a GPU that granted less would refuse it.
 var grant_for_test: usize = std.math.maxInt(usize);
 
+/// A test seam: the ladder back on its widest rung, as a fresh process holds it, under `grant` (maxInt: the GPU's own).
+pub fn ladderForTest(grant: usize) void {
+    ladder.at = 0;
+    grant_for_test = grant;
+}
+
+/// One real draw of a row of `vocab` zeros as `dtype` on `s`, so the ladder takes the rung the GPU grants before a dry
+/// recording reads it: a recording keeps the rung it met, and a refused one makes the served draw miss its plan.
+pub fn settle(vocab: usize, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !void {
+    if (!fits(1, dtype)) return;
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{ 1, @intCast(vocab) }, 2, dtype, s));
+    const keys = [_][2]u32{.{ 0, 1 }};
+    const r = try routed(zeros, 1.0, 1.0, 0, 0, &keys, s);
+    defer _ = mlx.mlx_array_free(r.tok);
+    defer _ = mlx.mlx_array_free(r.route);
+    try mlx.check(mlx.mlx_array_eval(r.tok));
+}
+
 // `sushi_draw_mix` is lowbias32, ported from hash-prospector (public domain): NOTICE.
 const HEADER =
     \\static inline uint sushi_draw_key(float x) {

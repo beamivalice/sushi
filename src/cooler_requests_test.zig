@@ -112,6 +112,7 @@ test "cooler contract: a Cooler load's speculative requests ask nothing of MLX, 
             try cooler.openLight(C, dir, true);
             {
                 errdefer _ = cooler.close();
+                if (cooler.config.expert_streaming and !cooler.config.stream_mtp_head) return error.SkipZigTest;
                 try testing.expect(C.headLoaded(cooler.xfm));
                 // One row, past the verify edge, a chunk: the forwards a prompt length can take.
                 for ([_]usize{ 1, 9, 40 }) |len| {
@@ -623,8 +624,13 @@ test "cooler contract: a Cooler load's sampled speculative requests, seeded or n
                 defer turn.end();
                 defer arch_sched.endRequest(&cooler.config);
                 const calls = mlx.engine.mlxCalls();
-                errdefer std.debug.print("cooler contract: sampled speculative request over {d} tokens, seed {?d}, top_k {d}\n", .{ prompt.len, sampling.seed, sampling.top_k });
-                var got = try C.specTokensWith(a, cooler.xfm, prompt, 12, sampling);
+                // A fixture with no drafter skips, which is no failure to name.
+                var skipped = false;
+                errdefer if (!skipped) std.debug.print("cooler contract: sampled speculative request over {d} tokens, seed {?d}, top_k {d}\n", .{ prompt.len, sampling.seed, sampling.top_k });
+                var got = C.specTokensWith(a, cooler.xfm, prompt, 12, sampling) catch |e| {
+                    skipped = e == error.SkipZigTest;
+                    return e;
+                };
                 defer got.deinit(a);
                 try testing.expectEqual(@as(usize, 12), got.items.len);
                 try testing.expectEqual(calls, mlx.engine.mlxCalls());
@@ -927,7 +933,7 @@ fn dsparkCompany(ld: *Load, dir: []const u8, prompts: []const []const u32, max: 
     const n = prompts.len;
     const roundsOf = struct {
         fn f(s: *scheduler.Slot) u64 {
-            return s.legacy_gen.?.dspark_stats.rounds;
+            return s.legacy_gen.?.drafter_stats.rounds;
         }
     }.f;
     var ticks: usize = 0;
@@ -1253,6 +1259,93 @@ test "cooler contract: grouped speculative rows beside another Cooler model's re
             try Group.expectSolo(qld, qdir, &qwen, &qgot);
             const dgot = Group.Out{ .published = .{ got.published[2], .empty, .empty, .empty, .empty, .empty, .empty, .empty }, .failed = .{ got.failed[2], null, null, null, null, null, null, null } };
             try Group.expectSolo(dld, ddir, set[2..3], &dgot);
+        }
+    }.run);
+}
+
+test "cooler contract: a served request on a load that holds its drafter drafts, greedy and seeded" {
+    try eachFixture(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            // A load with no drafter has nothing to draft with.
+            const head = @import("generate.zig").MtpHeadRef.fromModel(ld.xfm, true, null) orelse return error.SkipZigTest;
+            var sv: Served = undefined;
+            try sv.init(&ld, dir);
+            defer sv.deinit();
+            for ([_]SamplingParams{ .{ .temperature = 0 }, .{ .temperature = 0.8, .top_k = 20, .seed = 42 } }) |sp| {
+                var drafted: u64 = 0;
+                var got = try contract.servedDrafts(&sv, ids[0..@min(ids.len, 30)], 16, sp, head, &drafted);
+                defer got.deinit(a);
+                errdefer std.debug.print("cooler contract: a served request at temperature {d} drafted nothing over {d} tokens\n", .{ sp.temperature, got.items.len });
+                try testing.expect(drafted > 0);
+            }
+        }
+    }.run);
+}
+
+test "cooler contract: a served Hy4 STQ request with DFly2 says its serial tokens greedy and seeded, and its adaptive rounds take more than one width" {
+    try contract.servedOn("hy4flash", &.{"HY4_STQ_TINY"}, struct {
+        fn runDrafted(sv: *Served, prompt: []const u32, n: u32, sp: SamplingParams, head: @import("generate.zig").MtpHeadRef, hist: *[18]u32) !std.ArrayList(u32) {
+            const a = testing.allocator;
+            const sch = &sv.sch;
+            const scheduler = Served.scheduler;
+            const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = sp, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = true, .mtp = head });
+            defer {
+                sch.complete(slot);
+                for (sch.cleanup_queue.items) |s| s.deinit();
+                sch.cleanup_queue.clearRetainingCapacity();
+            }
+            _ = sch.pending.orderedRemove(0);
+            try scheduler.runPrefill(sch, slot);
+            if (!scheduler.postPrefillTerminal(sch, slot)) {
+                try sch.decoding.append(a, slot);
+                var one = [_]*scheduler.Slot{slot};
+                while (slot.joinsTick()) try scheduler.runDecodeTick(sch, &one);
+                scheduler.cullDecoding(sch);
+            }
+            if (slot.error_code) |e| {
+                std.debug.print("cooler contract: served Hy4 DFly2 request failed ({s})\n", .{e});
+                return error.RequestFailed;
+            }
+            const g = slot.legacy_gen.?;
+            hist.* = g.drafter_stats.rows_hist;
+            var got: std.ArrayList(u32) = .empty;
+            errdefer got.deinit(a);
+            try got.appendSlice(a, g.generated_ids.items);
+            return got;
+        }
+
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            var ld: Load = undefined;
+            try ld.open(C, dir, true);
+            defer _ = ld.close();
+            const head = @import("generate.zig").MtpHeadRef.fromModel(ld.xfm, true, null) orelse return error.Hy4DflyMissing;
+            for ([_]usize{ 13, 30 }) |plen| {
+                const prompt = ids[0..@min(ids.len, plen)];
+                for ([_]SamplingParams{ .{ .temperature = 0.0 }, .{ .temperature = 0.8, .top_k = 20, .seed = 42 } }) |sp| {
+                    var want = try serial(&ld, prompt, 32, sp);
+                    defer want.deinit(a);
+                    var sv: Served = undefined;
+                    try sv.init(&ld, dir);
+                    defer sv.deinit();
+                    var hist: [18]u32 = @splat(0);
+                    var got = try runDrafted(&sv, prompt, 32, sp, head, &hist);
+                    defer got.deinit(a);
+                    try testing.expectEqualSlices(u32, want.items, got.items);
+                    var widths: usize = 0;
+                    var rounds: u32 = 0;
+                    for (hist) |c| {
+                        rounds += c;
+                        if (c > 0) widths += 1;
+                    }
+                    errdefer std.debug.print("cooler contract: Hy4 DFly2 plen={d} temp={d} took {d} distinct width(s) over {d} rounds, hist={any}\n", .{ plen, sp.temperature, widths, rounds, hist[1..9] });
+                    try testing.expect(widths > 1 and rounds - hist[3] > 2);
+                }
+            }
         }
     }.run);
 }

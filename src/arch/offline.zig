@@ -4,6 +4,10 @@
 //! Ops an arch `kld` module may declare:
 //! - `hiddenCaptureWidth(config)`: the width of one hidden-capture row; default `hidden_size`.
 //! - `refuse(config, opts)`: launch options the arch cannot honor.
+//! - `beforeLoad(config, opts)`: what the run needs before the load plans: process-wide numerics, set before anything
+//!   touches the GPU, and the config the load is planned from.
+//! - `afterUnload(config)`: puts back the process-wide numerics `beforeLoad` set, when the load goes away or fails: a
+//!   later load in the process plans and runs as served.
 //! - `tryRun(allocator, io, opts, out)`: the arch's own capture path; true when it ran.
 //! - `afterLoad(xfm, config, kv)`: arch state to set up once the model is loaded.
 //! - `capturePromptChunks(...)`: the prompt forward that appends every block boundary; null falls back to the
@@ -40,6 +44,24 @@ pub fn refuse(config: *const model.ModelConfig, opts: kld.Options) !void {
     switch (s) {
         inline else => |c, t| {
             if (comptime hasOp(t, "refuse")) try registry.Mod(t).kld.refuse(c, opts);
+        },
+    }
+}
+
+pub fn beforeLoad(config: *model.ModelConfig, opts: kld.Options) !void {
+    const tag = @import("config.zig").tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| {
+            if (comptime hasOp(t, "beforeLoad")) try registry.Mod(t).kld.beforeLoad(config, opts);
+        },
+    }
+}
+
+pub fn afterUnload(config: *const model.ModelConfig) void {
+    const tag = @import("config.zig").tagOf(config) orelse return;
+    switch (tag) {
+        inline else => |t| {
+            if (comptime hasOp(t, "afterUnload")) registry.Mod(t).kld.afterUnload(config);
         },
     }
 }

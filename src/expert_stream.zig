@@ -102,7 +102,7 @@ pub const ExpertBill = struct { expert_bytes: u64, shape: quant.StoreShape = .{}
 /// `expertBytesFor` with the rest of what the store bills, read from the store the engine will open.
 pub fn expertBillFor(allocator: std.mem.Allocator, model_dir: []const u8, geometry: Geometry, layout: quant.Layout) !ExpertBill {
     switch (layout) {
-        .bf16_fused => return .{ .expert_bytes = try expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate) },
+        .bf16_fused => return .{ .expert_bytes = try expertBytes(2 * geometry.intermediate, geometry.hidden, geometry.intermediate), .shape = .{ .union_sets = if (geometry.union_within_cache) 0 else 1 } },
         .bf16_individual, .fp8_individual, .quantized_split, .mxfp4_split, .mxfp4_individual, .mxfp4_w123, .exl3_k4 => {
             var store = try quant.QuantStore.openForLayout(allocator, model_dir, geometry, layout);
             defer store.deinit();
@@ -149,12 +149,21 @@ pub fn cachePlanBytes(requested_bytes: u64, layers: u16, experts: u16, expert_by
         .workspace_bytes = workspace_bytes,
         .bounce_bytes = bounce_bytes,
         .layer_bytes = layer_bytes,
-        .prefill_peak_bytes = fillPeakBytes(expert_bytes, experts, slots, bounce_bytes),
+        // A store with no union workspace fills at most the cache's slots a route.
+        .prefill_peak_bytes = fillPeakBytes(expert_bytes, if (shape.union_sets == 0) slots else experts, slots, bounce_bytes),
     };
 }
 
+/// The store's shape as the engine serves it: an arch that routes within its cache keeps no union workspace, so its
+/// budget and fill peak price none.
+pub fn servedShape(geometry: Geometry, shape: quant.StoreShape) quant.StoreShape {
+    var s = shape;
+    if (geometry.union_within_cache) s.union_sets = 0;
+    return s;
+}
+
 pub fn cachePlanBytesForGeometry(requested_bytes: u64, geometry: Geometry, expert_bytes: u64) !CachePlan {
-    return cachePlanBytes(requested_bytes, moeLayerCount(geometry), geometry.kept(), expert_bytes, geometry.shape);
+    return cachePlanBytes(requested_bytes, moeLayerCount(geometry), geometry.kept(), expert_bytes, servedShape(geometry, geometry.shape));
 }
 
 /// Every expert at the mean, once per union workspace the store keeps, plus its grouped layers' union meta tables.
@@ -208,7 +217,7 @@ pub const BudgetLedger = struct {
     resident: bool = false,
 };
 
-/// The budget is the TOTAL resident target (GiB, the `--ssd-budget-gb` unit); the expert
+/// The budget is the weights budget (GiB, the `--ssd-budget-gb` unit; KV and prefill beside it); the expert
 /// cache is what remains after trunk, MTP, the vision tower with its encode reserve, the
 /// all-experts union workspace, the selected slab and the bounce buffers. The PLE table is a
 /// disk gather and is never billed. A budget that holds every routed expert (`StoreShape.all_bytes`) beside the trunk,
@@ -490,7 +499,8 @@ pub const Options = struct {
     /// Rate-grouped trellis tiles land in the pools in `layout.tileMajor` order, which the rate-group kernels read.
     tile_major: bool = false,
     /// Decode-width picks score an expert the layer's cache lacks this much lower (`ModelConfig.expertCacheBias`, 0 =
-    /// exact), in the router's own sqrt-softplus units. DeepSeek-V4.1 only; the weights stay the unbiased scores.
+    /// exact), in the router's own score units; an arch whose `ExpertStreamTraits.cache_bias` is set reads it. The weights
+    /// stay the unbiased scores.
     cache_bias: f32 = 0,
 };
 
@@ -974,15 +984,16 @@ pub const ExpertStore = struct {
         }.call;
 
         var key_buf: [192]u8 = undefined;
-        for (0..geometry.layers) |layer_usize| {
+        @memset(spans, .{ .file = 0, .offset = 0, .len = 0 });
+        for (geometry.first_moe_layer..geometry.layers) |layer_usize| {
             const layer: u16 = @intCast(layer_usize);
-            const gate_key = std.fmt.bufPrint(&key_buf, "model.language_model.layers.{d}.mlp.experts.gate_up_proj", .{layer}) catch return error.InvalidExpertGeometry;
+            const gate_key = std.fmt.bufPrint(&key_buf, "{s}{d}.mlp.experts.gate_up_proj", .{ geometry.fused_prefix, layer }) catch return error.InvalidExpertGeometry;
             const gate_map = weight_map.get(gate_key) orelse return error.MissingExpertTensor;
             if (gate_map != .string) return error.InvalidSafetensorsIndex;
             const gate_file = try openSource(allocator, &files_list, model_dir, gate_map.string);
             const gate_layout = try tensorLayout(allocator, files_list.items[gate_file].fd, gate_key, .{ geometry.experts, 2 * @as(u64, geometry.intermediate), geometry.hidden });
 
-            const down_key = std.fmt.bufPrint(&key_buf, "model.language_model.layers.{d}.mlp.experts.down_proj", .{layer}) catch return error.InvalidExpertGeometry;
+            const down_key = std.fmt.bufPrint(&key_buf, "{s}{d}.mlp.experts.down_proj", .{ geometry.fused_prefix, layer }) catch return error.InvalidExpertGeometry;
             const down_map = weight_map.get(down_key) orelse return error.MissingExpertTensor;
             if (down_map != .string) return error.InvalidSafetensorsIndex;
             const down_file = try openSource(allocator, &files_list, model_dir, down_map.string);
@@ -1703,15 +1714,9 @@ const LayerState = struct {
     /// the next call to rebuild.
     /// `cache_bias` > 0 also builds the map's pick-score penalty (`spec_pen`).
     fn refreshSpec(self: *LayerState, allocator: std.mem.Allocator, s: mlx.mlx_stream, cache_bias: f32) !void {
-        const experts = if (self.grouped) |gl| gl.expertCount() else self.cache.expert_to_slot.len;
-        if (self.spec_host.len != experts) {
-            if (self.spec_host.len != 0) allocator.free(self.spec_host);
-            self.spec_host = &.{};
-            self.spec_host = try allocator.alloc(i32, experts);
-            @memset(self.spec_host, -2);
-        }
-        const changed = if (self.grouped) |gl| refreshGroupedSpecMap(gl, self.spec_host) else refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host);
-        if (!changed and self.spec_slots.ctx != null) return;
+        try self.refreshSpecHost(allocator);
+        if (self.spec_slots.ctx != null) return;
+        const experts = self.spec_host.len;
         errdefer {
             if (self.spec_slots.ctx != null) _ = mlx.mlx_array_free(self.spec_slots);
             self.spec_slots = .{ .ctx = null };
@@ -1751,6 +1756,23 @@ const LayerState = struct {
         self.spec_raw = raw;
         if (self.spec_pen.ctx != null) _ = mlx.mlx_array_free(self.spec_pen);
         self.spec_pen = pen;
+    }
+
+    /// Brings the host map up to the cache; a GPU copy it no longer matches goes, for `refreshSpec` to make again.
+    fn refreshSpecHost(self: *LayerState, allocator: std.mem.Allocator) !void {
+        const experts = if (self.grouped) |gl| gl.expertCount() else self.cache.expert_to_slot.len;
+        if (self.spec_host.len != experts) {
+            if (self.spec_host.len != 0) allocator.free(self.spec_host);
+            self.spec_host = &.{};
+            self.spec_host = try allocator.alloc(i32, experts);
+            @memset(self.spec_host, -2);
+        }
+        const changed = if (self.grouped) |gl| refreshGroupedSpecMap(gl, self.spec_host) else refreshSpecMap(self.cache.expert_to_slot, self.cache.ready, self.spec_host);
+        if (!changed) return;
+        for ([_]*mlx.mlx_array{ &self.spec_slots, &self.spec_raw, &self.spec_pen }) |a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a.*);
+            a.* = .{ .ctx = null };
+        }
     }
 };
 
@@ -2207,7 +2229,7 @@ pub const Engine = struct {
             for (every[0..g.groups.count], 0..) |*dst, gi| dst.* = g.groups.keptOf(gi);
             for (0..3) |pi| union_elems[pi] = @max(union_elems[pi], g.trellisElems(pi, every[0..g.groups.count]));
         };
-        if (any_uniform or widest == null) {
+        if ((any_uniform or widest == null) and !geometry.union_within_cache) {
             engine.union_slabs = try createSlabSet(allocator, &engine.store, geometry.kept(), s);
             engine.slab_imports += presentSlabCount(engine.union_slabs);
         }
@@ -2493,6 +2515,8 @@ pub const Engine = struct {
             pf.credit.refill(wall_ns, acc.fill_bytes);
             pf.mu.unlock(io);
         }
+        // A load whose every expert is resident streams nothing: its breakdown is all zeros, shown only at debug level.
+        if (!log.isDebug() and self.allResident()) return;
         const scheduled = self.forward_count <= 2 or self.forward_count % BREAKDOWN_EVERY == 0;
         // At debug level every prefill chunk gets its line: a chunk is one forward, so the schedule would skip them.
         if (!scheduled and !acc.probe and !(rows > 64 and log.isDebug())) return;
@@ -2578,9 +2602,7 @@ pub const Engine = struct {
     /// the expert compute before the host reads the router ids. Null when the
     /// store is not quantized.
     pub fn specRoute(self: *Engine, layer_index: u16) !?SpecRoute {
-        if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
-        const layer = &self.layers[layer_index];
-        if (!layer.active or layer.grouped != null or layer.slabs.len != self.store.componentCount()) return null;
+        const layer = self.routeLayer(layer_index) orelse return null;
         try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
         var operands: [quant.component_count]mlx.mlx_array = @splat(.{ .ctx = null });
         for (layer.slabs, 0..) |operand, ci| operands[ci] = operand.array;
@@ -2599,19 +2621,33 @@ pub const Engine = struct {
     /// chain before the host reads the router ids (`specMatches` checks it). Null for a layer that is released,
     /// resident (its own GPU map) or not rate-grouped.
     pub fn specGrouped(self: *Engine, layer_index: u16) !?GroupedSpec {
+        const layer = self.groupedLayer(layer_index) orelse return null;
+        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
+        return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &layer.grouped.?.cache_ragged };
+    }
+
+    /// The layer `specRoute` maps: an active layer of a quantized store, not rate-grouped, its slabs all there.
+    fn routeLayer(self: *Engine, layer_index: u16) ?*LayerState {
+        if (self.store.quantized == null or self.store.layout() == .bf16_individual or layer_index >= self.layers.len) return null;
+        const layer = &self.layers[layer_index];
+        if (!layer.active or layer.grouped != null or layer.slabs.len != self.store.componentCount()) return null;
+        return layer;
+    }
+
+    /// The layer `specGrouped` maps, once the prefetch that touches it is done: an active rate-grouped layer, neither
+    /// lent nor resident, its slabs all there.
+    fn groupedLayer(self: *Engine, layer_index: u16) ?*LayerState {
         if (layer_index >= self.layers.len) return null;
         self.prefetchWait(layer_index);
         const layer = &self.layers[layer_index];
-        const gl = layer.grouped orelse return null;
+        if (layer.grouped == null) return null;
         if (!layer.active or layer.borrowed or layer.resident_map.ctx != null or layer.slabs.len != quant.component_count) return null;
-        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
-        return .{ .slots = layer.spec_slots, .host = layer.spec_host, .bank = &gl.cache_ragged };
+        return layer;
     }
 
-    /// The pick-score penalty `--expert-cache-bias` gives a layer's decode-width router (f32 `[experts]`).
-    /// Null where the bias is off, `--expert-pick-tolerance` is set (it swaps on the host and keeps nothing queued), or
-    /// the layer has no map (the cases `specGrouped` and `specRoute` answer null for).
-    pub fn cachePenalty(self: *Engine, layer_index: u16) !?mlx.mlx_array {
+    /// The layer whose cache map `--expert-cache-bias` scores; null where the bias is off, `--expert-pick-tolerance` is
+    /// set (it swaps on the host and keeps nothing queued), or the layer has no map (`specGrouped`'s and `specRoute`'s).
+    fn biasedLayer(self: *Engine, layer_index: u16) ?*LayerState {
         if (!(self.cache_bias > 0)) return null;
         if (pick_tolerance > 0) {
             if (!self.bias_logged) log.warn("[expert-bias] --expert-cache-bias is ignored: --expert-pick-tolerance is set\n", .{});
@@ -2619,12 +2655,73 @@ pub const Engine = struct {
             return null;
         }
         const grouped = layer_index < self.layers.len and self.layers[layer_index].grouped != null;
-        const has_map = if (grouped) (try self.specGrouped(layer_index)) != null else (try self.specRoute(layer_index)) != null;
-        if (!has_map) return null;
-        const pen = self.layers[layer_index].spec_pen;
-        if (pen.ctx != null and !self.bias_logged) log.info("[expert-bias] engaged: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths)\n", .{self.cache_bias});
+        return if (grouped) self.groupedLayer(layer_index) else self.routeLayer(layer_index);
+    }
+
+    fn biasEngaged(self: *Engine) void {
+        if (!self.bias_logged) log.info("[expert-bias] engaged: bias={d:.2} (lossy: an expert the cache lacks scores that much lower at decode widths)\n", .{self.cache_bias});
         self.bias_logged = true;
-        return if (pen.ctx != null) pen else null;
+    }
+
+    /// The pick-score penalty `--expert-cache-bias` gives a layer's decode-width router (f32 `[experts]`); null where
+    /// `biasedLayer` is.
+    pub fn cachePenalty(self: *Engine, layer_index: u16) !?mlx.mlx_array {
+        const layer = self.biasedLayer(layer_index) orelse return null;
+        try layer.refreshSpec(self.allocator, self.s, self.cache_bias);
+        if (layer.spec_pen.ctx == null) return null;
+        self.biasEngaged();
+        return layer.spec_pen;
+    }
+
+    /// `cachePenalty`'s scores written into `out` (f32 `[experts]`) for a forward that makes its own array of them, a
+    /// planned forward's host ask (D102); false where `biasedLayer` is null. No GPU map is made.
+    pub fn cachePenaltyHost(self: *Engine, layer_index: u16, out: []f32) !bool {
+        const layer = self.biasedLayer(layer_index) orelse return false;
+        try layer.refreshSpecHost(self.allocator);
+        if (out.len != layer.spec_host.len) return error.ExpertPenaltyWidth;
+        biasPenalty(layer.spec_host, self.cache_bias, out);
+        self.biasEngaged();
+        return true;
+    }
+
+    /// The distinct experts one route may ask for: a layer's cache slots.
+    pub fn slotsPerLayer(self: *const Engine) u16 {
+        return self.plan.slots_per_layer;
+    }
+
+    /// Whether a route of `picks` distinct experts on `layer_index` can overflow a rate group's pool, so that it reads
+    /// the union workspace (`prepareGrouped`): a rate-grouped layer with a group whose pool holds fewer slots.
+    pub fn routeMayOverflow(self: *const Engine, layer_index: u16, picks: usize) bool {
+        const gl = self.layers[layer_index].grouped orelse return false;
+        for (gl.caches) |c| if (c.slot_to_expert.len < picks) return true;
+        return false;
+    }
+
+    /// A dry recording's `prepareHost` (the static bill, `plan_api`): what a route whose experts all hit the layer's
+    /// cache gives, its slot ids in the right rate groups and the cache's operands, or with `workspace` what a route
+    /// whose group overflows its pool gives, the union workspace's; no fill, no lease and the cache untouched. A dry
+    /// recording runs no kernel, so no slot's bytes are read. A layer lent to a prefill, a store of quantized slabs, or
+    /// a workspace the engine does not hold, has no dry route: refused by name.
+    pub fn prepareDry(self: *Engine, layer_index: u16, occurrences: []const u16, workspace: bool) !Prepared {
+        if (layer_index >= self.layers.len) return error.ExpertLayerOutOfRange;
+        const layer = &self.layers[layer_index];
+        if (!layer.active) return error.ExpertLayerAbsent;
+        if (layer.borrowed) return error.ExpertDryBorrowed;
+        if (workspace and (layer.grouped == null or self.grouped_union.len != layer.slabs.len)) return error.ExpertDryNoWorkspace;
+        const remapped = try self.allocator.alloc(u16, occurrences.len);
+        errdefer self.allocator.free(remapped);
+        if (layer.grouped) |gl| {
+            for (occurrences, remapped) |expert, *d| d.* = @intCast(gl.slot_base[gl.groups.groupOf(expert)]);
+            return .{ .allocator = self.allocator, .remapped = remapped, .quantized = true, .workspace = workspace, .ragged = if (workspace) &gl.union_ragged else &gl.cache_ragged };
+        }
+        if (self.store.quantized != null or layer.slabs.len < 2) return error.ExpertDryUnsupported;
+        @memset(remapped, 0);
+        const gate_up = try layer.slabs[0].borrow();
+        errdefer _ = mlx.mlx_array_free(gate_up);
+        const down = try layer.slabs[1].borrow();
+        errdefer _ = mlx.mlx_array_free(down);
+        const views = try self.splitViews(gate_up, down, @intCast(layer.slabs[0].count));
+        return .{ .allocator = self.allocator, .gate = views.gate, .up = views.up, .down = views.down, .remapped = remapped, .raw_gate_up = gate_up, .raw_down = down };
     }
 
     pub fn prepareHost(self: *Engine, layer_index: u16, occurrences: []const u16) !Prepared {
@@ -2666,7 +2763,6 @@ pub const Engine = struct {
         try outcome;
         self.fill_bytes_total += bytes;
     }
-
 
     /// Starts the prefetch thread, reading within `credit`; a no-op where one runs already.
     pub fn startPrefetch(self: *Engine, credit: PrefetchCredit) !void {
@@ -3179,6 +3275,14 @@ pub const Engine = struct {
             log.info("[expert-swap] swapped {d} of {d} routed ids so far\n", .{ self.swapped_ids, self.swap_seen_ids });
         }
         return swapped;
+    }
+
+    /// Every active layer routes through its resident map (`residentRoute`): no route fills a slab from the SSD.
+    pub fn allResident(self: *const Engine) bool {
+        for (self.layers, 0..) |*layer, li| {
+            if (layer.active and self.residentRoute(@intCast(li)) == null) return false;
+        }
+        return true;
     }
 
     pub const ResidentRoute = struct { map: mlx.mlx_array, bank: *const Ragged };
@@ -3815,7 +3919,7 @@ pub const Engine = struct {
         };
         st.ended = true;
         self.fill_experts_total += st.misses;
-        for (st.spans[0 .. st.stages()]) |list| for (list.items) |span_value| {
+        for (st.spans[0..st.stages()]) |list| for (list.items) |span_value| {
             layer.stats.fill_bytes += span_value.len;
         };
     }
@@ -3852,6 +3956,8 @@ pub const Engine = struct {
         var resolution = try layer.cache.resolve(self.allocator, occurrences);
         defer resolution.deinit(self.allocator);
         const use_union = resolution.workspace;
+        // A store with no union workspace serves routes of at most its cache's slots (`Geometry.union_within_cache`).
+        if (use_union and self.geometry.union_within_cache) return error.RouteWiderThanCache;
         if (use_union and self.union_slabs.len != n) return error.MissingExpertSlab;
         const read_set = if (use_union) self.union_slabs else layer.slabs;
 

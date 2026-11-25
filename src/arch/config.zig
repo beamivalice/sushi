@@ -17,7 +17,8 @@ pub const CostLayout = @import("../round_cost.zig").Layout;
 
 /// How a pack stores the routed experts the streamed loader reads; the layout probe of its weight map follows it. The
 /// first two are banks under the checkpoint's `language_model.model.layers.` and `model.layers.` nesting.
-pub const ExpertSource = enum { none, language_model_banks, flat_banks, individual_source, mxfp4_w123 };
+/// `fused_banks`: fused BF16 banks `model.layers.L.mlp.experts.{gate_up,down}_proj` in every routed layer (Hy4-Flash).
+pub const ExpertSource = enum { none, language_model_banks, flat_banks, individual_source, mxfp4_w123, fused_banks };
 
 /// Constants an arch states about its config; the defaults are what an arch with nothing special says.
 pub const Facts = struct {
@@ -25,6 +26,8 @@ pub const Facts = struct {
     thinks_by_default: bool = false,
     /// Its packs may store pair-major expert tiles.
     reads_pair_major: bool = false,
+    /// Its packs may store the pack-order expert tiles; false: a pack-order pack is refused (`sushi repack` migrates it).
+    reads_pack_order: bool = true,
     /// The routed layers start here until the config's own dense prefix is read.
     stub_first_moe: u16 = 0,
     /// The config's `moe_layer_freq` names the dense prefix.
@@ -52,6 +55,9 @@ pub const Facts = struct {
     prefill_start_width: u32 = 0,
     /// `prefill_start_width` by the GPU's name (`chip.chipBrand()`), where it is set.
     prefill_start_width_of: ?*const fn (chip: []const u8) u32 = null,
+    /// A load on the static bill fixes its prefill chunk once, within `--prefill-chunk-min`/`--prefill-chunk-max` (D4):
+    /// this is the widest forward it runs, in rows. 0 = not on the static bill (its chunk is chosen as before).
+    static_chunk_max: u32 = 0,
     /// The MLX buffer pool its streamed decode holds, billed in the SSD-budget ledger.
     expert_pool_bytes: u64 = 0,
     /// Its routed experts always stream.
@@ -149,6 +155,21 @@ pub fn fact(config: *const model.ModelConfig, comptime name: []const u8) bool {
     return if (facts(config)) |f| @field(f, name) else false;
 }
 
+/// The widest chunk a load of the config's arch may fix when it is on the static bill (`Facts.static_chunk_max`); 0 when
+/// it is not, or the config is unclaimed.
+pub fn staticChunkMax(config: *const model.ModelConfig) u32 {
+    return if (facts(config)) |f| f.static_chunk_max else 0;
+}
+
+/// The model types whose loads are on the static bill, for the refusal of their flags elsewhere.
+pub const static_bill_types = blk: {
+    var out: []const u8 = "";
+    for (std.meta.tags(Tag)) |t| if (registry.Mod(t).config_facts.static_chunk_max != 0) {
+        out = out ++ (if (out.len == 0) "" else ", ") ++ registry.Mod(t).model_types[0];
+    };
+    break :blk out;
+};
+
 /// The `mtp_head_marker` of every built arch that has one.
 pub const mtp_head_markers = blk: {
     var out: []const []const u8 = &.{};
@@ -211,6 +232,22 @@ pub fn discoveredType(model_type: []const u8) ?[]const u8 {
         inline for (registry.Mod(tag).discovery_types) |t| if (std.mem.eql(u8, t, model_type)) return t;
     }
     return null;
+}
+
+/// What `sushi repack` needs of an arch whose STQ packs can be pair-major; the arch declares `repack` in its `arch.zig`.
+pub const Repack = struct {
+    /// The key text between a routed layer's prefix (a trunk layer's or a head's) and its `<proj>.g<N>.trellis`.
+    routed_marker: []const u8 = ".mlp.switch_mlp.",
+    /// The `text_config` key of the width a routed expert takes in and gives out; its other width is `moe_intermediate_size`.
+    hidden_key: []const u8 = "hidden_size",
+};
+
+/// The `repack` declaration of the enabled arch that serves `model_type`; null when it declares none or no arch serves it.
+pub fn repackOf(model_type: []const u8) ?Repack {
+    const tag = registry.ofModelType(model_type) orelse return null;
+    switch (tag) {
+        inline else => |t| return if (@hasDecl(registry.Mod(t), "repack")) registry.Mod(t).repack else null,
+    }
 }
 
 /// The facts of the arch that serves `model_type`; null when no enabled arch does.
@@ -318,26 +355,31 @@ pub fn kvBytesPerToken(config: *const model.ModelConfig) ?u64 {
     };
 }
 
-/// A Sushi Cooler arch's opt-out to MLX, declared by its arch module as `cooler_opt_out`: the launch flag, the
-/// model-settings key, and the refusal when that flag is given for a model of another arch.
-/// An arch on Sushi Cooler declares its opt-out once: the launch flag that keeps its loads on MLX (parsed from here,
-/// `arch_flags.options`) and its model setting.
+/// A Sushi Cooler arch's opt-out to MLX, declared once in its `cooler.opt_out`: the launch flag that keeps its loads
+/// on MLX (parsed from here, `arch_flags.options`) and its model-settings key.
 pub const CoolerOptOut = struct { flag: []const u8, setting: []const u8 };
 
 /// Who asked a load onto MLX instead of Sushi Cooler: nobody, the launch flag, or the model setting.
 pub const CoolerAsk = enum { none, flag, setting };
 
-/// The opt-out of the arch `t`; null for an arch without Sushi Cooler.
+/// How an arch stands on Sushi Cooler, declared by its arch module as `cooler`; an arch that declares none runs on
+/// MLX. `opt_out` keeps a load on MLX by the user's ask; null runs every load on Sushi Cooler (there is no MLX route).
+pub const Cooler = struct { opt_out: ?CoolerOptOut };
+
+/// The Sushi Cooler declaration of the arch `t`; null for an arch on MLX only.
+pub fn cooler(comptime t: Tag) ?Cooler {
+    return if (@hasDecl(registry.Mod(t), "cooler")) registry.Mod(t).cooler else null;
+}
+
+/// The opt-out of the arch `t`; null for an arch without Sushi Cooler or without an opt-out.
 pub fn coolerOptOut(comptime t: Tag) ?CoolerOptOut {
-    return if (@hasDecl(registry.Mod(t), "cooler_opt_out")) registry.Mod(t).cooler_opt_out else null;
+    return if (cooler(t)) |c| c.opt_out else null;
 }
 
 comptime {
-    for (std.meta.tags(Tag)) |t| if (coolerOptOut(t)) |o| {
+    for (std.meta.tags(Tag)) |t| if (cooler(t)) |c| {
         const M = registry.Mod(t);
-        for ([_][]const u8{ "coolerGap", "cooler_contract" }) |decl| {
-            if (!@hasDecl(M, decl)) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without " ++ decl);
-        }
+        if (!@hasDecl(M, "cooler_contract")) @compileError(@tagName(t) ++ " is on Sushi Cooler without cooler_contract");
         // Every drafter kind a Cooler load serves (DFlash2 runs on MLX only) is held to the contract, greedy and sampled.
         if (@hasDecl(M, "drafter")) for (M.drafter.kinds) |k| if (k != .dflash2) {
             for ([_][]const u8{ "specTokens", "specTokensWith" }) |decl| {
@@ -345,16 +387,18 @@ comptime {
             }
         };
         // The rows one forward of its Cooler load carries, or why one: never a silent default (`arch/sched.coolerRows`).
-        if (!@hasDecl(M.sched, "coolerRows")) @compileError(@tagName(t) ++ " declares the Sushi Cooler opt-out " ++ o.flag ++ " without sched.coolerRows");
-        if (@import("../model_settings.zig").findKey(&@import("../model_settings.zig").model_keys, o.setting) == null) @compileError(o.flag ++ " names no model setting " ++ o.setting);
+        if (!@hasDecl(M.sched, "coolerRows")) @compileError(@tagName(t) ++ " is on Sushi Cooler without sched.coolerRows");
+        if (c.opt_out) |o| {
+            if (@import("../model_settings.zig").findKey(&@import("../model_settings.zig").model_keys, o.setting) == null) @compileError(o.flag ++ " names no model setting " ++ o.setting);
+        }
     };
 }
 
 /// Whether this load keeps the arch's DSpark drafter stages resident.
-pub fn dsparkOn(config: *const model.ModelConfig) bool {
+pub fn drafterOn(config: *const model.ModelConfig) bool {
     const tag = tagOf(config) orelse return false;
     return switch (tag) {
-        inline else => |t| if (@hasDecl(registry.Mod(t), "dsparkOn")) registry.Mod(t).dsparkOn(config) else false,
+        inline else => |t| if (@hasDecl(registry.Mod(t), "drafterOn")) registry.Mod(t).drafterOn(config) else false,
     };
 }
 

@@ -7,6 +7,7 @@ Commands:
   run <model>         Download if needed, serve it, and chat right here
                       (a local model name or a HuggingFace "org/repo")
                       --think <value>: GLM low|high|max (default high);
+                      Hy4 off|high|max;
                       Qwen off|low|medium|xhigh; MiMo off, or any
                       other level as on.
                       /think <effort> changes it in the chat;
@@ -224,7 +225,23 @@ Options:
                         budget; this flag is the ceiling, not a floor.
                         When a request does not fit at <n>, it runs
                         at the widest narrower width that fits (down
-                        to 512) instead of being refused.
+                        to 512) instead of being refused. Deprecated on
+                        a Hy4-Flash load, where it means
+                        --prefill-chunk-max <n>.
+  --prefill-chunk-max <n>
+                      Hy4-Flash only: the widest prefill chunk its load
+                        may fix: 512, 1024, 2048, 4096 or 8192 rows
+                        (default 8192); any other is refused. The
+                        load takes the widest chunk within the two
+                        bounds whose arena fits beside the context, and
+                        every prefill runs at it. Outranks the model's
+                        prefill_chunk_max setting. Other models refuse it.
+  --prefill-chunk-min <n>
+                      Hy4-Flash only: the narrowest chunk its load may
+                        fix, one of the same widths (default 512).
+                        Equal to the max, it forces the chunk; a load that
+                        cannot hold it refuses with the numbers. Outranks
+                        prefill_chunk_min. Other models refuse it.
   --max-concurrent <n>  Sizes the submit queue (n + 32). Requests batch at
                         any value, at least 1 (default: 1). Above the
                         default prefix-cache entry count it raises that
@@ -265,7 +282,7 @@ Options:
                         (--prefix-cache-disk sizes them).
   --wired-margin-gib <n>
                       How far under iogpu.wired_limit_mb a plan may
-                        reach (default: 1, integers 1..32).
+                        reach (default: 1, integers 0..32).
   --expert-pick-tolerance <n>
                       LOSSY, streamed packs only (default: 0 = off,
                         exact routing). A routed expert missing from the
@@ -275,20 +292,21 @@ Options:
                         0.3 is a mild setting. A sigmoid router (MiMo)
                         compares sigmoid probabilities.
   --expert-cache-bias <n>
-                      LOSSY, DeepSeek-V4.1 and Qwen3.8 streamed STQ packs only
-                        (default: 0 = off, exact routing). At decode widths
-                        the router scores an expert the layer's cache lacks
-                        n lower, so a cached expert within n of it wins the
-                        pick; the weights stay the unbiased scores. A bigger
-                        n is more lossy and, when streaming, faster. 0..2,
-                        0.2 suggested; each model reads n in its own router
-                        units, so a value does not carry from one to the
-                        other. Ignored when --expert-pick-tolerance is set.
+                      LOSSY, DeepSeek-V4.1, Qwen3.8 and Hy4-Flash streamed STQ
+                        packs only (default: 0 = off, exact routing). At
+                        decode widths the router scores an expert the layer's
+                        cache lacks n lower, so a cached expert within n of it
+                        wins the pick; the weights stay the unbiased scores. A
+                        bigger n is more lossy and, when streaming, faster.
+                        0..2, 0.2 suggested; each model reads n in its own
+                        router units, so a value does not carry from one to
+                        another. Ignored when --expert-pick-tolerance is set.
   --ssd-budget-gb <n> Stream routed experts from SSD (Sushi pack or
-                        source checkpoint) with a
-                        TOTAL resident target of <n> GiB; the expert
-                        cache is what is left after the trunk, the
-                        prefill union and the fill buffers.
+                        source checkpoint) within a weights budget of
+                        <n> GiB: the trunk, the MTP head and the routed
+                        experts with their stream buffers; the expert
+                        cache is what is left. The KV cache and the
+                        prefill's memory are beside it.
   --ssd-prefetch <n>  Streamed-expert prefetch read cap (default: 0, off).
                         The share, in percent (0..100), of this Mac's SSD
                         read rate (measured at load) that the expert

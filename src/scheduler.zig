@@ -378,6 +378,8 @@ pub const Slot = struct {
     /// What the request's admission bill priced it to hold at its peak, margin excluded: memory that comes back
     /// once it finishes (`slot_admission.liveHold`).
     admitted_held: u64 = 0,
+    /// What the request reserved on its load's ledger (`static_bill.admit`); its end parks what its state holds.
+    ledger: ?@import("static_bill.zig").Reservation = null,
     /// Counted in `Scheduler.live_hold` from its admission until its free.
     hold_counted: bool = false,
     /// This tick decodes plain (batched) although the slot's MTP head is armed: the
@@ -763,7 +765,7 @@ pub const Slot = struct {
     /// terminal, so an uncopyable name falls back to a static one instead of leaving it null.
     fn latchErrorLocked(self: *Slot, name: []const u8) void {
         if (self.error_code == null) {
-            if (std.mem.eql(u8, name, "PrefillChunkDoesNotFit")) self.forward_refusal = forward_refusal_mod.take();
+            if (std.mem.eql(u8, name, "PrefillChunkDoesNotFit") or std.mem.eql(u8, name, "PrefillDoesNotFit")) self.forward_refusal = forward_refusal_mod.take();
             self.error_code = self.allocator.dupe(u8, name) catch static_error_name;
             // The client sees only "generation failed" for most names; this line is the one place the name is kept.
             log.err("[slot] request {d} failed ({s}): {s}\n", .{ self.request_id, @tagName(self.state), name });
@@ -2151,7 +2153,7 @@ pub const Scheduler = struct {
         // dispatches what it was going to dispatch anyway.
         return gen.spec_disabled_runtime or sched_policy.specTickMode(
             slot.enable_mtp,
-            gen.mtp != null or gen.dspark,
+            gen.mtp != null or gen.drafter_on,
             slot.enable_drafter,
             gen.dflash != null,
         ) == .regular;
@@ -2982,6 +2984,8 @@ pub fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
     if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
     if (s.model.handle) |h| arch_state.resetTables(arch_handle.trunk(h));
     if (s.model.config) |c| sched.endRequest(c);
+    // A client that left mid-decode never reaches the inference thread's release: its reservation ends here.
+    @import("static_bill.zig").requestEnded(s);
 }
 
 pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*Scheduler, *Slot) void) void {
@@ -2990,9 +2994,11 @@ pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*S
 
 /// Native GLM has no reusable prefix snapshot: a slot the inference thread stops touching
 /// (finished, errored or cancelled) releases its reserved target state before the next
-/// admission read, not when its connection thread completes it.
+/// admission read, not when its connection thread completes it. A request on a load's ledger parks what its state
+/// holds here too: its connection thread completes it after the next request may run.
 pub fn releaseNativeState(slot: *Slot) void {
     sched.releaseState(slot);
+    @import("static_bill.zig").requestEnded(slot);
 }
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
@@ -3719,6 +3725,8 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         sch.inflight_prefill_tokens.store(0, .monotonic);
         sch.inflight_prefill_expected.store(0, .monotonic);
     };
+    // A load on the ledger admits the request on its lines before it allocates anything.
+    try @import("static_bill.zig").admit(slot);
     // A fresh count for the `return_progress` reader: this slot's prefill runs once, but
     // a slot whose pass failed and is re-entered must not keep the failed run's numbers.
     slot.prefill_progress.processed.store(0, .monotonic);
@@ -3752,10 +3760,11 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
         slot.enable_drafter,
         slot.dflash != null,
     );
-    // deepseek_v41's head is DSpark: no head cache, no hidden capture; the model holds its own state.
+    // A block drafter's head (DeepSeek's DSpark, Hy4-Flash's DFly2): no head cache, no hidden capture; the model holds
+    // its own state.
     const use_mtp = wiring.use_mtp;
-    const use_dspark = use_mtp and if (slot.mtp) |h| h.kind() == .dspark else false;
-    const use_head_mtp = use_mtp and !use_dspark;
+    const use_drafter_rounds = use_mtp and if (slot.mtp) |h| h.kind().blockDrafter() else false;
+    const use_head_mtp = use_mtp and !use_drafter_rounds;
     const use_dflash = wiring.use_dflash or sched.nativeDflashArmed(slot);
     log.debug("[spec-wiring] mtp={} dflash={} (slot: drafter_flag={} dflash_handle={})\n", .{
         use_mtp,             use_dflash,
@@ -4146,7 +4155,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             // transition shim sync-forwards [t1] on the first decode call.
             // DFlash/MTP init paths already skip preforward unconditionally.
             .skip_lazy_preforward = !use_head_mtp and !use_dflash,
-            .dspark_enabled = use_dspark,
+            .drafter_enabled = use_drafter_rounds,
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
@@ -4587,7 +4596,7 @@ fn closeThoughtOnLoop(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
-/// through the model this tick; an MTP or DSpark slot goes back to speculating, any other spec mode
+/// through the model this tick; an MTP or drafter-round slot goes back to speculating, any other spec mode
 /// decodes the answer regular (`spec_disable_reason = .think_bound`). True = the slot's tick is spent.
 fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tb = gen.sampling.think_bound orelse return false;
@@ -4615,7 +4624,7 @@ fn commitThoughtClose(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []c
         slot_outcome.finishSlot(sch, slot, gen.finish_reason);
         return true;
     }
-    if (gen.dspark) switch (try gen.dsparkResumeAfterForced(slot.allocator)) {
+    if (gen.drafter_on) switch (try gen.drafterResumeAfterForced(slot.allocator)) {
         .resumed => |closer| {
             pushForcedToken(slot, closer);
             std.debug.assert(slot.completion_tokens == gen.completion_tokens);
@@ -4654,7 +4663,7 @@ fn thoughtPointWanted(slot: *const Slot, checkpoints_on: bool) bool {
 /// at or below it) is a restore point the next prompt shares (docs/engine-prefix-cache.md#thought-points).
 fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     if (!thoughtPointWanted(slot, checkpoints_on)) return;
-    const grid: u32 = sched.thoughtGrid(slot, gen) orelse if (gen.mtp != null and !gen.dspark and slot.ssm_entries != null)
+    const grid: u32 = sched.thoughtGrid(slot, gen) orelse if (gen.mtp != null and !gen.drafter_on and slot.ssm_entries != null)
         1
     else
         return;
@@ -4669,7 +4678,7 @@ fn armThoughtPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
 /// (docs/engine-prefix-cache.md#decode-end-points).
 fn armDecodeEndPoint(slot: *Slot, gen: *Generator, checkpoints_on: bool) void {
     if (!checkpoints_on or slot.ssm_entries == null) return;
-    if (gen.mtp_cache == null or gen.dspark or gen.dflash != null) return;
+    if (gen.mtp_cache == null or gen.drafter_on or gen.dflash != null) return;
     gen.end_point_armed = true;
 }
 
@@ -4732,9 +4741,9 @@ fn thinkBoundFired(gen: *const Generator) bool {
     return tb.fired;
 }
 
-/// A fired bound decodes plain unless an MTP head or DSpark resumed behind it (DFlash2 still decodes plain).
+/// A fired bound decodes plain unless an MTP head or a block drafter resumed behind it (DFlash2 still decodes plain).
 pub fn thinkBoundForcesPlain(gen: *const Generator) bool {
-    return thinkBoundFired(gen) and (gen.spec_disable_reason == .think_bound or (gen.mtp == null and !gen.dspark));
+    return thinkBoundFired(gen) and (gen.spec_disable_reason == .think_bound or (gen.mtp == null and !gen.drafter_on));
 }
 
 /// Drafts a thinking bound lets the slot's next MTP round carry, so it accepts no further than serial decode
@@ -4790,12 +4799,12 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
     // generators handle the disabled fallback internally.
     const tick_mode: sched_policy.SpecTickMode = if ((Planner.enabled() and slot.planner_force_plain) or thinkBoundForcesPlain(gen)) .regular else sched_policy.specTickMode(
         slot.enable_mtp,
-        gen.mtp != null or gen.dspark,
+        gen.mtp != null or gen.drafter_on,
         slot.enable_drafter,
         gen.dflash != null,
     );
-    if (tick_mode == .mtp and gen.dspark) {
-        const result = try gen.nextDspark(slot.allocator);
+    if (tick_mode == .mtp and gen.drafter_on) {
+        const result = try gen.nextDrafterRound(slot.allocator);
         if (result == null) {
             slot_outcome.finishSlot(sch, slot, gen.finish_reason);
             return;
@@ -5560,7 +5569,7 @@ test "single MTP slot reaches the round entry through runDecodeTick, and its ref
     var gen: Generator = undefined;
     gen.xfm = &xfm;
     gen.loop_guard = .{};
-    gen.dspark = false;
+    gen.drafter_on = false;
     gen.mtp_planner_owned = false;
     gen.generated_ids = .empty;
     gen.loop_guard_start = 0;

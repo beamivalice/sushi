@@ -10,6 +10,14 @@ const Trunk = trunk.Trunk;
 const bindLinears = @import("layer_weights.zig").bindLinears;
 
 
+/// The turn of a test that makes its own raw ops past a load's seal (a kernel, an input, forwards off the served path): the
+/// pool stays open, so an ask is counted, not refused as it is a served request's (D64).
+pub fn openTurn(h: ?@import("arch/handle.zig").Handle, config: *const @import("model.zig").ModelConfig) mlx.engine.Turn {
+    const turn = @import("arch/handle.zig").turnFor(h, config);
+    mlx.engine.gatePool(.open);
+    return turn;
+}
+
 /// A test gives the engine back: `enabled` returns to `was`, and with it off the arrays the EXL3 module cached go: the
 /// engine's side as a served process drops them at its last Cooler unload, MLX's so the next test finds MLX holding
 /// nothing of this one's.

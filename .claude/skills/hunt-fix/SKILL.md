@@ -118,6 +118,6 @@ From a dedicated landing worktree, for each fixer branch in order:
 
 ## Box rules
 
-- One real-pack process at a time, under `scripts/gpu-lock.sh`. Agents never take the lock.
+- Real-pack runs follow `scripts/gpu-lock.sh rule`: the lock is for quiet, timing and a big job, never to block others. Agents never take it.
 - Never wrap `tests/run.sh --tier live` in the GPU lock: it takes the lock itself.
 - Stop processes by PID. Never touch a server you did not start.

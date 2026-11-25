@@ -33,6 +33,11 @@ pub const VisionEncoder = struct {
         return error.NoPatchGridEncoder;
     }
 
+    /// Whether the tower writes a request's image rows into the request's own buffer (`arch/media.zig` `writesMedia`).
+    pub fn writesMedia(self: *const VisionEncoder) bool {
+        return if (self.tower) |*t| t.writesMedia() else false;
+    }
+
     /// Encode one VIDEO: `patches` holds `grid_t` temporal-patch groups'
     /// pixel_values concatenated (see `vision_common.buildPixelValuesVideo`).
     /// Only some towers have a video path.

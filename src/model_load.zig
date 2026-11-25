@@ -54,6 +54,7 @@ const LoadedModel = model_registry_mod.LoadedModel;
 const sampler = @import("sampler.zig");
 const testing = std.testing;
 const bills = @import("bills.zig");
+const static_bill = @import("static_bill.zig");
 
 // The load-time bills live in bills.zig; these are the names the loader and its callers use.
 pub const billedFillPeakBytes = bills.billedFillPeakBytes;
@@ -227,9 +228,9 @@ pub fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
 pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
-    if (o.kv_quant) |k| if (arch_flags.kvQuantRequestRefusal(config, k) != null) {
+    if (o.kv_quant) |k| if (arch_flags.kvQuantRequestRefusal(config, k)) |why| {
         config.kv_quant_override = null;
-        log.warn("[model-settings] kv_quant {s} ignored: the MLA latent is stored at off, 6 or 8 bits\n", .{k.wireName()});
+        log.warn("[model-settings] kv_quant {s} ignored: {s}\n", .{ k.wireName(), why });
     };
     config.mtp_override = o.mtp;
     config.ssd_budget_gb_override = o.ssd_budget_gb orelse 0;
@@ -243,6 +244,8 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.vision_override = o.vision;
     config.max_tokens_override = o.max_tokens;
     config.expert_cache_bias_override = o.expert_cache_bias;
+    config.prefill_chunk_max_override = o.prefill_chunk_max;
+    config.prefill_chunk_min_override = o.prefill_chunk_min;
     if (yarnFactorIgnoredLine(config, o.yarn_factor)) |line| log.warn("{s}\n", .{line});
     if (resolveSsdBudget(0, config.ssd_budget_gb_override, config.supportsExpertStreaming()).setting_ignored)
         log.warn("[model-settings] ssd_budget_gb ignored: this checkpoint does not stream experts from SSD\n", .{});
@@ -269,18 +272,37 @@ pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32
 pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig) !void {
     if (comptime @import("builtin").is_test) {
         if (config.test_skip_warm) {
-            if (arch_handle.onEngine(null, config)) @import("arch/cooler.zig").warmEnded(xfm);
+            // A light load still ends with the plans and the seal a served load's warm leaves.
+            if (arch_handle.onEngine(null, config)) {
+                const cooler = @import("arch/cooler.zig");
+                try cooler.planLoad(xfm, null);
+                cooler.warmEnded(xfm);
+            }
             return;
         }
     }
+    var pipelines = beginPipelines(io, a, config);
+    defer if (pipelines) |*p| p.deinit();
+    return warmLoadWith(io, a, config, xfm, verify_cap, aux_head, kv, if (pipelines) |*p| p else null);
+}
+
+/// A Cooler load's pipeline manifest, opened before anything it lists is needed: it first makes what the manifest
+/// lists (the warm's and what earlier requests compiled late), on worker threads, so the warm makes nothing it lists;
+/// the kept shapes of the load's plans sit beside it. null off Cooler.
+pub fn beginPipelines(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig) ?@import("arch/cooler_pipelines.zig").Plan {
+    if (!arch_handle.onEngine(null, config)) return null;
+    var plan = @import("arch/cooler_pipelines.zig").beginFor(a, io, config) orelse return null;
+    _ = plan.settle();
+    return plan;
+}
+
+/// `warmLoad` over the manifest `pipelines` the load opened (`beginPipelines`).
+pub fn warmLoadWith(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xfm: *Trunk, verify_cap: ?u32, aux_head: ?*anyopaque, kv: trunk.KVQuantConfig, pipelines: ?*@import("arch/cooler_pipelines.zig").Plan) !void {
     const warmup_start = std.Io.Timestamp.now(io, .awake);
     const on_engine = arch_handle.onEngine(null, config);
-    // A Cooler load first makes what its manifest lists (the warm's and what earlier requests compiled late), on worker
-    // threads; the warm then makes nothing it lists.
     const cooler_pipelines = @import("arch/cooler_pipelines.zig");
-    var plan: ?cooler_pipelines.Plan = if (on_engine) cooler_pipelines.beginFor(a, io, config) else null;
-    defer if (plan) |*p| p.deinit();
-    if (plan) |*p| _ = p.settle();
+    const plan = pipelines;
+    if (on_engine) @import("arch/cooler.zig").warmBegins(xfm);
     xfm.warmup() catch |err| {
         var cause: [512]u8 = undefined;
         if (on_engine) {
@@ -309,9 +331,57 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
         log.err("[warm] a served request failed ({s}: {s}); a load on Sushi Cooler does not serve without it\n", .{ @errorName(err), latchedCause(&cause) });
         return err;
     };
+    @import("arch/cooler.zig").planLoad(xfm, if (plan) |p| p.shapeCache() else null) catch |err| {
+        var cause: [512]u8 = undefined;
+        log.err("[plan] the load's plans were not built ({s}: {s}); a load on the static bill does not serve without them\n", .{ @errorName(err), latchedCause(&cause) });
+        return err;
+    };
     @import("arch/cooler.zig").warmEnded(xfm);
-    if (plan) |*p| p.store() else cooler_pipelines.rewriteLate();
+    if (plan) |p| p.store() else cooler_pipelines.rewriteLate();
 }
+
+/// The arena a load on the ledger holds at a candidate chunk, from the plans it recorded (`arch/cooler.zig` `planArena`).
+/// A load that warms, of an arch on the ledger (`static_bill.onLedger`): its ledger opens with its budget, read once, its
+/// plans are recorded, its prefill chunk is fixed on the arena they measure (D98), and that arena is made, so its warm
+/// runs what a request runs (D107). The trunk's copy of the config takes the chunk. Any other load is left as it is.
+pub fn openLedger(config: *ModelConfig, xfm: *Trunk, before: static_bill.Before, warms: bool, cache: ?@import("tensor/plan/plan_book.zig").Cache) !void {
+    const cooler = @import("arch/cooler.zig");
+    const room: ?u64 = if (static_bill.onLedger(config, warms)) try static_bill.open(config, before) else null;
+    var measured: PlanArena = .{ .xfm = xfm };
+    if (room) |r| {
+        try bills.refuseStaticChunkBeforePlans(config, r);
+        try cooler.planRecord(xfm, cache);
+    }
+    const chunk = try bills.fixStaticPrefillChunk(config, if (room) |r| .{ .room = r, .arena = measured.arena() } else null);
+    if (chunk == 0) return;
+    xfm.config.static_prefill_chunk = chunk;
+    xfm.config.pinned_prefill_chunk = chunk;
+    config.static_ledger.?.terms = bills.ledgerTermsAt(config, bills.defaultKvBits(config), chunk).?;
+    try cooler.planLoad(xfm, cache);
+}
+
+/// A load on the ledger whose warm ended is sealed: its model bill is committed and its context fixed
+/// (`static_bill.seal`), and the trunk's copy of the config takes both. Any other load is left as it is.
+pub fn sealLedger(config: *ModelConfig, xfm: *Trunk, before: static_bill.Before) !void {
+    if (config.static_ledger == null) return;
+    var measured: PlanArena = .{ .xfm = xfm };
+    try static_bill.seal(config, before, measured.arena());
+    xfm.config.static_ledger = config.static_ledger;
+    xfm.config.pinned_context = config.pinned_context;
+}
+
+pub const PlanArena = struct {
+    xfm: *Trunk,
+
+    pub fn arena(self: *PlanArena) bills.ArenaAt {
+        return .{ .ctx = self, .at = at };
+    }
+
+    fn at(ctx: *anyopaque, chunk: u32) anyerror!u64 {
+        const self: *PlanArena = @ptrCast(@alignCast(ctx));
+        return (try @import("arch/cooler.zig").planArena(self.xfm, chunk)) orelse error.LedgerLoadRecordedNoPlans;
+    }
+};
 
 /// Points a load's expert engine at the config admission reads: what a prefill may still borrow, and its own share of
 /// the lent decoder pools.
@@ -356,7 +426,13 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .drafter = settings_resolve.launch.drafter,
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
+        .prefill_chunk_max = settings_resolve.launch.prefill_chunk_max != null,
+        .prefill_chunk_min = settings_resolve.launch.prefill_chunk_min != null,
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
+    switch (bills.staticChunkBounds(buf, config)) {
+        .refused => |line| return .{ .err = error.LaunchFlagUnsupported, .line = line },
+        .bounds, .none => {},
+    }
     if (contextWindowRefusal(buf, config, ctx_flag)) |line| return .{ .err = error.ContextSizeAboveWindow, .line = line };
     return null;
 }
@@ -416,6 +492,26 @@ pub fn packShipsMtpHead(io: std.Io, allocator: std.mem.Allocator, model_type: []
     if (arch_config.fact(&probe, "dflash_by_flag")) return model_discovery.readStubMeta(io, allocator, model_dir).has_mtp;
     if (arch_load.shipsHead(io, allocator, &probe, model_dir)) |ships| return ships;
     return false;
+}
+
+/// A resident load's drafting head from its MTP decision and whether the pack ships the head: kept when both hold,
+/// missing (resolved off) for the default on a pack without one, refused for an asked-for one.
+pub fn residentHead(mtp: model_settings.MtpChoice, ships: bool) error{MtpHeadMissing}!struct { kept: bool, missing: bool } {
+    if (mtp.on and !ships and mtp.source != .default) return error.MtpHeadMissing;
+    return .{ .kept = mtp.on and ships, .missing = mtp.on and !ships };
+}
+
+test "a resident load keeps the drafting head the pack ships, drops a default one it lacks and refuses an asked-for one" {
+    const on_default: model_settings.MtpChoice = .{ .on = true, .source = .default };
+    const on_flag: model_settings.MtpChoice = .{ .on = true, .source = .flag };
+    const off_flag: model_settings.MtpChoice = .{ .on = false, .source = .flag };
+    const kept = try residentHead(on_default, true);
+    try testing.expect(kept.kept and !kept.missing);
+    const dropped = try residentHead(on_default, false);
+    try testing.expect(!dropped.kept and dropped.missing);
+    try testing.expectError(error.MtpHeadMissing, residentHead(on_flag, false));
+    const off = try residentHead(off_flag, true);
+    try testing.expect(!off.kept and !off.missing);
 }
 
 /// An engine-default MTP under expert streaming resolves off (`expert_stream.mtpUnderStreaming`):
@@ -1034,7 +1130,7 @@ pub const ExpertCacheResolution = struct {
     ledger: ?expert_stream_mod.BudgetLedger,
 };
 
-/// PURE: the expert-cache byte budget for this load. `--ssd-budget-gb` is a TOTAL resident target and the cache is what is left of it
+/// PURE: the expert-cache byte budget for this load. `--ssd-budget-gb` is the weights budget (KV and prefill beside it) and the cache is what is left of it
 /// after the resident trunk, the MTP head (only when it stays resident), the vision tower the
 /// split carries, the whole-layer prefill union, the selected-expert slab and the fill bounce buffers.
 pub fn resolveExpertCache(
@@ -1055,7 +1151,7 @@ pub fn resolveExpertCache(
         @intCast(config.num_experts_per_tok),
         per_expert,
         expert_stream_mod.BOUNCE_BYTES,
-        config.expert_shape,
+        expert_stream_mod.servedShape(config.expertGeometry(), config.expert_shape),
     );
     return .{ .cache_bytes = ledger.cache_bytes, .ledger = ledger };
 }
@@ -1207,9 +1303,11 @@ pub const LoadServingBill = struct {
 pub const PreflightServing = struct { serving: ?LoadServingBill, needed: u64 };
 
 /// A load's requirement on a preflight reading, and its explicit context's serving bill: the context is priced on the room
-/// the reading leaves once the weights are resident.
+/// the reading leaves once the weights are resident. A load on the ledger prices its measured arena beside the context
+/// at its chunk's choice (D98), after its weights, and refuses there by name.
 pub fn preflightServing(config: *const ModelConfig, weights: u64, mtp_on: bool, avail: bills.SushiAvailable) PreflightServing {
-    const serving = if (scheduler_mod.load_serving_bill) |bill| bill(config, if (avail.bytes) |b| b -| weights else 0) else null;
+    const resident = weights;
+    const serving = if (scheduler_mod.load_serving_bill) |bill| bill(config, if (avail.bytes) |b| b -| resident else 0) else null;
     return .{ .serving = serving, .needed = loadRequirementBytes(config, weights, mtp_on, if (serving) |b| b.needed else 0) };
 }
 
@@ -2015,6 +2113,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const job = JobTurn.begin(null, params.config);
     defer job.end();
     const own_load = job.own;
+    // What the engine held before this load: the load's own bytes are what its counts gain (`static_bill`).
+    const engine_before = static_bill.Before.now();
+    errdefer static_bill.close(params.config);
     if (params.config.unsupported_note) |note| log.warn("{s}\n", .{note});
     // Every refusal of this model, a request's included, offers a smaller pack from this one fact.
     params.config.smaller_pack = smallerPackOf(params.model_dir) == .exists;
@@ -2047,6 +2148,18 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // What the planner resolved, for a refusal that names the ssd budget it fits.
     var planned_resident: u64 = 0;
     var planned_assistant: u64 = 0;
+    // A resident load keeps the drafting head only where its arch says the pack ships it (`shipsHead`): the default
+    // resolves off, an asked-for head the pack lacks is refused by name.
+    var head_missing = false;
+    if (!streamed) if (arch_load.shipsHead(sch.io, sch.allocator, params.config, params.model_dir)) |ships| {
+        const mtp = mtpChoiceFor(params.mtp, params.config);
+        const head = residentHead(mtp, ships) catch |e| {
+            log.err("[mtp] the pack ships no drafting head; MTP is on ({s}), pass --no-mtp\n", .{mtp.sourceName()});
+            return e;
+        };
+        head_missing = head.missing;
+        params.config.stream_mtp_head = head.kept;
+    };
     if (streamed) {
         var budget = streaming_budget;
         const tier = ramDefaultTierFor(params.config);
@@ -2124,7 +2237,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             if (@TypeOf(params) == *LoadRequest) params.recordRefusalText(text);
             return refused.err;
         };
-    } else if (try arch_load.residentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on)) |bytes| {
+    } else if (try arch_load.residentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on and !head_missing)) |bytes| {
         streaming_resident_bytes = bytes;
     } else if (model_mod.usesSushiQuantMemoryBill(params.config)) {
         streaming_resident_bytes = try sushiResidentLoadBytes(sch.io, sch.allocator, params.model_dir, params.config, load_vision, mtpChoiceFor(params.mtp, params.config).on);
@@ -2147,6 +2260,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     try arch_load.drafterChosen(sch.io, sch.allocator, params.config, drafter_dir, params.no_drafter, mtpChoiceFor(params.mtp, params.config).on);
     if (try arch_load.stageDrafter(sch.io, sch.allocator, params.config, params.model_dir, drafter_dir, params.no_drafter)) |assistant_bytes|
         streaming_resident_bytes = streaming_resident_bytes.? +| assistant_bytes;
+
+    params.config.keeps_tower = load_vision and params.config.has_vision;
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -2258,12 +2373,15 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     weights_ptr.* = try model_mod.loadWeightsForConfig(sch.io, sch.allocator, params.model_dir, &load_config, load_vision);
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
+    load_config.weight_prefix = params.config.weight_prefix;
 
     // Trunk — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Trunk);
     errdefer sch.allocator.destroy(xfm_ptr);
     const build_t0 = load_clock.now();
-    xfm_ptr.* = try initTrunk(sch.io, sch.allocator, params.config, weights_ptr);
+    xfm_ptr.* = try initTrunk(sch.io, sch.allocator, &load_config, weights_ptr);
+    arch_config.adoptLoaded(params.config, &xfm_ptr.config);
+    xfm_ptr.config.mtp_override = params.config.mtp_override;
     load_clock.buildDone(build_t0);
     errdefer xfm_ptr.deinit();
     publishEngine(xfm_ptr, params.config);
@@ -2292,11 +2410,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const kv_quant_config = kv_cache.config;
     const mtp = mtpChoiceFor(params.mtp, params.config);
     const mtp_streaming_off = mtpDefaultOffUnderStreaming(mtp, params.config.expert_streaming, params.config.stream_mtp_head);
+    const mtp_off = mtp_streaming_off or head_missing;
     // GLM has no MTP head; the server's `MTP: off` line already says so.
     if (!arch_config.fact(params.config, "no_mtp_head")) log.info("[mtp] {s} ({s}{s})\n", .{
-        if (mtp_streaming_off) "off" else mtp.label(), if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
+        if (mtp_off) "off" else mtp.label(), if (head_missing) "the pack ships no drafting head; " else if (mtp_streaming_off) "streaming; " else "", mtp.sourceName(),
     });
-    const mtp_enabled = mtp.on and !mtp_streaming_off and !arch_config.fact(params.config, "no_mtp_head");
+    const mtp_enabled = mtp.on and !mtp_off and !arch_config.fact(params.config, "no_mtp_head");
     arch_serve.loadLines(params.config, .{ .io = sch.io, .allocator = sch.allocator, .model_dir = params.model_dir, .mtp_source = mtp.sourceName() });
     arch_load.logLoad(params.config, kv_quant_config, mtp.on, params);
     var rows_buf: [320]u8 = undefined;
@@ -2678,6 +2797,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
     }
 
+    var pipelines = if (params.warmup_eager) beginPipelines(sch.io, sch.allocator, params.config) else null;
+    defer if (pipelines) |*p| p.deinit();
+    // With its weights and expert cache resident, a load on the ledger reads its budget, once, and fixes its chunk and
+    // its arena in it.
+    try openLedger(params.config, xfm_ptr, engine_before, params.warmup_eager, if (pipelines) |*p| p.shapeCache() else null);
+
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path.
@@ -2686,9 +2811,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config,
             generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile),
         ) else null;
-        try warmLoad(sch.io, sch.allocator, params.config, xfm_ptr, verify_cap, aux_head, kv_quant_config);
+        try warmLoadWith(sch.io, sch.allocator, params.config, xfm_ptr, verify_cap, aux_head, kv_quant_config, if (pipelines) |*p| p else null);
     }
     settleLoadLatch(had_error_at_start);
+    try sealLedger(params.config, xfm_ptr, engine_before);
 
     // A MERGED drafter has no `--drafter` to echo, so the reported path comes
     // from what was actually resolved — `drafter_loaded` and `drafter_path`
@@ -3014,14 +3140,20 @@ test "waitForUnwire returns at once when shutdown_requested is set" {
 /// The decode meter's context: `tokens` ids through the model in chunks of 2048, as a served prefill runs them. No
 /// row of a chunk is sampled, so none reads out its logits (`skip_lm_head`).
 pub fn meterPrefill(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("model_handle.zig").ForwardCtx, tokens: usize) !usize {
-    const ids = try allocator.alloc(i32, 2048);
+    return meterPrefillChunk(allocator, xfm, ctx, tokens, 2048);
+}
+
+/// `meterPrefill` in chunks of `chunk_max`.
+fn meterPrefillChunk(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("model_handle.zig").ForwardCtx, tokens: usize, chunk_max: usize) !usize {
+    const stride = @max(1, chunk_max);
+    const ids = try allocator.alloc(i32, @min(stride, @max(1, tokens)));
     defer allocator.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(1 + (i % 1000));
     ctx.skip_lm_head = true;
     defer ctx.skip_lm_head = false;
     var done: usize = 0;
     while (done < tokens) {
-        const n_chunk = @min(2048, tokens - done);
+        const n_chunk = @min(stride, tokens - done);
         const shape = [_]c_int{ 1, @intCast(n_chunk) };
         const ti = try mlx.newData(ids.ptr, &shape, .int32);
         defer _ = mlx.mlx_array_free(ti);
@@ -3034,93 +3166,161 @@ pub fn meterPrefill(allocator: std.mem.Allocator, xfm: *Trunk, ctx: *@import("mo
 }
 
 /// DIAGNOSTIC (SUSHI_PREFILL_UBENCH=N): N cold one-chunk prefills per arm at load, each from an
-/// empty cache, logits never projected (the chunk loop never reads them). `_ROWS` (default 2025)
-/// is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
+/// empty cache, logits never projected (the chunk loop never reads them), or with `_KV=<n>` each after n tokens (an
+/// arch that marks its state rolls back to the mark between chunks; any other prefills them again, untimed).
+/// `_ROWS` (default 2025) is capped at the chunk admission would pick for such a prompt; `_TEXT=<abs path>` tokenized
 /// for real routing; `_ARMS=0,1,1,0` runs a pass per arm, 0 on the reference EXL3 NAX GEMM body, or with
 /// `_LEVER=decoded` 0 on the trunk's sorted GEMM instead of its decoded path.
+pub const PrefillUbenchOpts = struct {
+    n: usize = 3,
+    rows: usize = 2025,
+    kv: usize = 0,
+    arms: []const ?bool = &.{null},
+    decoded_lever: bool = false,
+    text_path: ?[]const u8 = null,
+    quiet: bool = false,
+};
+
+/// Where the meter's last timed chunk started and ended, and how many chunks ran (warm-up included).
+pub const PrefillUbenchResult = struct {
+    last_start_pos: usize = 0,
+    last_end_pos: usize = 0,
+    iterations: usize = 0,
+};
+
 fn prefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, cfg: *const ModelConfig, tok: *Tokenizer) void {
-    const tio = std.Io.Threaded.global_single_threaded.io();
     const n = @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(std.c.getenv("SUSHI_PREFILL_UBENCH").?, 0), 10) catch 3);
     const asked: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ROWS")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 2025 else 2025;
+    const kv: usize = if (std.c.getenv("SUSHI_PREFILL_UBENCH_KV")) |r| std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0 else 0;
     const pick = scheduler_mod.prefill_ubench_chunk orelse {
         log.warn("[prefill-ubench] skipped: no admission hook to size the chunk\n", .{});
         return;
     };
     // A wider forward than admission would run allocates outside the load's memory bill.
     const rows = @max(1, @min(asked, pick(cfg, asked + 1, 1, xfm.cache.config, false, 0, 0, false, false)));
-    const ids = alloc.alloc(i32, rows) catch return;
+    var arms: [16]?bool = @splat(null);
+    const n_arms = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ARMS")) |r| parseUbenchArms(std.mem.sliceTo(r, 0), &arms) else 1;
+    const decoded_lever = if (std.c.getenv("SUSHI_PREFILL_UBENCH_LEVER")) |l| std.mem.eql(u8, std.mem.sliceTo(l, 0), "decoded") else false;
+    const text_path: ?[]const u8 = if (std.c.getenv("SUSHI_PREFILL_UBENCH_TEXT")) |path| std.mem.sliceTo(path, 0) else null;
+    _ = runPrefillUbench(alloc, xfm, tok, .{
+        .n = n,
+        .rows = rows,
+        .kv = kv,
+        .arms = arms[0..n_arms],
+        .decoded_lever = decoded_lever,
+        .text_path = text_path,
+    }) catch |err| {
+        log.warn("[prefill-ubench] failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+/// The prefill meter's run: `opts.n` timed chunks of `opts.rows` per arm, each after `opts.kv` tokens.
+pub fn runPrefillUbench(alloc: std.mem.Allocator, xfm: *Trunk, tok: ?*Tokenizer, opts: PrefillUbenchOpts) !PrefillUbenchResult {
+    const tio = std.Io.Threaded.global_single_threaded.io();
+    const n = @max(1, opts.n);
+    const rows = @max(1, opts.rows);
+    const ids = try alloc.alloc(i32, rows);
     defer alloc.free(ids);
     for (ids, 0..) |*v, i| v.* = @intCast(1 + (i % 997));
-    if (std.c.getenv("SUSHI_PREFILL_UBENCH_TEXT")) |path| blk: {
-        const text = std.Io.Dir.cwd().readFileAlloc(tio, std.mem.sliceTo(path, 0), alloc, .limited(64 << 20)) catch break :blk;
+    if (opts.text_path) |path| if (tok) |tk| blk: {
+        const text = std.Io.Dir.cwd().readFileAlloc(tio, path, alloc, .limited(64 << 20)) catch break :blk;
         defer alloc.free(text);
-        const enc = tok.encode(alloc, text) catch break :blk;
+        const enc = tk.encode(alloc, text) catch break :blk;
         defer alloc.free(enc);
         if (enc.len == 0) break :blk;
         for (ids, 0..) |*v, i| v.* = @intCast(enc[i % enc.len]);
-    }
-    var arms: [16]?bool = @splat(null);
-    const n_arms = if (std.c.getenv("SUSHI_PREFILL_UBENCH_ARMS")) |r| parseUbenchArms(std.mem.sliceTo(r, 0), &arms) else 1;
+    };
     defer exl3_kernels.nax_reference_override = false;
     defer @import("sushi_exl3").trunk_gemm.enabled = true;
-    const decoded_lever = if (std.c.getenv("SUSHI_PREFILL_UBENCH_LEVER")) |l| std.mem.eql(u8, std.mem.sliceTo(l, 0), "decoded") else false;
     const had_error = mlx.errorPending();
     defer xfm.resetCache() catch {};
     const shape = [_]c_int{ 1, @intCast(rows) };
-    const times = alloc.alloc(f64, n) catch return;
+    const times = try alloc.alloc(f64, n);
     defer alloc.free(times);
     var first_ms: f64 = 0;
-    for (arms[0..n_arms]) |arm| {
-        if (decoded_lever)
+    var res: PrefillUbenchResult = .{};
+    var ctx = xfm.defaultCtx();
+    var marked = false;
+    defer if (marked) arch_load.ubenchDropMark(xfm);
+    if (opts.kv > 0) {
+        try xfm.resetCache();
+        xfm.bindOwnRows(opts.kv + rows);
+        ctx = xfm.defaultCtx();
+        ctx.cache.end_tokens = opts.kv + rows;
+        const done_pre = try meterPrefillChunk(alloc, xfm, &ctx, opts.kv, rows);
+        if (!opts.quiet) log.info("[prefill-ubench] prefilled {d} tokens\n", .{done_pre});
+        marked = try arch_load.ubenchMark(xfm);
+    }
+    for (opts.arms) |arm| {
+        if (opts.decoded_lever)
             @import("sushi_exl3").trunk_gemm.enabled = if (arm) |a| a else true
         else
             exl3_kernels.nax_reference_override = if (arm) |a| !a else false;
         var engine0 = mlx.engine.stats();
         for (0..n + 1) |iter| {
+            if (opts.kv == 0) {
+                try xfm.resetCache();
+                xfm.bindOwnRows(rows);
+                ctx = xfm.defaultCtx();
+                ctx.cache.end_tokens = rows;
+            } else if (ctx.cache.step != opts.kv) {
+                if (marked) {
+                    try arch_load.ubenchRollback(xfm, &ctx);
+                } else {
+                    try xfm.resetCache();
+                    xfm.bindOwnRows(opts.kv + rows);
+                    ctx = xfm.defaultCtx();
+                    ctx.cache.end_tokens = opts.kv + rows;
+                    _ = try meterPrefillChunk(alloc, xfm, &ctx, opts.kv, rows);
+                }
+            }
             if (iter == 1) {
                 mlx.engine.resetKernelProfile();
                 engine0 = mlx.engine.stats();
             }
-            xfm.resetCache() catch return;
-            xfm.bindOwnRows(rows);
-            var ctx = xfm.defaultCtx();
             ctx.skip_lm_head = true;
-            const ti = mlx.newData(ids.ptr, &shape, .int32) catch return;
+            res.last_start_pos = ctx.cache.step;
+            const ti = try mlx.newData(ids.ptr, &shape, .int32);
             defer _ = mlx.mlx_array_free(ti);
             var sw = io_util.Stopwatch.init(tio);
             const out = xfm.forwardWith(&ctx, ti) catch |err| {
                 mlx.dropLatchedErrorUnless(had_error);
-                log.warn("[prefill-ubench] forward failed: {s}\n", .{@errorName(err)});
-                return;
+                if (!opts.quiet) log.warn("[prefill-ubench] forward failed: {s}\n", .{@errorName(err)});
+                return err;
             };
             defer _ = mlx.mlx_array_free(out);
             mlx.check(mlx.mlx_array_eval(out)) catch |err| {
                 mlx.dropLatchedErrorUnless(had_error);
-                log.warn("[prefill-ubench] eval failed: {s}\n", .{@errorName(err)});
-                return;
+                if (!opts.quiet) log.warn("[prefill-ubench] eval failed: {s}\n", .{@errorName(err)});
+                return err;
             };
+            res.last_end_pos = ctx.cache.step;
+            res.iterations += 1;
             const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6;
             if (iter > 0) times[iter - 1] = ms else first_ms = ms;
         }
         std.mem.sortUnstable(f64, times, {}, std.sort.asc(f64));
-        log.info("[prefill-ubench] arm={s} rows={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s), untimed first {d:.2} ms\n", .{
-            if (arm) |a| (if (a) "1" else "0") else "shipped", rows, n, times[n / 2], times[0], times[n - 1],
-            @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0, first_ms,
-        });
-        const engine1 = mlx.engine.stats();
-        if (engine1.dispatches > engine0.dispatches) {
-            const chunks: f64 = @floatFromInt(n);
-            log.info("[prefill-ubench] engine: {d:.1} dispatches, {d:.1} barriers, {d:.1} command buffers, {d:.1} waits, {d:.3} ms GPU busy, {d:.3} ms idle between passes per chunk\n", .{
-                @as(f64, @floatFromInt(engine1.dispatches - engine0.dispatches)) / chunks,
-                @as(f64, @floatFromInt(engine1.barriers - engine0.barriers)) / chunks,
-                @as(f64, @floatFromInt(engine1.submits - engine0.submits)) / chunks,
-                @as(f64, @floatFromInt(engine1.waits - engine0.waits)) / chunks,
-                @as(f64, @floatFromInt(engine1.gpu_busy_ns - engine0.gpu_busy_ns)) / 1e6 / chunks,
-                @as(f64, @floatFromInt(engine1.gpu_gap_ns - engine0.gpu_gap_ns)) / 1e6 / chunks,
+        if (!opts.quiet) {
+            log.info("[prefill-ubench] arm={s} rows={d} kv={d} n={d} median {d:.2} ms min {d:.2} max {d:.2} ({d:.1} tok/s), untimed first {d:.2} ms\n", .{
+                if (arm) |a| (if (a) "1" else "0") else "shipped", rows, opts.kv, n, times[n / 2], times[0], times[n - 1],
+                @as(f64, @floatFromInt(rows)) / times[n / 2] * 1000.0, first_ms,
             });
-            mlx.engine.logKernelProfile(chunks);
+            const engine1 = mlx.engine.stats();
+            if (engine1.dispatches > engine0.dispatches) {
+                const chunks: f64 = @floatFromInt(n);
+                log.info("[prefill-ubench] engine: {d:.1} dispatches, {d:.1} barriers, {d:.1} command buffers, {d:.1} waits, {d:.3} ms GPU busy, {d:.3} ms idle between passes per chunk\n", .{
+                    @as(f64, @floatFromInt(engine1.dispatches - engine0.dispatches)) / chunks,
+                    @as(f64, @floatFromInt(engine1.barriers - engine0.barriers)) / chunks,
+                    @as(f64, @floatFromInt(engine1.submits - engine0.submits)) / chunks,
+                    @as(f64, @floatFromInt(engine1.waits - engine0.waits)) / chunks,
+                    @as(f64, @floatFromInt(engine1.gpu_busy_ns - engine0.gpu_busy_ns)) / 1e6 / chunks,
+                    @as(f64, @floatFromInt(engine1.gpu_gap_ns - engine0.gpu_gap_ns)) / 1e6 / chunks,
+                });
+                mlx.engine.logKernelProfile(chunks);
+            }
         }
     }
+    return res;
 }
 
 /// `_ARMS` list: each comma-separated entry is an arm, `0` the reference, anything else the shipped one.

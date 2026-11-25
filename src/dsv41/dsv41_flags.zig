@@ -1,35 +1,17 @@
-//! DeepSeek-V4.1's launch face (the `flags` slot of `arch.zig`): `repack`, the launch flags it
-//! cannot act on, and the borrow hooks the server installs.
+//! DeepSeek-V4.1's launch face (the `flags` slot of `arch.zig`): the launch flags it cannot act on and the borrow
+//! hooks the server installs.
 const std = @import("std");
 const model = @import("../model.zig");
 const flags = @import("../arch/flags.zig");
-const repack = @import("repack.zig");
 const borrow = @import("dsv41_borrow.zig");
 const dsv41_bill = @import("dsv41_bill.zig");
-const dspark_rows = @import("../dspark_rows.zig");
+const drafter_rows = @import("../drafter_rows.zig");
 const source = @import("dsv41_source.zig");
 const arch_serve = @import("../arch/serve.zig");
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const log = @import("../log.zig");
 
 pub const help = [_]flags.HelpChunk{
-    .{ .before = "  update ", .text =
-        \\  repack <pack>       Rewrite an STQ pack in place into the
-        \\                      pair-major layout. A shard is replaced only after
-        \\                      its rewrite reads back equal; a cut-off run
-        \\                      resumes when repeated. Stop any server using the
-        \\                      pack first. Never downloads. Options:
-        \\                      --pack-revision <id>  stamp the pack with a
-        \\                        revision (config.json and every shard header)
-        \\                      --shards <name-or-glob>  stamp only these shards
-        \\                        (repeatable; a pattern matching nothing is
-        \\                        refused)
-        \\                      --unstamped <shard>  leave this shard without a
-        \\                        stamp (repeatable; a symlinked shard needs it)
-        \\                      --check  read only: every shard not unstamped
-        \\                        carries the config's revision
-        \\
-    },
     .{ .before = "  --kv-quant", .text =
         \\  --ds41-mlx-engine   DeepSeek-V4.1 only: decode on MLX instead of Sushi Cooler,
         \\                      the engine of our own (the default on an STQ pack
@@ -40,16 +22,6 @@ pub const help = [_]flags.HelpChunk{
         \\
     },
 };
-
-pub const command = struct {
-    pub const name = "repack";
-    pub const runs_gpu = false;
-    pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
-        return repack.cmdRepack(allocator, io, args);
-    }
-};
-
-
 
 pub const settings_kv_quant_ignored = "model-settings.json kv_quant is ignored on deepseek_v41 (no KV cache to quantize)";
 
@@ -82,10 +54,10 @@ pub const serve = struct {
     pub fn loadLines(config: *const model.ModelConfig, ctx: arch_serve.LoadLog) void {
         const c = config.dsv41 orelse return;
         log.info("[dsv41] {d} bytes/token of compressed state\n", .{config.kvBytesPerToken()});
-        if (config.dsparkOn()) {
+        if (config.drafterOn()) {
             log.info("[spec] DeepSeek-V4.1-Flash decodes with DSpark ({d} stages, block {d}, resident; {s}{s})\n", .{ c.n_mtp, c.dspark.block, ctx.mtp_source, if (c.widthExactLayout()) "" else "; fixed width: this layout is not width-exact" });
             if (depth_bounds.active.explicit()) {
-                const range = dspark_rows.Range.of(depth_bounds.active, c.dspark.block);
+                const range = drafter_rows.Range.of(depth_bounds.active, c.dspark.block);
                 log.info("[spec] DSpark verifies {d}..{d} rows a round (--mtp-min-depth/--mtp-max-depth)\n", .{ range.min_rows, range.max_rows });
             }
         } else {

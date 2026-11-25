@@ -42,6 +42,13 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   takes any whole number 1-100; 50, 75 and 100 reach the encoder as its own words, `chat.scaleEffortFor`); no caps.
 - glm5_next (built-in): low, high, max (uncapped, a prompt instruction; `sends` takes low|high|max); `medium` folds to
   `high` and `xhigh` to `max`; off can never be offered (the template has no thinking-off switch).
+- hy_v4_flash (built-in, not served until its quant ships): off (the template's `no_think`), low and medium at `high`
+  under 2048 and 16384, high, and xhigh and max at `max`. The template reads the word; a row that sends it another
+  level's word (low and medium) keeps its cap where a template-read word otherwise drops it, since the cap is all that
+  tells those levels from high (`reasoningEffortFromWord`). The template's literal `no_think` makes `chat.templateSettings`
+  pass the arm's word through (`asks.noThinkWord`). Its preserve switch is spelled `preserved_thinking`; the same
+  `--preserve-thinking` / `preserve_thinking` setting reaches it under that name (`Settings.preserved_thinking`), and
+  unset leaves the template's own default (preserve when the request has tools).
 - mimo_v2 advertises off, on: its template has only on/off, so every thinking word (`minimal` through `max`) is on,
   uncapped, and off/none is off.
 - `/v1/models` rows, loaded or not, are read from the served table on every call: `reasoning_efforts` (the offered
@@ -300,7 +307,8 @@ before reading a completed stream and requires clean EOF.
   strings (`instructions`, `previous_response_id`, `safety_identifier`, `prompt_cache_key`), `truncation` (auto or
   disabled) and `max_tool_calls` (on `/v1/responses/compact` too; the envelope echoes the whole number accepted, `3.0` as 3), `completionsFieldFault` the legacy integer `logprobs`, refused at any value): `max_tokens`/`max_completion_tokens` (Responses: `max_output_tokens`; the first positive one wins, a null or 0 leaves the next in force) and `seed` take an integer or a whole
   float (`7.0`); `temperature`, `top_p`, `top_k`, the penalties take a number; `stop` a string or
-  strings; `kv_quant` `off|0|4|6|8|16`; every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
+  strings; `kv_quant` `off|0|4|6|8|16` (a load on the static bill serves only the width it loaded with and refuses another
+  by name); every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000
   (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
   and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),
@@ -534,11 +542,11 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
     unload empties the model's cache, so `bytes` counts resident models only.
     `/metrics`: `sushi:token_cache_bytes`, `sushi:token_cache_hits_total`, `sushi:token_cache_misses_total`,
     `sushi:token_cache_evictions_total` ([server-tool-calling](server-tool-calling.md)).
-  - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...}}`, one object per drafting mode (MTP: Qwen and MiMo heads;
-    DFlash2: GLM; DSpark: DeepSeek) with `requests` (that ran a round), `rounds` (one verify forward each), `drafted`,
+  - `"speculative":{"mtp":{...},"dflash":{...},"dspark":{...},"dfly2":{...}}`, one object per drafting mode (MTP: Qwen
+    and MiMo heads; DFlash2: GLM; DSpark: DeepSeek; DFly2: Hy4-Flash, two unrelated drafters) with `requests` (that ran a round), `rounds` (one verify forward each), `drafted`,
     `accepted` (drafted tokens the verifier kept, not the always-committed first token of a round) and `plain_rounds`
-    (DSpark: rounds that carried one verifier row, already inside `rounds`; MTP: planner ticks that ran without a draft,
-    outside `rounds`; DFlash2: the same, GLM's ticks that ran without a draft, outside `rounds`). DSpark adds `rows`, `{<verifier rows>:
+    (DSpark and DFly2: rounds that carried one verifier row, already inside `rounds`; MTP: planner ticks that ran without a draft,
+    outside `rounds`; DFlash2: the same, GLM's ticks that ran without a draft, outside `rounds`). DSpark and DFly2 add `rows`, `{<verifier rows>:
     rounds}`. They are the sums of the figures `[spec-stats]` logs, added once when a request ends
     ([engine-mtp](engine-mtp.md)), also for a request that errors mid-decode (`finishSpecAtCleanup`, once: `Slot.spec_recorded`). Acceptance % is `accepted / drafted`, mean accepted per round `accepted / rounds`.
     MTP's figures include its prompt-lookup rounds (head + lookup), as DFlash2's do; the `[spec-stats]` `per_draft_pct`
@@ -600,7 +608,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   unloads (use `model`); `stale` keeps those namespaces, and `all` lists a loading or unloading model as busy. A load
   publishes its tier's namespace when it attaches the tier, and the disk-stats publisher leaves a loading or unloading
   model's snapshot as it is, so that model owns its namespace until it is unloaded.
-- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.max_request_mb` (`file`, `default: 128`, `min: 1`, `max: 1024`, `source`, `locked: false`, `applies`; null resets to the default), `server.wired_margin_gib` (the same shape with `default: 1`, `min: 1`, `max: 32`, and `flag`, `locked: true` when `--wired-margin-gib` is given), `server.models_dir`,
+- `GET /v1/settings` reports `~/.sushi/model-settings.json` as the page edits it: `server.max_request_mb` (`file`, `default: 128`, `min: 1`, `max: 1024`, `source`, `locked: false`, `applies`; null resets to the default), `server.wired_margin_gib` (the same shape with `default: 1`, `min: 0`, `max: 32`, and `flag`, `locked: true` when `--wired-margin-gib` is given), `server.models_dir`,
   `server.update_check` and `server.pack_update_check` (booleans, `default: true`, `file`, `flag`, `source`, `locked`;
   `--no-update-check` pins both and reports `flag: "--no-update-check"`; a change reaches the check loops at once, no
   restart), `server.skip_mem_preflight` (the same fields, `default: false`; `--skip-mem-preflight` pins it and reports
@@ -800,8 +808,8 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   (the share of prompt tokens restored, cached vs computed tokens per request, requests that reused, hits by tier),
   storage (hot and SSD use, evictions per tier), writes by kind, request outcomes, response time (the average request as
   one bar of waiting, prefill and decode, then TTFT and end-to-end per bucket), prompt and output length side by side per
-  bucket, serial-decode reasons and DSpark rows per round. The draft acceptance card is one dot per request whose log row
-  carries `spec`, with a row per drafting mode under it (acceptance and mean accepted per round, DSpark plain-round
+  bucket, serial-decode reasons and the block drafters' (DSpark, DFly2) rows per round. The draft acceptance card is one dot per request whose log row
+  carries `spec`, with a row per drafting mode under it (acceptance and mean accepted per round, DSpark and DFly2 plain-round
   share); the dots alone say when nothing drafted or the server does not report it. Each bar row prints its exact value and has a tip (`data-tip` text). A card's bar
   rows (and the cached-vs-computed columns) are one Tab stop the arrow keys, Home and End walk; a poll that changes them
   updates the same nodes when the content keeps its shape, else hands the focus to the same place (`setHtml`, `rove`). A histogram takes the focus and the arrow keys step its buckets.
@@ -815,7 +823,7 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   down (config mode): tick charts on or off, Reset, Done. While it is open each chart shows a strip: drag it onto another
   chart (pointer events, so a finger works too; `touch-action: none` on the strip) or use its arrow buttons, which keep
   the focus ([server-webui](server-webui.md#dashboard-config-mode)). The choice is `localStorage` `sushi-dash:charts` (`{order, hidden}`), a browser preference and no server
-  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all but DSpark rows per round.
+  setting; until one exists Compact shows prefill, decode, GPU and memory and Advanced shows all but the block drafters' rows per round.
   A stored choice that names a card since merged (`memsplit`, `specmodes`, `cachetok`, `ttft`, `e2e`, `ptok`, `otok`)
   reads as the card that replaced it, at the first place of any of its parts, hidden only when all of them were; the
   migrated choice is stored back (`migrateLayout`). The hot tier's bytes are

@@ -395,7 +395,7 @@ fn getVerifyQmmKernel(m: c_int, bn: c_int) !mlx.mlx_fast_metal_kernel {
 }
 
 /// The int32 scalar `v` of the side making arrays now, the cache's (`side_cache.int`).
-pub fn cachedScalarInt(v: c_int) mlx.HostArrayRefused!mlx.mlx_array {
+pub fn cachedScalarInt(v: c_int) error{ HostArrayRefused, CacheFillDry }!mlx.mlx_array {
     return @import("sushi_exl3").side_cache.int(@intFromBool(mlx.engine.active), v);
 }
 

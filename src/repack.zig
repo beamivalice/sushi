@@ -1,21 +1,20 @@
-//! `sushi repack <pack>`: a pack-order DeepSeek-V4.1 STQ pack becomes pair-major, in place (docs/pack-format.md#repack).
+//! `sushi repack <pack>`: a pack-order STQ pack of an arch that declares `repack` becomes pair-major, in place
+//! (docs/pack-format.md#repack).
 //! A shard is replaced only after its rewrite was re-read and compared with the original; the index and `config.json`
 //! change last, so a run cut short leaves a pack the loader refuses and a rerun finishes.
 const std = @import("std");
 const exl3 = @import("sushi_exl3");
 const gl = exl3.group_layout;
-const expert_io = @import("../expert_io.zig");
-const dsv41_source = @import("dsv41_source.zig");
-const model = @import("../model.zig");
-const cli = @import("../cli.zig");
-const disk_placement = @import("../disk_placement.zig");
-const log = @import("../log.zig");
-const flag_value = @import("../flag_value.zig");
+const expert_io = @import("expert_io.zig");
+const cli = @import("cli.zig");
+const disk_placement = @import("disk_placement.zig");
+const log = @import("log.zig");
+const flag_value = @import("flag_value.zig");
+const arch_config = @import("arch/config.zig");
 const stamp = @import("repack_stamp.zig");
 
-pub const page: u64 = 16384;
-const marker = ".mlp.switch_mlp.";
-const pad_prefix = dsv41_source.pad_prefix;
+pub const page = gl.page;
+const pad_prefix = gl.pad_prefix;
 pub const tmp_suffix = ".repack-tmp";
 const lock_name = ".sushi-repack.lock";
 const index_name = "model.safetensors.index.json";
@@ -175,7 +174,8 @@ const Info = struct {
 
 const Routed = struct { prefix: []const u8, name: gl.Name };
 
-fn routedOf(key: []const u8) ?Routed {
+/// `key` as a routed projection's tensor, `marker` being the arch's key text before the projection name.
+fn routedOf(marker: []const u8, key: []const u8) ?Routed {
     const at = std.mem.indexOf(u8, key, marker) orelse return null;
     const name = gl.Name.parse(key[at + marker.len ..]) catch return null;
     return .{ .prefix = key[0 .. at + marker.len], .name = name };
@@ -184,11 +184,11 @@ fn routedOf(key: []const u8) ?Routed {
 const State = enum { plain, legacy, pair_major };
 
 /// What the shard holds of the routed experts; both orders in one shard is mixed.
-fn stateOf(info: Info) !State {
+fn stateOf(marker: []const u8, info: Info) !State {
     var legacy = false;
     var major = false;
     for (info.entries) |e| {
-        const r = routedOf(e.key) orelse continue;
+        const r = routedOf(marker, e.key) orelse continue;
         if (r.name.part != 0) continue;
         if (!r.name.grouped) return error.Exl3TileOrderNeedsGroups;
         if (r.name.pair_major) major = true else legacy = true;
@@ -210,7 +210,7 @@ fn tilesOf(e: Entry, order: exl3.format.TileOrder) !gl.TileDims {
 }
 
 /// A pair-major shard as `sushi repack` writes it, judged from its own header and pads.
-fn checkPairMajor(a: std.mem.Allocator, fd: std.c.fd_t, spec: exl3.Spec) !void {
+fn checkPairMajor(a: std.mem.Allocator, marker: []const u8, fd: std.c.fd_t, spec: exl3.Spec) !void {
     const info = try Info.read(a, fd);
     if (info.data_start % page != 0) return error.RepackShardInvalid;
     try exl3.shardTileOrderAgrees(.pair_major, info.stamp("tile_order"));
@@ -225,7 +225,7 @@ fn checkPairMajor(a: std.mem.Allocator, fd: std.c.fd_t, spec: exl3.Spec) !void {
             defer a.free(zeros);
             try expert_io.readExact(fd, zeros, info.data_start + e.start);
             for (zeros) |b| if (b != 0) return error.RepackShardInvalid;
-        } else if (routedOf(e.key)) |r| {
+        } else if (routedOf(marker, e.key)) |r| {
             if (r.name.part != 0) continue;
             if (!r.name.pair_major) return error.Exl3TileOrderMixed;
             _ = tilesOf(e, .pair_major) catch return error.RepackShardInvalid;
@@ -272,12 +272,12 @@ const RoutedEntry = struct { entry: Entry, ordinal: usize, name: gl.Name };
 
 /// `info` laid out pair-major: for gate, up, down, each group in turn, a projection's trellis then its scales, each
 /// trellis on a page; the other tensors follow in source order.
-fn buildPlan(a: std.mem.Allocator, info: Info, stem: []const u8, hidden: u32, inter: u32) !Plan {
+fn buildPlan(a: std.mem.Allocator, marker: []const u8, info: Info, stem: []const u8, hidden: u32, inter: u32) !Plan {
     var routed: std.ArrayList(RoutedEntry) = .empty;
     var others: std.ArrayList(Entry) = .empty;
     var prefixes: std.ArrayList([]const u8) = .empty;
     for (info.entries) |e| {
-        const r = routedOf(e.key) orelse {
+        const r = routedOf(marker, e.key) orelse {
             try others.append(a, e);
             continue;
         };
@@ -440,7 +440,7 @@ fn maxUnit(units: []const Unit) usize {
 }
 
 /// Writes the pair-major shard for `src_fd` to `tmp` and returns once it is on disk and re-read equal.
-fn writeShard(a: std.mem.Allocator, src_fd: std.c.fd_t, info: Info, plan: Plan, tmp: [:0]const u8, spec: exl3.Spec, workers: usize) !void {
+fn writeShard(a: std.mem.Allocator, marker: []const u8, src_fd: std.c.fd_t, info: Info, plan: Plan, tmp: [:0]const u8, spec: exl3.Spec, workers: usize) !void {
     const units = try buildUnits(a, plan, info.data_start);
     const total: u64 = plan.head.len + plan.data_len;
     const dst_fd = try openFd(tmp, true);
@@ -461,7 +461,7 @@ fn writeShard(a: std.mem.Allocator, src_fd: std.c.fd_t, info: Info, plan: Plan, 
     const head = try a.alloc(u8, plan.head.len);
     try expert_io.readExact(check_fd, head, 0);
     if (!std.mem.eql(u8, head, plan.head)) return error.RepackVerifyFailed;
-    checkPairMajor(a, check_fd, spec) catch return error.RepackVerifyFailed;
+    checkPairMajor(a, marker, check_fd, spec) catch return error.RepackVerifyFailed;
     var job: Job = .{ .units = units, .src_fd = src_fd, .dst_fd = check_fd, .verify = true, .max_len = maxUnit(units) };
     try runUnits(&job, workers);
 }
@@ -542,7 +542,7 @@ fn indexShards(a: std.mem.Allocator, index: std.json.ObjectMap) ![][]const u8 {
 }
 
 /// The index with trellis keys renamed and every shard's pads listed after the tensors.
-fn newIndex(a: std.mem.Allocator, index: std.json.ObjectMap, shards: []const Shard, dir: []const u8) ![]u8 {
+fn newIndex(a: std.mem.Allocator, marker: []const u8, index: std.json.ObjectMap, shards: []const Shard, dir: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     try out.appendSlice(a, "{\n");
     var first = true;
@@ -563,7 +563,7 @@ fn newIndex(a: std.mem.Allocator, index: std.json.ObjectMap, shards: []const Sha
             if (n > 0) try out.appendSlice(a, ",\n");
             n += 1;
             try out.appendSlice(a, "  ");
-            const renamed = if (routedOf(k)) |r| r.name.part == 0 and !r.name.pair_major else false;
+            const renamed = if (routedOf(marker, k)) |r| r.name.part == 0 and !r.name.pair_major else false;
             try appendJsonString(a, &out, if (renamed) try std.fmt.allocPrint(a, "{s}_pm", .{k}) else k);
             try out.appendSlice(a, ": ");
             try appendJsonString(a, &out, v.string);
@@ -618,7 +618,9 @@ pub fn repackPack(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Opt
     const config = std.json.parseFromSliceLeaky(std.json.Value, a, config_raw, .{}) catch return error.InvalidConfig;
     if (config != .object) return error.InvalidConfig;
     const model_type = config.object.get("model_type") orelse return error.RepackArchitectureUnsupported;
-    if (model_type != .string or !std.mem.eql(u8, model_type.string, "deepseek_v41")) return error.RepackArchitectureUnsupported;
+    if (model_type != .string) return error.RepackArchitectureUnsupported;
+    const seam = arch_config.repackOf(model_type.string) orelse return error.RepackArchitectureUnsupported;
+    const marker = seam.routed_marker;
     const quant = config.object.get("expert_quant") orelse return error.Exl3TileOrderUnsupported;
     if (quant != .object) return error.Exl3TileOrderUnsupported;
     const format = quant.object.get("format") orelse return error.Exl3TileOrderUnsupported;
@@ -629,7 +631,7 @@ pub fn repackPack(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Opt
     }
     const spec = try exl3.parseExpertQuant(config.object);
     const text = if (config.object.get("text_config")) |t| (if (t == .object) t.object else config.object) else config.object;
-    const geometry: Geometry = .{ .hidden = try intField(text, "hidden_size"), .inter = try intField(text, "moe_intermediate_size") };
+    const geometry: Geometry = .{ .hidden = try intField(text, seam.hidden_key), .inter = try intField(text, "moe_intermediate_size") };
 
     const lock = try Lock.acquire(gpa, io, dir);
     defer lock.release(gpa);
@@ -646,14 +648,14 @@ pub fn repackPack(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Opt
         const fd = try openFd(path, false);
         defer _ = std.c.close(fd);
         const info = try Info.read(a, fd);
-        const state = try stateOf(info);
+        const state = try stateOf(marker, info);
         if (state != .plain) {
             if (std.c.S.ISLNK(st.mode)) return error.RepackShardIsLink;
             try stampsAgree(spec, info);
             if (state == .legacy) {
                 try exl3.shardTileOrderAgrees(.pack, info.stamp("tile_order"));
                 remaining = @max(remaining, info.file_size);
-            } else checkPairMajor(a, fd, spec) catch |err| return if (err == error.RepackShardInvalid) error.Exl3TileOrderMixed else err;
+            } else checkPairMajor(a, marker, fd, spec) catch |err| return if (err == error.RepackShardInvalid) error.Exl3TileOrderMixed else err;
         }
         try shards.append(a, .{ .name = name, .state = state, .size = info.file_size });
     }
@@ -687,9 +689,9 @@ pub fn repackPack(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Opt
         defer _ = std.c.close(src_fd);
         const info = try Info.read(sa, src_fd);
         const stem = std.mem.trimEnd(u8, s.name, ".safetensors");
-        const plan = try buildPlan(sa, info, stem, geometry.hidden, geometry.inter);
+        const plan = try buildPlan(sa, marker, info, stem, geometry.hidden, geometry.inter);
         errdefer unlinkQuiet(tmp);
-        try writeShard(sa, src_fd, info, plan, tmp, spec, opts.workers);
+        try writeShard(sa, marker, src_fd, info, plan, tmp, spec, opts.workers);
         if (inUse(final, opts.count_self)) return error.RepackPackInUse;
         if (std.c.rename(tmp.ptr, final.ptr) != 0) return error.RepackIoFailed;
         try syncDir(a, dir);
@@ -700,13 +702,39 @@ pub fn repackPack(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, opts: Opt
         if (opts.fail_after_shards == done) return error.RepackInterrupted;
     }
 
-    try replaceFile(a, dir, index_name, try newIndex(a, index.object, shards.items, dir));
+    try replaceFile(a, dir, index_name, try newIndex(a, marker, index.object, shards.items, dir));
     try replaceFile(a, dir, "config.json", try newConfig(a, config_raw));
 
-    var loaded = try model.parseConfig(io, gpa, dir);
-    defer loaded.deinit(gpa);
-    try dsv41_source.validateTileOrder(io, gpa, dir, loaded.expert_tile_order, loaded.hidden_size, loaded.moe_intermediate_size);
+    try validateRepacked(gpa, io, dir, marker, spec, shards.items, geometry);
     return .repacked;
+}
+
+/// The pack as a loader's pre-load checks read it: the config and the index name pair-major, and every routed shard is
+/// one this command wrote, with the trellis grids of a `geometry` expert.
+fn validateRepacked(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, marker: []const u8, spec: exl3.Spec, shards: []const Shard, geometry: Geometry) !void {
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const config = std.json.parseFromSliceLeaky(std.json.Value, a, try readSmall(io, a, dir, "config.json"), .{}) catch return error.InvalidConfig;
+    if (config != .object or (try exl3.parseExpertQuant(config.object)).tile_order != .pair_major) return error.Exl3TileOrderMismatch;
+    const index = std.json.parseFromSliceLeaky(std.json.Value, a, try readSmall(io, a, dir, index_name), .{}) catch return error.InvalidSafetensorsIndex;
+    const map = if (index == .object) index.object.get("weight_map") orelse return error.InvalidSafetensorsIndex else return error.InvalidSafetensorsIndex;
+    if (map != .object) return error.InvalidSafetensorsIndex;
+    for (map.object.keys()) |key| if (routedOf(marker, key)) |r| {
+        if (r.name.part == 0 and !r.name.pair_major) return error.Exl3TileOrderMismatch;
+    };
+    for (shards) |s| {
+        if (s.state == .plain) continue;
+        const fd = try openFd(try pathZ(a, dir, s.name), false);
+        defer _ = std.c.close(fd);
+        checkPairMajor(a, marker, fd, spec) catch |err| return if (err == error.RepackShardInvalid) error.Exl3TileOrderMixed else err;
+        for ((try Info.read(a, fd)).entries) |e| {
+            const r = routedOf(marker, e.key) orelse continue;
+            if (r.name.part != 0) continue;
+            const down = r.name.projection == 2;
+            _ = try gl.trellisRate(.pair_major, e.shape, if (down) geometry.inter else geometry.hidden, if (down) geometry.hidden else geometry.inter);
+        }
+    }
 }
 
 /// A pack by path, relative directory or alias, as `sushi run` names one, but never downloaded.
@@ -727,7 +755,7 @@ fn explain(err: anyerror) []const u8 {
         error.RepackNotDownloaded => "the pack is not on this machine (repack never downloads: `sushi pull` it first)",
         error.UnknownModel => "unknown pack name",
         error.RepackNotAPack => "no config.json or model.safetensors.index.json there",
-        error.RepackArchitectureUnsupported => "only DeepSeek-V4.1 packs have a pair-major layout",
+        error.RepackArchitectureUnsupported => "this architecture's packs have no pair-major layout",
         error.Exl3TileOrderUnsupported => "only an STQ pack in the pack order can be repacked",
         error.Exl3TileOrderMixed => "a shard holds both orders, or a pair-major shard is not one this command wrote",
         error.Exl3TileOrderNeedsGroups => "a routed layer without rate groups cannot be pair-major",

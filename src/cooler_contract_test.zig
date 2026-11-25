@@ -21,6 +21,7 @@ const Generator = @import("generate.zig").Generator;
 const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const SamplingParams = @import("sampler.zig").SamplingParams;
 
+const static_bill = @import("static_bill.zig");
 const io = std.Io.Threaded.global_single_threaded.io();
 
 /// One test load of a fixture, on the side the test names. Its load and its unload run in the job turn a served load
@@ -35,6 +36,10 @@ pub const Load = struct {
     weights: model_mod.Weights,
     xfm: *Trunk,
     h: arch_handle.Handle,
+    /// Whether the load keeps the arch's vision tower in its weights, as a served load asked for images does.
+    vision: bool,
+    /// The engine's counts before the load's weights: a load on the ledger bills what they gained (`static_bill`).
+    before: static_bill.Before,
 
     pub fn prepare(self: *Load, comptime C: type, dir: []const u8, cooler: bool) !void {
         return self.prepareOn(testing.allocator, C, dir, cooler);
@@ -44,6 +49,7 @@ pub const Load = struct {
     /// takes; a Cooler load lifts the tests' MLX default.
     pub fn prepareOn(self: *Load, a: std.mem.Allocator, comptime C: type, dir: []const u8, cooler: bool) !void {
         self.a = a;
+        self.vision = false;
         const off = model_mod.cooler_off;
         defer model_mod.cooler_off = off;
         model_mod.cooler_off = if (cooler) .empty else .full;
@@ -60,7 +66,9 @@ pub const Load = struct {
         errdefer self.config.deinit(a);
         const job = JobTurn.begin(null, &self.config);
         defer job.end();
-        self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, false);
+        self.before = static_bill.Before.now();
+        self.config.keeps_tower = self.vision and self.config.has_vision;
+        self.weights = try model_mod.loadWeightsForConfig(io, a, dir, &self.config, self.vision);
         errdefer self.weights.deinit();
         model_mod.resolveWeightPrefix(&self.config, &self.weights);
         self.xfm = try a.create(Trunk);
@@ -106,6 +114,7 @@ pub const Load = struct {
             arch_handle.destroy(self.h, self.a);
             self.weights.deinit();
         }
+        static_bill.close(&self.config);
         self.config.deinit(self.a);
     }
 
@@ -116,13 +125,22 @@ pub const Load = struct {
         defer job.end();
         const kv = @import("bills.zig").kvCacheForLaunch(&self.config, null).config;
         try self.xfm.cache.reinit(self.config.num_hidden_layers, kv);
-        const mtp = model_load.mtpChoiceFor(null, &self.config);
-        const mtp_on = mtp.on and !model_load.mtpDefaultOffUnderStreaming(mtp, self.config.expert_streaming, self.config.stream_mtp_head) and
-            !@import("arch/config.zig").fact(&self.config, "no_mtp_head");
+        const mtp_on = self.mtpOn();
         if (mtp_on) _ = try @import("arch/arch_state.zig").buildDraftRerank(self.xfm);
         const policy = @import("mtp_policy.zig");
         const verify_cap: ?u32 = if (mtp_on) @min(policy.resolveMtpDepthCapForProfile(0, .generic), policy.mtpVerifyDraftsMax(&self.config)) else null;
+        // An arch on the ledger opens it, fixes its chunk and arena, warms and seals, as a served load does.
+        errdefer static_bill.close(&self.config);
+        try model_load.openLedger(&self.config, self.xfm, self.before, true, null);
         try model_load.warmLoad(io, self.a, &self.config, self.xfm, verify_cap, null, kv);
+        try model_load.sealLedger(&self.config, self.xfm, self.before);
+    }
+
+    /// Whether a launch with no MTP flag drafts with the arch's MTP head.
+    pub fn mtpOn(self: *Load) bool {
+        const mtp = model_load.mtpChoiceFor(null, &self.config);
+        return mtp.on and !model_load.mtpDefaultOffUnderStreaming(mtp, self.config.expert_streaming, self.config.stream_mtp_head) and
+            !@import("arch/config.zig").fact(&self.config, "no_mtp_head");
     }
 
     pub fn onEngine(self: *Load) bool {
@@ -141,6 +159,7 @@ pub const Load = struct {
             arch_serve.unloadModel(&self.config);
             break :blk mlx.engine.mlxCalls() - calls;
         };
+        static_bill.close(&self.config);
         self.config.deinit(self.a);
         return asked;
     }
@@ -160,6 +179,7 @@ var held_sheet: Sheet = undefined;
 pub fn heldLoad(comptime C: type, dir: []const u8) !*Load {
     for (held_loads[0..held_count]) |*h| if (std.mem.eql(u8, h.dir, dir)) return h.ld;
     if (held_count == held_loads.len) return error.TooManyHeldLoads;
+    unloadHeldOnLedger();
     const a = std.heap.smp_allocator;
     const ld = try a.create(Load);
     errdefer a.destroy(ld);
@@ -176,6 +196,51 @@ pub fn heldLoad(comptime C: type, dir: []const u8) !*Load {
     _ = heldRest(&none);
     held_sheet = Sheet.now();
     return ld;
+}
+
+/// A cell of the pool-cap regime skips a load on the ledger, whose forwards run under no cap: its narrow phases on its
+/// plans, its wide ones in its region (D97), its pool its turn's gate (D64). The cell names the ledger's test of the same.
+pub fn requirePoolCap(config: *const model_mod.ModelConfig) error{SkipZigTest}!void {
+    if (!@import("bills.zig").ledgerArch(config)) return;
+    @import("test_note.zig").notePartSkipped("a load on the ledger: its forwards run under no pool cap");
+    return error.SkipZigTest;
+}
+
+/// The refusals a load beside a load on the ledger may meet: what is left of the ceiling does not hold it.
+const memory_refusals = [_]anyerror{ error.InsufficientMemory, error.ExpertCacheDoesNotFit, error.WarmChunkDoesNotFit, error.ModelBillPastBudget, error.PrefillChunkDoesNotFit, error.ContextDoesNotFit };
+
+/// A served load of `dir` beside a load on the ledger, which holds its whole budget (D90): refused by name, before it
+/// holds anything.
+pub fn expectRefusedBesideLedger(comptime C: type, dir: []const u8) !void {
+    var second: Load = undefined;
+    second.open(C, dir, true) catch |e| {
+        errdefer std.debug.print("cooler contract: a load of {s} beside one on the ledger failed {s}, not a refusal by name\n", .{ std.fs.path.basename(dir), @errorName(e) });
+        return testing.expect(for (memory_refusals) |r| {
+            if (e == r) break true;
+        } else false);
+    };
+    _ = second.close();
+    return error.TestUnexpectedResult;
+}
+
+/// A load on the ledger holds its whole budget (D90), so no load opens beside one: the held loads on it are unloaded
+/// before any other opens, and opened again where a cell asks for them.
+fn unloadHeldOnLedger() void {
+    const rest = @import("test_rest.zig");
+    var i: usize = 0;
+    while (i < held_count) {
+        const h = held_loads[i];
+        if (h.ld.config.static_ledger == null) {
+            i += 1;
+            continue;
+        }
+        _ = h.ld.close();
+        std.heap.smp_allocator.destroy(h.ld);
+        std.heap.smp_allocator.free(h.dir);
+        std.mem.copyForwards(Held, held_loads[i .. held_count - 1], held_loads[i + 1 .. held_count]);
+        held_count -= 1;
+        rest.held.holds -= 1;
+    }
 }
 
 fn configHash(config: *const model_mod.ModelConfig) u64 {
@@ -315,6 +380,17 @@ pub fn fixtureChosen(sel: ?[]const u8, env: []const u8) bool {
     return false;
 }
 
+/// Whether an ordered pair of arches runs: both first fixtures set, and the selection names a fixture of either.
+pub fn pairChosen(sel: ?[]const u8, first: []const [:0]const u8, second: []const [:0]const u8, first_set: bool, second_set: bool) bool {
+    if (!first_set or !second_set) return false;
+    return anyChosen(sel, first) or anyChosen(sel, second);
+}
+
+fn anyChosen(sel: ?[]const u8, envs: []const [:0]const u8) bool {
+    for (envs) |env| if (fixtureChosen(sel, env)) return true;
+    return false;
+}
+
 /// Whether a cell skips before any load: with no selection, the gate's rule that every fixture is set, so a cell never
 /// pays for the fixtures present only to report a skip. A selection skips per named fixture instead (`Tally`).
 fn skipsUpFront(sel: ?[]const u8, set: []const bool) bool {
@@ -342,6 +418,12 @@ fn fixturesSet(comptime which: Which, buf: *[16]bool) []const bool {
 /// does). For a property of the fixture's format or geometry; one that holds for any fixture of an arch is `eachArch`.
 pub fn eachFixture(comptime body: fn (comptime C: type, dir: []const u8, ids: []const u32) anyerror!void) !void {
     return eachOf(.every, body);
+}
+
+/// Whether the arch whose contract is `C` has an MLX arm (its user's opt-out): one that runs only on Sushi Cooler says
+/// so with `mlx_arm = false`.
+pub fn hasMlxArm(comptime C: type) bool {
+    return !@hasDecl(C, "mlx_arm") or C.mlx_arm;
 }
 
 /// `body` on one fixture per arch: its first chosen and set fixture (the STQ tiny when set). For a property of the arch
@@ -480,7 +562,21 @@ test "cooler contract runner: SUSHI_CONTRACT_FIXTURE names the fixtures a run ta
     try testing.expectError(error.SkipZigTest, named_unset.verdict());
 }
 
-test "cooler contract: test_skip_warm skips the warm on a light load and never reaches a served load" {
+test "cooler contract runner: a pair runs when the selection names either arch's fixture, and only where both fixtures are set" {
+    const dsv41 = [_][:0]const u8{ "DSV41_STQ_TINY", "DSV41_STQ_TINY_PM", "DSV41_TINY" };
+    const qwen4 = [_][:0]const u8{ "QWEN4_STQ_TINY", "QWEN4_TEST_MODEL", "QWEN4_BF16_TINY" };
+    const hy4 = [_][:0]const u8{ "HY4_BF16_TINY", "HY4_STQ_TINY" };
+    try testing.expect(pairChosen(null, &dsv41, &hy4, true, true));
+    try testing.expect(!pairChosen(null, &dsv41, &hy4, true, false));
+    try testing.expect(!pairChosen(null, &dsv41, &hy4, false, true));
+    try testing.expect(pairChosen("HY4_STQ_TINY", &dsv41, &hy4, true, true));
+    try testing.expect(pairChosen("HY4_STQ_TINY", &hy4, &dsv41, true, true));
+    try testing.expect(!pairChosen("HY4_STQ_TINY", &dsv41, &qwen4, true, true));
+    try testing.expect(pairChosen("DSV41_STQ_TINY_PM", &dsv41, &qwen4, true, true));
+    try testing.expect(!pairChosen("HY4_STQ_TINY", &dsv41, &hy4, true, false));
+}
+
+test "cooler contract: test_skip_warm skips the warm on a light load and never reaches a served load; a light load on the ledger opens, plans and seals it" {
     try testing.expectEqual(false, (model_mod.ModelConfig{}).test_skip_warm);
     try testing.expectEqual(false, (@import("server_state.zig").ServerConfig{}).test_skip_warm);
     try eachArch(struct {
@@ -491,6 +587,8 @@ test "cooler contract: test_skip_warm skips the warm on a light load and never r
             const arch_before = cooler_warm.arch_warm_runs_for_test;
             var want: std.ArrayList(u32) = .empty;
             defer want.deinit(testing.allocator);
+            var served_ledger = false;
+            var served_gate: @FieldType(mlx.engine.BudgetSlot, "gate") = .open;
             {
                 var served: Load = undefined;
                 try served.open(C, dir, true);
@@ -499,6 +597,8 @@ test "cooler contract: test_skip_warm skips the warm on a light load and never r
                 try testing.expectEqual(served_before + 1, cooler_warm.runs_for_test);
                 if (@import("arch/config.zig").isOf(&served.config, "dsv41"))
                     try testing.expectEqual(arch_before + 1, cooler_warm.arch_warm_runs_for_test);
+                served_ledger = served.config.static_ledger != null;
+                served_gate = served.xfm.cooler_budget.gate;
                 want = try greedy(&served, prompt, 4);
             }
             const light_before = cooler_warm.runs_for_test;
@@ -508,6 +608,12 @@ test "cooler contract: test_skip_warm skips the warm on a light load and never r
             defer _ = light.close();
             try testing.expectEqual(light_before, cooler_warm.runs_for_test);
             try testing.expectEqual(light_arch_before, cooler_warm.arch_warm_runs_for_test);
+            try testing.expectEqual(served_ledger, light.config.static_ledger != null);
+            if (light.config.static_ledger) |l| {
+                try testing.expect(l.context.load(.acquire) > 0);
+                try testing.expect(light.config.static_prefill_chunk > 0);
+            }
+            try testing.expectEqual(served_gate, light.xfm.cooler_budget.gate);
             var got = try greedy(&light, prompt, 4);
             defer got.deinit(testing.allocator);
             try testing.expectEqualSlices(u32, want.items, got.items);
@@ -827,6 +933,46 @@ pub fn servedOn(comptime arch: []const u8, envs: []const [:0]const u8, comptime 
         ran = true;
     }
     if (!ran) return error.SkipZigTest;
+}
+
+/// One served request through the scheduler as serve runs it (prefill, then its ticks), drafting with `head` when set:
+/// its tokens, and how many drafts its rounds verified (an MTP head's or DSpark's).
+pub fn servedDrafts(sv: *Served, prompt: []const u32, n: u32, sampling: @import("sampler.zig").SamplingParams, head: ?@import("generate.zig").MtpHeadRef, drafted: *u64) !std.ArrayList(u32) {
+    const a = testing.allocator;
+    const sch = &sv.sch;
+    const scheduler = Served.scheduler;
+    const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = head != null, .mtp = head });
+    defer {
+        sch.complete(slot);
+        for (sch.cleanup_queue.items) |s| s.deinit();
+        sch.cleanup_queue.clearRetainingCapacity();
+    }
+    _ = sch.pending.orderedRemove(0);
+    scheduler.runPrefill(sch, slot) catch |e| {
+        scheduler.failPrefill(slot, e);
+        return e;
+    };
+    if (!scheduler.postPrefillTerminal(sch, slot)) {
+        try sch.decoding.append(a, slot);
+        var one = [_]*scheduler.Slot{slot};
+        while (slot.joinsTick()) try scheduler.runDecodeTick(sch, &one);
+        scheduler.cullDecoding(sch);
+    }
+    if (slot.error_code) |e| {
+        if (!sv.quiet_failures) std.debug.print("cooler contract: the served request failed ({s})\n", .{e});
+        return error.RequestFailed;
+    }
+    const g = slot.legacy_gen.?;
+    drafted.* = g.mtp_drafted_tokens + g.drafter_stats.drafted;
+    var got: std.ArrayList(u32) = .empty;
+    errdefer got.deinit(a);
+    try got.appendSlice(a, g.generated_ids.items);
+    // The turn's SSD write lands before the next request looks it up, as a served pause between turns gives it.
+    if (sv.entry.prefix_cache) |*hc| {
+        hc.flushPendingDisk(@import("arch/handle.zig").trunk(sv.entry.handle.?).s);
+        if (hc.disk) |*d| d.drainWriter();
+    }
+    return got;
 }
 
 /// Two served requests decoded as rows of one tick through the scheduler, as serve runs them.

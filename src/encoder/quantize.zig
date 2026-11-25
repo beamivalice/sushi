@@ -1,4 +1,5 @@
 const std = @import("std");
+const pool_mod = @import("pool.zig");
 const format = @import("sushi_exl3").format;
 const encode = @import("encode.zig");
 const st = @import("safetensors.zig");
@@ -130,8 +131,15 @@ fn admitRate(rate: format.Rate, window: format.Window) !void {
 }
 
 pub fn regularize(allocator: std.mem.Allocator, w: []const f32, in: usize, out: usize, sign_in: []const f32, sign_out: []const f32, mode: OutScales, hdiag: ?[]const f32) !Regularized {
+    return regularizeScaled(allocator, w, in, out, sign_in, sign_out, mode, hdiag, null);
+}
+
+/// `regularize` with the output scales given (`given`, one per output channel) instead of the RMS rule: the
+/// quantizer then rounds W / t and the decoder multiplies t back in through `svh`.
+pub fn regularizeScaled(allocator: std.mem.Allocator, w: []const f32, in: usize, out: usize, sign_in: []const f32, sign_out: []const f32, mode: OutScales, hdiag: ?[]const f32, given: ?[]const f32) !Regularized {
     try admitGeometry(in, out);
     if (w.len != in * out or sign_in.len != in or sign_out.len != out) return error.ShapeMismatch;
+    if (given) |g| if (g.len != out) return error.ShapeMismatch;
     if (hdiag) |d| if (d.len != in) return error.ShapeMismatch;
     const weight = try allocator.dupe(f32, w);
     errdefer allocator.free(weight);
@@ -142,9 +150,9 @@ pub fn regularize(allocator: std.mem.Allocator, w: []const f32, in: usize, out: 
     const out_scales = try allocator.alloc(f32, out);
     defer allocator.free(out_scales);
 
-    var apply = try chooseApplyOutScales(allocator, mode, hdiag);
+    var apply = if (given != null) true else try chooseApplyOutScales(allocator, mode, hdiag);
     @memset(out_scales, 0);
-    for (0..out) |c| {
+    if (given) |g| @memcpy(out_scales, g) else for (0..out) |c| {
         var total: f32 = 0;
         var r0: usize = 0;
         while (r0 < in) : (r0 += rms_block) {
@@ -154,15 +162,17 @@ pub fn regularize(allocator: std.mem.Allocator, w: []const f32, in: usize, out: 
         }
         out_scales[c] = blockRms(total, in);
     }
-    var mean_sum: f64 = 0;
-    for (out_scales) |v| mean_sum += v;
-    const out_mean = mean_sum / @as(f64, @floatFromInt(out));
-    if (out_mean <= 1e-30) {
-        @memset(out_scales, 0);
-        if (mode != .auto) apply = true;
-    } else {
-        const m: f32 = @floatCast(out_mean);
-        for (out_scales) |*v| v.* /= m;
+    if (given == null) {
+        var mean_sum: f64 = 0;
+        for (out_scales) |v| mean_sum += v;
+        const out_mean = mean_sum / @as(f64, @floatFromInt(out));
+        if (out_mean <= 1e-30) {
+            @memset(out_scales, 0);
+            if (mode != .auto) apply = true;
+        } else {
+            const m: f32 = @floatCast(out_mean);
+            for (out_scales) |*v| v.* /= m;
+        }
     }
     if (apply) {
         for (svh, out_scales) |*s, o| s.* = s.* * (if (@abs(o) < 1e-30) 0.1 else o) + 1e-10;
@@ -214,22 +224,29 @@ pub fn rotatedHessian(allocator: std.mem.Allocator, h: []const f32, suh: []const
 const chol_block = 64;
 const Lanes = @Vector(4, f64);
 
-fn dotRows(a: []const f64, b: []const f64, len: usize) f64 {
+/// Each product joins its lane's sum with one rounding (`@mulAdd`, one fused instruction).
+pub fn dotRows(a: []const f64, b: []const f64, len: usize) f64 {
     var acc: Lanes = @splat(0);
     var m: usize = 0;
     while (m + 4 <= len) : (m += 4) {
         const x: Lanes = a[m..][0..4].*;
         const y: Lanes = b[m..][0..4].*;
-        acc += x * y;
+        acc = @mulAdd(Lanes, x, y, acc);
     }
     var sum = @reduce(.Add, acc);
-    while (m < len) : (m += 1) sum += a[m] * b[m];
+    while (m < len) : (m += 1) sum = @mulAdd(f64, a[m], b[m], sum);
     return sum;
 }
 
 /// In-place lower Cholesky factor of the row-major n x n matrix `a` (upper triangle untouched).
 /// Returns 0, or the 1-based index of the first pivot that is not positive.
-fn choleskyLower(a: []f64, n: usize) usize {
+pub fn choleskyLower(a: []f64, n: usize) usize {
+    return choleskyLowerOn(null, a, n);
+}
+
+/// `choleskyLower` with the panel rows and the trailing update's column bands spread over `pool`: every element
+/// takes the same operations in the same order, so the factor is bit-identical.
+pub fn choleskyLowerOn(pool: ?*pool_mod.Pool, a: []f64, n: usize) usize {
     var k: usize = 0;
     while (k < n) : (k += chol_block) {
         const kb = @min(chol_block, n - k);
@@ -244,29 +261,60 @@ fn choleskyLower(a: []f64, n: usize) usize {
                 a[ii * n + jj] = (a[ii * n + jj] - dotRows(a[ii * n + k ..], a[jj * n + k ..], j)) / root;
             }
         }
-        for (k + kb..n) |i| {
-            for (0..kb) |j| {
-                const jj = k + j;
-                a[i * n + jj] = (a[i * n + jj] - dotRows(a[i * n + k ..], a[jj * n + k ..], j)) / a[jj * n + jj];
-            }
+        var step = CholStep{ .a = a, .n = n, .k = k, .kb = kb };
+        const below = n - (k + kb);
+        if (pool) |p| {
+            p.run((below + panel_rows - 1) / panel_rows, &step, CholStep.panelRows);
+            p.run((below + band_width - 1) / band_width, &step, CholStep.trailing);
+        } else {
+            for (0..(below + panel_rows - 1) / panel_rows) |t| step.panelRows(t);
+            for (0..(below + band_width - 1) / band_width) |t| step.trailing(t);
         }
-        trailingUpdate(a, n, k, kb);
     }
     return 0;
 }
 
-/// a[i][j] -= dotRows(a[i][k..k+kb], a[j][k..k+kb]) for k+kb <= j <= i. Tiles of two rows by four columns
-/// share their loads; each element keeps dotRows' own lanes, order and reduction, so the result is bit-identical.
-fn trailingUpdate(a: []f64, n: usize, k: usize, kb: usize) void {
-    const lo = k + kb;
+const band_width = 64;
+const panel_rows = 64;
+
+const CholStep = struct {
+    a: []f64,
+    n: usize,
+    k: usize,
+    kb: usize,
+
+    fn panelRows(self: *CholStep, t: usize) void {
+        const a = self.a;
+        const n = self.n;
+        const k = self.k;
+        const lo = k + self.kb + t * panel_rows;
+        for (lo..@min(lo + panel_rows, n)) |i| {
+            for (0..self.kb) |j| {
+                const jj = k + j;
+                a[i * n + jj] = (a[i * n + jj] - dotRows(a[i * n + k ..], a[jj * n + k ..], j)) / a[jj * n + jj];
+            }
+        }
+    }
+
+    fn trailing(self: *CholStep, t: usize) void {
+        trailingBand(self.a, self.n, self.k, self.kb, self.k + self.kb + t * band_width);
+    }
+};
+
+/// a[i][j] -= dotRows(a[i][k..k+kb], a[j][k..k+kb]) for j0 <= j < j0 + band, j <= i: one column band of the
+/// trailing update, narrow enough that its panel rows stay in L1 across every row below it. Tiles of two rows by
+/// four columns share their loads; each element keeps dotRows' own lanes, order and reduction.
+fn trailingBand(a: []f64, n: usize, k: usize, kb: usize, j0: usize) void {
     const vec_len = kb - kb % 4;
-    var i: usize = lo;
+    const j1 = @min(j0 + band_width, n);
+    var i: usize = j0;
     while (i < n) : (i += 2) {
         const pair = i + 1 < n;
         const xi0 = a[i * n + k ..][0..kb];
         const xi1 = if (pair) a[(i + 1) * n + k ..][0..kb] else xi0;
-        var j: usize = lo;
-        while (j + 4 <= i + 1) : (j += 4) {
+        const end0 = @min(j1, i + 1);
+        var j: usize = j0;
+        while (j + 4 <= end0) : (j += 4) {
             var acc: [2][4]Lanes = @splat(@splat(@splat(0)));
             var m: usize = 0;
             while (m < vec_len) : (m += 4) {
@@ -274,8 +322,8 @@ fn trailingUpdate(a: []f64, n: usize, k: usize, kb: usize) void {
                 const x1: Lanes = xi1[m..][0..4].*;
                 inline for (0..4) |c| {
                     const y: Lanes = a[(j + c) * n + k + m ..][0..4].*;
-                    acc[0][c] += x0 * y;
-                    acc[1][c] += x1 * y;
+                    acc[0][c] = @mulAdd(Lanes, x0, y, acc[0][c]);
+                    acc[1][c] = @mulAdd(Lanes, x1, y, acc[1][c]);
                 }
             }
             inline for (0..4) |c| {
@@ -283,15 +331,15 @@ fn trailingUpdate(a: []f64, n: usize, k: usize, kb: usize) void {
                 var s1 = @reduce(.Add, acc[1][c]);
                 const yj = a[(j + c) * n + k ..][0..kb];
                 for (vec_len..kb) |t| {
-                    s0 += xi0[t] * yj[t];
-                    s1 += xi1[t] * yj[t];
+                    s0 = @mulAdd(f64, xi0[t], yj[t], s0);
+                    s1 = @mulAdd(f64, xi1[t], yj[t], s1);
                 }
                 a[i * n + j + c] -= s0;
                 if (pair) a[(i + 1) * n + j + c] -= s1;
             }
         }
-        for (j..i + 1) |jj| a[i * n + jj] -= dotRows(xi0, a[jj * n + k ..][0..kb], kb);
-        if (pair) for (j..i + 2) |jj| {
+        for (j..end0) |jj| a[i * n + jj] -= dotRows(xi0, a[jj * n + k ..][0..kb], kb);
+        if (pair) for (j..@min(j1, i + 2)) |jj| {
             a[(i + 1) * n + jj] -= dotRows(xi1, a[jj * n + k ..][0..kb], kb);
         };
     }
@@ -399,8 +447,7 @@ pub fn ldlFactorDamped(allocator: std.mem.Allocator, h: []f32, n: usize, damped_
 pub fn gScaleBracket(codebook: format.Codebook) [2]f32 {
     return switch (codebook) {
         .mul1 => .{ 0.4, 1.2 },
-        .mcg => .{ 0.5, 1.5 },
-        .spec1, .pair1, .std1 => unreachable,
+        .mcg, .alpha, .spec1, .std1, .pair1 => .{ 0.5, 1.5 },
     };
 }
 
@@ -523,7 +570,7 @@ pub fn ldlq(allocator: std.mem.Allocator, enc: *encode.Encoder, inner: []const f
                 for (err_row, inner[(i + m) * cols ..][0..cols], rec[(i + m) * cols ..][0..cols]) |*e, wv, rv| e.* = wv - rv;
                 for (0..height) |r| {
                     const lv = l[(i + m) * rows + i + bi + r];
-                    for (comp[r * cols ..][0..cols], err_row) |*c, e| c.* += lv * e;
+                    for (comp[r * cols ..][0..cols], err_row) |*c, e| c.* = @mulAdd(f32, lv, e, c.*);
                 }
             }
             for (0..height) |r| for (comp[r * cols ..][0..cols], inner[(i + bi + r) * cols ..][0..cols]) |*c, wv| {
@@ -543,7 +590,7 @@ pub fn ldlq(allocator: std.mem.Allocator, enc: *encode.Encoder, inner: []const f
                 for (err_row, inner[(i + m) * cols ..][0..cols], rec[(i + m) * cols ..][0..cols]) |*e, wv, rv| e.* = wv - rv;
                 for (0..i) |r| {
                     const lv = l[(i + m) * rows + r];
-                    for (prod[r * cols ..][0..cols], err_row) |*c, e| c.* += lv * e;
+                    for (prod[r * cols ..][0..cols], err_row) |*c, e| c.* = @mulAdd(f32, lv, e, c.*);
                 }
             }
         }
@@ -913,7 +960,7 @@ test "quantize: the tiled trailing update equals the element-at-a-time Cholesky 
     const t = std.testing;
     var prng = std.Random.DefaultPrng.init(33);
     const r = prng.random();
-    for ([_]usize{ 130, 256 }) |n| {
+    for ([_]usize{ 130, 256, 331 }) |n| {
         const x = try t.allocator.alloc(f64, n * 40);
         defer t.allocator.free(x);
         for (x) |*v| v.* = r.floatNorm(f64);
@@ -990,4 +1037,16 @@ test "quantize: the lower-triangular block inverse multiplies back to the identi
     inv = blk;
     inv[5 * ldl_block + 5] = 0;
     try t.expect(!invertLowerBlock(&inv));
+}
+
+// (1 + e)(1 - e) = 1 - e^2 with e = 2^-27 needs 55 bits: a product rounded on its own is 1 and the sum loses e^2.
+test "quantize: a dot product joins each product to its sum with one rounding" {
+    const t = std.testing;
+    const e = std.math.ldexp(@as(f64, 1), -27);
+    var a = [_]f64{ 1, 0, 0, 0, 1 + e, 0, 0, 0, 1 + e };
+    var b = [_]f64{ -1, 0, 0, 0, 1 - e, 0, 0, 0, 0 };
+    try t.expectEqual(-e * e, dotRows(&a, &b, 8));
+    a[4] = 0;
+    b[8] = 1 - e;
+    try t.expectEqual(-e * e, dotRows(&a, &b, 9));
 }

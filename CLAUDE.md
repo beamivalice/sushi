@@ -48,6 +48,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
 | [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
 | [docs/hy4-flash-arch.md](docs/hy4-flash-arch.md) | Hy4-Flash (not served yet): forward on Sushi Cooler, seams, bills, pack, parity, 1.8.0 parts |
+| [docs/hy4-parity.md](docs/hy4-parity.md) | Hy4-Flash against Qwen and DeepSeek: feature matrix, larger gaps, live checks |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/encoder.md](docs/encoder.md) | `sushi convert exl3`: flags, what a pack holds, trunk rules, calibration, Hessians, resume, stamps |
 | [docs/engine-exl3-encoder.md](docs/engine-exl3-encoder.md) | EXL3 encoder core: trellis search, LDLQ, signs, shard writer, Qwen BF16 reader |
@@ -61,6 +62,9 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/engine-own-forward.md](docs/engine-own-forward.md) | the engine of our own (`src/tensor/`): the stream seam, lending and importing, in-place appends, Metal rules, the kernel table against MLX, load warm |
 | [docs/engine-mlx-gotchas.md](docs/engine-mlx-gotchas.md) | MLX errors, dtype promotion, barriers, views vs copies, allocator, Zig/tokenizer traps |
 | [docs/engine-memory-admission.md](docs/engine-memory-admission.md) | Metal OOM, preflight, auto-context, prefill chunk, admission |
+| [docs/bill_redesign.md](docs/bill_redesign.md) | the static Cooler bill's masterplan: plans recorded from the forward, one arena at offsets, storage-owned state, the ledger, the build order and spikes; Hy4 pilot for 1.8.0 |
+| [docs/bill_redesign_prompt.md](docs/bill_redesign_prompt.md) | the brief for the engineer who continues the static bill: where it stands, the first assignment, what is fixed, the traps |
+| [docs/stage3prompt.md](docs/stage3prompt.md) | the brief for stage 3 of the static bill (Hy4's narrow phases on the arena): what stage 2 left, what is decided, the traps, the tests |
 | [docs/server-http-apis.md](docs/server-http-apis.md) | API contracts, streaming, sampling, reasoning budget, constrained JSON, launcher |
 | [docs/server-webui.md](docs/server-webui.md) | web UI design: tokens and contrast, salmon accent, motion, logo, tooltips |
 | [docs/server-tool-calling.md](docs/server-tool-calling.md) | templates, tool-call parse chain and invariants, think tags, loop stops |
@@ -137,7 +141,8 @@ corpus entry or invariant in `src/format_corpus_test.zig` plus a rule in the mat
 - **An integration assertion that a MODEL must think/answer/call is a checkpoint expectation**: assert the INVARIANT,
   branch on the model's choice.
 - **A test exists to catch an error a change can make.** A parity test against another engine goes once the new one
-  is proven; no check repeats over fixtures, lengths or arms on one code path.
+  is proven, as does a drafter's or MTP head's reference parity (speed, never text; [testsuite](docs/testsuite.md));
+  no check repeats over fixtures, lengths or arms on one code path.
 - **No unreliable test**: a test whose verdict varies run to run on the same tree is made deterministic (a fixed seed,
   a bounded wait, a structural reading) or removed, naming what still covers it; never rerun until green. No blanket
   long wait: a read waits for its own measured work, a model load once, and a timeout names what it waited for.
@@ -188,6 +193,8 @@ release item about it. Deferred repo work goes to `docs/private/future.md`, neve
   ([server-http-apis](docs/server-http-apis.md), [server-tool-calling](docs/server-tool-calling.md)).
 - A pack is judged by KLD against a lossless teacher, never by bytes against another pack
   ([quality-kld](docs/quality-kld.md)).
+- No lower precision than the reference: a product the model's reference computes in f32 (router, indexer,
+  mixes, attention scores where it keeps them f32) stays f32 on every path; no bf16, f16 or split-bf16 arm for it.
 - The engine reads only aggregate machine load and its own I/O timings, states them only in a visible log line, and
   never names another program ([server-lifecycle](docs/server-lifecycle.md#machine-state)).
 
@@ -205,9 +212,9 @@ Server log `~/.sushi/logs/sushi-<port>.log` is THE post-mortem file (`--log-leve
 
 Procedures and examples: [docs/process-measurement.md](docs/process-measurement.md).
 
-**GPU sharing.** The lock is for jobs that need the box to themselves: a full model load (server boot, KLD, live test)
-and a quiet-box bench or timing whose absolute number is recorded. Conversions, pilots, builds and tests run in
-parallel without it if the total fits memory: never beside a MiMo-size (≥ 90 GB) load, and a quiet bench waits.
+**GPU sharing.** The lock is for a quiet run, a recorded timing and a big job whose memory beside the rest could OOM
+the box, never to block others; a conversion, tune, KLD, comparison, build or test runs beside its holder when memory
+fits (`scripts/gpu-lock.sh rule`, with the M5 Ultra's memory sum).
 - Take the lock right before EACH run: `scripts/gpu-lock.sh run <owner> [--max-min N] -- <cmd>` (releases on any
   exit). Declare `--max-min` over ~15 min; model-free tests never take it; `status` shows holder, age, queue.
 - Never hold it across a batch, or while analysing, editing, building or waiting. An A B B A re-acquires per arm.
@@ -226,7 +233,8 @@ commit + settings beside every new number; raw-file paths go to `docs/private/me
   spec verify first; one that changes output goes through the KLD gate ([quality-kld](docs/quality-kld.md)).
 - A lever is sized as the combined gain of its set (every fusion of one forward, every step of one chain), never one
   step at a time: a set over the bar is built even when no single step is.
-- At the gate, a KLD change under 0.01% passes; a larger one goes to the owner with its speed gain to decide.
+- At the gate, a KLD change under 0.01% passes, and so does one that moves KLD lower (closer to the BF16 teacher);
+  a larger rise goes to the owner with its speed gain to decide.
 - Exactness is judged on one hardware path: a NAX arm whose bytes differ from the SIMD arm's (new vs old hardware) is
   not an output change. Bytes that diverge by GPU class or generation are hardware divergence: we never chase identical
   bits across GPUs, and a byte pin holds on the GPU class it was proven on.

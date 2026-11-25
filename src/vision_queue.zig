@@ -416,8 +416,9 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         return;
     }
     // The connection thread's fit check ran before the queue: a prefill's cache growth, or the
-    // output of an encode ahead of this one, may have taken the headroom since.
-    if (req.bill_bytes > 0) if (scheduler_mod.vision_encode_available) |available_fn| if (req.model.config) |cfg| {
+    // output of an encode ahead of this one, may have taken the headroom since. A load on the ledger reserved the encode
+    // with its request (`static_bill.admit`), so no live reading gates it.
+    if (req.bill_bytes > 0) if (scheduler_mod.vision_encode_available) |available_fn| if (req.model.config) |cfg| if (cfg.static_ledger == null) {
         const available = available_fn(cfg);
         if (req.bill_bytes > available) {
             req.available_bytes = available;
@@ -451,6 +452,22 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
     var next_video: usize = 0;
     var window = ImageDecodeWindow{ .allocator = req.allocator, .config = req.model.config, .decode = scheduler_mod.vision_image_decode, .images = req.images };
     defer window.deinit();
+    // A tower that writes the request's rows into the request's own buffer takes it sized from every image's grid, and
+    // writes each image into it in turn: no image's rows are joined after.
+    var media: ?mlx.mlx_array = null;
+    defer if (media) |md| freeVisionArray(md);
+    var media_row: usize = 0;
+    // A test's hook stands in for the encoder, whose handle it never reads.
+    const hooked = @import("builtin").is_test and vision_block_test_hook != null;
+    if (!hooked and vision_enc.writesMedia()) {
+        const cfg = req.model.config orelse return finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
+        if (req.model.handle == null) return finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
+        if (req.videos.len > 0 or req.audio.len > 0) return finishVisionRequest(sch, req, "NoVideoEncoder");
+        const merge = @import("arch/media.zig").preproc(cfg).merge;
+        var rows: usize = 0;
+        for (req.images) |img| rows += @import("arch/media.zig").imageRows(cfg, merge, img.grid_h, img.grid_w);
+        media = vision_enc.tower.?.makeMedia(rows) catch |err| return finishVisionRequest(sch, req, mlx.settledErrorName(err));
+    }
     for (0..req.images.len + req.videos.len) |block| {
         const is_image = if (req.order.len > 0) req.order[block] == .image else block < req.images.len;
         if ((is_image and next_image == req.images.len) or (!is_image and next_video == req.videos.len)) {
@@ -472,6 +489,17 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
                     return;
                 };
                 defer window.release(next_image);
+                if (media) |*md| {
+                    const rows = @import("arch/media.zig").imageRows(req.model.config.?, @import("arch/media.zig").preproc(req.model.config.?).merge, px.grid_h, px.grid_w);
+                    vision_enc.tower.?.encodeInto(@import("arch/handle.zig").trunk(req.model.handle.?), md, media_row, px.pixels, px.grid_h, px.grid_w) catch |err| {
+                        failParts(sch, req, emb_parts.items, mlx.settledErrorName(err));
+                        return;
+                    };
+                    media_row += rows;
+                    n_vision += rows;
+                    yieldStep(req);
+                    continue;
+                }
                 break :blk encodeImageBlock(vision_enc, px);
             } else encodeVideoGroup(vision_enc, req.videos[next_video], @intCast(step))) catch |err| {
                 failParts(sch, req, emb_parts.items, mlx.settledErrorName(err));
@@ -489,6 +517,16 @@ pub fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         if (is_image) next_image += 1 else next_video += 1;
     }
 
+    if (media) |md| {
+        media = null;
+        req.done_mu.lockUncancelable(sch.io);
+        defer req.done_mu.unlock(sch.io);
+        req.result = md;
+        req.n_vision_tokens = n_vision;
+        req.done = true;
+        req.done_cond.broadcast(sch.io);
+        return;
+    }
     if (emb_parts.items.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
@@ -854,6 +892,20 @@ test "a queued vision encode is refused when its bill no longer fits, and an ear
         _ = mlx.mlx_array_free(r);
     };
     try testing.expect(unbilled.error_name == null);
+
+    // A load on the ledger: the request's admission reserved its encode, so no live reading gates it.
+    var lines: @import("ledger.zig").Ledger = .{};
+    cfg.static_ledger = &lines;
+    defer cfg.static_ledger = null;
+    Probe.capacity = 0;
+    const runs = Probe.tower_runs;
+    const on_ledger = try Probe.run(&sch, &model, 100);
+    defer if (on_ledger.result) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+    defer if (on_ledger.error_name) |e| testing.allocator.free(e);
+    try testing.expect(on_ledger.error_name == null);
+    try testing.expectEqual(runs + 1, Probe.tower_runs);
 }
 
 test "skippedMedia leaves out only the leading blocks the restored prefix holds whole" {

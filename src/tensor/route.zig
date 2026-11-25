@@ -37,6 +37,10 @@ pub fn enable() void {
     enabled = true;
 }
 
+/// The counter page a counted launch's last output is (`kernelApplyCounted`), and its leading counters.
+pub const counter_page_words = core.counter_page_words;
+pub const counter_words = core.counter_words;
+
 /// On while a forward of ours runs: the makers that take no stream and no array (a host array, a vector, a kernel
 /// config) make engine objects.
 pub var active: bool = false;
@@ -154,6 +158,11 @@ pub fn leftByTest(w: *std.Io.Writer, kept: u32) !bool {
         own_weights = false;
         left = true;
     }
+    if (core.poolGate() != .open) {
+        try w.writeAll(" the pool's gate closed;");
+        core.gatePool(.open);
+        left = true;
+    }
     if (core.fault.armed()) {
         try w.writeAll(" the pool fault injector armed;");
         core.fault.disarm();
@@ -173,8 +182,9 @@ pub fn turnTo(own: bool) Turn {
 }
 
 /// A model's cap: the bytes it last installed (null: none), and whether a wide forward installed them, which the
-/// model's next narrow forward lifts (`budgetWide`, `liftWide`).
-pub const BudgetSlot = struct { cap: ?u64 = null, wide: bool = false };
+/// model's next narrow forward lifts (`budgetWide`, `liftWide`); and the pool's gate in force for its turns
+/// (`core.closePool`), which a load that plans its phases closes at its seal.
+pub const BudgetSlot = struct { cap: ?u64 = null, wide: bool = false, gate: core.PoolGate = .open };
 
 /// The budget slot of the Cooler model whose turn it is (null: MLX's side, or the engine's work of no model): each
 /// model keeps the cap it last installed, so its work never runs under the cap another left.
@@ -186,7 +196,7 @@ var no_model: BudgetSlot = .{};
 /// What each open turn found, innermost last: the model slot whose turn it was, and the owner of the cap then in
 /// force, which its `end` gives back. Engine-owned, so a model that goes is scrubbed from every turn still open
 /// (`forgetSlot`).
-const Frame = struct { turn: ?*BudgetSlot, found: ?*BudgetSlot };
+const Frame = struct { turn: ?*BudgetSlot, found: ?*BudgetSlot, gate: core.PoolGate };
 var frames: [32]Frame = undefined;
 var depth: usize = 0;
 
@@ -194,15 +204,17 @@ var depth: usize = 0;
 /// in force becomes the model's: the bytes it last installed, over what the pool asks now, or none when it installed
 /// none. A turn of no model (MLX's side, or the engine's work of no model) runs under no cap: the work of several
 /// models in it never runs under the cap one of them, or another, left. A turn inside another gives that turn's cap
-/// back at its end; at the top level the cap stays, for the next turn to install its own.
+/// back at its end; at the top level the cap stays, for the next turn to install its own. The pool's gate is the
+/// model's (`BudgetSlot.gate`), open for a turn of no model, and every turn's end gives back the gate it found.
 pub fn turnToModel(own: bool, slot: ?*BudgetSlot) Turn {
     if (holds == 0) return .{};
     if (depth == frames.len) @panic("engine: turns nested past 32");
-    frames[depth] = .{ .turn = turn_slot, .found = budget_slot };
+    frames[depth] = .{ .turn = turn_slot, .found = budget_slot, .gate = core.poolGate() };
     depth += 1;
     const was: Turn = .{ .took = true, .active = active, .rest = mlx_at_rest.on.load(.acquire) };
     turn_slot = if (own) slot else null;
     installCap(turn_slot);
+    core.gatePool(if (turn_slot) |t| t.gate else .open);
     active = own;
     if (own == was.rest) return was;
     if (own) {
@@ -258,6 +270,7 @@ pub const Turn = struct {
         depth -= 1;
         const found = frames[depth];
         turn_slot = found.turn;
+        core.gatePool(found.gate);
         // The last hold may have gone inside the turn (the model's unload): nothing is given back then.
         if (holds == 0) return;
         if (depth > 0) installCap(found.found);
@@ -278,6 +291,16 @@ pub var own_weights: bool = false;
 pub fn wrapMapped(ptr: [*]u8, dims: []const c_int, dtype: mlx.mlx_dtype, payload: ?*anyopaque, release: core.MappedRelease) A {
     const t = core.wrapMapped(ptr, dtype, dims, payload, release) catch |e| {
         _ = fail("wrap_mapped", e);
+        return .{};
+    };
+    return core.handle(t);
+}
+
+/// `core.wrapOwned`: a state owner's mapping, written in place while it is sole; a null handle, the reason latched, when
+/// it cannot be wrapped.
+pub fn wrapOwned(ptr: [*]u8, dims: []const c_int, dtype: mlx.mlx_dtype, payload: ?*anyopaque, release: core.MappedRelease) A {
+    const t = core.wrapOwned(ptr, dtype, dims, payload, release) catch |e| {
+        _ = fail("wrap_owned", e);
         return .{};
     };
     return core.handle(t);
@@ -361,7 +384,6 @@ fn lendOf(a: A) core.Error!A {
     return core.lend(t);
 }
 
-
 /// An MLX vector of `items`, each tensor of ours lent.
 pub fn lentVector(items: []const A) V {
     var stack: [16]A = undefined;
@@ -403,6 +425,7 @@ fn fail(what: []const u8, e: anyerror) c_int {
         error.ThreadGroupTooLarge => std.fmt.bufPrintSentinel(&buf, "[engine] Thread group size ({d}) is greater than the maximum allowed threads per threadgroup ({d}).", .{ kernel.refused_threads, kernel.refused_limit }, 0),
         error.MetalCompile, error.MetalCommand, error.MetalBuffer => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: {s}: {s}", .{ what, @errorName(e), said[0..@min(said.len, 400)] }, 0),
         error.PoolOverBudget => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: PoolOverBudget: a buffer of {d} KB with {d} MB held for the pool, {d} MB of it asked by tensors in use, under a limit of {d} MB", .{ what, core.refused_budget.wanted >> 10, core.refused_budget.held >> 20, core.refused_budget.asked >> 20, core.refused_budget.limit >> 20 }, 0),
+        error.WideFull => if (core.refused_wide) |r| std.fmt.bufPrintSentinel(&buf, "[engine] {s}: WideFull: a wide execution's {s} reached {d} KB past the {d} KB the load's region holds", .{ what, if (r.host) "host ring" else "scratch", r.asked >> 10, r.room >> 10 }, 0) else std.fmt.bufPrintSentinel(&buf, "[engine] {s}: WideFull", .{what}, 0),
         error.ReadsFillingSlab => std.fmt.bufPrintSentinel(&buf, "[engine] {s}: ReadsFillingSlab: a pass of {d} dispatches binds {d} bytes at 0x{x} while a fill writes {d} bytes at 0x{x}", .{ what, core.refused_fill.dispatches, core.refused_fill.read_len, core.refused_fill.read, core.refused_fill.fill_len, core.refused_fill.fill }, 0),
         error.TensorUnsupported, error.TensorDtype => blk: {
             const why = core.refused_why orelse break :blk std.fmt.bufPrintSentinel(&buf, "[engine] {s}: {s}", .{ what, @errorName(e) }, 0);
@@ -541,6 +564,7 @@ pub fn mlx_array_eval(a: A) c_int {
         error.NotRowContiguous => core.sync() catch |e2| return fail("array_eval", e2),
         else => return fail("array_eval", e),
     };
+    core.evalPoint() catch |e| return fail("array_eval", e);
     return 0;
 }
 
@@ -554,7 +578,7 @@ pub fn data(comptime T: type, a: A) ?[*]const T {
         _ = fail("array_data", e);
         return null;
     };
-    const bytes = core.hostRead(t) catch |e| {
+    const bytes = core.readBytes(t) catch |e| {
         _ = fail("array_data", e);
         return null;
     };
@@ -564,7 +588,7 @@ pub fn data(comptime T: type, a: A) ?[*]const T {
 pub fn item(comptime T: type, res: *T, a: A) c_int {
     const t = core.ready(a) catch |e| return fail("array_item", e);
     if (t.size() != 1) return fail("array_item", error.TensorShape);
-    const bytes = core.hostRead(t) catch |e| return fail("array_item", e);
+    const bytes = core.readBytes(t) catch |e| return fail("array_item", e);
     res.* = std.mem.bytesToValue(T, bytes[0..@sizeOf(T)]);
     return 0;
 }
@@ -594,10 +618,50 @@ pub fn mlx_array_data_uint8(a: A) ?[*]const u8 {
     return data(u8, a);
 }
 
+/// `a`'s bytes as `T` for a readback that steers no shape (`core.hostResult`): made up in a dry recording.
+pub fn hostResult(comptime T: type, a: A, below: ?u32) ![]const T {
+    // As `data`: a failure is latched by name, the caller's error a host read's.
+    const t = core.ready(a) catch |e| {
+        _ = fail("array_data", e);
+        return error.HostRead;
+    };
+    const bytes = core.hostResult(t, below) catch |e| {
+        _ = fail("array_data", e);
+        return error.HostRead;
+    };
+    return @alignCast(std.mem.bytesAsSlice(T, bytes));
+}
+
+/// `a`'s pending slice update written now (`core.ready`).
+pub fn settleNow(a: A) !void {
+    _ = try core.ready(a);
+}
+
+pub const dryOn = core.dryOn;
 pub const isOurs = core.isOurs;
 pub const isMapped = core.isMapped;
 pub const poolBytes = core.poolBytes;
 pub const storePointer = core.storePointer;
+pub const storeKey = core.storeKey;
+pub const widePhase = core.widePhase;
+pub const PoolGate = core.PoolGate;
+pub const gatePool = core.gatePool;
+
+/// `a`'s bytes for the host to write, once every pass that binds them has run (`core.hostBytes`).
+pub fn hostWritable(a: A) ![]u8 {
+    return core.hostBytes(core.of(a));
+}
+
+/// Whether a write into `a`'s bytes lands in place: no other handle reads them (`core.sole`; MLX's donation rule for
+/// its own arrays).
+pub fn sole(a: A) !bool {
+    if (!core.isOurs(a)) {
+        var only = false;
+        try mlx.check(mlx._mlx_array_is_donatable(&only, a));
+        return only;
+    }
+    return core.sole(core.of(a).store);
+}
 
 /// The bytes of the store under tensor `a`: the length a mapping that takes its place must have.
 pub fn storeLen(a: A) usize {
@@ -628,6 +692,7 @@ pub fn refusedBudget() @TypeOf(core.refused_budget) {
     return core.refused_budget;
 }
 pub const mappedTotal = core.mappedTotal;
+pub const arenaTotal = core.arenaTotal;
 pub const touch = core.touch;
 
 /// Custom-kernel launches that built their instance key since the process began.
@@ -643,7 +708,8 @@ pub fn budget(bytes: u64) core.Error!void {
 /// `budget` of a forward wider than a verify block of the model of `slot`, whatever turn it runs in: the cap stays
 /// that model's until its next narrow forward lifts it (`liftWide`), whatever turns run between.
 pub fn budgetWide(slot: *BudgetSlot, bytes: u64) core.Error!void {
-    slot.* = .{ .cap = bytes, .wide = true };
+    slot.cap = bytes;
+    slot.wide = true;
     budget_slot = slot;
     return core.budget(bytes);
 }
@@ -655,16 +721,20 @@ pub fn liftWide(slot: *BudgetSlot, bytes: u64) core.Error!void {
     if (!slot.wide) return;
     if (budget_slot == slot or budget_slot == null) {
         try core.budget(bytes);
-        slot.* = .{};
+        slot.cap = null;
+        slot.wide = false;
         return core.budget(std.math.maxInt(u64));
     }
-    slot.* = .{};
+    slot.cap = null;
+    slot.wide = false;
 }
 
 fn installFor(cap: BudgetSlot) core.Error!void {
     const owner = turn_slot orelse &no_model;
     const bytes = cap.cap.?;
-    owner.* = cap;
+    // The model's gate is its load's, whatever cap a forward records.
+    owner.cap = cap.cap;
+    owner.wide = cap.wide;
     budget_slot = owner;
     return core.budget(bytes);
 }
@@ -763,6 +833,7 @@ pub fn pipelinesMade() struct { count: u64, ns: u64 } {
     return .{ .count = core.pipelines, .ns = core.pipeline_ns };
 }
 pub const isStream = core.isStream;
+pub const exactF32 = @import("matmul.zig").exactF32;
 
 /// The bytes from an array of the engine's buffer start to its element 0; null for an array of MLX's.
 pub fn byteOffset(a: A) ?usize {
@@ -1029,6 +1100,7 @@ pub fn mlx_eval(v: V) c_int {
         }
     }
     core.sync() catch |e| return fail("eval", e);
+    core.evalPoint() catch |e| return fail("eval", e);
     return 0;
 }
 
@@ -1477,6 +1549,23 @@ pub fn matmulRowsAs(res: *A, a: A, b: A, rows_as: usize) c_int {
     return op2("matmul", res, a, b, @import("matmul.zig").matmulRowsAs, .{rows_as});
 }
 
+/// A new engine buffer of `dims`, unwritten (no dispatch): the result a block's rows fill through `matmulInto`.
+pub fn freshArray(res: *A, dims: []const c_int, dtype: mlx.mlx_dtype) c_int {
+    return put(res, core.fresh(dtype, dims) catch |e| return fail("fresh", e));
+}
+
+/// `matmul(a, b)` into `dst` (`matmul.matmulInto`).
+pub fn matmulInto(a: A, b: A, dst: A) c_int {
+    const ta = core.take(a) catch |e| return fail("matmulInto", e);
+    defer core.release(ta);
+    const tb = core.take(b) catch |e| return fail("matmulInto", e);
+    defer core.release(tb);
+    const td = core.take(dst) catch |e| return fail("matmulInto", e);
+    defer core.release(td);
+    @import("matmul.zig").matmulInto(ta, tb, td) catch |e| return fail("matmulInto", e);
+    return 0;
+}
+
 pub fn mlx_fast_layer_norm(res: *A, x: A, weight: A, bias: A, eps: f32, _: S) c_int {
     const tx = core.take(x) catch |e| return fail("layer_norm", e);
     defer core.release(tx);
@@ -1851,6 +1940,17 @@ pub fn mlx_put_along_axis(res: *A, a: A, indices: A, values: A, axis: c_int, _: 
     return put(res, ops.putAlong(t, idx, v, axis) catch |e| return fail("put_along_axis", e));
 }
 
+/// `mlx_put_along_axis` written into `a`'s own bytes (`ops.putAlongInPlace`): its caller holds the only handle of `a`.
+pub fn putAlongInPlace(a: A, indices: A, values: A, axis: c_int) core.Error!void {
+    const t = try core.take(a);
+    defer core.release(t);
+    const idx = try core.take(indices);
+    defer core.release(idx);
+    const v = try core.take(values);
+    defer core.release(v);
+    try ops.putAlongInPlace(t, idx, v, axis);
+}
+
 pub fn mlx_pad(res: *A, a: A, axes: [*]const c_int, n_axes: usize, low: [*]const c_int, n_low: usize, high: [*]const c_int, n_high: usize, pad_value: A, mode: [*:0]const u8, _: S) c_int {
     if (!std.mem.eql(u8, std.mem.span(mode), "constant")) return fail("pad", core.refusing("a pad mode other than constant", error.TensorUnsupported));
     return op2("pad", res, a, pad_value, padOf, .{ axes[0..n_axes], low[0..n_low], high[0..n_high] });
@@ -1893,6 +1993,11 @@ pub fn mlx_arange(res: *A, start: f64, stop: f64, step: f64, dtype: mlx.mlx_dtyp
 
 pub fn mlx_zeros(res: *A, dims: [*]const c_int, n: usize, dtype: mlx.mlx_dtype, _: S) c_int {
     return put(res, ops.zeros(dims[0..n], dtype) catch |e| return fail("zeros", e));
+}
+
+/// `mlx_zeros` written on the GPU (`ops.zerosOnGpu`), off the host ring.
+pub fn zerosOnGpu(res: *A, dims: []const c_int, dtype: mlx.mlx_dtype) c_int {
+    return put(res, ops.zerosOnGpu(dims, dtype) catch |e| return fail("zeros_gpu", e));
 }
 
 // ── Random numbers ──
@@ -2115,20 +2220,41 @@ pub fn forgetConfig(c: mlx.mlx_fast_metal_kernel_config) void {
 }
 
 pub fn mlx_fast_metal_kernel_apply(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, _: S) c_int {
-    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply", core.refusing("the kernel was made before the engine was on", error.TensorUnsupported));
-    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply", core.refusing("the config was made before the engine was on", error.TensorUnsupported));
-    if (cfg.partial) return fail("kernel_apply", core.refusing("the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported));
-    const ins = takeAll(inputs) catch |e| return fail("kernel_apply", e);
+    return applyAs("kernel_apply", outputs, k, inputs, c, .fresh);
+}
+
+/// `mlx_fast_metal_kernel_apply` with its one output written over `into`, a tensor of ours (`kernel.launchInto`); an
+/// empty `into` makes the output fresh, bound as the launches written into it are (`kernel.launchDisjoint`).
+pub fn kernelApplyInto(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, into: A) c_int {
+    if (into.ctx != null and !core.isOurs(into)) return fail("kernel_apply_into", core.refusing("the output to write over is not the engine's", error.TensorUnsupported));
+    return applyAs("kernel_apply_into", outputs, k, inputs, c, if (into.ctx == null) .disjoint else .{ .into = into });
+}
+
+/// `mlx_fast_metal_kernel_apply` whose last output is the engine's counter page (`kernel.launchCounted`).
+pub fn kernelApplyCounted(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config) c_int {
+    return applyAs("kernel_apply_counted", outputs, k, inputs, c, .counted);
+}
+
+fn applyAs(comptime what: []const u8, outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, how: union(enum) { fresh, into: A, disjoint, counted }) c_int {
+    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail(what, core.refusing("the kernel was made before the engine was on", error.TensorUnsupported));
+    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail(what, core.refusing("the config was made before the engine was on", error.TensorUnsupported));
+    if (cfg.partial) return fail(what, core.refusing("the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported));
+    const ins = takeAll(inputs) catch |e| return fail(what, e);
     defer releaseAll(ins);
     var out_buf: [kernel.max_outputs]*Tensor = undefined;
     const outs = out_buf[0..cfg.n_out];
-    kernel.launch(def, ins, cfg, outs) catch |e| {
-        var what: [96]u8 = undefined;
-        return fail(std.fmt.bufPrint(&what, "kernel_apply {s}", .{def.name}) catch "kernel_apply", e);
+    (switch (how) {
+        .fresh => kernel.launch(def, ins, cfg, outs),
+        .into => |t| kernel.launchInto(def, ins, cfg, outs, core.of(t)),
+        .disjoint => kernel.launchDisjoint(def, ins, cfg, outs),
+        .counted => kernel.launchCounted(def, ins, cfg, outs),
+    }) catch |e| {
+        var buf: [96]u8 = undefined;
+        return fail(std.fmt.bufPrint(&buf, what ++ " {s}", .{def.name}) catch what, e);
     };
     const v = newVec() orelse {
         for (outs) |t| core.release(t);
-        return fail("kernel_apply", error.OutOfMemory);
+        return fail(what, error.OutOfMemory);
     };
     for (outs) |t| v.items.append(gpa, core.handle(t)) catch {
         core.release(t);
@@ -2138,30 +2264,25 @@ pub fn mlx_fast_metal_kernel_apply(outputs: *V, k: mlx.mlx_fast_metal_kernel, in
     return 0;
 }
 
-/// `mlx_fast_metal_kernel_apply` with its one output written over `into`, a tensor of ours (`kernel.launchInto`); an
-/// empty `into` makes the output fresh, bound as the launches written into it are (`kernel.launchDisjoint`).
-pub fn kernelApplyInto(outputs: *V, k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, into: A) c_int {
-    if (into.ctx != null and !core.isOurs(into)) return fail("kernel_apply_into", core.refusing("the output to write over is not the engine's", error.TensorUnsupported));
-    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply_into", core.refusing("the kernel was made before the engine was on", error.TensorUnsupported));
-    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply_into", core.refusing("the config was made before the engine was on", error.TensorUnsupported));
-    if (cfg.partial) return fail("kernel_apply_into", core.refusing("the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported));
-    const ins = takeAll(inputs) catch |e| return fail("kernel_apply_into", e);
-    defer releaseAll(ins);
+/// A custom kernel's outputs written into the engine tensors `dsts` (`kernel.launchInPlace`).
+pub fn kernelApplyInPlace(k: mlx.mlx_fast_metal_kernel, inputs: V, c: mlx.mlx_fast_metal_kernel_config, dsts: []const A) c_int {
+    const def = if (isKernel(k)) kernelOf(k) else defs.get(@intFromPtr(k.ctx)) orelse return fail("kernel_apply_in_place", core.refusing("the kernel was made before the engine was on", error.TensorUnsupported));
+    const cfg = if (isConfig(c)) configOf(c) else mirrors.get(@intFromPtr(c.ctx)) orelse return fail("kernel_apply_in_place", core.refusing("the config was made before the engine was on", error.TensorUnsupported));
+    if (cfg.partial) return fail("kernel_apply_in_place", core.refusing("the config holds more outputs or template arguments than the engine mirrors", error.TensorUnsupported));
+    if (dsts.len > kernel.max_outputs) return fail("kernel_apply_in_place", error.TensorShape);
     var out_buf: [kernel.max_outputs]*Tensor = undefined;
-    const outs = out_buf[0..cfg.n_out];
-    (if (into.ctx == null) kernel.launchDisjoint(def, ins, cfg, outs) else kernel.launchInto(def, ins, cfg, outs, core.of(into))) catch |e| {
+    for (dsts, 0..) |d, i| {
+        if (!core.isOurs(d)) return fail("kernel_apply_in_place", core.refusing("the destination to write in place is not the engine's", error.TensorUnsupported));
+        const t = core.of(d);
+        if (!t.live) return fail("kernel_apply_in_place", core.refusing("a tensor used after its release", error.TensorUnsupported));
+        out_buf[i] = t;
+    }
+    const ins = takeAll(inputs) catch |e| return fail("kernel_apply_in_place", e);
+    defer releaseAll(ins);
+    kernel.launchInPlace(def, ins, cfg, out_buf[0..dsts.len]) catch |e| {
         var what: [96]u8 = undefined;
-        return fail(std.fmt.bufPrint(&what, "kernel_apply_into {s}", .{def.name}) catch "kernel_apply_into", e);
+        return fail(std.fmt.bufPrint(&what, "kernel_apply_in_place {s}", .{def.name}) catch "kernel_apply_in_place", e);
     };
-    const v = newVec() orelse {
-        for (outs) |t| core.release(t);
-        return fail("kernel_apply_into", error.OutOfMemory);
-    };
-    for (outs) |t| v.items.append(gpa, core.handle(t)) catch {
-        core.release(t);
-    };
-    if (outputs.ctx != null) _ = if (isVec(outputs.*)) mlx_vector_array_free(outputs.*) else mlx.raw.mlx_vector_array_free(outputs.*);
-    outputs.* = vecHandle(v);
     return 0;
 }
 
@@ -4670,6 +4791,89 @@ test "with the kernel profile on, each dispatch is its own command buffer and th
     try t_std.expectEqual(@as(usize, 0), core.kernelProfile().len);
 }
 
+test "with the kernel profile on, each row carries the bytes its op binds to read and write, and no op waits for the one before" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    core.kernel_prof_hook = true;
+    defer core.kernel_prof_hook = null;
+    const values = ramp(f32, 60, 6, -3);
+    const host = hostArray(f32, &values, &.{ 3, 4, 5 }, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    // x is the engine's own, so each add binds one store twice.
+    var x: A = .{};
+    try mlx.check(mlx.mlx_add(&x, host, host, core.stream()));
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+    core.resetKernelProfile();
+    const before = core.stats();
+    for (0..3) |_| {
+        var y: A = .{};
+        try mlx.check(mlx.mlx_add(&y, x, x, core.stream()));
+        _ = mlx.mlx_array_free(x);
+        x = y;
+    }
+    const mid = core.stats();
+    try t_std.expectEqual(before.waits, mid.waits);
+    try mlx.check(mlx.mlx_array_eval(x));
+    try t_std.expectEqual(@as(u64, 3), core.stats().submits - before.submits);
+    // An unrolled loop makes a site an add: x + x reads x's 240 bytes once and writes 240.
+    var sum: core.KernelStat = .{ .name = "", .dispatches = 0, .total_ns = 0, .max_ns = 0 };
+    for (core.kernelProfile()) |r| {
+        try t_std.expect(std.mem.indexOf(u8, r.name, "add") != null);
+        sum.dispatches += r.dispatches;
+        sum.total_ns += r.total_ns;
+        sum.read_bytes += r.read_bytes;
+        sum.write_bytes += r.write_bytes;
+    }
+    try t_std.expectEqual(@as(u64, 3), sum.dispatches);
+    try t_std.expectEqual(@as(u64, 3 * 240), sum.read_bytes);
+    try t_std.expectEqual(@as(u64, 3 * 240), sum.write_bytes);
+    try t_std.expect(sum.total_ns > 0);
+    core.resetKernelProfile();
+}
+
+noinline fn profiledAdd(x: A) !A {
+    var y: A = .{};
+    try mlx.check(mlx.mlx_add(&y, x, x, core.stream()));
+    return y;
+}
+
+test "with the kernel profile on, one kernel made at two sites is two rows, each holding the return addresses of the code that made it" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    core.kernel_prof_hook = true;
+    defer core.kernel_prof_hook = null;
+    const values = ramp(f32, 60, 6, -3);
+    const host = hostArray(f32, &values, &.{ 3, 4, 5 }, .float32);
+    defer _ = mlx.mlx_array_free(host);
+    var x: A = .{};
+    try mlx.check(mlx.mlx_add(&x, host, host, core.stream()));
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+    core.resetKernelProfile();
+    const a = try profiledAdd(x);
+    defer _ = mlx.mlx_array_free(a);
+    const b = try profiledAdd(x);
+    defer _ = mlx.mlx_array_free(b);
+    try mlx.check(mlx.mlx_array_eval(b));
+    const rows = core.kernelProfile();
+    try t_std.expectEqual(@as(usize, 2), rows.len);
+    // Each row holds a return address into the function that asked for the add; the two differ by the test's call.
+    const start = @intFromPtr(&profiledAdd);
+    for (rows) |r| {
+        const in = for (r.site[0..r.site_n]) |addr| {
+            if (addr > start and addr < start + 4096) break true;
+        } else false;
+        try t_std.expect(in);
+    }
+    try t_std.expect(!std.mem.eql(usize, rows[0].site[0..rows[0].site_n], rows[1].site[0..rows[1].site_n]));
+    core.resetKernelProfile();
+}
+
 test "the kernel profile leaves values as they were" {
     try mlx.requireGpu();
     const was = enabled;
@@ -4958,6 +5162,43 @@ test "engine casts to bool give MLX's bytes for every float: zeros of both signs
     try expectSame(Build.toBool, &.{x});
     try expectSame(Build.toBool, &.{xh});
     try expectSame(Build.toBool, &.{xb});
+}
+
+test "engine put_along in place lands the values where put_along_axis puts them in its copy, and leaves the other rows" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = stream();
+    const scope = enter(es);
+    defer scope.end();
+    var base_vals: [8 * 4]f32 = undefined;
+    for (&base_vals, 0..) |*v, j| v.* = @floatFromInt(j);
+    const rows = [_]u32{ 6, 1, 3 };
+    var idx_vals: [3 * 4]u32 = undefined;
+    var upd_vals: [3 * 4]f32 = undefined;
+    for (0..3) |r| for (0..4) |c| {
+        idx_vals[r * 4 + c] = rows[r];
+        upd_vals[r * 4 + c] = -@as(f32, @floatFromInt(r * 4 + c + 1));
+    };
+    const base = mlx.mlx_array_new_data(&base_vals, &[_]c_int{ 8, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    const idx = mlx.mlx_array_new_data(&idx_vals, &[_]c_int{ 3, 4 }, 2, .uint32);
+    defer _ = mlx.mlx_array_free(idx);
+    const upd = mlx.mlx_array_new_data(&upd_vals, &[_]c_int{ 3, 4 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(upd);
+    var want: A = .{};
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx_put_along_axis(&want, base, idx, upd, 0, es));
+    var got: A = .{};
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx_copy(&got, base, es));
+    try putAlongInPlace(got, idx, upd, 0);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try std.testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0..32], mlx.mlx_array_data_float32(got).?[0..32]);
+    try std.testing.expectEqual(@as(f32, 0), mlx.mlx_array_data_float32(got).?[0]);
+    try std.testing.expectEqual(@as(f32, -1), mlx.mlx_array_data_float32(got).?[24]);
 }
 
 test "engine put_along_axis and pad give MLX's bytes: keep flags scattered along the last axis, a constant border" {
@@ -5636,6 +5877,34 @@ test "engine rope gives MLX's bytes: partial and whole, a prefill and a decode s
     try t_std.expectEqual(@as(usize, 0), named_failures);
 }
 
+test "engine exact f32: inside the scope an f32 product of rows keeps every mantissa bit whatever MLX's TF32 reading, and the scope gives back what it found" {
+    try mlx.requireGpu();
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const n = 64;
+    // 1 + 2^-12 needs more mantissa bits than a TF32 tile keeps: against the identity it comes back 1 there.
+    const one_plus: f32 = 1 + 1.0 / 4096.0;
+    const rows: [n * n]f32 = @splat(one_plus);
+    var eye: [n * n]f32 = @splat(0);
+    for (0..n) |i| eye[i * n + i] = 1;
+    const a = hostArray(f32, &rows, &.{ n, n }, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    const b = hostArray(f32, &eye, &.{ n, n }, .float32);
+    defer _ = mlx.mlx_array_free(b);
+    const tf32_was = (try @import("matmul.zig").gpu()).tf32;
+    {
+        const exact = exactF32();
+        defer exact.end();
+        var o: A = .{};
+        defer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_matmul(&o, a, b, core.stream()));
+        try mlx.check(mlx.mlx_array_eval(o));
+        for (mlx.mlx_array_data_float32(o).?[0 .. n * n]) |v| try t_std.expectEqual(one_plus, v);
+    }
+    try t_std.expectEqual(tf32_was, (try @import("matmul.zig").gpu()).tf32);
+}
+
 test "engine f32 matmul on the SIMD tiles: the first use of a tile before the seal makes every alignment of it, so no length compiles inside a request" {
     try mlx.requireGpu();
     const was = enabled;
@@ -5715,6 +5984,99 @@ test "engine bf16 matmul on the NAX tiles: a weight's first product before the s
     core.late_names.clear();
     for ([_]usize{ 129, 1500, 3000, 3500, 4095, 4096, 8191, 8192 }) |m| try Product.run(wt, m);
     errdefer std.debug.print("engine bf16 NAX matmul: compiled after the seal:\n{s}", .{core.late_names.text()});
+    try t_std.expectEqual(late, core.pipelines_late);
+}
+
+test "engine f16 matmul on the NAX tiles: a layout's first product before the seal makes every tile any M, N and K pick, so a request's other sizes (a narrower first chunk, a context's keys) compile nothing" {
+    try mlx.requireGpu();
+    const g = try @import("matmul.zig").gpu();
+    if (!g.nax) return error.SkipZigTest;
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const sealed_was = core.sealed;
+    defer core.sealed = sealed_was;
+    const Product = struct {
+        fn run(m: c_int, n: c_int, k: c_int) !void {
+            var x: A = .{};
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ m, k }, 2, .float16, core.stream()));
+            var w: A = .{};
+            defer _ = mlx.mlx_array_free(w);
+            try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ n, k }, 2, .float16, core.stream()));
+            var wt: A = .{};
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, w, core.stream()));
+            var o: A = .{};
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_matmul(&o, x, wt, core.stream()));
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
+    };
+    // The warm's one product; after the seal a request's take other N and K, each picking its K step by M + N against K.
+    core.sealed = false;
+    try Product.run(512, 256, 512);
+    core.sealed = true;
+    const late = core.pipelines_late;
+    core.late_names.clear();
+    for ([_][3]c_int{ .{ 4065, 4096, 8192 }, .{ 4096, 4096, 8192 }, .{ 300, 2048, 16384 }, .{ 5000, 128, 8192 }, .{ 129, 4096, 4096 } }) |p| try Product.run(p[0], p[1], p[2]);
+    errdefer std.debug.print("engine f16 NAX matmul: compiled after the seal:\n{s}", .{core.late_names.text()});
+    try t_std.expectEqual(late, core.pipelines_late);
+}
+
+test "engine f16 matmul on the NAX tiles: a dtype's first product before the seal makes every layout's tiles, so a request's product of a layout the warm never ran (a restored prefix's keys) compiles nothing" {
+    try mlx.requireGpu();
+    const mm = @import("matmul.zig");
+    const g = try mm.gpu();
+    if (!g.nax) return error.SkipZigTest;
+    const was = enabled;
+    enabled = true;
+    defer enabled = was;
+    const sealed_was = core.sealed;
+    defer core.sealed = sealed_was;
+    mm.forgetFamiliesForTest();
+    const Product = struct {
+        /// `[batch, m, k] x [k, n]`, the right side transposed when `wt`.
+        fn run(batch: c_int, m: c_int, n: c_int, k: c_int, wt: bool) !void {
+            var x: A = .{};
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_zeros(&x, &[_]c_int{ batch, m, k }, 3, .float16, core.stream()));
+            var w: A = .{};
+            defer _ = mlx.mlx_array_free(w);
+            try mlx.check(mlx.mlx_zeros(&w, if (wt) &[_]c_int{ n, k } else &[_]c_int{ k, n }, 2, .float16, core.stream()));
+            var rhs: A = .{};
+            defer _ = mlx.mlx_array_free(rhs);
+            if (wt) try mlx.check(mlx.mlx_transpose(&rhs, w, core.stream())) else try mlx.check(mlx.mlx_copy(&rhs, w, core.stream()));
+            var o: A = .{};
+            defer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_matmul(&o, x, rhs, core.stream()));
+            try mlx.check(mlx.mlx_array_eval(o));
+        }
+    };
+    // A load's first product is a dry recording's (the plans', the region's), which makes no pipeline; the warm's real
+    // one is untransposed; a request's after the seal take the other layout, batched and not.
+    core.sealed = false;
+    {
+        const plan_api = @import("plan/plan_api.zig");
+        var recorder = try plan_api.Recorder.begin(t_std.allocator, .{ .site = 1 });
+        defer recorder.deinit();
+        var driver: plan_api.Driver = .{ .gpa = t_std.allocator };
+        defer driver.deinit();
+        try core.beginRecording(.{ .dry = .{ .driver = &driver } }, &recorder);
+        Product.run(1, 512, 256, 512, false) catch |e| {
+            core.endRecording() catch {};
+            return e;
+        };
+        try core.endRecording();
+        var tr = try recorder.end();
+        tr.deinit();
+    }
+    try Product.run(1, 512, 256, 512, false);
+    core.sealed = true;
+    const late = core.pipelines_late;
+    core.late_names.clear();
+    for ([_][4]c_int{ .{ 1, 4127, 4096, 1024 }, .{ 1, 4097, 2048, 3072 }, .{ 2, 300, 2049, 4096 }, .{ 4, 129, 4096, 8192 } }) |p| try Product.run(p[0], p[1], p[2], p[3], true);
+    errdefer std.debug.print("engine f16 NAX matmul: compiled after the seal:\n{s}", .{core.late_names.text()});
     try t_std.expectEqual(late, core.pipelines_late);
 }
 
@@ -7430,6 +7792,28 @@ test "engine: a turn inside another Cooler model's turn gives the outer model it
     try std.testing.expectEqual(&a, budget_slot.?);
 }
 
+test "engine: a Cooler model's turn puts its pool gate in force, a turn of MLX's side, of another model or of no model opens it, and each turn's end gives back the gate it found" {
+    try mlx.requireGpu();
+    const fx = TurnFixture.begin();
+    defer fx.end();
+    var planned: BudgetSlot = .{ .gate = .refuse };
+    var other: BudgetSlot = .{};
+    try std.testing.expectEqual(core.PoolGate.open, core.poolGate());
+    {
+        const outer = turnToModel(true, &planned);
+        defer outer.end();
+        try std.testing.expectEqual(core.PoolGate.refuse, core.poolGate());
+        try std.testing.expectError(error.PoolClosed, core.fresh(.uint8, &.{64}));
+        for ([_]struct { own: bool, slot: ?*BudgetSlot }{ .{ .own = true, .slot = &other }, .{ .own = false, .slot = &planned }, .{ .own = true, .slot = null } }) |t| {
+            const inner = turnToModel(t.own, t.slot);
+            defer inner.end();
+            try std.testing.expectEqual(core.PoolGate.open, core.poolGate());
+        }
+        try std.testing.expectEqual(core.PoolGate.refuse, core.poolGate());
+    }
+    try std.testing.expectEqual(core.PoolGate.open, core.poolGate());
+}
+
 test "engine: work of no model inside a Cooler model's turn records nothing into that model's slot, and the model's cap is back at its end" {
     try mlx.requireGpu();
     const fx = TurnFixture.begin();
@@ -7966,4 +8350,156 @@ test "matmul: the TF32 reading takes no armed fault, which the call under test i
     const again = try matmul.gpu();
     try std.testing.expect(!mlx.fault.didFire());
     try std.testing.expectEqual(first.tf32, again.tf32);
+}
+
+test "matmul: under a plan, split-K asks its partials at their most partitions whatever the product's sizes, so the largest product a probe records holds every smaller one" {
+    try mlx.requireGpu();
+    const Ops = @import("../mlx_ops.zig").Ops;
+    const plan = @import("plan/plan_api.zig");
+    const al = std.testing.allocator;
+    const was = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = stream();
+    const scope = enter(es);
+    defer scope.end();
+    const exact = @import("matmul.zig").exactF32();
+    defer exact.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    // A latent's score product, 64 heads of 512 against the keys: split-K while the keys stay within the latent's width,
+    // its partition count stepping with the key tiles (8 at 96 keys, 2 at 512).
+    const q = try o.zeros(&.{ 64, 512 }, .float32);
+    for ([_]c_int{ 96, 512 }) |keys| {
+        const c = try o.zeros(&.{ 512, keys }, .float32);
+        var rec = try plan.Recorder.begin(al, .{ .site = plan.siteOf(@src()) });
+        defer rec.deinit();
+        var driver: plan.Driver = .{ .gpa = al };
+        defer driver.deinit();
+        {
+            try core.beginRecording(.{ .dry = .{ .driver = &driver } }, &rec);
+            defer core.endRecording() catch {};
+            var y = mlx.mlx_array_new();
+            try mlx.check(mlx_matmul(&y, q, c, es));
+            _ = mlx.mlx_array_free(y);
+        }
+        var most: u64 = 0;
+        for (rec.instances.items) |inst| for (inst.asks.items) |as| {
+            most = @max(most, as.bytes);
+        };
+        try std.testing.expectEqual(32 * 64 * @as(u64, @intCast(keys)) * 4, most);
+    }
+}
+
+test "matmul: under a plan, NAX split-K asks its partials at no fewer partitions than a smaller inner axis takes" {
+    try mlx.requireGpu();
+    if (!(try @import("matmul.zig").gpu()).nax) return error.SkipZigTest;
+    const Ops = @import("../mlx_ops.zig").Ops;
+    const plan = @import("plan/plan_api.zig");
+    const al = std.testing.allocator;
+    const was = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = stream();
+    const scope = enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    // An inner axis of 513 takes 3 parts (an odd axis to 1,024 halves into 3), one of 514 to 8,192 takes 2, then
+    // one a part as the GPU class cuts it: under a plan, at least 3.
+    const mm = @import("matmul.zig");
+    const class = (try mm.gpu()).class;
+    for ([_]c_int{ 513, 514, 4097, 13000 }) |k| {
+        const part = mm.splitKNaxTileFor(class, 64, 96, @intCast(k)).part_size;
+        const parts: u64 = @max((@as(usize, @intCast(k)) + part - 1) / part, mm.split_k_nax_parts_least);
+        const case = .{ .k = k, .parts = parts };
+        const q = try o.zeros(&.{ 64, case.k }, .bfloat16);
+        const c = try o.zeros(&.{ case.k, 96 }, .bfloat16);
+        var rec = try plan.Recorder.begin(al, .{ .site = plan.siteOf(@src()) });
+        defer rec.deinit();
+        var driver: plan.Driver = .{ .gpa = al };
+        defer driver.deinit();
+        {
+            try core.beginRecording(.{ .dry = .{ .driver = &driver } }, &rec);
+            defer core.endRecording() catch {};
+            var y = mlx.mlx_array_new();
+            try mlx.check(mlx_matmul(&y, q, c, es));
+            _ = mlx.mlx_array_free(y);
+        }
+        var most: u64 = 0;
+        for (rec.instances.items) |inst| for (inst.asks.items) |as| {
+            most = @max(most, as.bytes);
+        };
+        try std.testing.expectEqual(case.parts * 64 * 96 * 4, most);
+    }
+}
+
+test "matmul: matmulInto validates dst shape and aliasing, and matches matmul's dot path at 1x1" {
+    try mlx.requireGpu();
+    const Ops = @import("../mlx_ops.zig").Ops;
+    const was = enabled;
+    enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = stream();
+    const scope = enter(es);
+    defer scope.end();
+
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+
+    {
+        const a = try o.zeros(&.{ 2, 16 }, .float32);
+        const b = try o.zeros(&.{ 16, 8 }, .float32);
+        const buf = try o.zeros(&.{ 8, 2 }, .float32);
+        try std.testing.expectError(error.MlxError, mlx.check(matmulInto(a, b, try o.transpose(buf, &.{ 1, 0 }))));
+        mlx.checkError() catch {};
+        try std.testing.expectError(error.MlxError, mlx.check(matmulInto(a, b, try o.zeros(&.{ 2, 8 }, .bfloat16))));
+        mlx.checkError() catch {};
+        try std.testing.expectError(error.MlxError, mlx.check(matmulInto(a, b, try o.zeros(&.{ 8, 2 }, .float32))));
+        mlx.checkError() catch {};
+        try std.testing.expectError(error.MlxError, mlx.check(matmulInto(a, b, try o.zeros(&.{16}, .float32))));
+        mlx.checkError() catch {};
+    }
+
+    {
+        const a = try o.zeros(&.{ 16, 16 }, .float32);
+        const b = try o.zeros(&.{ 16, 16 }, .float32);
+        try std.testing.expectError(error.MlxError, mlx.check(matmulInto(a, b, a)));
+        mlx.checkError() catch {};
+        try std.testing.expectError(error.MlxError, mlx.check(matmulInto(a, b, b)));
+        mlx.checkError() catch {};
+    }
+
+    {
+        const a = try o.zeros(&.{ 4, 1, 16 }, .float32);
+        const b = try o.zeros(&.{ 16, 8 }, .float32);
+        const dst = try o.slot();
+        try mlx.check(freshArray(dst, &.{ 4, 1, 8 }, .float32));
+        try mlx.check(matmulInto(a, b, dst.*));
+        try mlx.check(mlx.mlx_array_eval(dst.*));
+    }
+
+    {
+        const n = 4096;
+        const av = try std.testing.allocator.alloc(f32, n);
+        defer std.testing.allocator.free(av);
+        const bv = try std.testing.allocator.alloc(f32, n);
+        defer std.testing.allocator.free(bv);
+        var prng = std.Random.DefaultPrng.init(0x1234);
+        for (av, bv) |*x, *y| {
+            x.* = prng.random().floatNorm(f32);
+            y.* = prng.random().floatNorm(f32);
+        }
+        const a = try o.own(mlx.mlx_array_new_data(av.ptr, &[_]c_int{ 1, n }, 2, .float32));
+        const b = try o.own(mlx.mlx_array_new_data(bv.ptr, &[_]c_int{ n, 1 }, 2, .float32));
+        const want = try o.binary(.mm, a, b);
+        const dst = try o.slot();
+        try mlx.check(freshArray(dst, &.{ 1, 1 }, .float32));
+        try mlx.check(matmulInto(a, b, dst.*));
+        try mlx.check(mlx.mlx_array_eval(want));
+        try mlx.check(mlx.mlx_array_eval(dst.*));
+        const wf = mlx.mlx_array_data_float32(want).?[0..1];
+        const gf = mlx.mlx_array_data_float32(dst.*).?[0..1];
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(wf), std.mem.sliceAsBytes(gf));
+    }
 }

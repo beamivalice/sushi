@@ -32,6 +32,9 @@ test "cooler contract: a wide forward that reads out every row's logits, as `sus
     try eachFixture(struct {
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const ld = try heldLoad(C, dir);
+            // On the ledger a wide forward runs in the region its load measured (`hy4 plan: a prefill chunk of every
+            // width ... runs in the region its load measured`); a `sushi kld` load is off the ledger and uncapped.
+            try contract.requirePoolCap(&ld.config);
             const a = testing.allocator;
             for ([_]usize{ 418, 2048 }) |width| {
                 const wide = try a.alloc(u32, width);
@@ -90,6 +93,9 @@ test "cooler contract: a decode after a wide forward that left free buffers of s
         fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
             const ld = try heldLoad(C, dir);
             const cooler = @import("arch/cooler.zig");
+            // On the ledger a request ends with no free buffer in the pool and asks it nothing (`hy4 close`, and the
+            // lines `hy4 ledger` sums after each request).
+            try contract.requirePoolCap(&ld.config);
             // An arch that installs its own hard caps refuses a buffer past them; its decode cap has its own cells.
             if (cooler.ownsCaps(&ld.config)) {
                 @import("test_note.zig").notePartSkipped("an arch with its own pool caps");
@@ -421,7 +427,8 @@ test "cooler contract: a Cooler image request refused at any pool buffer site a 
             var prompt: [12]u32 = undefined;
             for (&prompt, 0..) |*t, i| t.* = if (i >= 3 and i < 7) ld.config.image_token_id else ids[i % ids.len];
             {
-                const turn = arch_handle.turnFor(ld.h, &ld.config);
+                // The rows are the cell's own, not a served request's state (the tower's encode writes them).
+                const turn = test_support.openTurn(ld.h, &ld.config);
                 defer turn.end();
                 const scope = mlx.engine.enter(ld.xfm.s);
                 defer scope.end();
@@ -445,6 +452,12 @@ test "cooler contract: a Cooler image request refused at any pool buffer site a 
             a.free(try firstAsks(a, &seen, C, Req{ .ld = ld, .prompt = &text }, Req.go));
             const points = try firstAsks(a, &seen, C, Req{ .ld = ld, .prompt = &prompt }, Req.go);
             defer a.free(points);
+            // A load on the ledger takes an image's rows as the request's Media, not from the pool: its request asks
+            // the closed pool the sites a text request does, and none of its own (`hy4 ledger`, `hy4 close`).
+            if (points.len == 0) {
+                @import("test_note.zig").notePartSkipped("an image request with no pool buffer site of its own");
+                return error.SkipZigTest;
+            }
             const base = Sheet.now();
             var msg: [300]u8 = undefined;
             for (points, 0..) |pt, at| {
@@ -474,6 +487,39 @@ test "cooler contract: a Cooler load's /props names Sushi Cooler as the engine i
             try testing.expectEqualStrings("sushi-cooler", @import("models_api.zig").propsSettingsFor(sv.entry).engine);
         }
     }.run);
+}
+
+test "cooler contract held loads: a held load on the ledger holds its whole budget, so the next held load of any fixture opens once it is unloaded" {
+    const H = ContractOf("hy4flash");
+    const Q = ContractOf("qwen4");
+    if (comptime !@hasDecl(H, "prompt") or !@hasDecl(Q, "prompt")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const was_enabled = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer test_support.restoreEngine(was_enabled);
+    const envs = [_][:0]const u8{ "HY4_BF16_TINY", "HY4_STQ_TINY", "QWEN4_STQ_TINY" };
+    var dirs: [envs.len][]const u8 = undefined;
+    for (envs, &dirs) |env, *dir| {
+        if (!contract.fixtureChosen(contract.selection(), env)) return error.SkipZigTest;
+        dir.* = std.mem.span(std.c.getenv(env) orelse return error.SkipZigTest);
+    }
+    // Each opens beside the one before and, once the ledger's has gone, serves a request.
+    const Open = struct {
+        fn serves(comptime C: type, dir: []const u8) !void {
+            const ids = try C.prompt(testing.allocator, dir);
+            defer testing.allocator.free(ids);
+            const ld = heldLoad(C, dir) catch |e| {
+                std.debug.print("cooler contract: the held load of {s} beside the held loads before it: {s}\n", .{ std.fs.path.basename(dir), @errorName(e) });
+                return e;
+            };
+            var got = try greedy(ld, ids[0..9], 3);
+            got.deinit(testing.allocator);
+        }
+    };
+    try Open.serves(H, dirs[0]);
+    try Open.serves(H, dirs[1]);
+    try Open.serves(Q, dirs[2]);
+    try Open.serves(H, dirs[0]);
 }
 
 test "cooler contract held loads: the read after each test passes a held load between requests and names one whose config changed or beside which a dispatch stayed open" {
@@ -531,6 +577,7 @@ fn requestOf(comptime C: type, ld: *Load, prompt: []const u32, n: u32, spec: boo
     defer turn.end();
     defer arch_sched.endRequest(&ld.config);
     try ld.xfm.resetCache();
+    if (comptime !@hasDecl(C, "specTokens")) return error.SkipZigTest;
     return C.specTokens(testing.allocator, ld.xfm, prompt, n);
 }
 

@@ -936,7 +936,8 @@ pub const SwitchMlpBank = struct {
 /// wider one under-bills, and an under-bill here is an uncatchable Metal OOM.
 pub fn loadSwitchMlpBank(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, exl3: bool, config: *const ModelConfig, s: mlx.mlx_stream) !SwitchMlpBank {
     if (exl3) {
-        var plan = sushi_exl3.GroupLayout.init(config.hidden_size, config.moe_intermediate_size, config.expert_quant_rate);
+        // The experts' own width (`expertGeometry`): Hy4-Flash's run in a latent narrower than the model.
+        var plan = sushi_exl3.GroupLayout.init(config.expertGeometry().hidden, config.moe_intermediate_size, config.expert_quant_rate);
         plan.rates = config.expert_quant_rates;
         var groups: [sushi_exl3.group_layout.max_groups]sushi_exl3.Bank = undefined;
         var start_buf: [256]u8 = undefined;

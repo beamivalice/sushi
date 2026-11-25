@@ -53,6 +53,7 @@ test {
     _ = @import("regex.zig");
     _ = @import("tokenizer.zig");
     _ = @import("tokenizer_nfc.zig");
+    _ = @import("tokenizer_deepseek.zig");
     _ = @import("utf8_seq.zig");
     _ = @import("arch/chat.zig");
     _ = @import("arch/packs.zig");
@@ -94,7 +95,8 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("spec_cost_gate.zig");
-    _ = @import("dspark_rows.zig");
+    _ = @import("drafter_rows.zig");
+    _ = @import("row_grammar.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("prefix_policy.zig");
     _ = @import("sched_policy.zig");
@@ -121,4 +123,15 @@ test {
     _ = @import("sushibar/sushibar_logic.zig");
     _ = @import("sushibar/sushibar_proc.zig");
     _ = @import("fill_marks.zig");
+    _ = @import("ledger.zig");
+    _ = @import("static_bill.zig");
+    _ = @import("tensor/plan/plan_frame.zig");
+    _ = @import("tensor/plan/plan_trace.zig");
+    _ = @import("tensor/plan/plan_shape.zig");
+    _ = @import("tensor/plan/plan_pack.zig");
+    _ = @import("tensor/plan/plan_region.zig");
+    _ = @import("tensor/plan/plan_binder.zig");
+    _ = @import("tensor/plan/plan_api.zig");
+    _ = @import("tensor/plan/plan_soundness_test.zig");
+    _ = @import("tensor/plan/plan_book.zig");
 }

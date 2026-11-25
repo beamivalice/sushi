@@ -801,7 +801,7 @@ test "a fired thinking bound keeps an MTP slot speculating and the answer in MTP
     try testing.expect(thinkBoundForcesPlain(&gen));
     // DFlash2 carries no MTP head: a fired bound still decodes it plain.
     gen.mtp = null;
-    gen.dspark = false;
+    gen.drafter_on = false;
     gen.spec_disable_reason = .none;
     try testing.expect(thinkBoundForcesPlain(&gen));
     gen.think_closed_by_loop = true;

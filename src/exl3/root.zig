@@ -7,7 +7,7 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const host_side = @import("host_side.zig");
 /// The sushi version this copy of the module was cut at; the sushi tests check it against build.zig.zon.
-pub const version: []const u8 = "1.7.4";
+pub const version: []const u8 = "1.8.0-dev";
 pub const device = @import("device.zig");
 pub const format = @import("expert_exl3.zig");
 pub const pack = @import("pack.zig");
@@ -238,15 +238,23 @@ pub fn parseQuantBlock(block: std.json.Value) !Spec {
     if (block != .object) return error.ExpertLayoutUnsupported;
     const fmt_v = block.object.get("format") orelse return error.ExpertLayoutUnsupported;
     if (fmt_v != .string) return error.ExpertLayoutUnsupported;
+    // `exs` is STQ's name before its rename: a pack still naming it is migrated by tool, never read.
+    if (std.mem.eql(u8, fmt_v.string, "exs")) return error.Exl3CodebookTableLegacyConfig;
     const stq = std.mem.eql(u8, fmt_v.string, "stq");
     if (!stq and !std.mem.eql(u8, fmt_v.string, "exl3")) return error.ExpertLayoutUnsupported;
     const k_v = block.object.get("k") orelse return error.ExpertLayoutUnsupported;
     const rate = rateFromConfigK(k_v) orelse return error.ExpertLayoutUnsupported;
     const cb_v = block.object.get("codebook") orelse return error.ExpertLayoutUnsupported;
     if (cb_v != .string) return error.ExpertLayoutUnsupported;
+    // The names these codebooks had before STD1, SPEC1 and PAIR1: a pack still naming one, or a table codebook under
+    // `exl3`, is migrated by tool, never read.
+    for ([_][]const u8{ "s1", "dd1", "beta", "sushi1", "cantona" }) |old| {
+        if (std.mem.eql(u8, cb_v.string, old)) return error.Exl3CodebookTableLegacyConfig;
+    }
     const codebook = format.Codebook.fromName(cb_v.string) orelse return error.ExpertLayoutUnsupported;
     const tabled = codebook.hasTable();
-    if (tabled != stq) return error.ExpertLayoutUnsupported;
+    if (tabled and !stq) return error.Exl3CodebookTableLegacyConfig;
+    if (stq and !tabled) return error.ExpertLayoutUnsupported;
     const window = windowFromConfig(block.object.get("window")) orelse return error.Exl3WindowUnsupported;
     if (!tabled) {
         if (block.object.contains("codebook_table")) return error.Exl3CodebookTableCodebookMismatch;
@@ -266,7 +274,7 @@ pub fn shardTileOrderAgrees(order: format.TileOrder, stamp: ?[]const u8) !void {
 
 pub fn shardStampAgrees(spec: Spec, k: ?[]const u8, codebook: ?[]const u8, window: ?[]const u8) !void {
     if (codebook) |name| {
-        if (format.Codebook.fromName(name) != spec.codebook) return error.Exl3ShardStampMismatch;
+        if (!spec.codebook.stampedAs(name)) return error.Exl3ShardStampMismatch;
     }
     if (window) |bits| {
         const parsed = std.fmt.parseInt(i64, bits, 10) catch return error.Exl3ShardStampMismatch;
@@ -324,6 +332,15 @@ test "an EXL3 pack naming a codebook this build does not decode is refused" {
     try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator,
         \\{"expert_quant":{"format":"exl3","k":2.5,"codebook":"mul2","window":12}}
     ));
+}
+
+test "an EXL3 pack written before the alpha codebook's rename names it andonly" {
+    const t = std.testing;
+    const spec = try specFromConfigJson(t.allocator,
+        \\{"expert_quant":{"format":"exl3","k":2,"codebook":"andonly","window":15}}
+    );
+    try t.expectEqual(format.Codebook.alpha, spec.codebook);
+    try t.expectEqual(format.Window.w15, spec.window);
 }
 
 const SPEC1_TABLE = ",\"codebook_table\":\"spec1-w15\",\"codebook_digest\":\"37f72431\"";
@@ -389,6 +406,9 @@ test "an STQ pack with a missing, foreign or legacy table is refused by name" {
         .{ .raw = spec1_head ++ STD1_TABLE ++ "}}", .want = error.Exl3CodebookTableCodebookMismatch },
         .{ .raw = spec1_head ++ PAIR1_TABLE ++ "}}", .want = error.Exl3CodebookTableCodebookMismatch },
         .{ .raw = pair1_head ++ ",\"window\":15" ++ PAIR1_TABLE ++ "}}", .want = error.Exl3CodebookTableWindowMismatch },
+        .{ .raw = spec1_head ++ SPEC1_TABLE ++ ",\"beta_multiplier\":2215386935,\"beta_mask\":2415824848}}", .want = error.Exl3CodebookTableLegacyConfig },
+        .{ .raw = spec1_head ++ ",\"beta_multiplier\":2215386935,\"beta_mask\":2415824848}}", .want = error.Exl3CodebookTableLegacyConfig },
+        .{ .raw = pair1_head ++ ",\"cantona_scale\":4096,\"cantona_constants\":[]}}", .want = error.Exl3CodebookTableLegacyConfig },
         .{ .raw = spec1_head ++ ",\"codebook_table\":\"spec1-w15\"" ++ D ++ "\"2ac2594d\"}}", .want = error.Exl3CodebookTableLegacyConfig },
         .{ .raw = "{\"expert_quant\":{\"format\":\"stq\",\"k\":1,\"codebook\":\"pair1\"" ++ PAIR1_TABLE ++ "}}", .want = error.Exl3CodebookTableRateMissing },
         .{ .raw = "{\"expert_quant\":{\"format\":\"stq\",\"k\":4.5,\"codebook\":\"std1\",\"window\":15" ++ STD1_TABLE ++ "}}", .want = error.Exl3CodebookTableRateMissing },
@@ -396,10 +416,44 @@ test "an STQ pack with a missing, foreign or legacy table is refused by name" {
     }) |c| try t.expectError(c.want, specFromConfigJson(t.allocator, c.raw));
 }
 
-test "the stq format is for the codebooks that name a table, and exl3 is for the rest" {
+// A pack still naming a pre-rename codec or table is rewritten by sashimi's migrate tool, never read.
+test "a config naming a codec or table by a name from before STD1, SPEC1 and PAIR1 is refused as a legacy config" {
     const t = std.testing;
+    const tables = [_][]const u8{ SPEC1_TABLE, PAIR1_TABLE, STD1_TABLE };
+    const cases = [_]struct { fmt: []const u8, codebook: []const u8, window: []const u8, table: usize }{
+        .{ .fmt = "exl3", .codebook = "beta", .window = "15", .table = 0 },
+        .{ .fmt = "stq", .codebook = "beta", .window = "15", .table = 0 },
+        .{ .fmt = "stq", .codebook = "sushi1", .window = "15", .table = 0 },
+        .{ .fmt = "stq", .codebook = "s1", .window = "15", .table = 0 },
+        .{ .fmt = "exl3", .codebook = "s1", .window = "15", .table = 0 },
+        .{ .fmt = "exs", .codebook = "s1", .window = "15", .table = 0 },
+        .{ .fmt = "stq", .codebook = "dd1", .window = "16", .table = 1 },
+        .{ .fmt = "exl3", .codebook = "dd1", .window = "16", .table = 1 },
+        .{ .fmt = "exs", .codebook = "dd1", .window = "16", .table = 1 },
+        .{ .fmt = "stq", .codebook = "cantona", .window = "16", .table = 1 },
+        .{ .fmt = "exl3", .codebook = "cantona", .window = "16", .table = 1 },
+        .{ .fmt = "exs", .codebook = "cantona", .window = "16", .table = 1 },
+        // The new names under the old format are as stale as the old names.
+        .{ .fmt = "exl3", .codebook = "spec1", .window = "15", .table = 0 },
+        .{ .fmt = "exl3", .codebook = "pair1", .window = "16", .table = 1 },
+        .{ .fmt = "exl3", .codebook = "std1", .window = "15", .table = 2 },
+        .{ .fmt = "exs", .codebook = "std1", .window = "15", .table = 2 },
+    };
+    for (cases) |c| {
+        const raw = try std.fmt.allocPrint(t.allocator, "{{\"expert_quant\":{{\"format\":\"{s}\",\"k\":2.5,\"codebook\":\"{s}\",\"window\":{s}{s}}}}}", .{ c.fmt, c.codebook, c.window, tables[c.table] });
+        defer t.allocator.free(raw);
+        try t.expectError(error.Exl3CodebookTableLegacyConfig, specFromConfigJson(t.allocator, raw));
+    }
+    // A current codebook over a table that went by an old name.
+    for ([_][]const u8{ "s1-w15", "s1-w16", "s1-global", "sushi1-global", "beta-global-v1", "beta-w15-v1", "dd1-w16-v1", "cantona-w16-v1" }) |old| {
+        for ([_][]const u8{ "spec1", "std1", "pair1" }) |cb| {
+            const raw = try std.fmt.allocPrint(t.allocator, "{{\"expert_quant\":{{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"{s}\",\"window\":15,\"codebook_table\":\"{s}\",\"codebook_digest\":\"c5dba171\"}}}}", .{ cb, old });
+            defer t.allocator.free(raw);
+            try t.expectError(error.Exl3CodebookTableLegacyConfig, specFromConfigJson(t.allocator, raw));
+        }
+    }
+    // STQ is for the codebooks that name a table; MCG, MUL1 and ALPHA stay EXL3.
     try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"mcg\"}}"));
-    try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"std1\",\"window\":15" ++ STD1_TABLE ++ "}}"));
     try t.expectError(error.ExpertLayoutUnsupported, specFromConfigJson(t.allocator, "{\"expert_quant\":{\"format\":\"exq\",\"k\":2.5,\"codebook\":\"mcg\"}}"));
 }
 
@@ -527,7 +581,7 @@ test "exl3 Sushi CPU config and packed shapes admit K1 through K8" {
         try t.expectEqual(admitted, rateFromConfigK(.{ .float = k }) != null);
         try t.expectEqual(admitted, trellisAdmitted(&.{ 2, 8, 16, @intCast(n) }, 2, 128, 256, .{ .n = 128 }));
         if (!admitted) continue;
-        for ([_][]const u8{ "mul1", "mcg" }) |cb| {
+        for ([_][]const u8{ "mul1", "mcg", "alpha", "andonly" }) |cb| {
             const raw = try std.fmt.allocPrint(t.allocator, "{{\"expert_quant\":{{\"format\":\"exl3\",\"k\":{d},\"codebook\":\"{s}\"}}}}", .{ k, cb });
             defer t.allocator.free(raw);
             try t.expectEqual(@as(u32, @intCast(n)), (try specFromConfigJson(t.allocator, raw)).rate.n);

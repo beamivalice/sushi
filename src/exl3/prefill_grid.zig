@@ -234,7 +234,7 @@ fn gridMatchesSortedChain(rates: [3]c_int, skewed: bool, dec: api.format.Decode)
     const ids = try o.own(mlx.mlx_array_new_data(&id_data, &[_]c_int{ 1, 2048, 8 }, 3, .uint32));
     const scores = try o.own(mlx.mlx_array_new_data(&score_data, &[_]c_int{ 1, 2048, 8 }, 3, .float32));
     // A hash-mask codebook's reference is its sorted chain with the scale decoded into every weight.
-    base.unfolded_for_test = dec.codebook.tabledHashMask();
+    base.unfolded_for_test = dec.codebook.isHashMask();
     defer base.unfolded_for_test = false;
     const want = try o.own(try api.moeClamped(s, x.*, bank, ids.*, scores.*, dec, 10));
     try mlx.check(mlx.mlx_array_eval(want.*));
@@ -269,7 +269,7 @@ test "GLM serves PAIR1 on the prefill grid with the unfolded sorted chain's byte
     try gridMatchesSortedChain(.{ 24, 32, 48 }, true, .{ .codebook = .pair1, .window = .w16 });
 }
 
-test "GLM serves std1 on the prefill grid and probes a failing kernel once per codebook and window" {
+test "GLM serves alpha on the prefill grid and probes a failing kernel once per codebook and window" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
     const saved_kernels = kernels;
@@ -303,7 +303,7 @@ test "GLM serves std1 on the prefill grid and probes a failing kernel once per c
     try std.testing.expect((try moe(s, x.*, bank, ids.*, scores.*, .{ .codebook = .mcg, .window = .w14 })) == null);
     try std.testing.expectEqual(@as(usize, 2), build_attempts);
     for ([_]api.format.Window{ .w15, .w12 }, [_]usize{ 3, 4 }) |window, attempts| for (0..2) |_| {
-        try std.testing.expect((try moe(s, x.*, bank, ids.*, scores.*, .{ .codebook = .std1, .window = window, .table = api.codebook_tables.indexOf("std1") })) == null);
+        try std.testing.expect((try moe(s, x.*, bank, ids.*, scores.*, .{ .codebook = .alpha, .window = window })) == null);
         try std.testing.expectEqual(attempts, build_attempts);
     };
 }

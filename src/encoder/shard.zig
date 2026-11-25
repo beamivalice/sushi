@@ -39,36 +39,87 @@ pub fn mtpShardFileName(buf: []u8, layer: u32) ![]const u8 {
 /// Does not touch `config.json`. Returns the `expert_quant` object, copied into `quant_buf`, for
 /// the pack assembler to merge. A crash leaves the temp name, never a truncated shard.
 pub fn writeLayer(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, layer: u32, banks: Layer, quant_buf: []u8) ![]const u8 {
+    const one = [_]Group{.{ .banks = .{ banks.gate, banks.up, banks.down }, .rates = @splat(banks.rate) }};
+    try writeShard(allocator, io, dir, prefix, layer, &one, false, banks.dec, banks.provenance);
+    var k_buf: [16]u8 = undefined;
+    return std.fmt.bufPrint(quant_buf, "{{\"format\":\"{s}\",\"k\":{s},\"codebook\":\"{s}\",\"window\":{d}}}", .{ formatName(banks.dec.codebook), banks.rate.kText(&k_buf), @tagName(banks.dec.codebook), banks.dec.window.bits() });
+}
+
+/// One rate group of a layer: gate, up and down banks over the same experts, each at its own rate.
+pub const Group = struct {
+    banks: [3]Bank,
+    rates: [3]format.Rate,
+};
+
+/// Writes a layer as rate groups (`<proj>.gN.<part>`, docs/pack-format.md), groups in the order given.
+pub fn writeGroups(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, layer: u32, groups: []const Group, dec: format.Decode, provenance: []const [2][]const u8) !void {
+    if (groups.len == 0 or groups.len > api.group_layout.max_groups) return error.BankShape;
+    try writeShard(allocator, io, dir, prefix, layer, groups, true, dec, provenance);
+}
+
+/// The `expert_quant.format` a codebook's pack names.
+pub fn formatName(cb: format.Codebook) []const u8 {
+    return if (cb.hasTable()) "stq" else "exl3";
+}
+
+/// Where a bank set's tensors live: `{nest}.mlp.switch_mlp.<proj>[.gN].<part>` in the shard `file`. `pair_major` writes the
+/// trellis as `trellis_pm` on 16 KiB pages (docs/pack-format.md#tile-order); the pack order is the default.
+pub const Naming = struct { nest: []const u8, file: []const u8, pair_major: bool = false };
+
+/// `writeGroups` under a caller's names (DeepSeek-V4.1: `model.layers.{L}` and the DSpark stages' `mtp.{i}`).
+pub fn writeGroupsNamed(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, naming: Naming, groups: []const Group, dec: format.Decode, provenance: []const [2][]const u8) !void {
+    if (groups.len == 0 or groups.len > api.group_layout.max_groups) return error.BankShape;
+    for (naming.nest) |c| if (!nameChar(c)) return error.PrefixMismatch;
+    try writeNamed(allocator, io, dir, naming, groups, true, dec, provenance);
+}
+
+fn writeShard(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, prefix: []const u8, layer: u32, groups: []const Group, named: bool, dec: format.Decode, provenance: []const [2][]const u8) !void {
     if (!prefixOk(prefix)) return error.PrefixMismatch;
-    if (banks.rate.n % 2 != 0 or banks.rate.n < format.Rate.min_n or banks.rate.n > format.Rate.max_n) return error.RateUnsupported;
-    if (banks.dec.window.bits() < 12 or banks.dec.window.bits() > 16) return error.WindowUnsupported;
-    if (!bankOk(banks.gate, banks.rate) or !bankOk(banks.up, banks.rate) or !bankOk(banks.down, banks.rate)) return error.BankShape;
     var name_buf: [64]u8 = undefined;
     const final_name = if (std.mem.eql(u8, prefix, mtp_prefix)) try mtpShardFileName(&name_buf, layer) else try shardFileName(&name_buf, layer);
+    var nest_buf: [96]u8 = undefined;
+    const nest = try std.fmt.bufPrint(&nest_buf, "{s}.layers.{d}", .{ prefix, layer });
+    try writeNamed(allocator, io, dir, .{ .nest = nest, .file = final_name }, groups, named, dec, provenance);
+}
+
+fn writeNamed(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, naming: Naming, groups: []const Group, named: bool, dec: format.Decode, provenance: []const [2][]const u8) !void {
+    if (dec.window.bits() < 12 or dec.window.bits() > 16) return error.WindowUnsupported;
+    for (groups) |g| for (g.banks, g.rates) |b, rate| {
+        if (rate.n % 2 != 0 or rate.n < format.Rate.min_n or rate.n > format.Rate.max_n) return error.RateUnsupported;
+        if (!bankOk(b, rate) or b.experts != g.banks[0].experts) return error.BankShape;
+    };
+    const final_name = naming.file;
     if (dir.statFile(io, final_name, .{})) |_| return error.ShardExists else |_| {}
 
-    var k_buf: [16]u8 = undefined;
-    const k_text = banks.rate.kText(&k_buf);
-    const quant = try std.fmt.bufPrint(quant_buf, "{{\"format\":\"exl3\",\"k\":{s},\"codebook\":\"{s}\",\"window\":{d}}}", .{ k_text, @tagName(banks.dec.codebook), banks.dec.window.bits() });
-
-    const file_bytes = try packShard(allocator, prefix, layer, banks, k_text);
+    const file_bytes = try packShard(allocator, naming, groups, named, dec, provenance);
     defer allocator.free(file_bytes);
     var tmp_name_buf: [80]u8 = undefined;
     const tmp_name = try std.fmt.bufPrint(&tmp_name_buf, ".{s}.tmp", .{final_name});
-    try dir.writeFile(io, .{ .sub_path = tmp_name, .data = file_bytes });
+    try writeFileChunked(io, dir, tmp_name, file_bytes, write_chunk);
     publish(io, dir, tmp_name, final_name) catch |err| {
         if (!keepTemp(err)) dir.deleteFile(io, tmp_name) catch {};
         return err;
     };
-    return quant;
+}
+
+/// macOS refuses one write of 2 GiB or more (EINVAL), and a DeepSeek layer's shard is over 3 GB.
+const write_chunk: usize = 1 << 30;
+
+fn writeFileChunked(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, bytes: []const u8, chunk: usize) !void {
+    var file = try dir.createFile(io, sub_path, .{});
+    defer file.close(io);
+    var at: usize = 0;
+    while (at < bytes.len) : (at += chunk) try file.writeStreamingAll(io, bytes[at..][0..@min(chunk, bytes.len - at)]);
 }
 
 fn prefixOk(prefix: []const u8) bool {
     if (!std.mem.eql(u8, prefix, trunk_prefix) and !std.mem.eql(u8, prefix, mtp_prefix)) return false;
-    for (prefix) |c| {
-        if (!((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.')) return false;
-    }
+    for (prefix) |c| if (!nameChar(c)) return false;
     return true;
+}
+
+fn nameChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_' or c == '.';
 }
 
 fn bankOk(bank: Bank, rate: format.Rate) bool {
@@ -100,55 +151,93 @@ fn publish(io: std.Io, dir: std.Io.Dir, tmp_name: []const u8, final_name: []cons
 }
 
 fn linkFailure(errno: c_int) error{ ShardExists, PublishFailed }!void {
-    return if (errno == @intFromEnum(std.c.E.EXIST)) error.ShardExists else error.PublishFailed;
+    return if (errno == @backingInt(std.c.E.EXIST)) error.ShardExists else error.PublishFailed;
 }
 
 fn keepTemp(err: anyerror) bool {
     return err == error.PublishFailed;
 }
 
-fn packShard(allocator: std.mem.Allocator, prefix: []const u8, layer: u32, banks: Layer, k_text: []const u8) ![]u8 {
-    const projs = [_]struct { name: []const u8, bank: Bank }{
-        .{ .name = "gate_proj", .bank = banks.gate },
-        .{ .name = "up_proj", .bank = banks.up },
-        .{ .name = "down_proj", .bank = banks.down },
+/// The page a pair-major trellis starts on, in the file, and the pad tensors' name prefix: the layout rule of `sushi repack`
+/// (`src/dsv41/repack.zig`), kept here until the two share it.
+pub const page: usize = api.group_layout.page;
+pub const pad_prefix = api.group_layout.pad_prefix;
+
+fn packShard(allocator: std.mem.Allocator, naming: Naming, groups: []const Group, named: bool, dec: format.Decode, provenance: []const [2][]const u8) ![]u8 {
+    const nest = naming.nest;
+    const pm = naming.pair_major;
+    const proj_names = [3][]const u8{ "gate_proj", "up_proj", "down_proj" };
+    var widest = format.Rate{ .n = 0 };
+    for (groups) |g| for (g.rates) |r| {
+        widest.n = @max(widest.n, r.n);
     };
+    var k_buf: [16]u8 = undefined;
     var header = std.ArrayList(u8).empty;
     defer header.deinit(allocator);
-    try header.print(allocator, "{{\"__metadata__\":{{\"format\":\"exl3\",\"k\":\"{s}\",\"codebook\":\"{s}\",\"window\":\"{d}\"", .{ k_text, @tagName(banks.dec.codebook), banks.dec.window.bits() });
-    for (banks.provenance) |pair| {
+    try header.print(allocator, "{{\"__metadata__\":{{\"format\":\"{s}\",\"k\":\"{s}\",\"codebook\":\"{s}\",\"window\":\"{d}\"", .{ formatName(dec.codebook), widest.kText(&k_buf), @tagName(dec.codebook), dec.window.bits() });
+    for (provenance) |pair| {
         try header.print(allocator, ",{f}:{f}", .{ std.json.fmt(pair[0], .{}), std.json.fmt(pair[1], .{}) });
     }
+    if (pm) try header.appendSlice(allocator, ",\"tile_order\":\"pair_major\"");
     try header.appendSlice(allocator, "}");
     var payload = std.ArrayList(u8).empty;
     defer payload.deinit(allocator);
     var offset: usize = 0;
-    for (projs) |proj| {
-        const bank = proj.bank;
+    var pads: usize = 0;
+    const stem = if (std.mem.endsWith(u8, naming.file, ".safetensors")) naming.file[0 .. naming.file.len - ".safetensors".len] else naming.file;
+    for (proj_names, 0..) |proj_name, p| for (groups, 0..) |g, gi| {
+        const bank = g.banks[p];
         const parts = [_]struct { part: []const u8, dtype: []const u8, rank: usize, bytes: []const u8, d1: usize }{
             .{ .part = "trellis", .dtype = "U16", .rank = 4, .bytes = std.mem.sliceAsBytes(bank.trellis), .d1 = bank.in_features / 16 },
             .{ .part = "suh", .dtype = "F16", .rank = 2, .bytes = std.mem.sliceAsBytes(bank.suh), .d1 = bank.in_features },
             .{ .part = "svh", .dtype = "F16", .rank = 2, .bytes = std.mem.sliceAsBytes(bank.svh), .d1 = bank.out_features },
         };
         for (parts) |part| {
+            const permute = pm and part.rank == 4;
+            if (permute and offset % page != 0) {
+                // A gap of zeros that the index lists, so safetensors readers see no hole.
+                const gap = page - offset % page;
+                try header.print(allocator, ",\"{s}{s}.{d}\":{{\"dtype\":\"U8\",\"shape\":[{d}],\"data_offsets\":[{d},{d}]}}", .{ pad_prefix, stem, pads, gap, offset, offset + gap });
+                try payload.appendNTimes(allocator, 0, gap);
+                offset += gap;
+                pads += 1;
+            }
             try header.appendSlice(allocator, ",\"");
-            try header.appendSlice(allocator, prefix);
-            try header.print(allocator, ".layers.{d}.mlp.switch_mlp.", .{layer});
-            try header.appendSlice(allocator, proj.name);
+            try header.appendSlice(allocator, nest);
+            try header.appendSlice(allocator, ".mlp.switch_mlp.");
+            try header.appendSlice(allocator, proj_name);
+            if (named) try header.print(allocator, ".g{d}", .{gi});
             try header.appendSlice(allocator, ".");
             try header.appendSlice(allocator, part.part);
+            if (permute) try header.appendSlice(allocator, "_pm");
             try header.appendSlice(allocator, "\":{\"dtype\":\"");
             try header.appendSlice(allocator, part.dtype);
-            try header.print(allocator, "\",\"shape\":[{d},{d}", .{ bank.experts, part.d1 });
-            if (part.rank == 4) try header.print(allocator, ",{d},{d}", .{ bank.out_features / 16, banks.rate.n });
+            if (permute) {
+                try header.print(allocator, "\",\"shape\":[{d},{d},{d},2,{d}", .{ bank.experts, bank.out_features / 32, part.d1, g.rates[p].n });
+            } else {
+                try header.print(allocator, "\",\"shape\":[{d},{d}", .{ bank.experts, part.d1 });
+                if (part.rank == 4) try header.print(allocator, ",{d},{d}", .{ bank.out_features / 16, g.rates[p].n });
+            }
             const end = offset + part.bytes.len;
             try header.print(allocator, "],\"data_offsets\":[{d},{d}]}}", .{ offset, end });
-            try payload.appendSlice(allocator, part.bytes);
+            if (permute) {
+                // Each expert's `[IT][OT][n]` tiles become `[OT/2][IT][2][n]`.
+                const it = bank.in_features / 16;
+                const ot = bank.out_features / 16;
+                const per = it * ot * g.rates[p].n * 2;
+                const at = payload.items.len;
+                try payload.resize(allocator, at + part.bytes.len);
+                for (0..bank.experts) |e| {
+                    api.group_layout.tileMajor(u8, payload.items[at + e * per ..][0..per], part.bytes[e * per ..][0..per], it, ot, g.rates[p].n * 2);
+                }
+            } else try payload.appendSlice(allocator, part.bytes);
             offset = end;
         }
-    }
+    };
     try header.appendSlice(allocator, "}");
-    while (header.items.len % 8 != 0) try header.append(allocator, ' ');
+    // The data start is 8-byte aligned, or on a page when the trellis tiles must be.
+    const align_to: usize = if (pm) page else 8;
+    while ((8 + header.items.len) % align_to != 0) try header.append(allocator, ' ');
     var file = std.ArrayList(u8).empty;
     errdefer file.deinit(allocator);
     var len_buf: [8]u8 = undefined;
@@ -417,9 +506,9 @@ test "shard: writing a layer twice refuses instead of clobbering the shard" {
 
 test "shard: only an existing destination is ShardExists; any other link failure keeps the temp" {
     const t = std.testing;
-    try t.expectError(error.ShardExists, linkFailure(@intFromEnum(std.c.E.EXIST)));
-    try t.expectError(error.PublishFailed, linkFailure(@intFromEnum(std.c.E.NOSPC)));
-    try t.expectError(error.PublishFailed, linkFailure(@intFromEnum(std.c.E.ACCES)));
+    try t.expectError(error.ShardExists, linkFailure(@backingInt(std.c.E.EXIST)));
+    try t.expectError(error.PublishFailed, linkFailure(@backingInt(std.c.E.NOSPC)));
+    try t.expectError(error.PublishFailed, linkFailure(@backingInt(std.c.E.ACCES)));
     try t.expect(keepTemp(error.PublishFailed));
     try t.expect(!keepTemp(error.ShardExists));
 }
@@ -474,4 +563,87 @@ test "shard: the MTP head's bank takes its own prefix and file name" {
     defer file.deinit(t.allocator);
     try t.expect(file.tensors.get("language_model.mtp.layers.0.mlp.switch_mlp.down_proj.suh") != null);
     try t.expectError(error.PrefixMismatch, writeLayer(t.allocator, io, tmp.dir, "language_model.other", 0, .{ .gate = bank, .up = bank, .down = bank, .rate = rate, .dec = dec }, &quant_buf));
+}
+
+test "shard: rate groups write .gN banks, each at its own rate, that the engine's group layout accepts and decodes" {
+    const t = std.testing;
+    const io = t.io;
+    const dec = format.Decode{ .codebook = .std1, .window = .w15, .table = api.codebook_tables.indexOf("std1") };
+    const sizes = [2]usize{ 2, 1 };
+    const rates = [2][3]format.Rate{ .{ .{ .n = 48 }, .{ .n = 48 }, .{ .n = 24 } }, .{ .{ .n = 32 }, .{ .n = 32 }, .{ .n = 40 } } };
+    var prng = std.Random.DefaultPrng.init(23);
+    var groups: [2]Group = undefined;
+    for (&groups, sizes, rates) |*g, e, r| {
+        for (&g.banks, r) |*b, rate| b.* = try fillBank(t.allocator, &prng, e, 128, 128, rate, dec);
+        g.rates = r;
+    }
+    defer for (groups) |g| for (g.banks) |b| {
+        t.allocator.free(b.trellis);
+        t.allocator.free(b.suh);
+        t.allocator.free(b.svh);
+    };
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeGroups(t.allocator, io, tmp.dir, "language_model.model", 4, &groups, dec, &.{});
+
+    const raw = try tmp.dir.readFileAlloc(io, "layer-4.safetensors", t.allocator, .limited(1 << 22));
+    defer t.allocator.free(raw);
+    const aligned = try t.allocator.alignedAlloc(u8, .of(u16), raw.len);
+    defer t.allocator.free(aligned);
+    @memcpy(aligned, raw);
+    var file = try st.parse(t.allocator, aligned);
+    defer file.deinit(t.allocator);
+    try t.expectEqualStrings("stq", file.metadata.get("format").?);
+    try t.expectEqualStrings("3", file.metadata.get("k").?);
+    try t.expectEqualStrings("std1", file.metadata.get("codebook").?);
+
+    var plan = api.GroupLayout.init(128, 128, .{ .n = 48 });
+    const prefix = "language_model.model.layers.4.mlp.switch_mlp.";
+    var it = file.tensors.iterator();
+    while (it.next()) |entry| {
+        const view = entry.value_ptr.*;
+        var shape: [4]u64 = undefined;
+        for (view.shape, 0..) |d, i| shape[i] = d;
+        const dtype: api.group_layout.Dtype = if (std.mem.endsWith(u8, entry.key_ptr.*, ".trellis")) .u16 else .f16;
+        _ = try plan.add(entry.key_ptr.*[prefix.len..], shape[0..view.shape.len], dtype);
+    }
+    try plan.finish(3, 1, false, 3);
+
+    const projs = [_][]const u8{ "gate_proj", "up_proj", "down_proj" };
+    for (groups, 0..) |g, gi| for (projs, g.banks, g.rates) |proj, bank, rate| {
+        var key: [160]u8 = undefined;
+        const view = file.tensors.get(try std.fmt.bufPrint(&key, "{s}{s}.g{d}.trellis", .{ prefix, proj, gi })).?;
+        try t.expectEqual(@as(u64, rate.n), view.shape[3]);
+        const got = Bank{
+            .experts = bank.experts,
+            .in_features = 128,
+            .out_features = 128,
+            .trellis = st.slice(u16, view),
+            .suh = st.slice(u16, file.tensors.get(try std.fmt.bufPrint(&key, "{s}{s}.g{d}.suh", .{ prefix, proj, gi })).?),
+            .svh = st.slice(u16, file.tensors.get(try std.fmt.bufPrint(&key, "{s}{s}.g{d}.svh", .{ prefix, proj, gi })).?),
+        };
+        for (0..bank.experts) |e| {
+            const want = try reconstructExpert(t.allocator, bank, e, rate, dec);
+            defer t.allocator.free(want);
+            const have = try reconstructExpert(t.allocator, got, e, rate, dec);
+            defer t.allocator.free(have);
+            try t.expectEqualSlices(u16, want, have);
+        }
+    };
+}
+
+test "shard: a file written in chunks has the bytes of one write" {
+    const t = std.testing;
+    const io = t.io;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var bytes: [100]u8 = undefined;
+    for (&bytes, 0..) |*b, i| b.* = @intCast(i * 7 % 251);
+    for ([_]usize{ 1, 7, 100, 1000 }) |chunk| {
+        try writeFileChunked(io, tmp.dir, "out.bin", &bytes, chunk);
+        const got = try tmp.dir.readFileAlloc(io, "out.bin", t.allocator, .limited(1 << 10));
+        defer t.allocator.free(got);
+        try t.expectEqualSlices(u8, &bytes, got);
+        try tmp.dir.deleteFile(io, "out.bin");
+    }
 }

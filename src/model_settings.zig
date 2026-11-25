@@ -29,7 +29,7 @@ pub const default_max_request_mb: u32 = 128;
 pub const max_request_mb_limit: u32 = 1024;
 /// The safety margin under the GPU memory limit, in GiB: `--wired-margin-gib` and `server.wired_margin_gib` share it.
 pub const default_wired_margin_gib: u32 = 1;
-pub const wired_margin_gib_min: u32 = 1;
+pub const wired_margin_gib_min: u32 = 0;
 pub const wired_margin_gib_max: u32 = 32;
 
 /// `--expert-cache-bias <n>`; null = not given. It outranks a model's `expert_cache_bias`.
@@ -185,13 +185,17 @@ pub const Override = struct {
     max_tokens: ?u32 = null,
     /// The YaRN factor the config is parsed with; null = the config.json's own RoPE.
     yarn_factor: ?u8 = null,
-    /// DeepSeek-V4.1's cache-favoring pick (`--expert-cache-bias`), lossy; 0 = exact routing.
+    /// The cache-favoring pick (`--expert-cache-bias`, DeepSeek-V4.1 and Hy4-Flash), lossy; 0 = exact routing.
     expert_cache_bias: ?f32 = null,
+    /// The rows a static-bill load's prefill chunk is chosen within (`--prefill-chunk-max` / `--prefill-chunk-min`).
+    prefill_chunk_max: ?u32 = null,
+    prefill_chunk_min: ?u32 = null,
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null and o.expert_cache_bias == null;
+            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null and o.expert_cache_bias == null and
+            o.prefill_chunk_max == null and o.prefill_chunk_min == null;
     }
 };
 
@@ -267,6 +271,9 @@ fn fromValue(v: std.json.Value) Override {
     };
     if (obj.get("max_tokens")) |g| if (accepts("max_tokens", g)) {
         o.max_tokens = @intCast(g.integer);
+    };
+    inline for (.{ "prefill_chunk_max", "prefill_chunk_min" }) |key| if (obj.get(key)) |g| if (accepts(key, g)) {
+        @field(o, key) = @intCast(g.integer);
     };
     if (obj.get("yarn_factor")) |g| if (accepts("yarn_factor", g)) {
         o.yarn_factor = std.fmt.parseInt(u8, yarnChoice(g).?, 10) catch unreachable;
@@ -405,7 +412,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         _ = warnRejected(model_path, obj, &model_keys);
         _ = warnRemoved(model_path, obj);
     }
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} ds41_cooler={s} qwen_cooler={s} max_tokens={d} yarn_factor={d} expert_cache_bias={d}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} ds41_cooler={s} qwen_cooler={s} max_tokens={d} yarn_factor={d} expert_cache_bias={d} prefill_chunk_max={?d} prefill_chunk_min={?d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -420,6 +427,8 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         o.max_tokens orelse 0,
         o.yarn_factor orelse 0,
         o.expert_cache_bias orelse 0,
+        o.prefill_chunk_max,
+        o.prefill_chunk_min,
     });
     return o;
 }
@@ -476,6 +485,8 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "max_tokens", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
     .{ .name = "yarn_factor", .kind = .choice, .choices = &.{ "2", "4" }, .normalize = yarnChoice },
     .{ .name = "expert_cache_bias", .kind = .number, .min = 0, .max = expert_cache_bias_max },
+    .{ .name = "prefill_chunk_max", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
+    .{ .name = "prefill_chunk_min", .kind = .int, .min = 1, .max = std.math.maxInt(u32) },
 };
 
 /// Server-wide keys, under the file's `"server"` object (a model's key is its absolute path, so the two never meet).
@@ -518,7 +529,7 @@ pub const Fit = struct {
     stq_experts: bool = true,
     /// The arch has an expert prefetcher (`arch/admission.zig` `ExpertStreamTraits.prefetch`). It keeps no KV cache either.
     prefetch: bool = false,
-    /// The arch's router takes `expert_cache_bias` (`ExpertStreamTraits.cache_bias`).
+    /// The arch's router favours the experts its cache holds (`ExpertStreamTraits.cache_bias`).
     cache_bias: bool = false,
     /// The `kv_quant` spellings the cache stores, when it stores fewer than all of them; empty = every width.
     kv_choices: []const []const u8 = &.{},
@@ -534,6 +545,8 @@ pub const Fit = struct {
     window_default: u32 = 0,
     /// The model setting that turns this arch's Sushi Cooler off; null for an arch without the engine.
     cooler_setting: ?[]const u8 = null,
+    /// The widest prefill chunk a load on the static bill may fix (`arch_config.staticChunkMax`); 0 = not on it.
+    static_chunk_max: u32 = 0,
 };
 
 /// The context window the model has once `yarn_factor` (null = unset) is applied; 0 = unknown.
@@ -599,10 +612,12 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
     }
     if (eql(u8, key, "preserve_thinking")) return if (fit.template_preserves_thinking) null else "This model's chat template has no preserve-thinking switch.";
     if (eql(u8, key, "yarn_factor")) return if (fit.reads_yarn) null else "This model's RoPE has no YaRN context extension.";
+    if (eql(u8, key, "prefill_chunk_max") or eql(u8, key, "prefill_chunk_min"))
+        return if (fit.static_chunk_max != 0) null else "Only a load on the static bill fixes its prefill chunk; this model's is chosen per request.";
     if (eql(u8, key, "think_penalty")) return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
     if (eql(u8, key, "expert_cache_bias")) {
-        // The pick runs in the router, on the STQ layers whose cache map the GPU holds.
-        if (!fit.cache_bias) return "Only DeepSeek-V4.1's and Qwen3.8's routers can favour the experts already in memory.";
+        // The pick runs in the arch's router, on the rate-grouped (STQ) layers whose cache map the GPU holds.
+        if (!fit.cache_bias) return "This model's router cannot favour the experts already in memory.";
         if (!fit.streams_experts) return "This model does not stream its experts from SSD.";
         if (!fit.stq_experts) return "This pack has no STQ experts, so its router has no cached experts to favour.";
     }
@@ -651,6 +666,10 @@ pub fn limit(key: []const u8, fit: Fit) Limit {
         l.why = "An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.";
     }
     if (eql(u8, key, "ctx_size") or eql(u8, key, "max_tokens")) l.max = fit.context_cap;
+    if (eql(u8, key, "prefill_chunk_max") or eql(u8, key, "prefill_chunk_min")) {
+        l.max = fit.static_chunk_max;
+        l.why = "No wider than the widest forward this model runs.";
+    }
     return l;
 }
 
@@ -668,10 +687,29 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
         const lim = limit(e.key, fit);
         if (lim.disabled) return .{ .key = e.key, .why = lim.why };
         if (v == .string and !choiceAllowed(e.key, v.string, fit)) return .{ .key = e.key, .why = "This model's cache cannot store that width." };
-        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = maxWhy(buf, lim.max) };
+        if (isChunkBound(e.key) and v == .integer and !settings_resolve.isStaticChunkRung(@intCast(@max(v.integer, 0))))
+            return .{ .key = e.key, .why = "This model's prefill chunk is one of " ++ settings_resolve.static_chunk_rungs_text ++ "." };
+        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = if (lim.why.len > 0) lim.why else maxWhy(buf, lim.max) };
         for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
     }
+    if (chunkMinAboveMax(existing, edits, buf)) |r| return r;
     return ctxAboveWindow(fit, existing, edits, buf);
+}
+
+fn isChunkBound(key: []const u8) bool {
+    return std.mem.eql(u8, key, "prefill_chunk_max") or std.mem.eql(u8, key, "prefill_chunk_min");
+}
+
+/// A `prefill_chunk_min` the save leaves above its `prefill_chunk_max`; null when they hold or the save touches neither.
+fn chunkMinAboveMax(existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    var touches = false;
+    for (edits) |e| touches = touches or std.mem.eql(u8, e.key, "prefill_chunk_max") or std.mem.eql(u8, e.key, "prefill_chunk_min");
+    if (!touches) return null;
+    const max = stateOf(existing, edits, "prefill_chunk_max") orelse return null;
+    const min = stateOf(existing, edits, "prefill_chunk_min") orelse return null;
+    if (max != .integer or min != .integer or min.integer <= max.integer) return null;
+    const why = std.fmt.bufPrint(buf, "prefill_chunk_min {d} is above prefill_chunk_max {d}; lower the min or raise the max", .{ min.integer, max.integer }) catch "prefill_chunk_min is above prefill_chunk_max";
+    return .{ .key = "prefill_chunk_min", .why = why };
 }
 
 /// A key's value once `edits` land on `existing`; null = unset.
@@ -1156,9 +1194,10 @@ test "model_settings: expert_cache_bias is a number from 0 to 2, anything else i
     );
 }
 
-test "model_settings: expert_cache_bias shows only for a DeepSeek or Qwen pack whose STQ experts stream" {
+test "model_settings: expert_cache_bias shows only for a pack whose router favours cached experts and whose STQ experts stream" {
     const t = std.testing;
     const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .cache_bias = true, .streams_experts = true, .has_vision = true };
+    try t.expect(applies("expert_cache_bias", .{ .arch = "hy_v4_flash", .cache_bias = true, .streams_experts = true, .has_vision = true }));
     try t.expect(applies("expert_cache_bias", dsv));
     var not_stq = dsv;
     not_stq.stq_experts = false;
@@ -1169,7 +1208,7 @@ test "model_settings: expert_cache_bias shows only for a DeepSeek or Qwen pack w
     const qwen: Fit = .{ .arch = "qwen4_exp", .cache_bias = true, .streams_experts = true, .has_vision = true };
     try t.expect(applies("expert_cache_bias", qwen));
     const glm: Fit = .{ .arch = "glm5_next", .streams_experts = true, .has_vision = false };
-    try t.expectEqualStrings("Only DeepSeek-V4.1's and Qwen3.8's routers can favour the experts already in memory.", unavailable("expert_cache_bias", glm).?);
+    try t.expectEqualStrings("This model's router cannot favour the experts already in memory.", unavailable("expert_cache_bias", glm).?);
 }
 
 test "model_settings: preserve_thinking is a bool, anything else is unset" {
@@ -1304,7 +1343,8 @@ test "model_settings: server.wired_margin_gib reads an integer from the lowest t
     for ([_]struct { value: []const u8, want: ?u32 }{
         .{ .value = "1", .want = 1 },
         .{ .value = "32", .want = 32 },
-        .{ .value = "0", .want = null },
+        .{ .value = "0", .want = 0 },
+        .{ .value = "-1", .want = null },
         .{ .value = "33", .want = null },
         .{ .value = "1.5", .want = null },
         .{ .value = "\"4\"", .want = null },
@@ -1639,4 +1679,44 @@ test "model_settings: Sushi Cooler is on unless the flag, else the model's ds41_
     const opt = .{ .flag = "--ds41-mlx-engine", .setting = "ds41_cooler" };
     try t.expectEqualStrings("--ds41-mlx-engine", flagged.sourceName(opt));
     try t.expectEqualStrings("model-settings.json ds41_cooler", off.sourceName(opt));
+}
+
+test "model_settings: prefill_chunk_max and prefill_chunk_min are one of 512, 1024, 2048, 4096 and 8192 rows, honoured only on the static bill, and a save never leaves the min above the max" {
+    const t = std.testing;
+    var s = try parse(t.allocator,
+        \\{"/m/a": {"prefill_chunk_max": 4096, "prefill_chunk_min": 1024}, "/m/b": {"prefill_chunk_max": 0, "prefill_chunk_min": "512"}}
+    );
+    defer s.deinit();
+    try t.expectEqual(@as(?u32, 4096), s.lookup("/m/a").prefill_chunk_max);
+    try t.expectEqual(@as(?u32, 1024), s.lookup("/m/a").prefill_chunk_min);
+    try t.expectEqual(@as(?u32, null), s.lookup("/m/b").prefill_chunk_max);
+    try t.expectEqual(@as(?u32, null), s.lookup("/m/b").prefill_chunk_min);
+    try t.expect((Override{ .prefill_chunk_min = 512 }).isEmpty() == false);
+
+    const static: Fit = .{ .arch = "static", .streams_experts = false, .has_vision = false, .static_chunk_max = 8192 };
+    const other: Fit = .{ .arch = "other", .streams_experts = false, .has_vision = false };
+    var buf: [160]u8 = undefined;
+    for ([_][]const u8{ "prefill_chunk_max", "prefill_chunk_min" }) |key| {
+        try t.expect(applies(key, static));
+        try t.expect(limit(key, other).disabled);
+        try t.expectEqual(@as(u32, 8192), limit(key, static).max);
+        const edit: Edit = .{ .key = key, .value = .{ .integer = 2048 } };
+        try t.expect(refuseEdits(static, null, &.{edit}, &buf) == null);
+        try t.expectEqualStrings(key, refuseEdits(other, null, &.{edit}, &buf).?.key);
+        for ([_]i64{ 256, 3000, 4095, 8193, 16384 }) |rows| {
+            const off = refuseEdits(static, null, &.{.{ .key = key, .value = .{ .integer = rows } }}, &buf).?;
+            try t.expectEqualStrings(key, off.key);
+            try t.expectEqualStrings("This model's prefill chunk is one of 512, 1024, 2048, 4096 or 8192 rows.", off.why);
+        }
+        for ([_]i64{ 512, 1024, 4096, 8192 }) |rows| try t.expect(refuseEdits(static, null, &.{.{ .key = key, .value = .{ .integer = rows } }}, &buf) == null);
+    }
+    const min_above = refuseEdits(static, null, &.{ .{ .key = "prefill_chunk_max", .value = .{ .integer = 1024 } }, .{ .key = "prefill_chunk_min", .value = .{ .integer = 2048 } } }, &buf).?;
+    try t.expectEqualStrings("prefill_chunk_min", min_above.key);
+    try t.expectEqualStrings("prefill_chunk_min 2048 is above prefill_chunk_max 1024; lower the min or raise the max", min_above.why);
+    // Judged against what the file keeps: lowering the max under a saved min is refused, equal values force the chunk.
+    var existing: std.json.ObjectMap = .empty;
+    defer existing.deinit(t.allocator);
+    try existing.put(t.allocator, "prefill_chunk_min", .{ .integer = 2048 });
+    try t.expect(refuseEdits(static, existing, &.{.{ .key = "prefill_chunk_max", .value = .{ .integer = 1024 } }}, &buf) != null);
+    try t.expect(refuseEdits(static, existing, &.{.{ .key = "prefill_chunk_max", .value = .{ .integer = 2048 } }}, &buf) == null);
 }

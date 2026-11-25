@@ -6,6 +6,32 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **`sushi kld --help` and `/metrics` say what they serve**: kld's help states the wired margin's 0..32 GiB range its
+  parser takes, and `sushi:spec_rows_total`'s help names both block drafters (`dspark, dfly2`), not DSpark alone.
+- **Hy4-Flash's speculative decoding reports as DFly2, its own drafter**: `[spec-stats]`, the metrics' `mode` label, the bench and the dashboard said `dspark`, DeepSeek's unrelated drafter, for a Hy4-Flash request. The shared rounds both drafters use carry generic drafter names (`drafter_round.zig`, `[drafter-round]` log lines), and Hy4-Flash's round-width diagnostic is `SUSHI_HY4_DFLY2_ROWS`.
+- **A Hy4-Flash load that cannot fit its narrowest prefill chunk is refused at once**: where the context alone does
+  not fit the memory left, the refusal comes before the load records its plans, and says how much it needs at least.
+- **A second Hy4-Flash load of the same build and pack starts sooner**: it reads the prefill region its first load
+  measured back from beside the pipeline manifest instead of measuring it again.
+- **Hy4-Flash drafts faster after a missed guess, with the same text**: a DFly2 round keeps the tokens it accepted
+  from the verify instead of running them through the model again, so a round after a rejection costs about a
+  quarter of what it did.
+- **A Hy4-Flash prefill chunk deep in a long conversation runs in the region its load measured**: an 8,192-row chunk
+  at a middle depth could ask past it and fail the request (`WideFull`); a chunk past the first 2,048 tokens now runs
+  laid out as its class's deepest recording, which the load measures, and a load takes several seconds more to
+  measure them.
+- **Hy4-Flash prefills long prompts faster at the same output**: a chunk scores its indexer's groups in one tiled
+  launch, byte for byte, the part of a chunk that grows with its context.
+- **Sushibar's loading icon moves while a model loads**: the fish's orange sweeps toward its top right and back as
+  the green slot blinks; under Reduce motion it stays still.
+- **Sushibar's menu bar icon lights its disk slot green whenever a server answers**: a dark-set green bar replaces the
+  black slot on the no-model, loading and ready icons, and the no-model icon draws the striped fish of the offline one.
+- **`--wired-margin-gib` takes 0**: the Cooler bill holds the exact bytes a load and its requests use, so a raised `iogpu.wired_limit_mb` can be planned to without a spare gibibyte; the default stays 1, as does `server.wired_margin_gib`'s.
+- **A Hy4-Flash load with `--ctx-size` plans only to that context**: its plans and the prefill region it measures were recorded to the model's 1M-token cap whatever the context, holding arena and load time no request could use.
+- **Hy4-Flash on an M1 or M2 Mac gathers its STQ embedding on the GPU, as newer Macs do**: a DFly2 draft no longer waits on the GPU once for every slot, and the load no longer decodes the embedding on the CPU for each dry plan recording, with the same output.
+- **Hy4-Flash loads on an M1 or M2 Mac**: those GPUs grant its hyper-connection kernels and its sampler fewer than 1,024 threads a group, and the load failed with a Metal error or a missed plan; each kernel now runs at the widest group the GPU grants it, learned before the load records its plans.
+- **A Hy4-Flash load that skips its warm (a manifest of the same build) compiles nothing inside a request**: a prompt past a restored prefix took a matrix layout no warm forward runs; the first product of a dtype now makes every layout's tiles, on worker threads.
+- **A Hy4-Flash STQ load serves a prompt whose ids fall in a few blocks of the vocabulary**, where the warm's own prompt asked past the region the load measured and the load failed (`WideFull`): the embedding gather now asks what its recording asked whichever blocks the ids touch.
 - **`"return_progress": true` streams the prefill's progress, llama.cpp's shape**: while the prompt reads, a stream
   carries `prompt_progress` chunks (`total`, `cache`, `processed`, `time_ms`) beside the usual empty delta — one per
   prefill chunk the engine forwards (8,192 tokens at the default width) and a 0% one as processing starts, on
@@ -15,7 +41,59 @@ earlier history is mlx-serve's, in that project's changelog.
   as llama.cpp's server documents. A non-streaming request ignores the field, and a surface that does not read it
   (Messages, Responses) refuses it by name.
 - **A server asked to stop no longer keeps a connection open for up to a minute**: a reply blocked on a client that stopped reading, a request waiting for a model to unload or a cache to clear, and the wait for unloaded memory now end at the shutdown.
+- **A Hy4-Flash draw that misses its plan is refused by name and the load keeps serving**, where the server aborted on the next draw's token block.
 - **A fully resident DeepSeek load decodes several requests at once up to 8% faster with the same text**: the joined requests look up their Engram tables in one read instead of one each (M5 Ultra, 2.7bpw: 160 to 168 tok/s at 16 requests; one request unchanged).
+- **A finished Hy4-Flash request's state is parked when the inference thread finishes it**, not when its connection thread completes it, so a connection that completes late no longer parks the next request's state or leaves the finished one's reservation in the next one's way.
+- **A Hy4-Flash request is priced once, with its images, wherever its memory bill is read**: the connection thread's refusal, the scheduler's hold and the admission now agree, so the max_tokens a refusal names is served (or held to wait), an image request is held beside a running one instead of refused at its prefill, a request that waits is no longer refused for the pixels of the one running.
+- **A Hy4-Flash request no longer reserves the SSD writer's whole permit whatever its length**: with the SSD tier on every request reserved about 1.2 GB for the copy its restore point stages, so a 4k request reserved 1,265 MB and now reserves 251 MB (a 32k one 1,576 MB, now 872 MB); the copy is billed at the request's own state, at most the permit, and the context a load advertises follows.
+- **A Hy4-Flash load refused at its seal for a `--ctx-size` or `ctx_size` its lines no longer hold names the setting it came from and the widest prefill chunk that holds it**: the refusal always said `--ctx-size`, and its chunk was chosen on an arena priced below the whole pages Metal allocates and before the warm's pipelines were known.
+- **A Hy4-Flash load's preflight prices its warm's longest request at the widest prefill chunk the load may fix**, not at 512 rows, so a load whose widest chunk's request does not fit the free memory is refused by its preflight instead of at its warm; the streamed fit's serving request no longer adds 2,048 tokens of the old bill.
+- **A Hy4-Flash load refused by its memory budget is no longer stored as the pack's failure**: a `--ctx-size` or chunk the budget does not hold (`ContextDoesNotFit`, `ModelBillPastBudget`, `PrefillChunkDoesNotFit`, and `WarmChunkDoesNotFit` on any load) answered every later request from the stored failure, where it now goes back to `unloaded` and the next load re-reads `model-settings.json`.
+- **A streamed Hy4-Flash load whose expert cache holds fewer slots a layer than a prefill chunk has experts no longer runs a group per pick**: its groups followed the picks' order, so a chunk of thousands of rows made thousands of groups, each a whole routed chain over every pick, and a load's warm never ended; a group now holds each of its experts' picks whole, so a chunk's groups are its experts over the slots.
+- **A Hy4-Flash load in a process that ran a `sushi kld` load no longer keeps its f32 products**: a capture set them process-wide and nothing put them back, so a later load measured a larger region and ran at f32.
+- **A Hy4-Flash DFly2 round forced past eight rows (`SUSHI_HY4_DFLY2_ROWS`) is refused by name on a load that plans** (`Hy4ReadoutPastBlock`) instead of failing in MLX on a logits write.
+- **`sushi kld capture --layer-major` on Hy4-Flash bills a window by the pieces it runs**: a window past 8,192 rows was refused (`Hy4ChunkTooWide`) though its pieces of the prompt chunk run, and one past a chunk was billed a forward wider than any piece.
+- **A Hy4-Flash prefill chunk that crosses the selection threshold no longer asks more host memory than its load measured**: the region probed the state's start and its deepest only, and a chunk whose span the threshold cuts asks more of the host ring in between and was refused (`WideFull`), so the load now probes the cut too.
+- **A forced tool call on Hy4-Flash no longer fails the draw after its last forced token under the think penalty**: that token reached the next draw as a host array, which its planned sample refused (`PlanMiss`) in every think-penalty kind that reads ids.
+- **A Hy4-Flash request that does not draft is billed the blocks its DFly2 load holds for it**: the bill added the round's mark, selections and hidden state only for a request running a round, while the load reserves them for every request, so a request without a round (the drafter off for it) was under-billed by them.
+- **Hy4-Flash prefills about 3% faster at the same output**: its widest trunk projections run decoded on the matrix
+  units, with a tile that reuses the weight from cache, and the output projection's input is prepared where its rows
+  are written.
+- **Hy4-Flash decodes about 4% faster with the same text**: a decode row's attention runs its scores, softmax and value sum as three launches in MLX's own summation order, and the output gate rides the value product.
+- **Hy4-Flash prefill runs its glue in fewer launches, with the same text**: the hyper-connection mix, the router's pick, the attention gate and the indexer's projections run once a chunk or inside the launch beside them, and rows stay at the width the next launch reads.
+- **Hy4-Flash checks a speculative block's tokens with its BF16 latent projection in one launch over the block**, reading the weight once instead of once a row.
+- **Hy4-Flash prefill runs its attention on the matrix units on an M5**: a wide prefill span's scores, softmax and value sum are one launch each over the keys where they are stored, with no gathered copy of the picked rows; decode and verify rows are unchanged.
+- **`sushi convert exl3 --trunk-from` beside a Hy4-Flash or DeepSeek-V4.1 source is refused by name** (`TrunkFromUnsupported`) instead of being ignored while the trunk was written again from the source.
+- **Every EXL3/STQ pack's routed shards are checked before any weight loads**: a resident load now refuses a shard whose `tile_order` stamp is missing or disagrees with its config (`Exl3ShardStampMismatch`), as a streamed load did.
+- **`sushi convert exl3` stamps DeepSeek-V4.1's `model-globals.safetensors` at the head's K6**, and refuses a `--drafter-experts-k` off the PAIR1 grid even when `--expert-codebook` is omitted.
+- **`sushi kld capture --layer-major` on DeepSeek-V4.1 writes and resumes its `imatrix.safetensors` on Sushi Cooler**: the capture failed in MLX's file writer, which refuses the engine's arrays; the engine now writes and reads that file itself.
+- **Hy4-Flash drafts with DFly2 by default**: with no `--mtp` flag or `mtp` setting a load now speculates, about 5.5% faster than plain decode on the release pack; `--no-mtp` or the model setting turns it off.
+- **`sushi repack` also rewrites a Hy4-Flash STQ pack into the pair-major layout**, as it does a DeepSeek-V4.1 one; the command no longer belongs to one architecture.
+- **Hy4-Flash STQ packs are read pair-major only**: its routed experts load and stream in the order the decode and prefill kernels read them, with no CPU reshuffle when streaming, and a pack-order Hy4-Flash pack is refused by name until `sushi repack` migrates it.
+- **`sushi convert exl3` writes a Hy4-Flash pack pair-major directly**: the routed experts are `trellis_pm` on 16 KiB pages with the pads, stamps and index `sushi repack` writes, and `--resume` refuses an experts shard of the other tile order (`ResumeTileOrderMismatch`).
+- **`sushi convert exl3` writes a DeepSeek-V4.1 pack pair-major directly**: the routed experts (and DSpark's) are `trellis_pm` on 16 KiB pages with the pads, stamps and index `sushi repack` writes, so a converted pack needs no repack.
+- **`sushi convert exl3` writes a DeepSeek-V4.1 pack's trunk at K4, K5 or K6 and its DSpark stages at rates of their own**: `--trunk-k` (with `--trunk stq`) now sets the trunk banks, `--drafter-k` the DSpark trunk and the new `--drafter-experts-k` DSpark's routed experts; without them the pack is written as before.
+- **`sushi kld capture --layer-major` on Hy4-Flash can also write the head's input rows**: `SUSHI_HY4_HEAD_ROWS=1` adds `calib/head-in.f32`, one f32 row of 3072 per token in window order (12 KB a token), for an end-to-end tuner's teacher logits; with `SUSHI_HY4_CAPTURE_LEAN=1` as well the capture writes and computes nothing else (no rows, routes or sums).
+- **The `[disk-cache] persisted ...` log line calls the SSD tier's total `on SSD=`, not `resident=`**: the figure is the bytes stored on disk, and read as RAM it looked like memory growing.
+- **`--expert-cache-bias` (and the `expert_cache_bias` model setting) now works for a streamed Hy4-Flash STQ pack**: at decode widths its router favours the experts already in memory, so fewer are read from the SSD; it is lossy and off by default.
+- **A Hy4-Flash load with images on no longer compiles its vision tower's kernels inside the first image request**: the tower was never run before the load sealed; it now warms at load, as Qwen's and DeepSeek's do.
+- **Hy4-Flash no longer compiles kernels inside a request for a prompt of more than 32 embedding blocks or one whose last attention span is a few rows long**: the load's warm made neither the join of a second embedding group's rows nor the gate and `W_o` of a trellis pack at the widths of a short tail, so the first such prompt paid a compile mid-request; the load makes them now.
+- **Hy4-Flash advertises the context its own memory bill admits**: the context was sized from per-token rates that leave out the restore points and the widest forward, so on a 128 GB Mac it promised a context a request would be refused at.
+- **Unloading Hy4-Flash no longer drops the kernel caches of another model still loaded on the same side**: its unload freed the
+  EXL3 host arrays of both sides; the last model of a side frees them, as for every other model.
+- **`/props` and the metrics count the state a Hy4-Flash model holds beside its cached entries**: its running state, its restore points and
+  the last request's record were counted nowhere, so the cache and live byte gauges read low by up to a few states.
+- **Hy4-Flash holds less GPU memory after a prefill**: the sliding layers' rings, the pooled keys and the open group were
+  left unevaluated, each holding the last chunk's inputs until the next forward read it; a forward now submits them with its logits.
+- **Hy4-Flash's memory bill now counts the restore points a long prompt keeps and the state's real buffers, and keeps 4 restore points a prefill instead of 16**: a
+  128K prompt is billed 11.5 GB at 8-bit KV instead of 5.4 GB, so a request that would have run out of GPU memory is refused by name.
+- **A streamed Hy4-Flash load with a very small expert cache no longer drops routed picks on a wide prefill chunk**: the picks'
+  group count overflowed 16 bits, so picks past it ran in no group.
+- **A Hy4-Flash turn restored from a cached point just after an image answers as a cold run does**: the restored point read the
+  image's ids as ordinary tokens in Engram's history, so the rest of the prompt hashed to other table rows.
+- **A Hy4-Flash turn after a cancelled or failed request, or under other tools or another image, no longer continues the
+  last turn's cached state**: the live record is now keyed by the model's state, the tools and the image, so the turn
+  restarts from a point it can trust.
 
 ## v1.7.4 — DeepSeek 2.7bpw for 256 GB Macs, and a faster DeepSeek
 

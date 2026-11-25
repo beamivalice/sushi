@@ -7,14 +7,14 @@ const depth_bounds = @import("mtp_depth_bounds.zig");
 const Trunk = trunk.Trunk;
 const testing = std.testing;
 const generate = @import("generate.zig");
-const dspark_rows = @import("dspark_rows.zig");
+const drafter_rows = @import("drafter_rows.zig");
 const sampler = @import("sampler.zig");
 const mtp_policy = @import("mtp_policy.zig");
 const CallForce = generate.CallForce;
 const Constraint = generate.Constraint;
 const Generator = generate.Generator;
 const SamplingParams = sampler.SamplingParams;
-const dsparkEligible = dspark_rows.eligible;
+const drafterEligible = drafter_rows.eligible;
 const penaltyActive = sampler.penaltyActive;
 
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
@@ -513,7 +513,7 @@ test "mtpRefusal: a constraint speculates only where the drafter verifies rows u
     try testing.expectEqualStrings("grammar-constrained output", mtpRefusal(.{ .constraint = &c }).?);
     c.row_masks = true;
     try testing.expect(mtpRefusal(.{ .constraint = &c }) == null);
-    try testing.expect(dsparkEligible(.{ .constraint = &c }));
+    try testing.expect(drafterEligible(.{ .constraint = &c }));
     var proto = rp_mod.Protocol{ .kind = .bare_think };
     c.proto = &proto;
     c.pstate = .{ .phase = .reasoning };

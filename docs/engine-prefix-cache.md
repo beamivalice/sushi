@@ -189,7 +189,11 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   deepest 8 points in RAM, and a prompt sharing its history rolls the model's state back to the deepest one it reaches
   unless a stored point reaches further. Valid only while the model runs the `State.id` the record was published on and a request finished over it.
   Its off-grid points (prompt end, thought) are not written through; `flushLiveDsv41` writes them when the state is about to
-  be lost (handover, unload, 300 s idle, shutdown). A crash restores from the last grid point.
+  be lost (handover, unload, 300 s idle, shutdown). A crash restores from the last grid point. Hy4-Flash's record
+  does the same; both write through `live_points` (`write`, `releaseOffGrid`, `flush`), the arch giving only how a point
+  captures and the rows marker it needs. Hy4-Flash reads a point back with no array made (`DiskTier.restorePointInto`):
+  each tensor of the point's file and of its row segments goes straight into the state block its caller names, at the
+  row it starts from, so a restore at any depth stages nothing beside the state.
 - **With both tiers on, a flushed ringed entry keeps only its newest two ring checkpoints in RAM**
   (`RING_CHECKPOINT_RAM_KEEP`, `releaseRingCpsToDisk` at the end of every `flushPendingDisk`): each older one the SSD
   tier holds a ring file for (`DiskTier.ringPointsHeld`: an unpoisoned entry whose tokens agree through the point) leaves
@@ -529,7 +533,8 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
 - **Restore points sit on an 8192-token grid and at each prompt's end, to 1M tokens, on every arch** (Qwen: the
   checkpoint stride is `prefill_plan.effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless `--prefill-chunk` is wider, which
-  coarsens the grid; GLM: `glm_capture_stride`, [glm5-prefix-cache](glm5-prefix-cache.md); DeepSeek: `row_span`). The SSD
+  coarsens the grid; GLM: `glm_capture_stride`, [glm5-prefix-cache](glm5-prefix-cache.md); DeepSeek and Hy4-Flash:
+  `row_span`, [hy4-flash-arch](hy4-flash-arch.md#the-state-and-the-prefix-cache)). The SSD
   tier keeps 160 per entry (`SSM_DISK_MAX_PER_ENTRY`), so no count thins a conversation below 1M tokens.
   `--ssm-checkpoint-max` (16) caps only the states held in memory (`prefill_plan.thinHeldCheckpoints` skips released ones);
   it never thins what a write-through has put on disk.
@@ -820,6 +825,7 @@ added to its packs and journal to hold them (0 on plain files), so on that layer
 - **The `[disk-cache] persisted ... MB` line is the commit's own writes** (`DiskTier.last_persist_bytes`): its chunks,
   points, QSA history and spec sidecar, all but `meta.json` and `tokens.bin`. It used to leave out the history and the
   sidecar, which at 100k+ tokens were most of a Qwen turn's write.
+  Its trailing `on SSD=` is the tier's total stored bytes (`total_bytes`, what the budget compares to free space), never RAM.
 - **`failed` is apart from `written`**: a blob the writer could not write (a failed `open`/`write`/`rename`), dropped for
   a broken multi-part file or a stale epoch, discarded by a fence (the entry was deleted before it landed), or refused
   at `submit`; a synchronous write that raised counts its tensor payload. A part that landed before its file broke stays
@@ -886,7 +892,7 @@ process start whatever turns `--metrics` on.
 - Disk fingerprints include the model path, config size/mtime and overrides, plus sorted indexed weight-shard (or unindexed safetensors) names and size/mtime and `ngram_table.bin` size/mtime; payloads are statted through symlinks, never content-hashed. A Qwen GDN model adds a layout tag
   (`ModelConfig.cacheLayoutNamespace`): `gdn-f32-state-v1` for the default f32 state, `gdn-gate-f32-v1` for
   `--qwen-gdn 16`, so the two widths never restore each other's checkpoints and entries written under the old bf16
-  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. DeepSeek's tag (`dsv41_prefix.layoutKey`) also names `--drop-expert`'s dropped list (count and a digest of the per-layer ids) and a non-zero `--expert-pick-tolerance` or `--expert-cache-bias` (decode-width picks read the cache, so the states built on them are not an exact boot's); a boot with neither keeps the plain tag. A streamed Qwen's tag (`qwen4_prefix.diskLayoutKey`) names the same two settings (`-pick`, `-cbias`) when non-zero. KV width is not in the namespace: `bestMatch` skips an
+  gate are never restored (`sweepSiblings` collects the orphaned directory). GLM and MiMo hash as before. DeepSeek's tag (`dsv41_prefix.layoutKey`) also names `--drop-expert`'s dropped list (count and a digest of the per-layer ids) and a non-zero `--expert-pick-tolerance` or `--expert-cache-bias` (decode-width picks read the cache, so the states built on them are not an exact boot's); a boot with neither keeps the plain tag. A streamed Qwen's tag (`qwen4_prefix.diskLayoutKey`) and Hy4-Flash's (`hy4_prefix.diskLayoutKey`) names the same two settings (`-pick`, `-cbias`) when non-zero. KV width is not in the namespace: `bestMatch` skips an
   entry whose manifest quant differs from the live one.
 
 - `prefix_cache.ssdFirstActive` = a disk tier AND (capable arch OR RAM retention disabled), mirrored onto `HotPrefixCache.ssd_first` +

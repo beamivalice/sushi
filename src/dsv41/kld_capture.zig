@@ -91,7 +91,7 @@ pub fn accepts(cfg: *const model.ModelConfig, opts: kld.Options) !bool {
     if (opts.hidden_out.len > 0) return error.Dsv41HiddenCaptureUnsupported;
     if (opts.imatrix_windows != 0) return error.Dsv41ImatrixWindowsUnsupported;
     if (opts.tokens != 1) return error.Dsv41LayerMajorNeedsOneRow;
-    if (!opts.no_template or opts.pick_tolerance != 0 or (opts.mtp orelse false) or opts.wired_margin_bytes != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
+    if (!opts.no_template or opts.pick_tolerance != 0 or (opts.mtp orelse false) or (opts.wired_margin_bytes orelse 0) != 0) return error.Dsv41CaptureNeedsLosslessStreaming;
     return true;
 }
 
@@ -1325,7 +1325,7 @@ const Recorder = struct {
     mlp: []std.ArrayList(u8),
     ids: []std.ArrayList(u8),
     weights: []std.ArrayList(u8),
-    dspark_rows: [64]std.ArrayList(u8) = @splat(.empty),
+    drafter_rows: [64]std.ArrayList(u8) = @splat(.empty),
     /// The head's input rows, bf16, in the order the forward made them.
     head: std.ArrayList(u8) = .empty,
     /// Per layer, the sum of the squared down-projection inputs of each expert, `[experts * inter]`.
@@ -1353,7 +1353,7 @@ const Recorder = struct {
         for (self.sums) |row| for (row) |x| if (x) |v| self.a.free(v);
         self.a.free(self.sums);
         self.a.free(self.rows);
-        for (&self.dspark_rows) |*l| l.deinit(self.a);
+        for (&self.drafter_rows) |*l| l.deinit(self.a);
         self.head.deinit(self.a);
         for (self.down) |d| self.a.free(d);
         self.a.free(self.down);
@@ -1378,7 +1378,7 @@ const Recorder = struct {
         if (kind == .ffn_in or kind == .dspark_in) {
             const bytes = try hostBytes(self.a, self.s, x);
             defer self.a.free(bytes);
-            try (if (kind == .ffn_in) &self.mlp[layer] else &self.dspark_rows[layer]).appendSlice(self.a, bytes);
+            try (if (kind == .ffn_in) &self.mlp[layer] else &self.drafter_rows[layer]).appendSlice(self.a, bytes);
             if (kind == .dspark_in) return;
         }
         var sc = Scope.plain(self.a, self.s);
@@ -1683,7 +1683,7 @@ test "deepseek_v41 layer-major capture equals the window-major forward byte for 
                 const got = try readFile(a, io, root, "{s}/calib/dspark-in-{d:0>2}.bf16", .{ name, t });
                 defer a.free(got);
                 try testing.expect(got.len > 0);
-                try testing.expectEqualSlices(u8, rec.dspark_rows[t].items, got);
+                try testing.expectEqualSlices(u8, rec.drafter_rows[t].items, got);
             }
             const calib = try std.fmt.allocPrint(a, "{s}/{s}/calib", .{ root, name });
             defer a.free(calib);
@@ -1804,6 +1804,12 @@ test "deepseek_v41 layer-major capture: flags it takes and refuses, and the batc
     try testing.expect(try accepts(&cfg, bad));
     bad = ok;
     bad.pick_tolerance = 0.1;
+    try testing.expectError(error.Dsv41CaptureNeedsLosslessStreaming, accepts(&cfg, bad));
+    // A wired margin is refused where one is given and is not zero; an omitted flag gives none.
+    bad = ok;
+    bad.wired_margin_bytes = 0;
+    try testing.expect(try accepts(&cfg, bad));
+    bad.wired_margin_bytes = 1 << 30;
     try testing.expectError(error.Dsv41CaptureNeedsLosslessStreaming, accepts(&cfg, bad));
     bad = ok;
     bad.imatrix_out = "/x.safetensors";
@@ -2163,4 +2169,66 @@ test "kld: a deepseek_v41 teacher captures and compare reads it back (DSV41_TINY
     try testing.expectEqual(@as(usize, 2), o.get("prompts").?.array.items.len);
     try testing.expectEqual(@as(f64, 0), try util.jsonNumber(o.get("mean_kld_to_eos").?));
     try testing.expectEqual(@as(f64, 1), try util.jsonNumber(o.get("mean_top1").?));
+}
+
+test "deepseek_v41 layer-major capture runs end to end and resumes on a Sushi Cooler load (DSV41_TINY)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const src = try dsv.fixtureDir();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try stageTiny(a, io, tmp.dir, src);
+    try tmp.dir.writeFile(io, .{ .sub_path = "prompts.jsonl", .data = "{\"id\":\"a\",\"prompt\":\"ab\"}\n{\"id\":\"b\",\"prompt\":\"cd\"}\n" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const prompts = try std.fmt.allocPrint(a, "{s}/prompts.jsonl", .{root});
+    defer a.free(prompts);
+    const out_dir = try std.fmt.allocPrint(a, "{s}/cap", .{root});
+    defer a.free(out_dir);
+
+    var config = try model.parseConfig(io, a, root);
+    config.expert_streaming = true;
+    config.expert_cache_bytes = 3 * config.num_hidden_layers * try dsv_stream.expertBytes(&config.dsv41.?);
+    config.expert_source_dir = try a.dupe(u8, root);
+    @import("../cooler_side.zig").forTest(&config, true);
+    var loaded = kld.Loaded{
+        .allocator = a,
+        .io = io,
+        .config = config,
+        .tok = undefined,
+        .chat_config = undefined,
+        .weights = undefined,
+        .xfm = undefined,
+    };
+    defer loaded.config.deinit(a);
+    loaded.tok = try tokenizer_mod.loadTokenizer(io, a, root);
+    defer loaded.tok.deinit();
+    loaded.weights = try model.loadWeightsForConfig(io, a, root, &loaded.config, false);
+    defer loaded.weights.deinit();
+    loaded.xfm = try model_load.initTrunk(io, a, &loaded.config, &loaded.weights);
+    defer loaded.xfm.deinit();
+
+    var quiet: kld.Out = .{ .silent = true };
+    const opts = kld.Options{
+        .command = .capture,
+        .layer_major = true,
+        .model_dir = root,
+        .prompts = prompts,
+        .out_dir = out_dir,
+        .tokens = 1,
+        .no_template = true,
+    };
+    interrupt_layers_for_test = 10;
+    defer interrupt_layers_for_test = null;
+    try testing.expectError(error.TestInterrupted, runLoaded(a, io, &loaded, opts, 1, chunk_rows, &quiet));
+    interrupt_layers_for_test = null;
+    try runLoaded(a, io, &loaded, opts, 1, chunk_rows, &quiet);
+    var base = try fixture_mod.readBaseline(a, io, out_dir);
+    defer base.deinit();
+    try testing.expectEqual(@as(usize, 2), base.prompts.len);
+    var imatrix = try SumsFile.open(a, io, root, "cap/calib/imatrix.safetensors", .{});
+    defer imatrix.deinit(a);
+    try testing.expect(imatrix.tensor("layers.0.ffn.experts.gate_up_proj") != null);
+    try testing.expect(imatrix.tensor("layers.0.ffn.experts.down_proj") != null);
 }

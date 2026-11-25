@@ -48,7 +48,7 @@ Ranked by what an agent client feels.
 
 1. **Prompt-lookup rounds.** MTP replaces its draft with a verbatim copy of the context when the suffix matches
    (`mtpLookupChain`); DSpark never does, and agent edits repeat their context. Design: `mtp_lookup.Index` over prompt and
-   generated ids, and in `nextDspark` a match with a strong suffix becomes the verify block (up to `ring_slack` = 16 rows,
+   generated ids, and in `nextDrafterRound` a match with a strong suffix becomes the verify block (up to `ring_slack` = 16 rows,
    then `dsv41_serving.dsv41FinishImpl(accepted)` as now); a simple gate (suffix length, expected rows against the 5-row block, since each
    extra row widens the expert union read from SSD). Needs a live measurement of verify ms against rows.
 2. **Prefill throughput.** The routed experts' fill and grouped GEMM are about 55% of a warm chunk
@@ -71,7 +71,7 @@ number), under the GPU lock.
 3. Sampled speculation: one request at `temperature 1, top_p 0.95`, 14k to 28k context, thinking off. Expect
    `[spec-stats] mode=dspark` with `per_draft_pct` between the greedy and zero, and decode above the serial figure.
 4. Thinking bound: Anthropic `/v1/messages` with `thinking: {type: enabled, budget_tokens: 256}`. Expect
-   `[think-bound] reasoning budget 256 reached ...; thought closed`, then `[dspark] resumed after the forced thought close` and `[spec-stats] mode=dspark` counting rounds past the close.
+   `[think-bound] reasoning budget 256 reached ...; thought closed`, then `[drafter] resumed after the forced thought close` and `[spec-stats] mode=dspark` counting rounds past the close.
 5. Penalties: `repeat_penalty 1.2` request; expect `mode=dspark` in its stats line and no repeated-token run.
 6. Boot log: `[kv-cache] off (default)`, no `[mtp] depth range` line; `--kv-quant 4` (and `--qwen-gdn 16`, `--mtp-head-kv-quant`) each exit at start with the named error before any weights load; a settings `kv_quant` boots with
    one ignored line. A request with no thinking field returns `reasoning_content`.
