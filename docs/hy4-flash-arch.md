@@ -670,7 +670,9 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   bytes and the launch count are the one-threadgroup launch's, at one row and at a verify block's 2..8 (a grid of rows
   takes an even count). Each wide pipeline (form, template values, input dtypes) holds its own grant: one a GPU grants
   fewer than `hc_tg` threads keeps one threadgroup a row for the process, as MLX's stream does, and the others stay
-  wide. A served launch latches its pipeline's grant; before a dry recording, `Model.probeWide` latches
+  wide. A one-threadgroup pipeline holds its own threads a group: `hc_tg`, halved until the GPU grants it (an M1 grants
+  the fused forms 640 or 384), latched for the process, and the load lowers `hc_tg` to the widest halving every fused
+  form is granted (`hy4_hc.probeForms`, after `probeIdentity`), so the tiled and fused kernels run at one width and agree. A served launch latches its pipeline's grant; before a dry recording, `Model.probeWide` latches
   every grant the forward needs (a dry census, then a launch of each). Chained in one process (M5 Ultra, 4 streams of 3,072, GPU busy a launch, not quiet,
   no lock), base 01871ac7 against this change at one row: the plain mix 15.5 to 10.2 us, `back` 14.6 to 10.2,
   `expand_parts` 20.4 to 17.1 (W_o split 32) and 17.2 to 12.9 (split 16); every threadgroup reading all of W_o's

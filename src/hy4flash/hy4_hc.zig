@@ -447,7 +447,7 @@ fn runSplit(s: mlx.mlx_stream, inputs: []const Arr, x: Arr, w: Arr, base: Arr, f
     }
     if (!wide or granted == false or !try applyWide(&ov, form, iv, try cfgs.get(key, build), s, pipe)) {
         key.wide = false;
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try kernel(form, false), iv, try cfgs.get(key, build), s));
+        try applyNarrow(&ov, form, iv, &key, s, pipeOf(key, inputs), inputs);
     }
     const expand = form != .plain;
     const n: usize = if (expand) 3 else 2;
@@ -462,11 +462,11 @@ fn runSplit(s: mlx.mlx_stream, inputs: []const Arr, x: Arr, w: Arr, base: Arr, f
 
 /// One wide launch's pipeline as the engine instantiates it: the form, the template values its config sets and its
 /// inputs' dtypes. A GPU grants each pipeline its own threads a group, so each holds its own grant.
-const Pipe = struct { form: Form, hc: c_int, d: c_int, tg: c_int, eps: c_int, osplit: c_int, dts: [max_ins]u8 };
+const Pipe = struct { form: Form, wide: bool, hc: c_int, d: c_int, tg: c_int, eps: c_int, osplit: c_int, dts: [max_ins]u8 };
 const max_ins = 10;
 
 fn pipeOf(key: Key, inputs: []const Arr) Pipe {
-    var p: Pipe = .{ .form = key.form, .hc = key.hc, .d = key.d, .tg = key.tg, .eps = key.eps, .osplit = key.osplit, .dts = @splat(0xff) };
+    var p: Pipe = .{ .form = key.form, .wide = key.wide, .hc = key.hc, .d = key.d, .tg = key.tg, .eps = key.eps, .osplit = key.osplit, .dts = @splat(0xff) };
     // Every form takes at most `max_ins` inputs (`kernel`).
     for (inputs, p.dts[0..inputs.len]) |a, *dt| dt.* = @intCast(@intFromEnum(mlx.mlx_array_dtype(a)));
     return p;
@@ -477,6 +477,10 @@ const gpa = std.heap.c_allocator;
 /// Each wide pipeline's grant, once a launch answered it (a served one, or the load's probe, `probeNoted`): a refused
 /// pipeline runs each row as one threadgroup from then on.
 var grants: std.AutoHashMapUnmanaged(Pipe, bool) = .empty;
+
+/// Each one-threadgroup pipeline's threads a group, once a launch answered it: `hc_tg`, or the widest halving of it the
+/// GPU grants (Metal caps a register-heavy pipeline below 1024 on an M1 or M2, each pipeline at its own count).
+var narrow_tgs: std.AutoHashMapUnmanaged(Pipe, c_int) = .empty;
 
 /// The wide pipelines a dry forward reached with no grant latched, each with its inputs' shapes: `Model.probeWide`'s
 /// census, which `probeNoted` then launches.
@@ -510,7 +514,7 @@ pub var census: ?*Census = null;
 /// launch latches it (the values make no difference to a grant).
 pub fn probeNoted(s: mlx.mlx_stream, c: *const Census) !void {
     for (c.noted.items) |n| {
-        if (grants.contains(n.pipe)) continue;
+        if (if (n.pipe.wide) grants.contains(n.pipe) else narrow_tgs.contains(n.pipe)) continue;
         var o: Ops = .{ .s = s };
         defer o.deinit();
         var ins: [max_ins]Arr = undefined;
@@ -528,6 +532,7 @@ pub fn probeNoted(s: mlx.mlx_stream, c: *const Census) !void {
 /// Every grant forgotten, as a fresh process holds none: a test seam, for a test that changes what the GPU grants.
 pub fn forgetGrants() void {
     grants.clearRetainingCapacity();
+    narrow_tgs.clearRetainingCapacity();
 }
 
 /// Wide launches made since the process began.
@@ -552,6 +557,61 @@ fn applyWide(ov: *mlx.mlx_vector_array, form: Form, iv: mlx.mlx_vector_array, cf
     try grants.put(gpa, pipe, false);
     log.warn("[engine] hy4 hc: this GPU does not grant the wide {s} mix {d} threads a group; its rows run one threadgroup each\n", .{ @tagName(form), hck.hc_tg });
     return false;
+}
+
+/// Lowers `hck.hc_tg` to the widest halving this GPU grants every form's one-threadgroup launch of one row of 4 streams
+/// of `d` (an M1 caps the fused forms below 1024), so every hyper-connection kernel of the process, tiled or fused, runs
+/// at one width and the two give the same bytes. The load runs it after `hck.probeIdentity`, before it records a plan.
+pub fn probeForms(s: mlx.mlx_stream, d: c_int) !void {
+    const scope = mlx.engine.enter(s);
+    defer scope.end();
+    const was = wide_on;
+    wide_on = false;
+    defer wide_on = was;
+    while (true) {
+        forgetGrants();
+        var o: Ops = .{ .s = s };
+        defer o.deinit();
+        const c = try FormCase.zeros(&o, 1, d, if (d >= 3072) 32 else 16);
+        var least: c_int = @intCast(hck.hc_tg);
+        for (std.enums.values(Form)) |f| {
+            const r = try c.run(&o, f);
+            try mlx.check(mlx.mlx_array_eval(r.h));
+            var it = narrow_tgs.valueIterator();
+            while (it.next()) |tg| least = @min(least, tg.*);
+        }
+        forgetGrants();
+        if (least == hck.hc_tg) return;
+        log.info("[engine] hy4 hc: this GPU grants the fused mixes {d} threads a group; every hyper-connection kernel runs at it\n", .{least});
+        hck.hc_tg = @intCast(least);
+    }
+}
+
+/// The one-threadgroup-a-row launch into `ov` at its pipeline's latched threads a group; unlatched, at `key.tg`, halved
+/// on each size refusal until the GPU grants it (32 the last try). A dry recording learns no grant: the load's probe
+/// has, or its census notes the pipeline.
+fn applyNarrow(ov: *mlx.mlx_vector_array, form: Form, iv: mlx.mlx_vector_array, key: *Key, s: mlx.mlx_stream, pipe: Pipe, inputs: []const Arr) !void {
+    if (narrow_tgs.get(pipe)) |tg| {
+        key.tg = tg;
+        return mlx.check(mlx.mlx_fast_metal_kernel_apply(ov, try kernel(form, false), iv, try cfgs.get(key.*, build), s));
+    }
+    if (mlx.engine.dryOn()) {
+        const c = census orelse return error.Hy4HcNarrowUnprobed;
+        try c.note(pipe, inputs);
+        return mlx.check(mlx.mlx_fast_metal_kernel_apply(ov, try kernel(form, false), iv, try cfgs.get(key.*, build), s));
+    }
+    defer mlx.expected_refusal = null;
+    while (true) {
+        // Only a halving left to take expects the refusal: the last one's is the caller's error.
+        mlx.expected_refusal = if (key.tg > 32) "Thread group size" else null;
+        if (mlx.mlx_fast_metal_kernel_apply(ov, try kernel(form, false), iv, try cfgs.get(key.*, build), s) == 0) {
+            try narrow_tgs.put(gpa, pipe, key.tg);
+            return;
+        }
+        if (key.tg <= 32 or !mlx.takeErrorIf("Thread group size")) return error.MlxError;
+        log.warn("[engine] hy4 hc: this GPU does not grant the {s} mix {d} threads a group; its rows run at {d}\n", .{ @tagName(form), key.tg, @divExact(key.tg, 2) });
+        key.tg = @divExact(key.tg, 2);
+    }
 }
 
 /// `mixTiled` and `normIdentity` of the stream `x` [L, HC, D] f32 (`applies`): `post` [L, HC] and the normed row `h`
@@ -682,7 +742,10 @@ test "hy4 hc: a decode row's mix and its collapse and norm in one launch give th
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
+    const tg_was = hck.hc_tg;
+    defer hck.hc_tg = tg_was;
     for ([_]c_int{ 1, 6 }) |t| for ([_]c_int{ 3072, 128 }) |d| {
+        try probeForms(es, d);
         var o: Ops = .{ .s = es };
         defer o.deinit();
         const seed: u64 = @intCast(3 * t + d);
@@ -738,6 +801,8 @@ test "hy4 hc: a layer's combine norm and write-back and the next layer's mix and
     defer hck.hc_tg = tg_was;
     for ([_]usize{ 1024, 512 }) |tg| for ([_]c_int{ 1, 6 }) |t| for ([_]c_int{ 3072, 128 }) |d| {
         hck.hc_tg = tg;
+        // A GPU that grants the fused mixes less (an M1) runs every kernel of the case at what it grants.
+        try probeForms(es, d);
         var o: Ops = .{ .s = es };
         defer o.deinit();
         const seed: u64 = @intCast(7 * t + d + @as(c_int, @intCast(tg)));
@@ -810,6 +875,30 @@ const FormCase = struct {
         };
     }
 
+    /// `init`'s shapes and dtypes filled with zeros: what a grant reads, outside a test.
+    fn zeros(o: *Ops, t: c_int, d: c_int, osplit: c_int) !FormCase {
+        const z = struct {
+            fn of(od: *Ops, shape: []const c_int, dt: mlx.mlx_dtype) !Arr {
+                return od.contiguous(try od.zeros(shape, dt));
+            }
+        }.of;
+        return .{
+            .h = try z(o, &.{ t, 4, d }, .float32),
+            .y = try z(o, &.{ t, d }, .float32),
+            .pin = try z(o, &.{ t, 4 }, .float32),
+            .up = try z(o, &.{ t, d }, .float32),
+            .shared = try z(o, &.{ t, d }, .bfloat16),
+            .wn = try z(o, &.{d}, .bfloat16),
+            .op = try z(o, &.{ t * osplit, d }, .float32),
+            .osvh = try z(o, &.{d}, .float16),
+            .ow = try z(o, &.{d}, .bfloat16),
+            .osplit = osplit,
+            .hw = .{ .fn_w = try z(o, &.{ 8, 4 * d }, .float32), .scale = try z(o, &.{3}, .float32), .base = try z(o, &.{8}, .float32) },
+            .w = try z(o, &.{d}, .bfloat16),
+            .eps = try o.own(try hck.identityEps(1e-5, 1e-6, 2.0)),
+        };
+    }
+
     /// The form's launch, its outputs owned by `o`.
     fn run(c: FormCase, o: *Ops, form: Form) !Normed {
         const r = switch (form) {
@@ -835,8 +924,12 @@ test "hy4 hc: the wide launch gives the one-threadgroup launch's bytes for every
     const tg_was = hck.hc_tg;
     defer hck.hc_tg = tg_was;
     defer wide_on = true;
+    forgetGrants();
+    defer forgetGrants();
     for ([_]usize{ 1024, 512 }) |tg| for ([_]c_int{ 1, 3, 8 }) |t| for ([_]c_int{ 3072, 128 }) |d| {
         hck.hc_tg = tg;
+        // A GPU that grants the fused mixes less (an M1) runs every kernel of the case at what it grants.
+        try probeForms(es, d);
         var o: Ops = .{ .s = es };
         defer o.deinit();
         const osplit: c_int = if (d == 3072) 32 else 16;
@@ -853,7 +946,8 @@ test "hy4 hc: the wide launch gives the one-threadgroup launch's bytes for every
             const got = try c.run(&o, form);
             try mlx.check(mlx.mlx_array_eval(got.h));
             try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
-            try testing.expectEqual(wide_before + 1, wide_launches);
+            // A form whose wide pipeline this GPU refuses at this width (an M1 at 1,024 lanes) runs one threadgroup a row.
+            if (wide_launches == wide_before) try testing.expect(refusedGrants() > 0) else try testing.expectEqual(wide_before + 1, wide_launches);
             try testing.expectEqualSlices(u8, wp, try bytesOf(&o, got.post));
             try testing.expectEqualSlices(u8, wh, try bytesOf(&o, got.h));
             if (want.m) |m| try testing.expectEqualSlices(u8, try bytesOf(&o, m), try bytesOf(&o, got.m.?));
@@ -896,6 +990,58 @@ test "hy4 hc: where the GPU grants the wide mix fewer threads a group than hc_tg
     }
 }
 
+test "hy4 hc: where the GPU grants a form's one-threadgroup launch fewer threads than hc_tg too, its rows run at the widest halving it grants, with that width's bytes, from then on" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const kn = mlx.engine.kernel;
+    const tg_was = hck.hc_tg;
+    defer {
+        kn.grant_cap = std.math.maxInt(usize);
+        kn.grant_cap_name = "";
+        forgetGrants();
+        wide_on = true;
+        hck.hc_tg = tg_was;
+    }
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const c = try FormCase.init(&o, 1, 3072, 32, 11);
+    const rung = hck.hc_tg / 4;
+    for ([_]Form{ .plain, .expand, .back, .expand_norm, .expand_parts, .expand_rows }) |form| {
+        // Both widths of every form are capped, as an M1 caps a register-heavy pipeline (640, 384) below 1024.
+        forgetGrants();
+        kn.grant_cap = rung;
+        kn.grant_cap_name = "sushi_hy4_hc_";
+        var got: [2]Normed = undefined;
+        for (&got) |*g| {
+            g.* = try c.run(&o, form);
+            try mlx.check(mlx.mlx_array_eval(g.h));
+            try testing.expect(!mlx.errorPending());
+        }
+        try testing.expectEqual(@as(usize, 1), narrow_tgs.count());
+        var latched = narrow_tgs.valueIterator();
+        try testing.expectEqual(@as(c_int, @intCast(rung)), latched.next().?.*);
+        // What the form's one-threadgroup launch gives at that width on a GPU that grants it.
+        kn.grant_cap = std.math.maxInt(usize);
+        kn.grant_cap_name = "";
+        forgetGrants();
+        wide_on = false;
+        hck.hc_tg = rung;
+        const want = try c.run(&o, form);
+        hck.hc_tg = tg_was;
+        wide_on = true;
+        for (got) |g| {
+            try testing.expectEqualSlices(u8, try bytesOf(&o, want.post), try bytesOf(&o, g.post));
+            try testing.expectEqualSlices(u8, try bytesOf(&o, want.h), try bytesOf(&o, g.h));
+            if (want.m) |m| try testing.expectEqualSlices(u8, try bytesOf(&o, m), try bytesOf(&o, g.m.?));
+        }
+    }
+}
+
 /// The grants latched off.
 fn refusedGrants() usize {
     var n: usize = 0;
@@ -920,11 +1066,21 @@ test "hy4 hc: a GPU that refuses one form's wide pipeline: a dry recording with 
         kn.grant_cap_name = "";
         forgetGrants();
     }
-    const forms = [_]Form{ .plain, .expand, .back, .expand_parts, .expand_rows };
+    const forms = [_]Form{ .plain, .expand, .back, .expand_norm, .expand_parts, .expand_rows };
     var o: Ops = .{ .s = es };
     defer o.deinit();
     const c = try FormCase.init(&o, 1, 3072, 32, 7);
     try mlx.check(mlx.mlx_array_eval(c.h));
+    // The forms whose wide pipeline this GPU itself refuses (an M1 refuses the heavier ones at 1,024 lanes).
+    var own: [forms.len]bool = undefined;
+    for (forms, &own) |form, *r| {
+        forgetGrants();
+        var od: Ops = .{ .s = es };
+        defer od.deinit();
+        const got = try c.run(&od, form);
+        try mlx.check(mlx.mlx_array_eval(got.h));
+        r.* = refusedGrants() > 0;
+    }
     const Rec = struct {
         r: plan.Recorder,
         d: plan.Driver = .{ .gpa = testing.allocator },
@@ -970,11 +1126,18 @@ test "hy4 hc: a GPU that refuses one form's wide pipeline: a dry recording with 
                 try x.run(c, &od, form, true);
             };
         }
-        try testing.expectEqual(forms.len, cs.noted.items.len);
+        // Each form's wide pipeline, and the one-threadgroup pipeline of a form whose wide one is refused.
+        var refused: [forms.len]bool = undefined;
+        for (forms, own, &refused) |form, o_r, *r| r.* = o_r or form == capped;
+        var wide_notes: usize = 0;
+        for (cs.noted.items) |n| {
+            if (n.pipe.wide) wide_notes += 1 else try testing.expect(refused[std.mem.indexOfScalar(Form, &forms, n.pipe.form).?]);
+        }
+        try testing.expectEqual(forms.len, wide_notes);
         try probeNoted(es, &cs);
         try testing.expectEqual(forms.len, grants.count());
-        try testing.expectEqual(@as(usize, 1), refusedGrants());
-        for (forms) |form| {
+        try testing.expectEqual(std.mem.count(bool, &refused, &.{true}), refusedGrants());
+        for (forms, refused) |form, was_refused| {
             var dry: Rec = .{ .r = undefined };
             defer dry.deinit();
             var real: Rec = .{ .r = undefined };
@@ -984,7 +1147,7 @@ test "hy4 hc: a GPU that refuses one form's wide pipeline: a dry recording with 
             try dry.run(c, &od, form, true);
             const before = wide_launches;
             try real.run(c, &od, form, false);
-            try testing.expectEqual(form != capped, wide_launches > before);
+            try testing.expectEqual(!was_refused, wide_launches > before);
             try testing.expectEqual(@as(?plan.trace_mod.Difference, null), plan.trace_mod.firstDifference(real.r.instances.items, dry.r.instances.items));
         }
     }
@@ -1000,7 +1163,7 @@ test "hy4 hc: a census refuses by name an input it cannot note (more inputs than
     defer _ = mlx.mlx_array_free(deep);
     var cs: Census = .{};
     defer cs.deinit();
-    const pipe: Pipe = .{ .form = .plain, .hc = 4, .d = 1, .tg = 1, .eps = 0, .osplit = 0, .dts = @splat(0xff) };
+    const pipe: Pipe = .{ .form = .plain, .wide = true, .hc = 4, .d = 1, .tg = 1, .eps = 0, .osplit = 0, .dts = @splat(0xff) };
     var many: [max_ins + 1]Arr = @splat(flat);
     try testing.expectError(error.Hy4HcCensusInputs, cs.note(pipe, &many));
     try testing.expectError(error.Hy4HcCensusInputs, cs.note(pipe, &.{ flat, deep }));
@@ -1016,7 +1179,10 @@ test "hy4 hc: prefill rows past rows_max run plain, expand and back in one launc
     const es = mlx.engine.stream();
     const scope = mlx.engine.enter(es);
     defer scope.end();
+    const tg_was = hck.hc_tg;
+    defer hck.hc_tg = tg_was;
     for ([_]struct { t: c_int, d: c_int }{ .{ .t = 33, .d = 128 }, .{ .t = 64, .d = 3072 } }) |cs| {
+        try probeForms(es, cs.d);
         var o: Ops = .{ .s = es };
         defer o.deinit();
         const seed: u64 = @intCast(11 * cs.t + cs.d);
