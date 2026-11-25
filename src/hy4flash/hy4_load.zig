@@ -27,6 +27,7 @@ pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
     var shards = try weights_where.shardNames(io, allocator, model_dir);
     defer weights_where.freeShardNames(allocator, &shards);
     var total: u64 = 0;
+    var embed_bank = false;
     for (shards.items) |name| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, name }, 0);
         defer allocator.free(path);
@@ -39,6 +40,7 @@ pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
         while (it.next()) |e| {
             if (std.mem.eql(u8, e.key_ptr.*, "__metadata__") or !keeps(e.key_ptr.*, &k)) continue;
             if (e.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            if (std.mem.eql(u8, e.key_ptr.*, "model.embed_tokens.trellis")) embed_bank = true;
             // A bank the model decodes at load (`decodedAtLoad`) is held as its BF16 [out, in] rows, not as stored.
             if (decodedAtLoad(e.key_ptr.*)) |part| {
                 if (part == .trellis) {
@@ -59,7 +61,15 @@ pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
         }
     }
     if (k.unknown > 0) return error.Hy4TensorUnknown;
-    return total;
+    return total + embedCacheBytes(config, embed_bank);
+}
+
+/// The decoded blocks a load keeps beside its embedding bank where it gathers that bank on the host
+/// (`hy4_stq.EmbedGather`): a GPU without the NAX decode, as `Model` chooses.
+fn embedCacheBytes(config: *const ModelConfig, embed_bank: bool) u64 {
+    if (!embed_bank or @import("sushi_exl3").kernels.gemmNaxOn()) return 0;
+    const stq = @import("hy4_stq.zig");
+    return stq.EmbedGather.cacheBytes(config.hy4flash.?.dim, stq.EmbedGather.block_cache_bytes);
 }
 
 const BankPart = enum { trellis, scale };

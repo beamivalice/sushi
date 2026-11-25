@@ -251,8 +251,8 @@ pub fn routedAs(s: mlx.mlx_stream, dec: exl3.format.Decode, limit: f32, rb: *con
 /// a linear with in = dim, out = vocab, and token t's row is column t of `Wᵀ` [dim, vocab]. The output side's Hadamard
 /// mixes 128 consecutive ids, so a token's row needs its 128-id block alone: the block's output tiles over every input
 /// tile, decoded on the host as the kernels apply them (`exl3.linear.decodeDense`), with the block's 128 `svh`. The
-/// gather owns a host copy of the bank at its stored bytes (the caller drops the pack's tensors); a gather holds one
-/// block's f32 `Wᵀ` [dim, 128] at a time.
+/// gather owns a host copy of the bank at its stored bytes (the caller drops the pack's tensors) and keeps the f32 `Wᵀ`
+/// [dim, 128] of the blocks it decoded last, to `block_cache_bytes`.
 pub const EmbedGather = struct {
     words: []u16,
     suh: []u16,
@@ -261,12 +261,62 @@ pub const EmbedGather = struct {
     vocab: usize,
     n: u32,
     dec: exl3.format.Decode,
+    cache: ?*Blocks = null,
+
+    /// Decoded blocks, the least recently used replaced first. A slot names its block only once its decode is whole.
+    const Blocks = struct {
+        rows: []f32,
+        block: []u32,
+        used: []u64,
+        tick: u64 = 0,
+
+        const none = std.math.maxInt(u32);
+
+        fn slot(c: *const Blocks, s: usize) []f32 {
+            const w = c.rows.len / c.block.len;
+            return c.rows[s * w ..][0..w];
+        }
+
+        fn touch(c: *Blocks, s: usize) void {
+            c.tick += 1;
+            c.used[s] = c.tick;
+        }
+
+        fn find(c: *Blocks, b: u32) ?[]f32 {
+            const s = std.mem.indexOfScalar(u32, c.block, b) orelse return null;
+            c.touch(s);
+            return c.slot(s);
+        }
+
+        fn oldest(c: *const Blocks) usize {
+            return std.mem.indexOfMin(u64, c.used);
+        }
+    };
+
+    /// The slots `cache_bytes` holds at `dim`.
+    fn slotsFor(dim: usize, cache_bytes: u64) usize {
+        return @intCast(cache_bytes / (dim * 128 * @sizeOf(f32)));
+    }
+
+    /// The bytes a gather of `dim` keeps beside its copy of the bank, at `cache_bytes` of decoded blocks.
+    pub fn cacheBytes(dim: usize, cache_bytes: u64) u64 {
+        const slots = slotsFor(dim, cache_bytes);
+        return if (slots == 0) 0 else slots * (dim * 128 * @sizeOf(f32) + @sizeOf(u32) + @sizeOf(u64)) + @sizeOf(Blocks);
+    }
 
     /// Test seam: the blocks `rows` has decoded in this process.
     pub var blocks_decoded: usize = 0;
 
     /// A host copy of the bank's words and scales.
     pub fn of(gpa: std.mem.Allocator, b: Bank) !EmbedGather {
+        return ofWith(gpa, b, block_cache_bytes);
+    }
+
+    /// The bytes of decoded blocks a gather keeps.
+    pub const block_cache_bytes: u64 = 64 << 20;
+
+    /// `of`, keeping up to `cache_bytes` of decoded blocks.
+    pub fn ofWith(gpa: std.mem.Allocator, b: Bank, cache_bytes: u64) !EmbedGather {
         for ([_]Arr{ b.w, b.suh, b.svh }) |a| try mlx.check(mlx.mlx_array_eval(a));
         const sh = mlx.getShape(b.w);
         const dim: usize = @intCast(sh[1] * 16);
@@ -281,18 +331,40 @@ pub const EmbedGather = struct {
         const suh = try gpa.dupe(u16, suh_src[0..dim]);
         errdefer gpa.free(suh);
         const svh = try gpa.dupe(u16, svh_src[0..vocab]);
-        return .{ .words = words, .suh = suh, .svh = svh, .dim = dim, .vocab = vocab, .n = n, .dec = b.dec };
+        errdefer gpa.free(svh);
+        const slots = slotsFor(dim, cache_bytes);
+        const cache: ?*Blocks = if (slots == 0) null else c: {
+            const c = try gpa.create(Blocks);
+            errdefer gpa.destroy(c);
+            const kept = try gpa.alloc(f32, slots * dim * 128);
+            errdefer gpa.free(kept);
+            const block = try gpa.alloc(u32, slots);
+            errdefer gpa.free(block);
+            @memset(block, Blocks.none);
+            const used = try gpa.alloc(u64, slots);
+            @memset(used, 0);
+            c.* = .{ .rows = kept, .block = block, .used = used };
+            break :c c;
+        };
+        return .{ .words = words, .suh = suh, .svh = svh, .dim = dim, .vocab = vocab, .n = n, .dec = b.dec, .cache = cache };
     }
 
     pub fn deinit(self: *EmbedGather, gpa: std.mem.Allocator) void {
         gpa.free(self.words);
         gpa.free(self.suh);
         gpa.free(self.svh);
+        if (self.cache) |c| {
+            gpa.free(c.rows);
+            gpa.free(c.block);
+            gpa.free(c.used);
+            gpa.destroy(c);
+        }
     }
 
-    /// The bytes the copy holds: the bank's stored bytes.
+    /// The bytes the gather holds: the bank's stored bytes, and its decoded blocks with their ids and last uses.
     pub fn bytes(self: EmbedGather) u64 {
-        return 2 * (self.words.len + self.suh.len + self.svh.len);
+        const kept: u64 = if (self.cache) |c| 4 * c.rows.len + 4 * c.block.len + 8 * c.used.len + @sizeOf(Blocks) else 0;
+        return 2 * (self.words.len + self.suh.len + self.svh.len) + kept;
     }
 
     /// Each id's row into `out` [ids.len · dim], f32. An id past the vocabulary is refused. A dry recording reads no
@@ -315,16 +387,26 @@ pub const EmbedGather = struct {
         const ot = self.vocab / 16;
         const sub = try gpa.alloc(u16, (d / 16) * 8 * self.n);
         defer gpa.free(sub);
-        const blk = try gpa.alloc(f32, d * 128);
-        defer gpa.free(blk);
+        const own = try gpa.alloc(f32, if (self.cache == null) d * 128 else 0);
+        defer gpa.free(own);
         var i: usize = 0;
         while (i < order.len) {
             const b = ids[order[i]] / 128;
             if (ids[order[i]] >= self.vocab) return error.TokenOutOfRange;
-            // The block's 8 output tiles over every input tile, in the bank's own order.
-            for (0..d / 16) |tk| @memcpy(sub[tk * 8 * self.n ..][0 .. 8 * self.n], self.words[(tk * ot + b * 8) * self.n ..][0 .. 8 * self.n]);
-            try exl3.linear.decodeDense(gpa, sub, self.suh, self.svh[b * 128 ..][0..128], d, 128, self.n, self.dec, blk);
-            if (@import("builtin").is_test) blocks_decoded += 1;
+            const blk = (if (self.cache) |c| c.find(b) else null) orelse blk: {
+                const s: ?usize = if (self.cache) |c| c.oldest() else null;
+                const into = if (s) |k| self.cache.?.slot(k) else own;
+                if (s) |k| self.cache.?.block[k] = Blocks.none;
+                // The block's 8 output tiles over every input tile, in the bank's own order.
+                for (0..d / 16) |tk| @memcpy(sub[tk * 8 * self.n ..][0 .. 8 * self.n], self.words[(tk * ot + b * 8) * self.n ..][0 .. 8 * self.n]);
+                try exl3.linear.decodeDense(gpa, sub, self.suh, self.svh[b * 128 ..][0..128], d, 128, self.n, self.dec, into);
+                if (@import("builtin").is_test) blocks_decoded += 1;
+                if (s) |k| {
+                    self.cache.?.block[k] = b;
+                    self.cache.?.touch(k);
+                }
+                break :blk into;
+            };
             while (i < order.len and ids[order[i]] / 128 == b) : (i += 1) {
                 const row = order[i];
                 const col = ids[row] % 128;

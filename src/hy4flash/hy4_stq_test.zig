@@ -1015,6 +1015,54 @@ test "hy4 stq: a dry recording gathers the host embedding's rows as zeros, decod
     try testing.expectEqual(before + 4, hy4_stq.EmbedGather.blocks_decoded);
 }
 
+test "hy4 stq: the host embedding gather keeps the blocks it decoded to its byte cap: a block asked again is read back, not decoded, past the cap the least recently used goes, and every row keeps its bytes (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    var owned: std.ArrayList(Arr) = .empty;
+    defer {
+        for (owned.items) |x| _ = mlx.mlx_array_free(x);
+        owned.deinit(a);
+    }
+    const bank = (try hy4_stq.load(&p.stq, "model.embed_tokens", p.quant.trunk, &owned, a, es)).?;
+    const d: usize = p.config.dim;
+    const block_bytes: u64 = d * 128 * @sizeOf(f32);
+    var plain = try hy4_stq.EmbedGather.ofWith(a, bank, 0);
+    defer plain.deinit(a);
+    var g = try hy4_stq.EmbedGather.ofWith(a, bank, 2 * block_bytes);
+    defer g.deinit(a);
+    // Held at its cap: two blocks' rows, with their ids and last uses.
+    const kept = hy4_stq.EmbedGather.cacheBytes(d, 2 * block_bytes);
+    try testing.expect(kept >= 2 * block_bytes and kept < 2 * block_bytes + 1024);
+    try testing.expectEqual(plain.bytes() + kept, g.bytes());
+    // Blocks 0, 1 and 2; two fit.
+    const steps = [_]struct { ids: []const u32, decodes: usize }{
+        .{ .ids = &.{ 0, 1 }, .decodes = 1 },
+        .{ .ids = &.{ 1, 128, 0 }, .decodes = 1 },
+        .{ .ids = &.{5}, .decodes = 0 },
+        .{ .ids = &.{300}, .decodes = 1 }, // block 1 was used least recently: it goes
+        .{ .ids = &.{ 2, 301 }, .decodes = 0 },
+        .{ .ids = &.{129}, .decodes = 1 },
+    };
+    for (steps) |st| {
+        const got = try a.alloc(f32, st.ids.len * d);
+        defer a.free(got);
+        const want = try a.alloc(f32, st.ids.len * d);
+        defer a.free(want);
+        try plain.rows(a, st.ids, want);
+        const before = hy4_stq.EmbedGather.blocks_decoded;
+        try g.rows(a, st.ids, got);
+        try testing.expectEqual(st.decodes, hy4_stq.EmbedGather.blocks_decoded - before);
+        try testing.expectEqualSlices(u32, @ptrCast(want), @ptrCast(got));
+    }
+}
+
 test "hy4 stq served: a server's streamed load reads the STQ pack's rate-group banks as the stream's layout, not a refusal (HY4_STQ_TINY)" {
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
     const io = std.Io.Threaded.global_single_threaded.io();
