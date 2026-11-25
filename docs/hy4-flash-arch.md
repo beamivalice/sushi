@@ -134,7 +134,10 @@ activation dtype before the weight multiplies.
   K6 embedding bank ([pack-format](pack-format.md#hy4-stq)) is gathered on the GPU on every Mac (`hy4_embed`): the chunk's 128-id blocks decoded (`trunk_gemm.decodeDense`), then two kernels take the Hadamard down
   each 128-row chunk and along the token's column and scale by `suh·svh`, in the host decode's f32 order, so a row is
   `EmbedGather.rows`' bytes. The decode needs only NAX's fragment layout, not its matrix units, so an M1 or M2 runs it
-  too (a host gather made the DSpark draft read each slot's token back to the CPU: five waits a draft, not one). The host
+  too (a host gather made the DSpark draft read each slot's token back to the CPU: five waits a draft, not one). On the
+  M1 Max 32 GB, STQ 2.25bpw, `--ctx-size 200000 --prefill-chunk-max 1024 --ssd-budget-gb 20 --expert-cache-bias 0.2`,
+  a cold 4k code request, GPU lock, one run each: DSpark decode 16.5 tok/s against 13.5 on the host gather, prefill 61
+  against 55 tok/s (afc846e2 against 25739537), and the load's two region measures 2.4 and 2.8 s against 5.3 and 5.2. The host
   gather serves only off the GPU; it keeps the blocks it decoded last, to `EmbedGather.block_cache_bytes` (64 MiB, 42
   blocks at dim 3072), billed with its copy (`hy4_load.embedCacheBytes`). A group launches at a power-of-two block count (`launchBlocks`):
   the decode is templated on its width, so its six widths are made at load (`warmKernels`), never inside a request, with
