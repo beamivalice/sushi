@@ -93,7 +93,7 @@ const HELPERS_TAIL: [:0]const u8 =
     \\#ifndef EXL3_LANE_FIRST
     \\#define EXL3_LANE_FIRST 0u
     \\#endif
-    \\template<bool Wide, bool Funnel = false> struct exl3_lane_type {
+    \\template<bool Wide, bool Funnel = false, uint PairKind = 0u> struct exl3_lane_type {
     \\  using type = ulong;
     \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
     \\    return exl3_window(words, end, W, full);
@@ -101,7 +101,7 @@ const HELPERS_TAIL: [:0]const u8 =
     \\};
     \\// exl3_window's bits with a third word, built as two 32-bit funnels of adjacent words
     \\// (s < 32): OR-ing the third word into a 64-bit shift costs the ALU-bound decode GEMV far more.
-    \\template<> struct exl3_lane_type<false, true> {
+    \\template<> struct exl3_lane_type<false, true, 0u> {
     \\  using type = ulong;
     \\  static inline type read(const device uint *words, uint end, uint W, bool) {
     \\    const uint last = (end - 1u) >> 5u;
@@ -114,13 +114,57 @@ const HELPERS_TAIL: [:0]const u8 =
     \\    return as_type<ulong>(uint2(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s)));
     \\  }
     \\};
-    \\template<> struct exl3_lane_type<true> {
+    \\// PAIR1 narrow (N <= 42, EXL3_LANE_FIRST == 1u): all 4 odd codewords lie in bits 0..31 -> single 32-bit uint.
+    \\template<> struct exl3_lane_type<false, false, 1u> {
+    \\  using type = uint;
+    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    return uint((((ulong)words[prev] << 32u) | (ulong)words[last]) >> s);
+    \\  }
+    \\};
+    \\// PAIR1 medium (42 < N <= 108, EXL3_LANE_FIRST == 1u): uint2 keeps sh <= 16u as 32-bit shifts and sh > 16u as 32-bit funnels.
+    \\template<> struct exl3_lane_type<false, false, 2u> {
+    \\  using type = uint2;
+    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint a = words[last];
+    \\    const uint b = words[prev];
+    \\    return uint2(uint((((ulong)b << 32u) | (ulong)a) >> s), b >> s);
+    \\  }
+    \\};
+    \\template<> struct exl3_lane_type<false, true, 2u> {
+    \\  using type = uint2;
+    \\  static inline type read(const device uint *words, uint end, uint W, bool) {
+    \\    const uint last = (end - 1u) >> 5u;
+    \\    const uint prev = last == 0u ? W - 1u : last - 1u;
+    \\    const uint third = prev == 0u ? W - 1u : prev - 1u;
+    \\    const uint s = (0u - end) & 31u;
+    \\    const uint a = words[last];
+    \\    const uint b = words[prev];
+    \\    const uint c = words[third];
+    \\    return uint2(uint((((ulong)b << 32u) | (ulong)a) >> s), uint((((ulong)c << 32u) | (ulong)b) >> s));
+    \\  }
+    \\};
+    \\template<> struct exl3_lane_type<true, false, 0u> {
     \\  using type = ulong2;
     \\  static inline type read(const device uint *words, uint end, uint W, bool full) {
     \\    return ulong2(exl3_window(words, end, W, full), exl3_window(words, end - 32u, W, true));
     \\  }
     \\};
-    \\template<uint N> using exl3_lane_bits = typename exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u)>::type;
+    \\static inline constexpr uint exl3_pair_kind(uint N) {
+    \\  return (EXL3_LANE_FIRST == 1u && exl3_lane_sh(N, 0u) + 16u <= 64u)
+    \\    ? (exl3_lane_sh(N, 1u) + 16u <= 32u ? 1u : 2u)
+    \\    : 0u;
+    \\}
+    \\template<uint N> using exl3_lane_bits = typename exl3_lane_type<(exl3_lane_sh(N, 0u) + 16u > 64u), false, exl3_pair_kind(N)>::type;
+    \\static inline uint exl3_lane_word(uint bits, uint sh) { return bits >> sh; }
+    \\static inline uint exl3_lane_word(uint2 bits, uint sh) {
+    \\  return sh <= 16u ? (bits.x >> sh) : (sh < 32u ? ((bits.x >> sh) | (bits.y << (32u - sh))) : (bits.y >> (sh - 32u)));
+    \\}
     \\static inline uint exl3_lane_word(ulong bits, uint sh) { return uint(bits >> sh); }
     \\static inline uint exl3_lane_word(ulong2 bits, uint sh) {
     \\  return sh <= 48u ? uint(bits.x >> sh) : uint(bits.y >> (sh - 32u));
@@ -130,6 +174,7 @@ const HELPERS_TAIL: [:0]const u8 =
     \\  constexpr uint W = N / 2u;
     \\  constexpr uint low = W & (0u - W);
     \\  constexpr bool wide = exl3_lane_sh(N, 0u) + 16u > 64u;
+    \\  constexpr uint pk = exl3_pair_kind(N);
     \\  constexpr bool full = exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u);
     \\  const uint end = W * lane + W;
     \\  // At K3.5 the W bits under a lane's 32-bit window are the high W bits of the preceding lane's
@@ -137,9 +182,9 @@ const HELPERS_TAIL: [:0]const u8 =
     \\  if constexpr (N == 56u && EXL3_LANE_FIRST == 1u) {
     \\    const uint low_bits = uint(exl3_window(words, end, W, false));
     \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
-    \\    return as_type<ulong>(uint2(low_bits, prior >> (32u - W)));
+    \\    return uint2(low_bits, prior >> (32u - W));
     \\  }
-    \\  return exl3_lane_type<wide, !wide && full>::read(words, end, W, full);
+    \\  return exl3_lane_type<wide, !wide && full, pk>::read(words, end, W, full);
     \\}
     \\// Weight t's 16-bit codeword is the window ending at floor((t+1)*K), with
     \\// K = N/16; the pair (t0, t0+1) shares one 32-bit funnel read.
@@ -421,7 +466,7 @@ fn pair1Helpers(comptime win: exl3.Window, comptime fold: u32) [:0]const u8 {
 /// SPEC1's hash-mask decode with the (multiplier, mask) of the bank's rate: `exl3_hash_row_at(N)` is the table's row
 /// lookup, which `withTableRows` puts ahead of this text because the rows are the pack's data, not the kernel's.
 fn tabledHelpers(comptime win: exl3.Window, comptime fold: u32) [:0]const u8 {
-    return comptime "template<uint N> static inline half2 exl3_unscaled_n(uint2 cw) {\n" ++
+    return comptime "#undef EXL3_LANE_FIRST\ntemplate<uint N> static inline half2 exl3_unscaled_n(uint2 cw) {\n" ++
         "  constexpr exl3_hash_row r = exl3_hash_row_at(N);\n" ++
         "  static_assert(r.mult != 0u, \"the codebook table has no row at this rate\");\n" ++ windowMask(win) ++
         "  const half4 h = as_type<half4>((cw * uint2(r.mult)) & uint2(r.mask));\n" ++
