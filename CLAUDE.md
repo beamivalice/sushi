@@ -2,8 +2,8 @@ The engine is your own code base and you will keep working on this, any defect y
 
 # Sushi — project context for AI
 
-A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`)
-and DeepSeek-V4.1-Flash (`deepseek_v41`). MiMo-V2.6-Flash (`mimo_v2`) is unsupported from 1.5.1: still served, never
+A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwen4_exp`), GLM-5.3-Flash (`glm5_next`),
+DeepSeek-V4.1-Flash (`deepseek_v41`) and, from 1.8.0, Hy4-Flash (`hy_v4_flash`). MiMo-V2.6-Flash (`mimo_v2`) is unsupported from 1.5.1: still served, never
 release-gated (no test, bench or tuning for a release). Qwen and MiMo use native MTP and affine8 KV by
 default. GLM batches up to four requests over an affine8 MLA latent and FP32 KDA state, with DFlash2; its MTP stays off.
 DeepSeek serves one request at a time with streamed experts and DSpark. OpenAI/Anthropic-compatible HTTP, no Python at
@@ -13,7 +13,7 @@ serve time. Fork of ddalcu's mlx-serve.
 - **sashimi** is the PRIVATE quant-creation stack. This repo keeps only the CONSUMER contract (`docs/pack-format.md`,
   the shard-stamp check, `src/fixtures/`, `sushi kld`) and the oracle fixture dumpers (`tests/dump_*_fixtures.py`).
   Converter knowledge goes to `docs/private/`, never a committed file.
-- `src/` holds only the four served architectures and their shared machinery. Any other `model_type` is refused by
+- `src/` holds only the five served architectures and their shared machinery. Any other `model_type` is refused by
   name (`ArchitectureUnsupported` → 503), as is an unsupported file format (`ModelFormatUnsupported` → 503).
 - Target: an architecture is `src/<arch>/` plus one `src/arch/registry.zig` line, the only place outside its folder
   that names it; shared code names formats, never archs. Adding or dropping one:
@@ -47,7 +47,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ, `--drop-expert`, prefix cache, images |
 | [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
 | [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
-| [docs/hy4-flash-arch.md](docs/hy4-flash-arch.md) | Hy4-Flash (not served yet): forward on Sushi Cooler, seams, bills, pack, parity, 1.8.0 parts |
+| [docs/hy4-flash-arch.md](docs/hy4-flash-arch.md) | Hy4-Flash (served from 1.8.0): forward on Sushi Cooler, seams, bills, pack, parity, 1.8.0 parts |
 | [docs/hy4-parity.md](docs/hy4-parity.md) | Hy4-Flash against Qwen and DeepSeek: feature matrix, larger gaps, live checks |
 | [docs/engine-exl3-experts.md](docs/engine-exl3-experts.md) | EXL3 rate/codebook/window, prefill GEMM, decode chain, f32 SwiGLU, parity bars |
 | [docs/encoder.md](docs/encoder.md) | `sushi convert exl3`: flags, what a pack holds, trunk rules, calibration, Hessians, resume, stamps |

@@ -1,6 +1,6 @@
 # Hy4-Flash (`hy_v4_flash`): the design for Sushi Cooler
 
-Tencent's Hy4-Flash is not served yet. This doc maps its forward pass onto Sushi Cooler, component by component:
+Tencent's Hy4-Flash is served from sushi 1.8.0, on Sushi Cooler. This doc maps its forward pass onto the engine, component by component:
 the formula, the public source that pins it, and the engine piece it reuses or needs. It also lists the seams the
 engine must generalize first, the memory bill, what a pack needs, the parity plan, the open questions, and the parts
 the work lands in.
