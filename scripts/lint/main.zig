@@ -13,6 +13,7 @@ const rules = .{
     @import("folder_bytes_compare.zig"),
     @import("unused_import.zig"),
     @import("undefined_nested_write.zig"),
+    @import("undefined_partial_pass.zig"),
     @import("mlx_extern.zig"),
     @import("double_free.zig"),
     @import("scope_state.zig"),

@@ -763,7 +763,7 @@ fn servedStq(slots: ?u64, bar: f32) !void {
         errdefer a.free(out);
         const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
         defer m.deinit();
-        m.kv = .dense;
+        m.req().kv = .dense;
         var o: Ops = .{ .s = es };
         defer o.deinit();
         var at: usize = 0;
@@ -896,6 +896,42 @@ test "hy4 stq: after warmKernels a GPU embedding gather of any block count, in a
     }
     const made = mlx.engine.pipelinesMade().count - before;
     errdefer std.debug.print("gathers after the warm made {d} pipelines\n", .{made});
+    try testing.expectEqual(@as(u64, 0), made);
+}
+
+test "hy4 stq: after warmKernels the head of a joined tick of any width the load serves makes no pipeline (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try @import("hy4_model.zig").Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    // The widest tick the load joins, as the plan's record declares it.
+    m.logits_rows = fwd.joinedRowsMax();
+    try m.warmKernels();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const hc: c_int = @intCast(p.config.hc_mult);
+    const dim: c_int = @intCast(p.config.dim);
+    // The widths a verify block reads out first: what is not the head's own (the norms, the streams' mix) is made by them.
+    var before: u64 = 0;
+    var width: c_int = 1;
+    while (width <= m.logits_rows) : (width += 1) {
+        if (width == fwd.verify_rows_max + 1) before = mlx.engine.pipelinesMade().count;
+        const hs = try o.slot();
+        try mlx.check(mlx.mlx_zeros(hs, &[_]c_int{ width, hc, dim }, 3, .float32, es));
+        const logits = try m.readoutStreams(hs.*, .all);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+    }
+    const made = mlx.engine.pipelinesMade().count - before;
+    errdefer std.debug.print("a joined head of {d} to {d} rows after the warm made {d} pipelines\n", .{ fwd.verify_rows_max + 1, m.logits_rows, made });
     try testing.expectEqual(@as(u64, 0), made);
 }
 
@@ -1211,11 +1247,11 @@ fn appendRoundState(a: std.mem.Allocator, o: *Ops, m: *@import("hy4_model.zig").
         try appendRaw(a, o, list, arr);
     };
     markSeg(list, 0, 100);
-    try list.appendSlice(a, std.mem.sliceAsBytes(m.history.items));
-    try list.appendSlice(a, std.mem.asBytes(&m.pos));
+    try list.appendSlice(a, std.mem.sliceAsBytes(m.req().history.items));
+    try list.appendSlice(a, std.mem.asBytes(&m.req().pos));
     markSeg(list, 0, 101);
-    if (m.last_hidden) |h| try appendRaw(a, o, list, h);
-    for (m.last_picks[0..n], 0..) |maybe, l| if (maybe) |pk| {
+    if (m.req().last_hidden) |h| try appendRaw(a, o, list, h);
+    for (m.req().last_picks[0..n], 0..) |maybe, l| if (maybe) |pk| {
         markSeg(list, l, 102);
         try appendRaw(a, o, list, pk.rows);
         markSeg(list, l, 103);
@@ -2008,6 +2044,905 @@ test "hy4 verify: 2..8-row blocks match one-row steps (HY4_BF16_TINY)" {
     if (ran == 0) return error.SkipZigTest;
 }
 
+test "hy4 rows: batchedForward joins two slots as rows of one forward, each its solo bytes (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    const hy4_sched = @import("hy4_sched.zig");
+    const kv_cache = @import("../kv_cache.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    const vocab: usize = @intCast(p.config.vocab);
+    const vb = vocab * 4;
+    var rng = std.Random.DefaultPrng.init(0x62617463);
+    var ids: [32]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    const positions = [_]usize{ 9, 20 };
+    const n: usize = 2;
+    var solo: [2]hy4_model.Request = undefined;
+    var joined: [2]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer {
+        for (solo[0..made]) |*r| r.deinit();
+        for (joined[0..made]) |*r| r.deinit();
+    }
+    for (0..n) |i| {
+        solo[i] = try hy4_model.Request.init(a, 0);
+        joined[i] = try hy4_model.Request.init(a, 0);
+        made += 1;
+    }
+    for (0..n) |i| {
+        {
+            const lent = m.lend(&solo[i]);
+            defer lent.end();
+            _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+        }
+        {
+            const lent = m.lend(&joined[i]);
+            defer lent.end();
+            _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+        }
+    }
+    var want: [2][]u8 = undefined;
+    var wc: usize = 0;
+    defer {
+        for (want[0..wc]) |s| a.free(s);
+    }
+    for (0..n) |i| {
+        const lent = m.lend(&solo[i]);
+        defer lent.end();
+        const lg = try m.forwardReadout(&.{ids[positions[i]]}, .last);
+        want[i] = try copyF32Bytes(a, lg);
+        wc += 1;
+        _ = mlx.mlx_array_free(lg);
+    }
+    var xfm: @import("../trunk.zig").Trunk = undefined;
+    xfm.arch_state = .{};
+    xfm.arch_state.hy4flash.model = m;
+    xfm.s = es;
+    xfm.expert_stream = null;
+    var caches: [2]kv_cache.KVCache = undefined;
+    var cc: usize = 0;
+    defer {
+        for (caches[0..cc]) |*c| a.free(c.entries);
+    }
+    var ctxs: [2]@import("../model_handle.zig").ForwardCtx = undefined;
+    var ptrs: [2]*@import("../model_handle.zig").ForwardCtx = undefined;
+    var tokens: [2]u32 = undefined;
+    var offsets: [2]usize = @splat(0);
+    for (0..n) |i| {
+        caches[i] = try kv_cache.KVCache.init(a, @intCast(p.config.layers));
+        cc += 1;
+        caches[i].step = positions[i];
+        ctxs[i] = .{
+            .cache = &caches[i],
+            .moe_seq_offset = &offsets[i],
+            .ssm_entries = null,
+            .capture_hidden = null,
+            .vision_embeddings = null,
+            .arch_ctx = .{},
+        };
+        ctxs[i].arch_ctx.hy4flash.request = &joined[i];
+        ptrs[i] = &ctxs[i];
+        tokens[i] = ids[positions[i]];
+    }
+    var dummy: [2]@import("../scheduler.zig").Slot = undefined;
+    @memset(std.mem.asBytes(&dummy), 0);
+    var slot_ptrs: [2]*@import("../scheduler.zig").Slot = undefined;
+    for (0..n) |i| {
+        dummy[i].legacy_gen = null;
+        slot_ptrs[i] = &dummy[i];
+    }
+    var batch: []*@import("../scheduler.zig").Slot = slot_ptrs[0..n];
+    const out = try hy4_sched.batchedForward(undefined, a, &xfm, &batch, &tokens, &ptrs, &.{}, .{}, null);
+    defer {
+        for (out) |o| _ = mlx.mlx_array_free(o);
+        a.free(out);
+    }
+    for (0..n) |i| {
+        const got = try copyF32Bytes(a, out[i]);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, want[i], got[0..vb]);
+        try testing.expectEqual(positions[i] + 1, caches[i].step);
+    }
+}
+
+test "hy4 rows: a joined forward reads the MoE, head and attention-side banks once, not once per row (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    const n: usize = 8;
+    const d: usize = @intCast(p.config.dim);
+    const hc: c_int = @intCast(p.config.hc_mult);
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    var prng = std.Random.DefaultPrng.init(0x64697370);
+    const fxv = try a.alloc(f32, n * d);
+    defer a.free(fxv);
+    for (fxv) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const fx = try o.own(mlx.mlx_array_new_data(fxv.ptr, &[_]c_int{ @intCast(n), @intCast(d) }, 2, .float32));
+    const hsv = try a.alloc(f32, n * @as(usize, @intCast(hc)) * d);
+    defer a.free(hsv);
+    for (hsv) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const hs = try o.own(mlx.mlx_array_new_data(hsv.ptr, &[_]c_int{ @intCast(n), hc, @intCast(d) }, 3, .float32));
+    for ([_]Arr{ fx, hs }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+    {
+        const d0 = mlx.engine.stats().dispatches;
+        for (0..n) |i| {
+            const y = try m.ffnOne(1, try o.slice(fx, 0, @intCast(i), @intCast(i + 1)));
+            try mlx.check(mlx.mlx_array_eval(y));
+            _ = mlx.mlx_array_free(y);
+        }
+        const solo = mlx.engine.stats().dispatches - d0;
+        const d1 = mlx.engine.stats().dispatches;
+        const y = try m.ffnOne(1, fx);
+        try mlx.check(mlx.mlx_array_eval(y));
+        _ = mlx.mlx_array_free(y);
+        const joined = mlx.engine.stats().dispatches - d1;
+        try testing.expect(joined < solo);
+    }
+    {
+        const d0 = mlx.engine.stats().dispatches;
+        for (0..n) |i| {
+            const y = try m.readoutStreams(try o.slice(hs, 0, @intCast(i), @intCast(i + 1)), .last);
+            try mlx.check(mlx.mlx_array_eval(y));
+            _ = mlx.mlx_array_free(y);
+        }
+        const solo = mlx.engine.stats().dispatches - d0;
+        const d1 = mlx.engine.stats().dispatches;
+        const y = try m.readoutStreams(hs, .all);
+        try mlx.check(mlx.mlx_array_eval(y));
+        _ = mlx.mlx_array_free(y);
+        const joined = mlx.engine.stats().dispatches - d1;
+        try testing.expect(joined < solo);
+    }
+    const l: usize = 2;
+    const attn = m.layers[l].attn;
+    const g = m.layers[l].geometry;
+    const xv = try a.alloc(f32, n * d);
+    defer a.free(xv);
+    for (xv) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const x = try o.own(mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ @intCast(n), @intCast(d) }, 2, .float32));
+    try mlx.check(mlx.mlx_array_eval(x));
+    var positions: [16]c_int = undefined;
+    for (&positions, 0..) |*q, i| q.* = @intCast(3 + i * 7);
+    {
+        const d0 = mlx.engine.stats().dispatches;
+        for (0..n) |i| {
+            const one = try fwd.projectAsQ(&o, try o.contiguous(try o.slice(x, 0, @intCast(i), @intCast(i + 1))), attn, g, positions[i], .bfloat16, .float32);
+            for ([_]Arr{ one.q, one.c, one.k_pe, one.q_resid, one.q_raw.? }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+        }
+        const solo = mlx.engine.stats().dispatches - d0;
+        const d1 = mlx.engine.stats().dispatches;
+        const joined_pp = try fwd.projectRows(a, &o, x, attn, g, positions[0..n], .bfloat16, .float32);
+        defer a.free(joined_pp);
+        for (joined_pp) |q| for ([_]Arr{ q.q, q.c, q.k_pe, q.q_resid, q.q_raw.? }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+        const joined = mlx.engine.stats().dispatches - d1;
+        try testing.expect(joined < solo);
+    }
+    {
+        const span = m.span_rows;
+        const d0 = mlx.engine.stats().dispatches;
+        for (0..n) |i| {
+            const y = try fwd.linearSpans(&o, try o.slice(x, 0, @intCast(i), @intCast(i + 1)), attn.gate, span);
+            try mlx.check(mlx.mlx_array_eval(y));
+        }
+        const solo = mlx.engine.stats().dispatches - d0;
+        const d1 = mlx.engine.stats().dispatches;
+        const y = try fwd.linearSpans(&o, x, attn.gate, span);
+        try mlx.check(mlx.mlx_array_eval(y));
+        const joined = mlx.engine.stats().dispatches - d1;
+        try testing.expect(joined < solo);
+    }
+    {
+        const wide = g.heads * g.v;
+        const gated = try rows(&o, n, @intCast(wide), 0x6f6f);
+        try mlx.check(mlx.mlx_array_eval(gated));
+        const d0 = mlx.engine.stats().dispatches;
+        for (0..n) |i| {
+            const ri: c_int = @intCast(i);
+            var ol: fwd.OLeft = .normed;
+            const one = try fwd.outputWhole(&o, try o.slice(gated, 0, ri, ri + 1), attn, g, &ol);
+            try mlx.check(mlx.mlx_array_eval(one));
+        }
+        const solo = mlx.engine.stats().dispatches - d0;
+        const d1 = mlx.engine.stats().dispatches;
+        var ol: fwd.OLeft = .normed;
+        const one = try fwd.outputWhole(&o, gated, attn, g, &ol);
+        try mlx.check(mlx.mlx_array_eval(one));
+        const joined = mlx.engine.stats().dispatches - d1;
+        try testing.expectEqual(@as(u64, 1), joined);
+        try testing.expectEqual(@as(u64, n), solo);
+    }
+    {
+        const y = try rows(&o, n, d, 0x7070);
+        const h = try o.reshape(try rows(&o, n * @as(usize, @intCast(hc)), d, 0x7171), &.{ @intCast(n), hc, @intCast(d) });
+        const post = try rows(&o, n, @intCast(hc), 0x7272);
+        for ([_]Arr{ y, h, post }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+        const mix = m.layers[l].mix_ffn;
+        const d0 = mlx.engine.stats().dispatches;
+        for (0..n) |i| {
+            const ri: c_int = @intCast(i);
+            const em = try fwd.expandWhole(&o, try o.slice(h, 0, ri, ri + 1), try o.slice(post, 0, ri, ri + 1), try o.slice(y, 0, ri, ri + 1), .normed, attn, m.layers[l].geometry.eps, mix, hc, p.config.hc_magnitude, p.config.hc_eps, p.config.eps, attn.post_norm);
+            try mlx.check(mlx.mlx_array_eval(em.m));
+        }
+        const solo = mlx.engine.stats().dispatches - d0;
+        const d1 = mlx.engine.stats().dispatches;
+        const em = try fwd.expandWhole(&o, h, post, y, .normed, attn, m.layers[l].geometry.eps, mix, hc, p.config.hc_magnitude, p.config.hc_eps, p.config.eps, attn.post_norm);
+        try mlx.check(mlx.mlx_array_eval(em.m));
+        const joined = mlx.engine.stats().dispatches - d1;
+        try testing.expectEqual(@as(u64, 1), joined);
+        try testing.expectEqual(@as(u64, n), solo);
+    }
+}
+
+test "hy4 rows: projectRows over N rows at distinct positions gives each row its solo projected bytes (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    const l: usize = 2;
+    const attn = m.layers[l].attn;
+    const g = m.layers[l].geometry;
+    const d: usize = @intCast(p.config.dim);
+    const n: c_int = fwd.joinedRowsMax();
+    var rng = std.Random.DefaultPrng.init(0x70726f6a);
+    const xv = try a.alloc(f32, @as(usize, @intCast(n)) * d);
+    defer a.free(xv);
+    for (xv) |*v| v.* = rng.random().floatNorm(f32) * 0.1;
+    const x = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ n, @intCast(d) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_array_eval(x));
+    var positions: [16]c_int = undefined;
+    for (&positions, 0..) |*q, i| q.* = @intCast(3 + i * 7);
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    var want: [16][5][]u8 = undefined;
+    var made: usize = 0;
+    defer {
+        for (want[0..made]) |row| for (row) |s| a.free(s);
+    }
+    for (0..@as(usize, @intCast(n))) |i| {
+        const ri: c_int = @intCast(i);
+        const one = try fwd.projectAsQ(&o, try o.contiguous(try o.slice(x, 0, ri, ri + 1)), attn, g, positions[i], .bfloat16, .float32);
+        want[i] = .{
+            try copyF32Bytes(a, one.q),
+            try copyF32Bytes(a, one.c),
+            try copyF32Bytes(a, one.k_pe),
+            try copyF32Bytes(a, one.q_resid),
+            try copyF32Bytes(a, one.q_raw.?),
+        };
+        made += 1;
+    }
+    const joined = try fwd.projectRows(a, &o, x, attn, g, &positions, .bfloat16, .float32);
+    defer a.free(joined);
+    for (0..@as(usize, @intCast(n))) |i| {
+        const j = joined[i];
+        const got = [5][]u8{
+            try copyF32Bytes(a, j.q),
+            try copyF32Bytes(a, j.c),
+            try copyF32Bytes(a, j.k_pe),
+            try copyF32Bytes(a, j.q_resid),
+            try copyF32Bytes(a, j.q_raw.?),
+        };
+        defer for (got) |s| a.free(s);
+        for (want[i], got) |w, gg| try testing.expectEqualSlices(u8, w, gg);
+    }
+}
+
+test "hy4 rows: a joined W_o and post_proj_norm over 2 to 8 gated rows gives each row its one-row bytes, W_o's rows up to three and its partials past them (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    const l: usize = 2;
+    const c = p.config;
+    const attn = m.layers[l].attn;
+    const g = m.layers[l].geometry;
+    const mix = m.layers[l].mix_ffn;
+    const hc: c_int = @intCast(c.hc_mult);
+    const d: usize = @intCast(c.dim);
+    const wide: usize = @intCast(g.heads * g.v);
+    const y_bytes = d * 4;
+    const m_bytes = @as(usize, @intCast(hc)) * d * 4;
+    const post_bytes = @as(usize, @intCast(hc)) * 4;
+    const widest: usize = @intCast(fwd.joinedRowsMax());
+    for (2..widest + 1) |n| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const gated = try rows(&o, n, wide, 0x7700 + n);
+        const h = try o.reshape(try rows(&o, n * @as(usize, @intCast(hc)), d, 0x7800 + n), &.{ @intCast(n), hc, @intCast(d) });
+        const post = try rows(&o, n, @intCast(hc), 0x7900 + n);
+        for ([_]Arr{ gated, h, post }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+        var want_y: [16][]u8 = undefined;
+        var want_m: [16][]u8 = undefined;
+        var want_post: [16][]u8 = undefined;
+        var want_x: [16][]u8 = undefined;
+        var made: usize = 0;
+        defer for (want_y[0..made]) |s| a.free(s);
+        defer for (want_m[0..made]) |s| a.free(s);
+        defer for (want_post[0..made]) |s| a.free(s);
+        defer for (want_x[0..made]) |s| a.free(s);
+        for (0..n) |i| {
+            const ri: c_int = @intCast(i);
+            const y = try fwd.outputWhole(&o, try o.slice(gated, 0, ri, ri + 1), attn, g, null);
+            try mlx.check(mlx.mlx_array_eval(y));
+            var left: fwd.OLeft = .normed;
+            const one = try fwd.outputWhole(&o, try o.slice(gated, 0, ri, ri + 1), attn, g, &left);
+            try testing.expect(left == .rows);
+            want_y[i] = try copyF32Bytes(a, y);
+            const em = try fwd.expandWhole(&o, try o.slice(h, 0, ri, ri + 1), try o.slice(post, 0, ri, ri + 1), one, left, attn, g.eps, mix, hc, c.hc_magnitude, c.hc_eps, c.eps, m.layers[l].post_norm);
+            want_m[i] = try copyF32Bytes(a, em.m);
+            want_post[i] = try copyF32Bytes(a, em.mixed.post);
+            want_x[i] = try copyF32Bytes(a, em.mixed.x);
+            made += 1;
+        }
+        const joined_y = try fwd.outputWhole(&o, gated, attn, g, null);
+        try mlx.check(mlx.mlx_array_eval(joined_y));
+        const got_y = try copyF32Bytes(a, joined_y);
+        defer a.free(got_y);
+        for (0..n) |i| try testing.expectEqualSlices(u8, want_y[i], got_y[i * y_bytes ..][0..y_bytes]);
+        var left: fwd.OLeft = .normed;
+        const joined = try fwd.outputWhole(&o, gated, attn, g, &left);
+        switch (left) {
+            .rows => try testing.expect(n <= fwd.o_rows_max),
+            .parts => try testing.expect(n > fwd.o_rows_max and n <= fwd.verify_rows_max),
+            .normed => try testing.expect(n > fwd.verify_rows_max),
+        }
+        const em = try fwd.expandWhole(&o, h, post, joined, left, attn, g.eps, mix, hc, c.hc_magnitude, c.hc_eps, c.eps, m.layers[l].post_norm);
+        const got_m = try copyF32Bytes(a, em.m);
+        defer a.free(got_m);
+        const got_post = try copyF32Bytes(a, em.mixed.post);
+        defer a.free(got_post);
+        const got_x = try copyF32Bytes(a, em.mixed.x);
+        defer a.free(got_x);
+        for (0..n) |i| {
+            try testing.expectEqualSlices(u8, want_m[i], got_m[i * m_bytes ..][0..m_bytes]);
+            try testing.expectEqualSlices(u8, want_post[i], got_post[i * post_bytes ..][0..post_bytes]);
+            try testing.expectEqualSlices(u8, want_x[i], got_x[i * y_bytes ..][0..y_bytes]);
+        }
+    }
+}
+
+const IhcArm = enum { normed, rows, parts };
+
+/// The write-back's input `y` for one row `ri` of `gated` and `y` (every row when null): `y` as W_o's normed or finished
+/// rows, or W_o's partials of `gated` with their split.
+fn ihcInput(o: *Ops, arm: IhcArm, y: Arr, gated: Arr, attn: fwd.Attn, ri: ?c_int) !struct { y: Arr, left: fwd.OLeft } {
+    const lo: c_int = ri orelse 0;
+    const hi: c_int = if (ri) |r| r + 1 else mlx.getShape(y)[0];
+    switch (arm) {
+        .normed => return .{ .y = try o.slice(y, 0, lo, hi), .left = .normed },
+        .rows => return .{ .y = try o.slice(y, 0, lo, hi), .left = .rows },
+        .parts => {
+            const pr = (try hy4_stq.applyParts(o, try o.slice(gated, 0, lo, hi), attn.o.stq.?)).?;
+            return .{ .y = pr.part, .left = .{ .parts = pr.nsplit } };
+        },
+    }
+}
+
+test "hy4 rows: a joined iHC write-back and mix over 2 to 8 rows gives each row its one-row bytes, on W_o's normed rows, finished rows and partials (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    const l: usize = 2;
+    const c = p.config;
+    const d: usize = @intCast(c.dim);
+    const hc: c_int = @intCast(c.hc_mult);
+    const mix = m.layers[l].mix_ffn;
+    const attn = m.layers[l].attn;
+    const wide: usize = @intCast(m.layers[l].geometry.heads * m.layers[l].geometry.v);
+    const x_bytes = d * 4;
+    const m_bytes = @as(usize, @intCast(hc)) * d * 4;
+    const post_bytes = @as(usize, @intCast(hc)) * 4;
+    const widest: usize = @intCast(fwd.joinedRowsMax());
+    for (2..widest + 1) |n| {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const h = try o.reshape(try rows(&o, n * @as(usize, @intCast(hc)), d, 0x6800 + n), &.{ @intCast(n), hc, @intCast(d) });
+        const post = try rows(&o, n, @intCast(hc), 0x6900 + n);
+        const y = try rows(&o, n, d, 0x6a00 + n);
+        const gated = try rows(&o, n, wide, 0x6b00 + n);
+        for ([_]IhcArm{ .normed, .rows, .parts }) |arm| {
+            if (arm == .parts and n > fwd.verify_rows_max) continue;
+            var want_m: [16][]u8 = undefined;
+            var want_post: [16][]u8 = undefined;
+            var want_x: [16][]u8 = undefined;
+            var made: usize = 0;
+            defer for (want_m[0..made]) |s| a.free(s);
+            defer for (want_post[0..made]) |s| a.free(s);
+            defer for (want_x[0..made]) |s| a.free(s);
+            for (0..n) |i| {
+                const ri: c_int = @intCast(i);
+                const one = try ihcInput(&o, arm, y, gated, attn, ri);
+                const em = try fwd.expandWhole(&o, try o.slice(h, 0, ri, ri + 1), try o.slice(post, 0, ri, ri + 1), one.y, one.left, attn, m.layers[l].geometry.eps, mix, hc, c.hc_magnitude, c.hc_eps, c.eps, attn.post_norm);
+                want_m[i] = try copyF32Bytes(a, em.m);
+                want_post[i] = try copyF32Bytes(a, em.mixed.post);
+                want_x[i] = try copyF32Bytes(a, em.mixed.x);
+                made += 1;
+            }
+            const all = try ihcInput(&o, arm, y, gated, attn, null);
+            const joined = try fwd.expandWhole(&o, h, post, all.y, all.left, attn, m.layers[l].geometry.eps, mix, hc, c.hc_magnitude, c.hc_eps, c.eps, attn.post_norm);
+            const got_m = try copyF32Bytes(a, joined.m);
+            defer a.free(got_m);
+            const got_post = try copyF32Bytes(a, joined.mixed.post);
+            defer a.free(got_post);
+            const got_x = try copyF32Bytes(a, joined.mixed.x);
+            defer a.free(got_x);
+            for (0..n) |i| {
+                try testing.expectEqualSlices(u8, want_m[i], got_m[i * m_bytes ..][0..m_bytes]);
+                try testing.expectEqualSlices(u8, want_post[i], got_post[i * post_bytes ..][0..post_bytes]);
+                try testing.expectEqualSlices(u8, want_x[i], got_x[i * x_bytes ..][0..x_bytes]);
+            }
+        }
+    }
+}
+
+fn markReleased(payload: ?*anyopaque) callconv(.c) void {
+    const flag: *bool = @ptrCast(@alignCast(payload.?));
+    flag.* = true;
+}
+
+test "hy4 rows: a row's front split from the joined layer frees the handles it made when a later slice fails" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const cols: usize = 1 << 12;
+    const v = try a.alloc(f32, 3 * cols);
+    defer a.free(v);
+    for (v, 0..) |*x, i| x.* = @floatFromInt(i);
+    const shape = [_]c_int{ 3, @intCast(cols) };
+    {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const m = try o.own(mlx.mlx_array_new_data(v.ptr, &shape, 2, .float32));
+        const f = try hy4_model.Model.rowFront(&o, m, m, m, 1);
+        defer f.deinit();
+        for ([_]Arr{ f.mid, f.post, f.x }) |got| {
+            const bytes = try copyF32Bytes(a, got);
+            defer a.free(bytes);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(v[cols .. 2 * cols]), bytes);
+        }
+    }
+    var released = false;
+    const m = mlx.mlx_array_new_data_managed_payload(@constCast(v.ptr), &shape, 2, .float32, &released, markReleased);
+    {
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        while (o.count < o.values.len - 1) _ = try o.slot();
+        try testing.expectError(error.GraphTooLarge, hy4_model.Model.rowFront(&o, m, m, m, 0));
+    }
+    _ = mlx.mlx_array_free(m);
+    try testing.expect(released);
+}
+
+test "hy4 rows: a joined two-row decode finishes W_o once a layer, not once a row (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    var rng = std.Random.DefaultPrng.init(0x66696e69);
+    var ids: [32]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    const positions = [_]usize{ 9, 20 };
+    const n: usize = 2;
+    var solo: [2]hy4_model.Request = undefined;
+    var joined: [2]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer {
+        for (solo[0..made]) |*r| r.deinit();
+        for (joined[0..made]) |*r| r.deinit();
+    }
+    for (0..n) |i| {
+        solo[i] = try hy4_model.Request.init(a, 0);
+        joined[i] = try hy4_model.Request.init(a, 0);
+        made += 1;
+    }
+    for (0..n) |i| {
+        {
+            const lent = m.lend(&solo[i]);
+            defer lent.end();
+            _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+        }
+        {
+            const lent = m.lend(&joined[i]);
+            defer lent.end();
+            _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+        }
+    }
+    const s0 = hy4_stq.finished_launches;
+    for (0..n) |i| {
+        const lent = m.lend(&solo[i]);
+        defer lent.end();
+        _ = mlx.mlx_array_free(try m.forwardReadout(&.{ids[positions[i]]}, .last));
+    }
+    const row_wise = hy4_stq.finished_launches - s0;
+    var row_segs: [2]hy4_model.Model.Seg = undefined;
+    for (0..n) |i| row_segs[i] = .{ .request = &joined[i], .id = ids[positions[i]] };
+    const j0 = hy4_stq.finished_launches;
+    _ = mlx.mlx_array_free(try m.extendRows(row_segs[0..n]));
+    const layer_wise = hy4_stq.finished_launches - j0;
+    try testing.expect(row_wise > 0);
+    try testing.expectEqual(row_wise / 2, layer_wise);
+    try testing.expectEqual(@as(u64, 0), row_wise % 2);
+}
+
+test "hy4 rows: N requests at different positions, each row's logits and end state its solo one-row step's bytes (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    const vocab: usize = @intCast(p.config.vocab);
+    const vb = vocab * 4;
+    var rng = std.Random.DefaultPrng.init(0x726f77);
+    var ids: [160]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    const positions = [_]usize{ 3, 7, 11, 16, 21, 27, 34, 42, 55, 63, 71, 80, 92, 101, 113, 127 };
+    const widest: usize = @intCast(fwd.joinedRowsMax());
+    for (2..widest + 1) |n| {
+        var solo: [@intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX)]hy4_model.Request = undefined;
+        var joined: [@intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX)]hy4_model.Request = undefined;
+        var made: usize = 0;
+        defer {
+            for (solo[0..made]) |*r| r.deinit();
+            for (joined[0..made]) |*r| r.deinit();
+        }
+        for (0..n) |i| {
+            solo[i] = try hy4_model.Request.init(a, 0);
+            joined[i] = try hy4_model.Request.init(a, 0);
+            made += 1;
+        }
+        for (0..n) |i| {
+            {
+                const lent = m.lend(&solo[i]);
+                defer lent.end();
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+            }
+            {
+                const lent = m.lend(&joined[i]);
+                defer lent.end();
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+            }
+        }
+        var s1: [16][]u8 = undefined;
+        var s2: [16][]u8 = undefined;
+        var c1: usize = 0;
+        var c2: usize = 0;
+        defer {
+            for (s1[0..c1]) |s| a.free(s);
+            for (s2[0..c2]) |s| a.free(s);
+        }
+        for (0..n) |i| {
+            {
+                const lent = m.lend(&solo[i]);
+                defer lent.end();
+                const lg = try m.forwardReadout(&.{ids[positions[i]]}, .last);
+                s1[i] = try copyF32Bytes(a, lg);
+                c1 += 1;
+                _ = mlx.mlx_array_free(lg);
+            }
+            {
+                const lent = m.lend(&solo[i]);
+                defer lent.end();
+                const lg = try m.forwardReadout(&.{ids[positions[i] + 1]}, .last);
+                s2[i] = try copyF32Bytes(a, lg);
+                c2 += 1;
+                _ = mlx.mlx_array_free(lg);
+            }
+        }
+        var row_segs: [16]hy4_model.Model.Seg = undefined;
+        for (0..n) |i| row_segs[i] = .{ .request = &joined[i], .id = ids[positions[i]] };
+        const j1 = try m.extendRows(row_segs[0..n]);
+        const b1 = try copyF32Bytes(a, j1);
+        defer a.free(b1);
+        _ = mlx.mlx_array_free(j1);
+        for (0..n) |i| try testing.expectEqualSlices(u8, s1[i], b1[i * vb ..][0..vb]);
+        for (0..n) |i| row_segs[i] = .{ .request = &joined[i], .id = ids[positions[i] + 1] };
+        const j2 = try m.extendRows(row_segs[0..n]);
+        const b2 = try copyF32Bytes(a, j2);
+        defer a.free(b2);
+        _ = mlx.mlx_array_free(j2);
+        for (0..n) |i| try testing.expectEqualSlices(u8, s2[i], b2[i * vb ..][0..vb]);
+    }
+}
+
+/// A joined tick of `positions.len` requests, each prefilled to its position: the tick's logits bytes and its dispatches.
+fn joinedTick(a: std.mem.Allocator, m: *@import("hy4_model.zig").Model, ids: []const u32, positions: []const usize, bytes: *[]u8) !u64 {
+    const hy4_model = @import("hy4_model.zig");
+    const n = positions.len;
+    var reqs: [16]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer for (reqs[0..made]) |*r| r.deinit();
+    for (positions, 0..) |p, i| {
+        reqs[i] = try hy4_model.Request.init(a, 0);
+        made = i + 1;
+        const lent = m.lend(&reqs[i]);
+        defer lent.end();
+        _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..p], .none));
+    }
+    var tick: [16]hy4_model.Model.Seg = undefined;
+    for (positions, 0..) |p, i| tick[i] = .{ .request = &reqs[i], .id = ids[p] };
+    const d0 = mlx.engine.stats().dispatches;
+    const j = try m.extendRows(tick[0..n]);
+    defer _ = mlx.mlx_array_free(j);
+    try mlx.check(mlx.mlx_array_eval(j));
+    const d = mlx.engine.stats().dispatches - d0;
+    bytes.* = try copyF32Bytes(a, j);
+    return d;
+}
+
+test "hy4 rows: a joined tick of rows all past the window runs its sliding layers' attention once for every row, with each row's bytes (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    defer fwd.joined_attention_on = true;
+    var rng = std.Random.DefaultPrng.init(0x6a6f6e61);
+    var ids: [64]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    // The tiny's window is 8: every row has more than a window behind it.
+    const positions = [_]usize{ 9, 10, 13, 17, 20, 25, 31, 40 };
+    // Dispatches of the whole tick on the tiny's 3 sliding layers, grouped and one row at a time (M5 Max).
+    const counts = [_][3]u64{ .{ 1, 267, 267 }, .{ 4, 642, 654 }, .{ 8, 1181, 1229 } };
+    for (counts) |want| {
+        const n: usize = @intCast(want[0]);
+        fwd.joined_attention_on = false;
+        var rows_bytes: []u8 = undefined;
+        const per_row = try joinedTick(a, m, &ids, positions[0..n], &rows_bytes);
+        defer a.free(rows_bytes);
+        fwd.joined_attention_on = true;
+        var grouped_bytes: []u8 = undefined;
+        const grouped = try joinedTick(a, m, &ids, positions[0..n], &grouped_bytes);
+        defer a.free(grouped_bytes);
+        errdefer std.debug.print("{d} rows: {d} dispatches grouped, {d} a row at a time\n", .{ n, grouped, per_row });
+        try testing.expectEqualSlices(u8, rows_bytes, grouped_bytes);
+        try testing.expectEqual(want[1], grouped);
+        try testing.expectEqual(want[2], per_row);
+    }
+}
+
+test "hy4 rows: groups of 1 to 8 rows at different positions, to a 16-row join, give each group its solo verify's logits, byte for byte (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    m.keep_hidden = true;
+    const vocab: usize = @intCast(p.config.vocab);
+    var rng = std.Random.DefaultPrng.init(0x67727073);
+    var ids: [96]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    const Case = struct { starts: [3]usize, widths: [3]usize, n: usize };
+    const cases = [_]Case{
+        .{ .starts = .{ 3, 9, 21 }, .widths = .{ 1, 3, 4 }, .n = 3 },
+        .{ .starts = .{ 4, 12, 22 }, .widths = .{ 5, 6, 5 }, .n = 3 },
+        .{ .starts = .{ 2, 10, 0 }, .widths = .{ 8, 8, 0 }, .n = 2 },
+    };
+    for (cases) |c| {
+        const starts = c.starts;
+        const widths = c.widths;
+        const n = c.n;
+        var total: usize = 0;
+        for (widths[0..n]) |w| total += w;
+        try testing.expect(total <= @as(usize, @intCast(fwd.joinedRowsMax())));
+        var solo: [3]hy4_model.Request = undefined;
+        var joined: [3]hy4_model.Request = undefined;
+        var made: usize = 0;
+        defer {
+            for (solo[0..made]) |*r| r.deinit();
+            for (joined[0..made]) |*r| r.deinit();
+        }
+        for (0..n) |i| {
+            solo[i] = try hy4_model.Request.init(a, 0);
+            joined[i] = try hy4_model.Request.init(a, 0);
+            made = i + 1;
+            for ([_]*hy4_model.Request{ &solo[i], &joined[i] }) |r| {
+                const lent = m.lend(r);
+                defer lent.end();
+                try m.reserveFor(starts[i] + widths[i]);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..starts[i]], .none));
+            }
+        }
+        var want: [3][]u8 = undefined;
+        var wc: usize = 0;
+        defer for (want[0..wc]) |b| a.free(b);
+        for (0..n) |i| {
+            const lent = m.lend(&solo[i]);
+            defer lent.end();
+            const lg = try m.forwardServed(ids[starts[i]..][0..widths[i]], null, .all);
+            defer _ = mlx.mlx_array_free(lg);
+            want[i] = try copyF32Bytes(a, lg);
+            wc = i + 1;
+        }
+        var groups: [3]hy4_model.Model.Group = undefined;
+        for (0..n) |i| groups[i] = .{ .request = &joined[i], .ids = ids[starts[i]..][0..widths[i]] };
+        const all = try m.extendGroups(groups[0..n]);
+        defer _ = mlx.mlx_array_free(all);
+        const joined_bytes = try copyF32Bytes(a, all);
+        defer a.free(joined_bytes);
+        var row: usize = 0;
+        for (0..n) |i| {
+            const nb = widths[i] * vocab;
+            errdefer std.debug.print("group {d} ({d} rows at {d}): not its solo verify's bytes\n", .{ i, widths[i], starts[i] });
+            try testing.expectEqualSlices(u8, want[i], joined_bytes[row * vocab * 4 ..][0 .. nb * 4]);
+            row += widths[i];
+        }
+        try testing.expectEqual(total, row);
+    }
+}
+
+test "hy4 rows: a shared router at every width 2..8 gives each row its one-row picks and weights, rows from different positions" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+
+    const a = testing.allocator;
+    const e: c_int = 512;
+    const d: c_int = 3072;
+    const k: c_int = 16;
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    var prng = std.Random.DefaultPrng.init(0x726f);
+    const rnd = prng.random();
+    const wv = try a.alloc(f32, @intCast(e * d));
+    defer a.free(wv);
+    for (wv) |*v| v.* = rnd.floatNorm(f32) * 0.05;
+    const bv = try a.alloc(f32, @intCast(e));
+    defer a.free(bv);
+    for (bv) |*v| v.* = rnd.floatNorm(f32) * 0.1;
+    const max_w: c_int = fwd.joinedRowsMax();
+    const xvv = try a.alloc(f32, @intCast(max_w * d));
+    defer a.free(xvv);
+    for (0..@as(usize, @intCast(max_w))) |r| {
+        const scale: f32 = @floatFromInt(r + 1);
+        for (xvv[@as(usize, @intCast(r)) * @as(usize, @intCast(d)) ..][0..@as(usize, @intCast(d))]) |*v| v.* = rnd.floatNorm(f32) * scale + scale;
+    }
+    const w = try o.cast(try o.own(mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ e, d }, 2, .float32)), .bfloat16);
+    const bias = try o.own(mlx.mlx_array_new_data(bv.ptr, &[_]c_int{e}, 1, .float32));
+    const x_all = try o.own(mlx.mlx_array_new_data(xvv.ptr, &[_]c_int{ max_w, d }, 2, .float32));
+    for ([_]Arr{ w, bias, x_all }) |arr| try mlx.check(mlx.mlx_array_eval(arr));
+    const router: fwd.Router = .{ .weight = w, .bias = bias };
+    const row_bytes: usize = @as(usize, @intCast(k)) * 4;
+    var t: c_int = 2;
+    while (t <= max_w) : (t += 1) {
+        var ro: Ops = .{ .s = es };
+        defer ro.deinit();
+        const x = try ro.contiguous(try ro.slice(x_all, 0, 0, t));
+        try mlx.check(mlx.mlx_array_eval(x));
+        const wide = try fwd.routeMapped(&ro, x, router, k, 3.998, null);
+        const wbytes = try copyF32Bytes(a, wide.routed.weights);
+        defer a.free(wbytes);
+        const pbytes = try copyF32Bytes(a, wide.routed.picks);
+        defer a.free(pbytes);
+        for (0..@as(usize, @intCast(t))) |r| {
+            const ri: c_int = @intCast(r);
+            const one = try fwd.routeMapped(&ro, try ro.contiguous(try ro.slice(x_all, 0, ri, ri + 1)), router, k, 3.998, null);
+            const w1 = try copyF32Bytes(a, one.routed.weights);
+            defer a.free(w1);
+            const p1 = try copyF32Bytes(a, one.routed.picks);
+            defer a.free(p1);
+            try testing.expectEqualSlices(u8, w1, wbytes[r * row_bytes ..][0..row_bytes]);
+            try testing.expectEqualSlices(u8, p1, pbytes[r * row_bytes ..][0..row_bytes]);
+        }
+    }
+}
+
 test "hy4 verify launches: a 6-row verify router makes one launch past logits as one row does" {
     try mlx.requireGpu();
     const was = mlx.engine.enabled;
@@ -2594,5 +3529,72 @@ test "hy4 stq: wide moeFinishBack fuses shared down and lat_up finish into backM
             }
             try testing.expectEqual(want_d, fused_d);
         }
+    }
+}
+
+test "hy4 rows: a joined tick leaves each drafting request the hidden its solo one-row step does (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    m.keep_hidden = true;
+    var rng = std.Random.DefaultPrng.init(0x68696465);
+    var ids: [48]u32 = undefined;
+    for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
+    const positions = [_]usize{ 6, 15 };
+    const n: usize = 2;
+    var solo: [2]hy4_model.Request = undefined;
+    var joined: [2]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer {
+        for (solo[0..made]) |*r| r.deinit();
+        for (joined[0..made]) |*r| r.deinit();
+    }
+    for (0..n) |i| {
+        solo[i] = try hy4_model.Request.init(a, 0);
+        joined[i] = try hy4_model.Request.init(a, 0);
+        made += 1;
+    }
+    for (0..n) |i| {
+        {
+            const lent = m.lend(&solo[i]);
+            defer lent.end();
+            _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+        }
+        {
+            const lent = m.lend(&joined[i]);
+            defer lent.end();
+            _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+        }
+    }
+    var want: [2][]u8 = undefined;
+    var wc: usize = 0;
+    defer for (want[0..wc]) |s| a.free(s);
+    for (0..n) |i| {
+        const lent = m.lend(&solo[i]);
+        defer lent.end();
+        _ = mlx.mlx_array_free(try m.forwardReadout(&.{ids[positions[i]]}, .last));
+        want[i] = try copyF32Bytes(a, solo[i].last_hidden orelse return error.Hy4DflyNoHandover);
+        wc += 1;
+    }
+    var row_segs: [2]hy4_model.Model.Seg = undefined;
+    for (0..n) |i| row_segs[i] = .{ .request = &joined[i], .id = ids[positions[i]] };
+    _ = mlx.mlx_array_free(try m.extendRows(row_segs[0..n]));
+    for (0..n) |i| {
+        const got = try copyF32Bytes(a, joined[i].last_hidden orelse return error.Hy4DflyNoHandover);
+        defer a.free(got);
+        try testing.expectEqualSlices(u8, want[i], got);
     }
 }

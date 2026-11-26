@@ -18,6 +18,14 @@ assert.equal(page.adminBytes(25 * GiB), '25.0 GiB');
 assert.equal(page.adminBytes(300 * 1024 ** 2), '300 MiB');
 assert.equal(page.adminBytes(0), '0 KiB');
 
+// A pack's size line: what memory takes, then the whole pack when it is more (tables read from the SSD); one number when
+// the two agree within 5%; no memory claim for a pack that streams from the SSD, only its total.
+assert.equal(page.adminSizeLine(76.1 * GiB, 194 * GiB, false), '76.1 GiB in memory · 194 GiB total');
+assert.equal(page.adminSizeLine(64.8 * GiB, 66 * GiB, false), '64.8 GiB in memory');
+assert.equal(page.adminSizeLine(64.8 * GiB, null, false), '64.8 GiB in memory');
+assert.equal(page.adminSizeLine(475 * GiB, 475 * GiB, true), '475 GiB total');
+assert.equal(page.adminSizeLine(null, null, false), '');
+
 const now = 1_700_000_000_000;
 assert.equal(page.adminAgo(0, now), '-');
 assert.equal(page.adminAgo(now / 1000 - 30, now), 'just now');
@@ -191,3 +199,17 @@ for (const rule of ['.alert span', '.toast', '.chat-error span']) {
   assert.match(source, new RegExp(`\\${rule.replace(' ', ' ')}[^{]*\\{[^}]*white-space: pre-line`), `${rule} shows a message's lines`);
 }
 storeChecks.then(() => console.log('Web UI admin views: passed'), (e) => { console.error(e); process.exitCode = 1; });
+
+// A save that would leave the context above the token budget lowers the context to the budget and says why.
+{
+  const within = (set, settings) => { const s = { ...set }; return { note: page.adminContextWithinBudget(s, settings), set: s }; };
+  const both = within({ ctx_size: 8192, max_kv_tokens: 4096 }, {});
+  assert.equal(both.set.ctx_size, 4096);
+  assert.match(both.note, /lowered to 4,096 tokens/);
+  const budgetCut = within({ max_kv_tokens: 4096 }, { ctx_size: { file: 8192 } });
+  assert.equal(budgetCut.set.ctx_size, 4096, 'lowering the budget under a saved context lowers the context too');
+  assert.equal(within({ ctx_size: 4096, max_kv_tokens: 4096 }, {}).note, null);
+  assert.equal(within({ ctx_size: 8192 }, {}).note, null, 'no budget, no cap');
+  assert.equal(within({ max_kv_tokens: null }, { ctx_size: { file: 8192 } }).note, null, 'clearing the budget clears the cap');
+  assert.equal(within({ ctx_size: null, max_kv_tokens: 4096 }, {}).note, null, 'an auto context is held by the server');
+}

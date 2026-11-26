@@ -24,6 +24,7 @@ pub fn cacheLayoutNamespace(config: *const Config) ?[]const u8 {
 }
 pub const Model = *Trunk;
 pub const State = @import("hy4_state.zig").State;
+pub const Ctx = @import("hy4_state.zig").Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
     pub const product = "Hy4-Flash";
@@ -63,7 +64,11 @@ pub const samplingDefaults = @import("hy4_config.zig").samplingDefaults;
 /// An STQ pack's routed banks sit under the release's own names (`model.layers.{L}.mlp.switch_mlp`); its trunk shards
 /// carry the trunk's SPEC1 stamp beside the experts' PAIR1, so the shard stamps are not held to the expert block.
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model", .head = .none, .streams_groups = true };
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .streams_experts = true, .vision_on_streamed = true, .expert_source = .fused_banks, .prefill_start_width = 4096, .static_chunk_max = @import("hy4_config.zig").widest_chunk, .static_chunk_default = @import("hy4_config.zig").default_chunk, .streams_rate_groups = true, .reads_pair_major = true, .reads_pack_order = false, .exclusive_decode = true };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .streams_experts = true, .vision_on_streamed = true, .expert_source = .fused_banks, .prefill_start_width = 4096, .static_chunk_max = @import("hy4_config.zig").widest_chunk, .static_chunk_default = @import("hy4_config.zig").default_chunk, .streams_rate_groups = true, .reads_pair_major = true, .reads_pack_order = false, .exclusive_decode_of = joinsNoRows, .ssd_first_capable = true, .bias_unserved = true, .ssd_tables = &.{".engram_layer.multi_head_embedding."} };
+/// A load that joins no rows runs one request at a time; one that joins them is held to its row count.
+fn joinsNoRows(config: *const @import("../model.zig").ModelConfig) bool {
+    return @import("hy4_plan.zig").joinedRows(config) <= 1;
+}
 pub const OwnConfig = config_file.Config;
 pub const serveDefaults = config_file.Config.serveDefaults;
 /// The family's fields, then an STQ pack's trunk rate (`trunk_quant`), which the MLX-free family parse does not read:
@@ -139,7 +144,11 @@ pub fn deinit(xfm: Model) void {
 
 pub fn resetCache(xfm: Model) !void {
     @import("hy4_state.zig").dropVerify(&xfm.arch_state.hy4flash, false);
-    if (xfm.arch_state.hy4flash.model) |m| m.reset();
+    if (xfm.arch_state.hy4flash.model) |m| {
+        const own: ?@import("hy4_model.zig").Model.Lent = if (m.serves_requests and m.bound == null) m.lendOwn() else null;
+        defer if (own) |l| l.end();
+        m.reset();
+    }
     return xfm.resetTrunk();
 }
 
@@ -169,6 +178,7 @@ pub fn coolerPipelineScope(config: *const Config) [16]u8 {
 
 pub fn warmup(xfm: Model) !void {
     if (xfm.arch_state.hy4flash.model) |m| try m.warmKernels();
+    if (xfm.arch_state.hy4flash.model) |m| try m.warmJoined(@import("hy4_plan.zig").joinedRows(&xfm.config), @import("../bills.zig").configuredKvQuantFor(&xfm.config));
     return xfm.warmupTrunk();
 }
 
@@ -190,10 +200,10 @@ pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Ca
     // The ledger holds the encode where the load recorded that it keeps the tower (`ModelConfig.keeps_tower`).
     if ((tower != null) != xfm.config.keeps_tower) return error.Hy4TowerUnbilled;
     const encode: ?@import("hy4_plan.zig").Encode = if (tower) |*t| .{ .tower = t, .max_patches = media.maxImagePatches(media.preproc(&xfm.config)) } else null;
-    const p = try @import("hy4_plan.zig").record(m, xfm.allocator, bills.planReach(&xfm.config), dfly, bills.configuredKvQuantFor(&xfm.config), cache, encode);
+    const p = try @import("hy4_plan.zig").record(m, xfm.allocator, bills.planReach(&xfm.config), dfly, bills.configuredKvQuantFor(&xfm.config), cache, encode, @import("hy4_plan.zig").joinedRows(&xfm.config));
     errdefer p.deinit(xfm.allocator);
     p.pack = try packKey(xfm);
-    try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = xfm.suppress_mask, .think = xfm.think_marker_mask });
+    try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = xfm.suppress_mask });
     m.recorded = p;
 }
 
@@ -263,19 +273,22 @@ pub fn forwardIds(xfm: Model, ids: []const i32) !?mlx.mlx_array {
 /// [1, 1, vocab] in f32. A position 0 starts the request over.
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {
     const m = xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
+    const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+    defer scope.endForward();
+    const r = m.req();
     if (ctx.cache.step == 0) {
         // A cold request: the last one's live record no longer stands behind this state, nor an open verify's mark.
-        @import("hy4_state.zig").dropVerify(&xfm.arch_state.hy4flash, false);
+        @import("hy4_state.zig").dropVerifyReq(m, r, false);
         m.reset();
         m.dropLive();
-        m.kv = try kvWidth(ctx.cache.config);
+        r.kv = try kvWidth(ctx.cache.config);
     }
-    if (m.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
+    if (r.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
     const shape = mlx.getShape(ids);
     if (shape.len != 2 or shape[0] != 1) return error.InvalidHy4Input;
     // The request's state made at its end before the forward runs, so the forward asks for none of its own; never
     // short of the rows this forward writes.
-    if (ctx.cache.end_tokens > 0) try m.reserveFor(@max(ctx.cache.end_tokens, m.pos + @as(usize, @intCast(shape[1]))));
+    if (ctx.cache.end_tokens > 0) try m.reserveFor(@max(ctx.cache.end_tokens, r.pos + @as(usize, @intCast(shape[1]))));
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_astype(&flat, ids, .uint32, xfm.s));
@@ -287,7 +300,7 @@ pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_
     const spliced = if (vision) |v| m.splicesImage(host, v) else false;
     const logits = try @import("hy4_plan.zig").run(m, host, vision, if (ctx.skip_lm_head) .hidden_last else .last);
     if (xfm.expert_stream) |engine| engine.finishForward(n);
-    ctx.cache.step = m.pos;
+    ctx.cache.step = r.pos;
     // The image rows a forward splices are consumed, one an image token: a later forward splices past them, and a
     // decode past the image is the text forward.
     if (spliced) ctx.vision_splice_offset += std.mem.count(u32, host, &.{m.config.image_id});
@@ -312,8 +325,8 @@ pub fn lmHeadForDraft(xfm: Model, x: mlx.mlx_array) !mlx.mlx_array {
 }
 
 pub fn ownsModuleDecodeState(xfm: Model) bool {
-    _ = xfm;
-    return true;
+    const m = xfm.arch_state.hy4flash.model orelse return true;
+    return !m.serves_requests;
 }
 
 pub fn expertStream(config: *const Config) admission.ExpertStreamTraits {

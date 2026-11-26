@@ -234,14 +234,12 @@ test "hy4 plan audit: a dry model of the release builds the plans of its one-row
     mc.hy4flash = c;
     const media = @import("hy4_media.zig");
     const hy4_plan = @import("hy4_plan.zig");
-    const p = try hy4_plan.record(m, a, 1 << 20, &drafter, .engine_default, null, .{ .tower = &tower, .max_patches = media.maxImagePatches(media.preproc(&mc)) });
+    const p = try hy4_plan.record(m, a, 1 << 20, &drafter, .engine_default, null, .{ .tower = &tower, .max_patches = media.maxImagePatches(media.preproc(&mc)) }, 0);
     m.recorded = p;
-    // A served load's draws read a reserved-token mask and think markers.
+    // A served load's draws read a reserved-token mask.
     const suppress = try @import("../sampler.zig").buildSuppressMask(&.{ 5, 9 }, 0, c.vocab, s);
     defer _ = mlx.mlx_array_free(suppress);
-    const think = try @import("../think_penalty.zig").buildMask(a, &.{ 3, 4, 11 }, c.vocab);
-    defer _ = mlx.mlx_array_free(think);
-    try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = suppress, .think = think });
+    try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = suppress });
 }
 
 fn releaseModel(a: std.mem.Allocator, s: mlx.mlx_stream, c: *const hy4_config.Config, w: *model_mod.Weights) !*Model {

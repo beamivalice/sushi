@@ -156,7 +156,7 @@ test "hy4 vision: the tiny's image prompt (the tower's rows spliced at the image
     const m = try hy4_model.Model.init(a, f.config, &f.pack, es);
     defer m.deinit();
     // The oracle's latent is BF16, as a BF16 cache holds it.
-    m.kv = .dense;
+    m.req().kv = .dense;
     const want = try host(&o, try f.ref("vis.logits"));
     const vocab = f.config.vocab;
     const pre = try o.own(try m.forwardSpliced(prompt, .{ .rows = image }, .all));
@@ -228,7 +228,7 @@ test "hy4 vision: the image prompt prefilled in two chunks cut inside the image,
     const cut = first + 3;
     const m = try hy4_model.Model.init(a, f.config, &f.pack, es);
     defer m.deinit();
-    m.kv = .dense;
+    m.req().kv = .dense;
     const want = try host(&o, try f.ref("vis.logits"));
     const vocab = f.config.vocab;
     const one = try o.own(try m.forwardSpliced(prompt[0..cut], .{ .rows = image }, .all));
@@ -717,7 +717,7 @@ test "hy4 vision: the tiny's pack after vision-affine8, loaded as served, keeps 
     // Engram's tables stay in the shards, read by row, as served.
     const m = try hy4_model.Model.initWith(a, config.hy4flash.?, &weights, es, .{ .dir = dir });
     defer m.deinit();
-    m.kv = .dense;
+    m.req().kv = .dense;
     const want = try host(&o, try f.ref("vis.logits"));
     const got = try promptLogits(a, &o, m, ids[0..ids_f.len], rows, want.len);
     defer a.free(got);

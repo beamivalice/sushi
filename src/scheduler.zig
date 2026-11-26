@@ -1929,7 +1929,6 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) model_load.freeCpuState(self.allocator, &owned);
         model_load.applyModelSettings(owned.config, settings);
-        log.info("[concurrency] {s}: max_concurrent {d} ({s})\n", .{ owned.config.model_type, owned.config.max_concurrent, model_load.concurrencySourceText(owned.config.max_concurrent_source) });
         if (comptime @import("builtin").is_test) if (self.test_on_cooler) |on| @import("cooler_side.zig").forTest(owned.config, on);
         var launch_buf: [384]u8 = undefined;
         if (model_load.launchRefusal(&launch_buf, owned.config, self.kv_quant, self.ctx_size_flag)) |r| {
@@ -2138,6 +2137,7 @@ pub const Scheduler = struct {
 
         // Success — inference thread installed cpu_state onto the entry.
         owned_active = false;
+        model_load.logConcurrency(owned.config);
 
         // Already referenced since the claim, so no other load evicted it; only an explicit
         // unload can have claimed it since `markReady`, and that is a 503, not a failed load.
@@ -5493,14 +5493,27 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     defer for (sample_rows[0..shifted_n], logits_arr[0..shifted_n]) |row, raw| {
         if (row.ctx != raw.ctx) _ = mlx.mlx_array_free(row);
     };
-    for (batch, 0..) |slot, i| {
-        const gen = &slot.legacy_gen.?;
-        sample_rows[i] = try gen.thinkShifted(logits_arr[i], .{ .decided = &.{gen.next_token_id} });
-        shifted_n = i + 1;
-        sample_params[i] = gen.sampling;
-    }
-    if (batch.len > 0) {
-        try sampler.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
+    {
+        var gens: [sched_policy.MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
+        for (batch, 0..) |slot, i| {
+            gens[i] = &slot.legacy_gen.?;
+            sample_params[i] = slot.legacy_gen.?.sampling;
+            sample_rows[i] = logits_arr[i];
+        }
+        // An arch that plans its samples draws each row through its own request's root; every other load samples the
+        // rows as one batch.
+        const planned = try sched.sampleJoinedRows(xfm_ptr, gens[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], sample_ids[0..batch.len]);
+        if (!planned) {
+            for (batch, 0..) |slot, i| {
+                const gen = &slot.legacy_gen.?;
+                sample_rows[i] = try gen.thinkShifted(logits_arr[i], .{ .decided = &.{gen.next_token_id} });
+                shifted_n = i + 1;
+                sample_params[i] = gen.sampling;
+            }
+            if (batch.len > 0) {
+                try sampler.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
+            }
+        }
         for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
     }
 

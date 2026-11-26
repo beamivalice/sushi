@@ -8,6 +8,7 @@ pub const tests = .{
     @import("hy4_forward.zig"),
     @import("hy4_model.zig"),
     @import("hy4_state.zig"),
+    @import("hy4_request_test.zig"),
     @import("hy4_prefix.zig"),
     @import("hy4_load.zig"),
     @import("hy4_contract.zig"),
@@ -47,6 +48,7 @@ pub const tests = .{
     @import("hy4_encode_plan.zig"),
     @import("hy4_encode_plan_test.zig"),
     @import("hy4_close_test.zig"),
+    @import("hy4_sched.zig"),
 };
 
 /// The MLX-free test files `src/tests_host.zig` runs for this arch.

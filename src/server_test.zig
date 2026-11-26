@@ -2274,6 +2274,31 @@ test "server: a chat object tool_choice naming no function, and a Responses fiel
     }.run);
 }
 
+test "server: a logit_bias or a think_penalty is served on every route that reads it to a model whose arch serves them" {
+    try eachArch(4, .{}, struct {
+        const Case = struct { path: []const u8, body: []const u8, param: []const u8 };
+        const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
+        const cases = [_]Case{
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"think_penalty\":2," ++ chat_tail ++ "}", .param = "think_penalty" },
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"logit_bias\":{\"5\":-2}," ++ chat_tail ++ "}", .param = "logit_bias" },
+            .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"think_penalty\":2,\"prompt\":\"hi\"}", .param = "think_penalty" },
+            .{ .path = "/v1/completions", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"logit_bias\":{\"5\":-2},\"prompt\":\"hi\"}", .param = "logit_bias" },
+            .{ .path = "/v1/messages", .body = "{\"model\":\"tiny\",\"max_tokens\":2,\"think_penalty\":2," ++ chat_tail ++ "}", .param = "think_penalty" },
+            .{ .path = "/v1/responses", .body = "{\"model\":\"tiny\",\"max_output_tokens\":16,\"think_penalty\":2,\"input\":\"hi\"}", .param = "think_penalty" },
+        };
+        fn run() !void {
+            for (cases) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) {
+                    std.debug.print("{s} {s} with {s} was not served: {s}\n", .{ serving_arch, c.path, c.param, resp[0..@min(resp.len, 300)] });
+                    return error.BiasRequestNotServed;
+                }
+            }
+        }
+    }.run);
+}
+
 test "server: /v1/responses serves Codex's namespace tool, echoes it, and refuses its hosted web_search naming the setting" {
     try eachArch(2, .{}, struct {
         const function = "{\"type\":\"function\",\"name\":\"exec_command\",\"strict\":false,\"parameters\":{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}}}}";
@@ -3429,11 +3454,18 @@ test "server: stopServing waits for an embedded client's post-shutdown requests 
     try testing.expect(!State.drained_before_client.load(.acquire));
 }
 
-test "server: a request over max_kv_tokens is refused 400 naming the cap, stream and non-stream the same bytes" {
+test "server: a prompt over max_kv_tokens is the context's 400 naming the cap, stream and non-stream the same bytes" {
     try eachArch(2, .{ .kv_cap_tokens = 64 }, struct {
         fn run() !void {
-            const plain_body = "{\"model\":\"tiny\",\"max_tokens\":100,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
-            const stream_body = "{\"model\":\"tiny\",\"max_tokens\":100,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+            // The cap holds the context: only a prompt past it is refused (a max_tokens past it is clamped).
+            const content = comptime blk: {
+                var words: [300]u8 = undefined;
+                for (0..100) |i| words[i * 3 ..][0..3].* = "hi ".*;
+                const out = words;
+                break :blk &out;
+            };
+            const plain_body = "{\"model\":\"tiny\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"" ++ content ++ "\"}]}";
+            const stream_body = "{\"model\":\"tiny\",\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"" ++ content ++ "\"}]}";
             const plain = try request("POST", "/v1/chat/completions", plain_body);
             defer gpa.free(plain);
             const streamed = try request("POST", "/v1/chat/completions", stream_body);

@@ -531,7 +531,7 @@ pub fn runLoaded(a: std.mem.Allocator, io: std.Io, l: *kld.Loaded, opts: kld.Opt
     const bf16 = fwd.products == .bf16;
     // Each window starts from no state, and the teacher's latent is BF16 (`accepts` refuses a quantized one).
     m.reset();
-    m.kv = @import("../kv_quant.zig").KVQuantConfig.dense;
+    m.req().kv = @import("../kv_quant.zig").KVQuantConfig.dense;
     const cwd = std.Io.Dir.cwd();
     if (cwd.access(io, opts.out_dir, .{})) |_| return error.Hy4CaptureOutputExists else |err| if (err != error.FileNotFound) return err;
     const staging = try std.fmt.allocPrint(a, "{s}.partial", .{opts.out_dir});
@@ -1129,7 +1129,7 @@ test "hy4 layer-major window: a forward of the longest window's rows from no sta
     const window = try windowBytes(m, a, longest, kld.promptChunk(&t.loaded.config));
     defer m.reset();
     m.reset();
-    m.kv = @import("../kv_quant.zig").KVQuantConfig.dense;
+    m.req().kv = @import("../kv_quant.zig").KVQuantConfig.dense;
     try m.reserveFor(longest);
     mlx.engine.close();
     const in0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
@@ -1222,7 +1222,7 @@ fn tinyLayerMajor() !void {
     const reference = struct {
         fn logits(al: std.mem.Allocator, mm: *hy4_model.Model, ids: []const u32, chunk: usize) ![]u8 {
             mm.reset();
-            mm.kv = @import("../kv_quant.zig").KVQuantConfig.dense;
+            mm.req().kv = @import("../kv_quant.zig").KVQuantConfig.dense;
             var at: usize = 0;
             while (at + chunk < ids.len) : (at += chunk) _ = mlx.mlx_array_free(try mm.forwardReadout(ids[at .. at + chunk], .none));
             const last = try mm.forwardReadout(ids[at..], .last);
@@ -1449,7 +1449,7 @@ fn headRowsCell() !void {
         m.tap = sink.bind();
         for (tiny.windows) |ids| {
             m.reset();
-            m.kv = @import("../kv_quant.zig").KVQuantConfig.dense;
+            m.req().kv = @import("../kv_quant.zig").KVQuantConfig.dense;
             var at: usize = 0;
             while (at + cell.chunk < ids.len) : (at += cell.chunk) _ = mlx.mlx_array_free(try m.forwardReadout(ids[at .. at + cell.chunk], .none));
             _ = mlx.mlx_array_free(try m.forwardReadout(ids[at..], .last));
@@ -1744,7 +1744,7 @@ test "hy4 layer-major window: a window of several pieces is billed by the pieces
     // The pieces as `runBatch` runs them.
     defer m.reset();
     m.reset();
-    m.kv = @import("../kv_quant.zig").KVQuantConfig.dense;
+    m.req().kv = @import("../kv_quant.zig").KVQuantConfig.dense;
     try m.reserveFor(rows);
     mlx.engine.close();
     const in0 = mlx.engine.poolTotal() - mlx.engine.poolFree();

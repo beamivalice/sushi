@@ -599,8 +599,14 @@ pub fn memoryAdmitCount(sch: *Scheduler, admit_idx: []const usize) usize {
         const held = sch.pending.items[admit_idx[admitted]];
         if (!held.memory_hold_logged) {
             held.memory_hold_logged = true;
-            log.info("[admission] held: {d} tokens need ~{d}MB, ~{d}MB available beside live requests (~{d}MB of their growth outstanding); waiting for one to finish\n", .{
-                held.full_prompt.len, bills[admitted].?.needed >> 20, bills[admitted].?.available >> 20, outstanding >> 20,
+            var siblings: u64 = 0;
+            var promised: u64 = 0;
+            for (bills[0..admitted]) |bill| if (bill) |b| {
+                siblings += 1;
+                promised +|= b.needed;
+            };
+            log.info("[admission] held: {d} tokens need ~{d}MB, ~{d}MB available beside live requests (~{d}MB of their growth outstanding, ~{d}MB to the {d} admitted with it); waiting for one to finish\n", .{
+                held.full_prompt.len, bills[admitted].?.needed >> 20, bills[admitted].?.available >> 20, outstanding >> 20, promised >> 20, siblings,
             });
         }
     }
@@ -864,6 +870,64 @@ test "a staggered admission waits for the growth an earlier request was admitted
     Probe.available = 10 * gb;
     sch.live_hold = .{};
     try testing.expectEqual(@as(usize, 1), memoryAdmitCount(&sch, &.{0}));
+}
+
+test "a request held beside the siblings admitted in its tick says what they were promised" {
+    const gb: u64 = 1 << 30;
+    const Probe = struct {
+        fn numbers(_: *const ModelConfig, _: usize, _: u32, _: trunk.KVQuantConfig, _: bool, _: bool) MemoryBill {
+            return .{ .needed = 4 * gb, .available = 10 * gb, .commit = 4 * gb };
+        }
+    };
+    const path = "/tmp/sushi-admission-held.log";
+    _ = std.c.unlink(path);
+    try log.openFile(path, 0);
+    defer {
+        log.closeFile();
+        _ = std.c.unlink(path);
+    }
+    const saved = scheduler_mod.prefill_admission_numbers;
+    scheduler_mod.prefill_admission_numbers = Probe.numbers;
+    defer scheduler_mod.prefill_admission_numbers = saved;
+    var cfg = ModelConfig{ .model_type = "glm5_next" };
+    var xfm: Trunk = undefined;
+    var model: LoadedModel = undefined;
+    model.config = &cfg;
+    model.handle = arch_handle.fixtureHandle(&xfm);
+    var a = Slot.initForTest(std.testing.io, std.testing.allocator, &model);
+    a.bindCtxForTest();
+    a.model = &model;
+    a.full_prompt = &.{};
+    a.max_tokens = 1;
+    a.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
+    a.request = null;
+    a.vision_embeddings = null;
+    a.enable_mtp = false;
+    a.memory_hold_logged = false;
+    a.cancelled = std.atomic.Value(bool).init(false);
+    a.finished = false;
+    a.error_code = null;
+    a.growth_commit = 0;
+    var b = a;
+    var c = a;
+    var sch = Scheduler.initForTest(std.testing.io, std.testing.allocator);
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.live_hold = .{};
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.decoding.deinit(testing.allocator);
+    for ([_]*Slot{ &a, &b, &c }) |s| try sch.pending.append(testing.allocator, s);
+    // Each fits the free memory alone; the third does not fit beside the two before it.
+    try testing.expectEqual(@as(usize, 2), memoryAdmitCount(&sch, &.{ 0, 1, 2 }));
+
+    var buf: [2048]u8 = undefined;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    const n = std.c.read(fd, &buf, buf.len);
+    const text = buf[0..if (n > 0) @intCast(n) else 0];
+    errdefer std.debug.print("the held line: {s}\n", .{text});
+    try testing.expect(std.mem.indexOf(u8, text, "[admission] held: 0 tokens need ~4096MB, ~10240MB available beside live requests (~0MB of their growth outstanding, ~8192MB to the 2 admitted with it); waiting for one to finish") != null);
 }
 
 test "a commitment is released as the cache allocates it" {

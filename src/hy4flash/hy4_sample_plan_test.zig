@@ -7,7 +7,6 @@ const core = @import("../tensor/core.zig");
 const contract = @import("../cooler_contract_test.zig");
 const hy4_contract = @import("hy4_contract.zig");
 const sampler = @import("../sampler.zig");
-const think_penalty = @import("../think_penalty.zig");
 const hy4_model = @import("hy4_model.zig");
 const sample_plan = @import("hy4_sample_plan.zig");
 const fwd = @import("hy4_forward.zig");
@@ -21,8 +20,8 @@ const Drafting = struct {
     }
 };
 
-/// A served load of `dir` whose draws read a reserved-token mask and think markers, made as a load with a tokenizer
-/// makes them (`sampler.installSuppressMask`, `generate.installThinkMarkers`), before its warm plans.
+/// A served load of `dir` whose draws read a reserved-token mask, made as a load with a tokenizer makes it
+/// (`sampler.installSuppressMask`), before its warm plans.
 fn openMasked(ld: *contract.Load, dir: []const u8) !void {
     try ld.prepare(Drafting, dir, true);
     ld.config.test_skip_warm = true;
@@ -30,7 +29,6 @@ fn openMasked(ld: *contract.Load, dir: []const u8) !void {
     errdefer ld.discard();
     const vocab: usize = ld.xfm.config.vocab_size;
     ld.xfm.suppress_mask = try sampler.buildSuppressMask(&.{ 5, 9 }, 0, vocab, ld.xfm.outStream());
-    ld.xfm.think_marker_mask = try think_penalty.buildMask(ld.a, &.{ 3, 4, 11 }, vocab);
     try ld.serve();
 }
 
@@ -140,54 +138,6 @@ test "hy4 sample plan: a draw of every mix the load plans runs as one execution 
     if (!ran) return error.SkipZigTest;
 }
 
-test "hy4 sample plan: a forced call's token in flight reaches the planned draw of every think kind that reads ids, which gives the pool's token (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    var ld: contract.Load = undefined;
-    try openMasked(&ld, dir);
-    defer _ = ld.close();
-    const turn = hy4_contract.openTurn(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    const st = &m.plans.?.sample;
-    try fillLogits(a, m);
-    try core.closePool(.census);
-    defer core.closePool(.open) catch {};
-    const kinds = [_]sampler.Mix.Think{ .mask_inside, .mask_opens, .mask_unopened, .bias_inside, .bias_opens, .bias_unopened };
-    for (kinds) |think| for ([_]u32{ 1, 2, 7 }) |forced| {
-        const mix: sampler.Mix = .{ .entry = .step, .suppress = true, .greedy = true, .think = think };
-        errdefer std.debug.print("hy4 sample plan: think {t}, forced token {d}\n", .{ think, forced });
-        var in = try sample_plan.makeInputs(m, st, a, .{ .mix = mix });
-        defer in.deinit();
-        _ = mlx.mlx_array_free(in.pending.?);
-        in.pending = try @import("../generate.zig").forcedToken(ld.xfm, forced);
-        // The pool's draw and the planned one are one step, each writing the block after the one in flight; the pool's
-        // token is read and let go before the planned draw writes its block.
-        const turn_of_step = st.turn;
-        st.planned = false;
-        const pool = sample_plan.draw(m, st, &in, mix);
-        st.planned = true;
-        st.turn = turn_of_step;
-        const want = blk: {
-            const drawn = try pool;
-            defer drawn.deinit();
-            break :blk try tokenOf(drawn.step);
-        };
-        try testing.expect(try sample_plan.begin(m, mix));
-        const got = sample_plan.draw(m, st, &in, mix) catch |e| {
-            try sample_plan.fail(m);
-            return e;
-        };
-        defer got.deinit();
-        try sample_plan.end(m);
-        try testing.expectEqual(want, try tokenOf(got.step));
-    };
-    try testing.expectEqual(@as(u64, 0), st.misses);
-}
-
 test "hy4 sample plan: a planned draw that misses while its token is written is refused by name, the token blocks it leaves are sound, and the next draw is served (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -203,16 +153,22 @@ test "hy4 sample plan: a planned draw that misses while its token is written is 
     const st = &m.plans.?.sample;
     try fillLogits(a, m);
     defer core.closePool(.open) catch {};
-    const mix: sampler.Mix = .{ .entry = .step, .suppress = true, .greedy = true, .think = .mask_inside };
+    const mix: sampler.Mix = .{ .entry = .step, .suppress = true, .greedy = true };
     // Either block may be the one the missed draw was writing.
     for ([_]u1{ 0, 1 }) |at| {
         st.turn = at;
         var in = try sample_plan.makeInputs(m, st, a, .{ .mix = mix });
         defer in.deinit();
-        // A view of the block the draw writes: its write is not in place, which the plan did not record.
-        _ = mlx.mlx_array_free(in.pending.?);
-        in.pending = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&in.pending.?, st.tokens[at].?, &[_]c_int{1}, 1, m.s));
+        // A view of every block: the draw takes none that is sole, so it writes block `at` not in place, which the plan
+        // did not record.
+        var views: [sample_plan.token_slots]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer {
+            for (views) |v| _ = mlx.mlx_array_free(v);
+        }
+        for (&views, st.tokens) |*v, block| {
+            v.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(v, block.?, &[_]c_int{1}, 1, m.s));
+        }
         const misses = st.misses;
         try core.closePool(.refuse);
         try testing.expect(try sample_plan.begin(m, mix));
@@ -220,6 +176,10 @@ test "hy4 sample plan: a planned draw that misses while its token is written is 
         try testing.expectError(error.PlanMiss, sample_plan.fail(m));
         try testing.expectEqual(misses + 1, st.misses);
         try testing.expectEqual(at, st.turn);
+        for (&views) |*v| {
+            _ = mlx.mlx_array_free(v.*);
+            v.* = .{ .ctx = null };
+        }
         // What the missed draw left is no other execution's: the next draw writes the block it was writing, and the
         // pool's draw agrees with it.
         var next = try sample_plan.makeInputs(m, st, a, .{ .mix = mix });
@@ -253,7 +213,7 @@ const Served = struct {
 
 /// A request of `prompt` for 16 tokens under `sampling` and `opts`, its rounds DFly2's where `opts` drafts, on the
 /// load's plans or, `planned` false, on the pool.
-fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling: sampler.SamplingParams, opts: Generator.InitOptions, planned: bool) !Served {
+fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling: sampler.SamplingParams, opts: Generator.InitOptions, eos: []const u32, planned: bool) !Served {
     const m = ld.xfm.arch_state.hy4flash.model.?;
     const saved = m.plans;
     if (!planned) m.plans = null;
@@ -261,7 +221,7 @@ fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling
     var tok = Tokenizer.initEmpty(a);
     defer tok.deinit();
     try ld.xfm.resetCache();
-    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, ld.xfm, &tok, prompt, 16, sampling, &.{}, opts);
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), a, ld.xfm, &tok, prompt, 16, sampling, eos, opts);
     defer gen.deinit(a);
     var out: Served = .{};
     const draws = if (saved) |p| p.sample.draws else 0;
@@ -284,7 +244,7 @@ fn serve(a: std.mem.Allocator, ld: *contract.Load, prompt: []const u32, sampling
     return out;
 }
 
-test "hy4 sample plan: a served request's draws, greedy and sampled, under penalties and the think penalty, plain and in DFly2 rounds, give the pool's tokens, each draw an execution (HY4_STQ_TINY)" {
+test "hy4 sample plan: a served request's draws, greedy and sampled, under penalties, plain and in DFly2 rounds, give the pool's tokens, each draw an execution (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
@@ -302,22 +262,19 @@ test "hy4 sample plan: a served request's draws, greedy and sampled, under penal
     try testing.expect(m.plans.?.drafter != null);
     try core.closePool(.census);
     defer core.closePool(.open) catch {};
-    const think: think_penalty.ThinkPenalty = .{ .lambda = 2, .opener_id = 3, .closer_id = 4, .phase = .inside };
     const Case = struct { sampling: sampler.SamplingParams, opts: Generator.InitOptions = .{} };
     const cases = [_]Case{
         .{ .sampling = .{ .temperature = 0 } },
         .{ .sampling = .{ .temperature = 0.8, .top_k = 40, .top_p = 0.9, .min_p = 0.05, .seed = 11 } },
         .{ .sampling = .{ .temperature = 0.8, .seed = 11, .repeat_penalty = 1.2, .presence_penalty = 0.4 } },
-        .{ .sampling = .{ .temperature = 0, .think_penalty = think } },
-        .{ .sampling = .{ .temperature = 0.8, .seed = 5, .think_penalty = think } },
         .{ .sampling = .{ .temperature = 0 }, .opts = .{ .drafter_enabled = true } },
         .{ .sampling = .{ .temperature = 0.8, .seed = 7 }, .opts = .{ .drafter_enabled = true } },
-        .{ .sampling = .{ .temperature = 0.8, .seed = 7, .repeat_penalty = 1.2, .think_penalty = think }, .opts = .{ .drafter_enabled = true } },
+        .{ .sampling = .{ .temperature = 0.8, .seed = 7, .repeat_penalty = 1.2 }, .opts = .{ .drafter_enabled = true } },
     };
     for (cases, 0..) |c, i| {
         errdefer std.debug.print("hy4 sample plan: request {d} differs\n", .{i});
-        const want = try serve(a, &ld, prompt, c.sampling, c.opts, false);
-        const got = try serve(a, &ld, prompt, c.sampling, c.opts, true);
+        const want = try serve(a, &ld, prompt, c.sampling, c.opts, &.{}, false);
+        const got = try serve(a, &ld, prompt, c.sampling, c.opts, &.{}, true);
         try testing.expectEqual(want.n, got.n);
         try testing.expectEqualSlices(u32, want.tokens[0..want.n], got.tokens[0..got.n]);
         // A plain request draws a token a step; a DFly2 request, a verdict a round.
@@ -349,12 +306,12 @@ test "hy4 sample plan: on a GPU that grants the draw fewer threads than its wide
     defer m.reset();
     try core.closePool(.census);
     defer core.closePool(.open) catch {};
-    const got = try serve(a, &ld, ids[0..24], .{ .temperature = 0.8, .seed = 11 }, .{}, true);
+    const got = try serve(a, &ld, ids[0..24], .{ .temperature = 0.8, .seed = 11 }, .{}, &.{}, true);
     try testing.expect(got.n > 0);
     try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
 }
 
-test "hy4 sample plan: a request whose forced call ends in the think span samples on after the forced token with the pool's tokens, no draw missing (HY4_STQ_TINY)" {
+test "hy4 sample plan: a request whose stop set holds a token the model emits ends at it with the pool's tokens before it and none sampled after, plain and in DFly2 rounds (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
@@ -370,13 +327,73 @@ test "hy4 sample plan: a request whose forced call ends in the think span sample
     defer m.reset();
     try core.closePool(.census);
     defer core.closePool(.open) catch {};
-    const think: think_penalty.ThinkPenalty = .{ .lambda = 2, .opener_id = 3, .closer_id = 4, .phase = .inside };
+    const prompt = ids[0..24];
+    for ([_]Generator.InitOptions{ .{}, .{ .drafter_enabled = true } }) |opts| {
+        const free = try serve(a, &ld, prompt, .{ .temperature = 0 }, opts, &.{}, true);
+        var stop_at: usize = 0;
+        for (1..free.n) |k| {
+            if (std.mem.indexOfScalar(u32, free.tokens[0..k], free.tokens[k]) == null) {
+                stop_at = k;
+                break;
+            }
+        }
+        try testing.expect(stop_at > 0);
+        for ([_]bool{ false, true }) |planned| {
+            const stopped = try serve(a, &ld, prompt, .{ .temperature = 0 }, opts, &.{free.tokens[stop_at]}, planned);
+            try testing.expectEqualSlices(u32, free.tokens[0..stop_at], stopped.tokens[0..stopped.n]);
+        }
+    }
+    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
+}
+
+test "hy4 sample plan: a think penalty armed directly on a load that serves no bias is refused by name, never a plan miss (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try @import("hy4_contract.zig").prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try openMasked(&ld, dir);
+    defer _ = ld.close();
+    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const biases = [_]@import("../logit_bias.zig").Bias{.{ .id = 12, .delta = -2 }};
+    const armed = [_]sampler.SamplingParams{
+        .{ .temperature = 0, .think_penalty = .{ .lambda = 2, .opener_id = 3, .closer_id = 4, .phase = .inside } },
+        .{ .temperature = 0, .think_penalty = .{ .lambda = 1, .biases = &biases, .phase = .before } },
+    };
+    for (armed) |sampling| {
+        const refused = serve(a, &ld, ids[0..24], sampling, .{}, &.{}, true);
+        if (refused) |_| return error.TestExpectedRefusal else |e| try testing.expectEqualStrings("BiasUnserved", @errorName(e));
+    }
+    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
+}
+
+test "hy4 sample plan: a request whose forced call ends samples on after the forced token with the pool's tokens, no draw missing (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try @import("hy4_contract.zig").prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try openMasked(&ld, dir);
+    defer _ = ld.close();
+    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    try core.closePool(.census);
+    defer core.closePool(.open) catch {};
     const call = [_]u32{ 12, 13 };
     var served: [2]Served = undefined;
     for ([_]bool{ false, true }, &served) |planned, *out| {
         var cf: CallForce = .{ .forced = &call, .call_at = 0, .closer_id = null, .phase = .answer, .last = ids[23] };
-        const sampling: sampler.SamplingParams = .{ .temperature = 0, .think_penalty = think, .call_force = &cf };
-        out.* = try serve(a, &ld, ids[0..24], sampling, .{}, planned);
+        const sampling: sampler.SamplingParams = .{ .temperature = 0, .call_force = &cf };
+        out.* = try serve(a, &ld, ids[0..24], sampling, .{}, &.{}, planned);
     }
     try testing.expectEqual(served[0].n, served[1].n);
     try testing.expectEqualSlices(u32, served[0].tokens[0..served[0].n], served[1].tokens[0..served[1].n]);

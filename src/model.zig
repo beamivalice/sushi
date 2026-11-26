@@ -592,13 +592,19 @@ pub const ModelConfig = struct {
     /// a position past it aliases back inside the ramp. 0 = no rope-derived cap.
     pub fn contextCap(self: *const ModelConfig) u32 {
         const declared = self.max_position_embeddings;
-        if (!self.rope_yarn) return declared;
+        if (!self.rope_yarn) return self.heldToKvTokens(declared);
         const orig: f64 = @floatFromInt(self.yarn_orig_max_pos);
         const factor: f64 = @floatCast(self.yarn_factor);
         const scaled: f64 = @floor(orig * factor);
         const max_u32: f64 = @floatFromInt(std.math.maxInt(u32));
         const window: u32 = if (scaled >= max_u32) std.math.maxInt(u32) else @intFromFloat(scaled);
-        return if (declared == 0) window else @min(window, declared);
+        return self.heldToKvTokens(if (declared == 0) window else @min(window, declared));
+    }
+
+    /// No request holds more than the tokens all the model's requests may hold together (`max_kv_tokens`).
+    fn heldToKvTokens(self: *const ModelConfig, window: u32) u32 {
+        if (self.max_kv_tokens == 0 or self.max_kv_tokens >= window) return window;
+        return @intCast(self.max_kv_tokens);
     }
 
     /// How many layers hold an attention KV cache. A hybrid arch interleaves
@@ -1037,9 +1043,10 @@ pub const ModelConfig = struct {
         return @min(kv, cap);
     }
 
-    /// SSD-first prefix cache arch predicate; delegates to `longCtxGated`.
+    /// SSD-first prefix cache arch predicate: the long-context gate, or an arch whose requests own their state and so
+    /// restore from the SSD tier alone (`Facts.ssd_first_capable`).
     pub fn ssdFirstCapable(self: *const ModelConfig) bool {
-        return self.longCtxGated();
+        return self.longCtxGated() or self.fact("ssd_first_capable");
     }
 
     /// True when per-request SSM/conv cache entries must exist: hybrid
@@ -3802,6 +3809,11 @@ test "ModelConfig.longCtxGated: the long-context blast radius is ONE predicate, 
         var cfg = ModelConfig{ .model_type = mt };
         try t.expect(!cfg.longCtxGated());
         try t.expect(!cfg.ssdFirstCapable());
+    }
+    if (@import("arch/registry.zig").ofModelType("hy_v4_flash") != null) {
+        const hy4 = ModelConfig{ .model_type = "hy_v4_flash" };
+        try t.expect(!hy4.longCtxGated());
+        try t.expect(hy4.ssdFirstCapable());
     }
 }
 

@@ -2,8 +2,20 @@
 //! composed model and the pack's tensors the model reads, moved out of the loader's map so they live as long as it.
 const std = @import("std");
 const model_mod = @import("../model.zig");
+const trunk = @import("../trunk.zig");
+const arch_state = @import("../arch/arch_state.zig");
 const hy4_model = @import("hy4_model.zig");
 const hy4_dfly = @import("hy4_dfly.zig");
+
+pub var joined_ticks_for_test: u64 = 0;
+
+pub const Ctx = struct {
+    request: ?*hy4_model.Request = null,
+};
+
+pub fn requestOf(ctx: *const trunk.ForwardCtx) ?*hy4_model.Request {
+    return if (comptime @hasField(arch_state.Ctx, "hy4flash")) ctx.arch_ctx.hy4flash.request else null;
+}
 
 pub const State = struct {
     model: ?*hy4_model.Model = null,
@@ -17,8 +29,9 @@ pub const State = struct {
     verify: ?Verify = null,
     /// The prefill meter's mark (`SUSHI_PREFILL_UBENCH_KV`), each timed chunk rolled back to it.
     ubench_mark: ?hy4_model.Model.Mark = null,
+    own_run: ?hy4_model.Model.Lent = null,
 
-    pub const Verify = struct { mark: ?hy4_model.Model.Mark = null, ids: [16]u32, n: usize };
+    pub const Verify = hy4_model.Verify;
 
     /// Whether a served request may draft: DFly2 rolls the model back to the verify's mark itself.
     pub fn specRollsBack(self: *const State) bool {
@@ -50,6 +63,21 @@ pub const State = struct {
     pub fn runsOwnModel(self: *const State) bool {
         return self.model != null;
     }
+
+    pub fn servedWarmBegin(self: *State) void {
+        const m = self.model orelse return;
+        if (m.serves_requests and m.bound == null) self.own_run = m.lendOwn();
+    }
+
+    pub fn servedWarmEnd(self: *State) void {
+        if (self.own_run) |l| l.end();
+        self.own_run = null;
+        if (self.model) |m| if (m.serves_requests) {
+            const own = m.lendOwn();
+            defer own.end();
+            m.reset();
+        };
+    }
 };
 
 /// Moves every entry of `from` but the vision tower's into a new map the caller owns. The tower stays in `from`, the
@@ -74,9 +102,23 @@ pub fn takeWeights(allocator: std.mem.Allocator, from: *model_mod.Weights, c: *c
 
 /// Drops an open verify's mark, if any; with `reset` the model's state too (a round that failed mid-way).
 pub fn dropVerify(st: *State, reset: bool) void {
-    var v = st.verify orelse return;
-    st.verify = null;
-    const m = st.model orelse return;
+    const m = st.model orelse {
+        st.verify = null;
+        return;
+    };
+    const own: ?hy4_model.Model.Lent = if (m.serves_requests and m.bound == null) m.lendOwn() else null;
+    defer if (own) |l| l.end();
+    if (st.verify) |*v| {
+        st.verify = null;
+        if (v.mark) |*mk| m.dropMark(mk);
+        if (reset) m.reset();
+    }
+    dropVerifyReq(m, m.req(), reset);
+}
+
+pub fn dropVerifyReq(m: *hy4_model.Model, r: *hy4_model.Request, reset: bool) void {
+    var v = r.verify orelse return;
+    r.verify = null;
     if (v.mark) |*mk| m.dropMark(mk);
     if (reset) m.reset();
 }
@@ -99,4 +141,17 @@ test "hy4 state: the model takes the load's tensors but the vision tower's, whic
     try testing.expect(own.get("model.embed_tokens.weight") != null);
     try testing.expect(own.get("vit.embeddings.patch_embedding.weight") == null);
     try testing.expect(from.get("vit.embeddings.patch_embedding.weight") != null);
+}
+
+test "hy4 request: requestOf reads the bound hy4_model.Request from ForwardCtx" {
+    const testing = std.testing;
+    var req = try hy4_model.Request.init(testing.allocator, 0);
+    defer req.deinit();
+    var ctx: trunk.ForwardCtx = undefined;
+    ctx.arch_ctx = .{};
+    try testing.expectEqual(@as(?*hy4_model.Request, null), requestOf(&ctx));
+    ctx.arch_ctx.hy4flash.request = &req;
+    try testing.expectEqual(@as(?*hy4_model.Request, &req), requestOf(&ctx));
+    try testing.expectEqual(@as(usize, 0), req.position());
+    try testing.expectEqual(@as(u64, 0), req.residentBytes());
 }

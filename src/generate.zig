@@ -1303,6 +1303,7 @@ pub const Generator = struct {
         var sampling = sampling_in;
         sampling.suppress_mask = xfm.suppress_mask;
         sampling.think_penalty.file_biases = xfm.logit_bias;
+        if (@import("arch/config.zig").fact(&xfm.config, "bias_unserved") and (sampling.think_penalty.armed() or sampling.think_penalty.hasBias())) return error.BiasUnserved;
         const bias_vocab: usize = xfm.config.vocab_size;
         try sampling.think_penalty.prepare(allocator, bias_vocab, xfm.think_marker_mask, xfm.outStream());
         errdefer sampling.think_penalty.deinitPrepared();
@@ -2632,6 +2633,16 @@ pub const Generator = struct {
         /// No penalty here: a draft's proposal, or rows a verify already shifted.
         none,
     };
+
+    /// The lazy draw `logits` takes at `after`, its shift applied inside the draw's own execution.
+    pub fn stepFor(self: *Generator, logits: mlx.mlx_array, after: ThinkAfter) sampler.Step {
+        return .{
+            .logits = logits,
+            .sampling = self.sampling,
+            .generated = self.generated_ids.items,
+            .shift = self.thinkShift(after),
+        };
+    }
 
     /// `logits` under the think penalty where the span is open; the input itself when nothing
     /// shifts, else a new handle the caller frees.

@@ -72,6 +72,7 @@ pub fn snapshotBackoff(tok: anytype, prompt_ids: []const u32) ?usize {
 
 pub const config_facts: arch_config.Facts = .{
     .thinks_by_default = true,
+    .ssd_tables = &.{".engram.embed."},
     .reads_pair_major = true,
     .prefill_start_width_of = config_file.prefillWidthFor,
     .expert_pool_bytes = config_file.dsv41_pool_bytes,

@@ -210,6 +210,25 @@ printf '%s\n' 'const Cfg = struct { a: u32 = 0 };' 'const T = struct { config: C
   'fn notATest() void {' '    var t: T = undefined;' '    t.config.a = 1;' '}' > "$TMP/t/src/p.zig"
 expect_green "a whole assignment first, a flat write, an initialized local, a method call and a write outside a test"
 
+# rule undefined-partial-pass
+tree
+printf '%s\n' 'const Slot = struct { a: ?u32, b: u32, c: u32 };' 'fn use(s: []Slot) void { _ = s; }' \
+  'test "partial" {' '    var dummy: [2]Slot = undefined;' '    dummy[0].a = null;' '    dummy[1].a = null;' '    use(&dummy);' '}' > "$TMP/t/src/p.zig"
+expect_red "an array of structs undefined with one field written per element, then passed" "src/p.zig:7:5 \[undefined-partial-pass\] partial: 'dummy' is declared undefined and only 1 of its fields"
+
+tree
+printf '%s\n' 'const Slot = struct { a: ?u32, b: u32 };' 'const Opaque = struct { a: u32 };' 'fn use(s: []Slot) void { _ = s; }' 'fn reset(s: []Slot) void { _ = s; }' \
+  'test "near misses" {' \
+  '    var zeroed = std.mem.zeroes([2]Slot);' '    zeroed[0].a = null;' '    use(&zeroed);' \
+  '    var every: [2]Slot = undefined;' '    every[0].a = null;' '    every[0].b = 1;' '    use(&every);' \
+  '    var cleared: [2]Slot = undefined;' '    @memset(&cleared, .{ .a = null, .b = 0 });' '    cleared[0].a = null;' '    use(&cleared);' \
+  '    var whole: [2]Slot = undefined;' '    whole[0] = .{ .a = null, .b = 0 };' '    whole[0].a = null;' '    use(&whole);' \
+  '    var unpassed: [2]Slot = undefined;' '    unpassed[0].a = null;' '    _ = &unpassed;' \
+  '    var late: [2]Slot = undefined;' '    use(&late);' '    late[0].a = null;' \
+  '    var plain: Slot = undefined;' '    plain.a = null;' '    use((&plain)[0..1]);' \
+  '    var unknown: [2]Elsewhere = undefined;' '    _ = &unknown;' '}' > "$TMP/t/src/p.zig"
+expect_green "a zeroed array, every field written, a memset, a whole element, no pass, a pass first and a plain struct local"
+
 # rule mlx-extern
 tree
 printf '%s\n' 'fn f() void {' '    const c = struct {' '        extern "c" fn mlx_matmul(a: u32) c_int;' '    };' '    _ = c;' '}' > "$TMP/t/src/p.zig"

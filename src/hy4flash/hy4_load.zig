@@ -147,6 +147,8 @@ pub fn warmUbench(allocator: std.mem.Allocator, xfm: *@import("../trunk.zig").Tr
 pub fn ubenchMark(xfm: *@import("../trunk.zig").Trunk) !bool {
     const st = &xfm.arch_state.hy4flash;
     const m = st.model orelse return false;
+    const own: ?@import("hy4_model.zig").Model.Lent = if (m.serves_requests and m.bound == null) m.lendOwn() else null;
+    defer if (own) |l| l.end();
     st.ubench_mark = try m.mark();
     return true;
 }
@@ -155,16 +157,22 @@ pub fn ubenchMark(xfm: *@import("../trunk.zig").Trunk) !bool {
 pub fn ubenchRollback(xfm: *@import("../trunk.zig").Trunk, ctx: *@import("../trunk.zig").ForwardCtx) !void {
     const st = &xfm.arch_state.hy4flash;
     const m = st.model orelse return error.Hy4ModelMissing;
+    const own: ?@import("hy4_model.zig").Model.Lent = if (m.serves_requests and m.bound == null) m.lendOwn() else null;
+    defer if (own) |l| l.end();
     const mk = &(st.ubench_mark orelse return error.Hy4PointMismatch);
     try m.rollbackTo(mk, &.{});
-    ctx.cache.step = m.pos;
+    ctx.cache.step = m.reqConst().pos;
 }
 
 /// Frees the meter's mark.
 pub fn ubenchDropMark(xfm: *@import("../trunk.zig").Trunk) void {
     const st = &xfm.arch_state.hy4flash;
     if (st.ubench_mark) |*mk| {
-        if (st.model) |m| m.dropMark(mk);
+        if (st.model) |m| {
+            const own: ?@import("hy4_model.zig").Model.Lent = if (m.serves_requests and m.bound == null) m.lendOwn() else null;
+            defer if (own) |l| l.end();
+            m.dropMark(mk);
+        }
         st.ubench_mark = null;
     }
 }
@@ -174,10 +182,12 @@ fn dflyProbe(gpa: std.mem.Allocator, xfm: *@import("../trunk.zig").Trunk, kv: @i
     const st = &xfm.arch_state.hy4flash;
     const m = st.model orelse return error.Hy4ModelMissing;
     const d = &(st.drafter orelse return error.Hy4DflyMissing);
+    const own = m.lendOwn();
+    defer own.end();
     var fields = std.mem.splitScalar(u8, spec, ',');
     const tokens = try std.fmt.parseInt(usize, fields.first(), 10);
     const every = if (fields.next()) |f| try std.fmt.parseInt(usize, f, 10) else 1;
-    if (@import("hy4_flags.zig").storesKv(kv)) m.kv = kv;
+    if (@import("hy4_flags.zig").storesKv(kv)) m.req().kv = kv;
     m.dropLive();
     const io = std.Io.Threaded.global_single_threaded.io();
     const text: ?[]u8 = if (std.c.getenv("SUSHI_HY4_DFLY_PROBE_TEXT")) |path| try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(path), gpa, .limited(64 << 20)) else null;

@@ -2379,6 +2379,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "ModelFormatUnsupported",
         "ExpertCacheDoesNotFit",
         "ContextSizeAboveWindow",
+        "ContextSizeAboveKvTokens",
         "LaunchFlagUnsupported",
         "GlmKvQuantUnsupported",
         "ExpertStreamingRequired",
@@ -2486,6 +2487,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.NotEnoughMemory => .{ .type = "out_of_memory", .message = not_enough_memory_message },
         error.ResidentModelsCapReached => .{ .type = "resident_models_cap", .message = resident_models_cap_message, .retry_after = BUSY_RETRY_AFTER_SECS },
         error.InsufficientMemory => .{ .type = "out_of_memory", .message = insufficient_free_memory_message },
+        error.ContextSizeAboveKvTokens => .{ .type = "context_size_above_kv_tokens", .message = "--ctx-size, or this model's saved ctx_size, is above its max_kv_tokens, the tokens its requests may hold together. Lower it, or raise max_kv_tokens." },
         error.ContextSizeAboveWindow => .{ .type = "context_size_above_window", .message = "--ctx-size, or this model's saved ctx_size, is above the context window the model has under its yarn_factor and --config-overrides. Lower it, or raise yarn_factor." },
         error.LaunchFlagUnsupported => .{ .type = "launch_flag_unsupported", .message = "A launch flag this server was started with has no effect on this model. The server log names the flag; restart without it." },
         error.GlmKvQuantUnsupported => .{ .type = "kv_quant_unsupported", .message = "The KV-cache quantization in force (--kv-quant or the model's saved kv_quant) is not one this model stores. The server log names the accepted widths." },
@@ -2556,7 +2558,7 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 /// The message a load refusal's answer carries: the text the load wrote when it wrote one (the memory check's names the
 /// bound and what to free or change), else the refusal's own. The caller frees it.
 pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal, text: ?[]const u8) ![]u8 {
-    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
+    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.ContextSizeAboveKvTokens or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
         err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit or err == error.SsdBudgetBelowResident or err == error.NotEnoughMemory;
     if (written) if (text) |t| return allocator.dupe(u8, t);
     if (context) |c| return memoryContextRefusalMessage(allocator, c);
@@ -2645,7 +2647,13 @@ fn sendLoadFailedNamed(allocator: std.mem.Allocator, stream: *Conn, name: []cons
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
 }
 
-pub fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
+/// `kv_cap`: the model's `max_kv_tokens` when it holds the context (`bills.contextKvHold`), else 0.
+pub fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize, kv_cap: u64) []const u8 {
+    if (kv_cap > 0) return std.fmt.bufPrint(
+        buf,
+        "Prompt exceeds maximum context length: {d} tokens requested, {d} available, held by this model's max_kv_tokens {d}",
+        .{ prompt_tokens, ctx, kv_cap },
+    ) catch "Prompt exceeds maximum context length";
     return std.fmt.bufPrint(
         buf,
         "Prompt exceeds maximum context length: {d} tokens requested, {d} available",
@@ -3011,7 +3019,7 @@ test "contextOverflowMessage: the 400 names both counts so a client can act on i
     // The counts ARE the feature: without them a client can only say "too
     // long", and our own app can't offer "raise the context to N" — which is
     // the one action that fixes it.
-    const msg = contextOverflowMessage(&buf, 4108, 4096);
+    const msg = contextOverflowMessage(&buf, 4108, 4096, 0);
     try t.expectEqualStrings("Prompt exceeds maximum context length: 4108 tokens requested, 4096 available", msg);
 
     // Legacy prefix preserved verbatim — APIError.looksLikeContextOverflow and
@@ -3023,12 +3031,19 @@ test "contextOverflowMessage: the 400 names both counts so a client can act on i
     for (msg) |c| try t.expect(c >= 0x20 and c != '"' and c != '\\');
 }
 
+test "contextOverflowMessage: a context held by the model's max_kv_tokens says so, and one that is not stays as it was" {
+    const t = std.testing;
+    var buf: [200]u8 = undefined;
+    try t.expectEqualStrings("Prompt exceeds maximum context length: 110 tokens requested, 59 available, held by this model's max_kv_tokens 64", contextOverflowMessage(&buf, 110, 59, 64));
+    try t.expectEqualStrings("Prompt exceeds maximum context length: 98 tokens requested, 64 available", contextOverflowMessage(&buf, 98, 64, 0));
+}
+
 test "contextOverflowMessage: a buffer too small falls back rather than sending nothing" {
     const t = std.testing;
     // bufPrint failing must not propagate — the media-gen 400 that sent NO body
     // at all when its fixed buffer overflowed is the class this guards.
     var tiny: [8]u8 = undefined;
-    try t.expectEqualStrings("Prompt exceeds maximum context length", contextOverflowMessage(&tiny, 999999, 1));
+    try t.expectEqualStrings("Prompt exceeds maximum context length", contextOverflowMessage(&tiny, 999999, 1, 0));
 }
 
 test "a vanished client is not a token cap: the non-stream finish reason says so" {

@@ -656,8 +656,11 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
   request while its model runs that many; `max_kv_tokens` (a model-settings key, absent = no cap) holds one while the
   model's reserved tokens (each live request's prompt plus its `max_tokens`, and the RAM hot cache's retained entries)
   plus its own would pass the cap, evicting retained entries oldest-first before it waits (never one a live request uses or
-  the candidate restores from), and refuses at once with a 400 naming the cap a request whose own reservation passes it. The gates
+  the candidate restores from). A request alone past the cap never reaches the gate: the cap holds the context, so it is
+  a context limit (`max_tokens` clamped, a prompt past it the context's 400 naming `max_kv_tokens`). The gates
   reserve no bytes: on a Sushi Cooler load the ledger stays the one memory accountant.
+- A context above `max_kv_tokens` is never billed: one the flag or `ctx_size` asks is refused by name at load
+  (`ContextSizeAboveKvTokens`) and on a save, and an auto context stays under the cap (`ModelConfig.contextCap`).
 - `--prefill-chunk-max N` caps the per-request ladder and `--prefill-chunk-min M` floors it: N if it fits, else the
   widest rung below N that fits, down to M (default 512); refused only when that floor does not fit. The per-chunk
   adaptive width stays on within the bounds; equal bounds pin the width and turn it off. `requestPrefillPick` is the one rule for
@@ -733,7 +736,8 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
 - **Concurrent arrivals are each billed against the SAME free memory** on their connection threads. The gated arch
   (qwen4_exp) re-bills live memory before each prefill in `runPrefill`; an ungated one (mimo_v2) is re-billed at the
   pending drain (`admitsWithinMemory`: live requests plus this tick's earlier admits). One that does not fit beside
-  company waits in `pending` (`[admission] held`); alone it proceeds. Company is every admitted request whose slot is
+  company waits in `pending` (`[admission] held`, which names what this tick's earlier admits were promised beside
+  the free memory); alone it proceeds. Company is every admitted request whose slot is
   not freed yet (`Scheduler.live_hold`): a finished one awaiting its cleanup still holds its memory.
 - **The connection thread refuses only what does not fit once every running request is gone** (`fitsOnceAlone`: what
   is free, what the hot cache gives back and what the running requests' bills priced them to hold, counted from

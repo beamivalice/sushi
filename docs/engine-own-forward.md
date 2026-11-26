@@ -852,5 +852,7 @@ rebuilds one.
   not where prose is won: a one-row verify is 20 to 21 ms on both sides, so it needs less GPU work in the forward.
 - **`matmulInto` writes a product into a slice of a larger buffer** (`freshArray` makes the buffer unwritten): the
   kernel and bytes are `matmul`'s at that shape; Hy4's verify rows fill one block result this way instead of a concat.
+- **A Hy4 request's logits pair is `logits_rows` x vocab on every path and turn** (`Model.makeRequestLogits`, `writeGroupBlock`,
+  `forwardServed`): a block of another shape is remade, and a view left unfreed makes the next write copy, an ask no plan recorded.
 - **`launchInPlace` writes a custom kernel's outputs into existing tensors** (an arch's store): it settles a pending
   update first and copies a shared or strided destination before writing, so no other holder sees the write.

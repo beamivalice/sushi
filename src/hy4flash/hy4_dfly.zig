@@ -142,8 +142,9 @@ pub const Drafter = struct {
         const c = m.config;
         const n_draft: usize = c.dfly.draft;
         const t: c_int = @intCast(n_draft + 1);
-        const h = m.last_hidden orelse return error.Hy4DflyNoHandover;
-        const p0: c_int = @intCast(m.pos);
+        const req_ = m.reqConst();
+        const h = req_.last_hidden orelse return error.Hy4DflyNoHandover;
+        const p0: c_int = @intCast(req_.pos);
         const ids = try self.gpa.alloc(u32, n_draft + 1);
         defer self.gpa.free(ids);
         ids[0] = t1;
@@ -162,7 +163,7 @@ pub const Drafter = struct {
             // every row of it picks the variant (`Model.sharedRows`).
             const f = try plan.frame(@src(), .{i});
             defer f.end();
-            const v = if (plan.planned()) try plan.each(@src(), m.last_picks[ly.target] != null) else plan.Frame.none;
+            const v = if (plan.planned()) try plan.each(@src(), req_.last_picks[ly.target] != null) else plan.Frame.none;
             defer v.end();
             var ol: Ops = .{ .s = o.s };
             defer ol.deinit();

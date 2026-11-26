@@ -65,6 +65,7 @@ const defaultEnableMtpForStreaming = server_mod.defaultEnableMtpForStreaming;
 const finishDetailsField = server_mod.finishDetailsField;
 const forceMtpFor = server_mod.forceMtpFor;
 const getEffectiveContextLength = server_mod.getEffectiveContextLength;
+const contextKvHold = server_mod.contextKvHold;
 const getTimeoutNs = server_mod.getTimeoutNs;
 const jsonEscape = http.jsonEscape;
 const jsonEscapeOrEmpty = server_mod.jsonEscapeOrEmpty;
@@ -184,6 +185,13 @@ pub fn handleCompletions(
         .ok => |c| c,
     };
 
+    var bias_buf: [160]u8 = undefined;
+    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
+        log.warn("POST /v1/completions -> 400 ({s})\n", .{why});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
+    }
+
     if (echoRejectReason(req)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -271,8 +279,8 @@ pub fn handleCompletions(
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
         countRejected();
-        var ovf_buf: [160]u8 = undefined;
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
+        var ovf_buf: [224]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx, contextKvHold(config)), 400);
         return;
     }
 
@@ -322,7 +330,7 @@ fn requestSampling(config: *const model_mod.ModelConfig, req: request_fields.Che
 
 fn requestThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, req: request_fields.Checked(.completions), prompt_ids: []const u32) @import("think_penalty.zig").ThinkPenalty {
     const config = lm.config.?;
-    return armThinkPenalty(allocator, lm, lm.tokenizer.?, prompt_ids, true, resolveThinkPenalty(req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
+    return armThinkPenalty(allocator, lm, lm.tokenizer.?, prompt_ids, true, resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
 }
 
 const SpecRequest = struct { drafter: bool, mtp: bool, allow_batch_mtp: bool };

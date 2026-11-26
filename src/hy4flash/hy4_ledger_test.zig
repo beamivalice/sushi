@@ -80,7 +80,7 @@ test "hy4 ledger: a load that plans commits its model bill at the seal, its warm
             for (0..2) |i| {
                 _ = try sv.requestToCleanup(prompt[0 .. prompt.len - i * 7], 8, false);
                 try testing.expectEqual(@as(u64, 0), l.of(.state));
-                try testing.expect(l.of(.parked) > 0);
+                try testing.expectEqual(@as(u64, 0), l.of(.parked));
                 try expectLinesHeld(l, before, "after a request");
             }
         }
@@ -102,7 +102,7 @@ test "hy4 ledger: a request past the room the lines leave is refused before it a
             const prompt = ids[0..@min(ids.len, 40)];
             _ = try sv.requestToCleanup(prompt, 8, false);
             const parked = l.of(.parked);
-            try testing.expect(parked > 0);
+            try testing.expectEqual(@as(u64, 0), parked);
             const need = l.terms.?.at(prompt.len + 8);
             const budget = l.budget();
             defer l.setBudget(budget);
@@ -110,7 +110,7 @@ test "hy4 ledger: a request past the room the lines leave is refused before it a
             l.setBudget(l.committed() - parked + need);
             const pool_before = before.heldSince();
             _ = try sv.requestToCleanup(prompt, 8, false);
-            try testing.expect(l.of(.parked) > 0);
+            try testing.expectEqual(@as(u64, 0), l.of(.parked));
             try testing.expect(before.heldSince() <= pool_before + need);
             try expectLinesHeld(l, before, "after a request that released the parked state");
             // One byte short even with the parked state released: refused, nothing reserved, nothing held more.
@@ -266,7 +266,7 @@ test "hy4 ledger: a request's end parks at the inference thread's finish, and th
             defer if (!a_done) ended(&sv, a);
             // The request finished: its state is parked before its connection thread completes it.
             try testing.expectEqual(@as(u64, 0), l.of(.state));
-            try testing.expect(l.of(.parked) > 0);
+            try testing.expectEqual(@as(u64, 0), l.of(.parked));
             // B, the next turn with a longer reply, runs on the model's state.
             const b = try pendingSlot(&sv, prompt, 512, null);
             defer ended(&sv, b);

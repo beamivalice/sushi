@@ -1549,6 +1549,10 @@ pub fn matmulRowsAs(res: *A, a: A, b: A, rows_as: usize) c_int {
     return op2("matmul", res, a, b, @import("matmul.zig").matmulRowsAs, .{rows_as});
 }
 
+pub fn matmulGrouped(res: *A, a: A, b: A, transposed_b: bool) c_int {
+    return op2("matmul", res, a, b, @import("matmul.zig").matmulGrouped, .{transposed_b});
+}
+
 /// A new engine buffer of `dims`, unwritten (no dispatch): the result a block's rows fill through `matmulInto`.
 pub fn freshArray(res: *A, dims: []const c_int, dtype: mlx.mlx_dtype) c_int {
     return put(res, core.fresh(dtype, dims) catch |e| return fail("fresh", e));

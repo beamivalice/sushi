@@ -35,6 +35,12 @@ pub const CopyArm = struct { exact_rows: usize, block: usize };
 
 pub fn Rounds(comptime A: type) type {
     return struct {
+        /// The rows of `ids` a round of `wanted` publishes: no more than the tokens still allowed, and nothing past an
+        /// end-of-turn draft, where the reply's restore point stands.
+        pub fn roundRows(self: *const Generator, ids: []const u32, wanted: usize) usize {
+            return mtp_plan.rowsThroughAny(ids[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.eos_token_ids);
+        }
+
         /// Rows a drafter round may verify so it emits at most `room` tokens and the bound fires at the
         /// token serial decode fires at. A round always verifies its t1 row.
         pub fn drafterRowsForRoom(rows: usize, room: ?u32) usize {
@@ -310,8 +316,7 @@ pub fn Rounds(comptime A: type) type {
             };
             // The budget pre-commit invariant: t1 and the kept drafts together fit the tokens still allowed.
             const wanted = forced orelse try extendStage(self, allocator, &ids_buf, policy.rows(conf_buf[0 .. block_len - 1]));
-            // Nothing past an end-of-turn draft is published: the round ends on it, where the reply's restore point stands.
-            const turn = ids_buf[0..mtp_plan.rowsThroughAny(ids_buf[0..@min(wanted, self.max_tokens - self.completion_tokens)], self.eos_token_ids)];
+            const turn = ids_buf[0..roundRows(self, &ids_buf, wanted)];
             var rows: usize = drafterRowsForRoom(mtp_plan.rowsThroughId(turn, self.drafter_round_ends_at), think_room);
             const vocab: usize = A.vocab(xfm);
             var rows_masked = false;
@@ -414,9 +419,56 @@ pub fn Rounds(comptime A: type) type {
             return .{ .tokens = tokens, .accepted_tokens = accepted };
         }
 
-        pub const ConstrainedEntry = union(enum) { proceed, stop, served: DrafterStepResult };
+        pub fn settleDrafted(self: *Generator, allocator: std.mem.Allocator, ids: []const u32, logits: mlx.mlx_array, conf: []const f32, draft_ns: u64, verify_ns: u64) !DrafterStepResult {
+            const xfm = self.xfm;
+            const diag = self.drafter_diag;
+            const rows = ids.len;
+            const t1 = ids[0];
+            const verdict = try sampleVerdict(self, logits, ids, null);
+            const accepted = verdict.accepted;
+            try A.finish(xfm, &self.ctx, accepted);
+            const n_commit: usize = 1 + accepted;
+            const tokens = try allocator.dupe(u32, ids[0..n_commit]);
+            errdefer allocator.free(tokens);
+            try self.generated_ids.appendSlice(allocator, tokens);
+            self.advanceStep(@intCast(n_commit));
+            self.next_token_id = verdict.pending;
+            self.drafter_pending = false;
+            const st = &self.drafter_stats;
+            st.rounds += 1;
+            st.plain += @intFromBool(rows == 1);
+            st.rows_hist[rows] += 1;
+            st.drafted += rows - 1;
+            st.accepted += accepted;
+            st.draft_ns += draft_ns;
+            st.verify_ns += verify_ns;
+            if (diag == .off or diag == .log) {
+                const ms = struct {
+                    fn of(ns: u64) f32 {
+                        return @floatCast(@as(f64, @floatFromInt(ns)) / 1e6);
+                    }
+                }.of;
+                const draft_ms = ms(draft_ns);
+                const verify_ms = ms(verify_ns);
+                self.drafter_copy_backoff.observeStage(n_commit, draft_ms + verify_ms);
+                self.drafter_policy.observeRound(conf, @intCast(rows), accepted, draft_ms, verify_ms);
+            }
+            if (diag != .off) log.info("  [drafter-round] grouped rows={d} accepted={d} draft_ms={d:.1} verify_ms={d:.1} t1={d} conf={any}\n", .{
+                rows,
+                accepted,
+                @as(f64, @floatFromInt(draft_ns)) / 1e6,
+                @as(f64, @floatFromInt(verify_ns)) / 1e6,
+                t1,
+                conf,
+            });
+            if (self.completion_tokens >= self.max_tokens) {
+                self.done = true;
+                self.finish_reason = "length";
+            }
+            return .{ .tokens = tokens, .accepted_tokens = accepted };
+        }
 
-        pub const Pending = union(enum) { commit, stop, forced: u32 };
+        pub const ConstrainedEntry = union(enum) { proceed, stop, served: DrafterStepResult };        pub const Pending = union(enum) { commit, stop, forced: u32 };
 
         pub fn rowView(self: *const Generator, c: *Constraint) A.row_grammar.View {
             return .{ .grammar = c.grammar, .token_bytes = c.token_bytes, .proto = c.proto, .pstate = &c.pstate, .eos_ids = self.eos_token_ids };

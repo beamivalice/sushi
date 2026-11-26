@@ -382,7 +382,7 @@ test "hy4 oracle: the whole model prefills the prompt and decodes greedily as tr
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, t.cpu);
     defer m.deinit();
     // transformers keeps the latent in full precision: the oracle is held at the BF16 width.
-    m.kv = .dense;
+    m.req().kv = .dense;
     var o: Ops = .{ .s = t.cpu };
     defer o.deinit();
     const ids_f = try host(&o, try t.ref("ids", .{}));
@@ -430,7 +430,7 @@ test "hy4 oracle: attention in spans of 7 rows, edges inside groups, the window 
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, t.cpu);
     defer m.deinit();
     // transformers keeps the latent in full precision: the oracle is held at the BF16 width.
-    m.kv = .dense;
+    m.req().kv = .dense;
     m.span_rows = 7;
     const got = try o.own(try m.forward(&ids));
     try expectNear("spans of 7", &o, got, try o.slice(try t.ref("logits", .{}), 0, 0, 40), 2e-3);
@@ -451,7 +451,7 @@ test "hy4 oracle: a prefill in chunks of 1 (a decode row writes the ring first),
         const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, t.cpu);
         defer m.deinit();
         // transformers keeps the latent in full precision: the oracle is held at the BF16 width.
-        m.kv = .dense;
+        m.req().kv = .dense;
         var at: usize = 0;
         var label: [48]u8 = undefined;
         while (at < 40) {
@@ -493,7 +493,7 @@ fn coolerWhole() !void {
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, es);
     defer m.deinit();
     // transformers keeps the latent in full precision: the oracle is held at the BF16 width.
-    m.kv = .dense;
+    m.req().kv = .dense;
     var eo: Ops = .{ .s = es };
     defer eo.deinit();
     const prefill = try host(&eo, try eo.own(try m.forward(ids[0..40])));
@@ -517,7 +517,7 @@ fn coolerWhole() !void {
 fn coolerPrefilled(t: *Tiny, es: mlx.mlx_stream, eo: *Ops, ids: []const u32) !*@import("hy4_model.zig").Model {
     const m = try @import("hy4_model.zig").Model.init(testing.allocator, t.config, &t.pack, es);
     errdefer m.deinit();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     var at: usize = 0;
     while (at < ids.len) : (at += 64) _ = try eo.own(try m.forwardReadout(ids[at..@min(at + 64, ids.len)], .none));
     return m;
@@ -547,7 +547,7 @@ test "hy4 state: a decode row appends its row into each sparse layer's store in 
     for (300..316) |i| {
         _ = try eo.own(try m.forwardReadout(ids[i .. i + 1], .last));
         mlx.engine.close();
-        for (m.state[0..t.config.layers], &track) |*st, *tr| {
+        for (m.req().state[0..t.config.layers], &track) |*st, *tr| {
             const r = st.rows orelse continue;
             const ptr = @intFromPtr(core.storePointer(r.buf(0)));
             if (tr.ptr != 0 and ptr != tr.ptr) tr.moves += 1;
@@ -558,7 +558,7 @@ test "hy4 state: a decode row appends its row into each sparse layer's store in 
     }
     const after = core.stats();
     try testing.expectEqual(@as(u64, 0), after.updates_copied - before.updates_copied);
-    for (m.state[0..t.config.layers], track) |st, tr| if (st.rows != null) {
+    for (m.req().state[0..t.config.layers], track) |st, tr| if (st.rows != null) {
         try testing.expectEqual(@as(usize, 316), st.rows.?.used);
         try testing.expect(tr.moves <= tr.grows and tr.grows <= 1);
     };
@@ -581,12 +581,12 @@ test "hy4 state: a read of a sparse layer's rows still pending when a 6-row bloc
     for (&ids, 0..) |*d, i| d.* = @intCast((i * 7919) % 120000);
     const m = try coolerPrefilled(&t, es, &eo, ids[0..100]);
     defer m.deinit();
-    const l = for (m.state[0..t.config.layers], 0..) |st, li| {
+    const l = for (m.req().state[0..t.config.layers], 0..) |st, li| {
         if (st.rows != null) break li;
     } else return error.NoSparseLayer;
     // Room for the block: the write lands in the buffer the read holds, not in a grown one.
-    try m.state[l].rows.?.reserve(es);
-    const buf = m.state[l].rows.?.buf(0);
+    try m.req().state[l].rows.?.reserve(es);
+    const buf = m.req().state[l].rows.?.buf(0);
     const idx_v = [_]u32{ 99, 0, 42, 7 };
     const idx = try eo.own(mlx.mlx_array_new_data(&idx_v, &[_]c_int{4}, 1, .uint32));
     var ro: Ops = .{ .s = es };
@@ -631,7 +631,7 @@ test "hy4 layer-major: two windows run a layer at a time (embedStreams, engramRo
     const windows = [2][]const u32{ ids[0..20], ids[20..40] };
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, t.cpu);
     defer m.deinit();
-    m.kv = .dense;
+    m.req().kv = .dense;
     var want: [2][]const f32 = undefined;
     for (windows, &want) |w, *d| {
         m.reset();
@@ -650,7 +650,7 @@ test "hy4 layer-major: two windows run a layer at a time (embedStreams, engramRo
         h.* = try o.own(try m.passLayer(l, h.*, r, tw, tw, 0));
         m.releaseLayer(l);
     };
-    try testing.expectEqual(@as(usize, 0), m.pos);
+    try testing.expectEqual(@as(usize, 0), m.req().pos);
     for (hs, want) |h, wnt| {
         const got = try host(&o, try o.own(try m.readoutStreams(h, .all)));
         try testing.expectEqualSlices(u32, @ptrCast(wnt), @ptrCast(got));
@@ -709,7 +709,7 @@ test "hy4 tap: called at every site, each layer's rows once (o_in by span, exper
     for (ids_f[0..40], &ids) |v, *d| d.* = @intFromFloat(v);
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, t.cpu);
     defer m.deinit();
-    m.kv = .dense;
+    m.req().kv = .dense;
     // Spans of 16 rows: the 40-row prompt's o_in comes in three calls a layer.
     m.span_rows = 16;
     const c0 = mlx.calls.load(.monotonic);
@@ -782,29 +782,29 @@ test "hy4 prefix: a restore point taken mid-prompt, stored or live, after the re
     var eo: Ops = .{ .s = es };
     defer eo.deinit();
     // Cold: the prompt's rest after its first 21 rows (the point sits mid-group and mid-window), then a decode step.
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     _ = try eo.own(try m.forward(ids[0..21]));
     const cold_rest = try host(&eo, try eo.own(try m.forward(ids[21..40])));
     const cold_step = try host(&eo, try eo.own(try m.forward(ids[40..41])));
     // The point at 21, then the request runs on: every ring wraps past it and groups close.
     m.reset();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     _ = try eo.own(try m.forward(ids[0..21]));
     var cp = try prefix.capture(testing.allocator, m, 21);
     defer cp.deinit(testing.allocator);
     _ = try eo.own(try m.forward(ids[21..40]));
     _ = try eo.own(try m.forward(ids[40..44]));
     try prefix.restore(m, &cp, ids[0..44]);
-    try testing.expectEqual(@as(usize, 21), m.pos);
+    try testing.expectEqual(@as(usize, 21), m.req().pos);
     try testing.expectEqualSlices(f32, cold_rest, try host(&eo, try eo.own(try m.forward(ids[21..40]))));
     try testing.expectEqualSlices(f32, cold_step, try host(&eo, try eo.own(try m.forward(ids[40..41]))));
     // The live record's point (what a next turn rolls back to without a stored restore) restores the same state.
     m.reset();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     _ = try eo.own(try m.forward(ids[0..21]));
     try m.keepLivePoint();
     _ = try eo.own(try m.forward(ids[21..44]));
-    try m.rollbackPoint(&m.live_points.items[m.live_points.items.len - 1], 41);
+    try m.rollbackPoint(&m.req().live_points.items[m.req().live_points.items.len - 1], 41);
     try testing.expectEqualSlices(f32, cold_rest, try host(&eo, try eo.own(try m.forward(ids[21..40]))));
     try testing.expectEqualSlices(f32, cold_step, try host(&eo, try eo.own(try m.forward(ids[40..41]))));
 }
@@ -976,7 +976,7 @@ test "hy4 pinned: a layer whose experts are all pinned runs its picks as one gro
         defer st.close();
         const m = st.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
         const engine = st.xfm.expert_stream.?;
-        m.kv = .dense;
+        m.req().kv = .dense;
         var o: Ops = .{ .s = st.xfm.s };
         defer o.deinit();
         engine.beginForward();
@@ -1011,7 +1011,7 @@ test "hy4 oracle: a prefill read out as none extends the state, and the next row
     for (ids_f[0..40], &ids) |v, *d| d.* = @intFromFloat(v);
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, t.cpu);
     defer m.deinit();
-    m.kv = .dense;
+    m.req().kv = .dense;
     _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..39], .none));
     const got = try o.own(try m.forwardReadout(ids[39..40], .last));
     try expectNear("row 39 after a none prefill", &o, got, try o.slice(try t.ref("logits", .{}), 0, 39, 40), 2e-3);
@@ -1059,8 +1059,8 @@ test "hy4 verify: a 6-row verify block rolled back to each accepted count (0 to 
         for (0..accepted + 1) |r| try expectRowNear(try hostOf(&eo, try eo.slice(lg, 0, @intCast(r), @intCast(r + 1))), serial[r]);
         // The verdict keeps the pending token and `accepted` drafts; the next row continues from there.
         try m.rollbackTo(&mk, ids[40 .. 41 + accepted]);
-        try testing.expectEqual(@as(usize, 41 + accepted), m.pos);
-        try testing.expectEqual(@as(usize, 41 + accepted), m.history.items.len);
+        try testing.expectEqual(@as(usize, 41 + accepted), m.req().pos);
+        try testing.expectEqual(@as(usize, 41 + accepted), m.req().history.items.len);
         try expectRowNear(try hostOf(&eo, try eo.own(try m.forwardReadout(ids[41 + accepted .. 42 + accepted], .last))), serial[1 + accepted]);
         // Back to the round's start for the next count.
         var none: [0]u32 = .{};
@@ -1158,7 +1158,7 @@ test "hy4 core: a decode row and every verify block of 2..8 rows reach no core l
     defer fwd.core_kernel_on = true;
     const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, es);
     defer m.deinit();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     var eo: Ops = .{ .s = es };
     defer eo.deinit();
     const thr: usize = t.config.indexer.group_topk * t.config.indexer.group;
@@ -1179,7 +1179,7 @@ test "hy4 core: a decode row and every verify block of 2..8 rows reach no core l
     // roundings, codes and routing picks).
     fwd.products = .f32;
     m.reset();
-    m.kv = .dense;
+    m.req().kv = .dense;
     fwd.core_kernel_on = false;
     const chain = try eo.own(try m.forwardReadout(ids[0..40], .all));
     const chain_rows = try hostOf(&eo, chain);
@@ -1231,7 +1231,7 @@ const LiveRig = struct {
     fn cold(r: *LiveRig) void {
         r.m.reset();
         r.m.dropLive();
-        r.m.kv = .engine_default;
+        r.m.req().kv = .engine_default;
     }
 
     /// A finished request's record, as the scheduler publishes it.
@@ -1268,7 +1268,7 @@ fn withLiveRig(comptime body: fn (*LiveRig) anyerror!void) !void {
     defer r.eo.deinit();
     r.hc = LiveRig.pc.HotPrefixCache.init(testing.allocator, 4);
     defer r.hc.deinit();
-    r.m.kv = .engine_default;
+    r.m.req().kv = .engine_default;
     try body(&r);
 }
 
@@ -1305,7 +1305,7 @@ test "hy4 live: a next turn at another KV width than the live state's is not con
     try withLiveRig(struct {
         fn run(r: *LiveRig) !void {
             r.cold();
-            r.m.kv = .dense;
+            r.m.req().kv = .dense;
             try r.forward(r.ids[0..10]);
             try r.m.keepLivePoint();
             try r.forward(r.ids[10..20]);
@@ -1393,7 +1393,7 @@ test "hy4 live: a restore point of a request that never published does not ride 
             try r.forward(b_prompt[10..15]);
             try r.m.keepLivePoint();
             try testing.expectEqual(@as(usize, 10), (try r.lookup(r.ids[0..30], false, null)).?.matched);
-            try testing.expectEqual(@as(usize, 0), r.m.live_points.items.len);
+            try testing.expectEqual(@as(usize, 0), r.m.req().live_points.items.len);
             // D restores a stored point: the request keeps that point alone, not the ones taken before.
             r.cold();
             try r.forward(r.ids[0..10]);
@@ -1403,8 +1403,8 @@ test "hy4 live: a restore point of a request that never published does not ride 
             try r.forward(r.ids[10..12]);
             try r.m.keepLivePoint();
             try prefix.restore(r.m, &cp, r.ids[0..30]);
-            try testing.expectEqual(@as(usize, 1), r.m.live_points.items.len);
-            try testing.expectEqual(@as(usize, 10), r.m.live_points.items[0].pos);
+            try testing.expectEqual(@as(usize, 1), r.m.req().live_points.items.len);
+            try testing.expectEqual(@as(usize, 10), r.m.req().live_points.items[0].pos);
         }
     }.run);
 }
@@ -1435,8 +1435,8 @@ test "hy4 live: a forward that fails mid-layer leaves the model no state, and th
                 }
             }
             try testing.expect(fired_at != 0);
-            try testing.expectEqual(@as(usize, 0), r.m.pos);
-            for (r.m.state[0..r.t.config.layers]) |st| try testing.expect(st.k_pe == null and st.rows == null);
+            try testing.expectEqual(@as(usize, 0), r.m.req().pos);
+            for (r.m.req().state[0..r.t.config.layers]) |st| try testing.expect(st.k_pe == null and st.rows == null);
             try testing.expectEqual(@as(?LiveRig.pc.LookupResult, null), try r.lookup(r.ids[0..30], false, null));
             r.cold();
             try r.forward(r.ids[0..20]);
@@ -1466,28 +1466,28 @@ test "hy4 prefix: a restore point taken just after image ids (dead to Engram, re
     defer m.deinit();
     var eo: Ops = .{ .s = es };
     defer eo.deinit();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     _ = try eo.own(try m.forward(ids[0..21]));
-    const cold_history = try testing.allocator.dupe(u32, m.history.items);
+    const cold_history = try testing.allocator.dupe(u32, m.req().history.items);
     defer testing.allocator.free(cold_history);
     const cold = try host(&eo, try eo.own(try m.forward(ids[21..30])));
     // A stored point, then a live one, each restored over the prompt that ran past it.
     m.reset();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     _ = try eo.own(try m.forward(ids[0..21]));
     var cp = try prefix.capture(testing.allocator, m, 21);
     defer cp.deinit(testing.allocator);
     _ = try eo.own(try m.forward(ids[21..30]));
     try prefix.restore(m, &cp, ids[0..30]);
-    try testing.expectEqualSlices(u32, cold_history, m.history.items);
+    try testing.expectEqualSlices(u32, cold_history, m.req().history.items);
     try testing.expectEqualSlices(f32, cold, try host(&eo, try eo.own(try m.forward(ids[21..30]))));
     m.reset();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     _ = try eo.own(try m.forward(ids[0..21]));
     try m.keepLivePoint();
     _ = try eo.own(try m.forward(ids[21..30]));
-    try m.rollbackPoint(&m.live_points.items[m.live_points.items.len - 1], 41);
-    try testing.expectEqualSlices(u32, cold_history, m.history.items);
+    try m.rollbackPoint(&m.req().live_points.items[m.req().live_points.items.len - 1], 41);
+    try testing.expectEqualSlices(u32, cold_history, m.req().history.items);
     try testing.expectEqualSlices(f32, cold, try host(&eo, try eo.own(try m.forward(ids[21..30]))));
 }
 
@@ -1535,7 +1535,7 @@ test "hy4 prefix: a stored point taken where the request keeps its live point sh
         mlx.engine.trim();
         const in_use0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
         if (i == 0) try m.keepLivePoint() else {
-            var cp = try hy4_prefix.captureKept(a, m, m.pos);
+            var cp = try hy4_prefix.captureKept(a, m, m.req().pos);
             defer cp.deinit(a);
             mlx.engine.close();
             h.* = (mlx.engine.poolTotal() - mlx.engine.poolFree()) -| in_use0;
@@ -1560,7 +1560,7 @@ fn prefillKeepingPoints(a: std.mem.Allocator, m: anytype, ids: []const u32, w: u
         peak.* = @max(peak.*, mlx.engine.poolPeak(.process) -| in_use0);
         try m.keepLivePoint();
         // As `hy4_prefix.captureCheckpoint` with no write-through: the stored point is its position alone.
-        var cp = try hy4_prefix.capture(a, m, m.pos);
+        var cp = try hy4_prefix.capture(a, m, m.req().pos);
         cp.release();
         try cps.append(a, cp);
         // The chunk loop's retention for an arch with no request of its own: the newest, up to the arch's cap.
@@ -1659,7 +1659,7 @@ test "hy4 prefix: the points a long prefill and its live record keep hold their 
         // One more row: the newest point's rings are its own too.
         _ = mlx.mlx_array_free(try m.forwardReadout(ids[at - 1 .. at], .none));
         h.* = try prefix.pointsHeldBytes(m);
-        const points = live.points.items.len + m.live_points.items.len;
+        const points = live.points.items.len + m.req().live_points.items.len;
         errdefer std.debug.print("[hy4-points] {d} points at {d} hold {d} B; a point is billed {d} B\n", .{ points, len, h.*, B.pointBytes(&t.config, 8) });
         try testing.expectEqual(prefix.record_point_cap + hy4_model.Model.live_point_cap, points);
         try testing.expect(h.* <= points * B.pointBytes(&t.config, 8));
@@ -1687,7 +1687,7 @@ test "hy4 bill: the state a prefill leaves holds exactly its arrays' bytes, whic
     for ([_]bool{ false, true }) |served| for ([_]u64{ 8, 16 }) |kv| for ([_]usize{ 7, 1000, 4096, 4097, 8193 }) |len| {
         const m = try hy4_model.Model.init(a, t.config, &t.pack, es);
         defer m.deinit();
-        m.kv = if (kv == 8) .engine_default else .dense;
+        m.req().kv = if (kv == 8) .engine_default else .dense;
         mlx.engine.close();
         mlx.engine.trim();
         const in_use0 = mlx.engine.poolTotal() - mlx.engine.poolFree();
@@ -1701,7 +1701,7 @@ test "hy4 bill: the state a prefill leaves holds exactly its arrays' bytes, whic
         const held = (mlx.engine.poolTotal() - mlx.engine.poolFree()) -| in_use0;
         var arrays: [hy4_model.max_state_arrays]Arr = undefined;
         var own: u64 = 0;
-        for (m.state[0..t.config.layers]) |*st| for (hy4_model.stateArrays(st, &arrays)) |arr| {
+        for (m.req().state[0..t.config.layers]) |*st| for (hy4_model.stateArrays(st, &arrays)) |arr| {
             own += @import("../tensor/pool_class.zig").poolBytes(@intCast(@import("../ssm_cache.zig").arrayBytes(arr)));
         };
         const state_billed = B.stateBytes(&t.config, kv, len);
@@ -1724,7 +1724,7 @@ test "hy4 bill: the state a prefill leaves holds exactly its arrays' bytes, whic
 fn lazyStateArrays(m: anytype, layers: usize) usize {
     var lazy: usize = 0;
     var arrays: [@import("hy4_model.zig").max_state_arrays]Arr = undefined;
-    for (m.state[0..layers]) |*st| for (@import("hy4_model.zig").stateArrays(st, &arrays)) |arr| {
+    for (m.req().state[0..layers]) |*st| for (@import("hy4_model.zig").stateArrays(st, &arrays)) |arr| {
         var avail = false;
         _ = mlx._mlx_array_is_available(&avail, arr);
         if (!avail) lazy += 1;
@@ -1752,7 +1752,7 @@ test "hy4 state: a forward leaves every state array evaluated, whatever it reads
     for (ids, 0..) |*d, i| d.* = @intCast((i * 7919 + 3) % 120000);
     const m = try hy4_model.Model.init(testing.allocator, cfg, &t.pack, es);
     defer m.deinit();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     var eo: Ops = .{ .s = es };
     defer eo.deinit();
     // Prefill chunks read out nothing, a decode row reads its logits: the rows the ring wraps in and the groups close in.
@@ -1792,7 +1792,7 @@ const HeldRig = struct {
         var at: usize = 0;
         while (at < ids.len) : (at += 512) _ = mlx.mlx_array_free(try m.forwardReadout(ids[at..@min(at + 512, ids.len)], .none));
         try m.keepLivePoint();
-        var rig: HeldRig = .{ .m = m, .cp = try hy4_prefix.capture(testing.allocator, m, m.pos) };
+        var rig: HeldRig = .{ .m = m, .cp = try hy4_prefix.capture(testing.allocator, m, m.req().pos) };
         rig.live.publish(m, ids, false, .{});
         mlx.engine.close();
         mlx.engine.trim();
@@ -1923,7 +1923,7 @@ const SsdRig = struct {
         const res = try r.hc.lookupImpl(&target, &off, @import("../arch/prefix.zig").recurrent("hy4flash", r.m), r.es, prompt, false, 0, null, &.{}, null, null, null, false);
         if (res.matched == 0) {
             r.m.reset();
-            r.m.kv = .engine_default;
+            r.m.req().kv = .engine_default;
         }
         var cps: std.ArrayList(@import("../ssm_cache.zig").SSMCheckpoint) = .empty;
         defer {
@@ -1988,7 +1988,7 @@ fn withSsdRig(base: []const u8, span: u32, comptime body: fn (*SsdRig, *Tiny, []
     var r: SsdRig = .{ .m = try @import("hy4_model.zig").Model.init(testing.allocator, t.config, &t.pack, es), .hc = try SsdRig.cache(std.testing.io, base, &t.config, span), .es = es, .eo = &eo };
     defer r.m.deinit();
     defer r.hc.deinit();
-    r.m.kv = .engine_default;
+    r.m.req().kv = .engine_default;
     try body(&r, &t, ids, base);
 }
 
@@ -2027,7 +2027,7 @@ test "hy4 SSD tier: a conversation another one's cold request interrupts restore
             {
                 var ref = try @import("hy4_model.zig").Model.init(a, t.config, &t.pack, r.es);
                 defer ref.deinit();
-                ref.kv = .engine_default;
+                ref.req().kv = .engine_default;
                 var at: usize = 0;
                 // The same rows as the turns above: the prompt on the chunk grid, then the 7 forwarded replies.
                 while (at < 1300) : (at = @min((at / 256 + 1) * 256, 1300)) _ = try r.eo.own(try ref.forwardReadout(ids[at..@min((at / 256 + 1) * 256, 1300)], .last));
@@ -2087,7 +2087,7 @@ test "hy4 prefix: rolling back a long turn to a short point trims row stores to 
     const want_append, const want_decode = blk: {
         const ref = try hy4_model.Model.init(a, t.config, &t.pack, es);
         defer ref.deinit();
-        ref.kv = .engine_default;
+        ref.req().kv = .engine_default;
         _ = mlx.mlx_array_free(try ref.forwardReadout(p2[0..64], .none));
         const wa = try host(&eo, try eo.own(try ref.forwardReadout(p2[64..80], .last)));
         const wd = try host(&eo, try eo.own(try ref.forwardReadout(&next_tok, .last)));
@@ -2095,7 +2095,7 @@ test "hy4 prefix: rolling back a long turn to a short point trims row stores to 
     };
     const m = try hy4_model.Model.init(a, t.config, &t.pack, es);
     defer m.deinit();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     var hc = @import("../prefix_cache.zig").HotPrefixCache.init(a, 4);
     defer hc.deinit();
     mlx.engine.close();
@@ -2116,7 +2116,7 @@ test "hy4 prefix: rolling back a long turn to a short point trims row stores to 
     const g: usize = t.config.indexer.group;
     var max_cap: usize = 0;
     var max_pooled_cap: usize = 0;
-    for (m.state[0..t.config.layers]) |st| {
+    for (m.req().state[0..t.config.layers]) |st| {
         if (st.rows) |r| max_cap = @max(max_cap, r.cap);
         if (st.pooled) |r| max_pooled_cap = @max(max_pooled_cap, r.cap);
     }
@@ -2151,7 +2151,7 @@ test "hy4 prefix: RAM+SSD mode flushes live restore points to SSD on handover an
             const want = blk: {
                 var ref = try @import("hy4_model.zig").Model.init(a, t.config, &t.pack, r.es);
                 defer ref.deinit();
-                ref.kv = .engine_default;
+                ref.req().kv = .engine_default;
                 _ = try r.eo.own(try ref.forwardReadout(ids[0..600], .none));
                 break :blk try host(r.eo, try r.eo.own(try ref.forwardReadout(ids[600..610], .last)));
             };
@@ -2210,9 +2210,9 @@ test "hy4 model: a rollback to a mark taken with no hidden state clears last_hid
     defer m.dropMark(&mk);
     try testing.expect(!mk.hidden);
     _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..10], .last));
-    try testing.expect(m.last_hidden != null);
+    try testing.expect(m.req().last_hidden != null);
     try m.rollbackTo(&mk, &.{});
-    try testing.expect(m.last_hidden == null);
+    try testing.expect(m.req().last_hidden == null);
     const got = try host(&eo, try eo.own(try m.forwardReadout(ids[0..10], .last)));
     try testing.expectEqualSlices(f32, want, got);
 }

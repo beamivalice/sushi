@@ -92,6 +92,10 @@ pub const Store = struct {
     /// bytes are another execution's from then, and a bind or a host read of it is refused.
     level_seq: u64 = 0,
     level_hi: u32 = 0,
+    lev_seq: u64 = 0,
+    lev_read: u32 = 0,
+    lev_write: u32 = 0,
+    lev_whole: u32 = 0,
     live_at: u32 = 0,
     escaped: bool = false,
 
@@ -282,9 +286,6 @@ const State = struct {
     /// is one past the levels in this pass of the writes it reads and, for a write, of the reads and writes before it
     /// (a disjoint write, of the reads and the whole writes): independent work runs beside, whatever order it was made in.
     rec: metal.Recorder = .{},
-    lv_write: std.AutoHashMapUnmanaged(*Store, u32) = .empty,
-    lv_read: std.AutoHashMapUnmanaged(*Store, u32) = .empty,
-    lv_whole: std.AutoHashMapUnmanaged(*Store, u32) = .empty,
     /// The highest level of a dispatch in the open pass: with its number, the engine's mark (`markNow`).
     pass_level_hi: u32 = 0,
     /// The counter page (`counterPage`), made at its first ask.
@@ -1828,17 +1829,12 @@ fn wideStore(len: usize, for_host: bool) Error!*Store {
     try ar.live.ensureUnusedCapacity(gpa, 1);
     const store = ar.spare.pop() orelse (gpa.create(Store) catch return error.OutOfMemory);
     store.* = .{ .buffer = ar.buffer, .at = at, .ptr = ar.base + at, .len = len, .origin = .{ .wide = .{ .at = at, .len = place, .host = for_host } } };
-    _ = s.lv_write.remove(store);
-    _ = s.lv_read.remove(store);
-    _ = s.lv_whole.remove(store);
     const floor: u32 = @truncate(after);
     if (after >> 32 == s.seq and floor > 0) {
-        try s.lv_write.ensureUnusedCapacity(gpa, 1);
-        try s.lv_read.ensureUnusedCapacity(gpa, 1);
-        try s.lv_whole.ensureUnusedCapacity(gpa, 1);
-        s.lv_write.putAssumeCapacity(store, floor);
-        s.lv_read.putAssumeCapacity(store, floor);
-        s.lv_whole.putAssumeCapacity(store, floor);
+        store.lev_seq = s.seq;
+        store.lev_read = floor;
+        store.lev_write = floor;
+        store.lev_whole = floor;
         s.stats.arena_floors += 1;
     }
     store.live_at = @intCast(ar.live.items.len);
@@ -1880,18 +1876,12 @@ fn arenaStore(len: usize, for_host: bool) Error!*Store {
     const store = ar.spare.pop() orelse (gpa.create(Store) catch return error.OutOfMemory);
     errdefer ar.spare.append(gpa, store) catch gpa.destroy(store);
     store.* = .{ .buffer = ar.buffer, .at = got.offset, .ptr = ar.base + got.offset, .len = len, .origin = .{ .arena = got.slot } };
-    // A record reused while the open pass still names it carries its last tenant's levels.
-    _ = s.lv_write.remove(store);
-    _ = s.lv_read.remove(store);
-    _ = s.lv_whole.remove(store);
     const floor: u32 = @truncate(got.after);
     if (got.after >> 32 == s.seq and floor > 0) {
-        try s.lv_write.ensureUnusedCapacity(gpa, 1);
-        try s.lv_read.ensureUnusedCapacity(gpa, 1);
-        try s.lv_whole.ensureUnusedCapacity(gpa, 1);
-        s.lv_write.putAssumeCapacity(store, floor);
-        s.lv_read.putAssumeCapacity(store, floor);
-        s.lv_whole.putAssumeCapacity(store, floor);
+        store.lev_seq = s.seq;
+        store.lev_read = floor;
+        store.lev_write = floor;
+        store.lev_whole = floor;
         s.stats.arena_floors += 1;
     }
     if (comptime builtin.is_test) if (got.slot.item != plan.trace_mod.none) try arena_check.handOut(s, ar, store, got.room, got.after);
@@ -2341,15 +2331,45 @@ fn beforeDispatch() void {
     s.next_out.clearRetainingCapacity();
 }
 
+fn levOf(store: *const Store, s: *const State) struct { read: u32, write: u32, whole: u32 } {
+    if (store.lev_seq != s.seq) return .{ .read = 0, .write = 0, .whole = 0 };
+    return .{ .read = store.lev_read, .write = store.lev_write, .whole = store.lev_whole };
+}
+
+fn levSet(store: *Store, s: *const State, lev: u32) void {
+    if (store.lev_seq != s.seq) {
+        store.lev_seq = s.seq;
+        store.lev_read = 0;
+        store.lev_write = 0;
+        store.lev_whole = 0;
+    }
+    store.lev_read = @max(store.lev_read, lev);
+}
+
+fn levSetWrite(store: *Store, s: *const State, lev: u32, whole: bool) void {
+    if (store.lev_seq != s.seq) {
+        store.lev_seq = s.seq;
+        store.lev_read = 0;
+        store.lev_write = 0;
+        store.lev_whole = 0;
+    }
+    store.lev_write = if (whole) lev else @max(store.lev_write, lev);
+    if (whole) {
+        store.lev_whole = lev;
+        store.lev_read = 0;
+    }
+}
+
 /// The level in the open pass of the dispatch whose stores were just bound (`State.rec`), noted for its stores.
 fn dispatchLevel(s: *State) u32 {
     var lev: u32 = 0;
     var it = s.next_in.keyIterator();
-    while (it.next()) |k| lev = @max(lev, s.lv_write.get(k.*) orelse 0);
+    while (it.next()) |k| lev = @max(lev, levOf(k.*, s).write);
     it = s.next_out.keyIterator();
     while (it.next()) |k| {
-        const after = if (s.next_in.contains(k.*)) s.lv_write.get(k.*) orelse 0 else s.lv_whole.get(k.*) orelse 0;
-        lev = @max(lev, @max(after, s.lv_read.get(k.*) orelse 0));
+        const l = levOf(k.*, s);
+        const after = if (s.next_in.contains(k.*)) l.write else l.whole;
+        lev = @max(lev, @max(after, l.read));
     }
     lev += 1;
     s.pass_level_hi = @max(s.pass_level_hi, lev);
@@ -2357,18 +2377,12 @@ fn dispatchLevel(s: *State) u32 {
     while (it.next()) |k| {
         if (k.*.origin == .arena or k.*.origin == .wide) noteArenaLevel(k.*, s.seq, lev);
         if (s.next_out.contains(k.*)) continue;
-        const g = s.lv_read.getOrPut(gpa, k.*) catch @panic("engine: out of memory tracking a pass");
-        g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
+        levSet(k.*, s, lev);
     }
     it = s.next_out.keyIterator();
     while (it.next()) |k| {
         if (k.*.origin == .arena or k.*.origin == .wide) noteArenaLevel(k.*, s.seq, lev);
-        const g = s.lv_write.getOrPut(gpa, k.*) catch @panic("engine: out of memory tracking a pass");
-        if (s.next_in.contains(k.*)) {
-            g.value_ptr.* = lev;
-            s.lv_whole.put(gpa, k.*, lev) catch @panic("engine: out of memory tracking a pass");
-            _ = s.lv_read.remove(k.*);
-        } else g.value_ptr.* = if (g.found_existing) @max(g.value_ptr.*, lev) else lev;
+        levSetWrite(k.*, s, lev, s.next_in.contains(k.*));
     }
     return lev;
 }
@@ -2603,9 +2617,6 @@ fn clearPassBinds(s: *State) void {
 }
 
 fn clearHazards(s: *State) void {
-    s.lv_write.clearRetainingCapacity();
-    s.lv_read.clearRetainingCapacity();
-    s.lv_whole.clearRetainingCapacity();
     s.next_in.clearRetainingCapacity();
     s.next_out.clearRetainingCapacity();
 }
@@ -4069,4 +4080,39 @@ test "wide: a host-filled ask takes the host ring's replica of its execution, it
     try t.expect(s.store.at >= 2 * (16 << 10));
     release(s);
     try endWide();
+}
+
+test "engine: a dispatch's level is its stores' last use, and a later pass starts them over" {
+    const t = std.testing;
+    try mlx.requireGpu();
+    const s = try st();
+    const a = try fresh(.float32, &.{4});
+    defer release(a);
+    const b = try fresh(.float32, &.{4});
+    defer release(b);
+    var p = try pass();
+    bind(p, a, 0);
+    bindOut(p, b, 0);
+    beforeDispatch();
+    try t.expectEqual(@as(u32, 2), s.rec.next_level);
+    bind(p, b, 0);
+    beforeDispatch();
+    try t.expectEqual(@as(u32, 4), s.rec.next_level);
+    bind(p, b, 0);
+    bind(p, b, 1);
+    beforeDispatch();
+    try t.expectEqual(@as(u32, 4), s.rec.next_level);
+    bind(p, b, 0);
+    bindOut(p, b, 1);
+    beforeDispatch();
+    try t.expectEqual(@as(u32, 6), s.rec.next_level);
+    bind(p, b, 0);
+    beforeDispatch();
+    try t.expectEqual(@as(u32, 8), s.rec.next_level);
+    try submit();
+    p = try pass();
+    bind(p, b, 0);
+    beforeDispatch();
+    try t.expectEqual(@as(u32, 2), s.rec.next_level);
+    try submit();
 }

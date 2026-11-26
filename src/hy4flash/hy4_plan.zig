@@ -19,17 +19,37 @@ const KVQuantConfig = @import("../kv_quant.zig").KVQuantConfig;
 const Drafter = @import("hy4_dfly.zig").Drafter;
 const GemmScope = @import("sushi_exl3").linear.GemmScope;
 
+/// The rows a joined tick can hold at most (`hy4_forward.joinedRowsMax`, a comptime bound).
+const joined_rows_max: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+
 /// A planned forward's root: its rows, how it reads out, whether it keeps the drafter's handover, and its KV width (a
 /// request may name its own), each of which decides its structure.
 pub fn root(p: Probe) plan.FrameId {
     // A draft's root is its own: the block `[t1, mask x draft]`, its width the config's, read from the handover.
     if (p.phase == .draft) return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.kv.scheme, p.kv.bits, p.kv.group_size }) };
+    if (p.phase == .joined) return joinedId(p);
     return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.rows, p.readout, p.keep_hidden, p.kv.scheme, p.kv.bits, p.kv.group_size }) };
+}
+
+/// A joined tick's root: the rows `extendRows` runs, not a forward's `rows` ids (`root`).
+fn joinedId(p: Probe) plan.FrameId {
+    const max: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+    var sorted: [max]u16 = undefined;
+    @memcpy(sorted[0..p.groups.len], p.groups);
+    std.mem.sort(u16, sorted[0..p.groups.len], {}, std.sort.asc(u16));
+    var h = std.hash.Wyhash.init(0);
+    h.update(std.mem.sliceAsBytes(sorted[0..p.groups.len]));
+    return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.rows, p.readout, p.keep_hidden, p.kv.scheme, p.kv.bits, p.kv.group_size, h.final() >> 1 }) };
+}
+
+pub fn joinedRows(config: *const @import("../model.zig").ModelConfig) usize {
+    if (!config.expert_resident or !@import("../cooler_side.zig").onEngine(config)) return 1;
+    return @intCast(@import("hy4_forward.zig").joinedRowsMax());
 }
 
 /// One shape a root is recorded at: its rows after a state `n` rows deep; a target's forward, or DFly2's draft
 /// (`Drafter.draft`) from a state `n` rows deep and the handover of its last row.
-pub const Probe = struct { rows: usize, readout: Readout, keep_hidden: bool, kv: KVQuantConfig, n: usize = 0, phase: Phase = .forward, drafter: ?*const Drafter = null };
+pub const Probe = struct { rows: usize, readout: Readout, keep_hidden: bool, kv: KVQuantConfig, n: usize = 0, phase: Phase = .forward, drafter: ?*const Drafter = null, groups: []const u16 = &.{} };
 
 pub const Phase = enum {
     forward,
@@ -37,6 +57,8 @@ pub const Phase = enum {
     /// A forward the region runs (D97), recorded to measure it: its GEMM inputs are its own (`GemmScope`), as its
     /// execution's are.
     wide,
+    /// The scheduler's joined decode tick (`Model.extendRows`), recorded by running it over one request a row.
+    joined,
 };
 
 /// A draft at a state `n` rows deep, by `d`.
@@ -162,6 +184,10 @@ fn replayRoot(rows: usize, kv: KVQuantConfig) Probe {
     return .{ .rows = rows, .readout = .none, .keep_hidden = true, .kv = kv };
 }
 
+fn joinedRoot(rows: usize, keep_hidden: bool, kv: KVQuantConfig) Probe {
+    return .{ .rows = rows, .readout = .all, .keep_hidden = keep_hidden, .kv = kv, .phase = .joined };
+}
+
 /// A load's plans: the book of its planned roots, the reach every probe reserved the state for, the KV width they were
 /// recorded at (a request's own runs on the pool, billed so), and where the shapes its misses record are kept for the
 /// next load.
@@ -264,12 +290,15 @@ fn recordPasses(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, f
 /// its drafter flag left as it was.
 fn recordPass(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fill: core.Fill, ids_kind: Ids, driver: *plan.Driver) !plan_trace.Trace {
     if (probe.phase == .draft) return recordDraft(m, gpa, probe, reach, fill, driver);
+    if (probe.phase == .joined) return if (probe.groups.len > 0) recordJoinedGroups(m, gpa, probe, reach, fill, ids_kind, driver) else recordJoined(m, gpa, probe, reach, fill, ids_kind, driver);
+    const own = m.lendOwn();
+    defer own.end();
     const keep_was = m.keep_hidden;
     defer m.keep_hidden = keep_was;
     m.keep_hidden = probe.keep_hidden;
-    const kv_was = m.kv;
-    defer m.kv = kv_was;
-    m.kv = probe.kv;
+    const kv_was = m.own.kv;
+    defer m.own.kv = kv_was;
+    m.own.kv = probe.kv;
     // A dry recording leaves the blocks it writes unusable: it writes logits blocks of its own, and the caller may still
     // hold a view of the load's pair.
     const held = m.logits_fixed;
@@ -316,17 +345,145 @@ fn recordPass(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fil
     };
 }
 
+/// A joined tick recorded dry: one request a row, each a dry state `n` rows deep, run through `extendRows` as serving
+/// runs it, so the root holds the tick's own passes.
+fn recordJoined(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fill: core.Fill, ids_kind: Ids, driver: *plan.Driver) !plan_trace.Trace {
+    const n = probe.rows;
+    const own = m.lendOwn();
+    defer own.end();
+    const keep_was = m.keep_hidden;
+    defer m.keep_hidden = keep_was;
+    m.keep_hidden = probe.keep_hidden;
+    const held = m.logits_fixed;
+    const turn = m.logits_turn;
+    m.logits_fixed = .{ null, null };
+    defer {
+        m.freeLogitsBlocks();
+        m.logits_fixed = held;
+        m.logits_turn = turn;
+    }
+    var reqs: [joined_rows_max]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer for (reqs[0..made]) |*r| r.deinit();
+    for (0..n) |i| {
+        reqs[i] = try hy4_model.Request.init(gpa, 0);
+        made = i + 1;
+        reqs[i].kv = probe.kv;
+    }
+    m.reset();
+    defer m.reset();
+    {
+        var rec = try plan.Recorder.begin(gpa, .{ .site = plan.siteOf(@src()) });
+        defer rec.deinit();
+        var state_driver: plan.Driver = .{ .gpa = gpa };
+        defer state_driver.deinit();
+        try core.beginRecording(.{ .dry = .{ .driver = &state_driver } }, &rec);
+        defer core.endRecording() catch {};
+        for (reqs[0..n]) |*r| {
+            const lent = m.lend(r);
+            defer lent.end();
+            try m.dryState(probe.n, reach);
+        }
+        if (held[0] != null) try m.makeLogitsBlocks();
+    }
+    var rec = try plan.Recorder.begin(gpa, root(probe));
+    defer rec.deinit();
+    {
+        try core.beginRecording(.{ .dry = .{ .driver = driver, .fill = fill } }, &rec);
+        defer core.endRecording() catch {};
+        var segs: [joined_rows_max]Model.Seg = undefined;
+        var ids: [joined_rows_max]u32 = undefined;
+        spreadIds(&m.config, ids[0..n], ids_kind);
+        for (0..n) |i| segs[i] = .{ .request = &reqs[i], .id = ids[i] };
+        const joined = try m.extendRows(segs[0..n]);
+        _ = mlx.mlx_array_free(joined);
+    }
+    return rec.end() catch |e| {
+        if (e == error.PlanEscape) {
+            const at = rec.escape.?;
+            log.err("[plan] an ask of {d} B outlives a joined tick of {d} rows at {d} (frame {d}, ordinal {d})\n", .{ rec.instances.items[at.instance].asks.items[at.ordinal].bytes, probe.rows, probe.n, at.instance, at.ordinal });
+        }
+        return e;
+    };
+}
+
+fn recordJoinedGroups(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fill: core.Fill, ids_kind: Ids, driver: *plan.Driver) !plan_trace.Trace {
+    const max_rows: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+    const n = probe.groups.len;
+    if (n == 0 or n > max_rows) return error.Hy4RowsWidth;
+    const own = m.lendOwn();
+    defer own.end();
+    const keep_was = m.keep_hidden;
+    defer m.keep_hidden = keep_was;
+    m.keep_hidden = probe.keep_hidden;
+    const held = m.logits_fixed;
+    const turn = m.logits_turn;
+    m.logits_fixed = .{ null, null };
+    defer {
+        m.freeLogitsBlocks();
+        m.logits_fixed = held;
+        m.logits_turn = turn;
+    }
+    var reqs: [max_rows]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer for (reqs[0..made]) |*r| r.deinit();
+    var ids: [max_rows][max_rows]u32 = undefined;
+    var groups: [max_rows]Model.Group = undefined;
+    m.reset();
+    defer m.reset();
+    {
+        var rec = try plan.Recorder.begin(gpa, .{ .site = plan.siteOf(@src()) });
+        defer rec.deinit();
+        var state_driver: plan.Driver = .{ .gpa = gpa };
+        defer state_driver.deinit();
+        try core.beginRecording(.{ .dry = .{ .driver = &state_driver } }, &rec);
+        defer core.endRecording() catch {};
+        for (0..n) |i| {
+            reqs[i] = try hy4_model.Request.init(gpa, 0);
+            made = i + 1;
+            reqs[i].kv = probe.kv;
+            const lent = m.lend(&reqs[i]);
+            defer lent.end();
+            try m.dryState(probe.n, reach);
+            try m.makeRequestLogits(&reqs[i]);
+        }
+        if (held[0] != null) try m.makeLogitsBlocks();
+    }
+    var rec = try plan.Recorder.begin(gpa, root(probe));
+    defer rec.deinit();
+    {
+        try core.beginRecording(.{ .dry = .{ .driver = driver, .fill = fill } }, &rec);
+        defer core.endRecording() catch {};
+        for (0..n) |i| {
+            const w: usize = probe.groups[i];
+            spreadIds(&m.config, ids[i][0..w], ids_kind);
+            groups[i] = .{ .request = &reqs[i], .ids = ids[i][0..w] };
+        }
+        const joined = try m.extendGroups(groups[0..n]);
+        var start: usize = 0;
+        for (groups[0..n], 0..) |g, i| {
+            const v = try hy4_model.writeGroupBlock(g.request, joined, @intCast(start), @intCast(start + probe.groups[i]), m.logits_rows, m.s);
+            _ = mlx.mlx_array_free(v);
+            start += probe.groups[i];
+        }
+        _ = mlx.mlx_array_free(joined);
+    }
+    return rec.end();
+}
+
 /// A draft probe recorded dry: the state `n - 1` rows deep made without forwards, then one row run dry with the
 /// handover kept (its hidden row and each sparse layer's selection, as a verify's last row leaves them), then the draft.
 fn recordDraft(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fill: core.Fill, driver: *plan.Driver) !plan_trace.Trace {
     const d = probe.drafter orelse return error.Hy4DflyMissing;
     if (probe.n == 0) return error.Hy4DflyNoContext;
+    const own = m.lendOwn();
+    defer own.end();
     const keep_was = m.keep_hidden;
     defer m.keep_hidden = keep_was;
     m.keep_hidden = true;
-    const kv_was = m.kv;
-    defer m.kv = kv_was;
-    m.kv = probe.kv;
+    const kv_was = m.own.kv;
+    defer m.own.kv = kv_was;
+    m.own.kv = probe.kv;
     m.reset();
     defer m.reset();
     {
@@ -395,11 +552,17 @@ const shape_phase: u32 = 1;
 /// The third number: the handover's bit, then the KV width's scheme, bits and group size.
 pub fn shapeOf(p: Probe) plan_book.Shape {
     const kv: u64 = @intFromBool(p.keep_hidden) | @as(u64, @backingInt(p.kv.scheme)) << 8 | @as(u64, p.kv.bits) << 16 | @as(u64, p.kv.group_size) << 24;
-    return .{ .phase = if (p.phase == .draft) draft_phase else shape_phase, .args = .{ p.rows, @backingInt(p.readout), kv, p.n } };
+    const phase: u32 = switch (p.phase) {
+        .draft => draft_phase,
+        .joined => joined_phase,
+        else => shape_phase,
+    };
+    return .{ .phase = phase, .args = .{ p.rows, @backingInt(p.readout), kv, p.n } };
 }
 
-/// A kept shape's phase: a draft (`draftProbe`).
+/// A kept shape's phase: a draft (`draftProbe`), a joined tick (a forward's shape would record it as one request's rows).
 const draft_phase: u32 = 2;
+const joined_phase: u32 = 3;
 
 /// The probe a kept shape names, or null when it names none this load can run.
 fn probeOf(s: plan_book.Shape, reach: usize, drafter: ?*const Drafter, c: *const hy4_config.Config) ?Probe {
@@ -409,9 +572,11 @@ fn probeOf(s: plan_book.Shape, reach: usize, drafter: ?*const Drafter, c: *const
         if (s.args[3] == 0 or s.args[3] + c.dfly.draft + 1 > reach) return null;
         return draftProbe(d, c, fwd_probe.kv, s.args[3]);
     }
-    if (s.phase != shape_phase or s.args[2] & 0xfe != 0) return null;
+    if (s.phase != shape_phase and s.phase != joined_phase) return null;
+    if (s.args[2] & 0xfe != 0) return null;
     const rows = s.args[0];
-    if (rows == 0 or rows > @import("hy4_forward.zig").verify_rows_max or s.args[3] + rows > reach) return null;
+    const cap_rows: usize = if (s.phase == joined_phase) @intCast(@import("hy4_forward.zig").joinedRowsMax()) else @intCast(@import("hy4_forward.zig").verify_rows_max);
+    if (rows == 0 or rows > cap_rows or s.args[3] + rows > reach) return null;
     const readout: Readout = for (std.enums.values(Readout)) |r| {
         if (@backingInt(r) == s.args[1]) break r;
     } else return null;
@@ -419,7 +584,7 @@ fn probeOf(s: plan_book.Shape, reach: usize, drafter: ?*const Drafter, c: *const
         if (@backingInt(v) == (s.args[2] >> 8) & 0xff) break v;
     } else return null;
     const kv: KVQuantConfig = .{ .scheme = scheme, .bits = @intCast((s.args[2] >> 16) & 0xff), .group_size = @intCast(s.args[2] >> 24) };
-    return .{ .rows = rows, .readout = readout, .keep_hidden = s.args[2] & 1 == 1, .kv = kv, .n = s.args[3] };
+    return .{ .rows = rows, .readout = readout, .keep_hidden = s.args[2] & 1 == 1, .kv = kv, .n = s.args[3], .phase = if (s.phase == joined_phase) .joined else .forward };
 }
 
 /// The shapes earlier loads' misses kept, each recorded and learned into the book. One this load cannot run, or that
@@ -490,7 +655,7 @@ fn addProbe(m: *Model, gpa: std.mem.Allocator, p: *Plans, probe: Probe, reach: u
 /// pipelines latched first (D20), then each root recorded at every decode position, merged and packed, the shapes
 /// earlier misses kept learned, and the logits blocks made (D19). No arena is made: `makeArena` makes it with the
 /// region.
-pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const Drafter, kv: KVQuantConfig, cache: ?plan_book.Cache, encode: ?Encode) !*Plans {
+pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const Drafter, kv: KVQuantConfig, cache: ?plan_book.Cache, encode: ?Encode, joined: usize) !*Plans {
     const drafts = drafter != null;
     const t0 = @import("../load_clock.zig").now();
     try m.probeWide();
@@ -506,6 +671,7 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
     const positions = try decodePositions(gpa, &m.config, reach);
     defer gpa.free(positions);
     // Made first: each recording writes the logits into blocks of their shape, as a served forward does.
+    m.logits_rows = @intCast(@max(@as(usize, @intCast(@import("hy4_forward.zig").verify_rows_max)), joined));
     try m.makeLogitsBlocks();
     try m.makeIdsBlock();
     var roots: [4]Probe = undefined;
@@ -525,6 +691,34 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
         for (at) |n| {
             var probe = verifyRoot(rows, kv);
             probe.n = n;
+            try addProbe(m, gpa, p, probe, reach);
+            probes += 1;
+        }
+    };
+    // A joined tick's rows are one-row frames keyed by the row's own structure (`layerKey(l, p, 1)`), so the load
+    // records it at each one-row position a request can run, and the loop holds every key any mix of rows asks.
+    m.joined_grouped_at = for (positions) |n| {
+        if (n + 1 > m.config.window) break n;
+    } else null;
+    defer m.joined_grouped_at = null;
+    if (joined > 1) for (2..@min(joined, reach) + 1) |rows| {
+        for (positions) |n| {
+            var probe = joinedRoot(rows, m.keep_hidden, kv);
+            probe.n = n;
+            try addProbe(m, gpa, p, probe, reach);
+            probes += 1;
+        }
+    };
+    if (joined > 1 and drafts) for (2..@min(joined, @as(usize, @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX))) + 1) |slots| {
+        const w = @import("hy4_forward.zig").groupRows(@as(usize, m.config.dfly.draft), joined, slots);
+        if (w < 2 or slots * w > joined) continue;
+        var widths: [@import("sushi_exl3").project_rows.NAX_ROWS_MAX]u16 = @splat(@intCast(w));
+        const at = try blockPositions(gpa, m, reach, w);
+        defer gpa.free(at);
+        for (at) |n| {
+            var probe = joinedRoot(slots * w, m.keep_hidden, kv);
+            probe.n = n;
+            probe.groups = widths[0..slots];
             try addProbe(m, gpa, p, probe, reach);
             probes += 1;
         }
@@ -572,7 +766,7 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
 /// `record`, then the arena made with the region of `wide_rows`-row prefill chunks (`makeArena`; 0 measures none, and
 /// every wide forward is refused).
 pub fn build(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const Drafter, kv: KVQuantConfig, cache: ?plan_book.Cache, wide_rows: usize) !*Plans {
-    const p = try record(m, gpa, reach, drafter, kv, cache, null);
+    const p = try record(m, gpa, reach, drafter, kv, cache, null, 0);
     errdefer p.deinit(gpa);
     try makeArena(m, p, wide_rows);
     return p;
@@ -934,7 +1128,8 @@ pub fn makeArena(m: *Model, p: *Plans, wide_rows: usize) !void {
 /// way it went.
 pub fn run(m: *Model, ids: []const u32, vision: ?Model.VisionRows, readout: Readout) !mlx.mlx_array {
     const p = m.plans orelse return m.forwardServed(ids, vision, readout);
-    const probe: Probe = .{ .rows = ids.len, .readout = readout, .keep_hidden = m.keep_hidden, .kv = m.kv, .n = m.pos };
+    const req_ = m.reqConst();
+    const probe: Probe = .{ .rows = ids.len, .readout = readout, .keep_hidden = m.keep_hidden, .kv = req_.kv, .n = req_.pos };
     // A forward that splices an image's rows is not planned; an image request's decode past its prompt splices none.
     const tables = (if (!m.splicesImage(ids, vision)) p.tables(probe) else null) orelse return wide(m, p, ids, vision, readout);
     const id = root(probe);
@@ -954,7 +1149,7 @@ pub fn run(m: *Model, ids: []const u32, vision: ?Model.VisionRows, readout: Read
 /// splice included), a round wider than a verify block (D37, D42), a request at another KV width than the load planned.
 /// An ask past the region refuses the forward by name (`WideFull`).
 fn wide(m: *Model, p: *const Plans, ids: []const u32, vision: ?Model.VisionRows, readout: Readout) !mlx.mlx_array {
-    const at = m.pos;
+    const at = m.reqConst().pos;
     // A load-width chunk in the deep zone read out by its last row, as a served chunk is and as the load recorded its
     // classes, runs padded to its class's recording, so it tops out where that did; another readout keeps D97's measure.
     if (p.deep > 0 and vision == null and ids.len == p.region_rows and at >= p.deep and readout == .last) {
@@ -989,7 +1184,8 @@ fn wide(m: *Model, p: *const Plans, ids: []const u32, vision: ?Model.VisionRows,
 /// request's KV width, else on the pool.
 pub fn runDraft(m: *Model, d: *const Drafter, t1: u32) !Drafter.Draft {
     const p = m.plans orelse return d.draft(m, t1);
-    const probe = draftProbe(d, &m.config, m.kv, m.pos);
+    const req_ = m.reqConst();
+    const probe = draftProbe(d, &m.config, req_.kv, req_.pos);
     const tables = p.tables(probe) orelse return d.draft(m, t1);
     try core.beginExecution(tables, root(probe));
     var drafted = d.draft(m, t1) catch |e| {
@@ -1003,10 +1199,66 @@ pub fn runDraft(m: *Model, d: *const Drafter, t1: u32) !Drafter.Draft {
     return drafted;
 }
 
+/// A joined tick of requests as rows of one forward (`Model.extendRows`) on a load that planned it: it begins as an
+/// execution of the tick's root (D97: a 2..8-row decode tick is a narrow phase). null where the load plans no tick, or
+/// where the rows do not share the load's KV width: that tick runs in the region, as a request at another KV width does.
+pub fn beginJoined(m: *Model, segs: []const Model.Seg) !Probe {
+    const p = m.plans orelse return error.Hy4ModelMissing;
+    // The plans hold the load's kv alone (a request may not name another, `static_bill.kvRefusal`).
+    for (segs) |sg| if (!std.meta.eql(sg.request.kv, p.kv)) {
+        log.err("[plan] a joined tick's request holds a kv the load's plans do not: refused, never served in the wide region\n", .{});
+        return error.Hy4JoinedKvUnplanned;
+    };
+    const probe: Probe = .{ .rows = segs.len, .readout = .all, .keep_hidden = m.keep_hidden, .kv = p.kv, .phase = .joined };
+    const tables = p.tables(probe) orelse return missed(m, p, probe, .{ .kind = .unplanned, .id = root(probe) });
+    try core.beginExecution(tables, root(probe));
+    return probe;
+}
+
+/// The joined tick of `probe` ended as it should: its root closes. A miss refuses the tick by name (`PlanMiss`) and
+/// resets each row's request, as a forward that fails leaves it (D5).
+pub fn endJoined(m: *Model, probe: Probe, segs: []const Model.Seg) !void {
+    core.endExecution() catch |e| {
+        const miss = core.executionMiss() orelse return e;
+        for (segs) |sg| sg.request.reset();
+        return missed(m, m.plans.?, probe, miss);
+    };
+}
+
+pub fn joinedGroupsProbe(m: *Model, reqs: []const *hy4_model.Request, widths: []const u16) ?Probe {
+    const p = m.plans orelse return null;
+    if (widths.len != reqs.len) return null;
+    var total: usize = 0;
+    for (reqs, widths) |r, w| {
+        if (!std.meta.eql(r.kv, p.kv)) return null;
+        total += w;
+    }
+    const probe: Probe = .{ .rows = total, .readout = .all, .keep_hidden = m.keep_hidden, .kv = p.kv, .phase = .joined, .groups = widths };
+    return if (p.tables(probe) != null) probe else null;
+}
+
+pub fn beginJoinedGroups(m: *Model, probe: Probe) !void {
+    const p = m.plans orelse return error.Hy4ModelMissing;
+    const tables = p.tables(probe) orelse return error.Hy4RowsWidth;
+    try core.beginExecution(tables, root(probe));
+}
+
+pub fn endJoinedGroups(m: *Model, probe: Probe, groups: []const Model.Group) !void {
+    core.endExecution() catch |e| {
+        const miss = core.executionMiss() orelse return e;
+        for (groups) |g| g.request.reset();
+        return missed(m, m.plans.?, probe, miss);
+    };
+}
+
 fn missed(m: *Model, p: *Plans, probe: Probe, miss: plan.binder.Miss) error{PlanMiss} {
     p.misses += 1;
     m.reset();
-    log.warn("[plan] miss: a {s} of {d} rows at {d} ({t}, keep {}) asked {d} B against {d} B ({t}, frame {d}/{d}, ordinal {d})\n", .{ if (probe.phase == .draft) "draft" else "forward", probe.rows, probe.n, probe.readout, probe.keep_hidden, miss.asked, miss.cap, miss.kind, miss.id.site, miss.id.key, miss.ordinal });
+    log.warn("[plan] miss: a {s} of {d} rows at {d} ({t}, keep {}) asked {d} B against {d} B ({t}, frame {d}/{d}, ordinal {d})\n", .{ switch (probe.phase) {
+        .draft => "draft",
+        .joined => "joined tick",
+        else => "forward",
+    }, probe.rows, probe.n, probe.readout, probe.keep_hidden, miss.asked, miss.cap, miss.kind, miss.id.site, miss.id.key, miss.ordinal });
     const passes = recordChecked(m, p.book.gpa, probe, p.reach) catch |e| {
         log.warn("[plan] the missed shape was not recorded ({t}); it misses again until a load plans it\n", .{e});
         return error.PlanMiss;
@@ -1028,11 +1280,23 @@ fn missed(m: *Model, p: *Plans, probe: Probe, miss: plan.binder.Miss) error{Plan
         .next_load => log.warn("[plan] the missed shape needs more arena than the load holds: the next load plans it\n", .{}),
     }
     // Kept either way, so a restart plans it too.
-    if (p.cache) |*c| c.keep(p.book.gpa, shapeOf(probe)) catch |e| log.warn("[plan] the missed shape was not kept in {s} ({t}): a restart misses it again\n", .{ c.name(), e });
+    if (probe.groups.len == 0) if (p.cache) |*c| c.keep(p.book.gpa, shapeOf(probe)) catch |e| log.warn("[plan] the missed shape was not kept in {s} ({t}): a restart misses it again\n", .{ c.name(), e });
     return error.PlanMiss;
 }
 
 const testing = std.testing;
+
+test "hy4 plan: a kept joined shape wider than a verify block is a probe of a load whose joined cap holds it" {
+    const cap: usize = @intCast(@import("hy4_forward.zig").joinedRowsMax());
+    if (cap <= @as(usize, @intCast(@import("hy4_forward.zig").verify_rows_max))) return error.SkipZigTest;
+    var c: hy4_config.Config = undefined;
+    c = try hy4_config.parseText(hy4_config.release_file);
+    _ = &c;
+    const probe = joinedRoot(cap, false, KVQuantConfig.engine_default);
+    const got = probeOf(shapeOf(probe), 1 << 20, null, &c) orelse return error.TestNoKeptProbe;
+    try testing.expectEqual(cap, got.rows);
+    try testing.expectEqual(Phase.joined, got.phase);
+}
 
 test "hy4 plan: the decode positions take every residue of a group below and past each edge, the first group and the end, each once" {
     var c = try hy4_config.parseText(hy4_config.release_file);

@@ -145,7 +145,7 @@ test "hy4 points: a live point, a stored point and its write-through, a publish,
     const want_chunk, const want_step = blk: {
         const ref = try hy4_model.Model.init(a, r.t.config, &r.t.pack, r.es);
         defer ref.deinit();
-        ref.kv = .engine_default;
+        ref.req().kv = .engine_default;
         try ref.reserveFor(reach);
         _ = mlx.mlx_array_free(try ref.forwardReadout(ids[0..256], .none));
         _ = mlx.mlx_array_free(try ref.forwardReadout(ids[256..p], .none));
@@ -157,7 +157,7 @@ test "hy4 points: a live point, a stored point and its write-through, a publish,
     defer a.free(want_step);
     r.m = try hy4_model.Model.init(a, r.t.config, &r.t.pack, r.es);
     defer r.m.deinit();
-    r.m.kv = .engine_default;
+    r.m.req().kv = .engine_default;
     r.hc = try diskCache(std.testing.io, base, &r.t.config, 512);
     defer r.hc.deinit();
     const m = r.m;
@@ -166,7 +166,7 @@ test "hy4 points: a live point, a stored point and its write-through, a publish,
         fn same(rr: *Rig, ws: []const u8, wc: []const f32, wst: []const f32, at: []const u32) !void {
             var got: std.ArrayList(u8) = .empty;
             defer got.deinit(testing.allocator);
-            try testing.expectEqual(@as(usize, p), rr.m.pos);
+            try testing.expectEqual(@as(usize, p), rr.m.req().pos);
             try stateBytes(&rr.o, rr.m, &got);
             try testing.expectEqualSlices(u8, ws, got.items);
             const c = try logitsOf(&rr.o, rr.m, at[p .. p + 40]);
@@ -254,7 +254,7 @@ test "hy4 bill: the Points slots a request's state reserves hold exactly pointsB
     for ([_]u64{ 8, 16 }) |kv| for ([_]bool{ false, true }) |drafts| {
         const m = try hy4_model.Model.init(testing.allocator, t.config, &t.pack, es);
         defer m.deinit();
-        m.kv = if (kv == 8) .engine_default else .dense;
+        m.req().kv = if (kv == 8) .engine_default else .dense;
         m.keep_hidden = drafts;
         try m.reserveFor(64);
         const held = try prefix.pointsHeldBytes(m);
@@ -291,7 +291,7 @@ test "hy4 points: a live point taken while a stored point still shares a free sl
     defer o.deinit();
     const m = try hy4_model.Model.init(a, t.config, &t.pack, es);
     defer m.deinit();
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     var ids: [300]u32 = undefined;
     for (&ids, 0..) |*d, i| d.* = @intCast((i * 7919 + 17) % 120000);
     try m.reserveFor(ids.len);
@@ -299,7 +299,7 @@ test "hy4 points: a live point taken while a stored point still shares a free sl
     // A stored point over the live one's slot, the live one let go: the slot is free while the stored point reads it.
     var cp = try prefix.captureKept(a, m, 256);
     defer cp.deinit(a);
-    const shared = m.live_points.items[0].slot;
+    const shared = m.req().live_points.items[0].slot;
     m.dropLive();
     var held: std.ArrayList(u8) = .empty;
     defer held.deinit(a);
@@ -308,7 +308,7 @@ test "hy4 points: a live point taken while a stored point still shares a free sl
     const asks = try closedAsks(hy4_model.Model.keepLivePoint, .{m});
     errdefer std.debug.print("[hy4-points] the live point asked the closed pool {d} times\n", .{asks});
     try testing.expectEqual(@as(u64, 0), asks);
-    try testing.expect(m.live_points.items[0].slot != shared);
+    try testing.expect(m.req().live_points.items[0].slot != shared);
     var after: std.ArrayList(u8) = .empty;
     defer after.deinit(a);
     try pointBytes(&o, &cp, &after);
@@ -334,7 +334,7 @@ test "hy4 points: a request's state reserved before its lookup at the request's 
     const p = 512;
     const ref = try hy4_model.Model.init(a, t.config, &t.pack, es);
     defer ref.deinit();
-    ref.kv = .engine_default;
+    ref.req().kv = .engine_default;
     try ref.reserveFor(ids.len);
     _ = mlx.mlx_array_free(try ref.forwardReadout(ids[0..p], .none));
     var want: std.ArrayList(u8) = .empty;
@@ -346,7 +346,7 @@ test "hy4 points: a request's state reserved before its lookup at the request's 
     const m = try hy4_model.Model.init(a, t.config, &t.pack, es);
     defer m.deinit();
     try prefix.reserveRequest(m, p + 48, 40, 0);
-    try testing.expectEqual(@as(usize, p + 48 + 40), m.reach);
+    try testing.expectEqual(@as(usize, p + 48 + 40), m.req().reach);
     const before = core.stats().asks;
     try prefix.restore(m, &cp, ids[0..p]);
     const asks = core.stats().asks - before;
@@ -394,7 +394,7 @@ test "hy4 points: a restore from SSD reads the point's files straight into the r
     for (points, &cold) |p, *c| {
         const ref = try hy4_model.Model.init(a, r.t.config, &r.t.pack, r.es);
         defer ref.deinit();
-        ref.kv = .engine_default;
+        ref.req().kv = .engine_default;
         try ref.reserveFor(reach);
         var from: usize = 0;
         for (ends) |e| if (e <= p) {
@@ -408,7 +408,7 @@ test "hy4 points: a restore from SSD reads the point's files straight into the r
     r.m = try hy4_model.Model.init(a, r.t.config, &r.t.pack, r.es);
     defer r.m.deinit();
     const m = r.m;
-    m.kv = .engine_default;
+    m.req().kv = .engine_default;
     r.hc = try diskCache(std.testing.io, base, &r.t.config, 256);
     defer r.hc.deinit();
     const d = &r.hc.disk.?;
@@ -441,12 +441,12 @@ test "hy4 points: a restore from SSD reads the point's files straight into the r
     var asks: [points.len]u64 = @splat(0);
     for (points, &cold, &asks) |p, *c, *n| {
         // Over a state run past the point.
-        _ = mlx.mlx_array_free(try m.forwardReadout(ids[m.pos .. m.pos + 30], .none));
+        _ = mlx.mlx_array_free(try m.forwardReadout(ids[m.req().pos .. m.req().pos + 30], .none));
         // Nothing beside the state, wide phases included: the state was reserved at the reach (D61).
         const made = core.stats().asks;
         n.* = try closedAsks(Restore.disk, .{ &r, ids[0 .. p + 41], p });
         try testing.expectEqual(made, core.stats().asks);
-        try testing.expectEqual(p, m.pos);
+        try testing.expectEqual(p, m.req().pos);
         var got: std.ArrayList(u8) = .empty;
         defer got.deinit(a);
         try stateBytes(&r.o, m, &got);

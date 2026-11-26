@@ -8,6 +8,16 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **A named `--prefill-chunk-min` the architecture cannot run refuses the load by name**, naming the min, where it came
   from and the width the model can reach, instead of every request running under it.
+- **sushibar always shows a prompt read's seconds left**: the Show Seconds Left switch is gone.
+- **A Hy4-Flash or DeepSeek pack's in-memory size leaves out its Engram tables**, which stay on the SSD, and a model's
+  line in Models reads its memory, then the whole pack: `76.1 GiB in memory · 194 GiB total`.
+- **Hy4-Flash's load warm makes the grouped sliding-attention kernel too**, so the first batched tick past the window
+  compiles nothing inside a request.
+- **The Hy4-Flash release pack loads again with batched sliding-layer attention**: the joined chain no longer asks one
+  array list for every row's temporaries.
+- **A context above a model's `max_kv_tokens` is refused by name** at launch and on a settings save; the web UI lowers
+  it to the budget on save and says why, and a resident load now serves the `max_concurrent` it is given.
+- **`tool_choice` none now stops a tool call on the Anthropic and Responses endpoints too.**
 - **Each model sets how many requests run at once and how many tokens they may hold together**: the settings keys
   `max_concurrent` (1 by default; a Requests at once value in the server Settings sets every model's default, a
   model's own value outranks it, and `--max-concurrent` outranks both) and
@@ -15,6 +25,12 @@ earlier history is mlx-serve's, in that project's changelog.
   refused with the numbers.
 - **`--prefix-cache-entries` is removed**: the RAM prefix cache keeps as many conversations as the model's `max_concurrent`;
   given, the launch refuses it by name.
+- **Hy4-Flash compiles the head's kernels for every joined width at load**, so the first request that joins 9 to 16
+  rows no longer waits on them.
+- **Hy4-Flash joins two requests that draft with DFly2 as plain rows** instead of running their rounds one after the
+  other, about 24% more tokens a second for the pair.
+- **Hy4-Flash decodes joined requests with one attention launch set per sliding layer** instead of one per request, the
+  same bytes each request would get alone.
 - **Every model takes `--prefill-chunk-max` and `--prefill-chunk-min`**, each one of 512, 1024, 2048, 4096 or 8192
   rows, and their settings keys, which the web UI offers as a list of those five. A request starts at the max (by
   default the model's own start width, so nothing changes without a flag) and steps down no lower than the min.

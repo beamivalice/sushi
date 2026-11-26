@@ -53,6 +53,37 @@ test "hy4 late: after a Cooler load's served warm, a chunk's short last span of 
     try spanTails("HY4_STQ_TINY");
 }
 
+// The load's own kernel warm (`Model.warmKernels`) alone, with no served request after it: a chunk's short last span
+// launches the gate and W_o of a layer at its own width, and each width a rows arm serves is a pipeline of its own.
+test "hy4 late: the kernel warm alone makes every pipeline a chunk's short last span takes through the gate and W_o, at every width a rows arm serves (HY4_STQ_TINY)" {
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var cooler: contract.Load = undefined;
+    try cooler.openLight(hy4_contract, dir, true);
+    defer _ = cooler.close();
+    const m = cooler.xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
+    const turn = hy4_contract.openTurn(cooler.h, &cooler.config);
+    defer turn.end();
+    try m.warmKernels();
+    const made = mlx.engine.pipelinesMade().count;
+    var first: ?struct { layer: usize, tail: c_int } = null;
+    for (m.layers[0..m.config.layers], 0..) |*layer, l| for ([_]struct { fwd.Lin, mlx.mlx_dtype }{ .{ layer.attn.gate, .float32 }, .{ layer.attn.o, .bfloat16 } }) |pair| {
+        const bank = pair[0].stq orelse continue;
+        var tail: c_int = 1;
+        while (!@import("sushi_exl3").trunk.gemmRows(@intCast(tail), true)) : (tail += 1) {
+            const exact = mlx.engine.exactF32();
+            defer exact.end();
+            var o: Ops = .{ .s = m.s };
+            defer o.deinit();
+            const x = try o.slot();
+            try mlx.check(mlx.mlx_zeros(x, &[_]c_int{ tail, bank.inDim() }, 2, pair[1], m.s));
+            try mlx.check(mlx.mlx_array_eval(try fwd.linearStored(&o, x.*, pair[0])));
+            if (first == null and mlx.engine.pipelinesMade().count != made) first = .{ .layer = l, .tail = tail };
+        }
+    };
+    if (first) |f| std.debug.print("hy4 late: from layer {d}, tail {d} on, a span tail made a pipeline the kernel warm did not\n", .{ f.layer, f.tail });
+    try testing.expectEqual(made, mlx.engine.pipelinesMade().count);
+}
+
 /// A served image request as the scheduler runs it: the tower encodes the image, then the prompt prefills with the rows
 /// spliced at its placeholders and decodes. The grids are the patch counts an image of any size lands on, each a whole
 /// number of merge cells: a few patches, a row's worth, whole and not whole 512-row attention chunks, and wide.

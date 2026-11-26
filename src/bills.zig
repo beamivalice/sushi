@@ -270,6 +270,13 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
     return config.pinned_context;
 }
 
+/// The model's `max_kv_tokens` when it is what holds the context (below the model's own window, no manual context set),
+/// else 0: a context refusal names it then, since raising it is the remedy.
+pub fn contextKvHold(config: *const model_mod.ModelConfig) u64 {
+    if (config.max_kv_tokens == 0 or manualContext(config) > 0) return 0;
+    return if (config.contextCap() == config.max_kv_tokens) config.max_kv_tokens else 0;
+}
+
 pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
@@ -4775,6 +4782,27 @@ test "manualContext: an explicit --ctx-size outranks the model's ctx_size, which
     try t.expectEqual(@as(u32, 4096), manualContext(&cfg));
     cfg.ctx_override = 0;
     try t.expectEqual(@as(u32, 0), manualContext(&cfg));
+}
+
+test "contextKvHold names max_kv_tokens only when it holds the model's window" {
+    var cfg: model_mod.ModelConfig = .{};
+    cfg.max_position_embeddings = 4096;
+    try testing.expectEqual(@as(u64, 0), contextKvHold(&cfg));
+    cfg.max_kv_tokens = 64;
+    try testing.expectEqual(@as(u64, 64), contextKvHold(&cfg));
+    cfg.max_kv_tokens = 8192;
+    try testing.expectEqual(@as(u64, 0), contextKvHold(&cfg));
+}
+
+test "an auto context never passes the model's max_kv_tokens: the model's window is held to it, and an unset cap leaves it" {
+    const t = std.testing;
+    var cfg = model_mod.ModelConfig{ .max_position_embeddings = 1 << 20 };
+    cfg.max_kv_tokens = 4096;
+    try t.expectEqual(@as(u32, 4096), cfg.contextCap());
+    cfg.max_kv_tokens = 1 << 30;
+    try t.expectEqual(@as(u32, 1 << 20), cfg.contextCap());
+    cfg.max_kv_tokens = 0;
+    try t.expectEqual(@as(u32, 1 << 20), cfg.contextCap());
 }
 
 test "an explicit --ctx-size keeps the load-time context byte-identical" {

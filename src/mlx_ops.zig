@@ -20,6 +20,14 @@ pub const Ops = struct {
         return &self.values[self.count - 1];
     }
 
+    /// A new handle on `x`'s array, for a result that outlives the scratch `Ops` that made it; the caller owns it.
+    pub fn share(x: Arr) !Arr {
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_set(&out, x));
+        return out;
+    }
+
     pub fn own(self: *Ops, value: Arr) !Arr {
         if (self.count == self.values.len) {
             _ = mlx.mlx_array_free(value);

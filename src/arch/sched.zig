@@ -256,6 +256,15 @@ pub fn enterJoinedRows(xfm: *Trunk) void {
     @import("cooler.zig").enterJoined(&xfm.config, &xfm.cooler_budget);
 }
 
+/// A joined tick's draws on a load whose arch plans its samples: each row through its own request's planned root.
+/// True when the arch drew every row; false leaves the tick to `sampler.sampleRows`.
+pub fn sampleJoinedRows(xfm: *Trunk, gens: []const *generate.Generator, rows: []const mlx.mlx_array, params: []@import("../sampler.zig").SamplingParams, out: []i32) !bool {
+    const tag = tagOfModel(xfm) orelse return false;
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "sampleJoinedRows")) S(t).sampleJoinedRows(xfm, gens, rows, params, out) else false,
+    };
+}
+
 /// Whether the arch runs joined decode rows outside a scheduler (`rowsForward`); one whose rows need a request's
 /// own state from the scheduler does not.
 pub fn hasRowsForward(xfm: *const Trunk) bool {
@@ -557,7 +566,7 @@ pub fn flushResident(entry: *model_registry.LoadedModel, why: []const u8) void {
 
 const known_hooks = [_][]const u8{
     "facts",           "batches",       "rowCap",         "modelBatches",             "padsBatch",       "batchArm",
-    "readyToBatch",    "coolerRows",
+    "readyToBatch",    "coolerRows",    "sampleJoinedRows",
     "batchedForward",  "rowsForward",   "plannerObservesPlainRows",        "tickClass",                "mtpGroupable",    "initRequest",
     "checkKvQuant",    "coldLoadBill",  "modelStateBytes", "parkedStateBytes",      "releaseParked", "commitsAtCull",
     "prepareCommit",   "publishLive",   "commitOwn",      "cancelledNeedsCheckpoints", "handoffHistory",  "mtpHeadCommit",

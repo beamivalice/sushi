@@ -214,14 +214,19 @@ fn buildAppend(k: AppendKey) !kcfg.Config {
 /// Whether `append` serves the rows `c` [T, latent] and `k_pe` [T, rope], bf16, into a kv8 store (bits 8, group 64)
 /// on the engine's stream, 1..`append_rows_max` rows; `ring_len` is a sliding layer's ring (0: a linear store).
 pub fn appendApplies(s: mlx.mlx_stream, c: Arr, k_pe: Arr, group_size: u32, bits: u8, ring_len: c_int) bool {
-    if (!mlx.engine.isStream(s) or bits != 8 or group_size != 64) return false;
     if (mlx.mlx_array_dtype(c) != .bfloat16 or mlx.mlx_array_dtype(k_pe) != .bfloat16) return false;
     const cs = mlx.getShape(c);
     const ps = mlx.getShape(k_pe);
-    if (cs.len != 2 or ps.len != 2) return false;
-    if (cs[0] < 1 or cs[0] > append_rows_max or ps[0] != cs[0]) return false;
-    if (cs[1] <= 0 or @rem(cs[1], 64) != 0 or ps[1] <= 0) return false;
-    if (ring_len < 0 or (ring_len > 0 and cs[0] > ring_len)) return false;
+    if (cs.len != 2 or ps.len != 2 or ps[0] != cs[0]) return false;
+    return appendFits(s, cs[0], cs[1], ps[1], group_size, bits, ring_len);
+}
+
+/// `appendApplies` for BF16 rows of these shapes, before the rows exist.
+pub fn appendFits(s: mlx.mlx_stream, rows: c_int, width: c_int, rope: c_int, group_size: u32, bits: u8, ring_len: c_int) bool {
+    if (!mlx.engine.isStream(s) or bits != 8 or group_size != 64) return false;
+    if (rows < 1 or rows > append_rows_max) return false;
+    if (width <= 0 or @rem(width, 64) != 0 or rope <= 0) return false;
+    if (ring_len < 0 or (ring_len > 0 and rows > ring_len)) return false;
     return true;
 }
 

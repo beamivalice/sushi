@@ -174,15 +174,27 @@ fn applyWideDecoded(o: *Ops, x: Arr, b: Bank) !?Arr {
 /// `x · Wᵀ` through the bank as f32: the rows rounded to BF16 (the kernels' input, as the BF16 forward rounds them), the
 /// kernel's sums, the result rounded to BF16 and widened.
 pub fn apply(o: *Ops, x: Arr, b: Bank) !Arr {
-    if (try applyWideDecoded(o, x, b)) |y| return o.cast(y, .float32);
-    return o.own(try trunk_stq.matmulThruBf16(o.s, x, b.w, b.suh, b.svh, b.dec, false));
+    if (!joinedWide(x)) if (try applyWideDecoded(o, x, b)) |y| return o.cast(y, .float32);
+    return o.own(try trunk_stq.matmulThruBf16(o.s, x, b.w, b.suh, b.svh, b.dec, wideRows(x)));
 }
 
 /// `apply` before its widening: the kernel's BF16 rows, f32 rows read through bf16 in the launch where it serves.
 pub fn applyStored(o: *Ops, x: Arr, b: Bank) !Arr {
-    if (try applyWideDecoded(o, x, b)) |y| return y;
-    if (mlx.mlx_array_dtype(x) == .float32) return o.own(try trunk_stq.matmulThruBf16Stored(o.s, x, b.w, b.suh, b.svh, b.dec));
-    return o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, false));
+    if (!joinedWide(x)) {
+        if (try applyWideDecoded(o, x, b)) |y| return y;
+        if (mlx.mlx_array_dtype(x) == .float32) return o.own(try trunk_stq.matmulThruBf16Stored(o.s, x, b.w, b.suh, b.svh, b.dec));
+        return o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, wideRows(x)));
+    }
+    return o.own(try trunk_stq.matmul(o.s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, true));
+}
+
+fn wideRows(x: Arr) bool {
+    return mlx.getShape(x)[0] > @import("sushi_exl3").project_rows.PROJECT_ROWS_MAX;
+}
+
+fn joinedWide(x: Arr) bool {
+    const rows = mlx.getShape(x)[0];
+    return rows > @import("sushi_exl3").project_rows.PROJECT_ROWS_MAX and rows <= @import("sushi_exl3").project_rows.rowsMax(.{ .exact = true, .wide = true });
 }
 
 /// `RMSNorm_w(apply(x, b))` (`fwd.norm`'s f32 norm) with the bank's finish and the norm in one dispatch, `x` [T, in];

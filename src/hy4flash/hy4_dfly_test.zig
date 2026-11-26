@@ -76,8 +76,8 @@ test "hy4 dfly probe: the acceptance probe scores a block at every k-th position
     try hy4_dfly.probe(&d, m, &ids, 16, 3, &tally);
     try testing.expectEqual(@as(usize, 4), tally.blocks);
     try testing.expectEqual(@as(usize, 4), tally.reached[0]);
-    try testing.expectEqual(@as(usize, 0), m.pos);
-    try testing.expectEqual(@as(usize, 0), m.history.items.len);
+    try testing.expectEqual(@as(usize, 0), m.req().pos);
+    try testing.expectEqual(@as(usize, 0), m.req().history.items.len);
 }
 
 test "hy4 dfly: a draft whose confidence rows cannot be read to the host leaves nothing allocated" {
@@ -485,7 +485,7 @@ test "hy4 bill: on a load that drafts, the closed-form terms at a request's reac
         try testing.expect(arch.drafterOn(&ld.config));
         try testing.expect(m.keep_hidden);
         m.reset();
-        m.kv = if (kv == 8) .engine_default else .dense;
+        m.req().kv = if (kv == 8) .engine_default else .dense;
         const end = seq + max_tokens;
         try m.reserveFor(@intCast(end));
         const held = @import("hy4_prefix.zig").heldBytes(m, null);

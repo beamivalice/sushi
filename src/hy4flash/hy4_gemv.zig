@@ -8,7 +8,7 @@ const mlx = @import("../mlx.zig");
 const Arr = mlx.mlx_array;
 const kcfg = @import("hy4_kcfg.zig");
 
-pub const max_rows: c_int = 8;
+pub const max_rows: c_int = 16;
 
 const source: [:0]const u8 =
     \\constexpr int TM = 4;

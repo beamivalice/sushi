@@ -568,6 +568,7 @@ pub const Fit = struct {
     context_cap: u32 = 0,
     template_preserves_thinking: bool = true,
     template_thinks: bool = true,
+    serves_bias: bool = true,
     /// The arch's RoPE reads YaRN (`arch/config.zig` `Facts.reads_yarn`).
     reads_yarn: bool = true,
     /// What the config.json declares by itself: the window a YaRN factor extends from, and the window with no `yarn_factor`.
@@ -612,6 +613,13 @@ fn ctxAboveWindow(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, 
 }
 
 /// The same refusal for a value a load meets, from the file or from `--ctx-size`: the window the loaded config has, no edits.
+pub fn ctxAboveKvTokensLine(buf: []u8, ctx: u32, cap: u64, source: settings_resolve.Source) ?[]const u8 {
+    if (ctx == 0 or cap == 0 or ctx <= cap) return null;
+    const key = if (source == .flag) "--ctx-size" else "ctx_size";
+    const prefix = if (source == .flag) "" else "[model-settings] ";
+    return std.fmt.bufPrint(buf, "{s}{s} {d} is above this model's max_kv_tokens {d}, the tokens its requests may hold together; lower {s} or raise max_kv_tokens", .{ prefix, key, ctx, cap, key }) catch null;
+}
+
 pub fn ctxAboveWindowLine(buf: []u8, ctx: u32, window: u32, yarn: ?u8, source: settings_resolve.Source) ?[]const u8 {
     if (ctx == 0 or window == 0 or ctx <= window) return null;
     const key = if (source == .flag) "--ctx-size" else "ctx_size";
@@ -645,7 +653,10 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
     }
     if (eql(u8, key, "preserve_thinking")) return if (fit.template_preserves_thinking) null else "This model's chat template has no preserve-thinking switch.";
     if (eql(u8, key, "yarn_factor")) return if (fit.reads_yarn) null else "This model's RoPE has no YaRN context extension.";
-    if (eql(u8, key, "think_penalty")) return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
+    if (eql(u8, key, "think_penalty")) {
+        if (!fit.serves_bias) return "This model does not support a think penalty.";
+        return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
+    }
     if (eql(u8, key, "expert_cache_bias")) {
         // The pick runs in the arch's router, on the rate-grouped (STQ) layers whose cache map the GPU holds.
         if (!fit.cache_bias) return "This model's router cannot favour the experts already in memory.";
@@ -726,7 +737,23 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
         for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
     }
     if (chunkMinAboveMax(existing, edits, buf)) |r| return r;
+    if (ctxAboveKvTokens(existing, edits, buf)) |r| return r;
     return ctxAboveWindow(fit, existing, edits, buf);
+}
+
+/// A save that leaves `ctx_size` above `max_kv_tokens`, named by the key it edits (`ctx_size` when it edits both).
+fn ctxAboveKvTokens(existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    var key: ?[]const u8 = null;
+    for (edits) |e| {
+        if (std.mem.eql(u8, e.key, "ctx_size")) key = "ctx_size";
+        if (std.mem.eql(u8, e.key, "max_kv_tokens") and key == null) key = "max_kv_tokens";
+    }
+    const k = key orelse return null;
+    const ctx = stateOf(existing, edits, "ctx_size") orelse return null;
+    const cap = stateOf(existing, edits, "max_kv_tokens") orelse return null;
+    if (ctx != .integer or cap != .integer or ctx.integer < 1 or cap.integer < 1 or ctx.integer <= cap.integer) return null;
+    const why = std.fmt.bufPrint(buf, "ctx_size {d} is above max_kv_tokens {d}, the tokens this model's requests may hold together; lower ctx_size or raise max_kv_tokens", .{ ctx.integer, cap.integer }) catch "ctx_size is above max_kv_tokens";
+    return .{ .key = k, .why = why };
 }
 
 fn isChunkBound(key: []const u8) bool {
@@ -1529,6 +1556,10 @@ test "model_settings: limits: each arch and pack variant is offered only what th
     const plain: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .template_preserves_thinking = false, .template_thinks = false };
     try t.expect(!applies("preserve_thinking", plain));
     try t.expect(!applies("think_penalty", plain));
+
+    const unbiased: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .serves_bias = false };
+    try t.expect(!applies("think_penalty", unbiased));
+    try t.expect(applies("think_penalty", .{ .arch = "a", .streams_experts = false, .has_vision = false }));
 }
 
 test "model_settings: refuseEdits: a value or pair the model cannot honour is refused, a removal or a kept file value never" {
@@ -1789,4 +1820,20 @@ test "model_settings: prefill_chunk_max and prefill_chunk_min are one of 512, 10
     try existing.put(t.allocator, "prefill_chunk_min", .{ .integer = 2048 });
     try t.expect(refuseEdits(any, existing, &.{.{ .key = "prefill_chunk_max", .value = .{ .integer = 1024 } }}, &buf) != null);
     try t.expect(refuseEdits(any, existing, &.{.{ .key = "prefill_chunk_max", .value = .{ .integer = 2048 } }}, &buf) == null);
+}
+
+test "model_settings: a save never leaves ctx_size above max_kv_tokens, whichever of the two it edits" {
+    const t = std.testing;
+    const any: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false };
+    var buf: [200]u8 = undefined;
+    const both = refuseEdits(any, null, &.{ .{ .key = "ctx_size", .value = .{ .integer = 8192 } }, .{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } } }, &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("ctx_size", both.key);
+    try t.expectEqualStrings("ctx_size 8192 is above max_kv_tokens 4096, the tokens this model's requests may hold together; lower ctx_size or raise max_kv_tokens", both.why);
+    var existing: std.json.ObjectMap = .empty;
+    defer existing.deinit(t.allocator);
+    try existing.put(t.allocator, "ctx_size", .{ .integer = 8192 });
+    const lowered = refuseEdits(any, existing, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } }}, &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("max_kv_tokens", lowered.key);
+    try t.expect(refuseEdits(any, existing, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 8192 } }}, &buf) == null);
+    try t.expect(refuseEdits(any, existing, &.{.{ .key = "max_kv_tokens", .value = .null }}, &buf) == null);
 }

@@ -512,9 +512,10 @@ const test_domains = [_]TestDomain{
     },
     .{ .name = "deepseek", .folders = &.{"dsv41"}, .compile_gib = 8, .run_gib = 9 },
     .{ .name = "qwen", .folders = &.{"qwen4"}, .cut = true, .run_gib = 6 },
-    .{ .name = "glm", .folders = &.{"glm5"} },
+    .{ .name = "glm", .folders = &.{"glm5"}, .compile_gib = 7 },
     .{ .name = "mimo", .folders = &.{"mimo2"} },
-    .{ .name = "hy4", .folders = &.{"hy4flash"}, .compile_gib = 8, .env = hy4_tf32_off },
+    // Cold compile peaks at 8.85 GB: 9 GiB leaves 9% over it.
+    .{ .name = "hy4", .folders = &.{"hy4flash"}, .compile_gib = 9, .env = hy4_tf32_off },
     .{ .name = "kernels", .folders = &.{"tensor"}, .run_gib = 6, .files = &.{
         "attn_kernels",       "dflash_conv",    "dflash_qmv",      "expert_bf16_kernels", "fp8_block",    "hc_kernels", "linear",     "metal",
         "metal_mlx",          "mlx",            "mlx_kernel_keys", "mlx_pages",           "mlx_util",     "moe_gqmv",   "moe_router",
@@ -573,6 +574,7 @@ const alone_tests = [_]AloneTest{
     .{ .step = "deepseek-late-stream", .file = "dsv41/dsv41_stream", .name = "dsv41 kernels: after the load's warm, prompts of any length, every verify width and a growing context compile no Metal library on the STQ pack, streamed and resident, DSpark on and off (DSV41_STQ_TINY)" },
     .{ .step = "hy4-late-span-tail-bf16", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, a chunk's short last span of any width through the gate and W_o of any layer compiles no kernel (HY4_BF16_TINY)" },
     .{ .step = "hy4-late-span-tail-stq", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, a chunk's short last span of any width through the gate and W_o of any layer compiles no kernel (HY4_STQ_TINY)" },
+    .{ .step = "hy4-late-span-tail-warm", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: the kernel warm alone makes every pipeline a chunk's short last span takes through the gate and W_o, at every width a rows arm serves (HY4_STQ_TINY)" },
     .{ .step = "hy4-late-verify-stq", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, a 2..8-row verify compiles no kernel (HY4_STQ_TINY)" },
     .{ .step = "hy4-late-image-request", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, an image request's encode and its prompt's prefill compile no kernel at any grid (HY4_BF16_TINY)" },
     .{ .step = "hy4-late-image-splice-stq", .holds_cut = false, .env = hy4_tf32_off, .file = "hy4flash/hy4_late_test", .name = "hy4 late: after a Cooler load's served warm, an image prompt's splice at its image ids compiles no kernel at the release's row counts (HY4_STQ_TINY)" },

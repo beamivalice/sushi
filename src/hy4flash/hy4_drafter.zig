@@ -10,6 +10,7 @@ const drafter_round = @import("../drafter_round.zig");
 const hy4_dfly = @import("hy4_dfly.zig");
 const Trunk = trunk_mod.Trunk;
 const ForwardCtx = trunk_mod.ForwardCtx;
+const Generator = @import("../generate.zig").Generator;
 
 pub const kinds = [_]spec_types.Kind{.dfly2};
 pub const head_kind: spec_types.Kind = .dfly2;
@@ -22,7 +23,32 @@ pub fn headOf(xfm: *Trunk, _: bool, _: ?*anyopaque) ?Head {
 }
 
 /// The widest verify a round runs: the pending token and its drafts, and room past them.
-const max_rows = 16;
+pub const max_rows: usize = 16;
+
+pub fn groupEligible(gen: *const Generator) bool {
+    if (!gen.drafter_on or gen.done or gen.spec_disabled_runtime) return false;
+    if (gen.sampling.constraint != null or @import("../sampler.zig").penaltyActive(gen.sampling)) return false;
+    if (gen.sampling.think_bound != null or gen.sampling.call_force != null) return false;
+    return !gen.samplesSync();
+}
+
+pub fn draftBlock(xfm: *Trunk, ctx: *ForwardCtx, t1: u32) !Hooks.Draft {
+    return Hooks.draft(xfm, ctx, t1);
+}
+
+pub fn beginGroupVerify(xfm: *Trunk, ctx: *ForwardCtx, ids: []const u32) !void {
+    const st = &xfm.arch_state.hy4flash;
+    const m = st.model orelse return error.Hy4ModelMissing;
+    const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+    defer scope.endForward();
+    const r = m.req();
+    if (r.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
+    if (ids.len == 0 or ids.len > max_rows) return error.SpecDecodeUnsupported;
+    if (r.verify != null) return error.Hy4VerifyOpen;
+    var v: @import("hy4_state.zig").State.Verify = .{ .mark = if (ids.len > 1) try m.mark() else null, .ids = undefined, .n = ids.len };
+    @memcpy(v.ids[0..ids.len], ids);
+    r.verify = v;
+}
 
 const Hooks = struct {
     pub const Draft = hy4_dfly.Drafter.Draft;
@@ -36,7 +62,9 @@ const Hooks = struct {
         const st = &xfm.arch_state.hy4flash;
         const m = st.model orelse return error.Hy4ModelMissing;
         const d = &(st.drafter orelse return error.Hy4DflyMissing);
-        if (m.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
+        const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+        defer scope.endForward();
+        if (m.reqConst().pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
         return @import("hy4_plan.zig").runDraft(m, d, t1);
     }
 
@@ -45,9 +73,12 @@ const Hooks = struct {
     pub fn verify(xfm: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.mlx_array {
         const st = &xfm.arch_state.hy4flash;
         const m = st.model orelse return error.Hy4ModelMissing;
-        if (m.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
+        const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+        defer scope.endForward();
+        const r = m.req();
+        if (r.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
         if (ids.len == 0 or ids.len > max_rows) return error.SpecDecodeUnsupported;
-        if (st.verify != null) return error.Hy4VerifyOpen;
+        if (r.verify != null) return error.Hy4VerifyOpen;
         var v: @import("hy4_state.zig").State.Verify = .{ .mark = if (ids.len > 1) try m.mark() else null, .ids = undefined, .n = ids.len };
         errdefer if (v.mark) |*mk| m.dropMark(mk);
         @memcpy(v.ids[0..ids.len], ids);
@@ -59,16 +90,19 @@ const Hooks = struct {
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, logits, &[_]c_int{ 1, @intCast(ids.len), mlx.getShape(logits)[1] }, 3, xfm.s));
         // The mark is the open verify's from here, the last step that can fail behind: `finish` or `abort` drops it.
-        st.verify = v;
-        ctx.cache.step = m.pos;
+        r.verify = v;
+        ctx.cache.step = r.pos;
         return out;
     }
 
     pub fn verifyPlain(xfm: *Trunk, ctx: *ForwardCtx, id: u32) !mlx.mlx_array {
         const st = &xfm.arch_state.hy4flash;
         const m = st.model orelse return error.Hy4ModelMissing;
-        if (m.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
-        if (st.verify != null) return error.Hy4VerifyOpen;
+        const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+        defer scope.endForward();
+        const r = m.req();
+        if (r.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
+        if (r.verify != null) return error.Hy4VerifyOpen;
         var v: @import("hy4_state.zig").State.Verify = .{ .mark = null, .ids = undefined, .n = 1 };
         v.ids[0] = id;
         const was_keep = m.keep_hidden;
@@ -82,8 +116,8 @@ const Hooks = struct {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, logits, &[_]c_int{ 1, 1, mlx.getShape(logits)[1] }, 3, xfm.s));
-        st.verify = v;
-        ctx.cache.step = m.pos;
+        r.verify = v;
+        ctx.cache.step = r.pos;
         return out;
     }
 
@@ -91,22 +125,28 @@ const Hooks = struct {
         const m = xfm.arch_state.hy4flash.model orelse return false;
         const was = m.keep_hidden;
         m.keep_hidden = keep;
-        if (!keep) m.dropHidden();
+        if (!keep and (!m.serves_requests or m.bound != null)) m.dropHidden();
         return was;
     }
 
     /// The round failed between `verify` and `finish`: the open verify's mark is dropped and the model reset, as its
     /// state stands mid-round and no record names it.
-    pub fn abort(xfm: *Trunk, _: *ForwardCtx) void {
-        @import("hy4_state.zig").dropVerify(&xfm.arch_state.hy4flash, true);
+    pub fn abort(xfm: *Trunk, ctx: *ForwardCtx) void {
+        const m = xfm.arch_state.hy4flash.model orelse return;
+        const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+        defer scope.endForward();
+        @import("hy4_state.zig").dropVerifyReq(m, m.req(), true);
     }
 
     /// Keeps the first `accepted + 1` rows of the open verify: back to its mark, the kept rows run again.
     pub fn finish(xfm: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
         const st = &xfm.arch_state.hy4flash;
         const m = st.model orelse return error.Hy4ModelMissing;
-        var v = st.verify orelse return error.Hy4VerifyNotOpen;
-        st.verify = null;
+        const scope = m.enterForward(@import("hy4_state.zig").requestOf(ctx));
+        defer scope.endForward();
+        const r = m.req();
+        var v = r.verify orelse return error.Hy4VerifyNotOpen;
+        r.verify = null;
         defer if (v.mark) |*mk| m.dropMark(mk);
         const keep = 1 + accepted;
         if (keep > v.n) return error.SpecDecodeUnsupported;
@@ -119,7 +159,7 @@ const Hooks = struct {
                 if (xfm.expert_stream) |engine| engine.finishForward(keep);
             }
         }
-        ctx.cache.step = m.pos;
+        ctx.cache.step = r.pos;
     }
 
     /// Whether a verify row is its one-row step's bytes over widths 2..8, so greedy and seeded rounds may take any

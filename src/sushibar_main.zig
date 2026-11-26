@@ -199,8 +199,6 @@ var g_default_port: u16 = logic.default_port;
 var g_saved: logic.SavedPorts = .{};
 /// The "Listen on LAN" switch: Start binds `lan_host` while it is on. The main thread's.
 var g_lan: bool = false;
-/// The seconds switch: the menu bar shows a prompt read's seconds left beside the icon. The main thread's.
-var g_seconds: bool = true;
 var g_home: []const u8 = "/tmp";
 var g_sushi_found = false;
 var g_sibling_brew = false;
@@ -945,7 +943,7 @@ fn pollLoop() void {
 fn writeSaved(p: u16) void {
     var text: [logic.saved_max_bytes]u8 = undefined;
     io_util.makeDirPath(g_io, std.fs.path.dirname(g_saved_path) orelse ".") catch {};
-    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get(), g_lan, g_seconds) }) catch {};
+    std.Io.Dir.cwd().writeFile(g_io, .{ .sub_path = g_saved_path, .data = logic.formatSaved(&text, p, g_saved.items(), g_last_model.get(), g_lan) }) catch {};
 }
 
 fn readDefaultPort() u16 {
@@ -1341,7 +1339,6 @@ var blink_button: objc.id = null;
 var blink_lit = true;
 /// The reading frame shown, while a prompt read shows; `showIcon` clears it.
 var shown_reading: ?usize = null;
-var seconds_mi: objc.id = null;
 var loading_frame: usize = 0;
 var loading_timer: objc.id = null;
 var loading_button: objc.id = null;
@@ -1876,7 +1873,6 @@ fn refresh() void {
 
     var tv = view;
     tv.update_waiting = uv.available;
-    tv.show_seconds = g_seconds;
     const shown = logic.readout(&readout_buf, tv);
     const button = objc.msg(objc.id, status_item, "button", .{});
     const icon = logic.iconFor(view.link, .{ .ready = model.len > 0, .loading = loading_name.len > 0 });
@@ -1886,7 +1882,6 @@ fn refresh() void {
         showIcon(button, icon);
         blinkGenerating(button, icon == .ready and view.decoding);
     }
-    objc.msg(void, seconds_mi, "setState:", .{@as(isize, if (g_seconds) 1 else 0)});
     showBadge(button, logic.badge(view.link, port_taken, g_watch.crashed(p) and !ours_alive));
     setReadout(button, shown);
     showUpdateDot(button, uv.available);
@@ -2087,11 +2082,6 @@ fn lanToggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     toggleLan();
 }
 
-fn secondsToggleAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
-    g_seconds = !g_seconds;
-    writeSaved(port());
-    refresh();
-}
 fn applyPortAction(_: objc.id, _: objc.SEL, _: objc.id) callconv(.c) void {
     applyPortText();
 }
@@ -2270,7 +2260,6 @@ fn runMenuBar() noreturn {
         .{ .selector = "flagsTick:", .imp = @ptrCast(&flagsTick), .types = "v@:@" },
         .{ .selector = "pickPort:", .imp = @ptrCast(&pickPortAction), .types = "v@:@" },
         .{ .selector = "lanToggle:", .imp = @ptrCast(&lanToggleAction), .types = "v@:@" },
-        .{ .selector = "secondsToggle:", .imp = @ptrCast(&secondsToggleAction), .types = "v@:@" },
         .{ .selector = "blinkTick:", .imp = @ptrCast(&blinkTick), .types = "v@:@" },
         .{ .selector = "pickRow:", .imp = @ptrCast(&pickRowAction), .types = "v@:@" },
         .{ .selector = "removeRow:", .imp = @ptrCast(&removeRowAction), .types = "v@:@" },
@@ -2323,8 +2312,6 @@ fn runMenuBar() noreturn {
     port_field_mi = objc.new(objc.class("NSMenuItem"));
     objc.msg(void, port_field_mi, "setView:", .{port_field.create(menu_target)});
     objc.msg(void, port_menu, "addItem:", .{port_field_mi});
-    seconds_mi = addItem(menu, "Show Seconds Left", "secondsToggle:", 0, "", "timer");
-    setText(seconds_mi, "setToolTip:", "While a prompt is read, the fish fills green and the menu bar shows the seconds left beside it. Off, only the fish fills.");
     addSeparator(menu);
 
     open_mis[0] = addItem(menu, "Dashboard", "open:", @intFromEnum(logic.Page.dashboard), "1", "gauge.with.dots.needle.67percent");
@@ -2730,7 +2717,6 @@ pub fn main(init: std.process.Init) !void {
     const saved = logic.parseSaved(saved_text);
     g_saved = saved.ports;
     g_lan = saved.lan;
-    g_seconds = saved.seconds;
     g_last_model.set(saved.model());
     g_port.store(logic.choosePort(explicit, saved.port, g_default_port), .release);
 

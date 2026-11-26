@@ -269,8 +269,6 @@ pub const View = struct {
     decoding: bool = false,
     prefilling: bool = false,
     read: ?Read = null,
-    /// The seconds switch: the title shows a prompt read's seconds left.
-    show_seconds: bool = true,
     live: ?f64 = null,
     last: ?f64 = null,
     update_waiting: bool = false,
@@ -373,7 +371,7 @@ fn speedText(buf: []u8, tps: f64) []const u8 {
 }
 
 /// The menu bar's stacked readout beside the icon: `READ` over a prompt read's time left (an ellipsis until a chunk
-/// gives the rate, under 2 s, or with the seconds switch off), else `TOK/S` over the live speed; each line at most
+/// gives the rate, or under 2 s), else `TOK/S` over the live speed; each line at most
 /// `readout_max` characters. Otherwise the icon stands alone.
 pub const Readout = struct { caption: []const u8, value: []const u8 };
 pub const readout_max = 6;
@@ -386,7 +384,7 @@ pub fn readout(buf: *[2 * readout_max + 8]u8, v: View) Readout {
     if (v.link != .up) return readout_none;
     if (v.read != null or v.prefilling) {
         const left = if (v.read) |r| r.seconds_left orelse 0 else 0;
-        return .{ .caption = "READ", .value = if (v.show_seconds and left >= 2) secondsText(buf, left) catch readout_pending else readout_pending };
+        return .{ .caption = "READ", .value = if (left >= 2) secondsText(buf, left) catch readout_pending else readout_pending };
     }
     if (v.decoding) if (v.live) |t| return .{ .caption = "TOK/S", .value = speedText(buf, t) };
     return readout_none;
@@ -1535,8 +1533,6 @@ pub const Saved = struct {
     port: ?u16 = null,
     ports: SavedPorts = .{},
     lan: bool = false,
-    /// The seconds switch: on unless the file says off.
-    seconds: bool = true,
     model_buf: [max_model]u8 = undefined,
     model_len: usize = 0,
 
@@ -1567,22 +1563,18 @@ pub fn parseSaved(text: []const u8) Saved {
     if (obj.get("lan")) |l| if (l == .bool) {
         out.lan = l.bool;
     };
-    if (obj.get("seconds")) |on| if (on == .bool) {
-        out.seconds = on.bool;
-    };
     return out;
 }
 pub const saved_max_bytes = 8192;
 var saved_scratch: [saved_max_bytes]u8 = undefined;
 
-pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8, lan: bool, seconds: bool) []const u8 {
+pub fn formatSaved(buf: []u8, watched: u16, ports: []const u16, model: []const u8, lan: bool) []const u8 {
     var w: std.Io.Writer = .fixed(buf);
     w.print("{{\"port\":{d},\"ports\":[", .{watched}) catch return "";
     for (ports, 0..) |p, i| w.print("{s}{d}", .{ if (i > 0) "," else "", p }) catch return "";
     w.writeAll("]") catch return "";
     if (model.len > 0) w.print(",\"model\":{f}", .{json_text.Str{ .s = model }}) catch return "";
     if (lan) w.writeAll(",\"lan\":true") catch return "";
-    if (!seconds) w.writeAll(",\"seconds\":false") catch return "";
     w.writeAll("}\n") catch return "";
     return w.buffered();
 }
@@ -1843,7 +1835,7 @@ test "ports: an explicit --port beats the saved one, which beats the default" {
 
 test "ports: the saved file round-trips the watched port and the added ones, and refuses anything else" {
     var b: [320]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, "", false, true));
+    const got = parseSaved(formatSaved(&b, 18802, &.{ 18803, 18804 }, "", false));
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, got.ports.items());
     try std.testing.expectEqualStrings("", got.model());
@@ -1856,26 +1848,26 @@ test "ports: the saved file round-trips the watched port and the added ones, and
 
 test "last model: the saved file keeps the model the watched server had loaded, escaped, and old files have none" {
     var b: [320]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw", false, true));
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, "Example-Flash-Next-Sushi-STQ-2.75bpw", false));
     try std.testing.expectEqualStrings("Example-Flash-Next-Sushi-STQ-2.75bpw", got.model());
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     try std.testing.expectEqualSlices(u16, &.{18803}, got.ports.items());
-    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c", false, true)).model());
+    try std.testing.expectEqualStrings("a\"b\\c", parseSaved(formatSaved(&b, 1, &.{}, "a\"b\\c", false)).model());
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5,\"ports\":[6]}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"port\":5}").model());
     try std.testing.expectEqualStrings("", parseSaved("{\"model\":5}").model());
     const long: [max_model + 1]u8 = @splat('m');
     var jb: [max_model + 32]u8 = undefined;
     try std.testing.expectEqualStrings("", parseSaved(try std.fmt.bufPrint(&jb, "{{\"model\":\"{s}\"}}", .{&long})).model());
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, true), "model") == null);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false), "model") == null);
 }
 
 test "lan: the saved file keeps the switch, writes it only when on, and old files read as off" {
     var b: [320]u8 = undefined;
-    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 18802, &.{18803}, "M", true, true)).lan);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", true, true), "\"lan\":true") != null);
-    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false, true)).lan);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, true), "lan") == null);
+    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 18802, &.{18803}, "M", true)).lan);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", true), "\"lan\":true") != null);
+    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false)).lan);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false), "lan") == null);
     try std.testing.expectEqual(false, parseSaved("{\"port\":5}").lan);
     try std.testing.expectEqual(false, parseSaved("{\"lan\":false}").lan);
     try std.testing.expectEqual(false, parseSaved("{\"lan\":\"0.0.0.0\"}").lan);
@@ -3280,13 +3272,13 @@ test "log new lines: the pill shows once lines arrive while scrolled up, and goe
 test "last model: a 200-byte id round trips through the saved file, a file from before the wider bound loads unchanged" {
     const id: [200]u8 = @splat('x');
     var b: [saved_max_bytes]u8 = undefined;
-    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id, false, true));
+    const got = parseSaved(formatSaved(&b, 18802, &.{18803}, &id, false));
     try std.testing.expectEqualStrings(&id, got.model());
     try std.testing.expectEqual(@as(?u16, 18802), got.port);
     const edge: [max_model]u8 = @splat('e');
-    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge, false, true)).model());
+    try std.testing.expectEqualStrings(&edge, parseSaved(formatSaved(&b, 1, &.{}, &edge, false)).model());
     const quoted: [max_model]u8 = @splat('"');
-    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted, false, true)).model());
+    try std.testing.expectEqualStrings(&quoted, parseSaved(formatSaved(&b, 1, &.{}, &quoted, false)).model());
     const old = parseSaved("{\"port\":18802,\"ports\":[18803,18804],\"model\":\"Qwen-Sushi-STQ-2.75bpw\"}\n");
     try std.testing.expectEqualStrings("Qwen-Sushi-STQ-2.75bpw", old.model());
     try std.testing.expectEqualSlices(u16, &.{ 18803, 18804 }, old.ports.items());
@@ -3432,13 +3424,12 @@ test "reading: of several prompts read at once one under way shows before a queu
 
 test "readout: READ over a prompt read's seconds left, an ellipsis until they are known, before the speed of a reply beside it" {
     const r: Read = .{ .fraction = 0.6, .seconds_left = 12 };
-    try expectReadout("READ", "12s", .{ .link = .up, .prefilling = true, .read = r, .show_seconds = true });
-    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .read = r, .show_seconds = false });
-    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null }, .show_seconds = true });
+    try expectReadout("READ", "12s", .{ .link = .up, .prefilling = true, .read = r });
+    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null } });
     try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .last = 9 });
     // A prompt read beside a reply that generates shows, as the filling fish does.
-    try expectReadout("READ", "12s", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = r, .show_seconds = true });
-    try expectReadout("READ", "\u{2026}", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null }, .show_seconds = true });
+    try expectReadout("READ", "12s", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = r });
+    try expectReadout("READ", "\u{2026}", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null } });
 }
 
 test "readout: every caption and value fits its six characters" {
@@ -3473,20 +3464,17 @@ test "the reading icon: green fills the ready fish up to the step read, and each
     try std.testing.expectError(error.ReadingIconChanged, readingSvg(&buf, @embedFile("icon-loading.svg"), 3));
 }
 
-test "seconds switch: on by default, saved only when off, and old files read as on" {
+test "seconds left always show: a file from when they could be turned off reads as any other, and none writes the key" {
     var b: [320]u8 = undefined;
-    try std.testing.expectEqual(true, parseSaved("{\"port\":5}").seconds);
-    try std.testing.expectEqual(false, parseSaved(formatSaved(&b, 1, &.{}, "", false, false)).seconds);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, false), "\"seconds\":false") != null);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 1, &.{}, "", false, true), "seconds") == null);
-    try std.testing.expectEqual(true, parseSaved(formatSaved(&b, 1, &.{}, "", true, true)).seconds);
-    try std.testing.expectEqual(true, parseSaved("{\"seconds\":\"no\"}").seconds);
+    try std.testing.expectEqual(@as(?u16, 5), parseSaved("{\"port\":5,\"ports\":[],\"seconds\":false}").port);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 5, &.{}, "", false), "seconds") == null);
+    try expectReadout("READ", "12s", .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.6, .seconds_left = 12 } });
 }
 
 test "readout: seconds left read as seconds under a minute, minutes and seconds under an hour, past an hour as >1h, an ellipsis under 2 s" {
     const at = struct {
         fn f(s: ?u32) View {
-            return .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.5, .seconds_left = s }, .show_seconds = true };
+            return .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.5, .seconds_left = s } };
         }
     }.f;
     try expectReadout("READ", "2s", at(2));
@@ -3544,7 +3532,7 @@ test "reading: a prefill object whose numbers are not whole and non-negative is 
 test "reading: a time left past any clock reads as the most a u32 holds, never a wrapped or undefined count" {
     const far = readOf(.{ .total = 9_000_000_000_000_000, .cache = 0, .processed = 1, .time_ms = 1 });
     try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), far.seconds_left);
-    try expectReadout("READ", ">1h", .{ .link = .up, .prefilling = true, .read = far, .show_seconds = true });
+    try expectReadout("READ", ">1h", .{ .link = .up, .prefilling = true, .read = far });
 }
 
 test "metrics: an answer the client cannot read is a server that answers with nothing shown, never one that is offline" {

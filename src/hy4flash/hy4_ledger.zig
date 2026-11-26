@@ -124,6 +124,13 @@ pub fn hiddenBytes(c: *const hy4_config.Config) u64 {
     return s.total;
 }
 
+pub fn logitsBytes(c: *const hy4_config.Config, joined: u64) u64 {
+    const rows: u64 = @max(@as(u64, @intCast(@import("hy4_forward.zig").verify_rows_max)), joined);
+    var s: Sum = .{};
+    s.add(2, rows * @as(u64, c.vocab) * f32b);
+    return s.total;
+}
+
 /// What a prefill's stored restore points may copy beside the state (`hy4_prefix.captureCheckpoint`): with a
 /// write-through (SSD-first), the point a chunk takes shares the state's rows until the writer copies it into its own
 /// bounded host buffer, at most the writer's permit (`RequestTerms.copy_cap`: the copy is the request's state, up to
@@ -162,7 +169,7 @@ pub fn ledgerTerms(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u6
     const handover = if (holds) pickBytes(&c) +| hiddenBytes(&c) +| markBytes(&c, kv_bits) else 0;
     return .{
         .per_token = rate,
-        .fixed = stateBytes(&c, kv_bits, 0) +| floors +| rate *| spec_rows +| handover,
+        .fixed = stateBytes(&c, kv_bits, 0) +| floors +| rate *| spec_rows +| handover +| logitsBytes(&c, @intCast(@import("hy4_plan.zig").joinedRows(config))),
         .points = pointsBytes(&c, kv_bits, holds),
         .copy_cap = checkpointCap(config, chunk),
     };
@@ -386,4 +393,33 @@ test "hy4 bill: a request's copy of its state is billed at its own size up to th
     var ram = config;
     ram.prefix_cache_disk_declined = true;
     try testing.expectEqual(@as(u64, 0), ledgerTerms(&ram, kv, 8192).?.copy_cap);
+}
+
+test "hy4 bill: a joining load's logits pair is billed at the joined cap, a one-row load's at a verify block's" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfigText(io, a, "", @import("hy4_config.zig").release_config);
+    defer config.deinit(a);
+    config.expert_resident = true;
+    config.cooler_for_test = true;
+    const c = config.hy4flash.?;
+    const kv = bills.defaultKvBits(&config);
+    const verify: u64 = @intCast(@import("hy4_forward.zig").verify_rows_max);
+    var joined: u64 = 0;
+    const v = blk: {
+        const scope = @import("sushi_exl3").device.forceMatrix(true);
+        defer scope.end();
+        joined = @intCast(@import("hy4_plan.zig").joinedRows(&config));
+        break :blk ledgerTerms(&config, kv, 4096).?;
+    };
+    try testing.expect(joined > verify);
+    const one = blk: {
+        const scope = @import("sushi_exl3").device.forceMatrix(false);
+        defer scope.end();
+        try testing.expectEqual(verify, @as(u64, @intCast(@import("hy4_plan.zig").joinedRows(&config))));
+        break :blk ledgerTerms(&config, kv, 4096).?;
+    };
+    const row: usize = @intCast(@as(u64, c.vocab) * f32b);
+    const want = 2 * (pool_class.poolBytes(@as(usize, @intCast(joined)) * row) - pool_class.poolBytes(@as(usize, @intCast(verify)) * row));
+    try testing.expectEqual(@as(u64, want), v.fixed - one.fixed);
 }

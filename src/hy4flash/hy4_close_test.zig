@@ -106,7 +106,7 @@ test "hy4 close: past the seal, served text requests greedy, sampled, under pena
     }
 }
 
-test "hy4 close: past the seal, a served image request and a restore from the live record ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_BF16_TINY)" {
+test "hy4 close: past the seal, a served image request and a restore from the SSD point behind the last reply ask the closed pool nothing outside a wide phase and give the plans-off tokens (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
@@ -167,7 +167,7 @@ test "hy4 close: past the seal, a served image request and a restore from the li
         defer for (&said) |*s| s.deinit();
         try expectSame("image", &said[0], &said[1]);
     }
-    // A restore through the scheduler from the live record behind the last reply.
+    // A restore through the scheduler from the SSD point the last reply wrote.
     var first = try conversation(a, ids, 600, 0);
     defer first.deinit(a);
     var said: [2]Said = .{ .{}, .{} };
@@ -192,7 +192,9 @@ test "hy4 close: past the seal, a served image request and a restore from the li
         const before = core.stats().closed_asks;
         out.tokens = try sv.request(next.items, 8, &f);
         out.closed = core.stats().closed_asks - before;
-        try testing.expect(sv.reused > 0 and f == 0);
+        // The reply's end point gives back the whole conversation: the next turn prefills only its new tokens.
+        try testing.expectEqual(first.items.len + reply.items.len, @as(usize, sv.reused));
+        try testing.expectEqual(sv.reused, f);
     }
-    try expectSame("restore from the live record", &said[0], &said[1]);
+    try expectSame("restore from the SSD point", &said[0], &said[1]);
 }

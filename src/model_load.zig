@@ -272,25 +272,36 @@ pub fn concurrencySourceText(source: model_mod.ConcurrencySource) []const u8 {
 }
 
 /// Resolves `max_concurrent` onto the config: `--max-concurrent`, else the model's key, else the saved
-/// `server.max_concurrent`, else 1. A value is held to the model's own batched width and named when over it. An arch
-/// whose decode state can never batch (config-time `exclusiveDecode`, Hy4-Flash) is fixed at 1; a model that owns its
-/// state only at runtime (DeepSeek when it does not serve rows, a streamed GLM) is left to the admission gate's runtime
-/// `ownsModuleDecodeState` answer.
+/// `server.max_concurrent`, else 1. A value is held to the model's own batched width. An arch whose decode state can
+/// never batch (`exclusiveDecode`) is fixed at 1; a model that owns its state only at runtime (DeepSeek when it does not
+/// serve rows, a streamed GLM) is left to the admission gate's runtime `ownsModuleDecodeState` answer. Silent: it runs
+/// again once the streaming plan sets residency (`applyStreamingPlan`), which a resident load's rows read, and
+/// `logConcurrency` names a held value once the load has its own.
 pub fn resolveConcurrency(config: *ModelConfig) void {
-    const cap = maxConcurrentCapFor(config);
-    const never_batches = arch_config.exclusiveDecode(config);
-    const Source = model_mod.ConcurrencySource;
-    const pick: struct { value: u32, source: Source } =
-        if (server_state.max_concurrent_flag) |v| .{ .value = v, .source = .flag } else if (config.max_concurrent_override) |v| .{ .value = v, .source = .model_key } else if (server_state.maxConcurrentFile()) |v| .{ .value = v, .source = .server_key } else .{ .value = 1, .source = .default };
+    const pick = concurrencyPick(config);
     config.max_kv_tokens = config.max_kv_tokens_override orelse 0;
     config.max_concurrent_source = pick.source;
-    if (never_batches) {
-        if (pick.value > 1) log.info("[concurrency] {s} serves one request at a time: max_concurrent {d} ({s}) is fixed at 1\n", .{ config.model_type, pick.value, concurrencySourceText(pick.source) });
-        config.max_concurrent = 1;
-        return;
-    }
-    if (pick.value > cap) log.info("[concurrency] {s}: max_concurrent {d} ({s}) is above its {d}-row decode limit; serving {d}\n", .{ config.model_type, pick.value, concurrencySourceText(pick.source), cap, cap });
-    config.max_concurrent = @min(pick.value, cap);
+    config.max_concurrent = if (arch_config.exclusiveDecode(config)) 1 else @min(pick.value, maxConcurrentCapFor(config));
+}
+
+const ConcurrencyPick = struct { value: u32, source: model_mod.ConcurrencySource };
+
+fn concurrencyPick(config: *const ModelConfig) ConcurrencyPick {
+    if (server_state.max_concurrent_flag) |v| return .{ .value = v, .source = .flag };
+    if (config.max_concurrent_override) |v| return .{ .value = v, .source = .model_key };
+    if (server_state.maxConcurrentFile()) |v| return .{ .value = v, .source = .server_key };
+    return .{ .value = 1, .source = .default };
+}
+
+/// The load's concurrency line, and the reason when it serves fewer than were asked: read once the load is placed.
+pub fn logConcurrency(config: *const ModelConfig) void {
+    const pick = concurrencyPick(config);
+    const src = concurrencySourceText(pick.source);
+    if (pick.value > config.max_concurrent and arch_config.exclusiveDecode(config)) {
+        log.info("[concurrency] {s} serves one request at a time: max_concurrent {d} ({s}) is fixed at 1\n", .{ config.model_type, pick.value, src });
+    } else if (pick.value > config.max_concurrent) {
+        log.info("[concurrency] {s}: max_concurrent {d} ({s}) is above its {d}-row decode limit; serving {d}\n", .{ config.model_type, pick.value, src, config.max_concurrent, config.max_concurrent });
+    } else log.info("[concurrency] {s}: max_concurrent {d} ({s})\n", .{ config.model_type, config.max_concurrent, src });
 }
 
 /// A saved `yarn_factor` the parse did not apply is ignored with this one line, never a refusal: the file outlives the arch it was saved for.
@@ -299,8 +310,23 @@ pub fn yarnFactorIgnoredLine(config: *const ModelConfig, saved: ?u8) ?[]const u8
     return model_settings.unavailable("yarn_factor", arch_flags.settingsFit(config)) orelse "model-settings.json yarn_factor is ignored: the config.json was parsed without it";
 }
 
+/// The line saying `--think-penalty` does not apply to a model whose arch serves no bias; null when it does or none is given.
+pub fn thinkPenaltyFlagLine(buf: []u8, config: *const ModelConfig, flag: ?f32) ?[]const u8 {
+    const lambda = flag orelse return null;
+    if (lambda <= 0) return null;
+    var why_buf: [96]u8 = undefined;
+    const why = arch_flags.biasRefusal(&why_buf, config, "think_penalty") orelse return null;
+    return std.fmt.bufPrint(buf, "[think-penalty] --think-penalty {d} does not apply to this model: {s}", .{ lambda, why }) catch null;
+}
+
 /// The line that refuses a load whose `--ctx-size`, or else model-settings.json `ctx_size`, is above the window the config
 /// has under the settings and `--config-overrides`; null when it fits.
+/// A context the flag or the saved ctx_size asks above the model's `max_kv_tokens`: no request could ever hold it.
+pub fn contextKvTokensRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32) ?[]const u8 {
+    const pick = model_settings.contextPick(ctx_flag, config.ctx_override);
+    return model_settings.ctxAboveKvTokensLine(buf, pick.value, config.max_kv_tokens_override orelse 0, pick.source);
+}
+
 pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32) ?[]const u8 {
     const pick = model_settings.contextPick(ctx_flag, config.ctx_override);
     return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override, pick.source);
@@ -454,7 +480,7 @@ pub fn compileClosures(xfm: *Trunk, set: arch_state.CompileSet) void {
     arch_state.compile(xfm, set);
 }
 
-pub const LaunchRefusal = struct { err: error{ ArchitectureUnsupported, GlmKvQuantUnsupported, LaunchFlagUnsupported, ContextSizeAboveWindow }, line: []const u8 };
+pub const LaunchRefusal = struct { err: error{ ArchitectureUnsupported, GlmKvQuantUnsupported, LaunchFlagUnsupported, ContextSizeAboveWindow, ContextSizeAboveKvTokens }, line: []const u8 };
 
 /// Why a load of `config` is refused before it reads a weight: its arch, a launch flag or saved kv_quant it cannot act
 /// on, a context above its window. The cold-load pre-check, the load and offline mode ask the same question.
@@ -475,11 +501,13 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
+    if (arch_flags.biasLoadRefusal(buf, config)) |line| return .{ .err = error.LaunchFlagUnsupported, .line = line };
     switch (bills.prefillChunkBounds(buf, config)) {
         .refused => |line| return .{ .err = error.LaunchFlagUnsupported, .line = line },
         .bounds => {},
     }
     if (contextWindowRefusal(buf, config, ctx_flag)) |line| return .{ .err = error.ContextSizeAboveWindow, .line = line };
+    if (contextKvTokensRefusal(buf, config, ctx_flag)) |line| return .{ .err = error.ContextSizeAboveKvTokens, .line = line };
     return null;
 }
 
@@ -1161,6 +1189,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_streaming = true;
     config.expert_resident = plan.cache.resident;
     arch_config.adoptPlan(config);
+    resolveConcurrency(config);
     config.expert_cache_bytes = plan.cache.cache_bytes;
     config.expert_ssd_budget_bytes = if (plan.resolved.ledger != null) budget_bytes else 0;
     config.expert_workspace_bytes = plan.cache.workspace_bytes;
@@ -2472,7 +2501,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", settings_resolve.sourceLabel(keep.source, "--preserve-thinking") });
     }
     const think = settings_resolve.resolve(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, model_settings.default_think_penalty);
-    if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, settings_resolve.sourceLabel(think.source, "--think-penalty") });
+    var flag_line_buf: [192]u8 = undefined;
+    if (thinkPenaltyFlagLine(&flag_line_buf, params.config, model_settings.think_penalty_flag)) |line| log.info("{s}\n", .{line}) else if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, settings_resolve.sourceLabel(think.source, "--think-penalty") });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
@@ -3916,12 +3946,76 @@ test "a launch flag or saved kv_quant the arch cannot act on is refused with its
     try testing.expect(launchRefusal(&buf, &dsv, null, 0) == null);
 }
 
+test "a think penalty by flag or setting and a logit-bias file: the setting and the file are refused at load by the arch that serves no bias, the flag is a line saying it does not apply, and one that serves them loads" {
+    const registry = @import("arch/registry.zig");
+    if (registry.ofModelType("hy_v4_flash") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    const saved = model_settings.think_penalty_flag;
+    defer model_settings.think_penalty_flag = saved;
+    var buf: [384]u8 = undefined;
+    var hy4 = ModelConfig{ .model_type = "hy_v4_flash" };
+    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
+    model_settings.think_penalty_flag = 1.5;
+    try testing.expect(launchRefusal(&buf, &hy4, null, 0) == null);
+    try testing.expect(launchRefusal(&buf, &qwen, null, 0) == null);
+    try testing.expectEqualStrings("[think-penalty] --think-penalty 1.5 does not apply to this model: Hy4-Flash does not support think_penalty", thinkPenaltyFlagLine(&buf, &hy4, 1.5).?);
+    try testing.expect(thinkPenaltyFlagLine(&buf, &qwen, 1.5) == null);
+    try testing.expect(thinkPenaltyFlagLine(&buf, &hy4, 0) == null);
+    try testing.expect(thinkPenaltyFlagLine(&buf, &hy4, null) == null);
+    model_settings.think_penalty_flag = null;
+    hy4.think_penalty_override = 2;
+    try testing.expectEqualStrings("Hy4-Flash does not support think_penalty: remove it from this model's settings", launchRefusal(&buf, &hy4, null, 0).?.line);
+    hy4.think_penalty_override = null;
+    hy4.logit_bias_file_override = @import("logit_bias.zig").FilePath.from("bias.json");
+    try testing.expectEqualStrings("Hy4-Flash does not support logit_bias: remove logit_bias_file from this model's settings", launchRefusal(&buf, &hy4, null, 0).?.line);
+    hy4.logit_bias_file_override = null;
+    try testing.expect(launchRefusal(&buf, &hy4, null, 0) == null);
+}
+
 test "a model of no served arch is refused as such before any launch flag it cannot act on" {
     var buf: [384]u8 = undefined;
     const other = ModelConfig{ .model_type = "mistral", .drop_expert = 4 };
     const r = launchRefusal(&buf, &other, trunk.KVQuantConfig.affine(8), 0).?;
     try testing.expect(r.err == error.ArchitectureUnsupported);
     try testing.expect(std.mem.startsWith(u8, r.line, "model_type \"mistral\" is not served by this build ("));
+}
+
+test "model settings: Hy4-Flash answers max_concurrent by its load, held to its joined rows where it joins and fixed at 1 where it cannot" {
+    const saved = server_state.max_concurrent_flag;
+    defer server_state.max_concurrent_flag = saved;
+    defer server_state.setMaxConcurrentFile(server_state.maxConcurrentFile());
+    server_state.max_concurrent_flag = null;
+    server_state.setMaxConcurrentFile(null);
+
+    var off = ModelConfig{ .model_type = "hy_v4_flash" };
+    try testing.expect(arch_config.exclusiveDecode(&off));
+    applyModelSettings(&off, .{ .max_concurrent = 4 });
+    try testing.expectEqual(@as(u32, 1), off.max_concurrent);
+    try testing.expectEqual(@as(u32, 1), arch_flags.settingsFit(&off).max_concurrent_cap);
+
+    var joins = ModelConfig{ .model_type = "hy_v4_flash" };
+    joins.expert_resident = true;
+    joins.cooler_for_test = true;
+    const scope = @import("sushi_exl3").device.forceMatrix(false);
+    defer scope.end();
+    try testing.expect(!arch_config.exclusiveDecode(&joins));
+    try testing.expectEqual(@as(u32, 8), arch_flags.settingsFit(&joins).max_concurrent_cap);
+    // No setting: the default is one request, joined rows or not.
+    applyModelSettings(&joins, .{});
+    try testing.expectEqual(@as(u32, 1), joins.max_concurrent);
+    // A server default of 8 reaches a joining load, held to its rows; a load that cannot join stays at 1.
+    server_state.setMaxConcurrentFile(8);
+    applyModelSettings(&joins, .{});
+    try testing.expectEqual(@as(u32, 8), joins.max_concurrent);
+    applyModelSettings(&off, .{});
+    try testing.expectEqual(@as(u32, 1), off.max_concurrent);
+    server_state.setMaxConcurrentFile(16);
+    applyModelSettings(&joins, .{});
+    try testing.expectEqual(@as(u32, 8), joins.max_concurrent);
+    server_state.setMaxConcurrentFile(null);
+    applyModelSettings(&joins, .{ .max_concurrent = 4 });
+    try testing.expectEqual(@as(u32, 4), joins.max_concurrent);
+    applyModelSettings(&joins, .{ .max_concurrent = 12 });
+    try testing.expectEqual(@as(u32, 8), joins.max_concurrent);
 }
 
 test "model settings: max_concurrent is the launch flag, else the model key, else the saved server key, else 1; a value is held to the batch width, and a never-batching arch is fixed at 1" {
@@ -3983,4 +4077,39 @@ test "model settings: max_concurrent is the launch flag, else the model key, els
     try testing.expectEqual(@as(u64, 65_536), qwen.max_kv_tokens);
     applyModelSettings(&qwen, .{});
     try testing.expectEqual(@as(u64, 0), qwen.max_kv_tokens);
+}
+
+test "a context above the model's max_kv_tokens is refused by name, from the flag or the saved ctx_size; one under it, an unset cap or an auto context is not" {
+    var buf: [256]u8 = undefined;
+    var c = ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262144 };
+    c.max_kv_tokens_override = 4096;
+    const r = launchRefusal(&buf, &c, null, 16384) orelse return error.TestExpectedRefusal;
+    try testing.expectEqual(error.ContextSizeAboveKvTokens, r.err);
+    try testing.expectEqualStrings("--ctx-size 16384 is above this model's max_kv_tokens 4096, the tokens its requests may hold together; lower --ctx-size or raise max_kv_tokens", r.line);
+    c.ctx_override = 8192;
+    try testing.expectEqualStrings("[model-settings] ctx_size 8192 is above this model's max_kv_tokens 4096, the tokens its requests may hold together; lower ctx_size or raise max_kv_tokens", (launchRefusal(&buf, &c, null, 0) orelse return error.TestExpectedRefusal).line);
+    try testing.expect(launchRefusal(&buf, &c, null, 4096) == null);
+    c.ctx_override = 0;
+    try testing.expect(launchRefusal(&buf, &c, null, 0) == null);
+    c.max_kv_tokens_override = null;
+    try testing.expect(launchRefusal(&buf, &c, null, 16384) == null);
+}
+
+test "max_concurrent resolves where the streaming plan decides residency: a resident Hy4 load joins up to its rows, not one request at a time (HY4_STQ_TINY)" {
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, a, dir);
+    defer config.deinit(a);
+    config.has_vision = false;
+    const saved = server_state.max_concurrent_flag;
+    defer server_state.max_concurrent_flag = saved;
+    server_state.max_concurrent_flag = 8;
+    applyModelSettings(&config, .{});
+    const budget: u64 = 64 << 30;
+    const plan = try planExpertStreamingWith(io, a, &config, dir, budget, false, 0);
+    applyStreamingPlan(&config, plan, budget);
+    try testing.expect(config.expert_resident);
+    const rows: u32 = @intCast(arch_sched.rowCap(&config) orelse return error.SkipZigTest);
+    try testing.expectEqual(@min(@as(u32, 8), rows), config.max_concurrent);
 }

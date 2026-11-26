@@ -99,6 +99,7 @@ const defaultEnableMtpForStreaming = server_mod.defaultEnableMtpForStreaming;
 const expectSurfaceForcesCall = server_mod.expectSurfaceForcesCall;
 const forceMtpFor = server_mod.forceMtpFor;
 const getEffectiveContextLength = server_mod.getEffectiveContextLength;
+const contextKvHold = server_mod.contextKvHold;
 const getTimeoutNs = server_mod.getTimeoutNs;
 const handleChatCompletions = server_mod.handleChatCompletions;
 const joinedTextParts = request_parse.joinedTextParts;
@@ -529,6 +530,13 @@ pub fn handleAnthropicMessages(
 
     const req = (try checkedMessagesBody(allocator, stream, root, "/v1/messages")) orelse return;
 
+    var bias_buf: [160]u8 = undefined;
+    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
+        log.warn("POST /v1/messages -> 400 ({s})\n", .{why});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", why, 400);
+        return;
+    }
+
     // The Anthropic API requires max_tokens; an omitted one takes the filled budget like every surface.
     const requested_max_tokens = req.requestedMaxTokens();
     const max_tokens: u32 = resolveRequestMaxTokens(requested_max_tokens, request_policy.filledMaxTokens(config));
@@ -622,8 +630,8 @@ pub fn handleAnthropicMessages(
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
         countRejected();
-        var ovf_buf: [160]u8 = undefined;
-        try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
+        var ovf_buf: [224]u8 = undefined;
+        try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx, contextKvHold(config)), 400);
         return;
     }
 
@@ -636,7 +644,9 @@ pub fn handleAnthropicMessages(
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
-    const eos_slice = config.eosTokenSlice();
+    const none_end = try server_mod.noneEndFor(allocator, config, lm.handle != null, tok, chat_config, prompt.tool_choice, config.eosTokenSlice());
+    defer none_end.deinit(allocator);
+    const eos_slice = none_end.eos_ids;
     var sampling = sampler.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
@@ -677,7 +687,8 @@ pub fn handleAnthropicMessages(
         }
     }
 
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty.biases = none_end.biases();
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;

@@ -77,6 +77,7 @@ pub const setDiskAsk = server_state.setDiskAsk;
 const diskTierOn = bills.diskTierOn;
 pub const effectiveSsmCheckpointStride = bills.effectiveSsmCheckpointStride;
 pub const getEffectiveContextLength = bills.getEffectiveContextLength;
+pub const contextKvHold = bills.contextKvHold;
 pub const parseWiredMarginGib = bills.parseWiredMarginGib;
 pub const parseSsdBudgetGb = bills.parseSsdBudgetGb;
 const ssdBudgetAdmits = bills.ssdBudgetAdmits;
@@ -466,11 +467,17 @@ pub const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in 
 
 /// The decode-time half of tool_choice "none": the template's call opener, banned when it is one
 /// token, so a model that sees earlier calls in the history cannot write one as plain text.
-fn noneCallBan(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig) ?@import("logit_bias.zig").Bias {
+fn noneCallOpener(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig) ?u32 {
     const opener = (chat_mod.callOpener(allocator, chat_config) catch null) orelse return null;
     defer allocator.free(opener);
-    const id = atomicTokenId(allocator, tok, opener) orelse return null;
-    return .{ .id = id, .delta = -100 };
+    return atomicTokenId(allocator, tok, opener);
+}
+
+/// `request_policy.noneEnd` for one request on any surface: the template's call opener is looked up only under
+/// tool_choice none. The caller `deinit`s the result.
+pub fn noneEndFor(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, model_loaded: bool, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig, tool_choice: tool_calls_mod.ToolChoice, eos: []const u32) !request_policy.NoneEnd {
+    const opener = if (tool_choice == .none) noneCallOpener(allocator, tok, chat_config) else null;
+    return request_policy.noneEnd(allocator, config, tool_choice, model_loaded, opener, eos);
 }
 
 /// Arm the decode-time half of a forced tool_choice (required or named), or
@@ -920,6 +927,7 @@ pub fn serve(
     // at every value so a default boot does not read as "one at a time".
     const startup_entry = scheduler.registry.resolveEntry("") catch null;
     const verdict = if (startup_entry) |e| batchVerdictFor(e) else batchVerdictOf(config, false);
+    model_load.logConcurrency(config);
     log.info("Concurrency: max_concurrent={d} ({s}), {s} (arch: {s})\n", .{ config.max_concurrent, model_load.concurrencySourceText(config.max_concurrent_source), concurrencyClause(verdict), config.model_type });
     // Installed only now: until the load ends, a signal's default action ends the process mid-load.
     const sigact = std.posix.Sigaction{
@@ -2469,6 +2477,13 @@ pub fn handleChatCompletions(
         .ok => |c| c,
     };
 
+    var bias_buf: [160]u8 = undefined;
+    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{why});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+        return;
+    }
+
     // The messages and the tools are read with numbers as spelled (`request_parse.parseSpelled`).
     const spelled = try request_parse.parseSpelled(allocator, body);
     defer spelled.deinit();
@@ -2801,8 +2816,8 @@ pub fn handleChatCompletions(
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
         countRejected();
-        var ovf_buf: [160]u8 = undefined;
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", generation_stream.contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
+        var ovf_buf: [224]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", generation_stream.contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx, contextKvHold(config)), 400);
         return;
     }
 
@@ -2865,15 +2880,17 @@ pub fn handleChatCompletions(
 
     // A decode-time bound owns the budget; the surfaces then deliver the
     // whole (closed) thought instead of trimming it.
-    sampling.think_penalty = request_policy.armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, request_policy.resolveThinkPenalty(req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
+    sampling.think_penalty = request_policy.armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, request_policy.resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
     const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
         return;
     } else &.{};
     defer allocator.free(request_bias);
-    const none_ban = if (tool_choice == .none and lm.handle != null) noneCallBan(allocator, tok, chat_config) else null;
-    const biases = if (none_ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
-    defer if (none_ban != null) allocator.free(biases);
+    const none_end = try noneEndFor(allocator, config, lm.handle != null, tok, chat_config, tool_choice, eos_slice);
+    defer none_end.deinit(allocator);
+    const eos_ids = none_end.eos_ids;
+    const biases = if (none_end.ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
+    defer if (none_end.ban != null) allocator.free(biases);
     sampling.think_penalty.biases = biases;
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
@@ -2906,13 +2923,13 @@ pub fn handleChatCompletions(
     const sub_mrope = req_media.mrope;
     req_media.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, return_progress, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
+        generation_stream.handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_ids, stop_sequences.items, model_name, include_usage, return_progress, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
+        generation_stream.handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_ids, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, req_media.chain, cache_key, sub_mrope, kv_quant_override, tokenize_ns, &thought) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             generation_stream.sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -4003,11 +4020,9 @@ test "tool_choice none bans each family's one-token call opener, and nothing els
         var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
         try config.compile();
         defer config.dropCompiled();
-        const ban = noneCallBan(a, &tok, &config) orelse return error.OpenerNotBanned;
-        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, ban.id);
-        try std.testing.expectEqual(@as(f32, -100), ban.delta);
+        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, noneCallOpener(a, &tok, &config) orelse return error.OpenerNotBanned);
         // An opener the tokenizer splits would ban its first piece, a plain `<`, everywhere.
-        try std.testing.expect(noneCallBan(a, &split, &config) == null);
+        try std.testing.expect(noneCallOpener(a, &split, &config) == null);
     }
 }
 
@@ -4383,4 +4398,35 @@ test "stopServing does not fail at 0 ms when active_conn_threads rises after the
     var listener: ?std.Io.net.Server = null;
     var client_thread: ?std.Thread = null;
     try t.expect(stopServing(t.io, &accept_thread, &listener, &client_thread));
+}
+
+test "tool_choice none on any surface: the template's one-token opener is banned where bias is served and a stop id where it is not" {
+    const registry = @import("arch/registry.zig");
+    if (registry.ofModelType("hy_v4_flash") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|im_start|>", "<|im_end|>" });
+    defer deinitTestTokenizer(&tok);
+    var config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/qwen38_flash_next_chat_template.jinja"), .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    try config.compile();
+    defer config.dropCompiled();
+    const opener = tok.special_tokens.get("<tool_call>").?;
+    const eos = [_]u32{ 5, 6 };
+    const hy4 = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
+    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
+
+    const stop = try noneEndFor(a, &hy4, true, &tok, &config, .none, &eos);
+    defer stop.deinit(a);
+    try std.testing.expectEqualSlices(u32, &.{ 5, 6, opener }, stop.eos_ids);
+    try std.testing.expect(stop.ban == null);
+    const ban = try noneEndFor(a, &qwen, true, &tok, &config, .none, &eos);
+    defer ban.deinit(a);
+    try std.testing.expectEqualSlices(u32, &eos, ban.eos_ids);
+    try std.testing.expectEqual(opener, ban.ban.?.id);
+    try std.testing.expectEqual(opener, ban.biases()[0].id);
+    const auto = try noneEndFor(a, &hy4, true, &tok, &config, .auto, &eos);
+    defer auto.deinit(a);
+    try std.testing.expectEqualSlices(u32, &eos, auto.eos_ids);
+    try std.testing.expectEqual(@as(usize, 0), auto.biases().len);
 }

@@ -13,7 +13,7 @@ const kcfg = @import("hy4_kcfg.zig");
 /// Output rows a simdgroup sums, and simdgroups a threadgroup: a router's 512 rows are 256 simdgroups.
 const tm = 2;
 const nsg = 2;
-pub const max_rows: c_int = 8;
+pub const max_rows: c_int = 16;
 
 const source: [:0]const u8 =
     \\constexpr int TN = 4;
@@ -313,14 +313,30 @@ test "hy4 row: 2, 3, 6 and 8 rows through a BF16 weight in one launch equal each
         .{ 16, 128 },
         .{ 4, 128 },
     };
-    for ([_]c_int{ 2, 3, 6, 8 }, 0..) |t, ti| {
+    const widest: c_int = @import("hy4_forward.zig").joinedRowsMax();
+    for ([_]c_int{ 2, 3, 6, 8, 9, 16 }, 0..) |t, ti| {
+        if (t > widest) continue;
         for (shapes, 0..) |sh, si| {
             try blockCase(es, t, sh[0], sh[1], 100 + ti * 16 + si);
         }
     }
     var o: Ops = .{ .s = es };
     defer o.deinit();
-    const x9 = try o.zeros(&.{ 9, 3072 }, .float32);
-    const w9 = try o.zeros(&.{ 512, 3072 }, .bfloat16);
-    try testing.expect(!applies(es, x9, w9));
+    const x17 = try o.zeros(&.{ 17, 3072 }, .float32);
+    const w17 = try o.zeros(&.{ 512, 3072 }, .bfloat16);
+    try testing.expect(!applies(es, x17, w17));
+}
+
+test "hy4 rows: a shared f32 row linear at every width 2..8 gives each row its one-row bytes, rows from different positions" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    const widest: usize = @intCast(@import("hy4_forward.zig").joinedRowsMax());
+    for (2..widest + 1) |t| try blockCase(es, @intCast(t), 512, 3072, 0x726f + t);
 }

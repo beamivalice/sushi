@@ -289,17 +289,17 @@ test "hy4 plan: a request's state is reserved at its own reach: a smaller reach 
         // A request that reached 200 rows, then the next turn, in place, reaching 24: its stores are the bill's for 24.
         try (Prefill{ .ids = ids, .p = 10, .reach = 200, .hidden = false }).go(m);
         try m.reserveFor(24);
-        for (m.state[0..m.config.layers], m.layers[0..m.config.layers]) |*st, l| if (l.indexer != null) {
+        for (m.req().state[0..m.config.layers], m.layers[0..m.config.layers]) |*st, l| if (l.indexer != null) {
             try testing.expectEqual(row_store.capBound(24, div), st.rows.?.cap);
             if (st.pooled) |*p| try testing.expectEqual(row_store.capBound(24 / g, div), p.cap);
         };
         // A verify block rolled back inside a request reserved past it keeps the reservation: the next grows nothing.
         try (Prefill{ .ids = ids, .p = 10, .reach = 200, .hidden = false }).go(m);
         var caps: [64]usize = @splat(0);
-        for (m.state[0..m.config.layers], caps[0..m.config.layers]) |*st, *c| c.* = if (st.rows) |r| r.cap else 0;
+        for (m.req().state[0..m.config.layers], caps[0..m.config.layers]) |*st, *c| c.* = if (st.rows) |r| r.cap else 0;
         const back: RolledBack = .{ .ids = ids, .p = 10, .reach = 200 };
         try back.go(m);
-        for (m.state[0..m.config.layers], caps[0..m.config.layers]) |*st, c| try testing.expectEqual(c, if (st.rows) |r| r.cap else 0);
+        for (m.req().state[0..m.config.layers], caps[0..m.config.layers]) |*st, c| try testing.expectEqual(c, if (st.rows) |r| r.cap else 0);
         var verify: Phase = .{};
         defer verify.deinit();
         try verify.probe(m, .{ .site = 2, .key = 4 }, back, Rows{ .ids = ids, .p = 11, .w = 4 });
@@ -592,6 +592,24 @@ test "hy4 plan: a resident load plans its one-row forwards, and each runs on the
     if (!ran) return error.SkipZigTest;
 }
 
+test "hy4 rows: a load that joins rows plans a joined tick at every width 2..8 even without a drafter (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_BF16_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.openLight(hy4_contract, dir, true);
+    defer _ = ld.close();
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const base = m.plans.?;
+    const p = try hy4_plan.record(m, a, base.reach, null, base.kv, null, null, 8);
+    defer p.deinit(a);
+    for (2..@as(usize, @intCast(fwd.verify_rows_max)) + 1) |rows| {
+        const probe: hy4_plan.Probe = .{ .rows = rows, .readout = .all, .keep_hidden = false, .kv = base.kv, .phase = .joined };
+        try testing.expect(p.tables(probe) != null);
+    }
+}
+
 /// A forward of `t` rows of `ids` from position `p`, read out by its last row, after a real prefill of the rows before
 /// it: in the region the load measured when `planned`, else on the pool.
 fn wideRows(m: anytype, ids: []const u32, p: usize, t: usize, planned: bool, out: []f32) !struct { asks: u64, wide: u64, executions: u64 } {
@@ -671,7 +689,7 @@ test "hy4 plan: a prefill chunk of every width from past a verify block to the l
         try testing.expectError(error.WideFull, hy4_plan.run(m, ids[0..chunk], null, .last));
         var said: [512]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, mlx.takeError(&said) orelse "", "WideFull: a wide execution's scratch reached") != null);
-        try testing.expectEqual(@as(usize, 0), m.pos);
+        try testing.expectEqual(@as(usize, 0), m.req().pos);
         try testing.expectEqual(@as(u64, 1 << 20), core.refused_wide.?.room);
         try core.arenaRelease();
         try core.arenaFor(held);
@@ -811,7 +829,7 @@ fn oneBlock(a: std.mem.Allocator, m: anytype, ids: []const u32, p: usize, rows: 
     defer _ = mlx.mlx_array_free(lg);
     try mlx.check(mlx.mlx_array_eval(lg));
     try out.appendSlice(a, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.TestNoLogits)[0..mlx.mlx_array_size(lg)]));
-    const h = m.last_hidden orelse return error.TestNoHandover;
+    const h = m.req().last_hidden orelse return error.TestNoHandover;
     var hc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(hc);
     try mlx.check(mlx.mlx_astype(&hc, h, .float32, m.s));
@@ -1045,7 +1063,7 @@ test "hy4 plan: a drafting load whose context is narrower than a verify block or
     const saved = m.plans;
     defer m.plans = saved;
     const reach: usize = 5;
-    const narrow = try hy4_plan.build(m, a, reach, d, m.kv, null, 0);
+    const narrow = try hy4_plan.build(m, a, reach, d, m.req().kv, null, 0);
     defer {
         narrow.deinit(a);
         core.arenaRelease() catch {};
@@ -1077,8 +1095,8 @@ fn appendHost(a: std.mem.Allocator, arr: mlx.mlx_array, out: *std.ArrayList(u8))
 fn appendState(a: std.mem.Allocator, m: anytype, out: *std.ArrayList(u8)) !void {
     const hy4_model = @import("hy4_model.zig");
     var arrays: [hy4_model.max_state_arrays]mlx.mlx_array = undefined;
-    for (m.state[0..m.config.layers]) |*st| for (hy4_model.stateArrays(st, &arrays)) |arr| try appendHost(a, arr, out);
-    if (m.last_hidden) |h| try appendHost(a, h, out);
+    for (m.req().state[0..m.config.layers]) |*st| for (hy4_model.stateArrays(st, &arrays)) |arr| try appendHost(a, arr, out);
+    if (m.req().last_hidden) |h| try appendHost(a, h, out);
 }
 
 /// A DFly2 round at `p` as `hy4_drafter` runs it, after a real prefill of the rows before it: the mark, a verify block
@@ -1350,13 +1368,13 @@ test "hy4 plan: a forward at another KV width than the load planned, or one that
     const got = try a.alloc(f32, 2 * vocab);
     defer a.free(got);
     // A request that names BF16 KV.
-    const kv_was = m.kv;
-    m.kv = .{ .scheme = .off, .bits = 16, .group_size = 64 };
-    defer m.kv = kv_was;
+    const kv_was = m.req().kv;
+    m.req().kv = .{ .scheme = .off, .bits = 16, .group_size = 64 };
+    defer m.req().kv = kv_was;
     const bf16 = try oneRow(m, ids, 9, true, got[0..vocab]);
     try testing.expectEqual(@as(u64, 0), bf16.executions);
     try testing.expectEqual(@as(u64, 0), p.misses);
-    m.kv = kv_was;
+    m.req().kv = kv_was;
     // An image of two rows, both spliced already: the decode after it is the text forward.
     const dim: usize = m.config.dim;
     const zeros = try a.alloc(f32, 2 * dim);
@@ -1475,7 +1493,7 @@ test "hy4 plan: a prefill forward of any width at any depth the layers turn at a
         const keep_was = m.keep_hidden;
         defer m.keep_hidden = keep_was;
         m.keep_hidden = true;
-        const kept = try hy4_plan.record(m, a, p.reach, null, p.kv, null, null);
+        const kept = try hy4_plan.record(m, a, p.reach, null, p.kv, null, null, 0);
         defer kept.deinit(a);
         kept.region = try hy4_plan.regionAt(m, kept, p.region_rows);
         kept.region_rows = p.region_rows;
@@ -1784,4 +1802,420 @@ fn scratchAsks(m: anytype, p: anytype, rows: usize, n: usize) ![]u64 {
         try out.appendSlice(testing.allocator, pad);
     }
     return out.toOwnedSlice(testing.allocator);
+}
+
+test "hy4 plan: a joined forward frames each layer and asks each row's attention under its own one-row key (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const p = m.plans.?;
+    const positions = [_]usize{ 3, 9, 21 };
+    var reqs: [3]@import("hy4_model.zig").Request = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| reqs[i].deinit();
+    for (0..3) |i| {
+        reqs[i] = try @import("hy4_model.zig").Request.init(a, 0);
+        made = i + 1;
+        const lent = m.lend(&reqs[i]);
+        defer lent.end();
+        try m.reserveFor(positions[i] + 1);
+        _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..positions[i]], .none));
+    }
+    mlx.engine.close();
+    var segs: [3]@import("hy4_model.zig").Model.Seg = undefined;
+    for (0..3) |i| segs[i] = .{ .request = &reqs[i], .id = ids[positions[i]] };
+    var rec = try plan.Recorder.begin(a, .{ .site = 1 });
+    defer rec.deinit();
+    {
+        var driver: plan.Driver = .{ .gpa = a };
+        defer driver.deinit();
+        try core.beginRecording(.{ .dry = .{ .driver = &driver } }, &rec);
+        const j = try m.extendRows(segs[0..3]);
+        _ = mlx.mlx_array_free(j);
+        try core.endRecording();
+    }
+    // Each layer is one exact frame under the root, and each row's attention one variant of the loop inside it.
+    var seen: usize = 0;
+    for (0..m.config.layers) |l| {
+        const key = plan.keyOf(.{l});
+        var exact: ?usize = null;
+        for (rec.instances.items, 0..) |inst, i| {
+            if (inst.parent == 0 and inst.kind == .exact and inst.id.key == key) exact = i;
+        }
+        errdefer std.debug.print("layer {d}: no layer frame (key {d})\n", .{ l, key });
+        const at = exact orelse return error.TestExpectedEqual;
+        var rows: usize = 0;
+        for (rec.instances.items) |inst| {
+            if (inst.parent != at or inst.kind != .each) continue;
+            const want = plan.keyOf(m.layerKey(l, @intCast(positions[rows]), 1));
+            errdefer std.debug.print("layer {d} row {d}: key {d}, the row's {d}\n", .{ l, rows, inst.id.key, want });
+            try testing.expectEqual(want, inst.id.key);
+            rows += 1;
+        }
+        try testing.expectEqual(positions.len, rows);
+        seen += 1;
+    }
+    try testing.expectEqual(m.config.layers, seen);
+    _ = p;
+}
+
+/// `Resident` whose experts the engine holds resident, so the load joins its decode rows into one forward.
+const Joining = struct {
+    pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
+        try Resident.prepare(a, config, dir);
+        config.expert_resident = true;
+        config.expert_cache_bytes = std.math.maxInt(u64) / 2;
+    }
+};
+
+const hy4_sched_mod = @import("hy4_sched.zig");
+const hy4_model_mod = @import("hy4_model.zig");
+const kv_cache_mod = @import("../kv_cache.zig");
+const handle_mod = @import("../model_handle.zig");
+
+test "hy4 plan: joined ticks of 2, 3 and 8 requests at different positions run as executions with no wide ask and each row its solo one-row bytes (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const widths = [_]usize{ 2, 3, 8 };
+    // One each side of the tiny's window of 8 and its selection threshold of 16, and a group's first row.
+    const picks = [_][8]usize{
+        .{ 3, 9, 0, 0, 0, 0, 0, 0 },
+        .{ 4, 17, 13, 0, 0, 0, 0, 0 },
+        .{ 3, 5, 7, 9, 13, 17, 20, 1 },
+    };
+    var solo: [3][8]hy4_model_mod.Request = undefined;
+    var joined: [3][8]hy4_model_mod.Request = undefined;
+    var made: [3]usize = @splat(0);
+    defer for (0..3) |k| for (0..made[k]) |i| {
+        solo[k][i].deinit();
+        joined[k][i].deinit();
+    };
+    const keep_was = m.keep_hidden;
+    defer m.keep_hidden = keep_was;
+    m.keep_hidden = false;
+    for (widths, 0..) |n, k| {
+        for (0..n) |i| {
+            solo[k][i] = try hy4_model_mod.Request.init(a, 0);
+            joined[k][i] = try hy4_model_mod.Request.init(a, 0);
+            made[k] = i + 1;
+            const p = picks[k][i];
+            {
+                const lent = m.lend(&solo[k][i]);
+                defer lent.end();
+                try m.reserveFor(p + 1);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..p], .none));
+            }
+            {
+                const lent = m.lend(&joined[k][i]);
+                defer lent.end();
+                try m.reserveFor(p + 1);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..p], .none));
+            }
+        }
+    }
+    mlx.engine.close();
+    const vocab: usize = @intCast(m.config.vocab);
+    const vb = vocab * 4;
+    var want: [3][8][]u8 = undefined;
+    var wc: [3]usize = @splat(0);
+    defer for (0..3) |k| for (0..wc[k]) |i| a.free(want[k][i]);
+    for (widths, 0..) |n, k| {
+        for (0..n) |i| {
+            const p = picks[k][i];
+            const lent = m.lend(&solo[k][i]);
+            defer lent.end();
+            const lg = try hy4_plan.run(m, &.{ids[p]}, null, .last);
+            defer _ = mlx.mlx_array_free(lg);
+            want[k][i] = try a.alloc(u8, vb);
+            wc[k] = i + 1;
+            @memcpy(want[k][i], std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.TestNoLogits)[0..vocab]));
+        }
+    }
+    var xfm: @import("../trunk.zig").Trunk = undefined;
+    xfm.arch_state = .{};
+    xfm.arch_state.hy4flash.model = m;
+    xfm.s = ld.xfm.s;
+    xfm.expert_stream = null;
+    for (widths, 0..) |n, k| {
+        var caches: [8]kv_cache_mod.KVCache = undefined;
+        var cc: usize = 0;
+        defer for (caches[0..cc]) |*c| a.free(c.entries);
+        var ctxs: [8]handle_mod.ForwardCtx = undefined;
+        var ptrs: [8]*handle_mod.ForwardCtx = undefined;
+        var tokens: [8]u32 = undefined;
+        var offsets: [8]usize = @splat(0);
+        for (0..n) |i| {
+            const p = picks[k][i];
+            caches[i] = try kv_cache_mod.KVCache.init(a, @intCast(m.config.layers));
+            cc = i + 1;
+            caches[i].step = p;
+            ctxs[i] = .{
+                .cache = &caches[i],
+                .moe_seq_offset = &offsets[i],
+                .ssm_entries = null,
+                .capture_hidden = null,
+                .vision_embeddings = null,
+                .arch_ctx = .{},
+            };
+            ctxs[i].arch_ctx.hy4flash.request = &joined[k][i];
+            ptrs[i] = &ctxs[i];
+            tokens[i] = ids[p];
+        }
+        const before = core.stats();
+        var dummy: [8]@import("../scheduler.zig").Slot = undefined;
+        @memset(std.mem.asBytes(&dummy), 0);
+        var slot_ptrs: [8]*@import("../scheduler.zig").Slot = undefined;
+        for (0..n) |i| {
+            dummy[i].legacy_gen = null;
+            slot_ptrs[i] = &dummy[i];
+        }
+        var batch: []*@import("../scheduler.zig").Slot = slot_ptrs[0..n];
+        const out = try hy4_sched_mod.batchedForward(undefined, a, &xfm, &batch, tokens[0..n], ptrs[0..n], &.{}, .{}, null);
+        const after = core.stats();
+        var got: [8][]u8 = undefined;
+        var gc: usize = 0;
+        defer for (got[0..gc]) |g| a.free(g);
+        defer {
+            for (out[0..n]) |o| _ = mlx.mlx_array_free(o);
+            a.free(out);
+        }
+        errdefer std.debug.print("width {d}: wide {d} exec {d} miss {any}\n", .{ n, after.wide_executions - before.wide_executions, after.executions - before.executions, core.executionMiss() });
+        try testing.expectEqual(@as(u64, 0), after.wide_executions - before.wide_executions);
+        try testing.expectEqual(@as(u64, 1), after.executions - before.executions);
+        try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
+        for (0..n) |i| {
+            got[i] = try a.alloc(u8, vb);
+            gc = i + 1;
+            @memcpy(got[i], std.mem.sliceAsBytes((mlx.mlx_array_data_float32(out[i]) orelse return error.TestNoLogits)[0..vocab]));
+            errdefer std.debug.print("width {d} row {d} at {d}: not its solo bytes\n", .{ n, i, picks[k][i] });
+            try testing.expectEqualSlices(u8, want[k][i], got[i]);
+            try testing.expectEqual(picks[k][i] + 1, caches[i].step);
+        }
+    }
+}
+
+test "hy4 plan: joined ticks of 9, 12 and 16 requests run as executions of their root with no wide ask and each row its solo one-row bytes (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    if (fwd.joinedRowsMax() <= 8) return error.SkipZigTest;
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const p = m.plans.?;
+    const widths = [_]usize{ 9, 12, 16 };
+    var picks: [3][16]usize = undefined;
+    for (widths, 0..) |n, k| {
+        for (0..n) |i| picks[k][i] = (2 * i + k + 1) % 32;
+    }
+    for (widths, 0..) |n, k| {
+        _ = k;
+        const probe: hy4_plan.Probe = .{ .rows = n, .readout = .all, .keep_hidden = m.keep_hidden, .kv = p.kv, .phase = .joined };
+        errdefer std.debug.print("width {d}: no joined root planned\n", .{n});
+        try testing.expect(p.tables(probe) != null);
+    }
+    var solo: [3][16]hy4_model_mod.Request = undefined;
+    var joined: [3][16]hy4_model_mod.Request = undefined;
+    var made: [3]usize = @splat(0);
+    defer for (0..3) |k| for (0..made[k]) |i| {
+        solo[k][i].deinit();
+        joined[k][i].deinit();
+    };
+    for (widths, 0..) |n, k| {
+        for (0..n) |i| {
+            solo[k][i] = try hy4_model_mod.Request.init(a, 0);
+            joined[k][i] = try hy4_model_mod.Request.init(a, 0);
+            made[k] = i + 1;
+            const pos = picks[k][i];
+            {
+                const lent = m.lend(&solo[k][i]);
+                defer lent.end();
+                try m.reserveFor(pos + 1);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..pos], .none));
+            }
+            {
+                const lent = m.lend(&joined[k][i]);
+                defer lent.end();
+                try m.reserveFor(pos + 1);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..pos], .none));
+            }
+        }
+    }
+    mlx.engine.close();
+    const vocab: usize = @intCast(m.config.vocab);
+    const vb = vocab * 4;
+    var want: [3][16][]u8 = undefined;
+    var wc: [3]usize = @splat(0);
+    defer for (0..3) |k| for (0..wc[k]) |i| a.free(want[k][i]);
+    for (widths, 0..) |n, k| {
+        for (0..n) |i| {
+            const pos = picks[k][i];
+            const lent = m.lend(&solo[k][i]);
+            defer lent.end();
+            const lg = try hy4_plan.run(m, &.{ids[pos]}, null, .last);
+            defer _ = mlx.mlx_array_free(lg);
+            want[k][i] = try a.alloc(u8, vb);
+            wc[k] = i + 1;
+            @memcpy(want[k][i], std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.TestNoLogits)[0..vocab]));
+        }
+    }
+    var xfm: @import("../trunk.zig").Trunk = undefined;
+    xfm.arch_state = .{};
+    xfm.arch_state.hy4flash.model = m;
+    xfm.s = ld.xfm.s;
+    xfm.expert_stream = null;
+    const misses_was = p.misses;
+    for (widths, 0..) |n, k| {
+        var caches: [16]kv_cache_mod.KVCache = undefined;
+        var cc: usize = 0;
+        defer for (caches[0..cc]) |*c| a.free(c.entries);
+        var ctxs: [16]handle_mod.ForwardCtx = undefined;
+        var ptrs: [16]*handle_mod.ForwardCtx = undefined;
+        var tokens: [16]u32 = undefined;
+        var offsets: [16]usize = @splat(0);
+        for (0..n) |i| {
+            caches[i] = try kv_cache_mod.KVCache.init(a, @intCast(m.config.layers));
+            cc = i + 1;
+            caches[i].step = picks[k][i];
+            ctxs[i] = .{
+                .cache = &caches[i],
+                .moe_seq_offset = &offsets[i],
+                .ssm_entries = null,
+                .capture_hidden = null,
+                .vision_embeddings = null,
+                .arch_ctx = .{},
+            };
+            ctxs[i].arch_ctx.hy4flash.request = &joined[k][i];
+            ptrs[i] = &ctxs[i];
+            tokens[i] = ids[picks[k][i]];
+        }
+        var dummy: [16]@import("../scheduler.zig").Slot = undefined;
+        @memset(std.mem.asBytes(&dummy), 0);
+        var slot_ptrs: [16]*@import("../scheduler.zig").Slot = undefined;
+        for (0..n) |i| {
+            dummy[i].legacy_gen = null;
+            slot_ptrs[i] = &dummy[i];
+        }
+        var batch: []*@import("../scheduler.zig").Slot = slot_ptrs[0..n];
+        const before = core.stats();
+        const out = try hy4_sched_mod.batchedForward(undefined, a, &xfm, &batch, tokens[0..n], ptrs[0..n], &.{}, .{}, null);
+        const after = core.stats();
+        var got: [16][]u8 = undefined;
+        var gc: usize = 0;
+        defer for (got[0..gc]) |g| a.free(g);
+        defer {
+            for (out[0..n]) |o| _ = mlx.mlx_array_free(o);
+            a.free(out);
+        }
+        errdefer std.debug.print("width {d}: wide {d} exec {d} miss {any}\n", .{ n, after.wide_executions - before.wide_executions, after.executions - before.executions, core.executionMiss() });
+        try testing.expectEqual(@as(u64, 0), after.wide_executions - before.wide_executions);
+        try testing.expectEqual(@as(u64, 1), after.executions - before.executions);
+        try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
+        for (0..n) |i| {
+            got[i] = try a.alloc(u8, vb);
+            gc = i + 1;
+            @memcpy(got[i], std.mem.sliceAsBytes((mlx.mlx_array_data_float32(out[i]) orelse return error.TestNoLogits)[0..vocab]));
+            errdefer std.debug.print("width {d} row {d} at {d}: not its solo bytes\n", .{ n, i, picks[k][i] });
+            try testing.expectEqualSlices(u8, want[k][i], got[i]);
+            try testing.expectEqual(picks[k][i] + 1, caches[i].step);
+        }
+    }
+    try testing.expectEqual(misses_was, p.misses);
+}
+
+test "hy4 plan: a joining load's logits pair holds a joined tick's rows (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const cap: usize = @intCast(@import("hy4_forward.zig").joinedRowsMax());
+    const block = m.logits_fixed[0] orelse return error.TestNoLogitsBlock;
+    try testing.expectEqual(cap, @as(usize, @intCast(mlx.getShape(block)[0])));
+    try testing.expectEqual(@as(usize, @intCast(m.config.vocab)), @as(usize, @intCast(mlx.getShape(block)[1])));
+}
+
+test "hy4 plan: a joined tick whose request's kv is not the plans' is refused by name, never served in the wide region (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const p = m.plans.?;
+    var r0 = try hy4_model_mod.Request.init(a, 0);
+    defer r0.deinit();
+    var r1 = try hy4_model_mod.Request.init(a, 0);
+    defer r1.deinit();
+    r0.kv = p.kv;
+    r1.kv = p.kv;
+    r1.kv.scheme = if (p.kv.scheme == .off) .affine else .off;
+    const segs = [_]hy4_model_mod.Model.Seg{ .{ .request = &r0, .id = 0 }, .{ .request = &r1, .id = 0 } };
+    try testing.expectError(error.Hy4JoinedKvUnplanned, hy4_plan.beginJoined(m, &segs));
+}
+
+test "hy4 plan: a joined root records its grouped attention at one depth past the window and its per-row attention at every depth, one pass each (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const kv = m.plans.?.kv;
+    const reach = m.plans.?.reach;
+    const positions = try hy4_plan.decodePositions(a, &m.config, reach);
+    defer a.free(positions);
+    var past: usize = 0;
+    for (positions) |n| past += @intFromBool(n + 1 > m.config.window);
+    try testing.expect(past > 1);
+    const p = try hy4_plan.record(m, a, reach, null, kv, null, null, 2);
+    defer {
+        p.deinit(a);
+        core.arenaRelease() catch {};
+    }
+    const id = hy4_plan.root(.{ .rows = 2, .readout = .all, .keep_hidden = m.keep_hidden, .kv = kv, .phase = .joined });
+    const traces = for (p.book.roots.items) |r| {
+        if (r.id.eql(id)) break r.traces.items.len;
+    } else 0;
+    try testing.expectEqual(positions.len + 1, traces);
 }

@@ -17,7 +17,8 @@ Guard: `tests/test_webui_theme.cjs` (run by `tests/test_webui.sh`).
   under that cap, and its placeholder names it ("2,048 (level cap)" on Qwen's low). It reads "no cap" only for a word
   without one, and "off" when thinking is off. A saved cap change reaches a box still holding the value the page
   filled in (`dataset.auto`); a value typed over it stays. Guard: `tests/test_webui_effort.cjs`.
-- A token count reads one way everywhere (`adminTokens`: `8,192`, `974.8k`, `1M`, thousands not 1024s). A pack has two sizes, always so named: **in-memory size** (the `*.safetensors` the engine loads and bills, `bytes_on_disk`) and **full weight size** (everything the pack holds, `ngram_table.bin` included, which is what Hugging Face downloads). Models shows both for an installed catalog pack, Available shows the full weight size and, for an installed one, the in-memory size. Guard: `Models and Available each name both sizes` in `tests/test_webui_admin_ui.cjs`.
+- A token count reads one way everywhere (`adminTokens`: `8,192`, `974.8k`, `1M`, thousands not 1024s). A pack has two sizes, always so named: **in-memory size** (the `*.safetensors` the engine loads and bills, `bytes_on_disk`: Engram tables, read from the SSD, are left out) and **full weight size** (everything the pack holds, `ngram_table.bin` included, which is what Hugging Face downloads). A model's list line reads `76.1 GiB in memory · 194 GiB total` (`adminSizeLine`): what
+  memory takes (held, once loaded), then the total when it is over 5% more; a pack that streams from the SSD shows its total only. Models shows both for an installed catalog pack, Available shows the full weight size and, for an installed one, the in-memory size. Guard: `Models and Available each name both sizes` in `tests/test_webui_admin_ui.cjs`.
 - A user message offers Edit (a button in its tools, shown on hover, on the last answer and on keyboard focus): it refills the composer and its images, marks the message, and shows a status banner "Editing your message" with Cancel. Send cuts the chat from that message and answers the new text; Cancel, Escape in the composer or switching chats restores the draft and returns the cursor to the Edit button. Guard: `a user message can be edited and resent` in `tests/test_webui_chat.cjs`.
 - A streaming box (the chat, the Thinking panel) follows new text only while the reader is at its bottom, measured before the text grows; a reader who scrolled up stays put. Guard: `Thinking panel follows` in `tests/test_webui_chat.cjs`.
 - The chat never picks a model for the user from a guess: the picker follows the loaded model, else the one loaded last, else reads "Choose a model" and Send asks for a pick.
@@ -180,6 +181,9 @@ and the page tooltip share them.
   model list lands first) would rebuild them from the old settings and show the old cap with Save still offered.
 - Under `--think` the Default column is locked and checks the word the flag serves (a save still writes the file's own
   default), and that word must stay offered, as the server requires.
+
+- A model save that would leave `ctx_size` above `max_kv_tokens` lowers the context to the budget and says why in its
+  toast, never refuses (`adminContextWithinBudget`); the API refuses the same save by name.
 
 ## Dashboard charts
 

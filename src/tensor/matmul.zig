@@ -12,6 +12,7 @@ const plan_api = @import("plan/plan_api.zig");
 const device = @import("sushi_exl3").device;
 const ops = @import("ops.zig");
 const stock = @import("stock.zig");
+const kernel = @import("kernel.zig");
 const log = @import("../log.zig");
 
 const Tensor = core.Tensor;
@@ -311,6 +312,187 @@ pub fn matmulRowsAs(a: *Tensor, b: *Tensor, rows_as: usize) Error!*Tensor {
     if (a.shape[a.ndim - 1] != b.shape[b.ndim - 2]) return error.TensorShape;
     if (a.size() == 0 or b.size() == 0 or rows_as < 2) return core.refusing("a rows-as matmul of an empty operand or under two rows", error.TensorUnsupported);
     return product(a, b, rows_as, null);
+}
+
+pub fn matmulGrouped(a: *Tensor, b: *Tensor, transposed_b: bool) Error!*Tensor {
+    if (a.ndim != 3 or b.ndim != 3) return core.refusing("a grouped product whose operands are not [groups, rows, inner]", error.TensorShape);
+    switch (a.dtype) {
+        .float16, .bfloat16, .float32 => {},
+        else => return core.refusing("a grouped product in a dtype other than f32, f16 and bf16", error.TensorDtype),
+    }
+    if (a.dtype != b.dtype) return core.refusing("a grouped product of operands of two dtypes", error.TensorDtype);
+    if (a.shape[0] != b.shape[0]) return error.TensorShape;
+    const groups: usize = @intCast(a.shape[0]);
+    const m: usize = @intCast(a.shape[1]);
+    const k: usize = @intCast(a.shape[2]);
+    const n: usize = @intCast(b.shape[if (transposed_b) 1 else 2]);
+    if ((if (transposed_b) b.shape[2] else b.shape[1]) != a.shape[2]) return error.TensorShape;
+    if (m == 0 or n == 0 or k == 0) return core.refusing("a grouped product of an empty operand", error.TensorUnsupported);
+    if (groups < 2) return core.refusing("a grouped product of fewer than two groups", error.TensorUnsupported);
+    if (!a.rowContiguous() or !b.rowContiguous()) return core.refusing("a grouped product of an operand not row-contiguous", error.TensorUnsupported);
+    const out = try core.fresh(a.dtype, &.{ a.shape[0], @intCast(m), @intCast(n) });
+    errdefer core.release(out);
+    const one: Call = .{
+        .g = try gpu(),
+        .a = .{ .t = a, .transposed = false, .ld = @intCast(k) },
+        .b = if (transposed_b) .{ .t = b, .transposed = true, .ld = @intCast(k) } else .{ .t = b, .transposed = false, .ld = @intCast(n) },
+        .out = out,
+        .m = m,
+        .n = n,
+        .k = k,
+        .batch_out = 1,
+        .batches = .one,
+        .arm_m = m,
+    };
+    if (@min(m, n) == 1) {
+        try groupsSolo(a, b, transposed_b, out, m, n, k);
+        return out;
+    }
+    switch (steelPath(one)) {
+        .fused => try groupedFused(a, b, transposed_b, out, one, "steel_gemm_fused", fusedTile(one), 0),
+        .fused_nax => {
+            const ts = fusedNaxTile(one);
+            try groupedFused(a, b, transposed_b, out, one, "steel_gemm_fused_nax", ts.t, ts.swizzle);
+        },
+        .split_k => try groupedSplitK(a, b, transposed_b, out, one),
+        .split_k_nax => try groupsSolo(a, b, transposed_b, out, m, n, k),
+    }
+    return out;
+}
+
+fn groupsSolo(a: *Tensor, b: *Tensor, transposed_b: bool, out: *Tensor, m: usize, n: usize, k: usize) Error!void {
+    const groups: c_int = a.shape[0];
+    var i: c_int = 0;
+    while (i < groups) : (i += 1) {
+        const as = try ops.slice(a, &.{ i, 0, 0 }, &.{ i + 1, @intCast(m), @intCast(k) }, &.{ 1, 1, 1 });
+        defer core.release(as);
+        const ar = try ops.reshape(as, &.{ @intCast(m), @intCast(k) });
+        defer core.release(ar);
+        const br0 = try ops.slice(b, &.{ i, 0, 0 }, &.{ i + 1, if (transposed_b) @intCast(n) else @intCast(k), if (transposed_b) @intCast(k) else @intCast(n) }, &.{ 1, 1, 1 });
+        defer core.release(br0);
+        const brw = try ops.reshape(br0, if (transposed_b) &.{ @intCast(n), @intCast(k) } else &.{ @intCast(k), @intCast(n) });
+        defer core.release(brw);
+        const bm = if (transposed_b) try ops.transpose(brw, &.{ 1, 0 }) else try core.share(brw);
+        defer core.release(bm);
+        const ds = try ops.slice(out, &.{ i, 0, 0 }, &.{ i + 1, @intCast(m), @intCast(n) }, &.{ 1, 1, 1 });
+        defer core.release(ds);
+        const dr = try ops.reshape(ds, &.{ @intCast(m), @intCast(n) });
+        defer core.release(dr);
+        try matmulInto(ar, bm, dr);
+    }
+}
+
+fn groupedFused(a: *Tensor, b: *Tensor, transposed_b: bool, out: *Tensor, one: Call, comptime family: []const u8, t: Tile, swizzle: u5) Error!void {
+    const view = if (transposed_b) try ops.transpose(b, &.{ 0, 2, 1 }) else try core.share(b);
+    defer core.release(view);
+    var c = one;
+    c.out = out;
+    c.batches = collapseBatches(a, view);
+    c.batch_out = @intCast(a.shape[0]);
+    c.a = .{ .t = a, .transposed = false, .ld = @intCast(one.k) };
+    c.b = if (transposed_b) .{ .t = view, .transposed = true, .ld = @intCast(one.k) } else .{ .t = view, .transposed = false, .ld = @intCast(one.n) };
+    return fusedLaunch(c, family, t, swizzle);
+}
+
+const group_accum_source =
+    \\const int mn = MN;
+    \\const int at = int(thread_position_in_grid.x);
+    \\const int g = at / mn;
+    \\const int e = at - g * mn;
+    \\const device float* part = parts + (size_t)(g * PARTS) * (size_t)mn + (size_t)e;
+    \\float v = 0.0f;
+    \\for (int i = 0; i < PARTS; ++i) v += part[(size_t)i * (size_t)mn];
+    \\out[at] = v;
+;
+
+var group_accum: ?*kernel.Def = null;
+const GroupAccumKey = struct { parts: c_int, mn: c_int, total: c_int };
+var group_accum_cfgs: std.AutoHashMapUnmanaged(GroupAccumKey, *kernel.Config) = .empty;
+
+fn groupAccumDef() Error!*kernel.Def {
+    if (group_accum) |d| return d;
+    const made = try kernel.Def.create("sushi_group_splitk_accum", &.{"parts"}, &.{"out"}, group_accum_source, "", false, false);
+    group_accum = made;
+    return made;
+}
+
+fn groupAccum(parts: *Tensor, out: *Tensor, parts_n: usize, m: usize, n: usize) Error!void {
+    const key: GroupAccumKey = .{ .parts = @intCast(parts_n), .mn = @intCast(m * n), .total = @intCast(out.size()) };
+    const cfg = group_accum_cfgs.get(key) orelse blk: {
+        const made = try std.heap.c_allocator.create(kernel.Config);
+        made.* = .{};
+        try made.addOutput(out.dims(), .float32);
+        try made.addTemplate("PARTS", .{ .int = key.parts });
+        try made.addTemplate("MN", .{ .int = key.mn });
+        made.grid = .{ key.total, 1, 1 };
+        made.group = .{ 256, 1, 1 };
+        group_accum_cfgs.put(std.heap.c_allocator, key, made) catch return error.OutOfMemory;
+        break :blk made;
+    };
+    var dsts: [1]*Tensor = .{out};
+    kernel.launchInPlace(try groupAccumDef(), &.{parts}, cfg, &dsts) catch |e| switch (e) {
+        error.ThreadGroupTooLarge => return core.refusing("a grouped product's accumulation over the GPU's threadgroup limit", error.TensorUnsupported),
+        else => |o| return o,
+    };
+}
+
+fn groupedSplitK(a: *Tensor, b: *Tensor, transposed_b: bool, out: *Tensor, one: Call) Error!void {
+    const t = splitKTile(one);
+    const m = one.m;
+    const n = one.n;
+    const k = one.k;
+    const groups: usize = @intCast(a.shape[0]);
+    const tm = (m + 31) / 32;
+    const tn = (n + 31) / 32;
+    const tk = k / 16;
+    const parts_n = @min(@max(2, nextPowerOfTwo(tk / (tm * tn))), split_k_parts_max);
+    const iterations = (k / t.bk) / parts_n;
+    if (iterations == 0 or iterations * parts_n * t.bk != k) return groupsSolo(a, b, transposed_b, out, m, n, k);
+    const a_g = try ops.transpose(a, &.{ 1, 0, 2 });
+    defer core.release(a_g);
+    const a_i = try ops.contiguousCopy(a_g);
+    defer core.release(a_i);
+    const b_i = if (transposed_b) blk: {
+        const b_g = try ops.transpose(b, &.{ 1, 0, 2 });
+        defer core.release(b_g);
+        break :blk try ops.contiguousCopy(b_g);
+    } else try core.share(b);
+    defer core.release(b_i);
+    const ld: i64 = @intCast(groups * k);
+    var c = one;
+    c.out = out;
+    c.a = .{ .t = a_i, .transposed = false, .ld = ld };
+    c.b = if (transposed_b) .{ .t = b_i, .transposed = true, .ld = ld } else .{ .t = b_i, .transposed = false, .ld = @intCast(n) };
+    const total_parts = parts_n * groups;
+    const held = if (plan_api.planned()) @max(total_parts, split_k_parts_max) else total_parts;
+    const parts = try core.fresh(.float32, &.{ @intCast(held), @intCast(m), @intCast(n) });
+    defer core.release(parts);
+    const kern = try splitKKernel(c, t, m % t.bm == 0 and n % t.bn == 0, k % t.bk == 0);
+    const tiles_n = (n + t.bn - 1) / t.bn;
+    const tiles_m = (m + t.bm - 1) / t.bm;
+    const params: SplitKParams = .{
+        .m = Call.int(m),
+        .n = Call.int(n),
+        .k = Call.int(k),
+        .lda = @intCast(c.a.ld),
+        .ldb = @intCast(c.b.ld),
+        .ldc = Call.int(n),
+        .tiles_n = Call.int(tiles_n),
+        .tiles_m = Call.int(tiles_m),
+        .split_k_partitions = Call.int(total_parts),
+        .split_k_partition_stride = Call.int(m * n),
+        .split_k_partition_size = Call.int(iterations * t.bk),
+        .swizzle_log = 0,
+        .gemm_k_iterations_aligned = Call.int(iterations),
+    };
+    const p = try core.pass();
+    p.pipeline(kern);
+    core.bind(p, c.a.t, 0);
+    core.bind(p, c.b.t, 1);
+    core.bindOut(p, parts, 2);
+    p.constant(params, 3);
+    core.dispatchGroups(p, .{ .x = tiles_n, .y = tiles_m, .z = total_parts }, .{ .x = 32, .y = t.wn, .z = t.wm });
+    try groupAccum(parts, out, parts_n, m, n);
 }
 
 /// `Matmul::eval_gpu`: operands of one rank whose batch axes agree. `rows_as` fixes the row count the arm is chosen for.

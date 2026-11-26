@@ -251,14 +251,20 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     on the served trunk), `W_kvb` widened to f32, and `W_o` with `post_proj_norm` over the spans' gated rows joined
     (each span hands them on as `W_o` reads them, BF16). Before, each span ran its own gate and `W_o`, re-reading
     both weights 16 times a 4,096-row chunk on a sliding layer and 128 times on a sparse one.
+  - A joined decode tick whose rows all have more than a window behind them runs a sliding layer's attention once
+    for every row (`fwd.attendJoinedGated`, grouped products that keep each row's solo arm and tiling), a plan choice
+    keyed by the layer, the width and the join; a tick with a row inside its window runs each row's own chain.
+    An `Ops` holds 768 arrays, so a per-row chain keeps its temporaries on a scratch `Ops` of the row and asks the layer's
+    `Ops` a count that does not follow the width (the release's 16 rows overflowed it at load).
   - `fwd.linearSpans` gives each row its own span's launch's bytes: the whole spans in one launch and a short last
     span in one of its own (a launch of a few rows takes the vector kernels, other sums). A BF16 product takes the
     kernel, tile and k split chosen for one span (`mlx.engine.matmulRowsAs`): MLX's choice follows the row count,
     and without it the release's gate at 512 rows and its sliding `W_o` at 8,192 (past the split-K bound) move bytes.
     A trellis bank's sorted GEMM, and its decoded path past 1,024 rows, give a row its bytes at any count past the
     rows arm, so they launch as they stand.
-    The rows arm takes a width as a template value, so a short last span's one to eight rows through a bank's gate and
-    `W_o` are made at load (`warmSpanTails`); a width past the arm shares the GEMM's pipelines (`hy4 late` cells).
+    The rows arms take a width as a template value, so each width a short last span takes through a bank's gate and
+    `W_o` up to the wide arm's widest (sixteen rows on NAX; past eight, the wide arm's) is made at load
+    (`warmSpanTails`); a width past the arms shares the GEMM's pipelines (`hy4 late` cells).
   - A wide span's core reads its keys where they are held, not gathered per span: a sliding layer's window rows, and a
     sparse layer's rows to the chunk's end, are read from kv8 to BF16 once a layer and chunk (`hy4_latent.rangeBf16`;
     the copy grows with depth, so a deep-zone chunk runs padded to its class's deepest recording: [D110](bill_redesign.md)),
@@ -600,8 +606,9 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   splice inside the model's pass, `offset` rows on from earlier chunks; an image id with no row left is a plain token.
   On the static bill an encode is an execution on the arena writing the request's `Media`
   ([bill_redesign](bill_redesign.md), stage 4c).
-  The tower warms at load, before the seal (`Tower.warmEngine`, as Qwen's and DeepSeek's do): one block at seven patch
-  counts and the attention over 8,192 keys by shape alone (the looped softmax past 4,096 keys), so an image of any grid
+  The tower warms at load, before the seal (`Tower.warmEngine`, as Qwen's and DeepSeek's do): one block at every cell
+  count the one-launch gemv serves (a pipeline per row count, which the merger runs at the cells), at seven wider patch
+  counts, and the attention over 8,192 keys by shape alone (the looped softmax past 4,096 keys), so an image of any grid
   compiles nothing in its request. The splice takes the embedding's and the tower's rows through one f32 `take` by
   uint32 picks, which no text prompt makes: `warmKernels` splices one row at load, so an STQ pack (its embedding a GPU
   gather) compiles nothing at the first image (`hy4 late` image cells, `hy4 vision` tower cells at the release's
@@ -762,7 +769,12 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   verify 21.70 to 21.24 ms, 6 rows 31.18 to 29.86; one row unchanged.
 - **Every 2..8-row linear is per-row exact** (BF16 `linearStoredAs` and the indexer pool through `isVerifyBlock`):
   a BF16 `W_kva` at 6..8 rows takes MLX's wide GEMV otherwise. Cost at 461af929 (M5 Ultra, fwd-ubench @4K): a 3-row
-  verify 21.26 to 21.50 ms, 6 rows 29.90 to 30.80. A load's warm makes the STQ head's 2..8-row pipelines.
+  verify 21.26 to 21.50 ms, 6 rows 29.90 to 30.80. A load's warm makes the STQ head's 2..8-row pipelines. It also runs one joined tick at every width the load joins (`Model.warmJoined`): a joined
+  tick's plan is recorded dry, so nothing else makes its attention side's kernels before the first such tick. Each
+  width runs twice, each row's own attention and the grouped chain forced (`warm_grouped`, set only there): the grouped
+  kernels follow the ring, never the position, so one-token-deep requests make what a past-the-window tick needs.
+  A joined root records the grouped attention arm once, at the first depth past the window (`Model.joined_grouped_at`):
+  that arm reads each row's full ring at every depth past it; the per-row arm is recorded at every depth.
 - **The 2..8-row rule is one predicate, by the span's own width** (`fwd.isVerifyBlock`): every site that must give a
   verify row its one-row bytes (row linears, absorb and value-out with or without `hy4_absorb`, scores, the ring)
   asks it, and a chunk's short last span decides by its own rows, so the shared launch keeps each span's bytes.
@@ -1116,6 +1128,10 @@ reference difference (the Engram norm ε and rows, the streams' dtype, image pos
    DeepSeek's kernels tie to the lower index; the tiny oracle's ties are held to the reference's own margins.
 2. **Batched decode**: a streamed load serves one request at a time, as DeepSeek's does. Joining requests as rows on a
    fully resident pack follows DeepSeek's `coolerRows`, after the core.
+   The `max_concurrent` fit answers by load, as DeepSeek's does: a load that joins rows is held to
+   `hy4_plan.joinedRows`, one that cannot stays at 1 (`Facts.exclusive_decode_of`).
+   Two drafting requests in company join as plain rows (`hy4_sched.rows_company_min` is 2): two serial DFly2 rounds in
+   turn gave 61.0 and 61.3 tok/s total on the M5 Ultra STQ 4bpw pack, the same two as plain joined rows 75.9.
 
 ## Implementation plan
 

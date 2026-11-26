@@ -146,6 +146,39 @@ pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(vo
     return set;
 }
 
+/// The shards of `model.safetensors.index.json` every tensor of which names one of `fragments`; null when there are no
+/// fragments or no usable index. Free with `freeShardSet`.
+fn ssdTableShards(io: std.Io, dir: std.Io.Dir, fragments: []const []const u8) ?std.StringHashMapUnmanaged(void) {
+    if (fragments.len == 0) return null;
+    const a = std.heap.page_allocator;
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return null;
+    defer a.free(raw);
+    var parsed = std.json.parseFromSlice(std.json.Value, a, raw, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const wm = parsed.value.object.get("weight_map") orelse return null;
+    if (wm != .object) return null;
+    var table: std.StringHashMapUnmanaged(bool) = .empty;
+    defer table.deinit(a);
+    var it = wm.object.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* != .string) continue;
+        const is_table = for (fragments) |f| {
+            if (std.mem.indexOf(u8, e.key_ptr.*, f) != null) break true;
+        } else false;
+        const got = table.getOrPut(a, e.value_ptr.string) catch return null;
+        got.value_ptr.* = if (got.found_existing) got.value_ptr.* and is_table else is_table;
+    }
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    var t = table.iterator();
+    while (t.next()) |e| {
+        if (!e.value_ptr.*) continue;
+        const key = a.dupe(u8, e.key_ptr.*) catch continue;
+        set.put(a, key, {}) catch a.free(key);
+    }
+    return set;
+}
+
 /// Free a set from `indexShardSet`.
 pub fn freeShardSet(set: *std.StringHashMapUnmanaged(void)) void {
     var keys = set.keyIterator();
@@ -579,7 +612,7 @@ fn tryAddModel(
             .supported => |mt| mt,
         };
     };
-    const weights = weightBytes(io, sub);
+    const weights = weightBytes(io, sub, model_type);
 
     const id = if (id_prefix.len > 0)
         try std.fmt.allocPrint(allocator, "{s}/{s}", .{ id_prefix, name })
@@ -656,18 +689,22 @@ fn linkedOutside(io: std.Io, dir: std.Io.Dir, entry: std.Io.Dir.Entry, size: u64
 }
 
 /// The weight bytes of the model folder `dir`: what the loader reads, the shards `model.safetensors.index.json` names
-/// (every `*.safetensors` when there is no usable index). The one count discovery, register-by-path and a refresh share.
-fn weightBytes(io: std.Io, dir: std.Io.Dir) struct { bytes: ?u64, linked: u64 } {
+/// (every `*.safetensors` when there is no usable index), less a shard holding only tables the arch reads from the SSD
+/// (`Facts.ssd_tables`). The one count discovery, register-by-path and a refresh share.
+fn weightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) struct { bytes: ?u64, linked: u64 } {
     var bytes: u64 = 0;
     var linked: u64 = 0;
     var found = false;
     var referenced = indexShardSet(io, dir);
     defer if (referenced) |*r| freeShardSet(r);
+    var ssd_only = ssdTableShards(io, dir, factsOf(model_type).ssd_tables);
+    defer if (ssd_only) |*r| freeShardSet(r);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
         if (referenced) |r| if (!r.contains(entry.name)) continue;
+        if (ssd_only) |r| if (r.contains(entry.name)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind != .file) continue;
         bytes += @intCast(st.size);
@@ -706,7 +743,7 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     };
     var sub = dir.openDir(io, base, .{ .iterate = true }) catch return .{ .model_type = model_type, .bytes_on_disk = null };
     defer sub.close(io);
-    const weights = weightBytes(io, sub);
+    const weights = weightBytes(io, sub, model_type);
     const total = folderBytes(io, sub, 3);
     return .{ .model_type = model_type, .bytes_on_disk = weights.bytes, .bytes_linked = weights.linked, .bytes_total = if (total > 0) total else null };
 }
@@ -1290,6 +1327,41 @@ test "discovery counts shard bytes that come through symlinks leaving the pack" 
     const pack_len = try pack_dir.realPath(io, &pack_buf);
     const probe = try probeModelDir(io, allocator, pack_buf[0..pack_len]);
     try testing.expectEqual(@as(u64, 16), probe.bytes_linked);
+}
+
+test "bytes_on_disk leaves out a shard holding only tables its arch reads from the SSD (Engram), on discovery and by path" {
+    try test_note.needArchs(&.{ "hy4flash", "dsv41" });
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const packs = [_]struct { dir: []const u8, model_type: []const u8, table: []const u8 }{
+        .{ .dir = "hy4", .model_type = "hy_v4_flash", .table = "model.layers.1.engram_layer.multi_head_embedding.embedding.weight" },
+        .{ .dir = "ds", .model_type = "deepseek_v41", .table = "layers.1.engram.embed.weight" },
+    };
+    for (packs) |pk| {
+        var buf: [512]u8 = undefined;
+        try tmp.dir.createDirPath(io, pk.dir);
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/config.json", .{pk.dir}), .data = try std.fmt.bufPrint(buf[256..], "{{\"model_type\":\"{s}\"}}", .{pk.model_type}) });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/model-1.safetensors", .{pk.dir}), .data = "0123" });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/engram-1.safetensors", .{pk.dir}), .data = "0123456789abcdef" });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/model.safetensors.index.json", .{pk.dir}), .data = try std.fmt.bufPrint(buf[256..], "{{\"weight_map\":{{\"model.norm.weight\":\"model-1.safetensors\",\"{s}\":\"engram-1.safetensors\"}}}}", .{pk.table}) });
+    }
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    for (result.models) |m| {
+        try testing.expectEqual(@as(?u64, 4), m.bytes_on_disk);
+        try testing.expect(m.bytes_total.? >= 20);
+    }
+    for (packs) |pk| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var d = try tmp.dir.openDir(io, pk.dir, .{});
+        defer d.close(io);
+        const n = try d.realPath(io, &path_buf);
+        const probe = try probeModelDir(io, allocator, path_buf[0..n]);
+        try testing.expectEqual(@as(?u64, 4), probe.bytes_on_disk);
+    }
 }
 
 test "bytes_total counts every regular file of the pack, a symlink at its target's size, and bytes_on_disk stays the weights" {

@@ -10,7 +10,6 @@ const plan_book = @import("../tensor/plan/plan_book.zig");
 const plan_trace = @import("../tensor/plan/plan_trace.zig");
 const log = @import("../log.zig");
 const sampler = @import("../sampler.zig");
-const think_penalty = @import("../think_penalty.zig");
 const hy4_model = @import("hy4_model.zig");
 const fwd = @import("hy4_forward.zig");
 const Plans = @import("hy4_plan.zig").Plans;
@@ -23,15 +22,17 @@ pub fn root(mix: Mix) plan.FrameId {
     return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ mix.entry, mix.rows <= 1, mix.suppress, mix.greedy, mix.think, mix.repeat, mix.additive, mix.grammar }) };
 }
 
+pub const token_slots = 32;
+
 /// What a load's samples hold beside its forwards' plans (`hy4_plan.Plans.sample`).
 pub const State = struct {
     /// Whether the load's samples are planned (`build`).
     planned: bool = false,
-    /// The load's reserved-token and think-marker masks, which its requests' draws read.
+    /// The load's reserved-token mask, which its requests' draws read.
     masks: Masks = .{},
     /// The two blocks a step's token is written into, in turn: the generator holds one token across the next draw.
-    tokens: [2]?Arr = .{ null, null },
-    turn: u1 = 0,
+    tokens: [token_slots]?Arr = @splat(null),
+    turn: usize = 0,
     /// The mix of the execution open, when one is.
     open: ?Mix = null,
     /// A draw no root holds that runs on the pool by design, open until it ends: a verdict wider than a verify block.
@@ -48,16 +49,15 @@ pub const State = struct {
     }
 };
 
-fn freeTokens(tokens: *[2]?Arr) void {
+fn freeTokens(tokens: *[token_slots]?Arr) void {
     for (tokens) |*b| if (b.*) |a| {
         _ = mlx.mlx_array_free(a);
         b.* = null;
     };
 }
 
-/// What a load's requests' draws read of the load's own: its reserved-token mask (`Trunk.suppress_mask`) and its think
-/// markers' (`Trunk.think_marker_mask`), borrowed.
-pub const Masks = struct { suppress: ?Arr = null, think: ?Arr = null };
+/// What a load's requests' draws read of the load's own: its reserved-token mask (`Trunk.suppress_mask`), borrowed.
+pub const Masks = struct { suppress: ?Arr = null };
 
 /// A served draw of `mix` begins: an execution of its root where the load planned it (true), else none (false): a
 /// load without plans, or a verdict wider than a verify block, which is a prefill block's on the pool (D18). A mix the
@@ -131,8 +131,21 @@ pub fn forced(m: *Model, id: u32) !?Arr {
 
 fn kept(m: *Model, st: *State, lazy: Arr) !Arr {
     defer _ = mlx.mlx_array_free(lazy);
-    const turn = st.turn;
-    st.turn +%= 1;
+    var pick: usize = st.turn % token_slots;
+    for (0..token_slots) |off| {
+        const idx = (st.turn + off) % token_slots;
+        if (st.tokens[idx]) |b| {
+            if (try mlx.engine.sole(b)) {
+                pick = idx;
+                break;
+            }
+        } else {
+            pick = idx;
+            break;
+        }
+    }
+    const turn = pick;
+    st.turn = (turn + 1) % token_slots;
     // A write that fails inside an execution leaves its block owing bytes of the arena, which the execution's end takes
     // back: the block goes, and `remakeTokens` makes it again outside one.
     errdefer {
@@ -164,10 +177,10 @@ pub fn shapeOf(mix: Mix) plan_book.Shape {
 pub fn mixOf(s: plan_book.Shape) ?Mix {
     if (s.phase != shape_phase or s.args[1] == 0 or s.args[1] > 255 or s.args[3] >> 5 != 0) return null;
     const entry = std.enums.fromInt(Mix.Entry, s.args[0]) orelse return null;
-    const think = std.enums.fromInt(Mix.Think, s.args[2]) orelse return null;
+    if (s.args[2] != @intFromEnum(Mix.Think.off)) return null;
     const f = s.args[3];
     if (entry != .verdict and s.args[1] != 1) return null;
-    return .{ .entry = entry, .rows = @intCast(s.args[1]), .think = think, .suppress = f & 1 != 0, .greedy = f & 2 != 0, .repeat = f & 4 != 0, .additive = f & 8 != 0, .grammar = f & 16 != 0 };
+    return .{ .entry = entry, .rows = @intCast(s.args[1]), .suppress = f & 1 != 0, .greedy = f & 2 != 0, .repeat = f & 4 != 0, .additive = f & 8 != 0, .grammar = f & 16 != 0 };
 }
 
 /// A served draw of `mix` missed (`miss`, null for a mix no root was planned for): it is refused by name, its mix
@@ -216,25 +229,20 @@ fn missed(m: *Model, mix: Mix, miss: ?plan.binder.Miss) error{PlanMiss} {
 /// temperature's value, top-k, top-p, min-p, the seed and the penalties' ids).
 pub const Probe = struct { mix: Mix, other: bool = false };
 
-/// Every mix a draw of the load can take: each entry under each think penalty's shift the load can make (its marker
-/// mask's where it has one, a request's biases always), each penalty, greedy or not, a grammar mask; the load's own
+/// Every mix a draw of the load can take: each entry under each penalty, greedy or not, a grammar mask; the load's own
 /// reserved-token mask; a verdict at every rows up to a verify block's where the load drafts.
 pub fn mixes(gpa: std.mem.Allocator, st: *const State) ![]Mix {
-    const has_mask = st.masks.think != null;
     const suppress = st.masks.suppress != null;
     var list: std.ArrayList(Mix) = .empty;
     errdefer list.deinit(gpa);
     const bools = [_]bool{ false, true };
-    for (std.enums.values(Mix.Think)) |think| for (bools) |greedy| for (bools) |repeat| for (bools) |additive| {
-        const rows_shift = think != .off and think != .mask and think != .bias;
-        const by_mask = think == .mask or think == .mask_inside or think == .mask_opens or think == .mask_unopened;
-        if (by_mask and !has_mask) continue;
-        const base: Mix = .{ .entry = .step, .suppress = suppress, .greedy = greedy, .think = think, .repeat = repeat, .additive = additive };
+    for (bools) |greedy| for (bools) |repeat| for (bools) |additive| {
+        const base: Mix = .{ .entry = .step, .suppress = suppress, .greedy = greedy, .repeat = repeat, .additive = additive };
         for (bools) |grammar| {
             var step = base;
             step.grammar = grammar;
             try list.append(gpa, step);
-            if (st.rows_max == 0 or (think != .off and !rows_shift)) continue;
+            if (st.rows_max == 0) continue;
             for (1..@as(usize, st.rows_max) + 1) |rows| {
                 var v = step;
                 v.entry = .verdict;
@@ -242,7 +250,6 @@ pub fn mixes(gpa: std.mem.Allocator, st: *const State) ![]Mix {
                 try list.append(gpa, v);
             }
         }
-        if (rows_shift) continue;
         var sync = base;
         sync.entry = .sync;
         try list.append(gpa, sync);
@@ -250,13 +257,10 @@ pub fn mixes(gpa: std.mem.Allocator, st: *const State) ![]Mix {
     return list.toOwnedSlice(gpa);
 }
 
-/// What a probe's draw reads, made before its recording as a served draw finds them: the logits in the load's block,
-/// a pending token in a token block, a request's prepared biases.
+/// What a probe's draw reads, made before its recording as a served draw finds them: the logits in the load's block.
 pub const Inputs = struct {
     gpa: std.mem.Allocator,
     logits: Arr,
-    pending: ?Arr = null,
-    prepared: ?think_penalty.Prepared = null,
     masks: ?[]bool = null,
     sampling: sampler.SamplingParams,
     generated: []const u32,
@@ -264,14 +268,7 @@ pub const Inputs = struct {
 
     pub fn deinit(in: *Inputs) void {
         _ = mlx.mlx_array_free(in.logits);
-        if (in.pending) |a| _ = mlx.mlx_array_free(a);
-        if (in.prepared) |*pr| pr.deinit();
         if (in.masks) |b| in.gpa.free(b);
-    }
-
-    fn shift(in: *const Inputs, mix: Mix, mask: ?Arr) ?sampler.Shift {
-        if (mix.think == .off) return null;
-        return .{ .mask = mask, .state = in.sampling.think_penalty, .ids = in.pending };
     }
 };
 
@@ -303,33 +300,6 @@ pub fn makeInputs(m: *Model, st: *const State, gpa: std.mem.Allocator, probe: Pr
         sp.presence_penalty = 0.5;
         if (probe.other) sp.frequency_penalty = 0.25;
     }
-    var tp: think_penalty.ThinkPenalty = .{ .lambda = 1, .opener_id = 1, .closer_id = 2, .phase = .inside };
-    switch (mix.think) {
-        .off => tp = .{},
-        .mask, .mask_inside, .bias, .bias_inside => {},
-        .mask_opens, .bias_opens => tp.phase = .before,
-        .mask_unopened, .bias_unopened => {
-            tp.phase = .before;
-            tp.opener_id = null;
-        },
-        .bias_after => tp.phase = .after,
-    }
-    switch (mix.think) {
-        .bias, .bias_inside, .bias_opens, .bias_unopened, .bias_after => {
-            const one = [_]@import("../logit_bias.zig").Bias{.{ .id = 1, .delta = 1 }};
-            in.prepared = try think_penalty.Prepared.init(gpa, m.config.vocab, null, .{ .biases = &one }, m.s);
-            tp.prepared = in.prepared;
-        },
-        else => {},
-    }
-    sp.think_penalty = tp;
-    if (mix.entry == .step and mix.think != .off and mix.think != .mask and mix.think != .bias) {
-        var p = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(p);
-        // The token in flight is in the block before the one the next draw writes.
-        try mlx.check(mlx.mlx_reshape(&p, st.tokens[st.turn -% 1].?, &[_]c_int{1}, 1, m.s));
-        in.pending = p;
-    }
     if (mix.grammar) {
         in.masks = try gpa.alloc(bool, @as(usize, mix.rows) * m.config.vocab);
         @memset(in.masks.?, true);
@@ -357,21 +327,19 @@ const Verdict = @import("hy4_drafter.zig").rounds.Verdict;
 /// any, left open).
 pub fn draw(m: *Model, st: *State, in: *const Inputs, mix: Mix) !Drawn {
     const s = m.s;
-    const think_mask = st.masks.think;
     switch (mix.entry) {
         .step => {
-            const step: sampler.Step = .{ .logits = in.logits, .sampling = in.sampling, .generated = in.generated, .grammar = if (in.masks) |b| b else null, .shift = in.shift(mix, think_mask) };
+            const step: sampler.Step = .{ .logits = in.logits, .sampling = in.sampling, .generated = in.generated, .grammar = if (in.masks) |b| b else null };
             if (!std.meta.eql(step.mix(), mix)) return error.Hy4SampleProbeMix;
             return .{ .step = try kept(m, st, try sampler.sampleStep(std.heap.page_allocator, step, s)) };
         },
         .sync => {
-            const shift: ?sampler.MarkerShift = if (in.shift(mix, think_mask)) |sh| .{ .mask = sh.mask, .state = sh.state } else null;
-            if (!std.meta.eql(sampler.syncMix(in.sampling, in.generated, shift), mix)) return error.Hy4SampleProbeMix;
-            return .{ .sync = try sampler.sampleToken(in.logits, in.sampling, in.generated, shift, s) };
+            if (!std.meta.eql(sampler.syncMix(in.sampling, in.generated, null), mix)) return error.Hy4SampleProbeMix;
+            return .{ .sync = try sampler.sampleToken(in.logits, in.sampling, in.generated, null, s) };
         },
         .verdict => {
             const rounds = @import("hy4_drafter.zig").rounds;
-            const v: rounds.VerdictIn = .{ .logits = in.logits, .ids = in.ids[0..mix.rows], .sampling = in.sampling, .think = in.shift(mix, think_mask), .committed = if (mix.repeat or mix.additive) in.generated else null, .masks = if (in.masks) |b| b else null, .streams = .{ .ops = s, .greedy = s, .draws = s } };
+            const v: rounds.VerdictIn = .{ .logits = in.logits, .ids = in.ids[0..mix.rows], .sampling = in.sampling, .committed = if (mix.repeat or mix.additive) in.generated else null, .masks = if (in.masks) |b| b else null, .streams = .{ .ops = s, .greedy = s, .draws = s } };
             if (!std.meta.eql(v.mix(), mix)) return error.Hy4SampleProbeMix;
             return .{ .verdict = try rounds.verdictOf(v) };
         },
@@ -385,7 +353,7 @@ fn recordPass(m: *Model, st: *State, gpa: std.mem.Allocator, probe: Probe, fill:
     defer in.deinit();
     const held = st.tokens;
     const turn = st.turn;
-    st.tokens = .{ null, null };
+    st.tokens = @splat(null);
     defer {
         freeTokens(&st.tokens);
         st.tokens = held;
@@ -424,10 +392,12 @@ fn fillTokens(st: *State, s: mlx.mlx_stream) !void {
 
 /// The token blocks a failed draw let go (`kept`), made again: the pool's gate stays closed to every other ask.
 fn remakeTokens(st: *State, s: mlx.mlx_stream) !void {
-    if (st.tokens[0] != null and st.tokens[1] != null) return;
-    const wide = core.widePhase();
-    defer wide.end();
-    try fillTokens(st, s);
+    for (st.tokens) |b| if (b == null) {
+        const wide = core.widePhase();
+        defer wide.end();
+        try fillTokens(st, s);
+        return;
+    };
 }
 
 /// `probe` recorded under both fills: the zeros' trace, once the ramp's is found to be the same execution (a readback

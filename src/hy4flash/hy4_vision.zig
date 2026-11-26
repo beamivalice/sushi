@@ -366,14 +366,15 @@ pub const Tower = struct {
     /// step: made by shape alone (`warmContext`), not by an encode that wide.
     const context_keys: u32 = 8192;
 
-    /// A Cooler load's tower, before the load seals: one block at a grid of each of `warm_patches`, then the attention
-    /// over `context_keys`, so an image of any size compiles nothing inside a request. A manifest of the tower's key
-    /// that holds the warm makes its pipelines instead.
+    /// A Cooler load's tower, before the load seals: one block at a grid of every cell count the one-launch gemv serves
+    /// (`fwd.linear`, a pipeline per row count, which the merger runs at the cells) and of each of `warm_patches`, then
+    /// the attention over `context_keys`, so an image of any size compiles nothing inside a request. A manifest of the
+    /// tower's key that holds the warm makes its pipelines instead.
     pub fn warmEngine(self: *const Tower) !void {
         if (self.blocks.len == 0) return;
         const v = self.v;
         var key_buf: [128]u8 = undefined;
-        const key = std.fmt.bufPrint(&key_buf, "hy4/{s}/{s}/{d}.{d}.{d}.{d}.{d}.{d}/w1", .{
+        const key = std.fmt.bufPrint(&key_buf, "hy4/{s}/{s}/{d}.{d}.{d}.{d}.{d}.{d}/w2", .{
             if (self.blocks[0].q.affine != null) "q8" else "bf16", @tagName(fwd.products), v.hidden, v.heads, v.inter, v.merge, v.out_hidden, self.attn_rows,
         }) catch return error.Hy4VisionKey;
         if (mlx.engine.pipeline_registry.takeMarker(key)) {
@@ -388,9 +389,12 @@ pub const Tower = struct {
         one.blocks = self.blocks[0..1];
         const es = mlx.engine.stream();
         const feat: usize = 3 * @as(usize, v.patch) * v.patch;
-        for (warm_patches) |n| {
+        const cell = v.merge * v.merge;
+        const gemv_cells: u32 = @intCast(fwd.joinedRowsMax());
+        for (0..gemv_cells + warm_patches.len) |i| {
+            const n: u32 = if (i < gemv_cells) @as(u32, @intCast(i + 1)) * cell else warm_patches[i - gemv_cells];
             // A grid of whole merge cells: `merge` patches wide.
-            const cells = n / (v.merge * v.merge);
+            const cells = n / cell;
             const zeros = try self.gpa.alloc(f32, n * feat);
             defer self.gpa.free(zeros);
             @memset(zeros, 0);

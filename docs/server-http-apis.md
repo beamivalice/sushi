@@ -114,7 +114,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
   default (undefined: every turn's thinking kept). Off renders only the latest user turn's thinking.
 - `tool_choice` reads every surface's wire shape; `required`/`any` and a named function are enforced at decode, a
   named function the request does not declare is a 400 ([server-tool-calling](server-tool-calling.md#tool_choice)).
-- `/v1/models` `bytes_on_disk` is the bytes the pack reads, symlinked shards included; `bytes_linked` (0 when none) is the part
+- `/v1/models` `bytes_on_disk` is the bytes the pack reads, symlinked shards included, less a shard holding only tables
+  its arch reads from the SSD (the Engram tables of Hy4-Flash and DeepSeek, `Facts.ssd_tables`); `bytes_linked` (0 when none) is the part
   that comes through symlinks to files outside the pack folder (a symlink inside it counts as the pack's own), so disk use is
   `bytes_on_disk - bytes_linked`. The Models tab details show it as "linked from elsewhere".
 - `/v1/models` `bytes_total` (absent when the folder holds nothing readable) is the sum of every regular file in the pack's
@@ -473,8 +474,9 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
 - `/props.settings.prefill_decode_share` reports the effective process-wide share, including zero under the interleave kill switch.
 - `/props.settings.max_concurrent`, `max_kv_tokens` (0 = no cap) and `reserved_tokens` are the answering model's:
   its resolved concurrency (1 by default), its token cap, and the tokens its live requests reserve (prompt plus `max_tokens`) plus its
-  RAM hot cache's retained entries. A request whose own reservation is above `max_kv_tokens` is answered 400 naming
-  the cap and the reservation, the same bytes streamed or not.
+  RAM hot cache's retained entries. The cap holds the model's context, so a request past it is a context limit: a
+  `max_tokens` past it is clamped, and a prompt past it is the context's 400, which names `max_kv_tokens`, the same
+  bytes streamed or not.
 
 ## Security and observability
 

@@ -88,3 +88,5 @@ detached-global-read src/downloads.zig:render runs on a connection thread (GET /
 in-place-write src/ssm_cache.zig:ssmSliceUpdateRow rewrites one row of a batch's stacked state at a fixed shape: a row patch, never an appended buffer, so it has no page grid
 engine-lifecycle src/hy4flash/ubench.zig:runAttnCore a microbench on synthetic tensors, no model load: it turns the engine on for its own process, as a Cooler load would
 device-probe src/cli.zig:parseModelEfforts reads the /v1/models JSON row's architecture field, not the GPU device profile
+undefined-partial-pass src/mtp_round.zig:batched_MTP_draft_rows_stop_at_their_own_depth mtpDraftActiveRows reads only each chain's m
+undefined-partial-pass src/mtp_round.zig:batched_MTP_draft_rows_stop_without_touching_inactive_generators mtpChainBuildBatched reads only each chain's m and n_drafted here

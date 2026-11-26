@@ -30,6 +30,9 @@ pub const Facts = struct {
     reads_pack_order: bool = true,
     /// The routed layers start here until the config's own dense prefix is read.
     stub_first_moe: u16 = 0,
+    /// Tensor-name fragments of the tables it reads from the SSD, never loads (Engram): a shard holding only these is
+    /// not counted as weights the model holds in memory (`bytes_on_disk`).
+    ssd_tables: []const []const u8 = &.{},
     /// The config's `moe_layer_freq` names the dense prefix.
     dense_prefix_in_layer_freq: bool = false,
     /// Video input is wired.
@@ -123,6 +126,8 @@ pub const Facts = struct {
     /// `exclusive_decode` read from the config, where the arch's answer depends on it (a streamed load).
     exclusive_decode_of: ?*const fn (*const model.ModelConfig) bool = null,
     reads_yarn: bool = false,
+    ssd_first_capable: bool = false,
+    bias_unserved: bool = false,
 };
 
 /// The config data only `name`'s arch reads, parsed once with the config: its `OwnConfig`, or an empty struct where the

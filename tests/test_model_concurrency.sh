@@ -2,7 +2,8 @@
 # sushi-test: tier=live boot=own pack=qwen4 boots=1
 # A model's max_concurrent and max_kv_tokens hold, wait and refuse on a real pack: with max_concurrent 2 a third
 # request waits for a slot; two requests whose reservations (prompt + max_tokens) pass max_kv_tokens together run one
-# after the other; a request over the cap alone is refused 400 naming the cap, the same bytes streamed or not. MTP is
+# after the other; the context is held to the cap, so a prompt past it is the context's 400 naming the cap, the same
+# bytes streamed or not, and a max_tokens past it is clamped. MTP is
 # off: two MTP slots share one head and serialize on their own, which would pass the first check without the cap.
 . "$(dirname "$0")/lib/boot.sh"
 
@@ -66,14 +67,20 @@ print(int(b["first"] + 0.3 >= a["end"] - 0.5))' "$WORK")
 check "$second" "two requests over max_kv_tokens together run one after the other" "$(cat "$WORK"/k-*.json | tr '\n' ' ')"
 check "$(grep -c '\[queue\].*max_kv_tokens' "$SUSHI_LOG" | awk '{print ($1 > 0)}')" "the queue line names max_kv_tokens" "no [queue] line names it"
 
-# 3. A request over the cap alone is refused 400 naming the cap, streamed or not, the same bytes.
-over() { curl -s -o "$WORK/over-$1.body" -w '%{http_code}' "$SUSHI_URL/v1/completions" -H 'Content-Type: application/json' \
-    -d "{\"prompt\":\"hi\",\"max_tokens\":$((CAP + 100)),\"stream\":$1}"; }
+# 3. The context is held to the cap: a prompt longer than it alone is the context's 400, which names max_kv_tokens, the
+# same bytes streamed or not; a max_tokens past it is clamped to the room left, as any context's is.
+python3 -I -c 'import json, sys; print(json.dumps({"prompt": "hi " * (int(sys.argv[1]) + 200), "max_tokens": 8}))' "$CAP" > "$WORK/long.json"
+over() { python3 -I -c 'import json, sys; b = json.load(open(sys.argv[1])); b["stream"] = sys.argv[2] == "true"; print(json.dumps(b))' "$WORK/long.json" "$1" > "$WORK/long-$1.json"
+    curl -s -o "$WORK/over-$1.body" -w '%{http_code}' "$SUSHI_URL/v1/completions" -H 'Content-Type: application/json' --data-binary "@$WORK/long-$1.json"; }
 code_n=$(over false); code_s=$(over true)
-check "$([ "$code_n" = 400 ] && grep -q max_kv_tokens "$WORK/over-false.body" && echo 1 || echo 0)" \
-    "a request over max_kv_tokens alone is a 400 naming the cap" "$code_n $(head -c 200 "$WORK/over-false.body")"
+check "$([ "$code_n" = 400 ] && grep -q "max_kv_tokens $CAP" "$WORK/over-false.body" && echo 1 || echo 0)" \
+    "a prompt longer than max_kv_tokens is the context's 400, naming the cap" "$code_n $(head -c 200 "$WORK/over-false.body")"
 check "$([ "$code_s" = 400 ] && cmp -s "$WORK/over-false.body" "$WORK/over-true.body" && echo 1 || echo 0)" \
     "the streamed refusal is the same bytes" "$code_s $(head -c 200 "$WORK/over-true.body")"
+code_c=$(curl -s -o "$WORK/clamped.body" -w '%{http_code}' "$SUSHI_URL/v1/completions" -H 'Content-Type: application/json' \
+    -d "{\"prompt\":\"hi\",\"max_tokens\":$((CAP + 100)),\"temperature\":0}")
+check "$([ "$code_c" = 200 ] && grep -q "max_tokens clamped: $((CAP + 100)) -> " "$SUSHI_LOG" && echo 1 || echo 0)" \
+    "a max_tokens past the cap is clamped to the context it holds" "$code_c $(head -c 200 "$WORK/clamped.body")"
 
 sushi_stop
 exit $fail
