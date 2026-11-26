@@ -200,11 +200,13 @@ sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ssd-b
   --expert-cache-bias 0.2 --ctx-size 200000
 ```
 
-**64 GB Mac, Hy4-Flash-Sushi-STQ-2.25bpw** (limit 60000; a 500,000-token context)
+**64 GB Mac, Hy4-Flash-Sushi-STQ-2.25bpw** (limit 60000; experts streamed within a 41 GB budget, 443 of 512 cached
+per layer, a 500,000-token context; the load needs 45.3 GB and an idle 64 GB Mac has about 45 GB free, while all 512
+resident would need 47.2 GB)
 
 ```bash
 sushi pull hy4-flash:2.25bpw
-sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ctx-size 500000
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ssd-budget-gb 41 --ctx-size 500000
 ```
 
 **96 GB Mac, Hy4-Flash-Sushi-STQ-4bpw** (limit 92000; a 500,000-token context)
