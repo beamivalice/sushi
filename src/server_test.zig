@@ -265,9 +265,15 @@ fn withServer(tmp: *testing.TmpDir, ssd_budget_gb: ?u32, max_concurrent: u32, ne
     const unwire_was = model_load.unwire_wait_max_ms;
     model_load.unwire_wait_max_ms = 0;
     defer model_load.unwire_wait_max_ms = unwire_was;
+    // As `--max-concurrent` sets it: the scheduler's rows and every model's count (`model_load.resolveConcurrency`).
     const prev_max = server_state.max_concurrent;
+    const prev_flag = server_state.max_concurrent_flag;
     server_state.max_concurrent = max_concurrent;
-    defer server_state.max_concurrent = prev_max;
+    server_state.max_concurrent_flag = max_concurrent;
+    defer {
+        server_state.max_concurrent = prev_max;
+        server_state.max_concurrent_flag = prev_flag;
+    }
     defer server_state.shutdown_requested.store(false, .release);
     server.accept_spawned_with_hooks = false;
     server.serve(io, a, params, stub.config, "127.0.0.1", 0, .{
