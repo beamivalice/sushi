@@ -2579,6 +2579,25 @@ test "hy4 rows: a row's front split from the joined layer frees the handles it m
     try testing.expect(released);
 }
 
+test "hy4 rows: a load at BF16 KV warms its joined ticks, both attention arms, at every width (HY4_STQ_TINY)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    m.serves_requests = false;
+    // The joined arm is the rows' choice: their KV, never the model's own request's (8-bit by default).
+    try m.warmJoined(4, .dense);
+}
+
 test "hy4 rows: a joined two-row decode finishes W_o once a layer, not once a row (HY4_STQ_TINY)" {
     const hy4_model = @import("hy4_model.zig");
     try mlx.requireGpu();

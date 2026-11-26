@@ -1048,9 +1048,13 @@ pub const Model = struct {
             }
             // Rows all past the window on a sliding layer attend as one grouped chain over each row's full ring; the
             // choice is data's, so it is a plan choice and its variant keyed by the tick's width.
-            const kv = self.reqConst().kv;
+            // The rows' own KV, which they must share: no request is lent here, so the model's would be its own.
+            const kv = segs[0].request.kv;
+            const same_kv = for (segs[1..]) |sg| {
+                if (!std.meta.eql(sg.request.kv, kv)) break false;
+            } else true;
             const win_w: c_int = @intCast(c.window);
-            const can_join = (!@import("builtin").is_test or fwd.joined_attention_on) and n >= 2 and L.indexer == null and self.tap == null and kv.scheme != .off and
+            const can_join = (!@import("builtin").is_test or fwd.joined_attention_on) and n >= 2 and L.indexer == null and self.tap == null and same_kv and kv.scheme != .off and
                 hy4_latent.appendFits(self.s, 1, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits, win_w);
             var all_past = true;
             for (p0[0..n]) |p| all_past = all_past and p + 1 > win_w;
