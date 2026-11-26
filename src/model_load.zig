@@ -2056,7 +2056,7 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
             entry.prefix_cache.?.ssd_idle_mem = ssd_idle_mem;
             entry.prefix_cache.?.hybrid = has_ssm_layers or arch_config.fact(config, "state_beside_kv");
         }
-        if (ram_prefix_cache) entry.prefix_cache.?.max_entries = config.max_concurrent;
+        if (ram_prefix_cache) entry.prefix_cache.?.setMaxEntries(config.max_concurrent);
         if (disk_tier) |tier| {
             entry.prefix_cache.?.disk = tier;
             // Published at attach: a model owns its namespace while it loads, before the publisher reads it ready.
@@ -3644,6 +3644,54 @@ test "attachPrefixCache: the RAM cache keeps as many conversations as the model'
     f.config.max_concurrent = 3;
     attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
     try testing.expectEqual(@as(u32, 3), f.entry.prefix_cache.?.max_entries);
+}
+
+fn retainAttachConversation(cache: *prefix_cache_mod.HotPrefixCache, id: u32) !bool {
+    const tokens = [_]u32{ id, id + 100 };
+    return cache.retainNewEntry(.{
+        .tokens = try testing.allocator.dupe(u32, &tokens),
+        .has_tools = false,
+        .snapshot = .{ .entries = try testing.allocator.alloc(trunk.KVCacheEntry, 0), .step = 0, .allocator = testing.allocator, .config = trunk.KVQuantConfig.dense },
+        .last_used = id,
+        .quant_config = trunk.KVQuantConfig.dense,
+        .kv_bytes = 20,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
+    });
+}
+
+test "attachPrefixCache: a reload with a smaller max_concurrent drops conversations past the new count and keeps the newest" {
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.config.max_concurrent = 4;
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
+    const hc = &f.entry.prefix_cache.?;
+    for (1..5) |i| try testing.expect(try retainAttachConversation(hc, @intCast(i)));
+    try testing.expectEqual(@as(usize, 4), hc.entries.items.len);
+
+    f.config.max_concurrent = 1;
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqual(@as(u32, 4), hc.entries.items[0].tokens[0]);
+}
+
+test "attachPrefixCache: a shrink leaves a conversation a live slot has checked out" {
+    var f: AttachFixture = undefined;
+    try f.init();
+    defer f.deinit();
+    f.config.max_concurrent = 4;
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
+    const hc = &f.entry.prefix_cache.?;
+    for (1..5) |i| try testing.expect(try retainAttachConversation(hc, @intCast(i)));
+    hc.entries.items[0].checkout = .{ .slot = 7, .kind = .whole };
+
+    f.config.max_concurrent = 1;
+    attachPrefixCache(testing.allocator, testing.io, f.entry, AttachFixture.settings(true), 0, .load);
+    // The checked-out entry occupies the whole new count, so every evictable one goes.
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expect(hc.entries.items[0].checkout != null);
+    try testing.expectEqual(@as(u32, 1), hc.entries.items[0].tokens[0]);
 }
 
 test "attachPrefixCache: a tier the resolver refuses is recorded as declined, and SSD-only then builds no cache" {

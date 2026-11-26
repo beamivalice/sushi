@@ -2692,7 +2692,7 @@ pub const HotPrefixCache = struct {
         e.ssm_bytes = bytes;
     }
 
-    fn retainNewEntry(self: *HotPrefixCache, entry: Entry) !bool {
+    pub fn retainNewEntry(self: *HotPrefixCache, entry: Entry) !bool {
         var incoming = entry;
         errdefer freeEntryOwnedState(self.allocator, &incoming);
         while (self.max_entries != unlimited_entries and self.entries.items.len >= self.max_entries) {
@@ -3783,6 +3783,17 @@ pub const HotPrefixCache = struct {
             if (!self.reclaimFromLru("budget revised", null, self.current_kv_bytes - max_kv_bytes)) break;
         }
         self.shedCheckpointsToFit();
+        self.logResident();
+    }
+
+    /// A shrink evicts now, not at the next retention; a live slot's checkout or restore keeps its entry until release.
+    pub fn setMaxEntries(self: *HotPrefixCache, max_entries: u32) void {
+        self.max_entries = max_entries;
+        if (max_entries == unlimited_entries or self.entries.items.len <= max_entries) return;
+        while (self.entries.items.len > max_entries) {
+            const idx = self.lruIndexExcluding(self.last_restored_used, null) orelse break;
+            self.evictForSpace(idx, "count cap revised");
+        }
         self.logResident();
     }
 

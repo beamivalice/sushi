@@ -53,7 +53,8 @@ and golden strings (`zig build test-host`, no GPU, no lock).
 - **The RAM hot cache's entry count is the model's resolved `max_concurrent`** (default 1; `--prefix-cache-entries` is
   removed and refused by name): past it the oldest conversation goes, and the `--prefix-cache-mem` budget and admission's
   reclaim can drop one sooner. A load sets the count, so a reload takes a changed `max_concurrent`; the SSD tier keeps
-  its byte budget. Where a model sets `max_kv_tokens`, its retained entries count in that token pool and a request
+  its byte budget. A smaller count evicts at once through `setMaxEntries`, sparing checked-out and live-restored entries.
+  Where a model sets `max_kv_tokens`, its retained entries count in that token pool and a request
   that needs the room evicts them oldest-first; an entry a live request holds or restores from counts once, in that
   request's reservation. A `[queue]` wait line's held count uses the same once-only tally as the cap decision
   (`sched_policy.heldTokensFor`), never a second count of a sibling's restored entry.
