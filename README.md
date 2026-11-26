@@ -11,8 +11,8 @@ Which pack suits your Mac, and running a bigger one from the SSD: [Choosing a pa
 
 * [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input; on M5 Macs it generates on Sushi Cooler, sushi's own engine, and `--ds41-mlx-engine` or the model's settings page go back to MLX)
 * [DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw) (requires 256 GB+ and sushi 1.7.3 or later, 13-20% faster decode from 1.7.4 on an M5 Ultra, every expert resident, KLD 0.0607 against the 1.75bpw pack's 0.1525, text and image input; generates on Sushi Cooler)
-* [Hy4-Flash-Sushi-STQ-4bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-4bpw) (requires 96 GB+ and sushi 1.8.0 or later)
-* [Hy4-Flash-Sushi-STQ-2.25bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-2.25bpw) (requires 64 GB+, or 48 GB [streamed](#streaming), and sushi 1.8.0 or later)
+* [Hy4-Flash-Sushi-STQ-4bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-4bpw) (requires 96 GB+ and sushi 1.8.0 or later, up to a 1M context on 128 GB, KLD 0.0194, text and image input; generates on Sushi Cooler, `sushi pull hy4-flash`)
+* [Hy4-Flash-Sushi-STQ-2.25bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-2.25bpw) (requires 64 GB+, or 48 GB [streamed](#streaming), and sushi 1.8.0 or later, KLD 0.1022, text and image input; generates on Sushi Cooler, `sushi pull hy4-flash:2.25bpw`)
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (pack revision 2.0, requires 64 GB+ and sushi 1.5.1 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+, or 64 GB [streamed](#streaming))
@@ -33,6 +33,8 @@ loads, but from 1.5.1 releases do not test, benchmark or tune it. 1.5.0 is the l
 * MiMo-V2.6-Flash-Sushi-2.3bpw scores KLD 0.0860 (top-1 agreement 91.95%)
 * GLM-5.3-Flash-Sushi-2.4bpw scores KLD 0.0742 (top-1 agreement 90.33%)
 * GLM-5.3-Flash-Sushi-2bpw scores KLD 0.1037 (top-1 agreement 88.18%)
+* Hy4-Flash-Sushi-STQ-4bpw scores KLD 0.0194 (top-1 agreement 96.30%) on the eight-category reading, and
+  Hy4-Flash-Sushi-STQ-2.25bpw 0.1022 (91.72%); per category: [quality-kld](docs/quality-kld.md#hy4-eight-category)
 
 ## Install
 
@@ -45,7 +47,7 @@ Update with `brew upgrade sushi`.
 `sushibar` puts the server in the menu bar: the generation speed in tok/s as its title, and a menu with a live status card, Start/Stop and Load/Unload buttons (Start brings the server up empty; Load brings back the last model), a port switcher, its pages, and Log, Update and Quit buttons (Log follows the server log live; hold ⌥ for Quit & Stop).
 
 * The server listens on `127.0.0.1:12345` (Settings has a Default port).
-* Support speculative decoding: MTP for Qwen and MiMo, DFlash2 for GLM.
+* Support speculative decoding: MTP for Qwen and MiMo, DFlash2 for GLM, DSpark for DeepSeek, DFly2 for Hy4-Flash.
 * `return_progress: true` streams llama.cpp's `prompt_progress` (total, cache, processed, time_ms) on chat completions and completions while the prefill runs.
 * 8-bit KV cache are on by default.
 
@@ -79,11 +81,16 @@ the largest multiple of 8192 tokens that fits, at 8-bit / 4-bit KV, with 256 MiB
 | GLM-5.3-Flash-Sushi-2.4bpw | — | — | — | 1M / — |
 | MiMo-V2.6-Flash-Sushi-2.3bpw | — | — | — | 1M / 1M |
 | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ‡ | — | — | 1M / — | 1M / — |
+| Hy4-Flash-Sushi-STQ-2.25bpw § | 200k / — | 500k / — | · | · |
+| Hy4-Flash-Sushi-STQ-4bpw § | — | — | 500k / — | 1M / — |
 
 † At `--qwen-gdn 16` (bf16 GatedDeltaNet state), which the 32, 48 and 64 GB launch lines use. The f32 default gives
 less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 480k / 800k (Sushi-STQ-2.75bpw) at 64 GB.
 
 ‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on 96 and 128 GB Macs. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000` and at `80` on a 96 GB Mac with `sudo sysctl iogpu.wired_limit_mb=93000 vm.global_user_wire_limit=97517568000 vm.user_wire_limit=97517568000` ([usage](docs/usage.md#deepseek-launch)). Always raise the two user-wire limits with the GPU limit: without them the system slows down and can become unresponsive.
+
+§ Hy4-Flash's cells are its recommended launches ([usage](docs/usage.md)), at 8-bit KV, not a computed maximum; · is not
+measured. On a 48 GB Mac the 2.25bpw pack streams its experts within a 34 GB budget. Its Engram tables stay on the SSD.
 
 ## Streaming
 
@@ -117,6 +124,16 @@ as `Authorization: Bearer <key>`. If `SUSHI_KEY` is unset or empty, the server r
 | **DeepSeek 4.1 Flash-STQ-1.75bpw** (`--ssd-budget-gb 108`) | Prefill | 707 | 1,024 | 998 | 993 | 950 | 829 |
 | | Decode | 76.6 | 84.2 | 76.2 | 85.3 | 78.1 | 63.7 |
 
+| Sushi 🍣 1.8.0 | M5 Ultra 256 GB | 4k | 8k | 16k | 32k | 64k | 128k |
+|---|---|---:|---:|---:|---:|---:|---:|
+| **Hy4 Flash-STQ-4bpw** | Prefill | 1,929 | 1,939 | 1,904 | 1,837 | 1,713 | 1,510 |
+| | Decode | 143.2 | 115.0 | 116.3 | 102.3 | 74.5 | 96.2 |
+| **Hy4 Flash-STQ-2.25bpw** | Prefill | 1,954 | 1,941 | 1,919 | 1,846 | 1,724 | 1,515 |
+| | Decode | 147.6 | 126.7 | 86.3 | 103.6 | 68.5 | 106.2 |
+
+Code arm, shipping defaults (8-bit KV, DFly2). Hy4-Flash's decode moves with DFly2's draft acceptance at each rung.
+The release ladders: [v1.8.0](docs/bench/v1.8.0/summary.md).
+
 ### Tool-eval-bench 3.0 (Agentic)
 
 | Pack                 | Thinking | Score  | Points  | Rating | Max weights in RAM |
@@ -131,5 +148,5 @@ as `Authorization: Bearer <key>`. If `SUSHI_KEY` is unset or empty, the server r
 ## License
 
 MIT, for sushi and the mlx-serve code it forks ([LICENSE](LICENSE)); ported kernels and vendored code are listed in
-[NOTICE](NOTICE). The Qwen packs follow the Qwen Community License and the MiMo pack Xiaomi's MIT license, stated on
-each Hugging Face page.
+[NOTICE](NOTICE). The Qwen packs follow the Qwen Community License, the Hy4-Flash packs Tencent's Hy license and the
+MiMo pack Xiaomi's MIT license, stated on each Hugging Face page.
