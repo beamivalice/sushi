@@ -132,6 +132,13 @@ out="$( ( CHANGELOG="$TMP/match.md"; main --dry-run ) 2>&1 )"; rc=$?
 ok "dry-run without a record exit 1"      "$rc"           "1"
 has "  reporting it found none"           "$out"          "no gate record for $SHA_A"
 
+echo "── no terminal and no --yes ──"
+reset_dispatch; reset_records; record "$SHA_A" "$SHA_A"
+out="$( ( CHANGELOG="$TMP/match.md"; main ) 2>&1 < /dev/null )"; rc=$?
+ok "no terminal without --yes doesn't dispatch" "$(dispatched)" "no"
+ok "  exit 1"                                   "$rc"           "1"
+has "  naming --yes"                            "$out"          "needs --yes"
+
 echo ""
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -eq 0 ]; then echo "PASS $TOTAL/$TOTAL"; exit 0

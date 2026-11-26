@@ -154,6 +154,7 @@ main() {
   fi
 
   if [ "$assume_yes" -ne 1 ]; then
+    [ -t 0 ] || { echo "release.sh: stdin is not a terminal, so it cannot ask; it needs --yes to dispatch." >&2; return 1; }
     read -r -p "Trigger the Release workflow for v$version on '$REF' ($sha)? [y/N] " reply
     case "$reply" in
       [yY] | [yY][eE][sS]) ;;

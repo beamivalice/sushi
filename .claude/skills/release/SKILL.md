@@ -14,7 +14,8 @@ Order (owner, 2026-10-31):
    gates or is due with it (e.g. a pack upload that waits for the published release), and what each still needs.
 1. The version bump (Release step 1 below), committed and pushed; then step 1, the local gate on that pushed commit.
 2. Two tracks start together and should finish about together:
-   - remote: `./release.sh` (it needs step 1's record; `release.yml` builds and leaves the DRAFT);
+   - remote: `./release.sh` (`--yes` from a shell with no terminal; it needs step 1's record; `release.yml` builds and
+     leaves the DRAFT);
    - local: steps 2, 3 and 4.
 3. Both green: publish the draft (Release step 3).
 4. Any issue on either track: fix it on main and push. Delete the failed draft and its tag
