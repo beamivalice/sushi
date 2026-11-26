@@ -28,6 +28,19 @@ pub const ROWS_HELPERS: [:0]const u8 =
     \\  const float s3 = v.z - v.w;
     \\  return float4(s0 + s2, s1 + s3, s0 - s2, s1 - s3);
     \\}
+    \\template <typename OutT, int HD, int RD>
+    \\static inline OutT exl3_rope_lane(OutT a, uint ch, uint lane, float pf, const device float *freqs) {
+    \\  #pragma clang fp contract(off)
+    \\  constexpr uint HEAD = uint(HD - RD);
+    \\  if (ch < HEAD) return a;
+    \\  const float xv = float(a);
+    \\  const float partner = metal::simd_shuffle_xor(xv, ushort(1));
+    \\  const float x1 = (lane & 1u) == 0u ? xv : partner;
+    \\  const float x2 = (lane & 1u) == 0u ? partner : xv;
+    \\  const float theta = pf * freqs[(ch - HEAD) >> 1u];
+    \\  const float cs = metal::precise::cos(theta), sn = metal::precise::sin(theta);
+    \\  return OutT((lane & 1u) == 0u ? x1 * cs - x2 * sn : x1 * sn + x2 * cs);
+    \\}
     \\
 ;
 
@@ -114,6 +127,27 @@ const ROWS_FOLD: []const u8 =
     \\    yr[32] = OutT(v.y * psc * float(svh[ob + 32u]));
     \\    yr[64] = OutT(v.z * psc * float(svh[ob + 64u]));
     \\    yr[96] = OutT(v.w * psc * float(svh[ob + 96u]));
+    \\  }
+    \\
+;
+
+/// `ROWS_FOLD` with in-register tail RoPE on each `HD`-channel head's last `RD` channels (zero DRAM roundtrip).
+const ROWS_FOLD_ROPE: []const u8 =
+    \\  for (uint r = sg; r < uint(ROWS); r += SGS) {
+    \\    float4 v = 0.0f;
+    \\    for (uint k = 0u; k < KPARTS; k++) {
+    \\      const threadgroup float *pr = tgm + (r * KPARTS + k) * 128u + lane;
+    \\      v += float4(pr[0], pr[32], pr[64], pr[96]);
+    \\    }
+    \\    v = exl3_h128(v, lane);
+    \\    const uint ob = ot0 * TILE + lane;
+    \\    const uint ch = (ot0 * TILE) % uint(HD) + lane;
+    \\    const float pf = float(pos[r]);
+    \\    const auto yr = y + exl3_seg_at(r, ob, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
+    \\    yr[0] = exl3_rope_lane<OutT, HD, RD>(OutT(v.x * psc * float(svh[ob])), ch, lane, pf, freqs);
+    \\    yr[32] = exl3_rope_lane<OutT, HD, RD>(OutT(v.y * psc * float(svh[ob + 32u])), ch + 32u, lane, pf, freqs);
+    \\    yr[64] = exl3_rope_lane<OutT, HD, RD>(OutT(v.z * psc * float(svh[ob + 64u])), ch + 64u, lane, pf, freqs);
+    \\    yr[96] = exl3_rope_lane<OutT, HD, RD>(OutT(v.w * psc * float(svh[ob + 96u])), ch + 96u, lane, pf, freqs);
     \\  }
     \\
 ;
@@ -378,6 +412,28 @@ const ROWS_FINISH_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FIN
 
 const ROWS_FINISH_ROW_MAJOR_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, ROWS_FINISH_AT, ROWS_FINISH_AT_ROW_MAJOR);
 
+/// `ROWS_FINISH_SOURCE` for a one-bank query projection whose `HD`-channel heads leave tail-rotated by `RD`.
+const ROWS_FINISH_ROPE_SOURCE: [:0]const u8 =
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint tg = uint(threadgroup_position_in_grid.x);
+    \\const uint b = tg * 128u + lane;
+    \\const uint r = uint(threadgroup_position_in_grid.y);
+    \\float4 v = 0.0f;
+    \\for (uint s = 0u; s < uint(NSPLIT); s++) {
+    \\  const device float *p = part + (size_t)(r * uint(NSPLIT) + s) * uint(ODIM) + b;
+    \\  v += float4(p[0], p[32], p[64], p[96]);
+    \\}
+    \\v = exl3_h128(v, lane);
+    \\const float psc = 0.08838834764831845f;
+    \\const uint ch = (tg * 128u) % uint(HD) + lane;
+    \\const float pf = float(pos[r]);
+    \\device OutT *yr = y + (size_t)r * uint(ODIM) + b;
+    \\yr[0] = exl3_rope_lane<OutT, HD, RD>(OutT(v.x * psc * float(svh[b])), ch, lane, pf, freqs);
+    \\yr[32] = exl3_rope_lane<OutT, HD, RD>(OutT(v.y * psc * float(svh[b + 32u])), ch + 32u, lane, pf, freqs);
+    \\yr[64] = exl3_rope_lane<OutT, HD, RD>(OutT(v.z * psc * float(svh[b + 64u])), ch + 64u, lane, pf, freqs);
+    \\yr[96] = exl3_rope_lane<OutT, HD, RD>(OutT(v.w * psc * float(svh[b + 96u])), ch + 96u, lane, pf, freqs);
+;
+
 /// `ROWS_FINISH_SOURCE` of a one-bank launch whose row `y` leaves as HC streams: stream i is
 /// `fma(post[i], y, sum over j of fma(comb[j][i], x[j], acc))` rounded to OutT, `y` rounded to OutT first.
 const ROWS_FINISH_EXPAND_SOURCE: [:0]const u8 =
@@ -467,6 +523,143 @@ const ROWS_FINISH_RMS_SOURCE: [:0]const u8 =
     \\  for (int i = 0; i < 4; i++) yr[i] = w[c0 + uint(i)] * OutT(tx[i] * inv_mean[0]);
     \\}
 ;
+
+const ROWS_RING_HELPERS: [:0]const u8 = ROWS_HELPERS ++
+    \\static inline float exl3_round_scale(float v) {
+    \\  uint b = as_type<uint>(v);
+    \\  int e = int((b >> 23) & 0xFFu) - 127 + ((b & 0x7FFFFFu) != 0u ? 1 : 0);
+    \\  return as_type<float>(uint(clamp(e + 127, 1, 254)) << 23);
+    \\}
+    \\static inline float exl3_round_e4m3(float v) {
+    \\  if (v == 0.0f) return 0.0f;
+    \\  int e = max(int((as_type<uint>(v) >> 23) & 0xFFu) - 127, -6);
+    \\  float step = as_type<float>(uint(e - 3 + 127) << 23);
+    \\  return min(rint(v / step) * step, 448.0f);
+    \\}
+    \\static inline float exl3_qat_scale0(float amax) {
+    \\  return exl3_round_scale(max(amax, 1e-4f) * (1.0f / 448.0f));
+    \\}
+    \\static inline float exl3_qat_round0(float v, float s) {
+    \\  const float t = clamp(precise::divide(v, s), -448.0f, 448.0f);
+    \\  return copysign(exl3_round_e4m3(fabs(t)), t) * s;
+    \\}
+;
+
+/// `ROWS_FINISH_RMS_SOURCE` for a 2-segment `[NORM, KV_D]` attention input (`wq_a` + `wkv`) that also applies
+/// `kv_norm` + tail RoPE + optional fp8 QAT on the `KV_D` segment in the idle simdgroups and copies unchanged rows
+/// of `ring` into `rout` in parallel threadgroups, eliminating the `ropeKvRing` barrier and DRAM roundtrip.
+const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
+    \\#pragma clang fp contract(off)
+    \\const uint tgid = uint(threadgroup_position_in_grid.x);
+    \\const int cap = ring_shape[0];
+    \\if (tgid >= uint(ROWS)) {
+    \\  constexpr uint U = uint(KV_D) * sizeof(OutT) / 16u;
+    \\  const uint u = (tgid - uint(ROWS)) * uint(threads_per_threadgroup.x) + uint(thread_position_in_threadgroup.x);
+    \\  if (u >= uint(cap) * U) return;
+    \\  if ((int(u / U) + cap - int(pos[0]) % cap) % cap < int(ROWS)) return;
+    \\  ((device metal::uint4 *)rout)[u] = ((const device metal::uint4 *)ring)[u];
+    \\  return;
+    \\}
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const uint r = tgid;
+    \\threadgroup float fin[NORM];
+    \\threadgroup float kfin[KV_D];
+    \\threadgroup float sums[32];
+    \\threadgroup float ksums[32];
+    \\threadgroup float inv_mean[1];
+    \\threadgroup float kinv[1];
+    \\const uint b = sg * 128u + lane;
+    \\const bool normed = sg * 128u < uint(NORM);
+    \\constexpr uint Q_SGS = uint(NORM) / 128u;
+    \\const uint ksg = sg - Q_SGS;
+    \\float4 v = 0.0f;
+    \\for (uint s = 0u; s < uint(NSPLIT); s++) {
+    \\  const device float *p = part + (size_t)(r * uint(NSPLIT) + s) * uint(ODIM) + b;
+    \\  v += float4(p[0], p[32], p[64], p[96]);
+    \\}
+    \\v = exl3_h128(v, lane);
+    \\const float psc = 0.08838834764831845f;
+    \\const OutT o0 = OutT(v.x * psc * float(svh[b]));
+    \\const OutT o1 = OutT(v.y * psc * float(svh[b + 32u]));
+    \\const OutT o2 = OutT(v.z * psc * float(svh[b + 64u]));
+    \\const OutT o3 = OutT(v.w * psc * float(svh[b + 96u]));
+    \\if (normed) {
+    \\  fin[b] = float(o0);
+    \\  fin[b + 32u] = float(o1);
+    \\  fin[b + 64u] = float(o2);
+    \\  fin[b + 96u] = float(o3);
+    \\} else {
+    \\  const uint kb = ksg * 128u + lane;
+    \\  kfin[kb] = float(o0);
+    \\  kfin[kb + 32u] = float(o1);
+    \\  kfin[kb + 64u] = float(o2);
+    \\  kfin[kb + 96u] = float(o3);
+    \\}
+    \\if (sg == 0u) {
+    \\  sums[lane] = 0.0f;
+    \\  ksums[lane] = 0.0f;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\float tx[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    \\float acc = 0.0f;
+    \\if (normed) {
+    \\  for (int i = 0; i < 4; i++) {
+    \\    tx[i] = fin[sg * 128u + lane * 4u + uint(i)];
+    \\    acc = metal::fma(tx[i], tx[i], acc);
+    \\  }
+    \\  acc = simd_sum(acc);
+    \\  if (lane == 0u) sums[sg] = acc;
+    \\} else {
+    \\  for (int i = 0; i < 4; i++) {
+    \\    tx[i] = kfin[ksg * 128u + lane * 4u + uint(i)];
+    \\    acc = metal::fma(tx[i], tx[i], acc);
+    \\  }
+    \\  acc = simd_sum(acc);
+    \\  if (lane == 0u) ksums[ksg] = acc;
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sg == 0u) {
+    \\  const float s = simd_sum(sums[lane]);
+    \\  if (lane == 0u) inv_mean[0] = metal::precise::rsqrt(s / uint(NORM) + eps[0]);
+    \\} else if (sg == Q_SGS) {
+    \\  const float s = simd_sum(ksums[lane]);
+    \\  if (lane == 0u) kinv[0] = metal::precise::rsqrt(s / float(KV_D) + eps[0]);
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (normed) {
+    \\  const uint c0 = sg * 128u + lane * 4u;
+    \\  device OutT *qr = qout + (size_t)r * uint(NORM) + c0;
+    \\  for (int i = 0; i < 4; i++) qr[i] = w[c0 + uint(i)] * OutT(tx[i] * inv_mean[0]);
+    \\} else {
+    \\  const uint kt = ksg * 32u + lane;
+    \\  const float inv = kinv[0];
+    \\  float kv[4];
+    \\  for (int i = 0; i < 4; i++) kv[i] = float(kw[kt * 4u + uint(i)] * OutT(tx[i] * inv));
+    \\  constexpr uint KHEAD = uint(KV_D - RD);
+    \\  for (int i = 0; i < 4; i += 2) {
+    \\    const uint idx = kt * 4u + uint(i);
+    \\    if (idx >= KHEAD) {
+    \\      const float theta = float(pos[r]) * freqs[(idx - KHEAD) >> 1u];
+    \\      const float cs = metal::precise::cos(theta), sn = metal::precise::sin(theta);
+    \\      const float x1 = kv[i], x2 = kv[i + 1];
+    \\      kv[i] = float(OutT(x1 * cs - x2 * sn));
+    \\      kv[i + 1] = float(OutT(x1 * sn + x2 * cs));
+    \\    }
+    \\  }
+    \\  if (QAT != 0) {
+    \\    float amax = 0.0f;
+    \\    for (int i = 0; i < 4; i++) amax = metal::max(amax, metal::abs(kv[i]));
+    \\    for (ushort m = 4; m > 0; m >>= 1) amax = metal::max(amax, metal::simd_shuffle_xor(amax, m));
+    \\    const float sc = exl3_qat_scale0(amax);
+    \\    for (int i = 0; i < 4; i++) kv[i] = exl3_qat_round0(kv[i], sc);
+    \\  }
+    \\  device OutT *dst = rout + (size_t)(int(pos[r]) % cap) * uint(KV_D) + kt * 4u;
+    \\  for (int i = 0; i < 4; i++) dst[i] = OutT(kv[i]);
+    \\}
+;
+
+const ROWS_NAX_ROPE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_FOLD, ROWS_FOLD_ROPE);
 
 /// `ROWS_FINISH_RMS_SOURCE` of a launch through bf16 (`Mode.thru_bf16`): each finished output rounded to bf16 and widened,
 /// the norm in f32 over `w` widened as stored, the rows f32 (OutT): the through launch, then MLX's f32 rms norm.
@@ -637,6 +830,26 @@ var rows_finish_rms_cfgs: kernel_src.CfgCache(RowsFinishRmsKey, 32) = .{};
 var rows_finish_rms_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 var rows_finish_rms_thru_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+const RowsFinishRmsRingKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, norm: c_int, kv_dim: c_int, rd: c_int, qat: bool, cap: c_int };
+
+var rows_finish_rms_ring_cfgs: kernel_src.CfgCache(RowsFinishRmsRingKey, 32) = .{};
+
+var rows_finish_rms_ring_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+const RowsNaxRopeKey = struct { base: RowsKey, hd: c_int, rd: c_int };
+
+var rows_nax_rope_cfgs: kernel_src.CfgCache(RowsNaxRopeKey, 32) = .{};
+
+var rows_nax_rope_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
+
+const RowsFinishRopeKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, hd: c_int, rd: c_int };
+
+var rows_finish_rope_cfgs: kernel_src.CfgCache(RowsFinishRopeKey, 32) = .{};
+
+var rows_finish_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+const ROWS_ROPE_INS = [_][*:0]const u8{ "x", "trellis", "suh", "svh", "freqs", "pos" };
 
 const RowsFinishExpandKey = struct { out_dim: c_int, rows: c_int, nsplit: c_int, out_dt: mlx.mlx_dtype, hc: c_int };
 
@@ -1371,6 +1584,126 @@ pub fn launchRowsNormed(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_ar
     else
         try kernels.getNamedKernel(&rows_finish_rms_kernel, "sushi_exl3_rows_finish_rms", &.{ "part", "svh", "w", "eps" }, &.{"y"}, ROWS_FINISH_RMS_SOURCE, ROWS_HELPERS);
     const ov = try kernels.applyOuts(s, fk, &.{ part, svh, norm.w, norm.eps }, fcfg, 1);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+    return y;
+}
+
+/// Tail-RoPE parameters for a query projection (`wq_b`): `hd` head dim (multiple of 128), `rd` rotated tail (multiple
+/// of 32), `freqs` `[rd/2]` f32, `pos` `[rows]` i32.
+pub const Rope = struct { freqs: mlx.mlx_array, pos: mlx.mlx_array, hd: c_int, rd: c_int };
+
+/// Ring-update parameters for `launchRowsNormedRing`: norms + tail-rotates (+ optional fp8 QAT) the `kv` segment
+/// right after `norm.cols` and writes it into `ring` `[cap, kv_dim]` in the same finish dispatch.
+pub const KvRing = struct { kw: mlx.mlx_array, freqs: mlx.mlx_array, pos: mlx.mlx_array, ring: mlx.mlx_array, cap: c_int, kv_dim: c_int, rd: c_int, qat: bool };
+
+pub const NormedRingOut = struct { q: mlx.mlx_array, ring: mlx.mlx_array };
+
+pub fn normedRingFits(l: RowsLaunch, g: RowsGeom, bounds: [3]c_int, norm: Norm, kr: KvRing) bool {
+    if (l.thru or !normedFits(l, g, bounds, norm)) return false;
+    if (l.out_dim != norm.cols + kr.kv_dim or kr.kv_dim < 128 or @rem(kr.kv_dim, 128) != 0) return false;
+    if (kr.rd <= 0 or @rem(kr.rd, 4) != 0 or kr.rd > kr.kv_dim or kr.cap < l.rows) return false;
+    if (mlx.mlx_array_dtype(kr.kw) != l.out_dt or mlx.mlx_array_dtype(kr.ring) != l.out_dt) return false;
+    if (mlx.mlx_array_dtype(kr.freqs) != .float32 or mlx.mlx_array_dtype(kr.pos) != .int32) return false;
+    const elem_bytes: c_int = if (l.out_dt == .float32) 4 else 2;
+    return @rem(kr.kv_dim * elem_bytes, 16) == 0;
+}
+
+/// `launchRowsNormed` for a 2-segment `[q_lora, kv_row]` attention input that writes the normed query `[rows, norm.cols]`
+/// and the updated KV ring `[cap, kv_dim]` in one finish dispatch, eliminating `ropeKvRing`.
+pub fn launchRowsNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, kernel: mlx.mlx_fast_metal_kernel, bounds: [3]c_int, pin: ?PinnedCfg, norm: Norm, kr: KvRing) !NormedRingOut {
+    if (!normedRingFits(l, g, bounds, norm, kr)) return error.BadExl3Shape;
+    const key = RowsKey{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .thru = l.thru };
+    const cfg = if (pin) |p| p.cfg else rows_cfgs.get(key) orelse blk: {
+        const c = try buildRowsCfg(l, g, bounds, .{}, null);
+        rows_cfgs.put(key, c);
+        break :blk c;
+    };
+    const pv = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh }, cfg, 1);
+    defer _ = mlx.mlx_vector_array_free(pv);
+    var part = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(part);
+    try mlx.check(mlx.mlx_vector_array_get(&part, pv, 0));
+    const fkey = RowsFinishRmsRingKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .norm = norm.cols, .kv_dim = kr.kv_dim, .rd = kr.rd, .qat = kr.qat, .cap = kr.cap };
+    const fcfg = rows_finish_rms_ring_cfgs.get(fkey) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        const threads = @divExact(l.out_dim, 4);
+        const elem_bytes: c_int = if (l.out_dt == .float32) 4 else 2;
+        const row_vecs = @divExact(kr.kv_dim * elem_bytes, 16);
+        const ctgs = @divFloor(kr.cap * row_vecs + threads - 1, threads);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.rows, norm.cols }, 2, l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ kr.cap, kr.kv_dim }, 2, l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, (l.rows + ctgs) * threads, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, threads, 1, 1));
+        inline for (.{ "ODIM", "ROWS", "NSPLIT", "NORM", "KV_D", "RD", "QAT" }, .{ l.out_dim, l.rows, g.nsplit, norm.cols, kr.kv_dim, kr.rd, @as(c_int, @intFromBool(kr.qat)) }) |name, v|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+        rows_finish_rms_ring_cfgs.put(fkey, c);
+        break :blk c;
+    };
+    const fk = try kernels.getNamedKernel(&rows_finish_rms_ring_kernel, "sushi_exl3_rows_finish_rms_ring", &.{ "part", "svh", "w", "eps", "kw", "freqs", "pos", "ring" }, &.{ "qout", "rout" }, ROWS_FINISH_RMS_RING_SOURCE, ROWS_RING_HELPERS);
+    const ov = try kernels.applyOuts(s, fk, &.{ part, svh, norm.w, norm.eps, kr.kw, kr.freqs, kr.pos, kr.ring }, fcfg, 2);
+    defer _ = mlx.mlx_vector_array_free(ov);
+    var qout = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(qout);
+    var rout = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(rout);
+    try mlx.check(mlx.mlx_vector_array_get(&qout, ov, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&rout, ov, 1));
+    return .{ .q = qout, .ring = rout };
+}
+
+pub fn ropeFits(l: RowsLaunch, g: RowsGeom, rp: Rope) bool {
+    if (l.groups != 1 or l.thru or dyn_rows) return false;
+    if (rp.hd < 128 or @rem(rp.hd, 128) != 0 or @rem(l.out_dim, rp.hd) != 0) return false;
+    if (rp.rd <= 0 or @rem(rp.rd, 32) != 0 or rp.rd > rp.hd) return false;
+    if (mlx.mlx_array_dtype(rp.freqs) != .float32 or mlx.mlx_array_dtype(rp.pos) != .int32) return false;
+    return if (rowsFolds(g)) g.nax else true;
+}
+
+/// `launchRows` with tail RoPE folded into the output store (in `ROWS_NAX_ROPE_SOURCE` when folded, or in
+/// `ROWS_FINISH_ROPE_SOURCE` when k-split), eliminating the full-query DRAM roundtrip in `ropeKvRing`.
+pub fn launchRowsRope(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_array, suh: mlx.mlx_array, svh: mlx.mlx_array, l: RowsLaunch, g: RowsGeom, rp: Rope) !mlx.mlx_array {
+    if (!ropeFits(l, g, rp)) return error.BadExl3Shape;
+    const bounds: [3]c_int = @splat(l.out_dim);
+    if (rowsFolds(g)) {
+        const key = RowsNaxRopeKey{ .base = .{ .in_dim = l.in_dim, .out_dim = l.out_dim, .rows = l.rows, .groups = 1, .n = l.n, .out_dt = l.out_dt, .bounds = bounds, .geom = g, .thru = l.thru }, .hd = rp.hd, .rd = rp.rd };
+        const cfg = rows_nax_rope_cfgs.get(key) orelse blk: {
+            const c = try buildRowsCfg(l, g, bounds, .{}, null);
+            errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "HD", rp.hd));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "RD", rp.rd));
+            rows_nax_rope_cfgs.put(key, c);
+            break :blk c;
+        };
+        const kernel = try kernel_src.codebookKernelWith(&rows_nax_rope_kernel, "sushi_exl3_rows_nax_rope", &ROWS_ROPE_INS, &.{"y"}, ROWS_NAX_ROPE_SOURCE, ROWS_NAX_FRAGS);
+        const ov = try kernels.applyOuts(s, kernel, &.{ x, trellis, suh, svh, rp.freqs, rp.pos }, cfg, 1);
+        defer _ = mlx.mlx_vector_array_free(ov);
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_vector_array_get(&y, ov, 0));
+        return y;
+    }
+    const part = try launchRowsParts(s, x, trellis, suh, svh, l, g);
+    defer _ = mlx.mlx_array_free(part);
+    const fkey = RowsFinishRopeKey{ .out_dim = l.out_dim, .rows = l.rows, .nsplit = g.nsplit, .out_dt = l.out_dt, .hd = rp.hd, .rd = rp.rd };
+    const fcfg = rows_finish_rope_cfgs.get(fkey) orelse blk: {
+        const c = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &.{ l.rows, l.out_dim }, 2, l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "OutT", l.out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, @divExact(l.out_dim, 128) * 32, l.rows, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 32, 1, 1));
+        inline for (.{ "ODIM", "NSPLIT", "HD", "RD" }, .{ l.out_dim, g.nsplit, rp.hd, rp.rd }) |name, v|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, name, v));
+        rows_finish_rope_cfgs.put(fkey, c);
+        break :blk c;
+    };
+    const fk = try kernels.getNamedKernel(&rows_finish_rope_kernel, "sushi_exl3_rows_finish_rope", &.{ "part", "svh", "freqs", "pos" }, &.{"y"}, ROWS_FINISH_ROPE_SOURCE, ROWS_HELPERS);
+    const ov = try kernels.applyOuts(s, fk, &.{ part, svh, rp.freqs, rp.pos }, fcfg, 1);
     defer _ = mlx.mlx_vector_array_free(ov);
     var y = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(y);
