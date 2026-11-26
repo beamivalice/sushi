@@ -694,8 +694,10 @@ pub fn resolveSsdBudget(flag_bytes: u64, setting_gb: u32, streaming: bool) SsdBu
     return .{ .bytes = 0, .origin = .none, .setting_ignored = false };
 }
 
-/// The Macs a DeepSeek load picks its own `--ssd-budget-gb` on, by physical RAM.
+/// The Macs a load picks its own `--ssd-budget-gb` on, by physical RAM.
 pub const RamTier = enum {
+    gb48,
+    gb64,
     gb96,
     gb128,
     gb192,
@@ -703,17 +705,28 @@ pub const RamTier = enum {
 
     fn gib(self: RamTier) u64 {
         return switch (self) {
+            .gb48 => 48,
+            .gb64 => 64,
             .gb96 => 96,
             .gb128 => 128,
             .gb192 => 192,
             .gb256 => 256,
         };
     }
+
+    /// Whether the tier wants the pack's whole resident need as its default: a Mac that can hold the pack loads it
+    /// resident, one that cannot streams at the largest budget its limits and preflight admit.
+    fn wantsResident(self: RamTier) bool {
+        return switch (self) {
+            .gb48, .gb64, .gb192, .gb256 => true,
+            .gb96, .gb128 => false,
+        };
+    }
 };
 
 /// The tier `ram_bytes` belongs to, within 3% of its nominal size, or null.
 pub fn ramTier(ram_bytes: u64) ?RamTier {
-    for ([_]RamTier{ .gb96, .gb128, .gb192, .gb256 }) |tier| {
+    for (std.enums.values(RamTier)) |tier| {
         const nominal = tier.gib() << 30;
         if (ram_bytes *| 100 >= nominal * 97 and ram_bytes <= nominal * 103 / 100) return tier;
     }
@@ -756,9 +769,10 @@ pub const RamDefault = struct {
     bound_by: []const u8,
 };
 
-/// PURE: the budget a DeepSeek load takes with no flag and no setting. A 96 GB Mac streams at 80 GiB and a 128 GB Mac at
+/// PURE: the budget a load takes with no flag and no setting. A 96 GB Mac streams at 80 GiB and a 128 GB Mac at
 /// 96, or 108 once `iogpu.wired_limit_mb` is at least 120000;
-/// 192 and 256 GB Macs load fully resident (`resident_need`, the planner's bytes for it, 0 = the pack cannot).
+/// 48, 64, 192 and 256 GB Macs load fully resident (`resident_need`, the planner's bytes for it, 0 = the pack cannot)
+/// where the limits and the preflight hold it, else at the largest streamed budget they do.
 /// A budget the limits cannot hold beside `beside` (the 1M request bill and the image encode) steps down to the
 /// largest whole-GiB streamed budget they do, and one whose load needs more than `limits.free` (`preflight.needAt`,
 /// the load preflight's need) to the largest the preflight admits; none admitted leaves the preflight to refuse it.
@@ -787,7 +801,7 @@ fn limitsDefault(tier: RamTier, resident_need: u64, beside: u64, limits: BudgetL
     const wanted: u64 = switch (tier) {
         .gb96 => 80 * GiB,
         .gb128 => if (limits.wired_limit >= wired_limit_for_108) 108 * GiB else 96 * GiB,
-        .gb192, .gb256 => resident_need,
+        .gb48, .gb64, .gb192, .gb256 => resident_need,
     };
     const by_ceiling = limits.ceiling -| limits.margin -| beside;
     const by_wire = if (limits.user_wire > 0) limits.user_wire -| limits.user_wire_margin else std.math.maxInt(u64);
@@ -795,7 +809,7 @@ fn limitsDefault(tier: RamTier, resident_need: u64, beside: u64, limits: BudgetL
     if (wanted > 0 and wanted <= room)
         return .{
             .bytes = wanted,
-            .resident = tier == .gb192 or tier == .gb256,
+            .resident = tier.wantsResident(),
             .wanted_bytes = wanted,
             .bound_by = "",
             .wired_limit_mb = if (tier == .gb128 and wanted == 108 * GiB) limits.wired_limit >> 20 else 0,
@@ -834,7 +848,7 @@ fn stepDownLine(buf: []u8, d: RamDefault) []const u8 {
 }
 
 /// The refusal for a load that needs a budget and has no default: names the flag, the setting and the two tiers' defaults.
-pub const budget_required_message = "This checkpoint streams its experts from SSD and needs --ssd-budget-gb <n> or \"ssd_budget_gb\" in model-settings.json; with neither, a 96 GB Mac takes 80, a 128 GB Mac 96 (108 with iogpu.wired_limit_mb at 120000 or more), and a 192 or 256 GB Mac loads the pack fully resident.";
+pub const budget_required_message = "This checkpoint streams its experts from SSD and needs --ssd-budget-gb <n> or \"ssd_budget_gb\" in model-settings.json; with neither, a 48, 64, 192 or 256 GB Mac loads the pack fully resident where its memory holds it and else takes the largest budget that fits, a 96 GB Mac takes 80, and a 128 GB Mac 96 (108 with iogpu.wired_limit_mb at 120000 or more); a Mac of another memory size has no default.";
 
 /// The budget a DeepSeek load takes from its Mac's RAM tier. The planner is asked what holding every routed expert
 /// resident needs (a budget no pack exhausts), and the limits then decide whether that, or a streamed budget, fits.
@@ -1611,8 +1625,6 @@ test "a load with no flag and no setting takes its RAM tier's budget" {
     try t.expectEqual(RamTier.gb192, ramTier(192 * GiB).?);
     try t.expectEqual(RamTier.gb256, ramTier(256 * GiB).?);
     // Any other size has no default: the budget stays required.
-    try t.expectEqual(@as(?RamTier, null), ramTier(64 * GiB));
-    try t.expectEqual(@as(?RamTier, null), ramTier(48 * GiB));
     try t.expectEqual(@as(?RamTier, null), ramTier(512 * GiB));
     try t.expectEqual(@as(?RamTier, null), ramTier(0));
 
@@ -1753,6 +1765,111 @@ test "a default budget the load's free RAM cannot hold steps down to the largest
     // Free RAM too short for any budget leaves the default to the preflight, which refuses it by name.
     at.free = GiB;
     try t.expectEqual(108 * GiB, ramDefaultBudget(.gb128, 0, 5 * GB, at, preflight).bytes);
+}
+
+test "the 96, 128, 192 and 256 GB tiers choose what they chose before the 48 and 64 GB tiers joined" {
+    const t = testing;
+    const GiB: u64 = 1 << 30;
+    const roomy = BudgetLimits{ .ceiling = 400 * GiB, .ceiling_name = "the GPU working-set limit", .margin = GiB, .user_wire = 0, .user_wire_name = "", .user_wire_margin = GiB };
+    var raised = roomy;
+    raised.wired_limit = 125_000 << 20;
+    var tight = roomy;
+    tight.ceiling = 60 * GiB;
+    const cases = [_]struct { tier: RamTier, limits: BudgetLimits, need: u64, bytes: u64, resident: bool, wanted: u64, bound: []const u8 }{
+        .{ .tier = .gb96, .limits = roomy, .need = 90 * GiB, .bytes = 80 * GiB, .resident = false, .wanted = 80 * GiB, .bound = "" },
+        .{ .tier = .gb96, .limits = tight, .need = 0, .bytes = 52 * GiB, .resident = false, .wanted = 80 * GiB, .bound = "the GPU working-set limit" },
+        .{ .tier = .gb128, .limits = roomy, .need = 0, .bytes = 96 * GiB, .resident = false, .wanted = 96 * GiB, .bound = "" },
+        .{ .tier = .gb128, .limits = raised, .need = 0, .bytes = 108 * GiB, .resident = false, .wanted = 108 * GiB, .bound = "" },
+        .{ .tier = .gb128, .limits = tight, .need = 0, .bytes = 52 * GiB, .resident = false, .wanted = 96 * GiB, .bound = "the GPU working-set limit" },
+        .{ .tier = .gb192, .limits = roomy, .need = 130 * GiB, .bytes = 130 * GiB, .resident = true, .wanted = 130 * GiB, .bound = "" },
+        .{ .tier = .gb192, .limits = tight, .need = 130 * GiB, .bytes = 52 * GiB, .resident = false, .wanted = 130 * GiB, .bound = "the GPU working-set limit" },
+        .{ .tier = .gb256, .limits = roomy, .need = 130 * GiB, .bytes = 130 * GiB, .resident = true, .wanted = 130 * GiB, .bound = "" },
+        .{ .tier = .gb256, .limits = tight, .need = 0, .bytes = 52 * GiB, .resident = false, .wanted = 0, .bound = "" },
+    };
+    for (cases) |c| {
+        const d = ramDefaultBudget(c.tier, c.need, 7 * GiB, c.limits, TestPreflight{});
+        errdefer std.debug.print("{s}: {d} GiB resident {}, wanted {d} GiB, bound by '{s}'\n", .{ @tagName(c.tier), d.bytes >> 30, d.resident, d.wanted_bytes >> 30, d.bound_by });
+        try t.expectEqual(c.bytes, d.bytes);
+        try t.expectEqual(c.resident, d.resident);
+        try t.expectEqual(c.wanted, d.wanted_bytes);
+        try t.expectEqualStrings(c.bound, d.bound_by);
+    }
+}
+
+test "a 48 and a 64 GB Mac are RAM tiers within 3% of their size; a 32 or 36 GB Mac has none and its load refuses by name" {
+    const t = testing;
+    const GiB: u64 = 1 << 30;
+    try t.expectEqual(@as(?RamTier, .gb64), ramTier(64 * GiB));
+    try t.expectEqual(@as(?RamTier, .gb48), ramTier(48 * GiB));
+    try t.expectEqual(@as(?RamTier, .gb64), ramTier(64 * GiB * 103 / 100));
+    try t.expectEqual(@as(?RamTier, .gb64), ramTier(621 * GiB / 10));
+    try t.expectEqual(@as(?RamTier, null), ramTier(614 * GiB / 10));
+    try t.expectEqual(@as(?RamTier, null), ramTier(32 * GiB));
+    try t.expectEqual(@as(?RamTier, null), ramTier(36 * GiB));
+    // A model that asks for a RAM default takes it on the Mac the machine reports, and a load with no budget source on a
+    // Mac with no tier refuses.
+    const asks = ModelConfig{ .serve_defaults = .{ .ram_budget = true } };
+    const was = status.total_mem_override;
+    defer status.total_mem_override = was;
+    status.total_mem_override = 64 * GiB;
+    try t.expectEqual(@as(?RamTier, .gb64), ramDefaultTierFor(&asks));
+    try requireBudgetSource(.{ .bytes = 0, .origin = .none, .setting_ignored = false }, ramDefaultTierFor(&asks));
+    status.total_mem_override = 36 * GiB;
+    try t.expectError(error.ExpertStreamingRequired, requireBudgetSource(.{ .bytes = 0, .origin = .none, .setting_ignored = false }, ramDefaultTierFor(&asks)));
+}
+
+/// A streamed plan's preflight need as the user's 64 GB Mac read it: a budget holds the pack resident from 46 GiB (47.2
+/// GiB needed in all) and, streamed, adds 4.2 GiB of warmup and context to the budget.
+const SixtyFourPreflight = struct {
+    pub fn needAt(_: SixtyFourPreflight, budget: u64) ?u64 {
+        const GiB: u64 = 1 << 30;
+        return @min(budget + 42 * GiB / 10, 472 * GiB / 10);
+    }
+};
+
+test "a 64 GB Mac with no budget flag loads the pack resident where it fits, else at the largest streamed budget its preflight admits, never a refusal while one fits" {
+    const t = testing;
+    const GiB: u64 = 1 << 30;
+    // `iogpu.wired_limit_mb=60000` and both user-wire limits raised.
+    const wired: u64 = 60_000 << 20;
+    const limits = BudgetLimits{ .wired_limit = wired, .ceiling = wired, .ceiling_name = "iogpu.wired_limit_mb", .margin = GiB, .user_wire = wired, .user_wire_name = "vm.global_user_wire_limit", .user_wire_margin = GiB };
+    const resident_need = 472 * GiB / 10;
+    const beside = 3 * GiB;
+    // 45.2 GiB free: the resident default does not fit it, so it steps down to what does.
+    var idle = limits;
+    idle.free = 452 * GiB / 10;
+    const d = ramDefaultBudget(.gb64, resident_need, beside, idle, SixtyFourPreflight{});
+    errdefer std.debug.print("64 GB: {d} GiB resident {}, wanted {d} B, bound by '{s}'\n", .{ d.bytes >> 30, d.resident, d.wanted_bytes, d.bound_by });
+    try t.expectEqual(41 * GiB, d.bytes);
+    try t.expect(!d.resident);
+    try t.expectEqual(resident_need, d.wanted_bytes);
+    try t.expectEqualStrings("free RAM", d.bound_by);
+    try t.expect(SixtyFourPreflight.needAt(.{}, d.bytes).? <= idle.free.?);
+    try t.expect(SixtyFourPreflight.needAt(.{}, d.bytes + GiB).? > idle.free.?);
+    // Free RAM that holds the pack loads it resident, and the load line names no limit.
+    idle.free = 50 * GiB;
+    const resident = ramDefaultBudget(.gb64, resident_need, beside, idle, SixtyFourPreflight{});
+    try t.expect(resident.resident);
+    try t.expectEqual(resident_need, resident.bytes);
+    try t.expectEqualStrings("", resident.bound_by);
+    // A pack the limits cannot hold resident, or one with no resident layout, streams at the largest budget they admit.
+    const big = ramDefaultBudget(.gb64, 90 * GiB, beside, limits, SixtyFourPreflight{});
+    try t.expect(!big.resident);
+    try t.expectEqual((wired - GiB - beside) / GiB * GiB, big.bytes);
+    const none = ramDefaultBudget(.gb64, 0, beside, limits, SixtyFourPreflight{});
+    try t.expect(!none.resident);
+    try t.expectEqual((wired - GiB - beside) / GiB * GiB, none.bytes);
+    // The 48 GB Mac reads the same rule at its own limits.
+    const wired48: u64 = 36_000 << 20;
+    var lim48 = BudgetLimits{ .wired_limit = wired48, .ceiling = wired48, .ceiling_name = "iogpu.wired_limit_mb", .margin = GiB, .user_wire = wired48, .user_wire_name = "vm.global_user_wire_limit", .user_wire_margin = GiB };
+    lim48.free = 30 * GiB;
+    const small = ramDefaultBudget(.gb48, 20 * GiB, beside, lim48, SixtyFourPreflight{});
+    try t.expect(small.resident);
+    try t.expectEqual(20 * GiB, small.bytes);
+    const stepped = ramDefaultBudget(.gb48, resident_need, beside, lim48, SixtyFourPreflight{});
+    try t.expect(!stepped.resident);
+    try t.expect(stepped.bytes > 0 and stepped.bytes <= 25 * GiB);
+    try t.expect(SixtyFourPreflight.needAt(.{}, stepped.bytes).? <= lim48.free.?);
 }
 
 test "only a model with serve defaults takes a RAM-tier default, and the load lines name the arm" {

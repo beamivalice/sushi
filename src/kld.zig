@@ -1206,7 +1206,7 @@ test "kld: a streamed load with no flag and no setting takes serve's RAM default
     defer cfg.deinit(testing.allocator);
     try testing.expect(cfg.expertStreamingRequired());
     const none = model_load.resolveSsdBudget(0, cfg.ssd_budget_gb_override, cfg.supportsExpertStreaming());
-    for ([_]model_load.RamTier{ .gb96, .gb128, .gb192, .gb256 }) |tier| {
+    for (std.enums.values(model_load.RamTier)) |tier| {
         var serve_wait: bills.SettleBudget = .{};
         var got_wait: bills.SettleBudget = .{};
         const serve = model_load.ramDefaultFor(io, testing.allocator, &cfg, fixture, tier, false, 0, &serve_wait);
@@ -1215,7 +1215,7 @@ test "kld: a streamed load with no flag and no setting takes serve's RAM default
         try testing.expectEqual(serve.bytes, got.bytes);
         try testing.expectEqual(serve.wired_limit_mb, got.wired_limit_mb);
         // A big tier is resident unless this box's own limits stepped it down, which the default says.
-        if (tier == .gb192 or tier == .gb256) try testing.expect(serve.resident or serve.bound_by.len > 0);
+        if (tier != .gb96 and tier != .gb128) try testing.expect(serve.resident or serve.bound_by.len > 0);
     }
     var none_wait: bills.SettleBudget = .{};
     try testing.expectError(error.ExpertStreamingRequired, model_load.withRamDefault(io, testing.allocator, &cfg, fixture, none, null, false, 0, &none_wait));

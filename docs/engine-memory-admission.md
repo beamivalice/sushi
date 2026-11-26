@@ -149,6 +149,7 @@ bill function's output on the committed fixture configs of all served packs: a b
 - An ssd budget below what a streamed pack holds beside two cache slots per layer (`SsdBudgetBelowResident`) is refused naming the smallest budget its planner makes and what that plan holds (`bills.smallestBudgetGb`, `ssdBudgetBelowText`).
 - A RAM default the GPU memory limit leaves no room for (0 GiB) is that same refusal, never a 500 `ExpertCacheTooSmall`,
   on the registry gate and the load alike (`model_load.ssdBudgetBelowRefusal`, one text naming where the budget came from).
+- A 48 or 64 GB Mac (`RamTier.gb48`, `.gb64`, within 3% of its size) wants the pack's resident need as its default, as 192 and 256 GB do: the limits then the preflight step it down to the largest streamed budget they admit (`ramDefaultBudget`), so a load with no budget flag serves whenever some budget fits; only a Mac in no tier (32, 36 GB) refuses with `ExpertStreamingRequired`.
 - A memory refusal resets its entry to `.unloaded`, so every later request to the model runs its checks again and gets
   the whole refusal they write, re-read (server test "every request to a model whose load is refused for memory").
 - Every refusal a client reads, a fixed one included (a mid-request memory refusal, an image encode that does not fit, a model not loaded, a shutdown), says what can help its own bound, actions one per line: a setting by its Settings label and its flag, a launch-only flag said to be one, never an internal term (the engine's cap, a patch block) as the action.

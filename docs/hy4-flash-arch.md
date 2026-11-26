@@ -427,7 +427,7 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     cells: a bank in each order, decode to a prefill). A load skips every `__pad__.` key a repack lays between
     trellises (never loaded or billed). With
     no flag and no setting Hy4 takes the RAM-tier default as DeepSeek does (`serveDefaults.ram_budget`): the 4bpw
-    pack's 512 slots a layer (74.68 GB, a need of about 81 GB) resident on a 192 or 256 GB Mac; Engram's tables are
+    pack's 512 slots a layer (74.68 GB, a need of about 81 GB) resident on a 192 or 256 GB Mac (a 48 or 64 GB Mac takes the same rule: resident where its limits and free RAM hold the pack, else the largest streamed budget they admit); Engram's tables are
     never in it, they are read by row from SSD. The vision tower stays on such a load (`vision_on_streamed`): 512 slots
     beside it on 128 GB and up, 390 on 96 GB; `--no-vision` drops it.
   - A request that omits `max_tokens` gets 65,536 (`serveDefaults.max_tokens`), the completion cap Tencent serves the
