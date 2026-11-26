@@ -4845,13 +4845,15 @@ test "r174-f-closer-hold: a tools stream's reasoning and content deltas are the 
     }
 }
 
-test "format corpus: an arg_key value that lost its close and its call's close ends at the next call, which ships, and the open call is declined and named" {
+test "format corpus: an arg_key call that lost its close, its value's or its own, ends at the next call, which ships, and the open call is declined and named" {
     const allocator = testing.allocator;
     const shapes = [_][]const u8{
         // The value and the call both lost their close.
         "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt",
         // The call's close came while the value was open.
         "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</tool_call>",
+        // Only the call lost its close.
+        "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value>",
     };
     const next = "<tool_call>write<arg_key>path</arg_key><arg_value>b.txt</arg_value></tool_call>";
     for (shapes) |lost| for ([_][]const u8{ "", hy4_open }) |open| for ([_][]const u8{ "stop", "length" }) |finish| {
@@ -4859,12 +4861,43 @@ test "format corpus: an arg_key value that lost its close and its call's close e
         defer allocator.free(text);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
         const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
-        const got = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
-        defer got.deinit(allocator);
-        const calls = (got.reply orelse return error.NextCallDropped).calls;
-        try testing.expectEqual(@as(usize, 1), calls.len);
-        try testing.expectEqualStrings("write", calls[0].name);
-        try testing.expectEqualStrings("{\"path\":\"b.txt\"}", calls[0].arguments);
-        try testing.expectEqualStrings("read", (got.declined orelse return error.OpenCallNotDeclined).name orelse return error.OpenCallNotDeclined);
+        const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer whole.deinit(allocator);
+        const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
+        defer streamed.deinit(allocator);
+        for ([_]reply_mod.Settled{ whole, streamed }) |got| {
+            const calls = (got.reply orelse return error.NextCallDropped).calls;
+            try testing.expectEqual(@as(usize, 1), calls.len);
+            try testing.expectEqualStrings("write", calls[0].name);
+            try testing.expectEqualStrings("{\"path\":\"b.txt\"}", calls[0].arguments);
+            try testing.expectEqualStrings("read", (got.declined orelse return error.OpenCallNotDeclined).name orelse return error.OpenCallNotDeclined);
+        }
     };
+}
+
+test "format corpus: a stream and the whole reply agree at every cut of two arg_key calls the first lost its close of, and a call the model did not finish never ships" {
+    const allocator = testing.allocator;
+    const lost = "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value>";
+    const next = "<tool_call>write<arg_key>path</arg_key><arg_value>b.txt</arg_value></tool_call>";
+    for ([_][]const u8{ "", hy4_open }) |open| {
+        const text = try std.mem.concat(allocator, u8, &.{ open, lost, next, if (open.len > 0) hy4_close else "" });
+        defer allocator.free(text);
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
+        for (0..text.len + 1) |cut| {
+            errdefer std.debug.print("[cut {d}] {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
+            const whole = try reply_mod.settle(allocator, .{ .text = text[0..cut], .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
+            defer whole.deinit(allocator);
+            const streamed = try reply_mod.settle(allocator, .{ .text = text[0..cut], .source = .{ .gated = null }, .finish_reason = "stop", .finish_details = null }, ask);
+            defer streamed.deinit(allocator);
+            const a = if (whole.reply) |r| r.calls else &.{};
+            const b = if (streamed.reply) |r| r.calls else &.{};
+            try testing.expectEqual(a.len, b.len);
+            for (a, b) |x, y| {
+                try testing.expectEqualStrings(x.name, y.name);
+                try testing.expectEqualStrings(x.arguments, y.arguments);
+                try testing.expect(!std.mem.eql(u8, x.name, "read"));
+            }
+            try testing.expectEqualStrings(if (whole.declined) |d| d.name orelse "" else "", if (streamed.declined) |d| d.name orelse "" else "");
+        }
+    }
 }
