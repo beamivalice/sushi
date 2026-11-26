@@ -2015,6 +2015,84 @@ test "hy4 plan: joined ticks of 2, 3 and 8 requests at different positions run a
     }
 }
 
+test "hy4 plan: a joined tick of every width the load joins, its rows all at any one recorded position, runs as an execution of its root with no miss (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const keep_was = m.keep_hidden;
+    defer m.keep_hidden = keep_was;
+    m.keep_hidden = false;
+    const positions = try hy4_plan.decodePositions(a, &m.config, m.plans.?.reach);
+    defer a.free(positions);
+    const widths = [_]usize{ 2, 3, 5, 8 };
+    var xfm: @import("../trunk.zig").Trunk = undefined;
+    xfm.arch_state = .{};
+    xfm.arch_state.hy4flash.model = m;
+    xfm.s = ld.xfm.s;
+    xfm.expert_stream = null;
+    // The recording takes each position in a tick beside others; a tick whose rows all stand at one is the case the
+    // recording never ran as such.
+    for (widths) |n| for (positions) |pos| {
+        if (pos == 0 or pos + 1 >= ids.len) continue;
+        var reqs: [8]hy4_model_mod.Request = undefined;
+        var made: usize = 0;
+        defer for (reqs[0..made]) |*r| r.deinit();
+        var caches: [8]kv_cache_mod.KVCache = undefined;
+        var cc: usize = 0;
+        defer for (caches[0..cc]) |*c| a.free(c.entries);
+        var ctxs: [8]handle_mod.ForwardCtx = undefined;
+        var ptrs: [8]*handle_mod.ForwardCtx = undefined;
+        var tokens: [8]u32 = undefined;
+        var offsets: [8]usize = @splat(0);
+        for (0..n) |i| {
+            reqs[i] = try hy4_model_mod.Request.init(a, 0);
+            made = i + 1;
+            {
+                const lent = m.lend(&reqs[i]);
+                defer lent.end();
+                try m.reserveFor(pos + 1);
+                _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..pos], .none));
+            }
+            caches[i] = try kv_cache_mod.KVCache.init(a, @intCast(m.config.layers));
+            cc = i + 1;
+            caches[i].step = pos;
+            ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .arch_ctx = .{} };
+            ctxs[i].arch_ctx.hy4flash.request = &reqs[i];
+            ptrs[i] = &ctxs[i];
+            tokens[i] = ids[pos];
+        }
+        const before = core.stats();
+        var dummy: [8]@import("../scheduler.zig").Slot = undefined;
+        @memset(std.mem.asBytes(&dummy), 0);
+        var slot_ptrs: [8]*@import("../scheduler.zig").Slot = undefined;
+        for (0..n) |i| {
+            dummy[i].legacy_gen = null;
+            slot_ptrs[i] = &dummy[i];
+        }
+        var batch: []*@import("../scheduler.zig").Slot = slot_ptrs[0..n];
+        const out = try hy4_sched_mod.batchedForward(undefined, a, &xfm, &batch, tokens[0..n], ptrs[0..n], &.{}, .{}, null);
+        defer {
+            for (out[0..n]) |o| _ = mlx.mlx_array_free(o);
+            a.free(out);
+        }
+        const after = core.stats();
+        errdefer std.debug.print("width {d}, all rows at {d}: wide {d} exec {d} miss {any}\n", .{ n, pos, after.wide_executions - before.wide_executions, after.executions - before.executions, core.executionMiss() });
+        try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
+        try testing.expectEqual(@as(u64, 0), after.wide_executions - before.wide_executions);
+        try testing.expectEqual(@as(u64, 1), after.executions - before.executions);
+    };
+}
+
 test "hy4 plan: joined ticks of 9, 12 and 16 requests run as executions of their root with no wide ask and each row its solo one-row bytes (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -2217,5 +2295,9 @@ test "hy4 plan: a joined root records its grouped attention at one depth past th
     const traces = for (p.book.roots.items) |r| {
         if (r.id.eql(id)) break r.traces.items.len;
     } else 0;
-    try testing.expectEqual(positions.len + 1, traces);
+    // One trace a tick of two rows, each tick two positions in order (the positions past the window a tick of their
+    // own), and one more for the grouped attention at the first of those.
+    var below: usize = 0;
+    for (positions) |n| below += @intFromBool(n + 1 <= m.config.window);
+    try testing.expectEqual((below + 1) / 2 + (positions.len - below + 1) / 2 + 1, traces);
 }

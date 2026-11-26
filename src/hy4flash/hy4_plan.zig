@@ -49,7 +49,9 @@ pub fn joinedRows(config: *const @import("../model.zig").ModelConfig) usize {
 
 /// One shape a root is recorded at: its rows after a state `n` rows deep; a target's forward, or DFly2's draft
 /// (`Drafter.draft`) from a state `n` rows deep and the handover of its last row.
-pub const Probe = struct { rows: usize, readout: Readout, keep_hidden: bool, kv: KVQuantConfig, n: usize = 0, phase: Phase = .forward, drafter: ?*const Drafter = null, groups: []const u16 = &.{} };
+pub const Probe = struct { rows: usize, readout: Readout, keep_hidden: bool, kv: KVQuantConfig, n: usize = 0, phase: Phase = .forward, drafter: ?*const Drafter = null, groups: []const u16 = &.{},
+    /// A joined probe's rows each at its own depth (`n` is the first's); empty: every row at `n`.
+    ns: []const usize = &.{} };
 
 pub const Phase = enum {
     forward,
@@ -379,10 +381,10 @@ fn recordJoined(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, f
         defer state_driver.deinit();
         try core.beginRecording(.{ .dry = .{ .driver = &state_driver } }, &rec);
         defer core.endRecording() catch {};
-        for (reqs[0..n]) |*r| {
+        for (reqs[0..n], 0..) |*r, i| {
             const lent = m.lend(r);
             defer lent.end();
-            try m.dryState(probe.n, reach);
+            try m.dryState(if (probe.ns.len > 0) probe.ns[i] else probe.n, reach);
         }
         if (held[0] != null) try m.makeLogitsBlocks();
     }
@@ -701,12 +703,23 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
         if (n + 1 > m.config.window) break n;
     } else null;
     defer m.joined_grouped_at = null;
+    // Its rows' keys are each row's own, so one tick records as many positions as it has rows: each width takes the
+    // positions in order, `rows` a tick. The positions past the window start a tick of their own, every row of it past
+    // the window, the one the grouped attention is recorded at.
+    const grouped_from = if (m.joined_grouped_at) |g| std.mem.indexOfScalar(usize, positions, g).? else positions.len;
     if (joined > 1) for (2..@min(joined, reach) + 1) |rows| {
-        for (positions) |n| {
-            var probe = joinedRoot(rows, m.keep_hidden, kv);
-            probe.n = n;
-            try addProbe(m, gpa, p, probe, reach);
-            probes += 1;
+        for ([_][2]usize{ .{ 0, grouped_from }, .{ grouped_from, positions.len } }) |span| {
+            var at = span[0];
+            while (at < span[1]) : (at += rows) {
+                var ns: [joined_rows_max]usize = undefined;
+                // A short last tick repeats its segment's last position.
+                for (ns[0..rows], 0..) |*d, i| d.* = positions[@min(at + i, span[1] - 1)];
+                var probe = joinedRoot(rows, m.keep_hidden, kv);
+                probe.n = ns[0];
+                probe.ns = ns[0..rows];
+                try addProbe(m, gpa, p, probe, reach);
+                probes += 1;
+            }
         }
     };
     if (joined > 1 and drafts) for (2..@min(joined, @as(usize, @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX))) + 1) |slots| {
