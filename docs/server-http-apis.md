@@ -115,7 +115,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - `tool_choice` reads every surface's wire shape; `required`/`any` and a named function are enforced at decode, a
   named function the request does not declare is a 400 ([server-tool-calling](server-tool-calling.md#tool_choice)).
 - `/v1/models` `bytes_on_disk` is the bytes the pack reads, symlinked shards included, less a shard holding only tables
-  its arch reads from the SSD (the Engram tables of Hy4-Flash and DeepSeek, `Facts.ssd_tables`); `bytes_linked` (0 when none) is the part
+  its arch reads from the SSD (the Engram tables of Hy4-Flash and DeepSeek, `Facts.ssd_tables`; found by the index, or by each shard's header when the pack has no usable index); `bytes_linked` (0 when none) is the part
   that comes through symlinks to files outside the pack folder (a symlink inside it counts as the pack's own), so disk use is
   `bytes_on_disk - bytes_linked`. The Models tab details show it as "linked from elsewhere".
 - `/v1/models` `bytes_total` (absent when the folder holds nothing readable) is the sum of every regular file in the pack's

@@ -36,6 +36,7 @@ earlier history is mlx-serve's, in that project's changelog.
   migrates Hy4-Flash STQ packs, every routed shard's stamp is checked before a weight loads, and a fully resident
   DeepSeek load decodes several requests at once up to 8% faster with the same text.
 - A reload that lowers a model's `max_kv_tokens` now holds its context under the new cap, so a request is clamped to it instead of refused.
+- A Hy4-Flash or DeepSeek pack with no index no longer counts its Engram tables in its in-memory size.
 
 ---
 

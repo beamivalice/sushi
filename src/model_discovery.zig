@@ -23,6 +23,7 @@ const dflash = @import("dflash.zig");
 const mtp = @import("mtp.zig");
 const expert_stream = @import("expert_stream.zig");
 const expert_quant = @import("expert_quant.zig");
+const expert_io = @import("expert_io.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const arch_config = @import("arch/config.zig");
 
@@ -146,10 +147,46 @@ pub fn indexShardSet(io: std.Io, dir: std.Io.Dir) ?std.StringHashMapUnmanaged(vo
     return set;
 }
 
-/// The shards of `model.safetensors.index.json` every tensor of which names one of `fragments`; null when there are no
-/// fragments or no usable index. Free with `freeShardSet`.
-fn ssdTableShards(io: std.Io, dir: std.Io.Dir, fragments: []const []const u8) ?std.StringHashMapUnmanaged(void) {
+/// The shards every tensor of which names one of `fragments`, read from the index when `index_usable`, else from each
+/// top-level shard's header (the way the Engram reader finds a table); null when there are no fragments. A shard whose
+/// header cannot be read is not one. Free with `freeShardSet`.
+fn ssdTableShards(io: std.Io, dir: std.Io.Dir, fragments: []const []const u8, index_usable: bool) ?std.StringHashMapUnmanaged(void) {
     if (fragments.len == 0) return null;
+    if (!index_usable) return ssdTableShardsByHeader(io, dir, fragments);
+    return ssdTableShardsByIndex(io, dir, fragments);
+}
+
+fn namesFragment(name: []const u8, fragments: []const []const u8) bool {
+    for (fragments) |f| if (std.mem.indexOf(u8, name, f) != null) return true;
+    return false;
+}
+
+fn ssdTableShardsByHeader(io: std.Io, dir: std.Io.Dir, fragments: []const []const u8) ?std.StringHashMapUnmanaged(void) {
+    const a = std.heap.page_allocator;
+    var set: std.StringHashMapUnmanaged(void) = .empty;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        var file = dir.openFile(io, entry.name, .{}) catch continue;
+        defer file.close(io);
+        var header = expert_io.SafetensorsHeader.read(a, file.handle) catch continue;
+        defer header.deinit();
+        if (header.parsed.value != .object) continue;
+        var tensors: usize = 0;
+        const only_tables = for (header.parsed.value.object.keys()) |k| {
+            if (std.mem.eql(u8, k, "__metadata__")) continue;
+            if (!namesFragment(k, fragments)) break false;
+            tensors += 1;
+        } else tensors > 0;
+        if (!only_tables) continue;
+        const key = a.dupe(u8, entry.name) catch continue;
+        set.put(a, key, {}) catch a.free(key);
+    }
+    return set;
+}
+
+fn ssdTableShardsByIndex(io: std.Io, dir: std.Io.Dir, fragments: []const []const u8) ?std.StringHashMapUnmanaged(void) {
     const a = std.heap.page_allocator;
     const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return null;
     defer a.free(raw);
@@ -163,9 +200,7 @@ fn ssdTableShards(io: std.Io, dir: std.Io.Dir, fragments: []const []const u8) ?s
     var it = wm.object.iterator();
     while (it.next()) |e| {
         if (e.value_ptr.* != .string) continue;
-        const is_table = for (fragments) |f| {
-            if (std.mem.indexOf(u8, e.key_ptr.*, f) != null) break true;
-        } else false;
+        const is_table = namesFragment(e.key_ptr.*, fragments);
         const got = table.getOrPut(a, e.value_ptr.string) catch return null;
         got.value_ptr.* = if (got.found_existing) got.value_ptr.* and is_table else is_table;
     }
@@ -697,7 +732,7 @@ fn weightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) struct { byt
     var found = false;
     var referenced = indexShardSet(io, dir);
     defer if (referenced) |*r| freeShardSet(r);
-    var ssd_only = ssdTableShards(io, dir, factsOf(model_type).ssd_tables);
+    var ssd_only = ssdTableShards(io, dir, factsOf(model_type).ssd_tables, referenced != null);
     defer if (ssd_only) |*r| freeShardSet(r);
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
@@ -1853,4 +1888,80 @@ test "parseStubMeta: the RoPE the config.json itself declares, native window fir
 
     const flat = parseStubMeta(a, "{\"model_type\":\"qwen4_exp\",\"max_position_embeddings\":32768}", true);
     try std.testing.expectEqual(@as(u32, 32768), flat.rope.native);
+}
+
+fn writeTestShard(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, names: []const []const u8) !void {
+    const a = std.testing.allocator;
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(a);
+    try header.append(a, '{');
+    for (names, 0..) |n, i| {
+        if (i > 0) try header.append(a, ',');
+        const part = try std.fmt.allocPrint(a, "\"{s}\":{{\"dtype\":\"U8\",\"shape\":[4],\"data_offsets\":[{d},{d}]}}", .{ n, i * 4, i * 4 + 4 });
+        defer a.free(part);
+        try header.appendSlice(a, part);
+    }
+    try header.append(a, '}');
+    var file: std.ArrayList(u8) = .empty;
+    defer file.deinit(a);
+    var len: [8]u8 = undefined;
+    std.mem.writeInt(u64, &len, header.items.len, .little);
+    try file.appendSlice(a, &len);
+    try file.appendSlice(a, header.items);
+    try file.appendNTimes(a, 'x', names.len * 4);
+    try dir.writeFile(io, .{ .sub_path = sub_path, .data = file.items });
+}
+
+test "a pack with no index leaves out a shard whose every tensor is an arch SSD table" {
+    try test_note.needArchs(&.{ "hy4flash", "dsv41" });
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const packs = [_]struct { dir: []const u8, config: []const u8, table: []const u8 }{
+        .{ .dir = "hy4", .config = "{\"model_type\":\"hy_v4_flash\"}", .table = "model.layers.1.engram_layer.multi_head_embedding.embedding.weight" },
+        .{ .dir = "ds", .config = "{\"model_type\":\"deepseek_v41\"}", .table = "layers.1.engram.embed.weight" },
+    };
+    for (packs) |pk| {
+        const table = pk.table;
+        try tmp.dir.createDirPath(io, pk.dir);
+        var buf: [64]u8 = undefined;
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/config.json", .{pk.dir}), .data = pk.config });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/model.safetensors", .{pk.dir}), .data = "0123" });
+        try writeTestShard(io, tmp.dir, try std.fmt.bufPrint(&buf, "{s}/engram-model.safetensors", .{pk.dir}), &.{table});
+        // A shard holding a trunk tensor beside a table is weights.
+        try writeTestShard(io, tmp.dir, try std.fmt.bufPrint(&buf, "{s}/mixed.safetensors", .{pk.dir}), &.{ table, "model.norm.weight" });
+    }
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.models.len);
+    for (packs) |pk| {
+        var buf: [64]u8 = undefined;
+        const mixed_len = (try tmp.dir.statFile(io, try std.fmt.bufPrint(&buf, "{s}/mixed.safetensors", .{pk.dir}), .{})).size;
+        for (result.models) |m| if (std.mem.eql(u8, m.id, pk.dir)) try std.testing.expectEqual(@as(?u64, 4 + mixed_len), m.bytes_on_disk);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var d = try tmp.dir.openDir(io, pk.dir, .{});
+        defer d.close(io);
+        const n = try d.realPath(io, &path_buf);
+        const probe = try probeModelDir(io, allocator, path_buf[0..n]);
+        try std.testing.expectEqual(@as(?u64, 4 + mixed_len), probe.bytes_on_disk);
+    }
+}
+
+test "a stale index leaves out an arch SSD table shard by its header, not by the stale index's names" {
+    try test_note.needArchs(&.{"hy4flash"});
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const table = "model.layers.1.engram_layer.multi_head_embedding.embedding.weight";
+    try tmp.dir.createDirPath(io, "hy4");
+    try tmp.dir.writeFile(io, .{ .sub_path = "hy4/config.json", .data = "{\"model_type\":\"hy_v4_flash\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "hy4/model-1.safetensors", .data = "0123" });
+    // The index names no shard present: stale, so the headers decide.
+    try writeTestShard(io, tmp.dir, "hy4/old.safetensors", &.{table});
+    try tmp.dir.writeFile(io, .{ .sub_path = "hy4/model.safetensors.index.json", .data = "{\"weight_map\":{\"model.norm.weight\":\"gone.safetensors\"}}" });
+    var d = try tmp.dir.openDir(io, "hy4", .{ .iterate = true });
+    defer d.close(io);
+    const w = weightBytes(io, d, "hy_v4_flash");
+    try std.testing.expectEqual(@as(?u64, 4), w.bytes);
 }
