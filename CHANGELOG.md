@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- A model load no longer asks for 1 GiB of free memory beyond what it holds, so a pack that just fits a Mac's free memory loads.
 - A 48 or 64 GB Mac loads a streamed DeepSeek-V4.1 or Hy4-Flash pack with no `--ssd-budget-gb`: the load takes the pack resident where its memory holds it, else the largest streamed budget its limits and free RAM admit, and logs which limit stepped it down.
 - A request that names another `kv_quant` than a Hy4-Flash load serves is refused with one text that names the width the load serves.
 - A streamed DeepSeek-V4.1 load's `--ssd-prefetch` now engages under a small read budget, measures the SSD's read rate without

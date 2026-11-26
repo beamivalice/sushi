@@ -8344,9 +8344,6 @@ pub fn effectiveSushiAvailableBytes(host_avail: u64, proc_avail: u64, gpu_limit:
     return sushiAvailable(host_avail, proc_avail, gpu_limit, active, wired_floor).bytes;
 }
 
-/// Free memory a load keeps beyond everything it bills: allocator slack and pages macOS has not yet handed back.
-pub const LOAD_SAFETY_NET_BYTES: u64 = 1 << 30;
-
 /// What a load's warmup allocates above its billed weights: the measured peak over the billed bytes at
 /// each architecture's worst setting, rounded up (engine-memory-admission.md#load-warmup).
 pub fn loadWarmupBytes(config: *const model_mod.ModelConfig, mtp_on: bool) u64 {
@@ -8390,17 +8387,17 @@ pub fn warmRequestBill(config: *const model_mod.ModelConfig, kv_bits: u64, chunk
 /// A streamed load holds the cache, the whole-layer fill union and the bounce buffers beside the resident trunk; then its
 /// served warm needs `warm_need_bytes` (`warmNeedBytes`) free.
 pub fn streamedLoadRequirementBytes(resident_bytes: u64, cache_bytes: u64, fill_peak_bytes: u64, bounce_bytes: u64, warm_need_bytes: u64) u64 {
-    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| LOAD_SAFETY_NET_BYTES +| warm_need_bytes;
+    return expertStreamingGateBytes(resident_bytes, cache_bytes, fill_peak_bytes, bounce_bytes) +| warm_need_bytes;
 }
 
-/// Free memory a load demands: its billed weights, then the larger of the warmup transient plus the safety net and
+/// Free memory a load demands: its billed weights, then the larger of the warmup transient and
 /// the requested context's admission bill (the warmup ends before any request allocates).
 pub fn loadRequirementBytes(config: *const model_mod.ModelConfig, weights_bytes: u64, mtp_on: bool, context_bill: u64) u64 {
     const held = weights_bytes;
     if (config.expert_streaming) return streamedLoadRequirementBytes(held, config.expert_cache_bytes, loadStagingBytes(config, config.expert_fill_peak_bytes, config.expert_workspace_bytes), config.expert_bounce_bytes, warmNeedBytes(config));
     // A load on Sushi Cooler runs its served warm once the load's own transient is gone.
     const warm = if (@import("cooler_side.zig").onEngine(config)) warmNeedBytes(config) else 0;
-    return held +| @max(@max(loadWarmupBytes(config, mtp_on) +| LOAD_SAFETY_NET_BYTES, context_bill), warm);
+    return held +| @max(@max(loadWarmupBytes(config, mtp_on), context_bill), warm);
 }
 
 
@@ -8742,14 +8739,14 @@ test "effectiveAvailableBytes prefers the per-process jetsam headroom when prese
     try std.testing.expectEqual(@as(?u64, 4 * GB), effectiveAvailableBytes(4 * GB, 0, 0)); // macOS: proc query = 0 → host
 }
 
-test "a streamed load bills its trunk, expert cache, fill union and bounce buffers plus the net, and its warm's narrowest chunk" {
+test "a streamed load bills its trunk, expert cache, fill union and bounce buffers, and its warm's narrowest chunk" {
     if (!archBuilt("qwen4")) return error.SkipZigTest;
     const gib: u64 = 1 << 30;
     const cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .expert_streaming = true, .expert_cache_bytes = 12 * gib, .expert_fill_peak_bytes = 2 * gib, .expert_bounce_bytes = gib / 2 };
     const warm = warmFloorChunkBytes(&cfg);
     try testing.expect(warm > 0);
     try testing.expectEqual(warm, warmNeedBytes(&cfg));
-    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + gib + warm, loadRequirementBytes(&cfg, 6 * gib, true, 0));
+    try testing.expectEqual(6 * gib + 12 * gib + 2 * gib + gib / 2 + warm, loadRequirementBytes(&cfg, 6 * gib, true, 0));
     try testing.expectEqual(loadRequirementBytes(&cfg, 6 * gib, true, 0), streamedLoadRequirementBytes(6 * gib, 12 * gib, 2 * gib, gib / 2, warmNeedBytes(&cfg)));
 }
 
@@ -8801,10 +8798,10 @@ test "bill pin: loadWarmupBytes" {
 
 test "bill pin: loadRequirementBytes" {
     try pinLoadConfigs("loadRequirementBytes", &.{
-        65632468992, 85899345920, 66840428544, 85899345920, 78467806720, 78467806720, 78467806720, 78467806720,
-        65766686720, 85899345920, 65766686720, 85899345920, 78898760288, 78898760288, 78898760288, 78898760288,
-        66060796416, 85899345920, 66060796416, 85899345920, 79266352320, 79266352320, 79266352320, 79266352320,
-        68229854208, 68229854208, 68229854208, 68229854208, 81114756096, 81114756096, 81114756096, 81114756096,
+        64558727168, 85899345920, 65766686720, 85899345920, 77394064896, 77394064896, 77394064896, 77394064896,
+        64692944896, 85899345920, 64692944896, 85899345920, 77825018464, 77825018464, 77825018464, 77825018464,
+        64987054592, 85899345920, 64987054592, 85899345920, 78192610496, 78192610496, 78192610496, 78192610496,
+        67156112384, 67156112384, 67156112384, 67156112384, 80041014272, 80041014272, 80041014272, 80041014272,
     }, struct {
         fn run(c: *const model_mod.ModelConfig, g: *PinGot) void {
             var streamed = c.*;
@@ -8823,7 +8820,7 @@ test "bill pin: streamedLoadRequirementBytes and expertStreamingGateBytes" {
     got.add(streamedLoadRequirementBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30, 1 << 30));
     got.add(expertStreamingGateBytes(5 << 30, 10 << 30, 2 << 30, 1 << 30));
     got.add(expertStreamingGateBytes(std.math.maxInt(u64), 1, 1, 1));
-    try pinEq("streamedLoadRequirementBytes", &.{ 21474836480, 19327352832, 18446744073709551615 }, got.slice());
+    try pinEq("streamedLoadRequirementBytes", &.{ 20401094656, 19327352832, 18446744073709551615 }, got.slice());
 }
 
 test "bill pin: rerankCoarseBill and the coarse head bytes" {

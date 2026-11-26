@@ -174,7 +174,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   `iogpu.wired_limit_mb`). The client-facing preflight message also names the Settings switch "Skip the memory check
   before loading", the twin of `--skip-mem-preflight` (`server.skip_mem_preflight`, read per load, flag > file > off).
 - **One bill, `loadRequirementBytes`**: the weights the loader bills (enabled tensors only: MTP head, vision tower,
-  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient plus a fixed 1 GiB net
+  DFlash2 assistant and its runtime cache) + the larger of the arch's measured warmup transient
   and the requested context's admission bill (the warmup ends before any request allocates). No proportional term,
   no flat headroom. The cold-load registry gates (`residentColdLoadBillBytes`, `glmColdLoadBillBytes`) call the same
   function, so gate and preflight read one number.
@@ -214,7 +214,7 @@ bill function's output on the committed fixture configs of all served packs: a b
   generation error mapping consumes the slot's diagnostic on its connection thread so it cannot leak into another
   request.
 - **A streamed load bills what it holds** (`streamedLoadRequirementBytes`): resident trunk, MTP and vision + the expert
-  cache + the whole-layer fill union + the bounce buffers + the MLX pool's decode cap (DeepSeek, `ModelConfig.expertPoolBytes`, 1 GiB) + the net; `expertCacheFitForLoad` separately proves the
+  cache + the whole-layer fill union + the bounce buffers + the MLX pool's decode cap (DeepSeek, `ModelConfig.expertPoolBytes`, 1 GiB); `expertCacheFitForLoad` separately proves the
   planned KV against the wired limit. GLM allocates KV row by row per request, so its load bill carries no context
   term; request admission bills it.
 - GLM evicts its hot cache to admit (`admissionEvictsHotCache`), and its context sizer reserves no cache. With the
@@ -288,6 +288,11 @@ width admission picks; the f32 default leaves 4.0 and 0.77 GiB (bill arithmetic 
 ([Checkpoints in the bill](#bill-checkpoints)): its 4096-width bill is 10,954 MiB at bf16 and 11,157 at f32, which
 leaves 2.7 and 2.5 GiB.
 Previous bills for the same boots: 46.20, 91.65, 91.91 and 7.27 GiB (the streamed one was 12 GiB under its peak).
+
+**No load net (owner, 2026-11-27).** The 1 GiB net in the table above is gone: a load needs its weights plus the larger
+of its warmup and its context bill free, and nothing flat beside them, so a 64 GB Mac with about 45 GiB free loads
+Hy4-Flash 2.25bpw `--no-vision --no-mtp` resident (44.5 GiB held). The table's bills are 1 GiB lower where a net
+stood; the slack beside a bill is now the arch's own transient margin.
 
 Other expert layouts of these archs bill the same terms; their warmup is not measured on this box.
 

@@ -2519,23 +2519,23 @@ test "a loaded model's hot-cache budget is the resolver's clamp, never the raw l
     try testing.expectEqual(forty_gb, hotCacheMemForLoad(true, null, &cfg, forty_gb, &idle));
 }
 
-test "a load bills weights, then the larger of the measured warmup plus a 1 GiB net and the context bill" {
+test "a load bills weights, then the larger of the measured warmup and the context bill" {
 
     try test_note.needArchs(&.{ "mimo2", "glm5" });
     const gib: u64 = 1 << 30;
     var f = try @import("bills_fixtures_test.zig").LoadBillFixtures.init();
     defer f.deinit();
     // Flash-Next's MTP head load peaks above its resident bytes, so only an MTP-on load pays for it.
-    try testing.expectEqual(44 * gib + gib / 8 + gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, false, 0));
-    try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, 0));
-    try testing.expectEqual(90 * gib + gib / 4 + gib, model_load.loadRequirementBytes(&f.mimo, 90 * gib, true, 0));
+    try testing.expectEqual(44 * gib + gib / 8, model_load.loadRequirementBytes(&f.qwen, 44 * gib, false, 0));
+    try testing.expectEqual(44 * gib + gib * 5 / 4, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, 0));
+    try testing.expectEqual(90 * gib + gib / 4, model_load.loadRequirementBytes(&f.mimo, 90 * gib, true, 0));
     const glm_state = f.glm.ssmCheckpointBytes() + f.glm.qsaRingBytes() + (f.glm.kvBytesPerToken() + f.glm.qsaHistoryBytesPerToken()) * 1024;
     try testing.expect(glm_state > 0);
-    try testing.expectEqual(90 * gib + glm_state + gib * 3 / 8 + gib, model_load.loadRequirementBytes(&f.glm, 90 * gib, false, 0));
-    // A requested context's admission bill replaces warmup and net once it is the larger: no request has allocated
+    try testing.expectEqual(90 * gib + glm_state + gib * 3 / 8, model_load.loadRequirementBytes(&f.glm, 90 * gib, false, 0));
+    // A requested context's admission bill replaces the warmup once it is the larger: no request has allocated
     // during the warmup, and request admission bills that context again.
     try testing.expectEqual(44 * gib + 6 * gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, 6 * gib));
-    try testing.expectEqual(44 * gib + gib * 5 / 4 + gib, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
+    try testing.expectEqual(44 * gib + gib * 5 / 4, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, gib));
     try testing.expectEqual(44 * gib + gib * 9 / 4, model_load.loadRequirementBytes(&f.qwen, 44 * gib, true, gib * 9 / 4));
 }
 
