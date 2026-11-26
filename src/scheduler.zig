@@ -7440,8 +7440,6 @@ const FreshCall = struct {
 };
 
 test "an explicit retry whose load turns ready before it is marked posted frees the kept failure's name" {
-    // Skipped by the owner for 1.8.1: it segfaults at every seed on an M5 Max 128 GB, an open bug to fix.
-    if (true) return error.SkipZigTest;
     const io = testing.io;
     if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -7460,6 +7458,8 @@ test "an explicit retry whose load turns ready before it is marked posted frees 
     // Hold the queue so the request stops at its post, then the registry once it has claimed.
     sch.queue_mu.lockUncancelable(io);
     var call: FreshCall = .{ .sch = &sch };
+    var cs: ?model_load.CpuState = null;
+    defer if (cs) |*s| model_load.freeCpuState(testing.allocator, s);
     const t = try std.Thread.spawn(.{}, FreshCall.run, .{&call});
     defer t.join();
     var claimed = false;
@@ -7492,8 +7492,7 @@ test "an explicit retry whose load turns ready before it is marked posted frees 
     const name_on_entry_while_loading = target.error_name != null;
     reg.markReadyLocked(target, 10);
     reg.mutex.unlock(io);
-    var cs: model_load.CpuState = .{ .config = req.config, .tok = req.tok, .chat_config = req.chat_config };
-    model_load.freeCpuState(testing.allocator, &cs);
+    cs = .{ .config = req.config, .tok = req.tok, .chat_config = req.chat_config };
     req.done_mu.lockUncancelable(io);
     req.outcome = .ok;
     req.done = true;
