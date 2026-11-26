@@ -2074,7 +2074,7 @@ pub const Scheduler = struct {
                     });
                 } else {
                     var text_buf: [768]u8 = undefined;
-                    const text = bills.residentBudgetRefusalText(&text_buf, estimated, self.registry.max_resident_mem, self.registry.current_resident_bytes +| (self.registry.reserved_bytes -| estimated), self.registry.countLoadedLocked());
+                    const text = bills.residentBudgetRefusalText(&text_buf, estimated, self.registry.max_resident_mem, self.registry.current_resident_bytes +| self.registry.ledgerUnseenLocked(entry.id) +| (self.registry.reserved_bytes -| estimated), self.registry.countLoadedLocked());
                     log.err("Refusing to load {s}: {s}\n", .{ entry.id, text });
                     rep.record(text);
                 }

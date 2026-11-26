@@ -490,6 +490,110 @@ fn evictMlxModel(new_on_engine: bool) !usize {
     return PreflightSawMlx.mlx_cache orelse error.TestUnexpectedResult;
 }
 
+test "cooler contract: a Cooler load beside a sealed one that the load cannot fit beside plans the first one's eviction under a cap that holds both bills, then loads" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const a = testing.allocator;
+            const registry_mod = @import("model_registry.zig");
+            var first: Load = undefined;
+            try first.open(C, dir, true);
+            const l = first.config.static_ledger orelse {
+                _ = first.close();
+                return error.SkipZigTest;
+            };
+            const bill = l.snapshot().modelBill();
+            // A cap that holds both bills many times over, and a budget that is the room beside the first.
+            const cap: u64 = 8 << 30;
+            if (!(bill * 4 < cap and l.budget() > cap)) {
+                std.debug.print("a sealed Cooler tiny bills {d} MB under a budget of {d} MB\n", .{ bill >> 20, l.budget() >> 20 });
+                _ = first.close();
+                return error.TestUnexpectedResult;
+            }
+            const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, cap, null);
+            defer reg.deinit();
+            const resident = try reg.registerStub("first", dir, bill);
+            resident.config = &first.config;
+            reg.mutex.lockUncancelable(io);
+            reg.markReadyLocked(resident, bill);
+            reg.mutex.unlock(io);
+            var other_tmp = testing.tmpDir(.{});
+            defer other_tmp.cleanup();
+            var ob: [std.fs.max_path_bytes]u8 = undefined;
+            const second = try reg.registerStub("second", ob[0..try other_tmp.dir.realPath(io, &ob)], bill);
+            reg.mutex.lockUncancelable(io);
+            try testing.expect(reg.tryBeginLoadLocked(second));
+            reg.reserveLoadLocked(second, bill);
+            var victims: [2]*registry_mod.LoadedModel = undefined;
+            const n = reg.planEvictionsLocked(second.id, &victims);
+            reg.mutex.unlock(io);
+            // What the eviction does to the first: its unload, then the entry's bookkeeping.
+            resident.config = null;
+            _ = first.close();
+            reg.mutex.lockUncancelable(io);
+            if (n) |count| for (victims[0..count]) |v| reg.finalizeEvictionLocked(v);
+            reg.mutex.unlock(io);
+            errdefer std.debug.print("the registry planned {any} victims beside a sealed Cooler load under a cap of {d} MB (its bill {d} MB)\n", .{ n, cap >> 20, bill >> 20 });
+            try testing.expectEqual(@as(?usize, 1), n);
+            try testing.expectEqualStrings("first", victims[0].id);
+            var next: Load = undefined;
+            try next.open(C, dir, true);
+            _ = next.close();
+        }
+    }.run);
+}
+
+test "cooler contract: a model on the ledger that another load evicts gives its ledger back, so no reading counts it" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const gib: u64 = 1 << 30;
+    const ledger_mod = @import("ledger.zig");
+    const registry_mod = @import("model_registry.zig");
+    const scheduler_mod = @import("scheduler.zig");
+    const base = ledger_mod.unseenBeside(null);
+    const reg = try registry_mod.ModelRegistry.init(a, io, null, 3, 0, null);
+    defer reg.deinit();
+    var victim_tmp = testing.tmpDir(.{});
+    defer victim_tmp.cleanup();
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const victim = try reg.registerStub("victim", vb[0..try victim_tmp.dir.realPath(io, &vb)], 0);
+    // The victim as a Cooler load leaves it: its ledger on the heap, a budget the engine's count shows 60 GiB of.
+    const config = try a.create(model_mod.ModelConfig);
+    victim.config = config;
+    config.* = .{};
+    const l = try std.heap.c_allocator.create(ledger_mod.Ledger);
+    l.* = .{};
+    config.static_ledger = l;
+    errdefer @import("static_bill.zig").close(config);
+    l.setBudget(240 * gib);
+    try l.reserve(.weights, 77 * gib, null);
+    l.holdWhole(60 * gib);
+    try testing.expectEqual(base + 180 * gib, ledger_mod.unseenBeside(null));
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(victim, 0);
+    reg.markEvictingLocked(victim);
+    reg.mutex.unlock(io);
+
+    var other_tmp = testing.tmpDir(.{});
+    defer other_tmp.cleanup();
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    const other = try reg.registerStub("other", ob[0..try other_tmp.dir.realPath(io, &ob)], 0);
+    reg.mutex.lockUncancelable(io);
+    try testing.expect(reg.tryBeginLoadLocked(other));
+    reg.mutex.unlock(io);
+    // The load that evicts it fails at the arch gate, which leaves the eviction done.
+    var other_config: model_mod.ModelConfig = .{};
+    var victims = [_]*registry_mod.LoadedModel{victim};
+    var sch = scheduler_mod.Scheduler.initForTest(std.testing.io, std.testing.allocator);
+    sch.registry = reg;
+    sch.io = io;
+    sch.allocator = a;
+    var req: scheduler_mod.LoadRequest = .{ .entry = other, .config = &other_config, .tok = undefined, .chat_config = undefined, .model_dir = "", .evict_entries = &victims };
+    try testing.expect(!model_load.runLoadRequest(&sch, &req));
+    try testing.expectEqual(registry_mod.LoadState.unloaded, victim.state);
+    try testing.expectEqual(base, ledger_mod.unseenBeside(null));
+    try testing.expect(config.static_ledger == null);
+}
+
 test "cooler contract: a load that evicts a model on MLX reads its preflight with the victim's freed buffers given back, on the engine as on MLX" {
     for ([_]bool{ true, false }) |new_on_engine| {
         const parked = try evictMlxModel(new_on_engine);

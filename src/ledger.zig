@@ -144,6 +144,11 @@ pub const Ledger = struct {
         l.setUnseen(l.budget() -| l.seen -| l.of(.parked));
     }
 
+    /// What this load adds to a reading outside it (`unseenBeside`).
+    pub fn unseenNow(l: *const Ledger) u64 {
+        return l.unseen.load(.acquire);
+    }
+
     /// The load ends: readings count it no more.
     pub fn letGo(l: *Ledger) void {
         l.setUnseen(0);

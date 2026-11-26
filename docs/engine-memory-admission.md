@@ -637,6 +637,7 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
   the seal, its parked state; a running request's allocations err high, D91); the load's own readings read its lines.
   A new model loads only where it fits beside `B`, else its preflight refuses it by name. `B` counts MLX's cache and the
   engine's free buffers held before the load as other models'.
+- **The registry's eviction plan counts a resident ledger load as the fit does**: its bytes plus what the fit reads past them (`ModelRegistry.ledgerUnseenLocked`, the figure `ledger.unseenBeside` adds), so a load the fit would refuse beside it evicts it first; a model off the ledger counts its bytes alone.
 - Observability: `[ledger] budget …` at the chunk choice, `[ledger] model bill … context … chunk …` at the seal, one
   `[admission] needed=… committed=… budget=… verdict=…` line per decision; `/props` `memory.ledger`
   (`{"lines":{…},"budget":…,"committed":…}`) and `memory.active_bytes` is the ledger's sum.

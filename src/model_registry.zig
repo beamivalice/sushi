@@ -575,6 +575,13 @@ pub const LoadedModel = struct {
     }
 };
 
+/// What a resident model on the ledger adds to a reading outside it; 0 for any other model.
+fn ledgerUnseenOf(entry: *const LoadedModel) u64 {
+    const config = entry.config orelse return 0;
+    const l = config.static_ledger orelse return 0;
+    return l.unseenNow();
+}
+
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
 /// the `/v1/models` JSON listing. All slices are borrowed from the
 /// underlying entry — caller must finish reading before the snapshot slice
@@ -1794,10 +1801,12 @@ pub const ModelRegistry = struct {
     pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
+        var unseen = self.ledgerUnseenLocked(exclude_id);
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
-            // every in-flight reservation (including this load's own estimate).
-            const projected_mem = (self.current_resident_bytes -| freed) + self.reserved_bytes;
+            // every in-flight reservation (including this load's own estimate), plus what a load's fit counts of
+            // the resident loads on the ledger past their bytes.
+            const projected_mem = (self.current_resident_bytes -| freed) + self.reserved_bytes + unseen;
             // Count: every model held now, minus the victims we'll drop, plus
             // this load (currently `.loading`, becomes resident).
             const projected_count = self.countHeldLocked(exclude_id) - @as(u32, @intCast(n)) + 1;
@@ -1817,9 +1826,22 @@ pub const ModelRegistry = struct {
             }
             self.markEvictingLocked(victim); // now `.evicting` → pickLru won't repick
             freed += victim.bytes_resident;
+            unseen -|= ledgerUnseenOf(victim);
             out[n] = victim;
             n += 1;
         }
+    }
+
+    /// What every resident load on the ledger adds to a reading past its bytes: its budget less the model bill the
+    /// engine's count shows (`ledger.unseenBeside`), the figure a load's fit counts beside it. Caller holds `mutex`.
+    pub fn ledgerUnseenLocked(self: *const ModelRegistry, exclude_id: []const u8) u64 {
+        var total: u64 = 0;
+        var it = self.entries.valueIterator();
+        while (@constCast(&it).next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state == .ready and !std.mem.eql(u8, entry.id, exclude_id)) total +|= ledgerUnseenOf(entry);
+        }
+        return total;
     }
 
     /// Past the planned evictions nothing else is resident or reserved, and the cap allows a sole model.
@@ -2938,6 +2960,76 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf));
+}
+
+/// A resident model on the ledger as a Cooler load leaves it: its bill reserved, its budget the room beside it.
+const LedgerStub = struct {
+    entry: *LoadedModel,
+    ledger: *@import("ledger.zig").Ledger,
+
+    fn make(reg: *ModelRegistry, id: []const u8, bill: u64, budget: u64) !LedgerStub {
+        const lm = try makeReadyStub(reg, id, bill);
+        const config = try testing.allocator.create(ModelConfig);
+        config.* = .{};
+        const l = try testing.allocator.create(@import("ledger.zig").Ledger);
+        l.* = .{};
+        l.setBudget(budget);
+        try l.reserve(.weights, bill, null);
+        l.holdWhole(bill);
+        config.static_ledger = l;
+        lm.config = config;
+        return .{ .entry = lm, .ledger = l };
+    }
+
+    /// The entry's config and ledger are the test's, not the registry's.
+    fn release(self: LedgerStub) void {
+        self.ledger.letGo();
+        testing.allocator.destroy(self.ledger);
+        testing.allocator.destroy(self.entry.config.?);
+        self.entry.config = null;
+    }
+};
+
+test "planEvictions: a resident ledger load counts at its budget, the number the fit reads, so a cap that holds both bills still evicts it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 200, null);
+    defer reg.deinit();
+    const resident = try LedgerStub.make(reg, "ledger", 50, 1000);
+    defer resident.release();
+    const c = try beginLoad(reg, "c", 60); // 50 + 60 fits the 200 cap on bills; the 1000 budget beside it does not
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf));
+    try testing.expectEqualStrings("ledger", buf[0].id);
+}
+
+test "planEvictions: a resident ledger load in use is no victim, so a load beside it is refused" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 200, null);
+    defer reg.deinit();
+    const resident = try LedgerStub.make(reg, "ledger", 50, 1000);
+    defer resident.release();
+    _ = resident.entry.refcount.fetchAdd(1, .acq_rel);
+    defer _ = resident.entry.refcount.fetchSub(1, .acq_rel);
+    const c = try beginLoad(reg, "c", 60);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf));
+}
+
+test "planEvictions: a resident model off the ledger plans as its bytes, beside a load of any kind" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 200, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 50);
+    _ = try makeReadyStub(reg, "b", 50);
+    const c = try beginLoad(reg, "c", 60);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf));
 }
 
 test "reservation: released back to zero on markReady / markUnloaded" {

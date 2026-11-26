@@ -15,7 +15,8 @@ earlier history is mlx-serve's, in that project's changelog.
   made at load, so no request waits on a compile; its memory bill counts what it holds, so a request that would run
   out of memory is refused by name; and it loads on M1 and M2 Macs. Two Sushi binaries sharing one cache keep each
   their kernel manifest instead of deleting each other's. It honours `tool_choice` none and a forced tool, its
-  reasoning budget ends a thought early, and a tool call's arguments keep every byte the model wrote.
+  reasoning budget ends a thought early, and a tool call's arguments keep every byte the model wrote. Switching between
+  two Hy4-Flash packs unloads the first instead of refusing.
 - **Each model sets how many requests run at once and how many tokens they may hold**: `max_concurrent` (1 by default;
   a server-wide value sets every model's default, a model's own outranks it, `--max-concurrent` outranks both) and
   `max_kv_tokens`, both in the web UI. A request that does not fit waits; one that never could is refused with the

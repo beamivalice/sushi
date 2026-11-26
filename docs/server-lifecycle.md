@@ -198,6 +198,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   `/v1/load-model` (the app's path) on a 128 GB Mac at default flags.
 - **A reload FREES the CPU state `unloadResident` retains** while the entry is `.loading` (`releaseRetainedCpuState`):
   a reader holding no refcount takes the mutex AND skips them while `.loading`.
+- **A cold load beside a resident Cooler (ledger) model plans its eviction** (`planEvictionsLocked` counts the model's budget as the load's fit does, `ledgerUnseenLocked`), so a swap between two Cooler packs unloads the first and loads the second, whatever `--max-resident-mem` holds of their bills (under a cap of 0 the registry plans none); a candidate that cannot fit alone is refused with its numbers.
 - **An eviction turns the entry `.unloaded` in ONE place, `finalizeEvictionLocked`, under the mutex, after the cache clear
   and the unwire wait.** `unloadResident` frees without the mutex and leaves `state` alone: an `.unloaded` set before the
   wait let a request claim the load, and the finalize then overwrote its `.loading` — a second claim loaded the model again
