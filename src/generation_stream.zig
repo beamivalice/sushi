@@ -2381,6 +2381,7 @@ test "every load refusal the registry preserves answers under its own name" {
         "ContextSizeAboveWindow",
         "ContextSizeAboveKvTokens",
         "LaunchFlagUnsupported",
+        "PrefillChunkSettingRefused",
         "GlmKvQuantUnsupported",
         "ExpertStreamingRequired",
         "SsdBudgetBelowResident",
@@ -2490,6 +2491,7 @@ pub fn loadRefusalFor(err: anyerror) ?LoadRefusal {
         error.ContextSizeAboveKvTokens => .{ .type = "context_size_above_kv_tokens", .message = "--ctx-size, or this model's saved ctx_size, is above its max_kv_tokens, the tokens its requests may hold together. Lower it, or raise max_kv_tokens." },
         error.ContextSizeAboveWindow => .{ .type = "context_size_above_window", .message = "--ctx-size, or this model's saved ctx_size, is above the context window the model has under its yarn_factor and --config-overrides. Lower it, or raise yarn_factor." },
         error.LaunchFlagUnsupported => .{ .type = "launch_flag_unsupported", .message = "A launch flag this server was started with has no effect on this model. The server log names the flag; restart without it." },
+        error.PrefillChunkSettingRefused => .{ .type = "prefill_chunk_setting_refused", .message = "This model's saved prefill_chunk_min or prefill_chunk_max is one it cannot run. The server log names it; change it in the model's settings." },
         error.GlmKvQuantUnsupported => .{ .type = "kv_quant_unsupported", .message = "The KV-cache quantization in force (--kv-quant or the model's saved kv_quant) is not one this model stores. The server log names the accepted widths." },
         error.ArchitectureUnsupported => .{ .type = "architecture_unsupported", .message = "This checkpoint's model_type is not served by this build, which loads " ++ arch_packs.served_list ++ "." },
         error.ModelFormatUnsupported => .{ .type = "model_format_unsupported", .message = "This checkpoint's file format is not supported. Serve an MLX safetensors checkpoint (" ++ arch_packs.served_types_or ++ ")." },
@@ -2558,7 +2560,7 @@ pub fn sendNamedLoadRefusal(allocator: std.mem.Allocator, stream: *Conn, schedul
 /// The message a load refusal's answer carries: the text the load wrote when it wrote one (the memory check's names the
 /// bound and what to free or change), else the refusal's own. The caller frees it.
 pub fn loadRefusalMessage(allocator: std.mem.Allocator, err: anyerror, refusal: LoadRefusal, context: ?model_registry_mod.MemoryContextRefusal, text: ?[]const u8) ![]u8 {
-    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.ContextSizeAboveKvTokens or err == error.LaunchFlagUnsupported or err == error.GlmKvQuantUnsupported or
+    const written = err == error.InsufficientMemory or err == error.ContextSizeAboveWindow or err == error.ContextSizeAboveKvTokens or err == error.LaunchFlagUnsupported or err == error.PrefillChunkSettingRefused or err == error.GlmKvQuantUnsupported or
         err == error.SsdBudgetExceedsWiredLimit or err == error.ExpertCacheDoesNotFit or err == error.SsdBudgetBelowResident or err == error.NotEnoughMemory;
     if (written) if (text) |t| return allocator.dupe(u8, t);
     if (context) |c| return memoryContextRefusalMessage(allocator, c);

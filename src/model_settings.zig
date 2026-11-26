@@ -566,6 +566,8 @@ pub const Fit = struct {
     kv_choices: []const []const u8 = &.{},
     /// The model's context window; 0 = unknown.
     context_cap: u32 = 0,
+    /// The widest prefill chunk the arch's width reaches (`settings_resolve.chunkCeiling`); 0 = unknown.
+    prefill_chunk_ceiling: u32 = 0,
     template_preserves_thinking: bool = true,
     template_thinks: bool = true,
     serves_bias: bool = true,
@@ -708,6 +710,7 @@ pub fn limit(key: []const u8, fit: Fit) Limit {
         l.why = "An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.";
     }
     if (eql(u8, key, "ctx_size") or eql(u8, key, "max_tokens")) l.max = fit.context_cap;
+    if (eql(u8, key, "prefill_chunk_min")) l.max = fit.prefill_chunk_ceiling;
     if (eql(u8, key, "max_concurrent")) {
         if (fit.exclusive_decode) {
             l.max = 1;
@@ -733,10 +736,11 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
         if (v == .string and !choiceAllowed(e.key, v.string, fit)) return .{ .key = e.key, .why = "This model's cache cannot store that width." };
         if (isChunkBound(e.key) and v == .integer and !settings_resolve.isStaticChunkRung(@intCast(@max(v.integer, 0))))
             return .{ .key = e.key, .why = "This model's prefill chunk is one of " ++ settings_resolve.static_chunk_rungs_text ++ "." };
-        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size")) return .{ .key = e.key, .why = if (lim.why.len > 0) lim.why else if (std.mem.eql(u8, e.key, "max_concurrent")) "This model's decode joins at most this many requests at once." else maxWhy(buf, lim.max) };
+        if (lim.max > 0 and v == .integer and v.integer > lim.max and !std.mem.eql(u8, e.key, "ctx_size") and !isChunkBound(e.key)) return .{ .key = e.key, .why = if (lim.why.len > 0) lim.why else if (std.mem.eql(u8, e.key, "max_concurrent")) "This model's decode joins at most this many requests at once." else maxWhy(buf, lim.max) };
         for (lim.unset) |other| if (stateOf(existing, edits, other) != null) return .{ .key = e.key, .why = lim.why };
     }
     if (chunkMinAboveMax(existing, edits, buf)) |r| return r;
+    if (chunkMinAboveCeiling(fit, existing, edits, buf)) |r| return r;
     if (ctxAboveKvTokens(existing, edits, buf)) |r| return r;
     return ctxAboveWindow(fit, existing, edits, buf);
 }
@@ -769,6 +773,19 @@ fn chunkMinAboveMax(existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u
     const min = chunkRowsOf(stateOf(existing, edits, "prefill_chunk_min") orelse return null) orelse return null;
     if (min <= max) return null;
     const why = std.fmt.bufPrint(buf, "prefill_chunk_min {d} is above prefill_chunk_max {d}; lower the min or raise the max", .{ min, max }) catch "prefill_chunk_min is above prefill_chunk_max";
+    return .{ .key = "prefill_chunk_min", .why = why };
+}
+
+/// A save touching a chunk bound that leaves `prefill_chunk_min` above the width the arch reaches, which the next load
+/// refuses (`settings_resolve.chunkBounds`); null when the ceiling is unknown or the min fits.
+fn chunkMinAboveCeiling(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    if (fit.prefill_chunk_ceiling == 0) return null;
+    var touches = false;
+    for (edits) |e| touches = touches or isChunkBound(e.key);
+    if (!touches) return null;
+    const min = chunkRowsOf(stateOf(existing, edits, "prefill_chunk_min") orelse return null) orelse return null;
+    if (min <= fit.prefill_chunk_ceiling) return null;
+    const why = std.fmt.bufPrint(buf, "prefill_chunk_min {d} is above the {d} rows this model's prefill width can reach; lower prefill_chunk_min", .{ min, fit.prefill_chunk_ceiling }) catch "prefill_chunk_min is above the rows this model's prefill width can reach";
     return .{ .key = "prefill_chunk_min", .why = why };
 }
 

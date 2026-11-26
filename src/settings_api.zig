@@ -652,6 +652,8 @@ fn stubFit(io: std.Io, allocator: std.mem.Allocator, row: *const ModelRow) model
     fit.streaming_required = arch_config.fact(&probe, "streams_experts") or models_api.streamingRequiredMarker(arch, sm.quant_bits, sm.quantized_experts, geometry, row.index_complete);
     fit.stq_experts = sm.quantized_experts;
     fit.context_cap = sm.context_cap;
+    // An unloaded pack's score geometry is unread: its load refuses a min above its width, and retries the file.
+    fit.prefill_chunk_ceiling = 0;
     return fit;
 }
 

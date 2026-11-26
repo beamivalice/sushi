@@ -276,6 +276,7 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .cache_bias = admission.expertStream(config).cache_bias,
         .kv_choices = kvQuantChoices(config),
         .context_cap = config.contextCap(),
+        .prefill_chunk_ceiling = @import("../settings_resolve.zig").chunkCeiling(config),
         .reads_yarn = arch_config.fact(config, "reads_yarn"),
         .cooler_setting = coolerSettingName(config),
         .exclusive_decode = arch_config.exclusiveDecode(config),

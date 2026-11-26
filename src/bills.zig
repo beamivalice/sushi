@@ -9477,6 +9477,30 @@ test "prefill chunk bounds: a named min above the arch's widest width is refused
     try t.expectEqual(@as(u32, 4096), chunkBoundsOf(&cfg).min);
 }
 
+test "prefill chunk bounds: a settings save that leaves a min above the arch's widest width is refused by name, as the load would" {
+    const t = std.testing;
+    var cfg = fixtures.mimoV2BillConfig();
+    const fit = @import("arch/flags.zig").settingsFit(&cfg);
+    var buf: [256]u8 = undefined;
+    const min = struct {
+        fn edit(v: ?std.json.Value) [1]model_settings.Edit {
+            return .{.{ .key = "prefill_chunk_min", .value = v }};
+        }
+    };
+    const refused = model_settings.refuseEdits(fit, null, &min.edit(.{ .integer = 8192 }), &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("prefill_chunk_min", refused.key);
+    try t.expectEqualStrings("prefill_chunk_min 8192 is above the 4096 rows this model's prefill width can reach; lower prefill_chunk_min", refused.why);
+    try t.expect(model_settings.refuseEdits(fit, null, &min.edit(.{ .string = "8192" }), &buf) != null);
+    try t.expect(model_settings.refuseEdits(fit, null, &min.edit(.{ .integer = 4096 }), &buf) == null);
+    try t.expectEqual(@as(u32, 4096), model_settings.limit("prefill_chunk_min", fit).max);
+    // A save that only removes the max still leaves the saved 8192 min the load refuses.
+    var existing: std.json.ObjectMap = .empty;
+    defer existing.deinit(t.allocator);
+    try existing.put(t.allocator, "prefill_chunk_min", .{ .integer = 8192 });
+    try existing.put(t.allocator, "prefill_chunk_max", .{ .integer = 8192 });
+    try t.expect(model_settings.refuseEdits(fit, existing, &.{.{ .key = "prefill_chunk_max", .value = null }}, &buf) != null);
+}
+
 test "max_kv_tokens is a token pool, never a bill: the same request holds the same bytes at any cap" {
     var cfg = model_mod.ModelConfig{
         .model_type = "not_a_served_arch",

@@ -83,7 +83,25 @@ pub const ChunkBoundRefusal = union(enum) {
     not_a_rung: struct { rows: u32, name: []const u8 },
     min_above_given_max: struct { min: u32, min_name: []const u8, max: u32, max_name: []const u8 },
     min_above_arch_ceiling: struct { min: u32, min_name: []const u8, ceiling: u32 },
+
+    /// A bound model-settings.json names is at fault: the file is edited without a restart, so the next load retries.
+    pub fn fromFile(self: ChunkBoundRefusal) bool {
+        const eql = std.mem.eql;
+        return switch (self) {
+            .not_a_rung => |g| eql(u8, g.name, file_max_name) or eql(u8, g.name, file_min_name),
+            .min_above_given_max => |m| eql(u8, m.min_name, file_min_name) or eql(u8, m.max_name, file_max_name),
+            .min_above_arch_ceiling => |m| eql(u8, m.min_name, file_min_name),
+        };
+    }
 };
+
+const file_max_name = "model-settings.json prefill_chunk_max";
+const file_min_name = "model-settings.json prefill_chunk_min";
+
+/// The widest chunk this model's prefill width reaches at a short prompt: a named min above it is refused.
+pub fn chunkCeiling(config: *const model_mod.ModelConfig) u32 {
+    return @intCast(prefill_plan.boundedPrefillChunk(chunk_rung_top, config.prefillScoreHeadDim(), config.num_attention_heads, 1, config.has_sliding_window, config.isMoe(), config.longCtxGated()));
+}
 
 pub const BoundsPick = union(enum) {
     bounds: ChunkBounds,
@@ -92,8 +110,8 @@ pub const BoundsPick = union(enum) {
 
 pub fn chunkBounds(config: *const model_mod.ModelConfig) BoundsPick {
     const Bound = struct { rows: u32, name: []const u8 };
-    const max: ?Bound = if (launch.prefill_chunk_max) |v| .{ .rows = v, .name = "--prefill-chunk-max" } else if (config.prefill_chunk_max_override) |v| .{ .rows = v, .name = "model-settings.json prefill_chunk_max" } else null;
-    const min: ?Bound = if (launch.prefill_chunk_min) |v| .{ .rows = v, .name = "--prefill-chunk-min" } else if (config.prefill_chunk_min_override) |v| .{ .rows = v, .name = "model-settings.json prefill_chunk_min" } else null;
+    const max: ?Bound = if (launch.prefill_chunk_max) |v| .{ .rows = v, .name = "--prefill-chunk-max" } else if (config.prefill_chunk_max_override) |v| .{ .rows = v, .name = file_max_name } else null;
+    const min: ?Bound = if (launch.prefill_chunk_min) |v| .{ .rows = v, .name = "--prefill-chunk-min" } else if (config.prefill_chunk_min_override) |v| .{ .rows = v, .name = file_min_name } else null;
     for ([_]?Bound{ max, min }) |given| if (given) |g| if (!isStaticChunkRung(g.rows)) {
         return .{ .refused = .{ .not_a_rung = .{ .rows = g.rows, .name = g.name } } };
     };
@@ -104,8 +122,8 @@ pub fn chunkBounds(config: *const model_mod.ModelConfig) BoundsPick {
     if (lo > hi) return .{ .refused = .{ .min_above_given_max = .{ .min = lo, .min_name = min.?.name, .max = hi, .max_name = max.?.name } } };
     // A named min the width funnel caps at a short prompt would be under-run by every request: refuse the load instead.
     if (min) |named| {
-        const ceiling = prefill_plan.boundedPrefillChunk(lo, config.prefillScoreHeadDim(), config.num_attention_heads, 1, config.has_sliding_window, config.isMoe(), config.longCtxGated());
-        if (ceiling < lo) return .{ .refused = .{ .min_above_arch_ceiling = .{ .min = lo, .min_name = named.name, .ceiling = @intCast(ceiling) } } };
+        const ceiling = chunkCeiling(config);
+        if (ceiling < lo) return .{ .refused = .{ .min_above_arch_ceiling = .{ .min = lo, .min_name = named.name, .ceiling = ceiling } } };
     }
     return .{ .bounds = .{ .min = lo, .max = hi, .max_given = max != null or raised, .min_given = min != null, .raised_by_min = raised } };
 }

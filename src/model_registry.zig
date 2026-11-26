@@ -604,7 +604,7 @@ pub const ModelStatus = struct {
 
 /// Load failures a setting or the memory limit decides: the entry goes back to `.unloaded`, so the next load re-reads
 /// model-settings.json. Every other failure is the pack's and is stored.
-pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "ContextSizeAboveKvTokens", "GlmKvQuantUnsupported", "ContextDoesNotFit", "ModelBillPastBudget", "PrefillChunkDoesNotFit", "WarmChunkDoesNotFit" };
+pub const refusals = [_][]const u8{ "InsufficientMemory", "OutOfMemory", "SsdBudgetExceedsWiredLimit", "SsdBudgetBelowResident", "SsdBudgetBelowVision", "ExpertCacheDoesNotFit", "ContextSizeAboveWindow", "ContextSizeAboveKvTokens", "GlmKvQuantUnsupported", "ContextDoesNotFit", "ModelBillPastBudget", "PrefillChunkDoesNotFit", "PrefillChunkSettingRefused", "WarmChunkDoesNotFit" };
 
 /// The name of the stored failure a request was refused with, copied while the registry held it: by the time the answer
 /// is written an explicit retry may have claimed the entry.
@@ -1836,12 +1836,13 @@ pub const ModelRegistry = struct {
     /// (2026-08-08). Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ContextSizeAboveWindow, ContextSizeAboveKvTokens, LaunchFlagUnsupported, GlmKvQuantUnsupported, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, MtpHeadMissing, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, ContextSizeAboveWindow, ContextSizeAboveKvTokens, LaunchFlagUnsupported, PrefillChunkSettingRefused, GlmKvQuantUnsupported, ArchitectureUnsupported, ModelFormatUnsupported, ExpertCacheDoesNotFit, ExpertStreamingRequired, SsdBudgetBelowResident, SsdBudgetBelowVision, SsdBudgetExceedsWiredLimit, ExpertStreamingMtpUnsupported, MtpHeadMissing, ExpertStreamingUnsupportedLayout, ExpertSlabImportCopied, ExpertLayoutUnsupported, Exl3TopKExceedsReduceBank, Exl3TrellisGeometry, Exl3WindowUnsupported, Exl3ShardStampMismatch, Exl3TileOrderUnsupported, Exl3TileOrderMixed, Exl3TileOrderMismatch, Exl3TileOrderNeedsGroups, Exl3RateGroupsStreamingUnsupported, Exl3GateUpRateMismatch, Exl3CodebookTableUnknown, Exl3CodebookTableDigestMismatch, Exl3CodebookTableWindowMismatch, Exl3CodebookTableCodebookMismatch, Exl3CodebookTableRateMissing, Exl3CodebookTableLegacyConfig, Exl3CodebookTableUndecodable, PackRevisionMixed } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "ContextSizeAboveWindow")) return error.ContextSizeAboveWindow;
             if (std.mem.eql(u8, n, "ContextSizeAboveKvTokens")) return error.ContextSizeAboveKvTokens;
             if (std.mem.eql(u8, n, "LaunchFlagUnsupported")) return error.LaunchFlagUnsupported;
+            if (std.mem.eql(u8, n, "PrefillChunkSettingRefused")) return error.PrefillChunkSettingRefused;
             if (std.mem.eql(u8, n, "GlmKvQuantUnsupported")) return error.GlmKvQuantUnsupported;
             if (std.mem.eql(u8, n, "ArchitectureUnsupported")) return error.ArchitectureUnsupported;
             if (std.mem.eql(u8, n, "ModelFormatUnsupported")) return error.ModelFormatUnsupported;

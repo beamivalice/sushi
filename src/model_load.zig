@@ -483,7 +483,7 @@ pub fn compileClosures(xfm: *Trunk, set: arch_state.CompileSet) void {
     arch_state.compile(xfm, set);
 }
 
-pub const LaunchRefusal = struct { err: error{ ArchitectureUnsupported, GlmKvQuantUnsupported, LaunchFlagUnsupported, ContextSizeAboveWindow, ContextSizeAboveKvTokens }, line: []const u8 };
+pub const LaunchRefusal = struct { err: error{ ArchitectureUnsupported, GlmKvQuantUnsupported, LaunchFlagUnsupported, PrefillChunkSettingRefused, ContextSizeAboveWindow, ContextSizeAboveKvTokens }, line: []const u8 };
 
 /// Why a load of `config` is refused before it reads a weight: its arch, a launch flag or saved kv_quant it cannot act
 /// on, a context above its window. The cold-load pre-check, the load and offline mode ask the same question.
@@ -506,7 +506,7 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
     if (arch_flags.biasLoadRefusal(buf, config)) |line| return .{ .err = error.LaunchFlagUnsupported, .line = line };
     switch (bills.prefillChunkBounds(buf, config)) {
-        .refused => |line| return .{ .err = error.LaunchFlagUnsupported, .line = line },
+        .refused => |line| return .{ .err = if (settings_resolve.chunkBounds(config).refused.fromFile()) error.PrefillChunkSettingRefused else error.LaunchFlagUnsupported, .line = line },
         .bounds => {},
     }
     if (contextWindowRefusal(buf, config, ctx_flag)) |line| return .{ .err = error.ContextSizeAboveWindow, .line = line };
@@ -3937,6 +3937,23 @@ test "an explicit --ctx-size above the window is refused by name, under the yarn
     c.ctx_override = 1048576;
     try testing.expect(contextWindowRefusal(&buf, &c, 100000) == null);
     try testing.expect(std.mem.startsWith(u8, contextWindowRefusal(&buf, &c, 2000000).?, "--ctx-size 2000000 "));
+}
+
+test "a prefill chunk min the arch cannot run is a refusal the next load retries when the file names it, fixed when the flag does" {
+    const saved = settings_resolve.launch;
+    defer settings_resolve.launch = saved;
+    var cfg = @import("bills_fixtures_test.zig").mimoV2BillConfig();
+    var buf: [512]u8 = undefined;
+    settings_resolve.launch = .{};
+    cfg.prefill_chunk_min_override = 8192;
+    const file = launchRefusal(&buf, &cfg, null, 0) orelse return error.TestExpectedRefusal;
+    var retried = false;
+    for (@import("model_registry.zig").refusals) |name| retried = retried or std.mem.eql(u8, name, @errorName(file.err));
+    try testing.expect(retried);
+    cfg.prefill_chunk_min_override = null;
+    settings_resolve.launch = .{ .prefill_chunk_min = 8192 };
+    const flag = launchRefusal(&buf, &cfg, null, 0) orelse return error.TestExpectedRefusal;
+    try testing.expectEqual(error.LaunchFlagUnsupported, flag.err);
 }
 
 test "a launch flag or saved kv_quant the arch cannot act on is refused with its line, the same answer for the pre-check and the load" {
