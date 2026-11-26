@@ -323,6 +323,15 @@ fn rowsCompanyMin(slot: *const Slot) usize {
     };
 }
 
+/// The fewest rows one joined forward of the model runs, one or two: a group the tick's filter leaves narrower ticks its
+/// row as a single slot.
+pub fn joinedRowsMin(xfm: *const Trunk) usize {
+    const tag = tagOfModel(xfm) orelse return 1;
+    return switch (tag) {
+        inline else => |t| if (comptime has(t, "joined_rows_min")) S(t).joined_rows_min else 1,
+    };
+}
+
 /// The state a new slot owns beside its KV cache; null where the arch keeps none per request.
 pub fn initRequest(allocator: std.mem.Allocator, config: *const ModelConfig) !?NativeRequest {
     const tag = tagOfConfig(config) orelse return null;
@@ -579,6 +588,7 @@ const known_hooks = [_][]const u8{
     "restoreTarget",   "restoreEnd",    "writeThrough",  "nativeDflashArmed",                          "thoughtGrid",     "armThoughtPoint",
     "afterSpecBlock",  "endRequest",    "resetForRetry",  "flushResident",
     "logCheckpointsKept", "prepare_commit_label", "cancelled_entry_label", "rows_company_min",
+    "joined_rows_min",
 };
 
 fn isHook(comptime name: []const u8) bool {

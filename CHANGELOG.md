@@ -7,8 +7,9 @@ earlier history is mlx-serve's, in that project's changelog.
 ## v1.8.0 — Hy4-Flash, several requests at once
 
 - **Hy4-Flash serves several requests at once, each with its own text**: up to 16 requests decode together in joined
-  rows, every row the same bytes it would get alone, on Sushi Cooler's exact memory bill. Two requests that draft with
-  DFly2 run as a pair about 24% faster, and DFly2 speculation is on by default, about 5.5% faster than plain decode.
+  rows, every row the same bytes it would get alone, and a row whose partner ends first carries on alone, on Sushi
+  Cooler's exact memory bill. Two requests that draft with DFly2 run as a pair about 24% faster, and DFly2 speculation
+  is on by default, about 5.5% faster than plain decode.
 - **Hy4-Flash is faster, leaner and loads on more Macs**: decode about 4% faster, prefill about 3%, streamed decode
   about 6%, and a round after a missed draft costs a quarter of what it did, all with the same text. Its kernels are
   made at load, so no request waits on a compile; its memory bill counts what it holds, so a request that would run

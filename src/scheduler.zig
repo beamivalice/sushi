@@ -5040,10 +5040,17 @@ pub fn capMtpRoundToThinkBound(gen: *Generator) void {
 }
 
 pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    return runSingleTick(sch, slot, .run);
+}
+
+/// Whether a single-slot tick runs the per-tick guards (`loopGuardTick`), or finds them run for this tick already.
+const Guards = enum { run, done };
+
+fn runSingleTick(sch: *Scheduler, slot: *Slot, guards: Guards) !void {
     const turn = arch_handle.turnFor(slot.model.handle, slot.model.config);
     defer turn.end();
     var inner_err: ?anyerror = null;
-    runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
+    runSingleDecodeTickInner(sch, slot, guards) catch |e| switch (e) {
         // A reasoning-protocol dead end is this request's failure; the tick
         // error path would fail every active slot.
         error.NoValidProtocolToken, error.InvalidProtocolTransition, error.InvalidProtocolPayload => {
@@ -5060,13 +5067,13 @@ pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     if (inner_err) |e| return e;
 }
 
-fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
+fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot, guards: Guards) !void {
     const gen = if (slot.legacy_gen) |*g| g else {
         slot.markError("no_generator");
         return;
     };
 
-    if (try loopGuardTick(sch, slot, gen)) return;
+    if (guards == .run and try loopGuardTick(sch, slot, gen)) return;
     if (Planner.enabled() and slot.planner_force_plain) {
         gen.mtp_hidden_stale = true;
     }
@@ -5289,19 +5296,27 @@ const mtp_plan = @import("mtp_plan.zig");
 const prefill_plan = @import("prefill_plan.zig");
 const sampler = @import("sampler.zig");
 
+/// One joined tick of `active`. A group the filter leaves narrower than its arch's joined width ticks its one
+/// survivor as a single row, outside the batched turn.
 pub fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    if (try runJoinedRows(sch, active)) |alone| {
+        tickUnit((&alone)[0..1], runSingleTick(sch, alone, .done), "[batched] a row its group left alone");
+    }
+}
+
+fn runJoinedRows(sch: *Scheduler, active: []*Slot) !?*Slot {
     const turn = arch_handle.turnFor(active[0].model.handle, active[0].model.config);
     defer turn.end();
     var inner_err: ?anyerror = null;
-    runBatchedDecodeTickInner(sch, active) catch |e| {
-        inner_err = e;
-    };
+    var alone: ?*Slot = null;
+    if (runBatchedDecodeTickInner(sch, active)) |row| alone = row else |e| inner_err = e;
     mlx.checkErrorDecode() catch |mlx_err| {
         log.err("[scheduler] batched decode aborted: MLX failure ({s}) — failing all {d} slots in the group\n", .{ @errorName(mlx_err), active.len });
         for (active) |s| s.markError(@errorName(mlx_err));
-        return;
+        return null;
     };
     if (inner_err) |e| return e;
+    return alone;
 }
 
 /// Count the pending token once, immediately before forwarding it. Sampling and
@@ -5314,6 +5329,13 @@ fn batchEntryStops(gen: *Generator) !bool {
 /// path runs (loop stop, thinking budget), drained of its pipeline state, the ones that finish
 /// or spend their tick left out.
 pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
+    const drained = try drainTickRows(sch, active, live);
+    var pads: [sched_policy.MAX_BATCH_GROUP]u32 = undefined;
+    return try entryStopRows(sch, live[0..drained], &pads);
+}
+
+/// The first half of `batchedTickRows`: the guards and the drain, the rows that end there left out.
+fn drainTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
     var live_n: usize = 0;
     for (active) |slot| {
         const gen = if (slot.legacy_gen) |*g| g else {
@@ -5353,18 +5375,47 @@ pub fn batchedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot) !usize {
                 continue;
             }
         }
-        // A pipeline drain consumed the lookahead and sampled a NEW pending token.
-        // It needs the same accounting as a token carried from a previous batch.
+        live[live_n] = slot;
+        live_n += 1;
+    }
+    return live_n;
+}
+
+/// The second half of `batchedTickRows`: a drain sampled a NEW pending token, which needs the same accounting as a
+/// token carried from a previous batch. Compacts `rows` to the ones that go on; `pads` takes each one's pad run from
+/// before its count, so a row that then ticks alone can be counted again by its own path.
+fn entryStopRows(sch: *Scheduler, rows: []*Slot, pads: []u32) !usize {
+    var kept: usize = 0;
+    for (rows) |slot| {
+        const gen = &slot.legacy_gen.?;
+        const pad = gen.consecutive_pad;
         if (try batchEntryStops(gen)) {
             slot.completion_tokens = gen.completion_tokens;
             slot.stop_path = "batch";
             slot_outcome.finishSlot(sch, slot, gen.finish_reason);
             continue;
         }
-        live[live_n] = slot;
-        live_n += 1;
+        rows[kept] = slot;
+        pads[kept] = pad;
+        kept += 1;
     }
-    return live_n;
+    return kept;
+}
+
+const JoinedRows = union(enum) { none, alone: *Slot, joined: usize };
+
+/// The rows of a joined tick of `active` after the filter, in `live`, against the narrowest forward the arch runs
+/// (`width_min`, one or two): a row left alone ticks as a single slot, which runs the guards and counts its pending
+/// token itself, so this leaves neither of them run.
+fn joinedTickRows(sch: *Scheduler, active: []*Slot, live: []*Slot, width_min: usize) !JoinedRows {
+    std.debug.assert(width_min >= 1 and width_min <= 2);
+    const drained = try drainTickRows(sch, active, live);
+    var pads: [sched_policy.MAX_BATCH_GROUP]u32 = undefined;
+    const kept = if (drained >= width_min) try entryStopRows(sch, live[0..drained], &pads) else drained;
+    if (kept >= width_min) return .{ .joined = kept };
+    if (kept == 0) return .none;
+    if (drained >= width_min) live[0].legacy_gen.?.consecutive_pad = pads[0];
+    return .{ .alone = live[0] };
 }
 
 /// A GDN group with a slot that has no recurrent state yet cannot merge: it decodes serially this
@@ -5380,9 +5431,9 @@ fn serialFallback(sch: *Scheduler, xfm: *const Trunk, active: []*Slot, comptime 
     return true;
 }
 
-fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
+fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !?*Slot {
     const N = active.len;
-    if (N == 0) return;
+    if (N == 0) return null;
     const allocator = sch.allocator;
 
     // Phase D: all batched slots must share the same model — the caller
@@ -5394,7 +5445,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (active) |s| std.debug.assert(arch_handle.trunk(s.model.handle.?) == xfm_ptr);
     }
 
-    if (try serialFallback(sch, xfm_ptr, active, runSingleDecodeTick)) return;
+    if (try serialFallback(sch, xfm_ptr, active, runSingleDecodeTick)) return null;
 
     const observe_plain = Planner.enabled() and sched.plannerObservesPlainRows(xfm_ptr) and N <= Planner.MAX_ROWS;
     var price_watch = io_util.Stopwatch.init(active[0].io);
@@ -5428,8 +5479,13 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     if (N > sched_policy.MAX_BATCH_GROUP) return error.BatchGroupTooWide;
     var live_buf: [sched_policy.MAX_BATCH_GROUP]*Slot = undefined;
     const live = live_buf[0..N];
-    const live_n = try batchedTickRows(sch, active, live);
-    if (live_n == 0) return;
+    // The width the arch's joined forward runs is its own: a group the filter leaves narrower ticks its row alone.
+    const tick_rows = try joinedTickRows(sch, active, live, if (sch.force_batched) 1 else sched.joinedRowsMin(xfm_ptr));
+    const live_n = switch (tick_rows) {
+        .none => return null,
+        .alone => |slot| return slot,
+        .joined => |n| n,
+    };
     var batch = live[0..live_n];
 
     // Build inputs.
@@ -5579,7 +5635,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
     if (price_clean and live_n == N) {
         var gaps: [Planner.MAX_ROWS]f32 = undefined;
         for (batch, 0..) |slot, i| {
-            if (slot.state != .decoding or slot.cancelled.load(.acquire)) return;
+            if (slot.state != .decoding or slot.cancelled.load(.acquire)) return null;
             gaps[i] = slot.mtp_publish_gap_ms;
         }
         price_key.attention = xfm_ptr.cost_attention;
@@ -5588,6 +5644,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         const ms = @as(f32, @floatFromInt(price_watch.read())) / std.time.ns_per_ms;
         _ = xfm_ptr.mtp_group_cost.observeShape(price_key, ms, emitted[0..N], gaps[0..N], .round);
     }
+    return null;
 }
 
 const testing = std.testing;

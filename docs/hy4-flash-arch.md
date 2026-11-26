@@ -1134,6 +1134,8 @@ reference difference (the Engram norm ε and rows, the streams' dtype, image pos
    fully resident pack follows DeepSeek's `coolerRows`, after the core.
    The `max_concurrent` fit answers by load, as DeepSeek's does: a load that joins rows is held to
    `hy4_plan.joinedRows`, one that cannot stays at 1 (`Facts.exclusive_decode_of`).
+   A joined tick runs from two rows (`hy4_sched.joined_rows_min`, the widths the plans record): a group a drain or an
+   entry stop leaves with one row ticks that row serially, and `batchedForward` refuses one row by name (`Hy4RowsWidth`).
    Two drafting requests in company join as plain rows (`hy4_sched.rows_company_min` is 2): two serial DFly2 rounds in
    turn gave 61.0 and 61.3 tok/s total on the M5 Ultra STQ 4bpw pack, the same two as plain joined rows 75.9.
 

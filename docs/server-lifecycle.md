@@ -327,6 +327,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
     the submit-time `checkKvQuant`, the load refusal and `applyModelSettings` read it. The settings page reads the
     same rule as `glm5_flags.kv_quant_choices` through `Fit.kv_choices` (empty = every width); a test pins the list
     to `latentBits`.
+  - **A joined tick's width is decided after its filter**: the guards, the pipeline drain and the entry stops end rows, so
+    the width the forward runs is what is left; an arch's `joined_rows_min` (its narrowest joined forward, default 1)
+    sends a lone survivor to the single-slot tick (`joinedTickRows`), which runs the guards and counts its pending token.
   - The inference loop's per-tick work is allocation-free: the active list is kept across ticks, a batched tick builds
     its inputs in stack arrays of `MAX_BATCH_GROUP`, and admission scans nothing while `pending` is empty.
 - **The scheduler names no arch.** What differs per arch is the `sched` decl of its `arch.zig` (`<arch>_sched.zig`),

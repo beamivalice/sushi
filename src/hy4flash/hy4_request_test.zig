@@ -1027,6 +1027,109 @@ test "hy4 request: a joined tick draws each row through its own planned sample r
     try testing.expectEqualSlices(u32, solo_b.tokens.items, slot_b.legacy_gen.?.generated_ids.items);
 }
 
+test "hy4 request: a joined tick whose shorter row ends in the drain leaves the survivor its solo tokens (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(JoinedResident, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 4;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    try testing.expect(sched.modelBatches(xfm));
+    const greedy: @import("../sampler.zig").SamplingParams = .{ .temperature = 0 };
+    const prompt_a = ids[0..@min(ids.len, 24)];
+    const prompt_b = ids[5..@min(ids.len, 35)];
+    var solo_a = try soloRunWith(&sv, prompt_a, 3, greedy);
+    defer solo_a.tokens.deinit(a);
+    defer solo_a.state.deinit(a);
+    var solo_b = try soloRunWith(&sv, prompt_b, 9, greedy);
+    defer solo_b.tokens.deinit(a);
+    defer solo_b.state.deinit(a);
+    const slot_a = try submitWith(&sv, prompt_a, 3, greedy);
+    defer endSlot(&sv, slot_a);
+    try scheduler.runPrefill(&sv.sch, slot_a);
+    try sv.sch.decoding.append(a, slot_a);
+    // Two single ticks leave the short row at its last token, so the join tick's drain ends it.
+    var one = [_]*scheduler.Slot{slot_a};
+    var early: usize = 0;
+    while (early < 2 and slot_a.joinsTick()) : (early += 1) try scheduler.runDecodeTick(&sv.sch, &one);
+    const slot_b = try submitWith(&sv, prompt_b, 9, greedy);
+    defer endSlot(&sv, slot_b);
+    try scheduler.runPrefill(&sv.sch, slot_b);
+    try sv.sch.decoding.append(a, slot_b);
+    var ticks: usize = 0;
+    while ((slot_a.joinsTick() or slot_b.joinsTick()) and ticks < 32) : (ticks += 1) {
+        var active: [2]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for ([_]*scheduler.Slot{ slot_a, slot_b }) |s| if (s.joinsTick()) {
+            active[k] = s;
+            k += 1;
+        };
+        try scheduler.runDecodeTick(&sv.sch, active[0..k]);
+        scheduler.cullDecoding(&sv.sch);
+    }
+    try testing.expect(ticks < 32);
+    errdefer std.debug.print("errors A={?s} B={?s}, B ids {any}\n", .{ slot_a.error_code, slot_b.error_code, slot_b.legacy_gen.?.generated_ids.items });
+    try testing.expect(slot_a.error_code == null and slot_b.error_code == null);
+    try testing.expectEqualSlices(u32, solo_a.tokens.items, slot_a.legacy_gen.?.generated_ids.items);
+    try testing.expectEqualSlices(u32, solo_b.tokens.items, slot_b.legacy_gen.?.generated_ids.items);
+}
+
+test "hy4 request: two drafting requests whose shorter one ends at the joined tick's entry leave the survivor its solo DFly2 tokens (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 4;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
+    const prompts = [_][]const u32{ ids[0..@min(ids.len, 16)], ids[4..@min(ids.len, 24)] };
+    var solo_long = try soloRun(&sv, prompts[1], 14, true);
+    defer solo_long.tokens.deinit(a);
+    defer solo_long.state.deinit(a);
+    const slots = [2]*scheduler.Slot{ try submitPending(&sv, prompts[0], 14, true), try submitPending(&sv, prompts[1], 14, true) };
+    defer for (slots) |s| endSlot(&sv, s);
+    for (slots) |s| {
+        try scheduler.runPrefill(&sv.sch, s);
+        try sv.sch.decoding.append(a, s);
+    }
+    // A drafting row leaves no pipeline to drain, so the short row's budget is spent as the tick starts: the batch's
+    // entry ends it and leaves the other row alone.
+    const short = &slots[0].legacy_gen.?;
+    short.max_tokens = short.step;
+    var ticks: usize = 0;
+    while (ticks < 96) : (ticks += 1) {
+        var act: [2]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (slots) |s| if (s.joinsTick()) {
+            act[k] = s;
+            k += 1;
+        };
+        if (k == 0) break;
+        try scheduler.runDecodeTick(&sv.sch, act[0..k]);
+        scheduler.cullDecoding(&sv.sch);
+    }
+    try testing.expect(ticks < 96);
+    errdefer std.debug.print("errors {?s} {?s}\n", .{ slots[0].error_code, slots[1].error_code });
+    try testing.expect(slots[0].error_code == null and slots[1].error_code == null);
+    try testing.expectEqualSlices(u32, solo_long.tokens.items, slots[1].legacy_gen.?.generated_ids.items);
+}
+
 test "hy4 request: after the load, a joined tick at every width the load joins makes no pipeline, drafting rows in company too (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;

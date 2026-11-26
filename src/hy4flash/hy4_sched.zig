@@ -117,6 +117,9 @@ pub fn padsBatch(config: *const model.ModelConfig) bool {
 
 pub const rows_company_min: usize = 2;
 
+/// The plans record the joined tick from two rows (`hy4_plan.beginJoined`); one row is the serial forward's.
+pub const joined_rows_min: usize = 2;
+
 pub fn tickClass(slot: *const @import("../scheduler.zig").Slot) @import("../arch/sched.zig").TickClass {
     const gen = if (slot.legacy_gen) |*g| g else return .none;
     if (!gen.drafter_on or gen.done) return .none;
@@ -309,6 +312,7 @@ pub fn batchedForward(
 ) ![]mlx.mlx_array {
     _ = .{ rope_offsets, arm, hidden_rows };
     const m = xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
+    if (ctxs.len < joined_rows_min) return error.Hy4RowsWidth;
     if (@import("builtin").is_test and knobs.groups_on_for_test and groupable(batch.*)) {
         const hy4_drafter = @import("hy4_drafter.zig");
         const cap: usize = @intCast(@import("hy4_forward.zig").joinedRowsMax());
