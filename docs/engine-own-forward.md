@@ -727,6 +727,8 @@ rebuilds one.
   by source or key, counts it as preloaded (`core.pipelines_preloaded`), not compiled and not late. The engine's warm
   forwards, the wide chunks included, are skipped (`WarmScope.mlx`: MLX's prefill warm and its spilled-route chain stay); the NAX proof and the NAX probes already run at init.
   A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
+  A reload reads the same recipes again, so a registry table copies a recipe only for the entry it keeps
+  (`pipeline_registry.putSource`, `putStock`): the process's tables hold one copy of each, whatever the load count.
 - **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
   complete enumeration and the manifest is rewritten; the older builds of the scope are removed, but the newest other one, and the log says so: two binaries on one box keep each their manifest. A
   manifest rewritten after its load (a late kernel) opens its root again from the path, so a root removed and made again is never a stale handle; the plan's kept shapes and regions (`plan_book.Cache`) do the same at each read and write, and a load closes the root it opened.

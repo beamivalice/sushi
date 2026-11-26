@@ -6,7 +6,8 @@ const metal = @import("../metal.zig");
 const manifest = @import("../pipeline_manifest.zig");
 
 const Recipe = manifest.Recipe;
-const gpa = std.heap.c_allocator;
+/// Every table here is the process's, so a test counts bytes through this one allocator, never a second heap.
+var gpa: std.mem.Allocator = std.heap.c_allocator;
 
 var recorded: std.ArrayList(Recipe) = .empty;
 
@@ -73,11 +74,14 @@ var sources: std.HashMapUnmanaged(SourceKey, metal.Pipeline, SourceContext, 80) 
 /// The same for a stock kernel, by its table key, with the recipe to record when it is first used.
 var stock: std.StringHashMapUnmanaged(struct { pipeline: metal.Pipeline, recipe: Recipe }) = .empty;
 
-/// Keeps a source pipeline made ahead; false when the same one is already waiting.
+/// Keeps a source pipeline made ahead; false when the same one is already waiting, which keeps no copy of `r`.
 pub fn putSource(r: Recipe, pipeline: metal.Pipeline) !bool {
-    const owned = try dupeRecipe(r);
-    const entry = try sources.getOrPut(gpa, .{ .function = owned.function, .text = owned.text });
+    const entry = try sources.getOrPut(gpa, .{ .function = r.function, .text = r.text });
     if (entry.found_existing) return false;
+    errdefer sources.removeByPtr(entry.key_ptr);
+    const function = try gpa.dupe(u8, r.function);
+    errdefer gpa.free(function);
+    entry.key_ptr.* = .{ .function = function, .text = try gpa.dupe(u8, r.text) };
     entry.value_ptr.* = pipeline;
     return true;
 }
@@ -90,10 +94,10 @@ pub fn takeSource(function: []const u8, text: []const u8) ?metal.Pipeline {
 }
 
 pub fn putStock(r: Recipe, pipeline: metal.Pipeline) !bool {
+    if (stock.contains(r.key)) return false;
     const owned = try dupeRecipe(r);
-    const entry = try stock.getOrPut(gpa, owned.key);
-    if (entry.found_existing) return false;
-    entry.value_ptr.* = .{ .pipeline = pipeline, .recipe = owned };
+    errdefer freeRecipe(owned);
+    try stock.putNoClobber(gpa, owned.key, .{ .pipeline = pipeline, .recipe = owned });
     return true;
 }
 
@@ -256,4 +260,49 @@ test "pipeline registry: a marker recorded while no manifest stood settled is th
     settleMarkers(true);
     try testing.expect(!markerRecorded("K"));
     try testing.expect(markerRecorded("T2"));
+}
+
+/// Bytes the registry's allocator holds live, counted over the process's own heap.
+const Live = struct {
+    var bytes: usize = 0;
+    const vt: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const p = std.heap.c_allocator.rawAlloc(len, al, ra) orelse return null;
+        bytes += len;
+        return p;
+    }
+    fn resize(_: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        if (!std.heap.c_allocator.rawResize(mem, al, new_len, ra)) return false;
+        bytes = bytes - mem.len + new_len;
+        return true;
+    }
+    fn remap(_: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const p = std.heap.c_allocator.rawRemap(mem, al, new_len, ra) orelse return null;
+        bytes = bytes - mem.len + new_len;
+        return p;
+    }
+    fn free(_: *anyopaque, mem: []u8, al: std.mem.Alignment, ra: usize) void {
+        std.heap.c_allocator.rawFree(mem, al, ra);
+        bytes -= mem.len;
+    }
+};
+
+test "pipeline registry: a pipeline put again, as a like-for-like reload's manifest does, holds no second copy of its recipe" {
+    const was = gpa;
+    defer gpa = was;
+    gpa = .{ .ptr = undefined, .vtable = &Live.vt };
+    const fake: metal.Pipeline = .{ .raw = undefined, .max_threads = 1 };
+    const filler: [4096]u8 = @splat('x');
+    const source: Recipe = .{ .kind = .source, .function = "reload_probe_source", .text = &filler };
+    const stocked: Recipe = .{ .kind = .stock_flags, .function = "reload_probe_stock", .key = "reload_probe_stock#1", .flags = &.{.{ .index = 1, .value = true }}, .ints = &.{.{ .index = 2, .value = 7 }} };
+
+    try testing.expect(try putSource(source, fake));
+    try testing.expect(try putStock(stocked, fake));
+    const held = Live.bytes;
+    var load: usize = 0;
+    while (load < 3) : (load += 1) {
+        try testing.expect(!try putSource(source, fake));
+        try testing.expect(!try putStock(stocked, fake));
+    }
+    try testing.expectEqual(held, Live.bytes);
 }
