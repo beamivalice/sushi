@@ -28,9 +28,10 @@ pub const Ctx = @import("hy4_state.zig").Ctx;
 
 pub const packs = struct { // slot:packs (S2h)
     pub const product = "Hy4-Flash";
-    /// No `sushi pull` until a quant is released: the BF16 checkpoint streamed is groundwork, loaded by its path.
-    pub const unreleased = "Hy4-Flash ships no pack until its quant is released";
-    pub const aliases = [_]@import("../arch/packs.zig").Alias{};
+    pub const aliases = [_]@import("../arch/packs.zig").Alias{
+        .{ .name = "hy4-flash", .tag = "4bpw", .repo = "beamster/Hy4-Flash-Sushi-STQ-4bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96 },
+        .{ .name = "hy4-flash", .tag = "2.25bpw", .repo = "beamster/Hy4-Flash-Sushi-STQ-2.25bpw", .tier_gb = 64, .recommend_gb = 48 },
+    };
 };
 pub const flags = @import("hy4_flags.zig"); // slot:flags (S2h)
 pub const sched = @import("hy4_sched.zig"); // slot:sched (S2b)

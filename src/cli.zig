@@ -2334,6 +2334,19 @@ test "pull and list reject stray arguments" {
     try testing.expectError(error.UnexpectedArgument, parseListArgs(&.{"--anything"}));
 }
 
+test "cli: hy4-flash resolves to its 4bpw pack and hy4-flash:2.25bpw to the other, each recommended by RAM" {
+    try test_note.needArchs(&.{"hy4flash"});
+    try testing.expectEqualStrings("beamster/Hy4-Flash-Sushi-STQ-4bpw", resolveShortName("hy4-flash").?.repo);
+    try testing.expectEqualStrings("beamster/Hy4-Flash-Sushi-STQ-4bpw", resolveShortName("Hy4-Flash:4bpw").?.repo);
+    try testing.expectEqualStrings("beamster/Hy4-Flash-Sushi-STQ-2.25bpw", resolveShortName("hy4-flash:2.25bpw").?.repo);
+    try testing.expect(resolveShortName("hy4-flash:3bpw") == null);
+    try testing.expect(recommendedAlias("hy4-flash", 47) == null);
+    try testing.expectEqualStrings("2.25bpw", recommendedAlias("hy4-flash", 48).?.tag);
+    try testing.expectEqualStrings("2.25bpw", recommendedAlias("hy4-flash", 95).?.tag);
+    try testing.expectEqualStrings("4bpw", recommendedAlias("hy4-flash", 96).?.tag);
+    try testing.expectEqualStrings("4bpw", recommendedAlias("hy4-flash", 128).?.tag);
+}
+
 test "memory tiers: installed RAM rounds down to whole GB and picks fits or may stream" {
 
     try test_note.needArchs(&.{ "qwen4", "mimo2", "glm5", "dsv41" });

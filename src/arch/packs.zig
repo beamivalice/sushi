@@ -111,6 +111,8 @@ test "the alias table lists every arch's packs, in the arch gate's order, with t
         .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .streams = false, .flags = "" },
         .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams = true, .flags = "" },
         .{ .name = "deepseek-v4.1-flash", .tag = "2.7bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", .is_default = false, .tier_gb = 256, .recommend_gb = 256, .streams = true, .flags = "" },
+        .{ .name = "hy4-flash", .tag = "4bpw", .repo = "beamster/Hy4-Flash-Sushi-STQ-4bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams = false, .flags = "" },
+        .{ .name = "hy4-flash", .tag = "2.25bpw", .repo = "beamster/Hy4-Flash-Sushi-STQ-2.25bpw", .is_default = false, .tier_gb = 64, .recommend_gb = 48, .streams = false, .flags = "" },
     };
     try std.testing.expectEqual(rows.len, aliases.len);
     for (rows, aliases) |want, got| {
@@ -125,14 +127,11 @@ test "the alias table lists every arch's packs, in the arch gate's order, with t
     }
 }
 
-test "every arch declares a product name and at least one pack, or names why it has none yet" {
+test "every arch declares a product name and at least one pack" {
     inline for (comptime std.meta.tags(registry.Tag)) |t| {
         const p = registry.Mod(t).packs;
         try std.testing.expect(p.product.len > 0);
-        // `unreleased`: an arch still being built ships no pack, and says why; it goes when its first pack lands.
-        if (comptime @hasDecl(p, "unreleased")) {
-            try std.testing.expect(p.unreleased.len > 0 and p.aliases.len == 0);
-        } else try std.testing.expect(p.aliases.len > 0);
+        try std.testing.expect(p.aliases.len > 0);
     }
 }
 

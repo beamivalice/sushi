@@ -66,8 +66,10 @@ it may still run streamed ([Choosing a pack and streaming](usage-streaming.md)),
 | MiMo-V2.6-Flash-Sushi-2.3bpw | 128 GB | 128 GB |
 | DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | 96 GB (experts streamed) | 96 GB |
 | DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw | 256 GB (experts resident) | 256 GB |
+| Hy4-Flash-Sushi-STQ-2.25bpw | 64 GB | 48 GB (streamed) |
+| Hy4-Flash-Sushi-STQ-4bpw | 96 GB | 96 GB |
 
-Sizes are the whole download; a Qwen pack's n-gram table and DeepSeek's 189 GiB of Engram tables stay on the SSD and are
+Sizes are the whole download; a Qwen pack's n-gram table, DeepSeek's 189 GiB of Engram tables and Hy4-Flash's Engram tables stay on the SSD and are
 never loaded. Offline, `sushi list` shows only the models on disk.
 
 A pack carries a revision in `config.json` (`pack_revision.id`; a pack without it is revision 1.0). When Hugging Face
@@ -187,6 +189,20 @@ routed expert resident at the RAM default (no SSD reads, no limit to raise).
 ```bash
 sushi pull deepseek-v4.1-flash:2.7bpw
 sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw
+```
+
+**48 GB Mac, Hy4-Flash-Sushi-STQ-2.25bpw** (limit 45056; experts streamed)
+
+```bash
+sushi pull hy4-flash:2.25bpw
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ssd-budget-gb 36
+```
+
+**96 GB Mac, Hy4-Flash-Sushi-STQ-4bpw** (limit 94208)
+
+```bash
+sushi pull hy4-flash
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-4bpw
 ```
 
 DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
