@@ -330,7 +330,8 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   fixture leaves unset (`draining`), so it reads an earlier test's stack and can refuse; start from `submitTestScheduler`.
   `undefined-scheduler-slot` flags any `var x: Scheduler = undefined` or `var x: Slot = undefined` (any spelling whose
   last field is the type: an `@import`, an alias); a field added later is garbage the cull path reads: start from
-  `Scheduler.initForTest` or `Slot.initForTest`, which set every field.
+  `Scheduler.initForTest` or `Slot.initForTest`, which set every field; the `= undefined` is read through grouping
+  parentheses and `@as(_, x)`.
   `entry-checkout` flags a write of a hot-cache entry's `checkout` (assigned, set in a literal, captured by pointer,
   written through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
   `error-body-literal` flags an error envelope spelled outside `src/http.zig` (an `error` key whose object holds a
@@ -348,7 +349,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `cache-room` flags `roomFor` outside `mlx_pages.zig` and `src/tensor/`: the constructor that makes a cache buffer takes
   the engine's room for it once, as admission bills it.
 - `tests/guards/lint.allow` holds `<rule> <file>:<fn> <reason>`, one per line, for a hit that is deliberate. An entry
-  that matches nothing is stale and fails, so the list only shrinks.
+  that matches nothing is stale and fails, so the list only shrinks; an entry without a reason fails naming the line.
 - A new rule ships its red probe in `tests/test_lint.sh`, a green case for the near miss it must leave alone, and its
   allowlist entries.
 

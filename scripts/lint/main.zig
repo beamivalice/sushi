@@ -79,11 +79,12 @@ fn parseAllowlist(gpa: std.mem.Allocator, text: []const u8) !std.ArrayList(Entry
         if (line.len == 0 or line[0] == '#') continue;
         var words = std.mem.tokenizeScalar(u8, line, ' ');
         const rule_name = words.next().?;
-        const key = words.next() orelse {
+        const key = words.next();
+        if (key == null or words.next() == null) {
             std.debug.print("allowlist: '{s}' needs <rule> <file>:<fn> <reason>\n", .{line});
             return error.BadAllowlist;
-        };
-        try entries.append(gpa, .{ .rule = rule_name, .key = key });
+        }
+        try entries.append(gpa, .{ .rule = rule_name, .key = key.? });
     }
     return entries;
 }

@@ -21,7 +21,18 @@ fn lastField(tree: *const Ast, node: Node.Index) ?[]const u8 {
 }
 
 fn isUndefined(tree: *const Ast, node: Node.Index) bool {
-    return tree.nodeTag(node) == .identifier and std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined");
+    return switch (tree.nodeTag(node)) {
+        .identifier => std.mem.eql(u8, tree.tokenSlice(tree.nodeMainToken(node)), "undefined"),
+        .grouped_expression => isUndefined(tree, tree.nodeData(node).node_and_token[0]),
+        .builtin_call_two, .builtin_call_two_comma => blk: {
+            const builtin = tree.nodeMainToken(node);
+            if (tree.tokenTag(builtin) != .builtin or !std.mem.eql(u8, tree.tokenSlice(builtin), "@as")) break :blk false;
+            var buf: [2]Node.Index = undefined;
+            const params = tree.builtinCallParams(&buf, node) orelse break :blk false;
+            break :blk params.len == 2 and isUndefined(tree, params[1]);
+        },
+        else => false,
+    };
 }
 
 pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !void {

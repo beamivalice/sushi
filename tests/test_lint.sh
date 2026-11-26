@@ -882,6 +882,16 @@ printf '%s\n' 'test "t" {' '    var sch: @import("scheduler.zig").Scheduler = un
 expect_red "an undefined Scheduler through an @import" "src/p.zig:2:9 \[undefined-scheduler-slot\] t: Scheduler 'sch' is undefined: start it from Scheduler.initForTest"
 
 tree
+printf '%s\n' 'const sched = @import("scheduler.zig");' 'test "t" {' '    var slot: sched.Slot = @as(sched.Slot, undefined);' \
+  '    slot.request_id = 1;' '}' > "$TMP/t/src/p.zig"
+expect_red "an undefined Slot behind @as" "src/p.zig:3:9 \[undefined-scheduler-slot\] t: Slot 'slot' is undefined"
+
+tree
+printf '%s\n' 'const sched = @import("scheduler.zig");' 'test "t" {' '    var slot: sched.Slot = (undefined);' \
+  '    slot.request_id = 1;' '}' > "$TMP/t/src/p.zig"
+expect_red "a parenthesized undefined Slot" "src/p.zig:3:9 \[undefined-scheduler-slot\] t: Slot 'slot' is undefined"
+
+tree
 printf '%s\n' 'const sched = @import("scheduler.zig");' 'test "t" {' '    var p: *sched.Scheduler = undefined;' \
   '    var slots: [4]sched.Slot = undefined;' '    var o: ?sched.Slot = undefined;' '    _ = .{ p, slots, o };' '}' > "$TMP/t/src/p.zig"
 expect_green "a Scheduler pointer, a Slot array and an optional Slot"
@@ -933,6 +943,11 @@ echo 'const-write src/q.zig:f wrong file' > "$TMP/t/allow"
 expect_red "an entry for another file" "\[const-write\] f:"
 echo 'no-such-rule src/p.zig:f reason' > "$TMP/t/allow"
 expect_red "an unknown rule" "unknown rule 'no-such-rule'"
+
+tree
+printf '%s\n' 'const S = struct { x: u32 };' 'fn f(self: *const S) void {' '    @constCast(self).x = 1;' '}' > "$TMP/t/src/p.zig"
+echo 'const-write src/p.zig:f' > "$TMP/t/allow"
+expect_red "an allowlist entry with no reason" "allowlist: 'const-write src/p.zig:f' needs <rule> <file>:<fn> <reason>"
 
 # the real tree
 "$TMP/lint" src tests/guards/lint.allow >"$TMP/out" 2>&1 || fail "the real src/ passes with tests/guards/lint.allow"
