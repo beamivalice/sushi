@@ -67,6 +67,8 @@ pub const Plan = struct {
     case: Case,
     why: []const u8 = "",
     threads: usize,
+    /// Whether `root` came from the process's root path (`openRoot`), which a later write opens again.
+    from_path: bool = false,
     /// What the last `settle` spent making pipelines ahead, and how many it made.
     made_ns: u64 = 0,
     made_count: u64 = 0,
@@ -150,8 +152,9 @@ pub const Plan = struct {
 };
 
 /// Where this load's manifest lives once it holds a complete warm, for a warm that runs after the load's own (the
-/// vision tower's).
-var last: ?struct { a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key } = null;
+/// vision tower's). A root made from the process's path is opened again at each write, so a root removed and made
+/// again is never a stale handle.
+var last: ?struct { a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, from_path: bool, key: manifest.Key } = null;
 
 /// The scope of the manifest the load in progress settled, which its warm keys its markers by; null when no manifest
 /// can hold them (no root, or no scope).
@@ -167,7 +170,7 @@ pub fn writtenKey() ?manifest.Key {
 }
 
 fn remember(p: *const Plan) void {
-    last = if (p.root) |root| .{ .a = p.a, .io = p.io, .root = root, .key = p.key } else null;
+    last = if (p.root) |root| .{ .a = p.a, .io = p.io, .root = root, .from_path = p.from_path, .key = p.key } else null;
 }
 
 fn write(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key) bool {
@@ -198,7 +201,14 @@ pub fn forget() void {
 /// them. A load with no manifest root writes nothing.
 pub fn rewriteLate() void {
     const l = last orelse return;
-    if (!write(l.a, l.io, l.root, l.key)) return;
+    var reason: []const u8 = "";
+    const fresh = if (l.from_path) openRoot(l.io, &reason) else l.root;
+    const root = fresh orelse {
+        log.warn("[pipelines] manifest not written: {s}\n", .{reason});
+        return;
+    };
+    defer if (l.from_path and root_hook == null) root.close(l.io);
+    if (!write(l.a, l.io, root, l.key)) return;
     var dir_buf: [manifest.Key.dir_len]u8 = undefined;
     log.info("[pipelines] manifest {s} written again with a later warm: {d} recipes\n", .{ l.key.dirName(&dir_buf), registry.recipes().len });
 }
@@ -234,7 +244,9 @@ pub fn beginScope(a: std.mem.Allocator, io: std.Io, scope: anyerror![16]u8) Plan
     const key_ms = (load_clock.now() - t0) / std.time.ns_per_ms;
     var reason: []const u8 = "";
     const root = openRoot(io, &reason);
-    return begin(a, io, root, reason, .{ .scope = s, .build = build }, key_ms);
+    var plan = begin(a, io, root, reason, .{ .scope = s, .build = build }, key_ms);
+    plan.from_path = root != null;
+    return plan;
 }
 
 /// The plan of a load of `config` whose arch names its scope (`coolerPipelineScope`); null for an arch that settles its

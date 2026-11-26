@@ -238,7 +238,7 @@ The first load of a pack on a build leaves `~/.sushi/cache/pipelines/<scope>-<bu
 threads and skips the engine's warm forwards (`warmOwn`, `Fills`, `Blocks`, `Long`, the sampled verdict, the wide prefill chunks). What runs on
 MLX stays: its prefill warm and the spilled route's prefill chain (`warmSplit`), which no manifest covers. One `[pipelines]` line says which case ran: `made N pipelines from the manifest`, `manifest of
 another build, recompiled N on T threads`, `no manifest`, or `manifest unreadable (<reason>)`; the manifest is written only
-after a warm that returned without error, and the older builds of the scope are removed and named in the log. The key costs
+after a warm that returned without error, and the older builds of the scope but the newest other one are removed and named in the log. The key costs
 8 ms (the binary's SHA-256 included).
 
 One load per case, M5 Max, STQ 1.75bpw, `--serve` with `--ssd-budget-gb 108 --ctx-size 1000000`, `taskpolicy -a`, GPU lock,

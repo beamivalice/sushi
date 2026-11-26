@@ -273,18 +273,27 @@ test "dsv41 pipelines: a chunk whose index top-k streams over key tiles compiles
     }
 }
 
-test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older build's directory goes" {
+test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs in full, and the older builds' directories go but the newest other's" {
     try mlx.requireGpu();
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     defer forget();
-    const old = testKey("0a0a0a0a0a0a0a0a");
+    const oldest = testKey("0a0a0a0a0a0a0a0a");
+    const old = testKey("0c0c0c0c0c0c0c0c");
     const new = testKey("0b0b0b0b0b0b0b0b");
+    const io = std.Io.Threaded.global_single_threaded.io();
 
-    var first = plainBegin(tmp.dir, old);
+    var first = plainBegin(tmp.dir, oldest);
     defer first.deinit();
     try testing.expect(!first.settle());
     first.store();
+    // Another binary's manifest, written later: the file times tick finer than this wait.
+    std.Io.sleep(io, .fromMilliseconds(40), .real) catch {};
+    var middle = plainBegin(tmp.dir, old);
+    defer middle.deinit();
+    _ = middle.settle();
+    middle.store();
+    std.Io.sleep(io, .fromMilliseconds(40), .real) catch {};
 
     var second = plainBegin(tmp.dir, new);
     defer second.deinit();
@@ -292,11 +301,13 @@ test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs 
     try testing.expectEqual(dsv41_model.WarmScope.all, dsv41_serving.warmScopeOf(second.settle()));
     second.store();
 
-    const io = std.Io.Threaded.global_single_threaded.io();
     var now = try manifest.lookup(testing.allocator, io, tmp.dir, new);
     defer now.deinit();
     try testing.expect(now == .same);
-    var gone = try manifest.lookup(testing.allocator, io, tmp.dir, old);
+    var kept = try manifest.lookup(testing.allocator, io, tmp.dir, old);
+    defer kept.deinit();
+    try testing.expect(kept == .same);
+    var gone = try manifest.lookup(testing.allocator, io, tmp.dir, oldest);
     defer gone.deinit();
     try testing.expect(gone == .other);
 }

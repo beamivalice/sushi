@@ -258,6 +258,36 @@ test "cooler contract: a marker a vision tower recorded while its load's weights
     }.run);
 }
 
+test "cooler contract: a manifest rewritten after its root directory was removed and made again lands in the new one" {
+    const shared = @import("arch/cooler_pipelines.zig");
+    const pm = @import("pipeline_manifest.zig");
+    try mlx.requireGpu();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try pm.setRootFromHome(buf[0..try tmp.dir.realPath(io, &buf)]);
+    defer pm.clearRootForTest();
+    defer shared.forget();
+    mlx.engine.pipeline_registry.resetForTest();
+    var plan = shared.beginScope(testing.allocator, io, @as([16]u8, "aaaaaaaaaaaaaaaa".*));
+    defer plan.deinit();
+    _ = plan.settle();
+    plan.store();
+    const key = shared.writtenKey() orelse return error.NoManifestWritten;
+    // Another process or a cleanup removes the root; the next load makes it again.
+    try tmp.dir.deleteTree(io, ".sushi");
+    mlx.engine.pipeline_registry.record(.{ .kind = .source, .function = "late_kernel", .text = "kernel void late_kernel() {}\n" });
+    shared.rewriteLate();
+    var root = tmp.dir.openDir(io, ".sushi/cache/pipelines", .{ .iterate = true }) catch |e| {
+        std.debug.print("the root was not made again: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    defer root.close(io);
+    var found = try pm.lookup(testing.allocator, io, root, key);
+    defer found.deinit();
+    try testing.expect(found == .same);
+}
+
 /// Two DeepSeek packs whose scopes differ (the tile order does) and whose served warm has one shape.
 fn twoPacks() ?struct { a: []const u8, b: []const u8 } {
     const a = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return null);

@@ -289,6 +289,12 @@ pub fn setRootFromHome(home: []const u8) !void {
     configured_len = (try rootPath(&configured_buf, home)).len;
 }
 
+/// TEST-ONLY: the process has no root again.
+pub fn clearRootForTest() void {
+    comptime std.debug.assert(@import("builtin").is_test);
+    configured_len = 0;
+}
+
 pub fn configuredRoot() ?[]const u8 {
     return if (configured_len == 0) null else configured_buf[0..configured_len];
 }
@@ -376,22 +382,33 @@ pub fn write(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: Key, recip
     try dir.rename(temp_name, dir, file_name, io);
 }
 
-/// Removes the other builds of `key`'s scope; the names removed go to `removed` (owned by the caller).
+/// Removes the other builds of `key`'s scope but the most recently written one, so two binaries on one box keep each
+/// their manifest instead of deleting each other's; the names removed go to `removed` (owned by the caller).
 pub fn prune(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: Key, removed: *std.ArrayList([Key.dir_len]u8)) !void {
     var name_buf: [Key.dir_len]u8 = undefined;
     const mine = key.dirName(&name_buf);
-    var found: std.ArrayList([Key.dir_len]u8) = .empty;
+    const Other = struct { name: [Key.dir_len]u8, written: i96 };
+    var found: std.ArrayList(Other) = .empty;
     defer found.deinit(a);
     var it = root.iterate();
     while (try it.next(io)) |entry| {
         if (entry.kind != .directory or entry.name.len != Key.dir_len) continue;
         if (!std.mem.startsWith(u8, entry.name, &key.scope) or entry.name[16] != '-') continue;
         if (std.mem.eql(u8, entry.name, mine)) continue;
-        try found.append(a, entry.name[0..Key.dir_len].*);
+        var path_buf: [Key.dir_len + 1 + file_name.len]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ entry.name, file_name }) catch unreachable;
+        // A directory with no manifest file is a build that has not written yet, or one removed under us: neither is old.
+        const st = root.statFile(io, path, .{}) catch continue;
+        try found.append(a, .{ .name = entry.name[0..Key.dir_len].*, .written = st.mtime.toNanoseconds() });
     }
-    for (found.items) |name| {
-        try root.deleteTree(io, &name);
-        try removed.append(a, name);
+    var newest: ?usize = null;
+    for (found.items, 0..) |o, i| {
+        if (newest == null or o.written > found.items[newest.?].written) newest = i;
+    }
+    for (found.items, 0..) |o, i| {
+        if (i == newest) continue;
+        try root.deleteTree(io, &o.name);
+        try removed.append(a, o.name);
     }
 }
 
@@ -558,16 +575,25 @@ test "pipeline manifest: a damaged file is reported with its reason and its dire
     try testing.expectEqualStrings("ManifestChecksum", got.unreadable.reason);
 }
 
-test "pipeline manifest: a write leaves no temp file, and a prune removes only the other builds of the scope" {
+/// A moment past the last write, for a file system whose times tick coarser than two writes in a row.
+fn pastLastWrite() void {
+    std.Io.sleep(testing.io, .fromMilliseconds(40), .real) catch {};
+}
+
+test "pipeline manifest: a write leaves no temp file, and a prune removes the other builds of the scope but the newest" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const flags = [_]metal.Flag{};
     const recipes = sample(&flags);
     const mine = testKey("aaaaaaaaaaaaaaaa", "1111111111111111");
+    const older = testKey("aaaaaaaaaaaaaaaa", "3333333333333333");
     const old = testKey("aaaaaaaaaaaaaaaa", "2222222222222222");
     const foreign = testKey("bbbbbbbbbbbbbbbb", "2222222222222222");
-    for ([_]Key{ old, foreign, mine }) |k| try write(testing.allocator, io, tmp.dir, k, &recipes);
+    for ([_]Key{ older, old, foreign, mine }) |k| {
+        try write(testing.allocator, io, tmp.dir, k, &recipes);
+        pastLastWrite();
+    }
     var name_buf: [Key.dir_len]u8 = undefined;
     var left = try tmp.dir.openDir(io, mine.dirName(&name_buf), .{ .iterate = true });
     defer left.close(io);
@@ -578,13 +604,35 @@ test "pipeline manifest: a write leaves no temp file, and a prune removes only t
     defer removed.deinit(testing.allocator);
     try prune(testing.allocator, io, tmp.dir, mine, &removed);
     try testing.expectEqual(@as(usize, 1), removed.items.len);
-    try testing.expectEqualStrings(old.dirName(&name_buf), &removed.items[0]);
-    var gone = try lookup(testing.allocator, io, tmp.dir, old);
-    defer gone.deinit();
-    try testing.expect(gone == .other);
-    var kept = try lookup(testing.allocator, io, tmp.dir, foreign);
-    defer kept.deinit();
-    try testing.expect(kept == .same);
+    try testing.expectEqualStrings(older.dirName(&name_buf), &removed.items[0]);
+    for ([_]Key{ old, foreign, mine }) |k| {
+        var kept = try lookup(testing.allocator, io, tmp.dir, k);
+        defer kept.deinit();
+        try testing.expect(kept == .same);
+    }
+}
+
+test "pipeline manifest: two builds that write and prune in turn each keep their manifest" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const flags = [_]metal.Flag{};
+    const recipes = sample(&flags);
+    const a = testKey("aaaaaaaaaaaaaaaa", "1111111111111111");
+    const b = testKey("aaaaaaaaaaaaaaaa", "2222222222222222");
+    var removed: std.ArrayList([Key.dir_len]u8) = .empty;
+    defer removed.deinit(testing.allocator);
+    for ([_]Key{ a, b, a, b }) |k| {
+        try write(testing.allocator, io, tmp.dir, k, &recipes);
+        try prune(testing.allocator, io, tmp.dir, k, &removed);
+        pastLastWrite();
+    }
+    try testing.expectEqual(@as(usize, 0), removed.items.len);
+    for ([_]Key{ a, b }) |k| {
+        var kept = try lookup(testing.allocator, io, tmp.dir, k);
+        defer kept.deinit();
+        try testing.expect(kept == .same);
+    }
 }
 
 test "pipeline manifest: a write never touches a temp file another writer of the same manifest has open" {
