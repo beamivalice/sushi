@@ -728,7 +728,44 @@ fn archRefusal(opts: Options, arch: source.Arch) ?[]const u8 {
         return "DrafterExpertsKDsv41Only (--drafter-experts-k sets the DeepSeek-V4.1 DSpark experts' rate)";
     if (opts.trunk_from.len != 0 and (arch == .hy_v4_flash or arch == .deepseek_v41))
         return "TrunkFromUnsupported (--trunk-from takes a Qwen3.8-Flash-Next pack's trunk; Hy4-Flash and DeepSeek-V4.1 write theirs from the source)";
+    return unhonoredFlag(opts, arch);
+}
+
+/// A flag of the generic trunk driver, or of the calibration it builds, with whether `opts` gave it.
+const DriverFlag = struct { name: []const u8, given: bool };
+
+/// The refusal of a flag only the generic driver reads, given to a writer that never calls it; `--calib*` is built
+/// for Qwen alone, and `--capture` is read by the Hy4-Flash and DeepSeek-V4.1 writers alone.
+fn unhonoredFlag(opts: Options, arch: source.Arch) ?[]const u8 {
+    const own_writer = arch == .hy_v4_flash or arch == .deepseek_v41;
+    const stq = opts.trunk == .stq;
+    const flags = [_]DriverFlag{
+        .{ .name = "--layer-cooldown", .given = opts.layer_cooldown != 0 },
+        .{ .name = "--fisher-dir", .given = opts.fisher_dir.len != 0 },
+        .{ .name = "--target-boundaries", .given = opts.target_boundaries.len != 0 },
+        .{ .name = "--target", .given = opts.target != null },
+        .{ .name = "--trunk-bits", .given = opts.trunk_bits != null },
+        .{ .name = "--trunk-group", .given = opts.trunk_group != null },
+        .{ .name = "--factor-precision", .given = opts.factor_precision != .f64 },
+        .{ .name = "--trunk", .given = opts.trunk != .gptq },
+    };
+    if (own_writer) for (flags) |f| if (f.given) return driverFlagRefusal(f.name);
+    const calib_flags = [_]DriverFlag{
+        .{ .name = "--calib", .given = opts.calib.len != 0 },
+        .{ .name = "--calib-tokens", .given = opts.calib_tokens != (Options{}).calib_tokens },
+        .{ .name = "--calib-ids", .given = opts.calib_ids.len != 0 and !stq },
+        .{ .name = "--calib-windows", .given = opts.calib_windows.len != 0 and !stq },
+    };
+    if (arch != .qwen4_exp) for (calib_flags) |f| if (f.given) return driverFlagRefusal(f.name);
+    if (opts.capture.len != 0 and !own_writer) return driverFlagRefusal("--capture");
     return null;
+}
+
+fn driverFlagRefusal(flag: []const u8) []const u8 {
+    inline for (.{ "--layer-cooldown", "--fisher-dir", "--target-boundaries", "--target", "--trunk-bits", "--trunk-group", "--factor-precision", "--trunk", "--calib", "--calib-tokens", "--calib-ids", "--calib-windows", "--capture" }) |name| {
+        if (std.mem.eql(u8, flag, name)) return "FlagUnsupported (" ++ name ++ " is not read by this source's arch writer; see docs/flags.md)";
+    }
+    unreachable;
 }
 
 fn convertStqTrunk(allocator: std.mem.Allocator, io: std.Io, opts: Options, model_abs: []const u8, arch: source.Arch, trunk_abs: ?[]const u8) !void {
@@ -1192,4 +1229,70 @@ test "convert cli: a flag the source's arch does not honor, --trunk-from among t
     try t.expect(std.mem.startsWith(u8, archRefusal(o, .hy_v4_flash).?, "DrafterExpertsKDsv41Only"));
     try t.expect(archRefusal(o, .deepseek_v41) == null);
     try t.expect(archRefusal(.{}, .hy_v4_flash) == null);
+}
+
+test "convert cli: a flag only the generic driver reads is refused on the Hy4-Flash and DeepSeek-V4.1 writers" {
+    const t = std.testing;
+    const set = struct {
+        fn cooldown(o: *Options) void {
+            o.layer_cooldown = 30;
+        }
+        fn calibFile(o: *Options) void {
+            o.calib = "c.txt";
+        }
+        fn calibTokens(o: *Options) void {
+            o.calib_tokens = 4096;
+        }
+        fn calibIds(o: *Options) void {
+            o.calib_ids = "t.u32";
+            o.calib_windows = "w.json";
+        }
+        fn fisher(o: *Options) void {
+            o.fisher_dir = "f";
+        }
+        fn boundaries(o: *Options) void {
+            o.target_boundaries = "b";
+        }
+        fn target(o: *Options) void {
+            o.target = .compensated;
+        }
+        fn trunkMode(o: *Options) void {
+            o.trunk = .rtn;
+        }
+        fn bits(o: *Options) void {
+            o.trunk_bits = 6;
+        }
+        fn group(o: *Options) void {
+            o.trunk_group = 128;
+        }
+        fn precision(o: *Options) void {
+            o.factor_precision = .f32;
+        }
+    };
+    const setters = [_]*const fn (*Options) void{ set.cooldown, set.calibFile, set.calibTokens, set.calibIds, set.fisher, set.boundaries, set.target, set.trunkMode, set.bits, set.group, set.precision };
+    for ([_]source.Arch{ .hy_v4_flash, .deepseek_v41 }) |arch| for (setters) |apply| {
+        var o: Options = .{};
+        apply(&o);
+        try t.expect(std.mem.startsWith(u8, archRefusal(o, arch) orelse return error.TestUnexpectedResult, "FlagUnsupported"));
+    };
+    // The generic driver reads them on a Qwen source.
+    for (setters) |apply| {
+        var o: Options = .{};
+        apply(&o);
+        try t.expect(archRefusal(o, .qwen4_exp) == null);
+    }
+}
+
+test "convert cli: --capture is refused on a source whose writer does not read it, and a calibration text where only Qwen builds one" {
+    const t = std.testing;
+    var o: Options = .{};
+    o.capture = "calib";
+    for ([_]source.Arch{ .qwen4_exp, .glm5_next, .mimo_v2 }) |arch|
+        try t.expect(std.mem.startsWith(u8, archRefusal(o, arch) orelse return error.TestUnexpectedResult, "FlagUnsupported"));
+    try t.expect(archRefusal(o, .hy_v4_flash) == null);
+    try t.expect(archRefusal(o, .deepseek_v41) == null);
+    o = .{};
+    o.calib = "c.txt";
+    for ([_]source.Arch{ .glm5_next, .mimo_v2 }) |arch|
+        try t.expect(std.mem.startsWith(u8, archRefusal(o, arch) orelse return error.TestUnexpectedResult, "FlagUnsupported"));
 }

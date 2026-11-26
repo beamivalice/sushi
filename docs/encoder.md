@@ -30,7 +30,7 @@ sushi convert exl3 --model <source dir> --out <pack dir> [options]
 | `--window <12..16>` | 15 | trellis search window; `stq-pair1` is window 16, and another window beside it is refused (`Pair1WindowNot16`) |
 | `--calib <file>` | built-in mix | calibration text |
 | `--calib-tokens <n>` | 65536 | calibration tokens, at least 2048 |
-| `--capture <dir>` | none | DeepSeek-V4.1 only, required for it: the `calib/` directory of a layer-major calibration capture (`mlp-in-LL.bf16`, `route-LL.u16`, `trunk-LL.safetensors`, `trunk-head.safetensors`, `dspark-in-37..39.bf16`, `../windows.jsonl`); see [DeepSeek-V4.1](#deepseek-v41) |
+| `--capture <dir>` | none | DeepSeek-V4.1 and Hy4-Flash, required for the first and one of three for the second (with `--identity-hessian`, `--synthetic-codes`); another arch refuses it: the `calib/` directory of a layer-major calibration capture (`mlp-in-LL.bf16`, `route-LL.u16`, `trunk-LL.safetensors`, `trunk-head.safetensors`, `dspark-in-37..39.bf16`, `../windows.jsonl`); see [DeepSeek-V4.1](#deepseek-v41) |
 | `--synthetic-codes` | off | Hy4-Flash only (refused by name elsewhere), a dev pack: random trellis codes and scales matched to each source tensor's RMS, no calibration or search; see [Hy4-Flash](#hy4-flash) |
 | `--calib-ids <file>`, `--calib-windows <file>` | none | calibration as token ids (little-endian u32) cut into the windows a JSON `lengths` list gives, end to end; replaces `--calib` |
 | `--fisher-dir <dir>` | none | per-layer output Fishers (`fisher-LL.npz`): routed experts take [Fisher-weighted output scales](#fisher-and-target) |
@@ -41,7 +41,7 @@ sushi convert exl3 --model <source dir> --out <pack dir> [options]
 | `--trunk-bits <n>`, `--trunk-group <n>` | the model's served pack (Qwen 8, 64) | trunk affine width (2, 3, 4, 5, 6, 8) and group (32, 64, 128); `--trunk gptq` rounds 2, 4 and 8 only, and refuses the others up front; pending the owner's approval ([flags](flags.md#owner-calls)) |
 | `--factor-precision 64\|32` | 64 | Hessian factor: 64 on the CPU in float64 (the default and the oracle), 32 on the GPU in float32; 32 changes the pack bytes ([float32 factor](#float32-factor)) |
 | `--pin-pass <A>` | 64 | positions on each side of the wrap that the search's first pass covers, a multiple of 16 from 16 to 128; 128 is the full pass, a smaller A is faster and changes the pack bytes ([pin pass](#pin-pass)); `stq-pair1` counts A/2 pairs |
-| `--layer-cooldown <s>` | 0 | seconds the encoder rests, CPU and GPU idle, after each written layer; 0 is no rest, and no rest length paid on an M5 Max (see Calibration capture); the pack bytes and the resume key do not depend on it, so a resumed run may change it |
+| `--layer-cooldown <s>` | 0 | seconds the encoder rests (Qwen, GLM and MiMo only; Hy4-Flash and DeepSeek-V4.1 refuse it, as every flag only the generic driver reads, by name), CPU and GPU idle, after each written layer; 0 is no rest, and no rest length paid on an M5 Max (see Calibration capture); the pack bytes and the resume key do not depend on it, so a resumed run may change it |
 | `--cpu-threads <n>` | all cores | cap on the CPU count every pool is sized from (prep, target, feed, the trunk rounding and the search workers); at least 1, a value above the core count is the core count; the pack bytes do not depend on it |
 | `--resume` | off | continue an interrupted conversion in `--out` |
 
