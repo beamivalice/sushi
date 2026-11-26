@@ -90,7 +90,7 @@ pub var longest_for_test: ?Longest = null;
 
 fn underDeclaredLimit(buf: []u8, c: bills.Ceiling) []const u8 {
     const declared = c.declared.? >> 20;
-    const mb = c.unplanned >> 20;
+    const mb = bills.mbUp(c.unplanned);
     if (c.unplanned <= c.margin)
         return std.fmt.bufPrint(buf, "iogpu.wired_limit_mb={d} less the {d} MB --wired-margin-gib keeps unplanned", .{ declared, mb }) catch "the declared limit";
     if (c.gpu_floor == 0)
@@ -497,4 +497,11 @@ test "the [warm] line names a declared limit's unplanned bytes once" {
     try t.expectEqualStrings("iogpu.wired_limit_mb=2048 less the 2112 MB the GPU memory other processes hold, plus 512 MB, keeps unplanned", floor);
     const margin = underDeclaredLimit(&buf, .{ .declared = 120_000 * mib, .total_ram = 128 << 30, .margin = 8 << 30, .gpu_floor = 0, .unplanned = 8 << 30, .working_set = 100 << 30 });
     try t.expectEqualStrings("iogpu.wired_limit_mb=120000 less the 8192 MB --wired-margin-gib keeps unplanned", margin);
+}
+
+test "the [warm] line never names less unplanned than a declared limit keeps" {
+    const mib: u64 = 1 << 20;
+    var buf: [160]u8 = undefined;
+    const over = underDeclaredLimit(&buf, .{ .declared = 512 * mib, .total_ram = 32 << 30, .margin = 0, .gpu_floor = 0, .unplanned = 512 * mib + 1, .working_set = 24 << 30 });
+    try std.testing.expectEqualStrings("iogpu.wired_limit_mb=512 less the 513 MB slack", over);
 }

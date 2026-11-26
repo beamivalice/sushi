@@ -1694,6 +1694,11 @@ pub const ContextSource = enum {
 /// What a refusal's need counts: the arena the plans measure, or none, before the plans are recorded (a lower bound).
 pub const RefusalNeed = enum { measured, at_least };
 
+/// `bytes` in MB rounded up: a refusal names a need in it, so a need over what is free never reads as the same MB.
+pub fn mbUp(bytes: u64) u64 {
+    return (bytes +| ((1 << 20) - 1)) >> 20;
+}
+
 pub fn staticChunkRefusalLine(buf: []u8, min: u32, needed: u64, free: u64, context: ContextSource, need: RefusalNeed) []const u8 {
     const remedy = switch (context) {
         .flag => "lower --prefill-chunk-min or --ctx-size",
@@ -1703,7 +1708,7 @@ pub fn staticChunkRefusalLine(buf: []u8, min: u32, needed: u64, free: u64, conte
         .pinned => "the session keeps the context it advertised: free memory, or restart the server",
     };
     const at_least = if (need == .at_least) "at least " else "";
-    return std.fmt.bufPrint(buf, "[prefill] the load cannot hold its narrowest prefill chunk: {d} rows need {s}{d} MB beside the context, and {d} MB is free; {s}", .{ min, at_least, needed >> 20, free >> 20, remedy }) catch "[prefill] the load cannot hold its narrowest prefill chunk";
+    return std.fmt.bufPrint(buf, "[prefill] the load cannot hold its narrowest prefill chunk: {d} rows need {s}{d} MB beside the context, and {d} MB is free; {s}", .{ min, at_least, mbUp(needed), free >> 20, remedy }) catch "[prefill] the load cannot hold its narrowest prefill chunk";
 }
 
 /// The widest chunk below `chosen`, down to the load's min, whose arena and request of `tokens` fit `budget` beside `held`
@@ -9517,4 +9522,11 @@ test "contextKvHold names max_kv_tokens only when the cap holds the context" {
     cfg.max_kv_tokens = 1_048_576;
     cfg.pinned_context = 1_048_576;
     try testing.expectEqual(@as(u64, 0), contextKvHold(&cfg));
+}
+
+test "a narrowest-chunk refusal one byte short of the free memory names a need above what it says is free" {
+    const free: u64 = 1024 << 20;
+    var buf: [256]u8 = undefined;
+    const line = staticChunkRefusalLine(&buf, 4096, free + 1, free, .auto, .measured);
+    try std.testing.expectEqualStrings("[prefill] the load cannot hold its narrowest prefill chunk: 4096 rows need 1025 MB beside the context, and 1024 MB is free; lower --prefill-chunk-min", line);
 }

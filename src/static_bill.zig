@@ -168,7 +168,7 @@ fn contextRefusalLine(buf: []u8, r: ContextRefusal) []const u8 {
         .pinned => "no prefill chunk holds it, and the session keeps the context it advertised: free memory, or restart the server",
         .auto => "not one token fits at any prefill chunk: free memory",
     };
-    return std.fmt.bufPrint(buf, "[ledger] {s} of {d} tokens needs {d} MB beside the model bill of {d} MB at a prefill chunk of {d} rows; the budget of {d} MB leaves {d} MB, which holds {d} tokens; {s}", .{ label, r.context.tokens, r.needed / mb, r.bill / mb, r.chunk, r.budget / mb, r.room / mb, r.fits, remedy }) catch "[ledger] the context does not fit";
+    return std.fmt.bufPrint(buf, "[ledger] {s} of {d} tokens needs {d} MB beside the model bill of {d} MB at a prefill chunk of {d} rows; the budget of {d} MB leaves {d} MB, which holds {d} tokens; {s}", .{ label, r.context.tokens, bills.mbUp(r.needed), r.bill / mb, r.chunk, r.budget / mb, r.room / mb, r.fits, remedy }) catch "[ledger] the context does not fit";
 }
 
 /// A request that names a KV width other than its load's, on a load on the ledger: refused by name, since the load sized
@@ -363,4 +363,11 @@ test "static bill: a refused context names where it came from, and the widest ch
     const none = contextRefusalLine(&buf, flag);
     try testing.expect(std.mem.indexOf(u8, none, "--ctx-size of 65536 tokens") != null);
     try testing.expect(std.mem.indexOf(u8, none, "no prefill chunk down to the min of 512 rows holds it: lower --ctx-size") != null);
+}
+
+test "static bill: a context one byte short of the room names a need above the room it names" {
+    var buf: [640]u8 = undefined;
+    const line = contextRefusalLine(&buf, .{ .context = .{ .tokens = 65536, .source = .setting }, .needed = 8000 * mb + 1, .bill = 40000 * mb, .budget = 48000 * mb, .room = 8000 * mb, .fits = 65535, .chunk = 8192, .min = 512, .rung = null });
+    try testing.expect(std.mem.indexOf(u8, line, "needs 8001 MB beside the model bill") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "leaves 8000 MB") != null);
 }
