@@ -1380,8 +1380,8 @@ const ProbeCall = struct { between: []const u8, head: []const u8, after: []const
 
 fn locateProbeCall(rendered: []const u8) ?ProbeCall {
     const name_at = std.mem.indexOf(u8, rendered, probe_name) orelse return null;
-    const closer_at = std.mem.lastIndexOf(u8, rendered[0..name_at], think_tags.BARE_THINK_CLOSER) orelse return null;
-    const between = rendered[closer_at + think_tags.BARE_THINK_CLOSER.len .. name_at];
+    const closer = think_tags.lastRenderedCloseBefore(rendered, name_at) orelse return null;
+    const between = rendered[closer.pos + closer.len .. name_at];
     const head = std.mem.trimStart(u8, between, " \t\r\n");
     if (head.len == 0) return null;
     return .{ .between = between, .head = head, .after = rendered[name_at + probe_name.len ..] };
@@ -1393,8 +1393,8 @@ pub fn answerSeparator(allocator: std.mem.Allocator, chat_config: *const ChatCon
     const rendered = (try renderProbeCall(allocator, chat_config, .answer)) orelse return null;
     defer allocator.free(rendered);
     const at = std.mem.indexOf(u8, rendered, Probe.answer_marker) orelse return null;
-    const closer_at = std.mem.lastIndexOf(u8, rendered[0..at], think_tags.BARE_THINK_CLOSER) orelse return null;
-    return try allocator.dupe(u8, rendered[closer_at + think_tags.BARE_THINK_CLOSER.len .. at]);
+    const closer = think_tags.lastRenderedCloseBefore(rendered, at) orelse return null;
+    return try allocator.dupe(u8, rendered[closer.pos + closer.len .. at]);
 }
 
 /// The `<tag>` the template opens every tool call with (`<tool_call>`), or null when its call

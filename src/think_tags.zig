@@ -73,6 +73,17 @@ pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
     return tagLenAt(text, "</think");
 }
 
+/// The last think closer that ends at or before `end` in a template's render, in the plain spelling or Hy4's
+/// `</think:opensource>`: a render spells what the template writes, where generated text decodes to the plain tag.
+pub fn lastRenderedCloseBefore(text: []const u8, end: usize) ?TagAt {
+    var before = end;
+    while (std.mem.lastIndexOf(u8, text[0..before], "</think")) |at| {
+        if (callTagLenAt(text[at..], "</think")) |len| if (at + len <= end) return .{ .pos = at, .len = len };
+        before = at;
+    }
+    return null;
+}
+
 /// The think and channel tags a reading looks for.
 pub const Tag = enum { think_open, think_close, channel_thought, channel_close };
 

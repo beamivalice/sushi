@@ -3826,6 +3826,32 @@ test "a budget-closed thought commits the separator its template writes before a
     }
 }
 
+test "a reasoning budget closes a thought with the :opensource closer token the template renders, and a continuation bridges with it" {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think:opensource>", "</think:opensource>" });
+    defer tokenizer_mod.deinitTestTokenizer(&tok);
+    try tokenizer_mod.aliasOpensourceTags(&tok);
+    try tok.indexSpecials();
+    const closer_id = tok.special_tokens.get("</think:opensource>").?;
+    // The budget and the continuation bridge both look the closer up by its plain text: that is Hy4's one token.
+    try std.testing.expectEqual(@as(?u32, closer_id), atomicTokenId(a, &tok, think_tags.BARE_THINK_CLOSER));
+    const bridge = try tok.encode(a, think_tags.BARE_THINK_CLOSER);
+    defer a.free(bridge);
+    try std.testing.expectEqualSlices(u32, &.{closer_id}, bridge);
+
+    var cc = chat_mod.ChatConfig{ .chat_template = @import("hy4flash/hy4_chat.zig").release_template, .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .model_type = "hy_v4_flash" };
+    try cc.compile();
+    defer cc.dropCompiled();
+    const forced = (try thinkBoundForced(a, &tok, &cc, closer_id)) orelse return error.BudgetIsDeliveryCapOnly;
+    defer a.free(forced);
+    const early = try tok.encode(a, THINK_BOUND_EARLY_STOP);
+    defer a.free(early);
+    try std.testing.expectEqualSlices(u32, early, forced[0..early.len]);
+    try std.testing.expectEqualSlices(u32, &.{closer_id}, forced[early.len..]);
+}
+
 test "reasoningWithinBudget never cuts inside a character" {
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);

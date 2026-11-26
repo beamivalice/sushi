@@ -2088,7 +2088,7 @@ const opensource_tags = [_][2][]const u8{
     .{ "<arg_value:opensource>", "<arg_value>" }, .{ "</arg_value:opensource>", "</arg_value>" },
 };
 
-fn aliasOpensourceTags(tok: *Tokenizer) !void {
+pub fn aliasOpensourceTags(tok: *Tokenizer) !void {
     for (opensource_tags) |pair| {
         const id = tok.special_tokens.get(pair[0]) orelse continue;
         if (tok.special_tokens.contains(pair[1])) continue;

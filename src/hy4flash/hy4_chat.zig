@@ -152,3 +152,37 @@ test "Hy4's template renders each reference case as transformers does: system, h
     }
     try std.testing.expectEqual(@as(usize, 0), failed);
 }
+
+fn releaseConfig(a: std.mem.Allocator) !@import("../chat.zig").ChatConfig {
+    var config = @import("../chat.zig").ChatConfig{ .chat_template = release_template, .bos_token = "<\u{ff5c}hy_start:opensource\u{ff5c}>", .eos_token = "<\u{ff5c}hy_end:opensource\u{ff5c}>", .add_bos_token = false, .allocator = a, .model_type = "hy_v4_flash" };
+    try config.compile();
+    return config;
+}
+
+test "Hy4's tool_choice none bans the wrapper token its template opens every call with" {
+    const a = std.testing.allocator;
+    var config = try releaseConfig(a);
+    defer config.dropCompiled();
+    const opener = (try @import("../chat.zig").callOpener(a, &config)) orelse return error.NoOpener;
+    defer a.free(opener);
+    try std.testing.expectEqualStrings("<tool_calls:opensource>", opener);
+}
+
+test "Hy4's forced tool_choice reads the call its template writes after a closed thought" {
+    const chat = @import("../chat.zig");
+    const a = std.testing.allocator;
+    var config = try releaseConfig(a);
+    defer config.dropCompiled();
+    var forced = (try chat.forcedCallText(a, &config, null)) orelse return error.PromptOnly;
+    defer forced.deinit(a);
+    try std.testing.expect(std.mem.startsWith(u8, forced.call, "<tool_calls:opensource>"));
+}
+
+test "Hy4's template writes its answer straight after the closed thought" {
+    const a = std.testing.allocator;
+    var config = try releaseConfig(a);
+    defer config.dropCompiled();
+    const sep = (try @import("../chat.zig").answerSeparator(a, &config)) orelse return error.NoCloserBeforeAnswer;
+    defer a.free(sep);
+    try std.testing.expectEqualStrings("", sep);
+}

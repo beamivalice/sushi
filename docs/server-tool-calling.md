@@ -350,7 +350,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **`none` withholds the tools, skips the parser, and on chat, Messages and Responses bans the call opener**: a model that sees
   earlier calls in the history writes one anyway, as raw text in the answer. `request_policy.noneEnd` through `server.noneEndFor` (the one place, every surface, both stream modes) adds a -100 bias on
   the template's opener tag (`chat.callOpener`, `<tool_call>` on all three families) when it is one token, and leaves
-  it unbanned when the tokenizer splits it (its first piece would be a plain `<`); an arch serving no bias (Hy4-Flash) gets the opener as a stop id instead. Drafts stay on: it is a request bias.
+  it unbanned when the tokenizer splits it (its first piece would be a plain `<`); an arch serving no bias (Hy4-Flash) gets the opener as a stop id instead. Every probe reads the closer the template RENDERS, plain or Hy4's `</think:opensource>` (`think_tags.lastRenderedCloseBefore`); a server lookup by the plain text (the budget's closer, the continuation bridge) reaches Hy4's one token through the tokenizer's alias. Drafts stay on: it is a request bias.
   The chat page and `sushi run` send `tool_choice: "none"` on every request that offers no tools.
 - **`required`/`any` and a named function are enforced at decode** (`generate.CallForce`, armed by
   `server.armCallForce`): the markup the template itself writes after a closed thought (`chat.forcedCallText`; Qwen3.8
