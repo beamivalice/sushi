@@ -7,7 +7,7 @@ const std = @import("std");
 const mlx = @import("mlx_host").mlx;
 const host_side = @import("host_side.zig");
 /// The sushi version this copy of the module was cut at; the sushi tests check it against build.zig.zon.
-pub const version: []const u8 = "1.8.0-dev";
+pub const version: []const u8 = "1.8.0";
 pub const device = @import("device.zig");
 pub const format = @import("expert_exl3.zig");
 pub const pack = @import("pack.zig");
