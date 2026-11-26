@@ -125,13 +125,22 @@ pub fn token(m: *Model, lazy: Arr) !Arr {
 pub fn forced(m: *Model, id: u32) !?Arr {
     const p = m.plans orelse return null;
     if (!p.sample.planned) return null;
-    try remakeTokens(&p.sample, m.s);
-    return try kept(m, &p.sample, try mlx.newData(&id, &.{1}, .uint32));
+    const st = &p.sample;
+    try remakeTokens(st, m.s);
+    // Written in place on the host: past the seal a fresh array for the id is an ask the pool refuses.
+    const turn = try freeToken(st, true);
+    const host = std.mem.bytesAsSlice(u32, try mlx.engine.hostWritable(st.tokens[turn].?));
+    host[0] = id;
+    var view = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(view);
+    try mlx.check(mlx.mlx_reshape(&view, st.tokens[turn].?, &[_]c_int{1}, 1, m.s));
+    return view;
 }
 
-fn kept(m: *Model, st: *State, lazy: Arr) !Arr {
-    defer _ = mlx.mlx_array_free(lazy);
-    var pick: usize = st.turn % token_slots;
+/// The token block the next kept token takes, in turn: the first no other handle reads, else the turn's own. `sole_only`
+/// refuses the turn's own when another handle reads it, for a write that lands in place.
+fn freeToken(st: *State, sole_only: bool) !usize {
+    var pick: ?usize = if (sole_only) null else st.turn % token_slots;
     for (0..token_slots) |off| {
         const idx = (st.turn + off) % token_slots;
         if (st.tokens[idx]) |b| {
@@ -139,13 +148,19 @@ fn kept(m: *Model, st: *State, lazy: Arr) !Arr {
                 pick = idx;
                 break;
             }
-        } else {
+        } else if (!sole_only) {
             pick = idx;
             break;
         }
     }
-    const turn = pick;
+    const turn = pick orelse return error.Hy4TokenBlocksHeld;
     st.turn = (turn + 1) % token_slots;
+    return turn;
+}
+
+fn kept(m: *Model, st: *State, lazy: Arr) !Arr {
+    defer _ = mlx.mlx_array_free(lazy);
+    const turn = try freeToken(st, false);
     // A write that fails inside an execution leaves its block owing bytes of the arena, which the execution's end takes
     // back: the block goes, and `remakeTokens` makes it again outside one.
     errdefer {

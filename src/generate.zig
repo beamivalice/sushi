@@ -3895,7 +3895,7 @@ fn sampleRun(xfm: *Trunk, step: sampler.Step) !mlx.mlx_array {
 
 /// Prefill's first token: a forced call's when it owns token 0, else a draw (`sampler.firstTokenSample`).
 fn firstSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: sampler.SamplingParams) !mlx.mlx_array {
-    if (sampler.firstForced(sampling)) |id| return try tokenArray(id);
+    if (sampler.firstForced(sampling)) |id| return try forcedToken(xfm, id);
     return sampleRun(xfm, sampler.firstStep(xfm, logits, sampling));
 }
 

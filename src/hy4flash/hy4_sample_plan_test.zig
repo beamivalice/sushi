@@ -454,3 +454,25 @@ test "hy4 sample plan: a draw of a mix the load did not plan is refused by name,
     try expectSame(want, got);
     try testing.expectEqual(@as(u64, 1), st.misses);
 }
+
+test "hy4 sample plan: a forced call's token made outside any draw past the seal is the load's token block, written in place, asking the closed pool nothing (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.open(Drafting, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    try core.closePool(.refuse);
+    defer core.closePool(.open) catch {};
+    const before = core.stats().closed_asks;
+    for ([_]u32{ 7, 11, 7 }) |id| {
+        const t = (try sample_plan.forced(m, id)) orelse return error.TestUnplanned;
+        defer _ = mlx.mlx_array_free(t);
+        try testing.expectEqual(id, (try mlx.hostResult(u32, t, 1))[0]);
+    }
+    try testing.expectEqual(before, core.stats().closed_asks);
+}

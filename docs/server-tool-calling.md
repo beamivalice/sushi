@@ -375,6 +375,8 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (EOS, `length`, loop stop) ends it without a call.
 - While the call is pending each successor is decided after its predecessor is known (no pipelined fast path), draft
   paths stay off for the request (`mtp_plan.draftsRefused`), and the batched tick leaves the slot serial (`forced_call`).
+- A forced token is the arch's (`arch_cooler.forcedToken`), at token 0 too: a load that plans its samples writes it into
+  a token block in place (Hy4), since past its seal a fresh array for it is an ask the pool refuses.
 - A named choice for a function the request does not declare is a 400 on every surface. Guard:
   `tests/test_tool_choice_forced.sh`.
 

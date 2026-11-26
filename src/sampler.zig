@@ -24,7 +24,6 @@ const mtp_policy = @import("mtp_policy.zig");
 const CallForce = generate.CallForce;
 const Constraint = generate.Constraint;
 const Generator = generate.Generator;
-const tokenArray = generate.tokenArray;
 const verifyArgmax = generate.verifyArgmax;
 
 pub fn isGreedyTemperature(temperature: f32) bool {
@@ -812,7 +811,7 @@ pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, 
 
 /// Prefill's first token under the think penalty when the prompt leaves the span open.
 pub fn firstTokenSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (firstForced(sampling)) |id| return try tokenArray(id);
+    if (firstForced(sampling)) |id| return try generate.forcedToken(xfm, id);
     return sampleStep(std.heap.page_allocator, firstStep(xfm, logits, sampling), s);
 }
 
