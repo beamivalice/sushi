@@ -2362,8 +2362,9 @@ pub const Model = struct {
 
     /// Makes the kernels whose variant follows a size the served warm's prompts do not reach: the sort the indexer's
     /// picks run over every pooled group picks its block by the group count, which grows with the context, so a
-    /// partition at each power of two from 16 to 16,384 (past the multi-block sort) makes every variant at load; the
-    /// embedding gather's block counts and a span's short tail (`warmSpanTails`) likewise.
+    /// partition at each power of two from 16 to 16,384 (past the multi-block sort) makes every variant at load, and an
+    /// argsort of as many uint32 ids makes the routed experts' slot sort's (rows × top_k ids); the embedding gather's
+    /// block counts and a span's short tail (`warmSpanTails`) likewise.
     /// A joined tick at each width 2..`rows` over requests at the load's kv, once per attention arm (each row's own, the
     /// grouped chain forced): the kernels of both are made here, at load, never inside the first such tick.
     pub fn warmJoined(self: *Model, rows: usize, kv: kv_quant.KVQuantConfig) !void {
@@ -2435,6 +2436,13 @@ pub const Model = struct {
             const order = try o.slot();
             try mlx.check(mlx.mlx_argpartition_axis(order, try o.unary(.negative, row), @min(size - 1, 15), -1, o.s));
             try mlx.check(mlx.mlx_array_eval(order.*));
+            // The routed experts' slot sort (`expert_exl3_kernels`, `rate_groups`) sorts uint32 ids, rows × top_k of
+            // them, and picks its block by that count too.
+            const ids = try o.slot();
+            try mlx.check(mlx.mlx_astype(ids, range.*, .uint32, o.s));
+            const by = try o.slot();
+            try mlx.check(mlx.mlx_argsort_axis(by, ids.*, 0, o.s));
+            try mlx.check(mlx.mlx_array_eval(by.*));
         }
     }
 

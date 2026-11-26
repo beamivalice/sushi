@@ -1082,3 +1082,33 @@ test "hy4 request: after the load, a joined tick at every width the load joins m
     errdefer std.debug.print("joined ticks after the load made pipelines:\n{s}\n", .{mlx.engine.late_names.text()});
     try testing.expectEqual(late, mlx.engine.latePipelines());
 }
+
+test "hy4 request: after the load, a prompt whose chunk runs one or two rows past a whole span compiles no pipeline (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    const m = @import("../arch/handle.zig").trunk(sv.entry.handle.?).arch_state.hy4flash.model.?;
+    var prompt: [300]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = ids[(i * 3 + 1) % ids.len];
+    const late = mlx.engine.latePipelines();
+    mlx.engine.late_names.clear();
+    var restored: u32 = 0;
+    // A chunk past a whole span runs its last row or two as a span of their own (`fwd.linearSpans`): at both widths a
+    // layer splits a chunk by, before the selection threshold's 512.
+    for ([_]usize{ @intCast(@import("hy4_model.zig").gathered_span), @intCast(m.span_rows) }) |span| for ([_]usize{ 1, 2 }) |past| {
+        const len = span + past + 1;
+        var got = try sv.request(prompt[0..len], 1, &restored);
+        got.deinit(a);
+        errdefer std.debug.print("a {d}-token prompt ({d} rows past a {d}-row span) made pipelines:\n{s}\n", .{ len, past, span, mlx.engine.late_names.text() });
+        try testing.expectEqual(late, mlx.engine.latePipelines());
+    };
+}

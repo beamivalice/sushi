@@ -264,7 +264,9 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     rows arm, so they launch as they stand.
     The rows arms take a width as a template value, so each width a short last span takes through a bank's gate and
     `W_o` up to the wide arm's widest (sixteen rows on NAX; past eight, the wide arm's) is made at load
-    (`warmSpanTails`); a width past the arms shares the GEMM's pipelines (`hy4 late` cells).
+    (`warmSpanTails`); a width past the arms shares the GEMM's pipelines (`hy4 late` cells). The routed experts' slot
+    sort (uint32 ids, rows × top_k) picks its block by the count, so `warmKernels` sorts uint32 ids at each power of two
+    as it partitions the indexer's floats (`hy4 request` span-tail cell).
   - A wide span's core reads its keys where they are held, not gathered per span: a sliding layer's window rows, and a
     sparse layer's rows to the chunk's end, are read from kv8 to BF16 once a layer and chunk (`hy4_latent.rangeBf16`;
     the copy grows with depth, so a deep-zone chunk runs padded to its class's deepest recording: [D110](bill_redesign.md)),
