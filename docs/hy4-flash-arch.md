@@ -777,6 +777,8 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   kernels follow the ring, never the position, so one-token-deep requests make what a past-the-window tick needs.
   A joined root records the grouped attention arm once, at the first depth past the window (`Model.joined_grouped_at`):
   that arm reads each row's full ring at every depth past it; the per-row arm is recorded at every depth.
+  A joined tick's width is bounded by the load's joined cap, never by its reach (a tick's rows are requests, each at a
+  position below the reach): the book records every width 2..cap, and `beginJoined` refuses a wider one by name (`Hy4RowsWidth`).
 - **The 2..8-row rule is one predicate, by the span's own width** (`fwd.isVerifyBlock`): every site that must give a
   verify row its one-row bytes (row linears, absorb and value-out with or without `hy4_absorb`, scores, the ring)
   asks it, and a chunk's short last span decides by its own rows, so the shared launch keeps each span's bytes.

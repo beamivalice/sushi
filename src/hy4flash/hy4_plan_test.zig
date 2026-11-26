@@ -2301,3 +2301,151 @@ test "hy4 plan: a joined root records its grouped attention at one depth past th
     for (positions) |n| below += @intFromBool(n + 1 <= m.config.window);
     try testing.expectEqual((below + 1) / 2 + (positions.len - below + 1) / 2 + 1, traces);
 }
+
+/// One request's logits at `pos` through the one-row root, from a state prefilled with `ids[0..pos]`.
+fn soloLogits(m: *hy4_model_mod.Model, a: std.mem.Allocator, ids: []const u32, pos: usize) ![]u8 {
+    var req = try hy4_model_mod.Request.init(a, 0);
+    defer req.deinit();
+    const lent = m.lend(&req);
+    defer lent.end();
+    try m.reserveFor(pos + 1);
+    if (pos > 0) _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..pos], .none));
+    const lg = try hy4_plan.run(m, ids[pos .. pos + 1], null, .last);
+    defer _ = mlx.mlx_array_free(lg);
+    const vocab: usize = @intCast(m.config.vocab);
+    const out = try a.alloc(u8, vocab * 4);
+    @memcpy(out, std.mem.sliceAsBytes((mlx.mlx_array_data_float32(lg) orelse return error.TestNoLogits)[0..vocab]));
+    return out;
+}
+
+test "hy4 plan: a joined tick of 16 requests runs on a book recorded to a reach of 10, one execution of its root and each row its solo bytes (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const keep_was = m.keep_hidden;
+    defer m.keep_hidden = keep_was;
+    m.keep_hidden = false;
+    const load_plans = m.plans.?;
+    defer m.plans = load_plans;
+    const cap: usize = @intCast(fwd.joinedRowsMax());
+    const reach: usize = 10;
+    // Rows are separate requests, so a tick may be wider than the positions the book reaches.
+    try testing.expect(cap > reach);
+    var short = try hy4_plan.record(m, a, reach, null, load_plans.kv, null, null, cap);
+    defer {
+        m.plans = load_plans;
+        short.deinit(a);
+    }
+    m.plans = short;
+    var picks: [16]usize = undefined;
+    for (&picks, 0..) |*d, i| d.* = (3 * i) % reach;
+    var want: [reach][]u8 = undefined;
+    var made: usize = 0;
+    defer for (want[0..made]) |w| a.free(w);
+    for (0..reach) |pos| {
+        want[pos] = try soloLogits(m, a, ids, pos);
+        made = pos + 1;
+    }
+    var reqs: [16]hy4_model_mod.Request = undefined;
+    var nreq: usize = 0;
+    defer for (reqs[0..nreq]) |*r| r.deinit();
+    var caches: [16]kv_cache_mod.KVCache = undefined;
+    var ncache: usize = 0;
+    defer for (caches[0..ncache]) |*c| a.free(c.entries);
+    var ctxs: [16]handle_mod.ForwardCtx = undefined;
+    var ptrs: [16]*handle_mod.ForwardCtx = undefined;
+    var tokens: [16]u32 = undefined;
+    var offsets: [16]usize = @splat(0);
+    for (0..cap) |i| {
+        reqs[i] = try hy4_model_mod.Request.init(a, 0);
+        nreq = i + 1;
+        {
+            const lent = m.lend(&reqs[i]);
+            defer lent.end();
+            try m.reserveFor(picks[i] + 1);
+            if (picks[i] > 0) _ = mlx.mlx_array_free(try m.forwardReadout(ids[0..picks[i]], .none));
+        }
+        caches[i] = try kv_cache_mod.KVCache.init(a, @intCast(m.config.layers));
+        ncache = i + 1;
+        caches[i].step = picks[i];
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offsets[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .arch_ctx = .{} };
+        ctxs[i].arch_ctx.hy4flash.request = &reqs[i];
+        ptrs[i] = &ctxs[i];
+        tokens[i] = ids[picks[i]];
+    }
+    var dummy: [16]@import("../scheduler.zig").Slot = undefined;
+    @memset(std.mem.asBytes(&dummy), 0);
+    var slot_ptrs: [16]*@import("../scheduler.zig").Slot = undefined;
+    for (0..cap) |i| {
+        dummy[i].legacy_gen = null;
+        slot_ptrs[i] = &dummy[i];
+    }
+    var batch: []*@import("../scheduler.zig").Slot = slot_ptrs[0..cap];
+    var xfm: @import("../trunk.zig").Trunk = undefined;
+    xfm.arch_state = .{};
+    xfm.arch_state.hy4flash.model = m;
+    xfm.s = ld.xfm.s;
+    xfm.expert_stream = null;
+    const before = core.stats();
+    const out = hy4_sched_mod.batchedForward(undefined, a, &xfm, &batch, tokens[0..cap], ptrs[0..cap], &.{}, .{}, null) catch |e| {
+        std.debug.print("a joined tick of {d} on a reach of {d}: {t}, miss {any}\n", .{ cap, reach, e, core.executionMiss() });
+        return e;
+    };
+    defer {
+        for (out[0..cap]) |o| _ = mlx.mlx_array_free(o);
+        a.free(out);
+    }
+    const after = core.stats();
+    try testing.expectEqual(@as(u64, 1), after.executions - before.executions);
+    try testing.expectEqual(@as(u64, 0), after.wide_executions - before.wide_executions);
+    const vocab: usize = @intCast(m.config.vocab);
+    for (0..cap) |i| {
+        const got = (mlx.mlx_array_data_float32(out[i]) orelse return error.TestNoLogits)[0..vocab];
+        errdefer std.debug.print("row {d} at {d}: not its solo bytes\n", .{ i, picks[i] });
+        try testing.expectEqualSlices(u8, want[picks[i]], std.mem.sliceAsBytes(got));
+    }
+}
+
+test "hy4 plan: a joined tick wider than the book's joined width is refused by name, never missed (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Joining, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const load_plans = m.plans.?;
+    defer m.plans = load_plans;
+    var short = try hy4_plan.record(m, a, 10, null, load_plans.kv, null, null, 4);
+    defer {
+        m.plans = load_plans;
+        short.deinit(a);
+    }
+    m.plans = short;
+    var reqs: [5]hy4_model_mod.Request = undefined;
+    var made: usize = 0;
+    defer for (reqs[0..made]) |*r| r.deinit();
+    var segs: [5]hy4_model_mod.Model.Seg = undefined;
+    for (&reqs, &segs, 0..) |*r, *sg, i| {
+        r.* = try hy4_model_mod.Request.init(a, 0);
+        made = i + 1;
+        r.kv = short.kv;
+        sg.* = .{ .request = r, .id = 0 };
+    }
+    try testing.expectError(error.Hy4RowsWidth, hy4_plan.beginJoined(m, &segs));
+    try testing.expectEqual(@as(u64, 0), short.misses);
+}

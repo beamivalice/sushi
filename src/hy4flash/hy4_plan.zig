@@ -196,6 +196,8 @@ fn joinedRoot(rows: usize, keep_hidden: bool, kv: KVQuantConfig) Probe {
 pub const Plans = struct {
     book: plan_book.Book,
     reach: usize,
+    /// The widest joined tick the book holds a root for: rows of a tick are requests, so a tick may be wider than `reach`.
+    joined: usize = 0,
     kv: KVQuantConfig,
     cache: ?plan_book.Cache = null,
     /// The pack's identity (`pipeline_manifest.addPack`), which names the region kept beside the manifest; none keeps
@@ -667,7 +669,7 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
     // The level rule keeps reuse off work the GPU could run side by side (D23): the floors order every reuse, the rule
     // keeps their barriers to the pool's. Past its cap a buffer reuses by lifetimes: the key-sized ones a verify block
     // makes at a long context would take the arena from 70 MB to 4 GB.
-    p.* = .{ .book = .{ .gpa = gpa, .options = .{ .level_rule = true, .level_rule_cap = level_rule_cap, .guard = if (@import("builtin").is_test) 256 else 0 } }, .reach = reach, .kv = kv, .cache = cache, .drafter = drafter };
+    p.* = .{ .book = .{ .gpa = gpa, .options = .{ .level_rule = true, .level_rule_cap = level_rule_cap, .guard = if (@import("builtin").is_test) 256 else 0 } }, .reach = reach, .joined = if (joined > 1) @min(joined, joined_rows_max) else 0, .kv = kv, .cache = cache, .drafter = drafter };
     errdefer p.book.deinit();
     errdefer p.measured.deinit(gpa);
     const positions = try decodePositions(gpa, &m.config, reach);
@@ -707,7 +709,7 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
     // positions in order, `rows` a tick. The positions past the window start a tick of their own, every row of it past
     // the window, the one the grouped attention is recorded at.
     const grouped_from = if (m.joined_grouped_at) |g| std.mem.indexOfScalar(usize, positions, g).? else positions.len;
-    if (joined > 1) for (2..@min(joined, reach) + 1) |rows| {
+    if (p.joined > 1) for (2..p.joined + 1) |rows| {
         for ([_][2]usize{ .{ 0, grouped_from }, .{ grouped_from, positions.len } }) |span| {
             var at = span[0];
             while (at < span[1]) : (at += rows) {
@@ -1222,6 +1224,10 @@ pub fn beginJoined(m: *Model, segs: []const Model.Seg) !Probe {
         log.err("[plan] a joined tick's request holds a kv the load's plans do not: refused, never served in the wide region\n", .{});
         return error.Hy4JoinedKvUnplanned;
     };
+    if (segs.len > p.joined) {
+        log.err("[plan] a joined tick of {d} rows: the load plans joined ticks up to {d}\n", .{ segs.len, p.joined });
+        return error.Hy4RowsWidth;
+    }
     const probe: Probe = .{ .rows = segs.len, .readout = .all, .keep_hidden = m.keep_hidden, .kv = p.kv, .phase = .joined };
     const tables = p.tables(probe) orelse return missed(m, p, probe, .{ .kind = .unplanned, .id = root(probe) });
     try core.beginExecution(tables, root(probe));
