@@ -101,10 +101,9 @@ pub const Metrics = struct {
     gpu_clock_mhz: Gauge, // active-weighted since the last sample; 0 when idle or unreadable
     gpu_clock_max_mhz: Gauge, // top P-state, 0 when the clock is unreadable
     memory_mb: Gauge, // megabytes (phys_footprint)
-    // Real-time throughput source: completed generation tokens PLUS tokens
-    // generated so far by in-flight slots. The inference thread sets it once
-    // per decode tick (`publishLiveTokens`), so a reader never sees a finished
-    // slot's tokens counted in both halves.
+    // Real-time throughput source: every token generated so far, by ended and in-flight requests alike. The
+    // inference thread adds each slot's new tokens once per decode tick (`publishLiveTokens`), so it never counts a
+    // token twice and never goes backwards; at rest it equals the two totals.
     generation_tokens_live: Gauge,
     // Tokens forwarded so far by the prefill currently running, 0 when none is.
     // The OTHER half of the live picture: `generation_tokens_live` only moves
@@ -244,15 +243,6 @@ pub const Metrics = struct {
     }
 };
 
-/// Pure: the live-tokens gauge value = the generation tokens of every ended
-/// request (completed, cancelled or failed) PLUS the tokens generated so far by
-/// still-decoding slots. Kept here so the arithmetic
-/// is unit-testable and the "at rest ⇒ live == total" invariant is pinned
-/// without a running server.
-pub fn liveGenerationTokens(m: *const Metrics, inflight: u64) u64 {
-    return m.generation_tokens_total.load() + m.generation_tokens_unfinished_total.load() + inflight;
-}
-
 // ---------------------------------------------------------------------------
 // renderPrometheus — Prometheus text exposition format (OpenMetrics-compat)
 // ---------------------------------------------------------------------------
@@ -282,7 +272,7 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "sushi:gpu_clock_mhz", "GPU clock in MHz, active-weighted over the last sample (IOReport; 0 when idle or unreadable)", m.gpu_clock_mhz.load());
     try writeGauge(w, "sushi:gpu_clock_max_mhz", "Highest GPU P-state frequency in MHz (0 when unreadable)", m.gpu_clock_max_mhz.load());
     try writeGauge(w, "sushi:memory_mb", "Server physical memory footprint in megabytes (phys_footprint)", m.memory_mb.load());
-    try writeGauge(w, "sushi:generation_tokens_live", "Generation tokens of ended requests (completed, cancelled or failed) plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
+    try writeGauge(w, "sushi:generation_tokens_live", "Generation tokens generated so far by every request, ended or in flight (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "sushi:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
     try writeGauge(w, "sushi:prefill_tokens_expected", "Total tokens the in-flight prefill will forward, post-cache tail on the same scale as prefill_tokens_live (0 when idle; the bar's real target)", m.prefill_tokens_expected.load());
     try writeGauge(w, "sushi:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
@@ -706,18 +696,6 @@ test "Gauge.set and load" {
     try testing.expectEqual(@as(u64, 75), g.load());
     g.set(0);
     try testing.expectEqual(@as(u64, 0), g.load());
-}
-
-test "liveGenerationTokens = total + inflight aggregate" {
-    const testing = std.testing;
-    var m = Metrics.init();
-    m.generation_tokens_total.add(100);
-    // Live gauge = completed (100) + in-flight aggregate (37) published by the
-    // scheduler once per decode tick.
-    try testing.expectEqual(@as(u64, 137), liveGenerationTokens(&m, 37));
-    // At rest (nothing decoding ⇒ inflight aggregate 0) the live gauge must
-    // equal the completion counter — the invariant test_metrics.sh checks.
-    try testing.expectEqual(@as(u64, 100), liveGenerationTokens(&m, 0));
 }
 
 test "prefill throughput must exclude cache-restored tokens" {

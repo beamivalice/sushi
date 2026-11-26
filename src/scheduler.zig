@@ -440,6 +440,8 @@ pub const Slot = struct {
     /// The request's outcome has been counted in `Metrics`: by the inference thread, or by `settleHeld` before the
     /// connection thread completes the slot.
     metrics_recorded: bool = false,
+    /// Completion tokens already added to `generation_tokens_live` (inference thread).
+    live_published: u32 = 0,
     /// `SubmitParams.may_continue`, and whether the slot's finish left its count to `settleHeld`.
     may_continue: bool = false,
     record_held: bool = false,
@@ -1005,6 +1007,7 @@ pub const Slot = struct {
             .shutdown_cancelled = std.atomic.Value(bool).init(false),
             .committed_at_cull = false,
             .metrics_recorded = false,
+            .live_published = 0,
             .may_continue = false,
             .record_held = false,
             .continuation_of = null,
@@ -3204,11 +3207,7 @@ fn commitsAtCull(s: *const Slot) bool {
 pub fn drainSlots(sch: *Scheduler, slots: []const *Slot) void {
     if (slots.len == 0) return;
     for (slots) |s| cleanupSlot(sch, s);
-    {
-        sch.queue_mu.lockUncancelable(sch.io);
-        defer sch.queue_mu.unlock(sch.io);
-        recordDrained(sch.metrics, slots, sch.decoding.items);
-    }
+    recordDrained(sch.metrics, slots);
     const freed = slot_admission.heldBy(slots);
     // A slot's config outlives the slot; the drain's models, each once.
     var models: [16]*const ModelConfig = undefined;
@@ -4534,34 +4533,24 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     }
 }
 
-/// Sum the in-flight generated tokens over the active slots for the live-tok/s
-/// gauge, EXCLUDING any slot that already finished/cancelled/errored this tick
-/// (its tokens were counted into `generation_tokens_total` by `finishSlot`, so
-/// including them here would double-count — and would leave a stale non-zero
-/// aggregate once the last slot finishes, breaking the "at rest ⇒ live == total"
-/// invariant). Generic over the slot type so the exact filter is unit-testable
-/// with a lightweight stub; the real caller passes `[]*Slot`.
-fn sumInflightGeneratedTokens(active: anytype) u64 {
-    var inflight: u64 = 0;
-    for (active) |s| {
-        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
-        inflight += @as(u64, s.completion_tokens);
-    }
-    return inflight;
-}
-
-/// Sets the live-token gauge on the thread that finishes slots. The sampler only reads it, so it never sees a
-/// finished slot's tokens in both the total and the in-flight sum.
-fn publishLiveTokens(metrics: ?*metrics_mod.Metrics, active: anytype) void {
+/// Advances the live-token gauge by what each slot generated since it was last published. The gauge is the sum of
+/// those steps, so a request's end (counted into the totals on another thread, at another time) never moves it.
+/// Called on the inference thread only, over every slot that may have generated since the last call.
+pub fn publishLiveTokens(metrics: ?*metrics_mod.Metrics, slots: anytype) void {
     const m = metrics orelse return;
-    m.generation_tokens_live.set(metrics_mod.liveGenerationTokens(m, sumInflightGeneratedTokens(active)));
+    var step: u64 = 0;
+    for (slots) |s| {
+        step += s.completion_tokens -| s.live_published;
+        s.live_published = @max(s.live_published, s.completion_tokens);
+    }
+    if (step > 0) m.generation_tokens_live.set(m.generation_tokens_live.load() + step);
 }
 
-/// The cleanup drain's request counts, then the live-token gauge: a reply cut by a stop sequence enters the total
-/// here, and the loop may park next, so the gauge follows now. `decoding` is read under `queue_mu`.
-fn recordDrained(metrics: ?*metrics_mod.Metrics, drained: anytype, decoding: anytype) void {
+/// The cleanup drain's request counts and the last of the drained slots' tokens: a reply cut by a stop sequence
+/// enters the totals here, and the loop may park next, so the gauge follows now.
+fn recordDrained(metrics: ?*metrics_mod.Metrics, drained: anytype) void {
     for (drained) |s| slot_outcome.recordSlotCleanup(metrics, s);
-    publishLiveTokens(metrics, decoding);
+    publishLiveTokens(metrics, drained);
 }
 
 fn slotOnEngine(s: *Slot) bool {
@@ -5721,59 +5710,20 @@ test "complete keeps a slot in decoding until its pass is out, so admission neve
     while (sch.cleanup_queue.items.len > 0) sch.cleanup_queue.orderedRemove(0).deinit();
 }
 
-test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/errored" {
-    // Lightweight stub carrying exactly the fields the aggregate reads — proves
-    // the live-gauge filter without constructing a real (mlx-backed) Slot.
-    const StubSlot = struct {
-        completion_tokens: u32,
-        finished: bool,
-        error_code: ?[]const u8,
-        cancelled: std.atomic.Value(bool),
-        fn make(tok: u32) @This() {
-            return .{ .completion_tokens = tok, .finished = false, .error_code = null, .cancelled = std.atomic.Value(bool).init(false) };
-        }
-    };
-    var a = StubSlot.make(10);
-    var b = StubSlot.make(20);
-    var done = StubSlot.make(99);
-    done.finished = true; // already counted in generation_tokens_total
-    var errd = StubSlot.make(50);
-    errd.error_code = "OutOfMemory";
-    var cxl = StubSlot.make(7);
-    cxl.cancelled.store(true, .release);
-
-    // Two still-decoding slots (10 + 20); the finished/errored/cancelled ones
-    // are excluded, so the aggregate is 30 — never double-counting the tail.
-    const active = [_]*StubSlot{ &a, &b, &done, &errd, &cxl };
-    try testing.expectEqual(@as(u64, 30), sumInflightGeneratedTokens(active[0..]));
-
-    // At rest: the last decoding slot finishes ⇒ aggregate collapses to 0,
-    // pinning the "live == total at rest" invariant test_metrics.sh checks.
-    a.finished = true;
-    b.finished = true;
-    try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
-}
-
-test "the live-token gauge holds a finished slot's tokens once, whenever the sampler reads it" {
-    const StubSlot = struct {
-        completion_tokens: u32,
-        finished: bool = false,
-        error_code: ?[]const u8 = null,
-        cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    };
+test "the live-token gauge adds each slot's new tokens once, whatever the slot's end does around it" {
     var m = metrics_mod.Metrics.init();
-    var slot = StubSlot{ .completion_tokens = 2576 };
-    var active = [_]*StubSlot{&slot};
+    var a = slot_outcome.OutcomeStub{ .completion_tokens = 10 };
+    var b = slot_outcome.OutcomeStub{ .completion_tokens = 20 };
+    var active = [_]*slot_outcome.OutcomeStub{ &a, &b };
     publishLiveTokens(&m, active[0..]);
-    try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
-
-    // finishSlot counts the request into the total while the tick is still running.
-    slot.finished = true;
-    m.recordRequest(.success, 0, 0, 0, 10, slot.completion_tokens, 0);
-    try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
-
+    try testing.expectEqual(@as(u64, 30), m.generation_tokens_live.load());
     publishLiveTokens(&m, active[0..]);
-    try testing.expectEqual(@as(u64, 2576), m.generation_tokens_live.load());
+    try testing.expectEqual(@as(u64, 30), m.generation_tokens_live.load());
+    a.completion_tokens = 15;
+    a.finished = true;
+    b.error_code = "OutOfMemory";
+    publishLiveTokens(&m, active[0..]);
+    try testing.expectEqual(@as(u64, 35), m.generation_tokens_live.load());
 }
 
 test "the live-token gauge equals the total at rest after a reply that ended on a stop sequence" {
@@ -5786,8 +5736,9 @@ test "the live-token gauge equals the total at rest after a reply that ended on 
     stopped.stop_hit.store(true, .release);
     stopped.complete();
     publishLiveTokens(&m, active[0..]);
+    try testing.expectEqual(@as(u64, 940), m.generation_tokens_live.load());
     // The drain counts it as a success while `other` still decodes.
-    recordDrained(&m, &[_]*slot_outcome.OutcomeStub{&stopped}, active[1..]);
+    recordDrained(&m, &[_]*slot_outcome.OutcomeStub{&stopped});
     try testing.expectEqual(@as(u64, 900), m.generation_tokens_total.load());
     try testing.expectEqual(@as(u64, 940), m.generation_tokens_live.load());
 }
@@ -5802,7 +5753,7 @@ test "the live-token gauge never loses the tokens of a request cancelled or fail
     try testing.expectEqual(@as(u64, 390), m.generation_tokens_live.load());
     gone.complete();
     broke.error_code = "OutOfMemory";
-    recordDrained(&m, &[_]*slot_outcome.OutcomeStub{ &gone, &broke }, active[2..]);
+    recordDrained(&m, &[_]*slot_outcome.OutcomeStub{ &gone, &broke });
     try testing.expectEqual(@as(u64, 390), m.generation_tokens_live.load());
     try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
     try testing.expectEqual(@as(u64, 350), m.generation_tokens_unfinished_total.load());

@@ -525,6 +525,7 @@ pub const OutcomeStub = struct {
     may_continue: bool = false,
     record_held: bool = false,
     continuation_of: ?Head = null,
+    live_published: u32 = 0,
 
     /// `finishSlot` on the inference thread, which holds a slot that may continue after its thought.
     fn finishHolding(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
@@ -784,6 +785,81 @@ test "outcome: a slot that may continue is held only when its turn ended on a st
     cancelled.finishHolding(&m, "cancelled");
     try testing.expect(!cut.record_held and !cancelled.record_held);
     try expectOutcomes(&m, 1, 1, 0, 0);
+}
+
+/// Reads the live gauge after each step of a request's end and fails on the first move that is not a rise by exactly
+/// what was generated since the last read.
+const LiveGauge = struct {
+    m: *metrics_mod.Metrics,
+    seen: u64 = 0,
+
+    fn publish(self: *LiveGauge, slots: anytype, generated_since: u64) !void {
+        scheduler_mod.publishLiveTokens(self.m, slots);
+        try self.expect(generated_since);
+    }
+    fn expect(self: *LiveGauge, generated_since: u64) !void {
+        const now = self.m.generation_tokens_live.load();
+        try testing.expectEqual(self.seen + generated_since, now);
+        self.seen = now;
+    }
+};
+
+test "outcome: the live gauge holds a head's tokens once whether its connection thread has judged it yet or not" {
+    var m = metrics_mod.Metrics.init();
+    var g = LiveGauge{ .m = &m };
+    var head = OutcomeStub{ .may_continue = true, .completion_tokens = 40 };
+    const active = [_]*OutcomeStub{&head};
+    try g.publish(active[0..], 40);
+    head.finishHolding(&m, "stop");
+    try g.publish(active[0..], 0);
+    settleHeld(&m, &head);
+    try g.expect(0);
+    try g.publish(active[0..], 0);
+    head.complete();
+    recordSlotCleanup(&m, &head);
+    try g.publish(active[0..], 0);
+    try testing.expectEqual(m.generation_tokens_total.load(), g.seen);
+}
+
+test "outcome: the live gauge counts a continued reply's head once, through the continuation and past its end" {
+    var m = metrics_mod.Metrics.init();
+    var g = LiveGauge{ .m = &m };
+    var head = OutcomeStub{ .may_continue = true, .completion_tokens = 40 };
+    var heads = [_]*OutcomeStub{&head};
+    try g.publish(heads[0..], 40);
+    head.finishHolding(&m, "stop");
+    var cont = OutcomeStub{ .completion_tokens = 0, .continuation_of = Head.of(&head, 0) };
+    handOver(&head);
+    var both = [_]*OutcomeStub{ &head, &cont };
+    try g.publish(both[0..], 0);
+    cont.completion_tokens = 25;
+    try g.publish(both[0..], 25);
+    cont.finishHolding(&m, "stop");
+    try g.publish(both[0..], 0);
+    head.complete();
+    cont.complete();
+    recordSlotCleanup(&m, &head);
+    recordSlotCleanup(&m, &cont);
+    try g.publish(both[0..], 0);
+    try testing.expectEqual(m.generation_tokens_total.load(), g.seen);
+}
+
+test "outcome: the live gauge counts an EOS finish and an errored one once, each at its own end" {
+    var m = metrics_mod.Metrics.init();
+    var g = LiveGauge{ .m = &m };
+    var done = OutcomeStub{ .completion_tokens = 30 };
+    var broke = OutcomeStub{ .completion_tokens = 12 };
+    const active = [_]*OutcomeStub{ &done, &broke };
+    try g.publish(active[0..], 42);
+    done.finish(&m, "stop");
+    broke.fail("MlxFailure");
+    try g.publish(active[0..], 0);
+    done.complete();
+    broke.complete();
+    recordSlotCleanup(&m, &done);
+    recordSlotCleanup(&m, &broke);
+    try g.publish(active[0..], 0);
+    try testing.expectEqual(m.generation_tokens_total.load() + m.generation_tokens_unfinished_total.load(), g.seen);
 }
 
 test "request log: a finished request is logged once with its split of computed and restored prompt tokens" {

@@ -31,7 +31,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - **See a prompt being read**: `"return_progress": true` streams llama.cpp's `prompt_progress` chunks, and sushibar and
   the web UI show the read as a measured percentage, the web UI with its time estimate (`4% (est. 26 s)`); sushibar's
   icon also shows a model loading and a reply generating, and a reply continued after its thought counts as one request in
-  `/metrics` and the web UI's decode tile. Thanks @eliaskg for `return_progress`.
+  `/metrics` and the web UI's decode tile, whose speed chart no longer spikes when a reply ends. Thanks @eliaskg for `return_progress`.
 - **Clearer memory facts**: a pack's in-memory size leaves out the Engram tables that stay on the SSD
   (`76.1 GiB in memory · 194 GiB total`), every load refusal names its numbers rounded so a need never reads as
   fitting, `--wired-margin-gib 0` plans to the wired limit itself, a streamed `--vision` load reserves the memory of
