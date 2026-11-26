@@ -15,6 +15,7 @@ pub const PrefetchCredit = struct {
     credit: f64 = 0,
     share: f64 = 0,
     slice: f64 = 0,
+    reserved: f64 = 0,
 
     pub fn init(pct: u8, max_bps: f64, target_layers: usize) PrefetchCredit {
         return .{ .pct = @floatFromInt(pct), .max_bps = max_bps, .target_layers = @floatFromInt(@max(target_layers, 1)) };
@@ -35,17 +36,35 @@ pub const PrefetchCredit = struct {
     /// Whether the next job could read `bytes` whole: a prediction is worth making only then.
     pub fn affords(self: *const PrefetchCredit, bytes: u64) bool {
         const b: f64 = @floatFromInt(bytes);
-        return self.credit >= b and self.slice + self.share >= b;
+        return self.credit - self.reserved >= b and self.slice - self.reserved + self.share >= b;
+    }
+
+    /// Whether the next target layer can read `bytes` whole. When the round still holds `bytes` of unreserved credit
+    /// but this layer's slice plus its share falls short, its unspent share carries into `slice` for a later layer.
+    pub fn nextAffords(self: *PrefetchCredit, bytes: u64) bool {
+        if (self.affords(bytes)) return true;
+        if (self.credit - self.reserved >= @as(f64, @floatFromInt(bytes))) self.slice += self.share;
+        return false;
     }
 
     pub fn beginJob(self: *PrefetchCredit) void {
         self.slice += self.share;
     }
 
+    /// Holds `bytes` for a queued job until the worker settles its actual reads, preventing consecutive layers from
+    /// burst-queuing against the same unspent credit.
+    pub fn reserve(self: *PrefetchCredit, bytes: u64) void {
+        self.reserved += @floatFromInt(bytes);
+    }
+
+    pub fn unreserve(self: *PrefetchCredit, bytes: u64) void {
+        self.reserved = @max(0, self.reserved - @as(f64, @floatFromInt(bytes)));
+    }
+
     /// Spends `bytes` when the job's slice and the credit both hold them whole.
     pub fn take(self: *PrefetchCredit, bytes: u64) bool {
         const b: f64 = @floatFromInt(bytes);
-        if (self.credit < b or self.slice < b) return false;
+        if (self.credit - self.reserved < b or self.slice - self.reserved < b) return false;
         self.credit -= b;
         self.slice -= b;
         return true;
@@ -216,4 +235,33 @@ test "probe max is the fastest reading and 0 for none" {
     try testing.expectEqual(@as(f64, 0), probeMax(&.{}));
     try testing.expectEqual(@as(f64, 2e9), readRate(1 << 30, 536870912));
     try testing.expectEqual(@as(f64, 0), readRate(100, 0));
+}
+
+test "prefetch credit: nextAffords carries fractional shares and reserve prevents burst-queuing" {
+    // Two experts granted across four target layers (share = 0.5 experts): jobs fire on layers 1 and 3 even when
+    // layer 1's job has not finished on the worker before layer 2 checks `nextAffords`.
+    var c = creditOf(2, 4);
+    var queued_layers: [4]usize = undefined;
+    var n_queued: usize = 0;
+    for (0..4) |layer| {
+        if (!c.nextAffords(expert)) continue;
+        c.beginJob();
+        c.reserve(expert);
+        queued_layers[n_queued] = layer;
+        n_queued += 1;
+    }
+    try testing.expectEqualSlices(usize, &.{ 1, 3 }, queued_layers[0..n_queued]);
+    // Worker settles both queued jobs: neither can steal the other's reservation.
+    c.unreserve(expert);
+    try testing.expect(c.take(expert));
+    try testing.expect(!c.take(expert));
+    c.unreserve(expert);
+    try testing.expect(c.take(expert));
+    try testing.expectApproxEqAbs(@as(f64, 0), c.credit, 1e-6);
+    try testing.expectEqual(@as(f64, 0), c.reserved);
+
+    // Without credit for a whole expert, nextAffords never advances slice or fires.
+    var starved = creditOf(0.99, 4);
+    for (0..4) |_| try testing.expect(!starved.nextAffords(expert));
+    try testing.expectEqual(@as(f64, 0), starved.slice);
 }

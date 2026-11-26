@@ -212,7 +212,7 @@ pub const StqStream = struct {
             .can = canQueue,
             .queue = queueOpaque,
             .settle = settleOpaque,
-        }, .penalty = penaltyOpaque, .all_resident = allResident };
+        }, .penalty = penaltyOpaque, .prefetch_penalty = prefetchPenaltyOpaque, .all_resident = allResident };
     }
 
     fn allResident(ctx: *anyopaque) bool {
@@ -223,6 +223,11 @@ pub const StqStream = struct {
     fn penaltyOpaque(ctx: *anyopaque, layer: usize) anyerror!?A {
         const self: *StqStream = @ptrCast(@alignCast(ctx));
         return self.engine.cachePenalty(@intCast(layer));
+    }
+
+    fn prefetchPenaltyOpaque(ctx: *anyopaque, layer: usize, out: []f32) bool {
+        const self: *StqStream = @ptrCast(@alignCast(ctx));
+        return layer < self.engine.layers.len and self.engine.prefetchPenalty(@intCast(layer), out);
     }
 
     fn canQueue(ctx: *anyopaque, layer: usize) bool {
@@ -1631,6 +1636,38 @@ test "dsv41 prefetch: with no credit for one whole expert a round predicts nothi
     }
     try testing.expectEqual(before, model.prefetch_predicted);
     try testing.expectEqual(@as(u64, 0), starved.engine.prefetcher.?.jobs_queued.load(.monotonic));
+}
+
+test "dsv41 prefetch: fractional per-layer share still schedules jobs across target layers (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = try stqDir();
+    var fx = try model.loadFixture(dir, "fixture_noqat.safetensors");
+    defer fx.deinit();
+    const s = mlx.gpuStream();
+    var sc = Scope.plain(testing.allocator, s);
+    defer sc.deinit();
+    const ids = try model.tokens(&sc, &fx);
+    defer testing.allocator.free(ids);
+    var frac: StqServed = undefined;
+    try frac.init(dir, .bfloat16, true, true, 3, s);
+    defer frac.deinit();
+    try enablePrefetch(&frac, 1, 8, 2);
+    const pf = frac.engine.prefetcher.?;
+    const target_layers = frac.engine.prefetchTargets(1);
+    try testing.expect(target_layers >= 2);
+    // Grant just enough for one expert across all target layers, so each layer's share is < min_bytes.
+    const grant: f64 = @floatFromInt(pf.min_bytes);
+    pf.credit = .{ .pct = 100, .max_bps = grant, .target_layers = @floatFromInt(target_layers), .credit = grant, .share = grant / @as(f64, @floatFromInt(target_layers)), .slice = 0 };
+    try testing.expect(!pf.credit.affords(pf.min_bytes));
+    const b = try model.extend(frac.m, ids[0..20], .last);
+    defer _ = mlx.mlx_array_free(b);
+    // Reset credit right before verify because prefill's endForward refilled it.
+    pf.credit = .{ .pct = 100, .max_bps = grant, .target_layers = @floatFromInt(target_layers), .credit = grant, .share = grant / @as(f64, @floatFromInt(target_layers)), .slice = 0 };
+    const y = try model.verify(frac.m, ids[20..][0..5]);
+    defer _ = mlx.mlx_array_free(y);
+    try model.finishVerify(frac.m, 1);
+    frac.engine.prefetchQuiesce();
+    try testing.expect(pf.jobs_queued.load(.monotonic) > 0);
 }
 
 test "dsv41 prefetch: a model that never started it predicts and queues nothing in verify rounds and gives the bytes of one that did (DSV41_STQ_TINY)" {
