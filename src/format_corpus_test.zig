@@ -4436,6 +4436,37 @@ test "format corpus: a think tag a call's value spells is the value's text, what
     };
 }
 
+test "format corpus: a thought closer a call's value spells never ends the thought the call stands in, stream and non-stream alike" {
+    const allocator = testing.allocator;
+    const value = "a </think> b";
+    const calls = [_][]const u8{
+        "<tool_call><function=write><parameter=path>" ++ value ++ "</parameter></function></tool_call>",
+        "<tool_call>write<arg_key>path</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>",
+        hy4_open ++ "<tool_call>write<arg_key>path</arg_key><arg_value>" ++ value ++ "</arg_value></tool_call>" ++ hy4_close,
+    };
+    // `ends` is the thought's real close after the call: the call then stands inside a closed thought and is its text.
+    for (calls) |call| for ([_]bool{ false, true }) |ends| for ([_]bool{ false, true }) |streamed| {
+        const text = try std.mem.concat(allocator, u8, &.{ "plan", call, if (ends) "</think>Paris" else "" });
+        defer allocator.free(text);
+        errdefer std.debug.print("[ends {} streamed {}] {f}\n", .{ ends, streamed, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = null, .opens_think = true };
+        const got = try reply_mod.settle(allocator, .{ .text = text, .source = if (streamed) .{ .gated = null } else .whole, .finish_reason = "stop", .finish_details = null }, ask);
+        defer got.deinit(allocator);
+        const split = think_tags.splitThinkBlock(got.text, true, true);
+        try testing.expectEqualStrings("plan", split.reasoning_content orelse "");
+        try testing.expect(got.declined == null);
+        if (ends) {
+            try testing.expect(got.reply == null);
+            try testing.expectEqualStrings("Paris", split.content);
+        } else {
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, (got.reply orelse return error.FinishedCallDropped).calls[0].arguments, .{});
+            defer parsed.deinit();
+            try testing.expectEqualStrings(value, parsed.value.object.get("path").?.string);
+            try testing.expectEqualStrings("", split.content);
+        }
+    };
+}
+
 test "format corpus: no call markup reaches content, finished, declined or read as prose, stream and non-stream alike" {
     const allocator = testing.allocator;
     const dsml = "\u{ff5c}DSML\u{ff5c}";
