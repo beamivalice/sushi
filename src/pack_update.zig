@@ -303,7 +303,6 @@ pub fn checkPack(arena: Allocator, io: std.Io, known: []const Known, pack_path: 
 
 // ── The server's look: after a load, then once a day (the answer is kept across restarts) ──
 
-const slot_cap = 8;
 const slot_meta_cap = 384;
 
 const Slot = struct {
@@ -312,6 +311,8 @@ const Slot = struct {
     path_len: usize = 0,
     meta: [slot_meta_cap]u8 = undefined,
     meta_len: usize = 0,
+    /// A watch thread reads this slot's path: its row may be cleared, its folder may not.
+    watched: bool = false,
 };
 
 /// The folder's filesystem identity, never its spelling; a path that names no folder has none.
@@ -325,7 +326,24 @@ var enabled = false;
 var auto_on = std.atomic.Value(bool).init(true);
 var server_io: std.Io = undefined;
 var server_known: []const Known = &.{};
-var slots: [slot_cap]Slot = @splat(.{});
+var slots: std.ArrayListUnmanaged(Slot) = .empty;
+
+/// The slot for `id`, else an empty one, adding one when every slot holds another folder: a row is never dropped.
+/// Caller holds `mu`.
+fn slotForLocked(id: *const FolderId) ?usize {
+    var hole: ?usize = null;
+    for (slots.items, 0..) |*s, i| {
+        if (s.path_len == 0) {
+            if (hole == null) hole = i;
+        } else if (s.id.eql(id)) return i;
+    }
+    if (hole) |i| return i;
+    slots.append(std.heap.page_allocator, .{}) catch |err| {
+        log.debug("[pack-update] no slot for {s}: {t}\n", .{ std.fs.path.basename(id.bytes()), err });
+        return null;
+    };
+    return slots.items.len - 1;
+}
 
 /// Called once at serve start: `on` is false under `--no-update-check`, `auto` is the settings file's choice;
 /// `known` outlives the process.
@@ -371,19 +389,21 @@ pub fn watch(pack_path: []const u8) void {
     defer _ = std.c.pthread_mutex_unlock(&mu);
     if (!enabled) return;
     const id = folderId(server_io, pack_path) orelse return;
-    var free: ?usize = null;
-    for (&slots, 0..) |*s, i| {
-        if (s.path_len == 0) {
-            if (free == null) free = i;
-        } else if (s.id.eql(&id)) return;
+    for (slots.items) |*s| if (s.path_len != 0 and s.watched and s.id.eql(&id)) return;
+    const i = slotForLocked(&id) orelse return;
+    var s = &slots.items[i];
+    if (s.path_len == 0) {
+        @memcpy(s.path[0..pack_path.len], pack_path);
+        s.path_len = pack_path.len;
+        s.id = id;
     }
-    const i = free orelse return;
-    @memcpy(slots[i].path[0..pack_path.len], pack_path);
-    slots[i].path_len = pack_path.len;
-    slots[i].id = id;
+    s.watched = true;
     const t = std.Thread.spawn(.{}, watchLoop, .{i}) catch |err| {
-        slots[i].path_len = 0;
-        slots[i].id = .unset;
+        s.watched = false;
+        if (s.meta_len == 0) {
+            s.path_len = 0;
+            s.id = .unset;
+        }
         log.debug("[pack-update] watch thread: {t}\n", .{err});
         return;
     };
@@ -396,8 +416,8 @@ fn watchLoop(i: usize) void {
     while (true) {
         _ = std.c.pthread_mutex_lock(&mu);
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const path = path_buf[0..slots[i].path_len];
-        @memcpy(path, slots[i].path[0..path.len]);
+        const path = path_buf[0..slots.items[i].path_len];
+        @memcpy(path, slots.items[i].path[0..path.len]);
         const io = server_io;
         const known = server_known;
         _ = std.c.pthread_mutex_unlock(&mu);
@@ -416,7 +436,8 @@ fn watchLoop(i: usize) void {
     }
 }
 
-/// Publishes what a look found for the pack at `pack_path`, for `rowFragment`.
+/// Publishes what a look found for the pack at `pack_path`, for `rowFragment`. A row with nothing to say
+/// (`.current`, `.unknown`) frees the folder's slot; a watched folder keeps the slot its thread reads.
 pub fn record(io: std.Io, pack_path: []const u8, st: Status) void {
     const id = folderId(io, pack_path) orelse return;
     var tmp: [slot_meta_cap]u8 = undefined;
@@ -424,23 +445,26 @@ pub fn record(io: std.Io, pack_path: []const u8, st: Status) void {
     const n = if (metaFragment(&w, st)) |_| w.buffered().len else |_| 0;
     _ = std.c.pthread_mutex_lock(&mu);
     defer _ = std.c.pthread_mutex_unlock(&mu);
-    var free: ?usize = null;
-    for (&slots, 0..) |*s, i| {
-        if (s.path_len == 0) {
-            if (free == null) free = i;
-        } else if (s.id.eql(&id)) {
-            free = i;
-            break;
+    if (n == 0) {
+        for (slots.items) |*s| {
+            if (s.path_len == 0 or !s.id.eql(&id)) continue;
+            s.meta_len = 0;
+            if (!s.watched) {
+                s.path_len = 0;
+                s.id = .unset;
+            }
         }
+        return;
     }
-    const i = free orelse return;
-    if (slots[i].path_len == 0) {
-        @memcpy(slots[i].path[0..pack_path.len], pack_path);
-        slots[i].path_len = pack_path.len;
-        slots[i].id = id;
+    const i = slotForLocked(&id) orelse return;
+    var s = &slots.items[i];
+    if (s.path_len == 0) {
+        @memcpy(s.path[0..pack_path.len], pack_path);
+        s.path_len = pack_path.len;
+        s.id = id;
     }
-    @memcpy(slots[i].meta[0..n], tmp[0..n]);
-    slots[i].meta_len = n;
+    @memcpy(s.meta[0..n], tmp[0..n]);
+    s.meta_len = n;
 }
 
 /// The `,"pack_update":{...}` fragment for the `/v1/models` row of the pack at `pack_path`; empty when the last
@@ -449,13 +473,20 @@ pub fn rowFragment(io: std.Io, allocator: Allocator, pack_path: []const u8) Allo
     const id = folderId(io, pack_path) orelse return allocator.dupe(u8, "");
     _ = std.c.pthread_mutex_lock(&mu);
     defer _ = std.c.pthread_mutex_unlock(&mu);
-    for (&slots) |*s| {
+    for (slots.items) |*s| {
         if (s.path_len != 0 and s.id.eql(&id)) return allocator.dupe(u8, s.meta[0..s.meta_len]);
     }
     return allocator.dupe(u8, "");
 }
 
 const testing = std.testing;
+
+/// Tests only: the table is process-global, so each test starts and ends with no row.
+fn resetSlotsForTest() void {
+    _ = std.c.pthread_mutex_lock(&mu);
+    defer _ = std.c.pthread_mutex_unlock(&mu);
+    slots.clearRetainingCapacity();
+}
 
 const test_known = [_]Known{
     .{ .name = "alpha", .tag = "2.75bpw", .repo = "beamster/Alpha-Sushi-STQ-2.75bpw", .is_default = true },
@@ -656,16 +687,35 @@ test "toggle: the published switch gates the watch loop's look" {
     try testing.expect(looksNow(true, 100, 100 + 2 * day_s));
 }
 
+test "pack update: a ninth folder recorded still reaches its row" {
+    const io = testing.io;
+    var paths: [9][]u8 = undefined;
+    for (&paths, 0..) |*p, i| p.* = try std.fmt.allocPrint(testing.allocator, "/packs/pack-{d}", .{i});
+    defer for (paths) |p| testing.allocator.free(p);
+    defer resetSlotsForTest();
+    const up: Status = .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "org/x" } };
+    // Every folder finished a download (`.current`) and is then published with an update: more than the eight
+    // published packs, so a `.current` that holds a slot hides a ninth folder's row.
+    for (paths) |p| {
+        record(io, p, .current);
+        record(io, p, up);
+    }
+    for (paths, 0..) |p, i| {
+        const row = try rowFragment(io, testing.allocator, p);
+        defer testing.allocator.free(row);
+        if (row.len == 0) {
+            std.debug.print("folder {d}'s available update has no row\n", .{i});
+            return error.SlotDropped;
+        }
+    }
+}
+
 test "pack update: a finished update clears the row of the folder loaded under another spelling" {
     const io = testing.io;
     // The loaded entry's path as the registry walked it, and the catalog spelling a finished pull records under.
     const loaded = "/packs/./beamster/Pack";
     const recorded = "/packs/beamster/Pack";
-    defer {
-        _ = std.c.pthread_mutex_lock(&mu);
-        slots = @splat(.{});
-        _ = std.c.pthread_mutex_unlock(&mu);
-    }
+    defer resetSlotsForTest();
     record(io, loaded, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Pack" } });
     record(io, recorded, .current);
     // A finished pull leaves the pack at the published revision: its /v1/models row stops naming an update.
