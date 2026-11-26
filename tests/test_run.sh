@@ -359,6 +359,7 @@ attach)
         echo "skip_line_$cap=$out"
     done
     echo "kv_scheme=$(sushi_kv_scheme)"
+    echo "kv_wire=$(sushi_kv_wire)"
     ( sushi_require bogus ) > /dev/null 2>&1; echo "require_bogus=$?"
     ( unset SUSHI_URL; sushi_attach ) > /dev/null 2>&1; echo "attach_unset=$?"
     python3 - "$TESTS/lib" <<'PY'
@@ -505,6 +506,7 @@ for cap in vision video ledger; do
     has "  with one line naming it" "$(val "$out" skip_line_$cap)" "the boot lacks $cap (qwen4_exp)"
 done
 eq "sushi_kv_scheme reads the KV width the load serves" "$(val "$out" kv_scheme)" "kv8"
+eq "sushi_kv_wire spells it as the request field does" "$(val "$out" kv_wire)" "8"
 eq "require of an unknown capability is an error (1)" "$(val "$out" require_bogus)" "1"
 eq "attach without SUSHI_URL exits 1" "$(val "$out" attach_unset)" "1"
 eq "python twin: the nonce" "$(val "$out" py_nonce_head)" "n"

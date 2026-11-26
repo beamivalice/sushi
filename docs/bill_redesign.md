@@ -1380,7 +1380,8 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   forward asks it of its host ring. The stream's GPU maps (`specRoute`, `specGrouped`, `cachePenalty`, DeepSeek's and
   Qwen's) are unchanged. Every Hy4 load plans, so every one that warms is on the ledger.
 - **D103. A load on the ledger serves its own KV width**, and a request naming another is refused by name
-  (`static_bill.kvRefusal`, beside the arch's own KV refusal on every request surface). The load sized its closed-form
+  (`static_bill.kvRefusal`, the one decision and the one text for every request surface: it names the width the load
+  serves, and the arch's own words when its cache cannot store the asked width at all). The load sized its closed-form
   context, measured its region and planned its forwards at its width: a request at BF16 on a kv8 load would run in a
   region measured at kv8, draft on a closed pool, and hold twice the state the context priced. A request reserves its
   terms at its reach (`bills.ledgerRequestBill`), never an arch's request bill.

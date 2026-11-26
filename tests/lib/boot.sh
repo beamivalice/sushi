@@ -227,6 +227,13 @@ sushi_kv_scheme() {
     curl -sf "$SUSHI_URL/props" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["settings"]["kv_cache"]["scheme"])'
 }
 
+# sushi_kv_wire: the same width in the request field's spelling (8, 4, off), which is what a refusal names.
+sushi_kv_wire() {
+    local scheme
+    scheme=$(sushi_kv_scheme) || return 1
+    echo "${scheme#kv}"
+}
+
 # sushi_require <mtp|vision|video|batching|stq|thinking|spec|ledger>: exit 3 (SKIP) when the boot lacks it
 sushi_require() {
     local cap="${1:?sushi_require <cap>}" ok=0 arch="${SUSHI_ARCH:-}"

@@ -18,6 +18,8 @@ const vision_queue = @import("vision_queue.zig");
 const arch_media = @import("arch/media.zig");
 const slot_admission = @import("slot_admission.zig");
 const model_registry = @import("model_registry.zig");
+const kv_quant = @import("kv_quant.zig");
+const arch_flags = @import("arch/flags.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const mb: u64 = 1 << 20;
@@ -171,13 +173,16 @@ fn contextRefusalLine(buf: []u8, r: ContextRefusal) []const u8 {
     return std.fmt.bufPrint(buf, "[ledger] {s} of {d} tokens needs {d} MB beside the model bill of {d} MB at a prefill chunk of {d} rows; the budget of {d} MB leaves {d} MB, which holds {d} tokens; {s}", .{ label, r.context.tokens, bills.mbUp(r.needed), r.bill / mb, r.chunk, r.budget / mb, r.room / mb, r.fits, remedy }) catch "[ledger] the context does not fit";
 }
 
-/// A request that names a KV width other than its load's, on a load on the ledger: refused by name, since the load sized
-/// its context and its region and planned its forwards at its own width (D103). Null on any other load or width.
-pub fn kvRefusal(config: *const ModelConfig, kv: @import("kv_quant.zig").KVQuantConfig) ?[]const u8 {
-    if (config.static_ledger == null) return null;
+/// Why a request's `kv_quant` is refused, in one text (D103), or null when the load takes it. A load on the ledger serves
+/// only its own width, since it sized its context and its region and planned its forwards there: a request naming another
+/// is refused by that width, and by the arch's own words too when its cache cannot store the width at all. Any other load
+/// is refused only by its arch. The text is written into `buf`.
+pub fn kvRefusal(buf: []u8, config: *const ModelConfig, kv: kv_quant.KVQuantConfig) !?[]const u8 {
+    const arch_says = arch_flags.kvQuantRequestRefusal(config, kv);
+    if (config.static_ledger == null) return arch_says;
     const own = bills.configuredKvQuantFor(config);
-    if (kv.scheme == own.scheme and (kv.scheme == .off or kv.bits == own.bits)) return null;
-    return "This model serves only the kv_quant it was loaded with (--kv-quant): a request may not name another.";
+    if (kv.scheme == own.scheme and (kv.scheme == .off or kv.bits == own.bits)) return arch_says;
+    return try std.fmt.bufPrint(buf, "This model serves only kv_quant {s}, the width it was loaded with (--kv-quant): a request may not name another.{s}{s}", .{ own.wireName(), if (arch_says != null) " " else "", arch_says orelse "" });
 }
 
 /// What a request reserves on its load's ledger, priced once by `reservation`: every reader of a request's bill (its
@@ -339,15 +344,18 @@ pub fn propsJson(allocator: std.mem.Allocator, config: *const ModelConfig) !?[]u
 
 const testing = std.testing;
 
-test "static bill: a request at another KV width than its load's is refused by name on a load on the ledger, and passes at the load's width or on a load off it" {
+test "static bill: a request at another KV width than its load's is refused naming the load's width on a load on the ledger, and passes at the load's width or on a load off it" {
     var config: ModelConfig = .{};
+    var buf: [384]u8 = undefined;
     const own = bills.configuredKvQuantFor(&config);
-    const other: @import("kv_quant.zig").KVQuantConfig = if (own.scheme == .off) .affine(8) else .dense;
-    try testing.expect(kvRefusal(&config, other) == null);
+    const other: kv_quant.KVQuantConfig = if (own.scheme == .off) .affine(8) else .dense;
+    try testing.expect(try kvRefusal(&buf, &config, other) == null);
     var l: ledger.Ledger = .{};
     config.static_ledger = &l;
-    try testing.expect(kvRefusal(&config, own) == null);
-    try testing.expect(kvRefusal(&config, other) != null);
+    try testing.expect(try kvRefusal(&buf, &config, own) == null);
+    const why = (try kvRefusal(&buf, &config, other)).?;
+    var want: [32]u8 = undefined;
+    try testing.expect(std.mem.indexOf(u8, why, try std.fmt.bufPrint(&want, "serves only kv_quant {s},", .{own.wireName()})) != null);
 }
 
 test "static bill: a refused context names where it came from, and the widest chunk that holds it or that none does" {

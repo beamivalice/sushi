@@ -1729,7 +1729,8 @@ const IdleUnloadFit = struct {
 /// `media` is the request's deferred images, which a load on the ledger bills with the request.
 pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *http_conn.Conn, prompt_ids: []const u32, max_tokens: u32, config: *const model_mod.ModelConfig, model: ?*LoadedModel, is_anthropic: bool, kv_override: ?trunk.KVQuantConfig, unchunked_prefill: bool, enable_mtp: bool, media: ?*const vision_queue.DeferredMedia) !bool {
     const kv = kv_override orelse configuredKvQuantFor(config);
-    if (arch_flags.kvQuantRequestRefusal(config, kv) orelse static_bill.kvRefusal(config, kv)) |msg| {
+    var kv_buf: [384]u8 = undefined;
+    if (try static_bill.kvRefusal(&kv_buf, config, kv)) |msg| {
         if (is_anthropic) {
             try anthropic.sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -4379,6 +4380,38 @@ test "admission: a prompt that fits once the running requests finish waits in th
         } else {
             try t.expect(std.mem.indexOf(u8, raw, " does not fit in GPU memory: the request needs ") != null);
         }
+    }
+}
+
+test "a request naming another kv_quant than a load on the ledger serves is refused in one text that names the width the load serves, whichever width the arch's cache stores" {
+    try test_note.needArchs(&.{"hy4flash"});
+    const t = std.testing;
+    const Case = struct { own: trunk.KVQuantConfig, asked: trunk.KVQuantConfig, serves: []const u8, cache_says: bool };
+    const cases = [_]Case{
+        .{ .own = trunk.KVQuantConfig.affine(8), .asked = trunk.KVQuantConfig.dense, .serves = "serves only kv_quant 8", .cache_says = false },
+        .{ .own = trunk.KVQuantConfig.affine(8), .asked = trunk.KVQuantConfig.affine(4), .serves = "serves only kv_quant 8", .cache_says = true },
+        .{ .own = trunk.KVQuantConfig.affine(8), .asked = trunk.KVQuantConfig.affine(6), .serves = "serves only kv_quant 8", .cache_says = true },
+        .{ .own = trunk.KVQuantConfig.dense, .asked = trunk.KVQuantConfig.affine(8), .serves = "serves only kv_quant off", .cache_says = false },
+        .{ .own = trunk.KVQuantConfig.dense, .asked = trunk.KVQuantConfig.affine(4), .serves = "serves only kv_quant off", .cache_says = true },
+    };
+    for (cases) |c| {
+        var l: @import("ledger.zig").Ledger = .{};
+        var cfg = model_mod.ModelConfig{ .model_type = "hy_v4_flash", .kv_quant_override = c.own };
+        cfg.static_ledger = &l;
+        var sv: [2]std.posix.fd_t = undefined;
+        try t.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+        defer _ = std.c.close(sv[1]);
+        var conn: http_conn.Conn = undefined;
+        http_conn.Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, t.io);
+        const admitted = try checkAttentionMemory(t.allocator, &conn, &.{ 1, 2, 3 }, 8, &cfg, null, false, c.asked, false, false, null);
+        _ = std.c.close(sv[0]);
+        var buf: [4096]u8 = undefined;
+        const raw = readAllFromPair(sv[1], &buf);
+        errdefer std.debug.print("own {s} asked {s} (admitted {}): {s}\n", .{ c.own.wireName(), c.asked.wireName(), admitted, raw });
+        try t.expect(!admitted);
+        try t.expect(std.mem.startsWith(u8, raw, "HTTP/1.1 400"));
+        try t.expect(std.mem.indexOf(u8, raw, c.serves) != null);
+        try t.expectEqual(c.cache_says, std.mem.indexOf(u8, raw, "latent cache supports kv_quant 8 or off") != null);
     }
 }
 

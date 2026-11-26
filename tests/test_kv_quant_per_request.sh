@@ -41,7 +41,7 @@ fire() {
     echo -e "${GREEN}PASS${NC} $label: $(echo "$content" | head -c 80)..."
 }
 
-# refused <label> <kv_quant field value>: a 400 naming kv_quant on chat and on completions
+# refused <label> <kv_quant field value>: a 400 naming the width the load serves on chat and on completions
 refused() {
     local path body r
     for path in chat/completions completions; do
@@ -51,10 +51,10 @@ refused() {
             body="{\"model\":\"sushi\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Say hello.\"}],\"max_tokens\":8,\"kv_quant\":$2}"
         fi
         r=$(curl -s -m 60 -w '\n%{http_code}' -X POST -H "Content-Type: application/json" -d "$body" "$BASE/v1/$path")
-        if [ "${r##*$'\n'}" = 400 ] && grep -q kv_quant <<< "${r%$'\n'*}"; then
-            echo -e "${GREEN}PASS${NC} $1 on $path: a 400 naming kv_quant"
+        if [ "${r##*$'\n'}" = 400 ] && grep -qF "serves only kv_quant $OWN_WIRE," <<< "${r%$'\n'*}"; then
+            echo -e "${GREEN}PASS${NC} $1 on $path: a 400 naming the served width ($OWN_WIRE)"
         else
-            echo -e "${RED}FAIL${NC} $1 on $path: expected a 400 naming kv_quant"
+            echo -e "${RED}FAIL${NC} $1 on $path: expected a 400 naming the served width ($OWN_WIRE)"
             echo "  got: $(echo "$r" | head -c 300)"
             FAIL=1
         fi
@@ -63,6 +63,7 @@ refused() {
 
 if (sushi_require ledger > /dev/null); then
     LOADED=$(sushi_kv_scheme) || exit 1
+    OWN_WIRE=$(sushi_kv_wire) || exit 1
     case "$LOADED" in off) OWN='"off"' ;; kv*) OWN=${LOADED#kv} ;; esac
     echo "== a load on the ledger serves its own KV width ($LOADED) =="
     fire "request without kv_quant" ""

@@ -4,6 +4,10 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- A request that names another `kv_quant` than a Hy4-Flash load serves is refused with one text that names the width the load serves.
+
 ## v1.8.0 — Hy4-Flash support
 
 - **Hy4-Flash is here**: `sushi pull hy4-flash` downloads its Sushi STQ packs, 4bpw for a 96 GB Mac and 2.25bpw for a

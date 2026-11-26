@@ -219,8 +219,8 @@ alive_checks() {
     check "no MLX error / crash line in the log" "$([[ "$(log_count '\[mlx\] error|panic|Segmentation|error latched')" == 0 ]] && echo 0 || echo 1)"
 }
 
-# A cell naming a width other than the ledger load's: every surface refuses it with a 400 naming kv_quant, and the
-# load goes on serving its own width.
+# A cell naming a width other than the ledger load's: every surface refuses it with a 400 naming the width the load
+# serves, and the load goes on serving it.
 refusal_cell() { # $1 cfg
     local surface path body r msg
     for surface in "chat|/v1/chat/completions|{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8}" \
@@ -230,7 +230,7 @@ refusal_cell() { # $1 cfg
         path=${surface#*|}; body=${path#*|}; path=${path%%|*}
         r=$(status_body "$path" "$body")
         msg=$(echo "${r%$'\n'*}" | J 'd["error"]["message"]')
-        check "${surface%%|*}: $1 is a 400 naming kv_quant (the load serves $LEDGER_KV)" "$([[ "${r##*$'\n'}" == 400 && "$msg" == *kv_quant* ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
+        check "${surface%%|*}: $1 is a 400 naming the width the load serves ($LEDGER_KV)" "$([[ "${r##*$'\n'}" == 400 && "$msg" == *"serves only kv_quant $LEDGER_WIRE,"* ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
     done
     check "the load still serves $LEDGER_KV" "$([[ "$(sushi_kv_scheme)" == "$LEDGER_KV" ]] && echo 0 || echo 1)"
     r=$(CELL_FIELDS='{}' post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":16,\"temperature\":0}")
@@ -263,7 +263,7 @@ cell_fields() { # $1 cfg; sets CELL_FIELDS, or SKIP_WHY
 }
 
 # The KV width a load on the ledger serves, else empty. A cell's name (off, kv4, kv8) is its width's /props scheme name.
-if (sushi_require ledger > /dev/null); then LEDGER_KV=$(sushi_kv_scheme) || { echo "smoke matrix: /props names no kv_cache scheme" >&2; exit 1; }; else LEDGER_KV=; fi
+if (sushi_require ledger > /dev/null); then LEDGER_KV=$(sushi_kv_scheme) && LEDGER_WIRE=$(sushi_kv_wire) || { echo "smoke matrix: /props names no kv_cache scheme" >&2; exit 1; }; else LEDGER_KV=; LEDGER_WIRE=; fi
 if (sushi_require thinking > /dev/null); then think=yes; else think=no; fi
 IFS=',' read -r -a WANT_CFG <<< "$CONFIGS"
 echo "=== $SUSHI_ARCH on the shared boot ==="
