@@ -734,6 +734,11 @@ fn rootsWithFileDir(buf: *[9][]const u8, boot_roots: []const []const u8, pinned:
     return buf[0 .. boot_roots.len + 1];
 }
 
+/// What holds the "sushi" alias. `explicit` (`--model`, `setDefault`) pins it while its model is loaded; `explicit_unloaded`
+/// is that default while its model is gone, which the next chat-capable load takes and a reload makes `explicit` again;
+/// `promoted` follows the latest chat-capable load.
+const DefaultSource = enum { explicit, explicit_unloaded, promoted };
+
 /// Registry of all discovered + loaded models. One instance per server.
 ///
 /// Lifecycle:
@@ -780,9 +785,8 @@ pub const ModelRegistry = struct {
     /// specifies the literal "sushi"). Borrowed from the corresponding
     /// entry's `id`; valid for the registry's lifetime.
     default_id: []const u8,
-    /// The default came from a headless load, not `--model` or an explicit
-    /// `setDefault`, so it follows the latest chat-capable load.
-    default_promoted: bool = false,
+    /// Who holds `default_id`; the registry alone moves it.
+    default_source: DefaultSource = .promoted,
 
     /// Cap on `.ready` entries. ensureLoaded evicts before exceeding.
     max_resident_models: u32,
@@ -1051,7 +1055,7 @@ pub const ModelRegistry = struct {
         defer self.mutex.unlock(self.io);
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
-        self.default_promoted = false;
+        self.default_source = .explicit;
     }
 
     /// The entry whose folder is the one `path` names (any spelling of it), or null: no entry is ever another
@@ -1572,7 +1576,7 @@ pub const ModelRegistry = struct {
         entry.error_name = null;
         // A default whose model left no longer pins the alias: the next chat-capable load takes it, as on a headless
         // server, so a "sushi" request never loads the unloaded default beside the model the user loaded.
-        if (std.mem.eql(u8, self.default_id, entry.id)) self.default_promoted = true;
+        if (std.mem.eql(u8, self.default_id, entry.id) and self.default_source == .explicit) self.default_source = .explicit_unloaded;
         self.state_cond.broadcast(self.io);
     }
 
@@ -1738,11 +1742,11 @@ pub const ModelRegistry = struct {
         // chat-later hole (2026-07-05). The LATEST chat-capable load is the
         // default, so a model-less request never swaps back to an older model;
         // an explicit default (`--model`, `setDefault`) is never stolen.
-        if ((self.default_id.len == 0 or self.default_promoted) and entry.config != null and
-            !std.mem.eql(u8, self.default_id, entry.id))
-        {
+        if (std.mem.eql(u8, self.default_id, entry.id)) {
+            if (self.default_source == .explicit_unloaded) self.default_source = .explicit;
+        } else if ((self.default_id.len == 0 or self.default_source != .explicit) and entry.config != null) {
             self.default_id = entry.id;
-            self.default_promoted = true;
+            self.default_source = .promoted;
             log.info("[registry] default model -> {s} (latest chat-capable load on a headless server)\n", .{entry.id});
         }
         self.state_cond.broadcast(self.io);
@@ -3034,6 +3038,54 @@ test "ModelRegistry: an explicit default whose model was unloaded no longer pins
     const via_alias = try reg.ensureLoaded("sushi");
     try testing.expectEqual(b, via_alias);
     reg.release(via_alias);
+}
+
+test "ModelRegistry: an explicit default reloaded after an unload pins the alias again; a promoted one keeps following the latest load" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    var cfg_a = model_mod.ModelConfig{};
+    cfg_a.model_type = "mimo_v2";
+    var cfg_b = model_mod.ModelConfig{};
+    cfg_b.model_type = "mimo_v2";
+    const a = try reg.registerStub("small", "/m/small", 64);
+    a.config = &cfg_a;
+    const b = try reg.registerStub("large", "/m/large", 64);
+    b.config = &cfg_b;
+    defer {
+        a.config = null;
+        b.config = null;
+    }
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(a, 64);
+    reg.mutex.unlock(reg.io);
+    try reg.setDefault("small");
+
+    // Unloaded, then loaded again before any other load takes the alias: the explicit default pins it as it did before.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.finalizeEvictionLocked(a);
+    reg.markReadyLocked(a, 64);
+    reg.markReadyLocked(b, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("small", reg.default_id);
+
+    // A default promoted from a load follows the latest load, also after it left and came back.
+    var headless = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer headless.deinit();
+    const c = try headless.registerStub("first", "/m/first", 64);
+    c.config = &cfg_a;
+    const d = try headless.registerStub("second", "/m/second", 64);
+    d.config = &cfg_b;
+    defer {
+        c.config = null;
+        d.config = null;
+    }
+    headless.mutex.lockUncancelable(headless.io);
+    headless.markReadyLocked(c, 64);
+    headless.finalizeEvictionLocked(c);
+    headless.markReadyLocked(c, 64);
+    headless.markReadyLocked(d, 64);
+    headless.mutex.unlock(headless.io);
+    try testing.expectEqualStrings("second", headless.default_id);
 }
 
 /// Rescan tests never read the user's own settings file, whose models folder would join the roots.
