@@ -1570,6 +1570,9 @@ pub const ModelRegistry = struct {
         // pre-eviction value externally — pass-through here is a no-op.)
         entry.state = .unloaded;
         entry.error_name = null;
+        // A default whose model left no longer pins the alias: the next chat-capable load takes it, as on a headless
+        // server, so a "sushi" request never loads the unloaded default beside the model the user loaded.
+        if (std.mem.eql(u8, self.default_id, entry.id)) self.default_promoted = true;
         self.state_cond.broadcast(self.io);
     }
 
@@ -2990,6 +2993,46 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // registry deinit tries to free entry-owned configs.
     chat.config = null;
     chat2.config = null;
+}
+
+test "ModelRegistry: an explicit default whose model was unloaded no longer pins the alias: the next chat load takes it" {
+    // Live 2026-11-26: sushibar's Load made one Hy4 pack the explicit default, it was unloaded for another pack's
+    // load, and every "sushi" request then loaded the unloaded default beside the model the user had loaded.
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    var cfg_a = model_mod.ModelConfig{};
+    cfg_a.model_type = "mimo_v2";
+    var cfg_b = model_mod.ModelConfig{};
+    cfg_b.model_type = "mimo_v2";
+    const a = try reg.registerStub("small", "/m/small", 64);
+    a.config = &cfg_a;
+    const b = try reg.registerStub("large", "/m/large", 64);
+    b.config = &cfg_b;
+    defer {
+        a.config = null;
+        b.config = null;
+    }
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(a, 64);
+    reg.mutex.unlock(reg.io);
+    try reg.setDefault("small");
+
+    // The explicit default holds while its model is loaded...
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(b, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("small", reg.default_id);
+
+    // ...and once it is unloaded, the next chat-capable load is the default the alias resolves to.
+    reg.mutex.lockUncancelable(reg.io);
+    reg.finalizeEvictionLocked(a);
+    reg.finalizeEvictionLocked(b);
+    reg.markReadyLocked(b, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("large", reg.default_id);
+    const via_alias = try reg.ensureLoaded("sushi");
+    try testing.expectEqual(b, via_alias);
+    reg.release(via_alias);
 }
 
 /// Rescan tests never read the user's own settings file, whose models folder would join the roots.
