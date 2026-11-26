@@ -144,6 +144,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 - **Only an unknown NAME falls back to the default model** (SDK names like `gpt-4`); a PATH (`/…`, `~/…`, never
   `org/repo`) names its own entry as `/v1/load-model` resolves it (`routeRequestModel` → `registry.peekByPath`), and an
   unregistered path is a 404 `model_not_found` (Anthropic `not_found_error`), never another model's answer.
+- **A request routes by its top-level `model` key only** (`request_parse.parseModelFromBody` walks the top-level object and skips every nested value), so a `metadata`, tool schema or message that spells `"model"` never picks a model.
 - **One conversation renders one prompt on every surface** (the `one conversation renders the same prompt` test in
   `anthropic.zig`): text parts, Anthropic text and thinking blocks and Responses reasoning parts join by one rule
   (`chat.TextJoin`: an empty part drops, the rest join with `\n`), and its media parts render at the offset they sat

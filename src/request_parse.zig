@@ -9,50 +9,78 @@ const trunk = @import("trunk.zig");
 const json_schema = @import("json_schema.zig");
 const testing = std.testing;
 
-/// Plan 05 — extract the `"model":"..."` value from a JSON request body
-/// without doing a full parse. Returns a borrowed slice into `body` (valid
-/// until the body buffer is freed) or null if the field is missing or
-/// malformed. Used by `handleConnection` to route each POST to the right
-/// LoadedModel before invoking the handler.
-///
-/// Cheap (single linear scan, ~tens of nanoseconds for typical bodies);
-/// the per-handler full JSON parse runs immediately after and rejects any
-/// truly malformed body, so robustness here is fine.
+/// The top-level `"model"` string of a JSON object body, as a borrowed raw slice (escapes undecoded); null when the
+/// key is missing, not a string, or the body is not a well-formed object up to that key. Nested objects, arrays and
+/// string values that spell "model" are skipped, never read. The handler's full parse rejects a malformed body later.
 pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
-    var idx: usize = 0;
-    while (idx < body.len) {
-        const key_start = std.mem.indexOfPos(u8, body, idx, "\"model\"") orelse return null;
-        // Must be JSON object key: preceded by `{` or `,` (skipping whitespace).
-        var prev = key_start;
-        while (prev > 0) {
-            prev -= 1;
-            const c = body[prev];
-            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') continue;
-            if (c == '{' or c == ',') break;
-            // Not a top-level key — keep searching after this match.
-            idx = key_start + 1;
-            return parseModelFromBody(body[idx..]);
-        }
-        // Skip past the key + the colon.
-        var pos = key_start + "\"model\"".len;
-        while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t')) pos += 1;
+    var pos = skipSpace(body, 0);
+    if (pos >= body.len or body[pos] != '{') return null;
+    pos = skipSpace(body, pos + 1);
+    while (pos < body.len and body[pos] != '}') {
+        const key_end = skipString(body, pos) orelse return null;
+        const key = body[pos + 1 .. key_end - 1];
+        pos = skipSpace(body, key_end);
         if (pos >= body.len or body[pos] != ':') return null;
-        pos += 1;
-        while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t' or body[pos] == '\n' or body[pos] == '\r')) pos += 1;
-        if (pos >= body.len) return null;
-        // A string or nothing: null and absence mean the default, and a value of another type is refused by
-        // `request_fields` before any handler reads the body.
-        if (body[pos] != '"') return null;
-        pos += 1;
-        const val_start = pos;
-        while (pos < body.len and body[pos] != '"') {
-            if (body[pos] == '\\' and pos + 1 < body.len) pos += 1; // skip escape
-            pos += 1;
+        pos = skipSpace(body, pos + 1);
+        if (std.mem.eql(u8, key, "model")) {
+            // A string or nothing: null and absence mean the default, and a value of another type is refused by
+            // `request_fields` before any handler reads the body.
+            if (pos >= body.len or body[pos] != '"') return null;
+            const end = skipString(body, pos) orelse return null;
+            return body[pos + 1 .. end - 1];
         }
-        if (pos >= body.len) return null;
-        return body[val_start..pos];
+        pos = skipSpace(body, skipValue(body, pos) orelse return null);
+        if (pos < body.len and body[pos] == ',') pos = skipSpace(body, pos + 1) else break;
     }
     return null;
+}
+
+fn skipSpace(body: []const u8, from: usize) usize {
+    var pos = from;
+    while (pos < body.len and std.ascii.isWhitespace(body[pos])) pos += 1;
+    return pos;
+}
+
+/// The index after the string that opens at `body[from]`, or null when it is not one or never closes.
+fn skipString(body: []const u8, from: usize) ?usize {
+    if (from >= body.len or body[from] != '"') return null;
+    var pos = from + 1;
+    while (pos < body.len) : (pos += 1) {
+        switch (body[pos]) {
+            '\\' => pos += 1,
+            '"' => return pos + 1,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The index after the JSON value that starts at `body[from]`; a scalar ends at the next structural byte.
+fn skipValue(body: []const u8, from: usize) ?usize {
+    if (from >= body.len) return null;
+    var depth: usize = 0;
+    var pos = from;
+    while (pos < body.len) {
+        switch (body[pos]) {
+            '"' => pos = skipString(body, pos) orelse return null,
+            '{', '[' => {
+                depth += 1;
+                pos += 1;
+            },
+            '}', ']' => {
+                if (depth == 0) return pos;
+                depth -= 1;
+                pos += 1;
+            },
+            ',' => {
+                if (depth == 0) return pos;
+                pos += 1;
+            },
+            else => pos += 1,
+        }
+        if (depth == 0 and pos > from and (body[from] == '{' or body[from] == '[' or body[from] == '"')) return pos;
+    }
+    return if (depth == 0) pos else null;
 }
 
 /// `?model=<id>` for bodiless GETs (`/props`), percent-decoded into `buf`.
@@ -797,6 +825,36 @@ test "the model id is the key, not a value spelled \"model\"" {
     try testing.expectEqualStrings("m", parseModelFromBody("{\"role\":\"model\", \"model\" :\n \"m\"}").?);
     try testing.expect(parseModelFromBody("{\"model\":null}") == null);
     try testing.expect(parseModelFromBody("{\"messages\":[]}") == null);
+}
+
+test "the model id is read from the top-level key only, whatever nests or spells \"model\"" {
+    const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
+        .{ .body = "{\"metadata\":{\"model\":\"X\"},\"messages\":[]}", .want = null },
+        .{ .body = "{\"model\":\"top\",\"metadata\":{\"model\":\"X\"}}", .want = "top" },
+        .{ .body = "{\"metadata\":{\"model\":\"X\"},\"model\":\"top\"}", .want = "top" },
+        .{ .body = "{\"messages\":[{\"model\":\"X\"}]}", .want = null },
+        .{ .body = "{\"messages\":[{\"model\":\"X\"}],\"model\":\"top\"}", .want = "top" },
+        .{ .body = "{\"tools\":[{\"parameters\":{\"properties\":{\"model\":{\"type\":\"string\"}}}}]}", .want = null },
+        .{ .body = "{\"messages\":[{\"content\":\"{\\\"model\\\":\\\"X\\\"}\"}]}", .want = null },
+        .{ .body = "{\"content\":\"a, \\\"model\\\": \\\"X\\\"\",\"model\":\"top\"}", .want = "top" },
+        .{ .body = "{\"a\":\"}\",\"model\":\"top\"}", .want = "top" },
+        .{ .body = "{\"a\":\"\\\\\",\"model\":\"top\"}", .want = "top" },
+        .{ .body = "{\"model\":{\"model\":\"X\"}}", .want = null },
+        .{ .body = "[{\"model\":\"X\"}]", .want = null },
+        .{ .body = "{\"stream\":true,\"n\":-1.5e3,\"x\":null,\"model\":\"top\"}", .want = "top" },
+        .{ .body = " {\n \"a\" : [1, [2, \"]\"]] ,\n \"model\" : \"top\" }", .want = "top" },
+        .{ .body = "{\"a\":{\"b\":[{}]},\"model\":\"a\\\"b\"}", .want = "a\\\"b" },
+        .{ .body = "{\"a\":{\"model\":\"X\"", .want = null },
+        .{ .body = "{\"a\":", .want = null },
+        .{ .body = "", .want = null },
+    };
+    for (cases) |c| {
+        const got = parseModelFromBody(c.body);
+        if (c.want) |w| try testing.expectEqualStrings(w, got orelse return error.TestExpectedModel) else if (got) |g| {
+            std.debug.print("{s} -> {s}\n", .{ c.body, g });
+            return error.TestUnexpectedModel;
+        }
+    }
 }
 
 test "?model= is percent-decoded out of a bodiless GET and a missing or empty one is null" {
