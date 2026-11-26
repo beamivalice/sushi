@@ -51,6 +51,8 @@ def _has(cap):
         if cap == "vision":
             return bool(d["settings"]["vision"]["loaded"])
         return bool(d["settings"]["mtp"]["loaded"] or (cap == "spec" and d["settings"]["drafter"] not in ("none", "")))
+    if cap == "ledger":
+        return "ledger" in get_json("/props")["memory"]
     if cap == "video":
         return arch in ("qwen4_exp", "glm5_next") and _has("vision")
     if cap == "thinking":
@@ -65,7 +67,7 @@ def _has(cap):
 
 
 def require(cap):
-    """Exit 3 (SKIP) when the boot lacks the capability: mtp|vision|video|batching|stq|thinking|spec."""
+    """Exit 3 (SKIP) when the boot lacks the capability: mtp|vision|video|batching|stq|thinking|spec|ledger."""
     try:
         has = _has(cap)
     except (KeyError, OSError, ValueError) as e:

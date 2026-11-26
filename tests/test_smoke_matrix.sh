@@ -1,11 +1,11 @@
 #!/bin/bash
 # sushi-test: tier=live boot=api
 # test_smoke_matrix.sh — quick hot smoke on the shared api boot, whichever arch the pass booted
-# (qwen4_exp, mimo_v2, glm5_next, deepseek_v41): request configs × every API surface. Not a bench and not a
+# (qwen4_exp, mimo_v2, glm5_next, deepseek_v41, hy_v4_flash): request configs × every API surface. Not a bench and not a
 # correctness oracle: the bar per cell is "answers, no leak, no crash", so a checkpoint's choices (to think, to call
 # the tool) are branched on, never asserted.
 #
-#   tests/run.sh --tier live --model <qwen4|mimo2|glm5|dsv41> --only test_smoke_matrix.sh
+#   tests/run.sh --tier live --model <qwen4|mimo2|glm5|dsv41|hy4> --only test_smoke_matrix.sh
 #   SMOKE_CONFIGS=default,kv4 tests/run.sh --tier live --model qwen4 --only test_smoke_matrix.sh
 #
 # Configs are request fields on the one boot: default (the shipping kv8 and speculation) | off (kv_quant off) |
@@ -13,6 +13,9 @@
 # nospec (enable_mtp and enable_drafter false). GLM serves an affine8 MLA latent with DFlash2 and no MTP: it refuses
 # kv4 by name, and kv8 is its default, so its cells are default, off and nospec. DeepSeek has no KV cache and streams its experts, so its
 # cells are default and nospec. GLM has no thinking-off mode: it asks reasoning_effort low and skips "thinking off".
+# A load on the static bill (Hy4-Flash; `/props` carries `memory.ledger`) serves only the KV width it loaded with, so
+# an off/kv4/kv8 cell naming another is one named 400 per surface, never the override line; a cell naming the load's
+# own width runs as everywhere else.
 # Per cell: chat non-stream/stream, thinking on/off, tools, json_schema, logprobs refused, max_tokens cap, ignore_eos
 # (completions: stream == non-stream; chat: 400), 2-way concurrency, /v1/completions (an empty prompt 400s),
 # /v1/messages (both modes), /v1/responses (both modes), /v1/models, /metrics.json. Prefix-cache reuse has its own
@@ -208,8 +211,31 @@ print(repr(t))' 2>/dev/null)
     check "/metrics.json: answers" "$(echo "$r" | J 'len(d)>0' | grep -q True && echo 0 || echo 1)"
 
     # 13. the server is still alive and no [mlx] error latched
+    alive_checks
+}
+
+alive_checks() {
     check "server alive after the cell" "$([[ "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health")" == 200 ]] && echo 0 || echo 1)"
     check "no MLX error / crash line in the log" "$([[ "$(log_count '\[mlx\] error|panic|Segmentation|error latched')" == 0 ]] && echo 0 || echo 1)"
+}
+
+# A cell naming a width other than the ledger load's: every surface refuses it with a 400 naming kv_quant, and the
+# load goes on serving its own width.
+refusal_cell() { # $1 cfg
+    local surface path body r msg
+    for surface in "chat|/v1/chat/completions|{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8}" \
+        "completions|/v1/completions|{\"model\":\"m\",\"prompt\":\"$Q\",\"max_tokens\":8}" \
+        "messages|/v1/messages|{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}]}" \
+        "responses|/v1/responses|{\"model\":\"m\",\"input\":\"$Q\",\"max_output_tokens\":8}"; do
+        path=${surface#*|}; body=${path#*|}; path=${path%%|*}
+        r=$(status_body "$path" "$body")
+        msg=$(echo "${r%$'\n'*}" | J 'd["error"]["message"]')
+        check "${surface%%|*}: $1 is a 400 naming kv_quant (the load serves $LEDGER_KV)" "$([[ "${r##*$'\n'}" == 400 && "$msg" == *kv_quant* ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
+    done
+    check "the load still serves $LEDGER_KV" "$([[ "$(sushi_kv_scheme)" == "$LEDGER_KV" ]] && echo 0 || echo 1)"
+    r=$(CELL_FIELDS='{}' post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":16,\"temperature\":0}")
+    check "a request naming no width still answers after the refusals" "$([[ -n "$(echo "$r" | J 'd["choices"][0]["message"]["content"] or d["choices"][0]["message"].get("reasoning_content") or ""')" ]] && echo 0 || echo 1)" "$(echo "$r" | head -c 300)"
+    alive_checks
 }
 
 # cell config: the request fields it adds, or a SKIP reason
@@ -236,6 +262,8 @@ cell_fields() { # $1 cfg; sets CELL_FIELDS, or SKIP_WHY
     esac
 }
 
+# The KV width a load on the ledger serves, else empty. A cell's name (off, kv4, kv8) is its width's /props scheme name.
+if (sushi_require ledger > /dev/null); then LEDGER_KV=$(sushi_kv_scheme) || { echo "smoke matrix: /props names no kv_cache scheme" >&2; exit 1; }; else LEDGER_KV=; fi
 if (sushi_require thinking > /dev/null); then think=yes; else think=no; fi
 IFS=',' read -r -a WANT_CFG <<< "$CONFIGS"
 echo "=== $SUSHI_ARCH on the shared boot ==="
@@ -246,6 +274,10 @@ for cfg in "${WANT_CFG[@]}"; do
     export CELL_FIELDS
     echo ""
     echo "=== $CELL  $CELL_FIELDS ==="
+    case "$cfg" in
+        off | kv4 | kv8)
+            if [[ -n "$LEDGER_KV" && "$cfg" != "$LEDGER_KV" ]]; then refusal_cell "$cfg"; continue; fi ;;
+    esac
     spec0=$(log_count "$SPEC_RE")
     kv0=$(log_count 'kv-quant override: ')
     run_checks "$think"

@@ -17,6 +17,7 @@ sushi_pack() {
                 qwen4) name=Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw ;;
                 glm5) name=GLM-5.3-Flash-Sushi-2.4bpw ;;
                 dsv41) name=DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw ;;
+                hy4) name=Hy4-Flash-Sushi-STQ-4bpw ;;
                 mimo2) name=MiMo-V2.6-Flash-Sushi-2.3bpw ;;
                 qwen4-bf16) name=Qwen/Qwen3.8-Flash-Next ;;
                 mimo2-src) name=MiMo-V2.6-Flash ;;
@@ -220,7 +221,13 @@ except Exception:
     print(0)' "$2"
 }
 
-# sushi_require <mtp|vision|video|batching|stq|thinking|spec>: exit 3 (SKIP) when the boot lacks it
+# sushi_kv_scheme: the KV width the loaded model serves a request that names none (kv8, kv4, off), from /props.
+# A load on the ledger serves only this one: a request naming another is a named 400.
+sushi_kv_scheme() {
+    curl -sf "$SUSHI_URL/props" | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["settings"]["kv_cache"]["scheme"])'
+}
+
+# sushi_require <mtp|vision|video|batching|stq|thinking|spec|ledger>: exit 3 (SKIP) when the boot lacks it
 sushi_require() {
     local cap="${1:?sushi_require <cap>}" ok=0 arch="${SUSHI_ARCH:-}"
     case "$cap" in
@@ -230,6 +237,7 @@ sushi_require() {
             case "$arch" in qwen4_exp | glm5_next) ok=$(_sushi_probe /props 'd["settings"]["vision"]["loaded"]') ;; esac
             ;;
         batching) ok=$(_sushi_probe /props 'd["batching"]["supported"]') ;;
+        ledger) ok=$(_sushi_probe /props '"ledger" in d["memory"]') ;;
         spec) ok=$(_sushi_probe /props 'd["settings"]["mtp"]["loaded"] or d["settings"]["drafter"] not in ("none", "")') ;;
         thinking) ok=$(_sushi_probe /v1/models 'any("reasoning" in m.get("capabilities", []) for m in d["data"])') ;;
         stq)

@@ -4,7 +4,7 @@
 #
 # Live layer of the format test suite (the hermetic layer is
 # src/format_corpus_test.zig — run `zig build test -Dtest-filter="format corpus"`).
-# Attaches to the api boot of one model pass (qwen4_exp, mimo_v2, glm5_next or deepseek_v41) and asserts:
+# Attaches to the api boot of one model pass (qwen4_exp, mimo_v2, glm5_next, deepseek_v41 or hy_v4_flash) and asserts:
 #
 #   1. Thinking OFF baseline: answer in content, no control-tag leak (GLM has no off mode: a 400)
 #   2. Thinking ON truncated: reasoning_content only, content empty/clean
@@ -19,7 +19,7 @@
 #   8. /v1/messages stream + tools + thinking: tool_use block, no leak
 #   9-11. Truncated thinking on /v1/messages, /v1/responses and the chat stream
 #   12-14. Thinking streams: split in live chunks, with tools, and after a tool result
-#   15-17. Thinking x tools x stream grid, and stream == non-stream split
+#   15-17. Thinking x tools x stream grid (a tool turn is a call or a text answer, the model's choice), and stream == non-stream split
 #   18. Three tool chats over a three-tool catalog parse to structured calls
 #   19. Multi-line code round trip: a writeFile call and a multi-line tool result
 #   20. /v1/messages stream with thinking + tools (Claude Code's shape): block lifecycle, no tag leak
@@ -30,7 +30,7 @@
 # On any FAIL the slice's raw-output dump lines ("raw generated text before tool parse") are echoed for harvesting
 # into src/format_corpus_test.zig.
 #
-# Usage: tests/run.sh --tier live --only test_format_matrix.sh --model <qwen4|mimo2|glm5|dsv41>
+# Usage: tests/run.sh --tier live --only test_format_matrix.sh --model <qwen4|mimo2|glm5|dsv41|hy4>
 
 set -u
 
@@ -374,19 +374,22 @@ if [ "$THINKS" = 1 ]; then
 fi
 
 # ── 15. The thinking x tools x stream grid. The no-thinking half: a plain answer carries no reasoning, a
-#      tool turn carries a call and no reasoning. GLM has no thinking-off mode, so it skips the half. ──
+#      tool turn carries a well-formed call or a text answer, and no reasoning. GLM has no thinking-off mode, so it skips the half. ──
 CMD_PROMPT=$(user 'Run the command: echo hello')
 if [ "$GLM" = 1 ]; then
     echo -e "  ${YELLOW}SKIP${NC} 15. no-thinking permutations: GLM has no thinking-off mode"
 else
     R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$(user 'What is 2+2? Answer in one word.')],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
     chk "15. no thinking, no tools, non-stream: content, no reasoning_content" "r['content'] and not r['reasoning']"
+    # Whether the model calls the tool is its choice: a call is well formed, an answer is text with a fitting finish.
+    SHELL_CALL_OR_TEXT="(r['finish']=='tool_calls' and r['calls'][0]['name']=='shell' and isinstance(json.loads(r['calls'][0]['args']),dict) and isinstance(json.loads(r['calls'][0]['args']).get('command'),str)) if r['calls'] else (r['finish'] in ('stop','length') and r['content'].strip()!='')"
     R=$(ask chat 0 "{\"model\":\"x\",\"messages\":[$CMD_PROMPT],\"tools\":[$SHELL_TOOL],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
-    chk "15. no thinking, tools, non-stream: finish tool_calls, call shell, no reasoning_content" "r['finish']=='tool_calls' and r['calls'] and r['calls'][0]['name']=='shell' and not r['reasoning']"
+    chk "15. no thinking, tools, non-stream: a well-formed shell call (finish tool_calls) or a text answer (finish stop|length), no reasoning_content" "not r['reasoning'] and ($SHELL_CALL_OR_TEXT)"
+    chk_clean "15. no thinking, tools, non-stream: no tag or tool-call leak in content" content
     R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$(user 'What is 2+2? One word.')],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
     chk "15. no thinking, no tools, stream: content deltas, no reasoning deltas, [DONE]" "r['content_chunks']>0 and r['reasoning_chunks']==0 and r['done']"
     R=$(ask chat 1 "{\"model\":\"x\",\"messages\":[$CMD_PROMPT],\"tools\":[$SHELL_TOOL],\"max_tokens\":300,\"temperature\":0,\"enable_thinking\":false}")
-    chk "15. no thinking, tools, stream: tool_calls delta, finish tool_calls, no reasoning deltas" "r['calls'] and r['finish']=='tool_calls' and r['reasoning_chunks']==0"
+    chk "15. no thinking, tools, stream: a well-formed shell call (finish tool_calls) or content deltas (finish stop|length), no reasoning deltas" "r['reasoning_chunks']==0 and ($SHELL_CALL_OR_TEXT)"
     chk_clean "15. no thinking, tools, stream: no tag leak in content" content
 fi
 

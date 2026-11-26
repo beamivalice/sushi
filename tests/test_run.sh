@@ -187,6 +187,19 @@ eq "--only filters by glob" "$got" "pass qwen4
   boots: 1 shared + 0 own"
 got=$(SUSHI_TESTS_DIR="$FX" "$RUN" --list --tier live --model dsv41 | sed -n 2p)
 eq "a streamed DeepSeek serves one slot on a --ssd-budget-gb" "$got" "  boot api: --metrics --log-level debug --ssd-budget-gb 96 --max-concurrent 1"
+got=$(SUSHI_TESTS_DIR="$FX" "$RUN" --list --tier live --model hy4 | sed -n 1,2p)
+eq "hy4 is a model pass: the shared attach boots run in it" "$got" "pass hy4
+  boot api: --metrics --log-level debug --max-concurrent 4"
+d="$WORK/hy4fx"
+cp -R "$FX" "$d"
+mk "$d" test_hy4_only.sh tier=live boot=api pack=hy4
+mk "$d" hy4/test_h_host.sh tier=host
+matrix "$d"
+SUSHI_TESTS_DIR="$d" "$RUN" --check > /dev/null 2>&1
+eq "--check takes pack=hy4 on an attach script and a tests/hy4 folder" "$?" "0"
+eq "a pack=hy4 script runs in the hy4 pass" "$(SUSHI_TESTS_DIR="$d" "$RUN" --list --tier live --model hy4 | grep -c test_hy4_only.sh)" "1"
+eq "  and in no other pass" "$(SUSHI_TESTS_DIR="$d" "$RUN" --list --tier live --model qwen4 | grep -c test_hy4_only.sh)" "0"
+eq "a tests/hy4 script runs in the hy4 pass" "$(SUSHI_TESTS_DIR="$d" "$RUN" --list --model hy4 | grep -c hy4/test_h_host.sh)" "1"
 out=$(SUSHI_TESTS_DIR="$FX" "$RUN" --list --tier warm 2>&1)
 has "a bad --tier is refused" "$out" "--tier 'warm' is not"
 
@@ -240,7 +253,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         bodies = {
             "/health": b"ok",
-            "/props": json.dumps({"batching": {"supported": True}, "settings": {
+            "/props": json.dumps({"batching": {"supported": True}, "memory": ({"ledger": {"budget": 1}} if os.environ.get("STUB_LEDGER") else {}), "settings": {
+                "kv_cache": {"scheme": "kv8", "source": "default"},
                 "mtp": {"loaded": True}, "vision": {"loaded": False}, "drafter": "none"}}).encode(),
             "/v1/models": json.dumps({"data": [{"capabilities": ["chat", "reasoning"]}]}).encode(),
         }
@@ -259,7 +273,7 @@ if mode != "noready":
 srv.serve_forever()
 PY
 chmod +x "$STUB"
-mkdir -p "$WORK/models/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw" "$WORK/models/stubpack"
+mkdir -p "$WORK/models/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw" "$WORK/models/Hy4-Flash-Sushi-STQ-4bpw" "$WORK/models/stubpack"
 echo '{"model_type":"qwen4_exp","expert_quant":{"format":"stq"}}' > "$WORK/models/stubpack/config.json"
 echo '{"model_type":"qwen4_exp","expert_quant":{"format":"stq"}}' > "$WORK/models/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw/config.json"
 
@@ -340,10 +354,11 @@ attach)
     for cap in mtp batching spec thinking stq; do
         ( sushi_require $cap > /dev/null; ) ; echo "require_$cap=$?"
     done
-    for cap in vision video; do
+    for cap in vision video ledger; do
         out=$( ( sushi_require $cap ) ); echo "require_$cap=$?"
         echo "skip_line_$cap=$out"
     done
+    echo "kv_scheme=$(sushi_kv_scheme)"
     ( sushi_require bogus ) > /dev/null 2>&1; echo "require_bogus=$?"
     ( unset SUSHI_URL; sushi_attach ) > /dev/null 2>&1; echo "attach_unset=$?"
     python3 - "$TESTS/lib" <<'PY'
@@ -362,6 +377,12 @@ try:
 except SystemExit as e:
     print("py_vision_exit=%s" % e.code)
 PY
+    sushi_stop 0
+    ;;
+ledger)
+    STUB_LEDGER=1 sushi_boot l9 "$pack" > /dev/null || exit 9
+    sushi_attach
+    ( sushi_require ledger > /dev/null ); echo "require_ledger=$?"
     sushi_stop 0
     ;;
 gone)
@@ -394,6 +415,7 @@ PY
 pack)
     export SUSHI_MODELS_DIR="$WORK/models"
     echo "qwen4=$(sushi_pack qwen4)"
+    echo "hy4=$(sushi_pack hy4)"
     sushi_pack glm5 > /dev/null 2> "$WORK/pack.err"
     echo "glm5_rc=$?"
     echo "glm5_err=$(cat "$WORK/pack.err")"
@@ -478,19 +500,23 @@ eq "attach: the nonce is set" "$(val "$out" nonce_head)" "n"
 eq "attach: the log offset is the log size" "$(val "$out" offset_is_size)" "1"
 eq "attach: sushi_log_since is only what came after" "$(val "$out" since)" "line-after-attach|"
 for cap in mtp batching spec thinking stq; do eq "require $cap passes on the stub" "$(val "$out" require_$cap)" "0"; done
-for cap in vision video; do
+for cap in vision video ledger; do
     eq "require $cap exits 3 (SKIP)" "$(val "$out" require_$cap)" "3"
     has "  with one line naming it" "$(val "$out" skip_line_$cap)" "the boot lacks $cap (qwen4_exp)"
 done
+eq "sushi_kv_scheme reads the KV width the load serves" "$(val "$out" kv_scheme)" "kv8"
 eq "require of an unknown capability is an error (1)" "$(val "$out" require_bogus)" "1"
 eq "attach without SUSHI_URL exits 1" "$(val "$out" attach_unset)" "1"
 eq "python twin: the nonce" "$(val "$out" py_nonce_head)" "n"
 eq "python twin: log_since slices at attach" "$(val "$out" py_since)" "py-line"
 eq "python twin: require passes and SKIPs with 3" "$(val "$out" py_mtp)/$(val "$out" py_vision_exit)" "ok/3"
 eq "the lock is free after the attach scenario" "$(lock_free)" "1"
+out=$(scen ledger 2> /dev/null)
+eq "require ledger passes on a /props that carries memory.ledger" "$(val "$out" require_ledger)" "0"
 
 out=$(scen pack 2> /dev/null)
 eq "sushi_pack: the default pack under SUSHI_MODELS_DIR" "$(val "$out" qwen4)" "$WORK/models/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw"
+eq "sushi_pack: hy4 is the STQ 4bpw pack" "$(val "$out" hy4)" "$WORK/models/Hy4-Flash-Sushi-STQ-4bpw"
 eq "sushi_pack: a missing pack is SKIP (3)" "$(val "$out" glm5_rc)" "3"
 has "  with one line naming it" "$(val "$out" glm5_err)" "SKIP: pack 'glm5' missing"
 eq "sushi_pack: SUSHI_TEST_PACK_<MODEL> overrides" "$(val "$out" override)" "$WORK/elsewhere"
@@ -502,6 +528,9 @@ printf '. "%s/lib/profiles.sh"\nsushi_profile_flags "$@"\n' "$TESTS" > "$PROF"
 eq "profile exact on glm5 carries no MTP depth" "$(/bin/bash "$PROF" exact glm5)" "--metrics --log-level debug --max-concurrent 4 --prefix-cache-mem off --prefix-cache-disk off"
 eq "profile exact accepts an arch name" "$(/bin/bash "$PROF" exact mimo_v2)" "$(/bin/bash "$PROF" exact mimo2)"
 eq "SUSHI_TEST_DSV41_BUDGET sets the streamed budget" "$(SUSHI_TEST_DSV41_BUDGET=64 /bin/bash "$PROF" ram dsv41)" "--metrics --log-level debug --ssd-budget-gb 64 --max-concurrent 1 --prefix-cache-mem 2GB --prefix-cache-disk off"
+eq "profile api on hy4 takes the shared slots" "$(/bin/bash "$PROF" api hy4)" "--metrics --log-level debug --max-concurrent 4"
+eq "profile exact on hy4 carries no MTP depth" "$(/bin/bash "$PROF" exact hy4)" "--metrics --log-level debug --max-concurrent 4 --prefix-cache-mem off --prefix-cache-disk off"
+eq "profile exact accepts hy4's arch name" "$(/bin/bash "$PROF" exact hy_v4_flash)" "$(/bin/bash "$PROF" exact hy4)"
 /bin/bash "$PROF" api nope > /dev/null 2>&1
 eq "an unknown model is an error" "$?" "1"
 printf '. "%s/lib/profiles.sh"\nsushi_profile_settings "$@"\n' "$TESTS" > "$WORK/settings.sh"

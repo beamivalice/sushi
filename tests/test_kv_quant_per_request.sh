@@ -6,7 +6,9 @@
 #   2. equivalence: the same greedy request under kv_quant 4, 6 and 8 matches kv_quant "off" for its first N
 #      tokens (30; kv4 is the lossiest and takes 20). KV quantization is lossy, so the bar catches kernel bugs (wrong dequantize, off-by-one slice
 #      update, NaN), not the float-reduction tail (docs/engine-kv-cache.md, "Byte stability").
-# A scheme the arch refuses (kv4 on GLM) is left out; DeepSeek has no KV cache to quantize.
+# A scheme the arch refuses (kv4 on GLM) is left out; DeepSeek has no KV cache to quantize. A load on the static bill
+# (Hy4-Flash) serves only the width it loaded with: its own width answers, every other one is a named 400, and there is
+# no second width to compare against.
 set -u
 . "$(dirname "$0")/lib/boot.sh"
 sushi_attach
@@ -38,6 +40,44 @@ fire() {
     fi
     echo -e "${GREEN}PASS${NC} $label: $(echo "$content" | head -c 80)..."
 }
+
+# refused <label> <kv_quant field value>: a 400 naming kv_quant on chat and on completions
+refused() {
+    local path body r
+    for path in chat/completions completions; do
+        if [ "$path" = completions ]; then
+            body="{\"model\":\"sushi\",\"prompt\":\"$SUSHI_NONCE Say hello.\",\"max_tokens\":8,\"kv_quant\":$2}"
+        else
+            body="{\"model\":\"sushi\",\"messages\":[{\"role\":\"user\",\"content\":\"$SUSHI_NONCE Say hello.\"}],\"max_tokens\":8,\"kv_quant\":$2}"
+        fi
+        r=$(curl -s -m 60 -w '\n%{http_code}' -X POST -H "Content-Type: application/json" -d "$body" "$BASE/v1/$path")
+        if [ "${r##*$'\n'}" = 400 ] && grep -q kv_quant <<< "${r%$'\n'*}"; then
+            echo -e "${GREEN}PASS${NC} $1 on $path: a 400 naming kv_quant"
+        else
+            echo -e "${RED}FAIL${NC} $1 on $path: expected a 400 naming kv_quant"
+            echo "  got: $(echo "$r" | head -c 300)"
+            FAIL=1
+        fi
+    done
+}
+
+if (sushi_require ledger > /dev/null); then
+    LOADED=$(sushi_kv_scheme) || exit 1
+    case "$LOADED" in off) OWN='"off"' ;; kv*) OWN=${LOADED#kv} ;; esac
+    echo "== a load on the ledger serves its own KV width ($LOADED) =="
+    fire "request without kv_quant" ""
+    fire "kv_quant $OWN (the loaded width)" "$OWN"
+    for other in '"off"' 4 6 8; do
+        [ "$other" = "$OWN" ] || refused "kv_quant $other" "$other"
+    done
+    if [ "$(sushi_kv_scheme)" = "$LOADED" ]; then
+        echo -e "${GREEN}PASS${NC} the load still serves $LOADED"
+    else
+        echo -e "${RED}FAIL${NC} the load no longer serves $LOADED"
+        FAIL=1
+    fi
+    exit $FAIL
+fi
 
 echo "== per-request kv_quant override =="
 fire "request without kv_quant (inherits the process default)" ""

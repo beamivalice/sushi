@@ -214,7 +214,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   `qwen4 MTP verify token values` and `qwen4 deferred PLE: the captured hidden`.
   The decoded trunk GEMM on the pack's own K6 banks (GPU lock): `QWEN4_TEST_MODEL=<pack> zig build test
   -Doptimize=ReleaseFast -Dfixture-cut=true -Dtest-filter="trunk gemm: real pack trunk banks"`.
-- Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `enc` (the encoder) or `shared` (every model). A test's folder says
+- Model scope is `qwen4`, `mimo2`, `glm5`, `dsv41`, `hy4` (Hy4-Flash), `enc` (the encoder) or `shared` (every model). A test's folder says
   its model; a test of one model's code lives in that model's folder ([map and guards](#folder-map-and-scope-guards)).
 
 ## Folder map and scope guards
@@ -500,13 +500,13 @@ A live script defaults to a pack under `${SUSHI_MODELS_DIR:-$HOME/.sushi/models}
 loudly when the pack is missing. Every script is in the [tests/CLAUDE.md](../tests/CLAUDE.md) matrix, or it is deleted.
 
 **Header.** The line after the shebang (`#` for sh/py, `//` for cjs/mjs) is `sushi-test: key=value ...`; a second line
-may add only `needs=<commands>`. Scope is the folder (`tests/qwen4|mimo2|glm5|dsv41/`; the root is shared), never a tag.
+may add only `needs=<commands>`. Scope is the folder (`tests/qwen4|mimo2|glm5|dsv41|hy4/`; the root is shared), never a tag.
 
 | key | values |
 |---|---|
 | `tier` | `hermetic` (no binary), `host` (the binary, no weights, no lock), `pack` (real weights, run.sh takes the lock), `live` (loads a pack over HTTP); `bench`, `tool` and `lib` are never run |
 | `boot` | live only: `api`, `exact`, `ram`, `knobs` attach to a shared boot; `own` boots itself |
-| `pack` | `own` and `pack`: `default` (the folder's model), `each` (once per model pass), a model key or an alias. An attach script (`api`, `exact`, `ram`) runs in every model pass unless it names one, `pack=qwen4` (`qwen4`, `glm5`, `dsv41`, `mimo2`): for a property of the server, not of the model (`test_metrics.sh`, `test_timings.sh`) |
+| `pack` | `own` and `pack`: `default` (the folder's model), `each` (once per model pass), a model key or an alias. An attach script (`api`, `exact`, `ram`) runs in every model pass unless it names one, `pack=qwen4` (`qwen4`, `glm5`, `dsv41`, `hy4`, `mimo2`): for a property of the server, not of the model (`test_metrics.sh`, `test_timings.sh`) |
 | `boots` | `own` only: the scripted number of boots, for the ledger |
 
 Exit codes: 0 pass, 1 fail, 3 SKIP (one line naming what is missing).
@@ -517,7 +517,7 @@ script starts a server. `sushi_boot <label> <pack> [flags]` takes the GPU lock, 
 (also the EXIT trap) stops by PID and writes `<label>.END`. An attach script calls `sushi_attach` (a nonce for every
 prompt), reads `sushi_log_since` (a line the engine logs once per process, such as an `engaged` line, is read over the whole
 `$SUSHI_LOG`, since an earlier script on the boot may have logged it), runs the binary as a client through `sushi_cli`
-(`launch`), and asks `sushi_require <mtp|vision|video|batching|stq|thinking|spec>`. Profiles `api`, `exact`, `ram` and
+(`launch`), and asks `sushi_require <mtp|vision|video|batching|stq|thinking|spec|ledger>`. A load on the static bill (`ledger`: `/props` carries `memory.ledger`, never told by the model name) serves one KV width, `sushi_kv_scheme`: a script that sends a per-request `kv_quant` asserts the named 400 for any other width. Profiles `api`, `exact`, `ram` and
 `knobs` are one boot each per model pass (`knobs` keeps every prefix cache off and boots with a model-settings file
 naming `lib/knobs-bias.json`, written by `sushi_profile_settings`); `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
 `SUSHI_BOOT_TIMEOUT_S` and `SUSHI_STOP_WAIT_S` bound the waits.
@@ -529,7 +529,7 @@ launch with no `--port`.
 A script that stops its server on purpose (a SIGTERM test) sets `SUSHI_EXPECT_GONE` before `sushi_stop`, so the exit is
 not reported as a crash. A Python `own` script uses `lib/sushi_boot.py` (`Server`, `gpu_lock`, `private_env`, `pack`).
 
-**Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all] [--only glob]
+**Runner.** `tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|hy4|shared|all] [--only glob]
 [--list] [--check] [--keep-going] [--no-build] [--out dir]`. The default is `hermetic,host`, every pass. A selection that holds no script exits 2: an `--only` that
 matches nothing, or names a script outside the selected `--tier` or `--model` pass (it names the tier or pass to give;
 `boot=own` scripts on the default pack run in the `shared` pass), is refused, never a green empty run.

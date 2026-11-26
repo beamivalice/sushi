@@ -1,7 +1,7 @@
 #!/bin/bash
 # sushi-test: tier=tool
 # The test runner: reads each script's header and runs a tier, one model pass at a time, on shared boots.
-#   tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|shared|all]
+#   tests/run.sh [--tier hermetic,host,pack,live|all] [--model qwen4|mimo2|glm5|dsv41|hy4|shared|all]
 #                [--only <glob>] [--list] [--check] [--no-matrix] [--keep-going] [--no-build] [--out <dir>]
 #   --only needs a script in a selected --tier (a live script: --tier live); an empty selection exits 2.
 # Header, scope, boots and exit codes: docs/testsuite.md, "Integration scripts". Written for bash 3.2.
@@ -45,9 +45,9 @@ for t in $(echo "$TIERS" | tr , ' '); do
     case "$t" in hermetic | host | pack | live) ;; *) echo "run.sh: --tier '$t' is not hermetic|host|pack|live" >&2; exit 2 ;; esac
 done
 case "$MODELS" in
-    all) PASSES="qwen4 mimo2 glm5 dsv41 shared" ;;
-    qwen4 | mimo2 | glm5 | dsv41 | shared) PASSES="$MODELS" ;;
-    *) echo "run.sh: --model '$MODELS' is not qwen4|mimo2|glm5|dsv41|shared|all" >&2; exit 2 ;;
+    all) PASSES="qwen4 mimo2 glm5 dsv41 hy4 shared" ;;
+    qwen4 | mimo2 | glm5 | dsv41 | hy4 | shared) PASSES="$MODELS" ;;
+    *) echo "run.sh: --model '$MODELS' is not qwen4|mimo2|glm5|dsv41|hy4|shared|all" >&2; exit 2 ;;
 esac
 
 WORK=$(mktemp -d)
@@ -110,8 +110,8 @@ parse_header() {
     if [ -n "$H_PACK" ] && [ "$H_BOOT" != own ] && [ "$H_TIER" != pack ]; then
         # An attach script whose property is not the model's names the one pass it runs in.
         case "$H_BOOT:$H_PACK" in
-            api:qwen4 | exact:qwen4 | ram:qwen4 | api:glm5 | exact:glm5 | ram:glm5 | api:dsv41 | exact:dsv41 | ram:dsv41 | api:mimo2 | exact:mimo2 | ram:mimo2) ;;
-            *) H_ERR="pack= is for boot=own and tier=pack, or one model's pass (qwen4|glm5|dsv41|mimo2) on an attach boot"; return ;;
+            api:qwen4 | exact:qwen4 | ram:qwen4 | api:glm5 | exact:glm5 | ram:glm5 | api:dsv41 | exact:dsv41 | ram:dsv41 | api:hy4 | exact:hy4 | ram:hy4 | api:mimo2 | exact:mimo2 | ram:mimo2) ;;
+            *) H_ERR="pack= is for boot=own and tier=pack, or one model's pass (qwen4|glm5|dsv41|hy4|mimo2) on an attach boot"; return ;;
         esac
     fi
     if [ -n "$H_BOOTS" ]; then
@@ -135,8 +135,8 @@ scan() {
         folder=
         case "$rel" in */*) folder="${rel%%/*}" ;; esac
         case "$folder" in
-            "" | qwen4 | mimo2 | glm5 | dsv41 | lib) ;;
-            *) echo "$rel: folder '$folder' is not qwen4|mimo2|glm5|dsv41|lib" >> "$ERRORS"; continue ;;
+            "" | qwen4 | mimo2 | glm5 | dsv41 | hy4 | lib) ;;
+            *) echo "$rel: folder '$folder' is not qwen4|mimo2|glm5|dsv41|hy4|lib" >> "$ERRORS"; continue ;;
         esac
         parse_header "$f"
         if [ -n "$H_ERR" ]; then
@@ -257,7 +257,7 @@ require_selection() {
     done
     local hint= rel
     if [ -n "$ONLY" ]; then
-        for pass in qwen4 mimo2 glm5 dsv41 shared; do
+        for pass in qwen4 mimo2 glm5 dsv41 hy4 shared; do
             case " $PASSES " in *" $pass "*) continue ;; esac
             for rel in $(entries_of "$pass" | cut -f2); do hint="$hint; $rel runs in the $pass pass: pass --model $pass"; done
         done
