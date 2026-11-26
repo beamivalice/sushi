@@ -230,11 +230,43 @@ fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
     return .cancelled;
 }
 
-/// The `/metrics.json` request-log row of a slot that ended, read before the connection thread can free it.
+/// What the first part of a reply reports once a continuation (`generation_stream.continueAfterThought`) carries it
+/// on: that part is not a request of its own, so the continuation's slot counts and logs for both.
+pub const Head = struct {
+    request_id: u64,
+    first_token_ns: u64,
+    prefill_ns: u64,
+    decode_ns: u64,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    completion_tokens: u32,
+    /// How long the reply had run when the continuation was submitted.
+    age_ns: u64,
+    spec_mode: spec_stats.Mode,
+    spec_totals: spec_stats.Totals,
+
+    pub fn of(slot: anytype, age_ns: u64) Head {
+        return .{
+            .request_id = slot.request_id,
+            .first_token_ns = slot.first_token_ns,
+            .prefill_ns = slot.prefill_ns,
+            .decode_ns = slot.decode_ns,
+            .prompt_tokens = slot.prompt_tokens,
+            .cached_tokens = slot.cached_tokens,
+            .completion_tokens = slot.completion_tokens,
+            .age_ns = age_ns,
+            .spec_mode = slot.spec_mode,
+            .spec_totals = slot.spec_totals,
+        };
+    }
+};
+
 fn clampU32(n: u64) u32 {
     return @intCast(@min(n, std.math.maxInt(u32)));
 }
 
+/// The `/metrics.json` request-log row of a slot that ended, read before the connection thread can free it.
+/// A continuation's row is its reply's: the head's id and prompt, both parts' tokens and times.
 fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) void {
     // `prompt_tokens` is set when the prefill completes. A request that ended inside it forwarded
     // `prefill_computed` tokens and kept no restore.
@@ -253,6 +285,18 @@ fn logFinished(m: *metrics_mod.Metrics, slot: anytype, end: request_log.End) voi
         .spec_drafted = clampU32(slot.spec_totals.drafted),
         .spec_accepted = clampU32(slot.spec_totals.accepted),
     };
+    if (slot.continuation_of) |h| {
+        e.request_id = h.request_id;
+        e.prompt_tokens = h.prompt_tokens -| h.cached_tokens;
+        e.cached_tokens = h.cached_tokens;
+        e.generated_tokens += h.completion_tokens;
+        e.prefill_ns += h.prefill_ns;
+        e.decode_ns += h.decode_ns;
+        if (e.spec_mode == .none) e.spec_mode = h.spec_mode;
+        e.spec_rounds +|= clampU32(h.spec_totals.rounds);
+        e.spec_drafted +|= clampU32(h.spec_totals.drafted);
+        e.spec_accepted +|= clampU32(h.spec_totals.accepted);
+    }
     e.setModel(slot.model.id);
     m.finished.push(slot.io, e);
 }
@@ -267,15 +311,40 @@ fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics
         .cancelled => .cancelled,
         .failed => .@"error",
     });
+    const h = slot.continuation_of;
     m.recordRequest(
         outcome,
-        slot.first_token_ns,
-        slot.prefill_ns,
-        slot.decode_ns,
-        slot.prompt_tokens,
-        slot.completion_tokens,
-        slot.cached_tokens,
+        if (h) |x| x.first_token_ns else slot.first_token_ns,
+        slot.prefill_ns + if (h) |x| x.prefill_ns else 0,
+        slot.decode_ns + if (h) |x| x.decode_ns else 0,
+        if (h) |x| x.prompt_tokens else slot.prompt_tokens,
+        slot.completion_tokens + if (h) |x| x.completion_tokens else 0,
+        if (h) |x| x.cached_tokens else slot.cached_tokens,
     );
+}
+
+/// `finishSlot`'s count. A slot whose turn may continue after its thought (`Slot.may_continue`) ends as a request only
+/// when its connection thread has judged the turn (`settleHeld`): a continuation then ends it for the reply.
+fn recordFinish(metrics: ?*metrics_mod.Metrics, slot: anytype, reason: []const u8, outcome: metrics_mod.Outcome) void {
+    if (slot.may_continue and outcome == .success and std.mem.eql(u8, reason, "stop")) {
+        slot.record_held = true;
+        return;
+    }
+    recordSlotEnd(metrics, slot, outcome);
+}
+
+/// The connection thread submitted a continuation for a held head: the continuation's slot counts the reply, so the
+/// head never does.
+pub fn handOver(slot: anytype) void {
+    slot.record_held = false;
+    slot.metrics_recorded = true;
+}
+
+/// The connection thread judged a turn that was not continued: the slot ends as a request of its own, once.
+pub fn settleHeld(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
+    if (!slot.record_held) return;
+    slot.record_held = false;
+    recordSlotEnd(metrics, slot, finishOutcome(slot.finish_reason, null));
 }
 
 /// The cleanup drain's count: a slot refused before its first forward is a rejection; anything
@@ -352,7 +421,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, cap_reason: []const u8) void {
     // Record per-request metrics while slot fields are still live (before markFinished broadcasts:
     // the conn thread may complete()+free the slot immediately after). real_ttft = first_token_ns
     // (queue+prefill, captured at prefill completion); recordRequest derives e2e = first_token_ns + decode_ns.
-    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    recordFinish(sch.metrics, slot, reason, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -453,7 +522,16 @@ pub const OutcomeStub = struct {
     spec_recorded: bool = false,
     legacy_gen: ?SpecGenStub = null,
     prefill_computed: u32 = 0,
+    may_continue: bool = false,
+    record_held: bool = false,
+    continuation_of: ?Head = null,
 
+    /// `finishSlot` on the inference thread, which holds a slot that may continue after its thought.
+    fn finishHolding(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
+        recordFinish(m, self, reason, finishOutcome(reason, null));
+        self.finished = true;
+        self.finish_reason = reason;
+    }
     /// `finishSlot` on the inference thread: records, then publishes the terminator.
     fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
         recordSlotEnd(m, self, finishOutcome(reason, null));
@@ -601,6 +679,111 @@ fn expectLogged(m: *metrics_mod.Metrics, expected: []const struct { request_id: 
         try testing.expectEqual(@as(i64, @intCast(want.request_id)), row.object.get("request_id").?.integer);
         try testing.expectEqualStrings(want.outcome, row.object.get("outcome").?.string);
     }
+}
+
+fn firstRow(m: *metrics_mod.Metrics, rows: *?std.json.Parsed(std.json.Value)) !std.json.ObjectMap {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{");
+    try m.finished.writeSince(testing.io, 0, &out.writer);
+    try out.writer.writeAll("}");
+    rows.* = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.written(), .{});
+    const list = rows.*.?.value.object.get("requests").?.array.items;
+    try testing.expectEqual(@as(usize, 1), list.len);
+    return list[0].object;
+}
+
+test "outcome: a reply continued after its thought is one request, counted and logged by its continuation with the head's id and prompt" {
+    var m = metrics_mod.Metrics.init();
+    var head = OutcomeStub{ .request_id = 3, .may_continue = true, .prompt_tokens = 112, .cached_tokens = 12, .completion_tokens = 4, .spec_mode = .mtp, .spec_totals = .{ .rounds = 2, .drafted = 4, .accepted = 3 } };
+    head.finishHolding(&m, "stop");
+    try expectOutcomes(&m, 0, 0, 0, 0);
+    var cont = OutcomeStub{
+        .request_id = 4,
+        .prompt_tokens = 117,
+        .cached_tokens = 116,
+        .completion_tokens = 11,
+        .first_token_ns = 1_000_000,
+        .prefill_ns = 1_000_000,
+        .decode_ns = 30_000_000,
+        .continuation_of = Head.of(&head, 0),
+    };
+    handOver(&head);
+    cont.finishHolding(&m, "stop");
+    head.complete();
+    recordSlotCleanup(&m, &head);
+    cont.complete();
+    recordSlotCleanup(&m, &cont);
+    try expectOutcomes(&m, 1, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 112), m.prompt_tokens_total.load());
+    try testing.expectEqual(@as(u64, 15), m.generation_tokens_total.load());
+    try testing.expectEqual(@as(u64, 100), m.prefill_tokens_total.load());
+    try testing.expectEqual(@as(u64, 12), m.prefix_cache_tokens_total.load());
+    try testing.expectEqual(@as(u64, 5_000_000 + 50_000_000), m.e2e_latency_ns.sum.load(.monotonic));
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*p| p.deinit();
+    const row = try firstRow(&m, &parsed);
+    try testing.expectEqual(@as(i64, 3), row.get("request_id").?.integer);
+    try testing.expectEqual(@as(i64, 100), row.get("prompt_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 12), row.get("cached_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 15), row.get("generated_tokens").?.integer);
+    try testing.expectEqual(@as(f64, 0.005), row.get("prefill_seconds").?.float);
+    try testing.expectEqual(@as(f64, 0.05), row.get("decode_seconds").?.float);
+    const spec = row.get("spec").?.object;
+    try testing.expectEqualStrings("mtp", spec.get("mode").?.string);
+    try testing.expectEqual(@as(i64, 2), spec.get("rounds").?.integer);
+}
+
+test "outcome: a continuation that fails fails the one request its head began" {
+    var m = metrics_mod.Metrics.init();
+    var head = OutcomeStub{ .may_continue = true };
+    head.finishHolding(&m, "stop");
+    var cont = OutcomeStub{ .request_id = 8, .continuation_of = Head.of(&head, 0) };
+    handOver(&head);
+    cont.fail("MlxFailure");
+    cont.complete();
+    recordSlotCleanup(&m, &cont);
+    head.complete();
+    recordSlotCleanup(&m, &head);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+    var parsed: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed) |*p| p.deinit();
+    const row = try firstRow(&m, &parsed);
+    try testing.expectEqual(@as(i64, 7), row.get("request_id").?.integer);
+    try testing.expectEqualStrings("error", row.get("outcome").?.string);
+}
+
+test "outcome: a held head its connection thread settles is counted once, and the drain after adds nothing" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{ .may_continue = true };
+    s.finishHolding(&m, "stop");
+    try testing.expect(s.record_held);
+    try expectOutcomes(&m, 0, 0, 0, 0);
+    settleHeld(&m, &s);
+    settleHeld(&m, &s);
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 1, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 10), m.generation_tokens_total.load());
+}
+
+test "outcome: a held head its connection thread never settles is counted by the drain" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{ .may_continue = true };
+    s.finishHolding(&m, "stop");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 1, 0, 0, 0);
+}
+
+test "outcome: a slot that may continue is held only when its turn ended on a stop" {
+    var m = metrics_mod.Metrics.init();
+    var cut = OutcomeStub{ .may_continue = true };
+    cut.finishHolding(&m, "length");
+    var cancelled = OutcomeStub{ .may_continue = true };
+    cancelled.finishHolding(&m, "cancelled");
+    try testing.expect(!cut.record_held and !cancelled.record_held);
+    try expectOutcomes(&m, 1, 1, 0, 0);
 }
 
 test "request log: a finished request is logged once with its split of computed and restored prompt tokens" {

@@ -3519,3 +3519,56 @@ test "server: /props keeps its whole memory object with no model, before a load 
         }
     }.run);
 }
+
+test "server: a reply continued after its thought is one request in the counters and the log" {
+    server_state.setContinueAfterThought(true);
+    defer server_state.setContinueAfterThought(true);
+    try eachArch(1, .{}, struct {
+        const user = "[{\"role\":\"user\",\"content\":\"What time is it?\"}]";
+        fn run() !void {
+            const on = try request("POST", "/metrics/enable", "");
+            defer gpa.free(on);
+            if (!std.mem.startsWith(u8, on, "HTTP/1.1 200")) return error.MetricsNotEnabled;
+            const base = try request("GET", "/metrics.json?since=0", "");
+            defer gpa.free(base);
+            var bsp = try std.json.parseFromSlice(std.json.Value, gpa, bodyOf(base), .{});
+            defer bsp.deinit();
+            const base_success: u64 = @intCast(bsp.value.object.get("counters").?.object.get("requests_success_total").?.integer);
+            const base_rows: usize = if (bsp.value.object.get("requests")) |r| r.array.items.len else 0;
+
+            scheduler_mod.end_turn_for_test = .{ .cache_key = std.hash.Wyhash.hash(1, "thought-seam"), .after = 4 };
+            defer scheduler_mod.end_turn_for_test = null;
+            const resp = try request("POST", "/v1/chat/completions", "{\"prompt_cache_key\":\"thought-seam\",\"model\":\"tiny\",\"max_tokens\":24,\"temperature\":0,\"enable_thinking\":true,\"messages\":" ++ user ++ "}");
+            defer gpa.free(resp);
+            if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) {
+                std.debug.print("continued chat answered: {s}\n", .{resp[0..@min(resp.len, 600)]});
+                return error.NotServed;
+            }
+            if (std.mem.indexOf(u8, bodyOf(resp), "\"continued_after_thought\"") == null) return error.SkipZigTest;
+            var rp = try std.json.parseFromSlice(std.json.Value, gpa, bodyOf(resp), .{});
+            defer rp.deinit();
+            const usage = rp.value.object.get("usage").?.object;
+            const completion: i64 = usage.get("completion_tokens").?.integer;
+
+            const after = try request("GET", "/metrics.json?since=0", "");
+            defer gpa.free(after);
+            var asp = try std.json.parseFromSlice(std.json.Value, gpa, bodyOf(after), .{});
+            defer asp.deinit();
+            const success: u64 = @intCast(asp.value.object.get("counters").?.object.get("requests_success_total").?.integer);
+            const rows = asp.value.object.get("requests").?.array.items;
+            errdefer {
+                std.debug.print("one continued chat: usage completion {d}, success +{d}, rows +{d}\n", .{ completion, success - base_success, rows.len - base_rows });
+                for (rows[base_rows..], 0..) |row, i| {
+                    const o = row.object;
+                    std.debug.print("  row {d}: id {d} prompt {d} cached {d} generated {d} {s}\n", .{
+                        i, o.get("request_id").?.integer, o.get("prompt_tokens").?.integer,
+                        o.get("cached_tokens").?.integer, o.get("generated_tokens").?.integer, o.get("outcome").?.string,
+                    });
+                }
+            }
+            if (success - base_success != 1) return error.CountedTwice;
+            if (rows.len - base_rows != 1) return error.LoggedTwice;
+            if (rows[base_rows].object.get("generated_tokens").?.integer != completion) return error.RowCompletionDisagrees;
+        }
+    }.run);
+}

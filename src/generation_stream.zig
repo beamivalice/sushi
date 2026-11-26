@@ -13,6 +13,7 @@ const expert_stream_mod = @import("expert_stream.zig");
 const log = @import("log.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
+const slot_outcome = @import("slot_outcome.zig");
 const model_load_mod = @import("model_load.zig");
 const vision_queue = @import("vision_queue.zig");
 const slot_admission = @import("slot_admission.zig");
@@ -443,6 +444,8 @@ fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Schedu
     const left = @min(params.max_tokens -| slot.completion_tokens, billed -| prompt.len);
     if (left == 0) return keptThought(slot, .max_tokens);
     var next = params;
+    next.may_continue = false;
+    next.continuation_of = slot_outcome.Head.of(slot, @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds));
     next.prompt_ids = prompt;
     next.full_prompt = prompt;
     next.cached_tokens = 0;
@@ -451,6 +454,7 @@ fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Schedu
     const bridge = if (think_tags.indexOfThinkCloseTag(text, 0) == null) try tok.encode(allocator, think_tags.BARE_THINK_CLOSER) else try allocator.alloc(u32, 0);
     errdefer allocator.free(bridge);
     const cont = try sch.submit(next);
+    slot_outcome.handOver(slot);
     log.info("  [thought] request {d} ended its turn inside its thought: continued once after its closed think block as request {d} ({d} prompt tokens, {d} max_tokens left)\n", .{ slot.request_id, cont.request_id, prompt.len, left });
     return .{ .continued = .{ .slot = cont, .bridge = bridge } };
 }
@@ -593,6 +597,7 @@ pub fn nonStreamingViaScheduler(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
+        .may_continue = thought != null and server_state.continueAfterThought(),
     };
     const slot = try sch.submit(params);
     defer sch.complete(slot);
@@ -632,6 +637,7 @@ pub fn nonStreamingViaScheduler(
             details = continuedDetails(c.slot.finish_details);
         },
     };
+    if (cont == null) slot_outcome.settleHeld(sch.metrics, slot);
     const last = cont orelse slot;
     // An early stop or a cancel reports the tokens it returned, not the ones decoded past its end.
     const returned = end == .stopped or end == .cancelled;
@@ -1118,6 +1124,7 @@ pub const StreamingTokenStream = struct {
         if (self.slot) |s| {
             if (s.cancelled.load(.acquire)) sch.quiesce(s);
             const first: ?*scheduler_mod.Slot = if (self.thought) |t| t.first else null;
+            if (first == null) slot_outcome.settleHeld(sch.metrics, s);
             if (first != null) logContinuation(s);
             const head = first orelse s;
             self.prompt_tokens = head.prompt_tokens;
@@ -1486,6 +1493,7 @@ pub fn handleStreamingGeneration(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
+        .may_continue = thought != null and server_state.continueAfterThought(),
     };
     slot_handle = try sch.submit(params);
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);

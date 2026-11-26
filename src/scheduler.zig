@@ -159,6 +159,11 @@ pub const SubmitParams = struct {
     /// per-tick model switching is just a pointer hop. Required field
     /// post-Phase-D; tests using the legacy path pass the default model.
     model: *model_registry_mod.LoadedModel,
+    /// The turn may end inside its thought and be continued by a second slot (`generation_stream.continueAfterThought`):
+    /// its outcome is counted when its connection thread judges the turn (`slot_outcome.settleHeld`).
+    may_continue: bool = false,
+    /// Set on the continuation's slot: the reply it carries on, whose request it counts and logs as.
+    continuation_of: ?slot_outcome.Head = null,
 };
 
 /// The KDA checkpoints a GLM request keeps for the prefix cache, as admission bills them: how many it
@@ -432,8 +437,13 @@ pub const Slot = struct {
     shutdown_cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Inference thread only: `cullDecodingWith` committed this cancelled slot, so its cleanup drain must not.
     committed_at_cull: bool = false,
-    /// Inference thread only: the request's outcome has been counted in `Metrics`.
+    /// The request's outcome has been counted in `Metrics`: by the inference thread, or by `settleHeld` before the
+    /// connection thread completes the slot.
     metrics_recorded: bool = false,
+    /// `SubmitParams.may_continue`, and whether the slot's finish left its count to `settleHeld`.
+    may_continue: bool = false,
+    record_held: bool = false,
+    continuation_of: ?slot_outcome.Head = null,
     /// Set by the connection thread when the request's own stop sequence completed, before it cancels
     /// the slot: that end is a normal stop, not a disconnect.
     stop_hit: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -580,6 +590,8 @@ pub const Slot = struct {
             .deferred_media = params.deferred_media,
             .vision_key = params.vision_key,
             .cache_key = params.cache_key,
+            .may_continue = params.may_continue,
+            .continuation_of = params.continuation_of,
             .media_start = media_start,
             .media_chain = media_chain_owned,
             .mrope_pos = params.mrope_pos,
@@ -993,6 +1005,9 @@ pub const Slot = struct {
             .shutdown_cancelled = std.atomic.Value(bool).init(false),
             .committed_at_cull = false,
             .metrics_recorded = false,
+            .may_continue = false,
+            .record_held = false,
+            .continuation_of = null,
             .stop_hit = std.atomic.Value(bool).init(false),
             .in_pass = std.atomic.Value(u32).init(0),
             .constraint_payload_at = std.atomic.Value(u32).init(std.math.maxInt(u32)),
@@ -3291,14 +3306,18 @@ fn publishLiveKvResidency(sch: *Scheduler) void {
 fn recordLiveSession(sch: *Scheduler, s: *const Slot, phase: metrics_mod.Session.Phase, state_bytes: u64) void {
     if (sch.live_session_count == sch.live_sessions.len) return;
     const prompt: u32 = if (phase == .prefill) @intCast(s.full_prompt.len) else s.prompt_tokens;
-    var session = metrics_mod.Session.init(s.model.id, phase, prompt + s.completion_tokens, s.cached_tokens, s.completion_tokens, state_bytes);
+    // A continuation shows as the reply it carries on: its id, tokens, cap and age.
+    const head = s.continuation_of;
+    const generated = s.completion_tokens + if (head) |h| h.completion_tokens else 0;
+    var session = metrics_mod.Session.init(s.model.id, phase, prompt + s.completion_tokens, s.cached_tokens, generated, state_bytes);
     // sushi extensions over the upstream row: the stable submit sequence, the
     // request's own output cap, and its age — measured from the immutable
     // arrival anchor `Slot.init` stamped, re-derived at every publish so a
     // long tick never leaves a stale age behind.
-    session.request_id = s.request_id;
-    session.max_tokens = s.max_tokens;
-    const age_ns = s.request_start_ts.untilNow(sch.io, .boot).nanoseconds;
+    session.request_id = if (head) |h| h.request_id else s.request_id;
+    session.max_tokens = s.max_tokens + if (head) |h| h.completion_tokens else 0;
+    const own_ns: u64 = @intCast(s.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
+    const age_ns = own_ns + if (head) |h| h.age_ns else 0;
     session.elapsed_seconds = @as(f64, @floatFromInt(age_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
     session.entry_id = s.restored_entry;
     if (phase == .prefill) session.prefill = .{

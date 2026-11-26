@@ -520,7 +520,7 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   boot or from the first enable (`startGaugeSampler`, a state machine joined by `stopGaugeSampler` before the scheduler is
   torn down). The core calls no MLX; the sampler's `mlx_get_*_memory` reads are the existing `--metrics` behaviour.
 - **A request outcome is counted exactly once** (`Slot.metrics_recorded`, inference thread): `finishSlot` or the cleanup drain,
-  whichever sees the slot first (`recordSlotEnd`/`recordSlotCleanup`). The outcome comes from the slot's finish state, never
+  whichever sees the slot first (`recordSlotEnd`/`recordSlotCleanup`). A reply continued after its thought is one request: the head slot's count waits for its connection thread (`Slot.record_held`, `settleHeld`), and the continuation's slot counts and logs for both under the head's id, prompt and summed tokens and times (`slot_outcome.Head`). The outcome comes from the slot's finish state, never
   from `Slot.cancelled` (`complete` sets it on every completion): success feeds the histograms; `sushi:request_cancelled_total`
   (a disconnect mid-decode; a request ended by its own stop sequence sets `Slot.stop_hit` first and counts as success), `sushi:request_failed_total` and a refusal before a slot
   (`sushi:request_rejected_total`: context overflow, memory preflight, `PrefillDoesNotFit`) move only their counter.
@@ -566,7 +566,7 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
     has no `spec` member.
 - `/metrics.json` ends with `"sessions"`, one row per live request (phases `prefill` and `decode`, cap 32; published
   by the inference thread under `queue_mu`, copied by the reader under the same lock — there is no separate
-  `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused),
+  `/requests` route): `model`, `request_id` (submit sequence; stable across polls of one request, never reused: a continued reply keeps its head's id and shows both parts' tokens),
   `phase`, `prefill` on a prefill row only (`total`, `cache`, `processed`, `time_ms`, the numbers a `return_progress`
   stream's `prompt_progress` carries: a client reads the share read as `processed / total` and the time left as
   `(total - processed)` at `(processed - cache) / time_ms`), `context_tokens` (prompt + decoded; the FULL prompt on a prefill row), `context_length` (the model's
