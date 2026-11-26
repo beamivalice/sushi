@@ -897,3 +897,18 @@ test "DeepSeek: warmNeedBytes covers warmRequestBill with DSpark on Cooler" {
     errdefer std.debug.print("dsv41 floor={d}: warmNeedBytes={d} MB, warmRequestBill={d} MB\n", .{ floor, need >> 20, req >> 20 });
     try t.expect(need >= req);
 }
+
+test "a resident DeepSeek load's cold bill holds its Engram row caches, as a streamed load's split does (DSV41_STQ_TINY)" {
+    const path = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    var cfg = try model_mod.parseConfig(io, a, path);
+    defer cfg.deinit(a);
+    const caches = @import("../engram.zig").cacheBytes(cfg.dsv41.?.engram);
+    try std.testing.expect(caches > 0);
+    var none = cfg;
+    none.dsv41.?.engram.n = 0;
+    const with = try model_load.sushiResidentLoadBytes(io, a, path, &cfg, false, false);
+    const without = try model_load.sushiResidentLoadBytes(io, a, path, &none, false, false);
+    try std.testing.expectEqual(caches, with - without);
+}

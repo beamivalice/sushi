@@ -151,7 +151,7 @@ pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir
     };
 }
 
-pub fn streamedResidentExtra(config: *const Config) u64 {
+pub fn residentExtra(config: *const Config) u64 {
     const c = config.dsv41 orelse return 0;
     return @import("dsv41_engram.zig").cacheBytes(c.engram);
 }

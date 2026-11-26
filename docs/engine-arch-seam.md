@@ -216,7 +216,7 @@ Each is optional; shared code asks through the dispatch file named, never the ar
   shared EXL3 pack index check does not apply); `kvBytesPerToken`, `cacheLayoutNamespace` and `drafterOn`, `config`-keyed through
   `arch/config.zig`. The arch's own weights and whether its pack ships its drafting head are the `load` slot's `weights` and `shipsHead`
   (`arch/load.zig`).
-- `streamedResidentExtra(config)` (`arch/admission.zig`): bytes a streamed load keeps resident beside the trunk. `ExpertStreamTraits.stq_experts`
+- `residentExtra(config)` (`arch/admission.zig`): bytes a load keeps resident beside the trunk, streamed or resident (DeepSeek's Engram row caches). `ExpertStreamTraits.stq_experts`
   says the routed experts are STQ rate groups.
 - The `prefix` slot: `checkpointMax(global)`, `disk_checkpoint_cap`, `setDiskGrownSpec(allocator, config, tier)`, `restorePointModel(xfm)` (the
   whole request state is checkpointed as restore points and the prefill reads the next chunk's rows ahead) and `captureCheckpoint`

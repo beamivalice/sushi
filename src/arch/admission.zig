@@ -20,11 +20,11 @@ pub const ExpertStreamTraits = struct {
     cache_bias: bool = false,
 };
 
-/// Bytes a streamed load keeps resident beside the trunk that only the arch knows of; 0 where it has none.
-pub fn streamedResidentExtra(config: *const model.ModelConfig) u64 {
+/// Bytes a load keeps resident beside the trunk that only the arch knows of, streamed or resident; 0 where it has none.
+pub fn residentExtra(config: *const model.ModelConfig) u64 {
     const s = spec.of(config) orelse return 0;
     return switch (s) {
-        inline else => |c, t| if (@hasDecl(registry.Mod(t), "streamedResidentExtra")) registry.Mod(t).streamedResidentExtra(c) else 0,
+        inline else => |c, t| if (@hasDecl(registry.Mod(t), "residentExtra")) registry.Mod(t).residentExtra(c) else 0,
     };
 }
 

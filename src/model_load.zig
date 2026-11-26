@@ -1031,7 +1031,7 @@ pub fn planExpertStreamingWith(io: std.Io, allocator: std.mem.Allocator, config:
     }
     var split = try model_mod.streamingResidentSplit(io, allocator, model_dir, &streamed);
     split.trunk +|= coarseHeadBytes(&streamed) +| fp8ExpertScratchBytes(streamed.expert_layout, geometry) +| assistant_bytes +|
-        admission.streamedResidentExtra(&streamed);
+        admission.residentExtra(&streamed);
     if (!config.has_vision) split.vision = 0;
     if (!config.stream_mtp_head) split.mtp = 0;
     const bill = expert_stream_mod.expertBillFor(allocator, model_dir, geometry, streamed.expert_layout) catch |err| {
@@ -1395,9 +1395,9 @@ fn sushiAssistantLoadBytes(io: std.Io, allocator: std.mem.Allocator, directory: 
     return (try dflash_mod.assistantLoadBytes(io, allocator, directory, dflash_mod.quantBitsFromEnv())).resident;
 }
 
-fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
+pub fn sushiResidentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool, mtp_on: bool) !u64 {
     const split = try model_mod.residentWeightBytes(io, allocator, model_dir, load_vision, mtp_on, @import("cooler_side.zig").onEngine(config));
-    return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits());
+    return split.trunk +| split.mtp +| bills.rerankCoarseBill(split, config, mtp_on, mtp_mod.rerankCoarseBits()) +| admission.residentExtra(config);
 }
 
 /// The drafter a load binds: `--no-drafter` wins, then an explicit dir, then one shipped in the model dir.
