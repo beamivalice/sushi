@@ -89,6 +89,8 @@ less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 480k / 800k (Sushi-ST
 
 ‡ DeepSeek-V4.1-Flash streams its routed experts from the SSD on 96 and 128 GB Macs. It runs 1M at `--ssd-budget-gb 108` on a 128 GB Mac with `sudo sysctl iogpu.wired_limit_mb=125000 vm.global_user_wire_limit=131072000000 vm.user_wire_limit=131072000000` and at `80` on a 96 GB Mac with `sudo sysctl iogpu.wired_limit_mb=93000 vm.global_user_wire_limit=97517568000 vm.user_wire_limit=97517568000` ([usage](docs/usage.md#deepseek-launch)). Always raise the two user-wire limits with the GPU limit: without them the system slows down and can become unresponsive.
 
+On 64 GB and 96 GB Macs, DeepSeek-V4.1-Flash STQ 2.7bpw streams with `--expert-cache-bias`: see [Running DeepSeek-V4.1-Flash on 64 GB and 96 GB Macs](docs/dsv41-64gb-mac.md), a guide by [Samuel Reed (@STRML)](https://github.com/STRML), who also contributed the DeepSeek prefetch fixes in [PR #128](https://github.com/beamivalice/sushi/pull/128).
+
 § Hy4-Flash's cells are its recommended launches ([usage](docs/usage.md)), at 8-bit KV, not a computed maximum; · is not
 measured. On a 48 GB Mac the 2.25bpw pack streams its experts within a 34 GB budget. Its Engram tables stay on the SSD.
 

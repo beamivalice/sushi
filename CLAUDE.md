@@ -46,6 +46,7 @@ that architecture as its prefix (`qwen4-`, `mimo2-`, `glm5-`, `dsv41-`); `engine
 | [docs/glm5-clamped-experts.md](docs/glm5-clamped-experts.md) | GLM clamped EXL3 experts |
 | [docs/dsv41-arch.md](docs/dsv41-arch.md) | DeepSeek-V4.1-Flash: geometry, FP8 trunk + streamed experts, Engram, CED prefill, oracle, kernels, DSpark, STQ, `--drop-expert`, prefix cache, images |
 | [docs/dsv41-memory.md](docs/dsv41-memory.md) | DeepSeek-V4.1 ledger, per-layer cache split, 1M-token state, prefill borrow, resident load |
+| [docs/dsv41-64gb-mac.md](docs/dsv41-64gb-mac.md) | DeepSeek-V4.1 STQ 2.7bpw on 64 / 96 / 48 GB Macs: build, wired limits, launch profiles, KLD and speed (Samuel Reed's guide) |
 | [docs/dsv41-parity.md](docs/dsv41-parity.md) | DeepSeek-V4.1 against Qwen: feature matrix, larger gaps, live checks |
 | [docs/hy4-flash-arch.md](docs/hy4-flash-arch.md) | Hy4-Flash (served from 1.8.0): forward on Sushi Cooler, seams, bills, pack, parity, 1.8.0 parts |
 | [docs/hy4-parity.md](docs/hy4-parity.md) | Hy4-Flash against Qwen and DeepSeek: feature matrix, larger gaps, live checks |
