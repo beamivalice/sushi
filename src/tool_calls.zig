@@ -45,7 +45,8 @@ const toolNameIsDeclared = tool_schema.toolNameIsDeclared;
 
 /// Hy4's spelling of GLM's calls: `<tool_calls:opensource>` around `<tool_call:opensource>NAME<arg_key:opensource>K
 /// </arg_key:opensource><arg_value:opensource>V</arg_value:opensource></tool_call:opensource>`. The copy in GLM's
-/// plain tags with the wrapper dropped, or null when the text has none.
+/// plain tags with the wrapper dropped, or null when the text has none. A value (as `argValueClose` ends it) and a call
+/// of another dialect are copied as written: the repair changes call structure, never a value's bytes.
 fn opensourceTagRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     if (std.mem.indexOf(u8, text, ":opensource>") == null) return null;
     const pairs = [_][2][]const u8{
@@ -56,26 +57,81 @@ fn opensourceTagRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
+    var reader = tool_reading.Reader.init(text, true);
+    var foreign: ?tool_reading.Call = null;
+    var reading = true;
+    var key_closed = false;
     var i: usize = 0;
     outer: while (i < text.len) {
-        if (text[i] == '<') for (pairs) |p| if (std.mem.startsWith(u8, text[i..], p[0])) {
-            try out.appendSlice(allocator, p[1]);
-            i += p[0].len;
-            continue :outer;
+        while (reading and (foreign == null or foreign.?.start < i)) {
+            const c = reader.next() orelse {
+                reading = false;
+                foreign = null;
+                break;
+            };
+            if (!tool_reading.isArgKeyCall(text, c)) foreign = c;
+        }
+        if (foreign) |c| if (c.start == i) {
+            const end = c.end orelse text.len;
+            try out.appendSlice(allocator, text[i..end]);
+            i = end;
+            continue;
         };
+        if (text[i] == '<') {
+            if (key_closed) if (tagLenAt(text[i..], "<arg_value")) |len| {
+                const start = i + len;
+                const end = argValueClose(text, start) orelse text.len;
+                try out.appendSlice(allocator, "<arg_value>");
+                try out.appendSlice(allocator, text[start..end]);
+                i = end;
+                key_closed = false;
+                continue;
+            };
+            for (pairs) |p| if (std.mem.startsWith(u8, text[i..], p[0])) {
+                try out.appendSlice(allocator, p[1]);
+                i += p[0].len;
+                key_closed = std.mem.eql(u8, p[1], "</arg_key>");
+                continue :outer;
+            };
+            if (tagLenAt(text[i..], "</arg_key")) |len| {
+                try out.appendSlice(allocator, text[i .. i + len]);
+                i += len;
+                key_closed = true;
+                continue;
+            }
+        }
+        if (!std.ascii.isWhitespace(text[i])) key_closed = false;
         try out.append(allocator, text[i]);
         i += 1;
     }
     return try out.toOwnedSlice(allocator);
 }
 
+/// A `<tool_call>` at `wrapper` whose body opens with a special token (`token`..`token_end`) spelled where `<` belongs.
+const SpecialOpener = struct { wrapper: usize, token: usize, token_end: usize };
+
+/// `text` with the token of each opener read as `<`, those `accept` leaves out kept as written.
+fn spliceSpecialOpeners(allocator: std.mem.Allocator, text: []const u8, openers: []const SpecialOpener, accept: ?[]const bool) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var copied: usize = 0;
+    for (openers, 0..) |o, k| {
+        if (accept) |a| if (!a[k]) continue;
+        try out.appendSlice(allocator, text[copied..o.token]);
+        try out.append(allocator, '<');
+        copied = o.token_end;
+    }
+    try out.appendSlice(allocator, text[copied..]);
+    return try out.toOwnedSlice(allocator);
+}
+
 /// `<tool_call>` followed by a special token spelled where `<` belongs
-/// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none.
+/// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none. Only an opener that starts a
+/// call is read so: one a value spells is the value's own bytes.
 fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     const wrapper = "<tool_call>";
-    var out: ?std.ArrayList(u8) = null;
-    errdefer if (out) |*o| o.deinit(allocator);
-    var copied: usize = 0;
+    var found: std.ArrayList(SpecialOpener) = .empty;
+    defer found.deinit(allocator);
     var from: usize = 0;
     while (std.mem.indexOfPos(u8, text, from, wrapper)) |at| {
         var p = at + wrapper.len;
@@ -85,15 +141,33 @@ fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[
         const close = std.mem.indexOfPos(u8, text, p + 2, "|>") orelse continue;
         if (close - p > 32 or std.mem.indexOfAny(u8, text[p + 2 .. close], "<>\n ") != null) continue;
         if (!std.mem.startsWith(u8, text[close + 2 ..], "function=")) continue;
-        if (out == null) out = .empty;
-        try out.?.appendSlice(allocator, text[copied..p]);
-        try out.?.append(allocator, '<');
-        copied = close + 2;
-        from = copied;
+        try found.append(allocator, .{ .wrapper = at, .token = p, .token_end = close + 2 });
+        from = close + 2;
     }
-    var o = out orelse return null;
-    try o.appendSlice(allocator, text[copied..]);
-    return try o.toOwnedSlice(allocator);
+    if (found.items.len == 0) return null;
+
+    // Only the text with every opener read ends a call by the call's own value rules; a call opens at a start it reads.
+    const all = try spliceSpecialOpeners(allocator, text, found.items, null);
+    defer allocator.free(all);
+    const starts = try allocator.alloc(bool, found.items.len);
+    defer allocator.free(starts);
+    @memset(starts, false);
+    var reader = tool_reading.Reader.init(all, true);
+    var k: usize = 0;
+    var shift: usize = 0;
+    var any = false;
+    while (reader.next()) |c| {
+        while (k < found.items.len and found.items[k].wrapper - shift < c.start) {
+            shift += found.items[k].token_end - found.items[k].token - 1;
+            k += 1;
+        }
+        if (k < found.items.len and found.items[k].wrapper - shift == c.start) {
+            starts[k] = true;
+            any = true;
+        }
+    }
+    if (!any) return null;
+    return try spliceSpecialOpeners(allocator, text, found.items, starts);
 }
 
 /// A tool-call family a chat template teaches (`chat.callDialect`).
@@ -1460,9 +1534,10 @@ fn argValueClose(text: []const u8, val_start: usize) ?usize {
 fn argValueEndsAt(text: []const u8, p: usize) bool {
     const i = skipSpace(text, p);
     if (i == text.len) return true;
-    inline for (.{ "<arg_key", "<tool_call>", "<|" }) |opener| {
+    inline for (.{ "<arg_key", "<|", "</tool_calls:opensource>" }) |opener| {
         if (std.mem.startsWith(u8, text[i..], opener)) return true;
     }
+    if (tagLenAt(text[i..], "<tool_call") != null) return true;
     const close = tagLenAt(text[i..], "</tool_call") orelse return false;
     return !std.mem.startsWith(u8, text[skipSpace(text, i + close)..], "</arg_");
 }
@@ -5875,4 +5950,99 @@ test "r174-f-closer-monotone: a closer judged outside every value stays outside 
         }
     };
     try testing.expectEqual(@as(usize, 0), bad);
+}
+
+fn expectContentValue(raw: []const u8, dialect: ?Dialect, want: []const u8) !void {
+    const a = testing.allocator;
+    const calls = (try parseToolCallsAs(a, raw, dialect)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (calls) |c| {
+            a.free(c.name);
+            a.free(c.arguments);
+        }
+        a.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(want, parsed.value.object.get("content").?.string);
+}
+
+test "a Hy4 value that spells the wrapper's close ships it byte for byte" {
+    try expectContentValue(
+        "<tool_calls:opensource><tool_call:opensource>write_file<arg_key:opensource>content</arg_key:opensource><arg_value:opensource>a </tool_calls:opensource> b</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+        .arg_key,
+        "a </tool_calls:opensource> b",
+    );
+}
+
+test "a Hy4 value that spells a call's close or tags in the :opensource spelling ships them byte for byte" {
+    try expectContentValue(
+        "<tool_calls:opensource><tool_call:opensource>write_file<arg_key:opensource>content</arg_key:opensource><arg_value:opensource>print('</tool_call:opensource>')</arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+        .arg_key,
+        "print('</tool_call:opensource>')",
+    );
+    try expectContentValue(
+        "<tool_calls:opensource><tool_call:opensource>write_file<arg_key:opensource>content</arg_key:opensource><arg_value:opensource><tool_call:opensource>x<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource></arg_value:opensource></tool_call:opensource></tool_calls:opensource>",
+        .arg_key,
+        "<tool_call:opensource>x<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource>",
+    );
+}
+
+test "a Hermes parameter value that spells Hy4 tags ships them byte for byte" {
+    try expectContentValue(
+        "<tool_call>\n<function=write_file>\n<parameter=content>\nx <tool_calls:opensource><tool_call:opensource> y </tool_call:opensource></tool_calls:opensource>\n</parameter>\n</function>\n</tool_call>",
+        .function_tag,
+        "x <tool_calls:opensource><tool_call:opensource> y </tool_call:opensource></tool_calls:opensource>",
+    );
+}
+
+test "a Hermes value that spells a special-token call opener ships it byte for byte" {
+    try expectContentValue(
+        "<tool_call><function=write_file><parameter=content>x <tool_call><|im_start|>function=y> z</parameter></function></tool_call>",
+        .function_tag,
+        "x <tool_call><|im_start|>function=y> z",
+    );
+    try expectContentValue(
+        "<tool_call>write_file<arg_key>content</arg_key><arg_value>x <tool_call><|im_start|>function=y> z</arg_value></tool_call>",
+        .arg_key,
+        "x <tool_call><|im_start|>function=y> z",
+    );
+}
+
+test "a Hy4 wrapper around plain tags, and the call after a spelling value, read as the model wrote them" {
+    try expectContentValue(
+        "<tool_calls:opensource><tool_call>write_file<arg_key>content</arg_key><arg_value>a </tool_calls:opensource> b</arg_value></tool_call></tool_calls:opensource>",
+        .arg_key,
+        "a </tool_calls:opensource> b",
+    );
+    const a = testing.allocator;
+    const calls = (try parseToolCallsAs(a, "<tool_calls:opensource><tool_call:opensource>f<arg_key:opensource>k</arg_key:opensource><arg_value:opensource></tool_calls:opensource></arg_value:opensource></tool_call:opensource><tool_call:opensource>g<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource></tool_calls:opensource>", .arg_key)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (calls) |c| {
+            a.free(c.name);
+            a.free(c.arguments);
+        }
+        a.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("{\"k\":\"</tool_calls:opensource>\"}", calls[0].arguments);
+    try testing.expectEqualStrings("g", calls[1].name);
+    try testing.expectEqualStrings("{\"k\":\"v\"}", calls[1].arguments);
+}
+
+test "two Hermes calls that spell a special-token opener are both read as calls" {
+    const a = testing.allocator;
+    const raw = "<tool_call><|im_start|>function=f>\n<parameter=k>\n1\n</parameter>\n</function>\n</tool_call>\n<tool_call><|im_start|>function=g>\n<parameter=k>\n2\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCallsAs(a, raw, .function_tag)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (calls) |c| {
+            a.free(c.name);
+            a.free(c.arguments);
+        }
+        a.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("f", calls[0].name);
+    try testing.expectEqualStrings("g", calls[1].name);
 }

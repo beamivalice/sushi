@@ -324,6 +324,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An argument key never carries markup or a line break** (corpus invariant): a doubled `<arg_key><arg_key>K` keys on
   the LAST opener; a special token spelled where `<` belongs before `function=` right after `<tool_call>` is read as
   `<` (`hermesSpecialOpenerRepair`).
+- **A repair changes call structure, never a value's bytes**: `opensourceTagRepair` leaves every value (`argValueClose`)
+  and every call of another dialect as written, and `hermesSpecialOpenerRepair` reads only an opener the reading takes
+  for a call's start, never one a value spells. Corpus invariant: a value that spells another dialect's tags ships byte
+  for byte in every tag dialect.
 - **A think or channel tag inside a call's value is payload** (`tool_reading.outsideCalls`, read by `indexOfThinkOpenTag`, `indexOfThinkCloseTag`, the channel scans, `normalizeEmbeddedThinkBlocks`, the parse's thought strip and `splitThinkBlock`): a tag is structure only where no call that opens before it ends after it (or never ends: the call the text stops inside is declined, and its value's tags are its text, never a thought's close, unless a thought is open where it starts), in any family. `ThinkScan` stops latching a close once any call opener's start appears.
   preceding tool opener is still OPEN AND whose block closes afterwards.
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched).

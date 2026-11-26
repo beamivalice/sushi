@@ -2705,6 +2705,8 @@ const closer_in_value_calls = [_][]const u8{
     "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"a </tool_call> b\"}}\n</tool_call>",
     "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> b</arg_value></tool_call>",
     hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>a </tool_call> b</arg_value></tool_call>" ++ hy4_close,
+    hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>a </tool_calls:opensource> b</arg_value:opensource></tool_call:opensource>" ++ hy4_close,
+    hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>print('</tool_call:opensource>')</arg_value:opensource></tool_call:opensource>" ++ hy4_close,
     "<|tool_call>call:get_weather{city:<|\"|>a <tool_call|> b<|\"|>}<tool_call|>",
     "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">a </\u{ff5c}DSML\u{ff5c}invoke> b</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
     "<function_calls>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">a </invoke> b</parameter>\n</invoke>\n</function_calls>",
@@ -2775,6 +2777,8 @@ test "format corpus: a closer a parameter value spells ships the whole value in 
         "a </tool_call> b",
         "a </tool_call> b",
         "a </tool_call> b",
+        "a </tool_calls:opensource> b",
+        "print('</tool_call:opensource>')",
         "a <tool_call|> b",
         "a </\u{ff5c}DSML\u{ff5c}invoke> b",
         "a </invoke> b",
@@ -2915,6 +2919,53 @@ test "format corpus: a parameter VALUE never decides the call" {
             }
         }
     }
+}
+
+test "format corpus: a value that spells another dialect's call tags ships byte for byte in every tag dialect" {
+    // A repair or reading step changes the call structure the model wrote, never a value: the tags of Hy4's
+    // `:opensource` spelling and a special token where a Hermes `<` belongs are payload inside any dialect's value.
+    const allocator = testing.allocator;
+    const dsml = "\u{ff5c}DSML\u{ff5c}";
+    const Shape = struct { name: []const u8, pre: []const u8, post: []const u8 };
+    const shapes = [_]Shape{
+        .{ .name = "hermes function", .pre = "<tool_call><function=write_file><parameter=path>a.txt</parameter><parameter=content>", .post = "</parameter></function></tool_call>" },
+        .{ .name = "glm", .pre = "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.txt</arg_value><arg_key>content</arg_key><arg_value>", .post = "</arg_value></tool_call>" },
+        .{ .name = "hy4 plain tags", .pre = hy4_open ++ "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.txt</arg_value><arg_key>content</arg_key><arg_value>", .post = "</arg_value></tool_call>" ++ hy4_close },
+        .{ .name = "hy4 :opensource tags", .pre = hy4_open ++ "<tool_call:opensource>write_file<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>a.txt</arg_value:opensource><arg_key:opensource>content</arg_key:opensource><arg_value:opensource>", .post = "</arg_value:opensource></tool_call:opensource>" ++ hy4_close },
+        .{ .name = "dsml", .pre = "<" ++ dsml ++ "tool_calls><" ++ dsml ++ "invoke name=\"write_file\"><" ++ dsml ++ "parameter name=\"path\" string=\"true\">a.txt</" ++ dsml ++ "parameter><" ++ dsml ++ "parameter name=\"content\" string=\"true\">", .post = "</" ++ dsml ++ "parameter></" ++ dsml ++ "invoke></" ++ dsml ++ "tool_calls>" },
+        .{ .name = "invoke", .pre = "<invoke name=\"write_file\"><parameter name=\"path\">a.txt</parameter><parameter name=\"content\">", .post = "</parameter></invoke>" },
+    };
+    const values = [_][]const u8{
+        "a " ++ hy4_close ++ " b",
+        hy4_open ++ "x",
+        "<tool_call:opensource>",
+        "print('</tool_call:opensource>')",
+        "<arg_key:opensource>k</arg_key:opensource>",
+        "</arg_value:opensource>",
+        "<tool_call:opensource>f<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource>",
+        "x <tool_call><|im_start|>function=y> z",
+        "<tool_call>\n<|im_start|>function=y>\n</function>\n</tool_call>",
+    };
+    for (shapes) |shape| for (values) |value| {
+        const raw = try std.mem.concat(allocator, u8, &.{ shape.pre, value, shape.post });
+        defer allocator.free(raw);
+        errdefer std.debug.print("\n[{s}] raw: {f}\n", .{ shape.name, std.zig.fmtString(raw) });
+        const calls = (try tool_calls_mod.parseToolCalls(allocator, raw)) orelse return error.WholeCallDropped;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("write_file", calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+        try testing.expectEqualStrings("a.txt", (parsed.value.object.get("path") orelse return error.PathDropped).string);
+        try testing.expectEqualStrings(value, (parsed.value.object.get("content") orelse return error.ContentDropped).string);
+    };
 }
 
 test "format corpus: parse -> serialize -> parse is a fixpoint per family" {
