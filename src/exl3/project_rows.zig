@@ -1118,10 +1118,11 @@ const NaxSplit = struct { kph: c_int, nsplit: c_int };
 const NaxTuned = struct { in_dim: c_int, out_dim: c_int, groups: c_int, kph: c_int, nsplit: c_int, ultra_k5: ?NaxSplit = null };
 
 const NAX_TUNED = [_]NaxTuned{
-    .{ .in_dim = 5120, .out_dim = 1792, .groups = 1, .kph = 4, .nsplit = 5 },
-    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1, .ultra_k5 = .{ .kph = 2, .nsplit = 1 } },
-    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8, .ultra_k5 = .{ .kph = 4, .nsplit = 2 } },
-    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 2, .nsplit = 8 } },
+    .{ .in_dim = 5120, .out_dim = 1792, .groups = 1, .kph = 4, .nsplit = 5, .ultra_k5 = .{ .kph = 1, .nsplit = 20 } },
+    .{ .in_dim = 1280, .out_dim = 32768, .groups = 1, .kph = 4, .nsplit = 1, .ultra_k5 = .{ .kph = 1, .nsplit = 1 } },
+    .{ .in_dim = 4096, .out_dim = 1024, .groups = 8, .kph = 4, .nsplit = 8, .ultra_k5 = .{ .kph = 2, .nsplit = 2 } },
+    .{ .in_dim = 8192, .out_dim = 5120, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 1, .nsplit = 8 } },
+    .{ .in_dim = 6144, .out_dim = 25600, .groups = 1, .kph = 2, .nsplit = 4, .ultra_k5 = .{ .kph = 2, .nsplit = 1 } },
     .{ .in_dim = 5120, .out_dim = 129280, .groups = 1, .kph = 1, .nsplit = 2 },
 };
 
@@ -1798,7 +1799,7 @@ test "exl3 NAX joined rows: one launch at every row total gives each row its one
     }
     const profile = device.withProfile(device.Profile.from("g17d", .{ .major = 26, .minor = 2 }, false));
     defer profile.end();
-    try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 80, exact, .{ .kph = 2, .nsplit = 8 }));
+    try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 80, exact, .{ .kph = 1, .nsplit = 8 }));
     try std.testing.expectEqual(@as(usize, 2), try dynTemplates(8192, 5120, 1, 64, exact, .{ .kph = 2, .nsplit = 4 }));
 }
 
