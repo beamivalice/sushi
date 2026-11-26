@@ -263,16 +263,14 @@ pub const AdmitTick = struct { admits: usize = 0, refused: usize = 0 };
 /// earlier request of its model, an exclusive model's running one, or memory).
 pub fn capWaitLine(buf: []u8, c: sched_policy.AdmitCand, cands: []const sched_policy.AdmitCand, verdicts: []const sched_policy.AdmitVerdict) ?[]const u8 {
     var tick_live: u32 = 0;
-    var tick_reserved: u64 = 0;
-    for (cands, verdicts) |o, v| if (v == .admit and o.model == c.model) {
-        tick_live += 1;
-        tick_reserved +|= o.reservation;
-    };
+    for (cands, verdicts) |o, v| {
+        if (v == .admit and o.model == c.model) tick_live += 1;
+    }
     if (c.max_concurrent > 0 and c.live +| tick_live >= c.max_concurrent)
         return std.fmt.bufPrint(buf, "[queue] waiting for max_concurrent {d}: {d} of this model's requests run", .{ c.max_concurrent, c.live +| tick_live }) catch null;
-    const held = c.reserved +| tick_reserved +| (c.retained -| c.own_retained);
-    if (c.max_kv_tokens > 0 and held +| c.reservation > c.max_kv_tokens)
-        return std.fmt.bufPrint(buf, "[queue] waiting for max_kv_tokens {d}: {d} tokens held, this request reserves {d}", .{ c.max_kv_tokens, held, c.reservation }) catch null;
+    const held = sched_policy.heldTokensFor(c, cands, verdicts);
+    if (c.max_kv_tokens > 0 and held.total() +| c.reservation > c.max_kv_tokens)
+        return std.fmt.bufPrint(buf, "[queue] waiting for max_kv_tokens {d}: {d} tokens held, this request reserves {d}", .{ c.max_kv_tokens, held.total(), c.reservation }) catch null;
     return null;
 }
 
@@ -991,6 +989,19 @@ test "a request a cap holds says which cap in its queue line, and one only behin
     try t.expectEqualStrings("[queue] waiting for max_kv_tokens 6000: 3410 tokens held, this request reserves 3410", capWaitLine(&buf, kv[0], &kv, &.{.wait}).?);
     const fifo = [_]sched_policy.AdmitCand{.{ .model = A, .exclusive = false, .reserved = 10, .reservation = 10, .max_kv_tokens = 6000 }};
     try t.expect(capWaitLine(&buf, fifo[0], &fifo, &.{.wait}) == null);
+}
+
+test "capWaitLine counts a restored entry once when two admitted siblings restore different max_kv_tokens entries" {
+    const A: usize = 0xA0;
+    var buf: [192]u8 = undefined;
+    const cands = [_]sched_policy.AdmitCand{
+        .{ .model = A, .exclusive = false, .max_kv_tokens = 25, .own_retained = 60, .own_id = 1, .reservation = 10 },
+        .{ .model = A, .exclusive = false, .max_kv_tokens = 25, .own_retained = 40, .own_id = 2, .reservation = 10 },
+        .{ .model = A, .exclusive = false, .max_kv_tokens = 25, .retained = 100, .reservation = 10 },
+    };
+    const verdicts = [_]sched_policy.AdmitVerdict{ .admit, .admit, .wait };
+    const line = capWaitLine(&buf, cands[2], &cands, &verdicts) orelse return error.NoWaitLine;
+    try testing.expectEqualStrings("[queue] waiting for max_kv_tokens 25: 20 tokens held, this request reserves 10", line);
 }
 
 test "with max_kv_tokens set, a candidate evicts the oldest retained entry and admits instead of waiting" {

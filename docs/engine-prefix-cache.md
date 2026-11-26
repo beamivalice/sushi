@@ -55,7 +55,8 @@ and golden strings (`zig build test-host`, no GPU, no lock).
   reclaim can drop one sooner. A load sets the count, so a reload takes a changed `max_concurrent`; the SSD tier keeps
   its byte budget. Where a model sets `max_kv_tokens`, its retained entries count in that token pool and a request
   that needs the room evicts them oldest-first; an entry a live request holds or restores from counts once, in that
-  request's reservation.
+  request's reservation. A `[queue]` wait line's held count uses the same once-only tally as the cap decision
+  (`sched_policy.heldTokensFor`), never a second count of a sibling's restored entry.
 
 <a id="arch-seam"></a>
 ## Arch seam

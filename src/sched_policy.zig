@@ -261,6 +261,36 @@ pub const AdmitCand = struct {
 
 pub const AdmitVerdict = enum { admit, wait, refuse, reclaim };
 
+pub const HeldTokens = struct {
+    live: u64,
+    retained: u64,
+
+    pub fn total(self: HeldTokens) u64 {
+        return self.live +| self.retained;
+    }
+};
+
+/// One tally for the cap decision and its wait line: an admitted sibling's restored entry is inside its reservation.
+pub fn heldTokensFor(c: AdmitCand, cands: []const AdmitCand, verdicts: []const AdmitVerdict) HeldTokens {
+    var tick_reserved: u64 = 0;
+    var tick_own: u64 = 0;
+    for (verdicts, 0..) |v, k| {
+        const o = cands[k];
+        if (v != .admit or o.model != c.model) continue;
+        tick_reserved +|= o.reservation;
+        const id = o.own_id;
+        if (id == 0 or id == c.own_id) continue;
+        const seen = for (cands[0..k], verdicts[0..k]) |e, ev| {
+            if (ev == .admit and e.model == c.model and e.own_id == id) break true;
+        } else false;
+        if (!seen) tick_own +|= o.own_retained;
+    }
+    return .{
+        .live = c.reserved +| tick_reserved,
+        .retained = c.retained -| c.own_retained -| tick_own,
+    };
+}
+
 /// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
 /// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
 /// admitted exclusive candidate claimed it this tick
@@ -309,33 +339,23 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
             if (claimed) continue;
         }
         var tick_live: u32 = 0;
-        var tick_reserved: u64 = 0;
-        // Retained entries this tick's admits restore from are inside their reservations: count each once.
-        var tick_own: u64 = 0;
-        for (out[0..n], 0..) |j, k| if (cands[j].model == c.model) {
-            tick_live += 1;
-            tick_reserved +|= cands[j].reservation;
-            const id = cands[j].own_id;
-            if (id == 0 or id == c.own_id) continue;
-            const seen = for (out[0..k]) |e| {
-                if (cands[e].model == c.model and cands[e].own_id == id) break true;
-            } else false;
-            if (!seen) tick_own +|= cands[j].own_retained;
-        };
+        for (out[0..n]) |j| {
+            if (cands[j].model == c.model) tick_live += 1;
+        }
         if (c.max_concurrent > 0 and c.live +| tick_live >= c.max_concurrent) {
             if (n_blocked < blocked.len) blocked[n_blocked] = c.model;
             n_blocked += 1;
             continue;
         }
         if (c.max_kv_tokens > 0) {
-            const live_tokens = c.reserved +| tick_reserved +| c.reservation;
+            const held_tokens = heldTokensFor(c, cands, verdicts[0 .. i + 1]);
+            const live_tokens = held_tokens.live +| c.reservation;
             if (live_tokens > c.max_kv_tokens) {
                 if (n_blocked < blocked.len) blocked[n_blocked] = c.model;
                 n_blocked += 1;
                 continue;
             }
-            const retained = c.retained -| c.own_retained -| tick_own;
-            if (retained > 0 and live_tokens +| retained > c.max_kv_tokens) {
+            if (held_tokens.retained > 0 and live_tokens +| held_tokens.retained > c.max_kv_tokens) {
                 verdicts[i] = .reclaim;
                 if (n_blocked < blocked.len) blocked[n_blocked] = c.model;
                 n_blocked += 1;
