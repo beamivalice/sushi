@@ -39,7 +39,7 @@ fn dsv41Replay(a: std.mem.Allocator, tok: *const Tokenizer, tools: ?[]const u8, 
     const gen = try tok.encode(a, raw);
     errdefer a.free(gen);
 
-    const split = splitThinkBlock(raw, true, thinking);
+    const split = splitThinkBlock(.text, raw, true, thinking);
     const parsed = if (tools != null) try parseToolCalls(a, raw) else null;
     defer if (parsed) |calls| {
         for (calls) |c| {

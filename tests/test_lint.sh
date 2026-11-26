@@ -184,6 +184,16 @@ tree
 printf '%s\n' 'const std = @import("std");' 'const XxHash3 = struct {};' 'pub fn f(b: []const u8) u64 {' '    _ = XxHash3;' '    return std.hash.Wyhash.hash(0, b);' '}' > "$TMP/t/src/p.zig"
 expect_green "another hash and a local type of the same name"
 
+# rule tag-lead-named
+tree
+printf '%s\n' 'const think_tags = @import("think_tags.zig");' 'pub fn f(t: []const u8) bool {' '    return std.mem.startsWith(u8, t, think_tags.tag_lead);' '}' > "$TMP/t/src/p.zig"
+expect_red "a file naming the tag lead" "src/p.zig:3:49 \[tag-lead-named\] -: tag_lead"
+
+tree
+printf '%s\n' 'pub const tag_lead = "x";' 'pub fn f() []const u8 {' '    return tag_lead;' '}' > "$TMP/t/src/think_tags.zig"
+printf '%s\n' 'const think_tags = @import("think_tags.zig");' 'pub fn g(a: []const u8) !?[]u8 {' '    return think_tags.withoutLead(undefined, a);' '}' > "$TMP/t/src/p.zig"
+expect_green "think_tags naming the lead and a file that takes it off through withoutLead"
+
 # rule folder-bytes-compare
 tree
 printf '%s\n' 'const std = @import("std");' 'fn same(a: []const u8, path: []const u8) bool {' '    return std.mem.eql(u8, std.mem.trimEnd(u8, a, "/"), path);' '}' > "$TMP/t/src/model_registry.zig"

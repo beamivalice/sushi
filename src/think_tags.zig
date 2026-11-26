@@ -1,6 +1,7 @@
 const std = @import("std");
 const testing = std.testing;
 const chat = @import("chat.zig");
+const Tokenizer = @import("tokenizer.zig").Tokenizer;
 const tool_calls_mod = @import("tool_calls.zig");
 const BARE_INVOKE = tool_calls_mod.BARE_INVOKE;
 const tool_reading = @import("tool_reading.zig");
@@ -23,8 +24,8 @@ const renderChatTemplate = chat.renderChatTemplate;
 /// remainder is a genuine dangling re-open (`…<channel|>\n<|channel>thought\n`,
 /// 2026-06-19 live) — excluding it leaked the bare opener into content.
 const TrailingThinkOpen = struct { pos: usize, after: usize };
-fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
-    var tags: Tags = .{};
+fn lastUnclosedThinkOpen(reading: Reading, text: []const u8) ?TrailingThinkOpen {
+    var tags: Tags = .{ .reading = reading };
     return lastUnclosedThinkOpenIn(&tags, text);
 }
 
@@ -84,6 +85,115 @@ pub fn lastRenderedCloseBefore(text: []const u8, end: usize) ?TagAt {
     return null;
 }
 
+/// The bytes a reply's text carries before a think tag the model wrote as its own special token
+/// (`decodeReply`); a Unicode noncharacter, so a plain piece never spells it.
+pub const tag_lead = "\u{fdd1}";
+
+/// How a reply's text tells a think tag from text that spells one.
+pub const Reading = enum {
+    /// The tag is the text `<think>` or `</think>` wherever it stands: a tokenizer whose think tags are not both added tokens.
+    text,
+    /// The tag is the model's special token, which the reply carries as `tag_lead` then the tag; the same bytes spelled
+    /// by plain pieces are text, in a thought or in the answer.
+    token,
+
+    pub fn lead(self: Reading) []const u8 {
+        return switch (self) {
+            .text => "",
+            .token => tag_lead,
+        };
+    }
+
+    /// The opener as the reply's text spells it.
+    pub fn open(self: Reading) []const u8 {
+        return switch (self) {
+            .text => "<think>",
+            .token => tag_lead ++ "<think>",
+        };
+    }
+
+    /// The closer as the reply's text spells it.
+    pub fn close(self: Reading) []const u8 {
+        return switch (self) {
+            .text => "</think>",
+            .token => tag_lead ++ "</think>",
+        };
+    }
+};
+
+/// The reading of a model's replies: `.token` when both its think tags are added tokens of its tokenizer (Qwen, GLM,
+/// DeepSeek, MiMo; Hy4's `:opensource` pair aliases to them), else `.text`.
+pub fn readingOf(tok: *const Tokenizer) Reading {
+    return if (thinkTokens(tok) != null) .token else .text;
+}
+
+const ThinkTokens = struct { open: u32, close: u32 };
+
+fn thinkTokens(tok: *const Tokenizer) ?ThinkTokens {
+    const open = tok.special_tokens.get(BARE_THINK_OPENER) orelse return null;
+    const close = tok.special_tokens.get(BARE_THINK_CLOSER) orelse return null;
+    const open_text = tok.id_to_token.get(open) orelse return null;
+    const close_text = tok.id_to_token.get(close) orelse return null;
+    if (!std.mem.eql(u8, open_text, BARE_THINK_OPENER) or !std.mem.eql(u8, close_text, BARE_THINK_CLOSER)) return null;
+    return .{ .open = open, .close = close };
+}
+
+/// A reply's tokens as the text every reply surface reads. In the token reading a think tag token is `tag_lead` and its
+/// tag; a noncharacter a plain piece spells is the replacement character, so no plain text carries the lead.
+pub fn decodeReply(allocator: std.mem.Allocator, tok: *const Tokenizer, reading: Reading, ids: []const u32) ![]u8 {
+    if (reading == .text) return tok.decode(allocator, ids);
+    const marks = thinkTokens(tok) orelse return error.ThinkTokensMissing;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var run: usize = 0;
+    for (ids, 0..) |id, i| {
+        if (id != marks.open and id != marks.close) continue;
+        try appendPlain(allocator, tok, &out, ids[run..i]);
+        try out.appendSlice(allocator, tag_lead);
+        try out.appendSlice(allocator, if (id == marks.open) BARE_THINK_OPENER else BARE_THINK_CLOSER);
+        run = i + 1;
+    }
+    try appendPlain(allocator, tok, &out, ids[run..]);
+    return out.toOwnedSlice(allocator);
+}
+
+fn appendPlain(allocator: std.mem.Allocator, tok: *const Tokenizer, out: *std.ArrayList(u8), ids: []const u32) !void {
+    if (ids.len == 0) return;
+    const text = try tok.decode(allocator, ids);
+    defer allocator.free(text);
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, tag_lead)) |at| {
+        try out.appendSlice(allocator, text[from..at]);
+        try out.appendSlice(allocator, "\u{fffd}");
+        from = at + tag_lead.len;
+    }
+    try out.appendSlice(allocator, text[from..]);
+}
+
+/// `text` without any `tag_lead`, owned, or null when it holds none. The one exit of the lead: every JSON string the server
+/// writes (`http.jsonEscape`, `responses.jsonEscape`) and every parsed call (`tool_calls.parseToolCallsOpen`) takes this,
+/// so a tag no scan consumed reaches a client as the tag the model wrote and never with its lead.
+pub fn withoutLead(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, text, tag_lead) == null) return null;
+    const out = try allocator.alloc(u8, text.len - std.mem.count(u8, text, tag_lead) * tag_lead.len);
+    var n: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, tag_lead)) |at| {
+        @memcpy(out[n..][0 .. at - from], text[from..at]);
+        n += at - from;
+        from = at + tag_lead.len;
+    }
+    @memcpy(out[n..], text[from..]);
+    return out;
+}
+
+/// Length of the think opener that STARTS `text` in this reading (its lead included).
+pub fn thinkOpenLenAt(reading: Reading, text: []const u8) ?usize {
+    const lead = reading.lead();
+    if (!std.mem.startsWith(u8, text, lead)) return null;
+    return lead.len + (thinkOpenTagLenAt(text[lead.len..]) orelse return null);
+}
+
 /// The think and channel tags a reading looks for.
 pub const Tag = enum { think_open, think_close, channel_thought, channel_close };
 
@@ -91,6 +201,7 @@ pub const Tag = enum { think_open, think_close, channel_thought, channel_close }
 /// tag of each kind, and a kind the text never spells is searched once, not once per thought. Never used with a second
 /// text, and its tags are asked for rising bytes.
 pub const Tags = struct {
+    reading: Reading,
     next: [4]tool_reading.Next = .{
         .{ .needle = "<think" },
         .{ .needle = "</think" },
@@ -114,29 +225,35 @@ pub const Tags = struct {
                 .think_close => thinkCloseTagLenAt(text[p..]),
                 .channel_thought, .channel_close => n.needle.len,
             } orelse continue;
-            if (tag == .think_open or tag == .think_close) switch (self.spans.read(text, p, self.complete)) {
+            const think = tag == .think_open or tag == .think_close;
+            const lead = if (think) self.reading.lead() else "";
+            // A special token is structure wherever it stands: only plain text needs its quoting read from backticks.
+            const quotable = think and self.reading == .text;
+            if (p < lead.len or !std.mem.eql(u8, text[p - lead.len .. p], lead)) continue;
+            const at = p - lead.len;
+            if (quotable) switch (self.spans.read(text, at, self.complete)) {
                 .outside => {},
                 .inside => continue,
                 .unresolved => {
-                    self.unresolved = p;
+                    self.unresolved = at;
                     return null;
                 },
             };
-            return .{ .pos = p, .len = len };
+            return .{ .pos = at, .len = lead.len + len };
         }
         return null;
     }
 };
 
-/// The first `<think>` at or after `from` outside an inline code span and outside every call's value: the one scan
-/// every surface and `normalizeEmbeddedThinkBlocks` use.
-fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
-    return tool_reading.outsideCalls(text, from, .think_open);
+/// The first `<think>` at or after `from` outside every call's value, and outside an inline code span in the text
+/// reading: the one scan every surface and `normalizeEmbeddedThinkBlocks` use.
+fn indexOfThinkOpenTag(reading: Reading, text: []const u8, from: usize) ?TagAt {
+    return tool_reading.outsideCalls(reading, text, from, .think_open);
 }
 
-/// The first `</think>` at or after `from` outside an inline code span and outside every call's value.
-pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
-    return tool_reading.outsideCalls(text, from, .think_close);
+/// The first `</think>` at or after `from` outside every call's value, and outside an inline code span in the text reading.
+pub fn indexOfThinkCloseTag(reading: Reading, text: []const u8, from: usize) ?TagAt {
+    return tool_reading.outsideCalls(reading, text, from, .think_close);
 }
 
 fn indexOfThinkCloseTagIn(tags: *Tags, text: []const u8, from: usize) ?TagAt {
@@ -149,16 +266,16 @@ pub const ThoughtClose = struct { pos: usize, len: usize, is_channel: bool };
 /// The first close of a thought in `buf` (either family) that no call holds as payload. A stream's text may still grow, so
 /// unless `complete` a think close after a backtick that no closing run pairs yet is no close yet: the same text read as
 /// the whole reply says where the thought ends.
-pub fn thoughtClose(buf: []const u8, complete: bool) ?ThoughtClose {
-    const close = thoughtCloseIn(buf, complete) orelse return null;
+pub fn thoughtClose(reading: Reading, buf: []const u8, complete: bool) ?ThoughtClose {
+    const close = thoughtCloseIn(reading, buf, complete) orelse return null;
     // A call before the close may take it as payload once more bytes arrive (a tag dialect ends a value by what follows
     // its close), so only the reply's end settles a close that stands after a call opener.
     if (!complete) if (leakedToolMarkupStart(buf)) |opener| if (opener < close.pos) return null;
     return close;
 }
 
-fn thoughtCloseIn(buf: []const u8, complete: bool) ?ThoughtClose {
-    var tags: Tags = .{ .complete = complete };
+fn thoughtCloseIn(reading: Reading, buf: []const u8, complete: bool) ?ThoughtClose {
+    var tags: Tags = .{ .reading = reading, .complete = complete };
     const think = tool_reading.firstOutsideCalls(buf, 0, true, &tags, .think_close);
     const channel = std.mem.indexOf(u8, buf, "<channel|>");
     if (tags.unresolved) |u| if (channel == null or u < channel.?) return null;
@@ -231,6 +348,7 @@ pub const ContentStep = union(enum) {
 /// trimmed of "\n " and joined by one "\n": a part's leading whitespace never ships, even inside its first token,
 /// and a token's trailing whitespace waits for the next text or the end of the reply.
 pub const ContentStream = struct {
+    reading: Reading,
     span: CodeSpan = .{},
     /// A visible content byte was sent.
     started: bool = false,
@@ -295,13 +413,15 @@ pub const ContentStream = struct {
         self.head += tok.len;
         self.head_token += 1;
         self.look_for = null;
-        if (self.opens_thoughts and !quoted) if (modelThinkOpener(channel_armed, text)) |opener| return .{ .opens = opener };
+        if (self.opens_thoughts and !quoted) if (modelThinkOpener(self.reading, channel_armed, text)) |opener| return .{ .opens = opener };
         return .{ .step = .{ .step = try self.deliverAs(allocator, text, quoted), .text = text } };
     }
 
     /// Whether the first queued token is a think tag that reads as text; null while the bytes that decide it have not arrived.
     fn quotedTag(self: *ContentStream, text: []const u8, channel_armed: bool, over: bool) ?bool {
-        const opener = modelThinkOpener(channel_armed, text);
+        // A special token is structure wherever it stands.
+        if (self.reading == .token) return false;
+        const opener = modelThinkOpener(self.reading, channel_armed, text);
         const open_tag = opener != null and std.mem.eql(u8, opener.?, BARE_THINK_OPENER);
         const odd = self.span.openStart() != null;
         // The channel's `thought` token reads as text in a span, whatever follows.
@@ -355,13 +475,13 @@ pub const ContentStream = struct {
 
     /// The content a thought's close token carried: text, never a tag token. `.send` is valid until the next call.
     pub fn deliver(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8) !ContentStep {
-        return self.deliverAs(allocator, tt, self.span.openStart() != null);
+        return self.deliverAs(allocator, tt, self.reading == .text and self.span.openStart() != null);
     }
 
     /// `tt` is a token the reply spells (`quoted`: a think tag among them is text).
     fn deliverAs(self: *ContentStream, allocator: std.mem.Allocator, tt: []const u8, quoted: bool) !ContentStep {
-        const think_tag = std.mem.eql(u8, tt, BARE_THINK_OPENER) or std.mem.eql(u8, tt, BARE_THINK_CLOSER);
-        if (isChannelMarkerToken(tt) and !(think_tag and quoted)) return .marker;
+        const think_tag = std.mem.eql(u8, tt, self.reading.open()) or std.mem.eql(u8, tt, self.reading.close());
+        if (isChannelMarkerToken(self.reading, tt) and !(think_tag and quoted)) return .marker;
         self.span.feed(tt);
         if (std.mem.trimStart(u8, tt, "\n ").len == 0) {
             if (self.lead) return .drop;
@@ -463,15 +583,15 @@ pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
 }
 
 test "thinkOpenerPossible: a thought no opener can start is delivered without waiting for more bytes" {
-    try std.testing.expect(!thinkOpenerPossible("The"));
-    try std.testing.expect(!thinkOpenerPossible("Okay"));
-    try std.testing.expect(!thinkOpenerPossible("\nWe"));
-    try std.testing.expect(thinkOpenerPossible(""));
-    try std.testing.expect(thinkOpenerPossible(" \n"));
-    try std.testing.expect(thinkOpenerPossible("<"));
-    try std.testing.expect(thinkOpenerPossible("<thi"));
-    try std.testing.expect(thinkOpenerPossible("\n<|chan"));
-    try std.testing.expect(!thinkOpenerPossible("too"));
+    try std.testing.expect(!thinkOpenerPossible(.text, "The"));
+    try std.testing.expect(!thinkOpenerPossible(.text, "Okay"));
+    try std.testing.expect(!thinkOpenerPossible(.text, "\nWe"));
+    try std.testing.expect(thinkOpenerPossible(.text, ""));
+    try std.testing.expect(thinkOpenerPossible(.text, " \n"));
+    try std.testing.expect(thinkOpenerPossible(.text, "<"));
+    try std.testing.expect(thinkOpenerPossible(.text, "<thi"));
+    try std.testing.expect(thinkOpenerPossible(.text, "\n<|chan"));
+    try std.testing.expect(!thinkOpenerPossible(.text, "too"));
 }
 
 test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
@@ -484,15 +604,17 @@ test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
     try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("a < b and then lots of ordinary words follow here"));
 }
 
-/// Tag length when `text` ENDS with a complete think-close tag.
-fn endsWithThinkCloseTag(text: []const u8) ?usize {
+/// Tag length (its lead included) when `text` ENDS with a complete think-close tag.
+fn endsWithThinkCloseTag(reading: Reading, text: []const u8) ?usize {
     if (text.len == 0 or text[text.len - 1] != '>') return null;
     const lt = std.mem.lastIndexOfScalar(u8, text, '<') orelse return null;
     const l = thinkCloseTagLenAt(text[lt..]) orelse return null;
-    return if (lt + l == text.len) l else null;
+    if (lt + l != text.len) return null;
+    const lead = reading.lead();
+    return if (std.mem.endsWith(u8, text[0..lt], lead)) lead.len + l else null;
 }
 
-/// Tag length when `text` ENDS with a complete think-open tag.
+/// Tag length when a rendered PROMPT's `text` ENDS with a complete think-open tag.
 fn endsWithThinkOpenTag(text: []const u8) ?usize {
     if (text.len == 0 or text[text.len - 1] != '>') return null;
     const lt = std.mem.lastIndexOfScalar(u8, text, '<') orelse return null;
@@ -560,9 +682,9 @@ pub const MarkupCut = struct {
     }
 
     /// The close of the thought `buf` holds, not before the reply's end once a call opener cut it.
-    pub fn thoughtClose(self: *const MarkupCut, buf: []const u8, over: bool) ?ThoughtClose {
+    pub fn thoughtClose(self: *const MarkupCut, reading: Reading, buf: []const u8, over: bool) ?ThoughtClose {
         if (self.cut and !over) return null;
-        return closeOfThought(buf, over);
+        return closeOfThought(reading, buf, over);
     }
 
     /// How many leading bytes of `unsent` go when no more text follows.
@@ -603,7 +725,7 @@ pub fn visibleToolPreamble(content: []const u8) []const u8 {
 /// call, so any residual `<tool_call|>` reaching here is orphan by construction.
 /// Loops so a run of closers is fully removed: a closer at the tail has no closing backtick after it, so it is never
 /// inside a code span. Returns a prefix slice (no alloc).
-pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
+pub fn trimTrailingThinkClosers(reading: Reading, content: []const u8) []const u8 {
     var s = content;
     while (true) {
         const t = std.mem.trimEnd(u8, s, "\n \t\r");
@@ -611,7 +733,7 @@ pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
             s = t[0 .. t.len - "<channel|>".len];
         } else if (std.mem.endsWith(u8, t, "<tool_call|>")) {
             s = t[0 .. t.len - "<tool_call|>".len];
-        } else if (endsWithThinkCloseTag(t)) |l| {
+        } else if (endsWithThinkCloseTag(reading, t)) |l| {
             s = t[0 .. t.len - l];
         } else {
             return t;
@@ -622,8 +744,8 @@ pub fn trimTrailingThinkClosers(content: []const u8) []const u8 {
 /// Truncate a trailing unclosed thought opener (and its dangling thought)
 /// out of visible content. Used by the split arms after the leading block has
 /// been handled.
-fn stripTrailingThinkOpen(content: []const u8) []const u8 {
-    if (lastUnclosedThinkOpen(content)) |o| {
+fn stripTrailingThinkOpen(reading: Reading, content: []const u8) []const u8 {
+    if (lastUnclosedThinkOpen(reading, content)) |o| {
         return std.mem.trimEnd(u8, content[0..o.pos], "\n ");
     }
     return content;
@@ -639,8 +761,8 @@ pub const ThinkSplit = struct {
 /// Gemma 4's TWO tokens, the `<|channel>` marker (dropped from visible deltas) then the
 /// word `thought`. `channel_armed` = the previous delta was that marker and nothing visible
 /// has been emitted. Returns the opener to seed `think_buf` with.
-pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8 {
-    if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), "<think>")) return "<think>";
+pub fn modelThinkOpener(reading: Reading, channel_armed: bool, token_text: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, std.mem.trimEnd(u8, token_text, "\n"), reading.open())) return reading.open();
     if (channel_armed and std.mem.eql(u8, token_text, "thought")) return "<|channel>thought";
     return null;
 }
@@ -649,9 +771,9 @@ pub fn modelThinkOpener(channel_armed: bool, token_text: []const u8) ?[]const u8
 /// delta. Every entry is a single special token in its family's vocab, so
 /// exact-match filtering at the delta level is complete — a marker can't be
 /// split across deltas. Shared by every streaming surface's flush path.
-pub fn isChannelMarkerToken(tt: []const u8) bool {
+pub fn isChannelMarkerToken(reading: Reading, tt: []const u8) bool {
     return std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-        std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>");
+        std.mem.eql(u8, tt, reading.open()) or std.mem.eql(u8, tt, reading.close());
 }
 
 pub const BARE_THINK_OPENER = "<think>";
@@ -755,8 +877,8 @@ pub fn continuationPrefill(messages: []const Message, continue_final: bool) ?[]c
 /// `opened_by_template`: the generation prompt ended with a template-injected
 /// think opener (see `promptTailOpensThink`), so output with no literal opener
 /// and no close tag is still reasoning — generation started inside the block.
-pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
-    const split = splitThinkBlockKeepingMarkup(text, thinking, opened_by_template);
+pub fn splitThinkBlock(reading: Reading, text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    const split = splitThinkBlockKeepingMarkup(reading, text, thinking, opened_by_template);
     const reasoning: ?[]const u8 = if (split.reasoning_content) |r| blk: {
         const t = trimLeakedToolMarkup(r);
         break :blk if (t.len > 0) t else null;
@@ -768,8 +890,8 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
 /// content back to `parseToolCalls` (the /v1/messages non-streaming path).
 /// Every arm below returns raw slices; the cut is applied ONCE in the wrapper
 /// above so a new arm cannot forget it.
-pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
-    var tags: Tags = .{};
+pub fn splitThinkBlockKeepingMarkup(reading: Reading, text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    var tags: Tags = .{ .reading = reading };
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
     if (tool_reading.firstOutsideCalls(text, 0, true, &tags, .channel_close)) |close| {
         const end = close.pos;
@@ -789,17 +911,17 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         content = std.mem.trimStart(u8, content, "\n ");
         return .{
             .reasoning_content = if (reasoning.len > 0) reasoning else null,
-            .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
+            .content = trimTrailingThinkClosers(reading, stripTrailingThinkOpen(reading, content)),
         };
     }
     // Standard style: <think>...</think>
     if (indexOfThinkCloseTagIn(&tags, text, 0)) |close| {
-        const reasoning_start: usize = thinkOpenTagLenAt(text) orelse 0;
+        const reasoning_start: usize = thinkOpenLenAt(reading, text) orelse 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..close.pos], "\n ");
         const content = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
         return .{
             .reasoning_content = if (reasoning.len > 0) reasoning else null,
-            .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
+            .content = trimTrailingThinkClosers(reading, stripTrailingThinkOpen(reading, content)),
         };
     }
     if (thinking) {
@@ -812,7 +934,7 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
         //     an unclosed tail is truncated reasoning, never content.
         //   • No literal opener + no template opener → the model answered
         //     directly (Gemma style); keep the answer visible as content.
-        if (openThoughtBody(text, opened_by_template)) |reasoning| {
+        if (openThoughtBody(reading, text, opened_by_template)) |reasoning| {
             return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
         }
         // Prose answer that ENDS by opening a new, unclosed thought block
@@ -844,9 +966,9 @@ pub fn splitThinkBlockKeepingMarkup(text: []const u8, thinking: bool, opened_by_
 
 /// The reasoning of a thought that has no close yet and starts `text` (its literal opener, or the
 /// template's), or null when `text` does not start one.
-fn openThoughtBody(text: []const u8, opened_by_template: bool) ?[]const u8 {
-    if (thinkOpenTagLenAt(text) != null or std.mem.startsWith(u8, text, "<|channel>thought")) {
-        const start: usize = if (thinkOpenTagLenAt(text)) |l| l else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
+fn openThoughtBody(reading: Reading, text: []const u8, opened_by_template: bool) ?[]const u8 {
+    if (thinkOpenLenAt(reading, text) != null or std.mem.startsWith(u8, text, "<|channel>thought")) {
+        const start: usize = if (thinkOpenLenAt(reading, text)) |l| l else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
         return std.mem.trimStart(u8, text[start..], "\n ");
     }
     return if (opened_by_template) std.mem.trimStart(u8, text, "\n ") else null;
@@ -855,8 +977,8 @@ fn openThoughtBody(text: []const u8, opened_by_template: bool) ?[]const u8 {
 pub const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
 
 /// Earliest think/thought opener at or after `from` (either tag family).
-pub fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
-    var tags: Tags = .{};
+pub fn nextThinkOpen(reading: Reading, text: []const u8, from: usize) ?ThinkOpen {
+    var tags: Tags = .{ .reading = reading };
     return nextThinkOpenIn(&tags, text, from);
 }
 
@@ -903,9 +1025,9 @@ const Span = struct { from: usize, to: usize };
 
 /// The pieces of `text[from..to]` between its think/thought closers, appended to `spans`: a stream drops a closer's marker
 /// token (`ContentStream.deliver`), and a closer inside a code span is text on both. Whether any closer was cut.
-fn spansWithoutClosers(allocator: std.mem.Allocator, spans: *std.ArrayList(Span), text: []const u8, from: usize, to: usize) !bool {
+fn spansWithoutClosers(reading: Reading, allocator: std.mem.Allocator, spans: *std.ArrayList(Span), text: []const u8, from: usize, to: usize) !bool {
     const part = text[from..to];
-    var tags: Tags = .{};
+    var tags: Tags = .{ .reading = reading };
     var pos: usize = 0;
     var cut = false;
     while (nextThinkCloseIn(&tags, part, pos)) |c| {
@@ -952,7 +1074,7 @@ pub const content_join = "\n";
 /// Returns null when no rewrite is needed (zero or one LEADING closed block —
 /// the overwhelmingly common case, zero-cost). An unclosed trailing opener is
 /// left in place for the existing trailing-strip logic.
-pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+pub fn normalizeEmbeddedThinkBlocks(reading: Reading, allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     var reasoning_parts = std.ArrayList([]const u8).empty;
     defer reasoning_parts.deinit(allocator);
     // The pieces of every content part in order, and where each part's pieces end.
@@ -971,7 +1093,7 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
     // Template-opened leading block: a close tag BEFORE any opener (Qwen
     // renders `…assistant\n<think>\n` into the prompt, so output starts
     // mid-thought and contains only the close).
-    var tags: Tags = .{};
+    var tags: Tags = .{ .reading = reading };
     if (nextThinkCloseIn(&tags, text, 0)) |lc| {
         const open_pos = if (nextThinkOpenIn(&tags, text, 0)) |o| o.pos else text.len;
         if (lc.pos < open_pos) {
@@ -986,7 +1108,7 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 
     while (true) {
         const o = nextThinkOpenIn(&tags, text, pos) orelse {
-            stripped_closer = try spansWithoutClosers(allocator, &spans, text, pos, text.len) or stripped_closer;
+            stripped_closer = try spansWithoutClosers(reading, allocator, &spans, text, pos, text.len) or stripped_closer;
             try part_ends.append(allocator, spans.items.len);
             break;
         };
@@ -995,13 +1117,13 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
             // With no closed block the split's own unclosed arm reads the opener.
             if (closed_blocks == 0) break;
             // A thought re-opened and cut by the end of the reply is reasoning, as a stream delivers it.
-            stripped_closer = try spansWithoutClosers(allocator, &spans, text, pos, o.pos) or stripped_closer;
+            stripped_closer = try spansWithoutClosers(reading, allocator, &spans, text, pos, o.pos) or stripped_closer;
             try part_ends.append(allocator, spans.items.len);
             try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..], "\n "));
             closed_blocks += 1;
             break;
         };
-        stripped_closer = try spansWithoutClosers(allocator, &spans, text, pos, o.pos) or stripped_closer;
+        stripped_closer = try spansWithoutClosers(reading, allocator, &spans, text, pos, o.pos) or stripped_closer;
         try part_ends.append(allocator, spans.items.len);
         try reasoning_parts.append(allocator, std.mem.trim(u8, text[o.after..close.pos], "\n "));
         if (!style_set) {
@@ -1019,7 +1141,8 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    try out.appendSlice(allocator, if (style_think) "<think>\n" else "<|channel>thought\n");
+    try out.appendSlice(allocator, if (style_think) reading.open() else "<|channel>thought");
+    try out.append(allocator, '\n');
     var first = true;
     for (reasoning_parts.items) |r| {
         if (r.len == 0) continue;
@@ -1027,7 +1150,8 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
         try out.appendSlice(allocator, r);
         first = false;
     }
-    try out.appendSlice(allocator, if (style_think) "</think>\n" else "<channel|>\n");
+    try out.appendSlice(allocator, if (style_think) reading.close() else "<channel|>");
+    try out.append(allocator, '\n');
     first = true;
     var part_from: usize = 0;
     for (part_ends.items) |part_to| {
@@ -1053,9 +1177,11 @@ pub fn normalizeEmbeddedThinkBlocks(allocator: std.mem.Allocator, text: []const 
 /// Can a thought that begins with `buf` still grow into an opener the streaming gates strip?
 /// Every opener starts with `<`, so any other first byte is decided at once instead of waiting
 /// for the gates' 7 bytes.
-pub fn thinkOpenerPossible(buf: []const u8) bool {
+pub fn thinkOpenerPossible(reading: Reading, buf: []const u8) bool {
     const rest = std.mem.trimStart(u8, buf, " \n");
-    return rest.len == 0 or rest[0] == '<';
+    const lead = reading.lead();
+    if (lead.len == 0) return rest.len == 0 or rest[0] == '<';
+    return rest.len == 0 or std.mem.startsWith(u8, rest, lead) or std.mem.startsWith(u8, lead, rest);
 }
 
 pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
@@ -1360,8 +1486,8 @@ pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
 /// gates its `<think>` on `enable_thinking` renders the closed `<think></think>`
 /// signature (or no tag at all) when thinking is off, so the flag is false for
 /// them and this stays their exact behavior.
-pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
-    return streamThinkGate2(buf, enable_thinking, think_closed, false);
+pub fn streamThinkGate(reading: Reading, buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
+    return streamThinkGate2(reading, buf, enable_thinking, think_closed, false);
 }
 
 /// `prompt_opened_think`: the rendered generation prompt ended with an OPEN
@@ -1389,6 +1515,7 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
 /// a marker, nothing straddles the boundary at all. So the resume point is
 /// exact and bounded, with no overlap constant to get wrong.
 pub const ThinkScan = struct {
+    reading: Reading,
     /// Bytes already examined. Never trusted when the buffer is SHORTER than
     /// this (the loop reset the buffer without resetting the scan).
     checked_upto: usize = 0,
@@ -1427,12 +1554,13 @@ pub const ThinkScan = struct {
     const substr_overlap: usize = 16;
 
     pub fn reset(self: *ThinkScan) void {
-        self.* = .{};
+        self.* = .{ .reading = self.reading };
     }
 
     /// Reads the bytes since the last scan into the buffer's last-line span, and whether a think tag stands after its
     /// still unpaired opening backtick.
     fn followSpan(self: *ThinkScan, buf: []const u8) void {
+        if (self.reading == .token) return;
         self.span.feed(buf[self.checked_upto..]);
         const open = self.span.open;
         if (open != self.span_open) {
@@ -1491,9 +1619,9 @@ pub const ThinkScan = struct {
             if (!self.unresolved) {
                 const tags_from = if (self.floor) |f| @min(from, f) else from;
                 self.floor = null;
-                if (!self.saw_open and indexOfThinkOpenTag(buf, tags_from) != null) self.saw_open = true;
+                if (!self.saw_open and indexOfThinkOpenTag(self.reading, buf, tags_from) != null) self.saw_open = true;
                 if (self.close == null and !self.saw_tool_marker)
-                    self.close = indexOfThinkCloseTag(buf, tags_from);
+                    self.close = indexOfThinkCloseTag(self.reading, buf, tags_from);
             }
             self.checked_upto = buf.len;
         }
@@ -1502,7 +1630,7 @@ pub const ThinkScan = struct {
             // past the close for a `</tool_call`, so it must be recomputed on
             // the whole buffer. The caller latches `think_closed` right after a
             // split, so this runs for a handful of tokens, not a whole block.
-            self.close = indexOfThinkCloseTag(buf, 0);
+            self.close = indexOfThinkCloseTag(self.reading, buf, 0);
             self.last_scan_span = buf.len;
         }
     }
@@ -1524,17 +1652,17 @@ fn hasCallMarker(win: []const u8) bool {
 /// The settled reasoning of a thought still open on a tools stream, or null when it must wait for
 /// its close: only a thought that starts the undelivered buffer (prompt-opened, or its opener first)
 /// splits to the same prefix while open as once closed, so its deltas add up to the closed thought.
-pub fn heldThoughtSoFar(buf: []const u8, opens_think: bool, think_closed: bool) ?[]const u8 {
+pub fn heldThoughtSoFar(reading: Reading, buf: []const u8, opens_think: bool, think_closed: bool) ?[]const u8 {
     const prompt_opened = opens_think and !think_closed;
-    if (!prompt_opened and thinkOpenTagLenAt(buf) == null) return null;
-    const reasoning = splitThinkBlock(buf, true, prompt_opened).reasoning_content orelse return null;
+    if (!prompt_opened and thinkOpenLenAt(reading, buf) == null) return null;
+    const reasoning = splitThinkBlock(reading, buf, true, prompt_opened).reasoning_content orelse return null;
     return settledReasoning(reasoning);
 }
 
 /// `heldThoughtSoFar` kept over the growing undelivered text: the close scan is a `ThinkScan`, and the
 /// leaked-markup cut is judged once per byte. Reset whenever the undelivered text starts anew.
 pub const ThoughtScan = struct {
-    think: ThinkScan = .{},
+    think: ThinkScan,
     /// Offset in the undelivered text of the thought body the fields below describe.
     body_at: usize = 0,
     checked: usize = 0,
@@ -1547,7 +1675,7 @@ pub const ThoughtScan = struct {
     const overlap = @max("<function".len, "</function>".len) - 1;
 
     pub fn reset(self: *ThoughtScan) void {
-        self.* = .{};
+        self.* = .{ .think = .{ .reading = self.think.reading } };
     }
 
     fn advance(self: *ThoughtScan, body: []const u8, body_at: usize) void {
@@ -1591,11 +1719,12 @@ pub fn heldThoughtSoFarScan(
     scan: *ThoughtScan,
 ) ?[]const u8 {
     const prompt_opened = opens_think and !think_closed;
-    if (!prompt_opened and thinkOpenTagLenAt(buf) == null) return null;
+    const reading = scan.think.reading;
+    if (!prompt_opened and thinkOpenLenAt(reading, buf) == null) return null;
     scan.think.advance(buf);
     if (hold.held or hold.pending or scan.think.saw_channel_close or scan.think.close != null or scan.think.unresolved)
-        return heldThoughtSoFar(buf, opens_think, think_closed);
-    const body = openThoughtBody(buf, prompt_opened).?;
+        return heldThoughtSoFar(reading, buf, opens_think, think_closed);
+    const body = openThoughtBody(reading, buf, prompt_opened).?;
     scan.advance(body, @intFromPtr(body.ptr) - @intFromPtr(buf.ptr));
     const cut = if (scan.mini_evidence) scan.mini_cut orelse body.len else body.len;
     const kept = if (cut == body.len) body else std.mem.trimEnd(u8, body[0..cut], "\n\r\t ");
@@ -1626,10 +1755,10 @@ pub fn streamThinkGateScan(
     return if (scan.saw_channel_close or scan.close != null) .split_think else .hold_thinking;
 }
 
-pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
+pub fn streamThinkGate2(reading: Reading, buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
     const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
-        indexOfThinkOpenTag(buf, 0) != null or
+        indexOfThinkOpenTag(reading, buf, 0) != null or
         (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
         (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
         // A partial opener at the buffer TAIL (mid-text re-opened channel
@@ -1638,7 +1767,7 @@ pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bo
         endsWithPartialThinkOpen(buf);
     if (!has_thinking) return .flush_text;
     const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
-        indexOfThinkCloseTag(buf, 0) != null;
+        indexOfThinkCloseTag(reading, buf, 0) != null;
     return if (has_close) .split_think else .hold_thinking;
 }
 
@@ -1722,10 +1851,10 @@ pub fn closedThoughtDelta(body: []const u8, shipped: bool) []const u8 {
 /// The last delta of a thought the generation cut while still open, from the
 /// bytes the stream still holds: an opener not yet consumed is structure, and a
 /// thought that shipped nothing drops its leading "\n " as the split does.
-pub fn cutThoughtDelta(held: []const u8, opener_consumed: bool, shipped: bool) []const u8 {
+pub fn cutThoughtDelta(reading: Reading, held: []const u8, opener_consumed: bool, shipped: bool) []const u8 {
     var body = held;
     if (!opener_consumed) {
-        if (thinkOpenTagLenAt(body)) |l| {
+        if (thinkOpenLenAt(reading, body)) |l| {
             body = body[l..];
         } else if (std.mem.startsWith(u8, body, "<|channel>thought")) {
             body = body["<|channel>thought".len..];
@@ -1740,20 +1869,20 @@ pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
 }
 
 test "split content: think tags never reach content" {
-    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>Hello", true, false).content);
-    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>\nHello", true, false).content);
-    try testing.expectEqualStrings("Hello", splitThinkBlock("<think>reasoning</think>\n\nHello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock(.text, "<think>reasoning</think>Hello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock(.text, "<think>reasoning</think>\nHello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock(.text, "<think>reasoning</think>\n\nHello", true, false).content);
 }
 
 test "split content: empty for open think tag (truncated thought is never content)" {
-    try testing.expectEqualStrings("", splitThinkBlock("<think>still thinking...", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock(.text, "<think>still thinking...", true, false).content);
 }
 
 test "indexOfThinkCloseTag: a literal tool close inside the argument does not end the call" {
     const literal_close = "<tool_call>write<arg_value>see </tool_call> and </think> here</arg_value></tool_call>";
-    try testing.expect(indexOfThinkCloseTag(literal_close, 0) == null);
+    try testing.expect(indexOfThinkCloseTag(.text, literal_close, 0) == null);
     const hermes = "<tool_call><function=write><parameter=content>see </tool_call> and </think> here</parameter></function></tool_call>";
-    try testing.expect(indexOfThinkCloseTag(hermes, 0) == null);
+    try testing.expect(indexOfThinkCloseTag(.text, hermes, 0) == null);
 }
 
 test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload, not a block close" {
@@ -1761,41 +1890,41 @@ test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload
     // BEFORE the tool parse — so this cut used to destroy the whole call.
     const payload = "<tool_call>write\n<arg_key>content</arg_key>\n" ++
         "<arg_value>a thought ends with </think> here</arg_value>\n</tool_call>";
-    try testing.expect(indexOfThinkCloseTag(payload, 0) == null);
+    try testing.expect(indexOfThinkCloseTag(.text, payload, 0) == null);
 
     // A call the model emitted and CLOSED inside its thought: the `</think>`
     // after it is a REAL close and the answer stays content.
     const in_thought = "<think>let me try <tool_call>read</tool_call> hmm</think>The answer is 4.";
-    const c = indexOfThinkCloseTag(in_thought, 0) orelse return error.MissingClose;
+    const c = indexOfThinkCloseTag(.text, in_thought, 0) orelse return error.MissingClose;
     try testing.expectEqualStrings("The answer is 4.", in_thought[c.pos + c.len ..]);
-    try testing.expectEqualStrings("The answer is 4.", splitThinkBlock(in_thought, true, false).content);
+    try testing.expectEqualStrings("The answer is 4.", splitThinkBlock(.text, in_thought, true, false).content);
 
     // An opener that NEVER closes is leaked markup, not a payload container:
     // the close still ends the block, and trimLeakedToolMarkup takes the tail.
     const unclosed = "<think>starting <tool_call>partial</think>Answer.";
-    try testing.expect(indexOfThinkCloseTag(unclosed, 0) != null);
+    try testing.expect(indexOfThinkCloseTag(.text, unclosed, 0) != null);
 
     // Ordinary shapes are untouched.
-    try testing.expect(indexOfThinkCloseTag("<think>r</think>a", 0).?.pos == 8);
-    try testing.expect(indexOfThinkCloseTag("<think>r</think>a<tool_call>x</tool_call>", 0).?.pos == 8);
+    try testing.expect(indexOfThinkCloseTag(.text, "<think>r</think>a", 0).?.pos == 8);
+    try testing.expect(indexOfThinkCloseTag(.text, "<think>r</think>a<tool_call>x</tool_call>", 0).?.pos == 8);
 }
 
 test "indexOfThinkCloseTag: a close quoted in a code span does not end the thought" {
     // The model's reasoning quoting the raw string it was asked about.
     const quoted = "The user wants `<think>plan A</think>Done` parsed.\n</think>\n\nOPEN plan A CLOSE";
-    const split = splitThinkBlock(quoted, true, true);
+    const split = splitThinkBlock(.text, quoted, true, true);
     try testing.expectEqualStrings("The user wants `<think>plan A</think>Done` parsed.", split.reasoning_content.?);
     try testing.expectEqualStrings("OPEN plan A CLOSE", split.content);
     // Double backticks are a span too; a span ends with its line.
-    try testing.expect(indexOfThinkCloseTag("see ``</think>`` here", 0) == null);
-    try testing.expect(indexOfThinkCloseTag("a stray ` tick\n</think>x", 0) != null);
+    try testing.expect(indexOfThinkCloseTag(.text, "see ``</think>`` here", 0) == null);
+    try testing.expect(indexOfThinkCloseTag(.text, "a stray ` tick\n</think>x", 0) != null);
     // A fence is not a span, so the close after it is the real one.
-    try testing.expect(indexOfThinkCloseTag("```\ncode\n```</think>x", 0) != null);
+    try testing.expect(indexOfThinkCloseTag(.text, "```\ncode\n```</think>x", 0) != null);
     // A closed span is behind the tag.
-    try testing.expect(indexOfThinkCloseTag("the `tag` is done</think>x", 0) != null);
+    try testing.expect(indexOfThinkCloseTag(.text, "the `tag` is done</think>x", 0) != null);
     // A span opens only where its closing run follows on the line: a backtick nothing pairs with is literal.
-    try testing.expect(indexOfThinkCloseTag("a `</think>", 0) != null);
-    try testing.expect(indexOfThinkCloseTag("a `</think>`", 0) == null);
+    try testing.expect(indexOfThinkCloseTag(.text, "a `</think>", 0) != null);
+    try testing.expect(indexOfThinkCloseTag(.text, "a `</think>`", 0) == null);
 }
 
 test "r173-f-stray-backtick: a backtick no later backtick pairs with hides no think tag" {
@@ -1816,9 +1945,9 @@ test "r173-f-stray-backtick: a backtick no later backtick pairs with hides no th
         .{ .text = "a ``` ` b</think>c", .opened = true, .reasoning = "a ``` ` b", .content = "c" },
     };
     for (cases) |c| {
-        const norm = try normalizeEmbeddedThinkBlocks(a, c.text);
+        const norm = try normalizeEmbeddedThinkBlocks(.text, a, c.text);
         defer if (norm) |n| a.free(n);
-        const split = splitThinkBlock(norm orelse c.text, true, c.opened);
+        const split = splitThinkBlock(.text, norm orelse c.text, true, c.opened);
         errdefer std.debug.print("\nin={f} reasoning={?s} content={s}\n", .{ std.zig.fmtString(c.text), split.reasoning_content, split.content });
         try testing.expectEqualStrings(c.reasoning, split.reasoning_content orelse "");
         try testing.expectEqualStrings(c.content, split.content);
@@ -1836,7 +1965,7 @@ test "CodeSpan: fed a byte at a time, it reads every prefix as the whole-text sc
 
 test "ContentStream: a think tag after a backtick waits for its closing backtick or the line's end" {
     const allocator = testing.allocator;
-    var content = ContentStream{};
+    var content = ContentStream{ .reading = .text };
     defer content.deinit(allocator);
     try content.arrive(allocator, BARE_THINK_CLOSER);
     try testing.expect((try content.ready(allocator, false, false)).?.step.step == .marker);
@@ -1864,7 +1993,7 @@ test "ContentStream: a think tag after a backtick waits for its closing backtick
 
 test "ContentStream: a tag that waits when the reply ends is read as the whole reply reads it" {
     const allocator = testing.allocator;
-    var content = ContentStream{};
+    var content = ContentStream{ .reading = .text };
     defer content.deinit(allocator);
     try content.arrive(allocator, "say `");
     _ = try content.ready(allocator, false, false);
@@ -1874,7 +2003,7 @@ test "ContentStream: a tag that waits when the reply ends is read as the whole r
     try testing.expect((try content.ready(allocator, false, true)).?.step.step == .marker);
     try testing.expectEqualStrings("x", (try content.ready(allocator, false, true)).?.step.step.send);
     // A tag a stream's thought arm opens never reaches this arm's marker.
-    var tools = ContentStream{ .opens_thoughts = false };
+    var tools = ContentStream{ .reading = .text, .opens_thoughts = false };
     defer tools.deinit(allocator);
     try tools.arrive(allocator, BARE_THINK_OPENER);
     try testing.expect((try tools.ready(allocator, false, false)).?.step.step == .marker);
@@ -1882,7 +2011,7 @@ test "ContentStream: a tag that waits when the reply ends is read as the whole r
 
 test "ContentStream: parts around a thought are trimmed and joined by one newline" {
     const allocator = testing.allocator;
-    var content = ContentStream{};
+    var content = ContentStream{ .reading = .text };
     defer content.deinit(allocator);
     try testing.expect((try content.deliver(allocator, "\n\n")) == .drop);
     try testing.expectEqualStrings("A", (try content.deliver(allocator, "A")).send);
@@ -1899,7 +2028,7 @@ test "ContentStream: parts around a thought are trimmed and joined by one newlin
 
 test "ContentStream: a token's trailing whitespace waits, and a trimmed tail never ships" {
     const allocator = testing.allocator;
-    var content = ContentStream{};
+    var content = ContentStream{ .reading = .text };
     defer content.deinit(allocator);
     try testing.expectEqualStrings("Checking.", (try content.deliver(allocator, "Checking.\n\n")).send);
     try testing.expectEqualStrings("\n\nNext", (try content.deliver(allocator, "Next")).send);
@@ -1924,26 +2053,26 @@ test "ThoughtJoin: a later thought's first delta follows one blank line" {
 }
 
 test "normalizeEmbeddedThinkBlocks: a thought re-opened and cut by the end of the reply is reasoning" {
-    const merged = (try normalizeEmbeddedThinkBlocks(testing.allocator, "<think>t</think>A\n<think>\nu")).?;
+    const merged = (try normalizeEmbeddedThinkBlocks(.text, testing.allocator, "<think>t</think>A\n<think>\nu")).?;
     defer testing.allocator.free(merged);
-    const split = splitThinkBlock(merged, true, false);
+    const split = splitThinkBlock(.text, merged, true, false);
     try testing.expectEqualStrings("t\n\nu", split.reasoning_content.?);
     try testing.expectEqualStrings("A", split.content);
 }
 
 test "trimTrailingThinkClosers: a closer after a backtick nothing pairs with is a closer" {
-    try testing.expectEqualStrings("Use `", trimTrailingThinkClosers("Use `</think>"));
-    try testing.expectEqualStrings("Use `x`", trimTrailingThinkClosers("Use `x`</think>\n</think>"));
+    try testing.expectEqualStrings("Use `", trimTrailingThinkClosers(.text, "Use `</think>"));
+    try testing.expectEqualStrings("Use `x`", trimTrailingThinkClosers(.text, "Use `x`</think>\n</think>"));
 }
 
 test "a visible answer quoting a think block in a code span stays one answer" {
     // The answer after a closed thought writes the tags it was asked not to; they are text, not a second thought.
     const answer = "Reading `<think>plan A</think>Done` gives plan A and Done.";
-    try testing.expect(indexOfThinkOpenTag(answer, 0) == null);
-    try testing.expect(try normalizeEmbeddedThinkBlocks(testing.allocator, answer) == null);
+    try testing.expect(indexOfThinkOpenTag(.text, answer, 0) == null);
+    try testing.expect(try normalizeEmbeddedThinkBlocks(.text, testing.allocator, answer) == null);
     // The same tags outside a span still open and close a thought.
-    try testing.expect(indexOfThinkOpenTag("Answer.\n<think>plan A</think>Done", 0) != null);
-    const merged = (try normalizeEmbeddedThinkBlocks(testing.allocator, "Answer.\n<think>plan A</think>Done")).?;
+    try testing.expect(indexOfThinkOpenTag(.text, "Answer.\n<think>plan A</think>Done", 0) != null);
+    const merged = (try normalizeEmbeddedThinkBlocks(.text, testing.allocator, "Answer.\n<think>plan A</think>Done")).?;
     defer testing.allocator.free(merged);
     try testing.expectEqualStrings("<think>\nplan A</think>\nAnswer.\nDone", merged);
 }
@@ -1961,24 +2090,24 @@ test "openThoughtFlush: an open code span waits so the tag inside it stays quote
 }
 
 test "split content: text without think tags passes through" {
-    try testing.expectEqualStrings("Hello world", splitThinkBlock("Hello world", true, false).content);
+    try testing.expectEqualStrings("Hello world", splitThinkBlock(.text, "Hello world", true, false).content);
 }
 
 test "splitThinkBlock with complete think block" {
-    const result = splitThinkBlock("<think>reasoning here</think>answer here", false, false);
+    const result = splitThinkBlock(.text, "<think>reasoning here</think>answer here", false, false);
     try testing.expectEqualStrings("reasoning here", result.reasoning_content.?);
     try testing.expectEqualStrings("answer here", result.content);
 }
 
 test "splitThinkBlock with empty reasoning" {
-    const result = splitThinkBlock("<think>\n\n</think>\n\nactual content", false, false);
+    const result = splitThinkBlock(.text, "<think>\n\n</think>\n\nactual content", false, false);
     try testing.expect(result.reasoning_content == null);
     try testing.expectEqualStrings("actual content", result.content);
 }
 
 test "splitThinkBlock thinking=true no close tag, literal opener present" {
     // Model entered thinking but ran out of tokens before closing.
-    const result = splitThinkBlock("<think>partial reasoning", true, false);
+    const result = splitThinkBlock(.text, "<think>partial reasoning", true, false);
     try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
     try testing.expectEqualStrings("", result.content);
 }
@@ -1989,7 +2118,7 @@ test "splitThinkBlock thinking=true no close tag, template-opened block" {
     // INSIDE the think block with no literal opener. If generation stops
     // (length) before `</think>`, every token so far is reasoning — it must
     // land in reasoning_content, never in content. Matches the streaming path.
-    const result = splitThinkBlock("The user wants 17*23. Let me compute", true, true);
+    const result = splitThinkBlock(.text, "The user wants 17*23. Let me compute", true, true);
     try testing.expectEqualStrings("The user wants 17*23. Let me compute", result.reasoning_content.?);
     try testing.expectEqualStrings("", result.content);
 }
@@ -1998,7 +2127,7 @@ test "splitThinkBlock thinking=true no close tag, no opener, template did NOT op
     // Gemma-style direct answer: thinking enabled but the template injects no
     // opener and the model answered without a thought channel. The answer must
     // stay visible as content.
-    const result = splitThinkBlock("It is currently 8:15 AM PDT.", true, false);
+    const result = splitThinkBlock(.text, "It is currently 8:15 AM PDT.", true, false);
     try testing.expect(result.reasoning_content == null);
     try testing.expectEqualStrings("It is currently 8:15 AM PDT.", result.content);
 }
@@ -2006,19 +2135,19 @@ test "splitThinkBlock thinking=true no close tag, no opener, template did NOT op
 test "splitThinkBlock template-opened block with close tag still splits" {
     // Normal Qwen 3.6 round: no literal opener (template-injected), close tag
     // present — reasoning before it, content after.
-    const result = splitThinkBlock("compute 340+51=391</think>\n\n391.", true, true);
+    const result = splitThinkBlock(.text, "compute 340+51=391</think>\n\n391.", true, true);
     try testing.expectEqualStrings("compute 340+51=391", result.reasoning_content.?);
     try testing.expectEqualStrings("391.", result.content);
 }
 
 test "splitThinkBlock thinking=false no tags" {
-    const result = splitThinkBlock("just content", false, false);
+    const result = splitThinkBlock(.text, "just content", false, false);
     try testing.expect(result.reasoning_content == null);
     try testing.expectEqualStrings("just content", result.content);
 }
 
 test "splitThinkBlock strips think prefix in thinking mode" {
-    const result = splitThinkBlock("<think>my reasoning", true, false);
+    const result = splitThinkBlock(.text, "<think>my reasoning", true, false);
     try testing.expectEqualStrings("my reasoning", result.reasoning_content.?);
     try testing.expectEqualStrings("", result.content);
 }
@@ -2061,7 +2190,7 @@ test "endsWithPartialThinkOpen holds back partial opener tails (pi GGUF leak rep
 
 test "splitThinkBlock with think block before tool call" {
     const text = "<think>I need to call the calculator</think>\n<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"a\": 5}}\n</tool_call>";
-    const result = splitThinkBlock(text, false, false);
+    const result = splitThinkBlock(.text, text, false, false);
     try testing.expectEqualStrings("I need to call the calculator", result.reasoning_content.?);
     // `content` is VISIBLE text, so the call block is cut: parseToolCalls runs
     // on the raw output, and whatever it leaves behind is markup the client
@@ -2069,46 +2198,46 @@ test "splitThinkBlock with think block before tool call" {
     try testing.expectEqualStrings("", result.content);
     // The keeping-markup variant is what the one parse-from-content caller
     // (/v1/messages non-streaming) uses, and it still hands over the block.
-    const raw = splitThinkBlockKeepingMarkup(text, false, false);
+    const raw = splitThinkBlockKeepingMarkup(.text, text, false, false);
     try testing.expect(std.mem.startsWith(u8, raw.content, "<tool_call>"));
 }
 
 test "splitThinkBlock with think block before regular content" {
     const text = "<think>Let me think about this</think>\n\nThe answer is 42.";
-    const result = splitThinkBlock(text, false, false);
+    const result = splitThinkBlock(.text, text, false, false);
     try testing.expectEqualStrings("Let me think about this", result.reasoning_content.?);
     try testing.expectEqualStrings("The answer is 42.", result.content);
 }
 
 test "splitThinkBlock with empty think block" {
     const text = "<think>\n\n</think>\n\nJust content here.";
-    const result = splitThinkBlock(text, false, false);
+    const result = splitThinkBlock(.text, text, false, false);
     try testing.expect(result.reasoning_content == null);
     try testing.expectEqualStrings("Just content here.", result.content);
 }
 
 test "splitThinkBlock no think tags with tool call" {
     const text = "<tool_call>\n{\"name\": \"search\", \"arguments\": {}}\n</tool_call>";
-    const result = splitThinkBlock(text, false, false);
+    const result = splitThinkBlock(.text, text, false, false);
     try testing.expect(result.reasoning_content == null);
     try testing.expectEqualStrings("", result.content);
-    try testing.expectEqualStrings(text, splitThinkBlockKeepingMarkup(text, false, false).content);
+    try testing.expectEqualStrings(text, splitThinkBlockKeepingMarkup(.text, text, false, false).content);
 }
 
 test "split content: Gemma 4 channel tags never reach content" {
-    try testing.expectEqualStrings("Hello", splitThinkBlock("<|channel>thought\nreasoning here<channel|>Hello", true, false).content);
-    try testing.expectEqualStrings("Hello", splitThinkBlock("<|channel>thought\nreasoning<channel|>\nHello", true, false).content);
-    try testing.expectEqualStrings("", splitThinkBlock("<|channel>thought\nstill thinking...", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock(.text, "<|channel>thought\nreasoning here<channel|>Hello", true, false).content);
+    try testing.expectEqualStrings("Hello", splitThinkBlock(.text, "<|channel>thought\nreasoning<channel|>\nHello", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock(.text, "<|channel>thought\nstill thinking...", true, false).content);
 }
 
 test "splitThinkBlock Gemma 4 channel tags" {
-    const result = splitThinkBlock("<|channel>thought\nmy reasoning<channel|>answer here", false, false);
+    const result = splitThinkBlock(.text, "<|channel>thought\nmy reasoning<channel|>answer here", false, false);
     try testing.expectEqualStrings("my reasoning", result.reasoning_content.?);
     try testing.expectEqualStrings("answer here", result.content);
 }
 
 test "splitThinkBlock Gemma 4 thinking in progress" {
-    const result = splitThinkBlock("<|channel>thought\npartial reasoning", true, false);
+    const result = splitThinkBlock(.text, "<|channel>thought\npartial reasoning", true, false);
     try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
     try testing.expectEqualStrings("", result.content);
 }
@@ -2119,22 +2248,22 @@ test "splitThinkBlock truncated mid-thinking does not leak channel tag" {
     // close — then hit the output cap. The raw `<|channel>` control tag must
     // never reach visible content (it used to leak straight through).
     {
-        const r = splitThinkBlock("<|channel>\nThe answer is 42.", true, false);
+        const r = splitThinkBlock(.text, "<|channel>\nThe answer is 42.", true, false);
         try testing.expect(r.reasoning_content == null);
         try testing.expectEqualStrings("The answer is 42.", r.content);
     }
     // Bare dangling opener (cut off right after the tag) → nothing visible.
     {
-        const r = splitThinkBlock("<|channel>", true, false);
+        const r = splitThinkBlock(.text, "<|channel>", true, false);
         try testing.expectEqualStrings("", r.content);
     }
     {
-        const r = splitThinkBlock("<|channel>\n", true, false);
+        const r = splitThinkBlock(.text, "<|channel>\n", true, false);
         try testing.expectEqualStrings("", r.content);
     }
     // The template-injected-but-no-tags case must still pass through untouched.
     {
-        const r = splitThinkBlock("It is currently 8:15 AM PDT.", true, false);
+        const r = splitThinkBlock(.text, "It is currently 8:15 AM PDT.", true, false);
         try testing.expect(r.reasoning_content == null);
         try testing.expectEqualStrings("It is currently 8:15 AM PDT.", r.content);
     }
@@ -2147,19 +2276,19 @@ test "splitThinkBlock trailing unclosed thought opener does not leak (Gemma 12B 
     // must never reach visible content; pi rendered the literal tag to users.
     {
         // Bare trailing opener, nothing after.
-        const r = splitThinkBlock("Here is the design.\n<|channel>thought", true, false);
+        const r = splitThinkBlock(.text, "Here is the design.\n<|channel>thought", true, false);
         try testing.expectEqualStrings("Here is the design.", r.content);
         try testing.expect(r.reasoning_content == null);
     }
     {
         // Trailing opener with unclosed thought text → thought is reasoning.
-        const r = splitThinkBlock("Here is the design.\n<|channel>thought\nI should now write the file", true, false);
+        const r = splitThinkBlock(.text, "Here is the design.\n<|channel>thought\nI should now write the file", true, false);
         try testing.expectEqualStrings("Here is the design.", r.content);
         try testing.expectEqualStrings("I should now write the file", r.reasoning_content.?);
     }
     {
         // Same shape for the <think> family.
-        const r = splitThinkBlock("Done.\n<think>wait, maybe I", true, false);
+        const r = splitThinkBlock(.text, "Done.\n<think>wait, maybe I", true, false);
         try testing.expectEqualStrings("Done.", r.content);
         try testing.expectEqualStrings("wait, maybe I", r.reasoning_content.?);
     }
@@ -2168,9 +2297,9 @@ test "splitThinkBlock trailing unclosed thought opener does not leak (Gemma 12B 
 test "split content: trailing unclosed thought opener does not leak" {
     // The visible text must be truncated at a trailing unclosed opener (the
     // tag and dangling thought are reasoning, never content).
-    try testing.expectEqualStrings("Here is the design.", splitThinkBlock("Here is the design.\n<|channel>thought", true, false).content);
-    try testing.expectEqualStrings("Here is the design.", splitThinkBlock("Here is the design.\n<|channel>thought\nI should now write", true, false).content);
-    try testing.expectEqualStrings("Done.", splitThinkBlock("Done.\n<think>hmm", true, false).content);
+    try testing.expectEqualStrings("Here is the design.", splitThinkBlock(.text, "Here is the design.\n<|channel>thought", true, false).content);
+    try testing.expectEqualStrings("Here is the design.", splitThinkBlock(.text, "Here is the design.\n<|channel>thought\nI should now write", true, false).content);
+    try testing.expectEqualStrings("Done.", splitThinkBlock(.text, "Done.\n<think>hmm", true, false).content);
 }
 
 test "trimLeakedToolMarkup cuts at the first unparsed tool-call opener" {
@@ -2206,12 +2335,12 @@ test "in-thought tool markup never rides out as reasoning" {
         "<｜DSML｜invoke name=\"listFiles\">\n" ++
         "<｜DSML｜parameter name=\"path\" string=\"true\">quake</｜DSML｜parameter>\n" ++
         "</｜DSML｜invoke>\n</｜DSML｜tool_calls></think>I'll build it.";
-    const split = splitThinkBlock(raw, true, true);
+    const split = splitThinkBlock(.text, raw, true, true);
     try testing.expectEqualStrings("Let me check the directory.", split.reasoning_content.?);
     try testing.expectEqualStrings("I'll build it.", split.content);
 
     // Reasoning that is NOTHING but markup reports no reasoning at all.
-    const only_markup = splitThinkBlock("<｜DSML｜tool_calls>\n</｜DSML｜tool_calls></think>answer", true, true);
+    const only_markup = splitThinkBlock(.text, "<｜DSML｜tool_calls>\n</｜DSML｜tool_calls></think>answer", true, true);
     try testing.expectEqual(@as(?[]const u8, null), only_markup.reasoning_content);
     try testing.expectEqualStrings("answer", only_markup.content);
 }
@@ -2241,18 +2370,18 @@ test "splitThinkBlock re-opened thought opener right after close does not leak" 
     // still vanish, and `<|channel>thought` must never be mis-stripped as a
     // CONTENT channel (`<|channel>`), which leaked a glued "thought".
     {
-        const r = splitThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false);
+        const r = splitThinkBlock(.text, "<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false);
         try testing.expectEqualStrings("", r.content);
         try testing.expectEqualStrings("Let me plan.", r.reasoning_content.?);
     }
     {
         // <think> family equivalent.
-        const r = splitThinkBlock("<think>plan</think>\n<think>", true, false);
+        const r = splitThinkBlock(.text, "<think>plan</think>\n<think>", true, false);
         try testing.expectEqualStrings("", r.content);
     }
     {
         // Content BETWEEN the close and the re-open must survive the cut.
-        const r = splitThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false);
+        const r = splitThinkBlock(.text, "<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false);
         try testing.expectEqualStrings("Ready.", r.content);
     }
 }
@@ -2260,9 +2389,9 @@ test "splitThinkBlock re-opened thought opener right after close does not leak" 
 test "split content: re-opened thought opener right after close does not leak" {
     // Same regression, content side — this is the exact form that reached
     // chat-history.json (`<|channel>thought\n` as the whole content).
-    try testing.expectEqualStrings("", splitThinkBlock("<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false).content);
-    try testing.expectEqualStrings("Ready.", splitThinkBlock("<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false).content);
-    try testing.expectEqualStrings("", splitThinkBlock("<think>plan</think>\n<think>", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock(.text, "<|channel>thought\nLet me plan.<channel|>\n<|channel>thought\n", true, false).content);
+    try testing.expectEqualStrings("Ready.", splitThinkBlock(.text, "<|channel>thought\nPlan.<channel|>\nReady.<|channel>thought\n", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock(.text, "<think>plan</think>\n<think>", true, false).content);
 }
 
 test "renderChatTemplate: the Flash-Next template renders its own efforts and thinking-off (hermetic)" {
@@ -2412,28 +2541,28 @@ test "streamThinkGate: template-opened thinking holds tag-free prose" {
     // The Claude Code leak class: with thinking on and the opener injected by
     // the template, the model's prose has NO tags — it must still be held,
     // never flushed as visible text.
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("The user is asking about their system specs.", true, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "The user is asking about their system specs.", true, false));
     // …and split exactly when the close tag arrives.
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("The user is asking.\n</think>\n\nI don't have direct access.", true, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate(.text, "The user is asking.\n</think>\n\nI don't have direct access.", true, false));
 }
 
 test "streamThinkGate: after the split, prose flushes (hidden-answer guard)" {
-    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("The visible answer streams normally.", true, true));
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate(.text, "The visible answer streams normally.", true, true));
 }
 
 test "streamThinkGate: explicit openers hold even with thinking off or closed" {
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("Sure.<|channel>thought\nlet me reconsider", true, true));
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("<think>hmm", false, false));
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("<|channel>thought\nplan<channel|>done", false, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "Sure.<|channel>thought\nlet me reconsider", true, true));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "<think>hmm", false, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate(.text, "<|channel>thought\nplan<channel|>done", false, false));
 }
 
 test "streamThinkGate: partial opener at the buffer tail holds" {
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("The answer is 391.\n<|channel>", false, false));
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("Done. <thi", false, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "The answer is 391.\n<|channel>", false, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "Done. <thi", false, false));
 }
 
 test "streamThinkGate: plain prose with thinking off flushes" {
-    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("17 × 23 = 391.", false, false));
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate(.text, "17 × 23 = 391.", false, false));
 }
 
 test "streamThinkGate: a prompt-opened block is held even with thinking OFF" {
@@ -2447,17 +2576,17 @@ test "streamThinkGate: a prompt-opened block is held even with thinking OFF" {
     // Whether the prompt ends inside a think block is a fact about the
     // RENDERED BYTES, not about our request flag, which is why it needs its
     // own argument rather than riding `enable_thinking`.
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2("The user wants me to say hi in 5 words.", false, false, true));
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2("The user wants 5 words.</think>Hi there, how are you?", false, false, true));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2(.text, "The user wants me to say hi in 5 words.", false, false, true));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2(.text, "The user wants 5 words.</think>Hi there, how are you?", false, false, true));
 
     // Containment, both directions. Same buffers with the prompt flag FALSE
     // behave exactly as before — every other family's template renders the
     // closed `<think></think>` signature (or no tag) when thinking is off, so
     // `promptTailOpensThink` is false for them and this term can never fire.
-    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2("The user wants me to say hi in 5 words.", false, false, false));
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2(.text, "The user wants me to say hi in 5 words.", false, false, false));
     // And once the block has closed, a prompt-opened flag must not re-hold the
     // visible answer — that would hide every reply after the first.
-    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2("Hi there, how are you?", false, true, true));
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2(.text, "Hi there, how are you?", false, true, true));
 }
 
 test "unstreamedReasoning: only the remainder, and never a resend" {
@@ -2492,16 +2621,16 @@ test "streamTailIsReasoning: an unopened block was content all along" {
 
 test "cutThoughtDelta: a thought cut at its opener delivers nothing, as the split does" {
     // `max_tokens: 1` on a model that opens its own block: the stream holds only the seeded opener.
-    try testing.expectEqualStrings("", cutThoughtDelta("<think>", false, false));
-    try testing.expectEqualStrings("", cutThoughtDelta("<|channel>thought", false, false));
-    try testing.expectEqualStrings("", splitThinkBlock("<think>", true, false).reasoning_content orelse "");
+    try testing.expectEqualStrings("", cutThoughtDelta(.text, "<think>", false, false));
+    try testing.expectEqualStrings("", cutThoughtDelta(.text, "<|channel>thought", false, false));
+    try testing.expectEqualStrings("", splitThinkBlock(.text, "<think>", true, false).reasoning_content orelse "");
     // A prompt-opened thought cut before its first word, and one cut after it.
-    try testing.expectEqualStrings("", cutThoughtDelta("\n", false, false));
-    try testing.expectEqualStrings("Ok", cutThoughtDelta("\nOk", false, false));
+    try testing.expectEqualStrings("", cutThoughtDelta(.text, "\n", false, false));
+    try testing.expectEqualStrings("Ok", cutThoughtDelta(.text, "\nOk", false, false));
     // Once the opener is consumed, the same bytes are the thought's own text.
-    try testing.expectEqualStrings("<think>", cutThoughtDelta("<think>", true, false));
+    try testing.expectEqualStrings("<think>", cutThoughtDelta(.text, "<think>", true, false));
     // After a delta shipped, the held run (withheld whitespace, a partial close) goes out as is.
-    try testing.expectEqualStrings(" \n</thi", cutThoughtDelta(" \n</thi", true, true));
+    try testing.expectEqualStrings(" \n</thi", cutThoughtDelta(.text, " \n</thi", true, true));
 }
 
 test "promptTailOpensThink does not match Gemma's channel opener" {
@@ -2533,7 +2662,7 @@ test "streamThinkGate: the 3-arg form is the 4-arg form with no prompt opener" {
     for (cases) |c| {
         for ([_]bool{ true, false }) |think| {
             for ([_]bool{ true, false }) |closed| {
-                try testing.expectEqual(streamThinkGate(c, think, closed), streamThinkGate2(c, think, closed, false));
+                try testing.expectEqual(streamThinkGate(.text, c, think, closed), streamThinkGate2(.text, c, think, closed, false));
             }
         }
     }
@@ -2548,7 +2677,7 @@ test "split content: trailing <channel|> close-marker spam never leaks (degenera
     // content; trailing closers (and openers) are trimmed so <channel|> can't leak.
     const text = "Reasoning here about the file.\n<channel|>`glob` `./game.js`\n\n" ++
         "<channel|><channel|><channel|><channel|><channel|>";
-    const content = splitThinkBlock(text, true, false).content;
+    const content = splitThinkBlock(.text, text, true, false).content;
     try testing.expect(std.mem.indexOf(u8, content, "<channel|>") == null);
     // The scrap of real content before the spam survives.
     try testing.expect(std.mem.indexOf(u8, content, "glob") != null);
@@ -2556,7 +2685,7 @@ test "split content: trailing <channel|> close-marker spam never leaks (degenera
 
 test "split content: trailing </think> close spam never leaks" {
     const text = "<think>plan</think>The answer.</think></think></think>";
-    const content = splitThinkBlock(text, true, false).content;
+    const content = splitThinkBlock(.text, text, true, false).content;
     try testing.expect(std.mem.indexOf(u8, content, "</think>") == null);
     try testing.expect(std.mem.indexOf(u8, content, "The answer.") != null);
 }
@@ -2570,28 +2699,28 @@ test "split content: orphan Gemma <tool_call|> close never leaks (no-tag-leak)" 
     // never valid at the tail of content — same class as the <channel|> spam.
     // parseToolCalls already extracted any real call before this split runs, so
     // any residual <tool_call|> here is orphan by construction.
-    try testing.expectEqualStrings("", splitThinkBlock("<tool_call|>", true, false).content);
-    try testing.expectEqualStrings("Sure.", splitThinkBlock("Sure.<tool_call|>", true, false).content);
+    try testing.expectEqualStrings("", splitThinkBlock(.text, "<tool_call|>", true, false).content);
+    try testing.expectEqualStrings("Sure.", splitThinkBlock(.text, "Sure.<tool_call|>", true, false).content);
     // Legit prose (no control token) is untouched.
-    try testing.expectEqualStrings("2 + 2 = 4", splitThinkBlock("2 + 2 = 4", true, false).content);
+    try testing.expectEqualStrings("2 + 2 = 4", splitThinkBlock(.text, "2 + 2 = 4", true, false).content);
 }
 
 test "splitThinkBlock content never keeps trailing channel close spam" {
     const text = "<|channel>thought\nplan<channel|>\n<|channel>\nThe answer.<channel|><channel|><channel|>";
-    const split = splitThinkBlock(text, true, false);
+    const split = splitThinkBlock(.text, text, true, false);
     try testing.expect(std.mem.indexOf(u8, split.content, "<channel|>") == null);
     try testing.expect(std.mem.indexOf(u8, split.content, "The answer.") != null);
 }
 
 test "streamThinkGate holds a partial re-opened <think at the tail" {
     // Template-opened thinking: reasoning streams in with no literal opener.
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("partial reasoning", true, false));
-    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("reasoning</think>ans", true, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "partial reasoning", true, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate(.text, "reasoning</think>ans", true, false));
     // Mid-text re-open arriving token by token: the partial tail must hold the
     // flush (leaking "<thin" into visible text is the tag-leak class).
-    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("visible<thin", false, true));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate(.text, "visible<thin", false, true));
     // Prose that merely mentions "<think about it" is NOT a partial opener.
-    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("let's <think about it", false, true));
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate(.text, "let's <think about it", false, true));
 }
 
 test "streamShouldBufferForTools: lone DSML closer holds, ordinary closing tags flush" {
@@ -2673,11 +2802,11 @@ test "ThinkScan: incremental gate matches the fresh gate at every prefix length"
         for (flags) |f| {
             const enable_thinking = f[0];
             const prompt_opened = f[1];
-            var scan: ThinkScan = .{};
+            var scan: ThinkScan = .{ .reading = .text };
             var n: usize = 0;
             while (n <= full.len) : (n += 1) {
                 const buf = full[0..n];
-                const want = streamThinkGate2(buf, enable_thinking, false, prompt_opened);
+                const want = streamThinkGate2(.text, buf, enable_thinking, false, prompt_opened);
                 const got = streamThinkGateScan(buf, enable_thinking, false, prompt_opened, &scan);
                 if (want != got) {
                     std.debug.print("prefix {d} of \"{s}\" (think={}, opened={}): {any} != {any}\n", .{ n, full, enable_thinking, prompt_opened, got, want });
@@ -2699,16 +2828,16 @@ test "ThinkScan: a think tag after a backtick nothing pairs with splits only whe
         "x ` y\n</think>w",
     };
     for (corpus) |full| {
-        const want = thoughtClose(full, true);
-        var scan: ThinkScan = .{};
+        const want = thoughtClose(.text, full, true);
+        var scan: ThinkScan = .{ .reading = .text };
         for (0..full.len + 1) |n| {
             const got = streamThinkGateScan(full[0..n], true, false, true, &scan);
             if (got != .split_think) continue;
             errdefer std.debug.print("prefix {d} of {f}\n", .{ n, std.zig.fmtString(full) });
-            try testing.expectEqual(want.?.pos, thoughtClose(full[0..n], true).?.pos);
+            try testing.expectEqual(want.?.pos, thoughtClose(.text, full[0..n], true).?.pos);
         }
         // A reply that ends on a backtick nothing pairs is settled by its end, not by the gate.
-        if (openCodeSpanStart(full) == null) try testing.expectEqual(streamThinkGate2(full, true, false, true), streamThinkGateScan(full, true, false, true, &scan));
+        if (openCodeSpanStart(full) == null) try testing.expectEqual(streamThinkGate2(.text, full, true, false, true), streamThinkGateScan(full, true, false, true, &scan));
     }
 }
 
@@ -2716,7 +2845,7 @@ test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
     // The whole point. A smaller constant is not the fix — the re-examined
     // span must not grow with the buffer, or a 32K-token thought pays 8x what
     // the 113 KB bench measured.
-    var scan: ThinkScan = .{};
+    var scan: ThinkScan = .{ .reading = .text };
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
     var max_span: usize = 0;
@@ -2732,7 +2861,7 @@ test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
     try testing.expect(max_span <= 64);
 
     // A growing partial marker at the tail is re-examined, and only it.
-    var scan2: ThinkScan = .{};
+    var scan2: ThinkScan = .{ .reading = .text };
     var buf2 = std.ArrayList(u8).empty;
     defer buf2.deinit(testing.allocator);
     try buf2.appendSlice(testing.allocator, "<think>");
@@ -2750,7 +2879,7 @@ test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
     // The buffer is NOT append-only — the stream loop trims and resets it at
     // every emit. A stale cursor then points past the end or into different
     // bytes, which is the second failure mode a naive cursor introduces.
-    var scan: ThinkScan = .{};
+    var scan: ThinkScan = .{ .reading = .text };
     const first = "<think>reasoning</think>";
     try testing.expectEqual(StreamThinkGate.split_think, streamThinkGateScan(first, true, false, false, &scan));
     scan.reset();
@@ -2767,7 +2896,7 @@ pub fn expectIncrementalGatesAgree(raw: []const u8, seed: usize) !void {
     for ([_]usize{ 0, raw.len / 3 }) |delivered| {
         for ([_]bool{ false, true }) |opens_think| {
             var hold: ToolHoldScan = .{};
-            var thought: ThoughtScan = .{};
+            var thought: ThoughtScan = .{ .think = .{ .reading = .text } };
             var rng = std.Random.DefaultPrng.init(seed);
             var n: usize = 0;
             while (n < raw.len) {
@@ -2781,7 +2910,7 @@ pub fn expectIncrementalGatesAgree(raw: []const u8, seed: usize) !void {
                 }
                 if (want_hold or n < delivered) continue;
                 const undelivered = buf[delivered..];
-                const want = heldThoughtSoFar(undelivered, opens_think, false);
+                const want = heldThoughtSoFar(.text, undelivered, opens_think, false);
                 const got = heldThoughtSoFarScan(undelivered, opens_think, false, &hold, &thought);
                 const same = if (want) |w| got != null and std.mem.eql(u8, w, got.?) else got == null;
                 if (!same) {
@@ -2818,7 +2947,7 @@ test "ToolHoldScan and ThoughtScan: incremental verdicts match the full rescan a
 
 test "ToolHoldScan and ThoughtScan: per-token work does not grow with the reply" {
     var hold: ToolHoldScan = .{};
-    var thought: ThoughtScan = .{};
+    var thought: ThoughtScan = .{ .think = .{ .reading = .text } };
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(testing.allocator);
     var max_hold: usize = 0;
@@ -2844,7 +2973,7 @@ test "streaming content agrees with the non-streaming split on leading whitespac
     // generated token is the newline pair after the closer. The non-streaming
     // split drops it; the stream must reach the same bytes.
     const out = "\n\nOne, two, three.";
-    const expected = splitThinkBlock(out, true, false).content;
+    const expected = splitThinkBlock(.text, out, true, false).content;
     try testing.expectEqualStrings("One, two, three.", expected);
 
     const tokens = [_][]const u8{ "\n\n", "One", ", two", ", three." };
@@ -2953,26 +3082,55 @@ test "streamShouldBufferForTools: false positive — bare <function> with no att
 test "a model-opened think block latches from its own opener token" {
     // Both openers are dropped from visible deltas as channel markers, so without
     // this latch the whole thought streams as the answer (LFM2.5-8B-A1B, Gemma 4).
-    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>").?);
-    try std.testing.expectEqualStrings("<think>", modelThinkOpener(false, "<think>\n").?);
-    try std.testing.expectEqualStrings("<|channel>thought", modelThinkOpener(true, "thought").?);
-    try std.testing.expect(modelThinkOpener(false, "thought") == null);
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(.text, false, "<think>").?);
+    try std.testing.expectEqualStrings("<think>", modelThinkOpener(.text, false, "<think>\n").?);
+    try std.testing.expectEqualStrings("<|channel>thought", modelThinkOpener(.text, true, "thought").?);
+    try std.testing.expect(modelThinkOpener(.text, false, "thought") == null);
     // Prose that merely BEGINS with the word is not the opener token.
-    try std.testing.expect(modelThinkOpener(true, "thoughts") == null);
-    try std.testing.expect(modelThinkOpener(true, "\n") == null);
-    try std.testing.expect(modelThinkOpener(false, "<think>x") == null);
+    try std.testing.expect(modelThinkOpener(.text, true, "thoughts") == null);
+    try std.testing.expect(modelThinkOpener(.text, true, "\n") == null);
+    try std.testing.expect(modelThinkOpener(.text, false, "<think>x") == null);
 }
 
 test "heldThoughtSoFar: a held thought streams only while its start cannot move" {
-    try testing.expectEqualStrings("The user asks", heldThoughtSoFar("The user asks\n</thi", true, false).?);
-    try testing.expectEqualStrings("plan", heldThoughtSoFar("<think>plan", false, true).?);
-    try testing.expect(heldThoughtSoFar("Done. <think>plan", true, true) == null);
-    try testing.expect(heldThoughtSoFar("Done. <th", true, true) == null);
+    try testing.expectEqualStrings("The user asks", heldThoughtSoFar(.text, "The user asks\n</thi", true, false).?);
+    try testing.expectEqualStrings("plan", heldThoughtSoFar(.text, "<think>plan", false, true).?);
+    try testing.expect(heldThoughtSoFar(.text, "Done. <think>plan", true, true) == null);
+    try testing.expect(heldThoughtSoFar(.text, "Done. <th", true, true) == null);
 }
 
 test "normalizeEmbeddedThinkBlocks: a closer cut from a part splits it, and the parts around the thoughts are joined" {
     const raw = "Sure.<think>hmm</think>X</think>Y<think>q</think>\n\nDone.\n";
-    const plain = (try normalizeEmbeddedThinkBlocks(testing.allocator, raw)).?;
+    const plain = (try normalizeEmbeddedThinkBlocks(.text, testing.allocator, raw)).?;
     defer testing.allocator.free(plain);
-    try testing.expectEqualStrings("Sure.\nX" ++ "Y\nDone.", splitThinkBlock(plain, true, false).content);
+    try testing.expectEqualStrings("Sure.\nX" ++ "Y\nDone.", splitThinkBlock(.text, plain, true, false).content);
+}
+
+test "decodeReply: a think tag token carries the lead, plain pieces spelling it and a lead a piece spells do not" {
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const tokenizer_mod = @import("tokenizer.zig");
+    var lone = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{"<think>"});
+    defer tokenizer_mod.deinitTestTokenizer(&lone);
+    // A pack with one of the pair as an added token has no tag token: its tags are text.
+    try testing.expectEqual(Reading.text, readingOf(&lone));
+    var pair = try tokenizer_mod.byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think:opensource>", "</think:opensource>" });
+    defer tokenizer_mod.deinitTestTokenizer(&pair);
+    try tokenizer_mod.aliasOpensourceTags(&pair);
+    try testing.expectEqual(Reading.token, readingOf(&pair));
+    const open = pair.special_tokens.get("<think>").?;
+    const close = pair.special_tokens.get("</think>").?;
+    const lt = [_]u32{ '<', '/', 't', 'h', 'i', 'n', 'k', '>' };
+    const ids = [_]u32{ open, 'a' } ++ lt ++ [_]u32{close};
+    const text = try decodeReply(a, &pair, .token, &ids);
+    defer a.free(text);
+    try testing.expectEqualStrings(tag_lead ++ "<think>a</think>" ++ tag_lead ++ "</think>", text);
+    const lead_bytes = [_]u32{ 0xEF, 0xB7, 0x91 };
+    const sanitized = try decodeReply(a, &pair, .token, &lead_bytes);
+    defer a.free(sanitized);
+    try testing.expectEqualStrings("\u{fffd}", sanitized);
+    const plain = try decodeReply(a, &pair, .text, &ids);
+    defer a.free(plain);
+    try testing.expectEqualStrings("<think>a</think></think>", plain);
 }

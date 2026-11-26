@@ -502,14 +502,14 @@ pub const Reader = struct {
     started: bool = false,
     model_ended: bool,
     scan: Scan = Scan.init(),
-    tags: think_tags.Tags = .{},
+    tags: think_tags.Tags,
     /// The first thought opener at or after `think_from`, asked once and kept while the reading stands between the two.
     think: ?think_tags.ThinkOpen = null,
     think_from: usize = 0,
     think_known: bool = false,
 
-    pub fn init(text: []const u8, model_ended: bool) Reader {
-        return .{ .text = text, .model_ended = model_ended };
+    pub fn init(reading: think_tags.Reading, text: []const u8, model_ended: bool) Reader {
+        return .{ .text = text, .model_ended = model_ended, .tags = .{ .reading = reading } };
     }
 
     /// The first thought opener at or after the reading's place that no call spans. A thought is found once for the calls
@@ -583,8 +583,8 @@ fn nextCall(text: []const u8, from: usize, model_ended: bool, scan: *Scan) ?Call
 }
 
 /// Where the call the text leaves open starts: the first call that has no end. Null when the text stops outside one.
-pub fn openCallStart(text: []const u8, model_ended: bool) ?usize {
-    var reader = Reader.init(text, model_ended);
+pub fn openCallStart(reading: think_tags.Reading, text: []const u8, model_ended: bool) ?usize {
+    var reader = Reader.init(reading, text, model_ended);
     while (reader.next()) |c| if (c.end == null) return c.start;
     return null;
 }
@@ -593,10 +593,10 @@ pub fn openCallStart(text: []const u8, model_ended: bool) ?usize {
 pub const Defect = struct { start: usize, end: usize };
 
 /// The unfinished calls of the text, in order: the parser reads the text without them and the reply names the first.
-pub fn defects(allocator: std.mem.Allocator, text: []const u8, model_ended: bool) ![]Defect {
+pub fn defects(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, model_ended: bool) ![]Defect {
     var out = std.ArrayList(Defect).empty;
     errdefer out.deinit(allocator);
-    var reader = Reader.init(text, model_ended);
+    var reader = Reader.init(reading, text, model_ended);
     while (reader.next()) |c| {
         if (c.end == null) try out.append(allocator, .{ .start = c.start, .end = text.len });
         if (c.lost) try out.append(allocator, .{ .start = c.start, .end = c.end.? });
@@ -608,8 +608,8 @@ const Style = enum { any, think, channel };
 
 /// The first `tag` at or after `from` that no call's value holds: a think or channel tag inside a call is the call's
 /// payload, wherever its closer stands.
-pub fn outsideCalls(text: []const u8, from: usize, tag: think_tags.Tag) ?think_tags.TagAt {
-    var tags: think_tags.Tags = .{};
+pub fn outsideCalls(reading: think_tags.Reading, text: []const u8, from: usize, tag: think_tags.Tag) ?think_tags.TagAt {
+    var tags: think_tags.Tags = .{ .reading = reading };
     return firstOutsideCalls(text, from, true, &tags, tag);
 }
 
@@ -636,7 +636,7 @@ pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, tags:
             if (c.start >= m.pos) return m;
             const end = c.end orelse {
                 // A thought's own text may mention an opener; a call cut outside any thought holds every tag after it.
-                if (!thoughtOpenAt(text, c.start)) return null;
+                if (!thoughtOpenAt(tags.reading, text, c.start)) return null;
                 q = c.start + c.open_len;
                 continue;
             };
@@ -651,9 +651,9 @@ pub fn firstOutsideCalls(text: []const u8, from: usize, model_ended: bool, tags:
 }
 
 /// Whether a thought has opened and not closed by `at`, by the tags alone.
-fn thoughtOpenAt(text: []const u8, at: usize) bool {
+fn thoughtOpenAt(reading: think_tags.Reading, text: []const u8, at: usize) bool {
     const head = text[0..at];
-    var tags: think_tags.Tags = .{};
+    var tags: think_tags.Tags = .{ .reading = reading };
     var open: ?usize = null;
     var close: ?usize = null;
     inline for (.{ .{ think_tags.Tag.think_open, think_tags.Tag.think_close }, .{ think_tags.Tag.channel_thought, think_tags.Tag.channel_close } }) |kind| {
@@ -677,10 +677,10 @@ fn leadingThoughtEnd(text: []const u8, model_ended: bool, tags: *think_tags.Tags
 /// `text` with every call the reading finds that `keep` does not accept blanked to spaces (the bytes keep their
 /// places), or null when nothing is blanked: a family's parser then reads only its own calls, and a value that spells
 /// another family's markup never decides the call. The caller frees the copy.
-pub fn maskedExcept(allocator: std.mem.Allocator, text: []const u8, keep: *const fn (text: []const u8, call: Call) bool) !?[]u8 {
+pub fn maskedExcept(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, keep: *const fn (text: []const u8, call: Call) bool) !?[]u8 {
     var out: ?[]u8 = null;
     errdefer if (out) |o| allocator.free(o);
-    var reader = Reader.init(text, true);
+    var reader = Reader.init(reading, text, true);
     while (reader.next()) |c| {
         if (keep(text, c)) continue;
         if (out == null) out = try allocator.dupe(u8, text);

@@ -1095,7 +1095,9 @@ fn handleAnthropicNonStreaming(
     // The stop that ended the generation (Anthropic reports it as stop_reason "stop_sequence" + the echoed
     // `stop_sequence` field), the text it leaves and the calls in it (`reply.settle`).
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    const reading = generation_stream.replyReading(tok, sampling);
     const settled = try reply_mod.settle(allocator, generation_stream.generatedOf(&result), .{
+        .reading = reading,
         .stops = stop_sequences,
         .normalize = !generate_mod.payloadRouted(sampling.constraint),
         .has_tools = has_tools,
@@ -1127,7 +1129,7 @@ fn handleAnthropicNonStreaming(
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
     {
-        const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
+        const think_split = try splitConstrainedResponse(reading, allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
         const split_reasoning: ?[]const u8 = if (think_split.reasoning_content) |r| blk: {
             const t = think_tags.trimLeakedToolMarkup(r);
@@ -1363,6 +1365,7 @@ fn handleAnthropicStreaming(
     // enable_thinking (LFM2.5's unconditional pre-opened `<think>`).
     const prompt_opened_think = promptOpensThink(allocator, tok, prompt_ids);
     const opens_think = prompt_opened_think;
+    const reading = generation_stream.replyReading(tok, sampling);
     // Prompt-opened reasoning is DELIVERED as thinking blocks even when the
     // request didn't ask for thinking — generated tokens are never dropped.
     // A stream starts inside a think block only when the RENDERED PROMPT ends
@@ -1392,7 +1395,7 @@ fn handleAnthropicStreaming(
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
     var think_closed = false;
-    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream }, .opens_thoughts = !gated_stream };
+    var content: think_tags.ContentStream = .{ .reading = reading, .mark = .{ .on = !gated_stream }, .opens_thoughts = !gated_stream };
     defer content.deinit(allocator);
     var thought_mark: think_tags.MarkupCut = .{ .on = !gated_stream };
     var join: think_tags.ThoughtJoin = .{};
@@ -1413,12 +1416,12 @@ fn handleAnthropicStreaming(
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
-    var think_scan: think_tags.ThinkScan = .{};
+    var think_scan: think_tags.ThinkScan = .{ .reading = reading };
     // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
     // The tool gate and the held thought are memoized the same way; the thought scan also resets
     // whenever `text_delivered` moves, for it reads only the undelivered rest.
     var tool_scan: think_tags.ToolHoldScan = .{};
-    var thought_scan: think_tags.ThoughtScan = .{};
+    var thought_scan: think_tags.ThoughtScan = .{ .think = .{ .reading = reading } };
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
         for (token_texts.items) |t| allocator.free(t);
@@ -1474,7 +1477,7 @@ fn handleAnthropicStreaming(
         // The gate remembers WHICH stop matched (reported as stop_reason "stop_sequence" + the
         // echoed `stop_sequence` field in message_delta).
         const token_text = if (reply_over) try allocator.alloc(u8, 0) else if (tail_flush) try stop_gate.finish(allocator) else blk: {
-            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
+            const raw_decoded = try think_tags.decodeReply(allocator, tok, reading, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
             if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
@@ -1538,7 +1541,7 @@ fn handleAnthropicStreaming(
                         // Complete think block — split once: thinking block
                         // first, then the visible remainder as text. Reasoning
                         // ships regardless of the request's thinking flag.
-                        const split = think_tags.splitThinkBlock(undelivered, true, opens_think);
+                        const split = think_tags.splitThinkBlock(reading, undelivered, true, opens_think);
                         if (!budget_exhausted) if (split.reasoning_content) |rc| {
                             const capped = try reasoningWithinBudget(allocator, tok, rc, reasoning_budget);
                             defer if (capped.owned) allocator.free(capped.text);
@@ -1619,8 +1622,8 @@ fn handleAnthropicStreaming(
                 think_tokens += @intFromBool(token_text.len > 0);
             }
 
-            if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
-                if (think_tags.thinkOpenTagLenAt(think_buf.items)) |olen| {
+            if (!skipped_think_open and (think_buf.items.len >= reading.open().len or !think_tags.thinkOpenerPossible(reading, think_buf.items))) {
+                if (think_tags.thinkOpenLenAt(reading, think_buf.items)) |olen| {
                     var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
@@ -1659,7 +1662,7 @@ fn handleAnthropicStreaming(
 
             // Check for the close tag — accept whichever appears first.
             // A think close that waits on a backtick's partner is no close yet; the reply's end settles it.
-            if (thought_mark.thoughtClose(think_buf.items, reply_over)) |m| {
+            if (thought_mark.thoughtClose(reading, think_buf.items, reply_over)) |m| {
                 const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 const last = closed[0..thought_mark.final(closed)];
                 thought_shipped = false;
@@ -1704,6 +1707,7 @@ fn handleAnthropicStreaming(
         // silence, not off token arrival.
         const beaten = if (gated_stream and stream.keepaliveDue())
             beatToolUse(allocator, stream, &tool_stream, &tool_block, &block_index, &text_block_open, &thinking_block_open, text_buf.items, .{
+                .reading = reading,
                 .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?),
                 .opens_think = opens_think and !think_closed,
             }, tools_json)
@@ -1733,7 +1737,7 @@ fn handleAnthropicStreaming(
     }
 
     // Flush remaining think buffer
-    const think_rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+    const think_rest = join.cutTail(think_tags.cutThoughtDelta(reading, think_buf.items, skipped_think_open, thought_shipped));
     const think_tail = think_rest[0..thought_mark.final(think_rest)];
     if (!client_gone and !budget_exhausted) {
         try emitAnthropicThinking(allocator, stream, &block_index, &text_block_open, &thinking_block_open, &join, think_tail);
@@ -1762,6 +1766,7 @@ fn handleAnthropicStreaming(
             .finish_reason = finish_reason,
             .finish_details = ts.finish_details,
         }, .{
+            .reading = reading,
             .stops = stop_sequences,
             .normalize = !constrained_proto,
             .has_tools = has_tools,
@@ -1781,7 +1786,7 @@ fn handleAnthropicStreaming(
             // already emitted it, the remaining buffer has no template-opened
             // semantics — passing `opens_think` unguarded would misfile the
             // visible tail as reasoning.
-            const think_split = think_tags.splitThinkBlock(gen_text, true, opens_think and !think_closed);
+            const think_split = think_tags.splitThinkBlock(reading, gen_text, true, opens_think and !think_closed);
             if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
                 const capped = try reasoningWithinBudget(allocator, tok, reasoning, reasoning_budget);
                 defer if (capped.owned) allocator.free(capped.text);
@@ -1806,10 +1811,10 @@ fn handleAnthropicStreaming(
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
                 for (token_texts.items) |t| try full_text.appendSlice(allocator, t);
-                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
+                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocks(reading, allocator, full_text.items);
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
-                const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const think_split = think_tags.splitThinkBlock(reading, flush_text, true, opens_think and !think_closed);
                 const held = try content.finish(allocator, join.closed and think_split.content.len == 0);
                 if (held.len > 0) try emitAnthropicText(allocator, stream, block_index, &text_block_open, held);
                 if (!budget_exhausted) if (think_split.reasoning_content) |reasoning| {
@@ -2606,7 +2611,7 @@ test "a /v1/messages reply with a call inside a thought the prompt opened and ne
         \\[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]
     ;
     const generated = "I'll check.\n<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
-    const tool_reply = (try reply_mod.toolReply(a, generated, tools, true, .{ .dialect = .function_tag, .opens_think = true })).?;
+    const tool_reply = (try reply_mod.toolReply(a, generated, tools, true, .{ .reading = .text, .dialect = .function_tag, .opens_think = true })).?;
     defer tool_reply.deinit(a);
     var content = std.ArrayList(u8).empty;
     defer content.deinit(a);
@@ -2617,7 +2622,7 @@ test "a /v1/messages reply with a call inside a thought the prompt opened and ne
     const id_end = std.mem.indexOfScalarPos(u8, content.items, id_key.len, '"').?;
     try std.testing.expectEqualStrings("\",\"name\":\"get_weather\",\"input\":{\"city\":\"Tokyo\"}}", content.items[id_end..]);
     // The thought carries the words and none of the markup.
-    const split = think_tags.splitThinkBlock(generated, true, true);
+    const split = think_tags.splitThinkBlock(.text, generated, true, true);
     try std.testing.expectEqualStrings("I'll check.", split.reasoning_content.?);
     try std.testing.expectEqualStrings("", split.content);
 }
@@ -2780,7 +2785,7 @@ fn anthropicCallBuffers(call_head: []const u8) !void {
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;
-        try beatToolUse(a, &wire.conn, &progress, &tool_block, &block_index, &text_open, &thinking_open, buffered.items, .{ .dialect = null }, tools);
+        try beatToolUse(a, &wire.conn, &progress, &tool_block, &block_index, &text_open, &thinking_open, buffered.items, .{ .reading = .text, .dialect = null }, tools);
     }
     var buf: [8192]u8 = undefined;
     const raw = wire.read(&buf);

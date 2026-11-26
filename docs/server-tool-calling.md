@@ -414,7 +414,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
 - **An open thought streams only what its closed split delivers** (`trim(thought, "\n ")`): a trailing `"\n "` run and
   a close tag still arriving wait (`think_tags.settledReasoning` on the tools path, `think_tags.openThoughtFlush` /
   `closedThoughtDelta` on raw flushes). Streaming the newline before `</think>` made stream and non-stream differ.
-- **A think tag inside an inline code span is text** (`tool_reading.Spans`, read by `Tags.find` for `indexOfThinkCloseTag`
+- **A think tag is the model's own special token, never plain pieces that spell it** (`think_tags.Reading`): where
+  `<think>` and `</think>` are both added tokens of the tokenizer (Qwen, GLM, DeepSeek, MiMo; Hy4's `:opensource` pair
+  aliases to them; `think_tags.readingOf`), `decodeReply` writes each such token as `tag_lead` (U+FDD1) before its tag,
+  and `Tags.find`, the one scan, takes only that spelling. A quote spelled by plain pieces is text in a thought or an
+  answer, in a code span or not, and a token in a code span is still a tag; the stream arms and the whole reply
+  read the same text, so they cannot disagree. A U+FDD1 a plain piece spells decodes as U+FFFD. The lead never reaches a client: every JSON string the server writes
+  (`http.jsonEscape`, `responses.jsonEscape`) and every parsed call (`tool_calls.dropLeads`) takes `think_tags.withoutLead`, and lint
+  `tag-lead-named` keeps `tag_lead` in `think_tags.zig`; a tag no scan consumed (an opener in a thought, a stop cut inside a tag) is the tag as the model wrote it. A tokenizer without the
+  pair, a constrained reply (`generation_stream.replyReading`) and a client's own text (a continuation prefill) keep the
+  text reading below. Pins: the `token_cells` corpus test and the text-reading cell beside it.
+- **In the text reading, a think tag inside an inline code span is text** (`tool_reading.Spans`, read by `Tags.find` for `indexOfThinkCloseTag`
   and `indexOfThinkOpenTag`, the ONE scan every surface and `normalizeEmbeddedThinkBlocks` use): a model explaining
   its format writes `` `<think>x</think>` `` into a thought or an answer. A span opens only where its closing run follows
   on the line (a backtick nothing pairs with is literal, as when reading calls), so a stream cannot judge a tag after
@@ -432,7 +442,7 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   (`isChannelMarkerToken`), so `normalizeEmbeddedThinkBlocks` cuts closers out of the content between and after blocks
   (`contentWithoutClosers`; a closer inside a code span is text) and `trimTrailingThinkClosers` keeps the tail.
   `<think>t</think>391</think>391` is content `391391` stream and non-stream.
-- **Every stream's content arm is `think_tags.ContentStream`**: a think tag token inside a code span is text
+- **Every stream's content arm is `think_tags.ContentStream`**: in the text reading a think tag token inside a code span is text
   (`CodeSpan` parity plus the bytes to the closing run, which `arrive`/`ready` queue the tokens behind it for); a `<think>` outside one re-opens a thought,
   which streams as reasoning joined by `\n\n` (`ThoughtJoin`) while the content parts around it are trimmed and
   joined by `\n`, as `normalizeEmbeddedThinkBlocks` merges them. Whitespace waits only as whole tokens.

@@ -48,6 +48,7 @@ const reply_mod = @import("reply.zig");
 const tool_reading = @import("tool_reading.zig");
 const request_fields = @import("request_fields.zig");
 const responses_mod = @import("responses.zig");
+const http = @import("http.zig");
 
 test "format corpus: concurrent completion IDs stay distinct within one millisecond" {
     const Worker = struct {
@@ -1916,13 +1917,13 @@ test "format corpus: recorded model outputs across families" {
     for (corpus) |entry| {
         // ── Normalize first (mirrors the server: re-opened mid-text thought
         // channels merge into one leading block before any parse/split). ──
-        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
+        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(.text, allocator, entry.raw);
         defer if (normalized) |n| allocator.free(n);
         const raw: []const u8 = normalized orelse entry.raw;
 
         // ── Tool calls (when calls parse, content is suppressed and only
         // tool deltas + reasoning are emitted). ──
-        var calls = try tool_calls_mod.parseToolCallsAs(allocator, raw, entry.dialect);
+        var calls = try tool_calls_mod.parseToolCallsAs(.text, allocator, raw, entry.dialect);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 allocator.free(tc.name);
@@ -2069,7 +2070,7 @@ test "format corpus: recorded model outputs across families" {
         // DELIVERS whatever reasoning the model generated (thinking-off is
         // enforced prompt-side via think_tags.noThinkTailSuffix, never by dropping
         // generated tokens). `entry.thinking` documents the original request.
-        const split: think_tags.ThinkSplit = think_tags.splitThinkBlock(raw, true, entry.opened_by_template);
+        const split: think_tags.ThinkSplit = think_tags.splitThinkBlock(.text, raw, true, entry.opened_by_template);
         // When tool calls parsed, the server emits NO content from this text.
         const content: []const u8 = if (calls != null) "" else split.content;
 
@@ -2142,7 +2143,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         // helper covers `</think>`).
         const close_end: ?usize = blk: {
             var best: ?usize = null;
-            if (think_tags.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
+            if (think_tags.indexOfThinkCloseTag(.text, entry.raw, 0)) |c| best = c.pos + c.len;
             if (std.mem.indexOf(u8, entry.raw, "<channel|>")) |p| {
                 const e = p + "<channel|>".len;
                 if (best == null or e < best.?) best = e;
@@ -2154,7 +2155,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         var i: usize = 1;
         while (i <= entry.raw.len) : (i += 1) {
             const buf = entry.raw[0..i];
-            const gate = think_tags.streamThinkGate(buf, true, think_closed);
+            const gate = think_tags.streamThinkGate(.text, buf, true, think_closed);
             if (think_closed) break; // post-split buffers start fresh in the real path
             if (close_end == null or i < close_end.?) {
                 if (gate == .flush_text) {
@@ -2172,7 +2173,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
         // Truncated thinking (no close tag at all) must hold to the very end —
         // end-of-stream handling owns it from there.
         if (close_end == null) {
-            const gate = think_tags.streamThinkGate(entry.raw, true, false);
+            const gate = think_tags.streamThinkGate(.text, entry.raw, true, false);
             if (gate == .flush_text) {
                 try fail(entry, "gate flushed truncated thinking as text", entry.raw);
             }
@@ -2180,7 +2181,7 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     }
 
     // Invariant 3, directly: once think_closed, prose streams.
-    try testing.expectEqual(think_tags.StreamThinkGate.flush_text, think_tags.streamThinkGate("The visible answer.", true, true));
+    try testing.expectEqual(think_tags.StreamThinkGate.flush_text, think_tags.streamThinkGate(.text, "The visible answer.", true, true));
 }
 
 test "format corpus: no flush boundary lands inside a tool-call opener, any family" {
@@ -2465,6 +2466,7 @@ const markup_prose = [_][]const u8{
 
 fn settleCut(allocator: std.mem.Allocator, text: []const u8) !reply_mod.Settled {
     return reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = "length", .finish_details = null }, .{
+        .reading = .text,
         .stops = &.{},
         .normalize = true,
         .has_tools = true,
@@ -2546,7 +2548,7 @@ test "format corpus: a finished call ships and declines nothing, whatever markup
         const text = try std.mem.concat(allocator, u8, &.{ lead, call, tail });
         defer allocator.free(text);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
         const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer whole.deinit(allocator);
         const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
@@ -2571,6 +2573,7 @@ test "format corpus: a call whose inner call closed but whose wrapper did not sh
     for (open_wrapper) |call| for ([_]bool{ false, true }) |ended| {
         errdefer std.debug.print("[ended {}] {f}\n", .{ ended, std.zig.fmtString(call) });
         const got = try reply_mod.settle(allocator, .{ .text = call, .source = .whole, .finish_reason = if (ended) "stop" else "length", .finish_details = null }, .{
+            .reading = .text,
             .stops = &.{},
             .normalize = true,
             .has_tools = true,
@@ -2606,7 +2609,7 @@ test "format corpus: a call that lost its last value's close is declined and nam
         const text = try std.mem.concat(allocator, u8, &.{ shape.open, paris, tokyo, osaka, shape.close });
         defer allocator.free(text);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
         const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer whole.deinit(allocator);
         const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
@@ -3322,7 +3325,7 @@ test "format corpus: a string value parses back byte-exact from each family's ow
             defer allocator.free(rendered);
             const start = std.mem.indexOfPos(u8, rendered, std.mem.lastIndexOf(u8, rendered, "</think>").?, c.open).?;
             const end = std.mem.lastIndexOf(u8, rendered, c.close).? + c.close.len;
-            const parsed = (try tool_schema.parseForRequest(allocator, rendered[start..end], tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = dialect })) orelse return error.CallNotParsed;
+            const parsed = (try tool_schema.parseForRequest(allocator, rendered[start..end], tools, .{ .reading = .text, .allow_parallel = true, .autocorrect = true, .dialect = dialect })) orelse return error.CallNotParsed;
             defer {
                 for (parsed) |tc| {
                     allocator.free(tc.name);
@@ -3423,7 +3426,7 @@ test "format corpus: a continued turn holding only its thought ends where the fa
 /// Streams the thought in `raw` one byte at a time the way each chat stream path
 /// does and returns (tools path, no-tools path) deltas joined.
 fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {
-    const close_at = think_tags.indexOfThinkCloseTag(raw, 0).?.pos;
+    const close_at = think_tags.indexOfThinkCloseTag(.text, raw, 0).?.pos;
     const through_close = raw[0 .. close_at + "</think>".len];
 
     // Tools path: the open block's split, settled, then the closed split's rest.
@@ -3432,7 +3435,7 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     var streamed: usize = 0;
     for (1..through_close.len + 1) |i| {
         const buf = through_close[0..i];
-        const split = think_tags.splitThinkBlock(buf, true, opened);
+        const split = think_tags.splitThinkBlock(.text, buf, true, opened);
         const rc = split.reasoning_content orelse continue;
         const closed = i == through_close.len;
         const ready = if (closed) rc else think_tags.settledReasoning(rc);
@@ -3452,7 +3455,7 @@ fn streamThought(allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![
     const body = raw[body_from .. close_at + "</think>".len];
     for (body, 1..) |byte, n| {
         try pending.append(allocator, byte);
-        if (think_tags.thoughtClose(pending.items, n == body.len)) |close| {
+        if (think_tags.thoughtClose(.text, pending.items, n == body.len)) |close| {
             try plain.appendSlice(allocator, think_tags.closedThoughtDelta(pending.items[0..close.pos], shipped));
             break;
         }
@@ -3496,7 +3499,7 @@ test "format corpus: streamed reasoning adds up to the non-stream reasoning, on 
     for (edges) |raw| try cases.append(allocator, .{ .raw = raw, .opened = true });
     try testing.expect(cases.items.len > edges.len);
     for (cases.items) |c| {
-        const want = think_tags.splitThinkBlock(c.raw[0 .. think_tags.indexOfThinkCloseTag(c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
+        const want = think_tags.splitThinkBlock(.text, c.raw[0 .. think_tags.indexOfThinkCloseTag(.text, c.raw, 0).?.pos + "</think>".len], true, c.opened).reasoning_content orelse "";
         const got = try streamThought(allocator, c.raw, c.opened);
         defer for (got) |g| allocator.free(g);
         errdefer std.debug.print("\nraw: {s}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, want, got[0], got[1] });
@@ -3513,12 +3516,12 @@ fn appendReasoning(allocator: std.mem.Allocator, reasoning: *std.ArrayList(u8), 
 /// The (reasoning, content) a no-tools chat stream delivers for these tokens, through the `think_tags` steps
 /// its arms take: the thought arm streams what the closed thought will deliver, and the content arm
 /// (`ContentStream`) drops markers, re-opens a thought and joins the parts around it.
-fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opened: bool) ![2][]u8 {
+fn streamedReply(reading: think_tags.Reading, allocator: std.mem.Allocator, tokens: []const []const u8, opened: bool) ![2][]u8 {
     var reasoning = std.ArrayList(u8).empty;
     errdefer reasoning.deinit(allocator);
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
-    var content = think_tags.ContentStream{ .mark = .{ .on = true } };
+    var content = think_tags.ContentStream{ .reading = reading, .mark = .{ .on = true } };
     defer content.deinit(allocator);
     var thought_mark = think_tags.MarkupCut{ .on = true };
     var join = think_tags.ThoughtJoin{};
@@ -3559,9 +3562,9 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         }
         if (!in_think) continue;
         if (!think_has_token) try think_buf.appendSlice(allocator, tt);
-        if (!skipped and (think_buf.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(think_buf.items))) {
+        if (!skipped and (think_buf.items.len >= reading.open().len or !think_tags.thinkOpenerPossible(reading, think_buf.items))) {
             skipped = true;
-            const opener_len = think_tags.thinkOpenTagLenAt(think_buf.items) orelse
+            const opener_len = think_tags.thinkOpenLenAt(reading, think_buf.items) orelse
                 (if (std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) "<|channel>thought".len else null);
             if (opener_len) |l| {
                 var skip = l;
@@ -3572,7 +3575,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
             }
         }
         if (!skipped) continue;
-        if (thought_mark.thoughtClose(think_buf.items, over)) |close| {
+        if (thought_mark.thoughtClose(reading, think_buf.items, over)) |close| {
             const closed = think_tags.closedThoughtDelta(think_buf.items[0..close.pos], shipped);
             try appendReasoning(allocator, &reasoning, &join, closed[0..thought_mark.final(closed)]);
             join.close();
@@ -3596,7 +3599,7 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
         think_buf.shrinkRetainingCapacity(keep);
     }
     if (in_think) {
-        const rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped, shipped));
+        const rest = join.cutTail(think_tags.cutThoughtDelta(reading, think_buf.items, skipped, shipped));
         try appendReasoning(allocator, &reasoning, &join, rest[0..thought_mark.final(rest)]);
     } else {
         try out.appendSlice(allocator, try content.finish(allocator, join.closed));
@@ -3608,11 +3611,11 @@ fn streamedReply(allocator: std.mem.Allocator, tokens: []const []const u8, opene
 
 /// The non-stream (reasoning, content) of `raw` must equal the stream's for `tokens`; a stream may still
 /// ship exactly the same bytes.
-fn expectStreamMatchesReply(allocator: std.mem.Allocator, raw: []const u8, tokens: []const []const u8, opened: bool) !void {
-    const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, raw);
+fn expectStreamMatchesReply(reading: think_tags.Reading, allocator: std.mem.Allocator, raw: []const u8, tokens: []const []const u8, opened: bool) !void {
+    const norm = try think_tags.normalizeEmbeddedThinkBlocks(reading, allocator, raw);
     defer if (norm) |n| allocator.free(n);
-    const split = think_tags.splitThinkBlock(norm orelse raw, true, opened);
-    const got = try streamedReply(allocator, tokens, opened);
+    const split = think_tags.splitThinkBlock(reading, norm orelse raw, true, opened);
+    const got = try streamedReply(reading, allocator, tokens, opened);
     defer for (got) |g| allocator.free(g);
     const want_reasoning = split.reasoning_content orelse "";
     errdefer std.debug.print("\nraw: {s}\nnon-stream: {s} | {s}\nstream: {s} | {s}\n", .{ raw, want_reasoning, split.content, got[0], got[1] });
@@ -3672,7 +3675,7 @@ test "format corpus: a stream without tools ends where the non-stream reply cuts
     for (cases) |c| for ([_]usize{ 1, 2, 3, 5, 1000 }) |step| for ([_][]const []const u8{ &whole, &whole_calls }) |specials| {
         const tokens = try tokensOf(allocator, c.raw, specials, step);
         defer allocator.free(tokens);
-        try expectStreamMatchesReply(allocator, c.raw, tokens, c.opened);
+        try expectStreamMatchesReply(.text, allocator, c.raw, tokens, c.opened);
     };
 }
 
@@ -3683,7 +3686,7 @@ test "format corpus: a stream drops the whitespace leading a content part, insid
         .{ .raw = "Plan.</think>\n\nThe answer.", .tokens = &.{ "Plan", ".", "</think>", "\n\nThe", " answer", "." }, .opened = true },
         .{ .raw = "<think>t</think>A <think>u</think> B", .tokens = &.{ "<think>", "t", "</think>", "A", " ", "<think>", "u", "</think>", " B" }, .opened = false },
     };
-    for (cases) |c| try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+    for (cases) |c| try expectStreamMatchesReply(.text, allocator, c.raw, c.tokens, c.opened);
 }
 
 test "format corpus: a closer in content after the thought is dropped on the stream and the non-stream reply alike" {
@@ -3702,12 +3705,12 @@ test "format corpus: a closer in content after the thought is dropped on the str
         .{ .raw = "<think>t</think>Use `</think>", .tokens = &.{ "<think>", "t", "</think>", "Use `", "</think>" }, .opened = false, .content = "Use `" },
     };
     for (cases) |c| {
-        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(.text, allocator, c.raw);
         defer if (norm) |n| allocator.free(n);
-        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        const split = think_tags.splitThinkBlock(.text, norm orelse c.raw, true, c.opened);
         try testing.expectEqualStrings("t", split.reasoning_content.?);
         try testing.expectEqualStrings(c.content, split.content);
-        try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+        try expectStreamMatchesReply(.text, allocator, c.raw, c.tokens, c.opened);
     }
 }
 
@@ -3723,12 +3726,12 @@ test "format corpus: a thought re-opened after content is reasoning on the strea
         .{ .raw = "<think></think>A<think>u</think>B", .tokens = &.{ "<think>", "</think>", "A", "<think>", "u", "</think>", "B" }, .opened = false, .reasoning = "u", .content = "A\nB" },
     };
     for (cases) |c| {
-        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(.text, allocator, c.raw);
         defer if (norm) |n| allocator.free(n);
-        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        const split = think_tags.splitThinkBlock(.text, norm orelse c.raw, true, c.opened);
         try testing.expectEqualStrings(c.reasoning, split.reasoning_content.?);
         try testing.expectEqualStrings(c.content, split.content);
-        try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+        try expectStreamMatchesReply(.text, allocator, c.raw, c.tokens, c.opened);
     }
 }
 
@@ -3771,7 +3774,7 @@ test "format corpus: a think tag anywhere in content is the same bytes on the st
         for (0..at) |i| try tokens.append(allocator, answer[i..][0..1]);
         try tokens.appendSlice(allocator, tag);
         for (0..tail.len) |i| try tokens.append(allocator, tail[i..][0..1]);
-        try expectStreamMatchesReply(allocator, raw.items, tokens.items, false);
+        try expectStreamMatchesReply(.text, allocator, raw.items, tokens.items, false);
     };
 }
 
@@ -3795,9 +3798,9 @@ test "r173-f-stray-backtick: a backtick no later backtick pairs with hides no th
         .{ .raw = "<think>t</think>Use ` then <think>u", .opened = false, .reasoning = "t\n\nu", .content = "Use ` then", .in_content = true },
     };
     for (cases) |c| {
-        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, c.raw);
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(.text, allocator, c.raw);
         defer if (norm) |n| allocator.free(n);
-        const split = think_tags.splitThinkBlock(norm orelse c.raw, true, c.opened);
+        const split = think_tags.splitThinkBlock(.text, norm orelse c.raw, true, c.opened);
         errdefer std.debug.print("\nraw: {f}\nnon-stream: {?s} | {s}\n", .{ std.zig.fmtString(c.raw), split.reasoning_content, split.content });
         try testing.expectEqualStrings(c.reasoning, split.reasoning_content orelse "");
         try testing.expectEqualStrings(c.content, split.content);
@@ -3806,7 +3809,7 @@ test "r173-f-stray-backtick: a backtick no later backtick pairs with hides no th
         for (specials[@intFromBool(c.in_content)..]) |sp| for ([_]usize{ 1, 2, 3, 5, 1000 }) |step| {
             const tokens = try tokensOf(allocator, c.raw, sp, step);
             defer allocator.free(tokens);
-            try expectStreamMatchesReply(allocator, c.raw, tokens, c.opened);
+            try expectStreamMatchesReply(.text, allocator, c.raw, tokens, c.opened);
         };
     }
 }
@@ -3827,13 +3830,13 @@ test "r174-f-stream-channel-midreply: a Gemma thought opened after content is re
         var raw = std.ArrayList(u8).empty;
         defer raw.deinit(allocator);
         for (c.tokens) |t| try raw.appendSlice(allocator, t);
-        const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, raw.items);
+        const norm = try think_tags.normalizeEmbeddedThinkBlocks(.text, allocator, raw.items);
         defer if (norm) |n| allocator.free(n);
-        const split = think_tags.splitThinkBlock(norm orelse raw.items, true, c.opened);
+        const split = think_tags.splitThinkBlock(.text, norm orelse raw.items, true, c.opened);
         errdefer std.debug.print("\nraw: {f}\nnon-stream: {?s} | {s}\n", .{ std.zig.fmtString(raw.items), split.reasoning_content, split.content });
         try testing.expectEqualStrings(c.reasoning, split.reasoning_content orelse "");
         try testing.expectEqualStrings(c.content, split.content);
-        try expectStreamMatchesReply(allocator, raw.items, c.tokens, c.opened);
+        try expectStreamMatchesReply(.text, allocator, raw.items, c.tokens, c.opened);
     }
 }
 
@@ -3847,7 +3850,7 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     errdefer tools.deinit(allocator);
     var streamed: usize = 0;
     for (@max(first, 1)..cut + 1) |i| {
-        const rc = think_tags.splitThinkBlock(raw[0..i], true, opened).reasoning_content orelse "";
+        const rc = think_tags.splitThinkBlock(.text, raw[0..i], true, opened).reasoning_content orelse "";
         const ready = if (i == cut) rc else think_tags.settledReasoning(rc);
         if (think_tags.unstreamedReasoning(ready, streamed)) |fresh| {
             try tools.appendSlice(allocator, fresh);
@@ -3859,12 +3862,12 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
     errdefer plain.deinit(allocator);
     var held = std.ArrayList(u8).empty;
     defer held.deinit(allocator);
-    if (!opened) try held.appendSlice(allocator, think_tags.modelThinkOpener(false, raw[0..first]).?);
+    if (!opened) try held.appendSlice(allocator, think_tags.modelThinkOpener(.text, false, raw[0..first]).?);
     var consumed = false;
     var shipped = false;
     for (raw[first..cut]) |byte| {
         try held.append(allocator, byte);
-        if (!consumed and (held.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(held.items))) {
+        if (!consumed and (held.items.len >= "<think>".len or !think_tags.thinkOpenerPossible(.text, held.items))) {
             consumed = true;
             const l = think_tags.thinkOpenTagLenAt(held.items) orelse 0;
             std.mem.copyForwards(u8, held.items[0 .. held.items.len - l], held.items[l..]);
@@ -3878,7 +3881,7 @@ fn streamCutThought(allocator: std.mem.Allocator, raw: []const u8, cut: usize, o
         std.mem.copyForwards(u8, held.items[0..keep.len], keep);
         held.shrinkRetainingCapacity(keep.len);
     }
-    try plain.appendSlice(allocator, think_tags.cutThoughtDelta(held.items, consumed, shipped));
+    try plain.appendSlice(allocator, think_tags.cutThoughtDelta(.text, held.items, consumed, shipped));
     return .{ try tools.toOwnedSlice(allocator), try plain.toOwnedSlice(allocator) };
 }
 
@@ -3912,7 +3915,7 @@ test "format corpus: a thought cut by the length limit streams the non-stream re
         const first: usize = if (c.opened) 1 else "<think>".len;
         const end = std.mem.indexOf(u8, c.raw, "</think>").? + "</think>".len;
         for (first..end) |cut| {
-            const want = think_tags.splitThinkBlock(c.raw[0..cut], true, c.opened).reasoning_content orelse "";
+            const want = think_tags.splitThinkBlock(.text, c.raw[0..cut], true, c.opened).reasoning_content orelse "";
             const got = try streamCutThought(allocator, c.raw, cut, c.opened);
             defer for (got) |g| allocator.free(g);
             errdefer std.debug.print("\nraw: {s}\ncut: {d}\nwant: {any}\ntools: {any}\nplain: {any}\n", .{ c.raw, cut, want, got[0], got[1] });
@@ -4165,7 +4168,7 @@ test "format corpus: a stream ends on the non-stream content's tail, trailing wh
         .{ .raw = "1, 2, 3, ", .tokens = &.{ "1", ", ", "2", ", ", "3", ", " }, .opened = false },
         .{ .raw = "Done.\n\n", .tokens = &.{ "Done", ".\n\n" }, .opened = false },
     };
-    for (cases) |c| try expectStreamMatchesReply(allocator, c.raw, c.tokens, c.opened);
+    for (cases) |c| try expectStreamMatchesReply(.text, allocator, c.raw, c.tokens, c.opened);
 }
 
 test "format corpus: the text before a tool call streams as the non-stream preamble" {
@@ -4179,8 +4182,8 @@ test "format corpus: the text before a tool call streams as the non-stream pream
         .{ .raw = "Looking.  <tool_call>x</tool_call>", .tokens = &.{ "Looking", ".  " } },
     };
     for (cases) |c| {
-        const want = think_tags.visibleToolPreamble(think_tags.splitThinkBlock(c.raw, true, false).content);
-        var content = think_tags.ContentStream{};
+        const want = think_tags.visibleToolPreamble(think_tags.splitThinkBlock(.text, c.raw, true, false).content);
+        var content = think_tags.ContentStream{ .reading = .text };
         defer content.deinit(allocator);
         var got = std.ArrayList(u8).empty;
         defer got.deinit(allocator);
@@ -4286,7 +4289,7 @@ test "format corpus: an opener the model wrote and nothing more is a cut call: d
         const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", opener, after });
         defer allocator.free(text);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &stops, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
         const gen_finish = if (after.len > 0) "length" else finish;
         const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = gen_finish, .finish_details = null }, ask);
         defer whole.deinit(allocator);
@@ -4297,7 +4300,7 @@ test "format corpus: an opener the model wrote and nothing more is a cut call: d
         for ([_]reply_mod.Settled{ whole, streamed }) |got| {
             try testing.expect(got.reply == null);
             try testing.expect(got.declined != null);
-            const content = think_tags.splitThinkBlock(got.text, true, false).content;
+            const content = think_tags.splitThinkBlock(.text, got.text, true, false).content;
             try testing.expectEqualStrings("Let me check.", std.mem.trim(u8, content, " \n"));
         }
     };
@@ -4306,7 +4309,7 @@ test "format corpus: an opener the model wrote and nothing more is a cut call: d
 /// The bytes the reading's searches covered over `text`, and the open call it left.
 fn readWork(text: []const u8) struct { work: usize, open: ?usize } {
     const before = tool_reading.work;
-    var reader = tool_reading.Reader.init(text, false);
+    var reader = tool_reading.Reader.init(.text, text, false);
     var open: ?usize = null;
     while (reader.next()) |c| if (c.end == null) {
         open = c.start;
@@ -4386,7 +4389,7 @@ test "format corpus: a call whose value spells another call's markup is read as 
     for (calls, 0..) |call, k| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .arg_key, .dsml }) |dialect| {
         const want = if (k == 2 or k == 3) glm_value else value;
         errdefer std.debug.print("[{?s}] {f}\n", .{ if (dialect) |d| @tagName(d) else null, std.zig.fmtString(call) });
-        const read = (try tool_calls_mod.parseToolCallsAs(allocator, call, dialect)) orelse return error.WholeCallDropped;
+        const read = (try tool_calls_mod.parseToolCallsAs(.text, allocator, call, dialect)) orelse return error.WholeCallDropped;
         defer {
             for (read) |tc| {
                 allocator.free(tc.name);
@@ -4419,7 +4422,7 @@ test "format corpus: a think tag a call's value spells is the value's text, what
         const text = try std.mem.concat(allocator, u8, &.{ lead.text, call });
         defer allocator.free(text);
         errdefer std.debug.print("[{s} normalize {}] {f}\n", .{ finish, normalize, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = normalize, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = lead.opens };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = normalize, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = lead.opens };
         const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer whole.deinit(allocator);
         const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
@@ -4449,10 +4452,10 @@ test "format corpus: a thought closer a call's value spells never ends the thoug
         const text = try std.mem.concat(allocator, u8, &.{ "plan", call, if (ends) "</think>Paris" else "" });
         defer allocator.free(text);
         errdefer std.debug.print("[ends {} streamed {}] {f}\n", .{ ends, streamed, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = null, .opens_think = true };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = null, .opens_think = true };
         const got = try reply_mod.settle(allocator, .{ .text = text, .source = if (streamed) .{ .gated = null } else .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer got.deinit(allocator);
-        const split = think_tags.splitThinkBlock(got.text, true, true);
+        const split = think_tags.splitThinkBlock(.text, got.text, true, true);
         try testing.expectEqualStrings("plan", split.reasoning_content orelse "");
         try testing.expect(got.declined == null);
         if (ends) {
@@ -4489,13 +4492,13 @@ test "format corpus: no call markup reaches content, finished, declined or read 
         const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", c.text });
         defer allocator.free(text);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
         const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer whole.deinit(allocator);
         const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
         defer streamed.deinit(allocator);
         for ([_]reply_mod.Settled{ whole, streamed }) |got| {
-            const content = if (got.reply) |r| r.preamble else think_tags.splitThinkBlock(got.text, true, false).content;
+            const content = if (got.reply) |r| r.preamble else think_tags.splitThinkBlock(.text, got.text, true, false).content;
             try testing.expectEqualStrings("Let me check.", std.mem.trim(u8, content, " \n"));
             if (!c.call) try testing.expect(got.declined == null and got.reply == null);
         }
@@ -4532,7 +4535,7 @@ test "r173-f-span-cut-call: a call cut after a stray backtick is declined and na
         const plain = try std.mem.concat(allocator, u8, &.{ "I use  here ", body });
         defer allocator.free(plain);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(stray) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = weather_tool_schema, .allow_parallel = true, .dialect = null, .opens_think = false };
         const want = try reply_mod.settle(allocator, .{ .text = plain, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer want.deinit(allocator);
         try testing.expect(want.reply == null);
@@ -4542,7 +4545,7 @@ test "r173-f-span-cut-call: a call cut after a stray backtick is declined and na
             defer got.deinit(allocator);
             try testing.expect(got.reply == null);
             try testing.expectEqualStrings(want_name, (got.declined orelse return error.StrayNotDeclined).name orelse return error.StrayNotNamed);
-            try testing.expectEqualStrings("I use ` here", std.mem.trim(u8, think_tags.splitThinkBlock(got.text, true, false).content, " \n"));
+            try testing.expectEqualStrings("I use ` here", std.mem.trim(u8, think_tags.splitThinkBlock(.text, got.text, true, false).content, " \n"));
         }
     };
 }
@@ -4571,7 +4574,7 @@ test "r173-f-callend-linear: a value that spells its call's closer thousands of 
             try text.appendSlice(allocator, c.tail);
             errdefer std.debug.print("{f} x{d}\n", .{ std.zig.fmtString(c.head), k });
             const before = tool_reading.work;
-            var reader = tool_reading.Reader.init(text.items, false);
+            var reader = tool_reading.Reader.init(.text, text.items, false);
             const call = reader.next() orelse return error.CallNotRead;
             try testing.expectEqual(@as(?usize, text.items.len), call.end);
             try testing.expect(reader.next() == null);
@@ -4605,7 +4608,7 @@ test "format corpus: a call named while it is written keeps that name to its end
         // Two calls, the second one pending at most cuts.
         const text = try std.mem.concat(allocator, u8, &.{ "Let me check.\n", call, "\n", call });
         defer allocator.free(text);
-        const whole = (try reply_mod.parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse return error.NoCalls;
+        const whole = (try reply_mod.parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })) orelse return error.NoCalls;
         defer {
             for (whole) |c| {
                 allocator.free(c.name);
@@ -4621,7 +4624,7 @@ test "format corpus: a call named while it is written keeps that name to its end
         var cut: usize = 0;
         while (cut <= text.len) : (cut += 1) {
             if (cut < text.len and text[cut] & 0xC0 == 0x80) continue;
-            const got = try reply_mod.pendingCall(allocator, text[0..cut], .{ .dialect = null }, tools);
+            const got = try reply_mod.pendingCall(allocator, text[0..cut], .{ .reading = .text, .dialect = null }, tools);
             defer if (got) |g| g.deinit(allocator);
             errdefer std.debug.print("cut at {d}: {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
             if (got) |p| {
@@ -4714,21 +4717,21 @@ test "r174-f-closer-monotone: a thought that spells a mangled call's closer read
     // A closer is judged by the bytes before it: a quote appended after `</think>` no longer flips the call's end back.
     const allocator = testing.allocator;
     const raw = "plan <tool_call>{\"name\":\"f\",\"arguments\":{\"k\":\"v}}</tool_call> done</think>answer \"q";
-    const want = think_tags.splitThinkBlock(raw, true, true);
+    const want = think_tags.splitThinkBlock(.text, raw, true, true);
     // The think closer is one token, as every served tokenizer spells it: the boundaries land at 66, 74 and 83 (the quote that flipped it).
     for ([_]usize{ 1, 2, 7, 1000 }) |step| {
         const tokens = try tokensOf(allocator, raw, &.{"</think>"}, step);
         defer allocator.free(tokens);
         errdefer std.debug.print("\nstep {d}, whole: {?s} | {s}\n", .{ step, want.reasoning_content, want.content });
-        try expectStreamMatchesReply(allocator, raw, tokens, true);
+        try expectStreamMatchesReply(.text, allocator, raw, tokens, true);
     }
     // No prefix is split earlier than the whole reply splits.
-    var scan: think_tags.ThinkScan = .{};
+    var scan: think_tags.ThinkScan = .{ .reading = .text };
     for (0..raw.len + 1) |n| {
         const got = think_tags.streamThinkGateScan(raw[0..n], true, false, true, &scan);
         if (got != .split_think) continue;
-        errdefer std.debug.print("\nprefix {d} splits; the whole reply's close: {any}\n", .{ n, think_tags.indexOfThinkCloseTag(raw, 0) });
-        try testing.expectEqual(think_tags.indexOfThinkCloseTag(raw, 0).?.pos, think_tags.indexOfThinkCloseTag(raw[0..n], 0).?.pos);
+        errdefer std.debug.print("\nprefix {d} splits; the whole reply's close: {any}\n", .{ n, think_tags.indexOfThinkCloseTag(.text, raw, 0) });
+        try testing.expectEqual(think_tags.indexOfThinkCloseTag(.text, raw, 0).?.pos, think_tags.indexOfThinkCloseTag(.text, raw[0..n], 0).?.pos);
     }
 }
 
@@ -4737,12 +4740,12 @@ test "r174-f-closer-monotone: a string value that spells braces before a closer 
     // before the closer can say of a dropped quote; a later quote never rereads it.
     const open_value = "<tool_call>{\"name\":\"w\",\"arguments\":{\"c\":\"x = {}</tool_call> y</think>\"}}</tool_call>";
     const closed_value = "<tool_call>{\"name\":\"w\",\"arguments\":{\"c\":\"}}</tool_call> y</think>\"}}</tool_call>";
-    try testing.expectEqual(@as(?think_tags.TagAt, null), think_tags.indexOfThinkCloseTag(open_value, 0));
-    const read = think_tags.indexOfThinkCloseTag(closed_value, 0) orelse return error.CloseNotRead;
+    try testing.expectEqual(@as(?think_tags.TagAt, null), think_tags.indexOfThinkCloseTag(.text, open_value, 0));
+    const read = think_tags.indexOfThinkCloseTag(.text, closed_value, 0) orelse return error.CloseNotRead;
     try testing.expectEqual(std.mem.indexOf(u8, closed_value, "</think>").?, read.pos);
     // The same at every length of the text that holds the closer.
     for (std.mem.indexOf(u8, closed_value, "</tool_call>").? + "</tool_call>".len..closed_value.len + 1) |n| {
-        const got = think_tags.indexOfThinkCloseTag(closed_value[0..n], 0);
+        const got = think_tags.indexOfThinkCloseTag(.text, closed_value[0..n], 0);
         try testing.expectEqual(n >= read.pos + read.len, got != null);
     }
 }
@@ -4752,7 +4755,7 @@ test "r174-f-closer-monotone: a string value that spells braces before a closer 
 /// split at the close and at the end, must read the same: the tag dialects end a value by what follows its close.
 fn expectHeldThoughtMatchesReply(raw: []const u8) !void {
     const allocator = testing.allocator;
-    const want = think_tags.splitThinkBlock(raw, true, true);
+    const want = think_tags.splitThinkBlock(.text, raw, true, true);
     errdefer std.debug.print("\nraw: {f}\nwhole: {?s} | {s}\n", .{ std.zig.fmtString(raw), want.reasoning_content, want.content });
     // The cell holds a flip: the call's own closers end it at the close, and the reply's last bytes undo that.
     try testing.expectEqualStrings("", want.content);
@@ -4761,7 +4764,7 @@ fn expectHeldThoughtMatchesReply(raw: []const u8) !void {
     for (specials) |sp| for ([_]usize{ 1, 3, 1000 }) |step| {
         const tokens = try tokensOf(allocator, raw, sp, step);
         defer allocator.free(tokens);
-        try expectStreamMatchesReply(allocator, raw, tokens, true);
+        try expectStreamMatchesReply(.text, allocator, raw, tokens, true);
     };
 }
 
@@ -4791,8 +4794,8 @@ fn toolsArmDeltas(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
     var streamed: usize = 0;
     var closed = false;
     var hold: think_tags.ToolHoldScan = .{};
-    var gate: think_tags.ThinkScan = .{};
-    var thought: think_tags.ThoughtScan = .{};
+    var gate: think_tags.ThinkScan = .{ .reading = .text };
+    var thought: think_tags.ThoughtScan = .{ .think = .{ .reading = .text } };
     for (tokens, 0..) |tok, i| {
         try buf.appendSlice(allocator, tok);
         const undelivered = buf.items[delivered..];
@@ -4805,7 +4808,7 @@ fn toolsArmDeltas(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
                 }
             },
             .split_think => {
-                const split = think_tags.splitThinkBlock(undelivered, true, true);
+                const split = think_tags.splitThinkBlock(.text, undelivered, true, true);
                 if (split.reasoning_content) |rc| if (think_tags.unstreamedReasoning(rc, streamed)) |fresh| try out.print(allocator, "[{d} r:{s}]", .{ i, fresh });
                 if (split.content.len > 0) try out.print(allocator, "[{d} c:{s}]", .{ i, split.content });
                 buf.clearRetainingCapacity();
@@ -4860,7 +4863,7 @@ test "format corpus: an arg_key call that lost its close, its value's or its own
         const text = try std.mem.concat(allocator, u8, &.{ open, lost, next, if (open.len > 0) hy4_close else "" });
         defer allocator.free(text);
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
         const whole = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer whole.deinit(allocator);
         const streamed = try reply_mod.settle(allocator, .{ .text = text, .source = .{ .gated = null }, .finish_reason = finish, .finish_details = null }, ask);
@@ -4882,7 +4885,7 @@ test "format corpus: a stream and the whole reply agree at every cut of two arg_
     for ([_][]const u8{ "", hy4_open }) |open| {
         const text = try std.mem.concat(allocator, u8, &.{ open, lost, next, if (open.len > 0) hy4_close else "" });
         defer allocator.free(text);
-        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
+        const ask: reply_mod.Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
         for (0..text.len + 1) |cut| {
             errdefer std.debug.print("[cut {d}] {f}\n", .{ cut, std.zig.fmtString(text[0..cut]) });
             const whole = try reply_mod.settle(allocator, .{ .text = text[0..cut], .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
@@ -4900,4 +4903,202 @@ test "format corpus: a stream and the whole reply agree at every cut of two arg_
             try testing.expectEqualStrings(if (whole.declined) |d| d.name orelse "" else "", if (streamed.declined) |d| d.name orelse "" else "");
         }
     }
+}
+
+
+/// The (reasoning, content) a chat stream WITH tools delivers: the tools arm (`generation_stream`'s gated path) keeps the
+/// text whole, streams an open thought through `heldThoughtSoFarScan`, splits at a close the gate sees, flushes prose
+/// through the content arm, and splits what is left once the reply ends.
+fn streamedToolsReply(reading: think_tags.Reading, allocator: std.mem.Allocator, tokens: []const []const u8, opens_think: bool) ![2][]u8 {
+    var reasoning = std.ArrayList(u8).empty;
+    errdefer reasoning.deinit(allocator);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var content = think_tags.ContentStream{ .reading = reading, .opens_thoughts = false };
+    defer content.deinit(allocator);
+    var join = think_tags.ThoughtJoin{};
+    var text_buf = std.ArrayList(u8).empty;
+    defer text_buf.deinit(allocator);
+    var pending = std.ArrayList([]const u8).empty;
+    defer pending.deinit(allocator);
+    var delivered: usize = 0;
+    var think_scan = think_tags.ThinkScan{ .reading = reading };
+    var thought_scan = think_tags.ThoughtScan{ .think = .{ .reading = reading } };
+    var tool_scan = think_tags.ToolHoldScan{};
+    var think_closed = false;
+    var streamed: usize = 0;
+    for (tokens) |tt| {
+        try text_buf.appendSlice(allocator, tt);
+        try pending.append(allocator, tt);
+        const buf = text_buf.items;
+        const undelivered = buf[delivered..];
+        if (think_tags.streamShouldBufferForToolsScan(buf, &tool_scan)) continue;
+        switch (think_tags.streamThinkGateScan(buf, true, think_closed, opens_think, &think_scan)) {
+            .hold_thinking => if (think_tags.heldThoughtSoFarScan(undelivered, opens_think, think_closed, &tool_scan, &thought_scan)) |settled| {
+                if (think_tags.unstreamedReasoning(settled, streamed)) |fresh| {
+                    try appendReasoning(allocator, &reasoning, &join, fresh);
+                    streamed = settled.len;
+                }
+            },
+            .split_think => {
+                const split = think_tags.splitThinkBlock(reading, undelivered, true, opens_think);
+                pending.clearRetainingCapacity();
+                text_buf.clearRetainingCapacity();
+                delivered = 0;
+                think_scan.reset();
+                tool_scan = .{};
+                thought_scan.reset();
+                think_closed = true;
+                if (split.reasoning_content) |rc| if (think_tags.unstreamedReasoning(rc, streamed)) |fresh| try appendReasoning(allocator, &reasoning, &join, fresh);
+                join.close();
+                streamed = 0;
+                content.endPart();
+                if (split.content.len > 0) switch (try content.deliver(allocator, split.content)) {
+                    .send => |bytes| try out.appendSlice(allocator, bytes),
+                    else => {},
+                };
+            },
+            .flush_text => {
+                for (pending.items) |t| try content.arrive(allocator, t);
+                while (try content.ready(allocator, false, true)) |r| switch (r) {
+                    .opens => unreachable,
+                    .step => |st| switch (st.step) {
+                        .send => |bytes| try out.appendSlice(allocator, bytes),
+                        else => {},
+                    },
+                };
+                pending.clearRetainingCapacity();
+                delivered = buf.len;
+                thought_scan.reset();
+            },
+        }
+    }
+    var rest = std.ArrayList(u8).empty;
+    defer rest.deinit(allocator);
+    for (pending.items) |t| try rest.appendSlice(allocator, t);
+    const norm = try think_tags.normalizeEmbeddedThinkBlocks(reading, allocator, rest.items);
+    defer if (norm) |n| allocator.free(n);
+    const split = think_tags.splitThinkBlock(reading, norm orelse rest.items, true, opens_think and !think_closed);
+    try out.appendSlice(allocator, try content.finish(allocator, join.closed and split.content.len == 0));
+    if (think_tags.unstreamedReasoning(split.reasoning_content orelse "", streamed)) |fresh| try appendReasoning(allocator, &reasoning, &join, fresh);
+    try out.appendSlice(allocator, split.content);
+    const r = try reasoning.toOwnedSlice(allocator);
+    errdefer allocator.free(r);
+    return .{ r, try out.toOwnedSlice(allocator) };
+}
+
+const tk_open = think_tags.Reading.token.open();
+const tk_close = think_tags.Reading.token.close();
+
+/// The model's own think tokens, as a reply's text spells them, around text a plain piece spells.
+const TokenCell = struct {
+    name: []const u8,
+    tokens: []const []const u8,
+    /// The prompt ended inside a thought.
+    opened: bool,
+    reasoning: []const u8,
+    content: []const u8,
+};
+
+const token_cells = [_]TokenCell{
+    .{ .name = "a close spelled by plain pieces stays in the thought", .opened = false, .reasoning = "reason about </think> tags", .content = "answer", .tokens = &.{ tk_open, "reason about ", "</", "think", ">", " tags", tk_close, " answer" } },
+    .{ .name = "the same in a thought the prompt opened", .opened = true, .reasoning = "reason about </think> tags", .content = "answer", .tokens = &.{ "reason about ", "</", "think", ">", " tags", tk_close, " answer" } },
+    .{ .name = "a close spelled by one plain piece stays in the thought", .opened = true, .reasoning = "plan </think> more", .content = "done", .tokens = &.{ "plan ", "</think>", " more", tk_close, "done" } },
+    .{ .name = "a close quoted in a code span of the thought", .opened = true, .reasoning = "write `</think>` last", .content = "ok", .tokens = &.{ "write `", "</", "think", ">", "` last", tk_close, "ok" } },
+    .{ .name = "an opener spelled by plain pieces opens nothing in the answer", .opened = true, .reasoning = "t", .content = "use <think> to open", .tokens = &.{ "t", tk_close, "use ", "<", "think", ">", " to open" } },
+    .{ .name = "a close spelled by plain pieces in the answer is text", .opened = true, .reasoning = "t", .content = "the tag </think> ends it", .tokens = &.{ "t", tk_close, "the tag ", "</", "think", ">", " ends it" } },
+    .{ .name = "a thought the length limit cut keeps the plain close", .opened = false, .reasoning = "plan </think> more", .content = "", .tokens = &.{ tk_open, "plan ", "</", "think", ">", " more" } },
+    .{ .name = "a thought re-opened after content", .opened = false, .reasoning = "t\n\nu </think> v", .content = "A\nB", .tokens = &.{ tk_open, "t", tk_close, "A ", tk_open, "u ", "</", "think", ">", " v", tk_close, "B" } },
+    .{ .name = "a closer the model repeats in content is dropped", .opened = false, .reasoning = "t", .content = "391391", .tokens = &.{ tk_open, "t", tk_close, "391", tk_close, "391" } },
+    .{ .name = "a special token inside a code span is still a tag", .opened = false, .reasoning = "t", .content = "Use `` here", .tokens = &.{ tk_open, "t", tk_close, "Use `", tk_close, "` here" } },
+    // A tag no scan consumes stays in the delivered bytes as the tag the model wrote, and never with its lead.
+    .{ .name = "an opener token inside a thought is text of the thought", .opened = false, .reasoning = "a <think>b", .content = "c", .tokens = &.{ tk_open, "a ", tk_open, "b", tk_close, "c" } },
+};
+
+fn wholeReply(reading: think_tags.Reading, allocator: std.mem.Allocator, raw: []const u8, opened: bool) ![2][]u8 {
+    const norm = try think_tags.normalizeEmbeddedThinkBlocks(reading, allocator, raw);
+    defer if (norm) |n| allocator.free(n);
+    const split = think_tags.splitThinkBlock(reading, norm orelse raw, true, opened);
+    const r = try allocator.dupe(u8, split.reasoning_content orelse "");
+    errdefer allocator.free(r);
+    return .{ r, try allocator.dupe(u8, split.content) };
+}
+
+test "format corpus: a think tag is a special token the model wrote, never plain pieces that spell it, on every stream arm and the whole reply" {
+    const allocator = testing.allocator;
+    for (token_cells) |c| {
+        var raw = std.ArrayList(u8).empty;
+        defer raw.deinit(allocator);
+        for (c.tokens) |t| try raw.appendSlice(allocator, t);
+        const arms = [_]struct { name: []const u8, got: [2][]u8 }{
+            .{ .name = "whole", .got = try wholeReply(.token, allocator, raw.items, c.opened) },
+            .{ .name = "stream", .got = try streamedReply(.token, allocator, c.tokens, c.opened) },
+            .{ .name = "tools stream", .got = try streamedToolsReply(.token, allocator, c.tokens, c.opened) },
+        };
+        defer for (arms) |a| for (a.got) |g| allocator.free(g);
+        // What a client receives is the JSON text of these bytes: it holds what the model wrote, never a tag's lead.
+        for (arms) |a| for ([_]*const fn (std.mem.Allocator, []const u8) anyerror![]const u8{ http.jsonEscape, responses_mod.jsonEscape }) |escape| {
+            errdefer std.debug.print("\ncell: {s}\narm: {s}\nwant: {s} | {s}\ngot:  {s} | {s}\n", .{ c.name, a.name, c.reasoning, c.content, a.got[0], a.got[1] });
+            for ([_][2][]const u8{ .{ c.reasoning, a.got[0] }, .{ c.content, a.got[1] } }) |pair| {
+                const want = try escape(allocator, pair[0]);
+                defer allocator.free(want);
+                const got = try escape(allocator, pair[1]);
+                defer allocator.free(got);
+                try testing.expectEqualStrings(want, got);
+            }
+        };
+    }
+}
+
+test "format corpus: a tokenizer whose think tags are not added tokens reads them as text, on the stream and the whole reply alike" {
+    // Only the token reading tells a quote from the tag; without it the first spelling of a close ends the thought.
+    const allocator = testing.allocator;
+    const tokens = [_][]const u8{ "reason about ", "</", "think", ">", " tags", "</think>", " answer" };
+    var raw = std.ArrayList(u8).empty;
+    defer raw.deinit(allocator);
+    for (tokens) |t| try raw.appendSlice(allocator, t);
+    const whole = try wholeReply(.text, allocator, raw.items, true);
+    defer for (whole) |g| allocator.free(g);
+    try testing.expectEqualStrings("reason about", whole[0]);
+    try testing.expectEqualStrings("tags answer", whole[1]);
+    try expectStreamMatchesReply(.text, allocator, raw.items, &tokens, true);
+}
+
+test "format corpus: the lead of a think tag reaches no call and no stop-cut tail, whatever token a value or a stop splits" {
+    const allocator = testing.allocator;
+    // A think tag token a call's value holds is the tag the model wrote.
+    const call = "<tool_call>\n<function=write_file>\n<parameter=content>\nhas " ++ tk_close ++ " inside\n</parameter>\n</function>\n</tool_call>";
+    const raw = tk_open ++ "plan" ++ tk_close ++ call;
+    const calls = (try tool_schema.parseForRequest(allocator, raw, null, .{ .reading = .token, .allow_parallel = true, .autocorrect = false, .dialect = .function_tag })) orelse return error.NoCall;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "has </think> inside") != null);
+    for ([_][]const u8{ calls[0].name, calls[0].arguments }) |text| try testing.expect(std.mem.indexOf(u8, text, "\u{fdd1}") == null);
+    // A stop that begins inside a tag cuts the reply between the tag's lead and the tag.
+    const settled = try reply_mod.settle(allocator, .{ .text = "reasoning" ++ tk_close ++ "answer", .source = .whole, .finish_reason = "stop", .finish_details = null }, .{
+        .reading = .token,
+        .stops = &.{"</think>"},
+        .normalize = true,
+        .has_tools = false,
+        .tools_json = null,
+        .allow_parallel = true,
+        .dialect = null,
+        .opens_think = true,
+    });
+    defer settled.deinit(allocator);
+    const split = think_tags.splitThinkBlock(.token, settled.text, true, true);
+    for ([_][]const u8{ split.reasoning_content orelse "", split.content }) |text| {
+        const sent = try http.jsonEscape(allocator, text);
+        defer allocator.free(sent);
+        try testing.expect(std.mem.indexOf(u8, sent, "\u{fdd1}") == null);
+    }
+    const reasoning = try http.jsonEscape(allocator, split.reasoning_content orelse "");
+    defer allocator.free(reasoning);
+    try testing.expectEqualStrings("\"reasoning\"", reasoning);
 }

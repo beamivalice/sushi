@@ -1,6 +1,7 @@
 //! The HTTP transport of the server: the bind address, the response writers and their debug log, the error body, and the
 //! JSON string escape every body goes through. No request is interpreted here.
 const chat_mod = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
 const http_conn = @import("http_conn.zig");
 const instr = @import("metrics.zig");
 const log = @import("log.zig");
@@ -467,7 +468,10 @@ fn statusCode(status: []const u8) u32 {
 /// THE JSON string escaper for every response body. Every string here is model bytes
 /// somewhere and a token is a BPE fragment, so invalid UTF-8 is sanitized INSIDE the
 /// escaper (one U+FFFD per bad sequence); valid input passes through byte for byte.
-pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+pub fn jsonEscape(allocator: std.mem.Allocator, generated: []const u8) ![]const u8 {
+    const bare = try think_tags.withoutLead(allocator, generated);
+    defer if (bare) |b| allocator.free(b);
+    const input = bare orelse generated;
     if (std.unicode.utf8ValidateSlice(input)) return jsonEscapeValid(allocator, input);
     const clean = try chat_mod.utf8Sanitize(allocator, input);
     defer allocator.free(clean);

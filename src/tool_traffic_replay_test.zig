@@ -118,7 +118,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
 
         // Mirror the server exactly: normalize → parse → (bare-JSON inference is
         // schema-dependent and skipped here) → coerce.
-        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(testing.allocator, raw);
+        const normalized = try think_tags.normalizeEmbeddedThinkBlocks(.text, testing.allocator, raw);
         defer if (normalized) |n| testing.allocator.free(n);
         const text: []const u8 = normalized orelse raw;
 
@@ -134,7 +134,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         if (calls == null) {
             // Nothing parsed as a call ⇒ the text is shown to the user
             // (content side of the always-delivered split, same as the server).
-            const content = think_tags.splitThinkBlock(text, true, false).content;
+            const content = think_tags.splitThinkBlock(.text, text, true, false).content;
             // Legitimate output has AT MOST ONE close marker per style per turn
             // (one thought block). The strip logic guarantees no leak for that.
             // A model that emits ≥2 bare closes with no matching structure is

@@ -154,7 +154,7 @@ fn emitConstrainedResponses(a: std.mem.Allocator, stream: *Conn, seq: *u64, reas
     }
 }
 
-pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: sampler.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !think_tags.ThinkSplit {
+pub fn splitConstrainedResponse(reading: think_tags.Reading, allocator: std.mem.Allocator, routed: *?rp_mod.Delivery, sampling: sampler.SamplingParams, text: []const u8, payload_byte: ?usize, keep_markup: bool, opened: bool) !think_tags.ThinkSplit {
     if (sampling.constraint) |c| {
         if (c.proto) |p| {
             routed.* = rp_mod.Delivery.init(p);
@@ -166,7 +166,7 @@ pub fn splitConstrainedResponse(allocator: std.mem.Allocator, routed: *?rp_mod.D
             return .{ .reasoning_content = if (reasoning.len == 0) null else reasoning, .content = d.content.items };
         }
     }
-    return if (keep_markup) think_tags.splitThinkBlockKeepingMarkup(text, true, opened) else think_tags.splitThinkBlock(text, true, opened);
+    return if (keep_markup) think_tags.splitThinkBlockKeepingMarkup(reading, text, true, opened) else think_tags.splitThinkBlock(reading, text, true, opened);
 }
 
 /// Wrap a Responses-API streaming event payload with `sequence_number` (which
@@ -1026,11 +1026,12 @@ fn handleResponsesInner(
         // dropped (thinking-off is enforced prompt-side, noThinkTailSuffix).
         // Prompt-derived, never flag-derived — see the chat streaming arm.
         const constrained_proto = generate_mod.payloadRouted(sampling.constraint);
+        const reading = generation_stream.replyReading(tok, sampling);
         var in_think_block = promptOpensThink(allocator, tok, prompt_ids) and !constrained_proto;
         var delivery: ?rp_mod.Delivery = if (constrained_proto) rp_mod.Delivery.init(sampling.constraint.?.proto.?) else null;
         defer if (delivery) |*d| d.deinit(allocator);
         var channel_armed = false; // the `<|channel>` marker that may open a Gemma 4 thought
-        var content: think_tags.ContentStream = .{ .mark = .{ .on = !active_has_tools }, .opens_thoughts = !active_has_tools };
+        var content: think_tags.ContentStream = .{ .reading = reading, .mark = .{ .on = !active_has_tools }, .opens_thoughts = !active_has_tools };
         defer content.deinit(allocator);
         var thought_mark: think_tags.MarkupCut = .{ .on = !active_has_tools };
         var join: think_tags.ThoughtJoin = .{};
@@ -1083,7 +1084,7 @@ fn handleResponsesInner(
             }
             const token_text = if (reply_over) try allocator.alloc(u8, 0) else if (tail_flush) try stop_gate.finish(allocator) else blk: {
                 try token_ids_buf.append(allocator, token_id);
-                const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
+                const raw_decoded = try think_tags.decodeReply(allocator, tok, reading, &[_]u32{token_id});
                 defer allocator.free(raw_decoded);
                 if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
                 break :blk try stop_gate.push(allocator, raw_decoded);
@@ -1113,6 +1114,7 @@ fn handleResponsesInner(
                     .call_item_id = &call_item_id,
                     .call_item_index = &call_item_index,
                 }, raw_buf.items, .{
+                    .reading = reading,
                     .dialect = try chat_mod.callDialect(allocator, chat_config),
                     .opens_think = promptOpensThink(allocator, tok, prompt_ids),
                 }, active_tools_json, root.get("tools"))
@@ -1166,9 +1168,9 @@ fn handleResponsesInner(
                 if (!think_has_token) try think_buf.appendSlice(allocator, token_text);
 
                 // Skip a literal think opener if the template did not pre-inject one.
-                if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
-                    if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
-                        var skip: usize = 7;
+                if (!skipped_think_open and (think_buf.items.len >= reading.open().len or !think_tags.thinkOpenerPossible(reading, think_buf.items))) {
+                    if (std.mem.startsWith(u8, think_buf.items, reading.open())) {
+                        var skip: usize = reading.open().len;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                         const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                         think_buf.clearAndFree(allocator);
@@ -1192,7 +1194,7 @@ fn handleResponsesInner(
 
                 // Detect close tag (</think> or <channel|>).
                 // A think close that waits on a backtick's partner is no close yet; the reply's end settles it.
-                if (thought_mark.thoughtClose(think_buf.items, reply_over)) |m| {
+                if (thought_mark.thoughtClose(reading, think_buf.items, reply_over)) |m| {
                     const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                     const before = closed[0..thought_mark.final(closed)];
                     thought_shipped = false;
@@ -1249,7 +1251,7 @@ fn handleResponsesInner(
         }
 
         // Flush any remaining think buffer (no close tag found) as reasoning.
-        const think_rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+        const think_rest = join.cutTail(think_tags.cutThoughtDelta(reading, think_buf.items, skipped_think_open, thought_shipped));
         const think_tail = think_rest[0..thought_mark.final(think_rest)];
         if (!client_gone and in_think_block and !active_has_tools) {
             try emitResponsesReasoning(allocator, stream, seq_num, &streamed_reasoning_id, &streamed_reasoning_index, &streamed_reasoning_started, reasoningItemIndex(live_output_index, streamed_message_started, streamed_message_index), &join, think_tail);
@@ -1290,7 +1292,9 @@ fn handleResponsesInner(
 
     // ── apply stop sequences, split calls ──
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    const reading = generation_stream.replyReading(tok, sampling);
     var ended = try reply_mod.settle(allocator, generation_stream.generatedOf(&result), .{
+        .reading = reading,
         .stops = stop_sequences.items,
         .normalize = !generate_mod.payloadRouted(sampling.constraint),
         .has_tools = active_has_tools,
@@ -1316,7 +1320,7 @@ fn handleResponsesInner(
     // never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
+    const think_split = try splitConstrainedResponse(reading, allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
     const reasoning_text: ?[]const u8 = think_split.reasoning_content;
     const visible_text: []const u8 = think_split.content;
 
@@ -2106,9 +2110,9 @@ fn beatFunctionCall(
     if (stream.ws_mode == null) {
         if (try progress.beat(allocator, stream.io, buffered, origin, tools_json, .{ .closed_thought_first = true })) |beat| {
             if (beat == .open) {
-                const norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, buffered);
+                const norm = try think_tags.normalizeEmbeddedThinkBlocks(origin.reading, allocator, buffered);
                 defer if (norm) |n| allocator.free(n);
-                const split = think_tags.splitThinkBlock(norm orelse buffered, true, origin.opens_think);
+                const split = think_tags.splitThinkBlock(origin.reading, norm orelse buffered, true, origin.opens_think);
                 if (split.reasoning_content) |reasoning| {
                     try emitResponsesReasoning(allocator, stream, seq, live.reasoning_id, live.reasoning_index, live.reasoning_started, reasoningItemIndex(live.live_output_index.*, live.message_started.*, live.message_index.*), live.join, reasoning);
                     if (live.reasoning_started.* and !live.message_started.*) live.live_output_index.* += 1;
@@ -2459,7 +2463,7 @@ test "a call opened early on a keepalive names its namespace" {
         .call_item_index = &call_item_index,
     };
     const writing = "<tool_call>\n<function=close_agent>\n<parameter=target>\nagent-1\n";
-    try beatFunctionCall(a, &wire.conn, &seq, &progress, live, writing, .{ .dialect = null }, flat, parsed.value);
+    try beatFunctionCall(a, &wire.conn, &seq, &progress, live, writing, .{ .reading = .text, .dialect = null }, flat, parsed.value);
     var buf: [4096]u8 = undefined;
     const raw = wire.read(&buf);
     try testing.expect(std.mem.indexOf(u8, raw, "\"type\":\"function_call\",\"id\":\"") != null);
@@ -2789,7 +2793,7 @@ fn responsesCallBuffers(call_head: []const u8) !void {
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;
-        try beatFunctionCall(a, &wire.conn, &seq, &progress, live, buffered.items, .{ .dialect = null }, tools, null);
+        try beatFunctionCall(a, &wire.conn, &seq, &progress, live, buffered.items, .{ .reading = .text, .dialect = null }, tools, null);
     }
     var buf: [16384]u8 = undefined;
     const raw = wire.read(&buf);

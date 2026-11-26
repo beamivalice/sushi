@@ -87,7 +87,7 @@ pub fn soleThought(allocator: std.mem.Allocator, text: []const u8, ask: Ask) !?[
     const settled = try settle(allocator, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
     defer settled.deinit(allocator);
     if (settled.reply != null) return null;
-    const split = think_tags.splitThinkBlock(settled.text, true, ask.opens_think);
+    const split = think_tags.splitThinkBlock(ask.reading, settled.text, true, ask.opens_think);
     const thought = std.mem.trim(u8, split.reasoning_content orelse return null, " \t\r\n");
     if (thought.len == 0 or std.mem.trim(u8, split.content, " \t\r\n").len > 0) return null;
     return try allocator.dupe(u8, thought);
@@ -95,6 +95,8 @@ pub fn soleThought(allocator: std.mem.Allocator, text: []const u8, ask: Ask) !?[
 
 /// How the text came to be.
 pub const Origin = struct {
+    /// How the text spells its think tags (`think_tags.readingOf`).
+    reading: think_tags.Reading,
     /// The served template's call dialect (`chat.callDialect`), read first; null reads the families in the legacy order.
     dialect: ?tool_calls_mod.Dialect,
     /// The prompt ended inside a think block (`promptOpensThink`): text with no closer is reasoning.
@@ -153,7 +155,7 @@ pub const ToolReply = struct {
 /// out of the reasoning (`splitThinkBlock`). `text` outlives the result: the preamble slices it.
 pub fn toolReply(allocator: std.mem.Allocator, text: []const u8, tools_json: ?[]const u8, allow_parallel: bool, origin: Origin) !?ToolReply {
     const calls = (try parseToolCallsForRequest(allocator, text, tools_json, allow_parallel, origin)) orelse return null;
-    const split = think_tags.splitThinkBlock(text, true, origin.opens_think);
+    const split = think_tags.splitThinkBlock(origin.reading, text, true, origin.opens_think);
     return .{ .preamble = preambleOf(text, split.content, calls), .calls = calls };
 }
 
@@ -179,6 +181,8 @@ pub const Generated = struct {
 
 /// What the request asks of the end handling.
 pub const Ask = struct {
+    /// How the generation's text spells its think tags (`think_tags.readingOf`).
+    reading: think_tags.Reading,
     stops: []const []const u8,
     /// Merge re-opened mid-text thought channels into the leading block so no parse below leaks raw tags (Gemma 12B
     /// re-opens channels mid-turn). A span-routed constrained response sets false: its payload is authoritative and
@@ -227,12 +231,12 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
     };
     errdefer out.deinit(allocator);
     if (ask.normalize) {
-        out.normalized = try think_tags.normalizeEmbeddedThinkBlocks(allocator, cut.text);
+        out.normalized = try think_tags.normalizeEmbeddedThinkBlocks(ask.reading, allocator, cut.text);
         if (out.normalized) |n| out.text = n;
     }
     if (ask.has_tools and shouldParseToolCalls(gen.finish_details)) {
         const model_ended = cut.stop == null and std.mem.eql(u8, gen.finish_reason, "stop");
-        const origin: Origin = .{ .dialect = ask.dialect, .opens_think = ask.opens_think, .model_ended = model_ended };
+        const origin: Origin = .{ .reading = ask.reading, .dialect = ask.dialect, .opens_think = ask.opens_think, .model_ended = model_ended };
         out.reply = try toolReply(allocator, out.text, ask.tools_json, ask.allow_parallel, origin);
         out.declined = try declinedCall(allocator, out.text, origin, ask.tools_json);
     }
@@ -243,7 +247,7 @@ pub fn settle(allocator: std.mem.Allocator, gen: Generated, ask: Ask) !Settled {
 /// null when it leaves none. A bare JSON call has no marker: it is a call only once its name is whole and `tools_json`
 /// declares it, as the parse chain reads it.
 fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Declined {
-    const defects = try tool_reading.defects(allocator, text, origin.model_ended);
+    const defects = try tool_reading.defects(origin.reading, allocator, text, origin.model_ended);
     defer allocator.free(defects);
     if (defects.len == 0) return declinedBareCall(allocator, text, origin, tools_json);
     return try unfinishedCall(allocator, text, origin, defects[0]);
@@ -251,7 +255,7 @@ fn declinedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, 
 
 /// The call `defect` marks, named as far as its markup went.
 fn unfinishedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, defect: tool_reading.Defect) !Declined {
-    const calls = (try tool_calls_mod.parseToolCallsAs(allocator, text[defect.start..defect.end], origin.dialect)) orelse {
+    const calls = (try tool_calls_mod.parseToolCallsAs(origin.reading, allocator, text[defect.start..defect.end], origin.dialect)) orelse {
         // A body cut before it names the tool: the opener's own `name="…"` attribute does.
         const attr = tool_reading.attributeName(text, defect.start) orelse return .{ .name = null };
         return .{ .name = try allocator.dupe(u8, attr) };
@@ -269,7 +273,7 @@ fn unfinishedCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin
 fn declinedBareCall(allocator: std.mem.Allocator, text: []const u8, origin: Origin, tools_json: ?[]const u8) !?Declined {
     var open: ?[]u8 = null;
     errdefer if (open) |name| allocator.free(name);
-    if (try tool_calls_mod.parseToolCallsOpen(allocator, text, origin.dialect, &open)) |calls| {
+    if (try tool_calls_mod.parseToolCallsOpen(origin.reading, allocator, text, origin.dialect, &open)) |calls| {
         for (calls) |c| {
             allocator.free(c.name);
             allocator.free(c.arguments);
@@ -317,7 +321,7 @@ pub fn unparsedOf(allocator: std.mem.Allocator, text: []const u8, origin: Origin
     else
         return null;
     var parsed_before: usize = 0;
-    if (try tool_calls_mod.parseToolCallsAs(allocator, text[0..start], origin.dialect)) |before| {
+    if (try tool_calls_mod.parseToolCallsAs(origin.reading, allocator, text[0..start], origin.dialect)) |before| {
         parsed_before = before.len;
         for (before) |c| {
             allocator.free(c.name);
@@ -345,7 +349,7 @@ pub fn pendingCall(allocator: std.mem.Allocator, text: []const u8, origin: Origi
     // A read of a buffer that grows: the final read of the text writes the `[tool-parse]` notes, this one none.
     const partial = tool_calls_mod.PartialRead.begin();
     defer partial.end();
-    const defects = try tool_reading.defects(allocator, text, origin.model_ended);
+    const defects = try tool_reading.defects(origin.reading, allocator, text, origin.model_ended);
     defer allocator.free(defects);
     if (defects.len == 0) return null;
     const open = try unfinishedCall(allocator, text, origin, defects[0]);
@@ -380,7 +384,7 @@ pub fn parseToolCallsForRequest(
 ) !?[]tool_schema.ParsedToolCall {
     // An unfinished call is never shipped, whatever ended the generation (the model's own end included): the calls the
     // model finished stay, and `declinedCall` names the first unfinished one.
-    const defects = try tool_reading.defects(allocator, text, origin.model_ended);
+    const defects = try tool_reading.defects(origin.reading, allocator, text, origin.model_ended);
     defer allocator.free(defects);
     var rest = std.ArrayList(u8).empty;
     defer rest.deinit(allocator);
@@ -395,6 +399,7 @@ pub fn parseToolCallsForRequest(
         body = rest.items;
     }
     const calls = try tool_schema.parseForRequest(allocator, body, tools_json, .{
+        .reading = origin.reading,
         .allow_parallel = allow_parallel,
         .autocorrect = server_state.g_tool_autocorrect,
         .dialect = origin.dialect,
@@ -417,7 +422,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     ;
     const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
         "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -431,7 +436,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     try std.testing.expect(ra == .bool); // coerced from the STRING "False"
     try std.testing.expectEqual(false, ra.bool);
     // Null tools_json path must still parse (no coercion, no crash).
-    const calls2 = try parseToolCallsForRequest(allocator, text, null, true, .{ .dialect = null });
+    const calls2 = try parseToolCallsForRequest(allocator, text, null, true, .{ .reading = .text, .dialect = null });
     defer if (calls2) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -457,7 +462,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     const text = "<tool_call>{\"name\":\"edit\",\"arguments\":{\"edits\":[{\"newText\":\"new\",\"oldText\":\"old\"," ++
         "\"path\":\"us_presidents/generate_site.sh\"}]}}</tool_call>";
 
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -476,7 +481,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     // (unlike the inferred-name filter, which corrects our own heuristic).
     server_state.g_tool_autocorrect = false;
     defer server_state.g_tool_autocorrect = true;
-    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
+    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (raw_calls) |tc| {
             allocator.free(tc.name);
@@ -504,7 +509,7 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
 
     server_state.g_tool_autocorrect = false;
     defer server_state.g_tool_autocorrect = true; // restore the default for other tests
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -539,7 +544,7 @@ test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool 
         "presidents = [\n" ++
         "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
         "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",";
-    const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null });
+    const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null });
     defer if (calls) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -566,11 +571,11 @@ test "parseToolCallsForRequest: tool markup that parses to no call leaves one lo
     const wrecked = "I'll list the files.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}inv\u{793c}oke name=\"bash\">\n" ++
         "<\u{ff5c}DSML\u{ff5c}parameter name=\"command\" string=\"true\">ls</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
     try log.openFile(log_path, 0);
-    const none = parseToolCallsForRequest(allocator, wrecked, tools, true, .{ .dialect = null }) catch |e| {
+    const none = parseToolCallsForRequest(allocator, wrecked, tools, true, .{ .reading = .text, .dialect = null }) catch |e| {
         log.closeFile();
         return e;
     };
-    const prose = parseToolCallsForRequest(allocator, "The files are listed above.", tools, true, .{ .dialect = null }) catch |e| {
+    const prose = parseToolCallsForRequest(allocator, "The files are listed above.", tools, true, .{ .reading = .text, .dialect = null }) catch |e| {
         log.closeFile();
         return e;
     };
@@ -589,9 +594,9 @@ const two_calls_second_open = "\n\nfirst.\n\n<tool_call>\n<function=get_weather>
 
 test "unparsedOf: a buffer whose first call parsed and whose second did not names the second call's own start, its length and the one call before it" {
     const allocator = testing.allocator;
-    const defects = try tool_reading.defects(allocator, two_calls_second_open, false);
+    const defects = try tool_reading.defects(.text, allocator, two_calls_second_open, false);
     defer allocator.free(defects);
-    const got = (try unparsedOf(allocator, two_calls_second_open, .{ .dialect = null }, defects)) orelse return error.NoCut;
+    const got = (try unparsedOf(allocator, two_calls_second_open, .{ .reading = .text, .dialect = null }, defects)) orelse return error.NoCut;
     const second = std.mem.lastIndexOf(u8, two_calls_second_open, "<tool_call>").?;
     try testing.expectEqual(second, got.start);
     try testing.expectEqual(two_calls_second_open.len - second, got.len);
@@ -614,9 +619,9 @@ fn logOfRead(allocator: std.mem.Allocator, partial: bool, text: []const u8, tool
     try log.openFile(log_path, 0);
     errdefer log.closeFile();
     if (partial) {
-        if (try pendingCall(allocator, text, .{ .dialect = null }, tools)) |p| p.deinit(allocator);
+        if (try pendingCall(allocator, text, .{ .reading = .text, .dialect = null }, tools)) |p| p.deinit(allocator);
     } else {
-        const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null });
+        const calls = try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null });
         if (calls) |cs| {
             for (cs) |c| {
                 allocator.free(c.name);
@@ -667,7 +672,7 @@ test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
     ;
     const text = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -689,7 +694,7 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
     ;
     const text = "<tool_call>{\"name\":\"searchWeb\",\"arguments\":{\"q\":\"zig\"}}</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -713,7 +718,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
         "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"b\"}}</tool_call>";
 
     // allow_parallel=true (default wiring): both calls survive.
-    const both = (try parseToolCallsForRequest(allocator, text, null, true, .{ .dialect = null })).?;
+    const both = (try parseToolCallsForRequest(allocator, text, null, true, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (both) |tc| {
             allocator.free(tc.name);
@@ -724,7 +729,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
     try std.testing.expectEqual(@as(usize, 2), both.len);
 
     // allow_parallel=false: only the FIRST survives, intact.
-    const one = (try parseToolCallsForRequest(allocator, text, null, false, .{ .dialect = null })).?;
+    const one = (try parseToolCallsForRequest(allocator, text, null, false, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (one) |tc| {
             allocator.free(tc.name);
@@ -737,7 +742,7 @@ test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST ca
 
     // A single call with the flag off passes through untouched.
     const single_text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>";
-    const single = (try parseToolCallsForRequest(allocator, single_text, null, false, .{ .dialect = null })).?;
+    const single = (try parseToolCallsForRequest(allocator, single_text, null, false, .{ .reading = .text, .dialect = null })).?;
     defer {
         for (single) |tc| {
             allocator.free(tc.name);
@@ -758,7 +763,7 @@ test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoi
         \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
     ;
     const text = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .dialect = null })) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true, .{ .reading = .text, .dialect = null })) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -799,7 +804,7 @@ test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma
     };
 
     for (cases) |c| {
-        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools, true, .{ .dialect = null })) orelse {
+        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools, true, .{ .reading = .text, .dialect = null })) orelse {
             std.debug.print("\n[{s}] no tool call parsed\n", .{c.name});
             return error.NoToolCall;
         };
@@ -881,16 +886,16 @@ test "a call inside a thought the prompt opened and the model never closed is a 
         defer testing.allocator.free(after);
         const inside = try std.mem.concat(testing.allocator, u8, &.{ "Maybe ", call, " no.\n</think>\n\nIt is sunny." });
         defer testing.allocator.free(inside);
-        try expectCalls(open, .{ .dialect = null, .opens_think = true }, 1);
-        try expectCalls(after, .{ .dialect = null, .opens_think = true }, 1);
+        try expectCalls(open, .{ .reading = .text, .dialect = null, .opens_think = true }, 1);
+        try expectCalls(after, .{ .reading = .text, .dialect = null, .opens_think = true }, 1);
         // A call inside a thought that closed stays skipped.
-        try expectCalls(inside, .{ .dialect = null, .opens_think = true }, 0);
+        try expectCalls(inside, .{ .reading = .text, .dialect = null, .opens_think = true }, 0);
 
-        const reply = (try toolReply(testing.allocator, open, test_tools, true, .{ .dialect = null, .opens_think = true })).?;
+        const reply = (try toolReply(testing.allocator, open, test_tools, true, .{ .reading = .text, .dialect = null, .opens_think = true })).?;
         defer reply.deinit(testing.allocator);
         try testing.expectEqualStrings("get_weather", reply.calls[0].name);
         try testing.expectEqualStrings("", reply.preamble);
-        const split = think_tags.splitThinkBlock(open, true, true);
+        const split = think_tags.splitThinkBlock(.text, open, true, true);
         try testing.expectEqualStrings("I'll call it.", split.reasoning_content.?);
     }
 }
@@ -904,9 +909,9 @@ test "a generation that ended inside a call (the model's own end, a stop, the le
         "<|tool_call>call:write_file{path:<|\"|>notes.md<|\"|>,content:<|\"|>line one\n",
     };
     for (cut) |text| {
-        try expectCalls(text, .{ .dialect = null }, 0);
+        try expectCalls(text, .{ .reading = .text, .dialect = null }, 0);
         // The call it left open is named by its markup, in each dialect.
-        const left = (try declinedCall(testing.allocator, text, .{ .dialect = null }, test_tools)) orelse return error.DeclineNotNamed;
+        const left = (try declinedCall(testing.allocator, text, .{ .reading = .text, .dialect = null }, test_tools)) orelse return error.DeclineNotNamed;
         defer left.deinit(testing.allocator);
         errdefer std.debug.print("declined {?s} for {f}\n", .{ left.name, std.zig.fmtString(text) });
         try testing.expectEqualStrings("write_file", left.name orelse return error.DeclineNotNamed);
@@ -920,7 +925,7 @@ test "a cut after a call closed leaves the call" {
         "<|tool_call>call:get_weather{city:<|\"|>Tokyo<|\"|>}<tool_call|>",
         "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
     };
-    for (whole) |text| try expectCalls(text, .{ .dialect = null }, 1);
+    for (whole) |text| try expectCalls(text, .{ .reading = .text, .dialect = null }, 1);
 }
 
 test "a call the model finished before a cut stays and the open one after it is declined, in every dialect" {
@@ -936,7 +941,7 @@ test "a call the model finished before a cut stays and the open one after it is 
     for (pairs) |p| {
         const text = try std.mem.concat(testing.allocator, u8, &.{ p.done, "\n", p.open });
         defer testing.allocator.free(text);
-        const calls = (try parseToolCallsForRequest(testing.allocator, text, test_tools, true, .{ .dialect = null })) orelse return error.FinishedCallDropped;
+        const calls = (try parseToolCallsForRequest(testing.allocator, text, test_tools, true, .{ .reading = .text, .dialect = null })) orelse return error.FinishedCallDropped;
         defer {
             for (calls) |c| {
                 testing.allocator.free(c.name);
@@ -1014,9 +1019,9 @@ test "a stream and a non-stream reply end the same: a stop in a call, a stop aft
     // Chat and Messages ask alike; Responses asks the same, or skips the normalization of a constrained reply; a
     // template-opened think block changes where the thought ends.
     const asks = [_]Ask{
-        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
-        .{ .stops = &stops, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
-        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
+        .{ .reading = .text, .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .reading = .text, .stops = &stops, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .reading = .text, .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
     };
     const named: Cut = .{ .named = "get_weather" };
     for (asks) |ask| {
@@ -1056,7 +1061,7 @@ test "an unfinished call of every dialect the parse chain reads is declined and 
         hy4_open ++ "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Tok",
         hy4_open ++ "<tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Tok",
     };
-    const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
     for (open) |call| for ([_][]const u8{ "", "Let me check.\n" }) |lead| for ([_][]const u8{ "stop", "length" }) |finish| {
         const text = try std.mem.concat(a, u8, &.{ lead, call });
         defer a.free(text);
@@ -1071,8 +1076,8 @@ test "bare JSON cut short is declined and named, never repaired; a finished call
     ;
     const stops = [_][]const u8{"STOP"};
     const asks = [_]Ask{
-        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
-        .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
+        .{ .reading = .text, .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .reading = .text, .stops = &stops, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = true },
     };
     const whole = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}";
     const one_short = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}";
@@ -1117,7 +1122,7 @@ test "bare JSON cut short is declined and named, never repaired; a finished call
 test "a closer spelled inside a parameter value does not close the call: the generation cut there leaves it open, in every dialect" {
     const a = testing.allocator;
     const stops = [_][]const u8{"STOP"};
-    const ask: Ask = .{ .stops = &stops, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    const ask: Ask = .{ .reading = .text, .stops = &stops, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
     // Each text is a write_file call whose `content` value spells a closer of its own dialect, cut right after it or a few
     // bytes on; none of them has closed.
     const Open = struct { text: []const u8, cut: Cut = .{ .named = "write_file" } };
@@ -1171,7 +1176,7 @@ test "a span-routed constrained reply keeps the marker text in its payload as wr
     const call = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>";
     const payload = "{\"note\":\"a <think>b</think> c <think>d</think> e\"}\n";
     const text = payload ++ call;
-    const routed: Ask = .{ .stops = &.{}, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    const routed: Ask = .{ .reading = .text, .stops = &.{}, .normalize = false, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = false };
     try expectSameEnd(a, text, &.{}, "stop", routed, null, "stop", 1, .none);
     const kept = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, routed);
     defer kept.deinit(a);
@@ -1203,7 +1208,7 @@ test "a reply holds only its thought when it has no visible text and no call, it
     };
     for (cases) |c| {
         errdefer std.debug.print("text: {f}\n", .{std.zig.fmtString(c.text)});
-        const got = try soleThought(a, c.text, .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = c.opens });
+        const got = try soleThought(a, c.text, .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = tools, .allow_parallel = true, .dialect = null, .opens_think = c.opens });
         defer if (got) |g| a.free(g);
         if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
     }
@@ -1223,7 +1228,7 @@ test "r173-f-foreign-opener: an opener mentioned inside a thought that closed is
         "<think>Maybe <|tool_call>call:get_weather{city: no.</think>\n\nIt is sunny.",
     };
     for (texts) |text| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         errdefer std.debug.print("thought {f}: declined={?s}\n", .{ std.zig.fmtString(text), if (s.declined) |d| d.name orelse "(unnamed)" else null });
@@ -1244,7 +1249,7 @@ test "r173-f-foreign-opener: served dialects: a finished call whose value spells
     };
     var bad: usize = 0;
     for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
         const args = if (s.reply) |r| r.calls[0].arguments else "(no call)";
@@ -1268,7 +1273,7 @@ test "r173-f-foreign-opener: a foreign opener mentioned in a closed thought does
     for (leads, [_]bool{ false, true }) |lead, opens| {
         const text = try std.mem.concat(a, u8, &.{ lead, call });
         defer a.free(text);
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .function_tag, .opens_think = opens };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .function_tag, .opens_think = opens };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const n = if (s.reply) |r| r.calls.len else 0;
@@ -1288,7 +1293,7 @@ test "r173-f-foreign-opener: a finished call followed by prose that mentions an 
     for (tails) |tail| {
         const text = try std.mem.concat(a, u8, &.{ call, tail });
         defer a.free(text);
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .function_tag, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .function_tag, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const n = if (s.reply) |r| r.calls.len else 0;
@@ -1311,7 +1316,7 @@ test "r173-f-lost-close-wrapper: a call whose inner call closed but whose wrappe
     };
     var bad: usize = 0;
     for (cases) |c| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         if ((if (s.reply) |r| r.calls.len else 0) != 1 or s.declined != null) {
@@ -1335,7 +1340,7 @@ test "r173-f-lost-close-merge: a call that lost its last parameter close, follow
     };
     var bad: usize = 0;
     for (texts) |text| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .dsml }) |dialect| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const shipped = if (s.reply) |r| r.calls.len == 1 and std.mem.eql(u8, r.calls[0].name, "get_weather") and std.mem.indexOf(u8, r.calls[0].arguments, "\"Osaka\"") != null else false;
@@ -1355,7 +1360,7 @@ test "r173-f-foreign-opener: Gemma: a string value ending in a brace right befor
     const text = "<|tool_call>call:write_file{path:<|\"|>a.rs<|\"|>,content:<|\"|>fn f() {}<tool_call|> tail<|\"|>}<tool_call|>";
     var bad: usize = 0;
     for ([_][]const u8{ "stop", "length" }) |finish| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
         const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.indexOf(u8, r.calls[0].arguments, "tail") != null else false;
@@ -1379,7 +1384,7 @@ test "r173-f-foreign-opener: Hermes JSON: a string value ending in a brace right
     };
     var bad: usize = 0;
     for (cases) |c| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = c.finish, .finish_details = null }, ask);
         defer s.deinit(a);
         var ok = (if (s.reply) |r| @as(?usize, r.calls.len) else null) == c.calls and (s.declined != null) == c.declined;
@@ -1413,7 +1418,7 @@ test "r173-f-foreign-opener: a finished call whose value spells its own dialect'
     };
     var bad: usize = 0;
     for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
         var got: []const u8 = "(no call)";
@@ -1440,7 +1445,7 @@ test "r173-f-foreign-opener: a finished Hermes JSON call whose string spells the
     };
     var bad: usize = 0;
     for (texts) |text| for ([_]?tool_calls_mod.Dialect{ null, .function_tag, .arg_key, .dsml }) |dialect| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.eql(u8, r.calls[0].name, "write_file") and std.mem.indexOf(u8, r.calls[0].arguments, "here") != null or std.mem.indexOf(u8, r.calls[0].arguments, "done") != null else false;
@@ -1462,7 +1467,7 @@ test "r173-f-foreign-opener: a finished arg_key call whose value spells a whole 
     };
     var bad: usize = 0;
     for (texts) |text| for ([_][]const u8{ "stop", "length" }) |finish| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
         const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.eql(u8, r.calls[0].name, "write_file") and std.mem.indexOf(u8, r.calls[0].arguments, "done") != null else false;
@@ -1482,7 +1487,7 @@ test "r173-f-foreign-opener: a finished function-tag call whose value spells its
     for (values) |v| for ([_]?tool_calls_mod.Dialect{ .function_tag, null }) |dialect| {
         const text = try std.mem.concat(a, u8, &.{ "<tool_call>\n<function=write_file>\n<parameter=content>\n", v, "\n</parameter>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>" });
         defer a.free(text);
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.indexOf(u8, r.calls[0].arguments, "a.py") != null else false;
@@ -1502,7 +1507,7 @@ test "r173-f-foreign-opener: DSML: a finished call whose value spells its closer
     for (values) |v| for ([_][]const u8{ "stop", "length" }) |finish| {
         const text = try std.mem.concat(a, u8, &.{ "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"write_file\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"content\" string=\"true\">", v, "</\u{ff5c}DSML\u{ff5c}parameter>\n<\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">a.py</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>" });
         defer a.free(text);
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .dsml, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = .dsml, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
         const ok = if (s.reply) |r| r.calls.len == 1 and std.mem.indexOf(u8, r.calls[0].arguments, "a.py") != null else false;
@@ -1529,7 +1534,7 @@ test "r173-f-foreign-opener: a finished call whose value spells think tags keeps
         };
         const text = try std.mem.concat(a, u8, &.{ lead, call });
         defer a.free(text);
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = opens };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = dialect, .opens_think = opens };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         var got: []const u8 = "(no call)";
@@ -1569,7 +1574,7 @@ test "r173-f-foreign-opener: a declined call's markup never reaches content, str
     for (open) |call| {
         var buf: [512]u8 = undefined;
         const text = try std.fmt.bufPrint(&buf, "Let me check.\n{s}", .{call});
-        const content = think_tags.splitThinkBlock(text, true, false).content;
+        const content = think_tags.splitThinkBlock(.text, text, true, false).content;
         if (!std.mem.eql(u8, std.mem.trim(u8, content, " \n"), "Let me check.")) {
             bad += 1;
             std.debug.print("non-stream content leaks for {f}: {f}\n", .{ std.zig.fmtString(call), std.zig.fmtString(content) });
@@ -1604,7 +1609,7 @@ test "r173-f-foreign-opener: the preamble of a finished call holds no markup, in
     for (calls) |call| {
         const text = try std.mem.concat(a, u8, &.{ "Let me check.\n", call });
         defer a.free(text);
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
         const s = try settle(a, .{ .text = text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const pre = if (s.reply) |r| r.preamble else "(no call)";
@@ -1621,8 +1626,8 @@ test "r173-f-array-after-prose: a bare JSON array of calls after prose ships eve
     const first = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Tokyo\"}}";
     const second = "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Osaka\"}}";
     const asks = [_]Ask{
-        .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false },
-        .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = true },
+        .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false },
+        .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = true },
     };
     for (asks) |ask| for ([_][]const u8{ "Let me check.\n", "Let me check:\n```json\n" }) |lead| for ([_][]const u8{ "stop", "length", "cancelled" }) |finish| {
         const whole = try std.mem.concat(a, u8, &.{ lead, "[", first, ",", second, "]" });
@@ -1651,7 +1656,7 @@ test "r173-f-span-cut-call: a call a model backticks ships whole, and its value'
         .{ .text = "I use ` here <tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n</tool_call>", .dialect = .function_tag, .name = "get_weather" },
     };
     for (cases) |c| for ([_][]const u8{ "stop", "length" }) |finish| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = c.dialect, .opens_think = false };
         errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(c.text) });
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
@@ -1669,7 +1674,7 @@ const settle_work_per_byte = 140;
 
 /// The reading work of one `settle` of `text`: every byte a reading search covered (`tool_reading.work`).
 fn settleWork(allocator: std.mem.Allocator, text: []const u8, finish: []const u8) !usize {
-    const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+    const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
     const before = tool_reading.work;
     const s = try settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
     defer s.deinit(allocator);
@@ -1725,10 +1730,10 @@ test "r173-f-cut-think-tag: a think tag inside a cut call's value is that call's
     };
     var bad: usize = 0;
     for (texts) |t| for ([_]bool{ false, true }) |opens| for ([_][]const u8{ "length", "stop" }) |finish| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = opens };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = opens };
         const s = try settle(a, .{ .text = t, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
         defer s.deinit(a);
-        const content = think_tags.splitThinkBlock(s.text, true, opens).content;
+        const content = think_tags.splitThinkBlock(.text, s.text, true, opens).content;
         if (s.reply != null or s.declined == null or std.mem.indexOf(u8, content, "tags") != null or std.mem.indexOf(u8, content, "line") != null) {
             bad += 1;
             std.debug.print("opens_think={} [{s}] {f}: calls={d} declined={?s} content={f}\n", .{ opens, finish, std.zig.fmtString(t), if (s.reply) |r| r.calls.len else 0, if (s.declined) |d| d.name orelse "(unnamed)" else null, std.zig.fmtString(content) });
@@ -1754,7 +1759,7 @@ test "r173-f-bare-json-preamble: a finished bare-JSON call's own JSON is the cal
     var bad: usize = 0;
     for (cases) |c| {
         const opens = false;
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = opens };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = opens };
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
         const r = s.reply orelse {
@@ -1772,7 +1777,7 @@ test "r173-f-bare-json-preamble: a finished bare-JSON call's own JSON is the cal
         for (1..c.text.len + 1) |end| {
             if (think_tags.streamShouldBufferForToolsScan(c.text[0..end], &scan)) break;
             if (think_tags.endsWithPartialThinkOpen(c.text[0..end])) continue;
-            sent = think_tags.splitThinkBlock(c.text[0..end], true, opens).content;
+            sent = think_tags.splitThinkBlock(.text, c.text[0..end], true, opens).content;
         }
         if (!std.mem.startsWith(u8, c.preamble, std.mem.trim(u8, sent, " \n"))) {
             bad += 1;
@@ -1805,10 +1810,10 @@ test "r173-f-bare-json-hold: an ordinary reply with tools declared streams: each
     const longest_wait = 16;
     var bad: usize = 0;
     for (cases) |c| {
-        const ask: Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
+        const ask: Ask = .{ .reading = .text, .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = test_tools, .allow_parallel = true, .dialect = null, .opens_think = false };
         const s = try settle(a, .{ .text = c.text, .source = .whole, .finish_reason = "stop", .finish_details = null }, ask);
         defer s.deinit(a);
-        const whole = think_tags.splitThinkBlock(s.text, true, false).content;
+        const whole = think_tags.splitThinkBlock(.text, s.text, true, false).content;
         if (s.reply != null or !std.mem.eql(u8, whole, c.text)) {
             bad += 1;
             std.debug.print("{f}: whole calls={d} content={f}\n", .{ std.zig.fmtString(c.text), if (s.reply) |r| r.calls.len else 0, std.zig.fmtString(whole) });
@@ -1829,7 +1834,7 @@ test "r173-f-bare-json-hold: an ordinary reply with tools declared streams: each
                 std.debug.print("{f}: still held after the byte that rules the call out ({d})\n", .{ std.zig.fmtString(c.text), end });
             }
             if (held) continue;
-            const sent = think_tags.splitThinkBlock(c.text[0..end], true, false).content;
+            const sent = think_tags.splitThinkBlock(.text, c.text[0..end], true, false).content;
             if (!std.mem.startsWith(u8, whole, sent)) {
                 bad += 1;
                 std.debug.print("{f}: the stream sent {f}, not a prefix of the whole reply\n", .{ std.zig.fmtString(c.text), std.zig.fmtString(sent) });

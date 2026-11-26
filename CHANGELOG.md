@@ -9,6 +9,7 @@ earlier history is mlx-serve's, in that project's changelog.
 - A request that names another `kv_quant` than a Hy4-Flash load serves is refused with one text that names the width the load serves.
 - A streamed DeepSeek-V4.1 load's `--ssd-prefetch` now engages under a small read budget, measures the SSD's read rate without
   first-touch page faults, and prefetches the experts `--expert-cache-bias` would pick. Thanks @STRML.
+- **A thought ends only at the model's own close token**: a think tag a model quotes in plain text while reasoning no longer ends its thought early or leaks the rest of the reasoning into the answer, and the stream and the whole reply split the same.
 
 ## v1.8.0 — Hy4-Flash support
 

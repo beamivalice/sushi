@@ -337,6 +337,12 @@ fn deliveredReasoning(capped: ?[]const u8, raw: ?[]const u8) ?[]const u8 {
     return capped orelse raw;
 }
 
+/// How a chat reply's text spells its think tags. A constrained reply's payload is data, so its text is the model's bytes
+/// as decoded.
+pub fn replyReading(tok: *const Tokenizer, sampling: sampler.SamplingParams) think_tags.Reading {
+    return if (generate_mod.payloadRouted(sampling.constraint)) .text else think_tags.readingOf(tok);
+}
+
 /// Client stop sequences a non-stream surface hands the scheduler wait, so generation ends when one completes.
 const StopSpec = struct {
     stops: []const []const u8 = &.{},
@@ -414,9 +420,11 @@ fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Schedu
     if (!std.mem.eql(u8, slot.finish_reason, "stop") or slot.finish_details != null) return .none;
     const stop = slot.stop_token orelse return .none;
     if (!generate_mod.isEosId(stop, slot.eos_token_ids) or !server_state.continueAfterThought()) return .none;
-    const text = try tok.decode(allocator, generated);
+    const reading = think_tags.readingOf(tok);
+    const text = try think_tags.decodeReply(allocator, tok, reading, generated);
     defer allocator.free(text);
     const ask: reply_mod.Ask = .{
+        .reading = reading,
         .stops = r.stops,
         .normalize = true,
         .has_tools = r.has_tools,
@@ -451,7 +459,7 @@ fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Schedu
     next.cached_tokens = 0;
     next.max_tokens = left;
     next.sampling = continuationSampling(allocator, tok, r, prompt, params.sampling, force);
-    const bridge = if (think_tags.indexOfThinkCloseTag(text, 0) == null) try tok.encode(allocator, think_tags.BARE_THINK_CLOSER) else try allocator.alloc(u32, 0);
+    const bridge = if (think_tags.indexOfThinkCloseTag(reading, text, 0) == null) try tok.encode(allocator, think_tags.BARE_THINK_CLOSER) else try allocator.alloc(u32, 0);
     errdefer allocator.free(bridge);
     const cont = try sch.submit(next);
     slot_outcome.handOver(slot);
@@ -658,7 +666,9 @@ pub fn nonStreamingViaScheduler(
     // Only reachable non-streaming: a delta cannot be retracted, so a
     // streaming client has already received the tail.
     const emit_ids = loopTrimmedIds(output_ids.items, if (last.loop_trim_start) |t| cont_from + t else null);
-    const text = try tok.decode(allocator, emit_ids);
+    // A completion's text is the model's raw bytes; a chat reply's spells its think tag tokens (`think_tags.decodeReply`).
+    const reading: think_tags.Reading = if (stop.completion_skip_special == null) replyReading(tok, sampling) else .text;
+    const text = try think_tags.decodeReply(allocator, tok, reading, emit_ids);
     const token_ids = try output_ids.toOwnedSlice(allocator);
 
     // Convert the generator's (token index, byte offset) payload boundary
@@ -669,7 +679,7 @@ pub fn nonStreamingViaScheduler(
         var pb: ?usize = ps.byte_offset;
         if (ps.token_index > 0) {
             if (ps.token_index <= emit_ids.len) {
-                const prefix = tok.decode(allocator, emit_ids[0..ps.token_index]) catch null;
+                const prefix = think_tags.decodeReply(allocator, tok, reading, emit_ids[0..ps.token_index]) catch null;
                 if (prefix) |p| {
                     pb = p.len + ps.byte_offset;
                     allocator.free(p);
@@ -787,9 +797,11 @@ pub fn handleNonStreamingGeneration(
     // (think_tags.noThinkTailSuffix commits the channel), so any reasoning that
     // still shows up here is real work the client gets to see.
     const opens_think = promptOpensThink(allocator, tok, prompt_ids);
+    const reading = replyReading(tok, sampling);
 
     // The stop that ended the generation, the text it leaves and the calls in it (`reply.settle`).
     const settled = try reply_mod.settle(allocator, generatedOf(&result), .{
+        .reading = reading,
         .stops = stop_sequences,
         .normalize = !generate_mod.payloadRouted(sampling.constraint),
         .has_tools = has_tools,
@@ -809,7 +821,7 @@ pub fn handleNonStreamingGeneration(
     defer if (budget_reasoning_allocated) allocator.free(budget_truncated_reasoning.?);
 
     if (enable_thinking and reasoning_budget >= 0) {
-        const think_split = think_tags.splitThinkBlock(final_text, true, opens_think);
+        const think_split = think_tags.splitThinkBlock(reading, final_text, true, opens_think);
         if (think_split.reasoning_content) |reasoning| {
             // Count tokens in reasoning by encoding it
             const reasoning_ids = try tok.encode(allocator, reasoning);
@@ -862,7 +874,7 @@ pub fn handleNonStreamingGeneration(
 
             // Reasoning is delivered whenever the model produced it — the
             // request's thinking flag shaped the prompt, not the delivery.
-            const tc_think_split = think_tags.splitThinkBlock(final_text, true, opens_think);
+            const tc_think_split = think_tags.splitThinkBlock(reading, final_text, true, opens_think);
             var tc_reasoning_json: []const u8 = "";
             var tc_reasoning_allocated = false;
             {
@@ -928,7 +940,7 @@ pub fn handleNonStreamingGeneration(
     // stripped (tokens we discarded still counted against tok/s).
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
-    const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
+    const think_split = try splitConstrainedResponse(reading, allocator, &routed, sampling, final_text, result.constraint_payload_byte, false, opens_think);
     const content_text = think_split.content;
 
     const escaped = jsonEscapeOrEmpty(allocator, content_text);
@@ -1444,6 +1456,7 @@ pub fn handleStreamingGeneration(
     // enable_thinking render the closed signature and stay false here.
     const prompt_opened_think = promptOpensThink(allocator, tok, prompt_ids);
     const opens_think = prompt_opened_think;
+    const reading = replyReading(tok, sampling);
 
     // Pick the speculative-decoding mode (regular / drafter / MTP). The
     // per-token state machine below is driven by `StreamingTokenStream`,
@@ -1529,12 +1542,12 @@ pub fn handleStreamingGeneration(
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
     // think block is open and unclosed (47.99 us/token at 113 KB).
-    var think_scan: think_tags.ThinkScan = .{};
+    var think_scan: think_tags.ThinkScan = .{ .reading = reading };
     // Gate through streamThinkGateScan only, and reset the scan wherever the buffer is cleared.
     // The tool gate and the held thought are memoized the same way; the thought scan also resets
     // whenever `text_delivered` moves, for it reads only the undelivered rest.
     var tool_scan: think_tags.ToolHoldScan = .{};
-    var thought_scan: think_tags.ThoughtScan = .{};
+    var thought_scan: think_tags.ThoughtScan = .{ .think = .{ .reading = reading } };
     // When tools are present, buffer individual token texts for deferred streaming
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
@@ -1577,7 +1590,7 @@ pub fn handleStreamingGeneration(
     defer if (delivery) |*d| d.deinit(allocator);
     var think_closed = false; // a complete think block was already split+emitted this stream
     // The content arm delivers the non-stream content bytes (think_tags.ContentStream).
-    var content: think_tags.ContentStream = .{ .mark = .{ .on = !gated_stream }, .opens_thoughts = !gated_stream };
+    var content: think_tags.ContentStream = .{ .reading = reading, .mark = .{ .on = !gated_stream }, .opens_thoughts = !gated_stream };
     defer content.deinit(allocator);
     var thought_mark: think_tags.MarkupCut = .{ .on = !gated_stream };
     var join: think_tags.ThoughtJoin = .{};
@@ -1687,7 +1700,7 @@ pub fn handleStreamingGeneration(
         // The gate delivers the bytes before a match and holds back any tail that could still become
         // one, or a character the token left unfinished.
         const token_text = if (reply_over) try allocator.alloc(u8, 0) else if (tail_flush) try stop_gate.finish(allocator) else blk: {
-            const raw_decoded = try tok.decode(allocator, &[_]u32{token_id});
+            const raw_decoded = try think_tags.decodeReply(allocator, tok, reading, &[_]u32{token_id});
             defer allocator.free(raw_decoded);
             if (delivery) |*d| d.noteToken(raw_decoded.len, ts.slot.?.constraintPayloadStart());
             break :blk try stop_gate.push(allocator, raw_decoded);
@@ -1776,7 +1789,7 @@ pub fn handleStreamingGeneration(
                     },
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
-                        const split = think_tags.splitThinkBlock(undelivered, true, opens_think);
+                        const split = think_tags.splitThinkBlock(reading, undelivered, true, opens_think);
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
@@ -1874,8 +1887,8 @@ pub fn handleStreamingGeneration(
             // Many templates (e.g. Qwen 3.5/3.6, some Gemma 4 variants) pre-inject
             // the opener into the prompt so the model's first tokens are already
             // INSIDE the thinking block — no opener appears in the streamed text.
-            if (!skipped_think_open and (think_buf.items.len >= 7 or !think_tags.thinkOpenerPossible(think_buf.items))) {
-                if (think_tags.thinkOpenTagLenAt(think_buf.items)) |olen| {
+            if (!skipped_think_open and (think_buf.items.len >= reading.open().len or !think_tags.thinkOpenerPossible(reading, think_buf.items))) {
+                if (think_tags.thinkOpenLenAt(reading, think_buf.items)) |olen| {
                     // Remove the opener and any leading newline.
                     saw_think_open = true;
                     var skip: usize = olen;
@@ -1921,7 +1934,7 @@ pub fn handleStreamingGeneration(
             // format they use until the close tag arrives, so look for both
             // families.
             // A think close that waits on a backtick's partner is no close yet; the reply's end settles it.
-            if (thought_mark.thoughtClose(think_buf.items, reply_over)) |m| {
+            if (thought_mark.thoughtClose(reading, think_buf.items, reply_over)) |m| {
                 const closed = think_tags.closedThoughtDelta(think_buf.items[0..m.pos], thought_shipped);
                 const last = closed[0..thought_mark.final(closed)];
                 thought_shipped = false;
@@ -1969,6 +1982,7 @@ pub fn handleStreamingGeneration(
         // stream mid-generation.
         const beaten = if (gated_stream and stream.keepaliveDue())
             beatToolCall(allocator, stream, chat_id, model_name, &tool_stream, text_buf.items, .{
+                .reading = reading,
                 .dialect = try chat_mod.callDialect(allocator, lm.chat_config.?),
                 .opens_think = opens_think and !think_closed,
             }, tools_json)
@@ -2008,7 +2022,7 @@ pub fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (think_tags.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            const rest = join.cutTail(think_tags.cutThoughtDelta(think_buf.items, skipped_think_open, thought_shipped));
+            const rest = join.cutTail(think_tags.cutThoughtDelta(reading, think_buf.items, skipped_think_open, thought_shipped));
             const tail = rest[0..thought_mark.final(rest)];
             if (!budget_exhausted) try sendReasoning(allocator, stream, chat_id, model_name, &join, if (include_usage) &delivered_reasoning else null, tail);
         } else {
@@ -2047,6 +2061,7 @@ pub fn handleStreamingGeneration(
             .finish_reason = finish_reason,
             .finish_details = ts.finish_details,
         }, .{
+            .reading = reading,
             .stops = stop_sequences,
             .normalize = !constrained_proto,
             .has_tools = has_tools,
@@ -2064,7 +2079,7 @@ pub fn handleStreamingGeneration(
             // Emit reasoning_content before tool calls — whatever the model
             // generated is delivered, thinking flag or not.
             {
-                const think_split = think_tags.splitThinkBlock(gen_text, true, opens_think and !think_closed);
+                const think_split = think_tags.splitThinkBlock(reading, gen_text, true, opens_think and !think_closed);
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (think_tags.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
@@ -2101,10 +2116,10 @@ pub fn handleStreamingGeneration(
                 for (token_texts.items) |t| {
                     try full_text.appendSlice(allocator, t);
                 }
-                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
+                const flush_norm = try think_tags.normalizeEmbeddedThinkBlocks(reading, allocator, full_text.items);
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
-                const think_split = think_tags.splitThinkBlock(flush_text, true, opens_think and !think_closed);
+                const think_split = think_tags.splitThinkBlock(reading, flush_text, true, opens_think and !think_closed);
                 const held = try content.finish(allocator, join.closed and think_split.content.len == 0);
                 if (held.len > 0) try sendContentDelta(allocator, stream, chat_id, model_name, held);
                 // `budget_exhausted` means the cap was already streamed in full.
@@ -3069,9 +3084,9 @@ test "a tool-call answer keeps the model's visible preamble" {
     // Bar: non-streamed content == what the stream flushes before the tool markup.
     const t = std.testing;
     const raw = "<think>pick a tool</think>Checking the weather.\n<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>";
-    const split = think_tags.splitThinkBlock(raw, true, false);
+    const split = think_tags.splitThinkBlock(.text, raw, true, false);
     try t.expectEqualStrings("Checking the weather.", visibleToolPreamble(split.content));
-    const bare = think_tags.splitThinkBlock("<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>", true, false);
+    const bare = think_tags.splitThinkBlock(.text, "<tool_call>{\"name\":\"w\",\"arguments\":{}}</tool_call>", true, false);
     try t.expectEqualStrings("", visibleToolPreamble(bare.content));
     try t.expectEqualStrings("", visibleToolPreamble("  \n "));
 }
@@ -3504,7 +3519,7 @@ fn chatCallBuffers(call_head: []const u8) !void {
         if (!wire.conn.keepaliveDue()) continue;
         worst = @max(worst, since);
         since = 0;
-        try beatToolCall(a, &wire.conn, 7, "m", &progress, buffered.items, .{ .dialect = null }, stream_cell_tools);
+        try beatToolCall(a, &wire.conn, 7, "m", &progress, buffered.items, .{ .reading = .text, .dialect = null }, stream_cell_tools);
     }
     var buf: [8192]u8 = undefined;
     const raw = wire.read(&buf);

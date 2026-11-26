@@ -62,7 +62,7 @@ pub const Progress = struct {
         const pending = (try reply.pendingCall(allocator, text, origin, tools_json)) orelse return null;
         defer pending.deinit(allocator);
         if (pending.finished.len > 0) return null;
-        switch (thoughtBefore(text[0..pending.start], origin.opens_think)) {
+        switch (thoughtBefore(origin.reading, text[0..pending.start], origin.opens_think)) {
             .none => {},
             .closed => if (!policy.closed_thought_first) return null,
             .open => return null,
@@ -109,9 +109,9 @@ pub const Progress = struct {
 pub const Thought = enum { none, closed, open };
 
 /// The thought in the text before a call: none, one that closed, or one the call stands inside.
-pub fn thoughtBefore(before_call: []const u8, opens_think: bool) Thought {
-    if (think_tags.splitThinkBlock(before_call, true, opens_think).reasoning_content == null) return .none;
-    const closed = think_tags.indexOfThinkCloseTag(before_call, 0) != null or std.mem.indexOf(u8, before_call, "<channel|>") != null;
+pub fn thoughtBefore(reading: think_tags.Reading, before_call: []const u8, opens_think: bool) Thought {
+    if (think_tags.splitThinkBlock(reading, before_call, true, opens_think).reasoning_content == null) return .none;
+    const closed = think_tags.indexOfThinkCloseTag(reading, before_call, 0) != null or std.mem.indexOf(u8, before_call, "<channel|>") != null;
     return if (closed) .closed else .open;
 }
 
@@ -286,7 +286,7 @@ test "tool progress: a call that takes longer than the beat interval yields data
             now += token_ms;
             try buffered.appendSlice(allocator, tok);
             if (now - last_write < interval_ms) continue;
-            if (try progress.beat(allocator, testing.io, buffered.items, .{ .dialect = null }, weather_tools, .{})) |beat| {
+            if (try progress.beat(allocator, testing.io, buffered.items, .{ .reading = .text, .dialect = null }, weather_tools, .{})) |beat| {
                 const delta = try chatBeat(allocator, &progress, beat);
                 defer allocator.free(delta);
                 try client.take(allocator, delta);
@@ -303,7 +303,7 @@ test "tool progress: a call that takes longer than the beat interval yields data
         try testing.expectEqualStrings("get_weather", client.calls.items[0].name.?);
         try testing.expectEqualStrings("", client.calls.items[0].arguments.items);
 
-        const calls = (try reply.parseToolCallsForRequest(allocator, buffered.items, weather_tools, true, .{ .dialect = null })).?;
+        const calls = (try reply.parseToolCallsForRequest(allocator, buffered.items, weather_tools, true, .{ .reading = .text, .dialect = null })).?;
         defer freeCalls(allocator, calls);
         progress.settle(calls[0]);
         const end = try chatEnd(allocator, testing.io, &progress, 0, calls[0]);
@@ -325,7 +325,7 @@ test "tool progress: a call opened and then ended inside is cut, and the calls o
         errdefer std.debug.print("shape: {s}\n", .{shape.name});
         var progress = Progress{};
         defer progress.deinit(allocator);
-        _ = (try progress.beat(allocator, testing.io, shape.head, .{ .dialect = null }, weather_tools, .{})).?;
+        _ = (try progress.beat(allocator, testing.io, shape.head, .{ .reading = .text, .dialect = null }, weather_tools, .{})).?;
         // The reply holds no call: the opened one stays as sent.
         progress.settle(null);
         try testing.expectEqualStrings("get_weather", progress.cut().?.name);
@@ -333,7 +333,7 @@ test "tool progress: a call opened and then ended inside is cut, and the calls o
         // A reply whose first call is another tool's: it goes after the opened one, at its own index.
         var other = Progress{};
         defer other.deinit(allocator);
-        _ = (try other.beat(allocator, testing.io, shape.head, .{ .dialect = null }, weather_tools, .{})).?;
+        _ = (try other.beat(allocator, testing.io, shape.head, .{ .reading = .text, .dialect = null }, weather_tools, .{})).?;
         const call: tool_schema.ParsedToolCall = .{ .name = "get_stock", .arguments = "{\"symbol\":\"AAPL\"}" };
         other.settle(call);
         try testing.expect(other.cut() != null);
@@ -355,7 +355,7 @@ test "tool progress: a call after a finished one is never sent early, in every d
         defer progress.deinit(allocator);
         const text = try std.mem.concat(allocator, u8, &.{ shape.first_call, shape.head });
         defer allocator.free(text);
-        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .dialect = null }, weather_tools, .{})) == null);
+        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .reading = .text, .dialect = null }, weather_tools, .{})) == null);
         try testing.expect(progress.opened == null);
     }
 }
@@ -366,13 +366,13 @@ test "tool progress: no beat names a call before its name is settled and declare
     for (common) |text| {
         var progress = Progress{};
         defer progress.deinit(allocator);
-        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .dialect = null }, weather_tools, .{})) == null);
+        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .reading = .text, .dialect = null }, weather_tools, .{})) == null);
     }
     for (shapes) |shape| for (shape.unsettled) |text| {
         var progress = Progress{};
         defer progress.deinit(allocator);
         errdefer std.debug.print("[{s}] text: {f}\n", .{ shape.name, std.zig.fmtString(text) });
-        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .dialect = null }, weather_tools, .{})) == null);
+        try testing.expect((try progress.beat(allocator, testing.io, text, .{ .reading = .text, .dialect = null }, weather_tools, .{})) == null);
     };
 }
 
@@ -395,7 +395,7 @@ test "tool progress: a thought stands in the way of the opening, a closed one on
             var progress = Progress{};
             defer progress.deinit(allocator);
             errdefer std.debug.print("[{s}] case {d}\n", .{ shape.name, i });
-            const got = try progress.beat(allocator, testing.io, c.text, .{ .dialect = null, .opens_think = c.opens }, weather_tools, .{ .closed_thought_first = c.first });
+            const got = try progress.beat(allocator, testing.io, c.text, .{ .reading = .text, .dialect = null, .opens_think = c.opens }, weather_tools, .{ .closed_thought_first = c.first });
             try testing.expectEqual(c.goes, got != null);
         }
     }

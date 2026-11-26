@@ -880,7 +880,7 @@ pub fn renderChatSpans(
     const prefill = if (think_tags.continuationPrefill(messages, continue_final)) |p| try utf8Text(mend.allocator(), p) else null;
     const msgs = if (prefill != null) messages[0 .. messages.len - 1] else messages;
     // The thought of a continued turn rides `reasoning_content`; a close tag in its text would close the block twice.
-    if (prefill) |partial| if (think_tags.indexOfThinkCloseTag(partial, 0) != null) return error.ContinuationThoughtInContent;
+    if (prefill) |partial| if (think_tags.indexOfThinkCloseTag(.text, partial, 0) != null) return error.ContinuationThoughtInContent;
     // A turn holding only its thought is continued only as the template writes its think block.
     const thought_only = if (prefill) |partial| partial.len == 0 else false;
 
@@ -4138,8 +4138,8 @@ pub fn replayTurn(a: std.mem.Allocator, tok: *const Tokenizer, cfg: *const ChatC
     const gen = try tok.encode(a, raw);
     errdefer a.free(gen);
 
-    const split = think_tags.splitThinkBlock(raw, true, thinking);
-    const parsed = if (tools) |tj| try tool_schema.parseForRequest(a, raw, tj, .{ .allow_parallel = true, .autocorrect = true, .dialect = try callDialect(a, cfg) }) else null;
+    const split = think_tags.splitThinkBlock(.text, raw, true, thinking);
+    const parsed = if (tools) |tj| try tool_schema.parseForRequest(a, raw, tj, .{ .reading = .text, .allow_parallel = true, .autocorrect = true, .dialect = try callDialect(a, cfg) }) else null;
     defer if (parsed) |calls| {
         for (calls) |c| {
             a.free(c.name);

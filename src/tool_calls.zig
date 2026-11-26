@@ -47,7 +47,7 @@ const toolNameIsDeclared = tool_schema.toolNameIsDeclared;
 /// </arg_key:opensource><arg_value:opensource>V</arg_value:opensource></tool_call:opensource>`. The copy in GLM's
 /// plain tags with the wrapper dropped, or null when the text has none. A value (as `argValueClose` ends it) and a call
 /// of another dialect are copied as written: the repair changes call structure, never a value's bytes.
-fn opensourceTagRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+fn opensourceTagRepair(think_reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     if (std.mem.indexOf(u8, text, ":opensource>") == null) return null;
     const pairs = [_][2][]const u8{
         .{ "<tool_calls:opensource>", "" },           .{ "</tool_calls:opensource>", "" },
@@ -57,7 +57,7 @@ fn opensourceTagRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     };
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
-    var reader = tool_reading.Reader.init(text, true);
+    var reader = tool_reading.Reader.init(think_reading, text, true);
     var foreign: ?tool_reading.Call = null;
     var reading = true;
     var key_closed = false;
@@ -128,7 +128,7 @@ fn spliceSpecialOpeners(allocator: std.mem.Allocator, text: []const u8, openers:
 /// `<tool_call>` followed by a special token spelled where `<` belongs
 /// (`<|im_start|>function=x>`): the copy with that token read as `<`, or null when none. Only an opener that starts a
 /// call is read so: one a value spells is the value's own bytes.
-fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
+fn hermesSpecialOpenerRepair(think_reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8) !?[]u8 {
     const wrapper = "<tool_call>";
     var found: std.ArrayList(SpecialOpener) = .empty;
     defer found.deinit(allocator);
@@ -152,7 +152,7 @@ fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, text: []const u8) !?[
     const starts = try allocator.alloc(bool, found.items.len);
     defer allocator.free(starts);
     @memset(starts, false);
-    var reader = tool_reading.Reader.init(all, true);
+    var reader = tool_reading.Reader.init(think_reading, all, true);
     var k: usize = 0;
     var shift: usize = 0;
     var any = false;
@@ -180,37 +180,64 @@ pub const Dialect = enum {
     dsml,
 };
 
-/// Parse tool calls from model output of no known dialect.
+/// Parse tool calls from model output of no known dialect, its think tags read as text.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
-    return parseToolCallsAs(allocator, text, null);
+    return parseToolCallsAs(.text, allocator, text, null);
 }
 
 /// Parse tool calls from model output. The served dialect is read first and the others only when it finds no call:
 /// a parameter VALUE carrying another family's markup must never decide the call.
-pub fn parseToolCallsAs(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect) !?[]ParsedToolCall {
+pub fn parseToolCallsAs(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect) !?[]ParsedToolCall {
     var open: ?[]u8 = null;
     defer if (open) |name| allocator.free(name);
-    return parseToolCallsOpen(allocator, text, dialect, &open);
+    return parseToolCallsOpen(reading, allocator, text, dialect, &open);
 }
 
 /// `parseToolCallsAs`, and `open_bare`: the tool a bare unmarked JSON call names when the generation left it open (the
 /// name is whole, the object or its array element never closed), owned by the caller. Bare JSON is read only when no
 /// marked call is, so a marked call's text never sets it.
-pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect, open_bare: *?[]u8) !?[]ParsedToolCall {
+pub fn parseToolCallsOpen(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect, open_bare: *?[]u8) !?[]ParsedToolCall {
+    const calls = try parseToolCallsLead(reading, allocator, text, dialect, open_bare) orelse return null;
+    errdefer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try dropLeads(allocator, calls);
+    return calls;
+}
+
+/// A think tag token a call's value holds is the tag the model wrote: no call carries a tag's lead (`think_tags.withoutLead`).
+pub fn dropLeads(allocator: std.mem.Allocator, calls: []ParsedToolCall) !void {
+    for (calls) |*tc| {
+        if (try think_tags.withoutLead(allocator, tc.name)) |bare| {
+            allocator.free(tc.name);
+            tc.name = bare;
+        }
+        if (try think_tags.withoutLead(allocator, tc.arguments)) |bare| {
+            allocator.free(tc.arguments);
+            tc.arguments = bare;
+        }
+    }
+}
+
+fn parseToolCallsLead(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, dialect: ?Dialect, open_bare: *?[]u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
     var effective_text = text;
-    var tags: think_tags.Tags = .{};
+    var tags: think_tags.Tags = .{ .reading = reading };
     if (tool_reading.firstOutsideCalls(text, 0, true, &tags, .channel_close)) |end| {
         effective_text = std.mem.trimStart(u8, text[end.pos + end.len ..], "\n ");
     } else if (tool_reading.firstOutsideCalls(text, 0, true, &tags, .think_close)) |close| {
         effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
 
-    const opensource_fixed = try opensourceTagRepair(allocator, effective_text);
+    const opensource_fixed = try opensourceTagRepair(reading, allocator, effective_text);
     defer if (opensource_fixed) |r| allocator.free(r);
     if (opensource_fixed) |r| effective_text = r;
 
-    const special_fixed = try hermesSpecialOpenerRepair(allocator, effective_text);
+    const special_fixed = try hermesSpecialOpenerRepair(reading, allocator, effective_text);
     defer if (special_fixed) |r| allocator.free(r);
     if (special_fixed) |r| effective_text = r;
 
@@ -252,7 +279,7 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
     // GLM's bare `<tool_call>NAME<arg_key>…` format is tried before the generic `<tool` scan, which would misread
     // its non-JSON arg_key/arg_value body; when a family above it matched, the generic scan is skipped but the
     // shared safety net at the bottom still runs. The function-tag dialect reads the generic scan first.
-    if (dialect != .function_tag) try parseTaggedFamilies(allocator, effective_text, &calls, dialect);
+    if (dialect != .function_tag) try parseTaggedFamilies(reading, allocator, effective_text, &calls, dialect);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -569,7 +596,7 @@ pub fn parseToolCallsOpen(allocator: std.mem.Allocator, text: []const u8, dialec
         }
     }
 
-    if (dialect == .function_tag and calls.items.len == 0) try parseTaggedFamilies(allocator, effective_text, &calls, dialect);
+    if (dialect == .function_tag and calls.items.len == 0) try parseTaggedFamilies(reading, allocator, effective_text, &calls, dialect);
 
     // Gemma 4 format: <|tool_call>call:name{args}<tool_call|>
     if (calls.items.len == 0) {
@@ -702,12 +729,12 @@ fn dropUnnamedCalls(allocator: std.mem.Allocator, calls: *std.ArrayList(ParsedTo
 
 /// DeepSeek's DSML and GLM's arg_key calls, each family's calls kept only under a valid name. A served dialect's family
 /// is read first and the other only when it found no call; with no dialect both are read, DSML first.
-fn parseTaggedFamilies(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), dialect: ?Dialect) !void {
+fn parseTaggedFamilies(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall), dialect: ?Dialect) !void {
     const dsml_first = dialect != .arg_key;
     for ([_]bool{ dsml_first, !dsml_first }) |dsml| {
         if (dialect != null and calls.items.len > 0) return;
         // A family reads only its own calls: another family's markup in a value is payload.
-        const own = try tool_reading.maskedExcept(allocator, text, if (dsml) tool_reading.isDsmlCall else tool_reading.isArgKeyCall);
+        const own = try tool_reading.maskedExcept(reading, allocator, text, if (dsml) tool_reading.isDsmlCall else tool_reading.isArgKeyCall);
         defer if (own) |o| allocator.free(o);
         if (dsml) try parseDsmlToolCalls(allocator, own orelse text, calls) else try parseArgKeyToolCalls(allocator, own orelse text, calls);
         dropUnnamedCalls(allocator, calls);
@@ -3897,7 +3924,7 @@ test "parseHermesToolCall: the schema types a space-padded scalar, the call carr
     const raw = (try parseToolCalls(allocator, text)).?;
     defer tool_schema.freeParsedCalls(raw);
     try testing.expectEqualStrings("{\"path\":\"./src\",\"limit\":\" 5 \",\"recursive\":\" true \"}", raw[0].arguments);
-    const typed = (try tool_schema.parseForRequest(allocator, text, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
+    const typed = (try tool_schema.parseForRequest(allocator, text, tools, .{ .reading = .text, .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
     defer tool_schema.freeParsedCalls(typed);
     try testing.expectEqualStrings("{\"path\":\"./src\",\"limit\":5,\"recursive\":true}", typed[0].arguments);
 }
@@ -5308,7 +5335,7 @@ test "parseToolCalls arg_key: Hy4's :opensource spelling inside its <tool_calls:
         "<arg_key:opensource>path</arg_key:opensource><arg_value:opensource>jfk.txt</arg_value:opensource>" ++
         "<arg_key:opensource>count</arg_key:opensource><arg_value:opensource>3</arg_value:opensource>" ++
         "</tool_call:opensource><tool_call:opensource>get_time</tool_call:opensource></tool_calls:opensource>";
-    const calls = (try parseToolCallsAs(testing.allocator, raw, .arg_key)).?;
+    const calls = (try parseToolCallsAs(.text, testing.allocator, raw, .arg_key)).?;
     defer {
         for (calls) |tc| {
             testing.allocator.free(tc.name);
@@ -5731,7 +5758,7 @@ test "parseToolCalls qwen: a parameter value carrying </tool_call> is not droppe
 /// `raw` read as `dialect` is one call, `write_file`, whose `content` argument is `want`.
 fn expectWriteFile(raw: []const u8, dialect: ?Dialect, want: []const u8) !void {
     const allocator = testing.allocator;
-    const calls = (try parseToolCallsAs(allocator, raw, dialect)) orelse return error.NoToolCall;
+    const calls = (try parseToolCallsAs(.text, allocator, raw, dialect)) orelse return error.NoToolCall;
     defer tool_schema.freeParsedCalls(calls);
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("write_file", calls[0].name);
@@ -5774,7 +5801,7 @@ test "parseToolCallsAs: a value ends where the family's own grammar ends it" {
     try expectWriteFile("<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"write_file\">\n<｜DSML｜ parameter name=\"content\" string=\"true\"></｜DSML｜ parameter></｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>", .dsml, "</｜DSML｜ parameter>");
     // A GLM key after a value that spelled the call's close is still read.
     const allocator = testing.allocator;
-    const calls = (try parseToolCallsAs(allocator, "<tool_call>write_file<arg_key>content</arg_key><arg_value></tool_call></arg_value><arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>", .arg_key)).?;
+    const calls = (try parseToolCallsAs(.text, allocator, "<tool_call>write_file<arg_key>content</arg_key><arg_value></tool_call></arg_value><arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>", .arg_key)).?;
     defer tool_schema.freeParsedCalls(calls);
     try testing.expectEqualStrings("{\"content\":\"</tool_call>\",\"path\":\"a.txt\"}", calls[0].arguments);
 }
@@ -5954,7 +5981,7 @@ test "r174-f-closer-monotone: a closer judged outside every value stays outside 
 
 fn expectContentValue(raw: []const u8, dialect: ?Dialect, want: []const u8) !void {
     const a = testing.allocator;
-    const calls = (try parseToolCallsAs(a, raw, dialect)) orelse return error.TestUnexpectedResult;
+    const calls = (try parseToolCallsAs(.text, a, raw, dialect)) orelse return error.TestUnexpectedResult;
     defer {
         for (calls) |c| {
             a.free(c.name);
@@ -6017,7 +6044,7 @@ test "a Hy4 wrapper around plain tags, and the call after a spelling value, read
         "a </tool_calls:opensource> b",
     );
     const a = testing.allocator;
-    const calls = (try parseToolCallsAs(a, "<tool_calls:opensource><tool_call:opensource>f<arg_key:opensource>k</arg_key:opensource><arg_value:opensource></tool_calls:opensource></arg_value:opensource></tool_call:opensource><tool_call:opensource>g<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource></tool_calls:opensource>", .arg_key)) orelse return error.TestUnexpectedResult;
+    const calls = (try parseToolCallsAs(.text, a, "<tool_calls:opensource><tool_call:opensource>f<arg_key:opensource>k</arg_key:opensource><arg_value:opensource></tool_calls:opensource></arg_value:opensource></tool_call:opensource><tool_call:opensource>g<arg_key:opensource>k</arg_key:opensource><arg_value:opensource>v</arg_value:opensource></tool_call:opensource></tool_calls:opensource>", .arg_key)) orelse return error.TestUnexpectedResult;
     defer {
         for (calls) |c| {
             a.free(c.name);
@@ -6034,7 +6061,7 @@ test "a Hy4 wrapper around plain tags, and the call after a spelling value, read
 test "two Hermes calls that spell a special-token opener are both read as calls" {
     const a = testing.allocator;
     const raw = "<tool_call><|im_start|>function=f>\n<parameter=k>\n1\n</parameter>\n</function>\n</tool_call>\n<tool_call><|im_start|>function=g>\n<parameter=k>\n2\n</parameter>\n</function>\n</tool_call>";
-    const calls = (try parseToolCallsAs(a, raw, .function_tag)) orelse return error.TestUnexpectedResult;
+    const calls = (try parseToolCallsAs(.text, a, raw, .function_tag)) orelse return error.TestUnexpectedResult;
     defer {
         for (calls) |c| {
             a.free(c.name);

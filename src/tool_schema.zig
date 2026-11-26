@@ -673,13 +673,13 @@ pub fn filterInferredBySchema(
 ///   • the object's keys must satisfy exactly ONE tool in `tools_json`
 ///     (OpenAI shape): required ⊆ keys AND keys ⊆ properties;
 ///   • zero or multiple matching tools → null (ambiguity never guesses).
-pub fn inferBareJsonToolCalls(allocator: std.mem.Allocator, text: []const u8, tools_json: []const u8) !?[]ParsedToolCall {
+pub fn inferBareJsonToolCalls(reading: think_tags.Reading, allocator: std.mem.Allocator, text: []const u8, tools_json: []const u8) !?[]ParsedToolCall {
     // Strip a leading think block, mirroring parseToolCalls.
     var effective_text = text;
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
-    } else if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
-        effective_text = std.mem.trimStart(u8, text[think_end + 8 ..], "\n ");
+    } else if (think_tags.indexOfThinkCloseTag(reading, text, 0)) |close| {
+        effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
     var trimmed = std.mem.trimStart(u8, effective_text, "\n \t");
     // Skip one opening markdown fence line (``` or ```json etc.).
@@ -762,6 +762,8 @@ const test_tools_write_bash =
 ;
 
 pub const RequestOptions = struct {
+    /// How the text spells its think tags (`think_tags.readingOf`).
+    reading: think_tags.Reading,
     /// false keeps only the first parsed call (client-requested, never a repair heuristic).
     allow_parallel: bool,
     /// `--no-tool-autocorrect` turns this off: the hoist and the schema coercion.
@@ -773,14 +775,15 @@ pub const RequestOptions = struct {
 /// The ONE tool-call extraction path: parse in the served dialect, fall back to bare-JSON inference, clamp to
 /// `allow_parallel`, then hoist and coerce the arguments to the schema the request declared.
 pub fn parseForRequest(allocator: std.mem.Allocator, text: []const u8, tools_json: ?[]const u8, opts: RequestOptions) !?[]ParsedToolCall {
-    var parsed_calls = try tool_calls_mod.parseToolCallsAs(allocator, text, opts.dialect);
+    var parsed_calls = try tool_calls_mod.parseToolCallsAs(opts.reading, allocator, text, opts.dialect);
     // An inferred raw-JSON call must name a DECLARED tool: a truncated data object is not a call. Not gated on
     // autocorrect, which only gates repairs of the model's own output.
     if (parsed_calls) |c| {
         if (tools_json) |tj| parsed_calls = try filterInferredBySchema(allocator, c, tj);
     }
     var calls = parsed_calls orelse
-        (if (tools_json) |tj| try inferBareJsonToolCalls(allocator, text, tj) else null) orelse return null;
+        (if (tools_json) |tj| try inferBareJsonToolCalls(opts.reading, allocator, text, tj) else null) orelse return null;
+    try tool_calls_mod.dropLeads(allocator, calls);
     if (!opts.allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
         for (calls[1..]) |tc| {
@@ -808,7 +811,7 @@ test "inferBareJsonToolCalls maps bare-args fenced JSON to the unique matching t
     // Shape captured live from gemma-4-12b via Claude Code /v1/messages: thought
     // block, then a ```json fence holding ONLY the Write tool's arguments.
     const text = "<|channel>thought\nI will create this file using Write.<channel|>```json\n{\n  \"file_path\": \"/Users/user/mlx_info.html\",\n  \"content\": \"<h1>MLX</h1>\"\n}\n```\nI've created the file.";
-    const calls = (try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) orelse return error.NoCalls;
+    const calls = (try inferBareJsonToolCalls(.text, allocator, text, test_tools_write_bash)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -826,7 +829,7 @@ test "inferBareJsonToolCalls maps bare-args fenced JSON to the unique matching t
 test "inferBareJsonToolCalls unfenced bare object at content start" {
     const allocator = testing.allocator;
     const text = "{\"command\": \"ls -la\"}";
-    const calls = (try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) orelse return error.NoCalls;
+    const calls = (try inferBareJsonToolCalls(.text, allocator, text, test_tools_write_bash)) orelse return error.NoCalls;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -844,18 +847,18 @@ test "inferBareJsonToolCalls refuses ambiguous and non-matching objects" {
         \\[{"type":"function","function":{"name":"a","parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}},
         \\ {"type":"function","function":{"name":"b","parameters":{"type":"object","properties":{"x":{"type":"string"}},"required":["x"]}}}]
     ;
-    try testing.expect((try inferBareJsonToolCalls(allocator, "{\"x\": \"1\"}", dup_tools)) == null);
+    try testing.expect((try inferBareJsonToolCalls(.text, allocator, "{\"x\": \"1\"}", dup_tools)) == null);
     // Keys not in any tool's properties → null.
-    try testing.expect((try inferBareJsonToolCalls(allocator, "{\"zzz\": 1}", test_tools_write_bash)) == null);
+    try testing.expect((try inferBareJsonToolCalls(.text, allocator, "{\"zzz\": 1}", test_tools_write_bash)) == null);
     // Missing a required key → null.
-    try testing.expect((try inferBareJsonToolCalls(allocator, "{\"file_path\": \"a.txt\"}", test_tools_write_bash)) == null);
+    try testing.expect((try inferBareJsonToolCalls(.text, allocator, "{\"file_path\": \"a.txt\"}", test_tools_write_bash)) == null);
 }
 
 test "inferBareJsonToolCalls ignores JSON that does not lead the content" {
     const allocator = testing.allocator;
     // Example object mid-prose must never be promoted to a call.
     const text = "Here is an example of the payload you could send: {\"command\": \"ls\"} — adjust as needed.";
-    try testing.expect((try inferBareJsonToolCalls(allocator, text, test_tools_write_bash)) == null);
+    try testing.expect((try inferBareJsonToolCalls(.text, allocator, text, test_tools_write_bash)) == null);
 }
 
 test "filterInferredBySchema drops undeclared inferred calls, keeps declared and explicit ones" {
@@ -1621,12 +1624,12 @@ test "coerceToolArgsToSchema: a number keeps the model's spelling and a string p
     ;
     const qwen = "<tool_call>\n<function=E>\n<parameter=ratio>\n0.50\n</parameter>\n<parameter=limit>\n 7 \n</parameter>\n" ++
         "<parameter=label>\n1.50\n</parameter>\n<parameter=tag>\nnull\n</parameter>\n</function>\n</tool_call>";
-    const typed = (try parseForRequest(allocator, qwen, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
+    const typed = (try parseForRequest(allocator, qwen, tools, .{ .reading = .text, .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
     defer freeParsedCalls(typed);
     try testing.expectEqualStrings("{\"ratio\":0.50,\"limit\":7,\"label\":\"1.50\",\"tag\":\"null\"}", typed[0].arguments);
     // A JSON dialect's number in a string param becomes that param's text; the numbers beside it are untouched.
     const json = "<tool_call>{\"name\":\"E\",\"arguments\":{\"label\":1.50,\"ratio\":2.0,\"limit\":\"3\",\"tag\":true}}</tool_call>";
-    const fixed = (try parseForRequest(allocator, json, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = null })).?;
+    const fixed = (try parseForRequest(allocator, json, tools, .{ .reading = .text, .allow_parallel = true, .autocorrect = true, .dialect = null })).?;
     defer freeParsedCalls(fixed);
     try testing.expectEqualStrings("{\"label\":\"1.50\",\"ratio\":2.0,\"limit\":3,\"tag\":\"true\"}", fixed[0].arguments);
 }
@@ -1637,7 +1640,7 @@ test "coerceToolArgsToSchema: an integer param past i64 is still a number, spell
         \\[{"type":"function","function":{"name":"E","parameters":{"type":"object","properties":{"id":{"type":"integer"}}}}}]
     ;
     const qwen = "<tool_call>\n<function=E>\n<parameter=id>\n12345678901234567890\n</parameter>\n</function>\n</tool_call>";
-    const typed = (try parseForRequest(allocator, qwen, tools, .{ .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
+    const typed = (try parseForRequest(allocator, qwen, tools, .{ .reading = .text, .allow_parallel = true, .autocorrect = true, .dialect = .function_tag })).?;
     defer freeParsedCalls(typed);
     try testing.expectEqualStrings("{\"id\":12345678901234567890}", typed[0].arguments);
 }

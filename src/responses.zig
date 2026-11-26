@@ -10,13 +10,17 @@ const request_fields = @import("request_fields.zig");
 const request_parse = @import("request_parse.zig");
 const json_text = @import("json_text.zig");
 const chat_mod = @import("chat.zig");
+const think_tags = @import("think_tags.zig");
 
 // ─── small json helpers (intentionally duplicated from server.zig to avoid
 // ─── a circular import; identical behavior) ──────────────────────────────
 
 /// Escape into a JSON string literal. Every string here is built from model
 /// bytes, and a token is a BPE fragment — see the same chokepoint in server.zig.
-pub fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+pub fn jsonEscape(allocator: std.mem.Allocator, generated: []const u8) ![]const u8 {
+    const bare = try think_tags.withoutLead(allocator, generated);
+    defer if (bare) |b| allocator.free(b);
+    const input = bare orelse generated;
     if (!std.unicode.utf8ValidateSlice(input)) {
         const clean = try chat_mod.utf8Sanitize(allocator, input);
         defer allocator.free(clean);
