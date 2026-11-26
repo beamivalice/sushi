@@ -44,7 +44,7 @@ record sushi cannot read, or one from a newer sushi, refuses it the same way. A 
 (`chat_template*`, `*.jinja`) or a `.md`/`.txt` file never refuses a load. A folder with an older (v1) record is hashed
 once on its next pull, which then seals it. A folder without the manifest (an older sushi, a copy by hand) is hashed once
 (`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
-checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the last manifest
+checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the repo lists without a content id has no key, so its partial is deleted too and the pull logs that it restarted the file. A file the last manifest
 listed that the repo no longer has is removed (a case-only rename names the same file on a case-insensitive volume, so it is kept); nothing else in the folder is touched. `sushi run` still uses a present
 local copy without contacting Hugging Face. `run <name>` looks in the org layout (`~/.sushi/models/beamster/<repo>`) and
 the flat layout (`~/.sushi/models/<repo>`, `hf download --local-dir`) only; a folder with no record (a hand copy, `hf download`, an older

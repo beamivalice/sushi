@@ -555,7 +555,10 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
     var auth = HfAuth.initProcess(allocator, io) catch return error.DownloadFailed;
     defer auth.deinit(allocator, io);
     try curlBaseArgs(&argv, allocator, auth);
-    if (expect) |e| hf_pull.claimPartial(io, partial, e) catch {};
+    if (expect) |e| {
+        const discarded = hf_pull.claimPartial(io, partial, e) catch false;
+        if (discarded) reporter.say("restarted {s} from zero: its partial was for another revision", .{e.path});
+    }
     try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
     if (show_progress) {
         try argv.append(allocator, "--progress-bar");

@@ -305,14 +305,22 @@ fn partialKeyed(dir: std.Io.Dir, io: std.Io, partial: []const u8, f: RepoFile) b
 }
 
 /// Before curl resumes `partial`: keeps it when it is keyed to `f`, else deletes it, and records `f`'s key.
-pub fn claimPartial(io: std.Io, partial: []const u8, f: RepoFile) !void {
-    if (f.oid.len == 0) return;
+/// An oid-less row has no key to resume under, so its partial is always discarded. True when one was.
+pub fn claimPartial(io: std.Io, partial: []const u8, f: RepoFile) !bool {
     const cwd = std.Io.Dir.cwd();
-    if (!partialKeyed(cwd, io, partial, f)) cwd.deleteFile(io, partial) catch {};
+    if (f.oid.len == 0) {
+        const had = if (cwd.access(io, partial, .{})) |_| true else |_| false;
+        dropPartial(io, partial);
+        return had;
+    }
+    const kept = partialKeyed(cwd, io, partial, f);
+    const discarded = if (kept) false else if (cwd.access(io, partial, .{})) |_| true else |_| false;
+    if (!kept) cwd.deleteFile(io, partial) catch {};
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const key_path = try std.fmt.bufPrint(&path_buf, "{s}.oid", .{partial});
     var buf: [128]u8 = undefined;
     try cwd.writeFile(io, .{ .sub_path = key_path, .data = try std.fmt.bufPrint(&buf, "{s} {d}\n", .{ f.oid, f.size }) });
+    return discarded;
 }
 
 /// Removes `partial` and its key.
@@ -622,16 +630,37 @@ test "hf pull: claiming a partial discards an unkeyed or foreign one and keeps i
     defer testing.allocator.free(partial);
     const f: RepoFile = .{ .path = @constCast("m"), .size = 4, .oid = @constCast("abc") };
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial", .data = "xx" });
-    try claimPartial(testing.io, partial, f);
+    _ = try claimPartial(testing.io, partial, f);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial", .{}));
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial", .data = "xx" });
-    try claimPartial(testing.io, partial, f);
+    _ = try claimPartial(testing.io, partial, f);
     _ = try tmp.dir.statFile(testing.io, "m.partial", .{});
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.partial.oid", .data = "other 4\n" });
-    try claimPartial(testing.io, partial, f);
+    _ = try claimPartial(testing.io, partial, f);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial", .{}));
     dropPartial(testing.io, partial);
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(testing.io, "m.partial.oid", .{}));
+}
+
+test "hf pull: a stale partial is not resumed for a listing entry with no content id" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    // Bytes of another revision under the final name of this pull's file, and a listing row with no id to check them.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.partial", .data = "xx" });
+    const f: RepoFile = .{ .path = @constCast("m"), .size = 4 };
+    const partial = try std.fmt.allocPrint(testing.allocator, "{s}/m.partial", .{dir});
+    defer testing.allocator.free(partial);
+    // A partial resumes only under its `.partial.oid` key, and with no id there is no key: it must start from zero.
+    const discarded = try claimPartial(io, partial, f);
+    _ = tmp.dir.statFile(io, "m.partial", .{}) catch {
+        try testing.expect(discarded);
+        return;
+    };
+    std.debug.print("an unkeyed partial survives for an oid-less row, and curl resumes onto it unverified\n", .{});
+    return error.StalePartialKept;
 }
 
 test "hf pull: only files the old manifest named and the repo dropped are removed" {
