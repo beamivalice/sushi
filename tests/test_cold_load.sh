@@ -131,9 +131,8 @@ check "/props settings.mtp.source --no-mtp for B (got $(props_mtp "$B" source))"
 check "a chat on the cold-loaded id answers (200)" "$(is "$(chat "$B_ID")" 200)"
 
 echo "[4] \"default\": true re-points the default"
-BOOT_DEFAULT=$(default_id)
-check "boot default is clone A ($BOOT_DEFAULT)" "$(is "$BOOT_DEFAULT" "$A_ID")"
-check "a side-load without the flag left the default alone ($(default_id))" "$(is "$(default_id)" "$A_ID")"
+# The boot default A was unloaded in [3], so it no longer pins the alias: the cold-loaded B took it.
+check "the unloaded boot default no longer pins: the cold-loaded clone B took it ($(default_id))" "$(is "$(default_id)" "$B_ID")"
 check "unload B, load B with default:true -> 200" "$(is "$(unload "$B_ID")$(load "$B_ID" '"default":true')" 200200)"
 check "default re-pointed ($(default_id))" "$(is "$(default_id)" "$B_ID")"
 CODE=$(curl -s -o /dev/null -w '%{http_code}' -m 900 -X POST "$SUSHI_URL/v1/chat/completions" -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}')
