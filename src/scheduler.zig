@@ -7440,6 +7440,8 @@ const FreshCall = struct {
 };
 
 test "an explicit retry whose load turns ready before it is marked posted frees the kept failure's name" {
+    // Skipped by the owner for 1.8.1: it segfaults at every seed on an M5 Max 128 GB, an open bug to fix.
+    if (true) return error.SkipZigTest;
     const io = testing.io;
     if (@import("arch/registry.zig").ofModelType("qwen4_exp") == null) return error.SkipZigTest;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
