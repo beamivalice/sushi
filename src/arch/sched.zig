@@ -541,7 +541,13 @@ pub fn afterSpecBlock(slot: *Slot, gen: *Generator, block: []const u32) void {
 
 /// A request ended on this model.
 pub fn endRequest(config: *const ModelConfig) void {
-    defer @import("cooler.zig").endRequest(config);
+    closeRequest(config);
+    @import("cooler.zig").rest(config);
+}
+
+/// A request ended on this model, its slot still to be freed: the pool comes to rest once it is (`cooler.rest`).
+pub fn closeRequest(config: *const ModelConfig) void {
+    defer @import("cooler.zig").closeRequest(config);
     const tag = tagOfConfig(config) orelse return;
     switch (tag) {
         inline else => |t| if (comptime has(t, "endRequest")) S(t).endRequest(config),

@@ -36,12 +36,7 @@ fn captureRequestBytes(a: std.mem.Allocator, m: *const hy4_model.Model, r: *cons
 
 fn endSlot(sv: *Served, slot: *scheduler.Slot) void {
     sv.sch.complete(slot);
-    for (sv.sch.cleanup_queue.items) |s| {
-        scheduler.cleanupSlot(&sv.sch, s);
-        const turn = @import("../arch/handle.zig").turnFor(s.model.handle, s.model.config);
-        defer turn.end();
-        s.deinit();
-    }
+    scheduler.drainSlots(&sv.sch, sv.sch.cleanup_queue.items);
     sv.sch.cleanup_queue.clearRetainingCapacity();
 }
 

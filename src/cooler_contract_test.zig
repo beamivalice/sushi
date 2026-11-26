@@ -775,7 +775,7 @@ pub const Served = struct {
         const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
         defer {
             sch.complete(slot);
-            for (sch.cleanup_queue.items) |s| s.deinit();
+            scheduler.drainSlots(sch, sch.cleanup_queue.items);
             sch.cleanup_queue.clearRetainingCapacity();
         }
         _ = sch.pending.orderedRemove(0);
@@ -805,8 +805,7 @@ pub const Served = struct {
     }
 
     /// One request as the inference loop runs it, a failure settled by `failPrefill` or `failTick`, then completed and
-    /// taken by the loop's cleanup drain (`cleanupSlot`, then the slot's memory goes): the dispatches still open between
-    /// the drain and the slot's end.
+    /// taken by the loop's cleanup drain (`scheduler.drainSlots`): the dispatches still open once the slot is gone.
     pub fn requestToCleanup(self: *Served, prompt: []const u32, n: u32, mtp: bool) !u32 {
         const sch = &self.sch;
         const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(self.entry.handle.?), true, null) else null;
@@ -820,16 +819,9 @@ pub const Served = struct {
             scheduler.cullDecoding(sch);
         }
         sch.complete(slot);
-        var open: u32 = 0;
-        for (sch.cleanup_queue.items) |s| {
-            scheduler.cleanupSlot(sch, s);
-            open = @max(open, mlx.engine.openDispatches());
-            const turn = arch_handle.turnFor(s.model.handle, s.model.config);
-            defer turn.end();
-            s.deinit();
-        }
+        scheduler.drainSlots(sch, sch.cleanup_queue.items);
         sch.cleanup_queue.clearRetainingCapacity();
-        return open;
+        return mlx.engine.openDispatches();
     }
 
     /// Requests through the scheduler, each prefilled in turn and then decoded together, their rows joined in its ticks
@@ -846,7 +838,7 @@ pub const Served = struct {
         var made: usize = 0;
         defer {
             for (slots[0..made]) |slot| sch.complete(slot);
-            for (sch.cleanup_queue.items) |s| s.deinit();
+            scheduler.drainSlots(sch, sch.cleanup_queue.items);
             sch.cleanup_queue.clearRetainingCapacity();
         }
         for (prompts) |p| {
@@ -888,7 +880,7 @@ pub const Served = struct {
         const slot = try sch.submit(.{ .model = self.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = n });
         defer {
             sch.complete(slot);
-            for (sch.cleanup_queue.items) |s| s.deinit();
+            scheduler.drainSlots(sch, sch.cleanup_queue.items);
             sch.cleanup_queue.clearRetainingCapacity();
         }
         _ = sch.pending.orderedRemove(0);
@@ -957,7 +949,7 @@ pub fn servedDrafts(sv: *Served, prompt: []const u32, n: u32, sampling: @import(
     const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = head != null, .mtp = head });
     defer {
         sch.complete(slot);
-        for (sch.cleanup_queue.items) |s| s.deinit();
+        scheduler.drainSlots(sch, sch.cleanup_queue.items);
         sch.cleanup_queue.clearRetainingCapacity();
     }
     _ = sch.pending.orderedRemove(0);
@@ -1001,7 +993,7 @@ pub fn servedRowsWith(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, s
     var made: usize = 0;
     defer {
         for (slots[0..made]) |s| sch.complete(s);
-        for (sch.cleanup_queue.items) |s| s.deinit();
+        scheduler.drainSlots(sch, sch.cleanup_queue.items);
         sch.cleanup_queue.clearRetainingCapacity();
     }
     for (0..2) |i| {
@@ -1090,12 +1082,7 @@ pub const MixedTick = struct {
     }
 
     pub fn drain(sch: *scheduler.Scheduler) void {
-        for (sch.cleanup_queue.items) |s| scheduler.cleanupSlot(sch, s);
-        for (sch.cleanup_queue.items) |s| {
-            const turn = arch_handle.turnFor(s.model.handle, s.model.config);
-            defer turn.end();
-            s.deinit();
-        }
+        scheduler.drainSlots(sch, sch.cleanup_queue.items);
         sch.cleanup_queue.clearRetainingCapacity();
     }
 

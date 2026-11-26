@@ -146,12 +146,7 @@ fn pendingSlot(sv: *Served, prompt: []const u32, n: u32, deferred: ?*@import("..
 
 fn ended(sv: *Served, slot: *Served.scheduler.Slot) void {
     sv.sch.complete(slot);
-    for (sv.sch.cleanup_queue.items) |s| {
-        Served.scheduler.cleanupSlot(&sv.sch, s);
-        const turn = @import("../arch/handle.zig").turnFor(s.model.handle, s.model.config);
-        defer turn.end();
-        s.deinit();
-    }
+    Served.scheduler.drainSlots(&sv.sch, sv.sch.cleanup_queue.items);
     sv.sch.cleanup_queue.clearRetainingCapacity();
 }
 

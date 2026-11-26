@@ -2887,19 +2887,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             // After the teardown settles, like a load: a finished slot's flush has run by then.
             if (sch.cleanup_queue.items.len == 0 and sch.prefix_clear_queue.items.len > 0) clear_req = sch.prefix_clear_queue.orderedRemove(0);
         }
-        for (cleanup_batch[0..cleanup_n]) |s| cleanupSlot(sch, s);
-        if (cleanup_n > 0) {
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
-            recordDrained(sch.metrics, cleanup_batch[0..cleanup_n], sch.decoding.items);
-        }
-        const freed = slot_admission.heldBy(cleanup_batch[0..cleanup_n]);
-        deinitSlotsReturningPool(cleanup_batch[0..cleanup_n]);
-        if (cleanup_n > 0) {
-            sch.queue_mu.lockUncancelable(sch.io);
-            defer sch.queue_mu.unlock(sch.io);
-            slot_admission.releaseHoldLocked(sch, freed);
-        }
+        drainSlots(sch, cleanup_batch[0..cleanup_n]);
         destroyAbandoned(abandoned);
         if (orphan_vision_n > 0) {
             // An orphaned encode has no model left to turn to: an array of MLX's is freed in a turn of MLX's, and one
@@ -3196,7 +3184,34 @@ fn commitsAtCull(s: *const Slot) bool {
 }
 
 /// The cleanup drain's step for one slot the connection thread completed, before its deinit (inference thread).
-pub fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
+/// Ends drained slots, the inference loop's and every harness's one path: each request's end, its metrics, the slots
+/// freed, each model's pool brought to rest only then (a slot's deinit returns buffers to it), and the hold released.
+pub fn drainSlots(sch: *Scheduler, slots: []const *Slot) void {
+    if (slots.len == 0) return;
+    for (slots) |s| cleanupSlot(sch, s);
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        recordDrained(sch.metrics, slots, sch.decoding.items);
+    }
+    const freed = slot_admission.heldBy(slots);
+    // A slot's config outlives the slot; the drain's models, each once.
+    var models: [16]*const ModelConfig = undefined;
+    var n: usize = 0;
+    for (slots) |s| if (s.model.config) |c| {
+        if (std.mem.indexOfScalar(*const ModelConfig, models[0..n], c) == null) {
+            models[n] = c;
+            n += 1;
+        }
+    };
+    deinitSlotsReturningPool(slots);
+    for (models[0..n]) |c| @import("arch/cooler.zig").rest(c);
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    slot_admission.releaseHoldLocked(sch, freed);
+}
+
+fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
     const turn = arch_handle.turnFor(s.model.handle, s.model.config);
     defer turn.end();
     // Decode-phase cancel: `complete()` pulled this slot straight
@@ -3227,7 +3242,7 @@ pub fn cleanupSlot(sch: *Scheduler, s: *Slot) void {
     // record must not outlive the bytes `s.deinit()` frees.
     if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
     if (s.model.handle) |h| arch_state.resetTables(arch_handle.trunk(h));
-    if (s.model.config) |c| sched.endRequest(c);
+    if (s.model.config) |c| sched.closeRequest(c);
     // A client that left mid-decode never reaches the inference thread's release: its reservation ends here.
     @import("static_bill.zig").requestEnded(s);
     slot_admission.publishModelReserved(sch, s.model);

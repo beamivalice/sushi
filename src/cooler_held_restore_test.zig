@@ -624,12 +624,7 @@ test "cooler contract: a served Qwen takeover turn cancelled as its prefill ends
                 slot.cancelled.store(true, .release);
                 try testing.expect(scheduler.postPrefillTerminal(sch, slot));
                 sch.complete(slot);
-                for (sch.cleanup_queue.items) |s| {
-                    scheduler.cleanupSlot(sch, s);
-                    const turn = arch_handle.turnFor(s.model.handle, s.model.config);
-                    defer turn.end();
-                    s.deinit();
-                }
+                scheduler.drainSlots(sch, sch.cleanup_queue.items);
                 sch.cleanup_queue.clearRetainingCapacity();
                 const hc = &sv.entry.prefix_cache.?;
                 hc.flushPendingDisk(arch_handle.trunk(sv.entry.handle.?).s);
@@ -1161,4 +1156,35 @@ fn rewindPastHeld(ld: *Load, dir: []const u8, ids: []const u32, reused: *u32) !s
     const back = try sv.request(rewind.items, 16, &f);
     reused.* = sv.reused;
     return back;
+}
+
+test "cooler contract: a served request cancelled at its prefill leaves the pool at its resting cap once it is drained, as one that ends does" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const gpu_mem = @import("gpu_mem.zig");
+            const ld = try heldLoad(C, dir);
+            var sv: Served = undefined;
+            try sv.init(ld, dir);
+            defer sv.deinit();
+            const rest = @import("arch/cooler.zig").restCap(&ld.config);
+            const prompt = ids[0..@min(ids.len, 40)];
+            var from: u32 = 0;
+            var done = try sv.request(prompt, 8, &from);
+            done.deinit(a);
+            const after_end = gpu_mem.engineFree();
+            const sch = &sv.sch;
+            const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = 8 });
+            _ = sch.pending.orderedRemove(0);
+            try Served.scheduler.runPrefill(sch, slot);
+            slot.cancel();
+            sch.complete(slot);
+            Served.scheduler.drainSlots(sch, sch.cleanup_queue.items);
+            sch.cleanup_queue.clearRetainingCapacity();
+            const after_cancel = gpu_mem.engineFree();
+            errdefer std.debug.print("cooler contract: free pool {d} B after a request that ended, {d} B after one cancelled at its prefill; resting cap {d} B\n", .{ after_end, after_cancel, rest });
+            try testing.expect(after_end <= rest);
+            try testing.expect(after_cancel <= rest);
+        }
+    }.run);
 }

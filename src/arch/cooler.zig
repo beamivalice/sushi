@@ -155,9 +155,20 @@ fn trimTo(bytes: u64) void {
 /// Cooler arch's: the rest is what its ledger parks. An arch with its own caps keeps the rest as its cap in force
 /// (DeepSeek lifts it around a restore); for the rest no cap stays.
 pub fn endRequest(config: *const ModelConfig) void {
+    closeRequest(config);
+    rest(config);
+}
+
+/// The request's pass closes; a slot that frees buffers frees them after this and before `rest`.
+pub fn closeRequest(config: *const ModelConfig) void {
     if (!onEngine(config)) return;
     @import("cooler_pipelines.zig").requestEnded();
     mlx.engine.close();
+}
+
+/// The free buffers past the resting cap go back, after everything the request held is freed.
+pub fn rest(config: *const ModelConfig) void {
+    if (!onEngine(config)) return;
     if (ownCaps(config)) install(restCap(config)) else trimTo(restCap(config));
 }
 

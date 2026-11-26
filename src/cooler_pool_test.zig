@@ -857,7 +857,7 @@ fn stoppedAfterPrompt(sv: *Served, prompt: []const u32, n: u32, stop: u32, mtp: 
     const slot = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompt, .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{stop}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
     defer {
         sch.complete(slot);
-        for (sch.cleanup_queue.items) |s| s.deinit();
+        scheduler.drainSlots(sch, sch.cleanup_queue.items);
         sch.cleanup_queue.clearRetainingCapacity();
     }
     _ = sch.pending.orderedRemove(0);
