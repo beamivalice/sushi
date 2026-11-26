@@ -4,15 +4,22 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## Unreleased
+## v1.8.1 — Hy4-Flash on 64 GB Macs
 
-- A model load no longer asks for 1 GiB of free memory beyond what it holds, so a pack that just fits a Mac's free memory loads.
-- A 48 or 64 GB Mac loads a streamed DeepSeek-V4.1 or Hy4-Flash pack with no `--ssd-budget-gb`: the load takes the pack resident where its memory holds it, else the largest streamed budget its limits and free RAM admit, and logs which limit stepped it down.
-- A request that names another `kv_quant` than a Hy4-Flash load serves is refused with one text that names the width the load serves.
-- A streamed DeepSeek-V4.1 load's `--ssd-prefetch` now engages under a small read budget, measures the SSD's read rate without
-  first-touch page faults, and prefetches the experts `--expert-cache-bias` would pick. Thanks @STRML.
-- **A thought ends only at the model's own close token**: a think tag a model quotes in plain text while reasoning no longer ends its thought early or leaks the rest of the reasoning into the answer, and the stream and the whole reply split the same.
-- A model that unloads and loads again, as idle eviction does, no longer keeps about 24 MB more host memory per reload.
+- **Hy4-Flash 2.25bpw runs on 64 GB Macs with no extra flags**: a 48 or 64 GB Mac now picks its own SSD budget for a streamed
+  DeepSeek-V4.1 or Hy4-Flash pack, fully resident where free memory holds it, else the largest streamed budget that fits,
+  and the log names the budget it chose. On an idle 64 GB Mac, `--no-vision --no-mtp` loads Hy4-Flash 2.25bpw fully resident.
+- **Loads that just fit now load**: a model load no longer asks for 1 GiB of free memory beyond what it holds.
+- **Reasoning stays in the thought**: a think tag a model quotes in plain text while reasoning no longer ends its thought
+  early or leaks the rest of the reasoning into the answer, and streamed and whole replies split the same.
+- **Faster streamed DeepSeek-V4.1 prefetch**: `--ssd-prefetch` engages under a small read budget, measures the SSD's read
+  rate without first-touch page faults, and prefetches the experts `--expert-cache-bias` would pick. Thanks @STRML.
+- **Steadier memory across reloads**: a model that unloads and loads again, as idle eviction does, no longer grows host
+  memory per reload.
+- **Clearer `kv_quant` refusal**: a request that names another `kv_quant` than a Hy4-Flash load serves is refused with one
+  text that names the width the load serves.
+
+---
 
 ## v1.8.0 — Hy4-Flash support
 
