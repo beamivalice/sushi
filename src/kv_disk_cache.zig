@@ -507,7 +507,7 @@ pub const DiskTier = struct {
         self.scan() catch |err| {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
         };
-        self.gcToBudget();
+        self.enforceBudget();
         self.base_dir = allocator.dupe(u8, base_dir) catch null;
         return self;
     }
@@ -816,10 +816,10 @@ pub const DiskTier = struct {
         const budget = disk_placement.diskBudgetFromFreeSpace(self.operator_cap, self.fs.freeAsFiles(vs.free) +| self.total_bytes);
         if (budget) |b| {
             self.store_declined = false;
-            if (b != self.max_bytes) {
-                self.max_bytes = b;
-                self.gcToBudget();
-            }
+            if (b != self.max_bytes) self.max_bytes = b;
+            // The cap may have moved under a resident that already holds more (a lowered `--prefix-cache-disk`,
+            // `set_cap`); apply it now, not at the next allocation.
+            if (self.total_bytes > self.max_bytes) self.enforceBudget();
         } else if (!self.store_declined) {
             self.store_declined = true;
             log.warn("[disk-cache] {s}: {d} MB free leaves nothing after the {d} MB reserve — no NEW entries persist (already-persisted entries stay restorable)\n", .{
@@ -2407,7 +2407,7 @@ pub const DiskTier = struct {
         }
         self.last_store_id = id;
         self.settleHeld(s);
-        self.gcToBudget();
+        self.enforceBudget();
         const listed: usize = for (self.entries.items) |e| {
             if (e.id == id) break e.ssm_positions.len;
         } else 0;
@@ -2552,7 +2552,7 @@ pub const DiskTier = struct {
         self.total_bytes = clampAdd(self.total_bytes, delta);
         self.last_store_id = updated.id;
         self.settleHeld(s);
-        self.gcToBudget();
+        self.enforceBudget();
         return if (ssm_res.complete) .persisted else .partial;
     }
 
@@ -4585,6 +4585,181 @@ pub const DiskTier = struct {
     /// journal and snapshot.
     pub fn diskBytes(self: *const DiskTier) u64 {
         return self.fs.heldBytes() orelse self.total_bytes;
+    }
+
+    /// The one owner of the byte cap, called wherever a budget is applied (scan, `refreshDiskBudget`,
+    /// a commit): evict LRU residents, then a sole resident over the cap is cut to the highest restore
+    /// point that fits, or dropped whole when none does, so the tier is never left over its cap.
+    fn enforceBudget(self: *DiskTier) void {
+        self.gcToBudget();
+        if (self.max_bytes == 0 or self.total_bytes <= self.max_bytes) return;
+        const e = &self.entries.items[0];
+        // A poisoned entry cannot be restored; honouring the cap means dropping it, not keeping a cut corpse.
+        if (e.poisoned) {
+            log.info("  [disk-cache] dropped the last entry e{d} (byte budget; it is invalid)\n", .{e.id});
+            self.removeAt(0);
+            return;
+        }
+        // Its own commit is still writing it; the store's pre-flight refresh applies the cap first.
+        if (self.entryWritesPending(e.id)) return;
+        const target = self.entryCutTarget(e) orelse {
+            log.info("  [disk-cache] evicted the last entry (byte budget; {d:.1} MB; no restore point fits)\n", .{mib(self.total_bytes)});
+            cache_stats.process.recordEviction(.ssd, e.bytes);
+            self.removeAt(0);
+            return;
+        };
+        log.info("  [disk-cache] cut the last entry e{d} to {d} tokens for the {d:.1} MB byte budget\n", .{ e.id, target, mib(self.max_bytes) });
+        self.cutEntryTo(0, target);
+        if (self.total_bytes <= self.max_bytes) return;
+        log.info("  [disk-cache] evicted the last entry (byte budget; {d:.1} MB; the cut left it over)\n", .{mib(self.total_bytes)});
+        cache_stats.process.recordEviction(.ssd, self.entries.items[0].bytes);
+        self.removeAt(0);
+    }
+
+    /// The highest restore point of `e` whose kept files fit `max_bytes`: a ring or checkpoint point, or a
+    /// chunk boundary on plain attention. Null when none does.
+    fn entryCutTarget(self: *const DiskTier, e: *const IndexEntry) ?u32 {
+        var best: u32 = 0;
+        if (e.rings.len > 0) {
+            for (e.rings) |r| {
+                if (r.pos < e.kv_len and r.pos > best and self.cutBytes(e, r.pos) <= self.max_bytes) best = r.pos;
+            }
+        } else if (e.ssm_positions.len > 0) {
+            for (e.ssm_positions) |p| {
+                if (p < e.kv_len and p > best and self.cutBytes(e, p) <= self.max_bytes) best = p;
+            }
+        } else {
+            var k: usize = e.chunk_bytes.len;
+            while (k > 0) : (k -= 1) {
+                const p: u32 = @intCast(@min(@as(u64, k) * self.chunk_tokens, e.kv_len));
+                if (p < e.kv_len and self.cutBytes(e, p) <= self.max_bytes) {
+                    best = p;
+                    break;
+                }
+            }
+        }
+        return if (best >= MIN_PERSIST_TOKENS) best else null;
+    }
+
+    /// What `e` bills after a cut to `p`: the files it keeps at the sizes it billed them, its spec state and
+    /// its token tail gone. Inherited (linked) files it never billed do not count; the QSA history stays whole.
+    fn cutBytes(self: *const DiskTier, e: *const IndexEntry, p: u32) u64 {
+        var b: u64 = e.bytes;
+        const keep: usize = (@as(usize, p) + self.chunk_tokens - 1) / self.chunk_tokens;
+        for (e.chunk_bytes[keep..], keep..) |cb, i| {
+            if (i >= e.inherited_chunks) b -|= cb;
+        }
+        for (e.ssm_positions, e.ssm_bytes) |pos, cb| {
+            if (pos > p) b -|= cb;
+        }
+        for (e.rings) |r| {
+            if (r.pos > p) b -|= r.bytes;
+        }
+        if (e.grown.len > 0 and e.grown_span > 0) {
+            var top: u32 = 0;
+            for (e.ssm_positions) |pos| {
+                if (pos <= p) top = pos;
+            }
+            for (e.grown[top / e.grown_span ..], top / e.grown_span..) |gb, i| {
+                if (i >= e.inherited_grown) b -|= gb;
+            }
+        }
+        b -|= e.spec_bytes;
+        for (e.spec_segs[e.spec_segs_inherited..]) |sg| b -|= sg.bytes;
+        b -|= @as(u64, e.tokens.len - p) * 4;
+        return b;
+    }
+
+    /// Cut entry `idx` to `p` tokens: drop every file the restore point no longer reaches, shorten the token
+    /// record and its manifest, and credit the volume and the tier's bill with exactly what left.
+    fn cutEntryTo(self: *DiskTier, idx: usize, p: u32) void {
+        const e = &self.entries.items[idx];
+        const dir_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/", .{ self.root, e.id }) catch return;
+        defer self.allocator.free(dir_abs);
+        if (self.writer) |w| w.fence(dir_abs);
+        self.dropHeldOf(e.id);
+        var freed: u64 = 0;
+        const keep: usize = (@as(usize, p) + self.chunk_tokens - 1) / self.chunk_tokens;
+        var name_buf: [32]u8 = undefined;
+        for (keep..e.chunk_bytes.len) |i| {
+            const name = std.fmt.bufPrint(&name_buf, "c{d:0>6}.safetensors", .{i}) catch continue;
+            freed += self.deleteCountFreed(dir_abs, name);
+            if (i >= e.inherited_chunks) e.bytes -|= e.chunk_bytes[i];
+        }
+        e.chunk_bytes = self.allocator.realloc(e.chunk_bytes, keep) catch e.chunk_bytes;
+        if (e.inherited_chunks > e.chunk_bytes.len) e.inherited_chunks = @intCast(e.chunk_bytes.len);
+        var w: usize = 0;
+        for (e.ssm_positions, e.ssm_bytes) |pos, cb| {
+            if (pos > p) {
+                const name = std.fmt.bufPrint(&name_buf, "s{d:0>7}.safetensors", .{pos}) catch continue;
+                freed += self.deleteCountFreed(dir_abs, name);
+                e.bytes -|= cb;
+                continue;
+            }
+            e.ssm_positions[w] = pos;
+            e.ssm_bytes[w] = cb;
+            w += 1;
+        }
+        e.ssm_positions = self.allocator.realloc(e.ssm_positions, w) catch e.ssm_positions;
+        e.ssm_bytes = self.allocator.realloc(e.ssm_bytes, w) catch e.ssm_bytes;
+        w = 0;
+        for (e.rings) |r| {
+            if (r.pos > p) {
+                const name = std.fmt.bufPrint(&name_buf, "r{d:0>7}.safetensors", .{r.pos}) catch continue;
+                freed += self.deleteCountFreed(dir_abs, name);
+                e.bytes -|= r.bytes;
+                continue;
+            }
+            e.rings[w] = r;
+            w += 1;
+        }
+        e.rings = self.allocator.realloc(e.rings, w) catch e.rings;
+        if (e.grown.len > 0 and e.grown_span > 0) {
+            const segs = p / e.grown_span;
+            for (e.grown[segs..], segs..) |gb, i| {
+                const name = std.fmt.bufPrint(&name_buf, "g{d:0>5}.safetensors", .{i + 1}) catch continue;
+                freed += self.deleteCountFreed(dir_abs, name);
+                if (i >= e.inherited_grown) e.bytes -|= gb;
+            }
+            e.grown = self.allocator.realloc(e.grown, segs) catch e.grown;
+            if (e.inherited_grown > e.grown.len) e.inherited_grown = @intCast(e.grown.len);
+        }
+        // The spec describes the whole record; a cut record carries none (as the commit-time cut does).
+        freed += self.deleteCountFreed(dir_abs, "spec.safetensors");
+        for (e.spec_segs[e.spec_segs_inherited..], e.spec_segs_inherited..) |sg, j| {
+            _ = sg;
+            const name = std.fmt.bufPrint(&name_buf, "p{d:0>5}.safetensors", .{j}) catch continue;
+            freed += self.deleteCountFreed(dir_abs, name);
+        }
+        e.bytes -|= e.spec_bytes;
+        for (e.spec_segs[e.spec_segs_inherited..]) |sg| e.bytes -|= sg.bytes;
+        self.allocator.free(e.spec_segs);
+        e.spec_segs = &.{};
+        e.spec_segs_inherited = 0;
+        e.spec_bytes = 0;
+        e.spec_dflash = null;
+        e.spec_mtp = null;
+        const tail: u64 = @as(u64, e.tokens.len - p) * 4;
+        const tokens = self.allocator.dupe(u32, e.tokens[0..p]) catch return;
+        self.allocator.free(e.tokens);
+        e.tokens = tokens;
+        e.bytes -|= tail;
+        e.kv_len = p;
+        e.last_used = self.bump();
+        const tpath = std.fmt.allocPrint(self.allocator, "{s}tokens.bin", .{dir_abs}) catch return;
+        defer self.allocator.free(tpath);
+        self.fs.writeAt(tpath, true, 0, std.mem.sliceAsBytes(e.tokens), e.tokens.len * 4) catch {};
+        self.total_bytes -|= freed +| tail;
+        self.writeMeta(e.*) catch {};
+    }
+
+    /// Bytes deleting `<dir_abs><name>` returns to the volume: its size when it is the last link, else 0.
+    fn deleteCountFreed(self: *DiskTier, dir_abs: []const u8, name: []const u8) u64 {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}{s}", .{ dir_abs, name }) catch return 0;
+        const st = self.fs.stat(path) orelse return 0;
+        self.fs.deleteFile(path);
+        return if (st.nlink <= 1) st.size else 0;
     }
 
     fn gcToBudget(self: *DiskTier) void {
@@ -10088,4 +10263,117 @@ test "an SSD restore fills its KV in place when MLX's pool holds buffers a page 
     // The fill writes each chunk into the buffer it made (comment above `restoreKvInto`'s loop): each of the six
     // buffers may take a free one a page larger, never a second copy of the restored rows.
     try testing.expect(seeded <= clean + 6 * 16384);
+}
+
+test "DiskTier: a lowered cap on a restart cuts a sole hybrid entry, and the next prompt stores" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 768, 8, 0.0, .float32);
+    var ta: [768]u32 = undefined;
+    for (&ta, 0..) |*t, i| t.* = @intCast(i + 7);
+    var tb: [768]u32 = undefined;
+    for (&tb, 0..) |*t, i| t.* = @intCast(i + 900_000);
+    var src = buildHybridEntries(s, 11.0, 22.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]trunk.SSMCheckpoint{try trunk.captureSsmCheckpoint(testing.allocator, &src, 768, s)};
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    var held: u64 = 0;
+    {
+        var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-hybrid-cap", 0, 128, .real);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1 << 40, 2 << 40);
+        _ = try tier.appendCommit(cache.entries, 768, cache.config, &ta, false, &cps, s);
+        tier.drainWriter();
+        try testing.expectEqual(@as(usize, 1), tier.entryCount());
+        held = tier.total_bytes;
+        try testing.expect(held > 0);
+    }
+    var again = try DiskTier.initBackend(testing.allocator, io, base, "fp-hybrid-cap", held / 2, 128, .real);
+    defer again.deinit();
+    again.ssd_first = true;
+    again.armTestSpace(1 << 40, 2 << 40);
+    again.refreshDiskBudget();
+    if (again.total_bytes > again.max_bytes) {
+        std.debug.print("fx-d5: hybrid restart at half cap: {d} entries, {d} bytes over {d}\n", .{
+            again.entryCount(), again.total_bytes, again.max_bytes,
+        });
+    }
+    // A cap under one record's size holds no record; it must not leave the stale one over it either.
+    try testing.expect(again.total_bytes <= again.max_bytes);
+    // A cap that does hold a minimal record stores the next prompt again.
+    again.operator_cap = held;
+    again.refreshDiskBudget();
+    const out = try again.appendCommit(cache.entries, 768, cache.config, &tb, false, null, s);
+    if (out == .skipped or again.total_bytes > again.max_bytes) {
+        std.debug.print("fx-d5: hybrid raised budget: {d} entries, {d} bytes over {d}; next prompt {s}\n", .{
+            again.entryCount(), again.total_bytes, again.max_bytes, @tagName(out),
+        });
+    }
+    try testing.expect(out != .skipped);
+    try testing.expect(again.total_bytes <= again.max_bytes);
+}
+
+test "DiskTier: a lowered budget on a restart cuts a sole hybrid entry to the checkpoint that fits" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCache(&cache, s, 2, 768, 8, 0.0, .float32);
+    var ta: [768]u32 = undefined;
+    for (&ta, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src = buildHybridEntries(s, 11.0, 22.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]trunk.SSMCheckpoint{
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+        try trunk.captureSsmCheckpoint(testing.allocator, &src, 768, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    {
+        var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-hybrid-cut", 0, 128, .real);
+        defer tier.deinit();
+        tier.ssd_first = true;
+        tier.armTestSpace(1 << 40, 2 << 40);
+        _ = try tier.appendCommit(cache.entries, 768, cache.config, &ta, false, &cps, s);
+        tier.drainWriter();
+        try testing.expectEqual(@as(usize, 1), tier.entryCount());
+        try testing.expectEqual(@as(usize, 2), tier.entries.items[0].ssm_positions.len);
+        // A cap that holds the 512 point but not the 768 one: the record is cut to 512, not evicted.
+        const e = tier.entries.items[0];
+        tier.operator_cap = e.bytes - e.ssm_bytes[1];
+        tier.refreshDiskBudget();
+        try testing.expectEqual(@as(usize, 1), tier.entryCount());
+        try testing.expectEqual(@as(u32, 512), tier.entries.items[0].kv_len);
+        try testing.expectEqualSlices(u32, &.{512}, tier.entries.items[0].ssm_positions);
+        try testing.expect(tier.total_bytes <= tier.max_bytes);
+        var out = try KVCache.init(testing.allocator, 2);
+        defer out.deinit();
+        var dst: [3]SSMCacheEntry = .{
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+            .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        };
+        defer freeHybridEntries(&dst);
+        try testing.expectEqual(@as(u32, 512), try tier.restoreIntoHybrid(&out, &dst, 0, 512, s));
+    }
+    // The cut survives a restart: 512 rows, one point, under the cap.
+    var again = try DiskTier.initBackend(testing.allocator, io, base, "fp-hybrid-cut", 0, 128, .real);
+    defer again.deinit();
+    try testing.expectEqual(@as(usize, 1), again.entryCount());
+    try testing.expectEqual(@as(u32, 512), again.entries.items[0].kv_len);
+    try testing.expectEqualSlices(u32, &.{512}, again.entries.items[0].ssm_positions);
 }

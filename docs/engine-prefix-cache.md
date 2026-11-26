@@ -585,7 +585,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   A model with a request holding it (`refcount > 0`) is refused, not queued. The tier's namespace is published beside its
   numbers (`DiskStats.namespace`, the fingerprint directory as a number), which is how the listing names the owner without
   touching the tier from a connection thread. The stale delete takes each root's `.lock` like `sweepBase`, so a root another
-  process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then `refreshDiskBudget`).
+  process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then `refreshDiskBudget`, which cuts or drops a sole resident over the new cap).
 - The cache volume (`disk_placement.cacheVolume`, on the connection thread): the cache root resolved through symlinks,
   its free and total bytes and its mount's name. A `SUSHI_PREFIX_CACHE_DIR` that does not exist is unavailable (null
   name and space), never its parent's volume; the default root, made on first write, reports the volume it will land
@@ -746,9 +746,11 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   once the donor left the SSD tier.
 - **A second commit before the flush flushes the first** (`capturePendingDisk`): the cull pass commits every
   cancelled GLM slot before any flush, and the second capture used to discard the first.
-- **A sole entry never outgrows the tier** (`DiskTier.budgetTarget`): a record whose chunks, checkpoints, ring files
-  and sidecar would pass the byte budget alone is cut to the highest checkpoint or ring restore point that fits (any
-  length on plain attention), without its spec state; nothing fits, nothing is written. GLM picks its SSD rows the
+- **A sole entry never outgrows the tier** (`DiskTier.budgetTarget`, `DiskTier.enforceBudget`): a record whose chunks,
+  checkpoints, ring files and sidecar would pass the byte budget alone is cut to the highest checkpoint or ring restore
+  point that fits (any length on plain attention), without its spec state; nothing fits, nothing is written. The same
+  cut applies whenever the budget moves under a resident (a restart at a lowered budget, `set_cap`): the tier cuts its
+  last entry to the same restore point, or drops it whole when none fits (a poisoned entry is dropped, never cut). GLM picks its SSD rows the
   same way (`glmDiskLen` prices every checkpoint at or below them): a 1 GiB tier and 131K rows with eight checkpoints
   is 1.9 GiB, which used to land whole.
 - **The writer's permit bounds the staged host bytes** (`Writer.waitForRoom` runs before a blob's buffer exists, and

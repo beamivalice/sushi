@@ -1565,3 +1565,210 @@ test "DiskTier: the root-wide sweep gives the volume the pages of a content-addr
     try testing.expect(v.stat("e2/meta.json") != null);
     try testing.expect(tierBytes(io, base, "fp-swept") + first / 2 < before);
 }
+
+test "DiskTier: a lowered SSD budget on a restart cuts a sole over-budget entry, and the next prompt stores" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1 << 40;
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var held: u64 = 0;
+    {
+        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered", 0, 128, .real);
+        defer first.deinit();
+        first.ssd_first = true;
+        first.armTestSpace(total / 2, total);
+        _ = try first.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        first.drainWriter();
+        held = first.total_bytes;
+        try testing.expect(held > 0);
+    }
+    // The same root, restarted with a budget of half what the last boot stored.
+    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered", held / 2, 128, .real);
+    defer second.deinit();
+    second.ssd_first = true;
+    second.armTestSpace(total / 2, total);
+    second.refreshDiskBudget();
+    if (second.total_bytes > second.max_bytes) {
+        std.debug.print("fx-d5: restart at half budget: {d} entries, {d} bytes over a {d} byte cap\n", .{
+            second.entryCount(), second.total_bytes, second.max_bytes,
+        });
+    }
+    // A cap under one record's size holds no record; it must not leave the stale one over it either.
+    try testing.expect(second.total_bytes <= second.max_bytes);
+    // A cap that does hold a minimal record stores the next prompt again.
+    second.operator_cap = held;
+    second.refreshDiskBudget();
+    var other: [640]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(i + 90_000);
+    const outcome = try second.appendCommit(cache.entries, 640, cache.config, &other, false, null, s);
+    if (outcome == .skipped or second.total_bytes > second.max_bytes) {
+        std.debug.print("fx-d5: raised budget: {d} entries, {d} bytes over a {d} byte cap; next prompt: {s}\n", .{
+            second.entryCount(), second.total_bytes, second.max_bytes, @tagName(outcome),
+        });
+    }
+    try testing.expect(outcome != .skipped);
+    try testing.expect(second.total_bytes <= second.max_bytes);
+}
+
+test "DiskTier: control — with two entries the same lowered budget evicts the older one" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1 << 40;
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+
+    var held: u64 = 0;
+    {
+        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered2", 0, 128, .real);
+        defer first.deinit();
+        first.ssd_first = true;
+        first.armTestSpace(total / 2, total);
+        for ([_]u32{ 7, 90_000 }) |off| {
+            var tokens: [640]u32 = undefined;
+            for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
+            _ = try first.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        }
+        first.drainWriter();
+        try testing.expectEqual(@as(usize, 2), first.entryCount());
+        held = first.total_bytes;
+    }
+    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered2", held / 2, 128, .real);
+    defer second.deinit();
+    second.ssd_first = true;
+    second.armTestSpace(total / 2, total);
+    second.refreshDiskBudget();
+    if (!(second.total_bytes <= second.max_bytes)) {
+        std.debug.print("fx-d5: two-entry restart at half budget holds {d} over {d}\n", .{ second.total_bytes, second.max_bytes });
+    }
+    try testing.expect(second.total_bytes <= second.max_bytes);
+    try testing.expectEqual(@as(usize, 1), second.entryCount());
+}
+
+test "DiskTier: a live cap lowered under a sole entry (admin set_cap path) leaves the tier within its cap" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1 << 40;
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-livecap", 0, 128, .real);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(total / 2, total);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    const held = tier.total_bytes;
+    // `settings_api.set_cap` writes the new cap and refreshes: the budget must follow the operator.
+    tier.operator_cap = held / 2;
+    tier.refreshDiskBudget();
+    if (tier.total_bytes > tier.max_bytes) {
+        std.debug.print("fx-d5: live cap {d} under a sole entry of {d}: tier still holds {d}\n", .{ tier.max_bytes, held, tier.total_bytes });
+    }
+    try testing.expect(tier.total_bytes <= tier.max_bytes);
+}
+
+test "DiskTier: a lowered budget on a restart cuts a sole entry to the chunks that fit" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1 << 40;
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var held: u64 = 0;
+    {
+        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-cut", 0, 128, .real);
+        defer first.deinit();
+        first.ssd_first = true;
+        first.armTestSpace(total / 2, total);
+        _ = try first.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+        first.drainWriter();
+        held = first.total_bytes;
+    }
+    // A cap that holds four of the five chunks: the record is cut to those, not evicted.
+    const cap = held * 4 / 5 + 512;
+    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-cut", cap, 128, .real);
+    defer second.deinit();
+    second.ssd_first = true;
+    second.armTestSpace(total / 2, total);
+    second.refreshDiskBudget();
+    if (second.entryCount() != 1 or second.entries.items[0].kv_len != 512 or second.total_bytes > second.max_bytes) {
+        std.debug.print("fx-d5: cut at {d}: {d} entries, kv_len {d}, {d} bytes over {d}\n", .{
+            cap, second.entryCount(), if (second.entryCount() == 1) second.entries.items[0].kv_len else 0, second.total_bytes, second.max_bytes,
+        });
+    }
+    try testing.expectEqual(@as(usize, 1), second.entryCount());
+    try testing.expectEqual(@as(u32, 512), second.entries.items[0].kv_len);
+    try testing.expectEqual(@as(usize, 4), second.entries.items[0].chunk_bytes.len);
+    try testing.expect(second.total_bytes <= second.max_bytes);
+    var out = try KVCache.init(testing.allocator, 2);
+    defer out.deinit();
+    try testing.expectEqual(@as(u32, 512), try second.restoreInto(&out, 0, s));
+}
+
+test "DiskTier: a lowered cap drops a sole poisoned entry instead of cutting it" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+    const total: u64 = 1 << 40;
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
+    var tokens: [640]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-dead-cap", 0, 128, .real);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(total / 2, total);
+    _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
+    const id = tier.entries.items[0].id;
+    _ = tier.poisonId(id, "test");
+    const held = tier.total_bytes;
+    try testing.expect(held > 0);
+    // A dead entry cannot be restored; honouring the cap means dropping it, not keeping a cut corpse.
+    tier.operator_cap = held * 4 / 5 + 512;
+    tier.refreshDiskBudget();
+    if (tier.entryCount() != 0 or tier.total_bytes != 0) {
+        std.debug.print("fx-d5: poisoned sole entry at a lowered cap: {d} entries, {d} bytes\n", .{ tier.entryCount(), tier.total_bytes });
+    }
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+    try testing.expectEqual(@as(u64, 0), tier.total_bytes);
+}
