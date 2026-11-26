@@ -270,11 +270,15 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
     return config.pinned_context;
 }
 
-/// The model's `max_kv_tokens` when it is what holds the context (below the model's own window, no manual context set),
-/// else 0: a context refusal names it then, since raising it is the remedy.
+/// The model's `max_kv_tokens` when it is what holds the context (below the model's own window, and no smaller manual or
+/// memory-sized context), else 0: a context refusal names it then, since raising it is the remedy.
 pub fn contextKvHold(config: *const model_mod.ModelConfig) u64 {
     if (config.max_kv_tokens == 0 or manualContext(config) > 0) return 0;
-    return if (config.contextCap() == config.max_kv_tokens) config.max_kv_tokens else 0;
+    var open = config.*;
+    open.max_kv_tokens = 0;
+    if (open.contextCap() <= config.max_kv_tokens) return 0;
+    // Unpinned, the auto context is sized under the cap, so the cap is what holds it.
+    return if (config.pinned_context == 0 or config.pinned_context >= config.max_kv_tokens) config.max_kv_tokens else 0;
 }
 
 pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
@@ -9488,4 +9492,29 @@ test "max_kv_tokens is a token pool, never a bill: the same request holds the sa
         cfg.max_kv_tokens = cap;
         try testing.expectEqual(off, requestHeldBytes(&cfg, 1000, 100, 8, 512, .{}));
     }
+}
+
+test "a reload that lowers max_kv_tokens holds the frozen auto context under the cap" {
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262_144 };
+    cfg.pinned_context = 200_000;
+    model_load.applyModelSettings(&cfg, .{ .max_kv_tokens = 4096 });
+    try testing.expectEqual(@as(u32, 4096), cfg.contextCap());
+    try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&cfg));
+    // Raising the cap again never grows the frozen context.
+    model_load.applyModelSettings(&cfg, .{ .max_kv_tokens = 100_000 });
+    try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&cfg));
+}
+
+test "contextKvHold names max_kv_tokens only when the cap holds the context" {
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 1_048_576 };
+    cfg.max_kv_tokens = 4096;
+    cfg.pinned_context = 4096;
+    try testing.expectEqual(@as(u64, 4096), contextKvHold(&cfg));
+    // Memory admitted less than the cap: raising the cap cannot help.
+    cfg.pinned_context = 2048;
+    try testing.expectEqual(@as(u64, 0), contextKvHold(&cfg));
+    // A cap at the model's own window holds nothing below it.
+    cfg.max_kv_tokens = 1_048_576;
+    cfg.pinned_context = 1_048_576;
+    try testing.expectEqual(@as(u64, 0), contextKvHold(&cfg));
 }

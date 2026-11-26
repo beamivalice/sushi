@@ -280,6 +280,9 @@ pub fn concurrencySourceText(source: model_mod.ConcurrencySource) []const u8 {
 pub fn resolveConcurrency(config: *ModelConfig) void {
     const pick = concurrencyPick(config);
     config.max_kv_tokens = config.max_kv_tokens_override orelse 0;
+    // A context frozen by an earlier load never outlives a lower cap.
+    const cap = config.contextCap();
+    if (cap > 0 and config.pinned_context > cap) config.pinned_context = cap;
     config.max_concurrent_source = pick.source;
     config.max_concurrent = if (arch_config.exclusiveDecode(config)) 1 else @min(pick.value, maxConcurrentCapFor(config));
 }
