@@ -34,6 +34,8 @@ pub const LaunchFlagUse = struct {
     /// `--mtp-min-depth` / `--mtp-max-depth` as given; 0 = not given.
     mtp_min_depth: u32 = 0,
     mtp_max_depth: u32 = 0,
+    /// `--glp`: a GLP control vector to apply.
+    glp: bool = false,
 };
 
 /// `--help` text for one arch-only flag, written as the lines it prints, inserted before the line of shared flag `before`.
@@ -79,6 +81,8 @@ const shared_options = [_]Option{
     .{ .name = "--drop-expert", .takes_value = true, .apply = setDropExpert, .expected = "expected a multiple of 8 routed experts per layer (0 = off)" },
     .{ .name = "--prefill-chunk-max", .takes_value = true, .apply = setChunkMax, .expected = chunk_expected },
     .{ .name = "--prefill-chunk-min", .takes_value = true, .apply = setChunkMin, .expected = chunk_expected },
+    .{ .name = "--glp", .takes_value = true, .apply = setGlp, .expected = "expected one GLP .gguf path (a project vector cannot be merged with another control vector)" },
+    .{ .name = "--glp-alpha", .takes_value = true, .apply = setGlpAlpha, .expected = "expected a finite number >= 0" },
 };
 
 const chunk_expected = "expected " ++ settings_resolve.static_chunk_rungs_text;
@@ -100,6 +104,19 @@ fn setChunkMin(value: []const u8) bool {
 
 fn setDropExpert(value: []const u8) bool {
     model.drop_expert = @import("../expert_usage.zig").parseCount(value) orelse return false;
+    return true;
+}
+
+fn setGlp(value: []const u8) bool {
+    if (value.len == 0 or model.glp_path != null) return false;
+    model.glp_path = value;
+    return true;
+}
+
+fn setGlpAlpha(value: []const u8) bool {
+    const v = std.fmt.parseFloat(f32, value) catch return false;
+    if (!std.math.isFinite(v) or v < 0) return false;
+    model.glp_alpha = v;
     return true;
 }
 
@@ -154,6 +171,7 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
     const traits = admission.expertStream(config);
     if (use.drop_expert and !traits.drop_expert) return "--drop-expert has no effect on this model: only a quantized pack whose experts stream drops them; drop the flag";
     if (use.ssd_prefetch and !traits.prefetch) return "--ssd-prefetch has no effect on this model: it has no expert prefetcher; drop the flag";
+    if (use.glp and arch_config.tagOf(config) != .dsv41) return "--glp has no effect on this model: GLP steering is implemented for deepseek_v41 only; drop the flag";
     const tag = arch_config.tagOf(config) orelse return null;
     switch (tag) {
         inline else => |t| {

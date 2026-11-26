@@ -3,6 +3,7 @@ const test_note = @import("test_note.zig");
 const settings_resolve = @import("settings_resolve.zig");
 const server_state = @import("server_state.zig");
 const arch_flags = @import("arch/flags.zig");
+const glp = @import("glp.zig");
 const arch_config = @import("arch/config.zig");
 const mlx = @import("mlx.zig");
 const trunk = @import("trunk.zig");
@@ -471,6 +472,7 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_head_kv_quant = trunk.Trunk.mtp_head_kv_quant_flag,
         .drop_expert = config.drop_expert != 0,
         .ssd_prefetch = config.ssd_prefetch != null,
+        .glp = config.glp_path != null,
         .drafter = settings_resolve.launch.drafter,
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
@@ -2400,6 +2402,34 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer if (drafter_path_owned.len > 0) sch.allocator.free(drafter_path_owned);
     if (params.drafter_dir.len > 0) {
         drafter_path_owned = try sch.allocator.dupe(u8, drafter_dir);
+    }
+
+    // GLP steering: the file is parsed and every gate of the reader contract is checked before any
+    // weight is read. The arch's model init takes the parsed directions (`glp.takePending`).
+    var glp_pending = false;
+    errdefer if (glp_pending) glp.clearPending();
+    if (params.config.glp_path) |path| {
+        const result = glp.load(sch.io, sch.allocator, path, .{
+            .n_embd = params.config.hidden_size,
+            .n_layers = params.config.num_hidden_layers,
+            .alpha_override = params.config.glp_alpha,
+        }) catch |err| {
+            log.err("[glp] {s}: {s}\n", .{ path, @errorName(err) });
+            return err;
+        };
+        switch (result) {
+            .loaded => |l| {
+                glp.setPending(l);
+                glp_pending = true;
+                log.info("[glp] {s}: {d} layers steered, alpha {d}\n", .{ path, glp.steeredLayers(&l), l.alpha });
+            },
+            .refused => |r| {
+                var ref = r;
+                log.err("[glp] {s}: {s}\n", .{ path, ref.message });
+                ref.deinit(sch.allocator);
+                return error.GlpRefused;
+            },
+        }
     }
 
     if (@TypeOf(params) == LoadParams) {

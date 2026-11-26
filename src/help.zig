@@ -199,6 +199,18 @@ const shared =
     \\                      token's pick moves to its next-best expert; the
     \\                      memory bill shrinks by the dropped bytes. Answers
     \\                      change, so score it with `sushi kld compare`.
+    \\  --glp <file>        Steer DeepSeek-V4.1 at inference time with a GLP
+    \\                      control vector (a GGUF v3 file, project mode): at
+    \\                      each steered layer the component along the layer's
+    \\                      direction is removed from the post-fold residual
+    \\                      stream. Only spec_version 1, project,
+    \\                      residual_stream_post_layer and rank 1 are
+    \\                      implemented; any other file is refused by name.
+    \\                      --glp-alpha overrides the file's glp.alpha_default
+    \\                      (WEIGHTLESS_STEER_ALPHA does too).
+    \\  --glp-alpha <a>     Ablation strength for --glp (default: the file's
+    \\                      glp.alpha_default; 1.0 removes the component
+    \\                      exactly). Outranks WEIGHTLESS_STEER_ALPHA.
     \\  --kv-quant <mode>   KV-cache quantization scheme:
     \\                        8, 6 or 4 — affine group quant; default 8 on
     \\                          every model but DeepSeek-V4.1, which has no

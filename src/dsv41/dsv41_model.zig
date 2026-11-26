@@ -23,6 +23,7 @@ const model_mod = @import("../model.zig");
 const exl3 = @import("sushi_exl3");
 const expert_usage = @import("../expert_usage.zig");
 const transient_peak = @import("../transient_peak.zig");
+const glp = @import("../glp.zig");
 
 const A = sc_mod.A;
 const S = sc_mod.S;
@@ -786,6 +787,20 @@ fn prof(m: *const Model, rows: usize) ?*Profile {
     return if (rows > NARROW_ROWS or p.narrow) p else null;
 }
 
+/// GLP projective steering (spec_version 1, project, residual_stream_post_layer, rank 1): one
+/// unit-norm f32 direction per steered layer, applied at the post-fold stream on the mean over
+/// copies (GLP.md, "Multi-copy streams and the fold site"). The arrays are the model's `owned`
+/// ones; `deinit` frees only the slice.
+pub const Steer = struct {
+    dirs: []?A,
+    alpha: f32,
+
+    pub fn deinit(self: *Steer, gpa: std.mem.Allocator) void {
+        gpa.free(self.dirs);
+        self.* = undefined;
+    }
+};
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     s: S,
@@ -807,6 +822,8 @@ pub const Model = struct {
     dspark: ?DsparkW = null,
     /// Set while the backbone layers load (`Opts.drop`).
     drop: ?*const expert_usage.Drop = null,
+    /// GLP steering (`--glp`), or null. The directions are `owned` arrays.
+    steer: ?Steer = null,
     /// Arrays made at load (casts, views, stacks); freed in `deinit`.
     owned: std.ArrayList(A) = .empty,
     /// Bytes this load built in owned regions rather than read from the shards: widened f32 tensors, shared stacks,
@@ -1007,6 +1024,7 @@ pub const Model = struct {
         }
         for (self.owned.items) |x| _ = mlx.mlx_array_free(x);
         self.owned.deinit(self.gpa);
+        if (self.steer) |*s| s.deinit(self.gpa);
         self.gpa.free(self.layers);
         self.gpa.destroy(self);
     }
@@ -1519,6 +1537,17 @@ pub fn init(gpa: std.mem.Allocator, cfg: Config, weights: *model_mod.Weights, di
     if (c.engram.n > 0) try initEngram(m, weights, dir_path);
     if (mlx.streamIsGpu(s)) try kernels.probeHc(gpa, s, c.hc_mult, c.dim, c.hc_iters);
     if (mlx.streamIsGpu(s)) try kernels.probeTopk(gpa, s);
+    if (glp.takePending()) |loaded| {
+        var l = loaded;
+        defer l.deinit();
+        const dirs = try gpa.alloc(?A, c.layers);
+        @memset(dirs, null);
+        errdefer gpa.free(dirs);
+        for (0..@min(c.layers, l.dirs.len)) |li| if (l.dirs[li]) |d| {
+            dirs[li] = try m.own(try mlx.newData(d.ptr, &[_]c_int{ci(c.dim)}, .float32));
+        };
+        m.steer = .{ .dirs = dirs, .alpha = l.alpha };
+    }
     setWideArms(m);
     m.ced_split = c.cedSplit();
     return m;
@@ -4764,6 +4793,23 @@ fn layerInput(m: *Model, p: *Pass, li: usize, sc: *Scope, ev: *std.ArrayList(A),
     };
 }
 
+/// GLP projective steering at the post-fold stream: `h = mean_c(stream)`, then every copy loses
+/// `alpha * (h . d_hat) d_hat`. Subtracting the rank-1 term from every copy shifts the mean by
+/// exactly the projected term, so this is the spec's hc formula, not an approximation of it.
+fn steerLayer(sc: *Scope, m: *const Model, li: usize, x: A) !A {
+    const s = &m.steer.?;
+    const d = s.dirs[li].?;
+    const dt = mlx.mlx_array_dtype(x);
+    const rank = mlx.getShape(x).len;
+    const xf = try sc.astype(x, .float32);
+    const h = if (rank == 3) try sc.mean(xf, 1, false) else xf; // [T, D]
+    const coef = try sc.sum(try sc.mul(h, d), -1, true); // [T, 1]
+    const proj = try sc.mul(coef, d); // [T, D]
+    const scaled = try sc.mul(proj, try sc.f(s.alpha));
+    const out = if (rank == 3) try sc.sub(xf, try sc.expand(scaled, 1)) else try sc.sub(xf, scaled);
+    return sc.astype(out, dt);
+}
+
 fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     const gpa = m.gpa;
     if (p.tail) |t| if (li == m.ced_split.?) {
@@ -4788,7 +4834,13 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     const out = try block(&sc, m, p.st, li, p.x, p.cpre, p.p0, &p.sh, p.span, null, &.{});
     _ = mlx.mlx_array_free(p.x);
     _ = mlx.mlx_array_free(p.cpre);
-    p.x = out.x;
+    var next = out.x;
+    if (m.steer) |*s| if (li < s.dirs.len) if (s.dirs[li] != null) {
+        const steered = try steerLayer(&sc, m, li, out.x);
+        _ = mlx.mlx_array_free(out.x);
+        next = sc.out(steered);
+    };
+    p.x = next;
     p.cpre = out.pre;
     p.unresolved = p.sh.spec;
     p.sh.spec = null;

@@ -24,6 +24,13 @@ pub var drop_expert: u16 = 0;
 /// `--ssd-prefetch`: the percent of the SSD's read rate the expert prefetch may spend; null = not given.
 pub var ssd_prefetch: ?u8 = null;
 
+/// `--glp`: a GLP control vector (GGUF v3) applied at inference time; null = none. A launch decision
+/// like `--drop-expert`: `parseConfig` copies it into every load's config.
+pub var glp_path: ?[]const u8 = null;
+
+/// `--glp-alpha`: the runtime dose override for `--glp`; null = the file's `glp.alpha_default`.
+pub var glp_alpha: ?f32 = null;
+
 pub const default_ssd_prefetch: u8 = 0;
 
 /// The archs whose Sushi Cooler opt-out flag was given (`arch_config.CoolerOptOut.flag`).
@@ -35,6 +42,23 @@ pub fn parseSsdPrefetch(value: []const u8) ?u8 {
     for (value) |c| if (c < '0' or c > '9') return null;
     const pct = std.fmt.parseInt(u8, value, 10) catch return null;
     return if (pct <= 100) pct else null;
+}
+
+/// `WEIGHTLESS_STEER_ALPHA`: the cross-implementation runtime dose override for a GLP vector. A
+/// value that is not a finite number >= 0 is named and ignored, so the file's own dose applies.
+fn envGlpAlpha() ?f32 {
+    const raw = std.c.getenv("WEIGHTLESS_STEER_ALPHA") orelse return null;
+    const text = std.mem.span(raw);
+    if (text.len == 0) return null;
+    const v = std.fmt.parseFloat(f32, text) catch {
+        log.warn("[glp] WEIGHTLESS_STEER_ALPHA='{s}' is not a number; using the file's glp.alpha_default\n", .{text});
+        return null;
+    };
+    if (!std.math.isFinite(v) or v < 0) {
+        log.warn("[glp] WEIGHTLESS_STEER_ALPHA='{s}' must be finite and >= 0; using the file's glp.alpha_default\n", .{text});
+        return null;
+    }
+    return v;
 }
 
 const model_discovery = @import("model_discovery.zig");
@@ -180,6 +204,10 @@ pub const ModelConfig = struct {
     /// `--ssd-prefetch` as given, and the model-settings.json `ssd_prefetch`; the flag wins (`ssdPrefetchPct`).
     ssd_prefetch: ?u8 = null,
     ssd_prefetch_override: ?u8 = null,
+    /// `--glp`: the GLP control vector to apply, or null. Borrowed from argv.
+    glp_path: ?[]const u8 = null,
+    /// `--glp-alpha` or `WEIGHTLESS_STEER_ALPHA`; null = the file's `glp.alpha_default`.
+    glp_alpha: ?f32 = null,
     /// Sushi Cooler on or off: the launch flag as given (false = off, null = not given) and the model-settings.json
     /// `ds41_cooler`; the flag wins (`coolerChoice`).
     cooler_flag: ?bool = null,
@@ -1195,6 +1223,8 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     config.gdn_state_f32 = qwen_gdn_f32;
     config.drop_expert = drop_expert;
     config.ssd_prefetch = ssd_prefetch;
+    config.glp_path = glp_path;
+    config.glp_alpha = if (glp_path != null) (glp_alpha orelse envGlpAlpha()) else null;
     config.cooler_flag = if (arch_config.tagOf(&config)) |t| (if (cooler_off.contains(t)) false else null) else null;
     try arch_config.parseDir(&config, allocator, model_dir);
     if (config.supportsExpertStreaming()) {

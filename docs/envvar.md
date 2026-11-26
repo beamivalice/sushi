@@ -4,7 +4,7 @@ A temporary A/B knob is fine while a kernel, optimization or fix is being develo
 
 **Reading the columns.** *where* is file:line of the read site (served path first; a group lists files). *read* is `once` (cached on first use on the served path), `boot` or `load` (once at startup or model load), `per request`, `per call` / `per forward` / `per round` (an uncached `getenv` on a repeated path), or `test` (never on the served path). Every diagnostic read treats empty and a leading `0` as off. *documented* is a hit in `docs/`, `README.md`, `tests/CLAUDE.md` or `--help`.
 
-**Summary.** 159 vars. By kind: tradeoff levers 14, diagnostics 61, microbenches 19, test-only seams 55, paths and config 8, flag twins that are not equivalents 2.
+**Summary.** 160 vars. By kind: tradeoff levers 15, diagnostics 61, microbenches 19, test-only seams 55, paths and config 8, flag twins that are not equivalents 2.
 
 ## Tradeoff levers (14)
 
@@ -25,6 +25,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_NGRAM_WARM` | `qwen4_exp.zig:148` | default on: pread the Flash-Next n-gram table at load; `0` skips it | once | yes: qwen4-arch, qwen4-perf |
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
+| `WEIGHTLESS_STEER_ALPHA` | `model.zig` (`envGlpAlpha`, read by `parseConfig`) | the runtime dose for `--glp`: unset keeps the file's `glp.alpha_default`; a finite value >= 0 replaces it, anything else is named and ignored; `--glp-alpha` outranks it. The cross-implementation spelling of the GLP spec's runtime alpha | load | yes: flags, glp |
 
 ## Diagnostics (68)
 
