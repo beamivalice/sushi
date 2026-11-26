@@ -79,7 +79,7 @@ print(d[0].get('meta',{}).get('architecture','') if d else '')")
 [ "$ARCH" = "qwen4_exp" ] \
   && echo "PASS: a duplicate id resolves to the FIRST folder (arch $ARCH)" \
   || { echo "FAIL: duplicate resolved to arch '$ARCH', wanted the first folder's qwen4_exp"; rc=1; }
-grep -q "already found in an earlier --model-dir" "$TMP/multi.log" \
+grep -q "already found (same id or folder) in an earlier --model-dir" "$TMP/multi.log" \
   && echo "PASS: the skipped duplicate is logged" \
   || { echo "FAIL: nothing logged about the skipped duplicate"; rc=1; }
 stop
