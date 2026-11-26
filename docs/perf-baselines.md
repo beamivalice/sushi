@@ -958,6 +958,12 @@ before each server. One binary built from `bb9adb6a`.
 - MiMo 2.3bpw comes from a fresh AC rerun: its first-pass run crossed onto battery, as did GLM's, and battery slowed GLM 8–18%.
 - GLM 2.4bpw comes from the release binary `29107ce9` (SHA `98d1760b`), after the DFlash2 in-place commit fix.
 
+## v1.8.0 release context ladder
+
+[Version summary and per-model reports](bench/v1.8.0/summary.md), 2026-11-26, Apple M5 Ultra 256 GB, STQ packs only:
+Qwen STQ 4bpw, DeepSeek STQ 2.7bpw and, new, Hy4-Flash STQ 4bpw, 4k to 128k, one binary from `7c8d11d1` (SHA
+`66e39713`), shipping defaults, no cooldown. Code 4k decode 270.0 (MTP), 129.0 (DSpark) and 143.2 (DFly2) tok/s.
+
 ## v1.7.4 release context ladder
 
 [Version summary and per-model reports](bench/v1.7.4/summary.md), 2026-11-24. The first release ladder on the Apple M5

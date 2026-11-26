@@ -276,11 +276,11 @@ first EOS, against the previous release's reading (within ~1%). The fixture and 
 Public numbers (pack cards, the README) are the eight-category reading ([below](#eight-category)). A 16-prompt prose
 fixture is a regression gate only: without the other categories its mean leans on raw prose, so it is never reported.
 
-| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) | 1.6.0 (`ac3da7aa`) | 1.7.0 | 1.7.3 (`fc2fd843`) | 1.7.4 (`cb048670`) |
-|---|---|---|---|---|---|---|---|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 | 0.061793, 92.48%, 7061 positions (`c59df290`) | 0.061793, 92.48%, 7061 positions | · (the gate moved to STQ 4bpw) |
-| Qwen3.8-Flash-Next-Sushi-STQ-4bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | | | | 0.031214, 94.42%, 7061 positions (`c59df290`) | · | 0.031214, 94.42%, 7061 positions |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`) | 0.210682, 86.38%, 7533 positions | 0.209273, 86.78%, 7533 positions |
+| pack | fixture (`kld-teacher/`) | extra flags | 1.4.0 | 1.5.0 (`f8ec7254`) | 1.5.1 (`399895f6`) | 1.6.0 (`ac3da7aa`) | 1.7.0 | 1.7.3 (`fc2fd843`) | 1.7.4 (`cb048670`) | 1.8.0 (`7c8d11d1`) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | 0.065924, 91.94%, 7061 positions | 0.065924, 91.94%, 7061 positions | 0.061834, 92.30%, 7061 positions, pack revision 2.0 | 0.061793, 92.48%, 7061 positions (`c59df290`) | 0.061793, 92.48%, 7061 positions | · (the gate moved to STQ 4bpw) | · |
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw | `qwen38-flash-next-bf16-code8-prose8-16x512` | `--kv-quant 8` | | | | | 0.031214, 94.42%, 7061 positions (`c59df290`) | · | 0.031214, 94.42%, 7061 positions | 0.031214, 94.42%, 7061 positions |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw | `deepseek-v41-flash-1017-native-v1` | | 0.221423, 85.53% | 0.223124, 85.49%, 7533 positions | 0.209123, 86.84%, 7533 positions, pack revision 2.0 | 0.210305, 86.46%, 7533 positions | 0.210682, 86.38%, 7533 positions (`b039659c`) | 0.210682, 86.38%, 7533 positions | 0.209273, 86.78%, 7533 positions | 0.209273, 86.78%, 7533 positions |
 
 DeepSeek moved to pack revision 2.0 after 1.5.0; the 1.5.0 binary read it at 0.210305, 86.46%, so
 1.5.1 is within 0.6%. Qwen 1.5.1 equals 1.5.0 to the last digit.
@@ -333,12 +333,25 @@ two prompts per category: code, math, reasoning, design, wikitext, multilingual,
 - The teacher is the bf16 checkpoint with an f32 GDN state and gate ([qwen4-kld](qwen4-kld.md#gdn-f32-teacher)). Score
   students with `--qwen-gdn 32` and bf16 KV. These numbers are not comparable with any other fixture.
 
+<a id="hy4-eight-category"></a>
+## Eight-category reading (Hy4-Flash)
+
+The same 16 prompts and categories against Hy4-Flash's BF16 checkpoint (`hy4-flash-bf16-8cat-v1`, captured on a NAX
+GPU), compared at `--kv-quant 8 --no-mtp --tokens 512 --ctx-size 8192`, `MLX_ENABLE_TF32=0`, every routed expert
+resident, to the first EOS (7859 positions). M5 Max, `7c8d11d1`, 2026-11-26. KLD (top-1):
+
+| pack | all | code | math | reasoning | design | wikitext | multilingual | story | stem |
+|---|---|---|---|---|---|---|---|---|---|
+| Hy4-Flash-Sushi-STQ-4bpw | 0.019387 (96.30%) | 0.006021 | 0.005801 | 0.013732 | 0.016615 | 0.036889 | 0.016785 | 0.050044 | 0.007921 |
+| Hy4-Flash-Sushi-STQ-2.25bpw | 0.102246 (91.72%) | 0.028985 | 0.039940 | 0.087497 | 0.107893 | 0.080213 | 0.109945 | 0.325550 | 0.036802 |
+
 ## Teacher fixtures
 
 | fixture | model | notes |
 |---|---|---|
 | Flash-Next 16x512 raw | Flash-Next | the bf16 checkpoint, bf16 stream, raw text; the standard |
 | Flash-Next 8-category 16x512 | Flash-Next | the bf16 checkpoint, f32 GDN state and gate, 2 prompts per category ([above](#eight-category)) |
+| Hy4-Flash 8-category 16x512 | Hy4-Flash | the BF16 checkpoint through f32 products, captured on a NAX GPU, 2 prompts per category ([above](#hy4-eight-category)) |
 | Flash-Next 16x512 raw, f32 stream | Flash-Next | the same with an f32 residual stream |
 | Flash-Next 60x64 | Flash-Next | the 60x64 screen |
 | MiMo 16x512 raw | MiMo | the MOPD checkpoint as stored (FP8 trunk: bf16 weights in prefill, FP8 code x f32 block scale in decode), dense KV; captured 2026-09-30 by 83dc9b6c; mean strict NLL 0.2664; 652 s capture |

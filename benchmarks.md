@@ -29,7 +29,8 @@
 
 ## M5 Ultra 256 GB, decode tok/s by release, sushi bench (code / prose, 4k)
 
-| Model | v1.7.4 |
-|---|---|
-| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | 260.3 / 96.5 mtp |
-| DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw (DSpark) | 128.2 / 69.9 dspark |
+| Model | v1.7.4 | v1.8.0 |
+|---|---|---|
+| Qwen3.8-Flash-Next-Sushi-STQ-4bpw (MTP) | 260.3 / 96.5 mtp | 270.0 / 102.2 mtp |
+| DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw (DSpark) | 128.2 / 69.9 dspark | 129.0 / 70.6 dspark |
+| Hy4-Flash-Sushi-STQ-4bpw (DFly2) | · | 143.2 / 69.6 dfly2 |
