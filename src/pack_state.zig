@@ -76,6 +76,21 @@ pub fn of(io: std.Io, dir_path: []const u8) State {
     return ofDir(io, dir, std.fs.path.basename(std.mem.trimEnd(u8, dir_path, "/")));
 }
 
+/// The repo a folder says it holds, whatever its state: the marker's text while a pull runs or has stopped (the pull
+/// removes the record before it replaces files), else the record's. Null when the folder names none (a hand copy,
+/// or a marker an older sushi wrote empty).
+pub fn repoOf(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ?[]const u8 {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch return null;
+    defer dir.close(io);
+    if (dir.readFileAlloc(io, pull_marker, arena, .limited(4096))) |text| {
+        if (text.len > 0) return text;
+    } else |_| {}
+    return switch (hf_pull.readRecord(arena, io, dir)) {
+        .present => |m| if (m.repo.len > 0) m.repo else null,
+        .absent, .unreadable => null,
+    };
+}
+
 /// The state of the open folder `dir` (opened for iteration), which `name` calls in its reasons.
 pub fn ofDir(io: std.Io, dir: std.Io.Dir, name: []const u8) State {
 
@@ -230,6 +245,23 @@ test "pack state: a folder with weights and no marker or record is unsealed and 
     try testing.expectEqual(Kind.unsealed, s.kind);
     try testing.expect(s.loadable());
     try testing.expectEqualStrings("", s.reason());
+}
+
+test "pack state: a folder's repo is the marker's text, else the record's, else none" {
+    var fx = try Fixture.init();
+    defer fx.deinit();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try fx.write("config.json", "{}");
+    try fx.write("model.safetensors", "0123456789");
+    try testing.expect(repoOf(arena, testing.io, fx.path) == null);
+    try fx.writeRecord(&.{ "config.json", "model.safetensors" }, true);
+    try testing.expectEqualStrings("beamster/X", repoOf(arena, testing.io, fx.path).?);
+    try fx.write(pull_marker, "beamster/Y");
+    try testing.expectEqualStrings("beamster/Y", repoOf(arena, testing.io, fx.path).?);
+    try fx.write(pull_marker, "");
+    try testing.expectEqualStrings("beamster/X", repoOf(arena, testing.io, fx.path).?);
 }
 
 test "pack state: the marker makes a folder pulling whatever else it holds" {

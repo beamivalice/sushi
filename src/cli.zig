@@ -600,11 +600,12 @@ fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
     return st.size;
 }
 
-fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
+/// Sets the marker, which carries the repo being pulled (`pack_state.repoOf` reads it back), or clears it when `repo` is null.
+fn setPullMarker(io: std.Io, dest_dir: []const u8, repo: ?[]const u8) !void {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dest_dir, .{});
     defer dir.close(io);
-    if (on) {
-        try dir.writeFile(io, .{ .sub_path = pack_state.pull_marker, .data = "" });
+    if (repo) |r| {
+        try dir.writeFile(io, .{ .sub_path = pack_state.pull_marker, .data = r });
     } else {
         dir.deleteFile(io, pack_state.pull_marker) catch |err| if (err != error.FileNotFound) return err;
     }
@@ -649,7 +650,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     }
     reporter.say("{d} files, {d} MB total", .{ wanted, total_bytes / (1024 * 1024) });
     if (!reporter.event(.{ .listed = .{ .files = wanted, .bytes = total_bytes, .present = hf_pull.bytesPresent(io, dest_dir, wanted_files.items) } })) return error.PullCancelled;
-    setPullMarker(io, dest_dir, true) catch {
+    setPullMarker(io, dest_dir, resolved.repo) catch {
         reporter.say("error: cannot write to {s}", .{dest_dir});
         return error.PullFailed;
     };
@@ -721,7 +722,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         reporter.say("error: cannot write {s}/{s}", .{ dest_dir, hf_pull.manifest_name });
         return error.PullFailed;
     };
-    setPullMarker(io, dest_dir, false) catch {
+    setPullMarker(io, dest_dir, null) catch {
         reporter.say("error: cannot finish {s}: remove {s}/{s} by hand", .{ resolved.repo, dest_dir, pack_state.pull_marker });
         return error.PullFailed;
     };
@@ -809,9 +810,9 @@ pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []co
     const root = try modelsRootPath(allocator, homeDir());
     defer allocator.free(root);
     if (catalogPackPath(io, allocator, root, resolved.repo)) |found| return found;
-    const dest = try modelDestPath(allocator, homeDir(), resolved.repo);
-    errdefer allocator.free(dest);
     if (!isBeamsterRepo(resolved.repo)) refuseOrg(io, name);
+    const dest = try pullFolder(io, allocator, root, resolved.repo);
+    errdefer allocator.free(dest);
     warnBelowTier(resolved.repo);
     try pullRepo(allocator, io, resolved, dest, stderr_reporter, true);
     return dest;
@@ -837,7 +838,9 @@ pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void
         },
         error.NotBeamster => refuseOrg(io, name),
     };
-    const dir = try modelDestPath(allocator, homeDir(), resolved.repo);
+    const root = try modelsRootPath(allocator, homeDir());
+    defer allocator.free(root);
+    const dir = try pullFolder(io, allocator, root, resolved.repo);
     defer allocator.free(dir);
     if (!pack_state.of(io, dir).loadable()) warnBelowTier(resolved.repo);
     try pullRepo(allocator, io, resolved, dir, stderr_reporter, true);
@@ -1038,6 +1041,31 @@ pub fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u
     if (pack_state.of(io, flat_path).loadable()) return flat_path;
     allocator.free(flat_path);
     return null;
+}
+
+/// The folder under `root`, in either layout, that says it holds `repo` while it cannot load (a pull of it stopped or
+/// failed). Caller frees.
+pub fn stoppedPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
+    const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return null;
+    const trimmed = std.mem.trimEnd(u8, root, "/");
+    for ([_][]const u8{ repo, repo[slash + 1 ..] }) |rel| {
+        const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimmed, rel }) catch return null;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        if (pack_state.repoOf(arena_state.allocator(), io, path)) |held| {
+            if (std.mem.eql(u8, held, repo)) return path;
+        }
+        allocator.free(path);
+    }
+    return null;
+}
+
+/// The folder a pull of `repo` fills under `root`: the finished pack's, else the one a stopped pull of it left, else
+/// `<root>/<org>/<repo>`. Caller frees.
+pub fn pullFolder(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ![]u8 {
+    if (catalogPackPath(io, allocator, root, repo)) |found| return found;
+    if (stoppedPackPath(io, allocator, root, repo)) |stopped| return stopped;
+    return std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, root, "/"), repo });
 }
 
 const UpdateJob = struct {
@@ -2533,12 +2561,12 @@ test "cli: a pull cut short without a .partial file is not a present model" {
     // Packs pulled before the marker existed are complete.
     try testing.expect(pack_state.of(io, pack).loadable());
 
-    try setPullMarker(io, pack, true);
+    try setPullMarker(io, pack, "beamster/X");
     try testing.expect(!pack_state.of(io, pack).loadable());
 
-    try setPullMarker(io, pack, false);
+    try setPullMarker(io, pack, null);
     try testing.expect(pack_state.of(io, pack).loadable());
-    try setPullMarker(io, pack, false);
+    try setPullMarker(io, pack, null);
 }
 
 test "cli: parseTreeJson uses lfs size and skips directories" {
@@ -3643,6 +3671,44 @@ test "cli: a partial local pack is not listed as a chat model" {
         try testing.expectEqual(std.mem.eql(u8, name, "whole"), std.mem.indexOf(u8, row, "chat") != null);
         try testing.expectEqual(std.mem.eql(u8, name, "partial"), std.mem.indexOf(u8, row, "sushi pull") != null);
     }
+}
+
+test "cli: a pull of a pack stopped in the flat layout resumes in the flat folder" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const repo = aliases[0].repo;
+    const base = repo[std.mem.indexOfScalar(u8, repo, '/').? + 1 ..];
+    const flat = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, base });
+    defer testing.allocator.free(flat);
+    const org = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, repo });
+    defer testing.allocator.free(org);
+
+    // Nothing on disk: a first pull goes to the org folder.
+    const fresh = try pullFolder(io, testing.allocator, root, repo);
+    defer testing.allocator.free(fresh);
+    try testing.expectEqualStrings(org, fresh);
+
+    // An update of a flat pack, stopped once its record was removed: only the marker is left to say whose it is.
+    try model_discovery.writePackStub(io, tmp.dir, base);
+    var sb: [600]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors.partial", .{base}), .data = "01234" });
+    try setPullMarker(io, flat, repo);
+    try testing.expect(!pack_state.of(io, flat).loadable());
+    const stopped = try pullFolder(io, testing.allocator, root, repo);
+    defer testing.allocator.free(stopped);
+    if (!std.mem.eql(u8, stopped, flat)) {
+        std.debug.print("a pull of {s} stopped in {s} resumes in {s}\n", .{ repo, flat, stopped });
+        return error.SecondCopy;
+    }
+
+    // Another pack's stopped pull under this pack's folder name is not this pack's folder.
+    try setPullMarker(io, flat, "someone/else");
+    const other = try pullFolder(io, testing.allocator, root, repo);
+    defer testing.allocator.free(other);
+    try testing.expectEqualStrings(org, other);
 }
 
 test "cli: a pack present in both layouts is served from the org folder" {

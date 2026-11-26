@@ -270,6 +270,14 @@ fn installedPath(allocator: Allocator, io: std.Io, rs: []const []const u8, repo:
     return null;
 }
 
+/// Where a download of `repo` fills: the installed pack's folder, else the one a stopped pull of it left, else its
+/// own folder under `root`.
+fn downloadFolder(allocator: Allocator, io: std.Io, rs: []const []const u8, root: []const u8, repo: []const u8) ![]u8 {
+    if (installedPath(allocator, io, rs, repo)) |p| return p;
+    for (rs) |r| if (cli.stoppedPackPath(io, allocator, r, repo)) |p| return p;
+    return ownFolder(allocator, root, repo);
+}
+
 /// `<root>/<org>/<repo>`, where a download of a pack not yet installed goes.
 fn ownFolder(allocator: Allocator, root: []const u8, repo: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, root, "/"), repo });
@@ -667,7 +675,7 @@ fn render(allocator: Allocator, io: std.Io) ![]u8 {
         const downloading = for (active.items) |r| {
             if (std.ascii.eqlIgnoreCase(r, e.repo)) break true;
         } else false;
-        const partial = if (installed == null and !downloading) dirBytes(io, try ownFolder(arena, dest.path, e.repo)) else null;
+        const partial = if (installed == null and !downloading) dirBytes(io, try downloadFolder(arena, io, rs, dest.path, e.repo)) else null;
         try writePack(w, .{ .repo = e.repo, .size = e.size, .installed = installed, .partial_bytes = partial, .update = if (installed != null) e.update else null }, ram_gb);
     }
     try w.writeAll("],\"jobs\":[");
@@ -750,7 +758,7 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
     const root = destRoot(&dest_buf, stream.io, server_state.global_registry).path;
     var roots_buf: [9][]const u8 = undefined;
     const installed = installedPath(arena, stream.io, roots(&roots_buf, root, server_state.global_registry), repo);
-    const dest = installed orelse try ownFolder(arena, root, repo);
+    const dest = installed orelse try downloadFolder(arena, stream.io, roots(&roots_buf, root, server_state.global_registry), root, repo);
     var warning: ?[]const u8 = null;
     if (installed == null) if (size) |s| if (disk_placement.volumeSpaceNear(dest)) |v| {
         const need = precheckNeed(stream.io, dest, s, listing);
@@ -904,6 +912,27 @@ test "downloads: a pack whose shards are links needs nothing, so the 507 pre-che
     const files = [_]hf_pull.RepoFile{.{ .path = @constCast("model.safetensors"), .size = 10 }};
     // "one that needs nothing more writes nothing, so it passes however full the volume already is".
     try testing.expectEqual(@as(u64, 0), precheckNeed(io, pack, 10, &files));
+}
+
+test "downloads: a download of a pack whose flat-layout update stopped fills the flat folder" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const repo = cli.aliases[0].repo;
+    const base = repo[std.mem.indexOfScalar(u8, repo, '/').? + 1 ..];
+    try md.writePackStub(io, tmp.dir, base);
+    var sb: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors.partial", .{base}), .data = "01234" });
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/{s}", .{ base, pack_state.pull_marker }), .data = repo });
+    const flat = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, base });
+    defer testing.allocator.free(flat);
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const got = try downloadFolder(arena_state.allocator(), io, &.{root}, root, repo);
+    try testing.expectEqualStrings(flat, got);
 }
 
 test "downloads: a pack that cannot fit is stopped once its listing is known, naming the space" {

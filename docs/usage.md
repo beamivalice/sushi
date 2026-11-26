@@ -49,7 +49,7 @@ listed that the repo no longer has is removed (a case-only rename names the same
 local copy without contacting Hugging Face. `run <name>` looks in the org layout (`~/.sushi/models/beamster/<repo>`) and
 the flat layout (`~/.sushi/models/<repo>`, `hf download --local-dir`) only; a folder with no record (a hand copy, `hf download`, an older
 pull) counts when it has its `config.json`, every weights file its index names (else a `.safetensors`) and no `.partial`
-of a file it needs.
+of a file it needs. A pull or download fills the folder that already holds the repo, in either layout, even one that cannot load: the marker `.pull-incomplete` carries the repo being pulled, so a stopped update resumes where it began.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it
 recommends. A local folder that cannot load (a pull that did not finish, a sealed file since replaced) reads `partial`
