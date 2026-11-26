@@ -230,6 +230,8 @@ pub const Experts = union(enum) {
         /// The layer's pick-score penalty (`--expert-cache-bias`), f32 `[experts]`, added to the router's bias at decode
         /// widths. Null leaves the pick exact.
         penalty: ?*const fn (ctx: *anyopaque, layer: usize) anyerror!?A = null,
+        /// Host copy of the layer's `--expert-cache-bias` penalty (`[experts]`) for prefetch ranking; false when off or busy.
+        prefetch_penalty: ?*const fn (ctx: *anyopaque, layer: usize, out: []f32) bool = null,
     };
 
     pub const Spec = struct {
@@ -4631,13 +4633,13 @@ fn predictLogits(sc: *Scope, m: *const Model, h: A, j: usize) !A {
     return sc.matmul(try sc.astype(h, .float32), try sc.t2(try sc.astype(w, .float32)));
 }
 
-/// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias), best first;
-/// `best` receives their scores.
-fn rankPicks(logits: []const f32, bias: []const f32, out: []u16, best: []f32) void {
+/// The `out.len` experts of `logits` with the highest router pick score (sqrt-softplus plus the pick bias and optional
+/// cache-bias penalty), best first; `best` receives their scores.
+fn rankPicks(logits: []const f32, bias: []const f32, penalty: ?[]const f32, out: []u16, best: []f32) void {
     var filled: usize = 0;
     for (logits, bias, 0..) |x, b, e| {
         const soft = if (x > 20) x else std.math.log1p(std.math.exp(x));
-        const score = @sqrt(soft) + b;
+        const score = @sqrt(soft) + b + (if (penalty) |p| p[e] else 0);
         if (filled == out.len and score <= best[filled - 1]) continue;
         var at = if (filled < out.len) filled else filled - 1;
         while (at > 0 and best[at - 1] < score) : (at -= 1) {
@@ -4658,10 +4660,14 @@ fn issuePrefetch(m: *const Model, u: *const Unresolved) !void {
     const bias = try sc_mod.hostF32(m.layers[u.pred_layer].gate_bias);
     const rows = dim(u.pred, 0);
     const E = bias.len;
-    const n: usize = @min(m.prefetch_n, prefetch_cand_max, E);
+    var pen_stack: [512]f32 = undefined;
+    const pen_buf = if (E <= pen_stack.len) pen_stack[0..E] else try m.gpa.alloc(f32, E);
+    defer if (E > pen_stack.len) m.gpa.free(pen_buf);
+    const pen: ?[]const f32 = if (hk.prefetch_penalty) |pf_pen| (if (pf_pen(hk.ctx, u.pred_layer, pen_buf)) pen_buf else null) else null;
+    const n: usize = @min(if (pen != null) @min(m.prefetch_n, m.cfg.top_k) else m.prefetch_n, prefetch_cand_max, E);
     var cand: [16 * prefetch_cand_max]u16 = undefined;
     var score: [16 * prefetch_cand_max]f32 = undefined;
-    for (0..rows) |r| rankPicks(logits[r * E ..][0..E], bias, cand[r * n ..][0..n], score[r * n ..][0..n]);
+    for (0..rows) |r| rankPicks(logits[r * E ..][0..E], bias, pen, cand[r * n ..][0..n], score[r * n ..][0..n]);
     prefetch(hk.ctx, u.pred_layer, cand[0 .. rows * n], score[0 .. rows * n], rows, n, m.prefetch_m);
 }
 
