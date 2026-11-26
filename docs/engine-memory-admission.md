@@ -788,7 +788,8 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
   the headroom, and the refusal is a named 400 (`MediaRefused`).
 - **A streamed `--vision` load bills its tower in the ssd budget and proves its largest image beside it**: the load
   admits `budget + planned KV + largestImageEncodeBytes <= wired limit`; requests are still billed live as above
-  ([engine-expert-streaming](engine-expert-streaming.md#vision)).
+  ([engine-expert-streaming](engine-expert-streaming.md#vision)). The reserve prices the arch's own most rows
+  (`arch_media.maxImageRows`: Hy4's newline row per merged row, DeepSeek's delimiters), never the newline-free cell count.
 - **Qwen's tower is billed as it is held**: the load requantizes the tower's big matrices to affine 8-bit
   ([qwen4-arch](qwen4-arch.md#vision-tower)), so `indexedResidentSplit` bills 597,327,776 B, not the stored 897,862,112 B,
   to a resident load and to a streamed `--vision` ledger alike (the rule is `qwen_vision.quantGroupAtLoad` on the shard headers).

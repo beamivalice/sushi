@@ -4,7 +4,7 @@
 //!
 //! An arch's `media` declares `mode`, `claims`, `preproc`, `Tower` with `initTower`, `scratchBytes`, `resize` and
 //! `normalizeChw` (patch-grid towers) or `planImage` and `decodeImage` (an arch that decodes on its own). It may add
-//! `maxImagePatches`, `imageRows`, `expandVideo`, `videoResize`, `mropePositions`; each has a default.
+//! `maxImagePatches`, `maxImageRows`, `imageRows`, `expandVideo`, `videoResize`, `mropePositions`; each has a default.
 const std = @import("std");
 const arch_config = @import("config.zig");
 const mlx = @import("../mlx.zig");
@@ -175,6 +175,15 @@ pub fn maxImagePatches(vp: chat.VisionPreproc) u64 {
     const tag = ofMode(vp.mode) orelse return pixel_cap;
     return switch (tag) {
         inline else => |t| if (@hasDecl(M(t), "maxImagePatches")) M(t).maxImagePatches(vp) else pixel_cap,
+    };
+}
+
+/// Most prompt rows one image of `maxImagePatches` holds, whatever its aspect: what a streamed load's largest-image
+/// reserve prices, so it covers `imageRows` of every grid the processor admits.
+pub fn maxImageRows(vp: chat.VisionPreproc) usize {
+    const tag = ofMode(vp.mode) orelse return @intCast(maxImagePatches(vp) / (@max(@as(u64, vp.merge), 1) * @max(@as(u64, vp.merge), 1)));
+    return switch (tag) {
+        inline else => |t| if (@hasDecl(M(t), "maxImageRows")) M(t).maxImageRows(vp) else @intCast(maxImagePatches(vp) / (@max(@as(u64, vp.merge), 1) * @max(@as(u64, vp.merge), 1))),
     };
 }
 

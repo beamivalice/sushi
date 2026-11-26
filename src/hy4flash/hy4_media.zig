@@ -105,6 +105,12 @@ pub fn maxImagePatches(vp: chat.VisionPreproc) u64 {
     return bounds(vp).max / @max(@as(u64, vp.patch) * vp.patch, 1);
 }
 
+/// The tallest admitted grid is one merged cell wide: every cell is a row beside its newline.
+pub fn maxImageRows(vp: chat.VisionPreproc) usize {
+    const merge: u64 = @max(vp.merge, 1);
+    return @intCast(2 * (maxImagePatches(vp) / (merge * merge)));
+}
+
 /// Each merged row of an image and its newline.
 pub fn imageRows(merge: u32, grid_h: u32, grid_w: u32) usize {
     return @as(usize, grid_h / merge) * (grid_w / merge + 1);

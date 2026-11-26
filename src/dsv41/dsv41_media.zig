@@ -42,6 +42,11 @@ pub fn maxImagePatches(vp: chat.VisionPreproc) u64 {
     return merge * merge * (vp.max_tokens - 2);
 }
 
+/// A span never exceeds the processor's token budget, delimiters included.
+pub fn maxImageRows(vp: chat.VisionPreproc) usize {
+    return vp.max_tokens;
+}
+
 /// An image's span: its aligner cells, a newline per row, start and end.
 pub fn imageRows(merge: u32, grid_h: u32, grid_w: u32) usize {
     return dsv41_vision.spanRows(grid_h, grid_w, merge);

@@ -502,10 +502,9 @@ pub fn mediaInputs(config: *const model_mod.ModelConfig, images: []const chat_mo
 /// `--vision` load proves it fits beside its budget. Every request is still checked live.
 pub fn largestImageEncodeBytes(config: *const model_mod.ModelConfig) u64 {
     const vp = visionPreprocFromConfig(config);
-    const merge: u64 = @max(vp.merge, 1);
     const patches = arch_media.maxImagePatches(vp);
     const largest = [_]chat_mod.ImageData{.{ .pixels = &.{}, .width = 0, .height = 0, .grid_h = 1, .grid_w = @intCast(patches) }};
-    return visionEncodeBill(config, &largest, &.{}, @intCast(patches / (merge * merge))).bytes;
+    return visionEncodeBill(config, &largest, &.{}, arch_media.maxImageRows(vp)).bytes;
 }
 
 pub fn visionEncodeBillBytes(config: *const model_mod.ModelConfig, images: []const chat_mod.ImageData, videos: []const chat_mod.VideoData, rows: usize) u64 {
@@ -1448,11 +1447,31 @@ test "the largest-image encode bill covers any single image the tower's processo
         for (sides) |s| {
             const plan = arch_media.planImage(vp, s[1], s[0]).?;
             const img = [_]chat_mod.ImageData{testGridImage(plan.grid_h, plan.grid_w, "")};
-            const bill = visionEncodeBill(&config, &img, &.{}, arch_media.gridRows(1, img[0].grid_h, img[0].grid_w, vp.merge)).bytes;
+            const bill = visionEncodeBill(&config, &img, &.{}, arch_media.imageRows(&config, vp.merge, img[0].grid_h, img[0].grid_w)).bytes;
             try t.expect(bill <= reserve);
             largest = @max(largest, bill);
         }
         try t.expect(largest * 10 >= reserve * 9);
+    }
+}
+
+test "the largest-image reserve covers the rows the runtime bills of any image Hy4 and DeepSeek admit" {
+    var hy4 = try model_mod.parseConfigText(std.Io.Threaded.global_single_threaded.io(), std.testing.allocator, "", @import("hy4flash/hy4_config.zig").release_config);
+    defer hy4.deinit(std.testing.allocator);
+    const dsv_full = arch_media.testConfig("deepseek_v41");
+    const dsv: ?model_mod.ModelConfig = if (dsv_full) |f| .{ .model_type = "deepseek_v41", .dsv41 = f.dsv41 } else null;
+    // The tall and wide extremes put the most newline rows beside the fewest cells.
+    const sides = [_][2]u32{ .{ 73728, 32 }, .{ 32, 73728 }, .{ 20000, 20000 }, .{ 4321, 3210 }, .{ 30000, 64 }, .{ 64, 30000 } };
+    for ([_]?model_mod.ModelConfig{ hy4, dsv }) |row| {
+        const config = row orelse continue;
+        const reserve = largestImageEncodeBytes(&config);
+        const vp = visionPreprocFromConfig(&config);
+        for (sides) |s| {
+            const plan = arch_media.planImage(vp, s[1], s[0]) orelse continue;
+            const img = [_]chat_mod.ImageData{testGridImage(plan.grid_h, plan.grid_w, "")};
+            const rows = arch_media.imageRows(&config, vp.merge, plan.grid_h, plan.grid_w);
+            try std.testing.expect(visionEncodeBill(&config, &img, &.{}, rows).bytes <= reserve);
+        }
     }
 }
 
@@ -1954,7 +1973,7 @@ test "the reserve a streamed load keeps for the largest image is pinned per towe
     }
     const full = arch_media.testConfig("deepseek_v41") orelse return;
     const dsv: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41 = full.dsv41 };
-    try std.testing.expectEqual(@as(u64, 123627508), largestImageEncodeBytes(&dsv));
+    try std.testing.expectEqual(@as(u64, 123627520), largestImageEncodeBytes(&dsv));
 }
 
 test {

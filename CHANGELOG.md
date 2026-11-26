@@ -26,7 +26,8 @@ earlier history is mlx-serve's, in that project's changelog.
   icon also shows a model loading and a reply generating. Thanks @eliaskg for `return_progress`.
 - **Clearer memory facts**: a pack's in-memory size leaves out the Engram tables that stay on the SSD
   (`76.1 GiB in memory · 194 GiB total`), every load refusal names its numbers, `--wired-margin-gib 0` plans to the
-  wired limit itself, and a cache folder linked to another volume works.
+  wired limit itself, a streamed `--vision` load reserves the memory of the tallest image Hy4-Flash admits, and a cache
+  folder linked to another volume works.
 - **Packs and tools**: `sushi convert exl3` writes DeepSeek-V4.1 and Hy4-Flash packs pair-major directly, `sushi repack`
   migrates Hy4-Flash STQ packs, every routed shard's stamp is checked before a weight loads, and a fully resident
   DeepSeek load decodes several requests at once up to 8% faster with the same text.
