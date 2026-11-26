@@ -4844,3 +4844,27 @@ test "r174-f-closer-hold: a tools stream's reasoning and content deltas are the 
         try testing.expectEqualStrings(c.deltas, got);
     }
 }
+
+test "format corpus: an arg_key value that lost its close and its call's close ends at the next call, which ships, and the open call is declined and named" {
+    const allocator = testing.allocator;
+    const shapes = [_][]const u8{
+        // The value and the call both lost their close.
+        "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt",
+        // The call's close came while the value was open.
+        "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</tool_call>",
+    };
+    const next = "<tool_call>write<arg_key>path</arg_key><arg_value>b.txt</arg_value></tool_call>";
+    for (shapes) |lost| for ([_][]const u8{ "", hy4_open }) |open| for ([_][]const u8{ "stop", "length" }) |finish| {
+        const text = try std.mem.concat(allocator, u8, &.{ open, lost, next, if (open.len > 0) hy4_close else "" });
+        defer allocator.free(text);
+        errdefer std.debug.print("[{s}] {f}\n", .{ finish, std.zig.fmtString(text) });
+        const ask: reply_mod.Ask = .{ .stops = &.{}, .normalize = true, .has_tools = true, .tools_json = write_read_tools_schema, .allow_parallel = true, .dialect = .arg_key, .opens_think = false };
+        const got = try reply_mod.settle(allocator, .{ .text = text, .source = .whole, .finish_reason = finish, .finish_details = null }, ask);
+        defer got.deinit(allocator);
+        const calls = (got.reply orelse return error.NextCallDropped).calls;
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("write", calls[0].name);
+        try testing.expectEqualStrings("{\"path\":\"b.txt\"}", calls[0].arguments);
+        try testing.expectEqualStrings("read", (got.declined orelse return error.OpenCallNotDeclined).name orelse return error.OpenCallNotDeclined);
+    };
+}

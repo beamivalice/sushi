@@ -237,6 +237,9 @@ pub const Scan = struct {
     param: Next = .{ .needle = "<param" },
     function_close: Next = .{ .needle = "</function>" },
     gt: Next = .{ .needle = ">" },
+    call_tag: Next = .{ .needle = "<tool_call" },
+    value_open: Next = .{ .needle = "<arg_value" },
+    value_close: Next = .{ .needle = "</arg_value" },
     dsml_invoke: Next = .{ .needle = "<｜DSML｜invoke" },
     dsml_invoke_spaced: Next = .{ .needle = "<｜DSML｜ invoke" },
     spans: Spans = .{},
@@ -370,7 +373,48 @@ fn callEnd(f: *const Family, text: []const u8, at: usize, model_ended: bool, sca
     if (model_ended and f.body_closers.len > 0 and bodyIsFunction(text, at)) {
         for (f.body_closers) |c| best = earlierEnd(best, firstEnd(f, text, at, c, best, scan));
     }
+    if (f.values == .wrapper) {
+        if (openValueNextCall(text, at, if (best) |b| b.at else text.len, scan)) |next| return .{ .at = next, .lost = true };
+    }
     return best;
+}
+
+/// Where the `<arg_key>` call that opens at `at` stops because another call with arguments opens while one of its
+/// values is still open before `limit`: a value never runs across a call, whatever closes follow. A call that spells
+/// no `<arg_key>` (`<tool_call>x</tool_call>`) in its value does not end it.
+fn openValueNextCall(text: []const u8, at: usize, limit: usize, scan: *Scan) ?usize {
+    if (!carriesArgKeys(text, at)) return null;
+    var p = at + 1;
+    var open: ?usize = null;
+    while (scan.call_tag.findBefore(text, p, limit)) |q| : (p = q + 1) {
+        if (q >= limit) return null;
+        while (scan.value_open.findBefore(text, if (open) |o| o + 1 else at, q)) |o| {
+            if (o >= q) break;
+            open = o;
+        }
+        const from = open orelse continue;
+        const closed = scan.value_close.findBefore(text, from, q);
+        if (closed != null and closed.? < q) continue;
+        if (opensArgKeyCall(text, q)) return q;
+    }
+    return null;
+}
+
+/// Whether the call that opens at `at` has GLM's `<arg_key>` body, not a JSON object or Hermes' function tag.
+fn carriesArgKeys(text: []const u8, at: usize) bool {
+    const gt = std.mem.indexOfScalarPos(u8, text, at, '>') orelse return false;
+    charge(gt - at);
+    const body = std.mem.trimStart(u8, text[gt + 1 ..], " \t\r\n");
+    return !(std.mem.startsWith(u8, body, "{") or std.mem.startsWith(u8, body, "<function="));
+}
+
+/// `<tool_call>NAME<arg_key` at `q`: a call that carries an argument.
+fn opensArgKeyCall(text: []const u8, q: usize) bool {
+    var i = q + (think_tags.callTagLenAt(text[q..], "<tool_call") orelse return false);
+    i = skipSpace(text, i);
+    const name_at = i;
+    while (i < text.len and (std.ascii.isAlphanumeric(text[i]) or text[i] == '_' or text[i] == '-' or text[i] == '.')) i += 1;
+    return i > name_at and std.mem.startsWith(u8, text[skipSpace(text, i)..], "<arg_key");
 }
 
 fn earliestOf(a: ?usize, b: ?usize) ?usize {
