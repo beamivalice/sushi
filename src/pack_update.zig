@@ -407,7 +407,7 @@ fn watchLoop(i: usize) void {
             var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
             defer arena_state.deinit();
             const l = look(arena_state.allocator(), io, known, path);
-            record(path, l.status);
+            record(io, path, l.status);
             if (l.status == .available) log.info("[pack-update] {s}: revision {s} is available (you have {s}): run `{s}`\n", .{ std.fs.path.basename(path), l.status.available.latest, l.status.available.local, l.status.available.command });
             next_at = now + @max(l.wait_s, 60);
         }
