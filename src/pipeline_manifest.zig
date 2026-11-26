@@ -57,10 +57,19 @@ fn putBytes(list: *std.ArrayList(u8), a: std.mem.Allocator, bytes: []const u8) !
     try list.appendSlice(a, bytes);
 }
 
-/// The file's bytes: header, `key`, the recipes, and a SHA-256 of everything before it.
+/// What `encode` writes, to the byte.
+fn encodedLen(key: []const u8, recipes: []const Recipe) usize {
+    var n: usize = magic.len + 4 + 4 + key.len + 4 + digest_len;
+    for (recipes) |r| n += 1 + 3 * 4 + r.function.len + r.key.len + r.text.len + 4 + 5 * r.flags.len + 4 + 8 * r.ints.len;
+    return n;
+}
+
+/// The file's bytes: header, `key`, the recipes, and a SHA-256 of everything before it. The buffer is allocated once at
+/// its size: a manifest is megabytes, and the freed steps of a growing buffer stay resident in the process.
 pub fn encode(a: std.mem.Allocator, key: []const u8, recipes: []const Recipe) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
+    try out.ensureTotalCapacityPrecise(a, encodedLen(key, recipes));
     try out.appendSlice(a, magic);
     try putU32(&out, a, version);
     try putBytes(&out, a, key);
@@ -720,4 +729,38 @@ test "pipeline manifest: a process has no root until it is given the home" {
     try setRootFromHome("/home/someone");
     defer configured_len = 0;
     try testing.expectEqualStrings("/home/someone/.sushi/cache/pipelines", configuredRoot().?);
+}
+
+/// Counts the bytes an allocator was ever asked for, over the testing allocator.
+const Asked = struct {
+    var bytes: usize = 0;
+    const vt: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    fn alloc(_: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        bytes += len;
+        return testing.allocator.rawAlloc(len, al, ra);
+    }
+    fn resize(_: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        if (!testing.allocator.rawResize(mem, al, new_len, ra)) return false;
+        bytes += new_len -| mem.len;
+        return true;
+    }
+    fn remap(_: *anyopaque, mem: []u8, al: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const p = testing.allocator.rawRemap(mem, al, new_len, ra) orelse return null;
+        bytes += new_len -| mem.len;
+        return p;
+    }
+    fn free(_: *anyopaque, mem: []u8, al: std.mem.Alignment, ra: usize) void {
+        testing.allocator.rawFree(mem, al, ra);
+    }
+};
+
+test "pipeline manifest: encoding a large manifest asks for its one buffer, never a growing chain of them" {
+    const text: [64 * 1024]u8 = @splat('k');
+    var recipes: [48]Recipe = undefined;
+    for (&recipes) |*r| r.* = .{ .kind = .source, .function = "big_kernel", .text = &text };
+    Asked.bytes = 0;
+    const out = try encode(.{ .ptr = undefined, .vtable = &Asked.vt }, "key", &recipes);
+    defer testing.allocator.free(out);
+    try testing.expect(out.len > 3 * 1024 * 1024);
+    try testing.expectEqual(out.len, Asked.bytes);
 }

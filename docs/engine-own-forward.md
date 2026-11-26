@@ -729,6 +729,8 @@ rebuilds one.
   A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
   A reload reads the same recipes again, so a registry table copies a recipe only for the entry it keeps
   (`pipeline_registry.putSource`, `putStock`): the process's tables hold one copy of each, whatever the load count.
+  The manifest is megabytes and every load writes it again, so `encode` allocates its buffer once at its size: the
+  freed steps of a growing buffer stay resident in the process and a reload loop climbed by the manifest's size.
 - **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
   complete enumeration and the manifest is rewritten; the older builds of the scope are removed, but the newest other one, and the log says so: two binaries on one box keep each their manifest. A
   manifest rewritten after its load (a late kernel) opens its root again from the path, so a root removed and made again is never a stale handle; the plan's kept shapes and regions (`plan_book.Cache`) do the same at each read and write, and a load closes the root it opened.
