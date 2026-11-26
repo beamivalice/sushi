@@ -743,8 +743,10 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
     }
     if (chunkMinAboveMax(existing, edits, buf)) |r| return r;
     if (chunkMinAboveCeiling(fit, existing, edits, buf)) |r| return r;
-    if (ctxAboveKvTokens(existing, edits, buf)) |r| return r;
+    // The `--ctx-size` in force first: a file `ctx_size` it outranks is not what the next load reads.
     if (flagAboveKvTokens(fit, existing, edits, buf)) |r| return r;
+    if (flagAboveWindow(fit, existing, edits, buf)) |r| return r;
+    if (ctxAboveKvTokens(existing, edits, buf)) |r| return r;
     return ctxAboveWindow(fit, existing, edits, buf);
 }
 
@@ -761,6 +763,19 @@ fn ctxAboveKvTokens(existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u
     if (ctx != .integer or cap != .integer or ctx.integer < 1 or cap.integer < 1 or ctx.integer <= cap.integer) return null;
     const why = std.fmt.bufPrint(buf, "ctx_size {d} is above max_kv_tokens {d}, the tokens this model's requests may hold together; lower ctx_size or raise max_kv_tokens", .{ ctx.integer, cap.integer }) catch "ctx_size is above max_kv_tokens";
     return .{ .key = k, .why = why };
+}
+
+/// A `yarn_factor` the save leaves below the `--ctx-size` in force: the next load refuses that pair, and a flag cannot be edited.
+fn flagAboveWindow(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    if (fit.ctx_flag == 0) return null;
+    for (edits) |e| if (std.mem.eql(u8, e.key, "yarn_factor")) {
+        const yarn = yarnOf(stateOf(existing, edits, "yarn_factor"));
+        const window = windowUnder(fit, yarn);
+        const shown: ?u8 = if (yarn) |n| @intCast(n) else null; // yarnChoice keeps 2 and 4
+        const line = ctxAboveWindowLine(buf, fit.ctx_flag, window, shown, .flag) orelse return null;
+        return .{ .key = "yarn_factor", .why = line };
+    };
+    return null;
 }
 
 /// A `max_kv_tokens` the save sets below the `--ctx-size` in force: the next load refuses that pair, and a flag cannot be edited.
@@ -1870,6 +1885,36 @@ test "model_settings: a max_kv_tokens save is judged against the --ctx-size in f
     try t.expect(refuseEdits(flagged, existing, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf) == null);
     const bare: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false };
     try t.expect(refuseEdits(bare, null, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } }}, &buf) == null);
+}
+
+test "model_settings: a save is judged against the --ctx-size in force first, then the file's own ctx_size" {
+    const t = std.testing;
+    var buf: [256]u8 = undefined;
+    var existing: std.json.ObjectMap = .empty;
+    defer existing.deinit(t.allocator);
+    try existing.put(t.allocator, "ctx_size", .{ .integer = 65536 });
+    const lower_cap = [_]Edit{.{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } }};
+    // A flag above the new cap is named, never the file's ctx_size the flag outranks.
+    const over: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .ctx_flag = 32768 };
+    const named = refuseEdits(over, existing, &lower_cap, &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("max_kv_tokens", named.key);
+    try t.expectEqualStrings("--ctx-size 32768 is above this model's max_kv_tokens 4096, the tokens its requests may hold together; lower --ctx-size or raise max_kv_tokens", named.why);
+    // A flag under the cap leaves the file pair, which a later start without the flag would load.
+    const under: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .ctx_flag = 2048 };
+    const pair = refuseEdits(under, existing, &lower_cap, &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("max_kv_tokens", pair.key);
+    try t.expectEqualStrings("ctx_size 65536 is above max_kv_tokens 4096, the tokens this model's requests may hold together; lower ctx_size or raise max_kv_tokens", pair.why);
+
+    // The window a yarn_factor save leaves is judged against the flag first as well.
+    const yarn: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .reads_yarn = true, .context_cap = 262144, .window_native = 262144, .window_default = 262144, .ctx_flag = 600000 };
+    const wide = std.json.Value{ .string = "2" };
+    var file: std.json.ObjectMap = .empty;
+    defer file.deinit(t.allocator);
+    try file.put(t.allocator, "ctx_size", .{ .integer = 1_000_000 });
+    try file.put(t.allocator, "yarn_factor", .{ .string = "4" });
+    const drop = refuseEdits(yarn, file, &.{.{ .key = "yarn_factor", .value = wide }}, &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("yarn_factor", drop.key);
+    try t.expectEqualStrings("--ctx-size 600000 is above the 524288-token window this model has with yarn_factor 2; lower --ctx-size or yarn_factor", drop.why);
 }
 
 test "model_settings: a save never leaves ctx_size above max_kv_tokens, whichever of the two it edits" {
