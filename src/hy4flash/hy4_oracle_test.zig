@@ -2302,7 +2302,7 @@ test "hy4 bill: a load's chunk bounds default to 512 and 4096; a flag outranks t
     try testing.expectEqual(bills.ChunkBounds{ .min = 512, .max = 4096 }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
     config.prefill_chunk_max_override = 2048;
     config.prefill_chunk_min_override = 1024;
-    try testing.expectEqual(bills.ChunkBounds{ .min = 1024, .max = 2048, .max_given = true, .min_given = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
+    try testing.expectEqual(bills.ChunkBounds{ .min = 1024, .max = 2048, .max_given = true, .min_given = true, .min_from_file = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
     sr.launch.prefill_chunk_max = 4096;
     sr.launch.prefill_chunk_min = 4096;
     try testing.expectEqual(bills.ChunkBounds{ .min = 4096, .max = 4096, .max_given = true, .min_given = true }, try boundsOf(bills.prefillChunkBounds(&buf, &config)));
