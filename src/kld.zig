@@ -41,6 +41,8 @@ pub const Options = struct {
     ctx_size: u32 = 0,
     /// Dense, not the serving default: the teacher adds no quantization of its own.
     kv_quant_config: trunk.KVQuantConfig = trunk.KVQuantConfig.dense,
+    /// `--kv-quant` was given: the launch refusals judge a width the user asked for, never the dense default.
+    kv_quant_given: bool = false,
     /// `--qwen-gdn 16` stores the GDN state in bf16, so a student arm can be scored against the f32 teacher.
     qwen_gdn_f32: bool = true,
     /// DeepSeek only, compare only: the student drops this many routed experts a layer by the pack's usage list.
@@ -181,7 +183,10 @@ pub fn parseArgs(args: []const []const u8) ArgError!Options {
                 .top_k => o.top_k = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .limit => o.limit = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
                 .ctx_size => o.ctx_size = std.fmt.parseInt(u32, v, 10) catch return error.BadFlagValue,
-                .kv_quant => o.kv_quant_config = trunk.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue,
+                .kv_quant => {
+                    o.kv_quant_config = trunk.KVQuantConfig.fromJsonValue(.{ .string = v }) orelse return error.BadFlagValue;
+                    o.kv_quant_given = true;
+                },
                 .qwen_gdn => o.qwen_gdn_f32 = model_mod.parseQwenGdn(v) orelse return error.BadFlagValue,
                 .drop_expert => o.drop_expert = @import("expert_usage.zig").parseCount(v) orelse return error.BadFlagValue,
                 .ssd_budget_gb => o.ssd_budget_bytes = server_mod.parseSsdBudgetGb(v) catch return error.BadFlagValue,
@@ -327,13 +332,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, opts: Options) !*Load
         return error.LaunchFlagUnsupported;
     }
     model_load.applyModelSettings(&self.config, model_settings_mod.overrideFor(allocator, io, opts.model_dir));
-    var bounds_buf: [256]u8 = undefined;
-    switch (bills.prefillChunkBounds(&bounds_buf, &self.config)) {
-        .refused => |line| {
-            log.err("{s}\n", .{line});
-            return error.LaunchFlagUnsupported;
-        },
-        .bounds => {},
+    var launch_buf: [384]u8 = undefined;
+    if (model_load.launchRefusal(&launch_buf, &self.config, if (opts.kv_quant_given) opts.kv_quant_config else null, opts.ctx_size)) |r| {
+        log.err("{s}\n", .{r.line});
+        return r.err;
     }
     if (exactTeacherLine(opts.command, &self.config)) |line| log.info("{s}\n", .{line});
     self.config.ctx_override = model_settings_mod.contextPick(opts.ctx_size, self.config.ctx_override).value;
@@ -1285,4 +1287,76 @@ test "kld: a capture and a compare run on the cut Qwen pack, each pass bound at 
         defer l.deinit();
         try runCompare(t.io, t.allocator, l, opts, &out);
     }
+}
+
+
+test "kld load: an --ctx-size above the model's window is refused by name before anything loads" {
+    const t = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const opts = Options{ .model_dir = root, .prompts = "standard4", .out_dir = "/nonexistent/out", .ctx_size = 100_000_000 };
+    try t.expectError(error.ContextSizeAboveWindow, loadModel(io, t.allocator, opts));
+}
+
+// refused by name, ArchitectureUnsupported). A config-only folder shows which question the load asks first.
+test "kld load: an unserved architecture is refused by name before anything loads" {
+    const t = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const src = @embedFile("fixtures/model-configs/qwen4_exp.json");
+    const body = try std.mem.replaceOwned(u8, t.allocator, src, "qwen4_exp", "llama");
+    defer t.allocator.free(body);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = body });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const opts = Options{ .model_dir = root, .prompts = "standard4", .out_dir = "/nonexistent/out" };
+    try t.expectError(error.ArchitectureUnsupported, loadModel(io, t.allocator, opts));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "kld load: an --ctx-size above a saved max_kv_tokens is refused by name before anything loads" {
+    const t = std.testing;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("fixtures/model-configs/qwen4_exp.json") });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const home = try std.fmt.allocPrint(t.allocator, "{s}/home", .{root});
+    defer t.allocator.free(home);
+    const settings_dir = try std.fmt.allocPrint(t.allocator, "{s}/.sushi", .{home});
+    defer t.allocator.free(settings_dir);
+    try io_util.makeDirPath(io, settings_dir);
+    const settings = try std.fmt.allocPrint(t.allocator, "{{\"{s}\":{{\"max_kv_tokens\":1024}}}}", .{root});
+    defer t.allocator.free(settings);
+    try tmp.dir.writeFile(io, .{ .sub_path = "home/.sushi/model-settings.json", .data = settings });
+
+    var old_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const old = std.c.getenv("HOME");
+    var had_home = false;
+    if (old) |v| {
+        const s = std.mem.span(v);
+        @memcpy(old_buf[0..s.len], s);
+        old_buf[s.len] = 0;
+        had_home = true;
+    }
+    const home_z = try t.allocator.allocSentinel(u8, home.len, 0);
+    defer t.allocator.free(home_z);
+    @memcpy(home_z[0..home.len], home);
+    _ = setenv("HOME", home_z.ptr, 1);
+    defer if (had_home) {
+        _ = setenv("HOME", @ptrCast(&old_buf), 1);
+    } else {
+        _ = unsetenv("HOME");
+    };
+
+    const opts = Options{ .model_dir = root, .prompts = "standard4", .out_dir = "/nonexistent/out", .ctx_size = 4096 };
+    try t.expectError(error.ContextSizeAboveWindow, loadModel(io, t.allocator, opts));
 }

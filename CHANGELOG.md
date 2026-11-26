@@ -21,6 +21,8 @@ earlier history is mlx-serve's, in that project's changelog.
 - **You bound the prefill chunk**: every model takes `--prefill-chunk-max` and `--prefill-chunk-min` (512 to 8192 rows)
   and their settings keys; `--prefill-chunk` is removed and refused with the two flags named. Hy4-Flash's chunk
   defaults to 4096 rows, leaving more memory for the context.
+- **`sushi kld` refuses what the server refuses**: an unserved architecture, a `--ctx-size` above the model's window or
+  `max_kv_tokens`, and a `--kv-quant` the model cannot take are refused by name before it loads.
 - **See a prompt being read**: `"return_progress": true` streams llama.cpp's `prompt_progress` chunks, and sushibar and
   the web UI show the read as a measured percentage, the web UI with its time estimate (`4% (est. 26 s)`); sushibar's
   icon also shows a model loading and a reply generating. Thanks @eliaskg for `return_progress`.

@@ -45,6 +45,7 @@ Other architecture capture behavior, serving defaults and compare profiles remai
 the trunk, full expert union, I/O bounce slabs, per-layer LRU and at least8 GiB request reserve; allocator cache is0.
 Dense prefill uses at most512 tokens per chunk and synchronous layers, with BF16 compressed MLA and FP32 KDA state.
 Capture refuses any kv-quant; `kld compare --kv-quant 8` or `6` scores a GLM student with its served kv8 or kv6 latent.
+`sushi kld` loads through `model_load.launchRefusal`, the serving load's one question: an unserved arch, a launch flag or `--kv-quant` the arch cannot act on, and a context above the window or `max_kv_tokens` are refused by name before a weight is read.
 A GLM pack (not `bf16_individual`) captures through the generic path instead: a student self-reference of its served
 forward at a BF16 latent (kv4/kv6/kv8 refused), `reference_numerics` off. Generic GLM capture and compare prefill
 prompts in 2048-token chunks, so 128K-token prompts fit and both sides chunk alike.
