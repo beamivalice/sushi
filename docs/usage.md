@@ -191,18 +191,34 @@ sushi pull deepseek-v4.1-flash:2.7bpw
 sushi serve --model ~/.sushi/models/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw
 ```
 
-**48 GB Mac, Hy4-Flash-Sushi-STQ-2.25bpw** (limit 45056; experts streamed)
+**48 GB Mac, Hy4-Flash-Sushi-STQ-2.25bpw** (limit 44000; experts streamed within a 34 GB budget, a 200,000-token
+context; `--expert-cache-bias 0.2` favours the experts already in memory, which is lossy)
 
 ```bash
 sushi pull hy4-flash:2.25bpw
-sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ssd-budget-gb 36
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ssd-budget-gb 34 \
+  --expert-cache-bias 0.2 --ctx-size 200000
 ```
 
-**96 GB Mac, Hy4-Flash-Sushi-STQ-4bpw** (limit 94208)
+**64 GB Mac, Hy4-Flash-Sushi-STQ-2.25bpw** (limit 60000; a 500,000-token context)
+
+```bash
+sushi pull hy4-flash:2.25bpw
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-2.25bpw --ctx-size 500000
+```
+
+**96 GB Mac, Hy4-Flash-Sushi-STQ-4bpw** (limit 92000; a 500,000-token context)
 
 ```bash
 sushi pull hy4-flash
-sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-4bpw
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-4bpw --ctx-size 500000
+```
+
+**128 GB Mac, Hy4-Flash-Sushi-STQ-4bpw** (limit 125000; the full 1,048,576-token context)
+
+```bash
+sushi pull hy4-flash
+sushi serve --model ~/.sushi/models/beamster/Hy4-Flash-Sushi-STQ-4bpw --ctx-size 1048576
 ```
 
 DeepSeek serves a 1,000,000-token context and a 256,000-token budget for a request that omits `max_tokens`, as its
