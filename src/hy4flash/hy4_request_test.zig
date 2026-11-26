@@ -1130,6 +1130,44 @@ test "hy4 request: two drafting requests whose shorter one ends at the joined ti
     try testing.expectEqualSlices(u32, solo_long.tokens.items, slots[1].legacy_gen.?.generated_ids.items);
 }
 
+test "hy4 request: a drafting row its partner's entry stop leaves alone counts its pending pad once (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 4;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
+    const prompts = [_][]const u32{ ids[0..@min(ids.len, 16)], ids[4..@min(ids.len, 24)] };
+    const slots = [2]*scheduler.Slot{ try submitPending(&sv, prompts[0], 14, true), try submitPending(&sv, prompts[1], 14, true) };
+    defer for (slots) |s| endSlot(&sv, s);
+    for (slots) |s| {
+        try scheduler.runPrefill(&sv.sch, s);
+        try sv.sch.decoding.append(a, s);
+    }
+    const short = &slots[0].legacy_gen.?;
+    short.max_tokens = short.step;
+    // The survivor's pending token is the second pad of a run: counted twice it would end the request, counted once
+    // it leaves a run of two.
+    const survivor = &slots[1].legacy_gen.?;
+    survivor.next_token_id = 0;
+    survivor.consecutive_pad = 1;
+    var both = [_]*scheduler.Slot{ slots[0], slots[1] };
+    try scheduler.runDecodeTick(&sv.sch, &both);
+    errdefer std.debug.print("pad run {d}, finished {}, error {?s}\n", .{ survivor.consecutive_pad, slots[1].finished, slots[1].error_code });
+    try testing.expect(slots[0].finished and !slots[1].finished);
+    try testing.expectEqual(@as(u32, 2), survivor.consecutive_pad);
+    try testing.expect(slots[1].error_code == null);
+}
+
 test "hy4 request: after the load, a joined tick at every width the load joins makes no pipeline, drafting rows in company too (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
