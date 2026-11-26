@@ -4,21 +4,18 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
-## v1.8.0 — Hy4-Flash, several requests at once
+## v1.8.0 — Hy4-Flash support
 
+- **Hy4-Flash is here**: `sushi pull hy4-flash` downloads its Sushi STQ packs, 4bpw for a 96 GB Mac and 2.25bpw for a
+  64 GB Mac or a 48 GB Mac streaming its experts, with a recommended launch for each. It runs on Sushi Cooler, sushi's
+  own engine: its kernels are made at load, so no request waits on a compile, and its memory bill counts exactly what
+  it holds, so a request that would run out of memory is refused by name. DFly2 speculation is on by default, about
+  5.5% faster than plain decode; it reads images, calls tools (`tool_choice` none and a forced tool are honoured), ends
+  a thought early at its reasoning budget, and loads on M1 and M2 Macs too.
 - **Hy4-Flash serves several requests at once, each with its own text**: up to 16 requests decode together in joined
-  rows, every row the same bytes it would get alone, and a row whose partner ends first carries on alone, on Sushi
-  Cooler's exact memory bill. Two requests that draft with DFly2 run as a pair about 24% faster, and DFly2 speculation
-  is on by default, about 5.5% faster than plain decode.
-- **Hy4-Flash is faster, leaner and loads on more Macs**: decode about 4% faster, prefill about 3%, streamed decode
-  about 6%, and a round after a missed draft costs a quarter of what it did, all with the same text. Its kernels are
-  made at load, so no request waits on a compile; its memory bill counts what it holds, so a request that would run
-  out of memory is refused by name; and it loads on M1 and M2 Macs. Two Sushi binaries sharing one cache keep each
-  their kernel manifest instead of deleting each other's. It honours `tool_choice` none and a forced tool, its
-  reasoning budget ends a thought early, and a tool call's arguments keep every byte the model wrote, a call that lost
-  its close never swallowing the finished call after it. Switching between two Hy4-Flash packs unloads the first
-  instead of refusing. A `sushi pull` or Downloads update that was stopped in the flat folder layout resumes in that
-  folder instead of starting a second copy under the org folder.
+  rows, every row the same bytes it would get alone, and a row whose partner ends first carries on alone. Two requests
+  that draft with DFly2 run as a pair about 24% faster. Switching between two Hy4-Flash packs unloads the first
+  instead of refusing.
 - **Each model sets how many requests run at once and how many tokens they may hold**: `max_concurrent` (1 by default;
   a server-wide value sets every model's default, a model's own outranks it, `--max-concurrent` outranks both) and
   `max_kv_tokens`, both in the web UI. A request that does not fit waits; one that never could is refused with the
@@ -40,7 +37,10 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Packs and tools**: `sushi convert exl3` writes DeepSeek-V4.1 and Hy4-Flash packs pair-major directly and refuses a
   flag its source's writer does not read, `sushi repack` migrates Hy4-Flash STQ packs, `sushi kld` refuses what the
   server refuses before it loads, every routed shard's stamp is checked before a weight loads, and a fully resident
-  DeepSeek load decodes several requests at once up to 8% faster with the same text.
+  DeepSeek load decodes several requests at once up to 8% faster with the same text. A tool call's arguments keep
+  every byte the model wrote, and a call that lost its close never swallows the finished call after it. A stopped
+  `sushi pull` or Downloads update resumes in the folder it began in, and two Sushi binaries sharing one cache keep
+  each their kernel manifest.
 
 ---
 
