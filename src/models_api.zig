@@ -751,29 +751,47 @@ fn renderPropsBody(
     /// qwen4 n-gram warm object, ...). Concatenated by the handler.
     extra_json: []const u8,
 ) ![]u8 {
-    // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
-    // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
-    // "Free RAM" line can never drift from the number that gates a load. Distinct
-    // axis from `active_bytes` (the MLX GPU-allocator footprint).
-    //
-    // `cache_bytes` is MLX's reclaimable buffer pool — memory the process HOLDS
-    // but is not using. It is a third axis again, and its absence is why #110
-    // was invisible: the panel read 19.6 GB of `active_bytes` while the process
-    // sat at 81.4 GB, and nothing we served named the other 61.
+    const memory = try renderMemoryObject(allocator, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, kv_cache_mem, memory_json);
+    defer allocator.free(memory);
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":{f},"n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}{s}}}{s}}}
+        \\{{"default_generation_settings":{{"model":{f},"n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{s}{s}}}
     , .{
         json_text.Str{ .s = config.model_type }, ctx_str,
         config.vocab_size,              config.hidden_size,
         config.num_hidden_layers,       config.num_attention_heads,
         config.num_key_value_heads,     config.head_dim,
         config.quant_bits,              config.quant_group_size,
-        config.max_position_embeddings, active_mem,
-        peak_mem,                       available_mem,
-        metrics.getTotalMemBytes(),     safe_ctx,                       cache_mem,
-        kv_cache_mem,                   model_mod.ownedBytesTotal(),
-        memory_json,                    extra_json,
+        config.max_position_embeddings, memory,
+        extra_json,
     });
+}
+
+/// The `/props` `memory` object, built here for the body with a model and the one without so their keys cannot drift.
+///
+/// `available_bytes` is free SYSTEM RAM, computed with the SAME formula the model-load pre-flight uses
+/// (`metrics.getAvailableMemBytes`), so the tray's "Free RAM" line can never drift from the number that gates a load.
+/// `cache_bytes` is the allocator's reclaimable pool: memory the process HOLDS but is not using, a third axis beside
+/// `active_bytes` (the allocators' footprint) and the process's resident size.
+fn renderMemoryObject(
+    allocator: std.mem.Allocator,
+    active_mem: usize,
+    peak_mem: usize,
+    available_mem: u64,
+    safe_ctx: u32,
+    cache_mem: usize,
+    kv_cache_mem: u64,
+    /// Leading-comma JSON fragments spliced before the object's close (`ledger`).
+    memory_json: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"kv_cache_bytes":{d},"owned_bytes":{d}{s}}}
+    , .{ active_mem, peak_mem, available_mem, metrics.getTotalMemBytes(), safe_ctx, cache_mem, kv_cache_mem, model_mod.ownedBytesTotal(), memory_json });
+}
+
+/// KV of the hot prefix caches and the live slots; 0 before a scheduler exists.
+fn processKvCacheBytes() u64 {
+    const sch = server_state.global_scheduler orelse return 0;
+    return cache_stats.process.hot_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic);
 }
 
 /// The /props "batching" object: whether the loaded model rides the batched
@@ -984,11 +1002,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s},\"pack_revision\":{s}", .{ ngram_json, batching_json, settings_json, update_json, fallbacks_json, revision_json });
     defer allocator.free(extra_json);
 
-    const kv_cache_mem: u64 = if (server_state.global_scheduler) |sch|
-        cache_stats.process.hot_bytes.load(.monotonic) + sch.resident_live_kv_bytes.load(.monotonic)
-    else
-        0;
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, kv_cache_mem, memory.json, extra_json);
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, processKvCacheBytes(), memory.json, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -1046,11 +1060,13 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const active_mem = gpu_mem.activeBytes();
     const peak_mem = gpu_mem.peakBytes();
     const available_mem = metrics.getAvailableMemBytes();
+    const memory = try renderMemoryObject(allocator, active_mem, peak_mem, available_mem, 0, gpu_mem.cacheBytes(), processKvCacheBytes(), "");
+    defer allocator.free(memory);
     const update_json = try update_mod.propsJson(allocator);
     defer allocator.free(update_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"total_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
-    , .{ active_mem, peak_mem, available_mem, metrics.getTotalMemBytes(), sched_policy.MAX_BATCH_GROUP, update_json });
+        \\{{"total_slots":1,"memory":{s},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s}}}
+    , .{ memory, sched_policy.MAX_BATCH_GROUP, update_json });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

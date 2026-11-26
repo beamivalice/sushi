@@ -585,6 +585,7 @@ launch flag is gone ([flags](flags.md#removed)). Built-in GLM and DeepSeek words
   answered (other models refuse with 500 `chat template unusable`, uncounted) ([server-tool-calling](server-tool-calling.md#templates)); the count is process-wide, and it is zero when
   every prompt is the checkpoint's own.
 - `/props` `memory.total_bytes` = the machine's physical RAM (`hw.memsize`), the ceiling the Compact view's Memory tile and chart measure against.
+- `/props` with no model loaded (a cold boot, an unload) carries the same `memory` keys as one with a model, from one builder (`renderMemoryObject`), `max_safe_context` 0.
 - `/props` `memory.kv_cache_bytes` = the current model's hot-cache residency + every live slot's state + the state the
   current model keeps between requests for the next one (DeepSeek's parked rows and live restore points; a live slot
   of the model bills them instead), published each tick with or without `--metrics`; a donated checkout's buffers,

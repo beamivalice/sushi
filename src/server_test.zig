@@ -3486,3 +3486,36 @@ test "server: a prompt over max_kv_tokens is the context's 400 naming the cap, s
         }
     }.run);
 }
+
+test "server: /props keeps its whole memory object with no model, before a load and after an unload" {
+    try eachArch(1, .{ .cold = true }, struct {
+        fn check(what: []const u8) !void {
+            const resp = try request("GET", "/props", "");
+            defer gpa.free(resp);
+            if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) {
+                std.debug.print("{s} /props answered: {s}\n", .{ what, resp[0..@min(resp.len, 400)] });
+                return error.PropsRefused;
+            }
+            const body = bodyOf(resp);
+            var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+            defer parsed.deinit();
+            const mem = parsed.value.object.get("memory") orelse return error.NoMemory;
+            for ([_][]const u8{ "active_bytes", "cache_bytes", "kv_cache_bytes", "owned_bytes", "max_safe_context" }) |key| {
+                if (mem.object.get(key) == null) {
+                    std.debug.print("{s} /props memory lacks {s}: {s}\n", .{ what, key, body });
+                    return error.MemoryKeyMissing;
+                }
+            }
+        }
+        fn run() !void {
+            const load = try request("POST", "/v1/load-model", "{\"model\":\"tiny\"}");
+            defer gpa.free(load);
+            if (!std.mem.startsWith(u8, load, "HTTP/1.1 200")) return error.LoadRefused;
+            try check("loaded:");
+            const un = try request("POST", "/v1/unload-model", "{\"model\":\"tiny\"}");
+            defer gpa.free(un);
+            if (!std.mem.startsWith(u8, un, "HTTP/1.1 200")) return error.UnloadRefused;
+            try check("after an unload:");
+        }
+    }.run);
+}
