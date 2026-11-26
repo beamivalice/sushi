@@ -416,6 +416,15 @@ pub fn prune(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: Key, remov
 
 const testing = std.testing;
 
+/// TEST-ONLY: the manifest of `key` written at `second` seconds past the epoch, so a test states which build is newer.
+pub fn setWrittenForTest(io: std.Io, root: std.Io.Dir, key: Key, second: i64) !void {
+    comptime std.debug.assert(@import("builtin").is_test);
+    var name_buf: [Key.dir_len]u8 = undefined;
+    var path_buf: [Key.dir_len + 1 + file_name.len]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ key.dirName(&name_buf), file_name }) catch unreachable;
+    try root.setTimestamps(io, path, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, second) * std.time.ns_per_s } } });
+}
+
 const sample_ints = [_]metal.IntConstant{.{ .index = 26, .value = 128 }};
 
 fn sample(flags: []const metal.Flag) [4]Recipe {
@@ -575,10 +584,6 @@ test "pipeline manifest: a damaged file is reported with its reason and its dire
     try testing.expectEqualStrings("ManifestChecksum", got.unreadable.reason);
 }
 
-/// A moment past the last write, for a file system whose times tick coarser than two writes in a row.
-fn pastLastWrite() void {
-    std.Io.sleep(testing.io, .fromMilliseconds(40), .real) catch {};
-}
 
 test "pipeline manifest: a write leaves no temp file, and a prune removes the other builds of the scope but the newest" {
     const io = testing.io;
@@ -590,9 +595,9 @@ test "pipeline manifest: a write leaves no temp file, and a prune removes the ot
     const older = testKey("aaaaaaaaaaaaaaaa", "3333333333333333");
     const old = testKey("aaaaaaaaaaaaaaaa", "2222222222222222");
     const foreign = testKey("bbbbbbbbbbbbbbbb", "2222222222222222");
-    for ([_]Key{ older, old, foreign, mine }) |k| {
+    for ([_]Key{ older, old, foreign, mine }, 1..) |k, second| {
         try write(testing.allocator, io, tmp.dir, k, &recipes);
-        pastLastWrite();
+        try setWrittenForTest(io, tmp.dir, k, @intCast(second * 1000));
     }
     var name_buf: [Key.dir_len]u8 = undefined;
     var left = try tmp.dir.openDir(io, mine.dirName(&name_buf), .{ .iterate = true });
@@ -622,10 +627,10 @@ test "pipeline manifest: two builds that write and prune in turn each keep their
     const b = testKey("aaaaaaaaaaaaaaaa", "2222222222222222");
     var removed: std.ArrayList([Key.dir_len]u8) = .empty;
     defer removed.deinit(testing.allocator);
-    for ([_]Key{ a, b, a, b }) |k| {
+    for ([_]Key{ a, b, a, b }, 1..) |k, second| {
         try write(testing.allocator, io, tmp.dir, k, &recipes);
+        try setWrittenForTest(io, tmp.dir, k, @intCast(second * 1000));
         try prune(testing.allocator, io, tmp.dir, k, &removed);
-        pastLastWrite();
     }
     try testing.expectEqual(@as(usize, 0), removed.items.len);
     for ([_]Key{ a, b }) |k| {

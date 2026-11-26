@@ -287,13 +287,12 @@ test "dsv41 pipelines: a manifest of another build is recompiled, the warm runs 
     defer first.deinit();
     try testing.expect(!first.settle());
     first.store();
-    // Another binary's manifest, written later: the file times tick finer than this wait.
-    std.Io.sleep(io, .fromMilliseconds(40), .real) catch {};
+    try manifest.setWrittenForTest(io, tmp.dir, oldest, 1000);
     var middle = plainBegin(tmp.dir, old);
     defer middle.deinit();
     _ = middle.settle();
     middle.store();
-    std.Io.sleep(io, .fromMilliseconds(40), .real) catch {};
+    try manifest.setWrittenForTest(io, tmp.dir, old, 2000);
 
     var second = plainBegin(tmp.dir, new);
     defer second.deinit();
