@@ -12,7 +12,7 @@ Which pack suits your Mac, and running a bigger one from the SSD: [Choosing a pa
 * [DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw) (pack revision 2.0, requires 96 GB+ and sushi 1.5.0 or later, experts [streamed](#streaming), text and image input; on M5 Macs it generates on Sushi Cooler, sushi's own engine, and `--ds41-mlx-engine` or the model's settings page go back to MLX)
 * [DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw](https://huggingface.co/beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw) (requires 256 GB+ and sushi 1.7.3 or later, 13-20% faster decode from 1.7.4 on an M5 Ultra, every expert resident, KLD 0.0607 against the 1.75bpw pack's 0.1525, text and image input; generates on Sushi Cooler)
 * [Hy4-Flash-Sushi-STQ-4bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-4bpw) (requires 96 GB+ and sushi 1.8.0 or later, up to a 1M context on 128 GB, KLD 0.0194, text and image input; generates on Sushi Cooler, `sushi pull hy4-flash`)
-* [Hy4-Flash-Sushi-STQ-2.25bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-2.25bpw) (requires 64 GB+, streamed on 64 and 48 GB Macs ([streaming](#streaming)), and sushi 1.8.0 or later, KLD 0.1022, text and image input; generates on Sushi Cooler, `sushi pull hy4-flash:2.25bpw`)
+* [Hy4-Flash-Sushi-STQ-2.25bpw](https://huggingface.co/beamster/Hy4-Flash-Sushi-STQ-2.25bpw) (requires 64 GB+ and sushi 1.8.1 or later, resident on a 64 GB Mac with about 46 GB free, [streamed](#streaming) otherwise and on 48 GB, KLD 0.1022, text and image input; generates on Sushi Cooler, `sushi pull hy4-flash:2.25bpw`)
 * [Qwen3.8-Flash-Next-Sushi-2bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-2bpw) (requires 48 GB+, or 32 GB [streamed](#streaming))
 * [Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-STQ-2.75bpw) (pack revision 2.0, requires 64 GB+ and sushi 1.5.1 or later)
 * [Qwen3.8-Flash-Next-Sushi-4bpw](https://huggingface.co/beamster/Qwen3.8-Flash-Next-Sushi-4bpw) (requires 96 GB+, or 64 GB [streamed](#streaming))
@@ -92,7 +92,9 @@ less: 192k / 288k at 48 GB, and 968k / 1M (Sushi-2bpw) and 480k / 800k (Sushi-ST
 On 64 GB and 96 GB Macs, DeepSeek-V4.1-Flash STQ 2.7bpw streams with `--expert-cache-bias`: see [Running DeepSeek-V4.1-Flash on 64 GB and 96 GB Macs](docs/dsv41-64gb-mac.md), a guide by [Samuel Reed (@STRML)](https://github.com/STRML), who also contributed the DeepSeek prefetch fixes in [PR #128](https://github.com/beamivalice/sushi/pull/128).
 
 § Hy4-Flash's cells are its recommended launches ([usage](docs/usage.md)), at 8-bit KV, not a computed maximum; · is not
-measured. The 2.25bpw pack streams its experts on a 64 GB Mac within a 41 GB budget and on a 48 GB Mac within 34 GB.
+measured. On a 64 GB Mac the 2.25bpw pack loads resident with no budget flag when about 46 GB is free and otherwise
+streams its experts at the largest budget that fits (41 GB on an idle Mac with 45 GB free); on a 48 GB Mac it streams
+within 34 GB.
 Its Engram tables stay on the SSD.
 
 ## Streaming
