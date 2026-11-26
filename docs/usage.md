@@ -314,3 +314,12 @@ sushi launch omp
 pi, omp, codex, grok and hermes run from their own home under `~/.sushi/<agent>/`, so your usual config is untouched; dsh keeps your `~/.dsh` profile as it is and gets sushi's provider as an extra `--patch` layer (`~/.sushi/dsh/patch.yml`);
 claude and opencode reach the server through environment variables. `--print` writes the config and prints the
 launch script instead of running it.
+
+An agent brings its own tools and sushi returns every call the model writes, so no sushi setting turns them on: the tool
+button in the chat page and `sushi run --tool on` belong to sushi's own chat, never to an agent.
+
+**Hermes Agent** by hand (`sushi launch hermes` does the same): `hermes model`, then "Custom endpoint (enter URL
+manually)", base URL `http://127.0.0.1:12345/v1`, a blank API key, Enter at each further question (auto-detect API mode,
+the detected model, the context read from the server). Its tools are on by default. Hermes refuses a context under
+64,000 tokens ("below the minimum 64,000 required by Hermes Agent"): on a Mac whose auto context lands under it, serve
+with `--ctx-size 65536` or more.
