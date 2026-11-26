@@ -6,6 +6,7 @@ const attn_kernels = @import("../attn_kernels.zig");
 const qwen4_qsa_select = @import("qwen4_qsa_select.zig");
 const qwen4_qsa_gather = @import("qwen4_qsa_gather.zig");
 const std = @import("std");
+const chip = @import("../chip.zig");
 const mlx = @import("../mlx.zig");
 const kv_quant = @import("../kv_quant.zig");
 const qwen4_qsa = @import("qwen4_qsa.zig");
@@ -56,10 +57,19 @@ const splitKAttnDispatch = trunk_mod.splitKAttnDispatch;
 const splitMaskedSdpa256 = qwen4_forward.splitMaskedSdpa256;
 const ssmFreeQsaState = qwen4_qsa_state.ssmFreeQsaState;
 
-/// Measured split count (M5 Max, qwen4_exp, kv 62k, 8-bit KV, 12 counterbalanced boots):
-/// every count 8..64 beats the union gather by 5-13%, only S=6's 16-vs-32 clears the noise
-/// floor, so one flat constant. The un-split kernel (12 threadgroups at S=6) ran +15.6%.
+/// Measured split count for a GPU with matrix units (M5 Max, qwen4_exp, kv 62k, 8-bit KV,
+/// 12 counterbalanced boots): every count 8..64 beats the union gather by 5-13%, only S=6's
+/// 16-vs-32 clears the noise floor, so one flat constant. The un-split kernel (12 threadgroups
+/// at S=6) ran +15.6%.
 pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
+
+/// The M1 Max row (2026-11-19, `applegpu_g13s`, 32 GPU cores, no matrix units). 16 splits at
+/// S=1 launch 32 threadgroups — one wave on 32 cores — and the split pass measures 187.6 us a
+/// call at kv 4096 and 191.8 at 32768; 64 splits launch 128 short groups of 2 simdgroups (nsg = (gqa+7)/8 = 2
+/// at gqa 12, the served fallback) and measure ~142-149 us, and the served 5.7k-token decode
+/// reads 34.6 tok/s against 33.7/32.0 for the default (MTP depth 2 pinned, same prompt, one boot
+/// per arm). BK stays 16: BK=8 exists in the seam but fails the kernel's launch check in 1.7.0.
+pub const QSA_ATTN_NSPLIT_M1_MAX: c_int = 64;
 
 /// Ceiling on the split count; past it the f32 partial buffer costs more traffic than it buys.
 pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
@@ -67,19 +77,28 @@ pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
 /// Test and microbench seam: forces the split count.
 pub var qsa_attn_nsplit_override: ?c_int = null;
 
-/// Resolve every lazily-cached QSA env read once, from the main thread, before any other
+/// Per-silicon row, resolved in `warmQsaEnvCaches` before any other thread exists.
+var qsa_attn_m1_max_row: ?bool = null;
+
+/// Rounds a requested split count up to a power of two no higher than the ceiling.
+pub fn qsaAttnSplitCount(requested: c_int) c_int {
+    var f: c_int = 1;
+    while (f < requested and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
+    return f;
+}
+
+/// Resolve every lazily-cached QSA machine read once, from the main thread, before any other
 /// thread exists: first touch of a `?bool`/`?c_int` from two threads is a race.
 pub fn warmQsaEnvCaches() void {
+    qsa_attn_m1_max_row = std.mem.indexOf(u8, chip.chipBrand(), "M1 Max") != null;
     _ = qsaScoreSheetBudget();
 }
 
 pub fn qsaAttnNSplit() c_int {
-    const forced = qsa_attn_nsplit_override orelse 0;
-    if (forced > 0) {
-        var f: c_int = 1;
-        while (f < forced and f < QSA_ATTN_MAX_NSPLIT) f *= 2;
-        return f;
+    if (qsa_attn_nsplit_override) |forced| {
+        if (forced > 0) return qsaAttnSplitCount(forced);
     }
+    if (qsa_attn_m1_max_row orelse false) return QSA_ATTN_NSPLIT_M1_MAX;
     return QSA_ATTN_NSPLIT_DEFAULT;
 }
 
@@ -2410,7 +2429,9 @@ test "qsa sparse attn: the split-K merge is invariant in the split count (1, 8, 
 
 test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor binds the DISPATCH" {
     defer qsa_attn_nsplit_override = null;
+    defer qsa_attn_m1_max_row = null;
     qsa_attn_nsplit_override = null;
+    qsa_attn_m1_max_row = null;
     try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
     try std.testing.expectEqual(@as(c_int, 16), QSA_ATTN_NSPLIT_DEFAULT);
     qsa_attn_nsplit_override = 8;
@@ -2420,6 +2441,18 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
     qsa_attn_nsplit_override = 1000;
     try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnNSplit());
     qsa_attn_nsplit_override = null;
+
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnSplitCount(5));
+    try std.testing.expectEqual(@as(c_int, 64), qsaAttnSplitCount(64));
+    try std.testing.expectEqual(QSA_ATTN_MAX_NSPLIT, qsaAttnSplitCount(1000));
+
+    qsa_attn_m1_max_row = true;
+    qsa_attn_nsplit_override = 8;
+    try std.testing.expectEqual(@as(c_int, 8), qsaAttnNSplit());
+    qsa_attn_nsplit_override = null;
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_M1_MAX, qsaAttnNSplit());
+    qsa_attn_m1_max_row = false;
+    try std.testing.expectEqual(QSA_ATTN_NSPLIT_DEFAULT, qsaAttnNSplit());
 
     defer qsa_attn_bk_override = null;
     try std.testing.expectEqual(QSA_ATTN_BK, qsaAttnBk());
@@ -2563,7 +2596,11 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
     var prng = std.Random.DefaultPrng.init(0x0B5E_7A11);
     const rnd = prng.random();
     defer qsa_attn_simdgroups_override = null;
-    const arms = [_]c_int{ 2, 16 };
+    defer qsa_attn_nsplit_override = null;
+    // S=3, the MTP round's verify width: the split count is flat there (docs/qwen4-perf.md#qsa).
+    const bench_seq: c_int = 3;
+    const splits = [_]c_int{ 8, QSA_ATTN_NSPLIT_DEFAULT, 32, QSA_ATTN_NSPLIT_M1_MAX };
+    const sgs = [_]c_int{ 2, 16 };
     for ([_]c_int{ 4096, 32768 }) |kv| {
         var caches: [layers]KVCache = undefined;
         var views: [layers]DenseKVView = undefined;
@@ -2581,15 +2618,16 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
             views[i] = try qsaAttnCacheFixture(ta, s, k, v, kv, kv - 1, kv_quant.KVQuantConfig.affine(8), &caches[i]);
             built += 1;
         }
-        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, 1, kv, 512, ratio);
+        const blocks_host = try qsaVerifyBlocksHost(ta, rnd, bench_seq, kv, 512, ratio);
         defer ta.free(blocks_host);
-        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, 1, 512 }, 3, .int32);
+        const blocks = mlx.mlx_array_new_data(blocks_host.ptr, &[_]c_int{ 1, bench_seq, 512 }, 3, .int32);
         defer _ = mlx.mlx_array_free(blocks);
-        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+        const q0 = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, bench_seq, 256 }, s);
         defer _ = mlx.mlx_array_free(q0);
-        var us: [arms.len][reps]f64 = undefined;
-        for (0..reps + 1) |rep| for (arms, 0..) |arm, ai| {
-            qsa_attn_simdgroups_override = arm;
+        var us: [splits.len][sgs.len][reps]f64 = undefined;
+        for (0..reps + 1) |rep| for (splits, 0..) |nsplit, ni| for (sgs, 0..) |sg, ai| {
+            qsa_attn_nsplit_override = nsplit;
+            qsa_attn_simdgroups_override = sg;
             var q = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_array_set(&q, q0));
             for (0..chain) |_| for (&views) |*view| {
@@ -2601,12 +2639,12 @@ test "qsa sparse attn µbench: decode width, 12 dependent layers (SUSHI_QSA_ATTN
             try mlx.check(mlx.mlx_array_eval(q));
             const ns = clk.lap();
             _ = mlx.mlx_array_free(q);
-            if (rep > 0) us[ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
+            if (rep > 0) us[ni][ai][rep - 1] = @as(f64, @floatFromInt(ns)) / 1e3 / @as(f64, @floatFromInt(layers * chain));
         };
-        for (arms, 0..) |arm, ai| {
-            std.mem.sort(f64, &us[ai], {}, std.sort.asc(f64));
-            std.debug.print("[qsa-attn-ubench] kv={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, arm, us[ai][reps / 2], reps });
-        }
+        for (splits, 0..) |nsplit, ni| for (sgs, 0..) |sg, ai| {
+            std.mem.sort(f64, &us[ni][ai], {}, std.sort.asc(f64));
+            std.debug.print("[qsa-attn-ubench] kv={d} S={d} nsplit={d} simdgroups={d}: {d:.1} us/call (median of {d})\n", .{ kv, bench_seq, nsplit, sg, us[ni][ai][reps / 2], reps });
+        };
     }
 }
 

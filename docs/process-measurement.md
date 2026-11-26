@@ -11,6 +11,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [perf-baselines](perf-base
 
 - Look up the matching cell in [perf-baselines](perf-baselines.md) or [quality-kld](quality-kld.md) (and
   `benchmarks.md` for release columns). Same pack, same flags, same methodology.
+- **A prefill cell is a rate only when its prompt is disjoint from every earlier arm's.** Two prompts generated from
+  the same seed with different word counts share the shorter one's whole prefix: a 31k arm read 641 tok/s against 314
+  for the same code at kv4, because its first 16.5k tokens were a restore. Run arm prefill with
+  `--prefix-cache-disk 0` and a vocabulary unique per arm (a seed alone is not enough when the width changes).
 - Found → do NOT rerun it. Run only the new arm and cite the recorded commit, settings and date beside the new number.
 - Within one session, inherit the previous number. An old-binary baseline is rerun only in a clean new session (fresh
   box state) or when none exists for that exact setting; say which beside the number.

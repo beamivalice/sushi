@@ -1247,6 +1247,7 @@ const GROUP_RATES = [_]GroupRate{
     .{ .name = "mcg64", .n = 64, .dec = MCG_W15 },
     .{ .name = "stq36", .n = 36, .dec = kernels.SPEC1_W15 },
     .{ .name = "stq42", .n = 42, .dec = kernels.SPEC1_W15 },
+    .{ .name = "stq64", .n = 64, .dec = kernels.SPEC1_W15 },
 };
 
 pub const grouped_decode: report.Bench = .{
@@ -1257,8 +1258,8 @@ pub const grouped_decode: report.Bench = .{
     .steps = 32,
     .axes = &.{
         .{ .name = "geometry", .values = &.{ "flash", "deepseek" }, .numeric = false },
-        .{ .name = "rate", .values = &.{ "mcg32", "mcg40", "mcg48", "mcg64", "stq36", "stq42" }, .numeric = false },
-        .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "6", "8" } },
+        .{ .name = "rate", .values = &.{ "mcg32", "mcg40", "mcg48", "mcg64", "stq36", "stq42", "stq64" }, .numeric = false },
+        .{ .name = "rows", .values = &.{ "1", "2", "3", "4", "6", "8", "9" } },
         .{ .name = "carry", .values = &.{ "0", "0.5" }, .numeric = false },
     },
     .arms = &kernels.GROUP_ARMS,

@@ -60,6 +60,11 @@ pub const DepthCap = struct { cap: u32, label: []const u8, measured: bool = fals
 
 pub fn adaptiveDepthCapForMachine(chip: []const u8, default_cap: u32) DepthCap {
     if (std.mem.indexOf(u8, chip, "M1 Pro") != null) return .{ .cap = 4, .label = "m1-pro", .measured = true };
+    // M1 Max (2026-11-19, Qwen3.8-Flash-Next STQ 2.75bpw, MTP head, 5.7k-token decode, forced
+    // depth 1..6, one boot per arm, same prompt, 512 tokens): 32.2 / 33.9 / 35.0 / 31.9 / 29.3 /
+    // 27.5 tok/s at depth 1..6. The curve turns at 4 (the non-NAX verify row is bytes), and the
+    // auto cap 6 measured 34.3 after exploring 2-5. Cap 3 holds the planner to the tied peak.
+    if (std.mem.indexOf(u8, chip, "M1 Max") != null) return .{ .cap = 3, .label = "m1-max", .measured = true };
     // Base M4 (2026-08-22, tester report, a 9B 6-bit trunk, 16 GB):
     // saturated echo, median of 5, decode tok/s by forced depth —
     //   3: 47.44   4: 55.50   5: 47.50   6: 47.28
@@ -1858,7 +1863,7 @@ test "base M4 caps at 4 where M4 Pro/Max keep the default (2026-08-22 sweep)" {
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Pro", 6).cap);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M4 Max", 6).cap);
     // Every row above is a HUMAN sweep and outranks the boot probe.
-    for ([_][]const u8{ "Apple M4", "Apple M4 Max", "Apple M1 Pro", "Apple M5" }) |c| {
+    for ([_][]const u8{ "Apple M4", "Apple M4 Max", "Apple M1 Pro", "Apple M1 Max", "Apple M5" }) |c| {
         try testing.expect(adaptiveDepthCapForMachine(c, 6).measured);
     }
     try testing.expect(!adaptiveDepthCapForMachine("Apple M2 Pro", 6).measured);
@@ -1866,7 +1871,8 @@ test "base M4 caps at 4 where M4 Pro/Max keep the default (2026-08-22 sweep)" {
 
 test "adaptiveDepthCapForMachine: measured rows only, unmeasured chips keep the default" {
     try testing.expectEqual(@as(u32, 4), adaptiveDepthCapForMachine("Apple M1 Pro", 6).cap);
-    try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
+    try testing.expectEqual(@as(u32, 3), adaptiveDepthCapForMachine("Apple M1 Max", 6).cap);
+    try testing.expectEqualStrings("m1-max", adaptiveDepthCapForMachine("Apple M1 Max", 6).label);
     try testing.expectEqual(@as(u32, 6), adaptiveDepthCapForMachine("", 6).cap);
 }
 

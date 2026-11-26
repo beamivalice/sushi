@@ -272,6 +272,37 @@ twice, one boot per arm.
   one contaminated boot excluded. Greedy output diverged around token 8 of a 70K prompt. Not adopted: the arm and
   its kernel branch are removed.
 
+## M1 Max: the split count is a per-silicon row (2026-11-19)
+
+M1 Max 64 GB (`applegpu_g13s`, 32 GPU cores, no matrix units), sushi 1.7.0, STQ 2.75bpw, `--kv-quant 8`, 5.7k-token
+prompt, one boot per arm. At S=1 the default 16 splits launch exactly 32 threadgroups — one wave on 32 cores.
+
+- Kernel meter (`SUSHI_QSA_ATTN_UBENCH=1`, 12 dependent layers, median of 7; it now sweeps nsplit
+  {16, 64} × simdgroups {2, 16}): 16 splits 187.6 µs/call at kv 4096 and 191.8 at kv 32768 (both at
+  16 simdgroups — the served fallback at 32 threadgroups); 64 splits at 2 simdgroups 141.8 and 148.6
+  (an earlier read of the same code measured 188.5/188.8 against 140.8/146.9).
+  The served fallback at 64 splits is that 2-simdgroup arm: nsg = (gqa+7)/8 = 2 at gqa 12, and
+  1·2·64 > 32, so `qsaAttnSimdgroups` returns it.
+- Served decode, MTP depth 2 pinned, 512 tokens: 64 splits 34.6 tok/s against 33.7 and 32.0 for the default (A B A).
+  With MTP off, which removes acceptance noise: 25.08 against 24.73 and 24.56 (A B A).
+- MTP depth is a measured row, not the generic cap 6: forced depth 1..6 read 32.2 / 33.9 / 35.0 / 31.9 / 29.3 / 27.5
+  tok/s on the same prompt. `--mtp` with no bounds now caps at 3 on this chip (`src/mtp.zig`); the launcher keeps pinning 2.
+- The cold 16.5k prefill wall is ~328-333 tok/s and no launch lever moved it: `--qwen-mlx-engine` 321.9 (decode
+  38.5, also slower), `--prefill-chunk 8192` 329.6, `QWEN4_PLE_PREFETCH_PREFILL=1` 332.6, against 328.9 for the
+  control (no prefix cache, distinct prompts, one boot per arm). The routed window replay bound is in
+  [engine-exl3-experts](engine-exl3-experts.md).
+- Batching does not buy throughput: 2 and 4 concurrent 256-token streams moved the aggregate 23.4 → 25.3 → 25.2
+  tok/s (+8%, prefill included), and 8 streams collapsed to 9.2 with two zero-token replies. The launcher's
+  `--max-concurrent 4` is the right cap on this GPU.
+- Greedy text diverges with the split count (the merge order changes, as at every nsplit); these cells are rates, not
+  a byte gate. BK stays 16: the BK=8 seam fails the kernel's launch check on 1.7.0 (MlxError), so it is not an arm.
+- **The split count is flat at the verify width (2026-11-22, same meter, S=3, 12 dependent layers, median of 7):**
+  kv 4096 nsplit 16/32/64 read 307.5 / 310.2 / 311.5 us a call, kv 32768 320.4 / 318.4 / 323.1, and 8 splits is
+  worse at both (506.8 / 528.9 — the split pass stops filling the GPU). So the one-row row (64 splits) stands for the
+  MTP round's 3-row verify: the `S=3 nsplit=64 tgs=384` launch is not the cost, and a per-width split row is not a
+  lever. A boot-to-boot reading of -0.9 ms of GPU busy at 3 rows for 16 splits did not survive this meter (it is
+  4 us a layer) — that arm was reverted (`nsplit=64` kept).
+
 ## Sushi-2bpw streamed decode on an M1 Max 32 GB (`--ssd-budget-gb 20`, kv8)
 
 Greedy 300-token decode of one prompt after a warm-up (tok/s; same box, arms run back to back):
@@ -1227,3 +1258,138 @@ two requests coexist); `--prefix-cache-mem` (a RAM entry rebinds instead of rehy
 resident, which this box does not have spare). The chunk itself - 93% Cooler rows at 389 KB/row - is the only
 structural item left: tiling the rate-group, PLE or head rows inside a chunk would shrink it, and it needs a
 boot-per-arm measurement ([measurement](process-measurement.md)).
+
+
+## M1 Max 64 GB: the depth-2 pin survives 1.7, and a decoder waits a whole chunk (2026-11-20)
+
+The same pack and recipe as the section above, re-measured with a hill-climb harness instead of single-boot A/B
+cells: medians of 6, two control boots bracketing each candidate, GPU exclusive (the serving port moved so no other
+session could queue work onto it), AC, temp 0 (MTP's exact acceptance rule), one boot per arm. Controls read c1
+**41.09 / 40.50** tok/s, c4 **42.43 / 43.22**, cold prefill **313/292** and **321/277** tok/s at 4K/16K.
+
+Ceilings, measured here: **355 GB/s** read-only stream, **9.35 TFLOPS** fp16 at 4096³. The pack's shard headers sum
+to 45.14 GiB, 39.11 of it routed experts, so a serial token reads 3.30 GiB and a depth-2 round reads ~7.5 GiB — a
+c1 memory ceiling of **111 tok/s** against **46.4** served. A quiet 512-token greedy request reads
+`attempts=153 accepts=247 avg_per_round=1.61 per_draft_pct=80.7 round_ms=56.3`, i.e. 2.61 tokens per 56 ms: the gap
+is the round's fixed cost, not bytes, which is why every byte cut is dead here (kv format; a pruned draft head is
+0.44 GiB ≈ 1.2 ms of a 56 ms round; drop-expert needs an `expert_usage.json` a resident pack does not carry).
+
+- **Depth 3 loses at 1.7.** The 1.6 row read 35.0 against 33.9 tok/s; with exact-only acceptance the same arm now
+  reads c1 **39.61** against 41.09 / 40.50, c4 39.74 against 42.43 / 43.22, 16K prefill 268 against 292 / 277. Its
+  counters say why: 2.67 tokens/round against 2.61, but 48.7-55.8 % per-draft acceptance against 80.7 %, and an
+  88-151 ms round. A verify row is BYTES (each row reads its own experts), so depth must buy acceptance and it does
+  not. **The launcher's pin at 2 stands**; the chip's cap row at 3 stays a cold-start cap.
+- **`--max-mtp-ctx` has nothing to cut on this chip.** A 21,509-token request decodes **40.72 tok/s** with MTP
+  (`mode=mtp`), flat against short context, so a ceiling that forced serial past 32K could only lose. The adaptive
+  vote is already on MTP past 32K.
+- **Prefill is flat with context**: **324.8 tok/s at 124,813 tokens** against 313-321 at 4K, i.e. 92 % of the 4K
+  ceiling. QSA's `indexer_budget: 2048` bounds the attention term, so the long-context prefill complaint above is
+  restore + admission + contention, never compute.
+- **Two 125K streams are admitted with no queue wait** (both `started: 0.0`, no `[admission] held` in the window),
+  the second prefilling at half rate while they overlap. 2 x 250K remains out of reach.
+- **The chunk boundary, not the prefill rate, is what a live decoder feels.** One 400-token decoder against one
+  10.8K-token cold prefill at share 0.5: 44.18 tok/s before, **16.97** during, worst gap **11.48 s**.
+  `--prefill-chunk 2048` halves the gap (7.04 s) but collapses 16K prefill to **189.3 tok/s** from 277-292 (-32 %);
+  `--prefill-decode-share 0.75` costs 11.5 % of the prefill (236.7 tok/s) and made the gap *worse* (12.67 s). Both
+  rejected: share 0.5 and the auto chunk stay. This is the `max_gap_ms up to 13.1 s` the served log reports, and it
+  is a scheduler seam — the share is applied between chunks, and a 4096-row chunk is ~15 s here.
+- Gate: needle **3/3 exact** at 52K and at 190K requested (124,813 real tokens), answered in 45-47 tokens with
+  `reasoning_effort: off`; the first pass read 2/3 only because thinking ate a 96-token answer budget.
+
+### Engine arms against the profile (same meter, one boot each, 4096 keys, 100 forwards)
+
+| arm | rows=1, ms | rows=3, ms |
+|---|---:|---:|
+| control (fused HC read, expert pair split 2) | 31.6–32.9 | 54.6–55.8 |
+| HC read through MLX's quantized matmuls | **51.5** | **76.6** |
+| expert pair split 1 | 32.1 | 54.9 |
+| expert pair split 4 | 32.3 | 55.3 |
+| expert pair split 5 | 34.4 | 54.6 |
+
+- **The fused hyper-connection kernels are worth 1.4x at verify width over MLX's own quantized matmuls** here
+  (54.9 against 76.6 ms) and 1.6x at one row. Wider MLX kernels do not win on this GPU at these shapes, so HC
+  stays fused and the arm was deleted with its knob.
+- **The expert split count does not move this chip**: 1, 2, 4 and 5 all land inside the ±3 % run-to-run band
+  at both widths, so the geometry's flat 2 stays. The split is not what binds these kernels on 32 cores.
+- **Threadgroup width does not move it either**: `sushi_hc_read_u` at 4, 8, 16 and 32 simdgroups per threadgroup
+  reads 31.8/31.6/31.2/33.4 ms at one row and 55.4/54.8/55.2/55.2 at three — flat, with 32 worse. Each output
+  column keeps its own simdgroup and k partition at every width (bit-exact), so this isolates the shape test: the
+  GEMV blocks are not short of lanes, they are short of independent work per lane.
+- **What that leaves**: the distance to 70 tok/s is arithmetic — 2.61 tokens per round needs a 37 ms round, i.e.
+  **18.8 ms** out of 55.8. Three shape levers (implementation, split, width) have each been measured and none
+  touches it, so the remaining work changes the *work* inside the kernels (fewer dependent reductions per lane,
+  cheaper trellis decode per weight), which is numerics-changing and needs the KLD gate.
+- **The host build is already ~60 % hidden.** At three rows the forward is 55.8 ms with GPU busy **52.7** against
+  an eval wait of 41.3 — about 8 ms of GPU work overlaps the 13.2 ms build, so overlapping the build further has
+  at most ~2-3 ms in it, not the 13 ms the raw build figure suggests. The remaining headroom is kernel occupancy:
+  1684 dispatches, 52.7 ms busy, 31 µs per dispatch.
+- **The prepared routed chain now runs on Flash-Next** (2026-11-20): `preparedOn` admitted `hidden 2560 / inter 640`
+  (it was DeepSeek's `5120 / 2304` only) while member grouping stayed DeepSeek's. `shared.exl3_grouped_decode`
+  measured the arm at −10 % on the routed layer (fused 361/375 µs against prep 321/337, rows 3, the planes
+  byte-identical), and the in-forward meter reads the verify forward **53.2 / 51.8 ms against 54.5 / 55.8** before it
+  (−4 to −5 %), one row unchanged (31.5 / 30.8 against 31.6–32.9).
+- Where the time sits at three rows (per-kernel GPU ms, profiled pass): routed experts **19.7**, hyper-connections
+  **12.8**, GDN 14.3, attention 5.0, lm_head 1.9, router/swiglu/finishes/copies ~10. **Format is not the lever and
+  affine is not faster.** `shared.exl3_trunk_launches` on a dense `[248320x2560]` K6 projection reads trellis
+  **1934 µs against affine-8 3166 µs** at three rows (rows 1: 1356 against 1816), and
+  `shared.exl3_moe_layer` reads the routed layer at **413 µs (spec1) against 997 µs (stock MLX affine-4 gather_qmm
+  ×3)**. The pack's trellis decode is the fastest format this GPU has here; affine carries ~1.6x the bytes (4-bit
+  plus a scale and bias per 64 against 2.75 bpw) and MLX's affine kernels are tuned for matrix units this chip does
+  not have. Every kernel in the pack therefore runs 68–150 GB/s, the widest dense one included.
+
+### Clean-window re-read of the bill recipe (2026-11-21)
+
+With the box quiet, the packaged recipe (`--kv-quant 8 --prefill-chunk 2048 --max-tokens 8192`, settings file
+aligned) measures: **c1 40.22 / c4 45.39** at temperature 0 and **c1 38.51 / c4 41.66** at temperature 1, prefill
+**324 / 271** (4k / 16k) and **334 / 323** at temperature 1. Two earlier figures in this document's predecessor are
+retracted: the 16k prefill cost of chunk 2048 (189.3 tok/s) and the sampled four-stream collapse (25.8 tok/s) were
+both read in windows carrying foreign work — on a quiet box they are 271-323 tok/s and 41.66. The bill cut is
+therefore free: same decode, same prefill, **815 MB less per request**, no admission waits at 177k.
+
+### MTP depth is pinned because the controller picks 6 (2026-11-21)
+
+Three served arms on one quiet session: the shipped pin (`--mtp-min-depth 2 --mtp-max-depth 2`) reads **c1 41.59 /
+c4 45.06**, while letting the EV controller plan inside 1..6 or 2..6 makes it choose **depth 6 every round** and
+reads **39.02 / 38.95** at c4 (c1 flat, 41.05 / 41.31). The controller's expected-value model has no per-row cost, and
+a verify row costs ~10 ms here. So depth 2 is not a legacy default: it is the measured optimum, and an unpin is a
+13 % regression at four streams.
+
+Two measurement rules this campaign learned the hard way, worth keeping next to the numbers:
+
+- **`SUSHI_ENGINE_KERNEL_PROF` inflates the forward it profiles.** The same decode forward times 52 ms plain and
+  **437 ms** under `=12`, with `lm_head` going 1.39 -> 2.72 ms. Per-kernel *shares* from it are usable; per-kernel
+  absolute ms are not.
+- **A served cell is void when a same-window greedy control also moved.** The earlier 25.8 tok/s "sampled collapse"
+  and 189 tok/s "chunk-2048 prefill" were both that: their temp-0 controls read 25 and 270 in the same window.
+
+## M1 Max 64 GB: the kernel budget of a verify round, and what the ceiling is made of (2026-11-22)
+
+Hardware: `applegpu_g13s`, 32-core GPU, no MPP. Pack: Sushi-STQ-2.75bpw (spec1 w15, kv8), MTP pinned at depth 2.
+Measured with the engine's own switches, no profiler: `SUSHI_LAYER_CAP=24` against 48 (a graph ablation, so nothing
+is instrumented), the forward meter (`SUSHI_DECODE_FWD_UBENCH`), `shared.exl3_trunk_launches` and
+`shared.exl3_grouped_decode` arms interleaved in one process, and static AGX from `metal-profile`.
+
+Per layer, from the layer-cap slope: **565 us at one row, 947 us at three, 1299 at four**; the intercept (embed, PLE,
+lm_head, final norm) is 3.1 / 5.6 ms. The 3-row verify forward is 51 ms of GPU:
+
+| block | per layer | per forward | the bound it sits on |
+|---|---:|---:|---|
+| MoE experts, rate-grouped prepared chain (5 launches) | ~306 us | 14.7 ms | the issue rate |
+| trunk linears (7 launches) | ~240-272 us | 12-13 ms | 1.85-1.9x its own streaming floor |
+| residual: attention core, GDN verify, fused HC read, router, norms | ~390 us | ~18 ms | 3.1 us of each launch is ramp |
+| fixed: embed, PLE, lm_head, final norm | — | 5.6 ms | lm_head at 354 GB/s |
+
+- **The expert chain is at the machine's issue rate, not the byte roof.** 147M weight-rows a layer at ~2.8
+  instructions a weight reads 306 us at ~1 instruction a lane-cycle (1024 lanes, 1.295 GHz). Static AGX on the pair
+  GEMV: 634 instructions, 47 live GPRs, 100% occupancy, no `stack_load`/`stack_store`/`StackAdjust`, SCIB 57% / F32
+  20%; the 64-bit window shift is already a `breif` with the window mask folded in.
+- **The trunk at verify width is work-bound, not byte-bound**: `gdn_qkvz` reads 162.6 us against an 87.8 us streaming
+  floor (193 GB/s of a measured ~310) at 3 rows, and 110.7 against 88.5 at one. The decode amortizes over the rows,
+  the per-row FMA does not.
+- **A launch costs 3.1 us of GPU time**, ramp included: `SUSHI_DISPATCH_PROBE=8` (eight injected elementwise kernels a
+  MoE layer, +384 a forward) moved GPU busy 50.31 -> 51.51 ms. The 1779-dispatch forward therefore carries ~5.5 ms of
+  launch cost, ~3.7 ms of it outside the MoE and trunk lines.
+- The memory ceiling (111 tok/s at 3.2 GB/token) would need ~3.4x fewer instructions a weight. That is the matrix-unit
+  route (M1 has `simdgroup_matrix`, no MPP, and a 3-row fragment is 3/8 filled) or a lower-bit format; both change
+  output and neither is attempted here. The served c1 of 45.2-46.2 tok/s is within ~2% of what this algorithm's issue
+  rate allows on this GPU.

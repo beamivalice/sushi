@@ -212,6 +212,10 @@ fn raggedLayer(ops: *Ops, s: mlx.mlx_stream) !api.Ragged {
 test "Qwen shared expert folded into the rate-grouped routed launches is bit exact to the separate chain" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The launch-riding fold is the unprepared chain's; Flash-Next's prepared chain folds the shared expert into
+    // the reduce instead (`moeDecodeClampedSharedFused`), so the seam keeps the path under test.
+    api.rate_groups.prepared_force = false;
+    defer api.rate_groups.prepared_force = null;
     var random = std.Random.DefaultPrng.init(907);
     const rnd = random.random();
     var ops = Ops{ .s = s };
@@ -515,6 +519,10 @@ fn handedLogit(ops: *Ops, c: StoredCase, x: Arr) !Arr {
 test "Qwen shared expert fold: the geometry bound at load is the one the shapes give, and the fold keeps its bytes at every row count" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The launch-riding fold is the unprepared chain's; Flash-Next's prepared chain folds the shared expert into
+    // the reduce instead (`moeDecodeClampedSharedFused`), so the seam keeps the path under test.
+    api.rate_groups.prepared_force = false;
+    defer api.rate_groups.prepared_force = null;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var random = std.Random.DefaultPrng.init(919);
@@ -569,6 +577,10 @@ test "Qwen shared expert fold: the geometry bound at load is the one the shapes 
 test "Qwen shared expert fold: a stored geometry and routed shape save the shape reads of the banks on every call" {
     const s = mlx.gpuStream();
     if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    // The launch-riding fold is the unprepared chain's; Flash-Next's prepared chain folds the shared expert into
+    // the reduce instead (`moeDecodeClampedSharedFused`), so the seam keeps the path under test.
+    api.rate_groups.prepared_force = false;
+    defer api.rate_groups.prepared_force = null;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var random = std.Random.DefaultPrng.init(923);
