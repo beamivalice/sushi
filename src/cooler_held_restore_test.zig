@@ -53,6 +53,51 @@ test "cooler contract: a served Cooler request that restores from the SSD tier s
     }.run);
 }
 
+test "cooler contract: with the SSD tier off a served model reuses a repeated prompt from RAM, or keeps no RAM entries and says so where its RAM points would hold no state" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, ids: []const u32) !void {
+            const a = testing.allocator;
+            const log = @import("log.zig");
+            const path = "/tmp/sushi-ram-only-restore.log";
+            _ = std.c.unlink(path);
+            try log.openFile(path, 0);
+            defer {
+                log.closeFile();
+                _ = std.c.unlink(path);
+            }
+            var long: [700]u32 = undefined;
+            for (&long, 0..) |*t, i| t.* = ids[i % ids.len];
+            const ld = try heldLoad(C, dir);
+            var sv: Served = undefined;
+            try sv.initRamOnly(ld, dir, 1 << 30);
+            defer sv.deinit();
+            if (@import("arch/prefix.zig").ramHoldsNoState(ld.xfm)) {
+                try testing.expect(sv.entry.prefix_cache == null);
+                var buf: [4096]u8 = undefined;
+                const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+                try testing.expect(fd >= 0);
+                defer _ = std.c.close(fd);
+                const n = std.c.read(fd, &buf, buf.len);
+                const text = buf[0..if (n > 0) @intCast(n) else 0];
+                errdefer std.debug.print("cooler contract: the load said:\n{s}\n", .{text});
+                var want_buf: [160]u8 = undefined;
+                const want = try std.fmt.bufPrint(&want_buf, "[prefix-cache] {s} restores a prompt only from the SSD tier, which is off: it keeps no RAM prefix entries", .{ld.config.model_type});
+                try testing.expect(std.mem.indexOf(u8, text, want) != null);
+                return;
+            }
+            var cold_from: u32 = 0;
+            var cold = try sv.request(&long, 8, &cold_from);
+            defer cold.deinit(a);
+            var warm_from: u32 = 0;
+            var warm = try sv.request(&long, 8, &warm_from);
+            defer warm.deinit(a);
+            errdefer std.debug.print("cooler contract: the repeated prompt reused {d} tokens from RAM\n", .{sv.reused});
+            try testing.expect(sv.reused > 0);
+            try testing.expectEqualSlices(u32, cold.items, warm.items);
+        }
+    }.run);
+}
+
 test "cooler contract: a served request restored from a shorter prompt's SSD record takes it, and says the same tokens every time" {
     // Bytewise cold holds only for a restore at the request's own point (the SSD contract above): another prompt's
     // record sits off this prompt's cold split ([0, N - 31) then the tail), so its state reaches N - 31 in two

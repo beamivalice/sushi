@@ -281,6 +281,14 @@ pub fn restorePointModel(xfm: *trunk.Trunk) bool {
     }
 }
 
+/// Whether the loaded model's RAM tier would hold its restore points without their state, so only the SSD tier can
+/// serve a restore.
+pub fn ramHoldsNoState(xfm: *trunk.Trunk) bool {
+    switch (registry.handleOf(xfm)) {
+        inline else => |m, t| return if (comptime @hasDecl(P(t), "ramHoldsNoState")) P(t).ramHoldsNoState(m) else false,
+    }
+}
+
 /// A prefill checkpoint of a restore-point model at `pos`; `to_ssd` says a write-through takes it before the next
 /// forward, so the arch may share its rows. Null for a model that checkpoints by other means.
 pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *trunk.Trunk, ctx: *const trunk.ForwardCtx, pos: usize, to_ssd: bool) !?trunk.SSMCheckpoint {

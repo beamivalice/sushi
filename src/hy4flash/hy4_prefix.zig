@@ -249,6 +249,13 @@ pub fn restorePointModel(xfm: *trunk.Trunk) bool {
     return xfm.arch_state.hy4flash.model != null;
 }
 
+/// A served model's points keep their state only for the SSD write-through (`captureCheckpoint`), and it keeps no live
+/// record, so a RAM tier alone never restores.
+pub fn ramHoldsNoState(xfm: *trunk.Trunk) bool {
+    const m = xfm.arch_state.hy4flash.model orelse return false;
+    return m.serves_requests;
+}
+
 /// Restore points one prefill or one RAM entry lists: positions, their state released once a write-through has taken
 /// it or at once (`captureCheckpoint`), their small state the live points' (`Live`).
 pub const checkpoint_cap: u32 = 4;

@@ -682,6 +682,21 @@ pub const Served = struct {
 
     /// `ram_bytes`: the RAM tier's budget, 0 for the SSD tier alone.
     pub fn initTiers(self: *Served, ld: *Load, dir: []const u8, ram_bytes: u64) !void {
+        try self.initWith(ld, dir, ram_bytes, 1 << 30);
+        if (self.entry.prefix_cache == null or self.entry.prefix_cache.?.disk == null) {
+            self.deinit();
+            return error.SkipZigTest;
+        }
+        self.entry.prefix_cache.?.disk.?.armTestSpace(256 << 30, 1 << 40);
+    }
+
+    /// A RAM tier of `ram_bytes` and no SSD tier, as `--prefix-cache-disk off` leaves a load; the entry has no cache at
+    /// all where the load keeps none.
+    pub fn initRamOnly(self: *Served, ld: *Load, dir: []const u8, ram_bytes: u64) !void {
+        try self.initWith(ld, dir, ram_bytes, 0);
+    }
+
+    fn initWith(self: *Served, ld: *Load, dir: []const u8, ram_bytes: u64, disk_bytes: u64) !void {
         const a = testing.allocator;
         self.reused = 0;
         self.quiet_failures = false;
@@ -709,9 +724,7 @@ pub const Served = struct {
             .disk_resolver = null,
             .ssm_checkpoint_stride = server_state.ssm_checkpoint_stride,
             .ssm_checkpoint_max = server_state.ssm_checkpoint_max,
-        }, 1 << 30, .load);
-        if (self.entry.prefix_cache == null or self.entry.prefix_cache.?.disk == null) return error.SkipZigTest;
-        self.entry.prefix_cache.?.disk.?.armTestSpace(256 << 30, 1 << 40);
+        }, disk_bytes, .load);
         self.sch = scheduler.submitTestScheduler(a, 2);
         self.sch.kv_quant = null;
         self.sch.metrics = null;

@@ -379,6 +379,10 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
 `--prefix-cache-mem off --prefix-cache-disk 10GB` (the default arrangement, with a sized budget) keeps reusable text
 prefixes on SSD without retaining idle KV snapshots in the RAM cache. The live request still needs KV memory, and queued disk writes can hold
 buffers temporarily. No reuse at all is `--prefix-cache-mem off --prefix-cache-disk off`.
+A served restore-point model whose RAM points hold no state (Hy4-Flash: `captureCheckpoint` keeps a point's state only
+for the SSD write-through, and a served load keeps no live record) restores only from the SSD tier: with it off the load
+says `[prefix-cache] <model> restores a prompt only from the SSD tier, which is off: it keeps no RAM prefix entries` and
+keeps none (`prefix_arch.ramHoldsNoState`). DeepSeek's RAM points copy their state, so it reuses from RAM alone.
 With RAM and disk disabled, SSM checkpoint capture is disabled too. `/props` reports
 `settings.prefix_cache.ram_enabled=false` and `mem_bytes=0` when RAM retention is off.
 Context and prefill-chunk sizing also reserve zero idle-cache bytes in this mode, regardless
@@ -536,7 +540,9 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **A checkpoint leaves RAM as the next one is taken.** The write-through (`HotPrefixCache.writeThroughHybrid`) persists
   the chunk with its checkpoints, then settles them; a prefill holds two states (the previous newest until its file is
   written, and the one just taken) where it held every one it captured (up to 16: 897 MiB at `--qwen-gdn 16`, 1.76 GiB
-  at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. A failed write is released too: not a
+  at f32). Below `MIN_PERSIST_TOKENS` nothing is written, so nothing is released. The floor is the point's own
+  position: a prompt whose end point the prefill's backoff leaves under it (a Hy4 prompt of 512 to 542 tokens) persists
+  none, and its exact repeat prefills again. A failed write is released too: not a
   restore point, and the entry is poisoned at the next commit (`harvestWriteFailures`).
 - **Restore points sit on an 8192-token grid and at each prompt's end, to 1M tokens, on every arch** (Qwen: the
   checkpoint stride is `prefill_plan.effectiveSsmCheckpointStride(256, prefill chunk)`, 8192 unless a named `--prefill-chunk-max` sets it, which

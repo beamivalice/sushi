@@ -870,7 +870,9 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
   - The live record's points reach SSD where its state is about to be lost (`flushLive`): a lookup the record cannot
     serve (another conversation, a deeper stored point), the handover, and the scheduler's flush (unload, 300 s idle,
     shutdown, `hy4_sched.flushResident`). A finished request keeps one point where its state stands, behind its reply,
-    so a turn restored after a handover or a restart prefills only what is new.
+    so a turn restored after a handover or a restart prefills only what is new. The point stands at the reply's last
+    token, one past what an exact re-issue of prompt and reply may restore (a match re-forwards its last token): that
+    re-issue restores at the prompt's end point, and a turn that adds to the reply restores at the reply's.
   - A turn so writes its new rows once and each point's small state (10.34 MB at kv8 on the release), plus the rows
     past the last grid line in each off-grid point it flushes. The RAM and SSD matches compare an entry's KV width with
     the request's, so a point never crosses widths.

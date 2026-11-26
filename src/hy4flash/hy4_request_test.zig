@@ -1112,3 +1112,94 @@ test "hy4 request: after the load, a prompt whose chunk runs one or two rows pas
         try testing.expectEqual(late, mlx.engine.latePipelines());
     };
 }
+
+/// A served SSD-only load of the tiny, a prompt of `len` tokens from `ids` at `stride`, asked twice with `n` greedy tokens.
+fn repeatOnSsd(dir: []const u8, ids: []const u32, len: usize, stride: usize, n: u32) !struct { first: u32, second: u32, same: bool, points: [8]u32, count: usize } {
+    const a = testing.allocator;
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    const prompt = try a.alloc(u32, len);
+    defer a.free(prompt);
+    for (prompt, 0..) |*t, i| t.* = ids[(i * stride + 1) % ids.len];
+    var r1: u32 = 0;
+    var first = try sv.request(prompt, n, &r1);
+    defer first.deinit(a);
+    var r2: u32 = 0;
+    var second = try sv.request(prompt, n, &r2);
+    defer second.deinit(a);
+    var out: @TypeOf(repeatOnSsd(dir, ids, len, stride, n) catch unreachable) = .{ .first = r1, .second = r2, .same = std.mem.eql(u32, first.items, second.items), .points = @splat(0), .count = 0 };
+    for (sv.entry.prefix_cache.?.disk.?.entries.items) |e| for (e.ssm_positions) |p| if (out.count < out.points.len) {
+        out.points[out.count] = p;
+        out.count += 1;
+    };
+    return out;
+}
+
+test "hy4 request: a served SSD-first load persists a prompt's end point only at or past the persist floor, and a repeat restores from one it holds (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    const floor = @import("../kv_disk_cache.zig").MIN_PERSIST_TOKENS;
+    // A 512-token prompt's end point stands under the floor (the prefill's backoff): it is not persisted, so its repeat
+    // re-prefills; only the reply's end, past the repeat's own reach, is written.
+    const short = try repeatOnSsd(dir, ids, floor, 3, 2);
+    errdefer std.debug.print("512: restored {d} then {d}, points {any}\n", .{ short.first, short.second, short.points[0..short.count] });
+    for (short.points[0..short.count]) |p| try testing.expect(p >= floor);
+    try testing.expectEqual(@as(u32, 0), short.second);
+    try testing.expect(short.same);
+    // A 600-token prompt's end point is past the floor: it is persisted and its repeat restores from it.
+    const long = try repeatOnSsd(dir, ids, 600, 5, 2);
+    errdefer std.debug.print("600: restored {d} then {d}, points {any}\n", .{ long.first, long.second, long.points[0..long.count] });
+    try testing.expect(long.second >= floor and long.second < 600);
+    try testing.expect(long.same);
+}
+
+test "hy4 request: a served reply's end point serves the next turn that adds to the reply; a re-issue of prompt and reply exactly restores at the prompt's end point (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    const prompt = try a.alloc(u32, 600);
+    defer a.free(prompt);
+    for (prompt, 0..) |*t, i| t.* = ids[(i * 7 + 2) % ids.len];
+    var r0: u32 = 0;
+    var first = try sv.request(prompt, 4, &r0);
+    defer first.deinit(a);
+    const end = prompt.len + first.items.len;
+    const turn = try a.alloc(u32, end + 1);
+    defer a.free(turn);
+    @memcpy(turn[0..prompt.len], prompt);
+    @memcpy(turn[prompt.len..end], first.items);
+    turn[end] = ids[3];
+    // The exact re-issue's restore stops one token short of the reply's end point, so it takes the prompt's.
+    var exact: u32 = 0;
+    var e = try sv.request(turn[0..end], 2, &exact);
+    e.deinit(a);
+    errdefer std.debug.print("exact re-issue of {d} tokens restored {d}\n", .{ end, exact });
+    try testing.expect(exact >= kv_floor() and exact < prompt.len);
+    // A turn that adds a token after the reply restores at the reply's end.
+    var next: u32 = 0;
+    var t = try sv.request(turn, 2, &next);
+    t.deinit(a);
+    errdefer std.debug.print("the next turn of {d} tokens restored {d}\n", .{ turn.len, next });
+    try testing.expect(next >= end);
+}
+
+fn kv_floor() u32 {
+    return @import("../kv_disk_cache.zig").MIN_PERSIST_TOKENS;
+}

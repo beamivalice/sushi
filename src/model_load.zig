@@ -1992,7 +1992,7 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
     // KV and SSM to a snapshotted prefix; without them, divergence forces a
     // full reset, so we keep the legacy single-slot path for hybrid.
     const enable_ssm_cps = p.ssm_checkpoint_stride > 0;
-    const ram_prefix_cache = p.ram_enabled;
+    var ram_prefix_cache = p.ram_enabled;
     // Phase 3 persists hybrid recurrent state too: the disk tier is allowed whenever the RAM tier
     // accepts the arch — pure-attention always, hybrid iff SSM checkpoints are enabled.
     const has_ssm_layers = config.full_attention_interval > 0;
@@ -2063,6 +2063,10 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
     if (mode == .rearm and disk_tier == null) return;
     config.prefix_cache_disk_declined = disk_bytes > 0 and disk_tier == null;
     const disk_prefix_cache = disk_tier != null;
+    if (cache_applies and ram_prefix_cache and !disk_prefix_cache) if (xfm) |x| if (prefix_arch.ramHoldsNoState(x)) {
+        log.info("[prefix-cache] {s} restores a prompt only from the SSD tier, which is off: it keeps no RAM prefix entries\n", .{config.model_type});
+        ram_prefix_cache = false;
+    };
     if (cache_applies and (ram_prefix_cache or disk_prefix_cache)) {
         if (entry.prefix_cache == null) {
             // The weights are resident here, so the resolver's active-memory read
