@@ -1000,3 +1000,48 @@ test "a Qwen request's growth commit covers the cache it reserves at the width t
     try testing.expect(widened > 0);
     try testing.expectEqual(@as(usize, 0), bad);
 }
+
+test "a served load whose memory sizes its prefill width below a given min refuses by name, before it serves" {
+    const t = std.testing;
+    const settings_resolve = @import("settings_resolve.zig");
+    const gpu_mem = @import("gpu_mem.zig");
+    const saved_launch = settings_resolve.launch;
+    defer settings_resolve.launch = saved_launch;
+    var cfg = fixtures.qwen4RequestTestConfig();
+    settings_resolve.launch = .{ .prefill_chunk_min = 8192 };
+    // The arch runs 8192 rows at a short prompt, so the bounds accept the min.
+    const b = bills.chunkBoundsOf(&cfg);
+    try t.expectEqual(@as(u32, 8192), b.min);
+    // A small box: a declared 2048 MB ceiling less the 1 GiB margin, with 900 MB already held. Every live reading is
+    // a seam, so the host tier never reads the GPU.
+    const wired_was = bills.wired_limit_mb_override;
+    const active_was = gpu_mem.active_bytes_override;
+    const cache_was = gpu_mem.cache_bytes_override;
+    const static_was = bills.static_ceiling_override;
+    const margin_was = launch_state.wired_margin_flag_bytes;
+    defer {
+        bills.wired_limit_mb_override = wired_was;
+        gpu_mem.active_bytes_override = active_was;
+        gpu_mem.cache_bytes_override = cache_was;
+        bills.static_ceiling_override = static_was;
+        launch_state.wired_margin_flag_bytes = margin_was;
+    }
+    bills.wired_limit_mb_override = 2048;
+    gpu_mem.active_bytes_override = 900 << 20;
+    gpu_mem.cache_bytes_override = 0;
+    bills.static_ceiling_override = 4 << 30;
+    launch_state.wired_margin_flag_bytes = 1 << 30;
+    const sized = bills.sizerPrefillChunkNow(&cfg);
+    try t.expect(sized < b.min);
+    // The refusal the load must give exists and names the min and the width that fits...
+    const pick = bills.loadChunkWithin(b, sized);
+    switch (pick) {
+        .refused => |r| try t.expectEqual(b.min, r.min),
+        .chunk => return error.TestUnexpectedResult,
+    }
+    bills.refuseLoadChunkBelowMin(&cfg) catch |e| {
+        try t.expectEqual(error.PrefillChunkDoesNotFit, e);
+        return;
+    };
+    return error.TestExpectedRefusal;
+}

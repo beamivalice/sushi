@@ -59,6 +59,8 @@ pub const ChunkBounds = struct {
     min_given: bool = false,
     /// A given min above the model's default max raised the max to it.
     raised_by_min: bool = false,
+    /// The given min is model-settings.json's, not `--prefill-chunk-min`.
+    min_from_file: bool = false,
 };
 
 /// The widest chunk a model's prefill runs when no bound names its max: the static bill's own default (Hy4's 4096),
@@ -125,7 +127,7 @@ pub fn chunkBounds(config: *const model_mod.ModelConfig) BoundsPick {
         const ceiling = chunkCeiling(config);
         if (ceiling < lo) return .{ .refused = .{ .min_above_arch_ceiling = .{ .min = lo, .min_name = named.name, .ceiling = ceiling } } };
     }
-    return .{ .bounds = .{ .min = lo, .max = hi, .max_given = max != null or raised, .min_given = min != null, .raised_by_min = raised } };
+    return .{ .bounds = .{ .min = lo, .max = hi, .max_given = max != null or raised, .min_given = min != null, .raised_by_min = raised, .min_from_file = if (min) |g| std.mem.eql(u8, g.name, file_min_name) else false } };
 }
 
 /// The widest chunk a no-flag load ran with: the model's max where a bound named it, else the widest rung (8192, the

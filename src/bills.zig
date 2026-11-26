@@ -1483,8 +1483,10 @@ pub fn loadChunkWithin(b: ChunkBounds, sizer: u32) LoadChunkPick {
     return .{ .chunk = std.math.clamp(fits, if (b.min_given) b.min else 0, if (b.max_given) b.max else std.math.maxInt(u32)) };
 }
 
-pub fn chunkBelowMinLine(buf: []u8, fits: u32, min: u32) []const u8 {
-    return std.fmt.bufPrint(buf, "[prefill] --prefill-chunk-min {d} is above the {d} rows this load's memory sizes its prefill chunk to; lower --prefill-chunk-min", .{ min, fits }) catch "[prefill] this load cannot hold its narrowest prefill chunk";
+pub fn chunkBelowMinLine(buf: []u8, fits: u32, min: u32, from_file: bool) []const u8 {
+    const given = if (from_file) "model-settings.json prefill_chunk_min" else "--prefill-chunk-min";
+    const remedy = if (from_file) "the model's prefill_chunk_min" else "--prefill-chunk-min";
+    return std.fmt.bufPrint(buf, "[prefill] {s} {d} is above the {d} rows this load's memory sizes its prefill chunk to; lower {s} to at most {d}, or remove it", .{ given, min, fits, remedy, fits }) catch "[prefill] this load cannot hold its narrowest prefill chunk";
 }
 
 /// The sizer's width for this model right now, without pinning it: the same inputs `pinPrefillChunk` reads.
@@ -1497,11 +1499,10 @@ pub fn sizerPrefillChunkNow(config: *const model_mod.ModelConfig) u32 {
     return billedPrefillChunk(config, kv_bits, ceiling, active_mem, sizerCtxKvBytes(config, kv_bits), hot_cache_ask, 0);
 }
 
-/// A load whose width IS its prefill (`unchunked_prefill`, a load with no per-request ladder) refuses by name when a
-/// GIVEN min is above what its memory sizes the chunk to. A per-request model's width is chosen per request from the
-/// ladder, so its load has nothing to prove here (a request that cannot hold the min is refused by admission).
+/// A load refuses by name when a GIVEN min is above what its memory sizes the chunk to: every request would price the
+/// min's width and be refused, so the load would serve nothing. A static-bill load refuses at its own chunk fix.
 pub fn refuseLoadChunkBelowMin(config: *const model_mod.ModelConfig) anyerror!void {
-    if (config.static_prefill_chunk != 0 or perRequestPrefillChunkEnabled(config)) return;
+    if (config.static_prefill_chunk != 0) return;
     const b = chunkBoundsOf(config);
     if (!b.min_given) return;
     const pick = loadChunkWithin(b, sizerPrefillChunkNow(config));
@@ -1509,7 +1510,7 @@ pub fn refuseLoadChunkBelowMin(config: *const model_mod.ModelConfig) anyerror!vo
         .chunk => {},
         .refused => |r| {
             var buf: [256]u8 = undefined;
-            log.err("{s}\n", .{chunkBelowMinLine(&buf, r.fits, r.min)});
+            log.err("{s}\n", .{chunkBelowMinLine(&buf, r.fits, r.min, b.min_from_file)});
             return error.PrefillChunkDoesNotFit;
         },
     }
@@ -9414,7 +9415,8 @@ test "a load's width sits inside its bounds: the max caps the sizer, a given min
     const quiet = ChunkBounds{ .min = 512, .max = 4096 };
     try t.expectEqual(@as(u32, 512), loadChunkWithin(quiet, 512).chunk);
     var buf: [256]u8 = undefined;
-    try t.expectEqualStrings("[prefill] --prefill-chunk-min 1024 is above the 512 rows this load's memory sizes its prefill chunk to; lower --prefill-chunk-min", chunkBelowMinLine(&buf, 512, 1024));
+    try t.expectEqualStrings("[prefill] --prefill-chunk-min 1024 is above the 512 rows this load's memory sizes its prefill chunk to; lower --prefill-chunk-min to at most 512, or remove it", chunkBelowMinLine(&buf, 512, 1024, false));
+    try t.expectEqualStrings("[prefill] model-settings.json prefill_chunk_min 1024 is above the 512 rows this load's memory sizes its prefill chunk to; lower the model's prefill_chunk_min to at most 512, or remove it", chunkBelowMinLine(&buf, 512, 1024, true));
 }
 
 test "prefill chunk bounds: every served model takes both flags and both keys, and refuses any other value by name" {
