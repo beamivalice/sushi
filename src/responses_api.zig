@@ -890,9 +890,8 @@ fn handleResponsesInner(
             try sendSseHeaders(stream, "responses", SSE_ALLOW_HEADERS_DEFAULT);
         }
 
-        // Skeleton envelope (status:in_progress, output:[])
-        // Timings are all zero on the skeleton — the real numbers appear on
-        // the final `response.completed` envelope after generation.
+        // Skeleton envelope (status:in_progress, output:[]): usage is not measured yet, so it is null; the real
+        // numbers appear on the final `response.completed` envelope after generation.
         const skel = try buildResponsesEnvelope(
             stream.io,
             allocator,
@@ -900,10 +899,7 @@ fn handleResponsesInner(
             esc_model,
             "in_progress",
             "[]",
-            0,
-            0,
-            0,
-            0,
+            null,
             store_echo,
             prev_id,
             false,
@@ -1451,10 +1447,12 @@ fn handleResponsesInner(
         esc_model,
         status_str,
         out_buf.items,
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.cached_tokens,
-        reasoning_tok_count,
+        .{
+            .input_tokens = result.prompt_tokens,
+            .output_tokens = result.completion_tokens,
+            .cached_input_tokens = result.cached_tokens,
+            .reasoning_output_tokens = reasoning_tok_count,
+        },
         store_echo,
         prev_id,
         is_incomplete,
@@ -1726,6 +1724,15 @@ const ResponseEcho = struct {
     max_tool_calls: ?u32 = null,
 };
 
+/// A measured usage block; `null` in `buildResponsesEnvelope` means "not measured yet", which OpenAI writes as
+/// `"usage":null` until the terminal event.
+const ResponsesUsage = struct {
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_input_tokens: u32,
+    reasoning_output_tokens: u32,
+};
+
 /// Build the Responses envelope JSON body. Used for both the response.created
 /// skeleton (in_progress, output:[]) and the final response.completed body.
 /// Shape matches the OpenAI Responses API ResponseResource schema.
@@ -1736,10 +1743,7 @@ fn buildResponsesEnvelope(
     esc_model: []const u8,
     status_str: []const u8,
     output_json: []const u8,
-    input_tokens: u32,
-    output_tokens: u32,
-    cached_input_tokens: u32,
-    reasoning_output_tokens: u32,
+    usage: ?ResponsesUsage,
     should_store: bool,
     prev_id: ?[]const u8,
     incomplete: bool,
@@ -1761,6 +1765,9 @@ fn buildResponsesEnvelope(
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
     var num_buf: [32]u8 = undefined;
+    // The timings block keeps its shape on the skeleton; only a measured usage block has counts to report.
+    const input_tokens = if (usage) |u| u.input_tokens else 0;
+    const cached_input_tokens = if (usage) |u| u.cached_input_tokens else 0;
 
     try buf.append(allocator, '{');
     try buf.appendSlice(allocator, "\"id\":");
@@ -1845,17 +1852,21 @@ fn buildResponsesEnvelope(
     try buf.appendSlice(allocator, ",\"reasoning\":");
     try buf.appendSlice(allocator, echo.reasoning_json);
 
-    try buf.appendSlice(allocator, ",\"usage\":{\"input_tokens\":");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{input_tokens}));
-    try buf.appendSlice(allocator, ",\"output_tokens\":");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{output_tokens}));
-    try buf.appendSlice(allocator, ",\"total_tokens\":");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{input_tokens + output_tokens}));
-    try buf.appendSlice(allocator, ",\"input_tokens_details\":{\"cached_tokens\":");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{cached_input_tokens}));
-    try buf.appendSlice(allocator, "},\"output_tokens_details\":{\"reasoning_tokens\":");
-    try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{reasoning_output_tokens}));
-    try buf.appendSlice(allocator, "}}");
+    if (usage) |u| {
+        try buf.appendSlice(allocator, ",\"usage\":{\"input_tokens\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{u.input_tokens}));
+        try buf.appendSlice(allocator, ",\"output_tokens\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{u.output_tokens}));
+        try buf.appendSlice(allocator, ",\"total_tokens\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{u.input_tokens + u.output_tokens}));
+        try buf.appendSlice(allocator, ",\"input_tokens_details\":{\"cached_tokens\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{u.cached_input_tokens}));
+        try buf.appendSlice(allocator, "},\"output_tokens_details\":{\"reasoning_tokens\":");
+        try buf.appendSlice(allocator, try std.fmt.bufPrint(&num_buf, "{d}", .{u.reasoning_output_tokens}));
+        try buf.appendSlice(allocator, "}}");
+    } else {
+        try buf.appendSlice(allocator, ",\"usage\":null");
+    }
 
     if (echo.max_output_tokens) |n| {
         try buf.appendSlice(allocator, ",\"max_output_tokens\":");
@@ -2708,7 +2719,7 @@ test "a Responses envelope names the call a reply declined, ahead of a thought's
         .{ .details = reply_mod.thought_continued, .declined = named, .want = "tool_call_cut" },
     };
     for (cases) |c| {
-        const envelope = try buildResponsesEnvelope(testing.io, a, "\"resp_1\"", "\"m\"", "completed", "[]", 1, 1, 0, 0, false, null, false, true, c.details, c.declined, .{}, 0, 0, 0, 0);
+        const envelope = try buildResponsesEnvelope(testing.io, a, "\"resp_1\"", "\"m\"", "completed", "[]", .{ .input_tokens = 1, .output_tokens = 1, .cached_input_tokens = 0, .reasoning_output_tokens = 0 }, false, null, false, true, c.details, c.declined, .{}, 0, 0, 0, 0);
         defer a.free(envelope);
         errdefer std.debug.print("envelope: {s}\n", .{envelope});
         const parsed = try std.json.parseFromSlice(std.json.Value, a, envelope, .{});

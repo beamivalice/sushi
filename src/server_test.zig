@@ -3609,3 +3609,41 @@ test "server: request fields: a model of the wrong type is refused by name on ev
         }
     }.run);
 }
+
+test "server: a Responses stream's usage is null until measured, then the terminal event carries the real counts" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            try send(fd, "POST", "/v1/responses", "{\"model\":\"tiny\",\"max_output_tokens\":4,\"temperature\":0,\"stream\":true,\"input\":\"hi\"}");
+            const all = try readUntil(fd, null);
+            defer gpa.free(all);
+            const events = try sseEvents(all);
+            defer gpa.free(events);
+            var skeletons: usize = 0;
+            var terminal_input: ?i64 = null;
+            for (events) |e| {
+                if (e.data.len == 0 or e.data[0] != '{') continue;
+                var p = std.json.parseFromSlice(std.json.Value, gpa, e.data, .{}) catch continue;
+                defer p.deinit();
+                const root = p.value.object;
+                const ty = (root.get("type") orelse continue).string;
+                const envelope = (root.get("response") orelse continue).object;
+                const usage = envelope.get("usage") orelse return error.UsageKeyAbsent;
+                if (std.mem.eql(u8, ty, "response.created") or std.mem.eql(u8, ty, "response.in_progress")) {
+                    skeletons += 1;
+                    if (usage != .null) {
+                        std.debug.print("{s} claims usage: {s}\n", .{ ty, e.data[0..@min(e.data.len, 300)] });
+                        return error.UsageBeforeMeasured;
+                    }
+                } else if (std.mem.eql(u8, ty, "response.completed") or std.mem.eql(u8, ty, "response.incomplete")) {
+                    if (usage != .object) return error.TerminalUsageMissing;
+                    const n = (usage.object.get("input_tokens") orelse return error.NoInputTokens).integer;
+                    if (n > 0) terminal_input = n;
+                }
+            }
+            if (skeletons != 2) return error.NotBothSkeletonEvents;
+            if ((terminal_input orelse return error.NoTerminalUsage) <= 0) return error.ZeroTerminalUsage;
+        }
+    }.run);
+}

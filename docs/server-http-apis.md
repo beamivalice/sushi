@@ -191,7 +191,9 @@ answers while the weights load:
   markup (`ContentStream.finish`). The format corpus pins it for any token split. A spent reasoning budget WITHHOLDS the rest of the thought; a thought cut to a token budget after the fact ends on a whole character (`reasoningWithinBudget` drops the half a token cut); a tool-call reply, streamed or not,
   carries the pre-markup text (`visibleToolPreamble`; Responses lists it as a message item ahead of its `function_call`s,
   and stores it, so an input replay and a `previous_response_id` chain render the same prompt); a Responses stream's
-  `usage` and `timings` come from `StreamingTokenStream.result`, the one place a stream's stats become a result; a non-stream disconnect reports `client_disconnect`, never
+  `usage` and `timings` come from `StreamingTokenStream.result`, the one place a stream's stats become a result; its
+  `response.created` and `response.in_progress` say `"usage":null` (not measured yet), and only the terminal event writes
+  the counts; a non-stream disconnect reports `client_disconnect`, never
   `length`, and is noticed after every decoded token as well as during prefill, so a client's timed-out retry never
   leaves a ghost decoding to `max_tokens`; a request integer outside the range its field takes is a 400, never narrowed
   (`generationFieldFault`).
