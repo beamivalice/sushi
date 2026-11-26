@@ -55,6 +55,8 @@ a Qwen request commits the cache its admitted width reserves, not the default ch
 a Qwen request's growth commit covers the cache it reserves at the width the post-eviction re-ask runs it at
 a declared wired limit is the ceiling a request is admitted under on MiMo and GLM too, streamed or resident, and on an arch the engine does not serve
 a freed MiMo slot returns its KV to the OS, not to MLX's pool
+a given --prefill-chunk-max is the widest width a request may run, not a pin (MiMo)
+a given min above the model's default max raises the width the forward runs, past MiMo's qk-192 default cap
 a qwen4_exp config refusal keeps its own name in the 503 text
 a resident MiMo batches decode in groups of the FP8 GEMV's row-identical width; a streamed one stays serial
 a second GLM admission leaves free the cache growth the first was admitted to allocate
@@ -76,6 +78,8 @@ chat: Qwen's late-system edit reaches only a Qwen-typed config, never another ar
 chat: the embedded V4.1 template renders through the template engine byte-exact with DeepSeek's encoder
 chat: the shared Qwen test config places a late system turn as a Qwen load does
 chat: tool results a client sends out of call order render byte-exact with DeepSeek's encoder once the messages are ordered
+convert cli: --capture is refused on a source whose writer does not read it, and a calibration text where only Qwen builds one
+convert cli: a flag only the generic driver reads is refused on the Hy4-Flash and DeepSeek-V4.1 writers
 cooler contract: DeepSeek requests decoding together keep their stores whole and say their solo tokens
 cooler contract: Qwen grouped MTP ticks after a DeepSeek request ends run under no cap the DeepSeek model left, and all serve
 cooler contract: Qwen grouped MTP ticks that grow their caches after a DeepSeek request add nothing to the DeepSeek model's cap
@@ -260,6 +264,7 @@ the GDN state checkpoint bills four bytes per element at f32 and two at bf16; GL
 the GPU expert pick matches the host on a sigmoid router's log-sigmoid logits, MiMo's E and K
 the concurrency verdict: a resident GLM and qwen4 batch, an exclusive model queues, another MoE interleaves
 the exact load bill admits a MiMo load the flat 7 GiB headroom refused
+the largest-image reserve covers the rows the runtime bills of any image Hy4 and DeepSeek admit
 the load-time bill drops the MTP head when Qwen's default round is DFlash2
 thinking policy CLI: MiMo takes every thinking level as on, Qwen and GLM only their own words
 thinking policy HTTP: Qwen and GLM re-route the missing graded words, MiMo folds to on
