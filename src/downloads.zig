@@ -11,6 +11,7 @@ const cli = @import("cli.zig");
 const dp = @import("download_progress.zig");
 const pack_update = @import("pack_update.zig");
 const pack_state = @import("pack_state.zig");
+const hf_pull = @import("hf_pull.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_settings = @import("model_settings.zig");
 const status = @import("status.zig");
@@ -127,7 +128,7 @@ fn unlock() void {
 
 // ── The catalog ─────────────────────────────────────────────────────────
 
-const Entry = struct { repo: []const u8, size: ?u64, update: ?pack_update.Available = null };
+const Entry = struct { repo: []const u8, size: ?u64, files: []hf_pull.RepoFile = &.{}, update: ?pack_update.Available = null };
 
 const CatalogState = enum { loading, ready, offline };
 
@@ -153,11 +154,14 @@ fn buildCatalog(arena: Allocator, io: std.Io, rs: []const []const u8, updates: b
     var entries = std.ArrayList(Entry).empty;
     var offline = false;
     for (repos.items, 0..) |repo, i| {
-        const outcome: cli.FetchOutcome = if (offline) .offline else cli.fetchRepoSize(arena, io, repo);
+        const outcome: cli.ListingOutcome = if (offline) .offline else cli.fetchRepoListing(arena, io, repo);
         if (i == 0 and outcome == .offline and listed == null) offline = true;
         var e: Entry = .{ .repo = repo, .size = null };
         switch (outcome) {
-            .size => |s| e.size = s,
+            .listed => |l| {
+                e.size = l.size;
+                e.files = l.files;
+            },
             .not_found => continue,
             .offline => {},
         }
@@ -291,6 +295,12 @@ fn dirBytesIn(io: std.Io, dir: std.Io.Dir, depth: u8) u64 {
         else => {},
     };
     return total;
+}
+
+/// What a start still has to fetch for a pack of `size` in `dest`: the listed bytes less the files the folder
+/// already holds at their size (links followed), the rule the pull's own check applies to its listing.
+fn precheckNeed(io: std.Io, dest: []const u8, size: u64, files: []const hf_pull.RepoFile) u64 {
+    return size -| hf_pull.bytesPresent(io, dest, files);
 }
 
 /// The id of the model in memory served from `folder`, or null. Caller holds the registry's mutex. An unloading model
@@ -722,12 +732,16 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
     if (!dp.validRepo(cli.HF_ORG, asked))
         return http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Not a Sushi pack: downloads come from the Hugging Face org beamster only", 400);
     var size: ?u64 = null;
+    var listing: []hf_pull.RepoFile = &.{};
     const repo = blk: {
         lock();
         defer unlock();
         const r = catalogRepoLocked(asked) orelse break :blk null;
         for (cat_entries) |e| if (std.mem.eql(u8, e.repo, r)) {
             size = e.size;
+            // The catalog's arena goes with its next refresh: the pre-check reads its own copy.
+            listing = try arena.dupe(hf_pull.RepoFile, e.files);
+            for (listing) |*f| f.path = try arena.dupe(u8, f.path);
         };
         break :blk try arena.dupe(u8, r);
     } orelse return http.sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Not a published Sushi pack; Check again refreshes the list", 404);
@@ -739,7 +753,7 @@ pub fn handleStart(allocator: Allocator, stream: *http_conn.Conn, body: []const 
     const dest = installed orelse try ownFolder(arena, root, repo);
     var warning: ?[]const u8 = null;
     if (installed == null) if (size) |s| if (disk_placement.volumeSpaceNear(dest)) |v| {
-        const need = s -| (dirBytes(stream.io, dest) orelse 0);
+        const need = precheckNeed(stream.io, dest, s, listing);
         switch (dp.spaceVerdict(need, v.free, v.total)) {
             .short => {
                 const msg = try std.fmt.allocPrint(arena, "{s} needs {d:.1} GiB; the destination has {d:.1} GiB free and keeps {d:.1} GiB in reserve", .{ repo, gib(need), gib(v.free), gib(dp.reserve(v.total)) });
@@ -868,6 +882,28 @@ test "downloads: progress follows the pull's events, and a stop is answered at t
     try testing.expectEqual(@as(u64, 6), job.progress.fetched);
     job.cancel.store(true, .monotonic);
     try testing.expect(!onEvent(job, .{ .child = 42 }));
+}
+
+test "downloads: a pack whose shards are links needs nothing, so the 507 pre-check must bill it as 0" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    // The shard lives on another drive and is linked in: the H3 mirror layout `cli.cmdList` names.
+    try tmp.dir.createDirPath(io, "elsewhere");
+    try tmp.dir.writeFile(io, .{ .sub_path = "elsewhere/model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "beamster/Pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Pack/config.json", .data = "{}" });
+    try tmp.dir.symLink(io, "../../elsewhere/model.safetensors", "beamster/Pack/model.safetensors", .{});
+    // A stopped or failed pull's marker: `installed` is null, so handleStart's space pre-check runs on this folder.
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Pack/" ++ pack_state.pull_marker, .data = "" });
+    const pack = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Pack", .{root});
+    defer testing.allocator.free(pack);
+    // The catalog's listing of the pack: the one shard the folder already holds, through its link.
+    const files = [_]hf_pull.RepoFile{.{ .path = @constCast("model.safetensors"), .size = 10 }};
+    // "one that needs nothing more writes nothing, so it passes however full the volume already is".
+    try testing.expectEqual(@as(u64, 0), precheckNeed(io, pack, 10, &files));
 }
 
 test "downloads: a pack that cannot fit is stopped once its listing is known, naming the space" {

@@ -728,9 +728,9 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   pull's `.pull-incomplete` marker, a sealed file since replaced, an unreadable record, weights still `.partial`) is a 409
   `pack_downloading` too, carrying the state's reason, which says to resume it on Downloads or `sushi pull` it. The boot asks
   the same gate: a `--model` folder it refuses ends the boot, non-zero, with the reason in the log, as a failed startup load does. Both checks run under the registry's mutex (`load_gate`), so
-  neither slips past the other. A new pack whose size, less what its folder holds, would leave less
-  than a twentieth of the volume (at least 4 GiB, the SSD cache's reserve) is a 507 `insufficient_storage`; under a
-  tenth free it carries a `warning`. The download checks again before it writes, against the listing: the listed bytes
+  neither slips past the other. A new pack whose listed bytes, less the files its folder already holds at their size
+  (links followed, `hf_pull.bytesPresent`), would leave less than a twentieth of the volume (at least 4 GiB, the SSD
+  cache's reserve) is a 507 `insufficient_storage`; under a tenth free it carries a `warning`. The download checks again before it writes, against the listing: the listed bytes
   less the files already at their size and the partials of the others (`hf_pull.bytesPresent`); one that needs nothing
   more writes nothing, so it passes however full the volume already is.
 - One download runs at a time on a thread `downloads.zig` owns (never the inference thread or a connection thread),

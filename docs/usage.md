@@ -86,7 +86,8 @@ its size, marks the pack `sushi list` recommends for this Mac's memory, says "Ne
 downloadable, after a confirm), and shows which are downloaded, partly downloaded or have an update. Download saves into
 the models folder shown on the Models tab (`--model-dir` when given, else `server.models_dir`, else `~/.sushi/models`) under
 `beamster/<repo>`, after checking the free space: a pack that would leave less than a twentieth of the disk (at least 4
-GiB) is refused, one that leaves under a tenth free warns. Update replaces a downloaded pack in its own folder, after
+GiB) is refused, one that leaves under a tenth free warns. That check bills the listed bytes less the files already in
+the folder, a linked shard at its target's size, so a pack whose shards are linked from another drive needs nothing. Update replaces a downloaded pack in its own folder, after
 you unload it. A running download shows a progress bar, the file in flight, speed and time left. Stop keeps what is
 downloaded: Resume continues from it, also after the server restarts. A finished pack appears in the Installed list at
 once (Open takes you there), ready to load. A small dot on the Models tab marks a pack (or an update) this browser has

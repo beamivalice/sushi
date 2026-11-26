@@ -954,6 +954,60 @@ pub fn fetchRepoSize(allocator: std.mem.Allocator, io: std.Io, repo: []const u8)
     return fetchSizeViaCurl(&env, repo);
 }
 
+/// One repo's document for the server's Downloads catalog: its size for the page and its files for the space
+/// pre-check, which bills the listed bytes a folder already holds instead of the folder's own bytes.
+pub const RepoListing = struct { size: u64, files: []hf_pull.RepoFile };
+
+pub const ListingOutcome = union(enum) { listed: RepoListing, not_found, offline };
+
+pub fn fetchRepoListing(allocator: std.mem.Allocator, io: std.Io, repo: []const u8) ListingOutcome {
+    var env = ListEnv{ .allocator = allocator, .io = io };
+    return fetchListingViaCurl(&env, repo);
+}
+
+fn fetchListingViaCurl(ctx: *anyopaque, repo: []const u8) ListingOutcome {
+    const env: *const ListEnv = @ptrCast(@alignCast(ctx));
+    const url = hf_pull.hfUrl(env.allocator, hf_pull.endpoint(), "/api/models/{s}?blobs=true", .{repo}) catch return .offline;
+    defer env.allocator.free(url);
+    const got = curlGet(env.allocator, env.io, url, true, stderr_reporter) catch return .offline;
+    defer env.allocator.free(got.body);
+    switch (statusKind(got.status)) {
+        .ok => {},
+        .not_found => return .not_found,
+        .failed => return .offline,
+    }
+    const files = parseRepoFiles(env.allocator, got.body) catch return .offline;
+    var size: u64 = 0;
+    for (files) |f| size +|= f.size;
+    return .{ .listed = .{ .size = size, .files = files } };
+}
+
+/// The files a Hugging Face model document lists (`/api/models/<repo>?blobs=true`, `siblings`) and their sizes,
+/// as the tree listing gives them to the pull.
+pub fn parseRepoFiles(allocator: std.mem.Allocator, json: []const u8) ![]hf_pull.RepoFile {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidModelInfo;
+    const siblings = parsed.value.object.get("siblings") orelse return error.InvalidModelInfo;
+    if (siblings != .array) return error.InvalidModelInfo;
+    var files: std.ArrayList(hf_pull.RepoFile) = .empty;
+    errdefer {
+        for (files.items) |f| allocator.free(f.path);
+        files.deinit(allocator);
+    }
+    for (siblings.array.items) |item| {
+        if (item != .object) continue;
+        const name = item.object.get("rfilename") orelse continue;
+        if (name != .string) continue;
+        const size = item.object.get("size") orelse continue;
+        if (size != .integer or size.integer <= 0) continue;
+        const path = try allocator.dupe(u8, name.string);
+        errdefer allocator.free(path);
+        try files.append(allocator, .{ .path = path, .size = @intCast(size.integer) });
+    }
+    return files.toOwnedSlice(allocator);
+}
+
 /// The org's public Sushi repos, or null when Hugging Face gave no usable answer.
 pub fn fetchOrgPacks(allocator: std.mem.Allocator, io: std.Io) ?[][]u8 {
     const url = hf_pull.hfUrl(allocator, hf_pull.endpoint(), "/api/models?author={s}&limit=500", .{HF_ORG}) catch return null;
@@ -2407,6 +2461,17 @@ test "list: a pack size is the sum of its Hugging Face blob sizes" {
     ));
     try testing.expectError(error.InvalidModelInfo, parseRepoSize(testing.allocator, "[]"));
     try testing.expectError(error.InvalidModelInfo, parseRepoSize(testing.allocator, "not json"));
+    // The same document's files, as the Downloads space pre-check bills them.
+    const files = try parseRepoFiles(testing.allocator,
+        \\{"siblings":[{"rfilename":"config.json","size":100},{"rfilename":"model.safetensors","size":500},{"rfilename":"x"}]}
+    );
+    defer hf_pull.freeRepoFiles(testing.allocator, files);
+    try testing.expectEqual(@as(usize, 2), files.len);
+    try testing.expectEqualStrings("config.json", files[0].path);
+    try testing.expectEqual(@as(u64, 100), files[0].size);
+    try testing.expectEqualStrings("model.safetensors", files[1].path);
+    try testing.expectEqual(@as(u64, 500), files[1].size);
+    try testing.expectError(error.InvalidModelInfo, parseRepoFiles(testing.allocator, "[]"));
 }
 
 test "cli: every short name is a published Sushi pack" {
