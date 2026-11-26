@@ -144,6 +144,59 @@ fn warmRuns(comptime C: type, dir: []const u8, chunk: u32) !u32 {
     return cooler_warm.runs_for_test - before;
 }
 
+test "cooler contract: a served warm this build ran whole is skipped by a later load of its shape, whatever loaded in between" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            mlx.engine.pipeline_registry.resetForTest();
+            // A at the default shape, B at a narrower chunk (another marker, the same manifest), A again.
+            const first = try warmRuns(C, dir, 0);
+            const between = try warmRuns(C, dir, 2048);
+            const again = try warmRuns(C, dir, 0);
+            errdefer std.debug.print("served warms that ran: first={d} between={d} again={d}\n", .{ first, between, again });
+            try testing.expectEqual(@as(u32, 1), first);
+            try testing.expectEqual(@as(u32, 1), between);
+            try testing.expectEqual(@as(u32, 0), again);
+        }
+    }.run);
+}
+
+test "cooler contract: a load that fails after its manifest settled leaves the next load a manifest it finds, trusts and writes" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            const cooler_warm = @import("cooler_warm.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            mlx.engine.pipeline_registry.resetForTest();
+            const first = try warmRuns(C, dir, 0);
+            // A narrower chunk is a warm this manifest never held, and a bill it exceeds fails the load in it.
+            cooler_warm.bill_for_test = 1 << 20;
+            try testing.expectError(error.WarmOverBill, warmRuns(C, dir, 2048));
+            cooler_warm.bill_for_test = null;
+            var msg: [512]u8 = undefined;
+            _ = mlx.takeError(&msg);
+            // The next load of A's shape finds the manifest and skips the warm, and its own write lands.
+            const again = try warmRuns(C, dir, 0);
+            errdefer std.debug.print("served warms that ran: first={d} again={d}\n", .{ first, again });
+            try testing.expectEqual(@as(u32, 1), first);
+            try testing.expectEqual(@as(u32, 0), again);
+            const key = shared.writtenKey() orelse return error.NoManifestWritten;
+            var found = try @import("pipeline_manifest.zig").lookup(testing.allocator, io, tmp.dir, key);
+            defer found.deinit();
+            try testing.expect(found == .same);
+        }
+    }.run);
+}
+
 /// Two DeepSeek packs whose scopes differ (the tile order does) and whose served warm has one shape.
 fn twoPacks() ?struct { a: []const u8, b: []const u8 } {
     const a = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return null);
@@ -200,6 +253,20 @@ test "cooler contract: a served-warm marker one pack's manifest holds is not tak
     try testing.expectEqual(@as(u32, 1), a_first);
     try testing.expectEqual(@as(u32, 0), a_again);
     try testing.expectEqual(@as(u32, 1), b_default);
+}
+
+test "cooler contract: a pack's served warm is skipped by its next load in the process, whatever pack of another scope loaded in between" {
+    const C = @import("dsv41/arch.zig").cooler_contract;
+    var two: TwoPacks = undefined;
+    try two.begin();
+    defer two.end();
+    const a_first = try warmRuns(C, two.packs.a, 0);
+    const b_between = try warmRuns(C, two.packs.b, 0);
+    const a_again = try warmRuns(C, two.packs.a, 0);
+    errdefer std.debug.print("served warms that ran: a_first={d} b_between={d} a_again={d}\n", .{ a_first, b_between, a_again });
+    try testing.expectEqual(@as(u32, 1), a_first);
+    try testing.expectEqual(@as(u32, 1), b_between);
+    try testing.expectEqual(@as(u32, 0), a_again);
 }
 
 test "cooler contract: a served-warm marker one pack's warm recorded is not written into another pack's manifest" {

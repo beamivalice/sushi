@@ -710,7 +710,9 @@ rebuilds one.
   `--mtp-min-depth`, `--mtp-max-depth`; keyed only for a load with a drafter, so a load with none, Hy4-Flash until DFly2, takes
   its marker under any of them), its bill and the pool settings; a load of another key warms in full. A marker is
   one manifest's: each settle (trusted or not, even when its workers did not start) replaces the markers the process
-  holds with that manifest's own, and a manifest is written with its load's markers only. Two packs of one scope share
+  holds with that manifest's own, and a manifest is written with its load's markers only. A same-key manifest keeps every
+  marker it held, so a warm of another key, or a load that failed, never costs a later load of the first its skip (pinned
+  by `cooler contract: a served warm this build ran whole`). Two packs of one scope share
   their manifest's marker; the skipped warm's measure (`WarmOverBill`) and its kernels are the scope's.
 - **Key.** `scope` (16 hex) is, for DeepSeek, the pack (its config.json, its index, the name and size of each shard: not
   their bytes) and what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order,
