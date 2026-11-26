@@ -178,10 +178,20 @@ test "cooler contract: a load that fails after its manifest settled leaves the n
             defer shared.forget();
             mlx.engine.pipeline_registry.resetForTest();
             const first = try warmRuns(C, dir, 0);
-            // A narrower chunk is a warm this manifest never held, and a bill it exceeds fails the load in it.
-            cooler_warm.bill_for_test = 1 << 20;
-            try testing.expectError(error.WarmOverBill, warmRuns(C, dir, 2048));
-            cooler_warm.bill_for_test = null;
+            // A warm that asks the pool nothing (a static bill's requests run in its arena) has no bill to exceed: no
+            // load of it fails here, and the other fixtures hold the contract.
+            if ((cooler_warm.longest_for_test orelse return error.TestNoWarmReading).asked == 0) return;
+            // Another checkpoint stride is a warm this manifest never held on every arch (a static bill fixes its own
+            // chunk), and a bill it exceeds fails the load in it.
+            {
+                const state = @import("server_state.zig");
+                const stride_was = state.ssm_checkpoint_stride;
+                defer state.ssm_checkpoint_stride = stride_was;
+                state.ssm_checkpoint_stride = stride_was + 1;
+                cooler_warm.bill_for_test = 0;
+                defer cooler_warm.bill_for_test = null;
+                try testing.expectError(error.WarmOverBill, warmRuns(C, dir, 2048));
+            }
             var msg: [512]u8 = undefined;
             _ = mlx.takeError(&msg);
             // The next load of A's shape finds the manifest and skips the warm, and its own write lands.
