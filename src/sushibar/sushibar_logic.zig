@@ -72,18 +72,18 @@ pub const Row = struct { request_id: u64, generated: u64 };
 /// all, those the prefix cache restored, those read so far (the restored included) and the ms spent reading.
 pub const Prefill = struct { total: u64 = 0, cache: u64 = 0, processed: u64 = 0, time_ms: u64 = 0 };
 
-/// What the menu bar shows of a prompt read: the fraction read, and the seconds left once a chunk has given the rate.
-pub const Read = struct { fraction: f32, seconds_left: ?u32 };
+/// What the menu bar shows of a prompt read: the share of its work measured, `(processed - cache) / (total - cache)`,
+/// as a fraction for the fish and as a whole percent (floored) for the readout. A prompt wholly restored is 100.
+pub const Read = struct { fraction: f32, percent: u8 };
 
 pub fn readOf(p: Prefill) Read {
-    const done = @min(p.processed, p.total);
-    const fraction: f32 = if (p.total == 0) 0 else @floatCast(@as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(p.total)));
-    if (p.processed <= p.cache or p.time_ms == 0) return .{ .fraction = fraction, .seconds_left = null };
-    const per_ms = @as(f64, @floatFromInt(p.processed - p.cache)) / @as(f64, @floatFromInt(p.time_ms));
-    const left_ms = @as(f64, @floatFromInt(p.total - done)) / per_ms;
-    const left_s = @ceil(left_ms / 1000.0);
-    const most: f64 = @floatFromInt(std.math.maxInt(u32));
-    return .{ .fraction = fraction, .seconds_left = if (left_s >= most) std.math.maxInt(u32) else @intFromFloat(left_s) };
+    const work = p.total -| p.cache;
+    if (work == 0) return if (p.total == 0) .{ .fraction = 0, .percent = 0 } else .{ .fraction = 1, .percent = 100 };
+    const done = @min(p.processed, p.total) -| p.cache;
+    return .{
+        .fraction = @floatCast(@as(f64, @floatFromInt(done)) / @as(f64, @floatFromInt(work))),
+        .percent = @intCast(@as(u128, done) * 100 / work),
+    };
 }
 
 /// A row's `prefill` object, read field by field: a read only where each number is whole and not negative (a
@@ -121,9 +121,6 @@ pub const Sample = struct {
     prefilling: bool = false,
     /// The prompt read with the most tokens left, where the server reports reads.
     read: ?Read = null,
-    /// That read's own numbers and request, which the tracker carries forward between the server's reports.
-    prefill: ?Prefill = null,
-    prefill_id: u64 = 0,
     /// The newest finished request that generated tokens: `generated_tokens / decode_seconds`.
     finished_tps: ?f64 = null,
     /// The newest finished request's prompt speed: `prompt_tokens / prefill_seconds` (`prompt_tokens` excludes the restored).
@@ -178,7 +175,6 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
     };
     var rows: std.ArrayList(Row) = .empty;
     var longest: ?Prefill = null;
-    var longest_id: u64 = 0;
     for (wire.sessions) |s| {
         if (std.mem.eql(u8, s.phase, "decode")) try rows.append(arena, .{ .request_id = s.request_id, .generated = s.generated_tokens });
         if (!std.mem.eql(u8, s.phase, "prefill")) continue;
@@ -187,13 +183,10 @@ pub fn parseMetrics(arena: std.mem.Allocator, body: []const u8) !Sample {
         if (p.total == 0) continue;
         if (longest == null or showsBefore(p, longest.?)) {
             longest = p;
-            longest_id = s.request_id;
         }
     }
     if (longest) |p| {
         out.read = readOf(p);
-        out.prefill = p;
-        out.prefill_id = longest_id;
     }
     out.decoding = rows.items;
     var newest_speed_ms: i64 = std.math.minInt(i64);
@@ -287,11 +280,6 @@ pub const Tracker = struct {
     live: ?f64 = null,
     last: ?f64 = null,
     last_prefill: ?f64 = null,
-    /// The shown read's last report from the server, when it came and how far the report before it moved.
-    anchor: ?Anchor = null,
-
-    pub const Anchor = struct { id: u64, p: Prefill, at_ms: i64, step: u64 };
-
     /// `now_ms` is read before the request went out, so the next `since` cannot skip a request.
     pub fn observe(self: *Tracker, now_ms: i64, sample: Sample) void {
         const prev_live = self.live;
@@ -299,7 +287,6 @@ pub const Tracker = struct {
         self.decoding = sample.decoding.len > 0;
         self.prefilling = sample.prefilling;
         self.read = sample.read;
-        self.anchor = if (sample.prefill) |p| reanchor(self.anchor, sample.prefill_id, p, now_ms) else null;
         if (sample.link == .up) {
             self.since_ms = @max(sample.newest_finished_ms, now_ms);
             if (sample.finished_tps) |t| self.last = t;
@@ -326,41 +313,18 @@ pub const Tracker = struct {
         self.prev_ms = now_ms;
     }
 
-    /// The view at `now_ms`: the shown read carried forward from its last report (`carried`).
-    pub fn view(self: *const Tracker, link: Link, now_ms: i64) View {
+    /// The view: the shown read is the last report's, never moved on between reports.
+    pub fn view(self: *const Tracker, link: Link) View {
         return .{
             .link = link,
             .decoding = self.decoding,
             .prefilling = self.prefilling,
-            .read = if (self.anchor) |a| readOf(carried(a, now_ms)) else self.read,
+            .read = self.read,
             .live = self.live,
             .last = self.last,
         };
     }
 };
-
-/// A new report moves the anchor, and the tokens it moved are the next step's size; the same numbers again keep it.
-fn reanchor(old: ?Tracker.Anchor, id: u64, p: Prefill, now_ms: i64) Tracker.Anchor {
-    if (old) |a| if (a.id == id) {
-        if (a.p.processed == p.processed and a.p.time_ms == p.time_ms) return a;
-        return .{ .id = id, .p = p, .at_ms = now_ms, .step = p.processed -| a.p.processed };
-    };
-    return .{ .id = id, .p = p, .at_ms = now_ms, .step = p.processed -| p.cache };
-}
-
-/// A read between the server's reports, which land once a chunk: its last report moved on at the report's own rate
-/// for the time since, never past where the next report can land (one step on) or the prompt's end.
-pub fn carried(a: Tracker.Anchor, now_ms: i64) Prefill {
-    var p = a.p;
-    if (p.time_ms == 0 or p.processed <= p.cache or a.step == 0 or now_ms <= a.at_ms) return p;
-    const since: u64 = @intCast(now_ms - a.at_ms);
-    const rate = @as(f64, @floatFromInt(p.processed - p.cache)) / @as(f64, @floatFromInt(p.time_ms));
-    const gained: u64 = @intFromFloat(@min(@floor(rate * @as(f64, @floatFromInt(since))), 0x1p63));
-    const cap = @min(p.total, p.processed +| a.step);
-    p.processed = @max(p.processed, @min(p.processed +| gained, cap));
-    p.time_ms +|= since;
-    return p;
-}
 
 fn speedText(buf: []u8, tps: f64) []const u8 {
     // Decided after rounding to one decimal, so 99.96 reads 100 and not 100.0.
@@ -370,31 +334,24 @@ fn speedText(buf: []u8, tps: f64) []const u8 {
         std.fmt.bufPrint(buf, "{d:.1}", .{tps})) catch "?";
 }
 
-/// The menu bar's stacked readout beside the icon: `READ` over a prompt read's time left (an ellipsis until a chunk
-/// gives the rate, or under 2 s), else `TOK/S` over the live speed; each line at most
+/// The menu bar's stacked readout beside the icon: `READ` over a prompt read's percentage (an ellipsis until the
+/// first report), else `TOK/S` over the live speed; each line at most
 /// `readout_max` characters. Otherwise the icon stands alone.
 pub const Readout = struct { caption: []const u8, value: []const u8 };
 pub const readout_max = 6;
 /// No readout: the icon alone.
 pub const readout_none: Readout = .{ .caption = "", .value = "" };
-/// READ's value while the time left is not known.
+/// READ's value until the server has reported the read.
 pub const readout_pending = "\u{2026}";
 
 pub fn readout(buf: *[2 * readout_max + 8]u8, v: View) Readout {
     if (v.link != .up) return readout_none;
     if (v.read != null or v.prefilling) {
-        const left = if (v.read) |r| r.seconds_left orelse 0 else 0;
-        return .{ .caption = "READ", .value = if (left >= 2) secondsText(buf, left) catch readout_pending else readout_pending };
+        const r = v.read orelse return .{ .caption = "READ", .value = readout_pending };
+        return .{ .caption = "READ", .value = std.fmt.bufPrint(buf, "{d}%", .{r.percent}) catch readout_pending };
     }
     if (v.decoding) if (v.live) |t| return .{ .caption = "TOK/S", .value = speedText(buf, t) };
     return readout_none;
-}
-
-/// Seconds left as the readout shows them: `45s`, `4:59` from a minute, `>1h` from an hour.
-fn secondsText(buf: []u8, s: u32) std.fmt.BufPrintError![]const u8 {
-    if (s >= 3600) return std.fmt.bufPrint(buf, ">1h", .{});
-    if (s >= 60) return std.fmt.bufPrint(buf, "{d}:{d:0>2}", .{ s / 60, s % 60 });
-    return std.fmt.bufPrint(buf, "{d}s", .{s});
 }
 
 /// The menu bar icon: the outline template while no server answers; once one does, the colour box with its slot lit
@@ -1844,6 +1801,9 @@ test "ports: the saved file round-trips the watched port and the added ones, and
         try std.testing.expect(r.port == null and r.ports.n == 0);
     }
     try std.testing.expectEqual(@as(?u16, 5), parseSaved("{\"other\":1,\"port\":5}").port);
+    // A file from when seconds could be turned off reads as any other, and none writes the key.
+    try std.testing.expectEqual(@as(?u16, 5), parseSaved("{\"port\":5,\"ports\":[],\"seconds\":false}").port);
+    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 5, &.{}, "", false), "seconds") == null);
 }
 
 test "last model: the saved file keeps the model the watched server had loaded, escaped, and old files have none" {
@@ -3115,7 +3075,7 @@ test "log scroll: following resumes only at the bottom" {
 test "readout: an idle server shows the icon alone, the card keeps the last speed" {
     var t: Tracker = .{};
     t.observe(1_000, .{ .link = .up, .finished_tps = 42 });
-    const idle = t.view(.up, 1_000);
+    const idle = t.view(.up);
     try expectReadout("", "", idle);
     try std.testing.expect(idle.last.? == 42);
 }
@@ -3371,24 +3331,25 @@ test "the loading icon: its first frame is the static icon, the orange sweeps to
     try std.testing.expect(lit > 0 and lit < loading_frames);
 }
 
-test "reading: a prompt's read is its own numbers, the fraction read and the seconds left once a chunk gives the rate" {
-    // 64,530 tokens, none restored, 39,412 read in 20 s: 1,970.6 tok/s, 12.7 s left, shown as 13.
-    const r = readOf(.{ .total = 64530, .cache = 0, .processed = 39412, .time_ms = 20000 });
-    try std.testing.expectApproxEqAbs(@as(f32, 39412.0 / 64530.0), r.fraction, 1e-6);
-    try std.testing.expectEqual(@as(?u32, 13), r.seconds_left);
-    // A restored prefix starts the fill part-way and is not counted in the rate.
-    const hit = readOf(.{ .total = 64000, .cache = 40000, .processed = 48000, .time_ms = 4000 });
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), hit.fraction, 1e-6);
-    try std.testing.expectEqual(@as(?u32, 8), hit.seconds_left);
-    // Before the first chunk there is no rate: no seconds, never a guess.
-    try std.testing.expectEqual(@as(?u32, null), readOf(.{ .total = 64000, .cache = 40000, .processed = 40000, .time_ms = 0 }).seconds_left);
-    try std.testing.expectEqual(@as(?u32, null), readOf(.{ .total = 9000, .cache = 0, .processed = 0, .time_ms = 0 }).seconds_left);
-    try std.testing.expectEqual(@as(?u32, null), readOf(.{ .total = 9000, .cache = 0, .processed = 4096, .time_ms = 0 }).seconds_left);
-    // Read to the end: full, nothing left. A count past the total never fills past it.
-    try std.testing.expectEqual(@as(f32, 1), readOf(.{ .total = 100, .cache = 0, .processed = 100, .time_ms = 50 }).fraction);
-    try std.testing.expectEqual(@as(?u32, 0), readOf(.{ .total = 100, .cache = 0, .processed = 100, .time_ms = 50 }).seconds_left);
+test "reading: a prompt's read is the share of its work measured, the restored prefix not counted" {
+    // 10,000 tokens, 6,000 restored, 8,000 read: half of the 4,000 to do.
+    const r = readOf(.{ .total = 10000, .cache = 6000, .processed = 8000, .time_ms = 4000 });
+    try std.testing.expectEqual(@as(u8, 50), r.percent);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), r.fraction, 1e-6);
+    try std.testing.expectEqual(@as(u8, 99), readOf(.{ .total = 100000, .cache = 0, .processed = 99600, .time_ms = 9 }).percent);
+    try std.testing.expectEqual(@as(u8, 29), readOf(.{ .total = 100, .cache = 0, .processed = 29, .time_ms = 9 }).percent);
+    // A first report with nothing forwarded, a restored-only prefix, no time yet: nothing read.
+    try std.testing.expectEqual(@as(u8, 0), readOf(.{ .total = 9000, .cache = 0, .processed = 0, .time_ms = 0 }).percent);
+    try std.testing.expectEqual(@as(u8, 0), readOf(.{ .total = 64000, .cache = 40000, .processed = 40000, .time_ms = 0 }).percent);
+    // Read to the end is 100; a count past the total never passes it; a count below the cache is nothing.
+    try std.testing.expectEqual(@as(u8, 100), readOf(.{ .total = 100, .cache = 0, .processed = 100, .time_ms = 50 }).percent);
+    try std.testing.expectEqual(@as(u8, 100), readOf(.{ .total = 100, .cache = 0, .processed = 140, .time_ms = 50 }).percent);
     try std.testing.expectEqual(@as(f32, 1), readOf(.{ .total = 100, .cache = 0, .processed = 140, .time_ms = 50 }).fraction);
-    try std.testing.expectEqual(@as(f32, 0), readOf(.{ .total = 0, .cache = 0, .processed = 0, .time_ms = 0 }).fraction);
+    try std.testing.expectEqual(@as(u8, 0), readOf(.{ .total = 100, .cache = 60, .processed = 10, .time_ms = 50 }).percent);
+    // A prompt wholly restored reads 100.
+    try std.testing.expectEqual(@as(u8, 100), readOf(.{ .total = 500, .cache = 500, .processed = 500, .time_ms = 0 }).percent);
+    // No arithmetic wraps at the largest counts.
+    try std.testing.expectEqual(@as(u8, 50), readOf(.{ .total = std.math.maxInt(u64), .cache = 0, .processed = 1 << 63, .time_ms = 1 }).percent);
 }
 
 test "reading: of several prompts read at once one under way shows before a queued one, then the one with the most left; none without the server's numbers" {
@@ -3403,8 +3364,7 @@ test "reading: of several prompts read at once one under way shows before a queu
     ;
     const s = try parseMetrics(a, two);
     try std.testing.expect(s.prefilling);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), s.read.?.fraction, 1e-6);
-    try std.testing.expectEqual(@as(?u32, 36), s.read.?.seconds_left);
+    try std.testing.expectEqual(@as(u8, 10), s.read.?.percent);
     try std.testing.expectEqual(@as(usize, 1), s.decoding.len);
     const queued =
         \\{"gauges":{"requests_prefilling":2},"sessions":[
@@ -3412,7 +3372,7 @@ test "reading: of several prompts read at once one under way shows before a queu
         \\{"request_id":2,"phase":"prefill","generated_tokens":0,"prefill":{"total":10000,"cache":0,"processed":9000,"time_ms":4000}}]}
     ;
     const q = try parseMetrics(a, queued);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9), q.read.?.fraction, 1e-6);
+    try std.testing.expectEqual(@as(u8, 90), q.read.?.percent);
     // A server from before the numbers: prefilling, with no read to show.
     const old = try parseMetrics(a, "{\"gauges\":{\"requests_prefilling\":1},\"sessions\":[{\"request_id\":1,\"phase\":\"prefill\"}]}");
     try std.testing.expect(old.prefilling);
@@ -3422,19 +3382,33 @@ test "reading: of several prompts read at once one under way shows before a queu
     try std.testing.expectEqual(@as(?Read, null), dec.read);
 }
 
-test "readout: READ over a prompt read's seconds left, an ellipsis until they are known, before the speed of a reply beside it" {
-    const r: Read = .{ .fraction = 0.6, .seconds_left = 12 };
-    try expectReadout("READ", "12s", .{ .link = .up, .prefilling = true, .read = r });
-    try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null } });
+test "readout: READ over the measured percentage, an ellipsis until the first report, before the speed of a reply beside it" {
+    const at = struct {
+        fn f(percent: u8) View {
+            return .{ .link = .up, .prefilling = true, .read = .{ .fraction = @as(f32, @floatFromInt(percent)) / 100, .percent = percent } };
+        }
+    }.f;
+    try expectReadout("READ", "50%", at(50));
+    try expectReadout("READ", "99%", .{ .link = .up, .prefilling = true, .read = readOf(.{ .total = 1000, .cache = 0, .processed = 996, .time_ms = 1 }) });
+    try expectReadout("READ", "100%", at(100));
+    try expectReadout("READ", "0%", .{ .link = .up, .prefilling = true, .read = readOf(.{ .total = 9000, .cache = 0, .processed = 0, .time_ms = 0 }) });
     try expectReadout("READ", "\u{2026}", .{ .link = .up, .prefilling = true, .last = 9 });
     // A prompt read beside a reply that generates shows, as the filling fish does.
-    try expectReadout("READ", "12s", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = r });
-    try expectReadout("READ", "\u{2026}", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = .{ .fraction = 0.1, .seconds_left = null } });
+    try expectReadout("READ", "12%", .{ .link = .up, .decoding = true, .live = 42.66, .prefilling = true, .read = at(12).read });
+}
+
+test "readout: a read polled again with no new report shows the same percentage" {
+    var t: Tracker = .{};
+    t.observe(10_000, .{ .link = .up, .prefilling = true, .read = readOf(.{ .total = 16384, .cache = 0, .processed = 4096, .time_ms = 4000 }) });
+    try expectReadout("READ", "25%", t.view(.up));
+    try expectReadout("READ", "25%", t.view(.up));
+    t.observe(14_000, .{ .link = .up, .prefilling = true, .read = readOf(.{ .total = 16384, .cache = 0, .processed = 4096, .time_ms = 4000 }) });
+    try expectReadout("READ", "25%", t.view(.up));
 }
 
 test "readout: every caption and value fits its six characters" {
     var b: [2 * readout_max + 8]u8 = undefined;
-    const reads = [_]?Read{ null, .{ .fraction = 0.5, .seconds_left = 3599 }, .{ .fraction = 0, .seconds_left = null } };
+    const reads = [_]?Read{ null, .{ .fraction = 1, .percent = 100 }, .{ .fraction = 0, .percent = 0 } };
     for ([_]Link{ .offline, .unauthorized, .metrics_off, .silent, .up }) |link| for (reads) |rd| for ([_]?f64{ null, 9999.4, 0.04 }) |live| {
         const r = readout(&b, .{ .link = link, .decoding = live != null, .live = live, .prefilling = rd != null, .read = rd, .update_waiting = true });
         try std.testing.expect(try std.unicode.utf8CountCodepoints(r.caption) <= readout_max);
@@ -3462,31 +3436,6 @@ test "the reading icon: green fills the ready fish up to the step read, and each
         prev = at;
     }
     try std.testing.expectError(error.ReadingIconChanged, readingSvg(&buf, @embedFile("icon-loading.svg"), 3));
-}
-
-test "seconds left always show: a file from when they could be turned off reads as any other, and none writes the key" {
-    var b: [320]u8 = undefined;
-    try std.testing.expectEqual(@as(?u16, 5), parseSaved("{\"port\":5,\"ports\":[],\"seconds\":false}").port);
-    try std.testing.expect(std.mem.indexOf(u8, formatSaved(&b, 5, &.{}, "", false), "seconds") == null);
-    try expectReadout("READ", "12s", .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.6, .seconds_left = 12 } });
-}
-
-test "readout: seconds left read as seconds under a minute, minutes and seconds under an hour, past an hour as >1h, an ellipsis under 2 s" {
-    const at = struct {
-        fn f(s: ?u32) View {
-            return .{ .link = .up, .prefilling = true, .read = .{ .fraction = 0.5, .seconds_left = s } };
-        }
-    }.f;
-    try expectReadout("READ", "2s", at(2));
-    try expectReadout("READ", "59s", at(59));
-    try expectReadout("READ", "1:00", at(60));
-    try expectReadout("READ", "4:59", at(299));
-    try expectReadout("READ", "59:59", at(3599));
-    try expectReadout("READ", ">1h", at(3600));
-    try expectReadout("READ", ">1h", at(900_000));
-    try expectReadout("READ", "\u{2026}", at(1));
-    try expectReadout("READ", "\u{2026}", at(0));
-    try expectReadout("READ", "\u{2026}", at(null));
 }
 
 test "the generating icon: the ready sushi with its slot lit, then dim, at a steady beat" {
@@ -3526,55 +3475,11 @@ test "reading: a prefill object whose numbers are not whole and non-negative is 
     }
     // A fractional count of milliseconds is a count all the same.
     const frac = try parseMetrics(a, "{\"sessions\":[{\"request_id\":1,\"phase\":\"prefill\",\"prefill\":{\"total\":64530,\"cache\":0,\"processed\":39412,\"time_ms\":20000.5}}]}");
-    try std.testing.expectEqual(@as(?u32, 13), frac.read.?.seconds_left);
-}
-
-test "reading: a time left past any clock reads as the most a u32 holds, never a wrapped or undefined count" {
-    const far = readOf(.{ .total = 9_000_000_000_000_000, .cache = 0, .processed = 1, .time_ms = 1 });
-    try std.testing.expectEqual(@as(?u32, std.math.maxInt(u32)), far.seconds_left);
-    try expectReadout("READ", ">1h", .{ .link = .up, .prefilling = true, .read = far });
+    try std.testing.expectEqual(@as(u8, 61), frac.read.?.percent);
 }
 
 test "metrics: an answer the client cannot read is a server that answers with nothing shown, never one that is offline" {
     try std.testing.expectEqual(@as(?Read, null), unreadable(.up).read);
     try std.testing.expect(!unreadable(.up).prefilling);
     try std.testing.expectEqual(Link.up, unreadable(.up).link);
-}
-
-test "carried read: between reports a read moves on at its own rate, stops where the next report can land, and a new report re-anchors it" {
-    var t: Tracker = .{};
-    const at = struct {
-        fn sample(processed: u64, time_ms: u64) Sample {
-            return .{ .link = .up, .prefilling = true, .prefill = .{ .total = 16384, .cache = 0, .processed = processed, .time_ms = time_ms }, .prefill_id = 7 };
-        }
-    }.sample;
-    // First chunk: 4096 tokens in 4000 ms, so about a token a millisecond, and a step of 4096.
-    t.observe(10_000, at(4096, 4000));
-    try std.testing.expectEqual(@as(u64, 4096), carried(t.anchor.?, 10_000).processed);
-    try std.testing.expectEqual(@as(u64, 4096 + 1024), carried(t.anchor.?, 11_000).processed);
-    // Never past one step on, whatever the wait.
-    try std.testing.expectEqual(@as(u64, 8192), carried(t.anchor.?, 60_000).processed);
-    // The same report polled again keeps the anchor; the next one moves it and sizes the step.
-    t.observe(11_000, at(4096, 4000));
-    try std.testing.expectEqual(@as(i64, 10_000), t.anchor.?.at_ms);
-    t.observe(14_100, at(8192, 8000));
-    try std.testing.expectEqual(@as(i64, 14_100), t.anchor.?.at_ms);
-    try std.testing.expectEqual(@as(u64, 4096), t.anchor.?.step);
-    // The seconds left count down between reports.
-    const now = t.view(.up, 14_100).read.?.seconds_left.?;
-    const later = t.view(.up, 16_100).read.?.seconds_left.?;
-    try std.testing.expect(later < now);
-    // Another request starts its own anchor; no read drops it.
-    t.observe(15_000, .{ .link = .up, .prefilling = true, .prefill = .{ .total = 100, .cache = 0, .processed = 0, .time_ms = 0 }, .prefill_id = 8 });
-    try std.testing.expectEqual(@as(u64, 8), t.anchor.?.id);
-    try std.testing.expectEqual(@as(u64, 0), carried(t.anchor.?, 20_000).processed);
-    t.observe(16_000, .{ .link = .up });
-    try std.testing.expectEqual(@as(?Tracker.Anchor, null), t.anchor);
-}
-
-test "carried read: no rate, no move before the first chunk, and never past the prompt's end" {
-    const none: Tracker.Anchor = .{ .id = 1, .p = .{ .total = 1000, .cache = 200, .processed = 200, .time_ms = 0 }, .at_ms = 0, .step = 0 };
-    try std.testing.expectEqual(@as(u64, 200), carried(none, 5_000).processed);
-    const near: Tracker.Anchor = .{ .id = 1, .p = .{ .total = 1000, .cache = 0, .processed = 900, .time_ms = 900 }, .at_ms = 0, .step = 512 };
-    try std.testing.expectEqual(@as(u64, 1000), carried(near, 60_000).processed);
 }

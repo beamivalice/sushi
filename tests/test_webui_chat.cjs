@@ -743,7 +743,7 @@ test('after a click on Send the cursor is back in the prompt', async ({ browser 
   await context.close(); await stub.close();
 });
 
-test('a long prompt shows a filling bar and the seconds left until its text arrives', async ({ browser }) => {
+test('a long prompt shows a filling bar and its percentage and estimate until its text arrives', async ({ browser }) => {
   const progress = (res, p) => sse(res, { choices: [{ delta: { role: 'assistant', content: null } }], prompt_progress: p });
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -766,10 +766,12 @@ test('a long prompt shows a filling bar and the seconds left until its text arri
   assert.equal(await bar.isVisible(), true, 'the read is still going after 2 s');
   const seen = await page.evaluate(() => {
     const node = document.querySelector('.msg.assistant .read-progress');
-    return { fill: node.querySelector('.meter > span').style.width, left: node.textContent.trim(), bubble: document.querySelector('.msg.assistant').textContent };
+    return { fill: node.querySelector('.meter > span').style.width, now: node.querySelector('.meter').getAttribute('aria-valuenow'), left: node.textContent.trim(), bubble: document.querySelector('.msg.assistant').textContent };
   });
-  assert.ok(Math.abs(parseFloat(seen.fill) - 100 * 2000 / 12000) < 0.2, `the bar fills to what was read (${seen.fill})`);
-  assert.equal(seen.left, '≈ 12 s', `the seconds left (${seen.left})`);
+  // The fill glides on the carried read: from what was reported to one report's step (2,000 tokens) on, never past it.
+  assert.ok(parseFloat(seen.fill) >= 100 * 2000 / 12000 - 0.2 && parseFloat(seen.fill) <= 100 * 4000 / 12000 + 0.2, `the bar fills from what was read to one step on (${seen.fill})`);
+  assert.equal(seen.now, '16', 'the meter reads the reported percentage');
+  assert.match(seen.left, /^16% \(est\. \d+ s\)$/, `the reported percentage and an estimate (${seen.left})`);
   assert.doesNotMatch(seen.bubble, /Reading prompt|Generating/, 'the bubble carries no placeholder words');
   assert.equal(JSON.parse(stub.posts()[0].body).return_progress, true, 'the stream asks for progress');
   release();

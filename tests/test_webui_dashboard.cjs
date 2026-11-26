@@ -1127,22 +1127,23 @@ async function prefillRows(browser) {
         chip: cell.querySelector('.phase')?.textContent ?? '',
         fill: fill ? parseFloat(fill.style.width) : null,
         left: cell.querySelector('.pbar-left')?.textContent ?? '',
-        percent: /\d\s*%/.test(cell.textContent),
+        global: !!cell.querySelector('.d-left'),
       };
     }));
     const rows = await readRows();
     assert.deepEqual(rows.map((r) => r.chip), Array(5).fill('Reading prompt'), 'every row is reading');
-    // Seconds under a minute, minutes and seconds under an hour, past an hour as > 1 h, and no number once read.
-    assert.deepEqual(rows.map((r) => r.left), ['≈ 9 s', '≈ 4 s', '≈ 5:00', '> 1 h', ''], 'each row gives its own time left');
+    // The measured percentage of the work, then the estimate: seconds under a minute, minutes and seconds under an
+    // hour, past an hour as > 1 h, and none once read.
+    assert.deepEqual(rows.map((r) => r.left), ['25% (est. 9 s)', '33% (est. 4 s)', '3% (est. 5:00)', '0% (est. > 1 h)', '100%'], 'each row gives its own percentage and time left');
     assert.ok(Math.abs(rows[0].fill - 25) < 0.2, `the first bar fills to what it read (${rows[0].fill})`);
-    assert.ok(Math.abs(rows[1].fill - 50) < 0.2, `the second starts part-way full from its cache (${rows[1].fill})`);
-    assert.deepEqual(rows.map((r) => r.percent), Array(5).fill(false), 'a row with its own numbers shows no global percentage');
+    assert.ok(Math.abs(rows[1].fill - 100 / 3) < 0.2, `the second fills by its own work, not counting its cache (${rows[1].fill})`);
+    assert.deepEqual(rows.map((r) => r.global), Array(5).fill(false), 'a row with its own numbers shows no global percentage');
     // Polled again with the same report two seconds on, a bar moves on at its own rate (a token a ms for the first),
     // never past where the next report can land: one step (its 3,000 tokens read so far) further.
     await adv(page, 2000);
     const later = await readRows();
     assert.ok(Math.abs(later[0].fill - 41.7) < 0.2, `the first bar moved on two seconds at its rate (${later[0].fill})`);
-    assert.equal(later[0].left, '≈ 7 s', 'its time left counts down with it');
+    assert.equal(later[0].left, '25% (est. 7 s)', 'its estimate counts down with it, its percentage stays the report\'s');
     await adv(page, 60_000);
     const held = await readRows();
     assert.ok(Math.abs(held[0].fill - 50) < 0.2, `it stops one step on, where the next report lands (${held[0].fill})`);

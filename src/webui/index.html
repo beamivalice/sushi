@@ -3162,12 +3162,24 @@ function reanchorRead(old, p, now) {
   const step = old ? Math.max(0, p.processed - old.processed) : Math.max(0, p.processed - p.cache);
   return { ...p, at: now, step };
 }
-// Time left as sushibar's menu bar reads it: seconds under a minute, minutes and seconds under an hour, then > 1 h.
-function etaText(left) {
-  if (left == null) return "";
-  if (left >= 3600) return "> 1 h";
-  if (left >= 60) return `≈ ${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`;
-  return `≈ ${left} s`;
+// The share of a prompt read's work done, measured: the tokens forwarded since the restored prefix over the tokens to
+// forward, floored, 0..100 (a prompt wholly restored is 100); null for an empty prompt. Never extrapolated.
+function readPercent(total, cache, processed) {
+  if (!(total > 0)) return null;
+  const work = total - cache;
+  if (!(work > 0)) return 100;
+  const done = Math.min(Math.max(processed, cache), total) - cache;
+  return Math.min(100, Math.max(0, Math.floor(100 * done / work)));
+}
+// The read meter's text: the reported percentage, then the time left at the carried rate when one is known:
+// `4% (est. 26 s)`, `4% (est. 3:10)`, `4% (est. > 1 h)`, or just `4%`.
+function readMeterText(reported, carried) {
+  const pct = readPercent(reported.total, reported.cache, reported.processed);
+  if (pct == null) return "";
+  const left = readEta(carried.total, carried.cache, carried.processed, carried.time_ms);
+  if (left == null) return `${pct}%`;
+  const t = left >= 3600 ? "> 1 h" : left >= 60 ? `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}` : `${left} s`;
+  return `${pct}% (est. ${t})`;
 }
 function createStreamingView() {
   $("chatEmpty").hidden = true;
@@ -3212,7 +3224,7 @@ function createStreamingView() {
   state.schedule = () => {
     if (!state.raf) state.raf = requestAnimationFrame(flush);
   };
-  // The prompt read before the first token: a thin bar and the seconds left, shown only once the read has
+  // The prompt read before the first token: a thin bar and its percentage with the estimate, shown only once the read has
   // outlasted 2 s, so a short prompt never flashes one.
   state.promptProgress = (raw) => {
     if (state.text || state.reasoning) return;
@@ -3253,10 +3265,10 @@ function createStreamingView() {
       return;
     }
     const p = carriedRead(state.anchor, performance.now());
-    const pct = 100 * p.processed / p.total;
-    state.barFill.style.width = pct.toFixed(1) + "%";
-    state.barMeter.setAttribute("aria-valuenow", String(Math.round(pct)));
-    state.barEta.textContent = etaText(readEta(p.total, p.cache, p.processed, p.time_ms));
+    const work = p.total - p.cache;
+    state.barFill.style.width = (work > 0 ? 100 * (p.processed - p.cache) / work : 100).toFixed(1) + "%";
+    state.barMeter.setAttribute("aria-valuenow", String(readPercent(state.progress.total, state.progress.cache, state.progress.processed)));
+    state.barEta.textContent = readMeterText(state.progress, p);
   };
   state.finalize = () => {
     if (state.raf) cancelAnimationFrame(state.raf);
@@ -5728,8 +5740,8 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       const anchor = reanchorRead(readAnchors.get(id), reported, now);
       readAnchors.set(id, anchor);
       const c = carriedRead(anchor, now), cache = c.cache, read = c.processed;
-      const left = readEta(total, cache, read, c.time_ms);
-      return ` <span class="pbar" data-phase="progress" data-done="${read}" data-exp="${total}"><span class="pbar-track"><span class="pbar-fill" style="width:${(100 * read / total).toFixed(1)}%"></span></span>${left == null ? '' : `<span class="pbar-left">${etaText(left)}</span>`}</span>`;
+      const work = total - cache;
+      return ` <span class="pbar" data-phase="progress" data-done="${read}" data-exp="${total}"><span class="pbar-track"><span class="pbar-fill" style="width:${(work > 0 ? 100 * (read - cache) / work : 100).toFixed(1)}%"></span></span><span class="pbar-left">${readMeterText(reported, c)}</span></span>`;
     };
     const tb = $('sessions');
     if (!rows.length) { setHtml(tb, '<tr><td colspan="11" class="empty">No requests running and no saved conversations.</td></tr>'); lastGen.clear(); refreshPhaseTip(); return; }

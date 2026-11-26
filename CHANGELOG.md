@@ -8,7 +8,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 - **A named `--prefill-chunk-min` the architecture cannot run refuses the load by name**, naming the min, where it came
   from and the width the model can reach, instead of every request running under it.
-- **sushibar always shows a prompt read's seconds left**: the Show Seconds Left switch is gone.
+- **A prompt read shows its measured percentage**: in sushibar instead of seconds left (the Show Seconds Left switch is gone), and in the web UI beside the estimate (`4% (est. 26 s)`).
 - **A Hy4-Flash or DeepSeek pack's in-memory size leaves out its Engram tables**, which stay on the SSD, and a model's
   line in Models reads its memory, then the whole pack: `76.1 GiB in memory · 194 GiB total`.
 - **Hy4-Flash's load warm makes the grouped sliding-attention kernel too**, so the first batched tick past the window

@@ -856,7 +856,7 @@ fn pollLoop() void {
         if (p == port()) {
             lock();
             shared.port = p;
-            shared.view = tracker.view(sample.link, now);
+            shared.view = tracker.view(sample.link);
             if (fetch_models or !answers) {
                 shared.model.set(models.ready orelse "");
                 shared.model_full_len = if (models.ready) |m| m.len else 0;
