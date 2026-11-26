@@ -656,6 +656,24 @@ test "toggle: the published switch gates the watch loop's look" {
     try testing.expect(looksNow(true, 100, 100 + 2 * day_s));
 }
 
+test "pack update: a finished update clears the row of the folder loaded under another spelling" {
+    const io = testing.io;
+    // The loaded entry's path as the registry walked it, and the catalog spelling a finished pull records under.
+    const loaded = "/packs/./beamster/Pack";
+    const recorded = "/packs/beamster/Pack";
+    defer {
+        _ = std.c.pthread_mutex_lock(&mu);
+        slots = @splat(.{});
+        _ = std.c.pthread_mutex_unlock(&mu);
+    }
+    record(io, loaded, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Pack" } });
+    record(io, recorded, .current);
+    // A finished pull leaves the pack at the published revision: its /v1/models row stops naming an update.
+    const row = try rowFragment(io, testing.allocator, loaded);
+    defer testing.allocator.free(row);
+    try testing.expectEqual(@as(usize, 0), row.len);
+}
+
 test "pack update: two spellings of one pack folder are one slot" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
