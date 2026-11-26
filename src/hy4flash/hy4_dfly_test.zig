@@ -531,3 +531,36 @@ test "hy4: a load keeps no Engram row cache, so a repeated request reads its row
     try testing.expect(first > 0);
     try testing.expectEqual(first, second);
 }
+
+test "hy4 bill: a 3-slot streamed load's ledger lines hold what it holds after each served request, plain and drafting (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const contract = @import("../cooler_contract_test.zig");
+    const hy4_contract = @import("hy4_contract.zig");
+    const static_bill = @import("../static_bill.zig");
+    var ld: contract.Load = undefined;
+    try ld.prepare(hy4_contract, dir, true);
+    // Three slots a layer: every layer streams, so the requests run the group path and the cache's misses.
+    ld.config.expert_cache_bytes = 3 * @as(u64, ld.config.hy4flash.?.layers) * 26_112;
+    try ld.loadServed(dir);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    try testing.expect(ld.xfm.expert_stream.?.residentRoute(1) == null);
+    const l = ld.config.static_ledger.?;
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var sv: contract.Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    for ([_]bool{ false, true }) |drafting| for ([_]usize{ 24, 40 }) |len| {
+        var from: u32 = 0;
+        var got = try sv.requestWith(ids[0..len], 6, .{ .temperature = 0.0 }, drafting, &from);
+        got.deinit(a);
+        mlx.engine.close();
+        const s = l.snapshot();
+        const lines = s.committed - s.of(.margin) - s.of(.host) - s.of(.media) - s.of(.pipelines);
+        errdefer std.debug.print("hy4 bill: after a served request (drafting {}, {d} tokens): the lines hold {d} B, the engine {d} B\n", .{ drafting, len, lines, ld.before.heldSince() });
+        try testing.expectEqual(lines, ld.before.heldSince());
+    };
+}
