@@ -4028,6 +4028,94 @@ test "responses: a forced tool_choice is committed at the answer boundary on eve
     try expectSurfaceForcesCall("\"required\"", tools, null);
 }
 
+/// A forced call on a template that writes a newline between the name and its first tag: the model's own
+/// `NAME\n<arg_key>` (or `NAME\n</tool_call>` without arguments) is reachable after the committed name, and the
+/// call it writes parses back to its arguments.
+fn expectForcedCallAfterNewlineName(tool_choice_json: []const u8, wanted_tail: []const u8, written: []const u8, wanted_args: []const u8) !void {
+    const a = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    var tok = try byteTokenizerForTests(a, arena_state.allocator(), &.{ "<think>", "</think>", "<tool_call>", "</tool_call>", "<|assistant|>", "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>" });
+    defer deinitTestTokenizer(&tok);
+    const tools =
+        \\[{"type":"function","function":{"name":"get_time","parameters":{"type":"object","properties":{"k":{"type":"string"}}}}},
+        \\ {"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+    ;
+    const parsed_choice = try std.json.parseFromSlice(std.json.Value, a, tool_choice_json, .{});
+    defer parsed_choice.deinit();
+    const choice = tool_calls_mod.parseToolChoice(parsed_choice.value);
+    const instruction = try choice.instruction(a);
+    defer if (instruction) |i| a.free(i);
+    var config = chat_mod.ChatConfig{ .chat_template = @embedFile("fixtures/glm_newline_call_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a };
+    try config.compile();
+    defer config.dropCompiled();
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "What time is it?" }};
+    const target = try chat_mod.encodeCallText(a, &tok, "", "get_time", wanted_tail);
+    defer a.free(target);
+
+    for ([_]bool{ true, false }) |thinking| {
+        const rendered = try chat_mod.renderChatTemplate(a, &messages, &config, tools, instruction, thinking, null, false);
+        defer a.free(rendered);
+        const prompt_ids = try tok.encode(a, rendered);
+        defer a.free(prompt_ids);
+        var cf = armCallForce(a, &tok, &config, prompt_ids, thinking, choice, tools) orelse return error.ForceNotArmed;
+        defer cf.deinit(a);
+        var published = std.ArrayList(u32).empty;
+        defer published.deinit(a);
+        var thought = false;
+        while (true) {
+            const next = cf.decide(published.items);
+            switch (next) {
+                .force => |id| try published.append(a, id),
+                .choose => |ids| {
+                    // The model writes the template's own bytes: its next token must be one of the offered ids.
+                    const typed = published.items[cf.name_from.?..];
+                    try std.testing.expect(typed.len < target.len);
+                    try std.testing.expect(std.mem.indexOfScalar(u32, ids, target[typed.len]) != null);
+                    try published.append(a, target[typed.len]);
+                },
+                .sample => {
+                    if (!cf.pending()) break;
+                    if (thought) return error.ForceNeverFired;
+                    thought = true;
+                    const ids = try tok.encode(a, "hmm</think>");
+                    defer a.free(ids);
+                    try published.appendSlice(a, ids);
+                },
+            }
+        }
+        const text = try tok.decode(a, published.items);
+        defer a.free(text);
+        const call_at = std.mem.indexOf(u8, text, "<tool_call>").?;
+        const want = try std.mem.concat(a, u8, &.{ "<tool_call>get_time", wanted_tail });
+        defer a.free(want);
+        try std.testing.expectEqualStrings(want, text[call_at..]);
+
+        const answer = try std.mem.concat(a, u8, &.{ text[call_at..], written });
+        defer a.free(answer);
+        const dialect = try chat_mod.callDialect(a, &config);
+        const calls = (try reply_mod.parseToolCallsForRequest(a, answer, tools, true, .{ .reading = .text, .dialect = dialect })) orelse return error.ForcedCallNotParsed;
+        defer {
+            for (calls) |tc| {
+                a.free(tc.name);
+                a.free(tc.arguments);
+            }
+            a.free(calls);
+        }
+        try std.testing.expectEqual(@as(usize, 1), calls.len);
+        try std.testing.expectEqualStrings("get_time", calls[0].name);
+        try std.testing.expectEqualStrings(wanted_args, calls[0].arguments);
+    }
+}
+
+test "a forced call on a template writing a newline after the name admits the model's own call" {
+    const named = "{\"type\":\"function\",\"function\":{\"name\":\"get_time\"}}";
+    for ([_][]const u8{ "\"required\"", named }) |choice| {
+        try expectForcedCallAfterNewlineName(choice, "\n<arg_key>", "k</arg_key>\n<arg_value>v</arg_value>\n</tool_call>", "{\"k\":\"v\"}");
+        try expectForcedCallAfterNewlineName(choice, "\n</tool_call>", "", "{}");
+    }
+}
+
 test "tool_choice auto and none arm no forced call" {
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);

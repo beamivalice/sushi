@@ -360,8 +360,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-http-apis](server-
   `call: get_time` there. The arguments stay the model's; the parse chain and its valid-JSON invariant run unchanged.
   The name is closed by the template's own next bytes, read from probe renders: a delimiter (`>\n`), or, where a tag
   follows the name (GLM `<tool_call>NAME<arg_key>`, `NAME</tool_call>` without arguments), each tag that may follow, and
-  the name then goes through the sample among its ids with the tag as the last one. A template with nothing after the
-  name to read is prompt-only (`[tool-choice] forced call is prompt-only`), which no served template is.
+  the name then goes through the sample among its ids with the tag as the last one. Whitespace before the tag is part of
+  the tail (`NAME\n<arg_key>`, `NAME\n</tool_call>`), so the force never leaves only the argument-less close reachable.
+  A template with nothing after the name to read is prompt-only (`[tool-choice] forced call is prompt-only`), which no
+  served template is.
 - **They are also prompt-level**: the instruction closes the last user turn (or opens one after tool results), only
   where the render keeps every byte it has without it (`keepsEveryByte`), so the prefix cache still serves it; Qwen3.8
   with `preserve_thinking` off drops the in-flight reasoning once a user turn follows, so there the force stands alone.

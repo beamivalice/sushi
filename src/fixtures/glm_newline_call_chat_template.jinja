@@ -1,0 +1,22 @@
+[gMASK]<sop>
+{%- if tools -%}<|system|>{{ tools | tojson }}{%- endif -%}
+{%- for m in messages -%}
+{%- if m.role == 'user' -%}
+<|user|>{{ m.content }}
+{%- elif m.role == 'tool' -%}
+<|observation|>{{ m.content }}
+{%- elif m.role == 'assistant' -%}
+<|assistant|>
+{%- if m.reasoning_content is string -%}<think>{{ m.reasoning_content }}</think>{%- else -%}<think></think>{%- endif -%}
+{%- if m.content -%}{{ m.content }}{%- endif -%}
+{%- if m.tool_calls -%}
+{%- for call in m.tool_calls -%}
+{%- set tc = call.function if call.function else call -%}
+{{- '<tool_call>' ~ tc.name ~ '\n' -}}
+{%- for k, v in tc.arguments.items() -%}<arg_key>{{ k }}</arg_key>{{ '\n' }}<arg_value>{{ v }}</arg_value>{{ '\n' }}{%- endfor -%}
+</tool_call>
+{%- endfor -%}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}

@@ -2711,6 +2711,21 @@ test "forcedCallText reads each family's call markup from its own template" {
     try testing.expect(try forcedCallText(allocator, &plain, null) == null);
 }
 
+test "forcedCallText: a newline between the name and its first tag is part of each tail" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{ .chat_template = @embedFile("fixtures/glm_newline_call_chat_template.jinja"), .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = allocator };
+    try config.compile();
+    defer config.dropCompiled();
+    for ([_]?[]const u8{ null, "get_time" }) |name| {
+        var forced = (try forcedCallText(allocator, &config, name)).?;
+        defer forced.deinit(allocator);
+        try testing.expectEqualStrings("<tool_call>", forced.call);
+        try testing.expectEqual(@as(usize, 2), forced.name_tails.len);
+        try testing.expectEqualStrings("\n<arg_key>", forced.name_tails[0]);
+        try testing.expectEqualStrings("\n</tool_call>", forced.name_tails[1]);
+    }
+}
+
 test "answerSeparator reads what each family's template writes between a closed thought and its answer" {
     const allocator = testing.allocator;
     const Case = struct { tpl: []const u8, sep: ?[]const u8 };

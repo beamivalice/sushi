@@ -3232,6 +3232,8 @@ test "format corpus: a forced call is the family's own call markup and parses ba
         .{ .name = "mimo-v2.6", .tpl = @embedFile("fixtures/mimo_v26_chat_template.jinja") },
         .{ .name = "deepseek-v4.1", .tpl = @embedFile("fixtures/dsv41_chat_template.jinja"), .end = "<｜end▁of▁sentence｜>" },
         .{ .name = "glm-5.3", .tpl = @embedFile("fixtures/glm53_chat_template.jinja"), .end = "" },
+        // Whitespace leads the tag after the name: the tails keep it, or the forced bytes are not the template's.
+        .{ .name = "glm-newline-after-name", .tpl = @embedFile("fixtures/glm_newline_call_chat_template.jinja"), .end = "" },
     };
     const calls = [_]chat.ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
     const history = [_]chat.Message{
