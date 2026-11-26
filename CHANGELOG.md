@@ -6,6 +6,8 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **A named `--prefill-chunk-min` the architecture cannot run refuses the load by name**, naming the min, where it came
+  from and the width the model can reach, instead of every request running under it.
 - **Each model sets how many requests run at once and how many tokens they may hold together**: the settings keys
   `max_concurrent` (1 by default; a Requests at once value in the server Settings sets every model's default, a
   model's own value outranks it, and `--max-concurrent` outranks both) and

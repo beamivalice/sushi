@@ -1431,6 +1431,7 @@ pub fn prefillChunkBounds(buf: []u8, config: *const model_mod.ModelConfig) Chunk
         .refused => |r| .{ .refused = switch (r) {
             .not_a_rung => |g| std.fmt.bufPrint(buf, "{s} {d} is not a prefill chunk this model runs: " ++ settings_resolve.static_chunk_rungs_text, .{ g.name, g.rows }) catch g.name,
             .min_above_given_max => |m| std.fmt.bufPrint(buf, "{s} {d} is above {s} {d}", .{ m.min_name, m.min, m.max_name, m.max }) catch m.min_name,
+            .min_above_arch_ceiling => |m| std.fmt.bufPrint(buf, "{s} {d} is above the {d} rows this model's prefill width can reach; lower {s}", .{ m.min_name, m.min, m.ceiling, m.min_name }) catch m.min_name,
         } },
     };
 }
@@ -9419,6 +9420,24 @@ test "prefill chunk bounds: every served model takes both flags and both keys, a
         try testing.expectEqualStrings("model-settings.json prefill_chunk_min 4096 is above model-settings.json prefill_chunk_max 1024", try refusedPick(prefillChunkBounds(&buf, &config)));
     }
     try testing.expect(seen > 0);
+}
+
+test "prefill chunk bounds: a named min above the arch's widest width is refused by name" {
+    const t = std.testing;
+    const saved = settings_resolve.launch;
+    defer settings_resolve.launch = saved;
+    var buf: [256]u8 = undefined;
+    var cfg = fixtures.mimoV2BillConfig();
+    // A flag-only min raises the resolver's max to 8192, but the arch holds the width at 4096.
+    settings_resolve.launch = .{ .prefill_chunk_min = 8192 };
+    try t.expectEqualStrings("--prefill-chunk-min 8192 is above the 4096 rows this model's prefill width can reach; lower --prefill-chunk-min", try refusedPick(prefillChunkBounds(&buf, &cfg)));
+    // The same min from the model key names its source.
+    settings_resolve.launch = .{};
+    cfg.prefill_chunk_min_override = 8192;
+    try t.expectEqualStrings("model-settings.json prefill_chunk_min 8192 is above the 4096 rows this model's prefill width can reach; lower model-settings.json prefill_chunk_min", try refusedPick(prefillChunkBounds(&buf, &cfg)));
+    // A min at the ceiling still runs.
+    cfg.prefill_chunk_min_override = 4096;
+    try t.expectEqual(@as(u32, 4096), chunkBoundsOf(&cfg).min);
 }
 
 test "max_kv_tokens is a token pool, never a bill: the same request holds the same bytes at any cap" {

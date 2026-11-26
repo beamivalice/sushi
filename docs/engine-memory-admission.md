@@ -300,7 +300,7 @@ Other expert layouts of these archs bill the same terms; their warmup is not mea
   context, no 93% margin on top: the bill is the one reserve. Past it the 93% margin stays. Sizer and admission were
   two formulas: a 32 GB M1 Max advertised 71,680 tokens and refused past 20,549. The other archs keep `contextForBudget`.
 - The prefill CHUNK is a machine decision (`resolvePrefillChunk`, ladder 8192→512 at ≤ a quarter of the serving
-  budget). `--prefill-chunk-max` caps it and `--prefill-chunk-min` floors it (`bills.loadChunkWithin`: a given min the sizer cannot reach refuses the load by name); on the per-request ladder the max is the widest rung. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
+  budget). `--prefill-chunk-max` caps it and `--prefill-chunk-min` floors it (`bills.loadChunkWithin`: a given min the sizer cannot reach refuses the load by name); on the per-request ladder the max is the widest rung. A named min above the widest width the arch can run at a short prompt (`settings_resolve.chunkBounds` via `prefill_plan.boundedPrefillChunk`) refuses the load by name instead of letting every request run under it. `prefillMemoryNeeded` takes STORED and SCORED widths as two parameters.
 - **A rate-grouped EXL3 MoE bills its combine** (`rateGroupedPrefillBytesPerRow`, the pack index's widest layer in
   `ModelConfig.expert_rate_groups`): at its down projection a layer holds one f16 plane per rate group, each as tall as
   every sorted row (rows x top_k), and the combined one, beside its gate and up inputs and planes; the MoE term is the

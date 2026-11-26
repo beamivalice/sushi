@@ -4,6 +4,7 @@ const std = @import("std");
 const model_settings = @import("model_settings.zig");
 const model_mod = @import("model.zig");
 const arch_config = @import("arch/config.zig");
+const prefill_plan = @import("prefill_plan.zig");
 
 /// Where a load's value for one key came from. A request's own field outranks all of them.
 pub const Source = enum { flag, model_settings, default };
@@ -81,6 +82,7 @@ pub fn defaultChunkMin(max: u32) u32 {
 pub const ChunkBoundRefusal = union(enum) {
     not_a_rung: struct { rows: u32, name: []const u8 },
     min_above_given_max: struct { min: u32, min_name: []const u8, max: u32, max_name: []const u8 },
+    min_above_arch_ceiling: struct { min: u32, min_name: []const u8, ceiling: u32 },
 };
 
 pub const BoundsPick = union(enum) {
@@ -100,6 +102,11 @@ pub fn chunkBounds(config: *const model_mod.ModelConfig) BoundsPick {
     const hi: u32 = if (max) |g| g.rows else if (raised) min.?.rows else default_max;
     const lo: u32 = if (min) |g| g.rows else defaultChunkMin(hi);
     if (lo > hi) return .{ .refused = .{ .min_above_given_max = .{ .min = lo, .min_name = min.?.name, .max = hi, .max_name = max.?.name } } };
+    // A named min the width funnel caps at a short prompt would be under-run by every request: refuse the load instead.
+    if (min) |named| {
+        const ceiling = prefill_plan.boundedPrefillChunk(lo, config.prefillScoreHeadDim(), config.num_attention_heads, 1, config.has_sliding_window, config.isMoe(), config.longCtxGated());
+        if (ceiling < lo) return .{ .refused = .{ .min_above_arch_ceiling = .{ .min = lo, .min_name = named.name, .ceiling = @intCast(ceiling) } } };
+    }
     return .{ .bounds = .{ .min = lo, .max = hi, .max_given = max != null or raised, .min_given = min != null, .raised_by_min = raised } };
 }
 
