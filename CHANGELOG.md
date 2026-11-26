@@ -16,27 +16,24 @@ earlier history is mlx-serve's, in that project's changelog.
 - **Each model sets how many requests run at once and how many tokens they may hold**: `max_concurrent` (1 by default;
   a server-wide value sets every model's default, a model's own outranks it, `--max-concurrent` outranks both) and
   `max_kv_tokens`, both in the web UI. A request that does not fit waits; one that never could is refused with the
-  numbers; a context above the cap is refused at launch and lowered on a settings save. The RAM prompt cache keeps
-  `max_concurrent` conversations, and `--prefix-cache-entries` is removed.
+  numbers. The cap holds the context: a context above it is refused at launch, lowered on a settings save (never one a
+  `--ctx-size` flag holds) and held under a lowered cap on reload. The RAM prompt cache keeps `max_concurrent`
+  conversations, and `--prefix-cache-entries` is removed.
 - **You bound the prefill chunk**: every model takes `--prefill-chunk-max` and `--prefill-chunk-min` (512 to 8192 rows)
-  and their settings keys; `--prefill-chunk` is removed and refused with the two flags named. Hy4-Flash's chunk
-  defaults to 4096 rows, leaving more memory for the context.
-- **`sushi kld` refuses what the server refuses**: an unserved architecture, a `--ctx-size` above the model's window or
-  `max_kv_tokens`, and a `--kv-quant` the model cannot take are refused by name before it loads.
-- **`convert exl3` refuses a flag its source's writer does not read**: `--layer-cooldown`, `--fisher-dir`, `--trunk-bits` and the
-  other generic-driver flags are named and refused on Hy4-Flash and DeepSeek-V4.1, instead of being dropped without a line.
+  and their settings keys; `--prefill-chunk` is removed and refused with the two flags named. A min the model cannot
+  run is refused on a settings save, and a launch whose memory cannot hold the min is refused at start with how to
+  lower it. Hy4-Flash's chunk defaults to 4096 rows, leaving more memory for the context.
 - **See a prompt being read**: `"return_progress": true` streams llama.cpp's `prompt_progress` chunks, and sushibar and
   the web UI show the read as a measured percentage, the web UI with its time estimate (`4% (est. 26 s)`); sushibar's
   icon also shows a model loading and a reply generating. Thanks @eliaskg for `return_progress`.
 - **Clearer memory facts**: a pack's in-memory size leaves out the Engram tables that stay on the SSD
-  (`76.1 GiB in memory · 194 GiB total`), every load refusal names its numbers, `--wired-margin-gib 0` plans to the
-  wired limit itself, a streamed `--vision` load reserves the memory of the tallest image Hy4-Flash admits, and a cache
-  folder linked to another volume works.
-- **Packs and tools**: `sushi convert exl3` writes DeepSeek-V4.1 and Hy4-Flash packs pair-major directly, `sushi repack`
-  migrates Hy4-Flash STQ packs, every routed shard's stamp is checked before a weight loads, and a fully resident
+  (`76.1 GiB in memory · 194 GiB total`), every load refusal names its numbers rounded so a need never reads as
+  fitting, `--wired-margin-gib 0` plans to the wired limit itself, a streamed `--vision` load reserves the memory of
+  the tallest image Hy4-Flash admits, and a cache folder linked to another volume works.
+- **Packs and tools**: `sushi convert exl3` writes DeepSeek-V4.1 and Hy4-Flash packs pair-major directly and refuses a
+  flag its source's writer does not read, `sushi repack` migrates Hy4-Flash STQ packs, `sushi kld` refuses what the
+  server refuses before it loads, every routed shard's stamp is checked before a weight loads, and a fully resident
   DeepSeek load decodes several requests at once up to 8% faster with the same text.
-- A reload that lowers a model's `max_kv_tokens` now holds its context under the new cap, so a request is clamped to it instead of refused.
-- A Hy4-Flash or DeepSeek pack with no index no longer counts its Engram tables in its in-memory size.
 
 ---
 
