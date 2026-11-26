@@ -3647,3 +3647,56 @@ test "server: a Responses stream's usage is null until measured, then the termin
         }
     }.run);
 }
+
+test "server: a completions stream's usage chunk is a text_completion chunk and carries the cached details" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const fd = try connect();
+            defer _ = std.c.close(fd);
+            try send(fd, "POST", "/v1/completions", "{\"model\":\"tiny\",\"max_tokens\":4,\"temperature\":0,\"prompt\":\"hi\",\"stream\":true,\"stream_options\":{\"include_usage\":true}}");
+            const all = try readUntil(fd, null);
+            defer gpa.free(all);
+            const events = try sseEvents(all);
+            defer gpa.free(events);
+            var chunk: []const u8 = "";
+            var usage_chunks: usize = 0;
+            for (events) |e| {
+                if (e.data.len == 0 or e.data[0] != '{') continue;
+                if (std.mem.indexOf(u8, e.data, "\"choices\":[]") != null) {
+                    usage_chunks += 1;
+                    chunk = e.data;
+                }
+            }
+            if (usage_chunks != 1) return error.NotOneUsageChunk;
+            var p = try std.json.parseFromSlice(std.json.Value, gpa, chunk, .{});
+            defer p.deinit();
+            const root = p.value.object;
+            if (!std.mem.eql(u8, (root.get("object") orelse return error.NoObject).string, "text_completion.chunk")) return error.WrongObject;
+            const usage = (root.get("usage") orelse return error.NoUsage).object;
+            if ((usage.get("prompt_tokens") orelse return error.NoPromptTokens).integer <= 0) return error.ZeroPromptTokens;
+            if (usage.get("prompt_tokens_details") == null) {
+                std.debug.print("usage chunk: {s}\n", .{chunk[0..@min(chunk.len, 400)]});
+                return error.NoCachedTokensDetails;
+            }
+        }
+    }.run);
+}
+
+test "server: a completions reply's usage carries the cache details chat's does" {
+    try eachArch(4, .{}, struct {
+        fn run() !void {
+            const resp = try request("POST", "/v1/completions", "{\"model\":\"tiny\",\"max_tokens\":2,\"temperature\":0,\"prompt\":\"hi\"}");
+            defer gpa.free(resp);
+            if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) return error.CompletionRefused;
+            var p = std.json.parseFromSlice(std.json.Value, gpa, bodyOf(resp), .{}) catch return error.NotJson;
+            defer p.deinit();
+            const usage = (p.value.object.get("usage") orelse return error.NoUsage).object;
+            const prompt_tokens = (usage.get("prompt_tokens") orelse return error.NoPromptTokens).integer;
+            if (prompt_tokens <= 0) return error.ZeroPromptTokens;
+            if (usage.get("prompt_tokens_details") == null) {
+                std.debug.print("non-stream completions usage has no prompt_tokens_details: prompt_tokens {d}\n", .{prompt_tokens});
+                return error.NoCachedTokensDetails;
+            }
+        }
+    }.run);
+}

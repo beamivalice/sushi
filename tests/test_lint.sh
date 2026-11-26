@@ -967,6 +967,18 @@ printf '%s\n' 'pub const pull_marker = ".pull-incomplete";' 'pub const x = ".par
 printf '%s\n' 'const pack_state = @import("pack_state.zig");' \
   'test "a test names .partial and writes the marker" { _ = pack_state.pull_marker; _ = ".pull-incomplete"; _ = ".partial"; }' > "$TMP/t/src/q.zig"
 expect_green "a staging file in a file that handles no pack, the owner itself, and a test"
+# rule usage-hand-built
+tree
+printf '%s\n' 'fn f() []const u8 {' '    return "{\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}";' '}' > "$TMP/t/src/completions.zig"
+expect_red "an OpenAI usage object spelled by hand" "\[usage-hand-built\] f: a usage object spelled by hand"
+
+tree
+printf '%s\n' 'fn f() []const u8 {' '    return "{\"usage\":{\"input_tokens\":1}}";' '}' > "$TMP/t/src/responses_api.zig"
+expect_green "a Responses usage object (input_tokens), not the OpenAI chat shape"
+
+tree
+printf '%s\n' 'test "t" {' '    _ = "{\"usage\":{\"prompt_tokens\":1}}";' '}' > "$TMP/t/src/p.zig"
+expect_green "a usage object in a test"
 
 # the allowlist
 tree

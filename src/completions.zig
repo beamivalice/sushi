@@ -27,6 +27,7 @@ const noteMtpRefused = generation_stream.noteMtpRefused;
 const pickStreamMode = generation_stream.pickStreamMode;
 const contextOverflowMessage = generation_stream.contextOverflowMessage;
 const formatTimingsObject = generation_stream.formatTimingsObject;
+const formatChatUsage = generation_stream.formatChatUsage;
 const formatPerfBracket = generation_stream.formatPerfBracket;
 const sendStreamIdle = generation_stream.sendStreamIdle;
 const http_conn = @import("http_conn.zig");
@@ -430,9 +431,12 @@ fn handleNonStreamingCompletion(
     const timings_field = try completionTimingsField(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
     defer allocator.free(timings_field);
 
+    const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+    defer allocator.free(usage_obj);
+
     // finish_reason always carries finish_details beside it.
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":null,"finish_reason":"{s}"{s}}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
+        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[{{"index":0,"text":{s},"logprobs":null,"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{
         nextCompletionId(&server_state.completion_id_counter, nowMs(stream.io)),
         nowSecs(stream.io),
@@ -440,9 +444,7 @@ fn handleNonStreamingCompletion(
         escaped_text,
         finish_reason,
         finishDetailsField(finish_reason, result.finish_details),
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.prompt_tokens + result.completion_tokens,
+        usage_obj,
         timings_field,
     });
     defer allocator.free(response);
@@ -664,9 +666,11 @@ fn handleStreamingCompletion(
         // Usage rides its own empty-choices chunk (OpenAI's stream_options
         // shape) — never the finish chunk, so the ending is stated once.
         if (include_usage) {
+            const usage_obj = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
+            defer allocator.free(usage_obj);
             const usage_chunk = try std.fmt.allocPrint(allocator,
-                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-            , .{ cmpl_id, created_ts, model_name, total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+                \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"sushi","choices":[],"usage":{s}}}
+            , .{ cmpl_id, created_ts, model_name, usage_obj });
             defer allocator.free(usage_chunk);
             logHttpSseData(usage_chunk);
             try stream.writeAllNoFlush("data: ");

@@ -2683,14 +2683,14 @@ fn reasoningDetailsJson(allocator: std.mem.Allocator, count: usize) ![]u8 {
     return std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{count});
 }
 
-/// The chat-completions `usage` object, shared by the non-stream, tool-call
-/// and streaming-final-chunk emitters so the shape never drifts per path.
-/// `prompt_tokens_details.cached_tokens` is ALWAYS present (0 when cold) —
-/// OpenAI emits it unconditionally, and black-box conformance/cost tooling
-/// (llmprobe) treats a missing field as "no prompt caching" even though the
-/// engine caches. `extra_details` is a pre-formatted `,"key":{...}` fragment
-/// (completion_tokens_details) or "".
-fn formatChatUsage(
+/// The OpenAI `usage` object, shared by chat's non-stream, tool-call and
+/// streaming-final-chunk emitters and by `/v1/completions` so the shape never
+/// drifts per path. `prompt_tokens_details.cached_tokens` is ALWAYS present
+/// (0 when cold): OpenAI emits it unconditionally, and black-box
+/// conformance/cost tooling (llmprobe) treats a missing field as "no prompt
+/// caching" even though the engine caches. `extra_details` is a pre-formatted
+/// `,"key":{...}` fragment (completion_tokens_details) or "".
+pub fn formatChatUsage(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
     completion_tokens: u32,

@@ -11,7 +11,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [server-tool-calling](serv
 
 - OpenAI completion and Anthropic message IDs are opaque and process-unique even when the wall clock repeats or
   moves backwards; all OpenAI SSE chunks of one response keep the same ID.
-- **OpenAI chat/completions + Responses**: usage ALWAYS carries `prompt_tokens_details.cached_tokens`; thinking
+- **OpenAI chat/completions + Responses**: usage ALWAYS carries `prompt_tokens_details.cached_tokens`; on `/v1/chat/completions`
+  and `/v1/completions`, stream and non-stream alike, the object is `generation_stream.formatChatUsage`'s, never written
+  by hand in a surface; thinking
   opt-ins = `reasoning_effort` OR `enable_thinking` (top-level, else vLLM's `chat_template_kwargs.enable_thinking`;
   `reasoning_budget_tokens` outranks); a request naming neither takes the arch default (`defaultEnableThinking`);
   on Responses a `reasoning` object decides alone, and without one the same rule applies; `n>1` 400s.
