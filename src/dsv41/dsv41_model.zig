@@ -864,6 +864,8 @@ pub const Model = struct {
     rows: exl3.project_rows.Mode = .{},
     /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
     engram_ahead: ?*engram.Prefetch = null,
+    /// Persistent worker pool for Engram prefetch and multi-part shard preads.
+    engram_pool: ?*engram.ReadPool = null,
     engram_ahead_used: u64 = 0,
     /// Prefill chunks that left state only (`extendState`).
     state_only_used: u64 = 0,
@@ -995,6 +997,7 @@ pub const Model = struct {
             r.model = null;
         }
         self.dropAhead();
+        if (self.engram_pool) |pool| pool.destroy();
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -1561,6 +1564,11 @@ fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
     if (e.pad_id >= m.token_map.len) return error.EngramTokenMap;
     m.hash = try engram.Hash.init(e, m.token_map[e.pad_id]);
     m.engrams = try m.gpa.alloc(EngramLayer, e.n);
+    m.engram_pool = engram.ReadPool.create(m.gpa) catch null;
+    errdefer if (m.engram_pool) |pool| {
+        pool.destroy();
+        m.engram_pool = null;
+    };
     var opened: usize = 0;
     errdefer for (m.engrams[0..opened]) |*t| closeEngram(t);
     var b: NameBuf = undefined;
@@ -1580,6 +1588,7 @@ fn initEngram(m: *Model, w: *model_mod.Weights, dir_path: []const u8) !void {
         errdefer table.close();
         const rows = @min(engram.cache_rows, e.rows[i]);
         if (engram.RowCache.bytesFor(rows, e.head_dim, e.head_dim / 32) > 0) table.cache = try engram.RowCache.create(m.gpa, rows, e.head_dim, e.head_dim / 32);
+        table.pool = m.engram_pool;
         m.engrams[i] = .{ .layer = l, .wkv = wkv, .qk = prod, .table = table };
         opened = i + 1;
     }
@@ -4813,6 +4822,9 @@ fn layerInput(m: *Model, p: *Pass, li: usize, sc: *Scope, ev: *std.ArrayList(A),
                 const raw = try pf.take(p.p0, ei, 0);
                 defer raw.deinit(gpa);
                 break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
+            } else if (try e.table.tryReadCached(gpa, mine)) |raw| blk: {
+                defer raw.deinit(gpa);
+                break :blk sc.out(try sc.keep(try e.table.dequant(raw, mine.len, m.s)));
             } else sc.out(try sc.keep(try e.table.gather(gpa, mine, m.s))); // [L * cols, head_dim]
         }
         const table_rows = p.engram_rows[ei];
@@ -5248,9 +5260,30 @@ fn prefetchEngram(m: *Model, p: *Pass) !void {
         log.debug("[dsv41] engram rows of the chunk at {d} were read ahead ({d} rows)\n", .{ p.p0, p.ids.len });
     };
     if (p.engram_pf == null) {
+        if (p.ids.len <= NARROW_ROWS) {
+            const nc = hs.cols();
+            var all_cached = true;
+            var stack_mine: [NARROW_ROWS * engram.MAX_COLS]u32 = undefined;
+            for (m.engrams, 0..) |*e, ei| {
+                const cache = e.table.cache orelse {
+                    all_cached = false;
+                    break;
+                };
+                const mine = stack_mine[0 .. p.ids.len * nc];
+                for (0..p.ids.len) |t| @memcpy(mine[t * nc ..][0..nc], p.rows[(t * hs.n_layers + ei) * nc ..][0..nc]);
+                if (!cache.hasAll(mine)) {
+                    all_cached = false;
+                    break;
+                }
+            }
+            if (all_cached) {
+                aheadEngram(m, p) catch {};
+                return;
+            }
+        }
         var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
         for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
-        p.engram_pf = try engram.Prefetch.start(m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
+        p.engram_pf = try engram.Prefetch.startWithPool(m.engram_pool, m.gpa, tables[0..m.engrams.len], &.{.{ .at = p.p0, .len = p.ids.len, .ids = p.rows }}, hs.cols(), p.ids.len);
     }
     if (p.engram_pf.?.finished()) aheadEngram(m, p) catch {};
 }
@@ -5273,7 +5306,7 @@ fn aheadEngram(m: *Model, p: *Pass) !void {
     var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
     for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
     m.dropAhead();
-    m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
+    m.engram_ahead = try engram.Prefetch.startWithPool(m.engram_pool, gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
 }
 
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and

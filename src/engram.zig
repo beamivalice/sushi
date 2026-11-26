@@ -213,6 +213,8 @@ pub const Table = struct {
     w_row: u32,
     /// Hot rows held in RAM; null reads every row from the shard.
     cache: ?*RowCache = null,
+    /// Persistent worker pool for multi-part reads; null spawns threads per read.
+    pool: ?*ReadPool = null,
     /// A counter of the rows `pread` from the shard, for a test to point at its own cell.
     rows_read: ?*std.atomic.Value(u64) = null,
     /// A counter of the `F_RDADVISE` calls, for a test to point at its own cell.
@@ -315,6 +317,25 @@ pub const Table = struct {
         }
     };
 
+    /// Fast inline path: if every row of `ids` is already in `RowCache`, copies them immediately without waking
+    /// `ReadPool` or touching SSD. Returns `null` on any miss (or if caching is disabled), leaving cache stats
+    /// untouched so the caller can fall back to `read` without double-counting.
+    pub fn tryReadCached(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !?Raw {
+        const cache = self.cache orelse return null;
+        if (!cache.hasAll(ids)) return null;
+        const n = ids.len;
+        const w = try gpa.alignedAlloc(u8, .@"4", n * self.w_row);
+        errdefer gpa.free(w);
+        const sc = try gpa.alignedAlloc(u8, .@"4", n * self.sdim);
+        errdefer gpa.free(sc);
+        if (!cache.tryLookupAll(ids, w, sc)) {
+            gpa.free(sc);
+            gpa.free(w);
+            return null;
+        }
+        return .{ .w = w, .s = sc };
+    }
+
     /// Each distinct id is read once, from the cache or the shard, and copied to every position that holds it.
     pub fn read(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
         const n = ids.len;
@@ -322,8 +343,10 @@ pub const Table = struct {
         errdefer gpa.free(w);
         const sc = try gpa.alignedAlloc(u8, .@"4", n * self.sdim);
         errdefer gpa.free(sc);
-        const first = try gpa.alloc(u32, n);
-        defer gpa.free(first);
+        var stack_first: [16 * MAX_COLS]u32 = undefined;
+        const heap_first = if (n > stack_first.len) try gpa.alloc(u32, n) else null;
+        defer if (heap_first) |h| gpa.free(h);
+        const first = heap_first orelse stack_first[0..n];
         // Out of memory for the map reads every position, as a batch without repeats does.
         const repeats = firstOccurrences(gpa, ids, first) catch 0;
         const cache = self.cache orelse {
@@ -331,8 +354,10 @@ pub const Table = struct {
                 try self.readInto(ids, null, w, sc);
                 return .{ .w = w, .s = sc };
             }
-            const only = try gpa.alloc(u32, n - repeats);
-            defer gpa.free(only);
+            var stack_only: [16 * MAX_COLS]u32 = undefined;
+            const heap_only = if (n - repeats > stack_only.len) try gpa.alloc(u32, n - repeats) else null;
+            defer if (heap_only) |h| gpa.free(h);
+            const only = heap_only orelse stack_only[0 .. n - repeats];
             var k: usize = 0;
             for (first, 0..) |f, i| if (f == i) {
                 only[k] = @intCast(i);
@@ -342,8 +367,10 @@ pub const Table = struct {
             self.copyRepeats(first, w, sc);
             return .{ .w = w, .s = sc };
         };
-        const missed = try gpa.alloc(u32, n);
-        defer gpa.free(missed);
+        var stack_missed: [16 * MAX_COLS]u32 = undefined;
+        const heap_missed = if (n > stack_missed.len) try gpa.alloc(u32, n) else null;
+        defer if (heap_missed) |h| gpa.free(h);
+        const missed = heap_missed orelse stack_missed[0..n];
         var k = cache.lookup(ids, w, sc, missed);
         if (repeats > 0) {
             var kept: usize = 0;
@@ -455,6 +482,10 @@ pub const Table = struct {
             if (comptime builtin.is_test) peak_readers_for_test = @max(peak_readers_for_test, parts);
             if (parts == 1) {
                 if (!self.run(start, 1, end)) return error.EngramRead;
+                return;
+            }
+            if (self.t.pool) |p| {
+                if (!p.runRange(self, start, end, parts)) return error.EngramRead;
                 return;
             }
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
@@ -591,6 +622,32 @@ pub const RowCache = struct {
         self.ages[slot] = self.tick;
     }
 
+    /// Lock-held check for whether every row id in `ids` is currently cached (no mutation or stat updates).
+    pub fn hasAll(self: *RowCache, ids: []const u32) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        for (ids) |id| if (self.find(id) == null) return false;
+        return true;
+    }
+
+    /// Copies all rows of `ids` into `w` and `s` iff every id is resident in the cache; on any miss returns `false`
+    /// with zero stat mutation so the caller can fall back to `Table.read` without double-counting.
+    pub fn tryLookupAll(self: *RowCache, ids: []const u32, w: []u8, s: []u8) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mu.lockUncancelable(io);
+        defer self.mu.unlock(io);
+        for (ids) |id| if (self.find(id) == null) return false;
+        for (ids, 0..) |id, i| {
+            const slot = self.find(id).?;
+            self.bump(slot);
+            @memcpy(w[i * self.wl ..][0..self.wl], self.w[slot * self.wl ..][0..self.wl]);
+            @memcpy(s[i * self.sl ..][0..self.sl], self.s[slot * self.sl ..][0..self.sl]);
+        }
+        self.hits += ids.len;
+        return true;
+    }
+
     /// Copies each cached row of `ids` into its row of `w` and `s`; the positions of the others go to `missed`, whose
     /// count it returns.
     pub fn lookup(self: *RowCache, ids: []const u32, w: []u8, s: []u8, missed: []u32) usize {
@@ -639,6 +696,192 @@ pub const RowCache = struct {
     }
 };
 
+/// Persistent worker pool for Engram prefetch and multi-part shard preads.
+pub const ReadPool = struct {
+    gpa: std.mem.Allocator,
+    pf_mu: std.Io.Mutex = .init,
+    pf_cv: std.Io.Condition = .init,
+    pf_done_cv: std.Io.Condition = .init,
+    pf_head: ?*Prefetch = null,
+    pf_tail: ?*Prefetch = null,
+    pf_stop: bool = false,
+    pf_thread: ?std.Thread = null,
+
+    part_mu: std.Io.Mutex = .init,
+    part_cv: std.Io.Condition = .init,
+    part_done_cv: std.Io.Condition = .init,
+    batch: ?*PartBatch = null,
+    batch_seq: u64 = 0,
+    part_busy: bool = false,
+    part_stop: bool = false,
+    workers: [PAR_THREADS - 1]?std.Thread = @splat(null),
+    n_workers: usize = 0,
+
+    const PartBatch = struct {
+        job: *Table.Job,
+        start: usize,
+        end: usize,
+        parts: usize,
+        next_part: std.atomic.Value(usize) = .init(1),
+        active_workers: usize = 0,
+    };
+
+    pub fn create(gpa: std.mem.Allocator) !*ReadPool {
+        const self = try gpa.create(ReadPool);
+        errdefer gpa.destroy(self);
+        self.* = .{ .gpa = gpa };
+        self.pf_thread = try std.Thread.spawn(.{}, pfWorkerMain, .{self});
+        return self;
+    }
+
+    pub fn destroy(self: *ReadPool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.pf_mu.lockUncancelable(io);
+        self.pf_stop = true;
+        self.pf_cv.broadcast(io);
+        self.pf_mu.unlock(io);
+        if (self.pf_thread) |t| t.join();
+
+        self.part_mu.lockUncancelable(io);
+        self.part_stop = true;
+        self.part_cv.broadcast(io);
+        self.part_mu.unlock(io);
+        for (self.workers[0..self.n_workers]) |w| if (w) |t| t.join();
+        self.gpa.destroy(self);
+    }
+
+    fn submitPrefetch(self: *ReadPool, pf: *Prefetch) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.pool = self;
+        pf.next = null;
+        self.pf_mu.lockUncancelable(io);
+        defer self.pf_mu.unlock(io);
+        if (self.pf_stop) {
+            pf.ended.store(true, .release);
+            return;
+        }
+        if (self.pf_tail) |t| t.next = pf else self.pf_head = pf;
+        self.pf_tail = pf;
+        self.pf_cv.signal(io);
+    }
+
+    fn cancelOrWaitPrefetch(self: *ReadPool, pf: *Prefetch) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        pf.stop.store(true, .release);
+        self.pf_mu.lockUncancelable(io);
+        defer self.pf_mu.unlock(io);
+        var prev: ?*Prefetch = null;
+        var cur = self.pf_head;
+        while (cur) |node| : ({
+            prev = node;
+            cur = node.next;
+        }) {
+            if (node == pf) {
+                if (prev) |p| p.next = node.next else self.pf_head = node.next;
+                if (self.pf_tail == node) self.pf_tail = prev;
+                node.next = null;
+                pf.ended.store(true, .release);
+                return;
+            }
+        }
+        while (!pf.ended.load(.acquire)) self.pf_done_cv.wait(io, &self.pf_mu) catch {};
+    }
+
+    fn pfWorkerMain(self: *ReadPool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        while (true) {
+            self.pf_mu.lockUncancelable(io);
+            while (self.pf_head == null and !self.pf_stop) self.pf_cv.wait(io, &self.pf_mu) catch {};
+            if (self.pf_stop and self.pf_head == null) {
+                self.pf_mu.unlock(io);
+                return;
+            }
+            const pf = self.pf_head.?;
+            self.pf_head = pf.next;
+            if (self.pf_head == null) self.pf_tail = null;
+            pf.next = null;
+            self.pf_mu.unlock(io);
+
+            pf.runBody();
+
+            self.pf_mu.lockUncancelable(io);
+            pf.ended.store(true, .release);
+            self.pf_done_cv.broadcast(io);
+            self.pf_mu.unlock(io);
+        }
+    }
+
+    fn runRange(self: *ReadPool, job: *Table.Job, start: usize, end: usize, parts: usize) bool {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var batch: PartBatch = .{ .job = job, .start = start, .end = end, .parts = parts };
+        var fallback_inline = false;
+        {
+            self.part_mu.lockUncancelable(io);
+            defer self.part_mu.unlock(io);
+            while (self.part_busy and !self.part_stop) self.part_done_cv.wait(io, &self.part_mu) catch {};
+            if (self.part_stop) {
+                fallback_inline = true;
+            } else {
+                while (self.n_workers < parts - 1) : (self.n_workers += 1) {
+                    self.workers[self.n_workers] = std.Thread.spawn(.{}, partWorkerMain, .{self}) catch break;
+                }
+                self.batch = &batch;
+                self.batch_seq +%= 1;
+                self.part_busy = true;
+                self.part_cv.broadcast(io);
+            }
+        }
+        if (fallback_inline) {
+            var ok = true;
+            for (0..parts) |k| ok = job.run(start + k, parts, end) and ok;
+            return ok and !job.bad.load(.acquire);
+        }
+        var failed = !job.run(start, parts, end);
+        while (true) {
+            const k = batch.next_part.fetchAdd(1, .monotonic);
+            if (k >= parts) break;
+            if (!job.run(start + k, parts, end)) failed = true;
+        }
+        self.part_mu.lockUncancelable(io);
+        if (self.batch == &batch) self.batch = null;
+        while (batch.active_workers > 0) self.part_done_cv.wait(io, &self.part_mu) catch {};
+        self.part_busy = false;
+        self.part_done_cv.broadcast(io);
+        self.part_mu.unlock(io);
+        return !failed and !job.bad.load(.acquire);
+    }
+
+    fn partWorkerMain(self: *ReadPool) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var seen_seq: u64 = 0;
+        while (true) {
+            self.part_mu.lockUncancelable(io);
+            while (!self.part_stop and (self.batch == null or self.batch_seq == seen_seq)) {
+                self.part_cv.wait(io, &self.part_mu) catch {};
+            }
+            if (self.part_stop) {
+                self.part_mu.unlock(io);
+                return;
+            }
+            seen_seq = self.batch_seq;
+            const b = self.batch.?;
+            b.active_workers += 1;
+            self.part_mu.unlock(io);
+
+            while (true) {
+                const k = b.next_part.fetchAdd(1, .monotonic);
+                if (k >= b.parts) break;
+                _ = b.job.run(b.start + k, b.parts, b.end);
+            }
+
+            self.part_mu.lockUncancelable(io);
+            b.active_workers -= 1;
+            if (b.active_workers == 0) self.part_done_cv.broadcast(io);
+            self.part_mu.unlock(io);
+        }
+    }
+};
+
 /// Engram rows read ahead on a thread of its own: per grid (a run of `len` tokens from position `at`),
 /// layer by layer and span by span, the order the forward asks for them, so the SSD reads hide behind
 /// the GPU work of the spans, layers and chunks before.
@@ -652,6 +895,8 @@ pub const Prefetch = struct {
     /// Set once the thread has read every grid (or was stopped).
     ended: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    pool: ?*ReadPool = null,
+    next: ?*Prefetch = null,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
@@ -672,6 +917,11 @@ pub const Prefetch = struct {
 
     /// Reads `specs` in order. Copies what it is given; the returned value must not move (the thread holds it).
     pub fn start(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
+        return startWithPool(null, gpa, tables, specs, nc, span);
+    }
+
+    /// Reads `specs` in order on `pool`'s persistent worker thread when non-null, else spawns a dedicated thread.
+    pub fn startWithPool(pool: ?*ReadPool, gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
         const self = try gpa.create(Prefetch);
         errdefer gpa.destroy(self);
         const own_tables = try gpa.dupe(*const Table, tables);
@@ -691,7 +941,11 @@ pub const Prefetch = struct {
             made += 1;
         }
         self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        if (pool) |p| {
+            p.submitPrefetch(self);
+        } else {
+            self.thread = try std.Thread.spawn(.{}, run, .{self});
+        }
         return self;
     }
 
@@ -703,6 +957,10 @@ pub const Prefetch = struct {
 
     fn run(self: *Prefetch) void {
         defer self.ended.store(true, .release);
+        self.runBody();
+    }
+
+    fn runBody(self: *Prefetch) void {
         for (self.grids) |*g| {
             const n_spans = g.items.len / self.tables.len;
             for (self.tables, 0..) |table, layer| for (0..n_spans) |k| {
@@ -755,8 +1013,12 @@ pub const Prefetch = struct {
 
     /// Stops the thread, frees what was never taken and the prefetch itself.
     pub fn finish(self: *Prefetch) void {
-        self.stop.store(true, .release);
-        if (self.thread) |t| t.join();
+        if (self.pool) |p| {
+            p.cancelOrWaitPrefetch(self);
+        } else {
+            self.stop.store(true, .release);
+            if (self.thread) |t| t.join();
+        }
         for (self.grids) |g| freeGrid(self.gpa, g);
         self.gpa.free(self.grids);
         self.gpa.free(self.tables);
@@ -1211,4 +1473,59 @@ test "engram reads a page-cached wide shard without fanning out to the SSD queue
     try testing.expectEqual(@as(usize, 64), peak_readers_for_test);
     try testing.expectEqual(@as(usize, 3), MixedPages.samples);
     try expectPatternRows(raw, &ids);
+}
+
+test "engram ReadPool and inline RowCache tryReadCached match Table.read without SSD hits" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    const rows = 64;
+    try writePatternShard(io, td.dir, rows);
+    var buf: [512]u8 = undefined;
+    var table = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], layer1, rows, 64);
+    defer table.close();
+    const pool = try ReadPool.create(testing.allocator);
+    defer pool.destroy();
+    const cache = try RowCache.create(testing.allocator, rows, table.w_row, table.sdim);
+    defer cache.destroy();
+    var reads = std.atomic.Value(u64).init(0);
+    table.pool = pool;
+    table.cache = cache;
+    table.rows_read = &reads;
+
+    // Cold miss returns null with zero stat mutation or shard reads.
+    const probe = [_]u32{ 3, 17, 42, 63, 17 };
+    try testing.expect((try table.tryReadCached(testing.allocator, &probe)) == null);
+    try testing.expectEqual(@as(u64, 0), cache.hits);
+    try testing.expectEqual(@as(u64, 0), cache.misses);
+    try testing.expectEqual(@as(u64, 0), reads.load(.monotonic));
+
+    // Pooled multi-part read warms cache and matches exact pattern bytes.
+    var all_ids: [rows]u32 = undefined;
+    for (&all_ids, 0..) |*id, i| id.* = @intCast(i);
+    const warmed = try table.read(testing.allocator, &all_ids);
+    defer warmed.deinit(testing.allocator);
+    try expectPatternRows(warmed, &all_ids);
+    try testing.expectEqual(@as(u64, rows), reads.load(.monotonic));
+
+    // Hot tryReadCached returns exact rows with zero additional shard reads.
+    const cached = (try table.tryReadCached(testing.allocator, &probe)).?;
+    defer cached.deinit(testing.allocator);
+    try expectPatternRows(cached, &probe);
+    try testing.expectEqual(@as(u64, rows), reads.load(.monotonic));
+
+    // Pooled Prefetch serves multiple grids on the persistent worker without spawning.
+    var pf_ids: [4 * 2 * 2]u32 = undefined;
+    for (&pf_ids, 0..) |*id, i| id.* = @intCast((i * 7 + 5) % rows);
+    const tables = [_]*const Table{ &table, &table };
+    const pf = try Prefetch.startWithPool(pool, testing.allocator, &tables, &.{.{ .at = 0, .len = 4, .ids = &pf_ids }}, 2, 2);
+    defer pf.finish();
+    for (0..2) |layer| for (0..2) |k| {
+        const raw = try pf.take(0, layer, k);
+        defer raw.deinit(testing.allocator);
+        var want: [4]u32 = undefined;
+        for (0..2) |t| @memcpy(want[t * 2 ..][0..2], pf_ids[((k * 2 + t) * 2 + layer) * 2 ..][0..2]);
+        try expectPatternRows(raw, &want);
+    };
+    try testing.expectEqual(@as(u64, rows), reads.load(.monotonic));
 }

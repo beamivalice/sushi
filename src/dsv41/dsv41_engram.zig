@@ -7,10 +7,11 @@ const cfg_mod = @import("dsv41_config.zig");
 pub const Hash = engram.Hash;
 pub const Table = engram.Table;
 pub const RowCache = engram.RowCache;
+pub const ReadPool = engram.ReadPool;
 pub const Prefetch = engram.Prefetch;
 pub const cache_rows = engram.cache_rows;
 pub const cacheBytes = engram.cacheBytes;
-const MAX_COLS = engram.MAX_COLS;
+pub const MAX_COLS = engram.MAX_COLS;
 
 /// Layer `layer`'s table in the release checkpoint at `dir_path`.
 pub fn openTable(gpa: std.mem.Allocator, dir_path: []const u8, layer: usize, rows: u64, head_dim: u32) !Table {
