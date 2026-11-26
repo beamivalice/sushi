@@ -185,7 +185,11 @@ test "cooler contract: a load that fails after its manifest settled leaves the n
             var msg: [512]u8 = undefined;
             _ = mlx.takeError(&msg);
             // The next load of A's shape finds the manifest and skips the warm, and its own write lands.
-            const again = try warmRuns(C, dir, 0);
+            const before = cooler_warm.runs_for_test;
+            var cooler: Load = undefined;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            const again = cooler_warm.runs_for_test - before;
             errdefer std.debug.print("served warms that ran: first={d} again={d}\n", .{ first, again });
             try testing.expectEqual(@as(u32, 1), first);
             try testing.expectEqual(@as(u32, 0), again);
@@ -193,6 +197,63 @@ test "cooler contract: a load that fails after its manifest settled leaves the n
             var found = try @import("pipeline_manifest.zig").lookup(testing.allocator, io, tmp.dir, key);
             defer found.deinit();
             try testing.expect(found == .same);
+        }
+    }.run);
+}
+
+/// Whether the manifest of `key` holds the marker recipe `name`.
+fn holdsMarker(dir: std.Io.Dir, key: @import("pipeline_manifest.zig").Key, name: []const u8) !bool {
+    var found = try @import("pipeline_manifest.zig").lookup(testing.allocator, io, dir, key);
+    defer found.deinit();
+    const recipes = switch (found) {
+        .same => |l| l.recipes,
+        else => return error.NoManifest,
+    };
+    for (recipes) |r| if (r.kind == .marker and std.mem.eql(u8, r.key, name)) return true;
+    return false;
+}
+
+test "cooler contract: a warm that runs after a model unloaded writes no manifest, since no load has settled one" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            mlx.engine.pipeline_registry.resetForTest();
+            var key: @import("pipeline_manifest.zig").Key = undefined;
+            {
+                var cooler: Load = undefined;
+                try cooler.open(C, dir, true);
+                defer _ = cooler.close();
+                key = shared.writtenKey() orelse return error.NoManifestWritten;
+            }
+            // The next load's vision tower warms while its weights load, before its manifest is opened.
+            mlx.engine.pipeline_registry.recordMarker("vision tower", "tower/next-load");
+            shared.rewriteLate();
+            try testing.expect(!try holdsMarker(tmp.dir, key, "tower/next-load"));
+        }
+    }.run);
+}
+
+test "cooler contract: a marker a vision tower recorded while its load's weights loaded is in the manifest that load writes" {
+    try eachArch(struct {
+        fn run(comptime C: type, dir: []const u8, _: []const u32) !void {
+            const shared = @import("arch/cooler_pipelines.zig");
+            var tmp = testing.tmpDir(.{ .iterate = true });
+            defer tmp.cleanup();
+            shared.root_hook = tmp.dir;
+            defer shared.root_hook = null;
+            defer shared.forget();
+            mlx.engine.pipeline_registry.resetForTest();
+            mlx.engine.pipeline_registry.recordMarker("vision tower", "tower/this-load");
+            var cooler: Load = undefined;
+            try cooler.open(C, dir, true);
+            defer _ = cooler.close();
+            const key = shared.writtenKey() orelse return error.NoManifestWritten;
+            try testing.expect(try holdsMarker(tmp.dir, key, "tower/this-load"));
         }
     }.run);
 }

@@ -182,6 +182,13 @@ fn write(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key) 
     return true;
 }
 
+/// The model whose manifest this is unloaded: no manifest is rewritten until a load settles the next, and a marker
+/// recorded meanwhile (a vision tower's) is that load's.
+pub fn modelUnloaded() void {
+    last = null;
+    registry.manifestClosed();
+}
+
 /// A test's directory is gone with the test: nothing is rewritten after it.
 pub fn forget() void {
     last = null;

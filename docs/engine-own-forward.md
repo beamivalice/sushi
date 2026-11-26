@@ -585,7 +585,9 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   model's seal): one block over five patch counts, the seal lifted for its span. Its recipes ride the manifest with a
   `marker` recipe (`vision tower`, keyed by the tower's widths) that says the warm is whole; a same-key load makes the
   recipes with the rest, trusts the marker, and runs no tower warm. A load that ran the warm writes the manifest again
-  (`cooler_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers. The tower's load is
+  (`cooler_pipelines.rewriteLate`). A manifest whose recipes did not all make drops its markers. A tower that warms before its load's manifest settles (Hy4-Flash and
+  Qwen, with the weights) records its marker for the next settle, and an unload (`cooler_pipelines.modelUnloaded`) closes the
+  manifest: nothing rewrites it until a load settles the next. The tower's load is
   inside the lifted seal too (`Dsv41Vision.init`): its requantization makes one stock kernel, whose recipe rides the
   manifest with the warm's.
 - **Every warm forward of the engine runs under a request's budget** (`dsv41_model.warmBudget`, before each decode-width

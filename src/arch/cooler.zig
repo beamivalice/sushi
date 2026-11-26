@@ -169,6 +169,7 @@ pub fn ownsCaps(config: *const ModelConfig) bool {
 /// The model of `config` is unloaded: the pool's free buffers go, then any cap, since a cap is a forward's and the
 /// next load makes tensors before any.
 pub fn unloadModel(config: *const ModelConfig) void {
+    if (onEngine(config)) @import("cooler_pipelines.zig").modelUnloaded();
     if (!onEngine(config) or ownCaps(config)) return;
     mlx.engine.close();
     trimTo(0);

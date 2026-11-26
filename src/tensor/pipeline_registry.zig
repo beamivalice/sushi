@@ -117,9 +117,20 @@ pub fn putMarker(r: Recipe) !void {
     pending_markers.appendAssumeCapacity(try dupeRecipe(r));
 }
 
+/// Markers a warm recorded while no load's manifest stood settled (a vision tower warms as its weights load, before its
+/// manifest opens): the next settle takes them as its own.
+var early_markers: std.ArrayList(Recipe) = .empty;
+/// Whether a load's manifest is settled and its model not yet unloaded.
+var settled = false;
+
+/// The model of the settled manifest unloaded: a marker recorded from now belongs to the next load's manifest.
+pub fn manifestClosed() void {
+    settled = false;
+}
+
 /// One load's settle: its manifest's markers replace the last load's, trusted (the manifest's recipes all made) or
 /// dropped. A marker a warm recorded under the last load leaves `recorded` too, so the manifest written next holds
-/// this load's markers only.
+/// this load's markers only; the early markers are this load's.
 pub fn settleMarkers(trusted: bool) void {
     var i: usize = 0;
     while (i < recorded.items.len) {
@@ -132,6 +143,12 @@ pub fn settleMarkers(trusted: bool) void {
         for (pending_markers.items) |m| record(m);
     } else for (pending_markers.items) |m| freeRecipe(m);
     pending_markers.clearRetainingCapacity();
+    settled = true;
+    for (early_markers.items) |m| {
+        record(m);
+        freeRecipe(m);
+    }
+    early_markers.clearRetainingCapacity();
 }
 
 /// Whether a trusted manifest holds the marker `key`: the warm it names was made whole by recipes already made.
@@ -142,7 +159,16 @@ pub fn takeMarker(key: []const u8) bool {
 
 /// The warm named `key` has run in this process: its recipes are recorded, so this marks them whole.
 pub fn recordMarker(function: []const u8, key: []const u8) void {
-    record(.{ .kind = .marker, .function = function, .key = key });
+    const r: Recipe = .{ .kind = .marker, .function = function, .key = key };
+    if (settled) return record(r);
+    const owned = dupeRecipe(r) catch {
+        lost += 1;
+        return;
+    };
+    early_markers.append(gpa, owned) catch {
+        freeRecipe(owned);
+        lost += 1;
+    };
 }
 
 /// TEST-ONLY: the process's recipes forgotten, as a new process has none; pipelines already made stay made.
@@ -152,6 +178,9 @@ pub fn resetForTest() void {
     lost = 0;
     pending_markers.clearRetainingCapacity();
     accepted_markers.clearRetainingCapacity();
+    for (early_markers.items) |m| freeRecipe(m);
+    early_markers.clearRetainingCapacity();
+    settled = false;
 }
 
 // ── Tests ──
@@ -210,4 +239,21 @@ test "pipeline registry: a marker one load's warm recorded is not among the reci
     var has_source = false;
     for (recipes()) |r| has_source = has_source or r.kind == .source;
     try testing.expect(has_source);
+}
+
+test "pipeline registry: a marker recorded while no manifest stood settled is the next settle's, and an unload closes the manifest" {
+    resetForTest();
+    defer resetForTest();
+    // A vision tower warms as the weights load, before the load's manifest opens.
+    recordMarker("vision tower", "T");
+    settleMarkers(false);
+    try testing.expect(markerRecorded("T"));
+    // The model unloads; the tower of the next load records before its settle, which drops the last load's markers.
+    recordMarker("served warm", "K");
+    manifestClosed();
+    recordMarker("vision tower", "T2");
+    try testing.expect(markerRecorded("K"));
+    settleMarkers(true);
+    try testing.expect(!markerRecorded("K"));
+    try testing.expect(markerRecorded("T2"));
 }
