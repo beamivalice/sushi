@@ -3716,7 +3716,7 @@ function adminBytes(n) {
 // A pack's size line: what memory takes, then the whole pack when it is over 5% more (tables read from the SSD); a pack
 // that streams from the SSD makes no memory claim, only its total.
 function adminSizeLine(memory, total, streams) {
-  if (streams) return total || memory ? `${adminBytes(total || memory)} total` : "";
+  if (streams) return total ? `${adminBytes(total)} total` : "";
   if (!memory) return total ? `${adminBytes(total)} total` : "";
   return total > memory * 1.05 ? `${adminBytes(memory)} in memory · ${adminBytes(total)} total` : `${adminBytes(memory)} in memory`;
 }

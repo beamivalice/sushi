@@ -25,6 +25,7 @@ assert.equal(page.adminSizeLine(64.8 * GiB, 66 * GiB, false), '64.8 GiB in memor
 assert.equal(page.adminSizeLine(64.8 * GiB, null, false), '64.8 GiB in memory');
 assert.equal(page.adminSizeLine(475 * GiB, 475 * GiB, true), '475 GiB total');
 assert.equal(page.adminSizeLine(null, null, false), '');
+assert.equal(page.adminSizeLine(76.1 * GiB, null, true), '');
 
 const now = 1_700_000_000_000;
 assert.equal(page.adminAgo(0, now), '-');
