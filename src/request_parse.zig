@@ -40,7 +40,8 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
         pos += 1;
         while (pos < body.len and (body[pos] == ' ' or body[pos] == '\t' or body[pos] == '\n' or body[pos] == '\r')) pos += 1;
         if (pos >= body.len) return null;
-        // Accept "string" only — null/numbers/etc fall back to default.
+        // A string or nothing: null and absence mean the default, and a value of another type is refused by
+        // `request_fields` before any handler reads the body.
         if (body[pos] != '"') return null;
         pos += 1;
         const val_start = pos;

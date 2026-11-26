@@ -3572,3 +3572,40 @@ test "server: a reply continued after its thought is one request in the counters
         }
     }.run);
 }
+
+test "server: request fields: a model of the wrong type is refused by name on every surface, never quietly the default's answer" {
+    try eachArch(4, .{}, struct {
+        const Case = struct { path: []const u8, body: []const u8 };
+        const cases = [_]Case{
+            .{ .path = "/v1/chat/completions", .body = "{\"model\":5,\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+            .{ .path = "/v1/completions", .body = "{\"model\":5,\"max_tokens\":2,\"prompt\":\"hi\"}" },
+            .{ .path = "/v1/responses", .body = "{\"model\":5,\"max_output_tokens\":2,\"input\":\"hi\"}" },
+            .{ .path = "/v1/messages", .body = "{\"model\":5,\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}" },
+        };
+        fn refusedByModel(resp: []const u8) bool {
+            return std.mem.startsWith(u8, resp, "HTTP/1.1 400") and std.mem.indexOf(u8, bodyOf(resp), "'model'") != null;
+        }
+        fn run() !void {
+            var served: usize = 0;
+            for (cases) |c| {
+                const resp = try request("POST", c.path, c.body);
+                defer gpa.free(resp);
+                if (!refusedByModel(resp)) {
+                    served += 1;
+                    std.debug.print("{s} with model 5 answered {s}: {s}\n", .{ c.path, resp[0..@min(resp.len, 40)], bodyOf(resp)[0..@min(bodyOf(resp).len, 160)] });
+                }
+            }
+            const fd = try wsConnect();
+            defer _ = std.c.close(fd);
+            try wsSend(fd, "{\"type\":\"response.create\",\"model\":5,\"input\":\"hi\",\"max_output_tokens\":2,\"temperature\":0}");
+            const frame = try wsReadFrame(fd);
+            defer gpa.free(frame);
+            // The socket's refusal is its error frame, and it names the field like the HTTP surfaces' bodies do.
+            if (!std.mem.startsWith(u8, frame, "{\"type\":\"error\"") or std.mem.indexOf(u8, frame, "'model'") == null) {
+                served += 1;
+                std.debug.print("the WebSocket turn with model 5 answered: {s}\n", .{frame[0..@min(frame.len, 200)]});
+            }
+            if (served > 0) return error.WrongModelTypeServed;
+        }
+    }.run);
+}

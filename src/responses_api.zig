@@ -333,19 +333,6 @@ pub fn handleResponsesCompact(
     }
     const root = parsed.value.object;
 
-    // ── model (required) ──
-    const model_val = root.get("model");
-    const has_model = model_val != null and model_val.? == .string and model_val.?.string.len > 0;
-    if (!has_model) {
-        try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "model is required", 422);
-        return;
-    }
-
-    // ── input (required) ──
-    const input_val = root.get("input") orelse {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
-        return;
-    };
     var fault_buf: [384]u8 = undefined;
     const req = switch (request_fields.check(.compact, &fault_buf, root)) {
         .fault => |reason| {
@@ -354,6 +341,19 @@ pub fn handleResponsesCompact(
             return;
         },
         .ok => |c| c,
+    };
+
+    // ── model (required) ──
+    const model_id: []const u8 = req.text("model") orelse "";
+    if (model_id.len == 0) {
+        try sendErrorResponse(allocator, stream, "422 Unprocessable Entity", "invalid_request_error", "model is required", 422);
+        return;
+    }
+
+    // ── input (required) ──
+    const input_val = root.get("input") orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
+        return;
     };
 
     // ── instructions (optional) ──

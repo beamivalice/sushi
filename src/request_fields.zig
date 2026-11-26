@@ -85,6 +85,7 @@ const Row = struct {
 };
 
 const all = [_]Surface{ .chat, .completions, .messages, .responses };
+const every_surface = [_]Surface{ .chat, .completions, .messages, .responses, .compact };
 const not_messages = [_]Surface{ .chat, .completions, .responses };
 const chat_responses = [_]Surface{ .chat, .responses };
 const chat_completions = [_]Surface{ .chat, .completions };
@@ -94,6 +95,8 @@ const constraint_hint = "constrain the output with a JSON schema: response_forma
 const sampler_hint = "this server samples with temperature, top_k, top_p and min_p only";
 
 pub const rows = [_]Row{
+    // The routing id: every surface reads it, and only null or absence means "the default", never a value of another type.
+    .{ .key = "model", .kind = .text, .on = &every_surface },
     .{ .key = "temperature", .kind = .{ .number = .{ .min = 0, .max = 2 } }, .on = &all },
     .{ .key = "top_p", .kind = .{ .number = .{ .min = 0, .max = 1 } }, .on = &all },
     .{ .key = "top_k", .kind = .{ .whole = .{ .min = 0, .max = 1000 } }, .on = &all },
