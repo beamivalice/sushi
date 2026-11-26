@@ -274,9 +274,7 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
 /// memory-sized context), else 0: a context refusal names it then, since raising it is the remedy.
 pub fn contextKvHold(config: *const model_mod.ModelConfig) u64 {
     if (config.max_kv_tokens == 0 or manualContext(config) > 0) return 0;
-    var open = config.*;
-    open.max_kv_tokens = 0;
-    if (open.contextCap() <= config.max_kv_tokens) return 0;
+    if (config.contextWindow() <= config.max_kv_tokens) return 0;
     // Unpinned, the auto context is sized under the cap, so the cap is what holds it.
     return if (config.pinned_context == 0 or config.pinned_context >= config.max_kv_tokens) config.max_kv_tokens else 0;
 }

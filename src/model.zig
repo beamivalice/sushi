@@ -590,15 +590,21 @@ pub const ModelConfig = struct {
     /// `max_position_embeddings`. YaRN: `original_max_position_embeddings ×
     /// factor` — the window HF and vLLM both derive `max_model_len` from — since
     /// a position past it aliases back inside the ramp. 0 = no rope-derived cap.
-    pub fn contextCap(self: *const ModelConfig) u32 {
+    /// The model's own bound, before `max_kv_tokens`: a refusal for a context above it names the window, `contextCap` is what a request may hold.
+    pub fn contextWindow(self: *const ModelConfig) u32 {
         const declared = self.max_position_embeddings;
-        if (!self.rope_yarn) return self.heldToKvTokens(declared);
+        if (!self.rope_yarn) return declared;
         const orig: f64 = @floatFromInt(self.yarn_orig_max_pos);
         const factor: f64 = @floatCast(self.yarn_factor);
         const scaled: f64 = @floor(orig * factor);
         const max_u32: f64 = @floatFromInt(std.math.maxInt(u32));
         const window: u32 = if (scaled >= max_u32) std.math.maxInt(u32) else @intFromFloat(scaled);
-        return self.heldToKvTokens(if (declared == 0) window else @min(window, declared));
+        return if (declared == 0) window else @min(window, declared);
+    }
+
+    /// The window held to `max_kv_tokens`.
+    pub fn contextCap(self: *const ModelConfig) u32 {
+        return self.heldToKvTokens(self.contextWindow());
     }
 
     /// No request holds more than the tokens all the model's requests may hold together (`max_kv_tokens`).

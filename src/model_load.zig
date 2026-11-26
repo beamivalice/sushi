@@ -322,17 +322,17 @@ pub fn thinkPenaltyFlagLine(buf: []u8, config: *const ModelConfig, flag: ?f32) ?
     return std.fmt.bufPrint(buf, "[think-penalty] --think-penalty {d} does not apply to this model: {s}", .{ lambda, why }) catch null;
 }
 
-/// The line that refuses a load whose `--ctx-size`, or else model-settings.json `ctx_size`, is above the window the config
-/// has under the settings and `--config-overrides`; null when it fits.
 /// A context the flag or the saved ctx_size asks above the model's `max_kv_tokens`: no request could ever hold it.
 pub fn contextKvTokensRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32) ?[]const u8 {
     const pick = model_settings.contextPick(ctx_flag, config.ctx_override);
     return model_settings.ctxAboveKvTokensLine(buf, pick.value, config.max_kv_tokens_override orelse 0, pick.source);
 }
 
+/// The line that refuses a load whose `--ctx-size`, or else model-settings.json `ctx_size`, is above the window the config
+/// has under the settings and `--config-overrides`; null when it fits.
 pub fn contextWindowRefusal(buf: []u8, config: *const ModelConfig, ctx_flag: u32) ?[]const u8 {
     const pick = model_settings.contextPick(ctx_flag, config.ctx_override);
-    return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextCap(), config.yarn_factor_override, pick.source);
+    return model_settings.ctxAboveWindowLine(buf, pick.value, config.contextWindow(), config.yarn_factor_override, pick.source);
 }
 
 /// The load's warm: faults weight pages and compiles the decode path's kernels with throwaway forwards on this thread's
@@ -4117,6 +4117,20 @@ test "a context above the model's max_kv_tokens is refused by name, from the fla
     try testing.expect(launchRefusal(&buf, &c, null, 0) == null);
     c.max_kv_tokens_override = null;
     try testing.expect(launchRefusal(&buf, &c, null, 16384) == null);
+}
+
+test "a context above an applied max_kv_tokens is refused as the cap, one above the model's window as the window" {
+    var buf: [384]u8 = undefined;
+    var c = ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 262_144 };
+    applyModelSettings(&c, .{ .max_kv_tokens = 4096 });
+    try testing.expectEqual(@as(u64, 4096), c.max_kv_tokens);
+    const kv = launchRefusal(&buf, &c, null, 16384) orelse return error.TestExpectedRefusal;
+    try testing.expectEqual(error.ContextSizeAboveKvTokens, kv.err);
+    try testing.expectEqualStrings("--ctx-size 16384 is above this model's max_kv_tokens 4096, the tokens its requests may hold together; lower --ctx-size or raise max_kv_tokens", kv.line);
+    const win = launchRefusal(&buf, &c, null, 1_048_576) orelse return error.TestExpectedRefusal;
+    try testing.expectEqual(error.ContextSizeAboveWindow, win.err);
+    try testing.expectEqualStrings("--ctx-size 1048576 is above the 262144-token window this model has without yarn_factor; lower --ctx-size or set yarn_factor", win.line);
+    try testing.expect(launchRefusal(&buf, &c, null, 4096) == null);
 }
 
 test "max_concurrent resolves where the streaming plan decides residency: a resident Hy4 load joins up to its rows, not one request at a time (HY4_STQ_TINY)" {

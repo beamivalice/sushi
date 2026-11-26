@@ -1358,5 +1358,5 @@ test "kld load: an --ctx-size above a saved max_kv_tokens is refused by name bef
     };
 
     const opts = Options{ .model_dir = root, .prompts = "standard4", .out_dir = "/nonexistent/out", .ctx_size = 4096 };
-    try t.expectError(error.ContextSizeAboveWindow, loadModel(io, t.allocator, opts));
+    try t.expectError(error.ContextSizeAboveKvTokens, loadModel(io, t.allocator, opts));
 }

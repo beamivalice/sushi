@@ -660,7 +660,8 @@ the ledger (`static_bill.onLedger`; docs/bill_redesign.md parts 4 and 9). Its bi
   a context limit (`max_tokens` clamped, a prompt past it the context's 400 naming `max_kv_tokens`). The gates
   reserve no bytes: on a Sushi Cooler load the ledger stays the one memory accountant.
 - A context above `max_kv_tokens` is never billed: one the flag or `ctx_size` asks is refused by name at load
-  (`ContextSizeAboveKvTokens`) and on a save (a `max_kv_tokens` save is judged against the `--ctx-size` in force,
+  (`ContextSizeAboveKvTokens`; `ContextSizeAboveWindow` only above `ModelConfig.contextWindow`, the model's own bound before
+  the cap) and on a save (a `max_kv_tokens` save is judged against the `--ctx-size` in force,
   `Fit.ctx_flag`), and an auto context stays under the cap (`ModelConfig.contextCap`), a frozen one re-clamped where a
   load resolves the cap (`resolveConcurrency`); a context 400 names `max_kv_tokens` only when the cap, not a smaller
   memory-sized context, holds it.

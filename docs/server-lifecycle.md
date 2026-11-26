@@ -261,7 +261,8 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   is above the W-token window ...` and `ContextSizeAboveWindow` (`model_load.contextWindowRefusal`). An explicit
   `--ctx-size` outranks the file and is judged the same way, under the `yarn_factor` and `--config-overrides` in force:
   `--ctx-size N is above the W-token window ...` ends a boot load with a non-zero exit before any weight loads, and
-  answers an on-demand load with `503 context_size_above_window` carrying the same line.
+  answers an on-demand load with `503 context_size_above_window` carrying the same line. A context within the window but
+  above `max_kv_tokens` is `ContextSizeAboveKvTokens` instead: the window is judged on `contextWindow`, never `contextCap`.
   A launch flag the model's arch cannot act on (`model_load.launchRefusal`) is checked at the same two points and
   answers `503 launch_flag_unsupported` (a saved `kv_quant` the arch cannot store: `kv_quant_unsupported`) with the
   flag's line. Only the kv_quant refusal is in `ModelRegistry.refusals` (a hand-edited file decides it, so the next
