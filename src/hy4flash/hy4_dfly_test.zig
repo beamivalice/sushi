@@ -495,3 +495,39 @@ test "hy4 bill: on a load that drafts, the closed-form terms at a request's reac
     }
 }
 
+
+test "hy4: a load keeps no Engram row cache, so a repeated request reads its rows through the shard again (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const contract = @import("../cooler_contract_test.zig");
+    const hy4_contract = @import("hy4_contract.zig");
+    const arch_handle = @import("../arch/handle.zig");
+    const arch_sched = @import("../arch/sched.zig");
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.open(hy4_contract, dir, true);
+    defer _ = ld.close();
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    var reads = std.atomic.Value(u64).init(0);
+    var tables: usize = 0;
+    for (m.engram_store) |*e| if (e.disk) |*d| {
+        try testing.expect(d.cache == null);
+        d.rows_read = &reads;
+        tables += 1;
+    };
+    try testing.expect(tables > 0);
+    const turn = arch_handle.turnFor(ld.h, &ld.config);
+    defer turn.end();
+    defer arch_sched.endRequest(&ld.config);
+    var got = try hy4_contract.specTokens(a, ld.xfm, ids[0..24], 8);
+    defer got.deinit(a);
+    const first = reads.load(.monotonic);
+    var again = try hy4_contract.specTokens(a, ld.xfm, ids[0..24], 8);
+    defer again.deinit(a);
+    const second = reads.load(.monotonic) - first;
+    errdefer std.debug.print("hy4: the same request read {d} then {d} Engram rows from the shard\n", .{ first, second });
+    try testing.expect(first > 0);
+    try testing.expectEqual(first, second);
+}
