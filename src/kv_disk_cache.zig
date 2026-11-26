@@ -683,11 +683,11 @@ pub const DiskTier = struct {
         return false;
     }
 
-    /// Mark one entry dead; `chunk_bytes` is zeroed so every "is this whole?" reader answers no.
+    /// Mark one entry dead. `chunk_bytes` stays its billing estimate: the removal path credits what the
+    /// commit billed, and every whole-ness reader checks `poisoned` itself.
     fn poisonEntry(self: *DiskTier, e: *IndexEntry, err_name: []const u8) void {
         _ = self;
         e.poisoned = true;
-        @memset(e.chunk_bytes, 0);
         log.warn("  [disk-cache] e{d} invalidated ({s})\n", .{ e.id, err_name });
     }
 
@@ -8755,7 +8755,8 @@ test "DiskTier: a failed background write INVALIDATES the entry it belonged to (
 
     try testing.expectEqual(@as(usize, 1), tier.harvestWriteFailures());
     try testing.expect(tier.entries.items[0].poisoned);
-    for (tier.entries.items[0].chunk_bytes) |b| try testing.expectEqual(@as(u64, 0), b);
+    // The death mark is `poisoned` alone; the recorded sizes stay the bill removal credits.
+    for (tier.entries.items[0].chunk_bytes) |b| try testing.expect(b > 0);
     try testing.expect(!tier.holdsFullPrefix(cache.entries, cache.step, &tokens, false, cache.config));
     try testing.expect(tier.fullPrefixEntryId(cache.entries, cache.step, &tokens, false, cache.config) == null);
     try testing.expect(tier.bestMatch(&tokens, false, cache.config, .{}) == null);

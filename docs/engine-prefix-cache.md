@@ -180,7 +180,9 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   as long as the longest point ever kept until the entry is evicted. An extending commit writes only the segments
   past the store. The manifest lists the segments' bytes (`grown`, v11, which an older reader drops); a scan keeps the
   contiguous valid segments and drops each point that leans on a lost one. Segment bytes ride the entry's bill
-  (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`).
+  (`nonChunkBytes`, `bytesFreedByRemoving`, `billChunksOnce`) and the pre-write estimate (`entryBytesAt`). A poisoned
+  entry (`poisonEntry`) keeps its recorded chunk sizes, so dropping it credits every byte its commit billed: a chunk
+  whose write failed does not stay in `total_bytes`.
 - **A new entry inherits row segments from the entry holding the most** (`segmentDonor`, `linkInheritedSegments`, SSD-first
   or a writer; not the chunk donor, which may be a later turn that crossed no grid point and holds none): the segments
   whose whole span lies inside the prefix donor and heir share, which a point of the commit leans on,
@@ -585,7 +587,8 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   A model with a request holding it (`refcount > 0`) is refused, not queued. The tier's namespace is published beside its
   numbers (`DiskStats.namespace`, the fingerprint directory as a number), which is how the listing names the owner without
   touching the tier from a connection thread. The stale delete takes each root's `.lock` like `sweepBase`, so a root another
-  process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then `refreshDiskBudget`, which cuts or drops a sole resident over the new cap).
+  process owns is skipped. A new `prefix_cache_disk_gb` runs the same way (`set_cap`: `operator_cap` then
+  `refreshDiskBudget`, which cuts or drops a sole resident over the new cap).
 - The cache volume (`disk_placement.cacheVolume`, on the connection thread): the cache root resolved through symlinks,
   its free and total bytes and its mount's name. A `SUSHI_PREFIX_CACHE_DIR` that does not exist is unavailable (null
   name and space), never its parent's volume; the default root, made on first write, reports the volume it will land

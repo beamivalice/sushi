@@ -1692,6 +1692,93 @@ test "DiskTier: a live cap lowered under a sole entry (admin set_cap path) leave
     try testing.expect(tier.total_bytes <= tier.max_bytes);
 }
 
+test "DiskTier: a failed chunk write leaves the tier's byte count with the entry that is dropped" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-phantom", 0, 128, .real);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var a_tokens: [600]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var b_tokens: [600]u32 = undefined;
+    for (&b_tokens, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &a_tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+
+    // B's fourth chunk fails, as a full volume's would; its manifest still lands.
+    tier.writer.?.setPaused(true);
+    tier.writer.?.injectFailure("e2/c000003", .write);
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &b_tokens, false, null, s);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    try testing.expect(tier.writeErrors() > 0);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+
+    // The next commit harvests the failure, drops the dead entry, and stores B anew.
+    tier.writer.?.injectFailure(null, .write);
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &b_tokens, false, null, s);
+    tier.drainWriter();
+    var sum: u64 = 0;
+    for (tier.entries.items) |e| sum += e.bytes;
+    if (tier.total_bytes > sum + 4096) {
+        std.debug.print("fx-d5: after a failed chunk write: total_bytes {d}, live entries {d} ({d} entries)\n", .{ tier.total_bytes, sum, tier.entries.items.len });
+    }
+    try testing.expect(tier.total_bytes <= sum + 4096);
+}
+
+test "DiskTier: control — a chunk deleted from a healthy entry is credited from its estimate" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
+
+    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-credit", 0, 128, .real);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try kv_disk_cache.fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
+    var a_tokens: [600]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var b_tokens: [600]u32 = undefined;
+    for (&b_tokens, 0..) |*t, i| t.* = @intCast(i + 90_000);
+
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &a_tokens, false, null, s);
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &b_tokens, false, null, s);
+    tier.drainWriter();
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const b_id = tier.entries.items[1].id;
+    // Remove one of B's chunk files behind the index, then evict B whole.
+    var nb: [128]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nb, "fp-credit/e{d}/c000003.safetensors", .{b_id});
+    tmp.dir.deleteFile(io, name) catch {};
+    tier.invalidateNewest();
+    var sum: u64 = 0;
+    for (tier.entries.items) |e| sum += e.bytes;
+    if (tier.total_bytes > sum + 1024) {
+        std.debug.print("fx-d5: control (no poison): total_bytes {d}, live entries {d}\n", .{ tier.total_bytes, sum });
+    }
+    try testing.expect(tier.total_bytes <= sum + 1024);
+}
+
 test "DiskTier: a lowered budget on a restart cuts a sole entry to the chunks that fit" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
