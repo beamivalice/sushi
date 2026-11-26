@@ -183,7 +183,9 @@ and the page tooltip share them.
   default), and that word must stay offered, as the server requires.
 
 - A model save that would leave `ctx_size` above `max_kv_tokens` lowers the context to the budget and says why in its
-  toast, never refuses (`adminContextWithinBudget`); the API refuses the same save by name.
+  toast, never refuses (`adminContextWithinBudget`); the API refuses the same save by name. A `ctx_size` a launch flag
+  locks is never written: a budget below `--ctx-size` is refused on the `max_kv_tokens` row before the POST, in the
+  server's words.
 
 ## Dashboard charts
 

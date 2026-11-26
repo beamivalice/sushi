@@ -213,4 +213,14 @@ storeChecks.then(() => console.log('Web UI admin views: passed'), (e) => { conso
   assert.equal(within({ ctx_size: 8192 }, {}).note, null, 'no budget, no cap');
   assert.equal(within({ max_kv_tokens: null }, { ctx_size: { file: 8192 } }).note, null, 'clearing the budget clears the cap');
   assert.equal(within({ ctx_size: null, max_kv_tokens: 4096 }, {}).note, null, 'an auto context is held by the server');
+  // A launch flag pins the context: the save never writes it, and says which flag holds it above the budget.
+  const pinned = { ctx_size: { file: 131072, flag: '65536', locked: true, source: 'flag' }, max_kv_tokens: { file: null } };
+  const locked = within({ max_kv_tokens: 4096 }, pinned);
+  assert.equal('ctx_size' in locked.set, false, 'a save never writes a flag-locked ctx_size');
+  assert.match(locked.note, /--ctx-size 65536 is above this model's max_kv_tokens 4096,/);
+  const flagOnly = within({ max_kv_tokens: 4096 }, { ctx_size: { file: null, flag: '65536', locked: true, source: 'flag' } });
+  assert.match(flagOnly.note, /--ctx-size 65536/, 'the flag is the context even when the file holds none');
+  assert.equal('ctx_size' in flagOnly.set, false);
+  assert.equal(within({ max_kv_tokens: 65536 }, pinned).note, null, 'a budget the flag fits is no note');
+  assert.equal(within({ max_kv_tokens: null }, pinned).note, null, 'clearing the budget clears the cap');
 }

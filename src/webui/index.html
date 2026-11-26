@@ -3765,10 +3765,17 @@ function adminChanges(specs, settings, texts, badInput = {}) {
   }
   return { set, bad: null };
 }
-// A context above the token budget can never be held: the save lowers it to the budget and says why, never refuses.
+// A context above the token budget can never be held. A file context is lowered to the budget and the note says why; a
+// context a launch flag holds is never written: the note is the server's refusal, which the save shows instead of posting.
 function adminContextWithinBudget(set, settings) {
   const after = (k) => Number((k in set ? set[k] : settings[k]?.file) ?? 0) || 0;
-  const ctx = after("ctx_size"), budget = after("max_kv_tokens");
+  const budget = after("max_kv_tokens");
+  if (settings.ctx_size?.locked) {
+    const flag = Number(settings.ctx_size.flag) || 0;
+    if (!(flag > 0 && budget > 0 && flag > budget)) return null;
+    return `--ctx-size ${flag} is above this model's max_kv_tokens ${budget}, the tokens its requests may hold together; lower --ctx-size or raise max_kv_tokens`;
+  }
+  const ctx = after("ctx_size");
   if (!(ctx > 0 && budget > 0 && ctx > budget)) return null;
   set.ctx_size = budget;
   return `Context length lowered to ${budget.toLocaleString()} tokens: one conversation cannot hold more than this model's token budget for memory of past chats.`;
@@ -4431,6 +4438,13 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
     const lowered = adminContextWithinBudget(set, m.settings);
     let shown = null;
     adminSaveStarted(P);
+    if (lowered && m.settings.ctx_size?.locked) {
+      adminSaveRefused(P, "max_kv_tokens", labelled(lowered));
+      shown = F.sets.get("max_kv_tokens").row;
+      await invalidate({ models: true, settings: true });
+      shown.scrollIntoView({ block: "nearest" });
+      return;
+    }
     await withBusy(F.save, "Saving…", async () => {
       try {
         const r = await postJson("/v1/settings", { model: F.id, set });

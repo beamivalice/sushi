@@ -937,7 +937,11 @@ fn save(host: anytype, arena: std.mem.Allocator, io: std.Io, path: []const u8, p
     defer file.deinit();
     // Under the lock: a save checked against a file another save then rewrote could land a pair either alone is refused.
     if (fit) |f| if (plan.model_edits.len > 0) {
-        if (refusalMessage(arena, f, model_settings.modelObject(&file, model_path), plan.model_edits)) |message| return .{ .refused = message };
+        var judged = f;
+        if (locks.model("ctx_size")) |lock| if (lock.set) {
+            judged.ctx_flag = std.fmt.parseInt(u32, lock.text(), 10) catch 0;
+        };
+        if (refusalMessage(arena, judged, model_settings.modelObject(&file, model_path), plan.model_edits)) |message| return .{ .refused = message };
     };
     var next: [effort_mod.family_count]effort_mod.Edits = undefined;
     var sections = std.ArrayList(model_settings.SectionEdits).empty;
@@ -1903,6 +1907,31 @@ test "settings api: a model save is judged against the file it rewrites, so two 
     const path2 = try savedFile(&tmp, &path_buf, "{}");
     var host2: TestHost = .{ .io = testing.io, .path = path2 };
     try testing.expect(try save(&host2, a, testing.io, path2, parseRequest(a, "{\"model\":\"m\",\"set\":{\"mtp\":true}}").ok, "/m/a", fit) == .saved);
+}
+
+test "settings api: a max_kv_tokens save below the --ctx-size in force is refused naming the flag, with or without a file ctx_size" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const saved_globals = SavedGlobals.take();
+    defer saved_globals.restore();
+    const fit: model_settings.Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [600]u8 = undefined;
+    const path = try savedFile(&tmp, &path_buf, "{}");
+    var host: TestHost = .{ .io = testing.io, .path = path };
+    const body = "{\"model\":\"m\",\"set\":{\"max_kv_tokens\":4096}}";
+    // No flag and no file ctx_size: nothing to be above.
+    try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, body).ok, "/m/a", fit) == .saved);
+    model_settings.launch_locks.modelMut("ctx_size").pin("{d}", .{65536});
+    const refused = try save(&host, a, testing.io, path, parseRequest(a, body).ok, "/m/a", fit);
+    try testing.expect(refused == .refused);
+    try testing.expect(std.mem.indexOf(u8, refused.refused, "\"max_kv_tokens\"") != null);
+    try testing.expect(std.mem.indexOf(u8, refused.refused, "--ctx-size 65536 is above this model's max_kv_tokens 4096") != null);
+    // A budget the flag fits, and removing the budget, are never blocked by it.
+    try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, "{\"model\":\"m\",\"set\":{\"max_kv_tokens\":65536}}").ok, "/m/a", fit) == .saved);
+    try testing.expect(try save(&host, a, testing.io, path, parseRequest(a, "{\"model\":\"m\",\"set\":{\"max_kv_tokens\":null}}").ok, "/m/a", fit) == .saved);
 }
 
 test "settings api: max_tokens round-trips as a positive integer and is refused above the context window" {

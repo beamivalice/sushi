@@ -568,6 +568,8 @@ pub const Fit = struct {
     context_cap: u32 = 0,
     /// The widest prefill chunk the arch's width reaches (`settings_resolve.chunkCeiling`); 0 = unknown.
     prefill_chunk_ceiling: u32 = 0,
+    /// The `--ctx-size` in force, which outranks the file's `ctx_size`; 0 = not given.
+    ctx_flag: u32 = 0,
     template_preserves_thinking: bool = true,
     template_thinks: bool = true,
     serves_bias: bool = true,
@@ -742,6 +744,7 @@ pub fn refuseEdits(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit,
     if (chunkMinAboveMax(existing, edits, buf)) |r| return r;
     if (chunkMinAboveCeiling(fit, existing, edits, buf)) |r| return r;
     if (ctxAboveKvTokens(existing, edits, buf)) |r| return r;
+    if (flagAboveKvTokens(fit, existing, edits, buf)) |r| return r;
     return ctxAboveWindow(fit, existing, edits, buf);
 }
 
@@ -758,6 +761,18 @@ fn ctxAboveKvTokens(existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u
     if (ctx != .integer or cap != .integer or ctx.integer < 1 or cap.integer < 1 or ctx.integer <= cap.integer) return null;
     const why = std.fmt.bufPrint(buf, "ctx_size {d} is above max_kv_tokens {d}, the tokens this model's requests may hold together; lower ctx_size or raise max_kv_tokens", .{ ctx.integer, cap.integer }) catch "ctx_size is above max_kv_tokens";
     return .{ .key = k, .why = why };
+}
+
+/// A `max_kv_tokens` the save sets below the `--ctx-size` in force: the next load refuses that pair, and a flag cannot be edited.
+fn flagAboveKvTokens(fit: Fit, existing: ?std.json.ObjectMap, edits: []const Edit, buf: []u8) ?Refusal {
+    if (fit.ctx_flag == 0) return null;
+    for (edits) |e| if (std.mem.eql(u8, e.key, "max_kv_tokens")) {
+        const cap = stateOf(existing, edits, "max_kv_tokens") orelse return null;
+        if (cap != .integer or cap.integer < 1 or fit.ctx_flag <= cap.integer) return null;
+        const line = ctxAboveKvTokensLine(buf, fit.ctx_flag, @intCast(cap.integer), .flag) orelse "--ctx-size is above this model's max_kv_tokens; lower --ctx-size or raise max_kv_tokens";
+        return .{ .key = "max_kv_tokens", .why = line };
+    };
+    return null;
 }
 
 fn isChunkBound(key: []const u8) bool {
@@ -1837,6 +1852,24 @@ test "model_settings: prefill_chunk_max and prefill_chunk_min are one of 512, 10
     try existing.put(t.allocator, "prefill_chunk_min", .{ .integer = 2048 });
     try t.expect(refuseEdits(any, existing, &.{.{ .key = "prefill_chunk_max", .value = .{ .integer = 1024 } }}, &buf) != null);
     try t.expect(refuseEdits(any, existing, &.{.{ .key = "prefill_chunk_max", .value = .{ .integer = 2048 } }}, &buf) == null);
+}
+
+test "model_settings: a max_kv_tokens save is judged against the --ctx-size in force, naming the flag" {
+    const t = std.testing;
+    const flagged: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false, .ctx_flag = 65536 };
+    var buf: [200]u8 = undefined;
+    const low = refuseEdits(flagged, null, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } }}, &buf) orelse return error.TestExpectedRefusal;
+    try t.expectEqualStrings("max_kv_tokens", low.key);
+    try t.expectEqualStrings("--ctx-size 65536 is above this model's max_kv_tokens 4096, the tokens its requests may hold together; lower --ctx-size or raise max_kv_tokens", low.why);
+    try t.expect(refuseEdits(flagged, null, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 65536 } }}, &buf) == null);
+    try t.expect(refuseEdits(flagged, null, &.{.{ .key = "max_kv_tokens", .value = null }}, &buf) == null);
+    // A save that does not set the budget is not judged by it.
+    var existing: std.json.ObjectMap = .empty;
+    defer existing.deinit(t.allocator);
+    try existing.put(t.allocator, "max_kv_tokens", .{ .integer = 4096 });
+    try t.expect(refuseEdits(flagged, existing, &.{.{ .key = "mtp", .value = .{ .bool = true } }}, &buf) == null);
+    const bare: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false };
+    try t.expect(refuseEdits(bare, null, &.{.{ .key = "max_kv_tokens", .value = .{ .integer = 4096 } }}, &buf) == null);
 }
 
 test "model_settings: a save never leaves ctx_size above max_kv_tokens, whichever of the two it edits" {

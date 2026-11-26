@@ -1772,6 +1772,14 @@ async function main() {
       const posted = server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings').map((c) => c.body).at(-1);
       assert.deepEqual(posted, { model: 'Qwen-A', set: { max_concurrent: 4, max_kv_tokens: 65536 } });
     });
+    await scenario('a budget below the context a launch flag holds is refused on its row, never posted', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => { withCaps(s); s.state.models[0].settings.ctx_size = keyState({ file: 131072, flag: '65536', source: 'flag', locked: true }); } }, async ({ page, server }) => {
+      await page.waitForSelector(`${row('max_kv_tokens')} input`);
+      await page.fill(`${row('max_kv_tokens')} input`, '4096');
+      await page.click('.savebar button:text-is("Save")');
+      await page.waitForFunction(() => /--ctx-size 65536/.test(document.querySelector('.set[data-key="max_kv_tokens"]')?.textContent ?? ''));
+      assert.match(await page.textContent(row('max_kv_tokens')), /--ctx-size 65536 is above this model's .*4096/);
+      assert.deepEqual(server.calls.filter((c) => c.method === 'POST' && c.path === '/v1/settings'), [], 'the refused save is never posted');
+    });
     await scenario('a model without its own max_concurrent shows the value it inherits as its placeholder', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: (s) => { withCaps(s); s.state.models[0].defaults.max_concurrent = 3; } }, async ({ page }) => {
       await page.waitForSelector(`${row('max_concurrent')} input`);
       assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'Default (3)');

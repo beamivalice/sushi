@@ -266,6 +266,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   answers `503 launch_flag_unsupported` (a saved `kv_quant` the arch cannot store: `kv_quant_unsupported`) with the
   flag's line. Only the kv_quant refusal is in `ModelRegistry.refusals` (a hand-edited file decides it, so the next
   load re-reads the file); a flag against an arch is fixed until restart, so it is not a stored retry.
+- **A save is judged against the resolved context**: a `max_kv_tokens` below the `--ctx-size` in force is refused naming the flag (`Fit.ctx_flag`, set from the launch lock in `settings_api.save`), as the next load would.
 - **Effort tables live under `"effort:<family>"`** (`qwen4_exp`, `deepseek_v41`, `glm5_next`): `default` and one
   object per effort word holding only the changed `offered`, `sends` and `cap` (shape, validation and precedence:
   [server-http-apis](server-http-apis.md#effort-tables)). Read once at start (`model_settings.loadEffortTables`, a bad
