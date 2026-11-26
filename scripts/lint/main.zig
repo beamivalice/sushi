@@ -60,6 +60,7 @@ const rules = .{
     @import("result_field_free.zig"),
     @import("detached_global_read.zig"),
     @import("errdefer_handover.zig"),
+    @import("pack_state_seam.zig"),
 };
 
 const skipped_dirs = [_][]const u8{ "zig-cache", ".zig-cache", "zig-out", "lib" };

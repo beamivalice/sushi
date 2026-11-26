@@ -188,6 +188,19 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   only by it (lint `folder-bytes-compare`), a folder registers once (`error.FolderRegistered`), and a path no entry is at
   names no model: never another folder's by its name (`registry.peekByPath`; a new folder whose name is taken takes
   `<parent>/<name>`, else `IdTaken` → 409).
+<a id="pack-state"></a>
+- **Pack state** (`src/pack_state.zig`, `pack_state.of`): the ONE answer to "is this folder a finished, loadable pack?",
+  asked by the load gate, the boot, discovery, `sushi list` and `sushi run`; nothing else reads the pull's marker or
+  record (lint `pack-state-seam`). A pull verifies each file's content, then seals its weights in `.sushi-pull.json`
+  ([pack-format](pack-format.md#pack-revision)); five states:
+  - `pulling`: `.pull-incomplete` is there (a pull running, stopped or failed); not loadable.
+  - `sealed`: a v2 record's sealed files all still stat as recorded; loadable with no content read, whatever else the folder holds.
+  - `changed`: a sealed file is missing or differs, or the record cannot be read (a torn file, a newer sushi's); not loadable, naming the cause; `sushi pull` re-hashes it.
+  - `unsealed`: no record, or a v1 one (never fingerprinted) (a hand copy, `hf download`, a converter's output, an older pull); loadable by the
+    content rule: `config.json`, every file the weights index names (else a `.safetensors`), no `.partial` of a file it needs.
+  - `not_a_pack`: no `config.json`.
+  Every refusal carries a reason that ends in what to do. Discovery skips a folder that is not loadable; a `--model`
+  folder the gate refuses ends the boot with the reason (exit non-zero, before anything listens), as a failed startup load does.
 - **Discovery never lists a dot folder or a folder named `tiny-models` BELOW a root**, at either depth (`skipsBelowRoot`;
   one debug line per skipped fixtures folder). The repo's tiny test models live in `${SUSHI_MODELS_DIR}/tiny-models/<name>`
   and are not packs to serve. A root the user NAMES is always scanned (`--model-dir .../tiny-models` lists them), and

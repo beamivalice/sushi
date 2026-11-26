@@ -109,6 +109,7 @@ test {
     _ = @import("update.zig");
     _ = @import("pack_stamp.zig");
     _ = @import("hf_pull.zig");
+    _ = @import("pack_state.zig");
     _ = @import("download_progress.zig");
     _ = @import("pack_update.zig");
     _ = @import("ws.zig");

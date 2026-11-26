@@ -7,6 +7,7 @@ const exl3 = @import("sushi_exl3");
 const gl = exl3.group_layout;
 const expert_io = @import("expert_io.zig");
 const cli = @import("cli.zig");
+const pack_state = @import("pack_state.zig");
 const disk_placement = @import("disk_placement.zig");
 const log = @import("log.zig");
 const flag_value = @import("flag_value.zig");
@@ -743,7 +744,7 @@ pub fn resolvePack(a: std.mem.Allocator, io: std.Io, name: []const u8, home: []c
     if (cli.resolveRelativeDir(a, io, name)) |abs| return abs;
     const resolved = cli.resolveShortName(name) orelse return error.UnknownModel;
     const dest = try cli.modelDestPath(a, home, resolved.repo);
-    if (!cli.modelPresent(io, dest)) {
+    if (!pack_state.of(io, dest).loadable()) {
         a.free(dest);
         return error.RepackNotDownloaded;
     }

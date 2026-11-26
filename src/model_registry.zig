@@ -1490,10 +1490,13 @@ pub const ModelRegistry = struct {
 
     /// The launch model's load, claimed before the listener accepts, the way a cold load claims its own: it lists
     /// `loading`, a request for it waits in `ensureLoaded` instead of starting a second load, and its estimate counts in
-    /// another model's eviction gate. The caller holds the claim's reference until its boot is done.
-    pub fn claimStartupLoad(self: *ModelRegistry, entry: *LoadedModel, estimated: u64) bool {
+    /// another model's eviction gate. The caller holds the claim's reference until its boot is done. A folder the load
+    /// gate refuses is never claimed (`error.PackDownloading`), as with any other load.
+    pub fn claimStartupLoad(self: *ModelRegistry, entry: *LoadedModel, estimated: u64) error{PackDownloading}!bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        var why: [512]u8 = undefined;
+        if (self.loadBlocked(&why, entry) != null) return error.PackDownloading;
         if (!self.tryBeginLoadLocked(entry)) return false;
         self.reserveLoadLocked(entry, estimated);
         return true;
@@ -2453,8 +2456,8 @@ test "ModelRegistry: a launch model claimed for its startup load lists loading, 
     defer reg.deinit();
     const e = try reg.registerStub("launch", "/path/to/launch", 1024);
     try reg.setDefault("launch");
-    try testing.expect(reg.claimStartupLoad(e, 4096));
-    try testing.expect(!reg.claimStartupLoad(e, 4096));
+    try testing.expect(try reg.claimStartupLoad(e, 4096));
+    try testing.expect(!try reg.claimStartupLoad(e, 4096));
     const snap = try reg.snapshot(testing.allocator);
     defer testing.allocator.free(snap);
     try testing.expectEqualStrings("loading", snap[0].state);
@@ -2524,7 +2527,7 @@ test "ModelRegistry: a startup load that fails reaches the waiting request by na
     defer reg.deinit();
     const e = try reg.registerStub("launch", "/path/to/launch", 1024);
     try reg.setDefault("launch");
-    try testing.expect(reg.claimStartupLoad(e, 4096));
+    try testing.expect(try reg.claimStartupLoad(e, 4096));
     var w: StartupWaiter = .{ .reg = reg };
     const t = try std.Thread.spawn(.{}, StartupWaiter.run, .{&w});
     try testing.expect(w.stillWaiting());
@@ -3334,13 +3337,14 @@ test "ModelRegistry: rescan under a models root never absorbs tiny-models or dot
 
     try tmp.dir.createDirPath(io, "org/first");
     try tmp.dir.writeFile(io, .{ .sub_path = "org/first/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/first/model.safetensors", .data = "x" });
     const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
     var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
     defer reg.deinit();
 
-    try model_discovery.writePackStub(io, tmp.dir, "tiny-models/x");
-    try model_discovery.writePackStub(io, tmp.dir, ".hidden/y");
-    try model_discovery.writePackStub(io, tmp.dir, "org/second");
+    try model_discovery.writeLoadablePackStub(io, tmp.dir, "tiny-models/x");
+    try model_discovery.writeLoadablePackStub(io, tmp.dir, ".hidden/y");
+    try model_discovery.writeLoadablePackStub(io, tmp.dir, "org/second");
 
     try testing.expectEqual(@as(u32, 1), (try reg.rescanWithSettings(no_settings)).added);
     try testing.expect(reg.peek("org/second") != null);
@@ -3595,7 +3599,7 @@ test "LoadedModel: prompts encoded while the model unloads get the ids a quiet e
     try testing.expectEqual(before, cache_stats.process.snapshot().token_bytes);
 }
 
-test "a pack listed while its pull was partial carries its full bytes once the pull finishes" {
+test "a pack discovery skips while its pull is partial is listed with its full bytes once the pull finishes" {
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -3608,13 +3612,14 @@ test "a pack listed while its pull was partial carries its full bytes once the p
     const found = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
     const reg = try ModelRegistry.init(testing.allocator, io, found, 2, 0, null);
     defer reg.deinit();
-    const e = reg.peek("beamster/P") orelse return error.PartialPackNotListed;
+    try testing.expect(reg.peek("beamster/P") == null);
     // The pull resumes and finishes: the second shard lands and the marker goes.
     try tmp.dir.writeFile(io, .{ .sub_path = "beamster/P/model-00002.safetensors", .data = &@as([1000]u8, @splat('x')) });
     try tmp.dir.deleteFile(io, "beamster/P/.pull-incomplete");
     var pb: [std.fs.max_path_bytes]u8 = undefined;
     var sb: [std.fs.max_path_bytes]u8 = undefined;
     _ = try reg.absorbDownloadWithSettings(try std.fmt.bufPrint(&sb, "{s}/settings.json", .{root}), try std.fmt.bufPrint(&pb, "{s}/beamster/P", .{root}));
+    const e = reg.peek("beamster/P") orelse return error.FinishedPackNotListed;
     // bytes_on_disk is the eviction gate's estimate and the resident bill.
     const config_bytes = (try tmp.dir.statFile(io, "beamster/P/config.json", .{})).size;
     try testing.expectEqual(@as(?u64, 1010), e.bytes_on_disk);
@@ -3792,7 +3797,7 @@ test "ModelRegistry: after a case-only rename the entry is still the one its own
     const io = testing.io;
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try model_discovery.writePackStub(io, tmp.dir, "org/Pack");
+    try model_discovery.writeLoadablePackStub(io, tmp.dir, "org/Pack");
     var rb: [std.fs.max_path_bytes]u8 = undefined;
     const root = try tmpRoot(io, tmp.dir, &rb);
     const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
@@ -4156,7 +4161,7 @@ test "ModelRegistry: a rescan drops an unheld entry whose folder holds a config 
         var wb: [128]u8 = undefined;
         try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&wb, "{s}/model.safetensors", .{c.dir}), .data = "0123" });
     }
-    try model_discovery.writePackStub(io, tmp.dir, "beamster/Stays");
+    try model_discovery.writeLoadablePackStub(io, tmp.dir, "beamster/Stays");
     const reg = try ModelRegistry.init(testing.allocator, io, try model_discovery.discoverModelsMany(io, testing.allocator, &.{root}), 2, 0, null);
     defer reg.deinit();
     // One more entry no root lists: registered by path, outside every walked folder.

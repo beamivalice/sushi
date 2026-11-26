@@ -90,3 +90,9 @@ engine-lifecycle src/hy4flash/ubench.zig:runAttnCore a microbench on synthetic t
 device-probe src/cli.zig:parseModelEfforts reads the /v1/models JSON row's architecture field, not the GPU device profile
 undefined-partial-pass src/mtp_round.zig:batched_MTP_draft_rows_stop_at_their_own_depth mtpDraftActiveRows reads only each chain's m
 undefined-partial-pass src/mtp_round.zig:batched_MTP_draft_rows_stop_without_touching_inactive_generators mtpChainBuildBatched reads only each chain's m and n_drafted here
+pack-state-seam src/cli.zig:curlDownload the pull's own download file: it resumes and renames its `.partial`, and reads no folder's state
+pack-state-seam src/cli.zig:setPullMarker the pull is the marker's writer
+pack-state-seam src/cli.zig:pullRepo the pull is the record's and the marker's writer
+pack-state-seam src/downloads.zig:partialSize counts the bytes of the partial in flight for the progress bar, not a folder's state
+pack-state-seam src/pack_update.zig:lookWith reads the record's repo and commit for the update check, not the folder's state
+pack-state-seam src/model_registry.zig:markerGate a test gate that stands in for downloads.loadGate with the marker alone

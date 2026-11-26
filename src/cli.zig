@@ -27,6 +27,7 @@ const repl_tools = @import("repl_tools.zig");
 const repl_input = @import("repl_input.zig");
 const update = @import("update.zig");
 const hf_pull = @import("hf_pull.zig");
+const pack_state = @import("pack_state.zig");
 const pack_update = @import("pack_update.zig");
 const download_progress = @import("download_progress.zig");
 const model_settings = @import("model_settings.zig");
@@ -596,60 +597,13 @@ fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
     return st.size;
 }
 
-/// True when the model directory already holds a COMPLETE, loadable
-/// checkpoint. "config.json exists" is NOT enough: an interrupted `pull`
-/// (Ctrl-C mid-weights) leaves config.json + *.partial, and treating that
-/// as present skipped the resume and fed a weightless dir to the loader
-/// (live SIGSEGV — see tests/test_partial_download.sh). Complete means: no
-/// .partial leftovers anywhere (top level or one subdir deep, e.g.
-/// mtp/weights.safetensors.partial) and no `pull_marker`, plus config.json AND at least one
-/// .safetensors.
-pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
-    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return false;
-    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
-    defer dir.close(io);
-    return modelPresentInDir(io, dir);
-}
-
-fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
-    var has_config = false;
-    var has_safetensors = false;
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        switch (entry.kind) {
-            .file => {
-                if (std.mem.endsWith(u8, entry.name, ".partial") or std.mem.eql(u8, entry.name, pull_marker)) return false;
-                if (std.mem.eql(u8, entry.name, "config.json")) has_config = true;
-                if (std.mem.endsWith(u8, entry.name, ".safetensors")) has_safetensors = true;
-            },
-            .directory => {
-                // One level deep is enough for the pull layouts (mtp/ is the
-                // only subdir the chat-default selection downloads into).
-                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
-                defer sub.close(io);
-                var sit = sub.iterate();
-                while (sit.next(io) catch null) |se| {
-                    if (se.kind == .file and std.mem.endsWith(u8, se.name, ".partial")) return false;
-                }
-            },
-            else => {},
-        }
-    }
-    return has_config and has_safetensors;
-}
-
-/// Present for the whole of a pull and removed only after the last file verifies: a refused request (HTTP 429)
-/// leaves no `.partial`, so the files alone cannot tell an interrupted pull from a finished one. A pack pulled
-/// before the marker existed never has it and keeps the `.partial` rule.
-pub const pull_marker = ".pull-incomplete";
-
 fn setPullMarker(io: std.Io, dest_dir: []const u8, on: bool) !void {
     var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dest_dir, .{});
     defer dir.close(io);
     if (on) {
-        try dir.writeFile(io, .{ .sub_path = pull_marker, .data = "" });
+        try dir.writeFile(io, .{ .sub_path = pack_state.pull_marker, .data = "" });
     } else {
-        dir.deleteFile(io, pull_marker) catch |err| if (err != error.FileNotFound) return err;
+        dir.deleteFile(io, pack_state.pull_marker) catch |err| if (err != error.FileNotFound) return err;
     }
 }
 
@@ -706,9 +660,13 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     defer to_hash.deinit(allocator);
     var hash_slot = std.ArrayList(usize).empty;
     defer hash_slot.deinit(allocator);
+    var dest = std.Io.Dir.openDirAbsolute(io, dest_dir, .{}) catch {
+        reporter.say("error: cannot read {s}", .{dest_dir});
+        return error.PullFailed;
+    };
+    defer dest.close(io);
     for (wanted_files.items, actions, 0..) |f, *act, i| {
-        const prior: ?hf_pull.RepoFile = if (old) |m| m.find(io, dest_dir, f.path) else null;
-        act.* = hf_pull.decide(f, prior, old != null, fileSizeAt(io, dest_dir, f.path));
+        act.* = hf_pull.decide(f, priorRow(io, dest, dest_dir, old, f.path), old != null, fileSizeAt(io, dest_dir, f.path));
         if (act.* == .hash) {
             try to_hash.append(allocator, f);
             try hash_slot.append(allocator, i);
@@ -726,10 +684,11 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     // Files are replaced from here on: a manifest left behind would vouch for bytes that are about to change.
     hf_pull.removeManifest(io, dest_dir);
 
-    for (wanted_files.items, actions, 1..) |f, act, idx| {
+    for (wanted_files.items, actions, 1..) |*f, act, idx| {
         if (!reporter.event(.{ .file = .{ .index = idx, .path = f.path, .size = f.size, .skip = act == .skip } })) return error.PullCancelled;
         if (act == .skip) {
             reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
+            sealVerified(io, dest, reporter, f) catch return error.PullFailed;
             continue;
         }
         const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
@@ -737,7 +696,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
         const url = try hf_pull.hfUrl(allocator, base, "/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
         defer allocator.free(url);
-        curlDownload(allocator, io, url, dest_path, show_progress, f, reporter) catch |err| {
+        curlDownload(allocator, io, url, dest_path, show_progress, f.*, reporter) catch |err| {
             if (err == error.PullCancelled) return err;
             if (err == error.DownloadCorrupt) {
                 reporter.say("error: {s} does not match its Hugging Face checksum (partial deleted — rerun to download it again)", .{f.path});
@@ -746,6 +705,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             }
             return error.PullFailed;
         };
+        sealVerified(io, dest, reporter, f) catch return error.PullFailed;
     }
 
     if (old) |m| {
@@ -759,10 +719,29 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullFailed;
     };
     setPullMarker(io, dest_dir, false) catch {
-        reporter.say("error: cannot finish {s}: remove {s}/{s} by hand", .{ resolved.repo, dest_dir, pull_marker });
+        reporter.say("error: cannot finish {s}: remove {s}/{s} by hand", .{ resolved.repo, dest_dir, pack_state.pull_marker });
         return error.PullFailed;
     };
     reporter.say("success: {s} ready", .{resolved.repo});
+}
+
+/// The previous record's row for `path`, unless it cannot vouch for the file: a sealed file that no longer stats as the
+/// record sealed it, or one a v1 record lists, which was never fingerprinted. That file is hashed (once, then sealed),
+/// never skipped on the record's word.
+fn priorRow(io: std.Io, dest: std.Io.Dir, dest_dir: []const u8, old: ?hf_pull.Manifest, path: []const u8) ?hf_pull.RepoFile {
+    const row = (old orelse return null).find(io, dest_dir, path) orelse return null;
+    if (row.seal == null and hf_pull.sealsPath(path)) return null;
+    return if (hf_pull.sealCheck(io, dest, row) == .holds) row else null;
+}
+
+/// Records `f`'s stat now, right after its content was verified, unless it is a small text file a user edits by hand.
+fn sealVerified(io: std.Io, dest: std.Io.Dir, reporter: Reporter, f: *hf_pull.RepoFile) !void {
+    if (!hf_pull.sealsPath(f.path)) return;
+    const st = dest.statFile(io, f.path, .{}) catch |err| {
+        reporter.say("error: cannot read {s} after verifying it ({t})", .{ f.path, err });
+        return err;
+    };
+    f.seal = hf_pull.Seal.of(st);
 }
 
 /// The commit the repo's main branch is at, or null when the API does not say. A stopped pull ends here as cancelled;
@@ -824,9 +803,11 @@ pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []co
         printKnownAliases(io);
         std.process.exit(1);
     };
+    const root = try modelsRootPath(allocator, homeDir());
+    defer allocator.free(root);
+    if (catalogPackPath(io, allocator, root, resolved.repo)) |found| return found;
     const dest = try modelDestPath(allocator, homeDir(), resolved.repo);
     errdefer allocator.free(dest);
-    if (modelPresent(io, dest)) return dest;
     if (!isBeamsterRepo(resolved.repo)) refuseOrg(io, name);
     warnBelowTier(resolved.repo);
     try pullRepo(allocator, io, resolved, dest, stderr_reporter, true);
@@ -855,8 +836,7 @@ pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void
     };
     const dir = try modelDestPath(allocator, homeDir(), resolved.repo);
     defer allocator.free(dir);
-    // Always against the manifest: a folder an older pull left short carries no `pull_marker` and looks complete.
-    if (!modelPresent(io, dir)) warnBelowTier(resolved.repo);
+    if (!pack_state.of(io, dir).loadable()) warnBelowTier(resolved.repo);
     try pullRepo(allocator, io, resolved, dir, stderr_reporter, true);
     log.info("model at {s}\n", .{dir});
     log.info("run it: sushi run {s}\n", .{name});
@@ -993,12 +973,12 @@ pub fn catalogRow(a: Alias, outcome: FetchOutcome, downloaded: bool) CatalogRow 
 /// Where a catalog pack sits on disk, or null when it is not downloaded. Caller frees.
 pub fn catalogPackPath(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repo: []const u8) ?[]u8 {
     const org_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, root, "/"), repo }) catch return null;
-    if (modelPresent(io, org_path)) return org_path;
+    if (pack_state.of(io, org_path).loadable()) return org_path;
     allocator.free(org_path);
-    // `hf download --local-dir ~/.sushi/models/<pack>` (docs/usage.md) lands without the org folder.
+    // `hf download --local-dir ~/.sushi/models/<pack>` lands without the org folder.
     const slash = std.mem.indexOfScalar(u8, repo, '/') orelse return null;
     const flat_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ std.mem.trimEnd(u8, root, "/"), repo[slash + 1 ..] }) catch return null;
-    if (modelPresent(io, flat_path)) return flat_path;
+    if (pack_state.of(io, flat_path).loadable()) return flat_path;
     allocator.free(flat_path);
     return null;
 }
@@ -1135,18 +1115,15 @@ fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
 
 fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8, check_updates: bool) !void {
     const bytes = dirBytesOneLevel(io, dir);
-    // TYPE from the same classification serving uses (chat, embed, drafter,
-    // unsupported) so the list is honest about which rows `run` can actually
-    // chat with.
     const abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name }) catch null;
     defer if (abs) |a| allocator.free(a);
-    const kind_label: []const u8 = blk: {
-        const a = abs orelse break :blk "?";
-        const kind = model_discovery.classifyModelPath(io, allocator, a) orelse break :blk "?";
-        break :blk kind.label();
-    };
+    const state = pack_state.of(io, abs orelse "");
     var size_buf: [32]u8 = undefined;
-    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ name, kind_label, formatSize(&size_buf, bytes) });
+    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ name, localRowType(io, allocator, abs orelse "", &state), formatSize(&size_buf, bytes) });
+    if (!state.loadable()) {
+        try w.print("  {s}\n", .{state.reason()});
+        return;
+    }
     if (!check_updates) return;
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
     defer arena_state.deinit();
@@ -1159,9 +1136,17 @@ fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, di
     }
 }
 
+/// The TYPE of a local row: what serving would classify a loadable folder as (chat, drafter, unsupported), and the
+/// state of one that cannot load (partial, changed), so the list never calls an unfinished pack a chat model.
+fn localRowType(io: std.Io, allocator: std.mem.Allocator, abs: []const u8, state: *const pack_state.State) []const u8 {
+    if (!state.loadable()) return state.label();
+    const kind = model_discovery.classifyModelPath(io, allocator, abs) orelse return "?";
+    return kind.label();
+}
+
 /// Sum file bytes in a model dir INCLUDING one level of subdirectories —
 /// media bundles keep their weights in transformer/ vae/ text_encoder/ etc.
-/// (the same one-level layout assumption `modelPresent` makes). Top-level-
+/// (the same one-level layout assumption `pack_state` makes). Top-level-
 /// only summing showed a 7 GB FLUX bundle as "6 KB".
 fn dirBytesOneLevel(io: std.Io, dir: *std.Io.Dir) u64 {
     var bytes: u64 = 0;
@@ -2465,66 +2450,6 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(!shouldDownload("flax_model.msgpack"));
 }
 
-test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
-    // Regression: an interrupted `pull` (Ctrl-C mid-weights) leaves
-    // config.json + model.safetensors.partial. modelPresent used to return
-    // true on config.json alone, so the rerun skipped the resume and fed a
-    // weightless dir to the loader (SIGSEGV). Present now means: no .partial
-    // leftovers anywhere (top level or one subdir deep), and config.json +
-    // >=1 .safetensors.
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    // config.json alone (weights never started): not present.
-    try tmp.dir.createDirPath(io, "a");
-    try tmp.dir.writeFile(io, .{ .sub_path = "a/config.json", .data = "{}" });
-    {
-        var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
-    }
-
-    // config.json + interrupted weights: not present (the user's live repro).
-    try tmp.dir.writeFile(io, .{ .sub_path = "a/model.safetensors.partial", .data = "x" });
-    {
-        var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
-    }
-
-    // Complete single-file checkpoint: present.
-    try tmp.dir.createDirPath(io, "b");
-    try tmp.dir.writeFile(io, .{ .sub_path = "b/config.json", .data = "{}" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "b/model.safetensors", .data = "x" });
-    {
-        var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(modelPresentInDir(io, d));
-    }
-
-    // Complete weights but another file still partial (e.g. tokenizer.json):
-    // not present — resume must finish the pull.
-    try tmp.dir.writeFile(io, .{ .sub_path = "b/tokenizer.json.partial", .data = "x" });
-    {
-        var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
-    }
-
-    // Interrupted sidecar one subdir deep (mtp/weights.safetensors.partial):
-    // not present.
-    try tmp.dir.createDirPath(io, "c/mtp");
-    try tmp.dir.writeFile(io, .{ .sub_path = "c/config.json", .data = "{}" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "c/model.safetensors", .data = "x" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "c/mtp/weights.safetensors.partial", .data = "x" });
-    {
-        var d = try tmp.dir.openDir(io, "c", .{ .iterate = true });
-        defer d.close(io);
-        try testing.expect(!modelPresentInDir(io, d));
-    }
-}
-
 test "cli: a pull cut short without a .partial file is not a present model" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2538,13 +2463,13 @@ test "cli: a pull cut short without a .partial file is not a present model" {
     try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = "{}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "pack/model-00001.safetensors", .data = "x" });
     // Packs pulled before the marker existed are complete.
-    try testing.expect(modelPresent(io, pack));
+    try testing.expect(pack_state.of(io, pack).loadable());
 
     try setPullMarker(io, pack, true);
-    try testing.expect(!modelPresent(io, pack));
+    try testing.expect(!pack_state.of(io, pack).loadable());
 
     try setPullMarker(io, pack, false);
-    try testing.expect(modelPresent(io, pack));
+    try testing.expect(pack_state.of(io, pack).loadable());
     try setPullMarker(io, pack, false);
 }
 
@@ -3076,7 +3001,7 @@ test "cli: dirBytesOneLevel counts weight subdirs (FLUX bundle showed 6 KB)" {
     defer tmp.cleanup();
 
     // Media-bundle shape: small top-level config + the actual weights one
-    // level down in transformer/ and vae/ (the modelPresent layout).
+    // level down in transformer/ and vae/ (the pack_state layout).
     try tmp.dir.createDirPath(io, "m/transformer");
     try tmp.dir.createDirPath(io, "m/vae");
     try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" }); // 2 bytes
@@ -3537,4 +3462,248 @@ test "cli: a stop ends a pull held in its listing, not only one downloading file
         std.debug.print("a stop did not end the pull held in its listing\n", .{});
         return error.StopCannotReachListing;
     }
+}
+
+test "cli: an orphan .partial of a file the repo dropped does not hide a finished pack" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const pack = try std.fmt.allocPrint(testing.allocator, "{s}/pack", .{root});
+    defer testing.allocator.free(pack);
+    try tmp.dir.createDirPath(io, "pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/model.safetensors", .data = "12345" });
+    // A pull cut short on a shard, then a revision that no longer lists it: the pull failed before the manifest
+    // was written (it removes the old one first), so no manifest ever named the shard and nothing removed it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "pack/dropped.safetensors.partial", .data = "12" });
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const listing = [_]hf_pull.RepoFile{
+        .{ .path = @constCast("config.json"), .size = 2 },
+        .{ .path = @constCast("model.safetensors"), .size = 5 },
+    };
+    try hf_pull.writeManifest(arena_state.allocator(), io, pack, .{ .repo = "beamster/X", .files = &listing });
+    // The pull succeeded (manifest written, marker cleared): the folder is a complete, loadable checkpoint.
+    if (!pack_state.of(io, pack).loadable()) {
+        std.debug.print("a complete pack with the orphan .partial of a dropped shard reads unfinished\n", .{});
+        return error.OrphanHidesPack;
+    }
+}
+
+test "cli: a pack in the flat layout is used by its name, not pulled again" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(home);
+    // The repo `sushi run <name>` resolves to, which is not always the first alias's.
+    const a = aliases[0];
+    const repo = resolveShortName(a.name).?.repo;
+    const base = repo[std.mem.indexOfScalar(u8, repo, '/').? + 1 ..];
+    var sub_buf: [512]u8 = undefined;
+    const sub = try std.fmt.bufPrint(&sub_buf, ".sushi/models/{s}", .{base});
+    try model_discovery.writePackStub(io, tmp.dir, sub);
+    var file_buf: [600]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&file_buf, "{s}/model.safetensors", .{sub}), .data = "0123456789" });
+    const flat = try std.fmt.allocPrint(testing.allocator, "{s}/.sushi/models/{s}", .{ home, base });
+    defer testing.allocator.free(flat);
+    // The copy is on disk exactly where `sushi list` finds it (`catalogPackPath`'s flat layout).
+    try testing.expect(pack_state.of(io, flat).loadable());
+    const org = try modelDestPath(testing.allocator, home, repo);
+    defer testing.allocator.free(org);
+    try testing.expect(!pack_state.of(io, org).loadable());
+
+    // HOME = the fixture; the endpoint a closed loopback port, so a pull the bug takes cannot reach the network.
+    const old_home_z: ?[:0]u8 = if (std.c.getenv("HOME")) |h| try testing.allocator.dupeSentinel(u8, std.mem.span(h), 0) else null;
+    defer {
+        if (old_home_z) |z| {
+            _ = setenv("HOME", z.ptr, 1);
+            testing.allocator.free(z);
+        } else {
+            _ = unsetenv("HOME");
+        }
+    }
+    var home_z: [std.fs.max_path_bytes:0]u8 = undefined;
+    const home_n = (try std.fmt.bufPrint(&home_z, "{s}", .{home})).len;
+    home_z[home_n] = 0;
+    _ = setenv("HOME", home_z[0..home_n :0].ptr, 1);
+    const old_ep_z: ?[:0]u8 = if (std.c.getenv("SUSHI_HF_ENDPOINT")) |e| try testing.allocator.dupeSentinel(u8, std.mem.span(e), 0) else null;
+    defer {
+        if (old_ep_z) |z| {
+            _ = setenv("SUSHI_HF_ENDPOINT", z.ptr, 1);
+            testing.allocator.free(z);
+        } else {
+            _ = unsetenv("SUSHI_HF_ENDPOINT");
+        }
+    }
+    _ = setenv("SUSHI_HF_ENDPOINT", "http://127.0.0.1:1", 1);
+
+    const dir = ensureModelAvailable(testing.allocator, io, a.name) catch |err| {
+        std.debug.print("sushi run {s} tried to pull although the flat copy is on disk ({t})\n", .{ a.name, err });
+        return error.RePulled;
+    };
+    defer testing.allocator.free(dir);
+    if (!std.mem.eql(u8, dir, flat)) {
+        std.debug.print("sushi run {s} resolved to {s}, not the copy on disk {s}\n", .{ a.name, dir, flat });
+        return error.WrongFolder;
+    }
+}
+
+
+test "cli: a partial local pack is not listed as a chat model" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    // An interrupted pull: config.json is there, the weights are only a `.partial`.
+    try model_discovery.writePackStub(io, tmp.dir, "partial");
+    try tmp.dir.writeFile(io, .{ .sub_path = "partial/model.safetensors.partial", .data = "xx" });
+    try model_discovery.writePackStub(io, tmp.dir, "whole");
+    try tmp.dir.writeFile(io, .{ .sub_path = "whole/model.safetensors", .data = "xx" });
+    for ([_][]const u8{ "partial", "whole" }) |name| {
+        var sub = try tmp.dir.openDir(io, name, .{ .iterate = true });
+        defer sub.close(io);
+        // The local list prints a row for any folder with a config.json (`isModelDir`).
+        try testing.expect(isModelDir(io, &sub));
+        var out = std.Io.Writer.Allocating.init(testing.allocator);
+        defer out.deinit();
+        try printModelRow(io, testing.allocator, &out.writer, &sub, name, root, false);
+        const row = out.written();
+        try testing.expectEqual(std.mem.eql(u8, name, "whole"), std.mem.indexOf(u8, row, "chat") != null);
+        try testing.expectEqual(std.mem.eql(u8, name, "partial"), std.mem.indexOf(u8, row, "sushi pull") != null);
+    }
+}
+
+test "cli: a pack present in both layouts is served from the org folder" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    const repo = aliases[0].repo;
+    const base = repo[std.mem.indexOfScalar(u8, repo, '/').? + 1 ..];
+    // Both layouts complete: `<root>/<org>/<repo>` (a pull) and `<root>/<base>` (an `hf download --local-dir`).
+    try model_discovery.writePackStub(io, tmp.dir, repo);
+    try model_discovery.writePackStub(io, tmp.dir, base);
+    var sb: [600]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors", .{repo}), .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&sb, "{s}/model.safetensors", .{base}), .data = "0123456789" });
+    const got = catalogPackPath(io, testing.allocator, root, repo) orelse return error.NotListed;
+    defer testing.allocator.free(got);
+    const want = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ root, repo });
+    defer testing.allocator.free(want);
+    if (!std.mem.eql(u8, got, want)) {
+        std.debug.print("a twice-installed pack is served from {s}, not the org folder\n", .{got});
+        return error.FlatPreferred;
+    }
+}
+
+const SilentReporter = struct {
+    fn say(_: *anyopaque, _: []const u8) void {}
+};
+
+var silent_dummy: u8 = 0;
+
+fn silentReporter() Reporter {
+    return .{ .impl = &silent_dummy, .reportFn = &SilentReporter.say };
+}
+
+test "cli: a pull seals each weights file at its check and no small text file" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "12345" });
+    var weights: hf_pull.RepoFile = .{ .path = @constCast("model.safetensors"), .size = 5 };
+    var config: hf_pull.RepoFile = .{ .path = @constCast("config.json"), .size = 2 };
+    try sealVerified(io, tmp.dir, silentReporter(), &weights);
+    try sealVerified(io, tmp.dir, silentReporter(), &config);
+    try testing.expect(weights.seal != null);
+    try testing.expect(config.seal == null);
+    try testing.expectEqual(hf_pull.SealCheck.holds, hf_pull.sealCheck(io, tmp.dir, weights));
+    var missing: hf_pull.RepoFile = .{ .path = @constCast("gone.safetensors"), .size = 1 };
+    try testing.expectError(error.FileNotFound, sealVerified(io, tmp.dir, silentReporter(), &missing));
+}
+
+test "cli: a weights file that no longer stats as its record sealed it is hashed, not skipped" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.safetensors", .data = "12345" });
+    const st = try tmp.dir.statFile(io, "m.safetensors", .{});
+    const listed: hf_pull.RepoFile = .{ .path = @constCast("m.safetensors"), .size = 5, .oid = @constCast("aa"), .lfs = true };
+    var sealed = listed;
+    sealed.seal = hf_pull.Seal.of(st);
+    const old: hf_pull.Manifest = .{ .files = &.{sealed} };
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dir);
+    const prior = priorRow(io, tmp.dir, dir, old, "m.safetensors");
+    try testing.expectEqual(hf_pull.Action.skip, hf_pull.decide(listed, prior, true, 5));
+    // Another file of the same size takes its place: the record's word no longer covers it.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.new", .data = "54321" });
+    try tmp.dir.rename("m.new", tmp.dir, "m.safetensors", io);
+    try testing.expect(priorRow(io, tmp.dir, dir, old, "m.safetensors") == null);
+    try testing.expectEqual(hf_pull.Action.hash, hf_pull.decide(listed, priorRow(io, tmp.dir, dir, old, "m.safetensors"), true, 5));
+    try testing.expect(priorRow(io, tmp.dir, dir, old, "other") == null);
+    try testing.expect(priorRow(io, tmp.dir, dir, null, "m.safetensors") == null);
+}
+
+test "cli: a local row for a folder whose sealed weights changed says changed, and a tokenizer.json.partial keeps a pack partial" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    try model_discovery.writePackStub(io, tmp.dir, "sealed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sealed/model.safetensors", .data = "12345" });
+    const st = try tmp.dir.statFile(io, "sealed/model.safetensors", .{});
+    const rows = [_]hf_pull.RepoFile{.{ .path = @constCast("model.safetensors"), .size = 5, .oid = @constCast("aa"), .seal = hf_pull.Seal.of(st) }};
+    const pack = try std.fmt.allocPrint(testing.allocator, "{s}/sealed", .{root});
+    defer testing.allocator.free(pack);
+    try hf_pull.writeManifest(testing.allocator, io, pack, .{ .repo = "beamster/X", .files = &rows });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sealed/model.new", .data = "54321" });
+    try tmp.dir.rename("sealed/model.new", tmp.dir, "sealed/model.safetensors", io);
+    var sub = try tmp.dir.openDir(io, "sealed", .{ .iterate = true });
+    defer sub.close(io);
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try printModelRow(io, testing.allocator, &out.writer, &sub, "sealed", root, false);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "changed") != null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "chat") == null);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "sushi pull") != null);
+}
+
+test "cli: a v1 folder with one replaced shard is hashed, and only that shard downloads again" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(root);
+    var rows: [3]hf_pull.RepoFile = undefined;
+    const names = [_][]const u8{ "a.safetensors", "b.safetensors", "config.json" };
+    var oids: [3][64]u8 = undefined;
+    for (names, &rows, &oids) |n, *row, *oid| {
+        try tmp.dir.writeFile(io, .{ .sub_path = n, .data = "12345" });
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ root, n });
+        var digest: [64]u8 = undefined;
+        oid.* = (try hf_pull.digestFile(io, path, true, &digest))[0..64].*;
+        row.* = .{ .path = @constCast(n), .size = 5, .oid = &oid.*, .lfs = true };
+    }
+    // The v1 record vouches for all three; then a shard is swapped for another file of the same size.
+    const v1: hf_pull.Manifest = .{ .files = &rows };
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.safetensors", .data = "54321" });
+    var match: [2]bool = undefined;
+    var to_hash: [2]hf_pull.RepoFile = undefined;
+    for (rows[0..2], 0..) |f, i| {
+        try testing.expectEqual(hf_pull.Action.hash, hf_pull.decide(f, priorRow(io, tmp.dir, root, v1, f.path), true, 5));
+        to_hash[i] = f;
+    }
+    hf_pull.hashMatches(io, root, &to_hash, &match, null);
+    try testing.expectEqualSlices(bool, &.{ true, false }, &match);
+    // A small text file keeps the record's word.
+    try testing.expectEqual(hf_pull.Action.skip, hf_pull.decide(rows[2], priorRow(io, tmp.dir, root, v1, "config.json"), true, 5));
 }

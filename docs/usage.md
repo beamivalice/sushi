@@ -35,15 +35,25 @@ or changed, so it finishes an interrupted pull; until then the folder holds `.pu
 makes is bounded, and a bound that fires names the step it stopped.
 
 A file is kept by content, never by size: a finished pull leaves `.sushi-pull.json` (repo, Hugging Face commit, and each
-file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only
-when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
+file's size and checksum: sha256 for a large file, the git blob id for a small one; every file but the small text ones
+below also carries the inode and mtime it had when its checksum passed) and the next pull skips a file only when the repo
+lists the same checksum and the file still stats as it did. That record seals the folder: sushi loads it with no content
+read, and refuses it (naming the file) once a sealed file is replaced or removed, until `sushi pull` hashes it again; a
+record sushi cannot read, or one from a newer sushi, refuses it the same way. A hand edit of `config.json`,
+`generation_config.json`, the tokenizer (`tokenizer*.json`), `special_tokens_map.json`, the chat template
+(`chat_template*`, `*.jinja`) or a `.md`/`.txt` file never refuses a load. A folder with an older (v1) record is hashed
+once on its next pull, which then seals it. A folder without the manifest (an older sushi, a copy by hand) is hashed once
 (`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
 checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the last manifest
 listed that the repo no longer has is removed (a case-only rename names the same file on a case-insensitive volume, so it is kept); nothing else in the folder is touched. `sushi run` still uses a present
-local copy without contacting Hugging Face.
+local copy without contacting Hugging Face. `run <name>` looks in the org layout (`~/.sushi/models/beamster/<repo>`) and
+the flat layout (`~/.sushi/models/<repo>`, `hf download --local-dir`) only; a folder with no record (a hand copy, `hf download`, an older
+pull) counts when it has its `config.json`, every weights file its index names (else a `.safetensors`) and no `.partial`
+of a file it needs.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it
-recommends. A Mac's tier is its installed RAM in whole GB. Below a pack's tier it reads `may stream (--ssd-budget-gb)`:
+recommends. A local folder that cannot load (a pull that did not finish, a sealed file since replaced) reads `partial`
+or `changed` in the TYPE column, with the line that says what to do. A Mac's tier is its installed RAM in whole GB. Below a pack's tier it reads `may stream (--ssd-budget-gb)`:
 it may still run streamed ([Choosing a pack and streaming](usage-streaming.md)), with no promise.
 
 | pack | runs in memory from | recommended from |

@@ -1471,7 +1471,7 @@ pub const Scheduler = struct {
             .startup_pin = null,
         };
 
-        if (!params.no_initial_load and params.registry.claimStartupLoad(
+        if (!params.no_initial_load and try params.registry.claimStartupLoad(
             params.entry,
             model_load.gateEstimateBytes(params.entry.bytes_on_disk, params.config.num_hidden_layers, params.config.hidden_size),
         )) self.startup_pin = params.entry;

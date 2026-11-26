@@ -10,6 +10,7 @@ const http = @import("http.zig");
 const cli = @import("cli.zig");
 const dp = @import("download_progress.zig");
 const pack_update = @import("pack_update.zig");
+const pack_state = @import("pack_state.zig");
 const disk_placement = @import("disk_placement.zig");
 const model_settings = @import("model_settings.zig");
 const status = @import("status.zig");
@@ -306,26 +307,26 @@ fn loadedModelAtLocked(allocator: Allocator, folder: *const FolderId) Allocator.
 
 /// The registry's load gate on `folder`, the one the entry's path opens now: a pack folder a queued or running download
 /// or update fills cannot load, since its files are replaced one by one and a load would read some of each revision;
-/// nor can one a stopped or failed pull (this server's or `sushi pull`'s) left behind with its `.pull-incomplete`
-/// marker. A job's folder is derived from its `dest` at the check too, so neither side keeps an identity from before a
+/// nor can any folder `pack_state` says is not loadable (a stopped or failed pull's, a sealed file since replaced). A
+/// job's folder is derived from its `dest` at the check too, so neither side keeps an identity from before a
 /// rename or a relink.
 pub fn loadGate(io: std.Io, buf: []u8, folder: *const FolderId) ?[]const u8 {
-    const want = folder.bytes();
-    lock();
-    defer unlock();
-    for (jobs.items) |j| {
-        if (!j.phase.active()) continue;
-        const filling = FolderId.of(io, j.dest) catch continue;
-        if (!filling.eql(folder)) continue;
-        return std.fmt.bufPrint(buf, "{s} is being {s} on Downloads: wait for it to finish, or stop it there, then load it", .{ j.repo, if (j.update) "updated" else "downloaded" }) catch
-            "This model is being downloaded on Downloads: wait for it to finish, or stop it there, then load it";
+    {
+        lock();
+        defer unlock();
+        for (jobs.items) |j| {
+            if (!j.phase.active()) continue;
+            const filling = FolderId.of(io, j.dest) catch continue;
+            if (!filling.eql(folder)) continue;
+            return std.fmt.bufPrint(buf, "{s} is being {s} on Downloads: wait for it to finish, or stop it there, then load it", .{ j.repo, if (j.update) "updated" else "downloaded" }) catch
+                "This model is being downloaded on Downloads: wait for it to finish, or stop it there, then load it";
+        }
     }
-    // A stopped or failed pull leaves its marker and some files of each revision.
-    var marker: [std.fs.max_path_bytes]u8 = undefined;
-    const at = std.fmt.bufPrintSentinel(&marker, "{s}/{s}", .{ want, cli.pull_marker }, 0) catch return null;
-    if (std.c.access(at, 0) != 0) return null;
-    return std.fmt.bufPrint(buf, "The last download or update of {s} did not finish, so its files are mixed: resume it on Downloads (or `sushi pull` it again), then load it", .{std.fs.path.basename(want)}) catch
-        "The last download or update of this model did not finish: resume it on Downloads, then load it";
+    const state = pack_state.of(io, folder.bytes());
+    if (state.loadable()) return null;
+    const n = @min(buf.len, state.reason().len);
+    @memcpy(buf[0..n], state.reason()[0..n]);
+    return buf[0..n];
 }
 
 // ── The download thread ─────────────────────────────────────────────────
@@ -1033,9 +1034,9 @@ test "downloads: a folder a stopped pull left, with a model loaded from it, refu
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const dest = try std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ std.mem.trimEnd(u8, s.root, "/"), cli.aliases[0].repo });
-    try s.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ cli.aliases[0].repo, cli.pull_marker }), .data = "" });
+    try s.tmp.dir.writeFile(testing.io, .{ .sub_path = try std.fmt.allocPrint(arena_state.allocator(), "{s}/{s}", .{ cli.aliases[0].repo, pack_state.pull_marker }), .data = "" });
     // The marker makes the pack read as not installed: the check must not depend on that.
-    try testing.expect(!cli.modelPresent(testing.io, dest));
+    try testing.expect(!pack_state.of(testing.io, dest).loadable());
     e.state = .ready;
     defer e.state = .unloaded;
     const folder = try FolderId.of(testing.io, dest);
@@ -1110,7 +1111,7 @@ test "downloads: a symlinked models folder pointed at a stopped pull's copy: the
     try s.tmp.dir.writeFile(io, .{ .sub_path = "diskA/beamster/P/model.safetensors", .data = "0123" });
     try md.writePackStub(io, s.tmp.dir, "diskB/beamster/P");
     try s.tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/model.safetensors", .data = "01234567" });
-    try s.tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/" ++ cli.pull_marker, .data = "" });
+    try s.tmp.dir.writeFile(io, .{ .sub_path = "diskB/beamster/P/" ++ pack_state.pull_marker, .data = "" });
     s.root = s.root_buf[0..try s.tmp.dir.realPath(io, &s.root_buf)];
     try s.tmp.dir.symLink(io, "diskA", "models", .{ .is_directory = true });
     var lb: [std.fs.max_path_bytes]u8 = undefined;
@@ -1381,4 +1382,59 @@ test "downloads: a Stop that lands as the last file verifies ends the job stoppe
     finishJob(testing.io, job, true);
     try testing.expectEqual(Phase.cancelled, job.phase);
     try testing.expectEqual(@as(usize, 0), reg.entries.count());
+}
+
+test "downloads: a pull an older sushi stopped (.partial, no marker) cannot load" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const root = p[0..try tmp.dir.realPath(io, &p)];
+    try md.writePackStub(io, tmp.dir, "beamster/Legacy");
+    // The state a pull by an older sushi left: the small files whole, the weights only a .partial, and no
+    // `.pull-incomplete` (that marker did not exist then -- the `.partial` rule stands in).
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Legacy/model.safetensors.partial", .data = "xx" });
+    var found = try md.discoverModelsMany(io, testing.allocator, &.{root});
+    defer found.deinit();
+    try testing.expectEqual(@as(usize, 0), found.models.len); // /v1/models does not offer it
+    const pack = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Legacy", .{root});
+    defer testing.allocator.free(pack);
+    if (pack_state.of(io, pack).loadable()) {
+        std.debug.print("the interrupted folder reads loadable\n", .{});
+        return error.Present;
+    }
+    const folder = try FolderId.of(io, pack);
+    var gb: [1024]u8 = undefined;
+    if (loadGate(io, &gb, &folder) == null) {
+        std.debug.print("the load gate lets a folder whose weights are only .partial load\n", .{});
+        return error.GateOpen;
+    }
+}
+
+test "downloads: the boot's startup load refuses a folder a stopped pull left" {
+    const io = testing.io;
+    const md = @import("model_discovery.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try md.writePackStub(io, tmp.dir, "beamster/Legacy");
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Legacy/" ++ pack_state.pull_marker, .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beamster/Legacy/model.safetensors.partial", .data = "xx" });
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rb[0..try tmp.dir.realPath(io, &rb)];
+    const reg = try ModelRegistry.init(testing.allocator, io, null, 2, 0, null);
+    defer reg.deinit();
+    reg.load_gate = &loadGate;
+    // `--model <folder>` registers its folder whatever discovery lists.
+    const pack = try std.fmt.allocPrint(testing.allocator, "{s}/beamster/Legacy", .{root});
+    defer testing.allocator.free(pack);
+    const e = try reg.registerLaunchFolder(pack);
+    var gb: [512]u8 = undefined;
+    if (!(reg.loadBlocked(&gb, e) != null)) {
+        std.debug.print("the request path admits the marked folder\n", .{});
+        return error.RequestGateOpen;
+    }
+    // The boot's own load (`Scheduler.init` -> `claimStartupLoad`) must not skip the gate that refuses it.
+    try testing.expectError(error.PackDownloading, reg.claimStartupLoad(e, 0));
+    try testing.expect(e.state == .unloaded);
 }

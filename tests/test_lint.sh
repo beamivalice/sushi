@@ -950,6 +950,24 @@ printf '%s\n' 'const A = struct { fn free(a: A, x: []u32) void { _ = a; _ = x; }
   'fn f(a: A, ids: []u32, r: R) void {' '    defer a.free(ids);' '    defer r.deinit(a);' '}' > "$TMP/t/src/p.zig"
 expect_green "a plain slice freed, and a result released through deinit"
 
+# rule pack-state-seam
+tree
+printf '%s\n' 'const std = @import("std");' 'const hf_pull = @import("hf_pull.zig");' 'pub fn present(dir: std.Io.Dir, io: std.Io) bool {' \
+  '    return if (dir.statFile(io, ".pull-incomplete", .{})) |_| false else |_| true;' '}' \
+  'pub fn weights(name: []const u8) bool {' '    return std.mem.endsWith(u8, name, ".partial");' '}' \
+  'pub fn record() []const u8 {' '    return hf_pull.manifest_name;' '}' > "$TMP/t/src/p.zig"
+expect_red "the marker probed by its name" "src/p.zig:4:33 \[pack-state-seam\] present: .pull-incomplete read outside pack_state"
+expect_red "a .partial probe in a file that handles packs" "\[pack-state-seam\] weights: .partial read outside pack_state"
+expect_red "the record's name read outside pack_state" "\[pack-state-seam\] record: manifest_name read outside pack_state"
+
+tree
+printf '%s\n' 'const std = @import("std");' 'pub fn stage(a: std.mem.Allocator, out: []const u8) ![]u8 {' \
+  '    return std.fmt.allocPrint(a, "{s}.partial", .{out});' '}' > "$TMP/t/src/p.zig"
+printf '%s\n' 'pub const pull_marker = ".pull-incomplete";' 'pub const x = ".partial";' > "$TMP/t/src/pack_state.zig"
+printf '%s\n' 'const pack_state = @import("pack_state.zig");' \
+  'test "a test names .partial and writes the marker" { _ = pack_state.pull_marker; _ = ".pull-incomplete"; _ = ".partial"; }' > "$TMP/t/src/q.zig"
+expect_green "a staging file in a file that handles no pack, the owner itself, and a test"
+
 # the allowlist
 tree
 printf '%s\n' 'const S = struct { x: u32 };' 'fn handleOf(s: *S) *S { return s; }' 'fn f(self: *const S) *S {' \

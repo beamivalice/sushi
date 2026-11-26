@@ -17,6 +17,7 @@ const FolderId = @import("folder_identity.zig").FolderId;
 const std = @import("std");
 const test_note = @import("test_note.zig");
 const log = @import("log.zig");
+const pack_state = @import("pack_state.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("dflash.zig");
@@ -619,6 +620,11 @@ fn tryAddModel(
     const model_type: []const u8 = blk: {
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config) return false;
+        const state = pack_state.ofDir(io, sub, name);
+        if (!state.loadable()) {
+            log.info("[discovery] skip {s}: {s}\n", .{ name, state.reason() });
+            return true;
+        }
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -1054,10 +1060,12 @@ test "discoverModels finds flat and org/repo model dirs" {
 
     try tmp.dir.createDirPath(io, "flat-model");
     try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/model.safetensors", .data = "x" });
     // HF-style org/repo layout — the DownloadManager / `sushi pull`
     // convention. Must be discovered with id "org/name".
     try tmp.dir.createDirPath(io, "mlx-community/nested-model");
     try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/model.safetensors", .data = "x" });
     // Junk that must not surface: an org dir with a non-model child, and a
     // dot-dir.
     try tmp.dir.createDirPath(io, "empty-org/not-a-model");
@@ -1251,12 +1259,16 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
     // does not start. De-dup is not tidiness here.
     try a_dir.dir.createDirPath(io, "org/shared");
     try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"glm5_next\"}" });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/model.safetensors", .data = "x" });
     try a_dir.dir.createDirPath(io, "org/only-in-a");
     try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"mimo_v2\"}" });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/model.safetensors", .data = "x" });
     try b_dir.dir.createDirPath(io, "org/shared");
     try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/model.safetensors", .data = "x" });
     try b_dir.dir.createDirPath(io, "org/only-in-b");
     try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"qwen4_exp\"}" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/model.safetensors", .data = "x" });
 
     // `discoverModels` opens by ABSOLUTE path (the openDirAbsolute UB class),
     // and a testing tmpDir is `<cwd>/.zig-cache/tmp/<sub_path>`.
@@ -1801,7 +1813,7 @@ test "discovery skips a config.json whose root is not an object and drops a size
     }
 }
 
-/// Test helper: a `<sub>/config.json` of a served arch, enough for discovery to list it.
+/// Test helper: a `<sub>/config.json` of a served arch, with no weights: `pack_state` does not call it loadable.
 pub fn writePackStub(io: std.Io, dir: std.Io.Dir, sub: []const u8) !void {
     try dir.createDirPath(io, sub);
     const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/config.json", .{sub});
@@ -1811,15 +1823,22 @@ pub fn writePackStub(io: std.Io, dir: std.Io.Dir, sub: []const u8) !void {
     try dir.writeFile(io, .{ .sub_path = path, .data = body });
 }
 
+/// `writePackStub` plus the one weights file discovery needs to list the folder.
+pub fn writeLoadablePackStub(io: std.Io, dir: std.Io.Dir, sub: []const u8) !void {
+    try writePackStub(io, dir, sub);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/model.safetensors", .{sub}), .data = "x" });
+}
+
 test "discovery below a root skips tiny-models and dot folders at every depth, but a named root is scanned" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
-    try writePackStub(io, tmp.dir, "org/pack");
-    try writePackStub(io, tmp.dir, "tiny-models/x");
-    try writePackStub(io, tmp.dir, "org/tiny-models");
-    try writePackStub(io, tmp.dir, ".hidden/y");
+    try writeLoadablePackStub(io, tmp.dir, "org/pack");
+    try writeLoadablePackStub(io, tmp.dir, "tiny-models/x");
+    try writeLoadablePackStub(io, tmp.dir, "org/tiny-models");
+    try writeLoadablePackStub(io, tmp.dir, ".hidden/y");
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
 

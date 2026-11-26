@@ -748,6 +748,14 @@ pub fn appendRawToolDump(path: []const u8, tools_json: ?[]const u8, text: []cons
     if (text.len > 0) _ = std.c.write(fd, text.ptr, text.len);
 }
 
+/// Installs the load gate and says why the launch folder cannot load, or null: a `--model` folder the gate refuses ends
+/// the boot, as a failed startup load does.
+fn launchRefusal(params: model_load.LoadParams, buf: []u8) ?[]const u8 {
+    params.registry.load_gate = downloads.loadGate;
+    if (params.no_initial_load) return null;
+    return params.registry.loadBlocked(buf, params.entry);
+}
+
 /// Start the HTTP server on the given host and port.
 ///
 /// `cfg` carries all process-wide defaults (context size, timeouts, PLD
@@ -769,6 +777,11 @@ pub fn serve(
     port: u16,
     cfg: server_state.ServerConfig,
 ) !void {
+    var refusal_buf: [512]u8 = undefined;
+    if (launchRefusal(load_params, &refusal_buf)) |why| {
+        log.err("[load] {s} is not loaded: {s}\n", .{ load_params.entry.id, why });
+        return error.PackDownloading;
+    }
     // Before the listener and the SSD tier take their descriptors.
     fd_limits.raiseOpenFileLimit();
     _ = server_state.ensureShutdownWake();
@@ -825,7 +838,6 @@ pub fn serve(
     defer server_state.global_scheduler = null;
     server_state.global_registry = scheduler.registry;
     defer server_state.global_registry = null;
-    scheduler.registry.load_gate = downloads.loadGate;
     scheduler.test_on_cooler = cfg.test_on_cooler;
     scheduler.test_skip_warm = cfg.test_skip_warm;
     responses_api.initGlobalResponseStore(io, allocator);
@@ -4455,4 +4467,28 @@ test "tool_choice none on any surface: the template's one-token opener is banned
     defer auto.deinit(a);
     try std.testing.expectEqualSlices(u32, &eos, auto.eos_ids);
     try std.testing.expectEqual(@as(usize, 0), auto.biases().len);
+}
+
+test "serve: a launch folder the load gate refuses ends the boot with its reason, and one it admits boots as asked" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "pack");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pack/config.json", .data = "{}" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pack/model.safetensors", .data = "12345" });
+    const pack = try tmp.dir.realPathFileAlloc(std.testing.io, "pack", a);
+    defer a.free(pack);
+    const reg = try ModelRegistry.init(a, std.testing.io, null, 2, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerLaunchFolder(pack);
+    const launch = model_load.LoadParams{ .registry = reg, .entry = entry, .config = undefined, .tok = undefined, .chat_config = undefined, .model_dir = pack };
+    var why: [512]u8 = undefined;
+    try std.testing.expect(launchRefusal(launch, &why) == null);
+    try std.testing.expect(reg.load_gate != null);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pack/.pull-incomplete", .data = "" });
+    const reason = launchRefusal(launch, &why) orelse return error.LaunchNotRefused;
+    try std.testing.expect(std.mem.indexOf(u8, reason, "did not finish") != null);
+    var headless = launch;
+    headless.no_initial_load = true;
+    try std.testing.expect(launchRefusal(headless, &why) == null);
 }

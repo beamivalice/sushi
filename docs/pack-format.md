@@ -422,7 +422,14 @@ revision beside files of another, which `sushi pull` once left when a file kept 
 - `/v1/models` loaded rows carry `meta.pack_revision` and `/props` carries `pack_revision`: the id, or `null` for a pack
   that names none.
 - `sushi pull` leaves `.sushi-pull.json` in the folder (not a pack file; discovery ignores it) so the next pull compares
-  contents ([usage](usage.md#sushi-pull-and-sushi-list)).
+  contents ([usage](usage.md#sushi-pull-and-sushi-list)). The record (v2) holds the repo, the commit and per file its
+  size and content id; every file but the small hand-edited text ones (`config.json`, `generation_config.json`,
+  `tokenizer*.json`, `special_tokens_map.json`, `chat_template*`, `*.jinja`, `*.md`, `*.txt`) also holds the stat
+  (inode, mtime in ns) taken right after its content check passed. The engine loads a pulled pack only when that record
+  seals it (every sealed file still stats as recorded); a record it cannot read, or from a newer sushi, refuses the
+  folder; a folder with no record keeps the content rule (`config.json`, every file the index names or a `.safetensors`,
+  no `.partial` of a file it needs). A v1 record, with no stats, seals nothing: the next pull hashes each file once and
+  rewrites it as v2. [Pack state](server-lifecycle.md#pack-state).
 
 Writers: `sushi repack <pack> --pack-revision <id>` ([writer side](#pack-revision-writer)); the private converter
 stack writes the same format, keeping a page-aligned data start page-aligned.

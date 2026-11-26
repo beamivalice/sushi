@@ -6,8 +6,11 @@ const json_text = @import("json_text.zig");
 
 pub const default_endpoint = "https://huggingface.co";
 
-/// Name of the manifest a finished pull writes into the pack folder.
+/// Name of the record a finished pull writes into the pack folder (`pack_state` is its one reader).
 pub const manifest_name = ".sushi-pull.json";
+
+/// Current record version: v1 rows carry a content id, v2 weights rows also a `Seal`.
+const record_version = 2;
 
 /// Test-only (tests/test_pull_integrity.sh): replaces https://huggingface.co so a stub repo is served offline.
 pub fn endpoint() []const u8 {
@@ -21,13 +24,77 @@ pub fn hfUrl(allocator: std.mem.Allocator, base: []const u8, comptime tail_fmt: 
     return std.fmt.allocPrint(allocator, "{s}" ++ tail_fmt, .{base} ++ args);
 }
 
+/// A weights file's identity to `stat`, taken right after its content check passed. A later stat that differs says
+/// the file was replaced or edited since, and the folder is no longer the one the pull verified.
+pub const Seal = struct {
+    inode: u64,
+    mtime_ns: i64,
+
+    pub fn of(st: std.Io.File.Stat) Seal {
+        return .{ .inode = st.inode, .mtime_ns = std.math.cast(i64, st.mtime.nanoseconds) orelse std.math.maxInt(i64) };
+    }
+};
+
+pub const SealCheck = enum { holds, missing, differs };
+
+/// Whether `f.path` under `dir` still has the stat `f.seal` recorded and `f.size` bytes.
+pub fn sealCheck(io: std.Io, dir: std.Io.Dir, f: RepoFile) SealCheck {
+    const seal = f.seal orelse return .holds;
+    if (!safeRelative(f.path)) return .differs;
+    const st = dir.statFile(io, f.path, .{}) catch return .missing;
+    return if (st.kind == .file and st.size == f.size and std.meta.eql(Seal.of(st), seal)) .holds else .differs;
+}
+
+/// Small text files a user may edit by hand, matched on the base name: a record never seals them, so an edit never
+/// refuses a load. Every other file a record lists (weights, the n-gram table, any binary sidecar) is sealed.
+const hand_edited_names = [_][]const u8{ "config.json", "generation_config.json", "special_tokens_map.json" };
+const hand_edited_shapes = [_]struct { prefix: []const u8, suffix: []const u8 }{
+    .{ .prefix = "tokenizer", .suffix = ".json" },
+    .{ .prefix = "chat_template", .suffix = "" },
+    .{ .prefix = "", .suffix = ".jinja" },
+    .{ .prefix = "", .suffix = ".md" },
+    .{ .prefix = "", .suffix = ".txt" },
+};
+
+/// Whether a pull seals `path` once it verified it.
+pub fn sealsPath(path: []const u8) bool {
+    const base = std.fs.path.basename(path);
+    for (hand_edited_names) |n| if (std.mem.eql(u8, base, n)) return false;
+    for (hand_edited_shapes) |shape| {
+        if (std.mem.startsWith(u8, base, shape.prefix) and std.mem.endsWith(u8, base, shape.suffix)) return false;
+    }
+    return true;
+}
+
+pub const weights_index_name = "model.safetensors.index.json";
+
+/// The distinct files the pack's weights index names, owned by `arena`; `error.NoIndex` when there is none.
+pub fn indexedFiles(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) error{ NoIndex, InvalidIndex, OutOfMemory }![]const []const u8 {
+    const raw = dir.readFileAlloc(io, weights_index_name, arena, .limited(64 * 1024 * 1024)) catch |err| return switch (err) {
+        error.FileNotFound => error.NoIndex,
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidIndex,
+    };
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch return error.InvalidIndex;
+    if (doc != .object) return error.InvalidIndex;
+    const map = doc.object.get("weight_map") orelse return error.InvalidIndex;
+    if (map != .object) return error.InvalidIndex;
+    var seen: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (map.object.values()) |v| {
+        if (v != .string) return error.InvalidIndex;
+        try seen.put(arena, v.string, {});
+    }
+    return seen.keys();
+}
+
 /// One file of a repo or of a manifest. `oid` is the sha256 for an LFS file and the git blob sha1 for a small one;
-/// empty when the listing carried none.
+/// empty when the listing carried none. `seal` is set on a weights row of a finished pull.
 pub const RepoFile = struct {
     path: []u8,
     size: u64,
     oid: []u8 = &.{},
     lfs: bool = false,
+    seal: ?Seal = null,
 };
 
 pub fn freeRepoFiles(allocator: std.mem.Allocator, files: []RepoFile) void {
@@ -116,36 +183,56 @@ pub fn manifestJson(allocator: std.mem.Allocator, m: Manifest) ![]u8 {
     var out = std.Io.Writer.Allocating.init(allocator);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.print("{{\"version\":1,\"repo\":{f},\"commit\":{f},\"files\":[", .{ json_text.Str{ .s = m.repo }, json_text.Str{ .s = m.commit } });
+    try w.print("{{\"version\":{d},\"repo\":{f},\"commit\":{f},\"files\":[", .{ record_version, json_text.Str{ .s = m.repo }, json_text.Str{ .s = m.commit } });
     for (m.files, 0..) |f, i| {
-        try w.print("{s}\n{{\"path\":{f},\"size\":{d},\"{s}\":{f}}}", .{ if (i == 0) "" else ",", json_text.Str{ .s = f.path }, f.size, if (f.lfs) "sha256" else "git_oid", json_text.Str{ .s = f.oid } });
+        try w.print("{s}\n{{\"path\":{f},\"size\":{d},\"{s}\":{f}", .{ if (i == 0) "" else ",", json_text.Str{ .s = f.path }, f.size, if (f.lfs) "sha256" else "git_oid", json_text.Str{ .s = f.oid } });
+        if (f.seal) |seal| try w.print(",\"inode\":{d},\"mtime_ns\":{d}", .{ seal.inode, seal.mtime_ns });
+        try w.writeAll("}");
     }
     try w.writeAll("\n]}\n");
     return out.toOwnedSlice();
 }
 
-/// A manifest read back; everything is owned by `arena`.
+/// A manifest read back (v1 rows carry no seal); everything is owned by `arena`.
 pub fn parseManifest(arena: std.mem.Allocator, bytes: []const u8) !Manifest {
-    const Row = struct { path: []const u8, size: u64 = 0, sha256: ?[]const u8 = null, git_oid: ?[]const u8 = null };
+    const Row = struct { path: []const u8, size: u64 = 0, sha256: ?[]const u8 = null, git_oid: ?[]const u8 = null, inode: ?u64 = null, mtime_ns: ?i64 = null };
     const Doc = struct { version: u32 = 0, repo: []const u8 = "", commit: []const u8 = "", files: []const Row = &.{} };
     const doc = std.json.parseFromSliceLeaky(Doc, arena, bytes, .{ .ignore_unknown_fields = true }) catch return error.InvalidManifest;
-    if (doc.version != 1) return error.InvalidManifest;
+    if (doc.version != 1 and doc.version != record_version) return error.InvalidManifest;
     const files = try arena.alloc(RepoFile, doc.files.len);
-    for (doc.files, files) |r, *f| f.* = .{
-        .path = @constCast(r.path),
-        .size = r.size,
-        .oid = @constCast(r.sha256 orelse r.git_oid orelse ""),
-        .lfs = r.sha256 != null,
-    };
+    for (doc.files, files) |r, *f| {
+        if ((r.inode == null) != (r.mtime_ns == null)) return error.InvalidManifest;
+        f.* = .{
+            .path = @constCast(r.path),
+            .size = r.size,
+            .oid = @constCast(r.sha256 orelse r.git_oid orelse ""),
+            .lfs = r.sha256 != null,
+            .seal = if (r.inode) |ino| .{ .inode = ino, .mtime_ns = r.mtime_ns.? } else null,
+        };
+    }
     return .{ .repo = doc.repo, .commit = doc.commit, .files = files };
 }
 
-/// The manifest in `dir_path`, or null when there is none or it does not parse.
+/// What a folder holds of the pull's record: none, one this sushi reads, or a file it cannot read (a torn or foreign
+/// file, or a version it does not know).
+pub const Record = union(enum) { absent, present: Manifest, unreadable };
+
+pub fn readRecord(arena: std.mem.Allocator, io: std.Io, dir: std.Io.Dir) Record {
+    const raw = dir.readFileAlloc(io, manifest_name, arena, .limited(64 * 1024 * 1024)) catch |err| return switch (err) {
+        error.FileNotFound => .absent,
+        else => .unreadable,
+    };
+    return if (parseManifest(arena, raw)) |m| .{ .present = m } else |_| .unreadable;
+}
+
+/// The manifest in `dir_path`, or null when there is none or it cannot be read.
 pub fn readManifest(arena: std.mem.Allocator, io: std.Io, dir_path: []const u8) ?Manifest {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return null;
     defer dir.close(io);
-    const raw = dir.readFileAlloc(io, manifest_name, arena, .limited(64 * 1024 * 1024)) catch return null;
-    return parseManifest(arena, raw) catch null;
+    return switch (readRecord(arena, io, dir)) {
+        .present => |m| m,
+        .absent, .unreadable => null,
+    };
 }
 
 /// Written beside its final name and renamed, so a crash never leaves half a manifest.
@@ -404,8 +491,59 @@ test "hf pull: a manifest survives a round trip" {
     try testing.expectEqualStrings("d/m \"1\".safetensors", back.files[1].path);
     try testing.expect(back.files[1].lfs and !back.files[0].lfs);
     try testing.expectEqualStrings("aa11", back.files[0].oid);
-    try testing.expectError(error.InvalidManifest, parseManifest(arena.allocator(), "{\"version\":2}"));
+    try testing.expectError(error.InvalidManifest, parseManifest(arena.allocator(), "{\"version\":3}"));
     try testing.expectError(error.InvalidManifest, parseManifest(arena.allocator(), "nope"));
+}
+
+test "hf pull: a record keeps the seal of a weights row and none on a small file" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var files = [_]RepoFile{
+        .{ .path = @constCast("config.json"), .size = 12, .oid = @constCast("aa11") },
+        .{ .path = @constCast("m.safetensors"), .size = 99, .oid = @constCast("bb22"), .lfs = true, .seal = .{ .inode = 77, .mtime_ns = 1_700_000_000_123_456_789 } },
+    };
+    const text = try manifestJson(testing.allocator, .{ .repo = "beamster/X", .files = &files });
+    defer testing.allocator.free(text);
+    const back = try parseManifest(arena.allocator(), text);
+    try testing.expect(back.files[0].seal == null);
+    try testing.expectEqual(@as(u64, 77), back.files[1].seal.?.inode);
+    try testing.expectEqual(@as(i64, 1_700_000_000_123_456_789), back.files[1].seal.?.mtime_ns);
+}
+
+test "hf pull: every listed file is sealed except the small text files a user edits by hand" {
+    for ([_][]const u8{ "model.safetensors", "mtp/weights.safetensors", "ngram_table.bin", "model.safetensors.index.json", "tokenizer.model", "preprocessor_config.json" }) |p|
+        try testing.expect(sealsPath(p));
+    for ([_][]const u8{ "config.json", "mtp/config.json", "generation_config.json", "tokenizer.json", "tokenizer_config.json", "tokenizer_extra.json", "special_tokens_map.json", "chat_template.jinja", "chat_template.json", "x.jinja", "NOTES.md", "a.txt" }) |p|
+        try testing.expect(!sealsPath(p));
+}
+
+test "hf pull: a seal holds until the file is replaced, edited in size or removed" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.safetensors", .data = "12345" });
+    var f: RepoFile = .{ .path = @constCast("m.safetensors"), .size = 5 };
+    try testing.expectEqual(SealCheck.holds, sealCheck(testing.io, tmp.dir, f)); // nothing sealed
+    f.seal = Seal.of(try tmp.dir.statFile(testing.io, f.path, .{}));
+    try testing.expectEqual(SealCheck.holds, sealCheck(testing.io, tmp.dir, f));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "m.safetensors", .data = "1234567" });
+    try testing.expectEqual(SealCheck.differs, sealCheck(testing.io, tmp.dir, f));
+    try tmp.dir.deleteFile(testing.io, "m.safetensors");
+    try testing.expectEqual(SealCheck.missing, sealCheck(testing.io, tmp.dir, f));
+    f.path = @constCast("../escape");
+    try testing.expectEqual(SealCheck.differs, sealCheck(testing.io, tmp.dir, f));
+}
+
+test "hf pull: the weights index names each shard once" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectError(error.NoIndex, indexedFiles(arena.allocator(), testing.io, tmp.dir));
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = weights_index_name, .data = "{\"weight_map\":{\"a\":\"s1.safetensors\",\"b\":\"s2.safetensors\",\"c\":\"s1.safetensors\"}}" });
+    const names = try indexedFiles(arena.allocator(), testing.io, tmp.dir);
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = weights_index_name, .data = "{\"weight_map\":{\"a\":3}}" });
+    try testing.expectError(error.InvalidIndex, indexedFiles(arena.allocator(), testing.io, tmp.dir));
 }
 
 test "hf pull: a file is skipped only when its content id matches" {
