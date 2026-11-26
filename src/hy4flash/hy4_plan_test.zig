@@ -1293,7 +1293,7 @@ test "hy4 plan: a one-row forward whose shape no probe recorded is refused by na
     // The missed shape is kept beside the load's manifest.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    p.cache = .init(testing.io, tmp.dir, "scope-build");
+    p.cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
     defer p.cache = null;
     // Past the window and a group's edge: layers whose keys the one probe never took.
     try testing.expectError(error.PlanMiss, oneRow(m, ids, 20, true, got[vocab..]));
@@ -1325,7 +1325,7 @@ test "hy4 plan: a load plans the shapes earlier misses kept beside its manifest,
     const p = m.plans.?;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const cache: @import("../tensor/plan/plan_book.zig").Cache = .init(testing.io, tmp.dir, "scope-build");
+    const cache: @import("../tensor/plan/plan_book.zig").Cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
     // One the load can run, and one past its reach.
     try cache.keep(a, hy4_plan.shapeOf(.{ .rows = 1, .readout = .last, .keep_hidden = false, .kv = p.kv, .n = 21 }));
     try cache.keep(a, hy4_plan.shapeOf(.{ .rows = 1, .readout = .last, .keep_hidden = false, .kv = p.kv, .n = p.reach }));
@@ -1617,7 +1617,7 @@ test "hy4 plan: a load keeps its chunk width's region beside its manifest, named
     defer tmp.cleanup();
     const was = p.cache;
     defer p.cache = was;
-    p.cache = .init(testing.io, tmp.dir, "scope-build");
+    p.cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
     const full = (try forget(p, rows)).probes;
     var name_buf: [40]u8 = undefined;
     const name = hy4_plan.regionFileName(m, p, rows, &name_buf);

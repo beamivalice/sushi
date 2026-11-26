@@ -729,7 +729,7 @@ rebuilds one.
   A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
 - **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
   complete enumeration and the manifest is rewritten; the older builds of the scope are removed, but the newest other one, and the log says so: two binaries on one box keep each their manifest. A
-  manifest rewritten after its load (a late kernel) opens its root again from the path, so a root removed and made again is never a stale handle.
+  manifest rewritten after its load (a late kernel) opens its root again from the path, so a root removed and made again is never a stale handle; the plan's kept shapes and regions (`plan_book.Cache`) do the same at each read and write, and a load closes the root it opened.
 - **A warm gap hides behind another build's manifest.** That first load holds every pipeline the older build's warm
   made, among them ones the new warm no longer asks for; the rewritten manifest keeps only what the new warm touched,
   so the gap shows at the next same-key load. A change to the warm is checked live on two loads in a row: both read

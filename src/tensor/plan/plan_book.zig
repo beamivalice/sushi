@@ -150,14 +150,34 @@ pub const Shape = struct { phase: u32, args: [4]u64 = @splat(0) };
 /// opened for each read or write. `root` is the process's, never closed here.
 pub const Cache = struct {
     io: std.Io,
-    root: std.Io.Dir,
+    root: Root,
     buf: [64]u8 = undefined,
     len: usize = 0,
 
-    pub fn init(io: std.Io, root: std.Io.Dir, sub: []const u8) Cache {
+    /// A root directory as opened: `owned` when the caller closes it.
+    pub const Opened = struct { dir: std.Io.Dir, owned: bool };
+
+    /// Where the cache's directory sits: a handle, or the way to open it from its path each time, so a root removed and
+    /// made again is never a stale handle.
+    pub const Root = union(enum) {
+        handle: std.Io.Dir,
+        path: *const fn (io: std.Io) ?Opened,
+    };
+
+    pub fn init(io: std.Io, root: Root, sub: []const u8) Cache {
         var c: Cache = .{ .io = io, .root = root, .len = sub.len };
         @memcpy(c.buf[0..sub.len], sub);
         return c;
+    }
+
+    /// The cache's own directory, made if missing; the caller closes it.
+    pub fn dir(c: *const Cache) !std.Io.Dir {
+        const opened: Opened = switch (c.root) {
+            .handle => |h| .{ .dir = h, .owned = false },
+            .path => |open| open(c.io) orelse return error.FileNotFound,
+        };
+        defer if (opened.owned) opened.dir.close(c.io);
+        return opened.dir.createDirPathOpen(c.io, c.name(), .{});
     }
 
     pub fn name(c: *const Cache) []const u8 {
@@ -165,15 +185,15 @@ pub const Cache = struct {
     }
 
     pub fn read(c: *const Cache, a: std.mem.Allocator) ![]Shape {
-        var dir = try c.root.createDirPathOpen(c.io, c.name(), .{});
-        defer dir.close(c.io);
-        return readShapes(a, c.io, dir);
+        var d = try c.dir();
+        defer d.close(c.io);
+        return readShapes(a, c.io, d);
     }
 
     pub fn keep(c: *const Cache, a: std.mem.Allocator, shape: Shape) !void {
-        var dir = try c.root.createDirPathOpen(c.io, c.name(), .{});
-        defer dir.close(c.io);
-        return keepShape(a, c.io, dir, shape);
+        var d = try c.dir();
+        defer d.close(c.io);
+        return keepShape(a, c.io, d, shape);
     }
 };
 

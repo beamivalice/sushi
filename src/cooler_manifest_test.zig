@@ -288,6 +288,34 @@ test "cooler contract: a manifest rewritten after its root directory was removed
     try testing.expect(found == .same);
 }
 
+test "cooler contract: a plan's kept shapes land in a root removed and made again" {
+    const shared = @import("arch/cooler_pipelines.zig");
+    const pm = @import("pipeline_manifest.zig");
+    try mlx.requireGpu();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    try pm.setRootFromHome(buf[0..try tmp.dir.realPath(io, &buf)]);
+    defer pm.clearRootForTest();
+    defer shared.forget();
+    mlx.engine.pipeline_registry.resetForTest();
+    var plan = shared.beginScope(testing.allocator, io, @as([16]u8, "aaaaaaaaaaaaaaaa".*));
+    defer plan.deinit();
+    _ = plan.settle();
+    const cache = plan.shapeCache() orelse return error.NoShapeCache;
+    try cache.keep(testing.allocator, .{ .phase = 1 });
+    // Another process or a cleanup removes the root; the load's later misses are kept in the one made again.
+    try tmp.dir.deleteTree(io, ".sushi");
+    cache.keep(testing.allocator, .{ .phase = 2 }) catch |e| {
+        std.debug.print("a shape was not kept in the root made again: {s}\n", .{@errorName(e)});
+        return e;
+    };
+    const kept = try cache.read(testing.allocator);
+    defer testing.allocator.free(kept);
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expectEqual(@as(u32, 2), kept[0].phase);
+}
+
 /// Two DeepSeek packs whose scopes differ (the tile order does) and whose served warm has one shape.
 fn twoPacks() ?struct { a: []const u8, b: []const u8 } {
     const a = std.mem.span(std.c.getenv("DSV41_STQ_TINY_PM") orelse return null);

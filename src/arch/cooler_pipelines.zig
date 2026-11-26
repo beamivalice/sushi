@@ -69,12 +69,16 @@ pub const Plan = struct {
     threads: usize,
     /// Whether `root` came from the process's root path (`openRoot`), which a later write opens again.
     from_path: bool = false,
+    /// Whether `root` is a handle this plan opened, which it closes.
+    owns_root: bool = false,
     /// What the last `settle` spent making pipelines ahead, and how many it made.
     made_ns: u64 = 0,
     made_count: u64 = 0,
 
     pub fn deinit(p: *Plan) void {
         p.found.deinit();
+        // A path-made root is opened again by every later write and shape: this handle is the load's own.
+        if (p.owns_root) p.root.?.close(p.io);
     }
 
     /// Makes the pipelines of the manifest found, on worker threads. True when it made every pipeline of this build's
@@ -133,7 +137,7 @@ pub const Plan = struct {
     pub fn shapeCache(p: *const Plan) ?@import("../tensor/plan/plan_book.zig").Cache {
         const root = p.root orelse return null;
         var buf: [manifest.Key.dir_len]u8 = undefined;
-        return .init(p.io, root, p.key.dirName(&buf));
+        return .init(p.io, if (p.from_path) .{ .path = reopenRoot } else .{ .handle = root }, p.key.dirName(&buf));
     }
 
     /// After a complete warm: the recipes the process made, written for this key, and the older builds of the scope
@@ -150,6 +154,12 @@ pub const Plan = struct {
         for (removed.items) |name| log.info("[pipelines] removed the manifest {s} of an older build\n", .{name});
     }
 };
+
+fn reopenRoot(io: std.Io) ?@import("../tensor/plan/plan_book.zig").Cache.Opened {
+    var reason: []const u8 = "";
+    const dir = openRoot(io, &reason) orelse return null;
+    return .{ .dir = dir, .owned = root_hook == null };
+}
 
 /// Where this load's manifest lives once it holds a complete warm, for a warm that runs after the load's own (the
 /// vision tower's). A root made from the process's path is opened again at each write, so a root removed and made
@@ -201,14 +211,13 @@ pub fn forget() void {
 /// them. A load with no manifest root writes nothing.
 pub fn rewriteLate() void {
     const l = last orelse return;
-    var reason: []const u8 = "";
-    const fresh = if (l.from_path) openRoot(l.io, &reason) else l.root;
-    const root = fresh orelse {
-        log.warn("[pipelines] manifest not written: {s}\n", .{reason});
+    const opened: ?@import("../tensor/plan/plan_book.zig").Cache.Opened = if (l.from_path) reopenRoot(l.io) else .{ .dir = l.root, .owned = false };
+    const root = opened orelse {
+        log.warn("[pipelines] manifest not written: the manifest root did not open\n", .{});
         return;
     };
-    defer if (l.from_path and root_hook == null) root.close(l.io);
-    if (!write(l.a, l.io, root, l.key)) return;
+    defer if (root.owned) root.dir.close(l.io);
+    if (!write(l.a, l.io, root.dir, l.key)) return;
     var dir_buf: [manifest.Key.dir_len]u8 = undefined;
     log.info("[pipelines] manifest {s} written again with a later warm: {d} recipes\n", .{ l.key.dirName(&dir_buf), registry.recipes().len });
 }
@@ -246,6 +255,7 @@ pub fn beginScope(a: std.mem.Allocator, io: std.Io, scope: anyerror![16]u8) Plan
     const root = openRoot(io, &reason);
     var plan = begin(a, io, root, reason, .{ .scope = s, .build = build }, key_ms);
     plan.from_path = root != null;
+    plan.owns_root = root != null and root_hook == null;
     return plan;
 }
 

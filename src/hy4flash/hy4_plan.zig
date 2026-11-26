@@ -978,7 +978,7 @@ fn keepRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !voi
     const measured = p.measured.items[p.measured.items.len - 1];
     const bytes = try encodeRegion(gpa, .{ .measured = measured, .check = try checkNeed(m, p, rows), .deep = p.deep, .keys = keys.items, .classes = classes.items });
     defer gpa.free(bytes);
-    var dir = try c.root.createDirPathOpen(c.io, c.name(), .{});
+    var dir = try c.dir();
     defer dir.close(c.io);
     var name_buf: [40]u8 = undefined;
     const name = regionFileName(m, p, rows, &name_buf);
@@ -995,7 +995,7 @@ fn readRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !?pl
     const gpa = p.book.gpa;
     var name_buf: [40]u8 = undefined;
     const name = regionFileName(m, p, rows, &name_buf);
-    var dir = c.root.createDirPathOpen(c.io, c.name(), .{}) catch return null;
+    var dir = c.dir() catch return null;
     defer dir.close(c.io);
     const bytes = dir.readFileAlloc(c.io, name, gpa, .limited(1 << 30)) catch |e| {
         if (e != error.FileNotFound) log.warn("[plan] the kept region of {d}-row chunks unread: {s}; measured again\n", .{ rows, @errorName(e) });

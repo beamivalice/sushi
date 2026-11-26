@@ -427,7 +427,7 @@ test "hy4 sample plan: a draw of a mix the load did not plan is refused by name,
     r.tables = null;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    p.cache = .init(testing.io, tmp.dir, "scope-build");
+    p.cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
     defer p.cache = null;
     var in = try sample_plan.makeInputs(m, st, a, .{ .mix = mix });
     defer in.deinit();
