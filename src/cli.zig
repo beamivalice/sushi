@@ -2473,7 +2473,7 @@ test "pull: Hugging Face's 401/403/404 mean a missing repo, other failures mean 
     try testing.expect(statusKind(503) == .failed);
 }
 
-test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended" {
+test "list on a 64 GB Mac: sizes, downloaded, verdicts, and one pack recommended per model, Qwen 2.75bpw and Hy4-Flash 2.25bpw" {
 
     try test_note.needArchs(&.{"qwen4"});
     var rows: [aliases.len]CatalogRow = undefined;
@@ -2485,14 +2485,20 @@ test "list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recomme
     try testing.expect(std.mem.indexOf(u8, out, "This Mac: 64 GB") != null);
     var lines = std.mem.splitScalar(u8, out, '\n');
     var recommended: usize = 0;
+    var qwen = false;
+    var hy4 = false;
     while (lines.next()) |line| {
         if (std.mem.indexOf(u8, line, "<- recommended") == null) continue;
         recommended += 1;
-        try testing.expect(std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.75bpw"));
-        try testing.expect(std.mem.indexOf(u8, line, "yes") != null);
         try testing.expect(std.mem.indexOf(u8, line, "fits") != null);
+        if (std.mem.startsWith(u8, line, "qwen3.8-flash-next:2.75bpw")) {
+            qwen = true;
+            // The second row is the downloaded one.
+            try testing.expect(std.mem.indexOf(u8, line, "yes") != null);
+        } else if (std.mem.startsWith(u8, line, "hy4-flash:2.25bpw")) hy4 = true;
     }
-    try testing.expectEqual(@as(usize, 1), recommended);
+    try testing.expect(qwen and hy4);
+    try testing.expectEqual(@as(usize, 2), recommended);
     try testing.expect(std.mem.indexOf(u8, out, "may stream (--ssd-budget-gb)") != null);
 }
 
@@ -2520,7 +2526,8 @@ test "cli: every short name is a published Sushi pack" {
     for (aliases) |a| try testing.expect(std.mem.startsWith(u8, a.repo, "beamster/Qwen3.8-Flash-Next-Sushi-") or
         std.mem.startsWith(u8, a.repo, "beamster/MiMo-V2.6-Flash-Sushi-") or
         std.mem.startsWith(u8, a.repo, "beamster/GLM-5.3-Flash-Sushi-") or
-        std.mem.startsWith(u8, a.repo, "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-"));
+        std.mem.startsWith(u8, a.repo, "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-") or
+        std.mem.startsWith(u8, a.repo, "beamster/Hy4-Flash-Sushi-STQ-"));
 }
 
 test "cli: modelDestPath layout" {

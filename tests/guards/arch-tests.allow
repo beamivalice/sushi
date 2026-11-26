@@ -178,7 +178,7 @@ kld: --qwen-gdn 16 stores the GDN state in bf16, 32 is the default width
 kld: a capture and a compare run on the cut Qwen pack, each pass bound at the rows it writes (QWEN4_TEST_MODEL)
 kv6 is a first-class wire value: parsed, named and served by GLM's latent backend
 layout resolution is qwen4_exp only: the same index declares nothing for another arch
-list on a 64 GB Mac: sizes, downloaded, verdicts, and Qwen 2.75bpw recommended
+list on a 64 GB Mac: sizes, downloaded, verdicts, and one pack recommended per model, Qwen 2.75bpw and Hy4-Flash 2.25bpw
 mimo v2 fused qkv split keeps asymmetric value rows
 mimo_v2 EXL3 arms stay finite where the SwiGLU product passes the f16 ceiling
 mimo_v2 EXL3 beside an MXFP4 bank is a mixed pack and resolves to nothing
