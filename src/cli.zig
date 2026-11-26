@@ -365,15 +365,48 @@ pub const PullEvent = hf_pull.PullEvent;
 
 extern "c" fn waitid(idtype: c_int, id: c_uint, info: *anyopaque, options: c_int) c_int;
 
-/// Blocks until `pid` exits without reaping it, so the pid a caller holds cannot be reused until `wait` reaps it.
-fn waitExitedUnreaped(pid: std.posix.pid_t) void {
+/// Waits until `pid` exits without reaping it, so the pid a caller holds cannot be reused until `wait` reaps it.
+/// A stop SIGTERMs the child while this waits: a pull ends on the stop in every phase, not only during a file
+/// download, even when the peer accepted the request and never answers.
+fn waitExitedUnreaped(pid: std.posix.pid_t, stop: ?*const std.atomic.Value(bool)) void {
     const P_PID = 1;
     const WEXITED = 0x04;
     const WNOWAIT = 0x20;
-    var info: [256]u8 align(8) = undefined;
-    while (waitid(P_PID, @intCast(pid), &info, WEXITED | WNOWAIT) != 0) {
-        if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return;
+    const WNOHANG = 0x01;
+    var info: std.c.siginfo_t = undefined;
+    while (true) {
+        if (stop) |st| {
+            if (st.load(.monotonic)) _ = std.c.kill(pid, .TERM);
+        }
+        info = std.mem.zeroes(std.c.siginfo_t);
+        if (waitid(P_PID, @intCast(pid), &info, WEXITED | WNOWAIT | WNOHANG) != 0) {
+            if (std.c._errno().* != @intFromEnum(std.c.E.INTR)) return;
+        } else if (info.pid == pid) return;
+        var ts = std.c.timespec{ .sec = 0, .nsec = 50_000_000 };
+        _ = std.c.nanosleep(&ts, null);
     }
+}
+
+/// Runs a spawned curl to its end with the reporter holding its pid. The wait honours the caller's stop flag, so a
+/// Stop ends the curl even when nothing else signals it; the pid stays unreaped until the wait below, so the signal
+/// can never reach another process. `PullCancelled` when the stop asked for the end.
+fn runCurlChild(io: std.Io, child: *std.process.Child, reporter: Reporter) !std.process.Child.Term {
+    if (!reporter.event(.{ .child = child.id })) {
+        child.kill(io);
+        _ = reporter.event(.{ .child = null });
+        return error.PullCancelled;
+    }
+    waitExitedUnreaped(child.id.?, reporter.stop);
+    _ = reporter.event(.{ .child = null });
+    const term = try child.wait(io);
+    switch (term) {
+        .exited => |code| if (code == 0) return term,
+        else => {},
+    }
+    // Only a curl the stop cut short ends here as cancelled; one that finished cleanly is the next event's to
+    // report, so a finished file is still verified and put in place.
+    const stopped = if (reporter.stop) |st| st.load(.monotonic) else false;
+    return if (stopped) error.PullCancelled else term;
 }
 
 const HfEnv = pack_update.HfEnv;
@@ -416,9 +449,16 @@ const HfAuth = struct {
     }
 };
 
+/// A peer that accepts and never answers must not hold a pull: every curl bounds its connect and aborts a transfer
+/// that stays under a kilobyte a second for a minute. A file download gets no total `--max-time` (a large shard may
+/// take hours); a listing or a commit lookup is one small document and gets one too.
+const curl_stall_bounds = [_][]const u8{ "--connect-timeout", "5", "--speed-limit", "1024", "--speed-time", "60" };
+const curl_doc_bounds = [_][]const u8{ "--connect-timeout", "5", "--max-time", "30" };
+
 /// Appends the shared curl argv prefix and the Hugging Face credentials.
 fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator, auth: HfAuth) !void {
     try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
+    try list.appendSlice(allocator, &curl_stall_bounds);
     try auth.appendArgs(list, allocator);
 }
 
@@ -432,39 +472,66 @@ pub fn statusKind(code: u16) enum { ok, not_found, failed } {
 
 const Fetched = struct { status: u16, body: []u8 };
 
+var curl_out_seq = std.atomic.Value(u32).init(0);
+
+/// Runs one curl to completion with its stdout in a temp file: a listing runs to megabytes, and a pipe nobody drains
+/// while the wait runs would block curl. The pid reaches the reporter while it runs, so a stop ends it.
+fn curlCapture(allocator: std.mem.Allocator, io: std.Io, argv: []const []const u8, reporter: Reporter) ![]u8 {
+    const tmp_dir = if (std.c.getenv("TMPDIR")) |t| std.mem.trimEnd(u8, std.mem.span(t), "/") else "/tmp";
+    const out = try std.fmt.allocPrint(allocator, "{s}/sushi-curl-{d}-{d}", .{ tmp_dir, std.c.getpid(), curl_out_seq.fetchAdd(1, .monotonic) });
+    defer allocator.free(out);
+    var file = try std.Io.Dir.cwd().createFile(io, out, .{ .exclusive = true, .permissions = .fromMode(0o600) });
+    defer std.Io.Dir.cwd().deleteFile(io, out) catch {};
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .ignore,
+        .stdout = .{ .file = file },
+        .stderr = .ignore,
+    }) catch {
+        file.close(io);
+        return error.FetchFailed;
+    };
+    file.close(io);
+    errdefer child.kill(io);
+    const term = runCurlChild(io, &child, reporter) catch |err| switch (err) {
+        error.PullCancelled => return error.PullCancelled,
+        else => return error.FetchFailed,
+    };
+    switch (term) {
+        .exited => |code| if (code != 0) return error.FetchFailed,
+        else => return error.FetchFailed,
+    }
+    return std.Io.Dir.cwd().readFileAlloc(io, out, allocator, .limited(64 * 1024 * 1024)) catch return error.FetchFailed;
+}
+
 /// GET an HTTPS document via curl and return its status and body. No `-f`: the status is ours to read.
-/// `quick` bounds the wait to a few seconds and skips the retries, for a listing that must never hang.
-fn curlGet(allocator: std.mem.Allocator, io: std.Io, url: []const u8, quick: bool) !Fetched {
+/// `quick` bounds the wait to a few seconds and skips the retries; a pull's calls also hand curl's pid to the
+/// reporter and abort on a stalled peer.
+fn curlGet(allocator: std.mem.Allocator, io: std.Io, url: []const u8, quick: bool, reporter: Reporter) !Fetched {
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(allocator);
     try argv.appendSlice(allocator, &.{ "curl", "-sL" });
-    try argv.appendSlice(allocator, if (quick)
-        &.{ "--connect-timeout", "3", "--max-time", "6" }
-    else
-        &.{ "--retry", "3", "--retry-delay", "2" });
+    if (quick) {
+        try argv.appendSlice(allocator, &.{ "--connect-timeout", "3", "--max-time", "6" });
+    } else {
+        try argv.appendSlice(allocator, &curl_doc_bounds);
+        try argv.appendSlice(allocator, &.{ "--retry", "3", "--retry-delay", "2" });
+    }
     var auth = HfAuth.initProcess(allocator, io) catch return error.FetchFailed;
     defer auth.deinit(allocator, io);
     try auth.appendArgs(&argv, allocator);
     try argv.appendSlice(allocator, &.{ "-w", "\n%{http_code}", url });
-    const result = std.process.run(allocator, io, .{
-        .argv = argv.items,
-        .stdout_limit = .limited(64 * 1024 * 1024),
-    }) catch return error.FetchFailed;
-    defer allocator.free(result.stderr);
-    defer allocator.free(result.stdout);
-    switch (result.term) {
-        .exited => |code| if (code != 0) return error.FetchFailed,
-        else => return error.FetchFailed,
-    }
-    const cut = std.mem.lastIndexOfScalar(u8, result.stdout, '\n') orelse return error.FetchFailed;
-    const code = std.fmt.parseInt(u16, std.mem.trim(u8, result.stdout[cut + 1 ..], " \r\n"), 10) catch return error.FetchFailed;
-    return .{ .status = code, .body = try allocator.dupe(u8, result.stdout[0..cut]) };
+    const stdout = try curlCapture(allocator, io, argv.items, reporter);
+    defer allocator.free(stdout);
+    const cut = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.FetchFailed;
+    const code = std.fmt.parseInt(u16, std.mem.trim(u8, stdout[cut + 1 ..], " \r\n"), 10) catch return error.FetchFailed;
+    return .{ .status = code, .body = try allocator.dupe(u8, stdout[0..cut]) };
 }
 
 /// GET a small HTTPS document (the tree listing) via curl; returns its body.
 /// Quiet on failure: callers report (the REPL health poll EXPECTS failures while the server boots).
-fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
-    const got = try curlGet(allocator, io, url, false);
+fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8, reporter: Reporter) ![]u8 {
+    const got = try curlGet(allocator, io, url, false, reporter);
     errdefer allocator.free(got.body);
     return switch (statusKind(got.status)) {
         .ok => got.body,
@@ -502,14 +569,10 @@ fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_
         .stdout = .ignore,
         .stderr = if (show_progress) .inherit else .ignore,
     }) catch return error.DownloadFailed;
-    if (!reporter.event(.{ .child = child.id })) {
-        child.kill(io);
-        _ = reporter.event(.{ .child = null });
-        return error.PullCancelled;
-    }
-    waitExitedUnreaped(child.id.?);
-    _ = reporter.event(.{ .child = null });
-    const term = child.wait(io) catch return error.DownloadFailed;
+    const term = runCurlChild(io, &child, reporter) catch |err| switch (err) {
+        error.PullCancelled => return error.PullCancelled,
+        else => return error.DownloadFailed,
+    };
     switch (term) {
         .exited => |code| if (code != 0) return error.DownloadFailed,
         else => return error.DownloadFailed,
@@ -598,11 +661,12 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     const base = hf_pull.endpoint();
     const tree_url = try hf_pull.hfUrl(allocator, base, "/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
     defer allocator.free(tree_url);
-    const tree_json = curlFetch(allocator, io, tree_url) catch |err| {
+    const tree_json = curlFetch(allocator, io, tree_url, reporter) catch |err| {
+        if (err == error.PullCancelled) return error.PullCancelled;
         if (err == error.NotFound) {
             reporter.say("error: {s} was not found on Hugging Face: it may not be published yet (or it is private or gated: set HF_TOKEN or run `hf auth login`)", .{resolved.repo});
         } else {
-            reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN / `hf auth login` for gated repos)", .{resolved.repo});
+            reporter.say("error: could not list {s} (it timed out or the connection failed; check the name, your network, or HF_TOKEN / `hf auth login` for gated repos)", .{resolved.repo});
         }
         return error.PullFailed;
     };
@@ -688,7 +752,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         const gone = hf_pull.removeDropped(io, dest_dir, m, files);
         if (gone > 0) reporter.say("removed {d} files the repo no longer has", .{gone});
     }
-    const commit = repoCommit(allocator, io, base, resolved.repo);
+    const commit = repoCommit(allocator, io, base, resolved.repo, reporter) catch return error.PullCancelled;
     defer if (commit) |c| allocator.free(c);
     hf_pull.writeManifest(allocator, io, dest_dir, .{ .repo = resolved.repo, .commit = commit orelse "", .files = wanted_files.items }) catch {
         reporter.say("error: cannot write {s}/{s}", .{ dest_dir, hf_pull.manifest_name });
@@ -701,11 +765,18 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     reporter.say("success: {s} ready", .{resolved.repo});
 }
 
-/// The commit the repo's main branch is at, or null when the API does not say.
-fn repoCommit(allocator: std.mem.Allocator, io: std.Io, base: []const u8, repo: []const u8) ?[]u8 {
+/// The commit the repo's main branch is at, or null when the API does not say. A stopped pull ends here as cancelled;
+/// a lookup that failed says so, so a bound that fires is never a silent end.
+fn repoCommit(allocator: std.mem.Allocator, io: std.Io, base: []const u8, repo: []const u8, reporter: Reporter) error{PullCancelled}!?[]u8 {
     const url = hf_pull.hfUrl(allocator, base, "/api/models/{s}", .{repo}) catch return null;
     defer allocator.free(url);
-    const got = curlFetch(allocator, io, url) catch return null;
+    const got = curlFetch(allocator, io, url, reporter) catch |err| switch (err) {
+        error.PullCancelled => return error.PullCancelled,
+        else => {
+            reporter.say("warning: could not read the revision of {s} (the pull's files are complete)", .{repo});
+            return null;
+        },
+    };
     defer allocator.free(got);
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, got, .{}) catch return null;
     defer parsed.deinit();
@@ -871,7 +942,7 @@ fn fetchSizeViaCurl(ctx: *anyopaque, repo: []const u8) FetchOutcome {
     const env: *const ListEnv = @ptrCast(@alignCast(ctx));
     const url = hf_pull.hfUrl(env.allocator, hf_pull.endpoint(), "/api/models/{s}?blobs=true", .{repo}) catch return .offline;
     defer env.allocator.free(url);
-    const got = curlGet(env.allocator, env.io, url, true) catch return .offline;
+    const got = curlGet(env.allocator, env.io, url, true, stderr_reporter) catch return .offline;
     defer env.allocator.free(got.body);
     return switch (statusKind(got.status)) {
         .ok => .{ .size = parseRepoSize(env.allocator, got.body) catch return .offline },
@@ -904,7 +975,7 @@ pub fn fetchRepoSize(allocator: std.mem.Allocator, io: std.Io, repo: []const u8)
 pub fn fetchOrgPacks(allocator: std.mem.Allocator, io: std.Io) ?[][]u8 {
     const url = hf_pull.hfUrl(allocator, hf_pull.endpoint(), "/api/models?author={s}&limit=500", .{HF_ORG}) catch return null;
     defer allocator.free(url);
-    const got = curlGet(allocator, io, url, true) catch return null;
+    const got = curlGet(allocator, io, url, true, stderr_reporter) catch return null;
     defer allocator.free(got.body);
     if (statusKind(got.status) != .ok) return null;
     return download_progress.parseOrgPacks(allocator, got.body, HF_ORG) catch null;
@@ -3396,4 +3467,74 @@ test "list: pack update lookups run unless the settings file turns pack_update_c
     var other = try model_settings.parse(std.testing.allocator, "{\"server\":{\"update_check\":false}}");
     defer other.deinit();
     try std.testing.expect(packChecksFor(&other));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+const StopHarness = struct {
+    stop: *std.atomic.Value(bool),
+    done: std.atomic.Value(bool) = .init(false),
+
+    fn report(_: *anyopaque, _: []const u8) void {}
+
+    fn event(impl: *anyopaque, _: PullEvent) bool {
+        const self: *StopHarness = @ptrCast(@alignCast(impl));
+        return !self.stop.load(.monotonic);
+    }
+};
+
+test "cli: a stop ends a pull held in its listing, not only one downloading files" {
+    const io = std.testing.io;
+    const http_conn = @import("http_conn.zig");
+    // A listening socket nobody accepts: curl connects, sends the listing request and waits for an answer.
+    var listener = try http_conn.startListener("127.0.0.1", 0);
+    var closed = false;
+    defer if (!closed) listener.deinit(io);
+    var ep_buf: [64]u8 = undefined;
+    const endpoint = try std.fmt.bufPrint(&ep_buf, "http://127.0.0.1:{d}", .{listener.socket.address.ip4.port});
+    const old_ep: ?[:0]u8 = if (std.c.getenv("SUSHI_HF_ENDPOINT")) |e| try testing.allocator.dupeSentinel(u8, std.mem.span(e), 0) else null;
+    defer {
+        if (old_ep) |z| {
+            _ = setenv("SUSHI_HF_ENDPOINT", z.ptr, 1);
+            testing.allocator.free(z);
+        } else {
+            _ = unsetenv("SUSHI_HF_ENDPOINT");
+        }
+    }
+    var epz: [64:0]u8 = undefined;
+    @memcpy(epz[0..endpoint.len], endpoint);
+    epz[endpoint.len] = 0;
+    _ = setenv("SUSHI_HF_ENDPOINT", epz[0..endpoint.len :0].ptr, 1);
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const dest = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(dest);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var stop = std.atomic.Value(bool).init(false);
+    var h: StopHarness = .{ .stop = &stop };
+    const T = struct {
+        fn run(hh: *StopHarness, alloc: std.mem.Allocator, ioo: std.Io, dest_dir: []const u8) void {
+            const reporter: Reporter = .{ .impl = hh, .reportFn = &StopHarness.report, .eventFn = &StopHarness.event, .stop = hh.stop };
+            _ = pullRepo(alloc, ioo, .{ .repo = "beamster/Stalled" }, dest_dir, reporter, false) catch {};
+            hh.done.store(true, .release);
+        }
+    }.run;
+    const t = try std.Thread.spawn(.{}, T, .{ &h, arena.allocator(), io, dest });
+    var ts = std.c.timespec{ .sec = 0, .nsec = 400_000_000 };
+    _ = std.c.nanosleep(&ts, null); // the pull is inside curl's listing by now
+    stop.store(true, .monotonic);
+    var waited_ms: usize = 0;
+    ts = .{ .sec = 0, .nsec = 25_000_000 };
+    while (!h.done.load(.acquire) and waited_ms < 2500) : (waited_ms += 25) _ = std.c.nanosleep(&ts, null);
+    const honoured = h.done.load(.acquire);
+    listener.deinit(io); // the pending connection resets; curl returns so the thread can be joined
+    closed = true;
+    t.join();
+    if (!honoured) {
+        std.debug.print("a stop did not end the pull held in its listing\n", .{});
+        return error.StopCannotReachListing;
+    }
 }

@@ -31,7 +31,8 @@ largest context per Mac: [README, Memory](../README.md#memory).
 by name. `<model>` is a short name (`qwen3.8-flash-next[:tag]`, `mimo-v2.6-flash`, `glm-5.3-flash[:tag]`,
 `deepseek-v4.1-flash`) or `beamster/<repo>`; packs from any other org are refused. A rerun downloads only what is missing
 or changed, so it finishes an interrupted pull; until then the folder holds `.pull-incomplete`. A private repo pulls after
-`hf auth login` or with `HF_TOKEN`.
+`hf auth login` or with `HF_TOKEN`. A peer that accepts and never answers cannot hold a pull: every request a pull
+makes is bounded, and a bound that fires names the step it stopped.
 
 A file is kept by content, never by size: a finished pull leaves `.sushi-pull.json` (repo, Hugging Face commit, and each
 file's size and checksum: sha256 for a large file, the git blob id for a small one) and the next pull skips a file only

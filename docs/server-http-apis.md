@@ -739,9 +739,11 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   the server walks holds it (a `--model`-only server lists the pack it downloaded, and no other folder); its job reports `done` only
   after that, so a `/v1/models` read on `done` lists it.
 - `POST /v1/downloads/cancel {"repo":...}` drops a queued pack or stops a running one: `stopping` is true until it
-  reports. The curl in flight gets SIGTERM (its pid is held unreaped until the job clears it, so the signal never reaches
-  another process), the hash of the files on disk stops between files, and a file already being verified finishes its
-  verify. The partials and `.pull-incomplete` stay, so a later start resumes, after a restart too (the queue is in
+  reports. The curl in flight — the tree listing, the revision lookup or a file download — gets SIGTERM (its pid is
+  held unreaped until the job clears it, so the signal never reaches another process), the hash of the files on disk
+  stops between files, and a file already being verified finishes its verify. Every request a pull makes is bounded:
+  its connect, a transfer under 1 KB/s for a minute, and, for the listing and the revision, 30 s per attempt. The partials
+  and `.pull-incomplete` stay, so a later start resumes, after a restart too (the queue is in
   memory; the folder is the state). Server shutdown stops the curl the same way and refuses new starts (503). A Stop sent after the pull finished, while its pack is being registered, answers 409 `download_finishing` (the job then ends `done`); a Stop that landed before that point ends the job `cancelled` (its 200 removes nothing: a pull whose files finished keeps them). A server stop ends a pull whose files finished `done`, its revision recorded; only its registration waits for the next boot's discovery.
 - The page's **Models** tab draws it as its **Available** list (an Installed | Available switch in the tab's head;
   `/downloads` is the list's own URL): per pack the size, Recommended for this Mac, Needs N GB (with
