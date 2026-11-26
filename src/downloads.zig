@@ -397,14 +397,14 @@ fn workerLoop(io: std.Io) void {
         const reporter: cli.Reporter = .{ .impl = job, .reportFn = &onLine, .eventFn = &onEvent, .stop = &job.cancel };
         const ok = if (cli.pullRepo(gpa, io, .{ .repo = job.repo }, job.dest, reporter, false)) |_| true else |_| false;
 
-        finishJob(job, ok);
+        finishJob(io, job, ok);
     }
 }
 
 /// A pull's end. A failed or stopped pull is over at once. A finished one stays active (`verifying`) until its pack
 /// is registered: `GET /v1/downloads` reporting `done` is the page's one cue to refresh `/v1/models`, so the pack
 /// must be listed by then. The job is not dropped while active, so it is used through the registry rescan.
-fn finishJob(job: *Job, ok: bool) void {
+fn finishJob(io: std.Io, job: *Job, ok: bool) void {
     lock();
     job.progress.endFile(job.allocator, ok);
     job.pid = null;
@@ -430,7 +430,7 @@ fn finishJob(job: *Job, ok: bool) void {
         e.update = null;
     };
     unlock();
-    packPulled(job.dest);
+    packPulled(io, job.dest);
     if (RegistryUse.begin()) |use| {
         defer use.end();
         if (use.registry) |r| {
@@ -445,8 +445,8 @@ fn finishJob(job: *Job, ok: bool) void {
 }
 
 /// A finished pull leaves the pack at the published revision: its `/v1/models` row stops naming an update.
-fn packPulled(dest: []const u8) void {
-    pack_update.record(dest, .current);
+fn packPulled(io: std.Io, dest: []const u8) void {
+    pack_update.record(io, dest, .current);
 }
 
 /// Queues `repo` into the pack folder `dest` and starts the download thread when it is idle. False when it is
@@ -832,13 +832,13 @@ test "downloads: an update is refused for a model in memory, also while it loads
 
 test "downloads: a finished pull drops the update claim from the pack row" {
     const dest = "/packs/Updated-Sushi-3bpw";
-    pack_update.record(dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "org/x" } });
-    defer pack_update.record(dest, .current);
-    const before = try pack_update.rowFragment(testing.allocator, dest);
+    pack_update.record(testing.io, dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "org/x" } });
+    defer pack_update.record(testing.io, dest, .current);
+    const before = try pack_update.rowFragment(testing.io, testing.allocator, dest);
     defer testing.allocator.free(before);
     try testing.expect(before.len > 0);
-    packPulled(dest);
-    const after = try pack_update.rowFragment(testing.allocator, dest);
+    packPulled(testing.io, dest);
+    const after = try pack_update.rowFragment(testing.io, testing.allocator, dest);
     defer testing.allocator.free(after);
     try testing.expectEqualStrings("", after);
 }
@@ -1148,8 +1148,8 @@ test "downloads: a pull reports done only once its pack is registered, so the on
     const prev = server_state.global_registry;
     server_state.global_registry = reg;
     defer server_state.global_registry = prev;
-    pack_update.record(dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Fresh" } });
-    defer pack_update.record(dest, .current);
+    pack_update.record(testing.io, dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Fresh" } });
+    defer pack_update.record(testing.io, dest, .current);
     const job = try Job.create(testing.allocator, "beamster/Fresh", dest, true);
     defer job.destroy();
     job.phase = .verifying;
@@ -1159,12 +1159,12 @@ test "downloads: a pull reports done only once its pack is registered, so the on
     reg.mutex.lockUncancelable(io);
     const finisher = try std.Thread.spawn(.{}, struct {
         fn run(j: *Job) void {
-            finishJob(j, true);
+            finishJob(testing.io, j, true);
         }
     }.run, .{job});
     var spins: usize = 0;
     while (true) : (spins += 1) {
-        const row = try pack_update.rowFragment(testing.allocator, dest);
+        const row = try pack_update.rowFragment(testing.io, testing.allocator, dest);
         defer testing.allocator.free(row);
         if (row.len == 0) break;
         if (spins == 50_000_000) {
@@ -1209,7 +1209,7 @@ test "downloads: a pull that finishes as the server stops registers its pack bef
     reg.mutex.lockUncancelable(io);
     const finisher = try std.Thread.spawn(.{}, struct {
         fn run(j: *Job) void {
-            finishJob(j, true);
+            finishJob(testing.io, j, true);
         }
     }.run, .{job});
     var spins: usize = 0;
@@ -1271,7 +1271,7 @@ test "downloads: a pull that finishes after the server stopped registers nothing
     job.phase = .verifying;
     stop();
     defer start();
-    finishJob(job, true);
+    finishJob(testing.io, job, true);
     try testing.expectEqual(Phase.done, job.phase);
     try testing.expect(!registryBusy());
     try testing.expectEqual(@as(usize, 0), reg.entries.count());
@@ -1289,7 +1289,7 @@ test "downloads: a pull whose files finished as the server stops ends done and r
     const job = try Job.create(testing.allocator, "beamster/Finished", dest, true);
     defer job.destroy();
     job.phase = .verifying;
-    pack_update.record(dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Finished" } });
+    pack_update.record(testing.io, dest, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "beamster/Finished" } });
     lock();
     try jobs.append(gpa, job);
     unlock();
@@ -1304,9 +1304,9 @@ test "downloads: a pull whose files finished as the server stops ends done and r
     }
     // The server stops as the last file verifies: the files are whole, so the job is done, not stopped.
     stop();
-    finishJob(job, true);
+    finishJob(testing.io, job, true);
     try testing.expectEqual(Phase.done, job.phase);
-    const row = try pack_update.rowFragment(testing.allocator, dest);
+    const row = try pack_update.rowFragment(testing.io, testing.allocator, dest);
     defer testing.allocator.free(row);
     try testing.expectEqualStrings("", row);
     try testing.expect(!registryBusy());
@@ -1344,7 +1344,7 @@ test "downloads: a Stop sent while the finished pull's pack is being registered 
     reg.mutex.lockUncancelable(io);
     const finisher = try std.Thread.spawn(.{}, struct {
         fn run(j: *Job) void {
-            finishJob(j, true);
+            finishJob(testing.io, j, true);
         }
     }.run, .{job});
     var spins: usize = 0;
@@ -1378,7 +1378,7 @@ test "downloads: a Stop that lands as the last file verifies ends the job stoppe
     defer job.destroy();
     job.phase = .verifying;
     job.cancel.store(true, .monotonic);
-    finishJob(job, true);
+    finishJob(testing.io, job, true);
     try testing.expectEqual(Phase.cancelled, job.phase);
     try testing.expectEqual(@as(usize, 0), reg.entries.count());
 }

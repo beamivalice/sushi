@@ -432,7 +432,7 @@ pub fn renderModelEntry(
         const pack_revision_str = try packRevisionJson(allocator, config);
         defer allocator.free(pack_revision_str);
 
-        const pack_update_part = try pack_update.rowFragment(allocator, entry.path);
+        const pack_update_part = try pack_update.rowFragment(io, allocator, entry.path);
         defer allocator.free(pack_update_part);
         const pack_tail = try std.fmt.allocPrint(allocator, "{s},{s}{s}", .{ pack_revision_str, defaults_str, pack_update_part });
         defer allocator.free(pack_tail);
@@ -1607,7 +1607,7 @@ test "models row: meta.pack_update appears only for a pack with a newer publishe
     defer t.allocator.free(bare);
     try t.expect(std.mem.indexOf(u8, bare, "pack_update") == null);
 
-    pack_update.record(entry.path, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull example-pack" } });
+    pack_update.record(t.io, entry.path, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull example-pack" } });
     const row = try renderModelEntry(t.allocator, t.io, &entry);
     defer t.allocator.free(row);
     const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, row, .{});
@@ -1617,7 +1617,7 @@ test "models row: meta.pack_update appears only for a pack with a newer publishe
     try t.expectEqualStrings("2.0", up.get("latest").?.string);
     try t.expectEqualStrings("sushi pull example-pack", up.get("command").?.string);
 
-    pack_update.record(entry.path, .current);
+    pack_update.record(t.io, entry.path, .current);
     const after = try renderModelEntry(t.allocator, t.io, &entry);
     defer t.allocator.free(after);
     try t.expect(std.mem.indexOf(u8, after, "pack_update") == null);

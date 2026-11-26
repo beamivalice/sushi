@@ -643,7 +643,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     var hash_slot = std.ArrayList(usize).empty;
     defer hash_slot.deinit(allocator);
     for (wanted_files.items, actions, 0..) |f, *act, i| {
-        const prior: ?hf_pull.RepoFile = if (old) |m| m.find(f.path) else null;
+        const prior: ?hf_pull.RepoFile = if (old) |m| m.find(io, dest_dir, f.path) else null;
         act.* = hf_pull.decide(f, prior, old != null, fileSizeAt(io, dest_dir, f.path));
         if (act.* == .hash) {
             try to_hash.append(allocator, f);

@@ -6,6 +6,7 @@ const std = @import("std");
 const log = @import("log.zig");
 const hf_pull = @import("hf_pull.zig");
 const update = @import("update.zig");
+const FolderId = @import("folder_identity.zig").FolderId;
 
 const Allocator = std.mem.Allocator;
 
@@ -306,11 +307,18 @@ const slot_cap = 8;
 const slot_meta_cap = 384;
 
 const Slot = struct {
+    id: FolderId = .unset,
     path: [std.fs.max_path_bytes]u8 = undefined,
     path_len: usize = 0,
     meta: [slot_meta_cap]u8 = undefined,
     meta_len: usize = 0,
 };
+
+/// The folder's filesystem identity, never its spelling; a path that names no folder has none.
+fn folderId(io: std.Io, pack_path: []const u8) ?FolderId {
+    if (pack_path.len == 0 or pack_path.len > std.fs.max_path_bytes) return null;
+    return FolderId.of(io, pack_path) catch null;
+}
 
 var mu: std.c.pthread_mutex_t = .{};
 var enabled = false;
@@ -361,18 +369,21 @@ pub fn autoChecksOn() bool {
 pub fn watch(pack_path: []const u8) void {
     _ = std.c.pthread_mutex_lock(&mu);
     defer _ = std.c.pthread_mutex_unlock(&mu);
-    if (!enabled or pack_path.len == 0 or pack_path.len > std.fs.max_path_bytes) return;
+    if (!enabled) return;
+    const id = folderId(server_io, pack_path) orelse return;
     var free: ?usize = null;
     for (&slots, 0..) |*s, i| {
         if (s.path_len == 0) {
             if (free == null) free = i;
-        } else if (std.mem.eql(u8, s.path[0..s.path_len], pack_path)) return;
+        } else if (s.id.eql(&id)) return;
     }
     const i = free orelse return;
     @memcpy(slots[i].path[0..pack_path.len], pack_path);
     slots[i].path_len = pack_path.len;
+    slots[i].id = id;
     const t = std.Thread.spawn(.{}, watchLoop, .{i}) catch |err| {
         slots[i].path_len = 0;
+        slots[i].id = .unset;
         log.debug("[pack-update] watch thread: {t}\n", .{err});
         return;
     };
@@ -406,7 +417,8 @@ fn watchLoop(i: usize) void {
 }
 
 /// Publishes what a look found for the pack at `pack_path`, for `rowFragment`.
-pub fn record(pack_path: []const u8, st: Status) void {
+pub fn record(io: std.Io, pack_path: []const u8, st: Status) void {
+    const id = folderId(io, pack_path) orelse return;
     var tmp: [slot_meta_cap]u8 = undefined;
     var w = std.Io.Writer.fixed(&tmp);
     const n = if (metaFragment(&w, st)) |_| w.buffered().len else |_| 0;
@@ -416,16 +428,16 @@ pub fn record(pack_path: []const u8, st: Status) void {
     for (&slots, 0..) |*s, i| {
         if (s.path_len == 0) {
             if (free == null) free = i;
-        } else if (std.mem.eql(u8, s.path[0..s.path_len], pack_path)) {
+        } else if (s.id.eql(&id)) {
             free = i;
             break;
         }
     }
     const i = free orelse return;
     if (slots[i].path_len == 0) {
-        if (pack_path.len > std.fs.max_path_bytes) return;
         @memcpy(slots[i].path[0..pack_path.len], pack_path);
         slots[i].path_len = pack_path.len;
+        slots[i].id = id;
     }
     @memcpy(slots[i].meta[0..n], tmp[0..n]);
     slots[i].meta_len = n;
@@ -433,11 +445,12 @@ pub fn record(pack_path: []const u8, st: Status) void {
 
 /// The `,"pack_update":{...}` fragment for the `/v1/models` row of the pack at `pack_path`; empty when the last
 /// look found no update or none has answered. Caller frees.
-pub fn rowFragment(allocator: Allocator, pack_path: []const u8) Allocator.Error![]u8 {
+pub fn rowFragment(io: std.Io, allocator: Allocator, pack_path: []const u8) Allocator.Error![]u8 {
+    const id = folderId(io, pack_path) orelse return allocator.dupe(u8, "");
     _ = std.c.pthread_mutex_lock(&mu);
     defer _ = std.c.pthread_mutex_unlock(&mu);
     for (&slots) |*s| {
-        if (s.path_len == pack_path.len and std.mem.eql(u8, s.path[0..s.path_len], pack_path)) return allocator.dupe(u8, s.meta[0..s.meta_len]);
+        if (s.path_len != 0 and s.id.eql(&id)) return allocator.dupe(u8, s.meta[0..s.meta_len]);
     }
     return allocator.dupe(u8, "");
 }
@@ -641,4 +654,36 @@ test "toggle: the published switch gates the watch loop's look" {
     try testing.expect(looksNow(autoOn(), 1_000_000, 0));
     try testing.expect(!looksNow(true, 99, 100));
     try testing.expect(looksNow(true, 100, 100 + 2 * day_s));
+}
+
+test "pack update: two spellings of one pack folder are one slot" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Pack-Sushi-3bpw");
+    try tmp.dir.createDirPath(io, "Other-Sushi-3bpw");
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const root = p[0..try tmp.dir.realPath(io, &p)];
+    const given = try std.fmt.allocPrint(testing.allocator, "{s}/Pack-Sushi-3bpw", .{root});
+    defer testing.allocator.free(given);
+    record(io, given, .{ .available = .{ .local = "1.0", .latest = "2.0", .command = "sushi pull x", .repo = "org/x" } });
+    defer record(io, given, .current);
+    const slashed = try std.fmt.allocPrint(testing.allocator, "{s}//Pack-Sushi-3bpw/", .{root});
+    defer testing.allocator.free(slashed);
+    const got = try rowFragment(io, testing.allocator, slashed);
+    defer testing.allocator.free(got);
+    try testing.expect(got.len > 0);
+    const elsewhere = try std.fmt.allocPrint(testing.allocator, "{s}/Other-Sushi-3bpw", .{root});
+    defer testing.allocator.free(elsewhere);
+    const none = try rowFragment(io, testing.allocator, elsewhere);
+    defer testing.allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+    // Another case is the same folder only where the volume folds case.
+    if (tmp.dir.access(io, "pack-sushi-3bpw", .{})) |_| {
+        const folded = try std.fmt.allocPrint(testing.allocator, "{s}/pack-sushi-3bpw", .{root});
+        defer testing.allocator.free(folded);
+        const same = try rowFragment(io, testing.allocator, folded);
+        defer testing.allocator.free(same);
+        try testing.expect(same.len > 0);
+    } else |_| {}
 }

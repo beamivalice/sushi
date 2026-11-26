@@ -38,7 +38,7 @@ file's size and checksum: sha256 for a large file, the git blob id for a small o
 when the repo lists the same checksum. A folder without the manifest (an older sushi, a copy by hand) is hashed once
 (`checking N files already on disk…`) and only the files that differ download. Each download is checked against its
 checksum before it is put in place; a mismatch deletes the partial and fails naming the file. A `.partial` resumes only under its `.partial.oid` key (the checksum and size it was started for); a partial with another key, or none, is deleted and the file starts from zero. A file the last manifest
-listed that the repo no longer has is removed; nothing else in the folder is touched. `sushi run` still uses a present
+listed that the repo no longer has is removed (a case-only rename names the same file on a case-insensitive volume, so it is kept); nothing else in the folder is touched. `sushi run` still uses a present
 local copy without contacting Hugging Face.
 
 `sushi list` shows each pack's size, whether it is downloaded and whether this Mac meets its tier, and marks the one it

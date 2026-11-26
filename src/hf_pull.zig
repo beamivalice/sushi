@@ -97,8 +97,17 @@ pub const Manifest = struct {
     commit: []const u8 = "",
     files: []const RepoFile = &.{},
 
-    pub fn find(self: Manifest, path: []const u8) ?RepoFile {
+    /// The old row for `path` under `dir_path`: the row spelled the same, else the row naming the same file on disk
+    /// (a repo may rename a file in case only, and a case-insensitive volume holds one file for both spellings).
+    pub fn find(self: Manifest, io: std.Io, dir_path: []const u8, path: []const u8) ?RepoFile {
         for (self.files) |f| if (std.mem.eql(u8, f.path, path)) return f;
+        var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return null;
+        defer dir.close(io);
+        const want = dir.statFile(io, path, .{}) catch return null;
+        for (self.files) |f| {
+            const other = dir.statFile(io, f.path, .{}) catch continue;
+            if (other.inode == want.inode) return f;
+        }
         return null;
     }
 };
@@ -325,7 +334,19 @@ pub fn hashMatches(io: std.Io, dir_path: []const u8, files: []const RepoFile, ma
     for (threads[0..spawned]) |t| t.join();
 }
 
-/// Deletes the files the previous manifest named that the repo no longer lists; nothing else in the folder.
+/// Whether a listed path is the same file as `path`: one folder is one device, so the inode is the identity a
+/// case-insensitive volume folds (or a hard link shares) under two spellings.
+fn listedSameFile(dir: std.Io.Dir, io: std.Io, path: []const u8, listing: []const RepoFile) bool {
+    const st = dir.statFile(io, path, .{}) catch return false;
+    for (listing) |f| {
+        const other = dir.statFile(io, f.path, .{}) catch continue;
+        if (other.inode == st.inode) return true;
+    }
+    return false;
+}
+
+/// Deletes the files the previous manifest named that the repo no longer lists and the folder does not hold under a
+/// listed spelling; nothing else in the folder.
 pub fn removeDropped(io: std.Io, dir_path: []const u8, old: Manifest, listing: []const RepoFile) usize {
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return 0;
     defer dir.close(io);
@@ -335,7 +356,7 @@ pub fn removeDropped(io: std.Io, dir_path: []const u8, old: Manifest, listing: [
         const listed = for (listing) |f| {
             if (std.mem.eql(u8, f.path, o.path)) break true;
         } else false;
-        if (listed) continue;
+        if (listed or listedSameFile(dir, io, o.path, listing)) continue;
         dir.deleteFile(io, o.path) catch continue;
         removed += 1;
     }
@@ -492,4 +513,51 @@ test "hf pull: only files the old manifest named and the repo dropped are remove
     _ = try tmp.dir.statFile(testing.io, "kept", .{});
     _ = try tmp.dir.statFile(testing.io, "mine.txt", .{});
     try testing.expect(!safeRelative("/etc/passwd") and !safeRelative("a/../b") and safeRelative("mtp/x.safetensors"));
+}
+
+test "hf pull: a repo that renamed a file in case only keeps it" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = p[0..try tmp.dir.realPath(io, &p)];
+    try tmp.dir.writeFile(io, .{ .sub_path = "Shard.safetensors", .data = "12345" });
+    tmp.dir.access(io, "shard.safetensors", .{}) catch return error.SkipZigTest;
+    const old: Manifest = .{ .files = &.{.{ .path = @constCast("shard.safetensors"), .size = 5 }} };
+    const listing = [_]RepoFile{.{ .path = @constCast("Shard.safetensors"), .size = 5 }};
+    try testing.expectEqual(@as(usize, 0), removeDropped(io, dir, old, &listing));
+    _ = tmp.dir.statFile(io, "Shard.safetensors", .{}) catch return error.ListedFileDeleted;
+}
+
+test "hf pull: a repo that renamed a file in case only finds the old row" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = p[0..try tmp.dir.realPath(io, &p)];
+    try tmp.dir.writeFile(io, .{ .sub_path = "Shard.safetensors", .data = "12345" });
+    tmp.dir.access(io, "shard.safetensors", .{}) catch return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const old = try parseManifest(arena.allocator(), "{\"version\":1,\"repo\":\"o/r\",\"commit\":\"c\",\"files\":[{\"path\":\"shard.safetensors\",\"size\":5,\"sha256\":\"aa\"}]}");
+    const row = old.find(io, dir, "Shard.safetensors") orelse return error.OldRowNotFound;
+    try testing.expectEqualStrings("shard.safetensors", row.path);
+    const listed: RepoFile = .{ .path = @constCast("Shard.safetensors"), .size = 5, .oid = @constCast("aa"), .lfs = true };
+    try testing.expectEqual(Action.skip, decide(listed, row, true, 5));
+}
+
+test "hf pull: on a volume that tells two spellings apart only the dropped one is removed" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "Shard.safetensors", .data = "12345" });
+    if (tmp.dir.access(io, "shard.safetensors", .{})) |_| return error.SkipZigTest else |_| {}
+    try tmp.dir.writeFile(io, .{ .sub_path = "shard.safetensors", .data = "abcde" });
+    var p: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = p[0..try tmp.dir.realPath(io, &p)];
+    const old: Manifest = .{ .files = &.{.{ .path = @constCast("shard.safetensors"), .size = 5 }} };
+    const listing = [_]RepoFile{.{ .path = @constCast("Shard.safetensors"), .size = 5 }};
+    try testing.expectEqual(@as(usize, 1), removeDropped(io, dir, old, &listing));
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "shard.safetensors", .{}));
+    _ = tmp.dir.statFile(io, "Shard.safetensors", .{}) catch return error.ListedFileDeleted;
 }
