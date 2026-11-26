@@ -1803,6 +1803,7 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
     };
     const rot = try ropeQ(sc, m, latent, rope, pos, false, .fp4_e4m3, null);
     try ls.comp.?.append(sc, rot);
+    sh.clearUnpackedAll();
 }
 
 /// The `k` largest of each row of `x` as int32 indices: ascending with ties to the lower index on the kernel, else
@@ -2116,6 +2117,12 @@ const Shared = struct {
     /// The compression ratio of the indexer that made each `topk`.
     topk_ratio: []u8,
     cand: []A,
+    /// Per-span cached unpacked compressed picks for the latest `(src, clen, topk)`, reused across
+    /// non-owner layers sharing the same KV source and indexer top-k.
+    urows: []A,
+    uids: []A,
+    usrc: []usize,
+    uclen: []usize,
     /// A CED replay's first position: the decoder has no window rows before it, and its compressor already ran.
     floor: ?usize = null,
     /// `[L]` bool, the chunk's rows inside an image span (none for text): borrowed from the pass.
@@ -2150,16 +2157,53 @@ const Shared = struct {
         return self.index(sc, .{ .lens = true, .first = first, .n = n, .step = ratio });
     }
 
+    fn clearUnpacked(self: *Shared, si: usize) void {
+        if (self.urows[si].ctx != null) {
+            _ = mlx.mlx_array_free(self.urows[si]);
+            self.urows[si] = none;
+        }
+        if (self.uids[si].ctx != null) {
+            _ = mlx.mlx_array_free(self.uids[si]);
+            self.uids[si] = none;
+        }
+        self.usrc[si] = std.math.maxInt(usize);
+        self.uclen[si] = 0;
+    }
+
+    fn clearUnpackedAll(self: *Shared) void {
+        for (0..self.urows.len) |si| self.clearUnpacked(si);
+    }
+
+    fn setUnpacked(self: *Shared, si: usize, src: usize, clen: usize, rows: A, ids: A) void {
+        self.clearUnpacked(si);
+        self.urows[si] = rows;
+        self.uids[si] = ids;
+        self.usrc[si] = src;
+        self.uclen[si] = clen;
+    }
+
     fn init(gpa: std.mem.Allocator, spans: usize) !Shared {
         const t = try gpa.alloc(A, spans);
         errdefer gpa.free(t);
         const cd = try gpa.alloc(A, spans);
         errdefer gpa.free(cd);
         const tr = try gpa.alloc(u8, spans);
+        errdefer gpa.free(tr);
+        const ur = try gpa.alloc(A, spans);
+        errdefer gpa.free(ur);
+        const ui = try gpa.alloc(A, spans);
+        errdefer gpa.free(ui);
+        const us = try gpa.alloc(usize, spans);
+        errdefer gpa.free(us);
+        const uc = try gpa.alloc(usize, spans);
         @memset(t, none);
         @memset(cd, none);
         @memset(tr, 0);
-        return .{ .topk = t, .topk_ratio = tr, .cand = cd };
+        @memset(ur, none);
+        @memset(ui, none);
+        @memset(us, std.math.maxInt(usize));
+        @memset(uc, 0);
+        return .{ .topk = t, .topk_ratio = tr, .cand = cd, .urows = ur, .uids = ui, .usrc = us, .uclen = uc };
     }
 
     fn deinit(self: *Shared, gpa: std.mem.Allocator) void {
@@ -2171,9 +2215,19 @@ const Shared = struct {
         for (self.cand) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
+        for (self.urows) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (self.uids) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
         gpa.free(self.topk);
         gpa.free(self.topk_ratio);
         gpa.free(self.cand);
+        gpa.free(self.urows);
+        gpa.free(self.uids);
+        gpa.free(self.usrc);
+        gpa.free(self.uclen);
     }
 };
 
@@ -2204,14 +2258,23 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
         if (sh.topk[si].ctx != null) _ = mlx.mlx_array_free(sh.topk[si]);
         sh.topk[si] = sc.out(sp);
         sh.topk_ratio[si] = ly.ratio;
+        sh.clearUnpacked(si);
     }
     if (clen == 0 or sh.topk[si].ctx == null) return .{};
     const src = c.latest(li, Config.isKvSource);
     const comp = &st.layers[src].comp.?;
+    const want_raw = raw and comp.dtype == .bfloat16;
     var picks: Picks = if (comp.pack == null)
         .{ .topk = sh.topk[si], .comp_rows = try comp.rows(sc, clen) }
-    else
-        try packedPicks(sc, comp, sh.topk[si], raw and comp.dtype == .bfloat16);
+    else if (want_raw)
+        .{ .topk = sh.topk[si], .store = comp }
+    else if (sh.usrc[si] == src and sh.uclen[si] == clen and sh.urows[si].ctx != null)
+        .{ .topk = sh.uids[si], .comp_rows = sh.urows[si] }
+    else blk: {
+        const p = try packedPicks(sc, comp, sh.topk[si], false);
+        sh.setUnpacked(si, src, clen, sc.out(p.comp_rows), sc.out(p.topk));
+        break :blk p;
+    };
     picks.ratio = sh.topk_ratio[si];
     return picks;
 }
@@ -4719,6 +4782,7 @@ pub fn passLayer(m: *Model, p: *Pass, li: usize) !void {
     if (p.unresolved) |*next| next.deinit();
     p.unresolved = null;
     undo.?.restore();
+    p.sh.clearUnpackedAll();
     _ = mlx.mlx_array_free(p.x);
     _ = mlx.mlx_array_free(p.cpre);
     p.x = exact;
@@ -8600,4 +8664,40 @@ test "dsv41 packed prefill attention resumes after a fully masked key tile" {
     const err = maxRelErr(try sc_mod.hostF32(actual), truth);
     errdefer std.debug.print("relative error {e}\n", .{err});
     try testing.expect(err < kernels.attn_nax_bar);
+}
+
+test "dsv41 Shared caches unpacked compressed picks per span and invalidates cleanly" {
+    try mlx.requireGpu();
+    var sc = Scope.plain(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var sh = try Shared.init(testing.allocator, 2);
+    defer sh.deinit(testing.allocator);
+
+    const d = try attnCaseData(&sc, .{ .L = 3, .wp = 4, .K = 8, .nc = 16 }, 0xcafe);
+    var rows = try packedStore(&sc, d.comp);
+    defer rows.deinit();
+    var ids: [3 * 8]i32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 5 + 1) % 16);
+    const topk = try sc.ints(&ids, &.{ 3, 8 });
+
+    const fresh = try packedPicks(&sc, &rows, topk, false);
+    const ref_rows = try hostBytes(&sc, fresh.comp_rows);
+    const ref_ids = try hostBytes(&sc, fresh.topk);
+
+    const p0 = try packedPicks(&sc, &rows, topk, false);
+    sh.setUnpacked(0, 4, 16, sc.out(p0.comp_rows), sc.out(p0.topk));
+    try testing.expectEqual(@as(usize, 4), sh.usrc[0]);
+    try testing.expectEqual(@as(usize, 16), sh.uclen[0]);
+    try testing.expectEqualSlices(u8, ref_rows, try hostBytes(&sc, sh.urows[0]));
+    try testing.expectEqualSlices(u8, ref_ids, try hostBytes(&sc, sh.uids[0]));
+
+    sh.clearUnpacked(0);
+    try testing.expectEqual(std.math.maxInt(usize), sh.usrc[0]);
+    try testing.expect(sh.urows[0].ctx == null and sh.uids[0].ctx == null);
+
+    const p1 = try packedPicks(&sc, &rows, topk, false);
+    sh.setUnpacked(1, 7, 16, sc.out(p1.comp_rows), sc.out(p1.topk));
+    sh.clearUnpackedAll();
+    try testing.expectEqual(std.math.maxInt(usize), sh.usrc[1]);
+    try testing.expect(sh.urows[1].ctx == null and sh.uids[1].ctx == null);
 }
