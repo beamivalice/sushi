@@ -275,8 +275,11 @@ pub fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
 pub fn contextKvHold(config: *const model_mod.ModelConfig) u64 {
     if (config.max_kv_tokens == 0 or manualContext(config) > 0) return 0;
     if (config.contextWindow() <= config.max_kv_tokens) return 0;
-    // Unpinned, the auto context is sized under the cap, so the cap is what holds it.
-    return if (config.pinned_context == 0 or config.pinned_context >= config.max_kv_tokens) config.max_kv_tokens else 0;
+    // Unpinned, the auto context is sized under the cap, so the cap is what holds it; a pin at the cap's own safety
+    // margin (`safeAutoContext`) was sized from the cap too.
+    const cap: u32 = @intCast(@min(config.max_kv_tokens, std.math.maxInt(u32)));
+    const pinned = config.pinned_context;
+    return if (pinned == 0 or pinned >= cap or pinned >= safeAutoContext(cap)) config.max_kv_tokens else 0;
 }
 
 pub fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
@@ -9532,6 +9535,18 @@ test "a reload that lowers max_kv_tokens holds the frozen auto context under the
     // Raising the cap again never grows the frozen context.
     model_load.applyModelSettings(&cfg, .{ .max_kv_tokens = 100_000 });
     try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&cfg));
+}
+
+test "contextKvHold names max_kv_tokens when the context is the cap with its auto-context safety margin" {
+    var cfg = model_mod.ModelConfig{ .model_type = "qwen4_exp", .max_position_embeddings = 4096 };
+    cfg.max_kv_tokens = 64;
+    cfg.pinned_context = safeAutoContext(64);
+    try testing.expect(cfg.pinned_context < 64);
+    try testing.expectEqual(@as(u64, 64), contextKvHold(&cfg));
+    cfg.max_kv_tokens = 100_000;
+    cfg.max_position_embeddings = 1_048_576;
+    cfg.pinned_context = safeAutoContext(100_000);
+    try testing.expectEqual(@as(u64, 100_000), contextKvHold(&cfg));
 }
 
 test "contextKvHold names max_kv_tokens only when the cap holds the context" {
