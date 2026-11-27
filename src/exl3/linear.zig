@@ -355,6 +355,49 @@ pub fn linearSharedNormed(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: 
     return true;
 }
 
+/// `linearSharedNormed` for a 2-segment `[q_lora, kv_row]` attention input that writes normed `q_lora` `[rows, norm.cols]`
+/// and the updated KV ring `[cap, kv_dim]` in one finish dispatch, eliminating `ropeKvRing`.
+pub fn linearSharedNormedRing(s: mlx.mlx_stream, x: mlx.mlx_array, sh: Shared, dec: exl3.Decode, opts: Opts, norm: project_rows.Norm, kr: project_rows.KvRing) !?project_rows.NormedRingOut {
+    if (sh.count != 2) return null;
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(sh.p.trellis);
+    if (xs.len != 2 or ts.len != 4 or ts[0] != 1 or ts[1] * 16 != xs[1]) return error.BadExl3Shape;
+    const rows = xs[0];
+    const out = ts[2] * 16;
+    if (force_arm != null or rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, ts[3], opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
+    var bounds: [3]c_int = @splat(sh.cols[sh.count]);
+    for (1..sh.count) |i| bounds[i - 1] = sh.cols[i];
+    const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = mlx.mlx_array_dtype(x) };
+    if (!project_rows.normedRingFits(l, g, bounds, norm, kr)) return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    const pin: ?project_rows.PinnedCfg = if (sh.geo) |geo| (if (l.out_dt == .bfloat16 and opts.rows.exact == geo.key.exact) (if (geo.row(rows)) |r| (if (std.meta.eql(r.g, g)) r.pin else null) else null) else null) else null;
+    return try project_rows.launchRowsNormedRing(s, x, sh.p.trellis, sh.p.suh, sh.p.svh, l, g, try project_rows.rowsKernel(g), bounds, pin, norm, kr);
+}
+
+/// `linearWith` for a one-bank query projection whose `rp.hd`-channel heads leave tail-rotated by `rp.rd` in-register,
+/// returning null when the launch does not serve it.
+pub fn linearRope(s: mlx.mlx_stream, x: mlx.mlx_array, p: root.Proj, dec: exl3.Decode, opts: Opts, rp: project_rows.Rope) !?mlx.mlx_array {
+    if (force_arm != null) return null;
+    const xs = mlx.getShape(x);
+    const ts = mlx.getShape(p.trellis);
+    if (xs.len != 2 or ts.len != 4 or ts[0] != 1 or ts[1] * 16 != xs[1]) return error.BadExl3Shape;
+    const rows = xs[0];
+    const out = ts[2] * 16;
+    const dt = mlx.mlx_array_dtype(x);
+    if (@rem(xs[1], 128) != 0 or @rem(out, 128) != 0) return null;
+    if (rows < 1 or rows > project_rows.rowsMax(opts.rows)) return null;
+    const g = project_rows.rowsGeometry(xs[1], out, rows, 1, ts[3], opts.rows);
+    if (rows > (if (g.nax) project_rows.NAX_ROWS_MAX else project_rows.PROJECT_ROWS_MAX)) return null;
+    const l: project_rows.RowsLaunch = .{ .in_dim = xs[1], .out_dim = out, .rows = rows, .groups = 1, .n = (try kernels.packedRate(ts[3])).n, .out_dt = dt };
+    if (!project_rows.ropeFits(l, g, rp)) return null;
+    try dec.requireTable();
+    kernels.setDecodeParams(dec);
+    return try project_rows.launchRowsRope(s, x, p.trellis, p.suh, p.svh, l, g, rp);
+}
+
 fn splitShared(s: mlx.mlx_stream, flat: mlx.mlx_array, rows: c_int, sh: Shared, outs: []mlx.mlx_array) !void {
     var made: usize = 0;
     errdefer for (outs[0..made]) |o| {

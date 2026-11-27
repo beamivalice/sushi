@@ -2338,6 +2338,9 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
 
     const fus = fusedOn(sc, m);
     const pf = prof(m, L);
+    if (decodeAttnFits(sc, m, st, li, L) and pf == null and m.tap == null) {
+        if (try attentionDecodeFused(sc, m, st, li, h, p0, sh, pos, rope, ride)) |y| return y;
+    }
     const in = try attnQuery(sc, m, ly, h, @intCast(exl3.project_rows.rowsMax(sc.rows)));
     if (pf) |p| try p.mark(.attn_in, &in);
     const qr = in[0];
@@ -2443,6 +2446,81 @@ fn decodeAttnFits(sc: *const Scope, m: *const Model, st: *const State, li: usize
 /// What a decode-width attention leaves before its output projection: the heads (`[og, L, in]` when `grouped`, else
 /// `[L, H * hd]`), and the hc split its kernel rode.
 const DecodeHeads = struct { o: A, grouped: bool, split: ?kernels.HcSplit };
+
+/// Decode-width single-request `attention` with `ropeKvRing` eliminated: `in_shared`'s finish norms `q_lora` AND
+/// updates the KV ring in parallel, and `wq_b` tail-rotates `q` in-register before writing.
+fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize, sh: *Shared, pos: A, rope: A, ride: ?RideSplit) !?A {
+    const c = &m.cfg;
+    const ly = &m.layers[li];
+    const ls = &st.layers[li];
+    const sh_in = ly.in_shared orelse return null;
+    const qa = ly.wq_a.stq orelse return null;
+    const qb = ly.wq_b.stq orelse return null;
+    const L = dim(h, 0);
+    const hd = c.head_dim;
+    const rd = c.rope_dim;
+    if (L > exl3.project_rows.rowsMax(sc.rows)) return null;
+    if (ls.win.dt != mlx.mlx_array_dtype(h) or ls.win.width != hd or hd % 8 != 0) return null;
+    const eps = try kernels.hcEps(sc, c.eps, c.hc_eps);
+    const norm: exl3.project_rows.Norm = .{ .w = ly.q_norm, .eps = eps, .cols = sh_in.cols[1] };
+    const kr: exl3.project_rows.KvRing = .{
+        .kw = ly.kv_norm,
+        .freqs = rope,
+        .pos = pos,
+        .ring = ls.win.buf.array,
+        .cap = ci(ls.win.cap),
+        .kv_dim = ci(hd),
+        .rd = ci(rd),
+        .qat = m.qat_on,
+    };
+    const qr_ring = try exl3.linear.linearSharedNormedRing(sc.s, h, sh_in, qa.dec, .{ .rows = sc.rows }, norm, kr) orelse return null;
+    const qr = sc.keep(qr_ring.q) catch |e| {
+        _ = mlx.mlx_array_free(qr_ring.q);
+        _ = mlx.mlx_array_free(qr_ring.ring);
+        return e;
+    };
+    const next_ring = sc.keep(qr_ring.ring) catch |e| {
+        _ = mlx.mlx_array_free(qr_ring.ring);
+        return e;
+    };
+    const q = if (try exl3.linear.linearRope(sc.s, qr, qb.p, qb.dec, .{ .rows = sc.rows }, .{ .freqs = rope, .pos = pos, .hd = ci(hd), .rd = ci(rd) })) |q_flat|
+        try sc.reshape(try sc.keep(q_flat), &.{ ci(L), ci(c.heads), ci(hd) })
+    else blk: {
+        const qp = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(c.heads), ci(hd) });
+        break :blk try kernels.ropeTail(sc, qp, rope, pos, rd, false, .none, null);
+    };
+    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, none, sh);
+    ls.win.replace(sc.out(next_ring));
+    const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
+    if (width_probe) |t| {
+        try t.put("a_q_{d}", .{li}, q);
+        if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
+    }
+    var grouped = false;
+    var rode_split: ?kernels.HcSplit = null;
+    const o = try kernels.attnDecode(sc, .{
+        .q = q,
+        .ring = ls.win.buf.array,
+        .comp = picks.comp_rows,
+        .topk = picks.topk,
+        .sink = ly.sink,
+        .p0 = p0,
+        .window = c.window,
+        .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd))),
+        .freqs = rope,
+        .rd = rd,
+        .qat_fp8 = m.qat_on,
+        .out_dt = m.act,
+        .ratio = picks.ratio,
+        .mixes = if (ride) |rs| .{ .z = rs.z, .hc = c.hc_mult, .iters = c.hc_iters, .eps = eps } else null,
+        .split = &rode_split,
+        .apart = m.attn_apart,
+        .groups = if (m.tap == null and m.trace == null and width_probe == null and c.heads % c.o_groups == 0) c.o_groups else 0,
+        .grouped = &grouped,
+    });
+    if (width_probe) |t| try t.put("a_o_{d}", .{li}, o);
+    return try decodeOut(sc, m, li, .{ .o = o, .grouped = grouped, .split = rode_split }, ride);
+}
 
 /// The decode branch of `attention` up to its heads, for one request's rows `h` over its state: `in` (`attnQuery`) and
 /// `q_proj` (`wq_b`, `[L, H, hd]`) are its rows of projections that read no state, so a joined layer makes them once
@@ -8733,4 +8811,116 @@ test "dsv41 Shared caches unpacked compressed picks per span and invalidates cle
     sh.clearUnpackedAll();
     try testing.expectEqual(std.math.maxInt(usize), sh.usrc[1]);
     try testing.expect(sh.urows[1].ctx == null and sh.uids[1].ctx == null);
+}
+
+test "dsv41 fused normedRing and linearRope match ropeKvRing bit-for-bit at r=1 and r=6" {
+    try mlx.requireGpu();
+    const s = mlx.gpuStream();
+    const alloc = testing.allocator;
+    const dec = exl3.kernels.SPEC1_W15;
+    try dec.requireTable();
+    defer exl3.kernels.setDecodeParams(.mul1);
+
+    var sc = Scope.plain(alloc, s);
+    defer sc.deinit();
+
+    const in_dim: c_int = 5120;
+    const q_dim: c_int = 1280;
+    const kv_dim: c_int = 512;
+    const tot_dim: c_int = q_dim + kv_dim;
+    const n_heads: c_int = 16;
+    const q_out: c_int = n_heads * kv_dim;
+    const rd: usize = 64;
+    const cap: usize = 32;
+    const eps_f: f32 = 1e-6;
+    const eps = try kernels.hcEps(&sc, eps_f, eps_f);
+
+    const mkU16 = struct {
+        fn make(a: std.mem.Allocator, shape: []const c_int, seed: u64) !A {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(u16, n);
+            defer a.free(buf);
+            var prng = std.Random.DefaultPrng.init(seed);
+            prng.random().bytes(std.mem.sliceAsBytes(buf));
+            return mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .uint16);
+        }
+        fn signs(a: std.mem.Allocator, shape: []const c_int, seed: u64) !A {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(u16, n);
+            defer a.free(buf);
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            for (buf) |*v| v.* = if (rnd.boolean()) 0x3C00 else 0xBC00;
+            return mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float16);
+        }
+        fn gauss(scope: *Scope, shape: []const c_int, seed: u64, dt: mlx.mlx_dtype) !A {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try scope.a.alloc(f32, n);
+            defer scope.a.free(buf);
+            var prng = std.Random.DefaultPrng.init(seed);
+            const rnd = prng.random();
+            for (buf) |*v| v.* = @floatCast(rnd.floatNorm(f64) * 0.5);
+            const f = try scope.floats(buf, shape);
+            return if (dt == .float32) f else scope.astype(f, dt);
+        }
+    };
+
+    const sh_in: exl3.linear.Shared = .{
+        .p = .{
+            .trellis = try sc.keep(try mkU16.make(alloc, &.{ 1, @divExact(in_dim, 16), @divExact(tot_dim, 16), 80 }, 0x9101)),
+            .suh = try sc.keep(try mkU16.signs(alloc, &.{ 2, in_dim }, 0x9102)),
+            .svh = try sc.keep(try mkU16.signs(alloc, &.{ 1, tot_dim }, 0x9103)),
+        },
+        .cols = .{ 0, q_dim, tot_dim, tot_dim, tot_dim },
+        .count = 2,
+    };
+    const qb_p: exl3.Proj = .{
+        .trellis = try sc.keep(try mkU16.make(alloc, &.{ 1, @divExact(q_dim, 16), @divExact(q_out, 16), 80 }, 0x9201)),
+        .suh = try sc.keep(try mkU16.signs(alloc, &.{ 1, q_dim }, 0x9202)),
+        .svh = try sc.keep(try mkU16.signs(alloc, &.{ 1, q_out }, 0x9203)),
+    };
+
+    const q_norm = try mkU16.gauss(&sc, &.{q_dim}, 0x9301, .bfloat16);
+    const kv_norm = try mkU16.gauss(&sc, &.{kv_dim}, 0x9302, .bfloat16);
+    const freqs = try mkU16.gauss(&sc, &.{@divExact(rd, 2)}, 0x9303, .float32);
+    const ring0 = try mkU16.gauss(&sc, &.{ @intCast(cap), kv_dim }, 0x9304, .bfloat16);
+
+    for ([_]c_int{ 1, 6 }) |L| {
+        const h = try mkU16.gauss(&sc, &.{ L, in_dim }, 0x9400 + @as(u64, @intCast(L)), .bfloat16);
+        var pos_d: [6]i32 = undefined;
+        for (0..@as(usize, @intCast(L))) |i| pos_d[i] = @intCast(29 + i);
+        const pos = try sc.ints(pos_d[0..@intCast(L)], &.{L});
+
+        for ([_]bool{ false, true }) |qat| {
+            var ref_outs: [2]mlx.mlx_array = .{ .{}, .{} };
+            const norm: exl3.project_rows.Norm = .{ .w = q_norm, .eps = eps, .cols = q_dim };
+            try testing.expect(try exl3.linear.linearSharedNormed(s, h, sh_in, dec, &ref_outs, .{ .rows = .{ .exact = false } }, norm));
+            const ref_qr = try sc.keep(ref_outs[0]);
+            const ref_kv = try sc.keep(ref_outs[1]);
+            const ref_qp = try sc.reshape(try sc.keep(try exl3.linear.linearWith(s, ref_qr, qb_p, dec, .{ .rows = .{ .exact = false } })), &.{ L, n_heads, kv_dim });
+            const ref_rk = try kernels.ropeKvRing(&sc, ref_qp, ref_kv, kv_norm, freqs, pos, rd, eps_f, qat, ring0, cap, @intCast(kv_dim));
+
+            const kr: exl3.project_rows.KvRing = .{
+                .kw = kv_norm,
+                .freqs = freqs,
+                .pos = pos,
+                .ring = ring0,
+                .cap = @intCast(cap),
+                .kv_dim = kv_dim,
+                .rd = @intCast(rd),
+                .qat = qat,
+            };
+            const got_qr_ring = (try exl3.linear.linearSharedNormedRing(s, h, sh_in, dec, .{ .rows = .{ .exact = false } }, norm, kr)).?;
+            const got_qr = try sc.keep(got_qr_ring.q);
+            const got_ring = try sc.keep(got_qr_ring.ring);
+            const got_q = try sc.reshape(try sc.keep((try exl3.linear.linearRope(s, got_qr, qb_p, dec, .{ .rows = .{ .exact = false } }, .{ .freqs = freqs, .pos = pos, .hd = kv_dim, .rd = @intCast(rd) })).?), &.{ L, n_heads, kv_dim });
+
+            try testing.expectEqualSlices(u8, try hostBytes(&sc, ref_qr), try hostBytes(&sc, got_qr));
+            try testing.expectEqualSlices(u8, try hostBytes(&sc, ref_rk.ring), try hostBytes(&sc, got_ring));
+            try testing.expectEqualSlices(u8, try hostBytes(&sc, ref_rk.q), try hostBytes(&sc, got_q));
+        }
+    }
 }
