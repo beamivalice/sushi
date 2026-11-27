@@ -3617,3 +3617,25 @@ test "hy4 rows: a joined tick leaves each drafting request the hidden its solo o
         try testing.expectEqualSlices(u8, want[i], got);
     }
 }
+
+test "hy4 stq: the drafter's dense decodes free the identity they share, so a DFly2 load holds no unbilled eye (HY4_STQ_TINY, HY4_BF16_TINY_STQ)" {
+    const hy4_model = @import("hy4_model.zig");
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var p = try Packs.open(es);
+    defer p.close();
+    const m = try hy4_model.Model.initWith(a, p.config, &p.stq, es, .{ .dir = p.stq_dir, .quant = p.quant });
+    defer m.deinit();
+    try testing.expect(m.decode_eye == null);
+    try loadInto(&p.stq, p.stq_dir, "model-dfly", es);
+    var d = try @import("hy4_dfly.zig").Drafter.init(a, m, &p.stq);
+    defer d.deinit();
+    try testing.expectEqual(@as(usize, 0), m.decode_eye_dim);
+    try testing.expect(m.decode_eye == null);
+}

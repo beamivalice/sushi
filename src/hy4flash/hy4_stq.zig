@@ -241,10 +241,8 @@ pub fn load(w: *const model_mod.Weights, base: []const u8, dec: ?exl3.format.Dec
     return .{ .w = t.w, .suh = t.s, .svh = t.b, .dec = dec.? };
 }
 
-/// The bank decoded to a dense BF16 `[out, in]`, by the identity's rows through the kernel: for a weight the forward
-/// reads by slices (absorbed MLA's `kv_b`), not by products. The caller owns the result.
-pub fn decodeDense(gpa: std.mem.Allocator, s: mlx.mlx_stream, b: Bank) !Arr {
-    const in: usize = @intCast(b.inDim());
+/// Builds an evaluated `[in, in]` BF16 identity matrix once so `decodeDenseWithEye` can reuse it across all layers.
+pub fn makeIdentityBf16(gpa: std.mem.Allocator, s: mlx.mlx_stream, in: usize) !Arr {
     const eye = try gpa.alloc(f32, in * in);
     defer gpa.free(eye);
     @memset(eye, 0);
@@ -252,12 +250,30 @@ pub fn decodeDense(gpa: std.mem.Allocator, s: mlx.mlx_stream, b: Bank) !Arr {
     var o: Ops = .{ .s = s };
     defer o.deinit();
     const x = try o.own(mlx.mlx_array_new_data(eye.ptr, &[_]c_int{ @intCast(in), @intCast(in) }, 2, .float32));
+    const out = try o.result(try o.cast(x, .bfloat16));
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// Decodes `b` to a dense BF16 `[out, in]` using a pre-built `[in, in]` BF16 identity matrix.
+pub fn decodeDenseWithEye(s: mlx.mlx_stream, b: Bank, eye_bf16: Arr) !Arr {
+    var o: Ops = .{ .s = s };
+    defer o.deinit();
     // Row i of the product is column i of W: [in, out] = Wᵀ, exact in BF16 (one term a sum).
-    const wt = try o.own(try trunk_stq.matmul(s, try o.cast(x, .bfloat16), b.w, b.suh, b.svh, b.dec, false));
+    const wt = try o.own(try trunk_stq.matmul(s, eye_bf16, b.w, b.suh, b.svh, b.dec, false));
     const out = try o.result(try o.contiguous(try o.cast(try o.transpose(wt, &.{ 1, 0 }), .bfloat16)));
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_array_eval(out));
     return out;
+}
+
+/// The bank decoded to a dense BF16 `[out, in]`, by the identity's rows through the kernel: for a weight the forward
+/// reads by slices (absorbed MLA's `kv_b`), not by products. The caller owns the result.
+pub fn decodeDense(gpa: std.mem.Allocator, s: mlx.mlx_stream, b: Bank) !Arr {
+    const eye = try makeIdentityBf16(gpa, s, @intCast(b.inDim()));
+    defer _ = mlx.mlx_array_free(eye);
+    return decodeDenseWithEye(s, b, eye);
 }
 
 /// The routed experts of MoE layer `l` as the pack stores them (`model.layers.{l}.mlp.switch_mlp.{gate,up,down}_proj.gN`,

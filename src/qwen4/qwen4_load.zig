@@ -112,11 +112,29 @@ pub fn checkPlePlacement(config: *const model_mod.ModelConfig, has_ple: []const 
     return error.Qwen4PleNotInstalled;
 }
 
+fn specWarmMarker(scope: [16]u8, max_width: u32, kv: KVQuantConfig) [16]u8 {
+    const manifest = @import("../pipeline_manifest.zig");
+    var d: manifest.Digest = .{};
+    d.add("qwen4 spec warm", &scope);
+    d.addInt("max width", max_width);
+    d.addInt("kv scheme", @intFromEnum(kv.scheme));
+    d.addInt("kv bits", kv.bits);
+    d.addInt("kv group", kv.group_size);
+    d.addInt("verify nax", @intFromBool(verifyQmmNaxAvailable()));
+    return d.hex();
+}
+
 /// The head's verify at every draft width up to `max_width`, before the first request; a load without the head skips.
 pub fn warmVerify(config: *const model_mod.ModelConfig, xfm: *Trunk, max_width: u32, kv_config: KVQuantConfig) !void {
-    _ = config;
     if (qwen4_state.mtpOf(xfm) == null) return;
-    return warmupSpecVerify(xfm, max_width, kv_config);
+    const on_engine = @import("../cooler_side.zig").onEngine(config);
+    const marker: ?[16]u8 = if (on_engine) if (@import("../arch/cooler_pipelines.zig").settledScope()) |scope| specWarmMarker(scope, max_width, kv_config) else null else null;
+    if (marker) |mk| if (mlx.engine.pipeline_registry.takeMarker(&mk)) {
+        log.info("[spec-warmup] skipped: the manifest holds all verify, group and head pipelines\n", .{});
+        return;
+    };
+    try warmupSpecVerify(xfm, max_width, kv_config);
+    if (marker) |mk| mlx.engine.pipeline_registry.recordMarker("qwen4 spec warm", &mk);
 }
 
 fn specWarmVerify(self: *Trunk, slots: []const *SpecWarmSlot, seq: usize) !void {

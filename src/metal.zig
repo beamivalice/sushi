@@ -398,6 +398,16 @@ pub const Device = struct {
     /// A pass that writes four bytes of scratch, so the driver sees our queue in use: a queue left idle loses the
     /// residency of the sets attached to it within half a minute. Not waited on.
     pub fn touch(dev: *const Device) void {
+        dev.touchInner(false);
+    }
+
+    /// Like `touch`, and waits for the empty blit pass to finish so every committed residency set is wired before
+    /// returning (prevents VM wire contention with subsequent background page-cache warms or first-request latency).
+    pub fn touchSync(dev: *const Device) void {
+        dev.touchInner(true);
+    }
+
+    fn touchInner(dev: *const Device, wait: bool) void {
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
         if (touch_scratch == null) touch_scratch = dev.alloc(4) catch return;
@@ -408,6 +418,7 @@ pub const Device = struct {
         send(void, blit, "endEncoding", .{});
         commitSets();
         send(void, cmd, "commit", .{});
+        if (wait) send(void, cmd, "waitUntilCompleted", .{});
         _ = @atomicRmw(u64, &touches, .Add, 1, .release);
     }
 

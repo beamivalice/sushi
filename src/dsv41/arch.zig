@@ -144,11 +144,15 @@ pub const parseConfig = config_file.parseFamily;
 pub fn streamedResidentSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const Config) !?@import("../model.zig").ResidentSplit {
     const source = @import("dsv41_source.zig");
     const engine = cooler_side.onEngine(config);
-    return .{
-        .trunk = try source.residentBytes(io, allocator, model_dir, engine),
-        .mtp = if (config.dsv41.?.dspark.block > 0) try source.dsparkBytes(io, allocator, model_dir, engine) else 0,
-        .vision = if (config.has_vision) try source.visionBytes(io, allocator, model_dir, @import("../vision_common.zig").vision_bf16, engine) else 0,
-    };
+    return try source.streamedSplit(
+        io,
+        allocator,
+        model_dir,
+        config.dsv41.?.dspark.block > 0,
+        config.has_vision,
+        @import("../vision_common.zig").vision_bf16,
+        engine,
+    );
 }
 
 pub fn residentExtra(config: *const Config) u64 {
@@ -193,6 +197,8 @@ pub fn resetCache(xfm: Model) !void {
 }
 
 pub fn warmup(xfm: Model) !void {
+    // Runs on a warm manifest too: its first forward takes the expert routes' first cost, which a skip moves into the
+    // first request.
     return xfm.warmupTrunk();
 }
 

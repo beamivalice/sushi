@@ -26,12 +26,19 @@ pub fn addRecipeEnv(d: *manifest.Digest) void {
     for (recipe_env) |name| if (std.c.getenv(name)) |v| d.add(std.mem.span(name), std.mem.span(v));
 }
 
+var cached_build_key: ?[16]u8 = null;
+
 pub fn buildKey(a: std.mem.Allocator, io: std.Io) ![16]u8 {
+    if (!@import("builtin").is_test) {
+        if (cached_build_key) |k| return k;
+    }
     var d: manifest.Digest = .{};
     var arch_buf: [64]u8 = undefined;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     try manifest.addBuild(&d, a, io, device.archName(&arch_buf), try mlx.engine.metallibPath(&path_buf));
-    return d.hex();
+    const key = d.hex();
+    if (!@import("builtin").is_test) cached_build_key = key;
+    return key;
 }
 
 pub const Case = enum { off, none, unreadable, other_build, same };
@@ -77,21 +84,83 @@ pub const Plan = struct {
     /// Whether `archive.bin` beside this key's manifest loaded cleanly and how many recipes it covered.
     archive_loaded: bool = false,
     archive_recipes: usize = 0,
+    /// `pipeline_registry.generation` captured right after `await` settled, so warm loads with 0 new recipes skip disk rewrite.
+    settled_gen: u64 = 0,
+    /// In-flight async preload state between `startAsync` and `await`.
+    async_job: ?*cache.Job = null,
+    async_archive: ?cache.Archive = null,
+    async_t0: u64 = 0,
+    async_started: bool = false,
 
     pub fn deinit(p: *Plan) void {
+        if (p.async_job) |job| {
+            cache.abort(job);
+            p.async_job = null;
+        }
+        if (p.async_archive) |arch| {
+            arch.release();
+            p.async_archive = null;
+        }
         p.found.deinit();
         // A path-made root is opened again by every later write and shape: this handle is the load's own.
         if (p.owns_root) p.root.?.close(p.io);
     }
 
-    /// Makes the pipelines of the manifest found, on worker threads. True when it made every pipeline of this build's
-    /// manifest: an arch may then skip the warm forwards it runs only to make them.
-    pub fn settle(p: *Plan) bool {
+    /// Launches pipeline creation on worker threads without blocking, so weight I/O can overlap with Metal pipeline loading.
+    /// Must be paired with `await()` (or `deinit()` on error).
+    pub fn startAsync(p: *Plan) void {
+        if (p.async_started) return;
+        p.async_started = true;
+        var dir_buf: [manifest.Key.dir_len]u8 = undefined;
+        const dir = p.key.dirName(&dir_buf);
+        const recipes: []const manifest.Recipe = switch (p.found) {
+            .same, .other => |l| l.recipes,
+            else => &.{},
+        };
+        if (recipes.len == 0) return;
+        if (p.case == .same and p.from_path) {
+            if (manifest.configuredRoot()) |root_path| {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (manifest.archivePath(&path_buf, root_path, p.key)) |apath| {
+                    if (std.c.access(apath.ptr, std.c.F_OK) == 0) {
+                        if (cache.openArchive(apath)) |a| {
+                            p.async_archive = a;
+                            p.archive_loaded = true;
+                            p.archive_recipes = recipes.len;
+                        } else |_| {
+                            log.warn("[pipelines] binary archive {s} unreadable ({s}); building from sushi.metallib\n", .{ dir, cache.lastMetalError() });
+                        }
+                    }
+                } else |_| {}
+            }
+        }
+        p.async_t0 = load_clock.now();
+        p.async_job = cache.startWithArchive(recipes, p.threads, p.async_archive) catch |e| {
+            log.warn("[pipelines] manifest {s}: the workers did not start ({s}); the warm forwards run and rebuild it\n", .{ dir, @errorName(e) });
+            if (p.async_archive) |a| {
+                a.release();
+                p.async_archive = null;
+            }
+            p.case = .unreadable;
+            return;
+        };
+    }
+
+    /// Waits for `startAsync()` workers (calling `startAsync()` first if not yet started), installs preloaded
+    /// pipelines into `stock`, and settles markers. True when every pipeline of this build's manifest succeeded.
+    pub fn await(p: *Plan) bool {
+        if (!p.async_started) p.startAsync();
         // A later warm adds to a manifest only where a complete one stands: the one found, or the one `store` writes.
         last = null;
         // Every way out settles the markers: this manifest's if it is trusted, and none of an earlier load's.
         var trusted = false;
-        defer registry.settleMarkers(trusted);
+        defer {
+            registry.settleMarkers(trusted);
+            p.settled_gen = registry.generation;
+            if (last) |*l| {
+                l.written_gen = registry.generation;
+            }
+        }
         settled_scope = if (p.root != null) p.key.scope else null;
         var dir_buf: [manifest.Key.dir_len]u8 = undefined;
         const dir = p.key.dirName(&dir_buf);
@@ -99,32 +168,15 @@ pub const Plan = struct {
             .same, .other => |l| l.recipes,
             else => &.{},
         };
-        if (recipes.len > 0) {
-            var archive: ?cache.Archive = null;
-            defer if (archive) |a| a.release();
-            if (p.case == .same and p.from_path) {
-                if (manifest.configuredRoot()) |root_path| {
-                    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                    if (manifest.archivePath(&path_buf, root_path, p.key)) |apath| {
-                        if (std.c.access(apath.ptr, std.c.F_OK) == 0) {
-                            if (cache.openArchive(apath)) |a| {
-                                archive = a;
-                                p.archive_loaded = true;
-                                p.archive_recipes = recipes.len;
-                            } else |_| {
-                                log.warn("[pipelines] binary archive {s} unreadable ({s}); building from sushi.metallib\n", .{ dir, cache.lastMetalError() });
-                            }
-                        }
-                    } else |_| {}
-                }
-            }
-            const t0 = load_clock.now();
-            const report = if (cache.startWithArchive(recipes, p.threads, archive)) |job| cache.finish(job) else |e| {
-                log.warn("[pipelines] manifest {s}: the workers did not start ({s}); the warm forwards run and rebuild it\n", .{ dir, @errorName(e) });
-                p.case = .unreadable;
-                return false;
+        if (p.async_job) |job| {
+            p.async_job = null;
+            const archive_used = p.async_archive != null;
+            defer if (p.async_archive) |a| {
+                a.release();
+                p.async_archive = null;
             };
-            const wall = load_clock.now() - t0;
+            const report = cache.finish(job);
+            const wall = load_clock.now() - p.async_t0;
             p.made_ns = wall;
             p.made_count = report.made;
             const wall_ms = wall / std.time.ns_per_ms;
@@ -139,18 +191,26 @@ pub const Plan = struct {
                 // after a late warm keeps the ones this load never launched.
                 for (recipes) |r| registry.record(r);
                 remember(p);
-                log.info("[pipelines] made {d} pipelines from the manifest {s}{s} on {d} threads in {d} ms; an arch may skip its warm forwards (key {d} ms)\n", .{ report.made, dir, if (archive != null) " (binary archive)" else "", p.threads, wall_ms, p.key_ms });
+                log.info("[pipelines] made {d} pipelines from the manifest {s}{s} on {d} threads in {d} ms; an arch may skip its warm forwards (key {d} ms)\n", .{ report.made, dir, if (archive_used) " (binary archive)" else "", p.threads, wall_ms, p.key_ms });
                 return true;
             }
             log.info("[pipelines] manifest of another build, recompiled {d} on {d} threads in {d} ms; the warm forwards run and the manifest {s} is rewritten (key {d} ms)\n", .{ report.made, p.threads, wall_ms, dir, p.key_ms });
             return false;
         }
+        if (recipes.len > 0) return false;
         switch (p.case) {
             .none => log.info("[pipelines] no manifest; the warm forwards run and write {s} (key {d} ms)\n", .{ dir, p.key_ms }),
             .unreadable => log.warn("[pipelines] manifest unreadable ({s}); the warm forwards run and rebuild it (key {d} ms)\n", .{ p.why, p.key_ms }),
             else => log.info("[pipelines] manifest off ({s}); the warm forwards run\n", .{p.why}),
         }
         return false;
+    }
+
+    /// Makes the pipelines of the manifest found, on worker threads. True when it made every pipeline of this build's
+    /// manifest: an arch may then skip the warm forwards it runs only to make them.
+    pub fn settle(p: *Plan) bool {
+        p.startAsync();
+        return p.await();
     }
 
     /// Where a planned load keeps the shapes its misses record: this key's directory, beside its manifest. Null with no
@@ -164,34 +224,62 @@ pub const Plan = struct {
     /// After a complete warm: the recipes the process made, written for this key, and the older builds of the scope
     /// removed. A failure is a warning, not a failed load.
     pub fn store(p: *Plan) void {
+        p.storeWithArchive(true);
+    }
+
+    /// Writes the manifest and prunes older builds, deferring `archive.bin` until `finalizeLate()` (used by archs
+    /// whose vision tower and served warm run after their initial arch warm so `archive.bin` is written once with all recipes).
+    pub fn storeManifestOnly(p: *Plan) void {
+        p.storeWithArchive(false);
+    }
+
+    fn storeWithArchive(p: *Plan, write_archive: bool) void {
         const root = p.root orelse return;
+        const total = registry.recipes().len;
+        const archive_needed = write_archive and p.from_path and (!p.archive_loaded or total > p.archive_recipes);
         remember(p);
+        // A manifest found whole and left as it was still has the older builds of its scope removed.
+        if (p.case == .same and registry.generation == p.settled_gen and !archive_needed) return pruneOlder(p, root);
         if (!write(p.a, p.io, root, p.key)) return;
-        var removed: std.ArrayList([manifest.Key.dir_len]u8) = .empty;
-        defer removed.deinit(p.a);
-        manifest.prune(p.a, p.io, root, p.key, &removed) catch |e| log.warn("[pipelines] older manifests not removed: {s}\n", .{@errorName(e)});
+        if (last) |*l| l.written_gen = registry.generation;
         var dir_buf: [manifest.Key.dir_len]u8 = undefined;
         const dir = p.key.dirName(&dir_buf);
-        const total = registry.recipes().len;
         log.info("[pipelines] manifest {s} written: {d} recipes\n", .{ dir, total });
-        for (removed.items) |name| log.info("[pipelines] removed the manifest {s} of an older build\n", .{name});
-        if (p.from_path and (!p.archive_loaded or total > p.archive_recipes)) {
-            if (manifest.configuredRoot()) |root_path| {
-                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-                if (manifest.archivePath(&path_buf, root_path, p.key)) |apath| {
-                    const t0 = load_clock.now();
-                    if (cache.writeArchive(p.io, registry.recipes(), apath)) |n| {
-                        p.archive_loaded = true;
-                        p.archive_recipes = total;
-                        log.info("[pipelines] binary archive {s} written: {d} pipelines in {d} ms\n", .{ dir, n, (load_clock.now() - t0) / std.time.ns_per_ms });
-                    } else |e| {
-                        log.warn("[pipelines] binary archive {s} not written ({s}: {s})\n", .{ dir, @errorName(e), cache.lastMetalError() });
-                    }
-                } else |_| {}
+        pruneOlder(p, root);
+        if (archive_needed) {
+            if (writeArchiveForKey(p.io, p.key, dir)) |n| {
+                p.archive_loaded = true;
+                p.archive_recipes = total;
+                if (last) |*l| {
+                    l.archive_loaded = true;
+                    l.archive_recipes = total;
+                }
+                _ = n;
             }
         }
     }
 };
+
+fn pruneOlder(p: *const Plan, root: std.Io.Dir) void {
+    var removed: std.ArrayList([manifest.Key.dir_len]u8) = .empty;
+    defer removed.deinit(p.a);
+    manifest.prune(p.a, p.io, root, p.key, &removed) catch |e| log.warn("[pipelines] older manifests not removed: {s}\n", .{@errorName(e)});
+    for (removed.items) |name| log.info("[pipelines] removed the manifest {s} of an older build\n", .{name});
+}
+
+fn writeArchiveForKey(io: std.Io, key: manifest.Key, dir: []const u8) ?usize {
+    const root_path = manifest.configuredRoot() orelse return null;
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const apath = manifest.archivePath(&path_buf, root_path, key) catch return null;
+    const t0 = load_clock.now();
+    if (cache.writeArchive(io, registry.recipes(), apath)) |n| {
+        log.info("[pipelines] binary archive {s} written: {d} pipelines in {d} ms\n", .{ dir, n, (load_clock.now() - t0) / std.time.ns_per_ms });
+        return n;
+    } else |e| {
+        log.warn("[pipelines] binary archive {s} not written ({s}: {s})\n", .{ dir, @errorName(e), cache.lastMetalError() });
+        return null;
+    }
+}
 
 fn reopenRoot(io: std.Io) ?@import("../tensor/plan/plan_book.zig").Cache.Opened {
     var reason: []const u8 = "";
@@ -202,7 +290,16 @@ fn reopenRoot(io: std.Io) ?@import("../tensor/plan/plan_book.zig").Cache.Opened 
 /// Where this load's manifest lives once it holds a complete warm, for a warm that runs after the load's own (the
 /// vision tower's). A root made from the process's path is opened again at each write, so a root removed and made
 /// again is never a stale handle.
-var last: ?struct { a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, from_path: bool, key: manifest.Key } = null;
+var last: ?struct {
+    a: std.mem.Allocator,
+    io: std.Io,
+    root: std.Io.Dir,
+    from_path: bool,
+    key: manifest.Key,
+    written_gen: u64 = 0,
+    archive_loaded: bool = false,
+    archive_recipes: usize = 0,
+} = null;
 
 /// The scope of the manifest the load in progress settled, which its warm keys its markers by; null when no manifest
 /// can hold them (no root, or no scope).
@@ -218,7 +315,16 @@ pub fn writtenKey() ?manifest.Key {
 }
 
 fn remember(p: *const Plan) void {
-    last = if (p.root) |root| .{ .a = p.a, .io = p.io, .root = root, .from_path = p.from_path, .key = p.key } else null;
+    last = if (p.root) |root| .{
+        .a = p.a,
+        .io = p.io,
+        .root = root,
+        .from_path = p.from_path,
+        .key = p.key,
+        .written_gen = registry.generation,
+        .archive_loaded = p.archive_loaded,
+        .archive_recipes = p.archive_recipes,
+    } else null;
 }
 
 fn write(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, key: manifest.Key) bool {
@@ -248,16 +354,40 @@ pub fn forget() void {
 /// Pipelines made after the load's manifest was settled or written: the manifest of the load's key, written again with
 /// them. A load with no manifest root writes nothing.
 pub fn rewriteLate() void {
-    const l = last orelse return;
+    rewriteLateImpl(false);
+}
+
+/// Called at the end of `warmLoadWith` when an arch owns its own manifest (DeepSeek-V4.1): skips disk I/O when nothing
+/// changed and `archive.bin` already covers every recipe; otherwise writes the complete manifest and binary archive once.
+pub fn finalizeLate() void {
+    rewriteLateImpl(true);
+}
+
+fn rewriteLateImpl(with_archive: bool) void {
+    const l = &(last orelse return);
+    const total = registry.recipes().len;
+    const archive_needed = with_archive and l.from_path and (!l.archive_loaded or total > l.archive_recipes);
+    const manifest_needed = registry.generation != l.written_gen;
+    if (with_archive and !manifest_needed and !archive_needed) return;
     const opened: ?@import("../tensor/plan/plan_book.zig").Cache.Opened = if (l.from_path) reopenRoot(l.io) else .{ .dir = l.root, .owned = false };
     const root = opened orelse {
         log.warn("[pipelines] manifest not written: the manifest root did not open\n", .{});
         return;
     };
     defer if (root.owned) root.dir.close(l.io);
-    if (!write(l.a, l.io, root.dir, l.key)) return;
     var dir_buf: [manifest.Key.dir_len]u8 = undefined;
-    log.info("[pipelines] manifest {s} written again with a later warm: {d} recipes\n", .{ l.key.dirName(&dir_buf), registry.recipes().len });
+    const dir = l.key.dirName(&dir_buf);
+    if (!with_archive or manifest_needed) {
+        if (!write(l.a, l.io, root.dir, l.key)) return;
+        l.written_gen = registry.generation;
+        log.info("[pipelines] manifest {s} written again with a later warm: {d} recipes\n", .{ dir, total });
+    }
+    if (archive_needed) {
+        if (writeArchiveForKey(l.io, l.key, dir) != null) {
+            l.archive_loaded = true;
+            l.archive_recipes = total;
+        }
+    }
 }
 
 /// Looks up this key's manifest. A problem with the directory or the
@@ -320,3 +450,26 @@ pub fn requestEnded() void {
     rewriteLate();
 }
 
+test "pipelines: a load that leaves its manifest as it found it still removes the older builds of its scope but the newest" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const scope: [16]u8 = @splat('a');
+    const mine: manifest.Key = .{ .scope = scope, .build = @splat('3') };
+    const older: manifest.Key = .{ .scope = scope, .build = @splat('1') };
+    const old: manifest.Key = .{ .scope = scope, .build = @splat('2') };
+    for ([_]manifest.Key{ older, old, mine }, 1..) |k, second| {
+        try manifest.write(a, io, tmp.dir, k, &.{});
+        try manifest.setWrittenForTest(io, tmp.dir, k, @intCast(second * 1000));
+    }
+    var p = begin(a, io, tmp.dir, "", mine, 0);
+    defer p.deinit();
+    defer forget();
+    try std.testing.expectEqual(Case.same, p.case);
+    p.settled_gen = registry.generation;
+    p.store();
+    var buf: [manifest.Key.dir_len]u8 = undefined;
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, older.dirName(&buf), .{}));
+    for ([_]manifest.Key{ old, mine }) |k| try tmp.dir.access(io, k.dirName(&buf), .{});
+}

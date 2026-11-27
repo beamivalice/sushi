@@ -1349,6 +1349,110 @@ test "hy4 plan: a load plans the shapes earlier misses kept beside its manifest,
     try testing.expectEqual(traces(&plain.book, id) + 1, traces(&with.book, id));
 }
 
+/// What names the book `p`'s load would keep, with no tower.
+fn factsOf(p: *const hy4_plan.Plans) hy4_plan.BookFacts {
+    return .{ .pack = p.pack.?, .reach = p.reach, .joined = p.joined, .kv = p.kv, .has_drafter = p.drafter != null, .keeps_tower = false, .max_patches = 0, .has_suppress = p.sample.masks.suppress != null };
+}
+
+test "hy4 plan: a load's plan book kept beside its manifest reads back as the plans the load recorded: every root's tables, the encode, the verdict rows, the reach and the joined cap (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const p = m.plans.?;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cache: @import("../tensor/plan/plan_book.zig").Cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
+    p.cache = cache;
+    defer p.cache = null;
+    p.book_key = try hy4_plan.bookKey(m, factsOf(p));
+    defer p.book_key = null;
+    try hy4_plan.keepCachedBook(p);
+    const q = (try hy4_plan.readCachedBook(m, a, cache, factsOf(p), p.drafter, p.sample.masks)) orelse return error.TestNoKeptBook;
+    defer q.deinit(a);
+    try testing.expectEqual(p.book.roots.items.len, q.book.roots.items.len);
+    for (p.book.roots.items) |r| {
+        errdefer std.debug.print("[hy4-plan] root {d}/{d} reads back other tables\n", .{ r.id.site, r.id.key });
+        try testing.expect(r.tables.?.eql(q.book.tables(r.id).?));
+    }
+    try testing.expectEqual(p.book.layout(), q.book.layout());
+    try testing.expectEqual(p.encode, q.encode);
+    try testing.expectEqual(p.sample.rows_max, q.sample.rows_max);
+    try testing.expectEqual(p.reach, q.reach);
+    try testing.expectEqual(p.joined, q.joined);
+}
+
+test "hy4 plan: a one-row forward that misses on a plan book read back from its file is learned in place, served the next time with the bytes of the pool, and the book is written again so the next load reads it learned (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const plan_book = @import("../tensor/plan/plan_book.zig");
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: contract.Load = undefined;
+    try ld.openLight(Resident, dir, true);
+    defer _ = ld.close();
+    const turn = hy4_contract.openTurn(ld.h, &ld.config);
+    defer turn.end();
+    defer @import("../arch/sched.zig").endRequest(&ld.config);
+    const m = ld.xfm.arch_state.hy4flash.model.?;
+    defer m.reset();
+    const p = m.plans.?;
+    // The decode's root planned from one position only, written to its file and read back as a load reads it.
+    const id = hy4_plan.root(.{ .rows = 1, .readout = .last, .keep_hidden = false, .kv = p.kv });
+    var made: plan_book.Book = .{ .gpa = a, .options = p.book.options };
+    defer made.deinit();
+    const passes = try hy4_plan.recordChecked(m, a, .{ .rows = 1, .readout = .last, .keep_hidden = false, .kv = p.kv, .n = 1 }, p.reach);
+    defer a.free(passes.traces);
+    try testing.expectEqual(@as(usize, 1), passes.traces.len);
+    try made.add(id, passes.traces[0]);
+    try made.build();
+    const bytes = try made.encode(a);
+    defer a.free(bytes);
+    var book = try plan_book.Book.decode(a, bytes, p.book.options, p.book.alignment);
+    std.mem.swap(plan_book.Book, &book, &p.book);
+    defer book.deinit();
+    defer std.mem.swap(plan_book.Book, &book, &p.book);
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const cache: plan_book.Cache = .init(testing.io, .{ .handle = tmp.dir }, "scope-build");
+    p.cache = cache;
+    defer p.cache = null;
+    p.book_key = try hy4_plan.bookKey(m, factsOf(p));
+    defer p.book_key = null;
+    // The book as the load kept it, before the shape it misses is kept beside it.
+    try hy4_plan.keepCachedBook(p);
+    const vocab: usize = m.config.vocab;
+    const got = try a.alloc(f32, 2 * vocab);
+    defer a.free(got);
+    // Past the window and a group's edge: layers whose keys the one probe never took.
+    try testing.expectError(error.PlanMiss, oneRow(m, ids, 20, true, got[vocab..]));
+    try testing.expectEqual(@as(u64, 1), p.learned);
+    // The book written again under the shapes kept now is the only one left.
+    var books: usize = 0;
+    var kept_dir = try tmp.dir.openDir(testing.io, "scope-build", .{ .iterate = true });
+    defer kept_dir.close(testing.io);
+    var it = kept_dir.iterate();
+    while (try it.next(testing.io)) |entry| books += @intFromBool(std.mem.startsWith(u8, entry.name, "book-"));
+    try testing.expectEqual(@as(usize, 1), books);
+    const pool = try oneRow(m, ids, 20, false, got[0..vocab]);
+    const arena = try oneRow(m, ids, 20, true, got[vocab..]);
+    try testing.expectEqual(@as(u64, 0), pool.executions);
+    try testing.expectEqual(@as(u64, 1), arena.executions);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(got[0..vocab]), std.mem.sliceAsBytes(got[vocab..]));
+    // The next load, under the shape now kept, reads the book with the root as learned.
+    const q = (try hy4_plan.readCachedBook(m, a, cache, factsOf(p), p.drafter, p.sample.masks)) orelse return error.TestNoKeptBook;
+    defer q.deinit(a);
+    try testing.expect(p.book.tables(id).?.eql(q.book.tables(id).?));
+}
+
 test "hy4 plan: a forward at another KV width than the load planned, or one that splices an image's rows, runs on the pool with no miss; an image request's decode past its image runs on the arena (HY4_BF16_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
@@ -1603,7 +1707,7 @@ test "hy4 plan: a load-width prefill chunk in the deep zone read out by a readou
     try testing.expect(core.stats().wide_last_high <= p.region.scratch);
 }
 
-test "hy4 plan: a load keeps its chunk width's region beside its manifest, named by its pack, and the next reads it back, checked by one probe; a damaged file, another deep zone, a check that differs or another pack is measured again (HY4_STQ_TINY)" {
+test "hy4 plan: a load keeps its chunk width's region beside its manifest, named by its pack, and the next reads it back, checked by one probe; a damaged file, another deep zone, a check that differs or another pack is measured again, and a write removes the regions of other names (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;
     const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
@@ -1657,13 +1761,17 @@ test "hy4 plan: a load keeps its chunk width's region beside its manifest, named
     defer p.pack = pack;
     var other_buf: [40]u8 = undefined;
     p.pack.?[0] +%= 1;
-    try testing.expect(!std.mem.eql(u8, name, hy4_plan.regionFileName(m, p, rows, &other_buf)));
+    const other = hy4_plan.regionFileName(m, p, rows, &other_buf);
+    try testing.expect(!std.mem.eql(u8, name, other));
     try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
     try testing.expectEqual(full, (try forget(p, rows)).probes);
-    p.pack = null;
-    try sub.deleteFile(testing.io, name);
-    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    // Its write removes the regions kept under other names: one a setting left behind is never read again.
     try testing.expectError(error.FileNotFound, sub.statFile(testing.io, name, .{}));
+    _ = try sub.statFile(testing.io, other, .{});
+    p.pack = null;
+    try sub.deleteFile(testing.io, other);
+    try testing.expectEqual(measured, try hy4_plan.regionAt(m, p, rows));
+    try testing.expectError(error.FileNotFound, sub.statFile(testing.io, other, .{}));
     try testing.expectEqual(full, (try forget(p, rows)).probes);
 }
 

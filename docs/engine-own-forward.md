@@ -733,27 +733,46 @@ A complete warm leaves two files in `~/.sushi/cache/pipelines/<scope>-<build>/`:
    (`tensor/pipeline_registry.zig`, recorded at `stock.kernel`, `stock.kernelFlags`, and `stock.kernelConstants`). A
    recipe names a `sushi.metallib` function and its boolean and int `[[function_constant]]` values (legacy `.source`
    recipes are rejected by `pipeline_cache` with `error.MetalCompile`). A `marker` recipe makes no pipeline: it says
-   that a warm (`served warm`, `vision tower`) is whole in the file. The file ends in a SHA-256 of itself; a short,
-   changed or foreign file is refused by name and never read partly.
+   that a warm (`served warm`, `vision tower`, `hy4 arch warm`, `qwen4 trunk warm`, `qwen4 spec warm`,
+   `dsv41 trunk warm`) is whole in the file. The file ends in a SHA-256 of itself; a short, changed or foreign file is
+   refused by name and never read partly.
 2. `archive.bin` (`MTLBinaryArchive`, `src/metal.zig`, `src/tensor/pipeline_cache.zig`): the compiled GPU pipeline
    machine code for every recipe in the manifest, written atomically (temp + rename) beside `manifest.bin` whenever
    missing or after the recipe count grows. It inherits `<scope>-<build>` (binary SHA-256, `sushi.metallib` size/mtime,
    GPU architecture, OS build, manifest version) and is pruned together with older build directories by `manifest.prune`.
+   On DeepSeek-V4.1, `initDsv41` writes `manifest.bin` only (`storeManifestOnly`) and `model_load.warmLoad` finalizes
+   `archive.bin` once (`finalizeLate`) after vision and served warm complete so all ~1,210+ pipelines land in one pass.
 
 - **Every Cooler load keeps one** (`arch/cooler_pipelines.zig`): the arch names its scope (`coolerPipelineScope`, or
-  DeepSeek's own load, which also decides from it which warm forwards run); `model_load.warmLoad` makes the manifest's
-  recipes before the warm and writes `manifest.bin` and `archive.bin` after; a request that made a pipeline late writes
-  the manifest again (`arch_cooler.endRequest`), so the next load makes it ahead. The served warm exists only to make
-  pipelines, so it ends by recording a `served warm` marker, and a load whose manifest holds the marker of its own key
-  skips the requests (`[warm] served requests skipped`); the chunk's fit against the live headroom still runs. The
-  marker's key is the manifest's scope plus what the requests are made of: widths, KV scheme and group, drafter, the
-  MTP settings its rounds read (`--no-mtp-lookup`, `--max-mtp-ctx`, `--mtp-min-depth`, `--mtp-max-depth`; keyed only
-  for a load with a drafter), its bill and the pool settings; a load of another key warms in full. A marker is one
-  manifest's: each settle replaces the markers the process holds with that manifest's own, and a manifest is written
-  with its load's markers only. A same-key manifest keeps every marker it held, so a warm of another key, or a load
-  that failed, never costs a later load of the first its skip (pinned by `cooler contract: a served warm this build ran
-  whole`). `matmul.completeFamily` keys by `(dtype, use_nax)` so cold loads capture both `tf32` and `exact_f32`
+  DeepSeek's own load, which also decides from it which warm forwards run); `model_load.beginPipelinesAsync` kicks off
+  manifest preload (`Plan.startAsync`) before weight reads so pipeline creation overlaps with SSD I/O, joining via
+  `Plan.await` before `initTrunk`. Pipelines already present in `stock` (`stock.has`) are skipped on reloads, `buildKey`
+  is memoized per process, and warm loads whose `pipeline_registry` generation did not advance skip rewriting
+  `manifest.bin` and `archive.bin`. A request that made a pipeline late writes the manifest again
+  (`arch_cooler.endRequest`), so the next load makes it ahead. Both the served warm (`served warm`) and the
+  architecture-specific warmups (`hy4 arch warm`, `qwen4 trunk warm`, `qwen4 spec warm`, `dsv41 trunk warm`) record
+  keyed markers, so a same-key warm load skips redundant warm forwards while preserving live headroom checks. The
+  `served warm` marker's key is the manifest's scope plus what the requests are made of: widths, KV scheme and group,
+  drafter, the MTP settings its rounds read (`--no-mtp-lookup`, `--max-mtp-ctx`, `--mtp-min-depth`, `--mtp-max-depth`;
+  keyed only for a load with a drafter), its bill and the pool settings; a load of another key warms in full. A marker
+  is one manifest's: each settle replaces the markers the process holds with that manifest's own, and a manifest is
+  written with its load's markers only. A same-key manifest keeps every marker it held, so a warm of another key, or a
+  load that failed, never costs a later load of the first its skip (pinned by `cooler contract: a served warm this build
+  ran whole`). `matmul.completeFamily` keys by `(dtype, use_nax)` so cold loads capture both `tf32` and `exact_f32`
   `float32` tile families once and warm loads never rewrite `archive.bin`.
+- **Direct parallel weight and bulk expert loading with phase overlap**:
+  - Resident weights across shards are sorted by `(shard_idx, offset)` and read directly into mapped regions in parallel
+    via `expert_io.preadBatch` (up to 8 workers, 16 MiB chunks, zero bounce copies) in both `model.zig` and
+    `weights_where.zig`, with single-pass `streamedSplit` metadata scans (`hy4_load.zig`, `dsv41_source.zig`).
+  - Rate-grouped expert engines load `loadResident()` and `warmCache()` through `expert_stream.bulkFillGrouped`: a
+    single cross-layer coalesced `preadBatch` pass (up to 16 MiB contiguous runs, zero bounce copies, one thread-pool
+    barrier across all layers; `fill_marks` tracks up to 2,048 concurrent in-flight slabs).
+  - Warm DeepSeek-V4.1 loads overlap `startAsyncWarmCache` with `plan.settle()`, `dsv41_model.init()`, and
+    `VisionEncoder.init()`. Resident Hy4-Flash and Qwen3.8 loads overlap `startAsyncResidentLoad` with model/drafter
+    init and `ownBuiltWeights`, then call `mlx.engine.touchSync()` to synchronously wire `MTLResidencySet`s before
+    background page-cache warms (`ngram table warm`) or first-request serving.
+  - All architectures emit the `[load]` phase-timing summary line (`headers`, `read`, `build`, `pipelines`,
+    `warm forwards`, `wired`, `expert cache`, `other`, `total`).
 - **Key.** `scope` (16 hex) is the pack identity (config.json, index, shard names and sizes) and what shapes the warm
   (context, window, YaRN factor, candidate blocks, drafter, tile order, expert-cache and SSD bytes, resident or
   streamed, dropped experts, and `recipe_env`). `build` (16 hex) is the SHA-256 of the running binary, the size and
@@ -766,6 +785,13 @@ A complete warm leaves two files in `~/.sushi/cache/pipelines/<scope>-<build>/`:
   warm forwards are skipped (`WarmScope.mlx` for DeepSeek; `[warm] served requests skipped` for every Cooler arch). A
   reload reads the same recipes again, so `pipeline_registry.putStock` keeps one copy per key, and `encode` allocates
   its buffer once at its exact size so reload loops do not climb in RSS.
+- **The plan book** (Hy4-Flash, [D113](bill_redesign.md#decisions)): `book-<hash>.bin` beside `manifest.bin`, named
+  by every fact the load's recording reads past the build and the scope (`hy4_plan.BookKey`: the pack, the merged
+  config, reach, joined cap, KV width, drafter, streaming slots, bias, tower, suppress mask, threadgroup grants) and
+  the content of `plan-shapes`. A write removes the other `book-*.bin` of the directory, one a setting or shapes
+  state left. A repeat load maps it and reads its head; a root's traces are read when a miss learns it. The region
+  files beside it (`region-<hash>-<rows>.bin`) take the merged config into their hash and are pruned the same way.
+- **A load whose manifest is the one it found** writes none, and still prunes the older builds of its scope.
 - **Another build of the same scope.** The newest such manifest's recipes are preloaded from `sushi.metallib` AIR on
   worker threads, then the full warm runs and writes the new build's `manifest.bin` and `archive.bin`; older build
   directories (beyond the newest other one) are pruned. A manifest rewritten after load opens its root again from the

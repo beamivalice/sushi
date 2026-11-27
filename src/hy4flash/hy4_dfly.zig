@@ -44,6 +44,7 @@ pub const Drafter = struct {
         const c = m.config;
         const d = c.dfly;
         if (d.layers == 0 or d.n_targets != d.layers) return error.Hy4DflyConfig;
+        defer m.freeDecodeEye();
         const layers = try gpa.alloc(Layer, d.layers);
         errdefer gpa.free(layers);
         const p = "model.dfly_layers.";

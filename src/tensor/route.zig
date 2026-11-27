@@ -694,6 +694,7 @@ pub fn refusedBudget() @TypeOf(core.refused_budget) {
 pub const mappedTotal = core.mappedTotal;
 pub const arenaTotal = core.arenaTotal;
 pub const touch = core.touch;
+pub const touchSync = core.touchSync;
 
 /// Custom-kernel launches that built their instance key since the process began.
 pub fn kernelKeyBuilds() u64 {

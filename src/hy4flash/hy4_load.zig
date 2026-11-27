@@ -31,7 +31,7 @@ pub fn residentLoadBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: []
     for (shards.items) |name| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, name }, 0);
         defer allocator.free(path);
-        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
+        const fd = try expert_io.openHinted(path, .{ .nocache = false, .readahead_off = false });
         defer _ = std.c.close(fd);
         var header = try expert_io.SafetensorsHeader.read(allocator, fd);
         defer header.deinit();
@@ -105,14 +105,64 @@ pub fn shipsHead(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8
 
 /// What a streamed load of `config` keeps resident, for the preflight: the trunk as `weights` keeps it (the routed
 /// banks and Engram's tables stay on SSD), DFly2 as the head (the planner drops it when the load does not draft), and the
-/// tower as stored where the release ships one.
+/// tower as stored where the release ships one. Computed in a single pass over all shard headers.
 pub fn streamedSplit(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig) !model.ResidentSplit {
-    var streamed = config.*;
-    streamed.expert_streaming = true;
-    const trunk = (try residentLoadBytes(io, allocator, model_dir, &streamed, false, false)).?;
-    const with_tower = if (config.has_vision) (try residentLoadBytes(io, allocator, model_dir, &streamed, true, false)).? else trunk;
-    const with_dfly = if (streamed.hy4flash.?.dfly.layers > 0) (try residentLoadBytes(io, allocator, model_dir, &streamed, false, true)).? else trunk;
-    return .{ .trunk = trunk, .mtp = with_dfly - trunk, .vision = with_tower - trunk };
+    const c = &config.hy4flash.?;
+    const want_vision = config.has_vision;
+    const want_dfly = c.dfly.layers > 0;
+    var shards = try weights_where.shardNames(io, allocator, model_dir);
+    defer weights_where.freeShardNames(allocator, &shards);
+    var trunk: u64 = 0;
+    var mtp: u64 = 0;
+    var vision_bytes: u64 = 0;
+    var embed_bank = false;
+    var unknown: usize = 0;
+    for (shards.items) |name| {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, name }, 0);
+        defer allocator.free(path);
+        const fd = try expert_io.openHinted(path, .{ .nocache = false, .readahead_off = false });
+        defer _ = std.c.close(fd);
+        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+        defer header.deinit();
+        if (header.parsed.value != .object) return error.InvalidSafetensorsHeader;
+        var it = header.parsed.value.object.iterator();
+        while (it.next()) |e| {
+            const key = e.key_ptr.*;
+            if (std.mem.eql(u8, key, "__metadata__") or std.mem.startsWith(u8, key, pad_prefix)) continue;
+            const role = (census.roleOf(c, key) catch {
+                log.err("hy_v4_flash: the pack holds {s}, a tensor the release does not ship\n", .{key});
+                unknown += 1;
+                continue;
+            }).role;
+            const bucket: ?*u64 = switch (role) {
+                .routed_experts, .engram_table => null,
+                .vision => if (want_vision) &vision_bytes else null,
+                .dfly2 => if (want_dfly) &mtp else null,
+                else => &trunk,
+            };
+            const dst = bucket orelse continue;
+            if (e.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            if (std.mem.eql(u8, key, "model.embed_tokens.trellis")) embed_bank = true;
+            if (decodedAtLoad(key)) |part| {
+                if (part == .trellis) {
+                    const sh = e.value_ptr.object.get("shape") orelse return error.InvalidSafetensorsHeader;
+                    if (sh != .array or sh.array.items.len != 3 or sh.array.items[0] != .integer or sh.array.items[1] != .integer) return error.InvalidSafetensorsHeader;
+                    const in = 16 * (std.math.cast(u64, sh.array.items[0].integer) orelse return error.InvalidSafetensorsHeader);
+                    const out = 16 * (std.math.cast(u64, sh.array.items[1].integer) orelse return error.InvalidSafetensorsHeader);
+                    dst.* += in * out * 2;
+                }
+                continue;
+            }
+            const offs = e.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
+            if (offs != .array or offs.array.items.len != 2 or offs.array.items[0] != .integer or offs.array.items[1] != .integer) return error.InvalidSafetensorsHeader;
+            const lo = std.math.cast(u64, offs.array.items[0].integer) orelse return error.InvalidSafetensorsHeader;
+            const hi = std.math.cast(u64, offs.array.items[1].integer) orelse return error.InvalidSafetensorsHeader;
+            if (hi < lo) return error.InvalidSafetensorsHeader;
+            dst.* += hi - lo;
+        }
+    }
+    if (unknown > 0) return error.Hy4TensorUnknown;
+    return .{ .trunk = trunk + embedCacheBytes(config, embed_bank), .mtp = mtp, .vision = vision_bytes };
 }
 
 /// Whether a load keeps `key` resident. A streamed load reads the routed banks through the expert stream and Engram's

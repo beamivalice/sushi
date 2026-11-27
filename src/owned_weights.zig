@@ -29,6 +29,45 @@ fn hostBytes(x: A, want: usize) ![]const u8 {
     return p[0..want];
 }
 
+fn parallelMemcpy(dst: []u8, src: []const u8) void {
+    const threshold: usize = 16 << 20;
+    if (dst.len < threshold) {
+        @memcpy(dst, src);
+        return;
+    }
+    const max_workers: usize = 8;
+    const cpu = std.Thread.getCpuCount() catch 1;
+    const n_workers = @min(cpu, @min(max_workers, dst.len / (4 << 20)));
+    if (n_workers <= 1) {
+        @memcpy(dst, src);
+        return;
+    }
+    const Ctx = struct {
+        dst: []u8,
+        src: []const u8,
+        n_workers: usize,
+        fn run(c: *const @This(), w: usize) void {
+            const lo = (c.dst.len * w) / c.n_workers;
+            const hi = (c.dst.len * (w + 1)) / c.n_workers;
+            @memcpy(c.dst[lo..hi], c.src[lo..hi]);
+        }
+    };
+    const ctx: Ctx = .{ .dst = dst, .src = src, .n_workers = n_workers };
+    var threads: [max_workers]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |th| th.join();
+    for (1..n_workers) |w| {
+        threads[spawned] = std.Thread.spawn(.{}, Ctx.run, .{ &ctx, w }) catch {
+            // Fall back synchronously for the unspawned tail.
+            const lo = (dst.len * w) / n_workers;
+            @memcpy(dst[lo..], src[lo..]);
+            break;
+        };
+        spawned += 1;
+    }
+    ctx.run(0);
+}
+
 /// Bf16 `x` as f32 in an owned region, bit-equal to MLX's `astype`: the f32 bits are the bf16 bits shifted up.
 /// Null when `x` is not bf16 or the f32 copy is under the load's floor (`model.importFloor`); the caller then casts.
 pub fn widenF32(x: A) !?A {
@@ -38,7 +77,36 @@ pub fn widenF32(x: A) !?A {
     const src = std.mem.bytesAsSlice(u16, try hostBytes(x, n * 2));
     var region: ?*model.MappedRegion = try model.ownedRegion(n * 4);
     const dst = std.mem.bytesAsSlice(u32, region.?.ptr[0 .. n * 4]);
-    for (dst, src) |*d, b| d.* = @as(u32, b) << 16;
+    const threshold: usize = 4 << 20;
+    const cpu = std.Thread.getCpuCount() catch 1;
+    const n_workers = if (n < threshold) 1 else @min(cpu, @min(@as(usize, 8), n / (1 << 20)));
+    if (n_workers <= 1) {
+        for (dst, src) |*d, b| d.* = @as(u32, b) << 16;
+    } else {
+        const Ctx = struct {
+            dst: []align(1) u32,
+            src: []align(1) const u16,
+            n_workers: usize,
+            fn run(c: *const @This(), w: usize) void {
+                const lo = (c.dst.len * w) / c.n_workers;
+                const hi = (c.dst.len * (w + 1)) / c.n_workers;
+                for (c.dst[lo..hi], c.src[lo..hi]) |*d, b| d.* = @as(u32, b) << 16;
+            }
+        };
+        const ctx: Ctx = .{ .dst = dst, .src = src, .n_workers = n_workers };
+        var threads: [8]std.Thread = undefined;
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |th| th.join();
+        for (1..n_workers) |w| {
+            threads[spawned] = std.Thread.spawn(.{}, Ctx.run, .{ &ctx, w }) catch {
+                const lo = (dst.len * w) / n_workers;
+                for (dst[lo..], src[lo..]) |*d, b| d.* = @as(u32, b) << 16;
+                break;
+            };
+            spawned += 1;
+        }
+        ctx.run(0);
+    }
     return try model.wrapOwned(&region, mlx.getShape(x), .float32);
 }
 
@@ -119,13 +187,26 @@ pub fn stack(parts: []const A, kind: StackKind) !?A {
     var at: usize = 0;
     switch (kind) {
         .trellis => {
+            // Evaluate and validate each source part ONCE outside the row loop (avoids O(rows * parts) eval calls).
+            const max_stack_parts = 32;
+            var srcs_buf: [max_stack_parts][]const u8 = undefined;
+            var widths_buf: [max_stack_parts]usize = undefined;
+            const heap_srcs = if (parts.len > max_stack_parts) try std.heap.c_allocator.alloc([]const u8, parts.len) else null;
+            defer if (heap_srcs) |h| std.heap.c_allocator.free(h);
+            const heap_widths = if (parts.len > max_stack_parts) try std.heap.c_allocator.alloc(usize, parts.len) else null;
+            defer if (heap_widths) |h| std.heap.c_allocator.free(h);
+            const srcs = heap_srcs orelse srcs_buf[0..parts.len];
+            const widths = heap_widths orelse widths_buf[0..parts.len];
+            for (parts, 0..) |p, pi| {
+                widths[pi] = @intCast(mlx.getShape(p)[2] * mlx.getShape(p)[3]);
+                srcs[pi] = try hostBytes(p, mlx.mlx_array_size(p) * item);
+            }
             // Each tile row of the stack holds every part's tiles of that row, parts in order.
             const row_elems: usize = @intCast(shape[2] * shape[3]);
-            for (0..@intCast(shape[1])) |r| {
+            const rows_n: usize = @intCast(shape[1]);
+            for (0..rows_n) |r| {
                 var col: usize = 0;
-                for (parts) |p| {
-                    const w: usize = @intCast(mlx.getShape(p)[2] * mlx.getShape(p)[3]);
-                    const src = try hostBytes(p, mlx.mlx_array_size(p) * item);
+                for (srcs, widths) |src, w| {
                     @memcpy(out[(r * row_elems + col) * item ..][0 .. w * item], src[r * w * item ..][0 .. w * item]);
                     col += w;
                 }
@@ -133,7 +214,7 @@ pub fn stack(parts: []const A, kind: StackKind) !?A {
         },
         .rows, .cols, .experts => for (parts) |p| {
             const bytes = mlx.mlx_array_size(p) * item;
-            @memcpy(out[at..][0..bytes], try hostBytes(p, bytes));
+            parallelMemcpy(out[at..][0..bytes], try hostBytes(p, bytes));
             at += bytes;
         },
     }
@@ -198,7 +279,7 @@ pub fn raggedOwned(s: mlx.mlx_stream, banks: []const exl3.Bank, order: exl3.form
             for ([3]A{ p.trellis, p.suh, p.svh }, 0..) |a, part| {
                 const slot = part * 3 + pi;
                 const bytes = mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
-                @memcpy(regions[slot].?.ptr[at[slot]..][0..bytes], try hostBytes(a, bytes));
+                parallelMemcpy(regions[slot].?.ptr[at[slot]..][0..bytes], try hostBytes(a, bytes));
                 at[slot] += bytes;
             }
         }

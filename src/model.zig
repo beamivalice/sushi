@@ -2294,9 +2294,33 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         }
     }
 
-    var reader = expert_io.ParallelReader.init(allocator, expert_io.ParallelReader.default_chunk, expert_io.ParallelReader.default_workers);
-    defer reader.deinit();
     var file_count: u32 = 0;
+    const fused_streaming = streaming != null and streaming.?.layout == .bf16_fused;
+    const drops_mtp = drop_mtp or (streaming != null and !streaming.?.keep_mtp);
+
+    const Pending = struct {
+        shard_idx: u32,
+        key: []u8,
+        meta: SafetensorMeta,
+        region: ?*MappedRegion = null,
+        host: ?[]u8 = null,
+    };
+
+    var open_fds: std.ArrayList(std.c.fd_t) = .empty;
+    defer {
+        for (open_fds.items) |fd| _ = std.c.close(fd);
+        open_fds.deinit(allocator);
+    }
+    var pending: std.ArrayList(Pending) = .empty;
+    defer {
+        for (pending.items) |*p| {
+            allocator.free(p.key);
+            if (p.region) |r| destroyRegion(r);
+            if (p.host) |h| allocator.free(h);
+        }
+        pending.deinit(allocator);
+    }
+
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         // Accept regular files AND symlinks: HuggingFace cache snapshots store
@@ -2315,8 +2339,78 @@ fn loadWeightsFromOpenDirMode(io: std.Io, allocator: std.mem.Allocator, dir: std
         defer allocator.free(path);
 
         const shard: ?ShardOwners = if (owners) |o| .{ .map = o.value.object.get("weight_map").?.object, .present = &present, .file = entry.name } else null;
-        try loadSafetensorsFileMode(allocator, &reader, &weights, path, s, load_vision, streaming, drop_mtp, shard, entry.name);
+        const fd = try expert_io.openHinted(path, .{ .readahead_off = false });
+        errdefer _ = std.c.close(fd);
+        const header_t0 = load_clock.now();
+        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
+        defer header.deinit();
+        load_clock.headersDone(header_t0);
+
+        const shard_idx: u32 = @intCast(open_fds.items.len);
+        var kept_in_shard = false;
+        var tensors = header.parsed.value.object.iterator();
+        while (tensors.next()) |te| {
+            var key_buf: [512]u8 = undefined;
+            const key_str = loadedKey(te.key_ptr.*, &key_buf, load_vision, streaming, drops_mtp, shard) orelse continue;
+            if (!kept_in_shard) {
+                log.info("Loading {s}...\n", .{entry.name});
+                kept_in_shard = true;
+            }
+            const meta = try parseSafetensorMeta(&header, te.value_ptr.*);
+            const key_owned = try allocator.dupe(u8, key_str);
+            errdefer allocator.free(key_owned);
+            try pending.append(allocator, .{ .shard_idx = shard_idx, .key = key_owned, .meta = meta });
+        }
+        if (kept_in_shard) {
+            try open_fds.append(allocator, fd);
+        } else {
+            _ = std.c.close(fd);
+        }
         file_count += 1;
+    }
+
+    // Sort by `(shard_idx, file_offset)` for strictly sequential reads across all shards in parallel.
+    std.mem.sort(Pending, pending.items, {}, struct {
+        fn lt(_: void, a: Pending, b: Pending) bool {
+            if (a.shard_idx != b.shard_idx) return a.shard_idx < b.shard_idx;
+            return a.meta.offset < b.meta.offset;
+        }
+    }.lt);
+
+    const floor = importFloor(mlx.engine.own_weights);
+    var reads: std.ArrayList(expert_io.BatchRead) = .empty;
+    defer reads.deinit(allocator);
+    try reads.ensureTotalCapacity(allocator, pending.items.len);
+    var total_bytes: u64 = 0;
+
+    for (pending.items) |*p| {
+        if (p.meta.bytes == 0 or p.meta.bytes < floor) {
+            const host = try allocator.alloc(u8, @max(p.meta.bytes, 1));
+            p.host = host;
+            if (p.meta.bytes > 0) {
+                reads.appendAssumeCapacity(.{ .fd = open_fds.items[p.shard_idx], .offset = p.meta.offset, .dst = host[0..p.meta.bytes] });
+            }
+        } else {
+            const region = try ownedRegion(p.meta.bytes);
+            p.region = region;
+            reads.appendAssumeCapacity(.{ .fd = open_fds.items[p.shard_idx], .offset = p.meta.offset, .dst = region.ptr[0..p.meta.bytes] });
+        }
+        total_bytes += p.meta.bytes;
+    }
+
+    const read_t0 = load_clock.now();
+    try expert_io.preadBatch(allocator, reads.items, 8);
+    load_clock.readDone(read_t0, total_bytes);
+
+    for (pending.items) |*p| {
+        const wrapped = if (p.region) |region| blk: {
+            p.region = null;
+            break :blk try wrapFilledRegion(region, p.meta.bytes, p.meta.shape[0..p.meta.ndim], p.meta.dtype);
+        } else blk: {
+            const host = p.host.?;
+            break :blk try wrapSmallHostBytes(host, p.meta.bytes, p.meta.shape[0..p.meta.ndim], p.meta.dtype);
+        };
+        try installLoadedTensor(allocator, &weights, p.key, wrapped.array, s, fused_streaming);
     }
 
     // Incomplete-checkpoint guard. A dir with config/tokenizer but no (or no
@@ -2618,8 +2712,15 @@ pub fn readSafetensor(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header:
     return (try readSafetensorArray(reader, fd, header, meta)).array;
 }
 
-/// `readSafetensor` with the import's outcome: `mapped` is null for a tensor MLX copied.
-pub fn readSafetensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !TensorArray {
+pub const SafetensorMeta = struct {
+    dtype: mlx.mlx_dtype,
+    ndim: usize,
+    shape: [16]c_int,
+    offset: u64,
+    bytes: usize,
+};
+
+pub fn parseSafetensorMeta(header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !SafetensorMeta {
     if (meta != .object) return error.InvalidSafetensorsTensor;
     const dtype_value = meta.object.get("dtype") orelse return error.InvalidSafetensorsTensor;
     const dims = meta.object.get("shape") orelse return error.InvalidSafetensorsTensor;
@@ -2636,9 +2737,39 @@ pub fn readSafetensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, he
     const lo = offsets.array.items[0];
     const hi = offsets.array.items[1];
     if (lo != .integer or hi != .integer or lo.integer < 0 or hi.integer < lo.integer or @as(u64, @intCast(hi.integer - lo.integer)) != bytes) return error.InvalidSafetensorsTensor;
+    return .{
+        .dtype = dtype,
+        .ndim = dims.array.items.len,
+        .shape = shape,
+        .offset = header.data_start + @as(u64, @intCast(lo.integer)),
+        .bytes = @intCast(bytes),
+    };
+}
+
+/// Wraps an already-filled `MappedRegion` as a `TensorArray` (taking ownership of `region` on every path).
+pub fn wrapFilledRegion(region: *MappedRegion, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
+    const ptr = region.ptr;
+    const wrapped = try wrapRegion(region, shape, dtype);
+    return .{ .array = wrapped.array, .bytes = mlx.mlx_array_data_uint8(wrapped.array).?[0..len], .mapped = if (wrapped.aliased) ptr else null };
+}
+
+/// Wraps an already-filled host slice (`len < importFloor`) as a `TensorArray`.
+pub fn wrapSmallHostBytes(host: []const u8, len: usize, shape: []const c_int, dtype: mlx.mlx_dtype) !TensorArray {
+    const array = if (mlx.engine.own_weights)
+        mlx.made(mlx.engine.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), dtype)) catch return error.EngineWeightWrap
+    else
+        mlx.newData(host.ptr, shape, dtype) catch return error.OutOfMemory;
+    errdefer _ = mlx.mlx_array_free(array);
+    try mlx.check(mlx.mlx_array_eval(array));
+    return .{ .array = array, .bytes = if (len == 0) &.{} else mlx.mlx_array_data_uint8(array).?[0..len] };
+}
+
+/// `readSafetensor` with the import's outcome: `mapped` is null for a tensor MLX copied.
+pub fn readSafetensorArray(reader: *expert_io.ParallelReader, fd: std.c.fd_t, header: *const expert_io.SafetensorsHeader, meta: std.json.Value) !TensorArray {
+    const m = try parseSafetensorMeta(header, meta);
     const t0 = load_clock.now();
-    const array = try readTensorArray(reader, fd, header.data_start + @as(u64, @intCast(lo.integer)), @intCast(bytes), shape[0..dims.array.items.len], dtype);
-    load_clock.readDone(t0, bytes);
+    const array = try readTensorArray(reader, fd, m.offset, m.bytes, m.shape[0..m.ndim], m.dtype);
+    load_clock.readDone(t0, m.bytes);
     return array;
 }
 
@@ -2658,6 +2789,62 @@ fn loadedKey(
     const key = if (streaming) |load| streamedResidentKey(load, key_buf, key_raw) orelse return null else key_raw;
     if (!shouldKeepWeightKey(key, load_vision) or (drops_mtp and streamingDropsWeightKey(key))) return null;
     return key;
+}
+
+fn installLoadedTensor(allocator: std.mem.Allocator, weights: *Weights, key_str: []const u8, value: mlx.mlx_array, s: mlx.mlx_stream, fused_streaming: bool) !void {
+    // Read the shape BEFORE the cast frees `value` — a freed handle's
+    // ndim is a use-after-free, not a zero.
+    const ndim = mlx.mlx_array_ndim(value);
+    var final_value = value;
+    errdefer if (final_value.ctx != null) {
+        _ = mlx.mlx_array_free(final_value);
+    };
+    if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value))) {
+        var cast = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(cast);
+        try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
+        _ = mlx.mlx_array_free(value);
+        final_value = cast;
+        if (ndim == 1) narrowed_1d += 1;
+    }
+
+    if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.gate_up_proj")) {
+        var pair = try splitFusedGateUp(final_value, s);
+        errdefer {
+            if (pair[0].ctx != null) _ = mlx.mlx_array_free(pair[0]);
+            if (pair[1].ctx != null) _ = mlx.mlx_array_free(pair[1]);
+        }
+        _ = mlx.mlx_array_free(final_value);
+        final_value = .{ .ctx = null };
+        var gate_key_buf: [512]u8 = undefined;
+        var up_key_buf: [512]u8 = undefined;
+        const prefix_len = key_str.len - "experts.gate_up_proj".len;
+        const gate_key = std.fmt.bufPrint(&gate_key_buf, "{s}switch_mlp.gate_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
+        const up_key = std.fmt.bufPrint(&up_key_buf, "{s}switch_mlp.up_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
+        try putLoadedWeight(allocator, weights, gate_key, pair[0]);
+        pair[0] = .{ .ctx = null };
+        try putLoadedWeight(allocator, weights, up_key, pair[1]);
+        pair[1] = .{ .ctx = null };
+        return;
+    }
+    if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.down_proj")) {
+        var down_key_buf: [512]u8 = undefined;
+        const prefix_len = key_str.len - "experts.down_proj".len;
+        const down_key = std.fmt.bufPrint(&down_key_buf, "{s}switch_mlp.down_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
+        try putLoadedWeight(allocator, weights, down_key, final_value);
+        return;
+    }
+    if (fused_streaming and arch_load.fusedStreamFoldsNorm(key_str)) {
+        const folded = try foldDeltaNorm(final_value, s);
+        _ = mlx.mlx_array_free(final_value);
+        final_value = folded;
+    }
+    if (fused_streaming and std.mem.endsWith(u8, key_str, "conv1d.weight") and mlx.mlx_array_ndim(final_value) == 3) {
+        const transposed = try transposeFusedConv(final_value, s);
+        _ = mlx.mlx_array_free(final_value);
+        final_value = transposed;
+    }
+    try putLoadedWeight(allocator, weights, key_str, final_value);
 }
 
 /// `announce` names the shard in the log once its first tensor loads; a shard that loads nothing stays silent.
@@ -2696,60 +2883,7 @@ fn loadSafetensorsFileMode(
             pending_announce = null;
         }
         const value = try readSafetensor(reader, fd, &header, entry.value_ptr.*);
-
-        // Read the shape BEFORE the cast frees `value` — a freed handle's
-        // ndim is a use-after-free, not a zero.
-        const ndim = mlx.mlx_array_ndim(value);
-        var final_value = value;
-        errdefer if (final_value.ctx != null) {
-            _ = mlx.mlx_array_free(final_value);
-        };
-        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value))) {
-            var cast = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(cast);
-            try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
-            _ = mlx.mlx_array_free(value);
-            final_value = cast;
-            if (ndim == 1) narrowed_1d += 1;
-        }
-
-        if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.gate_up_proj")) {
-            var pair = try splitFusedGateUp(final_value, s);
-            errdefer {
-                if (pair[0].ctx != null) _ = mlx.mlx_array_free(pair[0]);
-                if (pair[1].ctx != null) _ = mlx.mlx_array_free(pair[1]);
-            }
-            _ = mlx.mlx_array_free(final_value);
-            final_value = .{ .ctx = null };
-            var gate_key_buf: [512]u8 = undefined;
-            var up_key_buf: [512]u8 = undefined;
-            const prefix_len = key_str.len - "experts.gate_up_proj".len;
-            const gate_key = std.fmt.bufPrint(&gate_key_buf, "{s}switch_mlp.gate_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
-            const up_key = std.fmt.bufPrint(&up_key_buf, "{s}switch_mlp.up_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
-            try putLoadedWeight(allocator, weights, gate_key, pair[0]);
-            pair[0] = .{ .ctx = null };
-            try putLoadedWeight(allocator, weights, up_key, pair[1]);
-            pair[1] = .{ .ctx = null };
-            continue;
-        }
-        if (fused_streaming and std.mem.endsWith(u8, key_str, ".mlp.experts.down_proj")) {
-            var down_key_buf: [512]u8 = undefined;
-            const prefix_len = key_str.len - "experts.down_proj".len;
-            const down_key = std.fmt.bufPrint(&down_key_buf, "{s}switch_mlp.down_proj.weight", .{key_str[0..prefix_len]}) catch return error.NameTooLong;
-            try putLoadedWeight(allocator, weights, down_key, final_value);
-            continue;
-        }
-        if (fused_streaming and arch_load.fusedStreamFoldsNorm(key_str)) {
-            const folded = try foldDeltaNorm(final_value, s);
-            _ = mlx.mlx_array_free(final_value);
-            final_value = folded;
-        }
-        if (fused_streaming and std.mem.endsWith(u8, key_str, "conv1d.weight") and mlx.mlx_array_ndim(final_value) == 3) {
-            const transposed = try transposeFusedConv(final_value, s);
-            _ = mlx.mlx_array_free(final_value);
-            final_value = transposed;
-        }
-        try putLoadedWeight(allocator, weights, key_str, final_value);
+        try installLoadedTensor(allocator, weights, key_str, value, s, fused_streaming);
     }
 }
 

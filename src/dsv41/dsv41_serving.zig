@@ -58,6 +58,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     else
         beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
+    // On a warm manifest load with streamed experts and no prefetch rate probe, start bulk cache preloading in the
+    // background so SSD reads overlap with `plan.settle()` and `dsv41_model.init()`.
+    if (!skip_warm and !engine.plan.resident and plan.case == .same and config.ssdPrefetchPct() == 0) {
+        try engine.startAsyncWarmCache();
+    }
     // Settle the manifest before `prepareGemmNax` and `dsv41_model.init` so a warm load preloads their pipelines.
     const settled = if (skip_warm) false else plan.settle();
     if (own_decode) {
@@ -128,9 +133,11 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const warm_t0 = load_clock.now();
     const made_before = mlx.engine.pipelinesMade();
     const scope = warmScopeOf(settled);
+    // The background cache fill ends before any forward routes experts, on every path that loads a model.
+    try engine.awaitAsyncWarmCache();
     if (warmAll(&shell, mdl, shell.arch_state.dsv41.stq_experts, scope)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s}{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", if (scope == .mlx) " (the engine's from the manifest)" else "", clock.lap() / std.time.ns_per_ms });
-        if (scope == .all and own_decode) plan.store();
+        if (scope == .all and own_decode) plan.storeManifestOnly();
     } else |e| {
         mlx.dropLatchedErrorUnless(had_error);
         // A forward the bill does not cover would be a Metal OOM in a request, and a forward of the engine's that

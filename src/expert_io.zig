@@ -1599,6 +1599,72 @@ pub const ParallelReader = struct {
     };
 };
 
+/// One contiguous read target for `preadBatch`.
+pub const BatchRead = struct {
+    fd: std.c.fd_t,
+    offset: u64,
+    dst: []u8,
+};
+
+/// Executes a batch of positioned reads directly into their destination slices across up to `workers` threads,
+/// splitting reads larger than `chunk_bytes` so huge tensors parallelize too. Zero bounce buffers, zero per-tensor
+/// thread spawn/join.
+pub fn preadBatch(allocator: std.mem.Allocator, reads: []const BatchRead, workers_in: usize) !void {
+    if (reads.len == 0) return;
+    const chunk_bytes: usize = 16 << 20;
+    const max_workers: usize = 8;
+
+    var chunks: std.ArrayList(BatchRead) = .empty;
+    defer chunks.deinit(allocator);
+    try chunks.ensureTotalCapacity(allocator, reads.len);
+    for (reads) |r| {
+        if (r.dst.len == 0) continue;
+        var pos: usize = 0;
+        while (pos < r.dst.len) {
+            const take = @min(r.dst.len - pos, chunk_bytes);
+            try chunks.append(allocator, .{
+                .fd = r.fd,
+                .offset = r.offset + pos,
+                .dst = r.dst[pos .. pos + take],
+            });
+            pos += take;
+        }
+    }
+    if (chunks.items.len == 0) return;
+
+    const n_workers = @min(std.math.clamp(workers_in, 1, max_workers), chunks.items.len);
+    const State = struct {
+        items: []const BatchRead,
+        next: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+        err: anyerror = error.FillReadFailed,
+
+        fn run(st: *@This()) void {
+            while (!st.failed.load(.acquire)) {
+                const idx = st.next.fetchAdd(1, .monotonic);
+                if (idx >= st.items.len) return;
+                const item = st.items[idx];
+                readExact(item.fd, item.dst, item.offset) catch |e| {
+                    if (st.failed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) st.err = e;
+                    return;
+                };
+            }
+        }
+    };
+    var st: State = .{ .items = chunks.items };
+    var threads: [max_workers]std.Thread = undefined;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |th| th.join();
+    for (1..n_workers) |_| {
+        threads[spawned] = std.Thread.spawn(.{}, State.run, .{&st}) catch break;
+        spawned += 1;
+    }
+    st.run();
+    for (threads[0..spawned]) |th| th.join();
+    spawned = 0;
+    if (st.failed.load(.acquire)) return st.err;
+}
+
 pub fn tensorRegion(allocator: std.mem.Allocator, fd: std.c.fd_t, key: []const u8) !TensorRegion {
     var len_bytes: [8]u8 = undefined;
     try readExact(fd, &len_bytes, 0);
@@ -2221,4 +2287,47 @@ test "a PageSlab counts its mapped bytes while it lives" {
     try std.testing.expectEqual(before + pageRoundUp(5000), slab_bytes.load(.monotonic));
     slab.destroy();
     try std.testing.expectEqual(before, slab_bytes.load(.monotonic));
+}
+
+test "preadBatch reads multiple files and unaligned offsets in parallel and reports short reads" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    const a_bytes = try t.allocator.alloc(u8, 65536 + 77);
+    defer t.allocator.free(a_bytes);
+    const b_bytes = try t.allocator.alloc(u8, 49152 + 13);
+    defer t.allocator.free(b_bytes);
+    for (a_bytes, 0..) |*v, i| v.* = @truncate(i *% 13 +% 7);
+    for (b_bytes, 0..) |*v, i| v.* = @truncate(i *% 29 +% 3);
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "a.bin", .data = a_bytes });
+    try tmp.dir.writeFile(t.io, .{ .sub_path = "b.bin", .data = b_bytes });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(t.io, &path_buf);
+    const pa = try std.fmt.allocPrintSentinel(t.allocator, "{s}/a.bin", .{path_buf[0..dir_len]}, 0);
+    defer t.allocator.free(pa);
+    const pb = try std.fmt.allocPrintSentinel(t.allocator, "{s}/b.bin", .{path_buf[0..dir_len]}, 0);
+    defer t.allocator.free(pb);
+    const fda = try openHinted(pa, .{ .readahead_off = false });
+    defer _ = std.c.close(fda);
+    const fdb = try openHinted(pb, .{ .readahead_off = false });
+    defer _ = std.c.close(fdb);
+
+    var dst0: [17]u8 = undefined;
+    var dst1: [19000]u8 = undefined;
+    var dst2: [4096]u8 = undefined;
+    var dst3: [25000]u8 = undefined;
+    const batch = [_]BatchRead{
+        .{ .fd = fda, .offset = 3, .dst = &dst0 },
+        .{ .fd = fdb, .offset = 1111, .dst = &dst1 },
+        .{ .fd = fda, .offset = 40960, .dst = &dst2 },
+        .{ .fd = fdb, .offset = 24000, .dst = &dst3 },
+    };
+    try preadBatch(t.allocator, &batch, 4);
+    try t.expectEqualSlices(u8, a_bytes[3..][0..dst0.len], &dst0);
+    try t.expectEqualSlices(u8, b_bytes[1111..][0..dst1.len], &dst1);
+    try t.expectEqualSlices(u8, a_bytes[40960..][0..dst2.len], &dst2);
+    try t.expectEqualSlices(u8, b_bytes[24000..][0..dst3.len], &dst3);
+
+    var past: [64]u8 = undefined;
+    try t.expectError(error.FillShortRead, preadBatch(t.allocator, &.{.{ .fd = fda, .offset = a_bytes.len - 10, .dst = &past }}, 2));
 }

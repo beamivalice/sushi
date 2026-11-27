@@ -326,8 +326,10 @@ pub const KdaLayer = struct {
         defer ops.deinit();
         const conv = try ops.contiguous(try ops.transpose(try ops.concat(&.{ self.conv_q, self.conv_k, self.conv_v }, 0), &.{ 0, 2, 1 }));
         const decay = try ops.unary(.exp, self.a_log);
-        try mlx.check(mlx.mlx_array_eval(conv));
-        try mlx.check(mlx.mlx_array_eval(decay));
+        const both = [_]Arr{ conv, decay };
+        const vec = mlx.mlx_vector_array_new_data(&both, both.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
         const owned_conv = try ops.result(conv);
         errdefer _ = mlx.mlx_array_free(owned_conv);
         const owned_decay = try ops.result(decay);

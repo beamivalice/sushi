@@ -1074,7 +1074,7 @@ Ruled by the owner on 2026-11-22:
 - **D5. A miss heals in process only within the arena held.** After the refused request the inference thread
   records that one shape and re-packs; if the new tables fit `G` and `H` as allocated, the next such request is
   served. If they need more, the shape goes to the plan cache and the next load sizes for it. The arena never grows
-  while serving (C2).
+  while serving (C2). A book read back from its file (D113) learns the same way, and a swap writes it again.
 - **D6. `sushi memory-bill <pack>`**, at stage 8: a pack's bill by owner from its config and index, with no GPU and
   no load, and the context that fits a budget.
 - **D7. The margin becomes a measured constant per GPU class (S6), arch by arch at its cutover**: Hy4 at stage 5,
@@ -1455,10 +1455,12 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   input, read out by the last row as a served chunk is) is a function of the build, the pack and the load's settings,
   and it was most of a same-build load's planning: the release 2.25bpw (M5 Max, 896c30d4, chunks 512 and 8192)
   measured its two regions in 6.9 s of 10.8 s, and a load of the same build reads them back in 36 ms. The load writes it, with the
-  classes' pads, to `region-<hash>.bin` in its manifest's directory (`Plans.cache`, keyed by the build and the kernels'
-  scope, pruned with the build); the hash names the pack (`Plans.pack`, `pipeline_manifest.addPack`: its config, index
-  and shard names and sizes, since Hy4's kernel scope names none), the reach, the chunk width, the KV width, the
-  drafter's handover, expert streaming and its slots, the alignment and the deep zone. The key decides; a reading
+  classes' pads, to `region-<hash>-<rows>.bin` in its manifest's directory (`Plans.cache`, keyed by the build and the
+  kernels' scope, pruned with the build); the hash names the pack (`Plans.pack`, `pipeline_manifest.addPack`: its
+  config, index and shard names and sizes, since Hy4's kernel scope names none), the merged model config
+  (`configHash`, so `--config-overrides` and a settings document count), the reach, the KV width, the drafter's
+  handover, expert streaming and its slots, the alignment and the deep zone. A write removes the regions of other
+  hashes, the load's other chunk widths kept. The key decides; a reading
   checks it: the file must be whole (a checksum, every value in its field's range), name the live load's width, deep
   zone and class count, and one probe recorded now (a load-width chunk at the deepest, read out by its last row) must
   ask exactly what it asked when the file was written. One probe cannot see a change confined to a shallow width or
@@ -1471,6 +1473,20 @@ Ruled by the owner on 2026-11-23, before stage 3 (the open questions of stage 2)
   `planRecord`: a manual context (flag, setting or pinned) where no candidate's request at it fits the room, and an auto
   context only where not one token fits, as an arena lowers an auto context and a chunk may then fit. Its line says
   "at least", since the arena it leaves out is not measured; anywhere else the plans decide, as before.
+- **D113. A load keeps its plan book beside its manifest and builds cold roots in parallel** (2026-11-27).
+  `plan_book.Book.encode` writes a checksummed head of every root's packed tables, each root's traces after it with
+  their own hash; `hy4_plan.keepCachedBook` puts it in `book-<hash>.bin` in the load's manifest directory and removes
+  the books of other names there. The name hashes every fact the recording reads beside the build and the scope
+  (`hy4_plan.BookKey`): the pack, the merged model config (`configHash`, so `--config-overrides` and a settings
+  document count), reach, joined cap, KV width, drafter, `keep_hidden`, streaming slots and expert-cache bias, tower,
+  suppress mask, the GPU's threadgroup grants, the arena's alignment, guard and `level_rule_cap`, and the content of
+  `plan-shapes`. A repeat load maps the file and reads the head alone (`readCachedBook`), latches the wide pipelines'
+  grants as a recording does (D20), and records nothing; any book it does not use is named in one `[plan]` line. A
+  cold load packs independent roots on up to 8 threads (`Book.build`). A root read back keeps its traces in the mapped
+  file and decodes them, hash checked, when a miss first learns it (D5), so it learns as a recorded root does; after a
+  swap the book is written again under the shapes kept then (`hy4_plan.keepLearned`), so the next load reads it
+  learned, a grouped probe's shape (never kept in `plan-shapes`) included. `keepRegion` reuses the
+  `(rows, reach -| rows, .last)` check already measured by `regionAt` instead of re-recording it.
 
 ## 15. Risks
 

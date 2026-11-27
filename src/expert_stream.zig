@@ -502,6 +502,9 @@ pub const Options = struct {
     /// exact), in the router's own score units; an arch whose `ExpertStreamTraits.cache_bias` is set reads it. The weights
     /// stay the unbiased scores.
     cache_bias: f32 = 0,
+    /// When true on a resident pack, skip the synchronous `loadResident()` during `initWithOptions` so the caller can
+    /// overlap it via `startAsyncResidentLoad()` / `awaitAsyncResidentLoad()`.
+    defer_resident_load: bool = false,
 };
 
 pub const Binding = struct {
@@ -2128,6 +2131,20 @@ pub const Engine = struct {
     bias_logged: bool = false,
     /// `Options.cache_bias`: this load's, never another's.
     cache_bias: f32 = 0,
+    /// Active background load (`startAsyncResidentLoad` or `startAsyncWarmCache`); joined before use or in `deinit`.
+    async_task: ?*AsyncTask = null,
+    resident_pending: bool = false,
+    warm_done_async: bool = false,
+
+    const AsyncKind = enum { resident, warm_cache };
+    const AsyncTask = struct {
+        thread: std.Thread,
+        kind: AsyncKind,
+        err: ?anyerror = null,
+        handled: bool = false,
+        bytes: u64 = 0,
+        elapsed_ns: u64 = 0,
+    };
 
     pub fn pendingReaders(self: *const Engine) usize {
         var n: usize = 0;
@@ -2253,7 +2270,13 @@ pub const Engine = struct {
                 max_slots = @max(max_slots, g.cache_slots);
             };
         }
-        if (plan.resident) try engine.loadResident();
+        if (plan.resident) {
+            if (opts.defer_resident_load) {
+                engine.resident_pending = true;
+            } else {
+                try engine.loadResident();
+            }
+        }
         if (pickInertLine(plan.resident, pick_tolerance)) |line| log.warn("{s}\n", .{line});
         var split_buf: [96]u8 = undefined;
         log.info("{s}", .{cacheSplitLine(&split_buf, allot != null, min_slots, max_slots)});
@@ -2319,7 +2342,16 @@ pub const Engine = struct {
         self.fds = &.{};
     }
 
+    fn abortAsyncTask(self: *Engine) void {
+        const task = self.async_task orelse return;
+        task.thread.join();
+        if (task.err) |e| log.warn("[expert-stream] background {s} fill ended in {s}; the engine is being torn down\n", .{ @tagName(task.kind), @errorName(e) });
+        self.allocator.destroy(task);
+        self.async_task = null;
+    }
+
     pub fn deinit(self: *Engine) void {
+        self.abortAsyncTask();
         expert_stats.process.engine(false, self.plan.cache_bytes);
         self.publishLent(0);
         self.stopPrefetch();
@@ -3046,6 +3078,7 @@ pub const Engine = struct {
     /// The read rate the serving pool reaches on this machine: random uncached experts read a layer after another, `k`
     /// to a layer at each of `probe_widths`, for `probe_ns` each. The caches and counters are put back as they were.
     pub fn probeReadRate(self: *Engine) !ProbeReading {
+        try self.awaitAsyncWarmCache();
         var out: ProbeReading = .{ .bps = @splat(0), .max_bps = 0 };
         if (self.plan.resident) return out;
         const Held = struct { layer: u16, caches: [quant.rate_group_limit]CacheSnapshot, count: usize, stats: LayerStats };
@@ -3125,10 +3158,329 @@ pub const Engine = struct {
         return out;
     }
 
+    /// True when every active layer is rate-grouped, not borrowed, and needs no CPU tile reshuffle, so `bulkFillGrouped`
+    /// can read every layer's experts straight into its `PageSlab`s in one coalesced `preadBatch` pass (0 bounce copy,
+    /// 1 barrier across all layers).
+    fn canBulkFillGrouped(self: *const Engine) bool {
+        var any = false;
+        for (self.layers) |*layer| {
+            if (!layer.active) continue;
+            any = true;
+            const gl = layer.grouped orelse return false;
+            if (layer.borrowed or layer.slabs.len != quant.component_count) return false;
+            if (gl.tile_major and !gl.source_tile_major) return false;
+        }
+        return any;
+    }
+
+    const BulkMode = enum { resident, warm_cache };
+
+    /// Cross-layer direct-IO bulk loader for `loadResident()` and `warmCache()` on rate-grouped engines.
+    /// Resolves every active layer's picks, coalesces contiguous `(fd, offset, dst)` runs up to 16 MiB, sorts by
+    /// `(fd, offset)`, and reads directly into `PageSlab`s via `expert_io.preadBatch` with zero bounce copies and one
+    /// thread-pool barrier. Returns `false` (leaving all caches untouched) when a fallback to per-layer `prepareHost`
+    /// is required (e.g. non-grouped engine, tile reshuffle, or a warm-cache pick overflowing a rate group).
+    fn bulkFillGrouped(self: *Engine, mode: BulkMode) !bool {
+        if (!self.canBulkFillGrouped()) return false;
+        const n = quant.component_count;
+        const warm_count = if (mode == .warm_cache) self.warmSlotsPerLayer() else 0;
+        if (mode == .warm_cache and warm_count == 0) return true;
+
+        var active_count: usize = 0;
+        for (self.layers) |*layer| {
+            if (layer.active) active_count += 1;
+        }
+        if (active_count == 0) return false;
+
+        const LayerWork = struct {
+            layer_index: u16,
+            gl: *GroupedLayer,
+            resolutions: [quant.rate_group_limit]GroupResolution = undefined,
+            resolved: usize = 0,
+            undos: [quant.rate_group_limit]CacheUndo = undefined,
+            undoable: usize = 0,
+            begun: usize = 0,
+            has_misses: bool = false,
+            scale_reads: std.ArrayList(ScaleRead) = .empty,
+        };
+
+        const work = try self.allocator.alloc(LayerWork, active_count);
+        defer self.allocator.free(work);
+        var age_log: std.ArrayList(AgedSlot) = .empty;
+        defer age_log.deinit(self.allocator);
+
+        var prepared_layers: usize = 0;
+        var committed = false;
+        var wrote_cache = false;
+        defer {
+            for (work[0..prepared_layers]) |*w| {
+                if (!committed) {
+                    const layer = &self.layers[w.layer_index];
+                    for (layer.slabs[0..w.begun]) |*operand| abortFill(operand);
+                    if (wrote_cache) {
+                        for (0..w.gl.groups.count) |g| w.gl.caches[g].invalidateUnready();
+                    } else {
+                        for (w.undos[0..w.undoable], 0..) |*undo, g| undo.restore(age_log.items, &w.gl.caches[g]);
+                    }
+                }
+                for (w.resolutions[0..w.resolved]) |*res| res.deinit(self.allocator);
+                for (w.undos[0..w.undoable]) |*undo| undo.deinit(self.allocator);
+                w.scale_reads.deinit(self.allocator);
+            }
+        }
+
+        const occurrences = try self.allocator.alloc(u16, if (mode == .resident) self.geometry.kept() else warm_count);
+        defer self.allocator.free(occurrences);
+        var ranked: std.ArrayList(u16) = .empty;
+        defer ranked.deinit(self.allocator);
+        var local: std.ArrayList(u16) = .empty;
+        defer local.deinit(self.allocator);
+
+        var routed: usize = 0;
+        for (self.layers, 0..) |*layer, li| {
+            if (!layer.active) continue;
+            defer routed += 1;
+            const gl = layer.grouped.?;
+            const layer_index: u16 = @intCast(li);
+
+            const picks: []const u16 = switch (mode) {
+                .resident => blk: {
+                    var next: usize = 0;
+                    for (0..self.geometry.experts) |e| {
+                        if (self.isDropped(layer_index, @intCast(e))) continue;
+                        occurrences[next] = @intCast(e);
+                        next += 1;
+                    }
+                    break :blk occurrences[0..next];
+                },
+                .warm_cache => blk: {
+                    ranked.clearRetainingCapacity();
+                    if (self.warm_usage) |u| {
+                        try rankedWarm(self.allocator, &ranked, gl, u.counts[routed], self.geometry.drop, layer_index);
+                    }
+                    if (ranked.items.len != 0) break :blk ranked.items;
+                    var next: u16 = 0;
+                    for (occurrences) |*expert| {
+                        while (self.isDropped(layer_index, next)) next += 1;
+                        expert.* = next;
+                        next += 1;
+                    }
+                    break :blk occurrences;
+                },
+            };
+
+            const w = &work[prepared_layers];
+            w.* = .{ .layer_index = layer_index, .gl = gl };
+            prepared_layers += 1;
+
+            const count: usize = gl.groups.count;
+            while (w.resolved < count) {
+                local.clearRetainingCapacity();
+                for (picks) |expert| {
+                    if (gl.groups.groupOf(expert) == w.resolved) {
+                        try local.append(self.allocator, expert - gl.groups.base[w.resolved]);
+                    }
+                }
+                w.undos[w.resolved] = try CacheUndo.begin(self.allocator, &age_log, &gl.caches[w.resolved], local.items);
+                w.undoable += 1;
+                self.cache_snapshots += @intFromBool(w.undos[w.resolved] == .full);
+                w.resolutions[w.resolved] = try gl.caches[w.resolved].resolve(self.allocator, local.items);
+                const res = &w.resolutions[w.resolved];
+                w.resolved += 1;
+                if (res.workspace) return false;
+                if (res.misses > 0) w.has_misses = true;
+            }
+        }
+
+        var raw_reads: std.ArrayList(io_mod.BatchRead) = .empty;
+        defer raw_reads.deinit(self.allocator);
+        var total_misses: u64 = 0;
+        var total_bytes: u64 = 0;
+
+        for (work[0..prepared_layers]) |*w| {
+            if (!w.has_misses) continue;
+            const layer = &self.layers[w.layer_index];
+            while (w.begun < n) : (w.begun += 1) {
+                const slab = layer.slabs[w.begun].slab orelse return error.MissingExpertSlab;
+                _ = try slab.tryBeginFill();
+            }
+            const gl = w.gl;
+            for (w.resolutions[0..w.resolved], 0..) |resolution, g| {
+                for (resolution.bindings) |binding| {
+                    if (binding.hit) continue;
+                    total_misses += 1;
+                    const global = gl.groups.base[g] + binding.expert;
+                    const slot = binding.slot orelse return error.ExpertBindingMissing;
+                    var scale_read: ScaleRead = .{ .expert = global };
+                    for (0..n) |ci| {
+                        const source = self.store.spanAt(w.layer_index, global, ci);
+                        const dst = gl.cacheRegion(&layer.slabs[ci], g, ci, slot);
+                        const slen: usize = @intCast(source.len);
+                        if (ci % 3 != 0) {
+                            if (self.scaleFromKept(w.layer_index, global, ci, dst[0..slen])) continue;
+                            scale_read.dst[ci] = dst[0..slen];
+                        }
+                        try raw_reads.append(self.allocator, .{
+                            .fd = self.fds[source.file],
+                            .offset = source.offset,
+                            .dst = dst[0..slen],
+                        });
+                        total_bytes += source.len;
+                    }
+                    if (self.kept != null and scale_read.dst[1].len > 0) {
+                        try w.scale_reads.append(self.allocator, scale_read);
+                    }
+                }
+            }
+        }
+
+        const batchReadLess = struct {
+            fn less(_: void, a: io_mod.BatchRead, b: io_mod.BatchRead) bool {
+                if (a.fd != b.fd) return a.fd < b.fd;
+                return a.offset < b.offset;
+            }
+        }.less;
+        std.mem.sort(io_mod.BatchRead, raw_reads.items, {}, batchReadLess);
+
+        var coalesced: std.ArrayList(io_mod.BatchRead) = .empty;
+        defer coalesced.deinit(self.allocator);
+        try coalesced.ensureTotalCapacity(self.allocator, raw_reads.items.len);
+        const max_coalesce: usize = 16 << 20;
+        for (raw_reads.items) |r| {
+            if (r.dst.len == 0) continue;
+            if (coalesced.items.len > 0) {
+                const prev = &coalesced.items[coalesced.items.len - 1];
+                if (prev.fd == r.fd and
+                    prev.offset + prev.dst.len == r.offset and
+                    @intFromPtr(prev.dst.ptr) + prev.dst.len == @intFromPtr(r.dst.ptr) and
+                    prev.dst.len + r.dst.len <= max_coalesce)
+                {
+                    prev.dst = prev.dst.ptr[0 .. prev.dst.len + r.dst.len];
+                    continue;
+                }
+            }
+            try coalesced.append(self.allocator, r);
+        }
+
+        var fill_clock = Clock.init();
+        if (coalesced.items.len > 0) {
+            wrote_cache = true;
+            const workers = if (self.io_pool) |p| p.opts.workers else FILL_WORKERS;
+            io_mod.preadBatch(self.allocator, coalesced.items, workers) catch |e| {
+                return if (e == error.FillShortRead) error.FillSpanPastEof else e;
+            };
+        }
+        const elapsed = fill_clock.lap();
+
+        for (work[0..prepared_layers]) |*w| {
+            if (w.scale_reads.items.len > 0) try self.keepRead(w.layer_index, w.scale_reads.items);
+        }
+        for (work[0..prepared_layers]) |*w| {
+            if (!w.has_misses) continue;
+            const layer = &self.layers[w.layer_index];
+            for (w.resolutions[0..w.resolved], 0..) |resolution, g| {
+                for (resolution.bindings) |binding| {
+                    if (!binding.hit) w.gl.caches[g].markReady(binding.slot.?);
+                }
+            }
+            for (layer.slabs[0..w.begun]) |*operand| {
+                const slab = operand.slab orelse return error.MissingExpertSlab;
+                _ = try slab.publish();
+                try slab.retire();
+            }
+            w.begun = 0;
+        }
+        committed = true;
+        self.fill_experts_total += total_misses;
+        self.fill_bytes_total += total_bytes;
+        self.fill_ns_total += elapsed;
+        return true;
+    }
+
+    fn asyncBulkMain(self: *Engine, task: *AsyncTask) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        const before = self.fill_bytes_total;
+        const mode: BulkMode = switch (task.kind) {
+            .resident => .resident,
+            .warm_cache => .warm_cache,
+        };
+        task.handled = self.bulkFillGrouped(mode) catch |e| {
+            task.err = e;
+            return;
+        };
+        task.bytes = self.fill_bytes_total - before;
+        task.elapsed_ns = @intCast(@max(@as(i96, 0), t0.untilNow(io, .awake).nanoseconds));
+    }
+
+    /// Starts `bulkFillGrouped(.warm_cache)` on a background thread so SSD reads overlap with pipeline preload,
+    /// model init, and vision encoder init. Joined by `warmCache()`, `awaitAsyncWarmCache()`, or `deinit()`.
+    pub fn startAsyncWarmCache(self: *Engine) !void {
+        if (self.plan.resident or self.async_task != null or self.warm_done_async or self.warmSlotsPerLayer() == 0 or !self.canBulkFillGrouped()) return;
+        const task = try self.allocator.create(AsyncTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{ .thread = undefined, .kind = .warm_cache };
+        task.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, asyncBulkMain, .{ self, task });
+        self.async_task = task;
+    }
+
+    pub fn awaitAsyncWarmCache(self: *Engine) !void {
+        const task = self.async_task orelse return;
+        if (task.kind != .warm_cache) return;
+        task.thread.join();
+        const err = task.err;
+        const handled = task.handled;
+        self.allocator.destroy(task);
+        self.async_task = null;
+        if (err) |e| return e;
+        if (handled) self.warm_done_async = true;
+    }
+
+    /// Starts `bulkFillGrouped(.resident)` on a background thread when the engine was created with
+    /// `defer_resident_load = true`. Joined by `awaitAsyncResidentLoad()` (which builds the GPU resident maps on the
+    /// inference thread) or `deinit()`.
+    pub fn startAsyncResidentLoad(self: *Engine) !void {
+        if (!self.resident_pending or self.async_task != null or !self.canBulkFillGrouped()) return;
+        const task = try self.allocator.create(AsyncTask);
+        errdefer self.allocator.destroy(task);
+        task.* = .{ .thread = undefined, .kind = .resident };
+        task.thread = try std.Thread.spawn(.{ .stack_size = 512 * 1024 }, asyncBulkMain, .{ self, task });
+        self.async_task = task;
+    }
+
+    pub fn awaitAsyncResidentLoad(self: *Engine) !void {
+        if (self.async_task) |task| if (task.kind == .resident) {
+            task.thread.join();
+            const err = task.err;
+            const handled = task.handled;
+            const bytes = task.bytes;
+            const elapsed_ns = task.elapsed_ns;
+            self.allocator.destroy(task);
+            self.async_task = null;
+            self.resident_pending = false;
+            if (err) |e| return e;
+            if (handled) {
+                try self.finishResidentMaps(bytes, elapsed_ns);
+                return;
+            }
+            return self.loadResident();
+        };
+        if (!self.resident_pending) return;
+        self.resident_pending = false;
+        try self.loadResident();
+    }
+
     pub fn warmCache(self: *Engine) !void {
+        try self.awaitAsyncWarmCache();
+        if (self.warm_done_async) {
+            self.warm_done_async = false;
+            return;
+        }
         self.prefetchQuiesce();
         const warm_count = self.warmSlotsPerLayer();
         if (warm_count == 0) return;
+        self.drainPendingReaders();
+        if (try self.bulkFillGrouped(.warm_cache)) return;
 
         const occurrences = try self.allocator.alloc(u16, warm_count);
         defer self.allocator.free(occurrences);
@@ -3244,13 +3596,28 @@ pub const Engine = struct {
         self.grouped_union = &.{};
     }
 
+    fn finishResidentMaps(self: *Engine, bytes: u64, elapsed_ns: u64) !void {
+        for (self.layers, 0..) |*layer, li| {
+            if (layer.grouped == null) continue;
+            try self.buildResidentMap(@intCast(li));
+        }
+        const ms: u64 = elapsed_ns / std.time.ns_per_ms;
+        log.info("[expert-stream] resident: read {d:.3} GB of routed experts in {d} ms; routes read no SSD\n", .{ @as(f64, @floatFromInt(bytes)) / 1e9, ms });
+    }
+
     /// Reads every routed expert of a resident pack into its pool and maps each expert to its slot.
     fn loadResident(self: *Engine) !void {
         const io = std.Io.Threaded.global_single_threaded.io();
         const t0 = std.Io.Timestamp.now(io, .awake);
+        const before = self.fill_bytes_total;
+        self.drainPendingReaders();
+        if (try self.bulkFillGrouped(.resident)) {
+            const elapsed_ns: u64 = @intCast(@max(@as(i96, 0), t0.untilNow(io, .awake).nanoseconds));
+            try self.finishResidentMaps(self.fill_bytes_total - before, elapsed_ns);
+            return;
+        }
         const all = try self.allocator.alloc(u16, self.geometry.kept());
         defer self.allocator.free(all);
-        const before = self.fill_bytes_total;
         for (self.layers, 0..) |*layer, li| {
             if (layer.grouped == null) continue;
             const stats = layer.stats;
@@ -6324,4 +6691,113 @@ test "expert stream: a slab made on the engine's stream is the engine's buffer o
     try std.testing.expectEqual(calls, mlx.engine.mlxCalls());
     try std.testing.expectEqual(timeouts, slab_release_timeouts.load(.monotonic));
     try std.testing.expectEqual(mapped, mlx.engine.mappedTotal());
+}
+
+fn writeGroupedExl3Fixture(dir: std.Io.Dir) !void {
+    const a = std.testing.allocator;
+    var header: std.ArrayList(u8) = .empty;
+    defer header.deinit(a);
+    var index: std.ArrayList(u8) = .empty;
+    defer index.deinit(a);
+    try header.append(a, '{');
+    try index.appendSlice(a, "{\"weight_map\":{");
+    var offset: usize = 0;
+    // 2 active layers (layers 1..2), 2 rate groups per layer (group 0: 2 experts @ n=32, group 1: 2 experts @ n=48).
+    const group_n = [_]usize{ 32, 48 };
+    for (1..3) |layer| {
+        for (0..2) |g| {
+            for (0..9) |ci| {
+                const c: quant.Component = @fromBackingInt(@intCast(ci));
+                const weight = ci % 3 == 0;
+                const n = group_n[g];
+                const bytes: usize = 2 * (if (weight) 8 * 8 * n * 2 else 128 * 2);
+                const key = try std.fmt.allocPrint(a, "model.layers.{d}.mlp.switch_mlp.{s}_proj.g{d}.{s}", .{
+                    layer,
+                    @tagName(quant.projectionOf(c)),
+                    g,
+                    if (weight) "trellis" else if (ci % 3 == 1) "suh" else "svh",
+                });
+                defer a.free(key);
+                const shape = if (weight) try std.fmt.allocPrint(a, "2,8,8,{d}", .{n}) else try a.dupe(u8, "2,128");
+                defer a.free(shape);
+                const sep = if (offset == 0) "" else ",";
+                const item = try std.fmt.allocPrint(a, "{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":[{s}],\"data_offsets\":[{d},{d}]}}", .{
+                    sep,
+                    key,
+                    if (weight) "U16" else "F16",
+                    shape,
+                    offset,
+                    offset + bytes,
+                });
+                defer a.free(item);
+                try header.appendSlice(a, item);
+                const entry = try std.fmt.allocPrint(a, "{s}\"{s}\":\"grouped.safetensors\"", .{ sep, key });
+                defer a.free(entry);
+                try index.appendSlice(a, entry);
+                offset += bytes;
+            }
+        }
+    }
+    try header.append(a, '}');
+    try index.appendSlice(a, "}}");
+    const file = try a.alloc(u8, 8 + header.items.len + offset);
+    defer a.free(file);
+    std.mem.writeInt(u64, file[0..8], header.items.len, .little);
+    @memcpy(file[8..][0..header.items.len], header.items);
+    for (file[8 + header.items.len ..], 0..) |*byte, i| byte.* = @truncate((i *% 37) +% (i / 19) +% 7);
+    try dir.writeFile(std.testing.io, .{ .sub_path = "grouped.safetensors", .data = file });
+    try dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+}
+
+test "expert stream bulkFillGrouped: resident and async warm fill byte-identical grouped slabs with zero bounce" {
+    const t = std.testing;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeGroupedExl3Fixture(tmp.dir);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = buf[0..try tmp.dir.realPath(t.io, &buf)];
+    const source_file = try tmp.dir.readFileAlloc(t.io, "grouped.safetensors", t.allocator, .limited(1 << 20));
+    defer t.allocator.free(source_file);
+
+    const geometry: Geometry = .{ .layers = 3, .experts = 4, .hidden = 128, .intermediate = 128, .first_moe_layer = 1, .exl3_n = 48 };
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    // 1. Deferred async resident load via bulkFillGrouped.
+    var eng = try Engine.initWithOptions(t.allocator, path, geometry, 64 << 20, s, .{ .layout = .exl3_k4, .defer_resident_load = true });
+    defer eng.deinit();
+    try t.expect(eng.plan.resident);
+    try t.expect(eng.canBulkFillGrouped());
+    try t.expect(!eng.allResident());
+    try eng.startAsyncResidentLoad();
+    try eng.awaitAsyncResidentLoad();
+    try t.expect(eng.allResident());
+    try t.expectEqual(@as(u64, 0), eng.fillStats().bytes_bounced);
+    for ([_]u16{ 1, 2 }) |li| {
+        const layer = &eng.layers[li];
+        const gl = layer.grouped.?;
+        for (0..4) |e| {
+            const g = gl.groups.groupOf(@intCast(e));
+            const local = gl.caches[g].expert_to_slot[e - gl.groups.base[g]];
+            try t.expect(local >= 0 and gl.caches[g].ready[@intCast(local)]);
+            for (0..quant.component_count) |ci| {
+                const span = eng.store.spanAt(li, @intCast(e), ci);
+                const got = gl.cacheRegion(&layer.slabs[ci], g, ci, @intCast(local));
+                const want = source_file[@intCast(span.offset)..][0..@intCast(span.len)];
+                try t.expectEqualSlices(u8, want, got);
+            }
+        }
+    }
+
+    // 2. Async warmCache on a streamed budget with keepScales enabled.
+    const streamed_budget = eng.plan.cache_bytes / 2;
+    var streamed = try Engine.initWithOptions(t.allocator, path, geometry, streamed_budget, s, .{ .layout = .exl3_k4 });
+    defer streamed.deinit();
+    try t.expect(!streamed.plan.resident);
+    try streamed.keepScales();
+    try streamed.startAsyncWarmCache();
+    try streamed.warmCache();
+    try t.expect(streamed.fill_experts_total > 0);
+    try t.expect(streamed.kept.?.read > 0);
+    try t.expectEqual(@as(u64, 0), streamed.fillStats().bytes_bounced);
 }

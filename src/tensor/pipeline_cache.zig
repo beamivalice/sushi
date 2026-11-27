@@ -68,6 +68,7 @@ pub fn writeArchive(io: std.Io, recipes: []const Recipe, path: [:0]const u8) !us
 pub const Job = struct {
     recipes: []const Recipe,
     pipelines: []?metal.Pipeline,
+    skip: []bool,
     lib: ?metal.Library,
     archive: ?Archive = null,
     next: std.atomic.Value(usize) = .init(0),
@@ -96,7 +97,7 @@ pub const Job = struct {
         while (true) {
             const i = job.next.fetchAdd(1, .monotonic);
             if (i >= job.recipes.len) return;
-            if (job.recipes[i].kind == .marker) continue;
+            if (job.recipes[i].kind == .marker or job.skip[i]) continue;
             job.pipelines[i] = job.make(dev, job.recipes[i]) catch {
                 job.fail(job.recipes[i].function);
                 continue;
@@ -130,24 +131,37 @@ pub fn start(recipes: []const Recipe, threads: usize) !*Job {
 }
 
 /// `start` backed by an optional `MTLBinaryArchive` (`archive` must outlive `finish`).
+/// Recipes already loaded in `stock` are skipped before spawning workers so in-process reloads avoid duplicate Metal work.
 pub fn startWithArchive(recipes: []const Recipe, threads: usize, archive: ?Archive) !*Job {
     const dev = try metal.device();
+    const skip = try gpa.alloc(bool, recipes.len);
+    errdefer gpa.free(skip);
     var needs_lib = false;
-    for (recipes) |r| needs_lib = needs_lib or (r.kind == .stock or r.kind == .stock_flags);
+    var to_make: usize = 0;
+    for (recipes, 0..) |r, i| {
+        const is_stock = r.kind == .stock or r.kind == .stock_flags;
+        const already = is_stock and stock.has(r.key);
+        skip[i] = already;
+        if (!already and r.kind != .marker) {
+            to_make += 1;
+            if (is_stock) needs_lib = true;
+        }
+    }
     const job = try gpa.create(Job);
     errdefer gpa.destroy(job);
     const results = try gpa.alloc(?metal.Pipeline, recipes.len);
     errdefer gpa.free(results);
     @memset(results, null);
-    const handles = try gpa.alloc(std.Thread, @max(1, @min(threads, recipes.len)));
+    const worker_n = if (to_make == 0) 0 else @max(1, @min(threads, to_make));
+    const handles = try gpa.alloc(std.Thread, worker_n);
     errdefer gpa.free(handles);
-    job.* = .{ .recipes = recipes, .pipelines = results, .lib = if (needs_lib) try stock.lib(dev) else null, .archive = archive, .handles = handles };
+    job.* = .{ .recipes = recipes, .pipelines = results, .skip = skip, .lib = if (needs_lib) try stock.lib(dev) else null, .archive = archive, .handles = handles };
     for (handles) |*h| {
         h.* = std.Thread.spawn(.{}, Job.work, .{job}) catch break;
         job.started += 1;
     }
     // Workers that could not start leave their share to the ones that did; with none, this thread does it all.
-    if (job.started == 0) Job.work(job);
+    if (to_make > 0 and job.started == 0) Job.work(job);
     return job;
 }
 
@@ -157,12 +171,17 @@ pub fn finish(job: *Job) Report {
     defer {
         gpa.free(job.handles);
         gpa.free(job.pipelines);
+        gpa.free(job.skip);
         gpa.destroy(job);
     }
     var report: Report = .{ .failed = job.failed.load(.acquire) };
     @memcpy(report.first_error[0..job.first_error_len], job.first_error[0..job.first_error_len]);
     report.first_error_len = job.first_error_len;
-    for (job.recipes, job.pipelines) |r, made| {
+    for (job.recipes, job.pipelines, job.skip) |r, made, skipped| {
+        if (skipped) {
+            report.made += 1;
+            continue;
+        }
         const p = made orelse {
             if (r.kind == .marker) registry.putMarker(r) catch {
                 report.failed += 1;
@@ -181,6 +200,16 @@ pub fn finish(job: *Job) Report {
         report.made += 1;
     }
     return report;
+}
+
+/// Cancels/joins a running job without installing its pipelines (for error unwind paths).
+pub fn abort(job: *Job) void {
+    for (job.handles[0..job.started]) |t| t.join();
+    for (job.pipelines) |made| if (made) |p| p.release();
+    gpa.free(job.handles);
+    gpa.free(job.pipelines);
+    gpa.free(job.skip);
+    gpa.destroy(job);
 }
 
 // ── Tests ──

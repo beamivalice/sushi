@@ -290,6 +290,9 @@ pub const Model = struct {
     /// plans.
     ids_fixed: ?Arr = null,
     logits_turn: u1 = 0,
+    /// Temporary `[in, in]` BF16 identity matrix reused across layers during `initWith` for `decodeDense`; always freed before init returns.
+    decode_eye: ?Arr = null,
+    decode_eye_dim: usize = 0,
     /// The one-byte array a stored point's absent arrays share (`hy4_prefix.pack`), made at load.
     placeholder: ?Arr = null,
 
@@ -452,6 +455,7 @@ pub const Model = struct {
         m.lm_head_stq = try m.bankOf(weights, "lm_head");
         if (m.lm_head_stq == null) m.lm_head = try get(weights, "lm_head.weight", .{});
         errdefer m.freeEngram();
+        defer m.freeDecodeEye();
         for (0..config.layers) |l| m.layers[l] = try m.resolveLayer(weights, l);
         if (config.engram.n > 0) try m.initEngram(weights, src.dir);
         if (fwd.hc_kernels_on and mlx.streamIsGpu(s)) {
@@ -500,7 +504,15 @@ pub const Model = struct {
         try hc.probeNoted(self.s, &census);
     }
 
+    /// The identity a load's dense decodes share; a loader that decodes (`initWith`, the drafter's) frees it when done.
+    pub fn freeDecodeEye(self: *Model) void {
+        if (self.decode_eye) |eye| _ = mlx.mlx_array_free(eye);
+        self.decode_eye = null;
+        self.decode_eye_dim = 0;
+    }
+
     pub fn deinit(self: *Model) void {
+        self.freeDecodeEye();
         if (self.recorded) |p| {
             p.deinit(self.gpa);
             self.recorded = null;
@@ -575,7 +587,15 @@ pub const Model = struct {
             views.deinit(self.gpa);
         }
         if (try hy4_stq.load(w, base, self.quant.trunk, &views, self.gpa, self.s)) |b| {
-            const dense = try self.keepStq(try hy4_stq.decodeDense(self.gpa, self.s, b));
+            const in_dim: usize = @intCast(b.inDim());
+            if (self.decode_eye == null or self.decode_eye_dim != in_dim) {
+                if (self.decode_eye) |old| _ = mlx.mlx_array_free(old);
+                self.decode_eye = null;
+                self.decode_eye_dim = 0;
+                self.decode_eye = try hy4_stq.makeIdentityBf16(self.gpa, self.s, in_dim);
+                self.decode_eye_dim = in_dim;
+            }
+            const dense = try self.keepStq(try hy4_stq.decodeDenseWithEye(self.s, b, self.decode_eye.?));
             self.stq_decoded_bytes += mlx.mlx_array_size(dense) * mlx.mlx_array_itemsize(dense);
             @import("../trunk_stq.zig").drop(w, base);
             return dense;
@@ -3089,8 +3109,24 @@ pub const Model = struct {
         const exact = mlx.engine.exactF32();
         defer exact.end();
         // The gate reads the attention norm's rows in f32, W_o the gated rows narrow (`fwd.linearInput`).
+        // Deduplicate by `(in, out, packed_n, dtype)` so identical geometries across 64 layers warm once instead of 64x.
+        const TailKey = struct { in_dim: c_int, out_dim: c_int, packed_n: c_int, dtype: mlx.mlx_dtype };
+        var seen_tails: [64]TailKey = undefined;
+        var seen_tail_n: usize = 0;
         for (self.layers[0..self.config.layers]) |*layer| for ([_]struct { fwd.Lin, mlx.mlx_dtype }{ .{ layer.attn.gate, .float32 }, .{ layer.attn.o, .bfloat16 } }) |pair| {
             const bank = pair[0].stq orelse continue;
+            const sh = mlx.getShape(bank.w);
+            const key: TailKey = .{ .in_dim = bank.inDim(), .out_dim = bank.outDim(), .packed_n = if (sh.len > 0) sh[sh.len - 1] else 0, .dtype = pair[1] };
+            var dup = false;
+            for (seen_tails[0..seen_tail_n]) |s| if (std.meta.eql(s, key)) {
+                dup = true;
+                break;
+            };
+            if (dup) continue;
+            if (seen_tail_n < seen_tails.len) {
+                seen_tails[seen_tail_n] = key;
+                seen_tail_n += 1;
+            }
             var rows: c_int = 1;
             while (!exl3.trunk.gemmRows(@intCast(rows), true)) : (rows += 1) {
                 var o: Ops = .{ .s = self.s };
@@ -3104,6 +3140,9 @@ pub const Model = struct {
         if (mlx.engine.isStream(self.s)) {
             const hy4_chain = @import("hy4_chain.zig");
             const hy4_absorb = @import("hy4_absorb.zig");
+            const GatedKey = struct { h: c_int, v: c_int, dtype: mlx.mlx_dtype };
+            var seen_gated: [16]GatedKey = undefined;
+            var seen_gated_n: usize = 0;
             var warmed_v: [2]bool = .{ false, false };
             for (self.layers[0..self.config.layers]) |*layer| {
                 const kind: usize = @intFromBool(layer.indexer != null);
@@ -3125,6 +3164,17 @@ pub const Model = struct {
                 const h = layer.geometry.heads;
                 const v = layer.geometry.v;
                 if (@rem(h * v, 128) != 0) continue;
+                const gkey: GatedKey = .{ .h = h, .v = v, .dtype = mlx.mlx_array_dtype(bank.suh) };
+                var gdup = false;
+                for (seen_gated[0..seen_gated_n]) |sg| if (std.meta.eql(sg, gkey)) {
+                    gdup = true;
+                    break;
+                };
+                if (gdup) continue;
+                if (seen_gated_n < seen_gated.len) {
+                    seen_gated[seen_gated_n] = gkey;
+                    seen_gated_n += 1;
+                }
                 var o: Ops = .{ .s = self.s };
                 defer o.deinit();
                 const u = try o.slot();

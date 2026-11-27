@@ -24,7 +24,6 @@ json-unchecked-shape src/model.zig:loadSafetensorsFileMode SafetensorsHeader.rea
 json-unchecked-shape src/weights_where.zig:loadWhere SafetensorsHeader.read refuses a header that is not an object
 json-unchecked-shape src/engram.zig:inShard SafetensorsHeader.read refuses a header that is not an object
 json-unchecked-shape src/repack.zig:read SafetensorsHeader.read refuses a header that is not an object
-json-unchecked-shape src/dsv41/dsv41_source.zig:sumBytes SafetensorsHeader.read refuses a header that is not an object
 json-unchecked-shape src/expert_io.zig:shardOf ShardIndex.open refuses an index whose weight_map is not an object
 json-unchecked-shape src/expert_store.zig:checkTileStamp cacheSourceHeader refuses a header that is not an object
 json-unchecked-shape src/expert_store.zig:cachedTensorRegion cacheSourceHeader refuses a header that is not an object

@@ -235,6 +235,7 @@ fn missed(m: *Model, mix: Mix, miss: ?plan.binder.Miss) error{PlanMiss} {
         .next_load => log.warn("[plan] the missed sample needs more arena than the load holds: the next load plans it\n", .{}),
     }
     if (p.cache) |*c| c.keep(p.book.gpa, shapeOf(mix)) catch |e| log.warn("[plan] the missed sample was not kept in {s} ({t}): a restart misses it again\n", .{ c.name(), e });
+    if (learned == .swapped) @import("hy4_plan.zig").keepLearned(p);
     return error.PlanMiss;
 }
 
@@ -393,7 +394,7 @@ fn recordPass(m: *Model, st: *State, gpa: std.mem.Allocator, probe: Probe, fill:
     return rec.end();
 }
 
-fn makeTokens(m: *Model, st: *State) !void {
+pub fn makeTokens(m: *Model, st: *State) !void {
     freeTokens(&st.tokens);
     st.turn = 0;
     try fillTokens(st, m.s);

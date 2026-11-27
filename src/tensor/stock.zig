@@ -76,10 +76,16 @@ pub fn preload(recipe: manifest.Recipe, pipeline: metal.Pipeline) Error!bool {
     return registry.putStock(recipe, pipeline) catch error.OutOfMemory;
 }
 
+/// True when `name` is already loaded in `pipelines` or waiting in preloaded stock.
+pub fn has(name: []const u8) bool {
+    return pipelines.contains(name) or registry.inStock(name);
+}
+
 /// Tests only: `kernel` meets `name` next as a new process does, whatever an earlier test built. A holder of the
 /// pipeline keeps it.
 pub fn forget(name: []const u8) void {
     _ = pipelines.remove(name);
+    registry.forgetStock(name);
 }
 
 /// The pipeline of the stock kernel `name`, built once.

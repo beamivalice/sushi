@@ -89,8 +89,12 @@ pub fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out
         if (parsed) |p| {
             defer p.deinit();
             if (p.value == .object) if (p.value.object.get("weight_map")) |wm| if (wm == .object) {
+                var seen: std.StringHashMapUnmanaged(void) = .empty;
+                defer seen.deinit(allocator);
                 for (wm.object.values()) |v| {
-                    if (v != .string or hasName(out.items, v.string)) continue;
+                    if (v != .string) continue;
+                    const gop = try seen.getOrPut(allocator, v.string);
+                    if (gop.found_existing) continue;
                     _ = dir.statFile(io, v.string, .{}) catch continue;
                     try out.ensureUnusedCapacity(allocator, 1);
                     out.appendAssumeCapacity(try allocator.dupe(u8, v.string));
@@ -119,11 +123,6 @@ pub fn shardNames(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, out
             out.appendAssumeCapacity(try std.fmt.allocPrint(allocator, "{s}/{s}", .{ entry.name, se.name }));
         }
     }
-}
-
-fn hasName(names: []const []u8, name: []const u8) bool {
-    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
 }
 
 const Stamp = struct { value: ?[]u8 };

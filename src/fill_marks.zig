@@ -2,10 +2,11 @@
 //! read bytes the host has not finished.
 const std = @import("std");
 
-const max_marks = 256;
+const max_marks = 2048;
 var mu: std.Io.Mutex = .init;
 var begin: [max_marks]usize = @splat(0);
 var end: [max_marks]usize = @splat(0);
+var count: usize = 0;
 /// Nonzero while any fill is in flight: the commit of a pass costs this one compare when none is.
 pub var live: std.atomic.Value(u32) = .init(0);
 
@@ -19,23 +20,24 @@ fn lock() std.Io {
 pub fn add(base: usize, len: usize) void {
     const io = lock();
     defer mu.unlock(io);
-    for (&begin, &end) |*b, *e| {
-        if (b.* != 0) continue;
-        b.* = base;
-        e.* = base + len;
-        _ = live.fetchAdd(1, .release);
-        return;
-    }
-    @panic("fill_marks: too many fills in flight");
+    if (count == max_marks) @panic("fill_marks: too many fills in flight");
+    begin[count] = base;
+    end[count] = base + len;
+    count += 1;
+    _ = live.fetchAdd(1, .release);
 }
 
 /// The fill that began at `base` is over.
 pub fn remove(base: usize) void {
     const io = lock();
     defer mu.unlock(io);
-    for (&begin) |*b| {
-        if (b.* != base) continue;
-        b.* = 0;
+    for (0..count) |i| {
+        if (begin[i] != base) continue;
+        count -= 1;
+        begin[i] = begin[count];
+        end[i] = end[count];
+        begin[count] = 0;
+        end[count] = 0;
         _ = live.fetchSub(1, .release);
         return;
     }
@@ -62,12 +64,9 @@ pub fn snapshot() Snapshot {
     const io = lock();
     defer mu.unlock(io);
     var out: Snapshot = .{};
-    for (begin, end) |b, e| {
-        if (b == 0) continue;
-        out.begin[out.n] = b;
-        out.end[out.n] = e;
-        out.n += 1;
-    }
+    @memcpy(out.begin[0..count], begin[0..count]);
+    @memcpy(out.end[0..count], end[0..count]);
+    out.n = count;
     return out;
 }
 

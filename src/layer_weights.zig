@@ -468,7 +468,6 @@ pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: boo
             var flat = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(flat);
             try mlx.check(mlx.mlx_contiguous(&flat, out.inject_w, false, s));
-            try mlx.check(mlx.mlx_array_eval(flat));
             try owned_bf16.append(allocator, flat);
             out.inject_flat = flat;
         }
@@ -477,7 +476,7 @@ pub fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: boo
 }
 
 /// Multiply a projection by a scalar: scales+biases of an affine weight, or
-/// the dense weight itself. Replacement arrays are owned (and evaluated).
+/// the dense weight itself. Replacement arrays are appended to `owned_bf16` and evaluated in the caller's batch eval.
 fn scaleTriple(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, k: mlx.mlx_array, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
     // The scalar must carry the TARGET's dtype: an f32 scalar promotes the
     // bf16 weight/scales, and a widened inject gate then widened the whole
@@ -490,7 +489,6 @@ fn scaleTriple(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, k: mlx
             var out = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(out);
             try mlx.check(mlx.mlx_multiply(&out, a, kt, st));
-            try mlx.check(mlx.mlx_array_eval(out));
             return out;
         }
     }.f;

@@ -213,4 +213,5 @@ test {
     _ = @import("arch/media.zig");
     _ = @import("arch/offline.zig");
     _ = @import("arch/prefix.zig");
+    _ = @import("arch/cooler_pipelines.zig");
 }

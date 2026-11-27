@@ -35,6 +35,11 @@ pub fn ladderForTest(grant: usize) void {
     grant_for_test = grant;
 }
 
+/// The settled threadgroup size for sampled draws (after `settle`).
+pub fn threadsPerGroup() u32 {
+    return ladder.threads();
+}
+
 /// One real draw of a row of `vocab` zeros as `dtype` on `s`, so the ladder takes the rung the GPU grants before a dry
 /// recording reads it: a recording keeps the rung it met, and a refused one makes the served draw miss its plan.
 pub fn settle(vocab: usize, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !void {

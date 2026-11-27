@@ -416,6 +416,13 @@ pub fn touch() void {
     (metal.device() catch return).touch();
 }
 
+/// Like `touch`, waiting for Metal to finish wiring the committed residency sets before returning.
+pub fn touchSync() void {
+    const s = &(state orelse return);
+    if (s.stats.mapped_bytes == 0) return metal.commitResident();
+    (metal.device() catch return).touchSync();
+}
+
 /// Which high-water of the pool's bytes in use: the one the process's peak reading resets, or a forward phase's.
 pub const Peak = enum { process, phase };
 var pool_peaks: [2]std.atomic.Value(u64) = .{ .init(0), .init(0) };

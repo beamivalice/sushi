@@ -10,12 +10,42 @@ const Recipe = manifest.Recipe;
 var gpa: std.mem.Allocator = std.heap.c_allocator;
 
 var recorded: std.ArrayList(Recipe) = .empty;
+/// Fast-path hash index over `recorded` so `has()` is O(1) instead of O(N^2) when loading 1k-2k recipes.
+/// Maps `recipeHash(r) -> index` into `recorded` (collisions fall back to a scan).
+var recorded_index: std.AutoHashMapUnmanaged(u64, usize) = .empty;
+/// Incremented whenever a new recipe or marker is appended to `recorded`, so warm loads can skip redundant rewrites.
+pub var generation: u64 = 0;
 
 /// Recipes that could not be kept: a manifest written without them would be short, so none is written.
 pub var lost: u32 = 0;
 
 pub fn recipes() []const Recipe {
     return recorded.items;
+}
+
+fn recipeHash(r: Recipe) u64 {
+    var h = std.hash.Wyhash.init(@intFromEnum(r.kind));
+    h.update(r.function);
+    h.update(&.{0});
+    h.update(r.key);
+    h.update(&.{0});
+    h.update(r.text);
+    for (r.flags) |f| {
+        std.hash.autoHash(&h, f.index);
+        std.hash.autoHash(&h, f.value);
+    }
+    for (r.ints) |c| {
+        std.hash.autoHash(&h, c.index);
+        std.hash.autoHash(&h, c.value);
+    }
+    return h.final();
+}
+
+fn rebuildIndex() void {
+    recorded_index.clearRetainingCapacity();
+    for (recorded.items, 0..) |r, i| {
+        recorded_index.put(gpa, recipeHash(r), i) catch {};
+    }
 }
 
 fn dupeRecipe(r: Recipe) !Recipe {
@@ -39,20 +69,32 @@ fn freeRecipe(r: Recipe) void {
     gpa.free(r.ints);
 }
 
-fn has(r: Recipe) bool {
+fn has(r: Recipe, h: u64) bool {
+    if (recorded_index.get(h)) |idx| {
+        if (idx < recorded.items.len and recorded.items[idx].eql(r)) return true;
+        for (recorded.items) |x| if (x.eql(r)) return true;
+        return false;
+    }
+    if (recorded_index.count() == recorded.items.len) return false;
     for (recorded.items) |x| if (x.eql(r)) return true;
     return false;
 }
 
 pub fn record(r: Recipe) void {
-    if (has(r)) return;
+    const h = recipeHash(r);
+    if (has(r, h)) return;
     const owned = dupeRecipe(r) catch {
         lost += 1;
         return;
     };
+    const idx = recorded.items.len;
     recorded.append(gpa, owned) catch {
+        freeRecipe(owned);
         lost += 1;
+        return;
     };
+    if (!recorded_index.contains(h)) recorded_index.put(gpa, h, idx) catch {};
+    generation += 1;
 }
 
 /// Made ahead from a manifest, by its table key, with the recipe to record when it is first used.
@@ -68,6 +110,11 @@ pub fn putStock(r: Recipe, pipeline: metal.Pipeline) !bool {
 
 pub fn inStock(key: []const u8) bool {
     return stock.contains(key);
+}
+
+/// Tests only: remove a preloaded stock entry so a test can re-exercise preload from a manifest.
+pub fn forgetStock(key: []const u8) void {
+    if (stock.fetchRemove(key)) |kv| freeRecipe(kv.value.recipe);
 }
 
 pub fn takeStock(key: []const u8) ?metal.Pipeline {
@@ -102,9 +149,14 @@ pub fn manifestClosed() void {
 /// this load's markers only; the early markers are this load's.
 pub fn settleMarkers(trusted: bool) void {
     var i: usize = 0;
+    var removed_any = false;
     while (i < recorded.items.len) {
-        if (recorded.items[i].kind == .marker) freeRecipe(recorded.orderedRemove(i)) else i += 1;
+        if (recorded.items[i].kind == .marker) {
+            freeRecipe(recorded.orderedRemove(i));
+            removed_any = true;
+        } else i += 1;
     }
+    if (removed_any) rebuildIndex();
     for (accepted_markers.items) |m| freeRecipe(m);
     accepted_markers.clearRetainingCapacity();
     if (trusted) {
@@ -144,6 +196,8 @@ pub fn recordMarker(function: []const u8, key: []const u8) void {
 pub fn resetForTest() void {
     comptime std.debug.assert(@import("builtin").is_test);
     recorded.clearRetainingCapacity();
+    recorded_index.clearRetainingCapacity();
+    generation = 0;
     lost = 0;
     pending_markers.clearRetainingCapacity();
     accepted_markers.clearRetainingCapacity();
@@ -208,6 +262,21 @@ test "pipeline registry: a marker one load's warm recorded is not among the reci
     var has_stock = false;
     for (recipes()) |r| has_stock = has_stock or r.kind == .stock;
     try testing.expect(has_stock);
+}
+
+test "pipeline registry: O(1) indexed record deduplicates identical recipes and advances generation only on additions" {
+    resetForTest();
+    defer resetForTest();
+    const gen0 = generation;
+    const r1: Recipe = .{ .kind = .stock, .function = "kern_alpha", .key = "kern_alpha" };
+    const r2: Recipe = .{ .kind = .stock, .function = "kern_beta", .key = "kern_beta" };
+    record(r1);
+    try testing.expectEqual(gen0 + 1, generation);
+    record(r1);
+    try testing.expectEqual(gen0 + 1, generation);
+    record(r2);
+    try testing.expectEqual(gen0 + 2, generation);
+    try testing.expectEqual(@as(usize, 2), recipes().len);
 }
 
 test "pipeline registry: a marker recorded while no manifest stood settled is the next settle's, and an unload closes the manifest" {

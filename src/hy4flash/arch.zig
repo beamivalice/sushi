@@ -89,7 +89,11 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
     var shell = try @import("../layer_weights.zig").initModuleShell(allocator, config, model_stream);
     errdefer shell.deinitTrunk();
     // A streamed load's banks stay on SSD; the shell owns the engine from here and frees it with itself.
-    if (config.expert_streaming) shell.expert_stream = try Trunk.newExpertEngine(allocator, &config, model_stream);
+    // On a resident pack, run the bulk SSD read asynchronously while `hy4_model.Model.initWith` and `Drafter.init` build.
+    if (config.expert_streaming) {
+        shell.expert_stream = try Trunk.newExpertEngineWithOptions(allocator, &config, model_stream, .{ .defer_resident_load = true });
+        if (shell.expert_stream.?.plan.resident) try shell.expert_stream.?.startAsyncResidentLoad();
+    }
     const st = &shell.arch_state.hy4flash;
     errdefer st.deinit(allocator);
     st.weights = try @import("hy4_state.zig").takeWeights(allocator, weights, &own);
@@ -116,6 +120,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
     }
     // DFly2, when the load keeps it: the shared drafter rounds over the model's own state (`hy4_drafter`).
     if (drafterOn(&config)) st.drafter = try @import("hy4_dfly.zig").Drafter.init(allocator, st.model.?, st.weights.?);
+    if (shell.expert_stream) |eng| try eng.awaitAsyncResidentLoad();
+    if (@import("../cooler_side.zig").onEngine(&config)) mlx.engine.touchSync();
     return shell;
 }
 
@@ -177,15 +183,51 @@ pub fn coolerPipelineScope(config: *const Config) [16]u8 {
     return d.hex();
 }
 
+/// What the arch warm's kernels follow beside the scope: the joined and KV widths, the drafter and its draft count, the
+/// tower, and each trunk bank's packed width (`rates`), which the span tails' kernels are made at.
+fn archWarmMarker(scope: [16]u8, config: *const Config, joined: usize, kv: @import("../kv_quant.zig").KVQuantConfig, rates: []const u64) [16]u8 {
+    const manifest = @import("../pipeline_manifest.zig");
+    var d: manifest.Digest = .{};
+    d.add("scope", &scope);
+    d.addInt("joined", joined);
+    d.addInt("kv scheme", @intFromEnum(kv.scheme));
+    d.addInt("kv bits", kv.bits);
+    d.addInt("kv group", kv.group_size);
+    d.addInt("dfly2", @intFromBool(drafterOn(config)));
+    d.addInt("drafts", if (config.hy4flash) |c| c.dfly.draft else 0);
+    d.addInt("vision", @intFromBool(config.keeps_tower));
+    for (rates) |r| d.addInt("trunk bank", r);
+    return d.hex();
+}
+
+/// Each layer's attention gate and W_o packed width, 0 for one stored dense: what `warmSpanTails` makes kernels at.
+fn trunkRates(m: *const @import("hy4_model.zig").Model, out: *[2 * config_file.max_layers]u64) []const u64 {
+    var n: usize = 0;
+    for (m.layers[0..m.config.layers]) |*layer| for ([_]@import("hy4_stq.zig").Lin{ layer.attn.gate, layer.attn.o }) |lin| {
+        const sh: []const c_int = if (lin.stq) |bank| mlx.getShape(bank.w) else &.{};
+        out[n] = if (sh.len > 0) @intCast(sh[sh.len - 1]) else 0;
+        n += 1;
+    };
+    return out[0..n];
+}
+
 pub fn warmup(xfm: Model) !void {
+    const joined = @import("hy4_plan.zig").joinedRows(&xfm.config);
+    const kv = @import("../bills.zig").configuredKvQuantFor(&xfm.config);
+    var rates_buf: [2 * config_file.max_layers]u64 = undefined;
+    const rates = if (xfm.arch_state.hy4flash.model) |m| trunkRates(m, &rates_buf) else &.{};
+    const marker: ?[16]u8 = if (@import("../arch/cooler_pipelines.zig").settledScope()) |scope| archWarmMarker(scope, &xfm.config, joined, kv, rates) else null;
+    if (marker) |mk| if (mlx.engine.pipeline_registry.takeMarker(&mk)) {
+        @import("../log.zig").info("[warm] hy4 arch warmup skipped: the manifest holds all arch and joined pipelines\n", .{});
+        return;
+    };
     if (xfm.arch_state.hy4flash.model) |m| try m.warmKernels();
     if (xfm.arch_state.hy4flash.model) |m| {
-        const joined = @import("hy4_plan.zig").joinedRows(&xfm.config);
-        const kv = @import("../bills.zig").configuredKvQuantFor(&xfm.config);
         try m.warmJoined(joined, kv);
         if (xfm.arch_state.hy4flash.drafter) |*d| try m.warmJoinedGroups(d, joined, kv);
     }
-    return xfm.warmupTrunk();
+    try xfm.warmupTrunk();
+    if (marker) |mk| mlx.engine.pipeline_registry.recordMarker("hy4 arch warm", &mk);
 }
 
 /// The load's plans recorded before its warm (D98, `hy4_plan.record`), its samples' with them, kept on the model
@@ -195,21 +237,36 @@ pub fn planRecord(xfm: Model, cache: ?@import("../tensor/plan/plan_book.zig").Ca
     const m = xfm.arch_state.hy4flash.model orelse return error.Hy4ModelMissing;
     if (m.plans != null or m.recorded != null) return;
     const bills = @import("../bills.zig");
+    const hy4_plan = @import("hy4_plan.zig");
     const dfly: ?*const @import("hy4_dfly.zig").Drafter = if (xfm.arch_state.hy4flash.drafter) |*d| d else null;
+    const v = m.config.vision;
+    const has_tower_weight = v != null and if (xfm.arch_state.hy4flash.loader_weights) |w| w.get("vit.embeddings.patch_embedding.weight") != null else false;
+    // The ledger holds the encode where the load recorded that it keeps the tower (`ModelConfig.keeps_tower`).
+    if (has_tower_weight != xfm.config.keeps_tower) return error.Hy4TowerUnbilled;
+    const max_patches: u64 = if (has_tower_weight) media.maxImagePatches(media.preproc(&xfm.config)) else 0;
+    const reach = bills.planReach(&xfm.config);
+    const kv = bills.configuredKvQuantFor(&xfm.config);
+    const joined = hy4_plan.joinedRows(&xfm.config);
+    const masks: @import("hy4_sample_plan.zig").Masks = .{ .suppress = xfm.suppress_mask };
+    const facts: hy4_plan.BookFacts = .{ .pack = try packKey(xfm), .reach = reach, .joined = joined, .kv = kv, .has_drafter = dfly != null, .keeps_tower = has_tower_weight, .max_patches = max_patches, .has_suppress = masks.suppress != null };
+    if (cache) |c| if (try hy4_plan.readCachedBook(m, xfm.allocator, c, facts, dfly, masks)) |cached| {
+        m.recorded = cached;
+        return;
+    };
+
     // A load that keeps the vision tower plans its encode beside its forwards, over the tower's own tensors.
     var tower: ?@import("hy4_vision.zig").Tower = null;
     defer if (tower) |*t| t.deinit();
-    const v = m.config.vision;
-    if (v != null) if (xfm.arch_state.hy4flash.loader_weights) |w| if (w.get("vit.embeddings.patch_embedding.weight") != null) {
-        tower = try @import("hy4_vision.zig").Tower.init(xfm.allocator, v.?, w);
-    };
-    // The ledger holds the encode where the load recorded that it keeps the tower (`ModelConfig.keeps_tower`).
-    if ((tower != null) != xfm.config.keeps_tower) return error.Hy4TowerUnbilled;
-    const encode: ?@import("hy4_plan.zig").Encode = if (tower) |*t| .{ .tower = t, .max_patches = media.maxImagePatches(media.preproc(&xfm.config)) } else null;
-    const p = try @import("hy4_plan.zig").record(m, xfm.allocator, bills.planReach(&xfm.config), dfly, bills.configuredKvQuantFor(&xfm.config), cache, encode, @import("hy4_plan.zig").joinedRows(&xfm.config));
+    if (has_tower_weight) {
+        tower = try @import("hy4_vision.zig").Tower.init(xfm.allocator, v.?, xfm.arch_state.hy4flash.loader_weights.?);
+    }
+    const encode: ?hy4_plan.Encode = if (tower) |*t| .{ .tower = t, .max_patches = max_patches } else null;
+    const p = try hy4_plan.record(m, xfm.allocator, reach, dfly, kv, cache, encode, joined);
     errdefer p.deinit(xfm.allocator);
-    p.pack = try packKey(xfm);
-    try @import("hy4_sample_plan.zig").record(m, p, .{ .suppress = xfm.suppress_mask });
+    p.pack = facts.pack;
+    try @import("hy4_sample_plan.zig").record(m, p, masks);
+    p.book_key = try hy4_plan.bookKey(m, facts);
+    hy4_plan.keepCachedBook(p) catch |e| @import("../log.zig").warn("[plan] the plan book was not kept for the next load: {s}\n", .{@errorName(e)});
     m.recorded = p;
 }
 
@@ -344,4 +401,19 @@ test "a model stamped as hy4flash is dispatched to hy4flash" {
     var xfm: Trunk = undefined;
     xfm.arch = tag;
     try std.testing.expectEqual(tag, std.meta.activeTag(registry.handleOf(&xfm)));
+}
+
+test "hy4 arch: the warm's marker follows the draft count and the trunk banks' rates, so a pack of the same scope that differs in either warms its own kernels" {
+    const a = std.testing.allocator;
+    const kv = @import("../kv_quant.zig").KVQuantConfig.engine_default;
+    const edited = try std.mem.replaceOwned(u8, a, config_file.release_file, "\"num_speculative_tokens\": 5", "\"num_speculative_tokens\": 3");
+    defer a.free(edited);
+    var marks: [2][16]u8 = undefined;
+    for ([_][]const u8{ config_file.release_file, edited }, &marks) |text, *mk| {
+        const c: Config = .{ .model_type = "hy_v4_flash", .hy4flash = try config_file.parseText(text), .stream_mtp_head = true };
+        mk.* = archWarmMarker(@splat('0'), &c, 4, kv, &.{ 96, 128 });
+    }
+    try std.testing.expect(!std.mem.eql(u8, &marks[0], &marks[1]));
+    const c: Config = .{ .model_type = "hy_v4_flash", .hy4flash = try config_file.parseText(config_file.release_file), .stream_mtp_head = true };
+    try std.testing.expect(!std.mem.eql(u8, &marks[0], &archWarmMarker(@splat('0'), &c, 4, kv, &.{ 96, 160 })));
 }

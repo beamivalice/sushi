@@ -205,6 +205,13 @@ pub fn loadSourceIndex(io: std.Io, allocator: Allocator, model_dir: []const u8) 
         .tensors = std.StringHashMap(TensorMeta).init(allocator),
         .stamps = std.StringHashMap(ShardStamp).init(allocator),
     };
+    // Group indexed tensor names by shard once (O(T)) instead of scanning the entire weight_map per shard (O(S * T)).
+    var by_file = std.StringHashMap(std.ArrayList([]const u8)).init(allocator);
+    defer {
+        var bfit = by_file.valueIterator();
+        while (bfit.next()) |lst| lst.deinit(allocator);
+        by_file.deinit();
+    }
     var it = weight_map_value.object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .string or entry.value_ptr.string.len == 0)
@@ -213,6 +220,9 @@ pub fn loadSourceIndex(io: std.Io, allocator: Allocator, model_dir: []const u8) 
             return error.AmbiguousSafetensorsIndex;
         try source.weight_map.put(entry.key_ptr.*, entry.value_ptr.string);
         try source.files.put(entry.value_ptr.string, {});
+        const gop = try by_file.getOrPut(entry.value_ptr.string);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        try gop.value_ptr.append(allocator, entry.key_ptr.*);
     }
 
     var files = source.files.iterator();
@@ -231,14 +241,13 @@ pub fn loadSourceIndex(io: std.Io, allocator: Allocator, model_dir: []const u8) 
         if (header_root != .object) return error.InvalidSafetensorsHeader;
         try source.stamps.put(filename, try readShardStamp(allocator, header_root.object));
 
-        // Index iteration is deliberate. It leaves all header-name slices in
+        // Only walk tensors indexed to this shard. Leaves header-name slices in
         // the short-lived arena and copies only shapes for indexed tensors.
-        var indexed = source.weight_map.iterator();
-        while (indexed.next()) |indexed_entry| {
-            if (!std.mem.eql(u8, indexed_entry.value_ptr.*, filename)) continue;
-            const tensor_value = header_root.object.get(indexed_entry.key_ptr.*) orelse
+        const shard_keys = if (by_file.get(filename)) |lst| lst.items else &[_][]const u8{};
+        for (shard_keys) |tensor_name| {
+            const tensor_value = header_root.object.get(tensor_name) orelse
                 continue;
-            if (source.tensors.contains(indexed_entry.key_ptr.*))
+            if (source.tensors.contains(tensor_name))
                 return error.AmbiguousSafetensorsTensor;
             const meta = try parseTensorMeta(
                 header_scratch,
@@ -247,7 +256,7 @@ pub fn loadSourceIndex(io: std.Io, allocator: Allocator, model_dir: []const u8) 
                 header.data_base,
             );
             const shape = try allocator.dupe(u64, meta.shape);
-            try source.tensors.put(indexed_entry.key_ptr.*, .{
+            try source.tensors.put(tensor_name, .{
                 .dtype = meta.dtype,
                 .shape = shape,
                 .data_start = meta.data_start,

@@ -88,16 +88,28 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: Config, weights: *
     var line_buf: [256]u8 = undefined;
     @import("../log.zig").info("{s}\n", .{@import("../cooler_side.zig").line(&line_buf, "[qwen4] forwards", &config)});
     const held = mlx.engine.isStream(s);
+    if (held) {
+        const exl3_kernels = @import("sushi_exl3").kernels;
+        if (config.expert_layout == .exl3_k4) {
+            try exl3_kernels.prepareGemmNax(config.expertDecode(), if (config.expert_tile_order == .pair_major) .tile_major else .pack, s);
+        }
+        if (config.trunk_quant) |dec| try exl3_kernels.prepareGemmNax(dec, .pack, s);
+    }
     if (config.indexer_budget != 0) {
         try qwen4_qsa_select.qsaScoreFusedArm(s);
         try qwen4_qsa_gather.qsaNaxArm(s);
     }
     var xfm = try Trunk.initTrunk(io, allocator, config, weights, s);
-    if (held) qwen4_cooler.ownBuiltWeights(&xfm) catch |e| {
+    errdefer {
         xfm.arch_state.qwen4.deinit(allocator);
         xfm.deinitTrunk();
-        return e;
-    };
+    }
+    if (held) try qwen4_cooler.ownBuiltWeights(&xfm);
+    if (xfm.expert_stream) |eng| try eng.awaitAsyncResidentLoad();
+    // Commit and synchronously wire Metal residency sets for all weights + resident expert slabs BEFORE the
+    // background 29.8 GB n-gram page-cache warm starts so wiring never contends with page-cache faulting on request 1.
+    if (held) mlx.engine.touchSync();
+    if (xfm.arch_state.qwen4.model) |st| st.table.startWarm();
     return xfm;
 }
 
@@ -147,8 +159,26 @@ pub fn resetCache(xfm: Model) !void {
     return xfm.resetTrunk();
 }
 
+fn trunkWarmMarker(scope: [16]u8, kv: @import("../kv_quant.zig").KVQuantConfig) [16]u8 {
+    const manifest = @import("../pipeline_manifest.zig");
+    var d: manifest.Digest = .{};
+    d.add("qwen4 trunk warm", &scope);
+    d.addInt("kv scheme", @intFromEnum(kv.scheme));
+    d.addInt("kv bits", kv.bits);
+    d.addInt("kv group", kv.group_size);
+    return d.hex();
+}
+
 pub fn warmup(xfm: Model) !void {
-    return xfm.warmupTrunk();
+    const on_engine = @import("../cooler_side.zig").onEngine(&xfm.config);
+    const kv = @import("../bills.zig").configuredKvQuantFor(&xfm.config);
+    const marker: ?[16]u8 = if (on_engine) if (@import("../arch/cooler_pipelines.zig").settledScope()) |scope| trunkWarmMarker(scope, kv) else null else null;
+    if (marker) |mk| if (mlx.engine.pipeline_registry.takeMarker(&mk)) {
+        @import("../log.zig").info("[warm] qwen4 trunk warmup skipped: the manifest holds all trunk pipelines\n", .{});
+        return;
+    };
+    try xfm.warmupTrunk();
+    if (marker) |mk| mlx.engine.pipeline_registry.recordMarker("qwen4 trunk warm", &mk);
 }
 
 pub fn forward(xfm: Model, ctx: *trunk.ForwardCtx, ids: mlx.mlx_array) !mlx.mlx_array {

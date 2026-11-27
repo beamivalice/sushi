@@ -2984,9 +2984,14 @@ pub const Trunk = struct {
 
 
     pub const ExpertStreamParts = struct { engine: *expert_stream_mod.Engine, imatrix: ?*imatrix_capture.Collector };
+    pub const ExpertEngineOpts = struct { defer_resident_load: bool = false };
 
     /// The ONE streamed expert engine of a load, keyed by the config's layout.
     pub fn newExpertEngine(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream) !*expert_stream_mod.Engine {
+        return newExpertEngineWithOptions(allocator, config, s, .{});
+    }
+
+    pub fn newExpertEngineWithOptions(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream, engine_opts: ExpertEngineOpts) !*expert_stream_mod.Engine {
         const engine = try allocator.create(expert_stream_mod.Engine);
         errdefer allocator.destroy(engine);
         const dir = config.expert_source_dir orelse return error.MissingExpertSourceDir;
@@ -3005,14 +3010,18 @@ pub const Trunk = struct {
         };
         var geometry = config.expertGeometry();
         geometry.drop = drop;
-        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major, .cache_bias = if (traits.cache_bias) config.expertCacheBias() else 0 });
+        engine.* = try expert_stream_mod.Engine.initWithOptions(allocator, dir, geometry, config.expert_cache_bytes, s, .{ .layout = config.expert_layout, .drop_owned = drop, .tile_major = traits.tile_major, .cache_bias = if (traits.cache_bias) config.expertCacheBias() else 0, .defer_resident_load = engine_opts.defer_resident_load });
         return engine;
     }
 
     /// The streamed expert engine and the imatrix collector that rides it. Once built, the engine
     /// is deinit'd on failure: its I/O workers run until `deinit` joins them.
     pub fn initExpertStream(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream) !ExpertStreamParts {
-        const engine = try newExpertEngine(allocator, config, s);
+        return initExpertStreamWithOptions(allocator, config, s, .{});
+    }
+
+    pub fn initExpertStreamWithOptions(allocator: std.mem.Allocator, config: *const ModelConfig, s: mlx.mlx_stream, engine_opts: ExpertEngineOpts) !ExpertStreamParts {
+        const engine = try newExpertEngineWithOptions(allocator, config, s, engine_opts);
         errdefer {
             engine.deinit();
             allocator.destroy(engine);

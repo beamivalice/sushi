@@ -270,6 +270,9 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
     var mixer = try layer_weights.loadHcWeights(weights, std.fmt.bufPrint(&mb, "{s}.hyper_connection_mixer", .{prefix}) catch unreachable, false, config.hc_count, config.hidden_size, &extra, allocator, s);
     try layer_weights.bindHcLinears(&mixer, &config);
     if (extra.items.len > 0) {
+        const eval_vec = mlx.mlx_vector_array_new_data(extra.items.ptr, extra.items.len);
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        try mlx.check(mlx.mlx_eval(eval_vec));
         const old = owned_bf16.* orelse &[_]mlx.mlx_array{};
         const merged = try std.mem.concat(allocator, mlx.mlx_array, &.{ old, extra.items });
         if (owned_bf16.*) |o| allocator.free(o);
@@ -308,7 +311,6 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
     var gpu_bytes: usize = 0;
     _ = mlx.mlx_get_active_memory(&gpu_bytes);
     st.table.calibrateArm();
-    st.table.startWarm(); // the weights load just evicted the table from page cache
     var mtp = try qwen4_forward.loadQwen4Mtp(allocator, config, weights, name_buf, s);
     errdefer if (mtp) |*m| m.deinit(allocator);
     if (config.expert_streaming) {
@@ -320,7 +322,10 @@ fn load(self: *State, args: arch_state.InitArgs) !?Trunk.ExpertStreamParts {
         parts.engine.deinit();
         allocator.destroy(parts.engine);
     };
-    if (config.expert_streaming) stream = try Trunk.initExpertStream(allocator, &config, s);
+    if (config.expert_streaming) {
+        stream = try Trunk.initExpertStreamWithOptions(allocator, &config, s, .{ .defer_resident_load = true });
+        if (stream.?.engine.plan.resident) try stream.?.engine.startAsyncResidentLoad();
+    }
     log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, {s}), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, if (config.expert_streaming and st.table.bits == 16) "sharded pread" else "mmapped", config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
     self.* = .{
         .model = st,

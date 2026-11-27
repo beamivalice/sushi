@@ -221,6 +221,8 @@ pub const Plans = struct {
     /// The pack's identity (`pipeline_manifest.addPack`), which names the region kept beside the manifest; none keeps
     /// no region and reads none.
     pack: ?[16]u8 = null,
+    /// What names the book kept beside the manifest (`keepCachedBook`); none keeps no book.
+    book_key: ?BookKey = null,
     /// The load's DFly2, whose drafts are planned; null for a load that does not draft.
     drafter: ?*const Drafter = null,
     /// Misses served since the load, and of them the shapes learned in place.
@@ -978,21 +980,23 @@ pub fn regionAt(m: *Model, p: *Plans, rows: usize) !plan.region.Need {
     const span = @min(@as(usize, @import("../prefill_plan.zig").final_span_rows), rows);
     const widths = [_]usize{ rows, span, rows - 1 };
     var most: plan.region.Need = .{};
+    var check_need: ?plan.region.Need = null;
     var probes: u64 = 0;
     for (widths[0..if (rows - 1 > span) 3 else 2]) |r| {
         for ([_]usize{ 0, p.reach -| r }) |n| for ([_]Readout{ .none, .last }) |readout| {
-            try measureWide(m, p, &most, r, n, readout);
+            const got = try measureWide(m, p, &most, r, n, readout);
+            if (r == rows and n == p.reach -| rows and readout == .last) check_need = got;
             probes += 1;
         };
         if (straddleDepth(&m.config, p.reach, r)) |n| {
-            try measureWide(m, p, &most, r, n, .last);
+            _ = try measureWide(m, p, &most, r, n, .last);
             probes += 1;
         }
     }
     const classes = try measureClasses(m, p, rows, &most);
     probes += classes;
     try p.measured.append(gpa, .{ .rows = rows, .need = most, .probes = probes, .classes = classes });
-    if (p.cache) |*c| if (p.pack != null) keepRegion(m, p, c, rows) catch |e| log.warn("[plan] the region of {d}-row chunks not kept for the next load: {s}\n", .{ rows, @errorName(e) });
+    if (p.cache) |*c| if (p.pack != null) keepRegion(m, p, c, rows, check_need) catch |e| log.warn("[plan] the region of {d}-row chunks not kept for the next load: {s}\n", .{ rows, @errorName(e) });
     const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
     log.info("[plan] a prefill of {d}-row chunks asks a region of {d} KB, host {d} KB, its {d} classes past {d} rows padded to their deepest; measured in {d} ms\n", .{ rows, most.scratch >> 10, most.host >> 10, classes, p.deep, ms });
     return most;
@@ -1009,12 +1013,20 @@ pub fn regionAt(m: *Model, p: *Plans, rows: usize) !plan.region.Need {
 const region_version: u64 = 2;
 const region_magic = "HY4REGN\x01";
 
-/// The file of `rows`-row chunks' region: named by what sizes it past the directory's build and kernel scope.
+const region_prefix = "region-";
+
+/// The file of `rows`-row chunks' region: named by what sizes it past the directory's build and kernel scope, the
+/// merged config among it (`configHash`), then by the rows; the part before the rows is the load's (`regionKeyPart`).
 pub fn regionFileName(m: *const Model, p: *const Plans, rows: usize, buf: *[40]u8) []const u8 {
+    var key_buf: [24]u8 = undefined;
+    return std.fmt.bufPrint(buf, "{s}{d}.bin", .{ regionKeyPart(m, p, &key_buf), rows }) catch unreachable;
+}
+
+fn regionKeyPart(m: *const Model, p: *const Plans, buf: []u8) []const u8 {
     var h = std.hash.Wyhash.init(region_version);
     std.hash.autoHash(&h, p.pack.?);
-    for ([_]u64{ rows, p.reach, p.book.alignment, @intFromBool(m.keep_hidden), @intFromBool(m.streamed), @backingInt(p.kv.scheme), p.kv.bits, p.kv.group_size, deepZone(&m.config), if (m.experts) |e| e.plan.slots_per_layer else 0 }) |v| std.hash.autoHash(&h, v);
-    return std.fmt.bufPrint(buf, "region-{x:0>16}.bin", .{h.final()}) catch unreachable;
+    for ([_]u64{ configHash(&m.config), p.reach, p.book.alignment, @intFromBool(m.keep_hidden), @intFromBool(m.streamed), @backingInt(p.kv.scheme), p.kv.bits, p.kv.group_size, deepZone(&m.config), if (m.experts) |e| e.plan.slots_per_layer else 0 }) |v| std.hash.autoHash(&h, v);
+    return std.fmt.bufPrint(buf, region_prefix ++ "{x:0>16}-", .{h.final()}) catch unreachable;
 }
 
 /// What a region file is checked by: a load-width chunk at the deepest read out by its last row, over one input.
@@ -1123,7 +1135,7 @@ fn decodeRegion(gpa: std.mem.Allocator, b: []const u8) !Kept {
 }
 
 /// Writes what `regionAt` just measured for `rows`-row chunks, with its check, through a temp file.
-fn keepRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !void {
+fn keepRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize, precomputed_check: ?plan.region.Need) !void {
     const gpa = p.book.gpa;
     var keys: std.ArrayList(u64) = .empty;
     defer keys.deinit(gpa);
@@ -1135,9 +1147,10 @@ fn keepRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !voi
         try classes.append(gpa, e.value_ptr.*);
     };
     const measured = p.measured.items[p.measured.items.len - 1];
-    const bytes = try encodeRegion(gpa, .{ .measured = measured, .check = try checkNeed(m, p, rows), .deep = p.deep, .keys = keys.items, .classes = classes.items });
+    const check = precomputed_check orelse try checkNeed(m, p, rows);
+    const bytes = try encodeRegion(gpa, .{ .measured = measured, .check = check, .deep = p.deep, .keys = keys.items, .classes = classes.items });
     defer gpa.free(bytes);
-    var dir = try c.dir();
+    var dir = try c.dirIterable();
     defer dir.close(c.io);
     var name_buf: [40]u8 = undefined;
     const name = regionFileName(m, p, rows, &name_buf);
@@ -1146,6 +1159,18 @@ fn keepRegion(m: *Model, p: *Plans, c: *const plan_book.Cache, rows: usize) !voi
     errdefer dir.deleteFile(c.io, temp) catch {};
     try dir.writeFile(c.io, .{ .sub_path = temp, .data = bytes });
     try dir.rename(temp, dir, name, c.io);
+    // The regions of other names go: this load's other chunk widths share its key part and stay.
+    var key_buf: [24]u8 = undefined;
+    const key = regionKeyPart(m, p, &key_buf);
+    var it_dir = dir.iterate();
+    var removed: usize = 0;
+    while (try it_dir.next(c.io)) |entry| {
+        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, region_prefix) or !std.mem.endsWith(u8, entry.name, ".bin")) continue;
+        if (std.mem.startsWith(u8, entry.name, key)) continue;
+        try dir.deleteFile(c.io, entry.name);
+        removed += 1;
+    }
+    if (removed > 0) log.info("[plan] {d} regions kept under other settings removed\n", .{removed});
 }
 
 /// The region of `rows`-row chunks the cache keeps, installed on `p` with its classes, where its check holds; null
@@ -1279,10 +1304,287 @@ fn freePasses(gpa: std.mem.Allocator, passes: []core.PadPass, made: usize) void 
 }
 
 /// `most`, and what a wide forward of `rows` rows after `n` read out by `readout` asks.
-fn measureWide(m: *Model, p: *const Plans, most: *plan.region.Need, rows: usize, n: usize, readout: Readout) !void {
+fn measureWide(m: *Model, p: *const Plans, most: *plan.region.Need, rows: usize, n: usize, readout: Readout) !plan.region.Need {
     var passes = try recordChecked(m, p.book.gpa, .{ .rows = rows, .readout = readout, .keep_hidden = m.keep_hidden, .kv = p.kv, .n = n, .phase = .wide }, p.reach);
     defer passes.deinit();
-    for (passes.traces) |*t| most.* = most.max(try plan.region.need(p.book.gpa, t, p.book.alignment));
+    var own: plan.region.Need = .{};
+    for (passes.traces) |*t| {
+        const need = try plan.region.need(p.book.gpa, t, p.book.alignment);
+        own = own.max(need);
+        most.* = most.max(need);
+    }
+    return own;
+}
+
+// ── The plan book kept for the next load ──
+//
+// The book (every forward, draft, joined, replay and sample root, each with its traces) and the encode's need, kept
+// beside the pipeline manifest. The directory names the build and the scope; the file name every other fact a
+// recording reads (`BookKey`) and the shapes kept in `plan-shapes`. A write removes the books of other names.
+
+const book_file_version: u64 = 2;
+const book_file_magic = "HY4BOOK\x02";
+const book_prefix = "book-";
+const book_suffix = ".bin";
+
+fn keptShapesHash(c: *const plan_book.Cache, gpa: std.mem.Allocator) u64 {
+    var dir = c.dir() catch return 0;
+    defer dir.close(c.io);
+    const bytes = dir.readFileAlloc(c.io, plan_book.shapes_file, gpa, .limited(1 << 20)) catch return 0;
+    defer gpa.free(bytes);
+    return std.hash.Wyhash.hash(book_file_version, bytes);
+}
+
+/// What a load names when it asks for its kept book (`bookKey`).
+pub const BookFacts = struct {
+    pack: [16]u8,
+    reach: usize,
+    /// The load's joined cap, before `record` clamps it.
+    joined: usize,
+    kv: KVQuantConfig,
+    has_drafter: bool,
+    keeps_tower: bool,
+    max_patches: u64,
+    has_suppress: bool,
+};
+
+/// Every fact a load's recording reads besides the build and the scope, which names the book it keeps.
+pub const BookKey = struct {
+    pack: [16]u8,
+    /// The merged config (`configHash`): `--config-overrides` and a settings document change what a recording reads.
+    config: u64,
+    reach: usize,
+    joined: usize,
+    kv: KVQuantConfig,
+    has_drafter: bool,
+    keeps_tower: bool,
+    max_patches: u64,
+    has_suppress: bool,
+    keep_hidden: bool,
+    streamed: bool,
+    slots_per_layer: usize,
+    cache_bias: bool,
+    hc_tg: u64,
+    draw_tg: u64,
+};
+
+/// A hash of every field of the model's merged config, floats by their bits.
+pub fn configHash(c: *const hy4_config.Config) u64 {
+    var h = std.hash.Wyhash.init(book_file_version);
+    hashValue(&h, c.*);
+    return h.final();
+}
+
+fn hashValue(h: *std.hash.Wyhash, v: anytype) void {
+    const T = @TypeOf(v);
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| inline for (s.field_names) |name| hashValue(h, @field(v, name)),
+        .array => for (v) |x| hashValue(h, x),
+        .optional => if (v) |x| {
+            std.hash.autoHash(h, true);
+            hashValue(h, x);
+        } else std.hash.autoHash(h, false),
+        .float => |f| std.hash.autoHash(h, @as(@Int(.unsigned, f.bits), @bitCast(v))),
+        else => std.hash.autoHash(h, v),
+    }
+}
+
+/// The key of `facts` on `m`, the sampler's threadgroup ladder settled first so the key holds this GPU's rung.
+pub fn bookKey(m: *Model, facts: BookFacts) !BookKey {
+    const draw = @import("../sampler_draw.zig");
+    try draw.settle(m.config.vocab, .float32, m.s);
+    return .{
+        .pack = facts.pack,
+        .config = configHash(&m.config),
+        .reach = facts.reach,
+        .joined = if (facts.joined > 1) @min(facts.joined, joined_rows_max) else 0,
+        .kv = facts.kv,
+        .has_drafter = facts.has_drafter,
+        .keeps_tower = facts.keeps_tower,
+        .max_patches = facts.max_patches,
+        .has_suppress = facts.has_suppress,
+        .keep_hidden = m.keep_hidden,
+        .streamed = m.streamed,
+        .slots_per_layer = if (m.experts) |e| e.plan.slots_per_layer else 0,
+        .cache_bias = if (m.experts) |e| e.cache_bias > 0 else false,
+        .hc_tg = @import("../hc_kernels.zig").hc_tg,
+        .draw_tg = draw.threadsPerGroup(),
+    };
+}
+
+pub fn bookFileName(key: BookKey, shapes_hash: u64, buf: *[40]u8) []const u8 {
+    const guard: u64 = if (@import("builtin").is_test) 256 else 0;
+    var h = std.hash.Wyhash.init(book_file_version);
+    std.hash.autoHash(&h, key.pack);
+    for ([_]u64{
+        key.config,
+        key.reach,
+        key.joined,
+        plan_book.default_alignment,
+        guard,
+        level_rule_cap,
+        @intFromBool(key.keep_hidden),
+        @intFromBool(key.streamed),
+        @intFromBool(key.has_drafter),
+        @backingInt(key.kv.scheme),
+        key.kv.bits,
+        key.kv.group_size,
+        key.slots_per_layer,
+        @intFromBool(key.cache_bias),
+        @intFromBool(key.keeps_tower),
+        key.max_patches,
+        @intFromBool(key.has_suppress),
+        key.hc_tg,
+        key.draw_tg,
+        shapes_hash,
+    }) |v| std.hash.autoHash(&h, v);
+    return std.fmt.bufPrint(buf, book_prefix ++ "{x:0>16}" ++ book_suffix, .{h.final()}) catch unreachable;
+}
+
+fn bookOptions() plan.pack.Options {
+    return .{ .level_rule = true, .level_rule_cap = level_rule_cap, .guard = if (@import("builtin").is_test) 256 else 0 };
+}
+
+/// What a kept book's file holds: the book, the encode's need and the widest verdict its samples plan.
+const BookFile = struct { book: plan_book.Book, encode: plan.region.Need, rows_max: u8 };
+
+const BookFileError = error{ Hy4BookFileDamaged, Hy4BookFileVersion } || plan.pack.DecodeError;
+
+/// The file's head before the book's own (`plan_book.Book.encode`), checksummed on its own.
+const book_file_head = book_file_magic.len + 8 + 8 + 8 + 1;
+
+fn encodeBookFile(gpa: std.mem.Allocator, p: *const Plans) ![]u8 {
+    const book_bytes = try p.book.encode(gpa);
+    defer gpa.free(book_bytes);
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll(book_file_magic);
+    try w.writeInt(u64, book_file_version, .little);
+    try w.writeInt(u64, p.encode.scratch, .little);
+    try w.writeInt(u64, p.encode.host, .little);
+    try w.writeByte(p.sample.rows_max);
+    try w.writeInt(u64, std.hash.Wyhash.hash(book_file_version, out.written()), .little);
+    try w.writeAll(book_bytes);
+    return out.toOwnedSlice();
+}
+
+/// A kept book's file, its roots' traces left in `bytes` (`plan_book.Book.decode`), which outlive the book.
+fn decodeBookFile(gpa: std.mem.Allocator, bytes: []const u8) BookFileError!BookFile {
+    if (bytes.len < book_file_head + 8 or !std.mem.eql(u8, bytes[0..book_file_magic.len], book_file_magic)) return error.Hy4BookFileDamaged;
+    if (std.mem.readInt(u64, bytes[book_file_head..][0..8], .little) != std.hash.Wyhash.hash(book_file_version, bytes[0..book_file_head])) return error.Hy4BookFileDamaged;
+    var cur: plan.pack.BinCursor = .{ .b = bytes[0..book_file_head], .at = book_file_magic.len };
+    if (try cur.u64_() != book_file_version) return error.Hy4BookFileVersion;
+    const encode: plan.region.Need = .{ .scratch = try cur.u64_(), .host = try cur.u64_() };
+    const rows_max = try cur.u8_();
+    return .{ .book = try plan_book.Book.decode(gpa, bytes[book_file_head + 8 ..], bookOptions(), plan_book.default_alignment), .encode = encode, .rows_max = rows_max };
+}
+
+fn unmapBook(bytes: []const u8) void {
+    std.posix.munmap(@alignCast(bytes));
+}
+
+/// The file `name` in `dir` mapped read-only: a load reads the pages its book's head takes, a root's traces when it is
+/// learned. The mapping outlives the file, which a later write may replace or remove.
+fn mapBookFile(io: std.Io, dir: std.Io.Dir, name: []const u8) ![]align(std.heap.page_size_min) const u8 {
+    const file = try dir.openFile(io, name, .{});
+    defer file.close(io);
+    const len = try file.length(io);
+    if (len == 0) return error.Hy4BookFileDamaged;
+    return std.posix.mmap(null, @intCast(len), .{ .READ = true }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+}
+
+/// The plans `cache` keeps for `facts` (the forwards', drafts', joined ticks', replays' and samples' roots, and the
+/// encode's need), with the wide pipelines latched as a recording latches them (D20): a miss records and learns in
+/// place. Null, by a named line, when there is none to use: the load records.
+pub fn readCachedBook(m: *Model, gpa: std.mem.Allocator, cache: plan_book.Cache, facts: BookFacts, drafter: ?*const Drafter, masks: @import("hy4_sample_plan.zig").Masks) !?*Plans {
+    const t0 = @import("../load_clock.zig").now();
+    const key = try bookKey(m, facts);
+    var name_buf: [40]u8 = undefined;
+    const name = bookFileName(key, keptShapesHash(&cache, gpa), &name_buf);
+    var dir = cache.dir() catch |e| {
+        log.warn("[plan] no kept plan book: {s} did not open ({t}); recording\n", .{ cache.name(), e });
+        return null;
+    };
+    defer dir.close(cache.io);
+    const bytes = mapBookFile(cache.io, dir, name) catch |e| {
+        if (e == error.FileNotFound) log.info("[plan] no kept plan book {s}; recording\n", .{name}) else log.warn("[plan] the kept plan book {s} was not read ({t}); recording\n", .{ name, e });
+        return null;
+    };
+    var file = decodeBookFile(gpa, bytes) catch |e| {
+        unmapBook(bytes);
+        if (e == error.OutOfMemory) return e;
+        log.warn("[plan] the kept plan book {s} is not used ({t}); recording\n", .{ name, e });
+        return null;
+    };
+    file.book.backing = .{ .bytes = bytes, .release = unmapBook };
+    errdefer file.book.deinit();
+    const rows_max: u8 = if (drafter != null) @intCast(@import("hy4_forward.zig").verify_rows_max) else 0;
+    if (file.rows_max != rows_max) {
+        log.warn("[plan] the kept plan book {s} plans verdicts of {d} rows, the load {d}; recording\n", .{ name, file.rows_max, rows_max });
+        file.book.deinit();
+        return null;
+    }
+    m.probeWide() catch |e| {
+        log.err("[plan] the wide pipelines' grants were not latched for the kept plan book ({t})\n", .{e});
+        return e;
+    };
+    m.logits_rows = @intCast(@max(@as(usize, @intCast(@import("hy4_forward.zig").verify_rows_max)), key.joined));
+    try m.makeLogitsBlocks();
+    try m.makeIdsBlock();
+    const p = try gpa.create(Plans);
+    errdefer gpa.destroy(p);
+    p.* = .{
+        .book = file.book,
+        .reach = key.reach,
+        .joined = key.joined,
+        .kv = key.kv,
+        .cache = cache,
+        .pack = key.pack,
+        .book_key = key,
+        .drafter = drafter,
+        .encode = file.encode,
+        .sample = .{ .planned = true, .masks = masks, .rows_max = rows_max },
+    };
+    errdefer p.sample.deinit();
+    try @import("hy4_sample_plan.zig").makeTokens(m, &p.sample);
+    const l = p.book.layout();
+    const ms = (@import("../load_clock.zig").now() - t0) / std.time.ns_per_ms;
+    log.info("[plan] {d} roots (with samples) read from {s} in {d} ms: scratch {d} KB, host ring {d} KB x {d}\n", .{ p.book.roots.items.len, name, ms, l.g >> 10, l.h >> 10, l.replicas });
+    return p;
+}
+
+/// `p`'s book and encode need written beside the pipeline manifest under its key and the shapes kept now, through a
+/// temp file; the books of other names in the directory are removed. A plan without a key or a cache writes none.
+pub fn keepCachedBook(p: *const Plans) !void {
+    const key = p.book_key orelse return;
+    const cache = &(p.cache orelse return);
+    const gpa = p.book.gpa;
+    const bytes = try encodeBookFile(gpa, p);
+    defer gpa.free(bytes);
+    var name_buf: [40]u8 = undefined;
+    const name = bookFileName(key, keptShapesHash(cache, gpa), &name_buf);
+    var dir = try cache.dirIterable();
+    defer dir.close(cache.io);
+    var temp_buf: [64]u8 = undefined;
+    const temp = std.fmt.bufPrint(&temp_buf, "{s}.{d}.tmp", .{ name, std.c.getpid() }) catch unreachable;
+    errdefer dir.deleteFile(cache.io, temp) catch {};
+    try dir.writeFile(cache.io, .{ .sub_path = temp, .data = bytes });
+    try dir.rename(temp, dir, name, cache.io);
+    var it = dir.iterate();
+    var removed: usize = 0;
+    while (try it.next(cache.io)) |entry| {
+        if (entry.kind != .file or !std.mem.startsWith(u8, entry.name, book_prefix) or !std.mem.endsWith(u8, entry.name, book_suffix)) continue;
+        if (std.mem.eql(u8, entry.name, name)) continue;
+        try dir.deleteFile(cache.io, entry.name);
+        removed += 1;
+    }
+    log.info("[plan] plan book {s} kept: {d} KB, {d} kept under other settings removed\n", .{ name, bytes.len >> 10, removed });
+}
+
+/// After a miss learned in place (D5): the book is written again, so the next load restores what this one learned.
+pub fn keepLearned(p: *const Plans) void {
+    keepCachedBook(p) catch |e| log.warn("[plan] the plan book was not written again with the shape learned ({t}): the next load reads the one it had\n", .{e});
 }
 
 /// The arena of `p` and the region of `wide_rows`-row prefill chunks (0: none), made where the load holds it.
@@ -1633,8 +1935,9 @@ fn missed(m: *Model, p: *Plans, probe: Probe, miss: plan.binder.Miss) error{Plan
         },
         .next_load => log.warn("[plan] the missed shape needs more arena than the load holds: the next load plans it\n", .{}),
     }
-    // Kept either way, so a restart plans it too.
+    // Kept either way, so a restart plans it too; the book learned is written under the shapes kept now.
     if (probe.groups.len == 0) if (p.cache) |*c| c.keep(p.book.gpa, shapeOf(probe)) catch |e| log.warn("[plan] the missed shape was not kept in {s} ({t}): a restart misses it again\n", .{ c.name(), e });
+    if (learned == .swapped) keepLearned(p);
     return error.PlanMiss;
 }
 
@@ -1698,4 +2001,40 @@ test "hy4 plan: a kept region whose value does not fit its field is refused as d
     std.mem.writeInt(u64, bytes[at..][0..8], 1 << 32, .little);
     std.mem.writeInt(u64, bytes[bytes.len - 8 ..][0..8], std.hash.Wyhash.hash(region_version, bytes[0 .. bytes.len - 8]), .little);
     try testing.expectError(error.Hy4RegionFileDamaged, decodeRegion(a, bytes));
+}
+
+test "hy4 plan: a kept book is named by the merged config its recording reads: two configs that differ only in an override name two books" {
+    const a = testing.allocator;
+    const edited = try std.mem.replaceOwned(u8, a, hy4_config.release_file, "\"num_speculative_tokens\": 5", "\"num_speculative_tokens\": 3");
+    defer a.free(edited);
+    var names: [2][40]u8 = undefined;
+    var got: [2][]const u8 = undefined;
+    for ([_][]const u8{ hy4_config.release_file, edited }, 0..) |text, i| {
+        const c = try hy4_config.parseText(text);
+        const key: BookKey = .{ .pack = @splat('0'), .config = configHash(&c), .reach = 4096, .joined = 0, .kv = KVQuantConfig.engine_default, .has_drafter = true, .keeps_tower = false, .max_patches = 0, .has_suppress = false, .keep_hidden = false, .streamed = false, .slots_per_layer = 0, .cache_bias = false, .hc_tg = 0, .draw_tg = 0 };
+        got[i] = bookFileName(key, 0, &names[i]);
+    }
+    try testing.expect(!std.mem.eql(u8, got[0], got[1]));
+}
+
+test "hy4 plan: a kept region is named by the merged config its measure reads: two configs that differ only in an override name two region files" {
+    const a = testing.allocator;
+    const edited = try std.mem.replaceOwned(u8, a, hy4_config.release_file, "\"num_speculative_tokens\": 5", "\"num_speculative_tokens\": 3");
+    defer a.free(edited);
+    var names: [2][40]u8 = undefined;
+    var got: [2][]const u8 = undefined;
+    for ([_][]const u8{ hy4_config.release_file, edited }, 0..) |text, i| {
+        var m: Model = undefined;
+        m.config = try hy4_config.parseText(text);
+        m.keep_hidden = false;
+        m.streamed = false;
+        m.experts = null;
+        var p: Plans = undefined;
+        p.pack = @splat('0');
+        p.reach = 4096;
+        p.book = .{ .gpa = a, .options = .{} };
+        p.kv = KVQuantConfig.engine_default;
+        got[i] = regionFileName(&m, &p, 512, &names[i]);
+    }
+    try testing.expect(!std.mem.eql(u8, got[0], got[1]));
 }

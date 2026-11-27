@@ -112,7 +112,283 @@ pub const Tables = struct {
     pub fn get(t: *const Tables, id: FrameId) ?*const FramePlan {
         return &t.plans[t.index.get(id) orelse return null];
     }
+
+    pub fn eql(a: *const Tables, b: *const Tables) bool {
+        if (a.g != b.g or a.h != b.h or a.alignment != b.alignment or a.guard != b.guard) return false;
+        if (a.roots.len != b.roots.len or a.plans.len != b.plans.len) return false;
+        for (a.roots, b.roots) |ra, rb| if (!ra.eql(rb)) return false;
+        for (a.plans, b.plans) |pa, pb| if (!framePlanEql(pa, pb)) return false;
+        return true;
+    }
 };
+
+fn placeEql(a: Place, b: Place) bool {
+    return a.offset == b.offset and a.cap == b.cap and a.item == b.item and a.preds.at == b.preds.at and a.preds.len == b.preds.len;
+}
+
+fn childEql(a: ChildPlan, b: ChildPlan) bool {
+    return a.slot == b.slot and a.offset == b.offset and a.block == b.block and a.exports == b.exports and a.preds.at == b.preds.at and a.preds.len == b.preds.len;
+}
+
+fn framePlanEql(a: FramePlan, b: FramePlan) bool {
+    if (!a.id.eql(b.id) or a.items != b.items or a.block != b.block or a.peak != b.peak or a.host != b.host or a.exports != b.exports) return false;
+    if (a.asks.len != b.asks.len or a.nodes.len != b.nodes.len or a.slots.len != b.slots.len or a.through.len != b.through.len or a.preds.len != b.preds.len) return false;
+    for (a.asks, b.asks) |x, y| if (x.kind != y.kind or !placeEql(x.place, y.place) or x.up != y.up) return false;
+    for (a.nodes, b.nodes) |x, y| {
+        if (std.meta.activeTag(x) != std.meta.activeTag(y)) return false;
+        switch (x) {
+            .ask => |u| if (u != y.ask) return false,
+            .exact => |e| if (!e.id.eql(y.exact.id) or !childEql(e.child, y.exact.child)) return false,
+            .group => |g| if (g.site != y.group.site or g.max != y.group.max or !childEql(g.child, y.group.child)) return false,
+        }
+    }
+    if (!std.mem.eql(u32, a.slots, b.slots) or !std.mem.eql(u32, a.preds, b.preds)) return false;
+    for (a.through, b.through) |x, y| if (x.here != y.here or !placeEql(x.place, y.place) or x.up != y.up) return false;
+    return true;
+}
+
+pub const DecodeError = error{ OutOfMemory, PlanFileDamaged };
+
+pub const BinCursor = struct {
+    b: []const u8,
+    at: usize = 0,
+
+    pub fn u8_(c: *BinCursor) DecodeError!u8 {
+        if (c.b.len - c.at < 1) return error.PlanFileDamaged;
+        defer c.at += 1;
+        return c.b[c.at];
+    }
+
+    pub fn u32_(c: *BinCursor) DecodeError!u32 {
+        if (c.b.len - c.at < 4) return error.PlanFileDamaged;
+        defer c.at += 4;
+        return std.mem.readInt(u32, c.b[c.at..][0..4], .little);
+    }
+
+    pub fn u64_(c: *BinCursor) DecodeError!u64 {
+        if (c.b.len - c.at < 8) return error.PlanFileDamaged;
+        defer c.at += 8;
+        return std.mem.readInt(u64, c.b[c.at..][0..8], .little);
+    }
+
+    pub fn len(c: *BinCursor, each: usize) DecodeError!usize {
+        const n = try c.u32_();
+        if (n > (c.b.len - c.at) / each) return error.PlanFileDamaged;
+        return n;
+    }
+
+    pub fn slice(c: *BinCursor, n: usize) DecodeError![]const u8 {
+        if (n > c.b.len - c.at) return error.PlanFileDamaged;
+        defer c.at += n;
+        return c.b[c.at..][0..n];
+    }
+};
+
+fn writePlace(w: *std.Io.Writer, p: Place) !void {
+    try w.writeInt(u64, p.offset, .little);
+    try w.writeInt(u64, p.cap, .little);
+    try w.writeInt(u32, p.item, .little);
+    try w.writeInt(u32, p.preds.at, .little);
+    try w.writeInt(u32, p.preds.len, .little);
+}
+
+fn readPlace(c: *BinCursor) DecodeError!Place {
+    return .{
+        .offset = try c.u64_(),
+        .cap = try c.u64_(),
+        .item = try c.u32_(),
+        .preds = .{ .at = try c.u32_(), .len = try c.u32_() },
+    };
+}
+
+fn writeChild(w: *std.Io.Writer, ch: ChildPlan) !void {
+    try w.writeInt(u32, ch.slot, .little);
+    try w.writeInt(u64, ch.offset, .little);
+    try w.writeInt(u64, ch.block, .little);
+    try w.writeInt(u32, ch.exports, .little);
+    try w.writeInt(u32, ch.preds.at, .little);
+    try w.writeInt(u32, ch.preds.len, .little);
+}
+
+fn readChild(c: *BinCursor) DecodeError!ChildPlan {
+    return .{
+        .slot = try c.u32_(),
+        .offset = try c.u64_(),
+        .block = try c.u64_(),
+        .exports = try c.u32_(),
+        .preds = .{ .at = try c.u32_(), .len = try c.u32_() },
+    };
+}
+
+/// Writes `t` in compact little-endian binary form so repeat loads can skip dry recording and packing.
+pub fn writeTables(w: *std.Io.Writer, t: *const Tables) !void {
+    try w.writeInt(u64, t.g, .little);
+    try w.writeInt(u64, t.h, .little);
+    try w.writeInt(u32, t.alignment, .little);
+    try w.writeInt(u64, t.guard, .little);
+    try w.writeInt(u32, @intCast(t.roots.len), .little);
+    for (t.roots) |r| {
+        try w.writeInt(u32, r.site, .little);
+        try w.writeInt(u64, r.key, .little);
+    }
+    try w.writeInt(u32, @intCast(t.plans.len), .little);
+    for (t.plans) |p| {
+        try w.writeInt(u32, p.id.site, .little);
+        try w.writeInt(u64, p.id.key, .little);
+        try w.writeInt(u32, p.items, .little);
+        try w.writeInt(u64, p.block, .little);
+        try w.writeInt(u64, p.peak, .little);
+        try w.writeInt(u64, p.host, .little);
+        try w.writeInt(u32, p.exports, .little);
+
+        try w.writeInt(u32, @intCast(p.asks.len), .little);
+        for (p.asks) |a| {
+            try w.writeByte(@intFromEnum(a.kind));
+            try writePlace(w, a.place);
+            try w.writeInt(u32, a.up, .little);
+        }
+
+        try w.writeInt(u32, @intCast(p.nodes.len), .little);
+        for (p.nodes) |n| switch (n) {
+            .ask => |u| {
+                try w.writeByte(0);
+                try w.writeInt(u32, u, .little);
+            },
+            .exact => |e| {
+                try w.writeByte(1);
+                try w.writeInt(u32, e.id.site, .little);
+                try w.writeInt(u64, e.id.key, .little);
+                try writeChild(w, e.child);
+            },
+            .group => |g| {
+                try w.writeByte(2);
+                try w.writeInt(u32, g.site, .little);
+                try w.writeInt(u32, g.max, .little);
+                try writeChild(w, g.child);
+            },
+        };
+
+        try w.writeInt(u32, @intCast(p.slots.len), .little);
+        for (p.slots) |v| try w.writeInt(u32, v, .little);
+
+        try w.writeInt(u32, @intCast(p.through.len), .little);
+        for (p.through) |th| {
+            try w.writeByte(@intFromBool(th.here));
+            try writePlace(w, th.place);
+            try w.writeInt(u32, th.up, .little);
+        }
+
+        try w.writeInt(u32, @intCast(p.preds.len), .little);
+        for (p.preds) |v| try w.writeInt(u32, v, .little);
+    }
+}
+
+/// Decodes a `Tables` written by `writeTables`, rebuilding `index` and freeing all partial allocations on error.
+pub fn readTables(gpa: std.mem.Allocator, c: *BinCursor) DecodeError!Tables {
+    const g = try c.u64_();
+    const h = try c.u64_();
+    const alignment = try c.u32_();
+    const guard = try c.u64_();
+    const n_roots = try c.len(12);
+    const roots = try gpa.alloc(FrameId, n_roots);
+    errdefer gpa.free(roots);
+    for (roots) |*r| r.* = .{ .site = try c.u32_(), .key = try c.u64_() };
+
+    const n_plans = try c.len(64);
+    const plans = try gpa.alloc(FramePlan, n_plans);
+    var built: usize = 0;
+    errdefer {
+        for (plans[0..built]) |p| {
+            gpa.free(p.asks);
+            gpa.free(p.nodes);
+            gpa.free(p.slots);
+            gpa.free(p.through);
+            gpa.free(p.preds);
+        }
+        gpa.free(plans);
+    }
+    var index: std.AutoHashMapUnmanaged(FrameId, u32) = .empty;
+    errdefer index.deinit(gpa);
+    try index.ensureTotalCapacity(gpa, @intCast(n_plans));
+
+    for (plans, 0..) |*p, pi| {
+        const id: FrameId = .{ .site = try c.u32_(), .key = try c.u64_() };
+        const items = try c.u32_();
+        const block = try c.u64_();
+        const peak = try c.u64_();
+        const host = try c.u64_();
+        const exports = try c.u32_();
+
+        const n_asks = try c.len(33);
+        const asks = try gpa.alloc(AskPlan, n_asks);
+        errdefer gpa.free(asks);
+        for (asks) |*a| {
+            const raw_kind = try c.u8_();
+            if (raw_kind > 3) return error.PlanFileDamaged;
+            a.* = .{
+                .kind = @enumFromInt(@as(u2, @intCast(raw_kind))),
+                .place = try readPlace(c),
+                .up = try c.u32_(),
+            };
+        }
+
+        const n_nodes = try c.len(5);
+        const nodes = try gpa.alloc(NodePlan, n_nodes);
+        errdefer gpa.free(nodes);
+        for (nodes) |*n| switch (try c.u8_()) {
+            0 => n.* = .{ .ask = try c.u32_() },
+            1 => n.* = .{ .exact = .{ .id = .{ .site = try c.u32_(), .key = try c.u64_() }, .child = try readChild(c) } },
+            2 => n.* = .{ .group = .{ .site = try c.u32_(), .max = try c.u32_(), .child = try readChild(c) } },
+            else => return error.PlanFileDamaged,
+        };
+
+        const n_slots = try c.len(4);
+        const slots = try gpa.alloc(u32, n_slots);
+        errdefer gpa.free(slots);
+        for (slots) |*v| v.* = try c.u32_();
+
+        const n_through = try c.len(33);
+        const through = try gpa.alloc(ThroughPlan, n_through);
+        errdefer gpa.free(through);
+        for (through) |*th| {
+            const raw_here = try c.u8_();
+            if (raw_here > 1) return error.PlanFileDamaged;
+            th.* = .{ .here = raw_here != 0, .place = try readPlace(c), .up = try c.u32_() };
+        }
+
+        const n_preds = try c.len(4);
+        const preds = try gpa.alloc(u32, n_preds);
+        errdefer gpa.free(preds);
+        for (preds) |*v| v.* = try c.u32_();
+
+        p.* = .{
+            .id = id,
+            .asks = asks,
+            .nodes = nodes,
+            .slots = slots,
+            .through = through,
+            .preds = preds,
+            .items = items,
+            .block = block,
+            .peak = peak,
+            .host = host,
+            .exports = exports,
+        };
+        built = pi + 1;
+        index.putAssumeCapacity(id, @intCast(pi));
+    }
+
+    return .{
+        .gpa = gpa,
+        .plans = plans,
+        .index = index,
+        .roots = roots,
+        .g = g,
+        .h = h,
+        .alignment = alignment,
+        .guard = guard,
+    };
+}
 
 pub const Options = struct {
     /// Bytes are shared only where the earlier buffer's last dispatch is below the later one's first, so a reuse never
@@ -564,4 +840,51 @@ test "a guard keeps its bytes after every buffer, and no other buffer takes them
     defer odd.deinit();
     try t.expectEqual(@as(u64, 16), odd.guard);
     for (odd.get(.{ .site = 1 }).?.asks) |as| try t.expectEqual(@as(u64, 0), as.place.offset % 8);
+}
+
+fn decodeTablesForTest(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    var cur: BinCursor = .{ .b = bytes };
+    var dec = try readTables(gpa, &cur);
+    dec.deinit();
+}
+
+test "packed tables round-trip through binary serialization and reject truncation or allocation failure cleanly" {
+    const t = std.testing;
+    var r = try Recorder.begin(t.allocator, .{ .site = 1 });
+    defer r.deinit();
+    var kept: [2]trace_mod.Ref = undefined;
+    for (&kept) |*k| {
+        try r.enter(.{ .site = 5 }, .each);
+        const scratch = try r.ask(32, false, false);
+        k.* = try r.ask(64, false, false);
+        r.free(scratch);
+        r.exit();
+    }
+    try r.enter(.{ .site = 9, .key = 42 }, .exact);
+    const ext = try r.ask(128, false, true);
+    r.free(ext);
+    r.exit();
+    for (kept) |k| r.free(k);
+    const host = try r.ask(16, true, false);
+    r.free(host);
+
+    var orig = try planOf(t.allocator, &r, .{ .guard = 16 });
+    defer orig.deinit();
+
+    var out: std.Io.Writer.Allocating = .init(t.allocator);
+    defer out.deinit();
+    try writeTables(&out.writer, &orig);
+    const bytes = out.written();
+
+    var cur: BinCursor = .{ .b = bytes };
+    var got = try readTables(t.allocator, &cur);
+    defer got.deinit();
+    try t.expectEqual(bytes.len, cur.at);
+    try t.expect(orig.eql(&got));
+    try t.expectEqual(orig.get(.{ .site = 9, .key = 42 }).?.block, got.get(.{ .site = 9, .key = 42 }).?.block);
+
+    var short_cur: BinCursor = .{ .b = bytes[0 .. bytes.len - 1] };
+    try t.expectError(error.PlanFileDamaged, readTables(t.allocator, &short_cur));
+
+    try t.checkAllAllocationFailures(t.allocator, decodeTablesForTest, .{bytes});
 }

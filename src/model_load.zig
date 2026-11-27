@@ -357,13 +357,21 @@ pub fn warmLoad(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig, xf
     return warmLoadWith(io, a, config, xfm, verify_cap, aux_head, kv, if (pipelines) |*p| p else null);
 }
 
+/// Starts preloading a Cooler load's pipeline manifest asynchronously on worker threads so weight I/O can overlap.
+/// Caller must call `plan.await()` before the first Metal dispatch (or `plan.deinit()` on error).
+pub fn beginPipelinesAsync(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig) ?@import("arch/cooler_pipelines.zig").Plan {
+    if (!arch_handle.onEngine(null, config)) return null;
+    var plan = @import("arch/cooler_pipelines.zig").beginFor(a, io, config) orelse return null;
+    plan.startAsync();
+    return plan;
+}
+
 /// A Cooler load's pipeline manifest, opened before anything it lists is needed: it first makes what the manifest
 /// lists (the warm's and what earlier requests compiled late), on worker threads, so the warm makes nothing it lists;
 /// the kept shapes of the load's plans sit beside it. null off Cooler.
 pub fn beginPipelines(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig) ?@import("arch/cooler_pipelines.zig").Plan {
-    if (!arch_handle.onEngine(null, config)) return null;
-    var plan = @import("arch/cooler_pipelines.zig").beginFor(a, io, config) orelse return null;
-    _ = plan.settle();
+    var plan = beginPipelinesAsync(io, a, config) orelse return null;
+    _ = plan.await();
     return plan;
 }
 
@@ -408,7 +416,7 @@ pub fn warmLoadWith(io: std.Io, a: std.mem.Allocator, config: *const ModelConfig
         return err;
     };
     @import("arch/cooler.zig").warmEnded(xfm);
-    if (plan) |p| p.store() else cooler_pipelines.rewriteLate();
+    if (plan) |p| p.store() else cooler_pipelines.finalizeLate();
 }
 
 /// The SSD tier's hold grid: the checkpoint stride's base, so a point the checkpoint grid made is never off the hold grid
@@ -2565,9 +2573,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    // Open and settle the pipeline manifest before weights/trunk/vision init so a warm load preloads
-    // every setup kernel (`prepareGemmNax`, `sushi_cast`, vision tower) with zero live compiles.
-    var pipelines = if (params.warmup_eager) beginPipelines(sch.io, sch.allocator, params.config) else null;
+    // Launch pipeline preload worker threads BEFORE reading weight shards from SSD so Metal pipeline creation
+    // overlaps with disk I/O, then join right before `initTrunk` / first Metal dispatch.
+    var pipelines = if (params.warmup_eager) beginPipelinesAsync(sch.io, sch.allocator, params.config) else null;
     defer if (pipelines) |*p| p.deinit();
 
     // Weights — first mlx call. Binds the stream on this thread.
@@ -2580,6 +2588,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer weights_ptr.deinit();
     model_mod.resolveWeightPrefix(params.config, weights_ptr);
     load_config.weight_prefix = params.config.weight_prefix;
+
+    // Settle preloaded pipelines before trunk/vision init so setup kernels (`prepareGemmNax`, `sushi_cast`, tower)
+    // find them preloaded with zero live compiles.
+    if (pipelines) |*p| _ = p.await();
 
     // Trunk — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Trunk);
@@ -3107,7 +3119,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.config.expert_bounce_bytes,
         )
     else
-        residentWeightBytes(streaming_resident_bytes, entry.bytes_on_disk, modelDiskBytes(sch.io, params.model_dir), params.config.num_hidden_layers, params.config.hidden_size);
+        residentWeightBytes(
+            streaming_resident_bytes,
+            entry.bytes_on_disk,
+            if (streaming_resident_bytes == null and entry.bytes_on_disk == 0) modelDiskBytes(sch.io, params.model_dir) else 0,
+            params.config.num_hidden_layers,
+            params.config.hidden_size,
+        );
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
@@ -3116,7 +3134,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.current_model = entry;
     publishHotCacheResidency(sch);
     load_clock.end();
-    if (params.config.dsv41 != null) {
+    {
         var line_buf: [512]u8 = undefined;
         log.info("{s}\n", .{load_clock.line(&line_buf, &load_clock.load)});
     }

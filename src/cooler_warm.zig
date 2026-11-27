@@ -183,7 +183,8 @@ pub fn warmServed(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, drafter: ?gener
         }
         try ran;
     }
-    try narrowAfter(io, a, xfm, ids[0..longest], chunk);
+    // Reuse the cache state left by the `longest` request above instead of resetting and re-prefilling `longest` tokens a second time.
+    try narrowAfterOn(xfm, ids[0..longest]);
     try archWarmPackedGather(xfm);
     for (sampled ++ penalized) |sp| {
         try request(io, a, xfm, ids[0..9], spec, sp, 8, 0);
@@ -431,6 +432,21 @@ fn drain(a: std.mem.Allocator, gen: *generate.Generator) !void {
     }
 }
 
+/// Appends every narrow chunk width `1..narrow_max` onto `xfm`'s live cache state (already past `longest` tokens).
+fn narrowAfterOn(xfm: *Trunk, ids: []const u32) !void {
+    var ctx = xfm.defaultCtx();
+    var row: [narrow_max]i32 = undefined;
+    for (&row, 0..) |*t, i| t.* = @intCast(ids[i % ids.len]);
+    for (1..narrow_max + 1) |n| {
+        const shape = [2]c_int{ 1, @intCast(n) };
+        const in = try generate.idsArray(xfm, &row, &shape);
+        defer _ = mlx.mlx_array_free(in);
+        const logits = try xfm.forwardWith(&ctx, in);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+    }
+}
+
 /// Every narrow chunk width once more, appended after `ids`: a prompt restored from the prefix cache prefills its tail
 /// there, and past a sparse indexer's budget the attention's block selection takes the width as a template value too.
 pub fn narrowAfter(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, ids: []const u32, chunk: usize) !void {
@@ -440,16 +456,7 @@ pub fn narrowAfter(io: std.Io, a: std.mem.Allocator, xfm: *Trunk, ids: []const u
     var gen = try generate.Generator.initWithOptions(io, a, xfm, &tok, ids, 1, .{ .temperature = 0 }, &.{}, .{ .skip_lazy_preforward = true, .pinned_prefill_chunk = chunk });
     defer gen.deinit(a);
     _ = try gen.next(a);
-    var row: [narrow_max]i32 = undefined;
-    for (&row, 0..) |*t, i| t.* = @intCast(ids[i % ids.len]);
-    for (1..narrow_max + 1) |n| {
-        const shape = [2]c_int{ 1, @intCast(n) };
-        const in = try generate.idsArray(xfm, &row, &shape);
-        defer _ = mlx.mlx_array_free(in);
-        const logits = try xfm.forwardWith(&gen.ctx, in);
-        defer _ = mlx.mlx_array_free(logits);
-        try mlx.check(mlx.mlx_array_eval(logits));
-    }
+    try narrowAfterOn(xfm, ids);
 }
 
 /// What a prompt restored from the prefix cache past a sparse indexer's budget reads that no cold chunk does (the

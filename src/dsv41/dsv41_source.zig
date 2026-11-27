@@ -102,71 +102,99 @@ pub fn dsparkBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u
 
 const Section = enum { trunk, stages, vision };
 
-/// `keeps`' bytes as built, over the trunk, only the DSpark stages, or only the vision tower.
-fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, section: Section, keep_bf16: bool, engine: bool) !u64 {
+/// Computes `(trunk, mtp, vision)` resident bytes in a single pass over all shard headers (instead of 6 passes).
+pub fn streamedSplit(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, want_stages: bool, want_vision: bool, keep_bf16: bool, engine: bool) !model.ResidentSplit {
     var shards = try shardNames(io, allocator, dir_path);
     defer freeShardNames(allocator, &shards);
     const floor = model.importFloor(engine);
-    // A pooling compressor (one with a gate) holds its weights in f32.
+
+    var headers = try allocator.alloc(expert_io.SafetensorsHeader, shards.items.len);
+    var opened: usize = 0;
+    defer {
+        for (headers[0..opened]) |*h| h.deinit();
+        allocator.free(headers);
+    }
+
     var pooled: std.ArrayList(u8) = .empty;
     defer pooled.deinit(allocator);
-    for (shards.items) |name| {
+    for (shards.items, 0..) |name, i| {
         const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
         defer allocator.free(path);
-        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
+        const fd = try expert_io.openHinted(path, .{ .nocache = false, .readahead_off = false });
         defer _ = std.c.close(fd);
-        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
-        defer header.deinit();
-        var tensors = header.parsed.value.object.iterator();
+        headers[i] = try expert_io.SafetensorsHeader.read(allocator, fd);
+        opened = i + 1;
+        if (headers[i].parsed.value != .object) return error.InvalidSafetensorsHeader;
+        var tensors = headers[i].parsed.value.object.iterator();
         while (tensors.next()) |entry| if (std.mem.endsWith(u8, entry.key_ptr.*, ".attn.compressor.wgate.weight")) {
             const k = entry.key_ptr.*;
             try pooled.appendSlice(allocator, k[0 .. k.len - "wgate.weight".len]);
             try pooled.append(allocator, 0);
         };
     }
-    var total: u64 = 0;
-    var ragged: [ragged_slots]u64 = @splat(0);
-    var banks: [bank_slots]u64 = @splat(0);
-    for (shards.items) |name| {
-        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ dir_path, name }, 0);
-        defer allocator.free(path);
-        const fd = try expert_io.openHinted(path, .{ .nocache = true, .readahead_off = false });
-        defer _ = std.c.close(fd);
-        var header = try expert_io.SafetensorsHeader.read(allocator, fd);
-        defer header.deinit();
+
+    var totals: [3]u64 = .{ 0, 0, 0 };
+    var ragged: [3][ragged_slots]u64 = .{ @splat(0), @splat(0), @splat(0) };
+    var banks: [3][bank_slots]u64 = .{ @splat(0), @splat(0), @splat(0) };
+    for (headers[0..opened]) |*header| {
+        if (header.parsed.value != .object) return error.InvalidSafetensorsHeader;
         var tensors = header.parsed.value.object.iterator();
         while (tensors.next()) |entry| {
             const key = entry.key_ptr.*;
             if (std.mem.eql(u8, key, "__metadata__") or !keeps(key, .{ .dspark = true, .vision = true })) continue;
             const mine: Section = if (isVisionKey(key)) .vision else if (std.mem.startsWith(u8, key, "mtp.")) .stages else .trunk;
-            if (mine != section) continue;
-            const offs = (entry.value_ptr.object.get("data_offsets") orelse return error.InvalidSafetensorsHeader).array.items;
+            if (mine == .stages and !want_stages) continue;
+            if (mine == .vision and !want_vision) continue;
+            if (entry.value_ptr.* != .object) return error.InvalidSafetensorsHeader;
+            const obj = entry.value_ptr.object;
+            const si: usize = @intFromEnum(mine);
+            const offs_val = obj.get("data_offsets") orelse return error.InvalidSafetensorsHeader;
+            if (offs_val != .array) return error.InvalidSafetensorsHeader;
+            const offs = offs_val.array.items;
             if (offs.len != 2 or offs[0] != .integer or offs[1] != .integer) return error.InvalidSafetensorsHeader;
-            const stored: u64 = @intCast(offs[1].integer - offs[0].integer);
-            const bytes = stored *| f32From(key, entry.value_ptr.object, pooled.items);
-            if (section == .vision and !keep_bf16) if (requantizedShape(key, entry.value_ptr.object)) |shape| {
-                total +|= vision.quantizedHeldBytes(shape[0], shape[1], engine);
+            const lo = std.math.cast(u64, offs[0].integer) orelse return error.InvalidSafetensorsHeader;
+            const hi = std.math.cast(u64, offs[1].integer) orelse return error.InvalidSafetensorsHeader;
+            if (hi < lo) return error.InvalidSafetensorsHeader;
+            const stored: u64 = hi - lo;
+            const bytes = stored *| f32From(key, obj, pooled.items);
+            if (mine == .vision and !keep_bf16) if (requantizedShape(key, obj)) |shape| {
+                totals[si] +|= vision.quantizedHeldBytes(shape[0], shape[1], engine);
                 continue;
             };
             if (raggedSlot(key)) |slot| {
-                ragged[slot] +|= bytes;
+                ragged[si][slot] +|= bytes;
                 continue;
             }
             if (bankSlot(key)) |slot| {
-                banks[slot] +|= bytes;
+                banks[si][slot] +|= bytes;
                 continue;
             }
-            // Engram's q.k product is an op's result, never a region.
             if (std.mem.endsWith(u8, key, ".engram.q_weight")) {
-                total +|= bytes;
+                totals[si] +|= bytes;
                 continue;
             }
-            total +|= builtBytes(key, bytes, floor);
+            totals[si] +|= builtBytes(key, bytes, floor);
         }
     }
-    for (ragged) |b| total +|= if (b > 0) expert_io.pageRoundUp(b) else 0;
-    for (banks) |b| total +|= if (b < floor) b else expert_io.pageRoundUp(b);
-    return total;
+    for (0..3) |si| {
+        for (ragged[si]) |b| totals[si] +|= if (b > 0) expert_io.pageRoundUp(b) else 0;
+        for (banks[si]) |b| totals[si] +|= if (b < floor) b else expert_io.pageRoundUp(b);
+    }
+    return .{
+        .trunk = totals[@intFromEnum(Section.trunk)],
+        .mtp = totals[@intFromEnum(Section.stages)],
+        .vision = totals[@intFromEnum(Section.vision)],
+    };
+}
+
+/// `keeps`' bytes as built, over the trunk, only the DSpark stages, or only the vision tower.
+fn sumBytes(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, section: Section, keep_bf16: bool, engine: bool) !u64 {
+    const split = try streamedSplit(io, allocator, dir_path, section == .stages, section == .vision, keep_bf16, engine);
+    return switch (section) {
+        .trunk => split.trunk,
+        .stages => split.mtp,
+        .vision => split.vision,
+    };
 }
 
 /// The `[out, in]` of a header entry the tower requantizes at load (`dsv41_vision.quantizesAtLoad`), else null.
