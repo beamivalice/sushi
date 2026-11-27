@@ -180,6 +180,7 @@ pub fn dtypeName(d: mlx.mlx_dtype) ?[]const u8 {
         .float32 => "F32",
         .bfloat16 => "BF16",
         .complex64 => "C64",
+        // .float64 is intentionally refused (unsupported on Metal GPU).
         else => null,
     };
 }
@@ -316,6 +317,8 @@ pub fn makeArrayFilled(
         try fill(ctx, dst);
         return arr;
     }
+    const mk = mlx.engine.makers(false);
+    defer mk.end();
     if (nbytes == 0) {
         var dummy: u8 = 0;
         try fill(ctx, &.{});
@@ -667,8 +670,24 @@ test "safetensors: native save/load round-trips all dtypes on both MLX and Sushi
     try mlx.requireGpu();
     try roundTripOnStream(mlx.gpuStream());
 
+    const was_enabled = mlx.engine.enabled;
     mlx.engine.enable();
+    defer @import("test_support.zig").restoreEngine(was_enabled);
     try roundTripOnStream(mlx.engine.stream());
+
+    // An MLX stream must still allocate MLX arrays even when called inside a Cooler scope.
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const hdr_w = "{\"w\":{\"dtype\":\"F32\",\"shape\":[2],\"data_offsets\":[0,8]}}";
+    var img: [8 + hdr_w.len + 8]u8 = undefined;
+    std.mem.writeInt(u64, img[0..8], hdr_w.len, .little);
+    @memcpy(img[8..][0..hdr_w.len], hdr_w);
+    @memcpy(img[8 + hdr_w.len ..][0..8], std.mem.asBytes(&[_]f32{ 1.5, -2.5 }));
+    const sc = mlx.engine.enter(mlx.engine.stream());
+    defer sc.end();
+    var on_cpu = try loadBytes(testing.allocator, &img, cpu);
+    defer on_cpu.deinit();
+    try testing.expect(!mlx.engine.isOurs(on_cpu.get("w").?));
 }
 
 test "safetensors: malformed headers, bad offsets, and truncated payloads are refused" {

@@ -85,6 +85,8 @@ fn dumpRestore(
     const json_path = try std.fmt.allocPrint(gpa, "{s}.json", .{stem});
     defer gpa.free(json_path);
 
+    const scope = if (mlx.engine.isStream(s)) mlx.engine.enter(s) else null;
+    defer if (scope) |sc| sc.end();
     var map = st.Loaded.init(gpa);
     defer map.deinit();
     var key_buf: [96]u8 = undefined;

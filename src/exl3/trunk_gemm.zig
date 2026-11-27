@@ -269,7 +269,7 @@ test "trunk gemm: real pack trunk banks, every shape the gate allows writes the 
         defer parsed.deinit();
         if (parsed.value != .object) return error.BadSafetensorsHeader;
         var it = parsed.value.object.iterator();
-        while (it.next()) |entry| {
+        outer: while (it.next()) |entry| {
             if (!std.mem.endsWith(u8, entry.key_ptr.*, ".trellis") or entry.value_ptr.* != .object) continue;
             const obj = entry.value_ptr.object;
             const sh_v = obj.get("shape") orelse continue;
@@ -277,8 +277,8 @@ test "trunk gemm: real pack trunk banks, every shape the gate allows writes the 
             if (sh_v != .array or sh_v.array.items.len != 3 or offs_v != .array or offs_v.array.items.len != 2) continue;
             var sh: [3]c_int = undefined;
             for (sh_v.array.items, &sh) |d, *dst| {
-                if (d != .integer) continue;
-                dst.* = std.math.cast(c_int, d.integer) orelse continue;
+                if (d != .integer) continue :outer;
+                dst.* = std.math.cast(c_int, d.integer) orelse continue :outer;
             }
             if (sh[2] != 96) continue;
             const in = sh[0] * 16;
@@ -287,12 +287,17 @@ test "trunk gemm: real pack trunk banks, every shape the gate allows writes the 
                 if (b.in == in and b.out == out) break true;
             } else false;
             if (seen or n_banks == banks.len) continue;
-            const lo: u64 = @intCast(offs_v.array.items[0].integer);
-            const hi: u64 = @intCast(offs_v.array.items[1].integer);
+            const lo_v = offs_v.array.items[0];
+            const hi_v = offs_v.array.items[1];
+            if (lo_v != .integer or hi_v != .integer or lo_v.integer < 0 or hi_v.integer < lo_v.integer) continue;
+            const lo: u64 = @intCast(lo_v.integer);
+            const hi: u64 = @intCast(hi_v.integer);
             const raw = try t.allocator.alloc(u8, @intCast(hi - lo));
             defer t.allocator.free(raw);
             if (try f.readPositionalAll(t.io, raw, 8 + hlen + lo) != raw.len) return error.TruncatedSafetensors;
-            const dt_s = (obj.get("dtype") orelse continue).string;
+            const dt_v = obj.get("dtype") orelse continue;
+            if (dt_v != .string) continue;
+            const dt_s = dt_v.string;
             const dtype: mlx.mlx_dtype = if (std.mem.eql(u8, dt_s, "U16")) .uint16 else if (std.mem.eql(u8, dt_s, "I16")) .int16 else if (std.mem.eql(u8, dt_s, "U8")) .uint8 else continue;
             const bank = try mlx.newData(raw.ptr, &[_]c_int{ 1, sh[0], sh[1], sh[2] }, dtype);
             banks[n_banks] = .{ .in = in, .out = out, .trellis = bank };
