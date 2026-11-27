@@ -421,9 +421,10 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   under-samples short kernels and mis-shares the rest ([perf-baselines](qwen4-perf.md#m2max-decode)).
 - A Metal System Trace: `xcrun xctrace record --template 'Metal System Trace' --instrument 'Metal GPU Counters'
   --attach <pid>`, then export `metal-shader-profiler-intervals` (the profiler under-samples short kernels).
-- Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=N` (`_ROWS`, capped at the admitted chunk;
-  `_KV=<n>` for a chunk after n tokens; `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX
-  reference and served bodies in one boot).
+- Time a prefill chunk with the load-time meter `SUSHI_PREFILL_UBENCH=<iters>` (**iteration count**, e.g. `3`–`6`,
+  never token count; pass chunk width via `_ROWS=<tokens>`, capped at the admitted chunk; `_KV=<n>` for a chunk
+  after n tokens; `_TEXT=<file>` for real routing; `_ARMS=0,1,0,1` alternates the EXL3 NAX reference and served
+  bodies in one boot).
 - Time MiMo's prefill attention for one chunk with `sushi-ubench run mimo2.prefill_attn` (`--rungs ql=...`, `--rungs kl=...`;
   kL = qL is the chunk alone): a global layer's served chain against pre-dequantized K/V, and a sliding layer's fused band
   kernel against the composed SDPA. MiMo's global decode attention (dense, dequant rebuild, matmul2d, split-K, kv 2k to
