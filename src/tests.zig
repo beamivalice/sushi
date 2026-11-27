@@ -128,7 +128,6 @@ test {
     _ = @import("http_head.zig");
     _ = @import("byte_budget.zig");
     _ = @import("mtp_lookup.zig");
-    _ = @import("think_penalty.zig");
     _ = @import("kv_quant.zig");
     _ = @import("trunk_stq.zig");
     _ = @import("linear.zig");

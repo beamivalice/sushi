@@ -1024,7 +1024,7 @@ pub fn mtpSerialCaptureTick(self: *Generator, allocator: std.mem.Allocator) !?Dr
     // Both checks below return on a Metal abort instead of ending the process, so the
     // handle needs an owner on the error path; a scoped `defer`, not errdefer + manual free.
     const val: i32 = blk: {
-        const lazy = try self.sampleLazy(logits, .committed);
+        const lazy = try self.sampleLazy(logits);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var v: i32 = 0;
@@ -1433,7 +1433,6 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // the leaf (Phase 4) and `ssmRollbackFromCapture` (Phase 5).
     errdefer arch_state.discardDeferred(xfm, &self.ctx);
     try arch_state.flushDeferred(xfm, &self.ctx);
-    _ = try self.thinkShiftRows(&verify_logits, st.verify_input);
     _ = try self.penaltyShiftRows(&verify_logits, st.verify_input);
     st.verify_logits = verify_logits;
     st.new_hidden = new_hidden;
@@ -1477,7 +1476,6 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
     states[0].group_logits = xfm.takeJoinedVerifyLogits();
     var shifted_any = false;
     for (gens[0..n], states[0..n], 0..) |gen, st, i| {
-        if (try gen.thinkShiftRows(&st.verify_logits, st.verify_input)) shifted_any = true;
         if (try gen.penaltyShiftRows(&st.verify_logits, st.verify_input)) shifted_any = true;
         if (st.tracing) {
             gen.mtp_trace.add(.verify, row_ns[i]);

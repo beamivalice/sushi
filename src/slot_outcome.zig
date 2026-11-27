@@ -150,13 +150,18 @@ fn formatStop(out: []u8, line: StopLine) []const u8 {
     return out[0..n];
 }
 
-/// An EOS ends the turn by itself; token 0 ends it only as the third pad in a row.
-fn stopKind(token: u32, eos: []const u32) []const u8 {
-    return if (generate_mod.isEosId(token, eos)) "eos" else "pad-run";
+/// An EOS ends the turn by itself; a `tool_choice: "none"` call opener joins `eos` outside the
+/// model's own EOS set; token 0 ends the turn only as the third pad in a row.
+fn stopKind(token: u32, eos: []const u32, model_eos: ?[]const u32) []const u8 {
+    if (!generate_mod.isEosId(token, eos)) return "pad-run";
+    if (model_eos) |meos| {
+        if (!generate_mod.isEosId(token, meos)) return "tool-choice-none";
+    }
+    return "eos";
 }
 
-/// Names the token that ended a turn finishing "stop" on an EOS or a pad run. Decodes into stack
-/// scratch: a log line never allocates and never fails the request.
+/// Names the token that ended a turn finishing "stop" on an EOS, a `tool_choice: "none"` opener,
+/// or a pad run. Decodes into stack scratch: a log line never allocates and never fails the request.
 fn logStop(slot: *Slot, reason: []const u8) void {
     if (!std.mem.eql(u8, reason, "stop")) return;
     const gen: ?*Generator = if (slot.legacy_gen) |*g| g else null;
@@ -175,9 +180,10 @@ fn logStop(slot: *Slot, reason: []const u8) void {
     if (path.len == 0) {
         path = if (gen) |g| (if (specTickMode(slot.enable_mtp, g.mtp != null or g.drafter_on, slot.enable_drafter, g.dflash != null) == .regular) "serial" else "spec") else "serial";
     }
+    const model_eos: ?[]const u32 = if (slot.model.config) |c| c.eosTokenSlice() else null;
     var buf: [384]u8 = undefined;
     log.info("{s}\n", .{formatStop(&buf, .{
-        .kind = stopKind(token, slot.eos_token_ids),
+        .kind = stopKind(token, slot.eos_token_ids, model_eos),
         .token = token,
         .token_text = token_text,
         .after = after,
@@ -1132,8 +1138,14 @@ test "[stop] names the token that ended the turn" {
         "[stop] reason=pad-run token=0 \"\" after=none \"\" completion=0 path=batch",
         formatStop(&buf, .{ .kind = "pad-run", .token = 0, .token_text = "", .after = null, .after_text = "", .completion = 0, .path = "batch" }),
     );
+    try testing.expectEqualStrings(
+        "[stop] reason=tool-choice-none token=151657 \"<tool_call>\" after=1510 \"ok\" completion=12 path=serial",
+        formatStop(&buf, .{ .kind = "tool-choice-none", .token = 151657, .token_text = "<tool_call>", .after = 1510, .after_text = "ok", .completion = 12, .path = "serial" }),
+    );
     const esc = formatStop(&buf, .{ .kind = "eos", .token = 2, .token_text = "a\"\nb", .after = 7, .after_text = "x", .completion = 1, .path = "spec" });
     try testing.expectEqualStrings("[stop] reason=eos token=2 \"a\\\"\\nb\" after=7 \"x\" completion=1 path=spec", esc);
-    try testing.expectEqualStrings("eos", stopKind(248046, &.{ 248046, 248044 }));
-    try testing.expectEqualStrings("pad-run", stopKind(0, &.{248046}));
+    try testing.expectEqualStrings("eos", stopKind(248046, &.{ 248046, 248044 }, &.{ 248046, 248044 }));
+    try testing.expectEqualStrings("eos", stopKind(248046, &.{ 248046, 248044 }, null));
+    try testing.expectEqualStrings("tool-choice-none", stopKind(151657, &.{ 248046, 151657 }, &.{248046}));
+    try testing.expectEqualStrings("pad-run", stopKind(0, &.{248046}, &.{248046}));
 }

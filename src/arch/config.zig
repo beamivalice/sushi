@@ -127,7 +127,6 @@ pub const Facts = struct {
     exclusive_decode_of: ?*const fn (*const model.ModelConfig) bool = null,
     reads_yarn: bool = false,
     ssd_first_capable: bool = false,
-    bias_unserved: bool = false,
 };
 
 /// The config data only `name`'s arch reads, parsed once with the config: its `OwnConfig`, or an empty struct where the

@@ -163,31 +163,6 @@ pub fn archFlagRefusal(config: *const model.ModelConfig, use: LaunchFlagUse) ?[]
     }
 }
 
-/// Why a request carrying `what` (`logit_bias`, `think_penalty`) is refused by this config's arch; null when it serves it.
-pub fn biasRefusal(buf: []u8, config: *const model.ModelConfig, what: []const u8) ?[]const u8 {
-    if (!arch_config.fact(config, "bias_unserved")) return null;
-    return std.fmt.bufPrint(buf, "{s} does not support {s}", .{ productOf(config), what }) catch what;
-}
-
-/// Why a load of `config` is refused for a think penalty set for the model itself (its saved setting) or a logit-bias
-/// file its arch does not serve; null when it takes them. `--think-penalty` is a launch default and never refuses.
-pub fn biasLoadRefusal(buf: []u8, config: *const model.ModelConfig) ?[]const u8 {
-    if (!arch_config.fact(config, "bias_unserved")) return null;
-    const product = productOf(config);
-    if (config.think_penalty_override) |lambda| {
-        if (lambda > 0) return std.fmt.bufPrint(buf, "{s} does not support think_penalty: remove it from this model's settings", .{product}) catch "think_penalty is not supported";
-    }
-    if (config.logit_bias_file_override != null) return std.fmt.bufPrint(buf, "{s} does not support logit_bias: remove logit_bias_file from this model's settings", .{product}) catch "logit_bias is not supported";
-    return null;
-}
-
-fn productOf(config: *const model.ModelConfig) []const u8 {
-    const tag = arch_config.tagOf(config) orelse return "this model";
-    switch (tag) {
-        inline else => |t| return registry.Mod(t).packs.product,
-    }
-}
-
 /// What a Cooler load serves, whatever its arch: no DFlash2, which runs on MLX only. A flag that asks otherwise is
 /// refused by name, with the arch's own way back to MLX.
 const cooler_refused = [_]struct { field: []const u8, flag: []const u8, why: []const u8 }{
@@ -281,7 +256,6 @@ pub fn settingsFit(config: *const model.ModelConfig) model_settings.Fit {
         .cooler_setting = coolerSettingName(config),
         .exclusive_decode = arch_config.exclusiveDecode(config),
         .max_concurrent_cap = if (arch_config.exclusiveDecode(config)) 1 else @intCast(arch_sched.rowCap(config) orelse sched_policy.MAX_BATCH_GROUP),
-        .serves_bias = !arch_config.fact(config, "bias_unserved"),
     };
 }
 
@@ -650,27 +624,4 @@ test "flags: --prefill-chunk-max and --prefill-chunk-min parse 512, 1024, 2048, 
         try testing.expect(model_settings.applies("prefill_chunk_min", settingsFit(&cfg)));
         try testing.expectEqual(@as([]const []const u8, &model_settings.chunk_choices), model_settings.findKey(&model_settings.model_keys, "prefill_chunk_max").?.choices);
     }
-}
-
-test "an arch that serves no bias refuses a request's logit_bias and think_penalty, a think penalty by setting and a bias file at load, each naming itself and the parameter; another arch serves them, and a think penalty by flag is no refusal" {
-    if (!built("hy_v4_flash") or !built("qwen4_exp")) return error.SkipZigTest;
-    var buf: [256]u8 = undefined;
-    const hy4 = model.ModelConfig{ .model_type = "hy_v4_flash" };
-    const qwen = model.ModelConfig{ .model_type = "qwen4_exp" };
-    try testing.expectEqualStrings("Hy4-Flash does not support logit_bias", biasRefusal(&buf, &hy4, "logit_bias").?);
-    try testing.expectEqualStrings("Hy4-Flash does not support think_penalty", biasRefusal(&buf, &hy4, "think_penalty").?);
-    try testing.expect(biasRefusal(&buf, &qwen, "logit_bias") == null);
-    try testing.expect(biasRefusal(&buf, &qwen, "think_penalty") == null);
-    try testing.expect(biasLoadRefusal(&buf, &hy4) == null);
-    var saved = hy4;
-    saved.think_penalty_override = 2;
-    try testing.expectEqualStrings("Hy4-Flash does not support think_penalty: remove it from this model's settings", biasLoadRefusal(&buf, &saved).?);
-    var filed = hy4;
-    filed.logit_bias_file_override = @import("../logit_bias.zig").FilePath.from("bias.json");
-    try testing.expectEqualStrings("Hy4-Flash does not support logit_bias: remove logit_bias_file from this model's settings", biasLoadRefusal(&buf, &filed).?);
-    try testing.expect(biasLoadRefusal(&buf, &qwen) == null);
-    var qwen_filed = qwen;
-    qwen_filed.logit_bias_file_override = @import("../logit_bias.zig").FilePath.from("bias.json");
-    qwen_filed.think_penalty_override = 2;
-    try testing.expect(biasLoadRefusal(&buf, &qwen_filed) == null);
 }

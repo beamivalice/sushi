@@ -8,11 +8,8 @@ const mtp_lookup = @import("../mtp_lookup.zig");
 const mtp_mod = @import("../mtp.zig");
 const mimo_mtp = @import("mimo_mtp.zig");
 const mimo_drafter = @import("mimo2_drafter.zig");
-const think_penalty = @import("../think_penalty.zig");
-const logit_bias = @import("../logit_bias.zig");
 const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
-const ThinkPenalty = think_penalty.ThinkPenalty;
 const testing = std.testing;
 const sampler = @import("../sampler.zig");
 const SamplingParams = sampler.SamplingParams;
@@ -182,18 +179,7 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     var prompt: [168]u32 = undefined;
     for (&prompt, 0..) |*v, i| v.* = @intCast((i * 7) % config.vocab_size);
 
-    const entries = [_]logit_bias.Bias{
-        .{ .id = 1, .delta = 2, .scope = .reasoning },
-        .{ .id = 2, .delta = -1, .scope = .answer },
-        .{ .id = 3, .delta = -2, .scope = .all },
-    };
-    const penalties = [_]ThinkPenalty{
-        .{},
-        .{ .biases = &entries, .phase = .inside, .closer_id = std.math.maxInt(u32) },
-        .{ .biases = &entries, .phase = .after },
-    };
-    for (penalties) |penalty| {
-    const greedy = SamplingParams{ .temperature = 0, .think_penalty = penalty };
+    const greedy = SamplingParams{ .temperature = 0 };
     var serial_xfm = try pldTestTransformer(io, config, &weights, kv);
     defer serial_xfm.deinit();
     var serial_gen = try Generator.initWithOptions(io, a, &serial_xfm, &tok, &prompt, want + 16, greedy, &.{}, .{ .skip_lazy_preforward = true });
@@ -250,7 +236,6 @@ test "mimo MTP prompt-lookup rounds decode like serial ticks, a lookup first rou
     defer _ = mlx.mlx_vector_array_free(eval);
     gen.mtp_cache.?.appendEvalArrays(eval);
     try mlx.check(mlx.mlx_eval(eval));
-    }
 }
 
 test "mtpLookupDraftCap: a MiMo lookup drafts no wider than its verify keeps decode rows" {

@@ -36,7 +36,7 @@ assert.equal(page.adminAgo(now / 1000 - 3 * 86400, now), '3 days ago');
 
 const bool = { name: 'mtp', type: 'bool' };
 const int = { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 };
-const num = { name: 'think_penalty', type: 'number', min: 0, max: 20 };
+const num = { name: 'expert_cache_bias', type: 'number', min: 0, max: 2 };
 const choice = { name: 'kv_quant', type: 'choice', choices: ['off', '4', '6', '8'] };
 const path = { name: 'models_dir', type: 'choice' };
 const value = (spec, text) => JSON.parse(JSON.stringify(page.adminControlValue(spec, text)));
@@ -50,8 +50,8 @@ assert.equal(value(int, '1e2').ok, false, 'exponent notation is not a whole numb
 assert.equal(value(int, '0x10').ok, false);
 assert.equal(value(num, '1e1').ok, false);
 assert.equal(value(num, '.5').ok, true);
-assert.deepEqual(value(num, '2.5'), { ok: true, value: 2.5 });
-assert.equal(value(num, '20.5').ok, false);
+assert.deepEqual(value(num, '1.5'), { ok: true, value: 1.5 });
+assert.equal(value(num, '2.5').ok, false);
 assert.deepEqual(value(choice, '8'), { ok: true, value: '8' });
 assert.equal(value(choice, '5').ok, false);
 assert.equal(value(path, '/models').ok, true);
@@ -61,12 +61,12 @@ const specs = [bool, int, num, choice];
 const settings = {
   mtp: { file: false, locked: false },
   ssd_prefetch: { file: 40, locked: false },
-  think_penalty: { file: null, locked: true, flag: '2' },
+  expert_cache_bias: { file: null, locked: true, flag: '0.2' },
   kv_quant: { file: '4', locked: false },
 };
 const changes = (texts) => JSON.parse(JSON.stringify(page.adminChanges(specs, settings, texts)));
-assert.deepEqual(changes({ mtp: 'false', ssd_prefetch: '40', think_penalty: '5', kv_quant: '4' }), { set: {}, bad: null });
-assert.deepEqual(changes({ mtp: 'true', ssd_prefetch: '', think_penalty: '5', kv_quant: '8' }), { set: { mtp: true, ssd_prefetch: null, kv_quant: '8' }, bad: null });
+assert.deepEqual(changes({ mtp: 'false', ssd_prefetch: '40', expert_cache_bias: '1', kv_quant: '4' }), { set: {}, bad: null });
+assert.deepEqual(changes({ mtp: 'true', ssd_prefetch: '', expert_cache_bias: '1', kv_quant: '8' }), { set: { mtp: true, ssd_prefetch: null, kv_quant: '8' }, bad: null });
 assert.deepEqual(changes({ ssd_prefetch: '900' }), { set: {}, bad: 'ssd_prefetch' });
 assert.equal(page.adminBytes(1023.8 * 1024 ** 2), '1.00 GiB', 'no "1024 MiB"');
 assert.equal(page.adminBytes(110 * GiB), '110 GiB');
@@ -80,7 +80,7 @@ assert.equal(page.adminTokens(1000), '1,000');
 assert.equal(page.adminProblem(int, '1e'), 'Enter a whole number from 0 to 100');
 assert.equal(page.adminProblem(int, '5'), null);
 assert.equal(page.adminProblem({ name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, 'x'), 'Enter a whole number of 1 or more', 'a u32 bound is "or more"');
-assert.equal(page.adminProblem({ name: 'think_penalty', type: 'number', min: 0, max: 20 }, 'x'), 'Enter a number from 0 to 20');
+assert.equal(page.adminProblem({ name: 'expert_cache_bias', type: 'number', min: 0, max: 2 }, 'x'), 'Enter a number from 0 to 2');
 assert.equal(page.adminFileText('8'), '8');
 assert.equal(page.adminFileText('off'), 'off');
 assert.equal(page.adminFileText(null), '');

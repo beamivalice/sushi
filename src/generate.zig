@@ -20,9 +20,7 @@ const spec_cost_gate = @import("spec_cost_gate.zig");
 const spec_stats = @import("spec_stats.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
-const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
-const logit_bias = @import("logit_bias.zig");
 
 const Trunk = trunk.Trunk;
 const arch_state = @import("arch/arch_state.zig");
@@ -353,22 +351,6 @@ pub const CallForce = struct {
         allocator.free(self.choice_buf);
     }
 };
-
-/// Map the overthinking markers onto this tokenizer once per load (`think_penalty.markerIds`).
-/// Never fails a load: an error leaves the mask null and the penalty inert.
-pub fn installThinkMarkers(xfm: *Trunk, tok: *const Tokenizer) void {
-    const ids = think_penalty.markerIds(xfm.allocator, &think_penalty.WORDS, tok) catch |err| {
-        log.warn("[think-penalty] marker mapping failed ({s}); penalty off\n", .{@errorName(err)});
-        return;
-    };
-    defer xfm.allocator.free(ids);
-    const logits_dim: usize = xfm.config.vocab_size;
-    xfm.think_marker_mask = think_penalty.buildMask(xfm.allocator, ids, logits_dim) catch |err| {
-        log.warn("[think-penalty] mask build failed ({s}); penalty off\n", .{@errorName(err)});
-        return;
-    };
-    log.debug("[think-penalty] {d} marker tokens from {d} words (multi-token spellings skipped)\n", .{ ids.len, think_penalty.WORDS.len });
-}
 
 /// Generation result (for non-streaming use).
 pub const GenerationResult = struct {
@@ -1304,11 +1286,6 @@ pub const Generator = struct {
         // inherits the model's mask without per-site wiring.
         var sampling = sampling_in;
         sampling.suppress_mask = xfm.suppress_mask;
-        sampling.think_penalty.file_biases = xfm.logit_bias;
-        if (@import("arch/config.zig").fact(&xfm.config, "bias_unserved") and (sampling.think_penalty.armed() or sampling.think_penalty.hasBias())) return error.BiasUnserved;
-        const bias_vocab: usize = xfm.config.vocab_size;
-        try sampling.think_penalty.prepare(allocator, bias_vocab, xfm.think_marker_mask, xfm.outStream());
-        errdefer sampling.think_penalty.deinitPrepared();
         if (mlx.engine.isStream(xfm.outStream())) sampling.draw_root = try drawRoot(io, sampling.seed);
         var options = options_in;
         const native_dflash = options.dflash_enabled and options.dflash != null and drafter.nativeDflashEligible(xfm, sampling);
@@ -2464,7 +2441,6 @@ pub const Generator = struct {
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
-        self.sampling.think_penalty.deinitPrepared();
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         self.dropPending();
         self.drafter_masks.deinit(allocator);
@@ -2582,7 +2558,7 @@ pub const Generator = struct {
         const step_logits = try self.takeLogits();
         const lazy = blk: {
             defer _ = mlx.mlx_array_free(step_logits);
-            break :blk try self.sampleLazy(step_logits, .committed);
+            break :blk try self.sampleLazy(step_logits);
         };
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -2595,26 +2571,23 @@ pub const Generator = struct {
     /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
     /// This is called at the START of each iteration, giving the GPU maximum time
     /// to compute since the async_eval at the END of the previous iteration.
-    /// The ONE lazy sampler for a slot's own draws: advances the seed draw index. `after` says
-    /// what precedes the sampled position, which decides the think penalty there.
-    pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array, after: ThinkAfter) !mlx.mlx_array {
-        return self.sampleMasked(logits, null, after);
+    /// The ONE lazy sampler for a slot's own draws: advances the seed draw index.
+    pub fn sampleLazy(self: *Generator, logits: mlx.mlx_array) !mlx.mlx_array {
+        return self.sampleMasked(logits, null);
     }
 
     /// `sampleLazy` under the grammar's `mask` (true keeps an id), when given.
-    pub fn sampleMasked(self: *Generator, logits: mlx.mlx_array, mask: ?[]const bool, after: ThinkAfter) !mlx.mlx_array {
-        const shift = self.thinkShift(after);
+    pub fn sampleMasked(self: *Generator, logits: mlx.mlx_array, mask: ?[]const bool) !mlx.mlx_array {
         defer self.sampling.draw +%= 1;
         // A penalised slot reaches here only from the constrained steps and a forced call's
         // name choice, whose logits follow `generated_ids` (`samplesSync`, `draftsRefused`).
-        return sampleRun(self.xfm, .{ .logits = logits, .sampling = self.sampling, .generated = self.generated_ids.items, .grammar = mask, .shift = shift });
+        return sampleRun(self.xfm, .{ .logits = logits, .sampling = self.sampling, .generated = self.generated_ids.items, .grammar = mask });
     }
 
     /// `sampleToken` after the committed ids, the serial draw that reads its token back.
     fn sampleSync(self: *Generator, logits: mlx.mlx_array) !sampler.SampleResult {
-        const shift = self.markerShiftCommitted();
-        const run = try arch_cooler.beginSample(self.xfm, sampler.syncMix(self.sampling, self.generated_ids.items, shift));
-        const r = sampler.sampleToken(logits, self.sampling, self.generated_ids.items, shift, self.xfm.outStream()) catch |e| {
+        const run = try arch_cooler.beginSample(self.xfm, sampler.syncMix(self.sampling, self.generated_ids.items));
+        const r = sampler.sampleToken(logits, self.sampling, self.generated_ids.items, self.xfm.outStream()) catch |e| {
             try run.fail();
             return e;
         };
@@ -2627,70 +2600,13 @@ pub const Generator = struct {
         return sampler.penaltyActive(self.sampling);
     }
 
-    /// What precedes a sampled position beyond the committed `generated_ids`.
-    pub const ThinkAfter = union(enum) {
-        committed,
-        /// Decided ids not committed yet (t1, a block decoder's accepted prefix).
-        decided: []const u32,
-        /// The pipelined token still in flight, `[1]` or `[1, 1]`.
-        pending: mlx.mlx_array,
-        /// No penalty here: a draft's proposal, or rows a verify already shifted.
-        none,
-    };
-
-    /// The lazy draw `logits` takes at `after`, its shift applied inside the draw's own execution.
-    pub fn stepFor(self: *Generator, logits: mlx.mlx_array, after: ThinkAfter) sampler.Step {
+    /// The lazy draw `logits` takes.
+    pub fn stepFor(self: *Generator, logits: mlx.mlx_array) sampler.Step {
         return .{
             .logits = logits,
             .sampling = self.sampling,
             .generated = self.generated_ids.items,
-            .shift = self.thinkShift(after),
         };
-    }
-
-    /// `logits` under the think penalty where the span is open; the input itself when nothing
-    /// shifts, else a new handle the caller frees.
-    pub fn thinkShifted(self: *Generator, logits: mlx.mlx_array, after: ThinkAfter) !mlx.mlx_array {
-        const sh = self.thinkShift(after) orelse return logits;
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try sampler.applyShift(&out, logits, sh, self.xfm.outStream());
-        return out;
-    }
-
-    /// The think penalty's shift of a sample at `after`, or null where nothing shifts.
-    fn thinkShift(self: *Generator, after: ThinkAfter) ?sampler.Shift {
-        const tp = &self.sampling.think_penalty;
-        if (!tp.active() or after == .none) return null;
-        tp.observe(self.generated_ids.items);
-        var state = tp.*;
-        switch (after) {
-            .decided => |ids| state.phase = tp.phaseAfter(ids),
-            else => {},
-        }
-        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or state.phase == .after or (after != .pending and state.phase != .inside))) return null;
-        return .{ .mask = self.xfm.think_marker_mask, .state = state, .ids = if (after == .pending) after.pending else null };
-    }
-
-    /// Shift a verify block in place: row j follows the committed ids, then `ids[0..j]`
-    /// (`[1, L]`, the rows the forward ran). True = the block changed.
-    pub fn thinkShiftRows(self: *Generator, logits: *mlx.mlx_array, ids: mlx.mlx_array) !bool {
-        const sh = self.rowsShift() orelse return false;
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try think_penalty.shiftScoped(&out, logits.*, sh.mask, sh.state, ids, self.xfm.outStream());
-        _ = mlx.mlx_array_free(logits.*);
-        logits.* = out;
-        return true;
-    }
-
-    /// The think penalty's shift of a verify block's rows after the committed ids, or null where nothing shifts.
-    pub fn rowsShift(self: *Generator) ?sampler.Shift {
-        const tp = &self.sampling.think_penalty;
-        if (!tp.active()) return null;
-        tp.observe(self.generated_ids.items);
-        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return null;
-        return .{ .mask = self.xfm.think_marker_mask, .state = tp.* };
     }
 
     /// Row j of a verify block under the request's repeat, presence and frequency penalties, over the committed
@@ -2710,15 +2626,6 @@ pub const Generator = struct {
         return true;
     }
 
-    /// The host-decided penalty for a sample after the committed ids, for `sampleToken`.
-    fn markerShiftCommitted(self: *Generator) ?sampler.MarkerShift {
-        const tp = &self.sampling.think_penalty;
-        if (!tp.active()) return null;
-        tp.observe(self.generated_ids.items);
-        if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase != .inside)) return null;
-        return .{ .mask = self.xfm.think_marker_mask, .state = tp.* };
-    }
-
     /// What a forced tool call makes of the next position.
     fn forcedNext(self: *Generator) CallForce.Decision {
         const cf = self.sampling.call_force orelse return .sample;
@@ -2734,7 +2641,7 @@ pub const Generator = struct {
         for (ids) |id| {
             if (id < mask.len) mask[id] = true;
         }
-        return self.sampleMasked(logits, mask, .committed);
+        return self.sampleMasked(logits, mask);
     }
 
     /// While a forced call is armed every successor is decided AFTER its
@@ -2799,7 +2706,7 @@ pub const Generator = struct {
         const val: i32 = blk: {
             const lazy = sampled: {
                 defer _ = mlx.mlx_array_free(step_logits);
-                break :sampled try self.sampleLazy(step_logits, .committed);
+                break :sampled try self.sampleLazy(step_logits);
             };
             defer _ = mlx.mlx_array_free(lazy);
             try mlx.check(mlx.mlx_array_eval(lazy));
@@ -3326,10 +3233,7 @@ pub const Generator = struct {
         if (self.pending != null and !self.samplesSync() and self.step + 1 < self.max_tokens and !self.callForcePending()) {
             const p = self.pending.?;
             const t_sample = tick_prof.mark();
-            const lazy_token = try self.sampleLazy(p.logits, if (p.token) |t|
-                .{ .pending = t }
-            else
-                .{ .decided = &.{self.next_token_id} });
+            const lazy_token = try self.sampleLazy(p.logits);
             tick_prof.add(.sample, t_sample);
 
             var adopted = false;
@@ -3421,7 +3325,7 @@ pub const Generator = struct {
         const lazy_token = blk: {
             defer _ = mlx.mlx_array_free(step_logits);
             break :blk switch (self.forcedNext()) {
-                .sample => try self.sampleLazy(step_logits, .committed),
+                .sample => try self.sampleLazy(step_logits),
                 .force => |id| try forcedToken(self.xfm, id),
                 .choose => |ids| try self.sampleAmong(allocator, step_logits, ids),
             };
@@ -3486,7 +3390,7 @@ pub const Generator = struct {
         // suffix the schema rejects is masked out here, never sampled and
         // degraded afterwards.
         const invalid_crossers = try rp_mod.applyReasoningMask(proto, &constraint.pstate, constraint.grammar, constraint.token_bytes, constraint.mask_buf);
-        const lazy = try self.sampleMasked(step_logits, if (invalid_crossers == 0) null else constraint.mask_buf, .committed);
+        const lazy = try self.sampleMasked(step_logits, if (invalid_crossers == 0) null else constraint.mask_buf);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -3601,7 +3505,7 @@ pub const Generator = struct {
         const step_logits = try self.takeLogits();
         defer _ = mlx.mlx_array_free(step_logits);
 
-        const lazy = try self.sampleMasked(step_logits, constraint.mask_buf, .committed);
+        const lazy = try self.sampleMasked(step_logits, constraint.mask_buf);
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
@@ -3741,7 +3645,7 @@ pub const Generator = struct {
         // build overlaps this step's GPU work; the token is realized after
         // dispatch and only then advances the grammar (the mask for the next
         // logits is built on the next call, off the realized state).
-        const lazy = try self.sampleMasked(step_logits, constraint.mask_buf, .committed);
+        const lazy = try self.sampleMasked(step_logits, constraint.mask_buf);
         defer _ = mlx.mlx_array_free(lazy);
         var next_logits: ?mlx.mlx_array = null;
         if (self.step + 1 < self.max_tokens) {
@@ -4520,18 +4424,4 @@ test "specTotals: a DFlash2 request reports the ticks it ran without a draft as 
     g.dflash_plain = .{ .ticks = 3 };
     try testing.expectEqual(Generator.SpecMode.dflash, g.specMode());
     try testing.expectEqual(spec_stats.Totals{ .rounds = 6, .drafted = 24, .accepted = 9, .plain = 3 }, g.specTotals());
-}
-
-pub fn installLogitBias(io: std.Io, xfm: *Trunk, tok: *const Tokenizer) !void {
-    const setting = if (xfm.config.logit_bias_file_override) |*p| p.slice() else null;
-    const path = setting orelse return;
-    const body = try std.Io.Dir.cwd().readFileAlloc(io, path, xfm.allocator, .limited(16 << 20));
-    defer xfm.allocator.free(body);
-    const logits_dim: usize = xfm.config.vocab_size;
-    const loaded = logit_bias.parse(xfm.allocator, body, std.fs.path.extension(path), tok, @min(logits_dim, tok.definedVocabSize())) catch |err| {
-        log.err("[logit-bias] {s}: {s}\n", .{ path, @errorName(err) });
-        return err;
-    };
-    xfm.logit_bias = loaded.biases;
-    log.info("[logit-bias] {s}: {d} entries, {d} expanded ids, {d} multi-token spellings skipped\n", .{ path, loaded.entries, loaded.biases.len, loaded.skipped });
 }

@@ -13,7 +13,6 @@ const scheduler_mod = @import("scheduler.zig");
 const generate_mod = @import("generate.zig");
 const slot_admission = @import("slot_admission.zig");
 const model_registry_mod = @import("model_registry.zig");
-const model_settings = @import("model_settings.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const generation_stream = @import("generation_stream.zig");
@@ -35,8 +34,6 @@ const Conn = http_conn.Conn;
 const sendSseHeaders = http_conn.sendSseHeaders;
 const request_policy = @import("request_policy.zig");
 const servedModelId = request_policy.servedModelId;
-const resolveThinkPenalty = request_policy.resolveThinkPenalty;
-const armThinkPenalty = request_policy.armThinkPenalty;
 const filledMaxTokens = request_policy.filledMaxTokens;
 const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
 const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
@@ -186,13 +183,6 @@ pub fn handleCompletions(
         .ok => |c| c,
     };
 
-    var bias_buf: [160]u8 = undefined;
-    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
-        log.warn("POST /v1/completions -> 400 ({s})\n", .{why});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
-        return;
-    }
-
     if (echoRejectReason(req)) |reason| {
         log.warn("POST /v1/completions -> 400 (unsupported echo)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
@@ -221,7 +211,7 @@ pub fn handleCompletions(
 
     const is_stream = req.flag("stream") orelse false;
 
-    var sampling = requestSampling(config, req);
+    const sampling = requestSampling(config, req);
 
     var stop_sequences = std.ArrayList([]const u8).empty;
     defer stop_sequences.deinit(allocator);
@@ -293,13 +283,6 @@ pub fn handleCompletions(
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, lm, false, kv_quant_override, false, bill_head, null)) return;
 
     const eos_slice = requestEosSlice(config, req);
-    sampling.think_penalty = requestThinkPenalty(allocator, lm, req, prompt_ids);
-    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
-        return;
-    } else &.{};
-    defer allocator.free(request_bias);
-    sampling.think_penalty.biases = request_bias;
 
     if (is_stream) {
         handleStreamingCompletion(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, req.flag("ignore_eos") orelse false, stop_sequences.items, model_name, include_usage, return_progress, enable_drafter, enable_mtp, allow_batch_mtp, cache_key, kv_quant_override) catch |err| {
@@ -314,7 +297,7 @@ pub fn handleCompletions(
     }
 }
 
-/// The sampling a completions request resolves, before the think penalty: the body, then the launch flags,
+/// The sampling a completions request resolves: the body, then the launch flags,
 /// then the model's generation config.
 fn requestSampling(config: *const model_mod.ModelConfig, req: request_fields.Checked(.completions)) sampler.SamplingParams {
     return .{
@@ -327,11 +310,6 @@ fn requestSampling(config: *const model_mod.ModelConfig, req: request_fields.Che
         .frequency_penalty = req.additivePenalty("frequency_penalty"),
         .seed = req.seed(),
     };
-}
-
-fn requestThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, req: request_fields.Checked(.completions), prompt_ids: []const u32) @import("think_penalty.zig").ThinkPenalty {
-    const config = lm.config.?;
-    return armThinkPenalty(allocator, lm, lm.tokenizer.?, prompt_ids, true, resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
 }
 
 const SpecRequest = struct { drafter: bool, mtp: bool, allow_batch_mtp: bool };
@@ -367,8 +345,7 @@ pub fn completeIds(allocator: std.mem.Allocator, lm: *LoadedModel, ids: []const 
 
     const effective_ctx = getEffectiveContextLength(config);
     if (ids.len > effective_ctx) return error.PromptExceedsContext;
-    var sampling = requestSampling(config, req);
-    sampling.think_penalty = requestThinkPenalty(allocator, lm, req, ids);
+    const sampling = requestSampling(config, req);
     const spec_request = requestSpec(config, req, lm.dflash != null, lm.mtp != null, nativeMeasuredMoeHead(lm));
     const enable_mtp = admitMtpForCtx(spec_request.mtp, ids.len);
     const spec = requestSpecModes(spec_request.drafter, enable_mtp, lm.dflash != null, mtpCapable(lm), sampling);

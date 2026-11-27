@@ -6,15 +6,12 @@ const tokenizer_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
-const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
-const logit_bias = @import("logit_bias.zig");
 const random = @import("tensor/random.zig");
 const sampler_draw = @import("sampler_draw.zig");
 const Trunk = trunk.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash.zig");
-const ThinkPenalty = think_penalty.ThinkPenalty;
 const testing = std.testing;
 const mtp_plan = @import("mtp_plan.zig");
 const ThinkBound = mtp_plan.ThinkBound;
@@ -67,8 +64,6 @@ pub const SamplingParams = struct {
     /// lazy (`mlx_where` + -inf, no host sync). Null = no suppression (kill switch, no-template
     /// models, every non-suppressing arch).
     suppress_mask: ?mlx.mlx_array = null,
-    /// Overthinking-marker penalty; the Generator's copy tracks the span over its committed ids.
-    think_penalty: ThinkPenalty = .{},
 };
 
 /// Whether a request consumes only each position's argmax: greedy (or top-1), no logit-moving
@@ -77,7 +72,6 @@ pub const SamplingParams = struct {
 pub fn argmaxOnlyRequest(sampling: SamplingParams) bool {
     return (isGreedyTemperature(sampling.temperature) or sampling.top_k == 1) and
         !penaltyActive(sampling) and
-        !sampling.think_penalty.active() and
         sampling.constraint == null and
         sampling.call_force == null;
 }
@@ -687,7 +681,6 @@ pub const Mix = struct {
     rows: u8 = 1,
     suppress: bool = false,
     greedy: bool = false,
-    think: Think = .off,
     /// The repeat penalty, and the presence and frequency penalties, which apply as one sum (`seen_penalty.apply`).
     repeat: bool = false,
     additive: bool = false,
@@ -697,10 +690,6 @@ pub const Mix = struct {
     /// `step`: a lazy draw (`sampleStep`); `sync`: the serial draw that reads its token back (`sampleToken`); `verdict`:
     /// a verify block's draws judged against its drafts.
     pub const Entry = enum(u8) { step, sync, verdict };
-    /// The think penalty's shift (`think_penalty.shiftScoped`): by its marker mask or its prepared biases, after the
-    /// committed ids, or row by row after ids the GPU holds, each row's gate by the span's state: open, opening at its
-    /// opener, closed, or before an opener there is none of.
-    pub const Think = enum(u8) { off, mask, bias, mask_inside, mask_opens, mask_unopened, bias_inside, bias_opens, bias_after, bias_unopened };
 
     pub fn penalties(m: *Mix, pen: seen_penalty.Penalties) void {
         m.repeat = seen_penalty.repeatOn(pen.repeat);
@@ -708,41 +697,15 @@ pub const Mix = struct {
     }
 };
 
-/// The shift `think_penalty.shiftScoped` makes of `state` and `mask`, gated by ids on the GPU when `rows`.
-pub fn thinkOf(mask: ?mlx.mlx_array, state: ThinkPenalty, rows: bool) Mix.Think {
-    const opens = state.opener_id != null;
-    if (state.hasBias()) {
-        if (!rows) return .bias;
-        return switch (state.phase) {
-            .inside => .bias_inside,
-            .after => .bias_after,
-            .before => if (opens) .bias_opens else .bias_unopened,
-        };
-    }
-    if (mask == null or state.lambda <= 0) return .off;
-    if (!rows) return if (state.phase == .inside) .mask else .off;
-    return switch (state.phase) {
-        .inside => .mask_inside,
-        .after => .off,
-        .before => if (opens) .mask_opens else .mask_unopened,
-    };
-}
-
-/// The think penalty's shift of a draw: `state` over `mask`, row by row after the GPU's `ids` when given (a pending
-/// token, `[1]` or `[1, 1]`).
-pub const Shift = struct { mask: ?mlx.mlx_array, state: ThinkPenalty, ids: ?mlx.mlx_array = null };
-
-/// A lazy draw: the grammar's mask, the think penalty's shift, the penalties over `generated`, then `sampleTokenLazy`.
+/// A lazy draw: the grammar's mask, the penalties over `generated`, then `sampleTokenLazy`.
 pub const Step = struct {
     logits: mlx.mlx_array,
     sampling: SamplingParams,
     generated: []const u32 = &.{},
     grammar: ?[]const bool = null,
-    shift: ?Shift = null,
 
     pub fn mix(st: Step) Mix {
         var m: Mix = .{ .entry = .step, .suppress = st.sampling.suppress_mask != null, .greedy = isGreedyTemperature(st.sampling.temperature), .grammar = st.grammar != null };
-        if (st.shift) |sh| m.think = thinkOf(sh.mask, sh.state, sh.ids != null);
         if (penaltyActive(st.sampling) and st.generated.len > 0) m.penalties(penaltiesOf(st.sampling));
         return m;
     }
@@ -762,31 +725,12 @@ pub fn sampleStep(allocator: std.mem.Allocator, st: Step, s: mlx.mlx_stream) !ml
         try applyGrammarMask(allocator, &masked, logits, g, s);
         logits = masked;
     }
-    var shifted: mlx.mlx_array = .{ .ctx = null };
-    defer if (shifted.ctx != null) {
-        _ = mlx.mlx_array_free(shifted);
-    };
-    if (st.shift) |sh| {
-        shifted = mlx.mlx_array_new();
-        try applyShift(&shifted, logits, sh, s);
-        logits = shifted;
-    }
     return penalizedSampleLazy(allocator, logits, st.sampling, st.generated, s);
 }
 
-/// `out = logits` under the think penalty's shift `sh`.
-pub fn applyShift(out: *mlx.mlx_array, logits: mlx.mlx_array, sh: Shift, s: mlx.mlx_stream) !void {
-    const pending = sh.ids orelse return think_penalty.shiftScoped(out, logits, sh.mask, sh.state, null, s);
-    var ids = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ids);
-    try mlx.check(mlx.mlx_reshape(&ids, pending, &[_]c_int{ 1, 1 }, 2, s));
-    try think_penalty.shiftScoped(out, logits, sh.mask, sh.state, ids, s);
-}
-
 /// The mix of `sampleToken` over these arguments.
-pub fn syncMix(sampling: SamplingParams, generated_ids: ?[]const u32, marker_shift: ?MarkerShift) Mix {
+pub fn syncMix(sampling: SamplingParams, generated_ids: ?[]const u32) Mix {
     var m: Mix = .{ .entry = .sync, .suppress = sampling.suppress_mask != null, .greedy = isGreedyTemperature(sampling.temperature) };
-    if (marker_shift) |ms| m.think = thinkOf(ms.mask, ms.state, false);
     if (penaltyActive(sampling)) if (generated_ids) |ids| if (ids.len > 0) m.penalties(penaltiesOf(sampling));
     return m;
 }
@@ -809,7 +753,7 @@ pub fn penalizedSampleLazy(allocator: std.mem.Allocator, logits: mlx.mlx_array, 
     return try sampleTokenLazy(logits, sampling, s);
 }
 
-/// Prefill's first token under the think penalty when the prompt leaves the span open.
+/// Prefill's first token.
 pub fn firstTokenSample(xfm: *Trunk, logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     if (firstForced(sampling)) |id| return try generate.forcedToken(xfm, id);
     return sampleStep(std.heap.page_allocator, firstStep(xfm, logits, sampling), s);
@@ -824,11 +768,9 @@ pub fn firstForced(sampling: SamplingParams) ?u32 {
     };
 }
 
-/// Prefill's first draw: under the think penalty where the prompt leaves the span open, no penalty over ids.
-pub fn firstStep(xfm: *const Trunk, logits: mlx.mlx_array, sampling: SamplingParams) Step {
-    const tp = sampling.think_penalty;
-    const shifts = tp.active() and (tp.hasBias() or (xfm.think_marker_mask != null and tp.phase == .inside));
-    return .{ .logits = logits, .sampling = sampling, .shift = if (shifts) .{ .mask = xfm.think_marker_mask, .state = tp } else null };
+/// Prefill's first draw: no penalty over ids yet.
+pub fn firstStep(_: *const Trunk, logits: mlx.mlx_array, sampling: SamplingParams) Step {
+    return .{ .logits = logits, .sampling = sampling };
 }
 
 pub fn sampleTokenLazy(logits_in: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -1193,12 +1135,9 @@ pub const SampleResult = struct {
     token_id: u32,
 };
 
-/// A host-decided think penalty for one sample: lower the `mask` ids by `lambda`.
-pub const MarkerShift = struct { mask: ?mlx.mlx_array, state: ThinkPenalty };
-
 /// Sample a token from the last position's logits.
 /// temperature < 0.01 (`isGreedyTemperature`): greedy argmax. Otherwise: scale logits, apply top_p, and sample.
-pub fn sampleToken(logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: ?[]const u32, marker_shift: ?MarkerShift, s: mlx.mlx_stream) !SampleResult {
+pub fn sampleToken(logits: mlx.mlx_array, sampling: SamplingParams, generated_ids: ?[]const u32, s: mlx.mlx_stream) !SampleResult {
     const host = mlx.engine.enter(s);
     defer host.end();
     const shape = mlx.getShape(logits);
@@ -1237,13 +1176,6 @@ pub fn sampleToken(logits: mlx.mlx_array, sampling: SamplingParams, generated_id
         try applySuppressMask(&suppressed, current, m, s);
         current = suppressed;
         suppressed_owned = true;
-    }
-
-    var marked = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(marked);
-    if (marker_shift) |m| {
-        try think_penalty.shiftScoped(&marked, current, m.mask, m.state, null, s);
-        current = marked;
     }
 
     // Apply repeat penalty to already-generated tokens
@@ -1817,7 +1749,7 @@ test "a constrained penalised step picks what sampleToken picks on the same mask
         try applyGrammarMask(a, &masked, logits, &allowed, s);
         const sampling = SamplingParams{ .temperature = 0, .presence_penalty = 0.5 };
         const generated = [_]u32{ 0, 3 };
-        const sync = try sampleToken(masked, sampling, &generated, null, s);
+        const sync = try sampleToken(masked, sampling, &generated, s);
         const lazy = try penalizedSampleLazy(std.heap.page_allocator, masked, sampling, &generated, s);
         defer _ = mlx.mlx_array_free(lazy);
         const got = try samplerTestReadFlat(a, lazy, 1, s);
@@ -1978,7 +1910,7 @@ test "the serial and lazy samplers count every occurrence under frequency_penalt
         .{ .sampling = .{ .temperature = 0, .frequency_penalty = 0.1 }, .want = 1 },
         .{ .sampling = .{ .temperature = 0, .presence_penalty = 0.1 }, .want = 0 },
     }) |c| {
-        const sync = try sampleToken(logits, c.sampling, &generated, null, s);
+        const sync = try sampleToken(logits, c.sampling, &generated, s);
         const lazy = try penalizedSampleLazy(std.heap.page_allocator, logits, c.sampling, &generated, s);
         defer _ = mlx.mlx_array_free(lazy);
         const got = try samplerTestReadFlat(a, lazy, 1, s);
@@ -2021,7 +1953,7 @@ test "sampleToken greedy selects argmax" {
     defer _ = mlx.mlx_array_free(logits);
 
     const params = SamplingParams{ .temperature = 0.0 };
-    const result = try sampleToken(logits, params, null, null, s);
+    const result = try sampleToken(logits, params, null, s);
     try testing.expectEqual(@as(u32, 3), result.token_id);
 }
 
@@ -2034,7 +1966,7 @@ test "sampleToken with temperature produces valid token" {
     defer _ = mlx.mlx_array_free(logits);
 
     const params = SamplingParams{ .temperature = 0.5 };
-    const result = try sampleToken(logits, params, null, null, s);
+    const result = try sampleToken(logits, params, null, s);
     // Token should be in valid range
     try testing.expect(result.token_id < 3);
 }
@@ -2199,7 +2131,7 @@ test "min_p: MLX's densities, the host sampler and the lazy sampler keep the rul
         var params = base;
         params.seed = 9;
         for (0..48) |_| {
-            const sync = try sampleToken(logits, params, null, null, s);
+            const sync = try sampleToken(logits, params, null, s);
             try testing.expect(kept[sync.token_id]);
             try testing.expect(kept[try evalLazyToken(try sampleTokenLazy(logits, params, s))]);
             params.draw +%= 1;
@@ -2280,7 +2212,7 @@ test "sampleToken from prefill logits (seq_len > 1)" {
     defer _ = mlx.mlx_array_free(logits);
 
     const params = SamplingParams{ .temperature = 0.0 };
-    const result = try sampleToken(logits, params, null, null, s);
+    const result = try sampleToken(logits, params, null, s);
     try testing.expectEqual(@as(u32, 0), result.token_id); // pos 2, index 0 = 9.0
 }
 
@@ -2978,7 +2910,7 @@ test "sampler: on the engine a sampled step, the sync sampler and a block's rows
         defer _ = mlx.mlx_array_free(lazy);
         try mlx.check(mlx.mlx_array_eval(lazy));
         try testing.expectEqual(rule.id, mlx.mlx_array_data_uint32(lazy).?[0]);
-        try testing.expectEqual(rule.id, (try sampleToken(step, sampling, null, null, s)).token_id);
+        try testing.expectEqual(rule.id, (try sampleToken(step, sampling, null, s)).token_id);
     }
 
     const block = mlx.mlx_array_new_data(flat.ptr, &[_]c_int{ n, V }, 2, .float32);
@@ -3034,7 +2966,7 @@ test "suppress_mask: a suppressed id is unreachable from both samplers, everythi
     try testing.expectEqual(@as(u32, 5), try evalLazyToken(try sampleTokenLazy(logits3, masked_t1, s)));
 
     // Sync sampler (the penalty path): the same policy.
-    const r = try sampleToken(logits3, masked_sp, null, null, s);
+    const r = try sampleToken(logits3, masked_sp, null, s);
     try testing.expectEqual(@as(u32, 5), r.token_id);
 
     // Stochastic-verify filters: a suppressed draft's acceptance probability
@@ -3575,7 +3507,6 @@ test "argmax-only requests: greedy with nothing that reads past the argmax" {
     try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.7 }));
     try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .repeat_penalty = 1.1 }));
     try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .presence_penalty = 0.5 }));
-    try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .think_penalty = .{ .lambda = 1 } }));
     var cf: CallForce = undefined;
     try std.testing.expect(!argmaxOnlyRequest(.{ .temperature = 0.0, .call_force = &cf }));
     var c: Constraint = undefined;
@@ -3591,20 +3522,4 @@ test "a lazy penalty allocation failure fails the request instead of sampling un
         var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
         try testing.expectError(error.OutOfMemory, penalizedSampleLazy(failing.allocator(), logits, .{ .temperature = 0, .presence_penalty = 2 }, &.{0}, s));
     }
-}
-
-test "logit bias CPU: rewards and penalties require the full head while zero stays off" {
-    const t = std.testing;
-    for ([_]f32{ -2, 2 }) |delta| {
-        const entries = [_]logit_bias.Bias{.{ .id = 1, .delta = delta }};
-        const sampling = SamplingParams{ .temperature = 0, .think_penalty = .{ .biases = &entries } };
-        try t.expect(!argmaxOnlyRequest(sampling));
-        var from_file = sampling;
-        from_file.think_penalty.biases = &.{};
-        from_file.think_penalty.file_biases = &entries;
-        try t.expect(!argmaxOnlyRequest(from_file));
-    }
-    const zero = [_]logit_bias.Bias{.{ .id = 1, .delta = 0 }};
-    try t.expect(argmaxOnlyRequest(.{ .temperature = 0, .think_penalty = .{ .biases = &zero } }));
-    try t.expect(argmaxOnlyRequest(.{ .temperature = 0 }));
 }

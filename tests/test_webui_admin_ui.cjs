@@ -22,7 +22,7 @@ const KEYS = [
   { name: 'ctx_size', type: 'int', min: 1, max: 4294967295 }, { name: 'kv_quant', type: 'choice', choices: ['off', '4', '6', '8'] },
   { name: 'mtp', type: 'bool' },
   { name: 'ssd_budget_gb', type: 'int', min: 1, max: 512 }, { name: 'ssd_prefetch', type: 'int', min: 0, max: 100 },
-  { name: 'preserve_thinking', type: 'bool' }, { name: 'think_penalty', type: 'number', min: 0, max: 20 }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' }, { name: 'qwen_cooler', type: 'bool' },
+  { name: 'preserve_thinking', type: 'bool' }, { name: 'vision', type: 'bool' }, { name: 'ds41_cooler', type: 'bool' }, { name: 'qwen_cooler', type: 'bool' },
   { name: 'max_tokens', type: 'int', min: 1, max: 4294967295 }, { name: 'yarn_factor', type: 'choice', choices: ['2', '4'] },
   { name: 'expert_cache_bias', type: 'number', min: 0, max: 2 },
   { name: 'prefill_chunk_max', type: 'choice', choices: ['512', '1024', '2048', '4096', '8192'] },
@@ -30,7 +30,7 @@ const KEYS = [
   { name: 'max_concurrent', type: 'int', min: 1, max: 32 }, { name: 'max_kv_tokens', type: 'int', min: 0, max: 4294967295 },
 ];
 const keyState = (extra = {}) => ({ file: null, flag: null, source: 'default', locked: false, ...extra });
-const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'preserve_thinking', 'think_penalty', 'max_tokens'];
+const BASE_KEYS = ['ctx_size', 'kv_quant', 'mtp', 'preserve_thinking', 'max_tokens', 'max_concurrent'];
 const allKeys = (over = {}) => Object.fromEntries(KEYS.map((k) => [k.name, over[k.name] ?? keyState()]));
 
 // A stub server: its state lives here in node, every call is recorded, and a test can hold a response back.
@@ -73,7 +73,7 @@ function makeServer(opts = {}) {
     models: state.models.map((m) => ({ id: m.id, path: `/models/${m.id}`, state: m.state, bytes_on_disk: m.bytes_on_disk, settings: m.settings, keys: m.keys, loaded_with: m.loaded_with ?? null, rope: m.rope ?? null, defaults: m.defaults ?? null, ...(opts.limits && m.limits ? { limits: m.limits } : {}) })) });
   if (opts.limits) {
     state.models[0].limits = { ctx_size: { max: 131072, why: "This model's context window is 131072 tokens." }, kv_quant: { choices: ['off', '8'], why: '4-bit and 6-bit need a different cache layout.' } };
-    state.models[2].keys = ['ctx_size', 'mtp', 'ssd_budget_gb', 'ssd_prefetch', 'think_penalty', 'vision'];
+    state.models[2].keys = ['ctx_size', 'mtp', 'ssd_budget_gb', 'ssd_prefetch', 'vision'];
     state.models[2].limits = { kv_quant: { disabled: true, why: 'This model keeps no KV cache to quantize.' }, preserve_thinking: { disabled: true, why: 'No preserve-thinking switch in this chat template.' },
       mtp: { unset: ['ssd_budget_gb'], why: 'An SSD budget makes this model stream its experts, and its MTP head cannot run while they stream.' } };
   }
@@ -92,7 +92,7 @@ function makeServer(opts = {}) {
       case '/v1/settings':
         if (method === 'POST') {
           const m = state.models.find((x) => x.id === body.model);
-          if (opts.limits && body.set && 'think_penalty' in body.set) return route.fulfill(json({ error: { message: 'think_penalty is not supported by this model' } }, 400));
+          if (opts.limits && body.set && 'max_concurrent' in body.set) return route.fulfill(json({ error: { message: 'max_concurrent is not supported by this model' } }, 400));
           for (const [k, v] of Object.entries(body.set ?? {})) if (m) m.settings[k] = keyState({ file: v, source: v === null ? 'default' : 'file' });
           if (body.server && 'models_dir' in body.server && body.server.models_dir !== null && !(body.server.models_dir in state.folders)) return route.fulfill(json({ error: { message: 'models_dir does not exist or cannot be read' } }, 400));
           for (const [k, v] of Object.entries(body.server ?? {})) { state.server[k] = { ...state.server[k], file: v, source: v === null ? 'default' : 'file' }; if (k === 'prefix_cache_disk_gb') state.server[k].effective_bytes = state.server[k].ask_bytes = (v ?? 20) * GiB; }
@@ -183,7 +183,7 @@ async function main() {
     for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
       // Every Default says what the server would use; a model with no known default keeps the bare word.
       const server = makeServer();
-      server.state.models[0].defaults = { kv_quant: '8', mtp: true, preserve_thinking: true, think_penalty: 0, vision: false, max_tokens: 256000 };
+      server.state.models[0].defaults = { kv_quant: '8', mtp: true, preserve_thinking: true, max_concurrent: 1, vision: false, max_tokens: 256000 };
       const { page, context, errors } = await open(browser, server, '/models#Qwen-A', { viewport, mode: 'advanced' });
       await page.waitForSelector(`${row('max_tokens')} input`);
       const first = (key) => page.evaluate((k) => { const r = document.querySelector(`.set[data-key="${k}"]`); const o = r.querySelector('select option'); return o ? o.textContent : r.querySelector('.tri button').textContent; }, key);
@@ -192,7 +192,7 @@ async function main() {
       assert.equal(await page.getAttribute(`${row('ctx_size')} input`, 'placeholder'), 'Default', 'a default measured at load is not guessed');
       assert.equal(await first('kv_quant'), 'Default (8-bit)', 'a choice shows its label');
       assert.equal(await first('mtp'), 'Default (On)', 'a switch shows On or Off');
-      assert.equal(await page.getAttribute(`${row('think_penalty')} input`, 'placeholder'), 'Default (0)');
+      assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'Default (1)');
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'no horizontal overflow');
       await page.evaluate(() => { window.__mutations = 0; window.__where = []; new MutationObserver((list) => { window.__mutations += list.length; for (const m of list) window.__where.push(`${m.type}:${m.attributeName ?? ''}:${m.target.nodeName}.${m.target.className}`); }).observe(document.querySelector('#modelsDetail .rows'), { subtree: true, childList: true, characterData: true, attributes: true, attributeFilter: ['placeholder'] }); });
       await settle(page, 16_000);
@@ -595,10 +595,10 @@ async function main() {
       await page.click('.savebar button:text-is("Save")');
       await settle(page, 1000);
       assert.deepEqual(server.calls.find((c) => c.path === '/v1/settings' && c.method === 'POST').body.set, { mtp: false }, 'only the usable change is sent');
-      await page.fill(`${row('think_penalty')} input`, '2');
+      await page.fill(`${row('max_concurrent')} input`, '2');
       await page.click('.savebar button:text-is("Save")');
       await settle(page, 1000);
-      assert.match(await page.textContent(`${row('think_penalty')} .bad`), /not supported by this model/, 'a refusal naming a setting shows on its row');
+      assert.match(await page.textContent(`${row('max_concurrent')} .bad`), /not supported by this model/, 'a refusal naming a setting shows on its row');
       await page.click('.list [data-id="Deep-C"]');
       await page.click('#confirmDialog button.danger-fill');
       await page.waitForFunction(() => document.querySelector('.detail h2')?.textContent === 'Deep-C');
@@ -873,12 +873,12 @@ async function main() {
       assert.equal(await page.textContent('#modelsDetail h2'), 'A1');
     });
     await scenario('an invalid value in a closed fold opens it and says so', { path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
-      await page.waitForSelector(`${row('think_penalty')} input`);
-      await page.fill(`${row('think_penalty')} input`, 'abc');
+      await page.waitForSelector(`${row('max_concurrent')} input`);
+      await page.fill(`${row('max_concurrent')} input`, 'abc');
       await page.click('#modeToggle [data-mode="compact"]');
       await settle(page);
       assert.equal(await page.evaluate(() => document.querySelector('details.more-set').open), true, 'the fold holding the error is open');
-      assert.equal(await page.isVisible(`${row('think_penalty')} .bad`), true);
+      assert.equal(await page.isVisible(`${row('max_concurrent')} .bad`), true);
       assert.match(await page.textContent('details.more-set summary'), /1 invalid/);
     });
     await scenario('a saved value on a disabled key can be removed', { serverOpts: { limits: true }, path: '/models#Deep-C', open: { mode: 'advanced' }, setup: (s) => {
@@ -1271,7 +1271,7 @@ async function main() {
       });
     // A plain-worded setting or badge keeps its engineering name in the tooltip: the model-settings.json key and the launch flag.
     const FLAGS = { ctx_size: '--ctx-size', kv_quant: '--kv-quant', mtp: '--mtp', ssd_budget_gb: '--ssd-budget-gb', ssd_prefetch: '--ssd-prefetch',
-      preserve_thinking: '--preserve-thinking', think_penalty: '--think-penalty', vision: '--vision', ds41_cooler: '--ds41-mlx-engine', expert_cache_bias: '--expert-cache-bias', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
+      preserve_thinking: '--preserve-thinking', vision: '--vision', ds41_cooler: '--ds41-mlx-engine', expert_cache_bias: '--expert-cache-bias', max_tokens: '--max-tokens', prefix_cache_disk_gb: '--prefix-cache-disk', models_dir: null, port: '--port',
       prefill_chunk_max: '--prefill-chunk-max', prefill_chunk_min: '--prefill-chunk-min',
       update_check: '--no-update-check', pack_update_check: '--no-update-check', skip_mem_preflight: '--skip-mem-preflight' };
     const WORDS = { ssd_budget_gb: /expert/, ssd_prefetch: /prefetch/, expert_cache_bias: /expert cache bias/ };
@@ -1528,13 +1528,13 @@ async function main() {
       assert.match(await page.textContent(row('expert_cache_bias')), /--expert-cache-bias 0\.3/);
     });
     await scenario('a refused model setting names a label, not a key, and raises no toast', { serverOpts: { limits: true }, path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
-      await page.waitForSelector(`${row('think_penalty')} input`);
-      await page.fill(`${row('think_penalty')} input`, '2');
+      await page.waitForSelector(`${row('max_concurrent')} input`);
+      await page.fill(`${row('max_concurrent')} input`, '2');
       await page.click('.savebar button:text-is("Save")');
       await settle(page, 500);
-      const bad = await page.textContent(`${row('think_penalty')} .bad`);
-      assert.match(bad, /^Shorter thinking is not supported by this model/);
-      assert.doesNotMatch(bad, /think_penalty/);
+      const bad = await page.textContent(`${row('max_concurrent')} .bad`);
+      assert.match(bad, /^Requests at once is not supported by this model/);
+      assert.doesNotMatch(bad, /max_concurrent/);
       assert.equal(await page.locator('#toastHost .toast').count(), 0);
     });
     await scenario('a bad number says "1 or more" and the save bar counts the invalid one', { path: '/models#Qwen-A', open: { mode: 'advanced' } }, async ({ page }) => {
@@ -1545,7 +1545,7 @@ async function main() {
       assert.doesNotMatch(await page.textContent(`${row('max_tokens')} .bad`), /4294967295/);
       assert.match(await page.textContent('.savebar'), /2 changes · 1 invalid/);
       await page.fill(`${row('max_tokens')} input`, '');
-      await page.fill(`${row('think_penalty')} input`, '1');
+      await page.fill(`${row('max_concurrent')} input`, '2');
       assert.match(await page.textContent('.savebar'), /2 changes/);
       assert.doesNotMatch(await page.textContent('.savebar'), /invalid/);
     });
@@ -1760,7 +1760,7 @@ async function main() {
     });
 
     // Concurrency and the KV token pool are plain fields on every model; an exclusive model's max_concurrent is fixed at 1.
-    const withCaps = (s) => { s.state.models[0].keys = [...BASE_KEYS, 'max_concurrent', 'max_kv_tokens']; s.state.models[0].defaults = { ...(s.state.models[0].defaults ?? {}), max_concurrent: 1, max_kv_tokens: 0 }; };
+    const withCaps = (s) => { s.state.models[0].keys = [...BASE_KEYS, 'max_kv_tokens']; s.state.models[0].defaults = { ...(s.state.models[0].defaults ?? {}), max_concurrent: 1, max_kv_tokens: 0 }; };
     await scenario('concurrency and the KV token budget render, show their defaults, and save', { path: '/models#Qwen-A', open: { mode: 'advanced' }, setup: withCaps }, async ({ page, server }) => {
       await page.waitForSelector(`${row('max_concurrent')} input`);
       assert.equal(await page.getAttribute(`${row('max_concurrent')} input`, 'placeholder'), 'Default (1)');

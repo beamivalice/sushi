@@ -471,7 +471,6 @@ fn continueAfterThought(allocator: std.mem.Allocator, sch: *scheduler_mod.Schedu
 fn continuationSampling(allocator: std.mem.Allocator, tok: *const Tokenizer, r: *const ThoughtResume, prompt: []const u32, base: sampler.SamplingParams, force: *?generate_mod.CallForce) sampler.SamplingParams {
     var s = base;
     s.think_bound = null;
-    s.think_penalty.phase = .after;
     // The prompt closed the thought, so a forced call is armed as an answer's: committed at the first token.
     force.* = server_mod.armCallForce(allocator, tok, r.chat_config, prompt, false, r.tool_choice, r.tools_json);
     s.call_force = if (force.*) |*f| f else null;

@@ -2280,7 +2280,7 @@ test "server: a chat object tool_choice naming no function, and a Responses fiel
     }.run);
 }
 
-test "server: a logit_bias or a think_penalty is served on every route that reads it to a model whose arch serves them" {
+test "server: a non-zero think_penalty or non-empty logit_bias is refused with 400 on every route" {
     try eachArch(4, .{}, struct {
         const Case = struct { path: []const u8, body: []const u8, param: []const u8 };
         const chat_tail = "\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]";
@@ -2296,9 +2296,9 @@ test "server: a logit_bias or a think_penalty is served on every route that read
             for (cases) |c| {
                 const resp = try request("POST", c.path, c.body);
                 defer gpa.free(resp);
-                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 200")) {
-                    std.debug.print("{s} {s} with {s} was not served: {s}\n", .{ serving_arch, c.path, c.param, resp[0..@min(resp.len, 300)] });
-                    return error.BiasRequestNotServed;
+                if (!std.mem.startsWith(u8, resp, "HTTP/1.1 400") or std.mem.indexOf(u8, resp, c.param) == null) {
+                    std.debug.print("{s} {s} with {s} was not refused: {s}\n", .{ serving_arch, c.path, c.param, resp[0..@min(resp.len, 300)] });
+                    return error.BiasRequestNotRefused;
                 }
             }
         }

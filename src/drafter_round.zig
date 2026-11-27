@@ -26,7 +26,6 @@ const Generator = generate_mod.Generator;
 const isEosId = generate_mod.isEosId;
 const verifyArgmax = generate_mod.verifyArgmax;
 const arch_cooler = @import("arch/cooler.zig");
-const think_penalty = @import("think_penalty.zig");
 const seen_penalty = @import("seen_penalty.zig");
 pub const RoundMeter = @import("round_meter.zig").RoundMeter;
 
@@ -518,7 +517,7 @@ pub fn Rounds(comptime A: type) type {
             const logits = try self.takeLogits();
             defer _ = mlx.mlx_array_free(logits);
             const kind = try A.row_grammar.maskFor(rowView(self, c), c.mask_buf);
-            const lazy = try self.sampleMasked(logits, if (kind == .masked) c.mask_buf else null, .committed);
+            const lazy = try self.sampleMasked(logits, if (kind == .masked) c.mask_buf else null);
             defer _ = mlx.mlx_array_free(lazy);
             try mlx.check(mlx.mlx_array_eval(lazy));
             var val: i32 = 0;
@@ -607,13 +606,12 @@ pub fn Rounds(comptime A: type) type {
         pub const Streams = struct { ops: mlx.mlx_stream, greedy: mlx.mlx_stream, draws: mlx.mlx_stream };
 
         /// What a verify block's verdict reads: its rows' logits `[1, rows, vocab]` and ids (`[t1, drafts...]`), the
-        /// request's sampling, the think penalty's shift and the penalties as the generator decided them for the rows,
-        /// and each row's grammar mask (`rows * vocab` bools), when given.
+        /// request's sampling, the penalties as the generator decided them for the rows, and each row's grammar mask
+        /// (`rows * vocab` bools), when given.
         pub const VerdictIn = struct {
             logits: mlx.mlx_array,
             ids: []const u32,
             sampling: sampler.SamplingParams,
-            think: ?sampler.Shift = null,
             /// The committed ids the penalties count, when they apply.
             committed: ?[]const u32 = null,
             masks: ?[]const bool = null,
@@ -623,7 +621,6 @@ pub fn Rounds(comptime A: type) type {
 
             pub fn mix(in: VerdictIn) sampler.Mix {
                 var m: sampler.Mix = .{ .entry = .verdict, .rows = @intCast(in.ids.len), .suppress = in.sampling.suppress_mask != null, .greedy = sampler.isGreedyTemperature(in.sampling.temperature), .grammar = in.masks != null };
-                if (in.think) |sh| m.think = sampler.thinkOf(sh.mask, sh.state, true);
                 if (in.committed != null) m.penalties(sampler.penaltiesOf(in.sampling));
                 return m;
             }
@@ -634,7 +631,7 @@ pub fn Rounds(comptime A: type) type {
         pub fn sampleVerdict(self: *Generator, logits: mlx.mlx_array, ids: []const u32, masks: ?[]const bool) !Verdict {
             const xfm = self.xfm;
             const streams: Streams = .{ .ops = xfm.outStream(), .greedy = A.verdictStream(xfm, xfm.outStream()), .draws = A.verdictStream(xfm, xfm.s) };
-            const in: VerdictIn = .{ .logits = logits, .ids = ids, .sampling = self.sampling, .think = self.rowsShift(), .committed = if (sampler.penaltyActive(self.sampling)) self.generated_ids.items else null, .masks = masks, .streams = streams };
+            const in: VerdictIn = .{ .logits = logits, .ids = ids, .sampling = self.sampling, .committed = if (sampler.penaltyActive(self.sampling)) self.generated_ids.items else null, .masks = masks, .streams = streams };
             const run = try arch_cooler.beginSample(self.xfm, in.mix());
             const v = verdictOf(in) catch |e| {
                 try run.fail();
@@ -692,27 +689,19 @@ pub fn Rounds(comptime A: type) type {
             };
             errdefer lv.deinit();
             var cur = in.logits;
-            if (in.think != null or in.committed != null) {
+            if (in.committed) |committed| {
                 var row_ids: [max_drafts + 1]i32 = undefined;
                 if (rows > row_ids.len) return error.SpecDecodeUnsupported;
                 for (in.ids, row_ids[0..rows]) |id, *o| o.* = @intCast(id);
                 const row_ids_arr = try mlx.newData(&row_ids, &[_]c_int{ 1, @intCast(rows) }, .int32);
                 defer _ = mlx.mlx_array_free(row_ids_arr);
-                if (in.think) |sh| {
-                    lv.held[lv.n_held] = mlx.mlx_array_new();
-                    lv.n_held += 1;
-                    try think_penalty.shiftScoped(&lv.held[lv.n_held - 1], cur, sh.mask, sh.state, row_ids_arr, s);
-                    cur = lv.held[lv.n_held - 1];
-                }
-                if (in.committed) |committed| {
-                    const shape = mlx.getShape(cur);
-                    const counts = try seen_penalty.buildCounts(std.heap.page_allocator, committed, @intCast(shape[shape.len - 1]));
-                    defer _ = mlx.mlx_array_free(counts);
-                    lv.held[lv.n_held] = mlx.mlx_array_new();
-                    lv.n_held += 1;
-                    try seen_penalty.shiftRows(&lv.held[lv.n_held - 1], cur, row_ids_arr, counts, sampler.penaltiesOf(in.sampling), s);
-                    cur = lv.held[lv.n_held - 1];
-                }
+                const shape = mlx.getShape(cur);
+                const counts = try seen_penalty.buildCounts(std.heap.page_allocator, committed, @intCast(shape[shape.len - 1]));
+                defer _ = mlx.mlx_array_free(counts);
+                lv.held[lv.n_held] = mlx.mlx_array_new();
+                lv.n_held += 1;
+                try seen_penalty.shiftRows(&lv.held[lv.n_held - 1], cur, row_ids_arr, counts, sampler.penaltiesOf(in.sampling), s);
+                cur = lv.held[lv.n_held - 1];
             }
             if (in.masks) |masks| {
                 const vocab: usize = @intCast(mlx.getShape(cur)[2]);
@@ -735,15 +724,14 @@ pub fn Rounds(comptime A: type) type {
                 .logits = logits,
                 .ids = ids,
                 .sampling = self.sampling,
-                .think = self.rowsShift(),
                 .committed = if (sampler.penaltyActive(self.sampling)) self.generated_ids.items else null,
                 .masks = masks,
                 .streams = .{ .ops = xfm.outStream(), .greedy = A.verdictStream(xfm, xfm.outStream()), .draws = A.verdictStream(xfm, xfm.s) },
             };
         }
 
-        /// The longest prefix of `in.ids`' drafts the rows agree with, and the token after it: the rows shifted for the
-        /// think penalty and the penalties as the serial ticks would sample them, masked row by row, then each row's
+        /// The longest prefix of `in.ids`' drafts the rows agree with, and the token after it: the rows shifted for
+        /// the penalties as the serial ticks would sample them, masked row by row, then each row's
         /// argmax (greedy) or its own draw. Row j draws with the key of the generated position it predicts, so the tokens
         /// are the same whatever the round mix; a point-mass draft survives a draw of the row's density with probability
         /// p(draft): the exact rule.

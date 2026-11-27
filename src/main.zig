@@ -573,14 +573,6 @@ fn runCli(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             server_state.prefix_cache_disk_source = .flag;
-        } else if (std.mem.eql(u8, args[i], "--think-penalty") and flag_value.follows(args, i)) {
-            i += 1;
-            const lambda = std.fmt.parseFloat(f32, args[i]) catch -1;
-            if (!(lambda >= 0 and lambda <= model_settings_mod.think_penalty_max)) {
-                log.err("--think-penalty: expected a number from 0 to {d}; got '{s}'\n", .{ model_settings_mod.think_penalty_max, args[i] });
-                std.process.exit(1);
-            }
-            model_settings_mod.think_penalty_flag = lambda;
         } else if (std.mem.eql(u8, args[i], "--preserve-thinking") and flag_value.follows(args, i)) {
             i += 1;
             model_settings_mod.preserve_thinking_flag = server_mod.parseOnOff(args[i]) orelse {
@@ -1281,8 +1273,6 @@ fn runCli(init: std.process.Init) !void {
         try tok.bindTemplate(chat_config.printedFacts(), config.eosTokenSlice(), &.{ config.image_token_id, config.video_token_id });
         try tok.enableSegmentCache(segment_cache_mod.default_budget);
         sampler.installSuppressMask(&xfm, tok);
-        generate_mod.installThinkMarkers(&xfm, tok);
-        try generate_mod.installLogitBias(io, &xfm, tok);
 
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the
@@ -1556,7 +1546,6 @@ fn pinLaunchFlags(given: struct { ctx_size: u32, kv_quant: ?[]const u8, mtp: ?bo
         if (comptime arch_config.coolerOptOut(t)) |o| if (model_mod.cooler_off.contains(t)) locks.modelMut(o.setting).pin("{s}", .{o.flag});
     }
     if (model_settings_mod.preserve_thinking_flag) |p| locks.modelMut("preserve_thinking").pin("{s}", .{if (p) "on" else "off"});
-    if (model_settings_mod.think_penalty_flag) |l| locks.modelMut("think_penalty").pin("{d}", .{l});
     if (model_settings_mod.expert_cache_bias_flag) |b| locks.modelMut("expert_cache_bias").pin("{d}", .{b});
     if (settings_resolve.launch.prefill_chunk_max) |n| locks.modelMut("prefill_chunk_max").pin("{d}", .{n});
     if (settings_resolve.launch.prefill_chunk_min) |n| locks.modelMut("prefill_chunk_min").pin("{d}", .{n});

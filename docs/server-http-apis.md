@@ -322,7 +322,7 @@ before reading a completed stream and requires clean EOF.
   strings; `kv_quant` `off|0|4|6|8|16` (a load on the static bill serves only the width it loaded with and refuses another
   by name, saying which width it serves); every bool (`request_parse.BoolField`, `stream_options.include_usage`, the `chat_template_kwargs` bools) takes true or false and is read by `request_parse.boolField` alone (lint `request-bool-read`), `service_tier` a string; null is absent. A wrong type is a 400 naming the field, and so is a number out of
   its range, with the range in the message (`tests/test_api_edges.sh`): `temperature` 0..2, `top_p` 0..1, `top_k` 0..1000
-  (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `think_penalty` 0..20, `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
+  (0 = off), the penalties -2..2, `repeat_penalty`/`repetition_penalty` 0..10 (0 = off), `max_tokens` 0..4294967295 where 0 is an omission (the app's Auto sends 0)
   and a negative is refused, `seed` any 64-bit integer (a negative one means unseeded, a wider one is refused),
   `reasoning_budget_tokens` and `thinking.budget_tokens` 32-bit integers. A `max_tokens` past what
   the window leaves after the prompt is the one value that is cut, not refused (clients such as Claude Code send 64000 on
@@ -356,49 +356,12 @@ before reading a completed stream and requires clean EOF.
   completions parse it alike (`parseRepeatPenalty`); a repeat penalty of 0 or below is off. OpenAI's `presence_penalty` and
   `frequency_penalty` (-2 to 2, `parseAdditivePenalty`) are subtracted from the logit once per seen id and once per
   occurrence; `frequency_penalty` is never read as `repeat_penalty` 1 + x, which halved every seen logit at 1.0.
-- **Think penalty** (`think_penalty` request > `--think-penalty` > model-settings.json > off, 0-20; arXiv 2606.00206):
-  while the thought is open every single-token spelling of the paper's markers (bare or space-led, lower or capital)
-  loses λ; a split spelling is skipped (its first piece starts other words). The paper penalises everywhere; we stop
-  at the closer. Every sampled position, serial or verify row, is shifted by its own prefix (`thinkShifted`,
-  `thinkShiftRows`), so greedy MTP keeps serial's bytes.
-
-
-## Experimental logit bias
-
-The per-model `logit_bias_file` setting in `model-settings.json` loads a JSON or CSV file at model load. The default is off. Each entry names exactly one `id`, exact vocabulary `token` string,
-or `word`; words expand to single-token lower/capital spellings with and without a leading space. Split spellings
-are skipped and counted in the load log.
-
-```json
-{"entries":[{"word":"Wait","delta":-1,"scope":"reasoning"},{"id":1234,"delta":2}]}
-```
-
-The equivalent CSV columns are `kind,target,delta,scope`:
-
-```csv
-kind,target,delta,scope
-word,Wait,-1,reasoning
-id,1234,2,all
-```
-
-`delta` is finite and between -100 and 100: negative penalizes, positive rewards. `scope` is `reasoning`, `answer`,
-or `all` (default). Answer scope applies outside reasoning, including before an opener; the closer ends reasoning.
-Unknown targets/scopes, out-of-vocabulary ids and malformed files fail model load with a named `LogitBias*` error.
-The load line reports the file, entry count, expanded ids and skipped spellings.
-
-`/v1/chat/completions` and `/v1/completions` accept OpenAI `logit_bias`, a map such as `{"1234":-2}`. These deltas
-apply to all positions and add to file entries and the optional think-penalty preset. Invalid ids, nonnumeric or
-out-of-range biases return 400; `null` and `[]` mean no bias. `think_penalty: 0` disables the preset only; file and request biases still apply.
-Overlapping entries add. Sampling uses shifted logits.
-
-Scoped vectors are prepared once per request on the inference thread. Active biases use the full target vocabulary
-head, including positive rewards. Serial, MTP, prompt-lookup and GLM DFlash2 rows apply the same prefix-dependent
-shifts; streaming and non-streaming preserve the same generated tokens. Existing non-stream-only repetition-tail trimming
-can still shorten displayed loop-stop replies; `SUSHI_LOOP_TRIM=0` disables that presentation step for strict byte
-comparisons while retaining loop detection. The unchanged `--think-penalty` preset remains off by default.
-
-Chat and legacy completions accept `repetition_penalty` as an alias for `repeat_penalty`. A positive
-`repeat_penalty` takes precedence when both are supplied; invalid or nonpositive values retain the existing fallback.
+- **Think penalty & logit bias (removed):** `think_penalty` and `logit_bias` are no longer served. Off/empty values
+  (`think_penalty: 0` or `null`; `logit_bias: {}`, `[]` or `null` on chat/completions) are accepted; any non-zero
+  `think_penalty` or non-empty `logit_bias` returns a named 400 (`request_fields.zig`). `tool_choice: "none"` ends the
+  turn at the template's single-token call opener (`request_policy.noneEnd`).
+- Chat and legacy completions accept `repetition_penalty` as an alias for `repeat_penalty`. A positive
+  `repeat_penalty` takes precedence when both are supplied; invalid or nonpositive values retain the existing fallback.
 
 ## Reasoning budget
 

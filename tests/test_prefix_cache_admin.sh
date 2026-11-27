@@ -159,15 +159,16 @@ post /v1/settings '{"model":"alpha","set":{"kv_quant":null}}' >/dev/null
 check "nothing is set: every key is default" "$(echo "$S" | jq '[.models[0].settings[] | .source] | all(. == "default")')"
 check "an unknown key is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"temperature":1}}' | jq -r '.error.type')" unknown_setting)"
 check "a removed key is refused as removed" "$(post /v1/settings '{"model":"alpha","set":{"mtp_greedy_tail":true}}' | jq -r '.error.message' | grep -c '"mtp_greedy_tail" is removed' || true)"
+check "think_penalty is refused as removed" "$(post /v1/settings '{"model":"alpha","set":{"think_penalty":2}}' | jq -r '.error.message' | grep -c '"think_penalty" is removed' || true)"
 check "a bad value is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"ssd_prefetch":101}}' | jq -r '.error.type')" invalid_setting)"
 check "an unknown model is a 404" "$(is "$(code -X POST "$BASE/v1/settings" -d '{"model":"nope","set":{"mtp":true}}')" 404)"
-check "saving a model key is ok" "$(post /v1/settings '{"model":"alpha","set":{"kv_quant":"4","think_penalty":2}}' | jq '.ok')"
+check "saving a model key is ok" "$(post /v1/settings '{"model":"alpha","set":{"kv_quant":"4","ctx_size":8192}}' | jq '.ok')"
 S="$(get /v1/settings)"
 check "the model key reads back with source file" \
-    "$(echo "$S" | jq '.models[0].settings | (.kv_quant.file == "4") and (.kv_quant.source == "file") and (.think_penalty.file == 2)')"
+    "$(echo "$S" | jq '.models[0].settings | (.kv_quant.file == "4") and (.kv_quant.source == "file") and (.ctx_size.file == 8192)')"
 check "the file holds the model's path as the key" "$(jq -e --arg p "$MODELS/alpha" '.[$p].kv_quant == "4"' "$WORK/home/.sushi/model-settings.json" >/dev/null && echo 1 || echo 0)"
-post /v1/settings '{"model":"alpha","set":{"kv_quant":null,"think_penalty":null}}' >/dev/null
-check "null removes the keys" "$(get /v1/settings | jq '.models[0].settings | (.kv_quant.file == null) and (.think_penalty.source == "default")')"
+post /v1/settings '{"model":"alpha","set":{"kv_quant":null,"ctx_size":null}}' >/dev/null
+check "null removes the keys" "$(get /v1/settings | jq '.models[0].settings | (.kv_quant.file == null) and (.ctx_size.source == "default")')"
 check "max_tokens is a listed key" "$(get /v1/settings | jq '(.model_keys | map(.name) | index("max_tokens")) != null')"
 check "max_tokens 0 is refused" "$(is "$(post /v1/settings '{"model":"alpha","set":{"max_tokens":0}}' | jq -r .error.type)" invalid_setting)"
 check "max_tokens is saved" "$(post /v1/settings '{"model":"alpha","set":{"max_tokens":32000}}' | jq '.ok')"

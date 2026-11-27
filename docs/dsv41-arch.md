@@ -711,7 +711,7 @@ The release's drafter: three sliding-window stages (`mtp.0..2`, window 128, rope
 experts top-3 and a shared expert each) that draft a block `[t, noise x 4]` in one pass. A request drafts unless it carries a forced call
 (`dsv41_dspark.drafterEligible`, MTP's rule); those decode serially (`gen.drafter_on` is false and its ticks are plain). A grammar or JSON schema drafts too
 ([below](#dspark-grammar)). A repeat or
-presence penalty and the think penalty shift the verify rows by the ids before them (`penaltyShiftRows`, `thinkShiftRows`). A thinking bound
+presence penalty shifts the verify rows by the ids before them (`penaltyShiftRows`). A thinking bound
 (Anthropic `budget_tokens`, `reasoning_budget_tokens`) is checked between rounds, and a round verifies at most the thought
 room left, so it fires at the token serial decode fires at; the closer is committed and DSpark rounds go on for the answer.
 A sampled request verifies the same block: the drafts are argmax tokens, a point mass, so each is kept with probability

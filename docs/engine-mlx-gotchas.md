@@ -254,8 +254,8 @@ Found while holding the engine of our own to MLX's bytes ([engine-own-forward](e
   re-encodes to the ids it was generated as. The load says so in a `[load]` line.
 - GLM's Split regex is the plain Llama-3 pattern (contractions plus `\p{N}{1,3}`): the gpt2 path with `.letters` word
   rules and 3-digit groups. The BPE `ignore_merges` flag
-  (GLM sets it) is honoured in `bpeMerge`, which reads `model.vocab` only: an added token is never in that map
-  (`Tokenizer.tokenId` looks a token up by text for `logit_bias`), or client text spelling one would become it.
+  (GLM sets it) is honoured in `bpeMerge`, which reads `model.vocab` only: an added token is never in that map,
+  or client text spelling one would become it.
 - A load names, in one `[load]` line, the tokenizer.json parts it does not apply: a `normalizer` other than NFC,
   a `decoder` or `post_processor` other than ByteLevel, and a `pre_tokenizer` read with the legacy word rules. The
   parity script covers GLM, Qwen and MiMo on code and tool-call text.

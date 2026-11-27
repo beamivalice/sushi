@@ -122,10 +122,6 @@ pub fn moduleStateSpecRollback(h: Handle) bool {
     return trunk(h).moduleStateSpecRollback();
 }
 
-pub fn logitBias(h: Handle) []const @import("../logit_bias.zig").Bias {
-    return trunk(h).logit_bias;
-}
-
 pub fn flushImatrix(h: Handle) void {
     trunk(h).flushImatrix();
 }
@@ -225,18 +221,16 @@ test "the last model on MLX's side gives back the arrays the EXL3 module cached 
     try std.testing.expectEqual(before, active());
 }
 
-test "a handle reads back the trunk it was made from, its stream, config and logit bias" {
+test "a handle reads back the trunk it was made from, its stream and config" {
     inline for (comptime std.enums.values(registry.Tag)) |tag| {
         var t: Trunk = undefined;
         t.arch = tag;
         t.s = mlx.gpuStream();
         t.config = .{ .model_type = "handle-test" };
-        t.logit_bias = &.{};
         const h = handleOf(&t);
         try std.testing.expectEqual(tag, std.meta.activeTag(h));
         try std.testing.expectEqual(&t, trunk(h));
         try std.testing.expectEqual(t.s.ctx, stream(h).ctx);
         try std.testing.expectEqualStrings("handle-test", config(h).model_type);
-        try std.testing.expectEqual(@as(usize, 0), logitBias(h).len);
     }
 }

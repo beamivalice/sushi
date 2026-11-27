@@ -5590,10 +5590,6 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !?*Slot {
     var sample_ids: [sched_policy.MAX_BATCH_GROUP]i32 = undefined;
     std.debug.assert(batch.len == logits_arr.len);
     std.debug.assert(batch.len <= sample_params.len);
-    var shifted_n: usize = 0;
-    defer for (sample_rows[0..shifted_n], logits_arr[0..shifted_n]) |row, raw| {
-        if (row.ctx != raw.ctx) _ = mlx.mlx_array_free(row);
-    };
     {
         var gens: [sched_policy.MAX_BATCH_GROUP]*generate_mod.Generator = undefined;
         for (batch, 0..) |slot, i| {
@@ -5604,16 +5600,8 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !?*Slot {
         // An arch that plans its samples draws each row through its own request's root; every other load samples the
         // rows as one batch.
         const planned = try sched.sampleJoinedRows(xfm_ptr, gens[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], sample_ids[0..batch.len]);
-        if (!planned) {
-            for (batch, 0..) |slot, i| {
-                const gen = &slot.legacy_gen.?;
-                sample_rows[i] = try gen.thinkShifted(logits_arr[i], .{ .decided = &.{gen.next_token_id} });
-                shifted_n = i + 1;
-                sample_params[i] = gen.sampling;
-            }
-            if (batch.len > 0) {
-                try sampler.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
-            }
+        if (!planned and batch.len > 0) {
+            try sampler.sampleRows(sample_ids[0..batch.len], sample_rows[0..batch.len], sample_params[0..batch.len], xfm_ptr.s);
         }
         for (batch, 0..) |slot, i| slot.legacy_gen.?.sampling.draw = sample_params[i].draw;
     }

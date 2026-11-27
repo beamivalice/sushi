@@ -3868,8 +3868,6 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       "Reading ahead can speed up a model that runs partly from the SSD. 0 (off) is the default.", "expert prefetch"],
     preserve_thinking: ["Keep earlier thinking", "Keeps the model's earlier thinking in the conversation it rereads each turn.", "--preserve-thinking",
       "Can help long, multi-step tasks, but fills the context faster. The default follows the model's own chat format.", ""],
-    think_penalty: ["Shorter thinking", "Nudges the model to finish thinking sooner. 0 is off; the most is 20.", "--think-penalty",
-      "Use it when the model thinks for too long. Start low and raise it if thinking still runs long.", ""],
     vision: ["Vision (image input)", "Loads the part of the model that reads images. Off saves its memory.", "--vision",
       "Turn it off if you only chat in text and want the memory back.", ""],
     ds41_cooler: ["Use Sushi's Cooler Engine instead of MLX", "Generates DeepSeek 4.1 text on Sushi Cooler, the engine built for this Mac, which uses less processor power than MLX. Untick it to go back to MLX if something breaks, and please report the problem.", "--ds41-mlx-engine",

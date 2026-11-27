@@ -1,8 +1,6 @@
 const std = @import("std");
 const test_note = @import("test_note.zig");
 const arch_chat = @import("arch/chat.zig");
-const arch_handle = @import("arch/handle.zig");
-const settings_resolve = @import("settings_resolve.zig");
 const request_parse = @import("request_parse.zig");
 const request_fields = @import("request_fields.zig");
 const http = @import("http.zig");
@@ -12,18 +10,14 @@ const chat_mod = @import("chat.zig");
 const think_tags = @import("think_tags.zig");
 const model_mod = @import("model.zig");
 const arch_config = @import("arch/config.zig");
-const arch_flags = @import("arch/flags.zig");
 const effort_mod = @import("effort.zig");
 const log = @import("log.zig");
-const logit_bias = @import("logit_bias.zig");
 const tool_calls_mod = @import("tool_calls.zig");
 const responses_mod = @import("responses.zig");
 const model_registry_mod = @import("model_registry.zig");
-const model_settings = @import("model_settings.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
 const sampler = @import("sampler.zig");
-const think_penalty = @import("think_penalty.zig");
 const testing = std.testing;
 const server = @import("server.zig");
 const server_state = @import("server_state.zig");
@@ -36,7 +30,6 @@ const atomicTokenId = server.atomicTokenId;
 const jsonEscape = http.jsonEscape;
 const parseOnOff = server.parseOnOff;
 const pickStreamMode = generation_stream.pickStreamMode;
-const promptOpensThink = server.promptOpensThink;
 const renderConfigFor = server.renderConfigFor;
 const requestSpecModes = generation_stream.requestSpecModes;
 const sendAnthropicError = @import("anthropic.zig").sendAnthropicError;
@@ -62,105 +55,30 @@ pub fn samplingTopK(config: *const model_mod.ModelConfig, request: ?u32) u32 {
     return resolveSamplingDefault(u32, request, server_state.server_config.default_top_k, config.gen_top_k, 0);
 }
 
-pub fn servesBias(config: *const model_mod.ModelConfig) bool {
-    return !arch_config.fact(config, "bias_unserved");
-}
-
-pub const NoneGuard = enum { ban, stop };
-
-pub fn noneGuard(config: *const model_mod.ModelConfig) NoneGuard {
-    return if (servesBias(config)) .ban else .stop;
-}
-
-/// What `tool_choice: "none"` does at decode: a bias-serving arch bans the call opener, one without bias ends the turn
-/// at it. `eos_ids` is the generation's stop set (`owned` when this call allocated it); `unarmed` is a guard whose
-/// opener is not one token, which arms nothing.
+/// What `tool_choice: "none"` does at decode: ends the turn at the call opener. `eos_ids` is the generation's stop
+/// set (`owned` when this call allocated it).
 pub const NoneEnd = struct {
     eos_ids: []const u32,
     owned: bool,
-    ban: ?logit_bias.Bias,
-    unarmed: bool,
 
     pub fn deinit(self: NoneEnd, allocator: std.mem.Allocator) void {
         if (self.owned) allocator.free(self.eos_ids);
     }
-
-    /// The ban as a bias slice, empty when none applies; it lives as long as `self`.
-    pub fn biases(self: *const NoneEnd) []const logit_bias.Bias {
-        return if (self.ban) |*b| b[0..1] else &.{};
-    }
 };
 
-/// The one place a request's stop set and call-opener ban are decided, for the streaming and non-streaming paths alike.
-/// `opener` is the template's call opener as one token, null when it has none; `eos` is the request's own stop ids.
-pub fn noneEnd(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, tool_choice: tool_calls_mod.ToolChoice, model_loaded: bool, opener: ?u32, eos: []const u32) !NoneEnd {
-    const none: NoneEnd = .{ .eos_ids = eos, .owned = false, .ban = null, .unarmed = false };
+/// The one place a request's stop set for `tool_choice: "none"` is decided, for the streaming and non-streaming paths
+/// alike. `opener` is the template's call opener as one token, null when it has none; `eos` is the request's own stop ids.
+pub fn noneEnd(allocator: std.mem.Allocator, tool_choice: tool_calls_mod.ToolChoice, model_loaded: bool, opener: ?u32, eos: []const u32) !NoneEnd {
+    const none: NoneEnd = .{ .eos_ids = eos, .owned = false };
     if (tool_choice != .none or !model_loaded) return none;
-    const id = opener orelse {
-        var unarmed = none;
-        unarmed.unarmed = true;
-        return unarmed;
-    };
-    switch (noneGuard(config)) {
-        .ban => return .{ .eos_ids = eos, .owned = false, .ban = .{ .id = id, .delta = -100 }, .unarmed = false },
-        .stop => return .{ .eos_ids = try std.mem.concat(allocator, u32, &.{ eos, &.{id} }), .owned = true, .ban = null, .unarmed = false },
-    }
-}
-
-/// The refusal of a body that carries a `think_penalty` above 0 or a non-empty `logit_bias` to a model whose arch serves
-/// neither; null when the model serves them or the body carries neither. `body` is a checked request's object.
-pub fn unservedBias(buf: []u8, config: *const model_mod.ModelConfig, body: std.json.ObjectMap) ?[]const u8 {
-    if (body.get("think_penalty")) |v| {
-        const lambda: f64 = switch (v) {
-            .integer => |i| @floatFromInt(i),
-            .float => |f| f,
-            else => 0,
-        };
-        if (lambda > 0) if (arch_flags.biasRefusal(buf, config, "think_penalty")) |why| return why;
-    }
-    if (body.get("logit_bias")) |v| {
-        const carried = switch (v) {
-            .object => |o| o.count() > 0,
-            .array => |a| a.items.len > 0,
-            .null => false,
-            else => true,
-        };
-        if (carried) if (arch_flags.biasRefusal(buf, config, "logit_bias")) |why| return why;
-    }
-    return null;
+    const id = opener orelse return none;
+    return .{ .eos_ids = try std.mem.concat(allocator, u32, &.{ eos, &.{id} }), .owned = true };
 }
 
 /// The in-stream thinking bound needs atomic think markers.
 fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
     if (lm.handle == null) return false;
     return atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER) != null;
-}
-
-/// The think penalty's lambda: the request's `think_penalty` > `--think-penalty` >
-/// model-settings.json > off.
-pub fn resolveThinkPenalty(config: *const model_mod.ModelConfig, request: ?f32, flag: ?f32, setting: ?f32) f32 {
-    if (request) |v| return v;
-    if (!servesBias(config)) return 0;
-    return settings_resolve.resolve(f32, flag, setting, model_settings.default_think_penalty).value;
-}
-
-/// The penalty for one request: off unless it thinks, lambda > 0 and its span is trackable
-/// (a single-token closer, and an opener when the prompt leaves the thought to the model).
-fn thinkPenaltyFor(lambda: f32, enable_thinking: bool, opener: ?u32, closer: ?u32, prompt_opened: bool) think_penalty.ThinkPenalty {
-    if (lambda <= 0 or !enable_thinking) return .{};
-    const close = closer orelse return .{};
-    if (opener == null and !prompt_opened) return .{};
-    return .{ .lambda = lambda, .opener_id = opener, .closer_id = close, .phase = if (prompt_opened) .inside else .before };
-}
-
-pub fn armThinkPenalty(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, lambda: f32) think_penalty.ThinkPenalty {
-    if (!enable_thinking or lm.handle == null) return .{};
-    if (!@import("think_penalty.zig").needsSpan(lambda, arch_handle.trunk(lm.handle.?).logit_bias)) return .{};
-    const closer = atomicTokenId(allocator, tok, think_tags.BARE_THINK_CLOSER);
-    var tp = thinkPenaltyFor(@max(lambda, 1), enable_thinking, atomicTokenId(allocator, tok, think_tags.BARE_THINK_OPENER), closer, promptOpensThink(allocator, tok, prompt_ids));
-    tp.lambda = if (tp.lambda > 0) lambda else 0;
-    if (tp.armed()) log.info("  think penalty {d}: markers lowered inside the reasoning span\n", .{lambda});
-    return tp;
 }
 
 /// The budget of a request that omits `max_tokens`, never 0 and never pegged to the window:
@@ -1228,43 +1146,6 @@ test "preserve_thinking: request > --preserve-thinking > model-settings.json > t
     try t.expectEqual(@as(?bool, null), resolvePreserveThinking(null, null, null));
 }
 
-test "think penalty: request > --think-penalty > model-settings.json > off" {
-    const Case = struct { request: ?f32, flag: ?f32, setting: ?f32, want: f32 };
-    const cases = [_]Case{
-        .{ .request = 0, .flag = 2, .setting = 3, .want = 0 },
-        .{ .request = 1.5, .flag = null, .setting = null, .want = 1.5 },
-        .{ .request = null, .flag = 2, .setting = 3, .want = 2 },
-        .{ .request = null, .flag = null, .setting = 3, .want = 3 },
-        .{ .request = null, .flag = null, .setting = null, .want = 0 },
-    };
-    const plain = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    for (cases) |c| try std.testing.expectEqual(c.want, resolveThinkPenalty(&plain, c.request, c.flag, c.setting));
-}
-
-test "think penalty: --think-penalty does not apply to a model whose arch serves no bias" {
-    const registry = @import("arch/registry.zig");
-    if (registry.ofModelType("hy_v4_flash") == null) return error.SkipZigTest;
-    const hy4 = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
-    try std.testing.expectEqual(@as(f32, 0), resolveThinkPenalty(&hy4, null, 2, null));
-    try std.testing.expectEqual(@as(f32, 0), resolveThinkPenalty(&hy4, null, null, null));
-}
-
-test "think penalty: arms a thinking request whose think markers are single tokens" {
-    const t = std.testing;
-    const open: u32 = 7;
-    const close: u32 = 8;
-    const prompt_opened = thinkPenaltyFor(1.5, true, open, close, true);
-    try t.expectEqual(@as(f32, 1.5), prompt_opened.lambda);
-    try t.expectEqual(think_penalty.ThinkPenalty.Phase.inside, prompt_opened.phase);
-    try t.expectEqual(close, prompt_opened.closer_id);
-    try t.expectEqual(think_penalty.ThinkPenalty.Phase.before, thinkPenaltyFor(1.5, true, open, close, false).phase);
-    try t.expect(!thinkPenaltyFor(0, true, open, close, true).armed());
-    try t.expect(!thinkPenaltyFor(1.5, false, open, close, true).armed());
-    try t.expect(!thinkPenaltyFor(1.5, true, open, null, true).armed());
-    try t.expect(!thinkPenaltyFor(1.5, true, null, close, false).armed());
-    try t.expect(thinkPenaltyFor(1.5, true, null, close, true).armed());
-}
-
 test "--preserve-thinking takes on or off" {
     try std.testing.expectEqual(@as(?bool, true), parseOnOff("on"));
     try std.testing.expectEqual(@as(?bool, false), parseOnOff("off"));
@@ -1838,83 +1719,34 @@ test "effort table: a non-word effort is refused on every surface, a word or nul
     }
 }
 
-test "request policy: a think_penalty above 0 and a non-empty logit_bias are refused by name for a model whose arch serves neither, served for one that does" {
-    const registry = @import("arch/registry.zig");
-    if (registry.ofModelType("hy_v4_flash") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const hy4 = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
-    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
-    var buf: [256]u8 = undefined;
-    const cases = [_]struct { body: []const u8, refused: ?[]const u8 }{
-        .{ .body = "{\"think_penalty\":2}", .refused = "Hy4-Flash does not support think_penalty" },
-        .{ .body = "{\"think_penalty\":0.5}", .refused = "Hy4-Flash does not support think_penalty" },
-        .{ .body = "{\"logit_bias\":{\"5\":-2}}", .refused = "Hy4-Flash does not support logit_bias" },
-        .{ .body = "{\"think_penalty\":0}", .refused = null },
-        .{ .body = "{\"logit_bias\":{}}", .refused = null },
-        .{ .body = "{\"logit_bias\":null,\"max_tokens\":4}", .refused = null },
-        .{ .body = "{\"logit_bias\":[]}", .refused = null },
-        .{ .body = "{\"max_tokens\":4}", .refused = null },
-    };
-    for (cases) |c| {
-        const root = (try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), c.body, .{})).object;
-        if (c.refused) |want| {
-            try std.testing.expectEqualStrings(want, unservedBias(&buf, &hy4, root).?);
-        } else {
-            try std.testing.expect(unservedBias(&buf, &hy4, root) == null);
-        }
-        try std.testing.expect(unservedBias(&buf, &qwen, root) == null);
-    }
-    try std.testing.expect(!servesBias(&hy4));
-    try std.testing.expect(servesBias(&qwen));
-    try std.testing.expectEqual(NoneGuard.stop, noneGuard(&hy4));
-    try std.testing.expectEqual(NoneGuard.ban, noneGuard(&qwen));
-}
-
-test "request policy: tool_choice none bans the call opener where the arch serves bias, and ends the turn at it where it does not" {
-    const registry = @import("arch/registry.zig");
-    if (registry.ofModelType("hy_v4_flash") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+test "request policy: tool_choice none ends the turn at the call opener" {
     const a = std.testing.allocator;
-    const hy4 = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
-    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
     const eos = [_]u32{ 7, 9 };
     const opener: u32 = 42;
     const none: tool_calls_mod.ToolChoice = .none;
 
-    // Bias served: the ban, the stop set untouched.
-    const ban = try noneEnd(a, &qwen, none, true, opener, &eos);
-    defer ban.deinit(a);
-    try std.testing.expectEqual(opener, ban.ban.?.id);
-    try std.testing.expectEqual(@as(f32, -100), ban.ban.?.delta);
-    try std.testing.expectEqualSlices(u32, &eos, ban.eos_ids);
-    try std.testing.expect(!ban.owned and !ban.unarmed);
-
-    // No bias: the opener joins the request's own stop ids exactly once, and nothing is banned.
-    const stop = try noneEnd(a, &hy4, none, true, opener, &eos);
+    // The opener joins the request's own stop ids exactly once.
+    const stop = try noneEnd(a, none, true, opener, &eos);
     defer stop.deinit(a);
     try std.testing.expectEqualSlices(u32, &.{ 7, 9, opener }, stop.eos_ids);
-    try std.testing.expect(stop.ban == null and !stop.unarmed);
+    try std.testing.expect(stop.owned);
 
-    // An opener the tokenizer splits has no single token: nothing is armed, and the result says so.
-    for ([_]*const model_mod.ModelConfig{ &hy4, &qwen }) |cfg| {
-        const split = try noneEnd(a, cfg, none, true, null, &eos);
-        defer split.deinit(a);
-        try std.testing.expectEqualSlices(u32, &eos, split.eos_ids);
-        try std.testing.expect(split.ban == null and split.unarmed and !split.owned);
-    }
+    // An opener the tokenizer splits has no single token: nothing is armed.
+    const split = try noneEnd(a, none, true, null, &eos);
+    defer split.deinit(a);
+    try std.testing.expectEqualSlices(u32, &eos, split.eos_ids);
+    try std.testing.expect(!split.owned);
 
     // Any other choice, or no loaded model, leaves the request alone.
     const named: tool_calls_mod.ToolChoice = .{ .named = "f" };
     for ([_]tool_calls_mod.ToolChoice{ .auto, .required, named }) |choice| {
-        for ([_]*const model_mod.ModelConfig{ &hy4, &qwen }) |cfg| {
-            const e = try noneEnd(a, cfg, choice, true, opener, &eos);
-            defer e.deinit(a);
-            try std.testing.expectEqualSlices(u32, &eos, e.eos_ids);
-            try std.testing.expect(e.ban == null and !e.unarmed and !e.owned);
-        }
+        const e = try noneEnd(a, choice, true, opener, &eos);
+        defer e.deinit(a);
+        try std.testing.expectEqualSlices(u32, &eos, e.eos_ids);
+        try std.testing.expect(!e.owned);
     }
-    const unloaded = try noneEnd(a, &hy4, none, false, opener, &eos);
+    const unloaded = try noneEnd(a, none, false, opener, &eos);
     defer unloaded.deinit(a);
     try std.testing.expectEqualSlices(u32, &eos, unloaded.eos_ids);
-    try std.testing.expect(unloaded.ban == null and !unloaded.owned);
+    try std.testing.expect(!unloaded.owned);
 }

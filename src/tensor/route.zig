@@ -6806,14 +6806,11 @@ test "engine copy shares its input, a view included, and gives MLX's bytes" {
     try expectSame(Build.viewCopy, &.{x});
 }
 
-test "the penalties and the think penalty on the engine's stream give MLX's bytes: one row, verify rows, a bias" {
+test "the penalties on the engine's stream give MLX's bytes: one row, verify rows" {
     try mlx.requireGpu();
     const seen_penalty = @import("../seen_penalty.zig");
-    const think_penalty = @import("../think_penalty.zig");
     const vocab = 300;
     const rows = 5;
-    const open: u32 = 20;
-    const closer: u32 = 21;
     const Chain = struct {
         fn one(comptime pen: seen_penalty.Penalties) fn (S, []const A) anyerror!A {
             return struct {
@@ -6833,19 +6830,6 @@ test "the penalties and the think penalty on the engine's stream give MLX's byte
                 }
             }.build;
         }
-        fn think(comptime span: think_penalty.ThinkPenalty.Phase, comptime biased: bool) fn (S, []const A) anyerror!A {
-            return struct {
-                fn build(s: S, in: []const A) anyerror!A {
-                    const file = [_]@import("../logit_bias.zig").Bias{ .{ .id = 2, .delta = 1, .scope = .reasoning }, .{ .id = 5, .delta = 3, .scope = .answer } };
-                    var p = think_penalty.ThinkPenalty{ .lambda = 2.5, .opener_id = open, .closer_id = closer, .phase = span, .file_biases = if (biased) &file else &.{} };
-                    try p.prepare(t_std.allocator, vocab, in[3], s);
-                    defer p.deinitPrepared();
-                    var o: A = .{};
-                    try think_penalty.shiftScoped(&o, in[0], in[3], p, in[2], s);
-                    return o;
-                }
-            }.build;
-        }
     };
     var values = ramp(f32, rows * vocab, 12, -6);
     const logits = hostArray(f32, &values, &.{ 1, rows, vocab }, .float32);
@@ -6859,23 +6843,12 @@ test "the penalties and the think penalty on the engine's stream give MLX's byte
     const ids_host = [rows]i32{ 40, 7, 3, 7, 250 };
     const ids = hostArray(i32, &ids_host, &.{ 1, rows }, .int32);
     defer _ = mlx.mlx_array_free(ids);
-    const think_ids_host = [rows]i32{ 7, open, 8, closer, 9 };
-    const think_ids = hostArray(i32, &think_ids_host, &.{ 1, rows }, .int32);
-    defer _ = mlx.mlx_array_free(think_ids);
-    var mask_host: [vocab]bool = @splat(false);
-    for ([_]usize{ 2, 5, 100, 299 }) |id| mask_host[id] = true;
-    const mask = hostArray(bool, &mask_host, &.{vocab}, .bool_);
-    defer _ = mlx.mlx_array_free(mask);
 
     try expectSame(Chain.one(.{ .repeat = 1.3 }), &.{ row, counts });
     try expectSame(Chain.one(.{ .repeat = 1.3, .presence = 0.5, .frequency = 0.25 }), &.{ row, counts });
     try expectSame(Chain.one(.{ .presence = 0.5, .frequency = 0.25 }), &.{ row, counts });
     try expectSame(Chain.block(.{ .repeat = 1.3 }), &.{ logits, counts, ids });
     try expectSame(Chain.block(.{ .repeat = 1.3, .presence = 0.5, .frequency = 0.25 }), &.{ logits, counts, ids });
-    try expectSame(Chain.think(.inside, false), &.{ logits, counts, think_ids, mask });
-    try expectSame(Chain.think(.before, false), &.{ logits, counts, think_ids, mask });
-    try expectSame(Chain.think(.inside, true), &.{ logits, counts, think_ids, mask });
-    try expectSame(Chain.think(.before, true), &.{ logits, counts, think_ids, mask });
 }
 
 /// `expectSame` for a table of cases: a failing one is named on stderr and counted, so one run shows them all.

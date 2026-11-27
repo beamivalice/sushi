@@ -477,11 +477,6 @@ pub const Tokenizer = struct {
         return std.mem.indexOf(u8, token, "\u{010A}") != null;
     }
 
-    /// The id a token's text names, for a client that picks a token by its text: the model's vocabulary, then the added tokens.
-    pub fn tokenId(self: *const Tokenizer, text: []const u8) ?u32 {
-        return self.vocab.get(text) orelse self.special_tokens.get(text);
-    }
-
     /// Look up a special token ID by its string representation.
     pub fn specialTokenId(self: *const Tokenizer, name: []const u8) ?u32 {
         return self.special_tokens.get(name);
@@ -2389,6 +2384,9 @@ test "ignore_merges: an added token's text in client input is text, and the temp
     const placed = try tok.encodeSpans(a, .{ .bytes = "/x", .origin = .template });
     defer a.free(placed);
     try testing.expectEqualSlices(u32, &.{9}, placed);
+    const decoded = try tok.decode(a, &.{9});
+    defer a.free(decoded);
+    try testing.expectEqualStrings("/x", decoded);
 }
 
 test "an added token spelled <tag:opensource> (Hy4) answers to and decodes as <tag> where the pack has no <tag>" {
@@ -2420,18 +2418,6 @@ test "an added token spelled <tag:opensource> (Hy4) answers to and decodes as <t
     const text = try tok.decode(a, &.{ 9, 0, 10, 11, 12, 13, 14 });
     defer a.free(text);
     try testing.expectEqualStrings("<think>a</think><tool_call><arg_key><tool_calls:opensource><tool_response:opensource>", text);
-}
-
-test "an added token still decodes and is found by text for a logit bias" {
-    const a = testing.allocator;
-    var tok = try parseTokenizerContent(testing.io, a, ignore_merges_json);
-    defer tok.deinit();
-    const text = try tok.decode(a, &.{9});
-    defer a.free(text);
-    try testing.expectEqualStrings("/x", text);
-    try testing.expectEqual(@as(?u32, 9), tok.tokenId("/x"));
-    try testing.expectEqual(@as(?u32, 2), tok.tokenId("a"));
-    try testing.expectEqual(@as(?u32, null), tok.tokenId("/y"));
 }
 
 test "a load names the tokenizer.json components it does not apply in one [load] line, and the NFC it applies" {

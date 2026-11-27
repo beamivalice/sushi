@@ -75,7 +75,6 @@ fn overrideValue(o: model_settings.Override, name: []const u8) ?std.json.Value {
     if (eql(u8, name, "ssd_budget_gb")) return if (o.ssd_budget_gb) |v| .{ .integer = v } else null;
     if (eql(u8, name, "ssd_prefetch")) return if (o.ssd_prefetch) |v| .{ .integer = v } else null;
     if (eql(u8, name, "preserve_thinking")) return if (o.preserve_thinking) |v| .{ .bool = v } else null;
-    if (eql(u8, name, "think_penalty")) return if (o.think_penalty) |v| .{ .float = v } else null;
     if (eql(u8, name, "vision")) return if (o.vision) |v| .{ .bool = v } else null;
     if (eql(u8, name, "ds41_cooler")) return if (o.ds41_cooler) |v| .{ .bool = v } else null;
     if (eql(u8, name, "qwen_cooler")) return if (o.qwen_cooler) |v| .{ .bool = v } else null;
@@ -98,7 +97,6 @@ fn loadedWith(config: *const model_mod.ModelConfig) model_settings.Override {
         .ssd_budget_gb = if (config.ssd_budget_gb_override > 0) config.ssd_budget_gb_override else null,
         .ssd_prefetch = config.ssd_prefetch_override,
         .preserve_thinking = config.preserve_thinking_override,
-        .think_penalty = config.think_penalty_override,
         .vision = config.vision_override,
         .max_tokens = config.max_tokens_override,
         .yarn_factor = config.yarn_factor_override,
@@ -124,7 +122,6 @@ pub fn resolvedDefaults(config: *const model_mod.ModelConfig) model_settings.Ove
         .mtp = model_load.mtpChoiceFor(null, &bare).on,
         .ssd_prefetch = bare.ssdPrefetchPct(),
         .preserve_thinking = model_settings.default_preserve_thinking,
-        .think_penalty = model_settings.default_think_penalty,
         .vision = model_settings.VisionChoice.resolve(null, null, model_load.visionDefaultOn(&bare, bare.expert_streaming)).on,
         .max_tokens = request_policy.filledMaxTokensWith(0, bare.defaultMaxTokens()),
         .expert_cache_bias = 0,
@@ -668,7 +665,6 @@ fn readPackFacts(io: std.Io, allocator: std.mem.Allocator, row: *ModelRow) void 
     var chat_config = chat.peekChatConfig(io, allocator, row.path, if (row.fit.arch.len > 0) row.fit.arch else null) catch return;
     defer chat_config.deinit();
     row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(&chat_config);
-    row.fit.template_thinks = chat.templateHasThinkSpan(&chat_config);
 }
 
 /// An entry's row from what the registry holds; the caller holds its lock.
@@ -682,7 +678,6 @@ fn heldRow(e: *model_registry_mod.LoadedModel) ModelRow {
         row.defaults = resolvedDefaults(c);
         if (e.chat_config) |cc| {
             row.fit.template_preserves_thinking = chat.templateTakesPreserveThinking(cc);
-            row.fit.template_thinks = chat.templateHasThinkSpan(cc);
         }
         const snap = e.disk_stats.snapshot();
         if (snap.namespace != 0) row.tier = .{ .cap_bytes = snap.budget, .used_bytes = snap.used };
@@ -1002,7 +997,7 @@ test "settings api: every saved key is classified, and the ones a load reads cle
     for ([_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "max_concurrent", "max_kv_tokens", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "wired_margin_gib" }) |key| {
         try std.testing.expect(reachesLoad(key));
     }
-    for ([_][]const u8{ "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "continue_after_thought" }) |key| {
+    for ([_][]const u8{ "preserve_thinking", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "continue_after_thought" }) |key| {
         try std.testing.expect(!reachesLoad(key));
     }
     // A new key must be classified above before it ships.
@@ -1019,7 +1014,7 @@ test "settings api: only the two SSD size keys re-arm a declined SSD tier, and b
 }
 
 fn classified(key: []const u8) bool {
-    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "max_concurrent", "max_kv_tokens", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "think_penalty", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
+    const known = [_][]const u8{ "ctx_size", "kv_quant", "mtp", "vision", "ds41_cooler", "qwen_cooler", "ssd_budget_gb", "ssd_prefetch", "yarn_factor", "expert_cache_bias", "prefill_chunk_max", "prefill_chunk_min", "max_concurrent", "max_kv_tokens", "models_dir", "prefix_cache_disk_gb", "skip_mem_preflight", "preserve_thinking", "max_tokens", "update_check", "pack_update_check", "port", "max_request_mb", "wired_margin_gib", "continue_after_thought" };
     for (known) |n| if (std.mem.eql(u8, n, key)) return true;
     return false;
 }
@@ -1703,7 +1698,7 @@ test "settings api: each model lists the limits its arch and pack put on its key
     try testing.expect(dropped.get("kv_quant") == null);
 
     const plain = models[2].object.get("limits").?.object;
-    for ([_][]const u8{ "kv_quant", "mtp", "ctx_size", "ssd_budget_gb", "vision", "preserve_thinking", "think_penalty" }) |k| try testing.expect(plain.get(k) == null);
+    for ([_][]const u8{ "kv_quant", "mtp", "ctx_size", "ssd_budget_gb", "vision", "preserve_thinking" }) |k| try testing.expect(plain.get(k) == null);
     try testing.expect(plain.get("ssd_prefetch").?.object.get("disabled").?.bool);
 
     const bare = models[3].object.get("limits").?.object;
@@ -1776,7 +1771,6 @@ test "settings api: a ready model reports the default each key resolves to; an u
     try testing.expectEqual(@as(i64, 256_000), d.get("max_tokens").?.integer);
     try testing.expect(d.get("mtp").?.bool);
     try testing.expect(d.get("preserve_thinking").?.bool);
-    try testing.expectEqual(@as(i64, 0), d.get("think_penalty").?.integer);
     try testing.expectEqual(@as(i64, 0), d.get("ssd_prefetch").?.integer);
     // Measured at load, so never guessed.
     try testing.expect(d.get("ctx_size") == null);

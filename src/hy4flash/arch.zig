@@ -65,7 +65,7 @@ pub const samplingDefaults = @import("hy4_config.zig").samplingDefaults;
 /// An STQ pack's routed banks sit under the release's own names (`model.layers.{L}.mlp.switch_mlp`); its trunk shards
 /// carry the trunk's SPEC1 stamp beside the experts' PAIR1, so the shard stamps are not held to the expert block.
 pub const pack_layout: arch_config.PackLayout = .{ .prefix = "model", .head = .none, .streams_groups = true };
-pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .streams_experts = true, .vision_on_streamed = true, .expert_source = .fused_banks, .prefill_start_width = 4096, .static_chunk_max = @import("hy4_config.zig").widest_chunk, .static_chunk_default = @import("hy4_config.zig").default_chunk, .streams_rate_groups = true, .reads_pair_major = true, .reads_pack_order = false, .exclusive_decode_of = joinsNoRows, .ssd_first_capable = true, .bias_unserved = true, .ssd_tables = &.{".engram_layer.multi_head_embedding."} };
+pub const config_facts: arch_config.Facts = .{ .thinks_by_default = true, .streams_experts = true, .vision_on_streamed = true, .expert_source = .fused_banks, .prefill_start_width = 4096, .static_chunk_max = @import("hy4_config.zig").widest_chunk, .static_chunk_default = @import("hy4_config.zig").default_chunk, .streams_rate_groups = true, .reads_pair_major = true, .reads_pack_order = false, .exclusive_decode_of = joinsNoRows, .ssd_first_capable = true, .ssd_tables = &.{".engram_layer.multi_head_embedding."} };
 /// A load that joins no rows runs one request at a time; one that joins them is held to its row count.
 fn joinsNoRows(config: *const @import("../model.zig").ModelConfig) bool {
     return @import("hy4_plan.zig").joinedRows(config) <= 1;
