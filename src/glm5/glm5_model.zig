@@ -1,6 +1,7 @@
 //! GLM trunk layers: affine/FP8 projections, mHC, KDA and the dense MLP.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const model = @import("../model.zig");
 const primitive = @import("glm5_next.zig");
 const Arr = mlx.mlx_array;
@@ -627,34 +628,20 @@ test "GLM HC loader preserves BF16 matrix and requires FP32 coefficients" {
 
 fn loadLayerFixture() !model.Weights {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(t.io, .{ .sub_path = "layers.safetensors", .data = @embedFile("../fixtures/glm5_layers.safetensors") });
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(t.io, &path_buf);
-    const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/layers.safetensors", .{path_buf[0..n]}, 0);
-    defer t.allocator.free(path);
-    var tensors = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensors);
-    var metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_load_safetensors(&tensors, &metadata, path.ptr, cpu));
-    const iter = mlx.mlx_map_string_to_array_iterator_new(tensors);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
+    var loaded = try safetensors.loadBytes(t.allocator, @embedFile("../fixtures/glm5_layers.safetensors"), cpu);
+    defer loaded.deinit();
     var weights = model.Weights.init(t.allocator);
     errdefer weights.deinit();
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-        const ret = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (ret != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-        try mlx.check(mlx.mlx_array_eval(value));
-        try weights.map.put(try t.allocator.dupe(u8, std.mem.span(key.?)), value);
+    var it = loaded.tensors.iterator();
+    while (it.next()) |e| {
+        const value = e.value_ptr.*;
+        e.value_ptr.* = .{};
+        errdefer _ = mlx.mlx_array_free(value);
+        const k = try t.allocator.dupe(u8, e.key_ptr.*);
+        errdefer t.allocator.free(k);
+        try weights.map.put(k, value);
     }
     return weights;
 }

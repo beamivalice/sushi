@@ -5,6 +5,7 @@
 const std = @import("std");
 const log = @import("../log.zig");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const arm_trial = @import("../arm_trial.zig");
 const sc_mod = @import("dsv41_scope.zig");
 const qat_mod = @import("dsv41_qat.zig");
@@ -3768,17 +3769,15 @@ test "dsv41 index scores: the integer matrix kernel gives the bits the scalar ke
     var sc = Scope.plain(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     for ([_]u8{ 2, 8, 14, 20 }) |layer| for ([_]usize{ 4096, 32768, 131072, 262144, 524288 }) |pos| {
-        const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/L{d}-pos{d}.safetensors", .{ dir, layer, pos }, 0);
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/L{d}-pos{d}.safetensors", .{ dir, layer, pos });
         defer testing.allocator.free(path);
-        var map = mlx.mlx_map_string_to_array_new();
-        var md = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        defer _ = mlx.mlx_map_string_to_string_free(md);
-        try mlx.check(mlx.mlx_load_safetensors(&map, &md, path.ptr, mlx.mlx_default_cpu_stream_new()));
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        var loaded = try safetensors.loadFile(testing.allocator, testing.io, path, cpu);
+        defer loaded.deinit();
         var got: [7]A = undefined;
-        for (&got, [_][:0]const u8{ "scores", "q", "w", "codes", "scales", "meta", "wscale" }) |*g, key| {
-            var arr = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_map_string_to_array_get(&arr, map, key.ptr));
+        for (&got, [_][]const u8{ "scores", "q", "w", "codes", "scales", "meta", "wscale" }) |*g, key| {
+            const arr = loaded.take(key) orelse return error.TestExpectedEqual;
             g.* = try sc.keep(arr);
         }
         const meta = try sc_mod.hostI32(got[5]);

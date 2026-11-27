@@ -2,6 +2,7 @@ const pc = @import("../prefix_cache.zig");
 const qwen4_forward = @import("qwen4_forward.zig");
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const trunk_mod = @import("../trunk.zig");
 const qwen4_qsa_state = @import("qwen4_qsa_state.zig");
 const kv_disk_cache = @import("../kv_disk_cache.zig");
@@ -419,12 +420,9 @@ test "HotPrefixCache: restore dump writes named tensors and is a no-op when unse
         const jf = std.c.fopen(json_path, "r") orelse return error.TestExpectedEqual;
         _ = std.c.fclose(jf);
     }
-    var tmap = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tmap);
-    var mmap = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(mmap);
-    try mlx.check(mlx.mlx_load_safetensors(&tmap, &mmap, st_path, s));
-    const names = [_][:0]const u8{
+    var loaded = try safetensors.loadFile(testing.allocator, testing.io, st_path, s);
+    defer loaded.deinit();
+    const names = [_][]const u8{
         "pos",
         "layers.0.aux_state",
         "layers.0.qsa_pooled",
@@ -437,10 +435,7 @@ test "HotPrefixCache: restore dump writes named tensors and is a no-op when unse
         "kv.0.v_tail",
     };
     for (names) |name| {
-        var got = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(got);
-        try mlx.check(mlx.mlx_map_string_to_array_get(&got, tmap, name));
-        try testing.expect(got.ctx != null);
+        try testing.expect(loaded.get(name) != null);
     }
 }
 

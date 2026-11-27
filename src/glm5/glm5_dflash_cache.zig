@@ -1,6 +1,7 @@
 //! Local runtime A4/group64 cache. The shipped BF16 checkpoint is read-only.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const draft = @import("../dflash.zig");
 const model = @import("../model.zig");
 const log = @import("../log.zig");
@@ -195,12 +196,6 @@ pub fn prepare(io: std.Io, a: std.mem.Allocator, source: []const u8, s: mlx.mlx_
     return .{ .path = destination, .generated = true };
 }
 
-fn insert(a: std.mem.Allocator, map: mlx.mlx_map_string_to_array, name: []const u8, value: mlx.mlx_array) !void {
-    const z = try a.dupeSentinel(u8, name, 0);
-    defer a.free(z);
-    try mlx.check(mlx.mlx_map_string_to_array_insert(map, z, value));
-}
-
 fn build(io: std.Io, a: std.mem.Allocator, source: []const u8, stage: []const u8, s: mlx.mlx_stream, payload: u64) !void {
     const src = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{source});
     defer a.free(src);
@@ -211,10 +206,8 @@ fn build(io: std.Io, a: std.mem.Allocator, source: []const u8, stage: []const u8
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
     try model.loadSafetensorsFile(a, &weights, src_z, cpu, false);
-    const map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(map);
-    const meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    var map = safetensors.Loaded.init(a);
+    defer map.deinit();
     var it = weights.map.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
@@ -223,28 +216,24 @@ fn build(io: std.Io, a: std.mem.Allocator, source: []const u8, stage: []const u8
         if (quantizeKey(name, mlx.getShape(raw))) {
             var q = try draft.quantizeDense(raw, cache_bits, cache_group, s);
             defer q.deinit();
-            for ([_]mlx.mlx_array{ q.w, q.scales, q.biases }) |v| try mlx.check(mlx.mlx_array_eval(v));
-            try insert(a, map, name, q.w);
+            try map.putRetained(name, q.w);
             const base = name[0 .. name.len - ".weight".len];
             const scales = try std.fmt.allocPrint(a, "{s}.scales", .{base});
             defer a.free(scales);
             const biases = try std.fmt.allocPrint(a, "{s}.biases", .{base});
             defer a.free(biases);
-            try insert(a, map, scales, q.scales);
-            try insert(a, map, biases, q.biases);
+            try map.putRetained(scales, q.scales);
+            try map.putRetained(biases, q.biases);
         } else {
-            try mlx.check(mlx.mlx_array_eval(raw));
-            try insert(a, map, name, raw);
+            try map.putRetained(name, raw);
         }
     }
-    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{stage}, 0);
+    const path = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{stage});
     defer a.free(path);
-    if (mlx.mlx_save_safetensors(path, map, meta) != 0) {
-        var message: [512]u8 = undefined;
-        const reason = mlx.takeError(&message) orelse "";
-        if (std.c._errno().* == @backingInt(std.c.E.NOSPC) or std.c._errno().* == @backingInt(std.c.E.ACCES) or std.mem.indexOf(u8, reason, "space") != null or std.mem.indexOf(u8, reason, "Permission") != null) return error.DflashCacheStorageUnavailable;
-        return error.MlxError;
-    }
+    _ = map.writeFile(io, path, s) catch |err| switch (err) {
+        error.NoSpaceLeft, error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem, error.WriteFailed => return error.DflashCacheStorageUnavailable,
+        else => return err,
+    };
     var from = try std.Io.Dir.openDirAbsolute(io, source, .{});
     defer from.close(io);
     var into = try std.Io.Dir.openDirAbsolute(io, stage, .{});
@@ -291,20 +280,17 @@ fn tinySource(io: std.Io, a: std.mem.Allocator, parent: std.Io.Dir, path: []cons
     try dir.writeFile(io, .{ .sub_path = "README.md", .data = "license: cc-by-nc-nd-4.0\nOriginal untouched checkpoint\n" });
     const source = try std.fs.path.join(a, &.{ path, shipped_subdir });
     errdefer a.free(source);
-    const file = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{source}, 0);
+    const file = try std.fmt.allocPrint(a, "{s}/model.safetensors", .{source});
     defer a.free(file);
-    const map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(map);
-    const meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    var map = safetensors.Loaded.init(a);
+    defer map.deinit();
     for ([_][]const u8{ "fc.weight", "candidate_selector.hidden_projection.weight", "candidate_selector.predecessor_codebook" }, [_][2]c_int{ .{ 128, 256 }, .{ 16, 128 }, .{ 32, 16 } }) |name, shape| {
         var array = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(array);
         try mlx.check(mlx.mlx_ones(&array, &shape, 2, .bfloat16, s));
-        try mlx.check(mlx.mlx_array_eval(array));
-        try insert(a, map, name, array);
+        try map.putRetained(name, array);
     }
-    try mlx.check(mlx.mlx_save_safetensors(file, map, meta));
+    _ = try map.writeFile(io, file, s);
     return source;
 }
 

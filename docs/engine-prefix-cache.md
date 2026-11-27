@@ -12,14 +12,17 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-kv-cache](engine-k
 
 | File | Role |
 |---|---|
-| `src/prefix_cache.zig` | Hot prefix cache (`--prefix-cache-mem`, `max_kv_tokens` eviction) |
-| `src/kv_disk_cache.zig` | SSD tier (`--prefix-cache-disk`) |
+| `src/prefix_cache.zig` | Hot prefix cache struct, public types, lifecycle, and method delegations (`--prefix-cache-mem`, `max_kv_tokens` eviction) |
+| `src/prefix_cache_index.zig`, `src/prefix_cache_evict.zig`, `src/prefix_cache_commit.zig` | Hot prefix cache focused modules: RAM lookup/restore & digests; takeover/checkout, trim math & eviction; commit, SSD spill/flush & checkpoint donors |
+| `src/kv_disk_cache.zig` | SSD tier struct, public types, lifecycle, and method delegations (`--prefix-cache-disk`) |
+| `src/kv_disk_restore.zig`, `src/kv_disk_persist.zig`, `src/kv_disk_index.zig` | SSD tier focused modules: lookup & restore; commit/chunk/sidecar/ring/held persistence & donor linking; manifest/scan, poisoning & budget/GC/cut |
+| `src/safetensors.zig` | Native Zig safetensors header/tensor reader and writer directly to/from Cooler Metal buffers or MLX arrays |
 | `src/prefix_policy.zig` | The cache's rules on positions, lengths and byte counts, host tier: the checkpoint drop index and `ThinPolicy`, `specAdoptPlan`, the ring mark positions, the shed simulation, the lookup's `BestMatch`, the eviction victim (`lruIndexExcluding`), the shared-return stop and the restore lien. [Policy and format](#policy-format) |
 | `src/disk_format.zig` | The SSD record's wire format, host tier: the safetensors header, `IndexEntry` and the `meta.json` manifest (render, version stamp, parse). [Policy and format](#policy-format) |
 | `src/disk_placement.zig` | The SSD tier's default budget (`resolveDiskBudget`), cache roots and model fingerprint, and the startup/usage lines |
-| `src/kv_disk_writer.zig` | SSD-first mode's background writer thread |
-| `src/kv_disk_fs.zig` | Every file operation of the SSD tier, on plain files or the content-addressed layer ([file layer](#file-layer)) |
-| `src/prefix_vfs.zig`, `src/prefix_vfs_tensors.zig` | The content-addressed layer: blocks, packs, journal, snapshot; tensor files as row-group blocks ([file layer](#file-layer)) |
+| `src/kv_disk_writer.zig` | Background CAS op writer thread (FIFO queue, byte permit, path fencing) |
+| `src/kv_disk_fs.zig` | Every file operation of the SSD tier on the content-addressed CAS layer ([file layer](#file-layer)) |
+| `src/prefix_vfs.zig`, `src/prefix_vfs_tensors.zig` | The content-addressed layer: blocks, packs, journal, snapshot; tensor files as row-group blocks decoded directly through `safetensors.zig` ([file layer](#file-layer)) |
 | `src/arch/prefix.zig` | The seam: dispatch over the arch's `prefix` module (restore target `State`, per-entry `Rows`, per-cache `CacheState`, the hooks below, the QSA-history `disk` section, the SSM-entry `aux` accelerators). The three files above name no arch. [Arch seam](#arch-seam) |
 | `src/disk_write_stats.zig` | Cumulative write bytes by file kind, per tier and per process ([write counters](#write-counters)) |
 | `src/restore_dump.zig` | Prefix-cache restore diagnostics (`tests/diff_restore_dump.py`) |
@@ -75,11 +78,9 @@ over the enabled archs:
 - **`CacheState`**: `HotPrefixCache.arch.<arch>` (DeepSeek's live-state record).
 - **`arraysOn(config)`**: the stream a load's cached state lives on when it is not MLX's: a Sushi Cooler load's
   (`cooler_side.stream`), the engine's. The load sets it on the hot cache and the SSD tier as it arms them (`arrays_on`); from then it
-  outranks the stream a caller passes, the tier's reads build on it instead of MLX's CPU stream, and the maps and
-  vectors a read or a write makes are of its side (`engine.enter`). On the content-addressed layer a tensor file then
-  loads straight from its blocks into the engine's own tensors (`prefix_vfs_tensors.loadTensors`), the same names,
-  dtypes, shapes, bytes and metadata as MLX's load. The plain-file backend's safetensors pass through MLX, so that
-  tier keeps MLX's arrays and the load says so.
+  outranks the stream a caller passes, and the tier's reads build directly on it via `safetensors.zig` and
+  `prefix_vfs_tensors.loadTensors` straight from verified CAS blocks into Cooler Metal buffers (or MLX arrays on MLX
+  loads), with zero `mlx_{load,save}_safetensors` calls.
 - **`checkpointsRequired(config)`**: `shouldUse` is off without SSM checkpoints for an arch whose request state is one.
 - **`adoptSpecHead`**: the in-checkpoint MTP head's snapshot adopted by the model's own head (Flash-Next), with its log lines.
 - **`disk`** and **`aux`** (Flash-Next): the `qsa.safetensors` section of a hybrid record (`DiskTier.persistQsaHistory`
@@ -632,19 +633,14 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   covers that.
 
 <a id="file-layer"></a>
-## The file layer: plain files or content-addressed
+## The file layer: content-addressed CAS VFS
 
-- **Every file operation of the tier goes through `DiskTier.fs`** (`src/kv_disk_fs.zig`), on one of two backends:
-  `cas` (the default), the content-addressed layer at `<root>/v/` (`prefix_vfs.zig`: packs, journal, snapshot), or
-  `real`, the plain files `<root>/e<id>/...`. `SUSHI_PREFIX_FS=real|cas` picks one when the tier starts, until the
-  `real` arm goes; the `background writer armed (fs=...)` line names it. The plain files pass through MLX arrays, so
-  a model whose arrays are the engine's (a Cooler load) gets no tier there: the load says so and runs as with
-  `--prefix-cache-disk off`.
-- **One call is one filesystem operation of the plain path, at the same point, by the same path.** A staged file is
-  one writer op (same FIFO, permit, fence and `isPending`), made visible where the plain file's rename lands and no
-  sooner than the plain write would land (`Writer.calibratePace` at arm). A file past the writer's part size goes as
-  the plain file's parts do: parts of one ticket (`Vfs.holdPart`), each its own op that appends its blocks, the last
-  journaling and publishing, so the inference thread only reads back and copies, as on plain files. A synchronous call (a delete, a link,
+- **Every file operation of the tier goes through `DiskTier.fs`** (`src/kv_disk_fs.zig`) on the content-addressed layer
+  at `<root>/v/` (`prefix_vfs.zig`: packs, journal, snapshot), which is the sole SSD backend.
+- **One call is one CAS VFS operation.** A staged file is
+  one writer op (FIFO, permit, fence and `isPending`), made visible when its publish lands. A file past the writer's part size goes as
+  parts of one ticket (`Vfs.holdPart`), each its own op that appends its blocks, the last
+  journaling and publishing, so the inference thread only reads back and copies. A synchronous call (a delete, a link,
   `tokens.bin`, the synchronous save, a manifest without the writer) lands on the calling thread.
 - **The inference thread never waits behind a pack append.** The writer lands a part in steps: `hashBlocks` (no lock),
   `appendBlocks` (places the new blocks at the pack end, under `land_mutex` and the Vfs lock), `fillBlocks` (writes
@@ -652,8 +648,7 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   record and publish. A synchronous call waits only for a placing or a journal record. `Writer.fence(path)` waits for a
   write in flight on `path` only, never another file's. Guards: `the inference thread reads and writes the layer
   without waiting` (`kv_disk_fs.zig`, the writer held at each step), `a fence waits out only the op in flight on its own
-  path` (`kv_disk_writer.zig`). A paced cas op lasts as long as the plain write, so waiting for it in a persist cost
-  1.6.0 40-117 ms per fence and 75 ms per manifest ([qwen4-perf](qwen4-perf.md#cas-persist-stall)).
+  path` (`kv_disk_writer.zig`).
 - **A block's address is XXH3-64 plus Wyhash of its bytes, and the XXH3 is `src/xxh3.zig`.** The standard library's
   `std.hash.XxHash3` gives the same values at 1.3 GB/s on an M5 Max (its long-input loop compiles to byte shuffles
   through general registers on arm64); `xxh3.zig` runs at about 30 GB/s, so a block's two hashes cost 16 GB/s, not
@@ -664,21 +659,13 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **A persist hashes every file it rewrites.** Whole chunks below the restored rows are hard-linked and never read; the
   open tail chunk, the ring, `spec.safetensors` and the checkpoint state are read back, copied and hashed whole, and
   their 256-token row groups dedup only after the hash.
-- **A load reads as MLX reads a plain file.** `loadTensors` pins the file's extents (`Vfs.pinFile`) and hands
-  `mlx_load_safetensors_reader` a reader over them: MLX reads each tensor lazily on its IO threads into its own
-  buffers, the reader gathers the tensor's blocks with no layer lock held and checks each against its hash, and the
-  load evaluates every tensor before it returns, so a bad block fails that load with `MlxError` as a corrupt plain
-  file does. No restored array is an imported (no-copy) buffer, so the live state and its bill are those of the
-  plain path. An eager read on the inference thread into fresh pages cost twice 1.5.1's restore
-  ([qwen4-perf](qwen4-perf.md#cas-restore-read)). Guards: `a flipped byte in any block of a file ... refuses its load`,
+- **A load decodes directly from verified CAS blocks via native Zig `safetensors.zig`.** `prefix_vfs_tensors.loadTensors`
+  pins the file's extents (`Vfs.pinFile`), releases the VFS lock, verifies each block's XXH3+Wyhash digest, and scatters
+  each tensor's bytes directly into a Cooler Metal buffer (`mlx.engine.hostFilled`) or MLX array (`mlx.newData`) with no
+  safetensors byte-stream reconstruction and zero `mlx_load_safetensors` / `mlx_map_string_to_array` calls. A corrupt or
+  short block fails that load cleanly as `MlxError`. Guards: `a flipped byte in any block of a file ... refuses its load`,
   `a load reads its blocks with no layer lock held` (`prefix_vfs_tensors_test.zig`), `a rotted tensor block of an SSD
-  chunk refuses the restore` (`prefix_cache.zig`).
-- **Open: a restore right after a large end persist waits for the writer.** `drainEntry` waits until the entry's
-  queued ops land, and a cas op lands later than the plain write: 26 ms of a 75 ms restore at 32,737 tokens, behind
-  a 168 MB persist ([qwen4-perf](qwen4-perf.md#cas-restore-read)).
-- **The layer answers as the plain files do**: names, sizes, link counts, inode classes, mtime order, listings; a
-  restore loads bitwise the same arrays (`prefix_vfs_tensors.loadTensors`; an unreadable file fails as
-  `mlx_load_safetensors` does, `MlxError`). So every decision of the tier reads today's answers.
+  chunk refuses the restore` (`prefix_cache_index_test.zig`).
 - **A file's token rows are stored by absolute position** (`NamedTensor.rows`, 256-token groups): a rewrite stores its
   header and the groups the old file did not hold whole, a rewrite of identical bytes stores nothing. The save sites:
   - a KV chunk (and GLM's latent chunk): axis 2 from `c0`; a ring file: axis 2 from `pos - rows`;
@@ -689,16 +676,14 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
 - **A slice keeps its rows' positions** (`rowsFrom`): a `p*`/`q*` segment cut from the tail shares the groups the tail
   held whole, and a DeepSeek point past a segment maps the rows past it. Every other tensor is whole-file blocks.
   MiMo's ring files (window + 30 rows) hold no whole group, so they store as before. Guards: `DiskTier row groups:`
-  (`kv_disk_cache.zig`, `qwen4_disk_qsa.zig`) and `every row-mapped kind` (`prefix_vfs_tensors_test.zig`).
-- **Both save arms write one encoding** (`disk_format.encodeHeader`): the synchronous arm wrote
-  `mlx_save_safetensors`'s bytes, 2-18 bytes off the writer's for the same tensors, so the size the budget reads
-  followed the arm. Production reaches the synchronous arm only when its writer fails to start; the pin test arms the
-  writer as production does.
-- **The budget sees the volume as the plain files would leave it**: `refreshDiskBudget` reads free + physical -
+  (`kv_disk_index_test.zig`, `qwen4_disk_qsa.zig`) and `every row-mapped kind` (`prefix_vfs_tensors_test.zig`).
+- **One safetensors encoding everywhere** (`disk_format.encodeHeader` / `safetensors.zig`): both staged and synchronous
+  saves produce the same header and byte layout.
+- **The budget sees physical CAS space accurately**: `refreshDiskBudget` reads free + physical -
   logical (`Fs.freeAsFiles`); `tierBytes` counts a layer's pack, journal and snapshot bytes; the sibling sweep reads a
   layer's entries (manifest mtime, a shared inode once) and deletes through it. The admin listing reads a layer
   read-only (`Options.read_only`: it replays the journal and changes no file, so a live tier's layer is safe) and
-  lists its entries, file bytes and newest manifest as the plain files would.
+  lists its entries, file bytes and newest manifest.
 - **The layer holds at most `max_open_packs` (16) pack descriptors, whatever the tier's size** (`Vfs.usePack`,
   `PackFiles`). The pack being written stays open; any other opens for the one call that reads, writes or punches it
   and keeps its slot until the least recently used idle pack makes room. A call holds a descriptor only while it runs,
@@ -708,30 +693,29 @@ frees its state, and `DiskTier.settleCheckpoints` releases every checkpoint but 
   pack once filled the soft limit of 256 a Terminal or launchd start inherits, and the server stopped accepting
   connections. Guards: `the open pack descriptors stay bounded whatever the number of packs`, `a layer of more packs
   than the soft descriptor limit`, `a pack open past the descriptor quota` (`prefix_vfs.zig`).
-- **A dead block's whole pages go back to the volume, as a plain file's go at its unlink** (`Vfs.reclaim`: `F_PUNCHHOLE`
+- **A dead block's whole pages go back to the volume** (`Vfs.reclaim`: `F_PUNCHHOLE`
   over a pack's merged dead runs; a pack still goes with its last live block). The tier reclaims at every GC and entry
   delete, the sibling sweep before it closes a layer, and an open queues every pack byte outside a live block, so a
   crash between a record and its punch only defers them. A pack's dead runs (`DeadRuns`, keyed by start and by end)
   hold each dead byte once: a block that dies beside a run joins it, and the joined run's old keys go from both maps.
-  The GC still evicts on the bill, as on plain files; past it
-  the layer holds its journal, snapshot and the partial pages beside live blocks, all of which `disk_used_bytes`, the
+  Past GC, the layer holds its journal, snapshot and the partial pages beside live blocks, all of which `disk_used_bytes`, the
   usage line (`DiskTier.diskBytes`) and `tierBytes` (allocated blocks) count. Guards: `DiskTier budget:`
-  (`kv_disk_cache.zig`), `reclaim gives the volume`, `a crash before, between or after a reclaim`, `a block that dies
+  (`kv_disk_index_test.zig`), `reclaim gives the volume`, `a crash before, between or after a reclaim`, `a block that dies
   just before a dead run` (`prefix_vfs.zig`).
 - **An emptied tier reports zero on every count** (`DiskTier.invalidateAll`, the model-scope clear): it compacts the
   layer, so the journal of the deletes goes and only the snapshot's state record stays (`prefix_vfs.state_record_bytes`,
   45 bytes: next inode, last mtime, last sequence, so a reopened layer reuses neither). `DiskTier.diskBytes` leaves that
   one named record out. Guard: `prefix cache admin: clearDisk` (`prefix_cache_admin.zig`).
-- **A `cas` attach deletes the plain-file `e<id>` records under its root** (`DiskTier.dropPlainRecords`), once, under
-  the root lock and before its scan, with one `removed N plain-file entries` line: the layer would neither restore
-  nor free them, so they would sit beside it, up to a second budget on disk. Nothing is converted. A `real` attach
-  keeps them as its entries; the root's `v/` and every other name are left alone.
-- `SUSHI_TEST_CRASH_AFTER_LANDINGS` counts an op's publish as a landing and never the pace probe's file (only a `cas`
-  tier writes one), so the crash flow cuts at the same file on both backends.
-- **Tests run on both backends**: `zig build test` runs `test-prefix-cache` a second time with
-  `SUSHI_PREFIX_FS=real`. A test reads or damages a record's files through `kv_disk_fs.test*` (a live tier's layer, or
-  one opened for the call); the SHA-256 pins hash each file's plain-file image (`regenerate`); `random commits,
-  restores, evictions and restarts answer alike` drives both backends with one sequence and compares every answer.
+- **Attach deletes any legacy plain-file `e<id>` records under its root** (`DiskTier.dropPlainRecords`), once, under
+  the root lock and before its scan, with one `removed N plain-file entries` line: the CAS layer would neither restore
+  nor free them, so they would sit beside it, up to a second budget on disk. Nothing is converted; the root's `v/` and
+  every other name are left alone.
+- `SUSHI_TEST_CRASH_AFTER_LANDINGS` counts an op's publish as a landing, letting restart crash tests cut cleanly at any
+  file boundary.
+- **Tests exercise the CAS layer directly**: a test reads or damages a record's files through `kv_disk_fs.test*` (a live
+  tier's layer, or one opened for the call); the SHA-256 pins hash each file's canonical safetensors image (`regenerate`);
+  `random commits, restores, evictions and restarts keep the CAS index and files consistent` (`kv_disk_index_test.zig`)
+  fuzzes the full CAS lifecycle.
 
 <a id="ssd-flush"></a>
 ## The SSD flush
@@ -934,7 +918,7 @@ process start whatever turns `--metrics` on.
 - **The cache's array work runs on its arrays' stream** (`arraysStream`: the engine's on Sushi Cooler): a checkpoint
   trim, an inheritance or a shed that moves the QSA history on MLX's stream inside an engine forward is refused, and
   the request or the commit fails with it. An SSM snapshot or restore takes its caller's stream for the same reason;
-  lint `cache-gpu-stream` refuses `gpuStream()` in `prefix_cache.zig` and `ssm_cache.zig` outside `arraysStream`.
+  lint `cache-gpu-stream` refuses `gpuStream()` in `prefix_cache*.zig` and `ssm_cache.zig` outside `arraysStream`.
 - **A restore never patches a live SSM group row**: `prefillSteps` releases the slot from the group before its lookup,
   and a streamed Qwen load on Sushi Cooler carries one row per forward, so no group is live there at all.
 - **A checkout is a PROMISE until the append DONATES** (`donateCheckout` right before `Generator.initWithOptions`,

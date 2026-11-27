@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const st = @import("safetensors.zig");
 const trunk = @import("trunk.zig");
 const log = @import("log.zig");
 const tape = @import("restore_tape.zig");
@@ -79,49 +80,47 @@ fn dumpRestore(
     const gpa = std.heap.page_allocator;
     const stem = try std.fmt.allocPrint(gpa, "{s}/{s}-{d}-pos{d}", .{ dir, meta.kind, n, meta.pos });
     defer gpa.free(stem);
-    const st_path = try std.fmt.allocPrintSentinel(gpa, "{s}.safetensors", .{stem}, 0);
+    const st_path = try std.fmt.allocPrint(gpa, "{s}.safetensors", .{stem});
     defer gpa.free(st_path);
     const json_path = try std.fmt.allocPrint(gpa, "{s}.json", .{stem});
     defer gpa.free(json_path);
 
-    const map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(map);
-    const mmap = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    var map = st.Loaded.init(gpa);
+    defer map.deinit();
     var key_buf: [96]u8 = undefined;
 
-    try putInt(map, try zfmt(&key_buf, "pos", .{}), @intCast(meta.pos));
+    try putInt(&map, "pos", @intCast(meta.pos));
     if (ssm) |entries| {
         for (entries, 0..) |*e, i| {
-            try putArr(map, try zfmt(&key_buf, "layers.{d}.conv_state", .{i}), e.conv_state, s);
-            try putArr(map, try zfmt(&key_buf, "layers.{d}.ssm_state", .{i}), e.ssm_state, s);
-            try putArr(map, try zfmt(&key_buf, "layers.{d}.aux_state", .{i}), e.aux_state, s);
-            try putPooled(map, try zfmt(&key_buf, "layers.{d}.qsa_pooled", .{i}), e, s);
-            try putPlePrev(map, try zfmt(&key_buf, "layers.{d}.ple_prev", .{i}), e);
+            try putArr(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.conv_state", .{i}), e.conv_state);
+            try putArr(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.ssm_state", .{i}), e.ssm_state);
+            try putArr(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.aux_state", .{i}), e.aux_state);
+            try putPooled(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.qsa_pooled", .{i}), e, s);
+            try putPlePrev(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.ple_prev", .{i}), e);
             const hist: c_int = if (e.qsa_hist_rows > 0) e.qsa_hist_rows else 0;
             const held: c_int = if (e.aux_state.ctx != null and mlx.getShape(e.aux_state).len >= 2)
                 mlx.getShape(e.aux_state)[1]
             else
                 e.qsa_key_rows;
             const ring_start: c_int = if (held > 0 and hist >= held) hist - held else 0;
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.qsa_rows", .{i}), hist);
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.qsa_key_rows", .{i}), e.qsa_key_rows);
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.qsa_hist_rows", .{i}), hist);
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.qsa_ratio", .{i}), e.qsa_ratio);
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.ring_start", .{i}), ring_start);
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.initialized", .{i}), if (e.initialized) 1 else 0);
-            try putInt(map, try zfmt(&key_buf, "layers.{d}.ple_prev_valid", .{i}), if (e.ple_prev_valid) 1 else 0);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.qsa_rows", .{i}), hist);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.qsa_key_rows", .{i}), e.qsa_key_rows);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.qsa_hist_rows", .{i}), hist);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.qsa_ratio", .{i}), e.qsa_ratio);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.ring_start", .{i}), ring_start);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.initialized", .{i}), if (e.initialized) 1 else 0);
+            try putInt(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}.ple_prev_valid", .{i}), if (e.ple_prev_valid) 1 else 0);
         }
     }
     for (cache.entries, 0..) |*entry, i| {
         if (!entry.initialized) continue;
         var view = cache.denseView(@intCast(i), s) catch continue;
         defer view.deinit();
-        try putKvTail(map, try zfmt(&key_buf, "kv.{d}.k_tail", .{i}), view.k, s);
-        try putKvTail(map, try zfmt(&key_buf, "kv.{d}.v_tail", .{i}), view.v, s);
+        try putKvTail(&map, try std.fmt.bufPrint(&key_buf, "kv.{d}.k_tail", .{i}), view.k, s);
+        try putKvTail(&map, try std.fmt.bufPrint(&key_buf, "kv.{d}.v_tail", .{i}), view.v, s);
     }
 
-    try mlx.check(mlx.mlx_save_safetensors(st_path, map, mmap));
+    _ = try map.writeFile(std.Io.Threaded.global_single_threaded.io(), st_path, s);
 
     const mtp_txt: []const u8 = if (meta.mtp_base) |b|
         try std.fmt.allocPrint(gpa, "{d}", .{b})
@@ -147,72 +146,66 @@ fn zfmt(buf: []u8, comptime fmt: []const u8, args: anytype) ![:0]u8 {
     return buf[0..n.len :0];
 }
 
-fn putInt(map: mlx.mlx_map_string_to_array, key: [:0]const u8, v: c_int) !void {
+fn putInt(map: *st.Loaded, key: []const u8, v: c_int) !void {
     const arr = try mlx.newInt(v);
-    defer _ = mlx.mlx_array_free(arr);
-    _ = mlx.mlx_array_eval(arr);
-    try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));
+    errdefer _ = mlx.mlx_array_free(arr);
+    try map.put(key, arr);
 }
 
-fn putArr(map: mlx.mlx_map_string_to_array, key: [:0]const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) !void {
-    _ = s;
+fn putArr(map: *st.Loaded, key: []const u8, arr: mlx.mlx_array) !void {
     if (arr.ctx == null or mlx.mlx_array_size(arr) == 0) return;
-    _ = mlx.mlx_array_eval(arr);
-    try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));
+    try map.putRetained(key, arr);
 }
 
-fn putPlePrev(map: mlx.mlx_map_string_to_array, key: [:0]const u8, e: *const SSMCacheEntry) !void {
+fn putPlePrev(map: *st.Loaded, key: []const u8, e: *const SSMCacheEntry) !void {
     const shape = [_]c_int{@intCast(e.ple_prev.len)};
     const arr = try mlx.newData(@ptrCast(&e.ple_prev), &shape, .uint32);
-    defer _ = mlx.mlx_array_free(arr);
-    _ = mlx.mlx_array_eval(arr);
-    try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, arr));
+    errdefer _ = mlx.mlx_array_free(arr);
+    try map.put(key, arr);
 }
 
-fn putPooled(map: mlx.mlx_map_string_to_array, key: [:0]const u8, e: *const SSMCacheEntry, s: mlx.mlx_stream) !void {
+fn putPooled(map: *st.Loaded, key: []const u8, e: *const SSMCacheEntry, s: mlx.mlx_stream) !void {
     if (e.qsa_pooled.ctx == null) return;
     const ratio = @max(e.qsa_ratio, 1);
     const hist: c_int = if (e.qsa_hist_rows > 0) e.qsa_hist_rows else 0;
     const need = @divTrunc(hist, ratio);
     const ps = mlx.getShape(e.qsa_pooled);
     if (ps.len < 2) {
-        try putArr(map, key, e.qsa_pooled, s);
+        try putArr(map, key, e.qsa_pooled);
         return;
     }
     const keep = if (need > 0 and need < ps[1]) need else ps[1];
     if (keep <= 0) return;
     if (keep == ps[1]) {
-        try putArr(map, key, e.qsa_pooled, s);
+        try putArr(map, key, e.qsa_pooled);
         return;
     }
     var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
+    errdefer _ = mlx.mlx_array_free(sliced);
     const start = [_]c_int{ 0, 0, 0 };
     const stop = [_]c_int{ ps[0], keep, ps[2] };
     const strides = [_]c_int{ 1, 1, 1 };
     try mlx.check(mlx.mlx_slice(&sliced, e.qsa_pooled, &start, 3, &stop, 3, &strides, 3, s));
-    _ = mlx.mlx_array_eval(sliced);
-    try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, sliced));
+    try map.put(key, sliced);
 }
 
-fn putKvTail(map: mlx.mlx_map_string_to_array, key: [:0]const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) !void {
+fn putKvTail(map: *st.Loaded, key: []const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) !void {
     if (arr.ctx == null or mlx.mlx_array_size(arr) == 0) return;
     const sh = mlx.getShape(arr);
     if (sh.len != 4) {
-        try putArr(map, key, arr, s);
+        try putArr(map, key, arr);
         return;
     }
     const t = sh[2];
     if (t <= 0) return;
     const n: c_int = @min(64, t);
     var tail = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tail);
+    errdefer _ = mlx.mlx_array_free(tail);
     const start = [_]c_int{ 0, 0, t - n, 0 };
     const stop = [_]c_int{ sh[0], sh[1], t, sh[3] };
     const strides = [_]c_int{ 1, 1, 1, 1 };
     try mlx.check(mlx.mlx_slice(&tail, arr, &start, 4, &stop, 4, &strides, 4, s));
-    _ = mlx.mlx_array_eval(tail);
-    try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, tail));
+    try map.put(key, tail);
 }
 
 // ── restore tape ─────────────────────────────────────────────────────────

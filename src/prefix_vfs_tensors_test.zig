@@ -2,9 +2,11 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const st = @import("safetensors.zig");
 const vt = @import("prefix_vfs_tensors.zig");
 const prefix_vfs = @import("prefix_vfs.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
+const kv_disk_fs = @import("kv_disk_fs.zig");
 const kv_quant = @import("kv_quant.zig");
 const trunk = @import("trunk.zig");
 
@@ -125,51 +127,18 @@ const Env = struct {
     }
 };
 
-fn cstr(text: []const u8) ![:0]u8 {
-    return std.fmt.allocPrintSentinel(ta, "{s}", .{text}, 0);
-}
-
 fn cpuLoad(path: []const u8) !vt.Loaded {
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    const path_z = try cstr(path);
-    defer ta.free(path_z);
-    var tensors = mlx.mlx_map_string_to_array_new();
-    var meta = mlx.mlx_map_string_to_string_new();
-    errdefer {
-        _ = mlx.mlx_map_string_to_array_free(tensors);
-        _ = mlx.mlx_map_string_to_string_free(meta);
-    }
-    try mlx.check(mlx.mlx_load_safetensors(&tensors, &meta, path_z.ptr, cpu));
-    return .{ .tensors = tensors, .meta = meta };
+    return st.loadFile(ta, tio, path, cpu);
 }
 
-fn mapCount(map: mlx.mlx_map_string_to_array) !usize {
-    const it = mlx.mlx_map_string_to_array_iterator_new(map);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
-    var n: usize = 0;
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var val = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(val);
-        if (mlx.mlx_map_string_to_array_iterator_next(&key, &val, it) != 0 or key == null) break;
-        n += 1;
-    }
-    return n;
-}
-
-fn expectSameLoads(spec: KindSpec, want: vt.Loaded, got: vt.Loaded) !void {
-    try testing.expectEqual(spec.tensors.len, try mapCount(want.tensors));
-    try testing.expectEqual(spec.tensors.len, try mapCount(got.tensors));
+fn expectSameLoads(spec: KindSpec, want: *const vt.Loaded, got: *const vt.Loaded) !void {
+    try testing.expectEqual(spec.tensors.len, want.count());
+    try testing.expectEqual(spec.tensors.len, got.count());
     for (spec.tensors) |t| {
-        const key_z = try cstr(t.key);
-        defer ta.free(key_z);
-        var a = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(a);
-        var b = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(b);
-        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_array_get(&a, want.tensors, key_z.ptr));
-        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_array_get(&b, got.tensors, key_z.ptr));
+        const a = want.get(t.key) orelse return error.TestExpectedEqual;
+        const b = got.get(t.key) orelse return error.TestExpectedEqual;
         try testing.expectEqual(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(b));
         try testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
         try mlx.check(mlx.mlx_array_eval(a));
@@ -179,14 +148,10 @@ fn expectSameLoads(spec: KindSpec, want: vt.Loaded, got: vt.Loaded) !void {
         try testing.expectEqualSlices(u8, ba, bb);
     }
     for (spec.meta) |m| {
-        const key_z = try cstr(m.key);
-        defer ta.free(key_z);
-        var a: [*:0]const u8 = undefined;
-        var b: [*:0]const u8 = undefined;
-        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_string_get(&a, want.meta, key_z.ptr));
-        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_string_get(&b, got.meta, key_z.ptr));
-        try testing.expectEqualStrings(std.mem.span(a), std.mem.span(b));
-        try testing.expectEqualStrings(m.value, std.mem.span(b));
+        const a = want.getMeta(m.key) orelse return error.TestExpectedEqual;
+        const b = got.getMeta(m.key) orelse return error.TestExpectedEqual;
+        try testing.expectEqualStrings(a, b);
+        try testing.expectEqualStrings(m.value, b);
     }
 }
 
@@ -194,9 +159,8 @@ fn readWhole(path: []const u8) ![]u8 {
     return kv_disk_cache.readFileAlloc(ta, tio, path, 1 << 30) orelse error.FileNotFound;
 }
 
-/// One kind of file written by the plain-file tier's two arms (the writer's staged encoder and the synchronous save)
-/// and by the VFS: the loads agree on every name, dtype, shape, byte and metadata value, and the VFS size is the writer
-/// arm's.
+/// One kind of file written by `safetensors.saveFile` and by the VFS: the loads agree on every name, dtype, shape,
+/// byte and metadata value, and the regenerated image matches byte for byte.
 fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     try mlx.requireGpu();
     const s = mlx.gpuStream();
@@ -204,30 +168,15 @@ fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     try env.init();
     defer env.deinit();
 
-    const sync_path = try env.path("sync.safetensors", .{});
-    defer ta.free(sync_path);
-    const staged_path = try env.path("staged.safetensors", .{});
-    defer ta.free(staged_path);
-
+    const plain_path = try env.path("plain.safetensors", .{});
+    defer ta.free(plain_path);
+    var plain_size: u64 = 0;
     {
-        var tier = try DiskTier.initBackend(ta, tio, env.root(), "fp-sync", 0, 128, .real);
-        defer tier.deinit();
         var b = try Built.init(spec, sliced);
         defer b.deinit();
-        _ = try tier.saveNamed(try ta.dupe(u8, sync_path), b.named.items, spec.meta, spec.kind, s);
+        plain_size = try st.saveFile(ta, tio, plain_path, b.views, spec.meta, s);
     }
-    var staged_size: u64 = 0;
-    {
-        var tier = try DiskTier.initBackend(ta, tio, env.root(), "fp-staged", 0, 128, .real);
-        defer tier.deinit();
-        tier.enableBackgroundWriter();
-        var b = try Built.init(spec, sliced);
-        defer b.deinit();
-        staged_size = try tier.saveNamed(try ta.dupe(u8, staged_path), b.named.items, spec.meta, spec.kind, s);
-        tier.drainWriter();
-        try testing.expectEqual(@as(u64, 0), tier.writeErrors());
-    }
-    try testing.expectEqual(staged_size, kv_disk_cache.fileSize(tio, staged_path).?);
+    try testing.expectEqual(plain_size, kv_disk_cache.fileSize(tio, plain_path).?);
 
     const vroot = try env.path("vfs", .{});
     defer ta.free(vroot);
@@ -237,33 +186,30 @@ fn expectKindMatchesTier(spec: KindSpec, sliced: bool) !void {
     var b = try Built.init(spec, sliced);
     defer b.deinit();
     const size = try vt.saveTensors(vfs, "e1/file.safetensors", b.views, spec.meta, b.maps, spec.kind, s);
-    try testing.expectEqual(staged_size, size);
-    try testing.expectEqual(staged_size, vfs.stat("e1/file.safetensors").?.size);
+    try testing.expectEqual(plain_size, size);
+    try testing.expectEqual(plain_size, vfs.stat("e1/file.safetensors").?.size);
 
-    const want_bytes = try readWhole(staged_path);
+    const want_bytes = try readWhole(plain_path);
     defer ta.free(want_bytes);
     const regen = try vt.regenerate(vfs, ta, "e1/file.safetensors");
     defer ta.free(regen);
     try testing.expectEqualSlices(u8, want_bytes, regen);
 
-    const loaded = try loadMlx(vfs, "e1/file.safetensors");
+    var loaded = try loadMlx(vfs, "e1/file.safetensors");
     defer loaded.deinit();
-    const from_staged = try cpuLoad(staged_path);
-    defer from_staged.deinit();
-    const from_sync = try cpuLoad(sync_path);
-    defer from_sync.deinit();
-    try expectSameLoads(spec, from_staged, loaded);
-    try expectSameLoads(spec, from_sync, loaded);
+    var from_plain = try cpuLoad(plain_path);
+    defer from_plain.deinit();
+    try expectSameLoads(spec, &from_plain, &loaded);
 
     // The engine's own load of the file: the same again, with nothing asked of MLX.
     const was_enabled = mlx.engine.enabled;
     mlx.engine.enabled = true;
     defer @import("test_support.zig").restoreEngine(was_enabled);
     const calls_before = mlx.engine.mlxCalls();
-    const own = try vt.loadTensors(vfs, "e1/file.safetensors", mlx.engine.stream());
+    var own = try vt.loadTensors(vfs, "e1/file.safetensors", mlx.engine.stream());
     defer own.deinit();
     try testing.expectEqual(calls_before, mlx.engine.mlxCalls());
-    try expectSameLoads(spec, from_staged, own);
+    try expectSameLoads(spec, &from_plain, &own);
 }
 
 const kv_rows_map = RowMap{ .axis = 2, .pos0 = 3 * 1024 };
@@ -674,7 +620,7 @@ test "tensor files on the vfs: a flipped pack byte refuses that file with the ti
     defer vfs.close();
     try testing.expectError(error.MlxError, loadMlx(vfs, "a"));
     try testing.expectError(error.MlxError, loadMlx(vfs, "a"));
-    const ok = try loadMlx(vfs, "b");
+    var ok = try loadMlx(vfs, "b");
     defer ok.deinit();
     try testing.expectError(error.FileNotFound, loadMlx(vfs, "missing"));
 }
@@ -763,7 +709,7 @@ fn expectProductionChunks(config: kv_quant.KVQuantConfig, dtype: mlx.mlx_dtype) 
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var tier = try DiskTier.initBackend(ta, tio, env.root(), "fp-prod", 0, 0, .real);
+    var tier = try DiskTier.init(ta, tio, env.root(), "fp-prod", 0, 0);
     defer tier.deinit();
     tier.enableBackgroundWriter();
     var cache = try trunk.KVCache.initWithConfig(ta, 3, config);
@@ -780,13 +726,15 @@ fn expectProductionChunks(config: kv_quant.KVQuantConfig, dtype: mlx.mlx_dtype) 
     var vfs = try Vfs.open(ta, tio, vroot, .{});
     defer vfs.close();
 
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
     for (0..2) |idx| {
         const file = try std.fmt.allocPrint(ta, "{s}/e{d}/c{d:0>6}.safetensors", .{ tier.root, tier.entries.items[0].id, idx });
         defer ta.free(file);
-        const want = try readWhole(file);
+        const want = kv_disk_fs.testRead(tio, file, 1 << 30) orelse return error.FileNotFound;
         defer ta.free(want);
         const keys = try headerKeys(want, arena);
-        const from_tier = try cpuLoad(file);
+        var from_tier = try st.loadBytes(ta, want, cpu);
         defer from_tier.deinit();
 
         const views = try ta.alloc(vt.Tensor, keys.len);
@@ -795,14 +743,8 @@ fn expectProductionChunks(config: kv_quant.KVQuantConfig, dtype: mlx.mlx_dtype) 
         defer ta.free(specs);
         const maps = try ta.alloc(?RowMap, keys.len);
         defer ta.free(maps);
-        defer for (views) |v| {
-            _ = mlx.mlx_array_free(v.arr);
-        };
         for (keys, views, specs, maps) |k, *v, *sp, *m| {
-            const kz = try cstr(k);
-            defer ta.free(kz);
-            var arr = mlx.mlx_array_new();
-            try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_array_get(&arr, from_tier.tensors, kz.ptr));
+            const arr = from_tier.get(k) orelse return error.TestExpectedEqual;
             v.* = .{ .key = k, .arr = arr };
             sp.* = .{ .key = k, .shape = &.{}, .dtype = .float32 };
             m.* = .{ .axis = 2, .pos0 = idx * 1024 };
@@ -812,9 +754,9 @@ fn expectProductionChunks(config: kv_quant.KVQuantConfig, dtype: mlx.mlx_dtype) 
         const regen = try vt.regenerate(vfs, ta, "chunk");
         defer ta.free(regen);
         try testing.expectEqualSlices(u8, want, regen);
-        const loaded = try loadMlx(vfs, "chunk");
+        var loaded = try loadMlx(vfs, "chunk");
         defer loaded.deinit();
-        try expectSameLoads(.{ .name = "", .kind = .kv, .tensors = specs }, from_tier, loaded);
+        try expectSameLoads(.{ .name = "", .kind = .kv, .tensors = specs }, &from_tier, &loaded);
     }
 }
 
@@ -878,7 +820,7 @@ test "tensor files on the vfs: a load reads its blocks with no layer lock held" 
     const w = try std.Thread.spawn(.{}, Writer.watch, .{ &writer, vfs, &gate });
     const loaded = loadMlx(vfs, "a");
     w.join();
-    const got = try loaded;
+    var got = try loaded;
     defer got.deinit();
     try testing.expect(gate.entered.load(.acquire));
     try testing.expect(writer.free);
@@ -932,14 +874,10 @@ test "tensor files on the vfs: a flipped byte in any block of a file, header, fi
 
     var vfs = try Vfs.open(ta, tio, vroot, .{});
     defer vfs.close();
-    const got = try loadMlx(vfs, "a");
+    var got = try loadMlx(vfs, "a");
     defer got.deinit();
     for ([_]struct { []const u8, mlx.mlx_array }{ .{ "f", f }, .{ "k", k } }) |want| {
-        const key_z = try cstr(want[0]);
-        defer ta.free(key_z);
-        var arr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(arr);
-        try testing.expectEqual(@as(c_int, 0), mlx.mlx_map_string_to_array_get(&arr, got.tensors, key_z.ptr));
+        const arr = got.get(want[0]) orelse return error.TestExpectedEqual;
         try mlx.check(mlx.mlx_array_eval(arr));
         try mlx.check(mlx.mlx_array_eval(want[1]));
         try testing.expectEqualSlices(u8, vt.bytesOf(want[1]) orelse return error.NoBytes, vt.bytesOf(arr) orelse return error.NoBytes);

@@ -255,32 +255,46 @@ test "trunk gemm: real pack trunk banks, every shape the gate allows writes the 
     };
     var layer: usize = 0;
     while (true) : (layer += 1) {
-        const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/trunk-stq-L{d:0>2}.safetensors", .{ dir, layer }, 0);
+        const path = try std.fmt.allocPrint(t.allocator, "{s}/trunk-stq-L{d:0>2}.safetensors", .{ dir, layer });
         defer t.allocator.free(path);
-        std.Io.Dir.cwd().access(t.io, path, .{}) catch break;
-        var map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        var meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try mlx.check(mlx.mlx_load_safetensors(&map, &meta, path.ptr, mlx.mlx_default_cpu_stream_new()));
-        const it = mlx.mlx_map_string_to_array_iterator_new(map);
-        defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
-        while (true) {
-            var key: ?[*:0]const u8 = null;
-            var value = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(value);
-            if (mlx.mlx_map_string_to_array_iterator_next(&key, &value, it) != 0 or key == null) break;
-            if (!std.mem.endsWith(u8, std.mem.span(key.?), ".trellis")) continue;
-            const sh = mlx.getShape(value);
-            if (sh.len != 3 or sh[2] != 96) continue;
+        const f = std.Io.Dir.cwd().openFile(t.io, path, .{}) catch break;
+        defer f.close(t.io);
+        var word: [8]u8 = undefined;
+        if (try f.readPositionalAll(t.io, &word, 0) != 8) return error.TruncatedSafetensors;
+        const hlen: usize = @intCast(std.mem.readInt(u64, &word, .little));
+        const hdr = try t.allocator.alloc(u8, hlen);
+        defer t.allocator.free(hdr);
+        if (try f.readPositionalAll(t.io, hdr, 8) != hlen) return error.TruncatedSafetensors;
+        var parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, hdr, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.BadSafetensorsHeader;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.endsWith(u8, entry.key_ptr.*, ".trellis") or entry.value_ptr.* != .object) continue;
+            const obj = entry.value_ptr.object;
+            const sh_v = obj.get("shape") orelse continue;
+            const offs_v = obj.get("data_offsets") orelse continue;
+            if (sh_v != .array or sh_v.array.items.len != 3 or offs_v != .array or offs_v.array.items.len != 2) continue;
+            var sh: [3]c_int = undefined;
+            for (sh_v.array.items, &sh) |d, *dst| {
+                if (d != .integer) continue;
+                dst.* = std.math.cast(c_int, d.integer) orelse continue;
+            }
+            if (sh[2] != 96) continue;
             const in = sh[0] * 16;
             const out = sh[1] * 16;
             const seen = for (banks[0..n_banks]) |b| {
                 if (b.in == in and b.out == out) break true;
             } else false;
             if (seen or n_banks == banks.len) continue;
-            var bank = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&bank, value, &[_]c_int{ 1, sh[0], sh[1], sh[2] }, 4, s));
+            const lo: u64 = @intCast(offs_v.array.items[0].integer);
+            const hi: u64 = @intCast(offs_v.array.items[1].integer);
+            const raw = try t.allocator.alloc(u8, @intCast(hi - lo));
+            defer t.allocator.free(raw);
+            if (try f.readPositionalAll(t.io, raw, 8 + hlen + lo) != raw.len) return error.TruncatedSafetensors;
+            const dt_s = (obj.get("dtype") orelse continue).string;
+            const dtype: mlx.mlx_dtype = if (std.mem.eql(u8, dt_s, "U16")) .uint16 else if (std.mem.eql(u8, dt_s, "I16")) .int16 else if (std.mem.eql(u8, dt_s, "U8")) .uint8 else continue;
+            const bank = try mlx.newData(raw.ptr, &[_]c_int{ 1, sh[0], sh[1], sh[2] }, dtype);
             banks[n_banks] = .{ .in = in, .out = out, .trellis = bank };
             n_banks += 1;
         }

@@ -3,6 +3,7 @@
 //! against a dense f64 product of the host tile decode, the f32 truth. Skipped without the pack.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const exl3 = @import("sushi_exl3");
 const format = exl3.format;
 const kernels = exl3.kernels;
@@ -30,44 +31,28 @@ fn packDir() ?[:0]const u8 {
 }
 
 const Shard = struct {
-    map: mlx.mlx_map_string_to_array,
+    loaded: safetensors.Loaded,
 
-    /// The safetensors load runs on the CPU stream: a GPU stream has no read for it.
     fn open(alloc: std.mem.Allocator, dir: []const u8, kind: []const u8, layer: usize) !Shard {
-        const path = try std.fmt.allocPrintSentinel(alloc, "{s}/model-{s}-{d:0>2}.safetensors", .{ dir, kind, layer }, 0);
+        const path = try std.fmt.allocPrint(alloc, "{s}/model-{s}-{d:0>2}.safetensors", .{ dir, kind, layer });
         defer alloc.free(path);
-        var map = mlx.mlx_map_string_to_array_new();
-        errdefer _ = mlx.mlx_map_string_to_array_free(map);
-        var meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try mlx.check(mlx.mlx_load_safetensors(&map, &meta, path.ptr, mlx.mlx_default_cpu_stream_new()));
-        return .{ .map = map };
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        return .{ .loaded = try safetensors.loadFile(alloc, std.testing.io, path, cpu) };
     }
 
     fn deinit(self: *Shard) void {
-        _ = mlx.mlx_map_string_to_array_free(self.map);
+        self.loaded.deinit();
     }
 
-    fn has(self: *const Shard, alloc: std.mem.Allocator, name: []const u8) !bool {
-        const it = mlx.mlx_map_string_to_array_iterator_new(self.map);
-        defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
-        while (true) {
-            var key: ?[*:0]const u8 = null;
-            var value = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(value);
-            if (mlx.mlx_map_string_to_array_iterator_next(&key, &value, it) != 0 or key == null) return false;
-            if (std.mem.eql(u8, std.mem.span(key.?), name)) return true;
-        }
-        _ = alloc;
+    fn has(self: *const Shard, _: std.mem.Allocator, name: []const u8) !bool {
+        return self.loaded.get(name) != null;
     }
 
     fn get(self: *const Shard, alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !mlx.mlx_array {
-        const name = try std.fmt.allocPrintSentinel(alloc, fmt, args, 0);
+        const name = try std.fmt.allocPrint(alloc, fmt, args);
         defer alloc.free(name);
-        var a = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(a);
-        try mlx.check(mlx.mlx_map_string_to_array_get(&a, self.map, name.ptr));
-        return a;
+        return (try self.loaded.getOwned(name)) orelse error.MissingTensor;
     }
 };
 

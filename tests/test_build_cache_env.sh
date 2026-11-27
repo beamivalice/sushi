@@ -28,7 +28,7 @@ done
 # What the test process saw: a host test writes its SUSHI_ variables to SUSHI_TEST_ENV_DUMP (same -D args every time).
 PROBE="test env: SUSHI_TEST_ENV_DUMP"
 probe() { env "$1=$2" SUSHI_TEST_ENV_DUMP="$TMP/dump" "$ZIG" build test-host -Doptimize=ReleaseFast "-Dtest-filter=$PROBE" >"$TMP/out" 2>&1; }
-for var in SUSHI_CONTRACT_FIXTURE SUSHI_PREFIX_FS SUSHI_MODELS_DIR; do
+for var in SUSHI_CONTRACT_FIXTURE SUSHI_PREFIX_CACHE_DIR SUSHI_MODELS_DIR; do
   for value in one two; do
     rm -f "$TMP/dump"
     probe "$var" "$value" || { echo "  FAIL: probe with $var=$value"; sed 's/^/    /' "$TMP/out" | tail -6; FAIL=$((FAIL + 1)); continue; }

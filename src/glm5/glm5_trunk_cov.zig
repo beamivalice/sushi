@@ -2,6 +2,7 @@
 const std = @import("std");
 const arch_config = @import("../arch/config.zig");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const model = @import("../model.zig");
 const forward = @import("glm5_forward.zig");
 const base = @import("glm5_model.zig");
@@ -29,30 +30,25 @@ pub const Collector = struct {
     }
 
     /// Writes `<weight name>` -> covariance for every tapped projection of `layer`, plus the shared token count.
-    pub fn save(self: *Collector, weights: *const model.Weights, layer_prefix: []const u8, path: []const u8) !void {
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
+    pub fn save(self: *Collector, io: std.Io, weights: *const model.Weights, layer_prefix: []const u8, path: []const u8) !void {
+        var map = safetensors.Loaded.init(self.allocator);
+        defer map.deinit();
         var tokens: u32 = 0;
         var named: usize = 0;
         var it = weights.map.iterator();
-        var key_buf: [256]u8 = undefined;
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             if (!std.mem.startsWith(u8, name, layer_prefix) or !std.mem.endsWith(u8, name, ".weight")) continue;
             const slot = self.slots.get(@intFromPtr(entry.value_ptr.ctx)) orelse continue;
             tokens = @intCast(slot.tokens);
             named += 1;
-            try mlx.check(mlx.mlx_map_string_to_array_insert(map, try std.fmt.bufPrintSentinel(&key_buf, "{s}", .{name}, 0), slot.cov));
+            try map.putRetained(name, slot.cov);
         }
         if (named != self.slots.count()) return error.TrunkCovUnnamedProjection;
         const count = mlx.mlx_array_new_data(&tokens, &[_]c_int{1}, 1, .uint32);
         defer _ = mlx.mlx_array_free(count);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(map, "tokens", count));
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        const path_z = try std.fmt.allocPrintSentinel(self.allocator, "{s}", .{path}, 0);
-        defer self.allocator.free(path_z);
-        try mlx.check(mlx.mlx_save_safetensors(path_z.ptr, map, meta));
+        try map.putRetained("tokens", count);
+        _ = try map.writeFile(io, path, self.stream);
     }
 
     /// Rows are every position of `x`; the sum stays F32 and is evaluated per call so the graph stays bounded.
@@ -131,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         if ((window + 1) % 100 == 0 or window + 1 == windows) std.debug.print("layer {d}: cov window {d}/{d}\n", .{ index, window + 1, windows });
     }
     var buf: [256]u8 = undefined;
-    try collector.save(&weights, try std.fmt.bufPrint(&buf, "{s}.layers.{d}.", .{ cfg.weight_prefix, index }), out);
+    try collector.save(io, &weights, try std.fmt.bufPrint(&buf, "{s}.layers.{d}.", .{ cfg.weight_prefix, index }), out);
 }
 
 test "GLM trunk cov collector sums X^T X per projection across calls" {
