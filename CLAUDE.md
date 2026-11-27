@@ -109,10 +109,13 @@ mlx: [process-measurement](docs/process-measurement.md#build-environment-notes).
 
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions).
   `zig build test` does NOT refresh `zig-out/bin/sushi`: rebuild before any live A/B.
+- `zig build` builds `sushi` and `zig-out/lib/sushi.metallib` in parallel (`zig build sushi-metallib` builds the library
+  alone). `sushi.metallib` precompiles every Sushi Cooler kernel (stock MLX, `ops`/chains, and all custom EXL3/shared/arch
+  kernels); Cooler never compiles Metal source at runtime and never falls back to `mlx.metallib`.
 - The MLX host overhead patch and the Metal-buffer accessor are temporary aids of the move off MLX, decode first;
   no other new patch goes on mlx or mlx-c ([engine-mlx-gotchas](docs/engine-mlx-gotchas.md#host-overhead)).
-- A git worktree lacks `.zig-toolchain/` and `lib/mlx/`: symlink both from the main checkout. After a toolchain/SDK
-  change `rm -rf .zig-cache` (configure-time output is cached).
+- A git worktree lacks `.zig-toolchain/`, `lib/mlx/` and `lib/mlx-src/`: symlink them from the main checkout. After
+  a toolchain/SDK change `rm -rf .zig-cache` (configure-time output is cached).
 
 ## Testing — TDD is mandatory
 
@@ -196,6 +199,9 @@ release item about it. Deferred repo work goes to `docs/private/future.md`, neve
   ([quality-kld](docs/quality-kld.md)).
 - No lower precision than the reference: a product the model's reference computes in f32 (router, indexer,
   mixes, attention scores where it keeps them f32) stays f32 on every path; no bf16, f16 or split-bf16 arm for it.
+- A new or changed Cooler kernel is registered in `src/tensor/metallib_{shared,exl3}.zig` or `src/<arch>/metallib.zig`;
+  an unregistered one is refused by name, and `stock metallib` checks completeness
+  ([engine-own-forward](docs/engine-own-forward.md#sushi-metallib)).
 - The engine reads only aggregate machine load and its own I/O timings, states them only in a visible log line, and
   never names another program ([server-lifecycle](docs/server-lifecycle.md#machine-state)).
 

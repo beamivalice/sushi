@@ -303,6 +303,46 @@ fn emitSpecial(ub: *OpsBuffers, unit: OpsUnit, fn_name: []const u8, op: SpecialO
     }
 }
 
+const WorkItem = struct {
+    unit_name: []const u8,
+    out_path: []const u8,
+};
+
+fn emitOneUnit(io: std.Io, gpa: std.mem.Allocator, item: WorkItem) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const cwd = std.Io.Dir.cwd();
+
+    if (std.mem.eql(u8, item.unit_name, "ops_all")) {
+        var ops_bufs = try OpsBuffers.init(a);
+        defer ops_bufs.deinit();
+        try ops_bufs.ensureBuilt();
+        var combined: std.ArrayList(u8) = .empty;
+        defer combined.deinit(a);
+        try combined.appendSlice(a, spec.ops_metal_helpers);
+        for (ops_bufs.ops) |buf| {
+            try combined.appendSlice(a, buf.items[spec.ops_metal_helpers.len..]);
+        }
+        try cwd.writeFile(io, .{ .sub_path = item.out_path, .data = combined.items });
+        return;
+    }
+    if (std.meta.stringToEnum(OpsUnit, item.unit_name)) |ops_unit| {
+        var ops_bufs = try OpsBuffers.init(a);
+        defer ops_bufs.deinit();
+        try ops_bufs.ensureBuilt();
+        try cwd.writeFile(io, .{ .sub_path = item.out_path, .data = ops_bufs.opsBuf(ops_unit).items });
+        return;
+    }
+    var custom_buf: std.ArrayList(u8) = .empty;
+    defer custom_buf.deinit(a);
+    if (try catalog.emitCustomUnit(&custom_buf, a, item.unit_name)) {
+        try cwd.writeFile(io, .{ .sub_path = item.out_path, .data = custom_buf.items });
+        return;
+    }
+    return error.UnknownUnit;
+}
+
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     var arena = std.heap.ArenaAllocator.init(init.gpa);
@@ -312,23 +352,44 @@ pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, a);
     _ = args.next();
 
-    var ops_bufs = try OpsBuffers.init(a);
-    defer ops_bufs.deinit();
-
-    const cwd = std.Io.Dir.cwd();
+    var items: std.ArrayList(WorkItem) = .empty;
     while (args.next()) |unit_name| {
         const out_path = args.next() orelse return error.MissingOutPath;
-        if (std.meta.stringToEnum(OpsUnit, unit_name)) |ops_unit| {
-            try ops_bufs.ensureBuilt();
-            try cwd.writeFile(io, .{ .sub_path = out_path, .data = ops_bufs.opsBuf(ops_unit).items });
-            continue;
-        }
-        var custom_buf: std.ArrayList(u8) = .empty;
-        defer custom_buf.deinit(a);
-        if (try catalog.emitCustomUnit(&custom_buf, a, unit_name)) {
-            try cwd.writeFile(io, .{ .sub_path = out_path, .data = custom_buf.items });
-            continue;
-        }
-        return error.UnknownUnit;
+        try items.append(a, .{ .unit_name = unit_name, .out_path = out_path });
     }
+    if (items.items.len <= 1) {
+        for (items.items) |it| try emitOneUnit(io, init.gpa, it);
+        return;
+    }
+
+    const WorkerCtx = struct {
+        io: std.Io,
+        gpa: std.mem.Allocator,
+        items: []const WorkItem,
+        next: std.atomic.Value(usize) = .init(0),
+        failed: std.atomic.Value(bool) = .init(false),
+
+        fn run(ctx: *@This()) void {
+            while (true) {
+                const idx = ctx.next.fetchAdd(1, .monotonic);
+                if (idx >= ctx.items.len) return;
+                emitOneUnit(ctx.io, ctx.gpa, ctx.items[idx]) catch |e| {
+                    std.debug.print("gen-metallib: unit {s}: {s}\n", .{ ctx.items[idx].unit_name, @errorName(e) });
+                    ctx.failed.store(true, .release);
+                    return;
+                };
+            }
+        }
+    };
+    var ctx: WorkerCtx = .{ .io = io, .gpa = init.gpa, .items = items.items };
+    const n_threads = @min(items.items.len, @min(std.Thread.getCpuCount() catch 4, 16));
+    var threads: [16]std.Thread = undefined;
+    var spawned: usize = 0;
+    for (0..n_threads - 1) |i| {
+        threads[i] = try std.Thread.spawn(.{}, WorkerCtx.run, .{&ctx});
+        spawned += 1;
+    }
+    ctx.run();
+    for (threads[0..spawned]) |t| t.join();
+    if (ctx.failed.load(.acquire)) return error.EmitUnitFailed;
 }

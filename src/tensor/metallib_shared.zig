@@ -260,7 +260,7 @@ const vqmm_ks_specs: [18]KernelSpec = blk: {
         for ([_]usize{ 2, 4, 8 }) |bn| {
             out[idx] = .{
                 .name = std.fmt.comptimePrint("sushi_vqmm_ks_m{d}_n{d}", .{ m, bn }),
-                .source_fn = vqmmKsSource,
+                .source_fn = custom.codegenFn(vqmmKsSource),
                 .source_arg = m * 16 + bn,
                 .inputs = &vqmm_ins,
                 .outputs = &vqmm_outs,
@@ -282,7 +282,7 @@ const vqmm_msg_specs: [6]KernelSpec = blk: {
     for (2..8, 0..) |m, idx| {
         out[idx] = .{
             .name = std.fmt.comptimePrint("sushi_vqmm_msg_m{d}", .{m}),
-            .source_fn = vqmmMsgSource,
+            .source_fn = custom.codegenFn(vqmmMsgSource),
             .source_arg = m,
             .inputs = &vqmm_ins,
             .outputs = &vqmm_outs,
@@ -578,7 +578,7 @@ const static_specs = [_]KernelSpec{
     // ── src/hc_prefill.zig (2 kernels) ──
     .{
         .name = "sushi_hc_prefill_norm",
-        .source = @embedFile("../kernels/hc_prefill_norm.metal"),
+        .source = if (custom.is_codegen) @embedFile("../kernels/hc_prefill_norm.metal") else "",
         .inputs = &.{
             .{ .name = "x", .ty = par("T") },
             .{ .name = "w", .ty = par("T") },
@@ -599,7 +599,7 @@ const static_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_hc_prefill_mix",
-        .source = @embedFile("../kernels/hc_prefill_mix.metal"),
+        .source = if (custom.is_codegen) @embedFile("../kernels/hc_prefill_mix.metal") else "",
         .inputs = &.{
             .{ .name = "up", .ty = par("T") },
             .{ .name = "normed", .ty = par("T") },
@@ -725,7 +725,7 @@ const static_specs = [_]KernelSpec{
     // ── src/trunk.zig (5 kernels) ──
     .{
         .name = "gated_delta_step",
-        .source = trunk.gdnKernelSource(false, false),
+        .source = if (custom.is_codegen) trunk.gdnKernelSource(false, false) else "",
         .inputs = &gdn_ins_plain,
         .outputs = &gdn_outs_plain,
         .params = &gdn_params,
@@ -733,7 +733,7 @@ const static_specs = [_]KernelSpec{
     },
     .{
         .name = "gated_delta_step_vec",
-        .source = trunk.gdnKernelSource(true, false),
+        .source = if (custom.is_codegen) trunk.gdnKernelSource(true, false) else "",
         .inputs = &gdn_ins_plain,
         .outputs = &gdn_outs_plain,
         .params = &gdn_params,
@@ -741,7 +741,7 @@ const static_specs = [_]KernelSpec{
     },
     .{
         .name = "gated_delta_step_seq",
-        .source = trunk.gdnKernelSource(false, true),
+        .source = if (custom.is_codegen) trunk.gdnKernelSource(false, true) else "",
         .inputs = &gdn_ins_seq,
         .outputs = &gdn_outs_seq,
         .params = &gdn_params,
@@ -749,7 +749,7 @@ const static_specs = [_]KernelSpec{
     },
     .{
         .name = "gated_delta_step_seq_vec",
-        .source = trunk.gdnKernelSource(true, true),
+        .source = if (custom.is_codegen) trunk.gdnKernelSource(true, true) else "",
         .inputs = &gdn_ins_seq,
         .outputs = &gdn_outs_seq,
         .params = &gdn_params,
@@ -790,8 +790,8 @@ const static_specs = [_]KernelSpec{
     .{
         .name = "sushi_attn_pd_nax",
         .nax = true,
-        .header = @embedFile("../kernels/attn_pd_nax_header.metal"),
-        .source = @embedFile("../kernels/attn_pd_nax.metal"),
+        .header = if (custom.is_codegen) @embedFile("../kernels/attn_pd_nax_header.metal") else "",
+        .source = if (custom.is_codegen) @embedFile("../kernels/attn_pd_nax.metal") else "",
         .inputs = &attn_pd_ins,
         .outputs = &attn_pd_outs,
         .params = &.{
@@ -1285,8 +1285,8 @@ const static_specs = [_]KernelSpec{
     .{
         .name = "sushi_fp8_block_tile",
         .nax = true,
-        .header = fp8.TILE_HEADER,
-        .source = fp8.tileSource(false),
+        .header = if (custom.is_codegen) fp8.TILE_HEADER else "",
+        .source = if (custom.is_codegen) fp8.tileSource(false) else "",
         .inputs = &fp8_ins_x,
         .outputs = &fp8_outs_1,
         .params = &([_]ParamSpec{
@@ -1298,8 +1298,8 @@ const static_specs = [_]KernelSpec{
     .{
         .name = "sushi_fp8_block_tile3",
         .nax = true,
-        .header = fp8.TILE_HEADER,
-        .source = fp8.tileSource(true),
+        .header = if (custom.is_codegen) fp8.TILE_HEADER else "",
+        .source = if (custom.is_codegen) fp8.tileSource(true) else "",
         .inputs = &fp8_ins_x,
         .outputs = &fp8_outs_3,
         .params = &([_]ParamSpec{
@@ -1469,8 +1469,8 @@ const static_specs = [_]KernelSpec{
     .{
         .name = "sushi_vqmm_nax_m16",
         .nax = true,
-        .header = verify_qmm.VQMM_NAX_HEADER,
-        .source_fn = vqmmNaxSource,
+        .header = if (custom.is_codegen) verify_qmm.VQMM_NAX_HEADER else "",
+        .source_fn = custom.codegenFn(vqmmNaxSource),
         .inputs = &.{
             .{ .name = "x", .ty = par("T") },
             .{ .name = "w_q", .ty = fix(.uint32) },

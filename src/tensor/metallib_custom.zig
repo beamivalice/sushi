@@ -9,7 +9,16 @@
 //! Imports no MLX, Metal, or Apple framework symbols so host-only build tools compile it directly.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const spec = @import("metallib_spec.zig");
+
+/// True only in `gen-metallib`; false in `sushi`, `sushi-ubench`, and test binaries so Zig skips
+/// analyzing and LLVM-optimizing build-time-only Metal codegen closures and source strings.
+pub const is_codegen: bool = @hasDecl(build_options, "metallib_codegen") and build_options.metallib_codegen;
+
+pub inline fn codegenFn(comptime f: SourceFn) ?SourceFn {
+    return if (is_codegen) f else null;
+}
 
 pub const Dtype = spec.Dtype;
 
@@ -96,6 +105,9 @@ pub const InputSlot = struct {
     ty: TypeRef,
     /// True iff the input is passed as a 0-d scalar (`const constant T&`), false for `const device T*`.
     scalar: bool = false,
+    /// When true on a `.fixed = .uint32` index buffer (non-negative `slots`/`order`), runtime `.int32`
+    /// inputs bind directly to the `.uint32` kernel (identical 32-bit bits, avoiding 2x kernel duplication).
+    allow_i32_as_u32: bool = false,
 };
 
 pub const OutputSlot = struct {
@@ -531,7 +543,13 @@ pub fn resolveSpec(
     for (inputs, ks.inputs, 0..) |ri, si, i| {
         in_dt[i] = ri.dtype;
         switch (si.ty) {
-            .fixed => |d| if (ri.dtype != d) return false,
+            .fixed => |d| {
+                if (ri.dtype == d) {
+                    in_dt[i] = d;
+                } else if (si.allow_i32_as_u32 and d == .uint32 and ri.dtype == .int32) {
+                    in_dt[i] = .uint32;
+                } else return false;
+            },
             .param => |pname| {
                 const vi = variantParamIndex(ks, pname) orelse return false;
                 if (val_set[vi]) {
@@ -744,9 +762,84 @@ fn ioSigEql(a: IoSigKey, b: IoSigKey) bool {
         std.mem.eql(u8, a.out_sig[0..a.n_out], b.out_sig[0..b.n_out]);
 }
 
+pub const ShardMode = enum { by_spec, by_inst };
+
+pub const ParsedShard = struct {
+    base: []const u8,
+    idx: usize = 0,
+    count: usize = 1,
+};
+
+/// Parses an optional `_p<idx>of<count>` shard suffix from a unit name (e.g. `exl3_fz_simd_p3of8`).
+pub fn parseShardUnit(unit_name: []const u8) ParsedShard {
+    const p_pos = std.mem.lastIndexOf(u8, unit_name, "_p") orelse return .{ .base = unit_name };
+    const tail = unit_name[p_pos + 2 ..];
+    const of_pos = std.mem.indexOf(u8, tail, "of") orelse return .{ .base = unit_name };
+    const idx = std.fmt.parseInt(usize, tail[0..of_pos], 10) catch return .{ .base = unit_name };
+    const count = std.fmt.parseInt(usize, tail[of_pos + 2 ..], 10) catch return .{ .base = unit_name };
+    if (count == 0 or idx >= count) return .{ .base = unit_name };
+    return .{ .base = unit_name[0..p_pos], .idx = idx, .count = count };
+}
+
 /// Emits one `KernelSpec` inside `namespace k_<ns_idx> { ... }` with exact buffer layout,
-/// FC bindings, template instantiations, and macro cleanup.
-pub fn emitSpec(out: *std.ArrayList(u8), a: std.mem.Allocator, ks: *const KernelSpec, ns_idx: usize) !void {
+/// FC bindings, template instantiations, and macro cleanup. When `shard_count > 1`, only
+/// instantiations assigned to `shard_idx` (via `*inst_cursor % shard_count`) and their
+/// referenced IO signatures are emitted; specs with zero matching instantiations emit nothing.
+pub fn emitSpecSharded(
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    ks: *const KernelSpec,
+    ns_idx: usize,
+    shard_idx: usize,
+    shard_count: usize,
+    inst_cursor: *usize,
+) !void {
+    // Collect instantiations for this shard and group by IO signature before building Metal source.
+    const Inst = struct {
+        sig_idx: usize,
+        vals: [max_ct]CtVal,
+        n_vals: usize,
+        fname: []u8,
+    };
+    const Collect = struct {
+        a: std.mem.Allocator,
+        shard_idx: usize,
+        shard_count: usize,
+        cursor: *usize,
+        sigs: std.ArrayList(IoSigKey) = .empty,
+        insts: std.ArrayList(Inst) = .empty,
+
+        fn cb(self: *@This(), k: *const KernelSpec, vals: []const CtVal, in_dt: []const Dtype, out_dt: []const Dtype, fname: []const u8) !void {
+            const cur = self.cursor.*;
+            self.cursor.* = cur + 1;
+            if (self.shard_count > 1 and (cur % self.shard_count) != self.shard_idx) return;
+            const sk = ioSigKeyOf(k, in_dt, out_dt);
+            const sig_idx = for (self.sigs.items, 0..) |existing, i| {
+                if (ioSigEql(existing, sk)) break i;
+            } else blk: {
+                const idx = self.sigs.items.len;
+                try self.sigs.append(self.a, sk);
+                break :blk idx;
+            };
+            var inst: Inst = .{
+                .sig_idx = sig_idx,
+                .vals = undefined,
+                .n_vals = vals.len,
+                .fname = try self.a.dupe(u8, fname),
+            };
+            @memcpy(inst.vals[0..vals.len], vals);
+            try self.insts.append(self.a, inst);
+        }
+    };
+    var col: Collect = .{
+        .a = a,
+        .shard_idx = shard_idx,
+        .shard_count = shard_count,
+        .cursor = inst_cursor,
+    };
+    try visitSpec(ks, &col, Collect.cb);
+    if (col.insts.items.len == 0) return;
+
     const header = if (ks.header_fn) |hf| try hf(a, ks.source_arg) else ks.header;
     const source = if (ks.source_fn) |sf| try sf(a, ks.source_arg) else ks.source;
     const stripped = try stripComments(a, source);
@@ -769,41 +862,6 @@ pub fn emitSpec(out: *std.ArrayList(u8), a: std.mem.Allocator, ks: *const Kernel
             n_attrs += 1;
         }
     }
-
-    // Collect all instantiations and group by IO signature.
-    const Inst = struct {
-        sig_idx: usize,
-        vals: [max_ct]CtVal,
-        n_vals: usize,
-        fname: []u8,
-    };
-    const Collect = struct {
-        a: std.mem.Allocator,
-        sigs: std.ArrayList(IoSigKey) = .empty,
-        insts: std.ArrayList(Inst) = .empty,
-
-        fn cb(self: *@This(), k: *const KernelSpec, vals: []const CtVal, in_dt: []const Dtype, out_dt: []const Dtype, fname: []const u8) !void {
-            const sk = ioSigKeyOf(k, in_dt, out_dt);
-            const sig_idx = for (self.sigs.items, 0..) |existing, i| {
-                if (ioSigEql(existing, sk)) break i;
-            } else blk: {
-                const idx = self.sigs.items.len;
-                try self.sigs.append(self.a, sk);
-                break :blk idx;
-            };
-            var inst: Inst = .{
-                .sig_idx = sig_idx,
-                .vals = undefined,
-                .n_vals = vals.len,
-                .fname = try self.a.dupe(u8, fname),
-            };
-            @memcpy(inst.vals[0..vals.len], vals);
-            try self.insts.append(self.a, inst);
-        }
-    };
-    var col: Collect = .{ .a = a };
-    try visitSpec(ks, &col, Collect.cb);
-    if (col.insts.items.len == 0) return;
 
     var has_tparams = false;
     for (ks.params) |p| if (p.kind.isTemplate()) {
@@ -948,13 +1006,120 @@ fn appendTemplateArgs(out: *std.ArrayList(u8), a: std.mem.Allocator, ks: *const 
     }
 }
 
+pub fn emitSpec(out: *std.ArrayList(u8), a: std.mem.Allocator, ks: *const KernelSpec, ns_idx: usize) !void {
+    var cursor: usize = 0;
+    try emitSpecSharded(out, a, ks, ns_idx, 0, 1, &cursor);
+}
+
+/// Counts the valid instantiations of `ks` (fast, zero source generation; used for LPT shard balancing).
+pub fn countSpecInsts(ks: *const KernelSpec) !usize {
+    const Counter = struct {
+        n: usize = 0,
+        fn cb(self: *@This(), _: *const KernelSpec, _: []const CtVal, _: []const Dtype, _: []const Dtype, _: []const u8) !void {
+            self.n += 1;
+        }
+    };
+    var c: Counter = .{};
+    try visitSpec(ks, &c, Counter.cb);
+    return c.n;
+}
+
+/// Emits specs from `lists` matching `is_nax` into one `.metal` unit (or one shard of it).
+/// `.by_spec` uses deterministic LPT bin packing by instantiation count so every shard balances
+/// evenly without duplicating headers or template bodies across translation units.
+pub fn emitSpecListsSharded(
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    is_nax: bool,
+    lists: []const []const KernelSpec,
+    mode: ShardMode,
+    shard_idx: usize,
+    shard_count: usize,
+) !void {
+    try writeUnitPreamble(out, a, is_nax);
+    if (shard_count <= 1) {
+        var ns_idx: usize = 0;
+        for (lists) |specs| {
+            for (specs) |*ks| {
+                if (ks.nax != is_nax) continue;
+                var dummy: usize = 0;
+                try emitSpecSharded(out, a, ks, ns_idx, 0, 1, &dummy);
+                ns_idx += 1;
+            }
+        }
+        return;
+    }
+
+    switch (mode) {
+        .by_spec => {
+            const Entry = struct { ks: *const KernelSpec, ns_idx: usize, weight: usize };
+            var entries: std.ArrayList(Entry) = .empty;
+            defer entries.deinit(a);
+            var ns_idx: usize = 0;
+            for (lists) |specs| {
+                for (specs) |*ks| {
+                    if (ks.nax != is_nax) continue;
+                    try entries.append(a, .{ .ks = ks, .ns_idx = ns_idx, .weight = @max(try countSpecInsts(ks), 1) });
+                    ns_idx += 1;
+                }
+            }
+            // Deterministic descending sort by (weight, ns_idx) for greedy LPT bin packing.
+            const order = try a.alloc(usize, entries.items.len);
+            defer a.free(order);
+            for (order, 0..) |*o, i| o.* = i;
+            std.mem.sort(usize, order, entries.items, struct {
+                fn gt(items: []const Entry, lhs: usize, rhs: usize) bool {
+                    if (items[lhs].weight != items[rhs].weight) return items[lhs].weight > items[rhs].weight;
+                    return items[lhs].ns_idx < items[rhs].ns_idx;
+                }
+            }.gt);
+            const loads = try a.alloc(usize, shard_count);
+            defer a.free(loads);
+            @memset(loads, 0);
+            const assigned = try a.alloc(usize, entries.items.len);
+            defer a.free(assigned);
+            for (order) |ei| {
+                var best: usize = 0;
+                for (1..shard_count) |s| {
+                    if (loads[s] < loads[best]) best = s;
+                }
+                assigned[ei] = best;
+                loads[best] += entries.items[ei].weight;
+            }
+            for (entries.items, 0..) |e, ei| {
+                if (assigned[ei] != shard_idx) continue;
+                var dummy: usize = 0;
+                try emitSpecSharded(out, a, e.ks, e.ns_idx, 0, 1, &dummy);
+            }
+        },
+        .by_inst => {
+            var ns_idx: usize = 0;
+            var inst_cursor: usize = 0;
+            for (lists) |specs| {
+                for (specs) |*ks| {
+                    if (ks.nax != is_nax) continue;
+                    try emitSpecSharded(out, a, ks, ns_idx, shard_idx, shard_count, &inst_cursor);
+                    ns_idx += 1;
+                }
+            }
+        },
+    }
+}
+
+/// Emits all specs in `specs` matching `is_nax` into a complete `.metal` unit (or one shard of it).
+pub fn emitSpecsUnitSharded(
+    out: *std.ArrayList(u8),
+    a: std.mem.Allocator,
+    specs: []const KernelSpec,
+    is_nax: bool,
+    mode: ShardMode,
+    shard_idx: usize,
+    shard_count: usize,
+) !void {
+    try emitSpecListsSharded(out, a, is_nax, &.{specs}, mode, shard_idx, shard_count);
+}
+
 /// Emits all specs in `specs` matching `is_nax` into a complete `.metal` unit.
 pub fn emitSpecsUnit(out: *std.ArrayList(u8), a: std.mem.Allocator, specs: []const KernelSpec, is_nax: bool) !void {
-    try writeUnitPreamble(out, a, is_nax);
-    var ns_idx: usize = 0;
-    for (specs) |*ks| {
-        if (ks.nax != is_nax) continue;
-        try emitSpec(out, a, ks, ns_idx);
-        ns_idx += 1;
-    }
+    try emitSpecsUnitSharded(out, a, specs, is_nax, .by_inst, 0, 1);
 }

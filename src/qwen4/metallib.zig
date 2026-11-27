@@ -237,7 +237,7 @@ pub const specs: []const KernelSpec = &.{
     // ── qwen4_gdn.zig (6 SIMD kernels) ──
     .{
         .name = "gated_delta_blocked_tb16",
-        .source = qgdn.gdnBlockedSource(16),
+        .source = if (custom.is_codegen) qgdn.gdnBlockedSource(16) else "",
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_all,
@@ -245,7 +245,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "gated_delta_blocked_tb32",
-        .source = qgdn.gdnBlockedSource(32),
+        .source = if (custom.is_codegen) qgdn.gdnBlockedSource(32) else "",
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_narrow,
@@ -253,7 +253,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "gated_delta_blocked_tb48",
-        .source = qgdn.gdnBlockedSource(48),
+        .source = if (custom.is_codegen) qgdn.gdnBlockedSource(48) else "",
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_narrow,
@@ -261,7 +261,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "gated_delta_pipelined_tb12",
-        .source = @embedFile("../kernels/gdn_pipelined.metal"),
+        .source = if (custom.is_codegen) @embedFile("../kernels/gdn_pipelined.metal") else "",
         .inputs = &gdn_blocked_ins,
         .outputs = &gdn_blocked_outs,
         .params = &gdn_blocked_params_narrow,
@@ -422,8 +422,8 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "sushi_qsa_nax_precise",
         .nax = true,
-        .header = @embedFile("../kernels/qsa_nax_header.metal"),
-        .source = @embedFile("../kernels/qsa_nax.metal"),
+        .header = if (custom.is_codegen) @embedFile("../kernels/qsa_nax_header.metal") else "",
+        .source = if (custom.is_codegen) @embedFile("../kernels/qsa_nax.metal") else "",
         .inputs = &.{
             .{ .name = "q", .ty = par("T") },
             .{ .name = "k", .ty = par("T") },
@@ -442,8 +442,8 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "sushi_qsa_nax_packed",
         .nax = true,
-        .header = qgat.QSA_PACKED_HEADER ++ @embedFile("../kernels/qsa_nax_header.metal"),
-        .source = @embedFile("../kernels/qsa_nax.metal"),
+        .header = if (custom.is_codegen) qgat.QSA_PACKED_HEADER ++ @embedFile("../kernels/qsa_nax_header.metal") else "",
+        .source = if (custom.is_codegen) @embedFile("../kernels/qsa_nax.metal") else "",
         .inputs = &.{
             .{ .name = "q", .ty = par("T") },
             .{ .name = "k", .ty = fix(.uint32) },

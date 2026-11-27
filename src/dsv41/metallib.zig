@@ -1030,7 +1030,7 @@ pub const specs: []const KernelSpec = &.{
     // ── dsv41/ubench.zig (2 SIMD link helpers) ──
     .{
         .name = "dsv41_ubench_picks_link",
-        .source = ub.LINK_SOURCE,
+        .source = if (custom.is_codegen) ub.LINK_SOURCE else "",
         .inputs = &.{
             .{ .name = "topk", .ty = fix(.int32) },
             .{ .name = "rows", .ty = par("R") },
@@ -1043,7 +1043,7 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "dsv41_ubench_fusion_link",
-        .source = ub.FUSION_LINK_SOURCE,
+        .source = if (custom.is_codegen) ub.FUSION_LINK_SOURCE else "",
         .inputs = &.{
             .{ .name = "base", .ty = par("T") },
             .{ .name = "dep_a", .ty = par("DA") },

@@ -328,10 +328,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
   time (`project_rows.dyn_rows`: two pipelines, at eight rows and at the cap, past eight decided at compile time on the
   first); a plain group's total, its row count, stays a template value, since the warm joins every count and a run-time
   count costs a plain tick about 3%.
-- **The engine cuts a Metal compile error at 400 characters** (`tensor/route.zig`), the source line it names long gone:
-  assemble the kernel's source into a `[[kernel]]` wrapper and compile it offline with
-  `xcrun -sdk macosx metal -std=metal4.0 -c`, which names the line. A Zig `\\` string joins its lines with no final
-  newline, so a `#define` or `#pragma` at a snippet's end swallows the next snippet's first line: join snippets with `"\n"`.
+- **Sushi Cooler kernels compile at build time into `sushi.metallib`** (`zig build sushi-metallib`), so MSL syntax or
+  type errors fail the build with exact `.metal` lines instead of at serve time; register every new Cooler custom
+  kernel in `src/tensor/metallib_shared.zig`, `src/tensor/metallib_exl3.zig`, or `src/<arch>/metallib.zig`
+  ([engine-own-forward](engine-own-forward.md#sushi-metallib)). On legacy MLX-side paths (non-Cooler archs), a Metal
+  compile error is cut at 400 characters and kills the process at first eval: assemble the snippet into a `[[kernel]]`
+  wrapper and compile offline with `xcrun -sdk macosx metal -std=metal4.0 -c`. A Zig `\\` string joins its lines with
+  no final newline, so a `#define` or `#pragma` at a snippet's end swallows the next snippet's first line: join
+  snippets with `"\n"`.
 - **A cooperative-tensor template arg is `metal::remove_addrspace_t<decltype(t)>`**, never `decltype(t)` (the
   macOS 27 MPP header rejects the `thread` qualifier).
 - Metal JIT-compiles at first EVAL, not at apply, so an optional NAX arm is PROBED on a one-tile problem before it
@@ -360,10 +364,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - **On the M5 Ultra keep each counter's threadgroups inside one half of the grid**: Hy4's wide iHC mix (eight threadgroups
   a row) ran 3 to 8 us a launch slower at 3, 5 and 7 rows than at 2, 4, 6 and 8 until the grid took an even row count,
   its padding row returning at once (`hy4_hc`; in-process chained launches, GPU busy a launch, the change on 01871ac7).
-- **A custom kernel whose source fails to compile kills the process** at its first eval (mlx-c `array.cpp:352`, exit
-  255). The JIT probe declines only kernels that build. Compile a new source offline first: wrap it in MLX's
-  custom-kernel template (inputs, their `_strides`, the attribute arguments, one instantiation per template set) and
-  run `xcrun -sdk macosx metal -std=metal4.0 -c -I lib/mlx/include`. That is CPU only and needs no GPU lock.
+- **On legacy MLX-side custom kernels, a source that fails to compile kills the process** at its first eval (mlx-c
+  `array.cpp:352`, exit 255). Cooler kernels never compile at runtime — `zig build sushi-metallib` catches compile
+  errors at build time and `stock metallib` checks every registered kernel by construction.
 - **A `uint4` K/V staging load needs a 16-byte aligned BASE, not only aligned strides**: a last-axis slice of a padded
   cache (`[3,259)` of 264) passes the stride gates and reads wrong values. `attn256Base16Aligned` declines it before the
   p256 and QSA gather kernels; a lazy array has no address and passes.
@@ -384,7 +387,9 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-exl3-experts](engi
 - A `metal_kernel` config is cached by FULL SHAPE (`ShapeKey`); a per-token-varying TEMPLATE value is a fresh JIT
   per value — ramping values ride INPUTS.
 - Threadgroup memory is an OCCUPANCY decision (≤ ~10 KiB).
-- JIT vs metallib transcendentals disagree (a 16-bit domain is swept ENTIRELY, `swigluSigTable`).
+- `-fno-fast-math` vs `-fmetal-math-mode=safe` (`MTLMathModeSafe`) transcendentals disagree: stock MLX units compile
+  with `-fno-fast-math`, while generated Cooler custom units compile with `-fmetal-math-mode=safe` to match MLX's
+  `fast::metal_kernel` bit-for-bit (a 16-bit domain is swept ENTIRELY, `swigluSigTable`).
 - A custom kernel's signature comes from each input's ACTUAL dtype; <8-element arrays land in `constant`; every new
   kernel ships a one-shot "engaged" log + parity on the LIVE dtype.
 

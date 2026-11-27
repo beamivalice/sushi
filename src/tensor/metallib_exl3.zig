@@ -64,13 +64,6 @@ const fc_b_fold_out: u32 = spec.fc_bool_base + 14; // FC_B14 (index 62)
 
 // ── Rate Tables ──
 
-/// Every admitted EXL3 rate (16..128 even = 57 values).
-const all_scalar_rates: [57]i32 = blk: {
-    var r: [57]i32 = undefined;
-    for (&r, 0..) |*v, i| v.* = @intCast(16 + 2 * i);
-    break :blk r;
-};
-
 /// Every PAIR1 rate (24..64 even = 21 values).
 const pair1_rates: [21]i32 = blk: {
     var r: [21]i32 = undefined;
@@ -107,6 +100,9 @@ fn par(n: []const u8) TypeRef {
 fn inSlot(n: []const u8, ty: TypeRef) InputSlot {
     return .{ .name = n, .ty = ty };
 }
+fn idxSlot(n: []const u8) InputSlot {
+    return .{ .name = n, .ty = fix(.uint32), .allow_i32_as_u32 = true };
+}
 fn outSlot(n: []const u8, ty: TypeRef) OutputSlot {
     return .{ .name = n, .ty = ty };
 }
@@ -120,7 +116,6 @@ fn ign(n: []const u8) ParamSpec {
 const floats = [_]Dtype{ .float16, .bfloat16, .float32 };
 const bf_f16 = [_]Dtype{ .bfloat16, .float16 };
 const bf_f32 = [_]Dtype{ .bfloat16, .float32 };
-const u32_i32 = [_]Dtype{ .uint32, .int32 };
 
 // ── String Replacement Helpers (Build-Time Only) ──
 
@@ -898,7 +893,8 @@ fn buildRidersBodyFc(a: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 // ── Static Source Function Dispatchers ──
 
-fn srcClean(comptime raw: []const u8) custom.SourceFn {
+fn srcClean(comptime raw: []const u8) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             return fcCleanSource(a, raw);
@@ -960,7 +956,8 @@ fn srcClampedMidDown(a: std.mem.Allocator, _: usize) ![]const u8 {
     return s;
 }
 
-fn srcRows(comptime raw: []const u8, comptime is_nax: bool, comptime is_counted: bool) custom.SourceFn {
+fn srcRows(comptime raw: []const u8, comptime is_nax: bool, comptime is_counted: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             return transformRowsSource(a, raw, is_nax, is_counted);
@@ -968,7 +965,8 @@ fn srcRows(comptime raw: []const u8, comptime is_nax: bool, comptime is_counted:
     }.f;
 }
 
-fn srcRg(comptime kind: RgKind, comptime group: u32, comptime is_pair1: bool) custom.SourceFn {
+fn srcRg(comptime kind: RgKind, comptime group: u32, comptime is_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             return buildMixedRateBody(a, kind, group, is_pair1);
@@ -1001,7 +999,8 @@ fn srcFzMid(a: std.mem.Allocator, _: usize) ![]const u8 {
 
 const FzBMode = enum { lane, one, shared_rows };
 
-fn hdrFzStage(comptime a_pair1: bool, comptime b_pair1: bool) custom.SourceFn {
+fn hdrFzStage(comptime a_pair1: bool, comptime b_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const ah = try buildCodecHeader(a, .{ .is_pair1 = a_pair1, .mixed_rate = true, .secondary = false });
@@ -1011,7 +1010,8 @@ fn hdrFzStage(comptime a_pair1: bool, comptime b_pair1: bool) custom.SourceFn {
     }.f;
 }
 
-fn srcFzStage(comptime is_down: bool, comptime group: u32, comptime b_mode: FzBMode, comptime a_pair1: bool, comptime b_pair1: bool) custom.SourceFn {
+fn srcFzStage(comptime is_down: bool, comptime group: u32, comptime b_mode: FzBMode, comptime a_pair1: bool, comptime b_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const a_body = try buildMixedRateBody(a, if (is_down) .down_prepared else .pair_prepared, group, a_pair1);
@@ -1043,7 +1043,8 @@ fn srcFzStage(comptime is_down: bool, comptime group: u32, comptime b_mode: FzBM
     }.f;
 }
 
-fn hdrFoldAffine(comptime mixed: bool, comptime a_pair1: bool) custom.SourceFn {
+fn hdrFoldAffine(comptime mixed: bool, comptime a_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const ah = try buildCodecHeader(a, .{ .is_pair1 = a_pair1, .mixed_rate = mixed, .secondary = false });
@@ -1053,7 +1054,8 @@ fn hdrFoldAffine(comptime mixed: bool, comptime a_pair1: bool) custom.SourceFn {
     }.f;
 }
 
-fn srcFoldAffine(comptime mixed: bool, comptime is_down: bool, comptime with_logit: bool, comptime a_pair1: bool) custom.SourceFn {
+fn srcFoldAffine(comptime mixed: bool, comptime is_down: bool, comptime with_logit: bool, comptime a_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const a_body: []const u8 = if (mixed)
@@ -1079,7 +1081,8 @@ fn srcFoldAffine(comptime mixed: bool, comptime is_down: bool, comptime with_log
     }.f;
 }
 
-fn hdrFoldTrellis(comptime mixed: bool, comptime is_down: bool, comptime with_logit: bool, comptime a_pair1: bool, comptime b_pair1: bool) custom.SourceFn {
+fn hdrFoldTrellis(comptime mixed: bool, comptime is_down: bool, comptime with_logit: bool, comptime a_pair1: bool, comptime b_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const ah = try buildCodecHeader(a, .{ .is_pair1 = a_pair1, .mixed_rate = mixed, .secondary = false });
@@ -1108,7 +1111,8 @@ fn hdrFoldTrellis(comptime mixed: bool, comptime is_down: bool, comptime with_lo
     }.f;
 }
 
-fn srcFoldTrellis(comptime mixed: bool, comptime is_down: bool, comptime with_logit: bool, comptime a_pair1: bool, comptime b_pair1: bool) custom.SourceFn {
+fn srcFoldTrellis(comptime mixed: bool, comptime is_down: bool, comptime with_logit: bool, comptime a_pair1: bool, comptime b_pair1: bool) ?custom.SourceFn {
+    if (!custom.is_codegen) return null;
     return struct {
         fn f(a: std.mem.Allocator, _: usize) ![]const u8 {
             const a_body: []const u8 = if (mixed)
@@ -1221,35 +1225,35 @@ const static_simd_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_prepare_h128",
         .source = kernels.PREPARE_SOURCE,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("suh", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("x", par("X")), inSlot("suh", fix(.float16)), idxSlot("slots") },
         .outputs = &.{outSlot("y", fix(.float16))},
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("IDIM") },
     },
     .{
         .name = "sushi_exl3_finish_h128",
         .source = kernels.FINISH_SOURCE,
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), idxSlot("slots") },
         .outputs = &.{outSlot("y", par("OutT"))},
-        .params = &.{ .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM") },
+        .params = &.{ .{ .name = "OutT", .kind = .ct_dtype, .dtypes = &floats }, fcInt("ODIM") },
     },
     // 2. SwiGLU mid + decode mid + rg_mid + down_lane_prepare
     .{
         .name = "sushi_exl3_mid_swiglu",
         .source_fn = srcClean(kernels.MID_SOURCE),
-        .inputs = &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), idxSlot("slots") },
         .outputs = &.{outSlot("yd", fix(.float16))},
-        .params = &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("CLAMP_LIMIT") },
+        .params = &.{ fcInt("ODIM"), fcInt("CLAMP_LIMIT") },
     },
     .{
         .name = "sushi_exl3_decode_mid",
         .source_fn = srcClean(kernels.DECODE_MID_SOURCE),
-        .inputs = &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), idxSlot("slots") },
         .outputs = &.{outSlot("prepared", fix(.float16))},
-        .params = &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("NSPLIT") },
+        .params = &.{ fcInt("IDIM"), fcInt("NSPLIT") },
     },
     .{
         .name = "sushi_exl3_rg_mid",
-        .source_fn = srcRgMid,
+        .source_fn = custom.codegenFn(srcRgMid),
         .inputs = &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) },
         .outputs = &.{outSlot("prepared", fix(.float16))},
         .params = &.{ fcInt("IDIM"), fcInt("NSPLIT") },
@@ -1257,47 +1261,47 @@ const static_simd_specs = [_]KernelSpec{
     .{
         .name = "sushi_down_lane_prepare",
         .source_fn = srcClean(kernels.DOWN_LANE_MID_SOURCE),
-        .inputs = &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), idxSlot("slots") },
         .outputs = &.{outSlot("yd", fix(.float16))},
-        .params = &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("CLAMP_LIMIT") },
+        .params = &.{ fcInt("ODIM"), fcInt("CLAMP_LIMIT") },
     },
     // 3. Down reduces (4 variants + sorted_inverse + shared_trellis + 3 fused + prefill_planes)
     .{
         .name = "sushi_exl3_down_reduce",
         .source_fn = srcClean(kernels.REDUCE_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", par("S")), inSlot("sc", par("SC")) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), idxSlot("slots"), inSlot("sc", par("SC")) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_exl3_down_reduce_shared",
         .source_fn = srcClean(kernels.REDUCE_SHARED_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", par("S")), inSlot("sc", par("SC")), inSlot("shared", par("SH")) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), idxSlot("slots"), inSlot("sc", par("SC")), inSlot("shared", par("SH")) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SH", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SH", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("TOPK") },
         .filter = sameOrBfFilter,
     },
     .{
         .name = "sushi_exl3_down_reduce_shared_lead",
         .source_fn = srcClean(kernels.REDUCE_SHARED_SOURCE),
-        .inputs = &.{ inSlot("shared", par("SH")), inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", par("S")), inSlot("sc", par("SC")) },
+        .inputs = &.{ inSlot("shared", par("SH")), inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), idxSlot("slots"), inSlot("sc", par("SC")) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SH", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SH", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("TOPK") },
         .filter = sameOrBfFilter,
     },
     .{
         .name = "sushi_exl3_down_reduce_gated_shared",
         .source_fn = srcClean(kernels.REDUCE_GATED_SHARED_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), inSlot("slots", par("S")), inSlot("sc", par("SC")), inSlot("shared", par("T")), inSlot("gate", par("T")) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("svh", fix(.float16)), idxSlot("slots"), inSlot("sc", par("SC")), inSlot("shared", par("T")), inSlot("gate", par("T")) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_exl3_sorted_inverse_reduce",
         .source_fn = srcClean(sorted_windows.SORTED_INVERSE_SOURCE),
-        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("inverse", fix(.uint32)), inSlot("svh", fix(.float16)), inSlot("slots", par("S")), inSlot("sc", par("SC")) },
+        .inputs = &.{ inSlot("inner", fix(.float16)), inSlot("inverse", fix(.uint32)), inSlot("svh", fix(.float16)), idxSlot("slots"), inSlot("sc", par("SC")) },
         .outputs = &.{outSlot("y", par("T"))},
-        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("ODIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "T", .kind = .ct_dtype, .dtypes = &floats }, .{ .name = "SC", .kind = .io_dtype, .dtypes = &floats }, fcInt("ODIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_exl3_down_reduce_shared_trellis",
@@ -1339,63 +1343,63 @@ const static_simd_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_token_pair_prepare",
         .source = kernels.TOKEN_PAIR_PREPARE_SOURCE,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", par("S")), inSlot("order", par("O")) },
+        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), idxSlot("slots"), idxSlot("order") },
         .outputs = &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) },
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, .{ .name = "O", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("IDIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_exl3_token_pair_unsorted",
-        .source_fn = srcTokenPairUnsorted,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", par("S")) },
+        .source_fn = custom.codegenFn(srcTokenPairUnsorted),
+        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), idxSlot("slots") },
         .outputs = &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) },
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("IDIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_exl3_token_scatter",
         .source = kernels.TOKEN_SCATTER_SOURCE,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("order", par("O")) },
+        .inputs = &.{ inSlot("x", par("X")), idxSlot("order") },
         .outputs = &.{outSlot("y", par("X"))},
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "O", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("DIM") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("DIM") },
     },
     .{
         .name = "sushi_exl3_pair_prepare",
         .source = kernels.PAIR_PREP_SOURCE,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), idxSlot("slots") },
         .outputs = &.{outSlot("prep", fix(.float16))},
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("IDIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_lane_prepare",
         .source = kernels.LANE_PREP_SOURCE,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", par("S")), inSlot("order", par("O")) },
+        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), idxSlot("slots"), idxSlot("order") },
         .outputs = &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) },
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, .{ .name = "O", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("IDIM"), fcInt("TOPK") },
     },
     .{
         .name = "sushi_lane_unsorted",
         .source = kernels.LANE_PREP_UNSORTED_SOURCE,
-        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", par("S")) },
+        .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), idxSlot("slots") },
         .outputs = &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) },
-        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("TOPK") },
+        .params = &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, fcInt("IDIM"), fcInt("TOPK") },
     },
     // 5. Window tables & combine & fused prefill stages
     .{
         .name = "sushi_exl3_gpu_windows",
         .source_fn = srcClean(sorted_windows.GPU_WINDOW_SOURCE),
-        .inputs = &.{ inSlot("eids", fix(.uint32)), inSlot("order", par("O")), inSlot("count", fix(.uint32)) },
+        .inputs = &.{ inSlot("eids", fix(.uint32)), idxSlot("order"), inSlot("count", fix(.uint32)) },
         .outputs = &.{ outSlot("starts", fix(.uint32)), outSlot("nlives", fix(.uint32)), outSlot("inverse", fix(.uint32)) },
-        .params = &.{ .{ .name = "O", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("WIN"), fcInt("EXPERTS") },
+        .params = &.{ fcInt("WIN"), fcInt("EXPERTS") },
     },
     .{
         .name = "sushi_exl3_rg_windows",
         .source = rate_groups.GROUP_WINDOW_SOURCE,
-        .inputs = &.{ inSlot("eids", fix(.uint32)), inSlot("order", par("O")), inSlot("count", fix(.uint32)), inSlot("meta", fix(.uint32)) },
+        .inputs = &.{ inSlot("eids", fix(.uint32)), idxSlot("order"), inSlot("count", fix(.uint32)), inSlot("meta", fix(.uint32)) },
         .outputs = &.{ outSlot("starts", fix(.uint32)), outSlot("nlives", fix(.uint32)), outSlot("inverse", fix(.uint32)), outSlot("local", fix(.uint32)) },
-        .params = &.{ .{ .name = "O", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("WIN"), .{ .name = "MAX_EXPERTS", .kind = .ct_int, .ints = &.{512} } },
+        .params = &.{ fcInt("WIN"), .{ .name = "MAX_EXPERTS", .kind = .ct_int, .ints = &.{512} } },
     },
     .{
         .name = "sushi_exl3_rg_combine",
-        .source_fn = srcCombine,
+        .source_fn = custom.codegenFn(srcCombine),
         .source_arg = 0,
         .inputs = &combine_ins_plain,
         .outputs = &.{outSlot("y", fix(.float16))},
@@ -1403,7 +1407,7 @@ const static_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rg_combine_chained",
-        .source_fn = srcCombine,
+        .source_fn = custom.codegenFn(srcCombine),
         .source_arg = 1,
         .inputs = &combine_ins_chained,
         .outputs = &.{outSlot("y", fix(.float16))},
@@ -1411,7 +1415,7 @@ const static_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_fz_prefill_prep",
-        .source_fn = srcFzPrefillPrep,
+        .source_fn = custom.codegenFn(srcFzPrefillPrep),
         .inputs = &.{
             inSlot("x", fix(.bfloat16)), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("order", fix(.int32)),
             inSlot("s_x", fix(.bfloat16)), inSlot("s_suhg", fix(.float16)), inSlot("s_suhu", fix(.float16)), inSlot("s_slots", fix(.uint32)),
@@ -1422,7 +1426,7 @@ const static_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_fz_prefill_mid",
-        .source_fn = srcFzPrefillMid,
+        .source_fn = custom.codegenFn(srcFzPrefillMid),
         .inputs = &prefill_mid_ins,
         .outputs = &.{ outSlot("yd", fix(.float16)), outSlot("s_yd", fix(.float16)) },
         .params = &.{ fcInt("ODIM"), fcInt("CLAMP_LIMIT"), fcInt("S_ODIM"), fcInt("S_CLAMP_LIMIT") },
@@ -1440,15 +1444,15 @@ fn pairCodecSpecs(
     comptime nax: bool,
     comptime h_scalar: usize,
     comptime h_pair1: usize,
-    comptime sfn: custom.SourceFn,
+    comptime sfn: ?custom.SourceFn,
     comptime ins: []const InputSlot,
     comptime outs: []const OutputSlot,
     comptime params_scalar: []const ParamSpec,
     comptime params_pair1: []const ParamSpec,
 ) [2]KernelSpec {
     return .{
-        .{ .name = base ++ "_scalar", .nax = nax, .header_fn = exl3HeaderFn, .source_arg = h_scalar, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params_scalar },
-        .{ .name = base ++ "_pair1", .nax = nax, .header_fn = exl3HeaderFn, .source_arg = h_pair1, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params_pair1 },
+        .{ .name = base ++ "_scalar", .nax = nax, .header_fn = custom.codegenFn(exl3HeaderFn), .source_arg = h_scalar, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params_scalar },
+        .{ .name = base ++ "_pair1", .nax = nax, .header_fn = custom.codegenFn(exl3HeaderFn), .source_arg = h_pair1, .source_fn = sfn, .inputs = ins, .outputs = outs, .params = params_pair1 },
     };
 }
 
@@ -1468,25 +1472,25 @@ const gemm_ins = [_]InputSlot{
 };
 const gemm_outs = [_]OutputSlot{outSlot("y", fix(.float16))};
 
-const gemm_sorted_p_sc = nhwParams(&all_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM"), fcInt("WIN") });
+const gemm_sorted_p_sc = nhwParams(&served_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM"), fcInt("WIN") });
 const gemm_sorted_p_p1 = nhwParams(&pair1_rates, &.{ fcInt("IDIM"), fcInt("ODIM"), fcInt("WIN") });
 
-const gemm_smat_p_sc = nhwParams(&all_scalar_rates, &.{ .{ .name = "WIN", .kind = .ct_int, .ints = &.{ 16, 32 } }, fcInt("IDIM"), fcInt("ODIM") });
+const gemm_smat_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "WIN", .kind = .ct_int, .ints = &.{ 16, 32 } }, fcInt("IDIM"), fcInt("ODIM") });
 const gemm_smat_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "WIN", .kind = .ct_int, .ints = &.{ 16, 32 } }, fcInt("IDIM"), fcInt("ODIM") });
 
-const gemv_idx_p_sc = nhwParams(&all_scalar_rates, &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("ODIM") });
-const gemv_idx_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, fcInt("IDIM"), fcInt("ODIM") });
+const gemv_idx_p_sc = nhwParams(&served_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
+const gemv_idx_p_p1 = nhwParams(&pair1_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
 
-const down_fused_p_sc = nhwParams(&all_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("FUNNEL") });
+const down_fused_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("FUNNEL") });
 const down_fused_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("FUNNEL") });
 
-const pair_gemv_p_sc = nhwParams(&all_scalar_rates, &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
+const pair_gemv_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
 const pair_gemv_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "X", .kind = .io_dtype, .dtypes = &floats }, .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
 
-const pair_prep_gemv_p_sc = nhwParams(&all_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
+const pair_prep_gemv_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
 const pair_prep_gemv_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSPLIT"), fcInt("TOPK"), fcInt("FUNNEL") });
 
-const down_prep_p_sc = nhwParams(&all_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") });
+const down_prep_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") });
 const down_prep_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 2 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("FUNNEL") });
 
 fn pairGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpts: []const i32, comptime prepared: bool) [if (prepared) 9 else 10]ParamSpec {
@@ -1531,44 +1535,44 @@ fn downGroupedParams(comptime g: i32, comptime rates: []const i32, comptime otpt
 
 const pg_g2_sc = pairGroupedParams(2, &served_scalar_rates, &.{ 1, 2 }, false);
 const pg_g2_p1 = pairGroupedParams(2, &pair1_rates, &.{ 1, 2 }, false);
-const ppg_g2_sc = pairGroupedParams(2, &all_scalar_rates, &.{ 1, 2 }, true);
+const ppg_g2_sc = pairGroupedParams(2, &served_scalar_rates, &.{ 1, 2 }, true);
 const ppg_g2_p1 = pairGroupedParams(2, &pair1_rates, &.{ 1, 2 }, true);
-const dpg_g2_sc = downGroupedParams(2, &all_scalar_rates, &.{ 1, 2 });
+const dpg_g2_sc = downGroupedParams(2, &served_scalar_rates, &.{ 1, 2 });
 const dpg_g2_p1 = downGroupedParams(2, &pair1_rates, &.{ 1, 2 });
 
 const clamped_md_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 4, 8 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("CLAMP_LIMIT") });
 const clamped_md_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "OTPT", .kind = .ct_int, .ints = &.{ 1, 4, 8 } }, fcInt("IDIM"), fcInt("ODIM"), fcInt("CLAMP_LIMIT") });
 
-const coop_t1_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
-const coop_t1_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
-const coop_t2_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
-const coop_t2_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "S", .kind = .io_dtype, .dtypes = &u32_i32 }, .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
+const coop_t1_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
+const coop_t1_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{1} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
+const coop_t2_p_sc = nhwParams(&served_scalar_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
+const coop_t2_p_p1 = nhwParams(&pair1_rates, &.{ .{ .name = "TILES", .kind = .ct_int, .ints = &.{2} }, fcInt("IDIM"), fcInt("ODIM"), fcInt("NSLOTS"), fcInt("SERIAL_REDUCTION") });
 
 const single_simd_specs =
     pairCodecSpecs("sushi_exl3_k4_gemm_sorted", false, hdr_scalar, hdr_pair1, srcClean(kernels.GEMM_SORTED_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
     pairCodecSpecs("sushi_exl3_k4_gemm_sorted_tm", false, hdr_scalar, hdr_pair1, srcClean(kernels.GEMM_SORTED_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_sorted_p_sc, &gemm_sorted_p_p1) ++
     pairCodecSpecs("sushi_exl3_k4_gemm_simdmat", false, hdr_scalar_smat, hdr_pair1_smat, srcClean(kernels.GEMM_SIMDMAT_SOURCE), &gemm_ins, &gemm_outs, &gemm_smat_p_sc, &gemm_smat_p_p1) ++
     pairCodecSpecs("sushi_exl3_k4_gemm_simdmat_tm", false, hdr_scalar_smat, hdr_pair1_smat, srcClean(kernels.GEMM_SIMDMAT_TM_SOURCE), &gemm_ins, &gemm_outs, &gemm_smat_p_sc, &gemm_smat_p_p1) ++
-    pairCodecSpecs("sushi_exl3_k4_mul1_gemv_indexed", false, hdr_scalar, hdr_pair1, srcClean(kernels.INDEXED_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", par("S")) }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_exl3_indexed_pair_coop", false, hdr_scalar, hdr_pair1, srcClean(kernels.INDEXED_PAIR_COOP_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", par("S")) }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
+    pairCodecSpecs("sushi_exl3_k4_mul1_gemv_indexed", false, hdr_scalar, hdr_pair1, srcClean(kernels.INDEXED_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
+    pairCodecSpecs("sushi_exl3_indexed_pair_coop", false, hdr_scalar, hdr_pair1, srcClean(kernels.INDEXED_PAIR_COOP_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
     pairCodecSpecs("sushi_exl3_k4_down_fused", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_FUSED_SOURCE), &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &down_fused_p_sc, &down_fused_p_p1) ++
     pairCodecSpecs("sushi_exl3_pair_gemv", false, hdr_scalar, hdr_pair1, srcClean(kernels.PAIR_GEMV_SOURCE), &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pair_gemv_p_sc, &pair_gemv_p_p1) ++
     pairCodecSpecs("sushi_exl3_pair_gemv_prepared", false, hdr_scalar, hdr_pair1, srcClean(kernels.PAIR_GEMV_PREPARED_SOURCE), &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pair_prep_gemv_p_sc, &pair_prep_gemv_p_p1) ++
     pairCodecSpecs("sushi_exl3_down_prepared", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_PREPARED_SOURCE), &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &down_prep_p_sc, &down_prep_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_gemv_grouped_g2", false, hdr_scalar, hdr_pair1, srcClean(kernels.pairGroupedSource(2)), &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pg_g2_sc, &pg_g2_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_gemv_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, srcClean(kernels.pairPreparedGroupedSource(2)), &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &ppg_g2_sc, &ppg_g2_p1) ++
-    pairCodecSpecs("sushi_exl3_down_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, srcClean(kernels.downGroupedSource(2)), &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &dpg_g2_sc, &dpg_g2_p1) ++
-    pairCodecSpecs("sushi_lane_pair", false, hdr_scalar, hdr_pair1, srcClean(kernels.LANE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", par("S")) }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_lane_pair_one", false, hdr_scalar, hdr_pair1, srcClean(kernels.ONE_ROW_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", par("S")) }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_down_lane_coop", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_LANE_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", par("S")) }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_down_one", false, hdr_scalar, hdr_pair1, srcClean(kernels.ONE_ROW_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", par("S")) }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
-    pairCodecSpecs("sushi_exl3_clamped_middle_down", false, hdr_scalar, hdr_pair1, srcClampedMidDown, &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &clamped_md_p_sc, &clamped_md_p_p1) ++
-    pairCodecSpecs("sushi_exl3_group2", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", par("S")) }, &.{outSlot("y", fix(.float16))}, &coop_t1_p_sc, &coop_t1_p_p1) ++
-    pairCodecSpecs("sushi_exl3_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_TILED_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", par("S")) }, &.{outSlot("y", fix(.float16))}, &coop_t2_p_sc, &coop_t2_p_p1) ++
-    pairCodecSpecs("sushi_exl3_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_THREE_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", par("S")) }, &.{outSlot("y", fix(.float16))}, &coop_t2_p_sc, &coop_t2_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_group2", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", par("S")) }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t1_p_sc, &coop_t1_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_TILED_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", par("S")) }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p_sc, &coop_t2_p_p1) ++
-    pairCodecSpecs("sushi_exl3_pair_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_THREE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", par("S")) }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p_sc, &coop_t2_p_p1);
+    pairCodecSpecs("sushi_exl3_pair_gemv_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcClean(kernels.pairGroupedSource(2)) else null, &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &pg_g2_sc, &pg_g2_p1) ++
+    pairCodecSpecs("sushi_exl3_pair_gemv_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcClean(kernels.pairPreparedGroupedSource(2)) else null, &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{ outSlot("yg", fix(.float32)), outSlot("yu", fix(.float32)) }, &ppg_g2_sc, &ppg_g2_p1) ++
+    pairCodecSpecs("sushi_exl3_down_prepared_grouped_g2", false, hdr_scalar, hdr_pair1, if (custom.is_codegen) srcClean(kernels.downGroupedSource(2)) else null, &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &dpg_g2_sc, &dpg_g2_p1) ++
+    pairCodecSpecs("sushi_lane_pair", false, hdr_scalar, hdr_pair1, srcClean(kernels.LANE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
+    pairCodecSpecs("sushi_lane_pair_one", false, hdr_scalar, hdr_pair1, srcClean(kernels.ONE_ROW_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
+    pairCodecSpecs("sushi_down_lane_coop", false, hdr_scalar, hdr_pair1, srcClean(kernels.DOWN_LANE_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
+    pairCodecSpecs("sushi_down_one", false, hdr_scalar, hdr_pair1, srcClean(kernels.ONE_ROW_COOP_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &gemv_idx_p_sc, &gemv_idx_p_p1) ++
+    pairCodecSpecs("sushi_exl3_clamped_middle_down", false, hdr_scalar, hdr_pair1, custom.codegenFn(srcClampedMidDown), &.{ inSlot("ig", fix(.float16)), inSlot("iu", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)) }, &.{outSlot("y", fix(.float16))}, &clamped_md_p_sc, &clamped_md_p_p1) ++
+    pairCodecSpecs("sushi_exl3_group2", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t1_p_sc, &coop_t1_p_p1) ++
+    pairCodecSpecs("sushi_exl3_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_TILED_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t2_p_sc, &coop_t2_p_p1) ++
+    pairCodecSpecs("sushi_exl3_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_THREE_SOURCE), &.{ inSlot("x", fix(.float16)), inSlot("trellis", fix(.uint16)), idxSlot("slots") }, &.{outSlot("y", fix(.float16))}, &coop_t2_p_sc, &coop_t2_p_p1) ++
+    pairCodecSpecs("sushi_exl3_pair_group2", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t1_p_sc, &coop_t1_p_p1) ++
+    pairCodecSpecs("sushi_exl3_pair_group2_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_TILED_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p_sc, &coop_t2_p_p1) ++
+    pairCodecSpecs("sushi_exl3_pair_group3_tile2_lane", false, hdr_scalar, hdr_pair1, srcClean(coop_rows2.LANE_THREE_PAIR_SOURCE), &.{ inSlot("xg", fix(.float16)), inSlot("xu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), idxSlot("slots") }, &.{ outSlot("yg", fix(.float16)), outSlot("yu", fix(.float16)) }, &coop_t2_p_sc, &coop_t2_p_p1);
 
 // ── Unit 2: `exl3_rows_simd` Spec Tables ──
 
@@ -1764,7 +1768,7 @@ const rows_cnt_pair_ins = [_]InputSlot{
 const rows_simd_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_simd,
         .source_fn = srcRows(project_rows.ROWS_SOURCE, false, false),
         .inputs = &rows_ins,
@@ -1782,7 +1786,7 @@ const rows_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rows_pair1",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_pair1_rows_simd,
         .source_fn = srcRows(project_rows.ROWS_SOURCE, false, false),
         .inputs = &rows_ins,
@@ -1800,7 +1804,7 @@ const rows_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rows_pend_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_simd,
         .source_fn = srcRows(project_rows.ROWS_PEND_SOURCE, false, false),
         .inputs = &rows_pend_ins,
@@ -1819,7 +1823,7 @@ const rows_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rows_thru_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_simd,
         .source_fn = srcRows(project_rows.ROWS_THRU_SOURCE, false, false),
         .inputs = &rows_thru_ins,
@@ -1837,7 +1841,7 @@ const rows_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rows_thru_counted_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_simd_cnt,
         .source_fn = srcRows(project_rows.ROWS_THRU_COUNTED_SOURCE, false, true),
         .inputs = &rows_cnt_ins,
@@ -1855,7 +1859,7 @@ const rows_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rows_thru_counted_rms_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_simd_cnt,
         .source_fn = srcRows(project_rows.ROWS_THRU_COUNTED_RMS_SOURCE, false, true),
         .inputs = &rows_cnt_rms_ins,
@@ -1873,7 +1877,7 @@ const rows_simd_specs = [_]KernelSpec{
     },
     .{
         .name = "sushi_exl3_rows_thru_counted_pair_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_simd_cnt,
         .source_fn = srcRows(project_rows.ROWS_THRU_COUNTED_PAIR_SOURCE, false, true),
         .inputs = &rows_cnt_pair_ins,
@@ -1895,7 +1899,7 @@ const rows_simd_specs = [_]KernelSpec{
 fn rgPairSpec(comptime is_pair1: bool) KernelSpec {
     return .{
         .name = if (is_pair1) "sushi_exl3_rg_pair_pair1" else "sushi_exl3_rg_pair_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = if (is_pair1) hdr_rg_pair1 else hdr_rg_scalar,
         .source_fn = srcRg(.pair, 0, is_pair1),
         .inputs = &.{ inSlot("x", par("X")), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)) },
@@ -1907,7 +1911,7 @@ fn rgPairSpec(comptime is_pair1: bool) KernelSpec {
 fn rgDownSpec(comptime is_pair1: bool) KernelSpec {
     return .{
         .name = if (is_pair1) "sushi_exl3_rg_down_pair1" else "sushi_exl3_rg_down_scalar",
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = if (is_pair1) hdr_rg_pair1 else hdr_rg_scalar,
         .source_fn = srcRg(.down, 0, is_pair1),
         .inputs = &.{ inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("trellis", fix(.uint16)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)) },
@@ -1921,7 +1925,7 @@ fn rgPrepPairSpec(comptime group: u32, comptime is_pair1: bool) KernelSpec {
     const otpts: []const i32 = if (group <= 2) &.{ 1, 2 } else &.{1};
     return .{
         .name = "sushi_exl3_rg_pair_prepared" ++ suffix,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = if (is_pair1) hdr_rg_pair1 else hdr_rg_scalar,
         .source_fn = srcRg(.pair_prepared, group, is_pair1),
         .inputs = &.{ inSlot("prep", fix(.float16)), inSlot("tg", fix(.uint16)), inSlot("tu", fix(.uint16)), inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)) },
@@ -1938,7 +1942,7 @@ fn rgPrepDownSpec(comptime group: u32, comptime is_pair1: bool) KernelSpec {
     const otpts: []const i32 = if (group <= 2) &.{ 1, 2 } else &.{1};
     return .{
         .name = "sushi_exl3_rg_down_prepared" ++ suffix,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = if (is_pair1) hdr_rg_pair1 else hdr_rg_scalar,
         .source_fn = srcRg(.down_prepared, group, is_pair1),
         .inputs = &.{ inSlot("middle", fix(.float16)), inSlot("trellis", fix(.uint16)), inSlot("slots", fix(.uint32)), inSlot("meta", fix(.uint32)) },
@@ -2079,7 +2083,7 @@ const fz_simd_specs = blk: {
     // 1. DSv41 fused prep & mid
     .{
         .name = "sushi_exl3_fz_prep",
-        .source_fn = srcFzPrep,
+        .source_fn = custom.codegenFn(srcFzPrep),
         .inputs = &.{
             inSlot("x", fix(.bfloat16)), inSlot("suhg", fix(.float16)), inSlot("suhu", fix(.float16)), inSlot("slots", fix(.uint32)),
             inSlot("s_x", fix(.bfloat16)), inSlot("s_suhg", fix(.float16)), inSlot("s_suhu", fix(.float16)), inSlot("s_slots", fix(.uint32)),
@@ -2089,7 +2093,7 @@ const fz_simd_specs = blk: {
     },
     .{
         .name = "sushi_exl3_fz_mid",
-        .source_fn = srcFzMid,
+        .source_fn = custom.codegenFn(srcFzMid),
         .inputs = &.{
             inSlot("ig", fix(.float32)), inSlot("iu", fix(.float32)), inSlot("svhg", fix(.float16)), inSlot("svhu", fix(.float16)), inSlot("suhd", fix(.float16)), inSlot("slots", fix(.uint32)),
             inSlot("s_ig", fix(.float16)), inSlot("s_iu", fix(.float16)), inSlot("s_svhg", fix(.float16)), inSlot("s_svhu", fix(.float16)), inSlot("s_suhd", fix(.float16)), inSlot("s_slots", fix(.uint32)),
@@ -2124,7 +2128,7 @@ const fz_simd_specs = blk: {
 
 // ── Unit 5: `exl3_gemm_nax` Spec Tables ──
 
-const dense_nax_p_sc = nhwParams(&all_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
+const dense_nax_p_sc = nhwParams(&served_scalar_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
 const dense_nax_p_p1 = nhwParams(&pair1_rates, &.{ fcInt("IDIM"), fcInt("ODIM") });
 
 const gemm_nax_specs =
@@ -2205,7 +2209,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_SOURCE, true, false),
         .inputs = &rows_ins,
@@ -2224,7 +2228,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_pair1",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_pair1_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_SOURCE, true, false),
         .inputs = &rows_ins,
@@ -2243,7 +2247,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_rope_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_ROPE_SOURCE, true, false),
         .inputs = &rows_rope_ins,
@@ -2261,7 +2265,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_rope_pair1",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_pair1_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_ROPE_SOURCE, true, false),
         .inputs = &rows_rope_ins,
@@ -2279,7 +2283,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_dyn_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_DYN_SOURCE, true, false),
         .inputs = &rows_ins,
@@ -2298,7 +2302,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_pend_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_PEND_SOURCE, true, false),
         .inputs = &rows_pend_ins,
@@ -2318,7 +2322,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_thru_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax,
         .source_fn = srcRows(project_rows.ROWS_NAX_THRU_SOURCE, true, false),
         .inputs = &rows_thru_ins,
@@ -2337,7 +2341,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_thru_counted_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax_cnt,
         .source_fn = srcRows(project_rows.ROWS_NAX_THRU_COUNTED_SOURCE, true, true),
         .inputs = &rows_cnt_ins,
@@ -2356,7 +2360,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_thru_counted_rms_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax_cnt,
         .source_fn = srcRows(project_rows.ROWS_NAX_THRU_COUNTED_RMS_SOURCE, true, true),
         .inputs = &rows_cnt_rms_ins,
@@ -2375,7 +2379,7 @@ const rows_nax_specs = [_]KernelSpec{
     .{
         .name = "sushi_exl3_rows_nax_thru_counted_pair_scalar",
         .nax = true,
-        .header_fn = exl3HeaderFn,
+        .header_fn = custom.codegenFn(exl3HeaderFn),
         .source_arg = hdr_scalar_rows_nax_cnt,
         .source_fn = srcRows(project_rows.ROWS_NAX_THRU_COUNTED_PAIR_SOURCE, true, true),
         .inputs = &rows_cnt_pair_ins,
@@ -3129,45 +3133,38 @@ pub fn visitFunctions(ctx: anytype, comptime onName: fn (@TypeOf(ctx), []const u
     try custom.visitSpecs(&fz_nax_specs, ctx, onName);
 }
 
-fn emitSpecLists(out: *std.ArrayList(u8), a: std.mem.Allocator, is_nax: bool, lists: []const []const KernelSpec) !void {
-    try custom.writeUnitPreamble(out, a, is_nax);
-    var ns_idx: usize = 0;
-    for (lists) |specs| {
-        for (specs) |*ks| {
-            std.debug.assert(ks.nax == is_nax);
-            try custom.emitSpec(out, a, ks, ns_idx);
-            ns_idx += 1;
-        }
-    }
+pub fn gemmNaxSpecs() []const KernelSpec {
+    return &gemm_nax_specs;
 }
 
 pub fn emitUnit(out: *std.ArrayList(u8), a: std.mem.Allocator, unit_name: []const u8) !bool {
-    if (std.mem.eql(u8, unit_name, "exl3_simd")) {
-        try emitSpecLists(out, a, false, &.{ &static_simd_specs, &single_simd_specs });
+    const sh = custom.parseShardUnit(unit_name);
+    if (std.mem.eql(u8, sh.base, "exl3_simd")) {
+        try custom.emitSpecListsSharded(out, a, false, &.{ &static_simd_specs, &single_simd_specs }, .by_inst, sh.idx, sh.count);
         return true;
     }
-    if (std.mem.eql(u8, unit_name, "exl3_rows_simd")) {
-        try emitSpecLists(out, a, false, &.{ &rows_finish_specs, &rows_simd_specs });
+    if (std.mem.eql(u8, sh.base, "exl3_rows_simd")) {
+        try custom.emitSpecListsSharded(out, a, false, &.{ &rows_finish_specs, &rows_simd_specs }, .by_inst, sh.idx, sh.count);
         return true;
     }
-    if (std.mem.eql(u8, unit_name, "exl3_rg_simd")) {
-        try emitSpecLists(out, a, false, &.{&rg_simd_specs});
+    if (std.mem.eql(u8, sh.base, "exl3_rg_simd")) {
+        try custom.emitSpecListsSharded(out, a, false, &.{&rg_simd_specs}, .by_inst, sh.idx, sh.count);
         return true;
     }
-    if (std.mem.eql(u8, unit_name, "exl3_fz_simd")) {
-        try emitSpecLists(out, a, false, &.{&fz_simd_specs});
+    if (std.mem.eql(u8, sh.base, "exl3_fz_simd")) {
+        try custom.emitSpecListsSharded(out, a, false, &.{&fz_simd_specs}, .by_inst, sh.idx, sh.count);
         return true;
     }
-    if (std.mem.eql(u8, unit_name, "exl3_gemm_nax")) {
-        try emitSpecLists(out, a, true, &.{&gemm_nax_specs});
+    if (std.mem.eql(u8, sh.base, "exl3_gemm_nax")) {
+        try custom.emitSpecListsSharded(out, a, true, &.{&gemm_nax_specs}, .by_spec, sh.idx, sh.count);
         return true;
     }
-    if (std.mem.eql(u8, unit_name, "exl3_rows_nax")) {
-        try emitSpecLists(out, a, true, &.{&rows_nax_specs});
+    if (std.mem.eql(u8, sh.base, "exl3_rows_nax")) {
+        try custom.emitSpecListsSharded(out, a, true, &.{&rows_nax_specs}, .by_inst, sh.idx, sh.count);
         return true;
     }
-    if (std.mem.eql(u8, unit_name, "exl3_fz_nax")) {
-        try emitSpecLists(out, a, true, &.{&fz_nax_specs});
+    if (std.mem.eql(u8, sh.base, "exl3_fz_nax")) {
+        try custom.emitSpecListsSharded(out, a, true, &.{&fz_nax_specs}, .by_inst, sh.idx, sh.count);
         return true;
     }
     return false;

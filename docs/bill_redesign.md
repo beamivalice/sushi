@@ -230,7 +230,7 @@ engine's choke points, not in any op:
 | `core.freshFor` | logs the ask (frame, ordinal, bytes, host flag), returns a tensor with a shape and no bytes |
 | `core.dropStore` at zero refs | logs the death of that ask |
 | `core.bind*`, `core.dispatch` | computes the dispatch's level by `dispatchLevel`'s rule over the whole execution, on maps no pass cut clears and keyed by ask (the packer reads it), encodes nothing |
-| pipeline lookup and creation (`stock.kernel*`, `core.pipelineFromSource`) | skipped |
+| pipeline lookup and creation (`stock.kernel*`, `kernel.launch*`) | skipped |
 | `core.fromHost`, a host scalar, `route.hostFilled` | logged as a host ask over a host scratch of its bytes, which its filler writes (`hostFilled` and `core.hostBytes` hand their caller the bytes); no buffer |
 | an eval used as a wait (`mlx_array_eval`, `mlx_eval`, `mlx_async_eval`), `sync`, `submit`, `waitFor` | no-ops |
 | a read of bytes a dispatch of the execution wrote (`mlx_array_data_*`, `item_*`) | an error (`DryReadback`) naming the caller, unless the site went through `plan.hostResult` or `plan.choose`/`bound`; a read of bytes the host filled is a plain read, and so is one of the load's own state from before the execution (a dry model's state has none) |

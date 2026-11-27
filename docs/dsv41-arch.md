@@ -234,16 +234,19 @@ not the warm-cache gain): 35383538 `kernels warmed ... in 74721 ms` (warm forwar
 `in 40656 ms` (warm forwards 25409 ms, total 46933 ms); `compiled inside a request` 0 in both, 4k code decode 80 tok/s in both.
 The warm-cache gain is R1's 8.4 s from the table, not measured again.
 
-MLX's regions are 63% of the warm cache's 19.5 s; the engine's compile is 0.1 s there and 9 to 16 s with a cold system
-cache, all of it `newLibraryWithSource`.
+MLX's regions are 63% of the warm cache's 19.5 s; the historical table above predates full `sushi.metallib`
+precompilation (runtime `newLibraryWithSource` has since been removed — every Cooler kernel now ships precompiled in
+`sushi.metallib` and persists compiled GPU pipeline binaries in `archive.bin`).
 
 ### The pipeline manifest (`[pipelines]`)
 
-The first load of a pack on a build leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` (key, format and cases:
-[engine-own-forward](engine-own-forward.md#the-pipeline-manifest)); the next load makes the engine's pipelines from it on 8
-threads and skips the engine's warm forwards (`warmOwn`, `Fills`, `Blocks`, `Long`, the sampled verdict, the wide prefill chunks). What runs on
-MLX stays: its prefill warm and the spilled route's prefill chain (`warmSplit`), which no manifest covers. One `[pipelines]` line says which case ran: `made N pipelines from the manifest`, `manifest of
-another build, recompiled N on T threads`, `no manifest`, or `manifest unreadable (<reason>)`; the manifest is written only
+The first load of a pack on a build leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` and `archive.bin`
+(`MTLBinaryArchive`; key, format and cases:
+[engine-own-forward](engine-own-forward.md#the-pipeline-manifest-and-binary-archive)); the next load makes the engine's
+pipelines from `archive.bin` on 8 threads in ~130–260 ms (0 `[engine] compiled` lines) and skips the engine's warm
+forwards (`warmOwn`, `Fills`, `Blocks`, `Long`, the sampled verdict, the wide prefill chunks). What runs on
+MLX stays: its prefill warm and the spilled route's prefill chain (`warmSplit`), which no manifest covers. One `[pipelines]` line says which case ran: `made N pipelines from the manifest ... (binary archive)`, `manifest of
+another build, recompiled N on T threads`, `no manifest`, or `manifest unreadable (<reason>)`; the manifest and archive are written only
 after a warm that returned without error, and the older builds of the scope but the newest other one are removed and named in the log. The key costs
 8 ms (the binary's SHA-256 included).
 

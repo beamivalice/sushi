@@ -406,9 +406,12 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **A host read waits for the pass that wrote the bytes, not for the queue.** Waiting for everything in flight loses
   the layer the forward queued ahead (25.5 against 20.4 ms per forward).
 - The pool never hands out a store the open pass binds.
-- **A custom kernel compiles after what MLX puts before it.** `kernel.zig`'s preamble carries MLX's bfloat math and simd
-  overloads (`mlx_bf16_math.metal`): without them `metal::abs` on a bfloat does not compile and `metal::exp` returns
-  float where MLX rounds to bfloat. A launch that fails names its kernel.
+- **Every custom kernel is precompiled in `sushi.metallib` with MLX's bfloat preamble.** `metallib_custom.zig` emits
+  MLX's bfloat math and simd overloads (`mlx_bf16_math.metal`) at build time into each generated unit (compiled with
+  `-fmetal-math-mode=safe` so FP32 math matches `MTLMathModeSafe` bit-for-bit): without them `metal::abs` on a bfloat
+  does not compile and `metal::exp` returns float where MLX rounds to bfloat. At runtime `kernel.zig` resolves every
+  launch through `metallib_catalog.zig` to a precompiled function and `[[function_constant]]` table — never compiling
+  Metal source — and refuses any unregistered kernel or failed launch by name.
 - **Residency is kept the way MLX keeps it** (`metal.zig`, after mlx/backend/metal/resident.cpp): every buffer of
   ours sits in a residency set attached to our queue with a standing request, and the sets are capped at 5% of the
   working set (floor 64 MiB, at most 32, first fit; a buffer over the cap has a set of its own). The cap bounds what
@@ -600,10 +603,10 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **A failed launch declines a kernel arm only before that arm has ever worked** (`kernels.gemm_nax_worked`). After
   one launch has run, a failure is the launch's own (a pass the engine refuses by name, memory) and is returned: taken
   as "the arm is unavailable" it switched the whole process to another arm, with other bytes, without a word.
-- **Engine pipeline creation is 0.1 s with the system's shader cache warm and 9 to 16 s cold**, all of it
-  `newLibraryWithSource` (435 pipelines, M5 Max); the pipeline state is 0.03 to 0.06 s. A binary archive replaces only
-  that state step, so it buys nothing here. A binary the system has not run is cold again, and the
-  manifest's recipes then compile on 8 threads in about 2.5 s ([the manifest](#the-pipeline-manifest)).
+- **Every Cooler kernel loads from `sushi.metallib` (zero runtime Metal source compilation), and repeat loads load
+  their GPU machine code from `archive.bin`** (`MTLBinaryArchive` beside `manifest.bin`): on an M5 Max, a same-key load
+  creates ~1,200–1,800 pipelines across 8 worker threads in **~130–260 ms** even when macOS's system Metal shader cache
+  is cold or disabled ([sushi.metallib](#sushi-metallib), [the pipeline manifest](#the-pipeline-manifest)).
 - **A kernel has one signature.** MLX binds an input under 8 elements as a `constant` reference and a longer one
   as a `device` pointer, so one source is two pipelines; ours binds every array as a `device` pointer.
 - **The warm runs every shape that names a pipeline** (`warmOwn`, `warmOwnFills`, `warmOwnBlocks`, `warmOwnLong`,
@@ -688,61 +691,93 @@ Each one cost a wrong result or a large slowdown before it was a rule.
 - **A pipeline made after the warm is logged** (`engine.seal`): `[engine] compiled inside a request (N ms): <name>`
   at warning level, and the request-end debug line counts them. The count is 0 on the release pack.
 
-### The pipeline manifest
+<a id="sushi-metallib"></a>
+### Precompiled kernels (`sushi.metallib`)
 
-A complete warm leaves `~/.sushi/cache/pipelines/<scope>-<build>/manifest.bin` (`src/pipeline_manifest.zig`): the recipe
-of each engine pipeline the process made (`tensor/pipeline_registry.zig`, recorded at the three places a pipeline is
-created: `stock.kernel`, `stock.kernelFlags`, `stock.kernelConstants`, `core.pipelineFromSource`). A recipe is the
-metallib function and its boolean and int constants, or the exact source text and entry point; a source recipe is the
-identity of its pipeline, so a stale recipe cannot answer for another source. A `marker` recipe makes no pipeline: it
-says that a warm run after the load's own (the vision tower's) is whole in the file. The file ends in a SHA-256 of
-itself; a short, changed or foreign file is refused by name and never read partly. The format number is in the file
-and in the build key, so a manifest of an older format is never read: its directory is another key's, and the load
-rebuilds one.
+Every Sushi Cooler kernel — stock MLX ops, generated elementwise/gather/cast `ops`, and every custom shared, EXL3/STQ,
+and per-arch kernel — ships precompiled in `zig-out/lib/sushi.metallib` (`build.zig:addSushiMetallib`). Cooler never
+calls `newLibraryWithSource` at runtime and never falls back to `mlx.metallib`:
+
+- **Single source of truth.** Stock MLX units live in `src/tensor/metallib/*.metal` (compiled with `-fno-fast-math` to
+  match MLX) plus small whole-file kernels in `lib/mlx-src`. Generated Cooler units are emitted at build time by
+  `src/metallib_gen_main.zig` from `src/tensor/metallib_spec.zig` (`ops` / chains) and `src/metallib_catalog.zig`
+  (`src/tensor/metallib_shared.zig`, `src/tensor/metallib_exl3.zig`, and each enabled arch's `src/<arch>/metallib.zig`
+  registered in `src/arch/registry.zig`), compiled with `-fmetal-math-mode=safe` so FP32 transcendentals match
+  `MTLCompileOptions.mathMode = Safe` bit-for-bit.
+- **Adding or changing a Cooler custom kernel.** Register its `KernelSpec` in `metallib_shared.zig`,
+  `metallib_exl3.zig`, or `src/<arch>/metallib.zig`. Prefer `fc_int` / `fc_bool` (`[[function_constant]]`) over
+  `ct_int` / `ct_bool` whenever a parameter does not size a register/threadgroup array or template type, so the catalog
+  stays compact and links fast. Mark NAX (`MetalPerformancePrimitives`) specs `.nax = true` so they isolate into `*_nax`
+  units and non-NAX GPUs (M1/M2/M3/M4) load cleanly. Any kernel or specialization missing from the catalog is refused
+  by name (`error.MetalCompile`, surfaced via `metal.lastError()`).
+- **Completeness by construction.** `stock metallib` in `src/tensor/stock.zig` walks `metallib_spec.visitOps` and
+  `metallib_catalog.visitAll` (the exact same tables `gen-metallib` emits from) and verifies every function resolves in
+  `sushi.metallib` plus named refusal of unknown custom kernels.
+- **Parallel build and codegen gating.** `zig build` builds `sushi` and `sushi.metallib` concurrently.
+  `build.zig:addSushiMetallib` builds `gen-metallib` in `.Debug` (emitting generated units in parallel across up to 16
+  threads), shards heavy EXL3 units by instantiation, compiles every `.metal` unit directly to its own `.metallib` in
+  parallel (parallelizing `air-lld`), and stitches all per-unit `.metallib`s with
+  `xcrun metallib --split-module-without-linking`, which links nothing, in place of one serial `air-lld`. Only `gen-metallib` compiles with `build_options.metallib_codegen = true`; `sushi`,
+  `sushi-ubench`, and all test binaries set it `false` so Zig skips analyzing and optimizing build-time-only Metal
+  codegen closures (`custom.codegenFn` / `custom.is_codegen`).
+- **Library discovery (`src/metallib_path.zig`).** One search serves both the loader and the round-cost stamp:
+  `SUSHI_METALLIB` if set (test steps point it at `zig-out/lib/sushi.metallib`), else `sushi.metallib` beside the
+  binary (`lib/`, `../lib/`, or flat). A shipped binary never probes a checkout's `zig-out/`, and a missing library is
+  logged once with every searched path.
+
+<a id="the-pipeline-manifest"></a>
+### The pipeline manifest and binary archive
+
+A complete warm leaves two files in `~/.sushi/cache/pipelines/<scope>-<build>/`:
+1. `manifest.bin` (`src/pipeline_manifest.zig`): the recipe of each engine pipeline the process made
+   (`tensor/pipeline_registry.zig`, recorded at `stock.kernel`, `stock.kernelFlags`, and `stock.kernelConstants`). A
+   recipe names a `sushi.metallib` function and its boolean and int `[[function_constant]]` values (legacy `.source`
+   recipes are rejected by `pipeline_cache` with `error.MetalCompile`). A `marker` recipe makes no pipeline: it says
+   that a warm (`served warm`, `vision tower`) is whole in the file. The file ends in a SHA-256 of itself; a short,
+   changed or foreign file is refused by name and never read partly.
+2. `archive.bin` (`MTLBinaryArchive`, `src/metal.zig`, `src/tensor/pipeline_cache.zig`): the compiled GPU pipeline
+   machine code for every recipe in the manifest, written atomically (temp + rename) beside `manifest.bin` whenever
+   missing or after the recipe count grows. It inherits `<scope>-<build>` (binary SHA-256, `sushi.metallib` size/mtime,
+   GPU architecture, OS build, manifest version) and is pruned together with older build directories by `manifest.prune`.
 
 - **Every Cooler load keeps one** (`arch/cooler_pipelines.zig`): the arch names its scope (`coolerPipelineScope`, or
   DeepSeek's own load, which also decides from it which warm forwards run); `model_load.warmLoad` makes the manifest's
-  recipes before the warm and writes it after; a request that compiled a pipeline late writes it again
-  (`arch_cooler.endRequest`), so the next load of the pack makes it ahead. A shape only a served request reaches costs
-  its compile once per box, not once per load. The served warm exists only to make pipelines, so it ends by recording a
-  `served warm` marker, and a load whose manifest holds the marker of its own key skips the requests (`[warm] served
-  requests skipped`: 14.6 s of the real Qwen pack's load, DeepSeek's repeat start and every reload alike); the chunk's fit
-  against the live headroom still runs. The marker's key is the manifest's scope plus what the requests are made of:
-  widths, KV scheme and group, drafter, the MTP settings its rounds read (`--no-mtp-lookup`, `--max-mtp-ctx`,
-  `--mtp-min-depth`, `--mtp-max-depth`; keyed only for a load with a drafter, so a load with none, Hy4-Flash until DFly2, takes
-  its marker under any of them), its bill and the pool settings; a load of another key warms in full. A marker is
-  one manifest's: each settle (trusted or not, even when its workers did not start) replaces the markers the process
-  holds with that manifest's own, and a manifest is written with its load's markers only. A same-key manifest keeps every
-  marker it held, so a warm of another key, or a load that failed, never costs a later load of the first its skip (pinned
-  by `cooler contract: a served warm this build ran whole`). Two packs of one scope share
-  their manifest's marker; the skipped warm's measure (`WarmOverBill`) and its kernels are the scope's.
-- **Key.** `scope` (16 hex) is, for DeepSeek, the pack (its config.json, its index, the name and size of each shard: not
-  their bytes) and what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order,
-  expert-cache and SSD bytes, resident or streamed, dropped experts, and its `recipe_env` variables); for Qwen, the
-  shapes and formats its kernels follow. Both add the shared kernels' `recipe_env`. `build` (16 hex) is the
-  SHA-256 of the running binary, the size and mtime of `sushi.metallib`, the GPU architecture, the OS build and the manifest
-  version. A diagnostic that changes no recipe (the kernel profile, the report, probe and profile switches) is not in it.
-- **Same key.** The recipes are made on up to 8 worker threads (our own Metal binding only, never MLX), after the model is built;
-  the inference thread then installs them. A launch finds its pipeline
-  by source or key, counts it as preloaded (`core.pipelines_preloaded`), not compiled and not late. The engine's warm
-  forwards, the wide chunks included, are skipped (`WarmScope.mlx`: MLX's prefill warm and its spilled-route chain stay); the NAX proof and the NAX probes already run at init.
-  A recipe the manifest lacks compiles in the request and shows in `kernels compiled after the load`.
-  A reload reads the same recipes again, so a registry table copies a recipe only for the entry it keeps
-  (`pipeline_registry.putSource`, `putStock`): the process's tables hold one copy of each, whatever the load count.
-  The manifest is megabytes and every load writes it again, so `encode` allocates its buffer once at its size: the
-  freed steps of a growing buffer stay resident in the process and a reload loop climbed by the manifest's size.
-- **Another build of the same scope.** The newest such manifest is made the same way, then the full warm runs as the
-  complete enumeration and the manifest is rewritten; the older builds of the scope are removed, but the newest other one, and the log says so: two binaries on one box keep each their manifest. A
-  manifest rewritten after its load (a late kernel) opens its root again from the path, so a root removed and made again is never a stale handle; the plan's kept shapes and regions (`plan_book.Cache`) do the same at each read and write, and a load closes the root it opened.
-- **A warm gap hides behind another build's manifest.** That first load holds every pipeline the older build's warm
-  made, among them ones the new warm no longer asks for; the rewritten manifest keeps only what the new warm touched,
-  so the gap shows at the next same-key load. A change to the warm is checked live on two loads in a row: both read
-  `0 kernels compiled after the load`.
-- **No manifest, or one that cannot be read** (the reason is named): today's load, then a manifest is written. A recipe that
-  fails to make from a same-key manifest makes it untrusted: the full warm runs.
-- Written only after a warm that returned without error, through a temp file of its own (process and write) and a rename. One `[pipelines]` line says
-  which case ran. A later warm (the tower's) writes it again only where a complete one stands, found or stored by this
-  load: a short manifest would be trusted by every later load, which skips the warm that could fill it.
+  recipes before the warm and writes `manifest.bin` and `archive.bin` after; a request that made a pipeline late writes
+  the manifest again (`arch_cooler.endRequest`), so the next load makes it ahead. The served warm exists only to make
+  pipelines, so it ends by recording a `served warm` marker, and a load whose manifest holds the marker of its own key
+  skips the requests (`[warm] served requests skipped`); the chunk's fit against the live headroom still runs. The
+  marker's key is the manifest's scope plus what the requests are made of: widths, KV scheme and group, drafter, the
+  MTP settings its rounds read (`--no-mtp-lookup`, `--max-mtp-ctx`, `--mtp-min-depth`, `--mtp-max-depth`; keyed only
+  for a load with a drafter), its bill and the pool settings; a load of another key warms in full. A marker is one
+  manifest's: each settle replaces the markers the process holds with that manifest's own, and a manifest is written
+  with its load's markers only. A same-key manifest keeps every marker it held, so a warm of another key, or a load
+  that failed, never costs a later load of the first its skip (pinned by `cooler contract: a served warm this build ran
+  whole`). `matmul.completeFamily` keys by `(dtype, use_nax)` so cold loads capture both `tf32` and `exact_f32`
+  `float32` tile families once and warm loads never rewrite `archive.bin`.
+- **Key.** `scope` (16 hex) is the pack identity (config.json, index, shard names and sizes) and what shapes the warm
+  (context, window, YaRN factor, candidate blocks, drafter, tile order, expert-cache and SSD bytes, resident or
+  streamed, dropped experts, and `recipe_env`). `build` (16 hex) is the SHA-256 of the running binary, the size and
+  mtime of `sushi.metallib`, the GPU architecture, the OS build, and the manifest version. Diagnostics that change no
+  recipe are not in it.
+- **Same key.** `Plan.settle` opens `archive.bin` when present (logging a warning and falling back to `sushi.metallib`
+  AIR if unreadable) and creates all pipelines on up to 8 worker threads (`(binary archive)` in the `[pipelines]` log
+  line); the inference thread installs them into `pipeline_registry`. Every launch takes its pipeline from the
+  preloaded table (`core.pipelines_preloaded`), logging **0 `[engine] compiled` lines** on a warm load. The engine's
+  warm forwards are skipped (`WarmScope.mlx` for DeepSeek; `[warm] served requests skipped` for every Cooler arch). A
+  reload reads the same recipes again, so `pipeline_registry.putStock` keeps one copy per key, and `encode` allocates
+  its buffer once at its exact size so reload loops do not climb in RSS.
+- **Another build of the same scope.** The newest such manifest's recipes are preloaded from `sushi.metallib` AIR on
+  worker threads, then the full warm runs and writes the new build's `manifest.bin` and `archive.bin`; older build
+  directories (beyond the newest other one) are pruned. A manifest rewritten after load opens its root again from the
+  path so a recreated root is never a stale handle (`plan_book.Cache` does the same).
+- **A warm gap hides behind another build's manifest.** Check warm changes on two same-key loads in a row: both must
+  report `0 kernels compiled after the load` (and `0` `[engine] compiled` lines on the warm load).
+- **No manifest, or one that cannot be read** (the reason is named): full warm runs, then writes `manifest.bin` and
+  `archive.bin`. Any recipe that fails to create from a same-key manifest marks it untrusted and falls back to the full
+  warm.
+- Written only after a warm that returned without error, through a process-unique temp file and atomic rename. One
+  `[pipelines]` line says which case ran. A later warm (the tower's) rewrites the manifest only where a complete one
+  stands.
 - **A Cooler load whose warm fails does not serve**: a forward of the engine's that fails in the warm fails in a
   request. On MLX a failed warm is a warning and costs requests their compiles.
 - **A launch the warm must reach on the release shape is tested at that shape.** The tiny fixtures hold no 5120 x 129280

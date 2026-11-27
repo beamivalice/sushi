@@ -225,8 +225,8 @@ fn hcSpec(comptime f: hy4_hc.Form, comptime wide: bool) KernelSpec {
 
     return .{
         .name = name,
-        .header = if (f == .expand_parts or f == .back_inner) exl3.project_rows.ROWS_HELPERS else "",
-        .source = hy4_hc.kernelSource(f, wide),
+        .header = if (custom.is_codegen and (f == .expand_parts or f == .back_inner)) exl3.project_rows.ROWS_HELPERS else "",
+        .source = if (custom.is_codegen) hy4_hc.kernelSource(f, wide) else "",
         .inputs = ins,
         .outputs = outs,
         .params = base_params ++ dt_params ++ ctr_params ++ extra_params,
@@ -613,8 +613,8 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "sushi_hy4_engram_heads",
         .disambig = "nh4",
-        .header = hy4_engram_gate.header,
-        .source_fn = engramHeadsSource,
+        .header = if (custom.is_codegen) hy4_engram_gate.header else "",
+        .source_fn = custom.codegenFn(engramHeadsSource),
         .source_arg = 4,
         .inputs = engramHeadsInputs(4),
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
@@ -629,8 +629,8 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "sushi_hy4_engram_heads",
         .disambig = "nh16",
-        .header = hy4_engram_gate.header,
-        .source_fn = engramHeadsSource,
+        .header = if (custom.is_codegen) hy4_engram_gate.header else "",
+        .source_fn = custom.codegenFn(engramHeadsSource),
         .source_arg = 16,
         .inputs = engramHeadsInputs(16),
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},
@@ -644,8 +644,8 @@ pub const specs: []const KernelSpec = &.{
     },
     .{
         .name = "sushi_hy4_engram_value",
-        .header = hy4_engram_gate.header,
-        .source = hy4_engram_gate.value_source,
+        .header = if (custom.is_codegen) hy4_engram_gate.header else "",
+        .source = if (custom.is_codegen) hy4_engram_gate.value_source else "",
         .inputs = &.{
             .{ .name = "lin", .ty = .{ .fixed = .float32 } },
             .{ .name = "b", .ty = .{ .param = "TB" } },
@@ -661,8 +661,8 @@ pub const specs: []const KernelSpec = &.{
     .{
         .name = "sushi_hy4_engram_delta",
         .disambig = "nc4",
-        .header = hy4_engram_gate.header,
-        .source_fn = engramDeltaSource,
+        .header = if (custom.is_codegen) hy4_engram_gate.header else "",
+        .source_fn = custom.codegenFn(engramDeltaSource),
         .source_arg = 4,
         .inputs = engramDeltaInputs(4),
         .outputs = &.{.{ .name = "out", .ty = .{ .fixed = .float32 } }},

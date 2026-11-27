@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
     built_archs = archs;
     build_options.addOption([]const []const u8, "archs", archs);
     build_options.addOption(bool, "host_tier", false);
+    build_options.addOption(bool, "metallib_codegen", false);
     // The host test root links no MLX, so gpu_mem.zig refuses a live GPU read under it.
     const host_options = b.addOptions();
     host_options.addOption([]const u8, "version", version);
@@ -76,6 +77,7 @@ pub fn build(b: *std.Build) void {
     host_options.addOption([]const u8, "git_sha", git_sha);
     host_options.addOption([]const []const u8, "archs", archs);
     host_options.addOption(bool, "host_tier", true);
+    host_options.addOption(bool, "metallib_codegen", false);
 
     const mod = b.createModule(.{
         .root_source_file = b.path(if (tool != null) "src/tool_root.zig" else "src/main.zig"),
@@ -114,7 +116,7 @@ pub fn build(b: *std.Build) void {
     // release tarball rewires @rpath/libmlxc.dylib to @executable_path.
     exe.headerpad_max_install_names = true;
 
-    const sushi_metallib = addSushiMetallib(b, target, build_options);
+    const sushi_metallib = addSushiMetallib(b, target);
     const install_metallib = b.addInstallFileWithDir(sushi_metallib, .lib, "sushi.metallib");
     b.getInstallStep().dependOn(&install_metallib.step);
     const metallib_step = b.step("sushi-metallib", "Compile and install zig-out/lib/sushi.metallib");
@@ -1461,7 +1463,7 @@ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
 /// flags; generated custom units use `-fmetal-math-mode=safe` so their math mode
 /// and FP32 transcendental functions match `MTLCompileOptions.mathMode = Safe`
 /// (used by MLX's `fast::metal_kernel`) byte for byte.
-fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_options: *std.Build.Step.Options) std.Build.LazyPath {
+fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyPath {
     const metal_flags = [_][]const u8{
         "xcrun",
         "-sdk",
@@ -1525,22 +1527,31 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
         "fp_quantized",
         "fp_quantized_nax",
     };
+    // Balanced unit layout: list heaviest shards FIRST so Zig schedules them on P-cores immediately
+    // after `gen-metallib`. Each `.metal` unit compiles directly to its own `.metallib` in parallel
+    // (parallelizing `air-lld`), then `xcrun metallib --split-module-without-linking` stitches all
+    // per-unit `.metallib`s into `sushi.metallib` with O(1) per-file overhead.
+    const gen_unit_specs = [_]struct { base: []const u8, shards: usize }{
+        .{ .base = "exl3_rg_simd", .shards = 6 },
+        .{ .base = "exl3_fz_simd", .shards = 5 },
+        .{ .base = "exl3_fz_nax", .shards = 4 },
+        .{ .base = "exl3_rows_simd", .shards = 3 },
+        .{ .base = "exl3_rows_nax", .shards = 3 },
+        .{ .base = "exl3_simd", .shards = 3 },
+        .{ .base = "shared_simd", .shards = 1 },
+        .{ .base = "nax_small", .shards = 1 },
+        .{ .base = "ops_all", .shards = 1 },
+    };
     var gen_units: std.ArrayList([]const u8) = .empty;
-    gen_units.appendSlice(b.allocator, &.{
-        "ops_copy_cast",
-        "ops_elem",
-        "ops_gather",
-        "ops_misc",
-        "shared_simd",
-        "shared_nax",
-        "exl3_simd",
-        "exl3_rows_simd",
-        "exl3_rg_simd",
-        "exl3_fz_simd",
-        "exl3_gemm_nax",
-        "exl3_rows_nax",
-        "exl3_fz_nax",
-    }) catch @panic("OOM");
+    for (gen_unit_specs) |u| {
+        if (u.shards == 1) {
+            gen_units.append(b.allocator, u.base) catch @panic("OOM");
+        } else {
+            for (0..u.shards) |si| {
+                gen_units.append(b.allocator, b.fmt("{s}_p{d}of{d}", .{ u.base, si, u.shards })) catch @panic("OOM");
+            }
+        }
+    }
     for (srcFolders(b)) |folder| {
         if (built_archs.len > 0) {
             var included = false;
@@ -1550,28 +1561,31 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
         const mpath = b.fmt("src/{s}/metallib.zig", .{folder});
         buildRootHandle(b).access(b.graph.io, mpath, .{}) catch continue;
         gen_units.append(b.allocator, b.fmt("arch_{s}_simd", .{folder})) catch @panic("OOM");
-        gen_units.append(b.allocator, b.fmt("arch_{s}_nax", .{folder})) catch @panic("OOM");
     }
 
     const exl3_host_stub = b.createModule(.{
         .root_source_file = b.path("src/metallib_exl3_host.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .Debug,
     });
     const exl3_gen_mod = b.createModule(.{
         .root_source_file = b.path("src/exl3/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .Debug,
         .imports = &.{.{ .name = "mlx_host", .module = exl3_host_stub }},
     });
+    const gen_options = b.addOptions();
+    gen_options.addOption([]const []const u8, "archs", built_archs);
+    gen_options.addOption(bool, "host_tier", true);
+    gen_options.addOption(bool, "metallib_codegen", true);
     const gen_exe = b.addExecutable(.{
         .name = "gen-metallib",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/metallib_gen_main.zig"),
             .target = target,
-            .optimize = .ReleaseFast,
+            .optimize = .Debug,
             .imports = &.{
-                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "build_options", .module = gen_options.createModule() },
                 .{ .name = "sushi_exl3", .module = exl3_gen_mod },
             },
         }),
@@ -1579,8 +1593,8 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
     const gen_run = b.addRunArtifact(gen_exe);
     gen_run.setName("generate sushi.metallib sources");
 
-    const link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", "-mmacosx-version-min=26.2" });
-    link.setName("metal link sushi.metallib");
+    const link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metallib", "--split-module-without-linking" });
+    link.setName("metallib stitch sushi.metallib");
 
     for (gen_units.items) |unit| {
         gen_run.addArg(unit);
@@ -1590,11 +1604,10 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
         if (!std.mem.startsWith(u8, unit, "ops_")) {
             compile.addArgs(&.{ "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-sign-compare", "-Wno-unused-function", "-Wno-unused-but-set-variable", "-Wno-unused-but-set-parameter", "-Wno-sometimes-uninitialized" });
         }
-        compile.addArg("-c");
         compile.addFileArg2(metal_src, .{});
         compile.addArg("-o");
-        const air = compile.addOutputFileArg2(b.fmt("sushi_gen_{s}.air", .{unit}), .{});
-        link.addFileArg2(air, .{});
+        const part = compile.addOutputFileArg2(b.fmt("sushi_gen_{s}.metallib", .{unit}), .{});
+        link.addFileArg2(part, .{});
     }
 
     for (mlx_whole_files) |stem| {
@@ -1603,12 +1616,11 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
         compile.addArg("-MMD");
         compile.addArg("-MF");
         _ = compile.addDepFileOutputArg2(b.fmt("mlx_{s}.d", .{stem}), .{});
-        compile.addArg("-c");
         compile.addFileArg2(b.path(b.fmt("lib/mlx-src/mlx/backend/metal/kernels/{s}.metal", .{stem})), .{});
         compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
         compile.addArg("-o");
-        const air = compile.addOutputFileArg2(b.fmt("mlx_{s}.air", .{stem}), .{});
-        link.addFileArg2(air, .{});
+        const part = compile.addOutputFileArg2(b.fmt("mlx_{s}.metallib", .{stem}), .{});
+        link.addFileArg2(part, .{});
     }
     for (sushi_units) |stem| {
         const compile = b.addSystemCommand(&metal_flags);
@@ -1616,12 +1628,11 @@ fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_optio
         compile.addArg("-MMD");
         compile.addArg("-MF");
         _ = compile.addDepFileOutputArg2(b.fmt("sushi_{s}.d", .{stem}), .{});
-        compile.addArg("-c");
         compile.addFileArg2(b.path(b.fmt("src/tensor/metallib/{s}.metal", .{stem})), .{});
         compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
         compile.addArg("-o");
-        const air = compile.addOutputFileArg2(b.fmt("sushi_{s}.air", .{stem}), .{});
-        link.addFileArg2(air, .{});
+        const part = compile.addOutputFileArg2(b.fmt("sushi_{s}.metallib", .{stem}), .{});
+        link.addFileArg2(part, .{});
     }
 
     link.addArg("-o");
