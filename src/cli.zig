@@ -2079,7 +2079,7 @@ fn changeToolFolder(allocator: std.mem.Allocator, io: std.Io, w: *std.Io.Writer,
         const path = try unquotePath(allocator, arg);
         defer allocator.free(path);
         switch (try repl_tools.changeRoot(allocator, io, tools.root, homeDir(), path)) {
-            .refused => |msg| return w.print("cannot /cd to {s}: {s}\n", .{ path, msg }),
+            .missing, .refused => |msg| return w.print("cannot /cd to {s}: {s}\n", .{ path, msg }),
             .ok => |root| {
                 allocator.free(tools.root);
                 tools.root = root;

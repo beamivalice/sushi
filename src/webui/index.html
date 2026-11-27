@@ -2979,7 +2979,7 @@ $("editButton").onclick = () => setChatEdit(!chatEdit());
 let folderSelection = null;
 let folderAbort = null;
 let folderOpts = null;
-// `opening`: the folder came from a setting, so one that is gone falls back to its nearest parent that exists.
+// `opening`: the folder came from a setting, so one that is gone (a 404) falls back to its nearest parent that exists.
 let folderMissing = "";
 async function browseFolder(directory, opening = false) {
   folderAbort?.abort();
@@ -3013,7 +3013,7 @@ async function browseFolder(directory, opening = false) {
   } catch (error) {
     if (controller.signal.aborted) return;
     const cut = directory?.lastIndexOf("/") ?? -1;
-    if (opening && error.status === 400 && cut >= 0 && directory !== "/") {
+    if (opening && error.status === 404 && cut >= 0 && directory !== "/") {
       folderMissing ||= directory;
       return browseFolder(directory.slice(0, cut) || "/", true);
     }
@@ -3021,10 +3021,11 @@ async function browseFolder(directory, opening = false) {
     $("folderNote").hidden = true;
     $("folderList").textContent = "";
     // Only a refused browse (403, a server beyond this Mac) leaves a typed path to try; a folder the server named bad is not offered.
-    folderError(folderOpts?.typed && error.status === 403 ? `${error.message}. Type the folder's full path above to use it.` : /[.!?]$/.test(error.message) ? error.message : `${error.message[0].toUpperCase()}${error.message.slice(1)}.`);
+    folderError(folderOpts?.typed && error.status === 403 ? `${error.message}. Type the folder's full path above to use it.` : folderSentence(error.message));
     typedChoice(error.status === 403);
   }
 }
+const folderSentence = (why) => /[.!?]$/.test(why) ? why : `${why[0].toUpperCase()}${why.slice(1)}.`;
 function folderError(message) {
   $("folderError").textContent = message;
   $("folderError").hidden = !message;
@@ -4139,7 +4140,7 @@ function uiModeOf(stored) { return stored === "advanced" ? "advanced" : "compact
       alt: d.file ? { label: "Use the default folder" } : null,
       choose: async (path) => {
         let r;
-        try { r = await postJson("/v1/settings", { server: { models_dir: path } }); } catch (e) { throw new Error(/models_dir does not exist or cannot be read/.test(String(e.message)) ? "That path is not a folder sushi can read." : adminErrorText(e)); }
+        try { r = await postJson("/v1/settings", { server: { models_dir: path } }); } catch (e) { throw new Error(folderSentence(adminErrorText(e).replace(/^models_dir: /, ""))); }
         toast(typeof r.applied?.models_dir === "string" && r.applied.models_dir ? sentence(r.applied.models_dir) : path ? "Saved. Rescanning the folder." : "Back to the default folder.");
         await invalidate({ models: true, settings: true, failures: true });
       },

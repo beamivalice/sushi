@@ -161,7 +161,8 @@ and the page tooltip share them.
 - The models folder is chosen on the Models page: the header shows the folders in use, and **Change folder…** opens the
   chat's folder picker (`/v1/tools` browse, so this Mac's page on a loopback bind; elsewhere a typed absolute path is
   taken as is). A pick saves `server.models_dir` and rescans at once; **Use the default folder** clears it; a
-  `--model-dir` launch leaves no Change button.
+  `--model-dir` launch leaves no Change button. Only a saved folder that is gone (a 404) opens on its nearest parent;
+  one the server will not open (a macOS privacy block, its permissions, a file) opens on itself with the server's reason.
 - A toast that carries the server's refusal (a load, an update and its result, a Models or Settings action) stays until dismissed
   (`toast(..., "err", { stay: true })`); any other error toast leaves after 8 s, a confirmation after 2.4 s.
 - Each model's page shows the three wire limits as they read now (refetched when the window regains focus, as after

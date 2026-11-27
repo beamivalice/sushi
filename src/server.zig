@@ -267,6 +267,7 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers
     }
     const root = switch (try pack.changeRoot(allocator, stream.io, cwd, cwd, if (directory) |d| d.string else cwd)) {
         .ok => |path| path,
+        .missing => |reason| return sendErrorResponse(allocator, stream, "404 Not Found", "not_found_error", reason, 404),
         .refused => |reason| return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400),
     };
     defer allocator.free(root);
@@ -302,8 +303,8 @@ fn handleWebTools(allocator: std.mem.Allocator, stream: *http_conn.Conn, headers
 
 /// Explicit folder-picker navigation, separate from the model's confined file tools.
 fn sendWebToolFolders(allocator: std.mem.Allocator, stream: *http_conn.Conn, root: []const u8) !void {
-    var dir = std.Io.Dir.openDirAbsolute(stream.io, root, .{ .iterate = true }) catch
-        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Cannot browse this folder", 400);
+    var dir = std.Io.Dir.openDirAbsolute(stream.io, root, .{ .iterate = true }) catch |err|
+        return sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", try @import("repl_tools.zig").folderOpenRefusal(err), 400);
     defer dir.close(stream.io);
     var directories = std.ArrayList([]u8).empty;
     defer {

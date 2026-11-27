@@ -39,7 +39,7 @@ function makeServer(opts = {}) {
   const gates = {};
   const state = {
     gpuLimit: { total_ram_bytes: 48 * GiB, iogpu_mb: 40960, global_user_wire_bytes: 40960 * 2 ** 20, user_wire_bytes: 38 * GiB, in_use_mb: 40960, standard_mb: 45056, command: 'sudo sysctl iogpu.wired_limit_mb=45056 vm.global_user_wire_limit=47244640256 vm.user_wire_limit=47244640256', applies: 'run it in Terminal, then restart sushi' },
-    folders: { '/h/.sushi/models': ['beamster'], '/h/.sushi': ['models'], '/Volumes/ssd': ['models', 'other'], '/Volumes/ssd/models': [] }, browseRefused: false,
+    folders: { '/h/.sushi/models': ['beamster'], '/h/.sushi': ['models'], '/Volumes/ssd': ['models', 'other'], '/Volumes/ssd/models': [] }, denied: {}, browseRefused: false,
     failSettings: 0, loadDelay: null, settingsDelay: [], loadFails: false, down: false, hooks: {},
     models: [
       { id: 'Qwen-A', state: 'ready', bytes_on_disk: 38 * GiB, bytes_resident: 40 * GiB, context_length: 262144, input_modalities: ['text', 'image'], keys: [...BASE_KEYS, 'vision'], settings: allKeys({ ctx_size: keyState({ file: 65536, source: 'file' }), kv_quant: keyState({ flag: '8', source: 'flag', locked: true }) }) },
@@ -94,7 +94,7 @@ function makeServer(opts = {}) {
           const m = state.models.find((x) => x.id === body.model);
           if (opts.limits && body.set && 'max_concurrent' in body.set) return route.fulfill(json({ error: { message: 'max_concurrent is not supported by this model' } }, 400));
           for (const [k, v] of Object.entries(body.set ?? {})) if (m) m.settings[k] = keyState({ file: v, source: v === null ? 'default' : 'file' });
-          if (body.server && 'models_dir' in body.server && body.server.models_dir !== null && !(body.server.models_dir in state.folders)) return route.fulfill(json({ error: { message: 'models_dir does not exist or cannot be read' } }, 400));
+          if (body.server && 'models_dir' in body.server && body.server.models_dir !== null && !(body.server.models_dir in state.folders)) return route.fulfill(json({ error: { message: 'models_dir: no such folder' } }, 400));
           for (const [k, v] of Object.entries(body.server ?? {})) { state.server[k] = { ...state.server[k], file: v, source: v === null ? 'default' : 'file' }; if (k === 'prefix_cache_disk_gb') state.server[k].effective_bytes = state.server[k].ask_bytes = (v ?? 20) * GiB; }
           const cacheNote = body.server?.prefix_cache_disk_gb ? 'applied to the running tiers' : 'saved; applies at the next model load';
           return route.fulfill(json({ applied: Object.fromEntries(Object.keys(body.set ?? body.server ?? {}).map((k) => [k, k === 'prefix_cache_disk_gb' ? cacheNote : 'saved'])), model_loaded: m?.state === 'ready' }));
@@ -121,8 +121,10 @@ function makeServer(opts = {}) {
       case '/v1/tools': {
         if (!body?.browse) return route.fulfill(json({ edit_default: false }));
         if (state.browseRefused) return route.fulfill(json({ error: { message: "Tools require this Mac's chat page Origin and a loopback server bind" } }, 403));
-        const root = body.directory ?? '/h/.sushi/models';
-        if (!(root in state.folders)) return route.fulfill(json({ error: { message: 'no such folder' } }, 400));
+        // As the server's realpath does, a trailing slash names the same folder.
+        const root = (body.directory ?? '/h/.sushi/models').replace(/(.)\/+$/, '$1');
+        if (root in state.denied) return route.fulfill(json({ error: { message: state.denied[root] } }, 400));
+        if (!(root in state.folders)) return route.fulfill(json({ error: { message: 'no such folder' } }, 404));
         return route.fulfill(json({ root, parent: root.replace(/\/[^/]+$/, '') || '/', directories: state.folders[root], truncated: false }));
       }
       case '/metrics.json': case '/metrics': return route.fulfill(json({ error: { message: 'metrics off' } }, 503));
@@ -1663,7 +1665,7 @@ async function main() {
       assert.equal(await page.isDisabled('#folderChoose'), true, 'only an absolute path is taken as typed');
       await page.fill('#folderPath', '/nowhere');
       await page.click('#folderChoose');
-      await page.waitForFunction(() => document.getElementById('folderError').textContent.includes('not a folder sushi can read'));
+      await page.waitForFunction(() => document.getElementById('folderError').textContent === 'No such folder.');
       assert.equal(await page.evaluate(() => document.getElementById('folderPicker').open), true);
       await page.fill('#folderPath', '/Volumes/ssd');
       await page.click('#folderChoose');
@@ -1677,6 +1679,24 @@ async function main() {
       assert.equal(await page.inputValue('#folderPath'), '/h/.sushi', 'it shows the nearest folder that exists');
       assert.match(await page.textContent('#folderNote'), /\/h\/\.sushi\/models does not exist yet/);
       assert.equal(await page.isEnabled('#folderChoose'), true);
+    });
+    const privacy = 'no permission to read this folder: macOS privacy settings keep it from sushi; allow the app that runs sushi in System Settings → Privacy & Security → Files and Folders (Removable Volumes for an external drive) or Full Disk Access';
+    await scenario('a models folder macOS keeps from sushi is named so, never "Not a folder", and is not swapped for a parent', { path: '/models', setup: (s) => { s.state.denied['/Volumes/ETH-Storage-ZHITAI/Models'] = privacy; s.state.server.models_dir.file = '/Volumes/ETH-Storage-ZHITAI/Models'; s.state.server.models_dir.source = 'file'; } }, async ({ page, server }) => {
+      const sentence = `N${privacy.slice(1)}.`;
+      await page.click('#modelsDirChange');
+      await page.waitForSelector('#folderError:not([hidden])');
+      assert.equal(await page.textContent('#folderError'), sentence);
+      assert.equal(await page.isVisible('#folderNote'), false, 'a folder it may not read is not called missing');
+      assert.equal(await page.inputValue('#folderPath'), '/Volumes/ETH-Storage-ZHITAI/Models');
+      const browses = () => server.calls.filter((c) => c.path === '/v1/tools' && c.body?.browse).length;
+      assert.equal(browses(), 1, 'no walk up to a parent');
+      assert.equal(await page.isDisabled('#folderChoose'), true);
+      await page.fill('#folderPath', '/Volumes/ETH-Storage-ZHITAI/Models/');
+      await page.press('#folderPath', 'Enter');
+      await page.waitForFunction(() => document.getElementById('folderList').textContent === '' && !document.getElementById('folderError').hidden);
+      assert.equal(browses(), 2);
+      assert.equal(await page.textContent('#folderError'), sentence);
+      assert.equal(await page.isDisabled('#folderChoose'), true);
     });
     await scenario('a typed path that is no folder gets a plain sentence and cannot be used', { path: '/models' }, async ({ page, server }) => {
       await page.click('#modelsDirChange');

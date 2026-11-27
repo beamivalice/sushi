@@ -2221,7 +2221,7 @@ test "web tools: list, confined execution, and browser origin guard" {
         .{ .origin = "http://localhost:12345", .body = "[]", .status = "400 Bad Request", .contains = "object" },
         .{ .origin = "http://localhost:12345", .body = "{\"browse\":true}", .status = "200 OK", .contains = "directories" },
         .{ .origin = "http://localhost:12345", .body = "{\"directory\":3}", .status = "400 Bad Request", .contains = "absolute" },
-        .{ .origin = "http://localhost:12345", .body = "{\"directory\":\"/sushi-folder-does-not-exist\"}", .status = "400 Bad Request", .contains = "no such folder" },
+        .{ .origin = "http://localhost:12345", .body = "{\"directory\":\"/sushi-folder-does-not-exist\"}", .status = "404 Not Found", .contains = "no such folder" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"../outside\\\"}\"}", .status = "200 OK", .contains = "refused" },
         .{ .origin = "http://localhost:12345", .body = "{\"name\":\"exec\",\"arguments\":\"{}\"}", .status = "200 OK", .contains = "unknown tool" },
         // The chat's own write flag is the switch: with it the call reaches the confinement check,
@@ -2249,6 +2249,44 @@ test "web tools: list, confined execution, and browser origin guard" {
             try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
             if (c.lacks.len > 0) try t.expect(std.mem.indexOf(u8, responseBody(response), c.lacks) == null);
         }
+    }
+}
+
+test "web tools: the folder picker names why a folder will not open, and only a missing one is a 404" {
+    const t = std.testing;
+    const io = t.io;
+    const old_host = server_state.listen_host;
+    const old_port = server_state.listen_port;
+    defer {
+        server_state.listen_host = old_host;
+        server_state.listen_port = old_port;
+    }
+    server_state.listen_host = "127.0.0.1";
+    server_state.listen_port = 12345;
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Models/beamster");
+    try tmp.dir.createDirPath(io, "locked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "hi\n" });
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0o000), .{});
+    defer tmp.dir.setFilePermissions(io, "locked", .fromMode(0o755), .{}) catch {};
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const Case = struct { sub: []const u8, status: []const u8, contains: []const u8 };
+    for ([_]Case{
+        .{ .sub = "Models/", .status = "200 OK", .contains = "\"directories\":[\"beamster\"]" },
+        .{ .sub = "locked", .status = "400 Bad Request", .contains = "no permission to read this folder" },
+        .{ .sub = "notes.txt", .status = "400 Bad Request", .contains = "not a folder" },
+        .{ .sub = "missing", .status = "404 Not Found", .contains = "no such folder" },
+    }) |c| {
+        const body = try std.fmt.allocPrint(t.allocator, "{{\"browse\":true,\"directory\":\"{s}/{s}\"}}", .{ base, c.sub });
+        defer t.allocator.free(body);
+        const req = try std.fmt.allocPrint(t.allocator, "POST /v1/tools HTTP/1.1\r\nOrigin: http://localhost:12345\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        defer t.allocator.free(req);
+        const response = try serveOneForTest(req);
+        defer t.allocator.free(response);
+        try t.expect(std.mem.indexOf(u8, response, c.status) != null);
+        try t.expect(std.mem.indexOf(u8, responseBody(response), c.contains) != null);
     }
 }
 

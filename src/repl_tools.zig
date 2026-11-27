@@ -149,7 +149,24 @@ pub fn confineWriteTarget(allocator: std.mem.Allocator, io: std.Io, root: []cons
     return confineNewPath(allocator, io, root, user_path);
 }
 
-pub const RootChange = union(enum) { ok: [:0]u8, refused: []const u8 };
+/// `missing` is a path that names nothing; `refused` names why an existing one cannot be used.
+pub const RootChange = union(enum) { ok: [:0]u8, missing: []const u8, refused: []const u8 };
+
+const refuse_no_folder = "no such folder";
+pub const FolderError = std.Io.Dir.OpenError || std.Io.File.RealPathError;
+
+/// Why a folder will not open, by name. On macOS, EPERM is the privacy control that guards external drives and
+/// protected folders per app; EACCES is the folder's own owner and mode.
+pub fn folderOpenRefusal(err: FolderError) error{Canceled}![]const u8 {
+    return switch (err) {
+        error.Canceled => error.Canceled,
+        error.FileNotFound => refuse_no_folder,
+        error.NotDir => "not a folder",
+        error.PermissionDenied => "no permission to read this folder: macOS privacy settings keep it from sushi; allow the app that runs sushi in System Settings → Privacy & Security → Files and Folders (Removable Volumes for an external drive) or Full Disk Access",
+        error.AccessDenied => "no permission to read this folder: its permissions do not let this user open it",
+        inline else => |e| "cannot open this folder: " ++ @errorName(e),
+    };
+}
 
 /// The real path of the folder `/cd <arg>` names: absolute, `~`-relative, or
 /// relative to `root`. A folder whose path names a secret store is refused.
@@ -162,13 +179,15 @@ pub fn changeRoot(allocator: std.mem.Allocator, io: std.Io, root: []const u8, ho
     else
         try std.fs.path.join(allocator, &.{ root, target });
     defer allocator.free(joined);
-    if (!std.fs.path.isAbsolute(joined)) return .{ .refused = "no such folder" };
+    if (!std.fs.path.isAbsolute(joined)) return .{ .missing = refuse_no_folder };
     const real = std.Io.Dir.realPathFileAbsoluteAlloc(io, joined, allocator) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .refused = "no such folder" },
+        error.FileNotFound, error.NotDir => return .{ .missing = refuse_no_folder },
+        else => |e| return .{ .refused = try folderOpenRefusal(e) },
     };
+    errdefer allocator.free(real);
     const refusal: ?[]const u8 = blk: {
-        var dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch break :blk "not a folder";
+        var dir = std.Io.Dir.openDirAbsolute(io, real, .{}) catch |err| break :blk try folderOpenRefusal(err);
         dir.close(io);
         var it = std.mem.tokenizeScalar(u8, real, '/');
         while (it.next()) |c| if (isSecretName(c)) break :blk "that folder may hold secrets";
@@ -1895,7 +1914,7 @@ test "repl tools: /cd resolves a folder by real path and refuses anything else" 
                     return err;
                 };
             },
-            .refused => |msg| {
+            .missing, .refused => |msg| {
                 testing.expect(c.want == null and msg.len > 0) catch |err| {
                     std.debug.print("/cd {s} refused: {s}\n", .{ c.arg, msg });
                     return err;
@@ -1903,6 +1922,54 @@ test "repl tools: /cd resolves a folder by real path and refuses anything else" 
             },
         }
     }
+}
+
+test "repl tools: /cd names why a folder cannot be opened, and a folder it may not read is never 'not a folder'" {
+    const allocator = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Models");
+    try tmp.dir.createDirPath(io, "locked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "hi\n" });
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0o000), .{});
+    defer tmp.dir.setFilePermissions(io, "locked", .fromMode(0o755), .{}) catch {};
+    const base = try tmp.dir.realPathFileAlloc(io, ".", allocator);
+    defer allocator.free(base);
+
+    const Case = struct { sub: []const u8, want: []const u8 };
+    for ([_]Case{
+        // The reporter's spelling: an absolute folder typed with a trailing slash.
+        .{ .sub = "Models/", .want = "" },
+        .{ .sub = "locked", .want = "no permission to read this folder: its permissions" },
+        .{ .sub = "notes.txt", .want = "not a folder" },
+        .{ .sub = "missing", .want = "no such folder" },
+    }) |c| {
+        const arg = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base, c.sub });
+        defer allocator.free(arg);
+        switch (try changeRoot(allocator, io, base, base, arg)) {
+            .ok => |got| {
+                defer allocator.free(got);
+                try testing.expectEqualStrings("", c.want);
+                try testing.expectEqualStrings(arg[0 .. arg.len - 1], got);
+            },
+            .refused, .missing => |msg| try testing.expect(c.want.len > 0 and std.mem.startsWith(u8, msg, c.want)),
+        }
+    }
+}
+
+test "repl tools: each reason a folder will not open is named; macOS privacy names where to allow it" {
+    try testing.expectEqualStrings("not a folder", try folderOpenRefusal(error.NotDir));
+    try testing.expectEqualStrings("no such folder", try folderOpenRefusal(error.FileNotFound));
+    // EPERM: macOS privacy (TCC) keeps an external drive or a protected folder from this process.
+    const privacy = try folderOpenRefusal(error.PermissionDenied);
+    try testing.expect(std.mem.startsWith(u8, privacy, "no permission to read this folder: macOS"));
+    try testing.expect(std.mem.indexOf(u8, privacy, "System Settings → Privacy & Security → Files and Folders") != null);
+    try testing.expect(std.mem.indexOf(u8, privacy, "Removable Volumes") != null);
+    // EACCES: the folder's own owner and mode.
+    try testing.expect(std.mem.startsWith(u8, try folderOpenRefusal(error.AccessDenied), "no permission to read this folder: its permissions"));
+    try testing.expectEqualStrings("cannot open this folder: SymLinkLoop", try folderOpenRefusal(error.SymLinkLoop));
+    try testing.expectError(error.Canceled, folderOpenRefusal(error.Canceled));
 }
 
 /// A folder with one subfolder, text files, a binary file, a hidden file, a secret-named
@@ -2113,7 +2180,7 @@ test "repl tools: after /cd the file tools are confined to the new folder, just 
 
     const root = switch (try changeRoot(allocator, io, start, "/nonexistent", "sub")) {
         .ok => |r| r,
-        .refused => return error.CdRefused,
+        .missing, .refused => return error.CdRefused,
     };
     defer allocator.free(root);
     const ctx: Context = .{ .allocator = allocator, .io = io, .root = root, .vision = false };

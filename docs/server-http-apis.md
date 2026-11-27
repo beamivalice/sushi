@@ -634,7 +634,7 @@ All four routes sit behind `--api-key` like the other admin routes, and a reques
   `ctx_size`); the load refuses those by name.
   `kv_quant` is a choice name (`off`, `4`, `6`, `8`) wherever it is read or written; a request may say `0`, `16`, `"16"` or `"off"`
   and the file stores `"off"`. Unknown keys are a 400 `unknown_setting`, a bad value a 400 `invalid_setting`, a `models_dir` that is not a readable
-  folder a 400, an unknown model a 404, a settings file that is not a JSON object a 409; every key is checked before anything
+  folder a 400 naming why (`models_dir: <the picker's reason>`), an unknown model a 404, a settings file that is not a JSON object a 409; every key is checked before anything
   is written, and the write is a temp file plus rename (through a symlinked settings file, to its target; a model section is found
   without regard to a trailing slash in its key). A key a launch flag pins is still written (it applies at a start
   without the flag) and reported with the flag's source. Per-model keys are stamped at load, so they apply at the model's next
@@ -955,7 +955,10 @@ catalog, thread) and `src/download_progress.zig` (host tier: names, space, byte 
   `write` (boolean) is the chat's Edit chip and alone decides whether the two write tools are offered and run;
   the listing answers with `edit_default` (the server's `--edit`, what a new chat starts with).
   With `browse: true`, the endpoint instead returns `root`, `parent`, `directories`, and `truncated` for the
-  picker (up to 1000 visible, non-secret subfolders). The browser passes the selected canonical directory
+  picker (up to 1000 visible, non-secret subfolders). A `directory` that names nothing is a 404 `no such folder`; one that
+  exists but will not open is a 400 naming why (`not a folder`; EACCES `no permission to read this folder: its
+  permissions…`; EPERM, macOS privacy, names System Settings → Privacy & Security → Files and Folders): a folder sushi may
+  not read is never called "not a folder" (`repl_tools.folderOpenRefusal`). The browser passes the selected canonical directory
   separately from model arguments on every call. Vision models get `view_image`; returned images remain in memory only.
 - This bridge requires a loopback bind and peer, the chat page's Origin, and the normal API-key policy.
   It works from `localhost` or `127.0.0.1`, not a remote browser or wildcard bind. File tools are confined to

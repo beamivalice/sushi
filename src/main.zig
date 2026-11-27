@@ -811,7 +811,7 @@ fn runCli(init: std.process.Init) !void {
                 d.close(io);
                 allocator.free(default_models_root_storage.?);
                 default_models_root_storage = try allocator.dupe(u8, dir);
-            } else |_| log.warn("[model-settings] server.models_dir {s} cannot be opened, using the default models directory\n", .{dir});
+            } else |err| log.warn("[model-settings] server.models_dir {s} cannot be opened ({s}), using the default models directory\n", .{ dir, @import("repl_tools.zig").folderOpenRefusal(err) catch |e| @errorName(e) });
         }
         models_root = default_models_root_storage;
     }

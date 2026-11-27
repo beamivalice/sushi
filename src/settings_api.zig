@@ -731,10 +731,11 @@ pub fn handleGet(allocator: std.mem.Allocator, stream: *http_conn.Conn) !void {
     try http.sendResponse(stream, "200 OK", "application/json", body);
 }
 
-fn dirReadable(io: std.Io, path: []const u8) bool {
-    var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
+/// Why `path` cannot be the models folder, by name, or null when it can be listed.
+fn modelsDirRefusal(io: std.Io, path: []const u8) error{Canceled}!?[]const u8 {
+    var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch |err| return try @import("repl_tools.zig").folderOpenRefusal(err);
     d.close(io);
-    return true;
+    return null;
 }
 
 /// The 400 text for the first edit this model cannot honour, or null.
@@ -763,8 +764,8 @@ pub fn handlePost(allocator: std.mem.Allocator, stream: *http_conn.Conn, request
     };
 
     for (plan.server_edits) |e| if (std.mem.eql(u8, e.key, "models_dir")) if (e.value) |v| {
-        if (!dirReadable(stream.io, v.string)) {
-            try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", "models_dir does not exist or cannot be read", 400);
+        if (try modelsDirRefusal(stream.io, v.string)) |why| {
+            try http.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_setting", try std.fmt.allocPrint(arena, "models_dir: {s}", .{why}), 400);
             return;
         }
     };
@@ -1162,6 +1163,24 @@ test "settings api: a request names real keys with valid values, or is refused w
     try expectRejected("{}", 400, "invalid_request_error");
     try expectRejected("[1]", 400, "invalid_request_error");
     try expectRejected("nope", 400, "invalid_request_error");
+}
+
+test "settings api: a models_dir that cannot be listed is refused with its own reason, a folder it may not read by permission" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "Models");
+    try tmp.dir.createDirPath(io, "locked");
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes.txt", .data = "hi\n" });
+    try tmp.dir.setFilePermissions(io, "locked", .fromMode(0o000), .{});
+    defer tmp.dir.setFilePermissions(io, "locked", .fromMode(0o755), .{}) catch {};
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expectEqual(@as(?[]const u8, null), try modelsDirRefusal(io, try std.fmt.bufPrint(&pb, "{s}/Models/", .{base})));
+    try testing.expectEqualStrings("no such folder", (try modelsDirRefusal(io, try std.fmt.bufPrint(&pb, "{s}/missing", .{base}))).?);
+    try testing.expectEqualStrings("not a folder", (try modelsDirRefusal(io, try std.fmt.bufPrint(&pb, "{s}/notes.txt", .{base}))).?);
+    try testing.expect(std.mem.startsWith(u8, (try modelsDirRefusal(io, try std.fmt.bufPrint(&pb, "{s}/locked", .{base}))).?, "no permission to read this folder"));
 }
 
 test "settings api: the update-check keys take a boolean and nothing else" {
