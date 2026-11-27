@@ -21,6 +21,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 const io_util = @import("io_util.zig");
+const metallib_path = @import("metallib_path.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 
 /// Drafts per round the table covers (MTP depth <= 8, a DFlash block up to 16); index 0 is serial.
@@ -831,6 +832,8 @@ fn exePath(buf: []u8) ?[:0]const u8 {
 }
 
 fn mixMlxArtifacts(h: *std.hash.Fnv1a_64) void {
+    var sushi_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (metallib_path.forThisProcess(&sushi_buf)) |p| mixFileStamp(h, p) else |_| {}
     var dylib_buf: [4096]u8 = undefined;
     const dylib = mlxDylibPath(&dylib_buf) orelse return;
     mixFileStamp(h, dylib);
@@ -839,6 +842,7 @@ fn mixMlxArtifacts(h: *std.hash.Fnv1a_64) void {
     const metal = std.fmt.bufPrint(&metal_buf, "{s}/mlx.metallib", .{dir}) catch return;
     mixFileStamp(h, metal);
 }
+
 
 fn mlxDylibPath(buf: []u8) ?[]const u8 {
     if (builtin.os.tag.isDarwin()) {

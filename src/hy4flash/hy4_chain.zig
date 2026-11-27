@@ -6,7 +6,7 @@ const Arr = mlx.mlx_array;
 const kcfg = @import("hy4_kcfg.zig");
 
 /// MLX's `Sigmoid` functor (`unary_ops.h`, the engine's `sushi_sigmoid`) on a float.
-const header: [:0]const u8 =
+pub const header: [:0]const u8 =
     \\inline float hy4_sigmoid(float x) {
     \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
     \\  return (x < 0) ? y : 1 - y;
@@ -14,7 +14,7 @@ const header: [:0]const u8 =
 ;
 
 /// `(g · σ(g)) · u`: the SwiGLU's `silu` (`Ops.silu`, the Sigmoid then the Multiply) times the up rows.
-const swiglu_source: [:0]const u8 =
+pub const swiglu_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint i = thread_position_in_grid.x;
     \\float x = static_cast<float>(g[i]);
@@ -157,7 +157,7 @@ pub fn swigluAs(s: mlx.mlx_stream, g: Arr, u: Arr, out_dt: mlx.mlx_dtype) !Arr {
     return shaped;
 }
 
-const swiglu_finish_prepare_source: [:0]const u8 =
+pub const swiglu_finish_prepare_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
@@ -259,7 +259,7 @@ pub fn swigluFinishPrepare(s: mlx.mlx_stream, g_inner: Arr, g_svh: Arr, u_inner:
 
 /// `recallAt`'s groups [T, take + 1] f32: the picks `order` [T, take] (int32) widened, then each row's own group
 /// `floor((p0 + t) / ratio)` (the arange, the Divide and the Floor).
-const groups_source: [:0]const u8 =
+pub const groups_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint c = thread_position_in_grid.x;
     \\uint t = thread_position_in_grid.y;
@@ -270,7 +270,7 @@ const groups_source: [:0]const u8 =
 /// `recalledRows` over the groups [T, k] f32 (own group last): each row's `k · ratio` key rows `pos = g · ratio + r`
 /// clamped to `n - 1` (uint32), and whether it reads each (`pos` at or before its position, and from an earlier group
 /// or the own group's column), in the ops' f32 order.
-const rows_source: [:0]const u8 =
+pub const rows_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint s = thread_position_in_grid.x;
     \\uint t = thread_position_in_grid.y;
@@ -352,7 +352,7 @@ fn applyOuts(s: mlx.mlx_stream, k: mlx.mlx_fast_metal_kernel, inputs: []const Ar
 
 /// The attention output gate: `u ⊙ σ(gate)` with `u` [H, T, v] (any strides) and the gate's rows [T, H·v] as stored,
 /// widened, written [T, H·v] as `W_o` reads them (the Cast, the Sigmoid, the Multiply and the transpose's copy).
-const gate_source: [:0]const u8 =
+pub const gate_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint i = thread_position_in_grid.x;
     \\uint t = thread_position_in_grid.y;
@@ -396,7 +396,7 @@ pub fn gated(s: mlx.mlx_stream, u: Arr, gate: Arr) !Arr {
     return out[0];
 }
 
-const gate_into_source: [:0]const u8 =
+pub const gate_into_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint i = thread_position_in_grid.x;
     \\uint t = thread_position_in_grid.y;
@@ -447,7 +447,7 @@ pub fn gatedInto(s: mlx.mlx_stream, u: Arr, gate: Arr, dst: Arr, r0: c_int) !voi
     try mlx.check(mlx.kernelApplyInto(&ov, gate_into_kernel.?, iv, cfg, s, dst) orelse return error.MlxError);
 }
 
-const gate_prepared_into_source: [:0]const u8 =
+pub const gate_prepared_into_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint t = uint(threadgroup_position_in_grid.y);
@@ -598,7 +598,7 @@ const sink_softmax_tail: [:0]const u8 =
     \\}
 ;
 
-const sink_softmax_causal_source: [:0]const u8 =
+pub const sink_softmax_causal_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint gid = threadgroup_position_in_grid.x;
     \\int lid = int(thread_index_in_threadgroup);
@@ -633,7 +633,7 @@ const sink_softmax_causal_source: [:0]const u8 =
     \\}
 ++ sink_softmax_tail;
 
-const sink_softmax_mask_source: [:0]const u8 =
+pub const sink_softmax_mask_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint gid = threadgroup_position_in_grid.x;
     \\int lid = int(thread_index_in_threadgroup);
@@ -723,7 +723,7 @@ pub fn sinkSoftmaxMask(s: mlx.mlx_stream, a: Arr, b: Arr, mask: Arr, sinks: Arr,
     return out[0];
 }
 
-const ring_keys_source: [:0]const u8 =
+pub const ring_keys_source: [:0]const u8 =
     \\uint col = thread_position_in_grid.x;
     \\uint i = thread_position_in_grid.y;
     \\uint r = thread_position_in_grid.z;
@@ -809,7 +809,7 @@ fn steelPlan(m: c_int, n: c_int, k: c_int) ?SteelPlan {
     return .{ .parts = parts, .pk = @divTrunc(tk, parts) * 16 };
 }
 
-const steel_scores_source: [:0]const u8 =
+pub const steel_scores_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const int key0 = int(threadgroup_position_in_grid.x) * 8;
@@ -866,7 +866,7 @@ const steel_scores_source: [:0]const u8 =
     \\simdgroup_store(rope, s2 + size_t(sg * 8) * N + key0, N);
 ;
 
-const steel_values_source: [:0]const u8 =
+pub const steel_values_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const int d0 = int(threadgroup_position_in_grid.x) * 8;
@@ -1041,7 +1041,7 @@ pub fn steelValues(s: mlx.mlx_stream, p: Arr, c: Arr) !Arr {
     return out[0];
 }
 
-const steel_scores_groups_source: [:0]const u8 =
+pub const steel_scores_groups_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const int key0 = int(threadgroup_position_in_grid.x) * 8;
@@ -1101,7 +1101,7 @@ const steel_scores_groups_source: [:0]const u8 =
     \\simdgroup_store(rope, const_cast<device float*>(s2g), N);
 ;
 
-const steel_values_groups_source: [:0]const u8 =
+pub const steel_values_groups_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const int d0 = int(threadgroup_position_in_grid.x) * 8;

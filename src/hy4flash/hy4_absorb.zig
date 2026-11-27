@@ -10,13 +10,13 @@ const kcfg = @import("hy4_kcfg.zig");
 
 /// `out[h, n] = Σ_k q[h, k] · W[h·ROWS + k, n]`: `q` [H, NOPE] f32, `W` = kv_b [H·ROWS, LAT] BF16. `gemv_t`'s tile: NSG
 /// simdgroups of 8 x 4 lanes, 4 inputs by 4 outputs a thread, NSG · 16 outputs a threadgroup.
-const q_source: [:0]const u8 =
+pub const q_source: [:0]const u8 =
     \\constexpr int SM = 8;
     \\constexpr int SN = 4;
     \\constexpr int TM = 4;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_M = SM * TM;
-    \\constexpr int BLOCK_N = NSG * SN * TN;
+    \\const int BLOCK_N = NSG * SN * TN;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint z = threadgroup_position_in_grid.z;
@@ -31,8 +31,10 @@ const q_source: [:0]const u8 =
     \\for (int r = 0; r < RT; ++r) {
     \\  for (int tn = 0; tn < TN; ++tn) result[r][tn] = 0.0f;
     \\}
-    \\constexpr int n_iter = NOPE / BLOCK_M;
+    \\const int n_iter = NOPE / BLOCK_M;
+    \\#ifndef SUSHI_METALLIB
     \\static_assert(NOPE % BLOCK_M == 0 && LAT % BLOCK_N == 0, "an absorbed shape off the gemv_t tile");
+    \\#endif
     \\for (int i = 0; i < n_iter; ++i) {
     \\  for (int tm = 0; tm < TM; ++tm) {
     \\    float inter[TN];
@@ -77,13 +79,15 @@ const v_main: [:0]const u8 =
     \\int r0 = int(z / uint(HEADS)) * RT;
     \\int out_row = int(threadgroup_position_in_grid.x) * 4 * TM + int(sg) * TM;
     \\const device TW* mat = kvb + ((size_t)h * (size_t)ROWS + (size_t)NOPE + (size_t)out_row) * (size_t)LAT;
+    \\#ifndef SUSHI_METALLIB
     \\static_assert(LAT % BLOCK_N == 0 && VDIM % (4 * TM) == 0, "an absorbed shape off the gemv tile");
+    \\#endif
     \\float result[RT][TM];
     \\for (int r = 0; r < RT; ++r) {
     \\  for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
-    \\constexpr int n_iter = LAT / BLOCK_N;
+    \\const int n_iter = LAT / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  float inter[TM][TN];
     \\  for (int tm = 0; tm < TM; ++tm) {
@@ -135,10 +139,10 @@ const v_out_gated: [:0]const u8 =
     \\}
 ;
 
-const v_source = v_main ++ v_out_plain;
-const v_source_gated = v_main ++ v_out_gated;
+pub const v_source = v_main ++ v_out_plain;
+pub const v_source_gated = v_main ++ v_out_gated;
 
-const sigmoid_header: [:0]const u8 =
+pub const sigmoid_header: [:0]const u8 =
     \\inline float hy4_sigmoid(float x) {
     \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
     \\  return (x < 0) ? y : 1 - y;

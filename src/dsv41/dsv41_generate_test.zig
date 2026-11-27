@@ -5559,7 +5559,7 @@ test "dsv41 engine: a joined decode forward copies a request's rows out only at 
         fn of() u64 {
             var c: u64 = 0;
             // A join is a concatenate, one dispatch for up to four parts; a split is a copy each part.
-            for (core.kernelProfile()) |k| if (std.mem.eql(u8, k.name, "sushi_copy_into") or std.mem.startsWith(u8, k.name, "sushi_concat")) {
+            for (core.kernelProfile()) |k| if (std.mem.startsWith(u8, k.name, "sushi_ops_copy_into") or std.mem.startsWith(u8, k.name, "sushi_ops_concat")) {
                 c += k.dispatches;
             };
             return c;

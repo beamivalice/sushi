@@ -19,7 +19,7 @@ fn replace(comptime source: []const u8, comptime old: []const u8, comptime value
     const at = comptime std.mem.indexOf(u8, source, old).?;
     return source[0..at] ++ value ++ source[at + old.len ..] ++ "";
 }
-const SOURCE = replace(replace(support.source, "uint win = uint(threadgroup_position_in_grid.y);", "uint win = uint(threadgroup_position_in_grid.x);"), "uint(threadgroup_position_in_grid.x) * 128u + sg * 32u", "uint(threadgroup_position_in_grid.y) * 128u + sg * 32u");
+pub const SOURCE = replace(replace(support.source, "uint win = uint(threadgroup_position_in_grid.y);", "uint win = uint(threadgroup_position_in_grid.x);"), "uint(threadgroup_position_in_grid.x) * 128u + sg * 32u", "uint(threadgroup_position_in_grid.y) * 128u + sg * 32u");
 var kernels: [kernel_src.SLOT_ROWS][api.format.Window.count]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
 var failed: [kernel_src.SLOT_ROWS][api.format.Window.count]bool = @splat(@splat(false));
 var build_attempts: usize = 0;

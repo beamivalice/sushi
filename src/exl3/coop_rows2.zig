@@ -129,14 +129,14 @@ fn groupedSource(comptime triples: bool, comptime tiled: bool) [:0]const u8 {
     const epilogue = replace(replace(replace(EPILOGUE, "j<2u", "j<3u"), "j==0u?first:partner", "j==0u?first:(j==1u?partner:third)"), "if(lid<32u)", "if(lid<48u)");
     return THREE_MEMBERS ++ "\nif(partner==first) {\n" ++ outputTiles(original, 1) ++ "\n} else if(third==first) {\n" ++ outputTiles(paired ++ EPILOGUE, 2) ++ "\n} else {\n" ++ outputTiles(triple ++ epilogue, 3) ++ "\n}\n";
 }
-const SOURCE = groupedSource(false, false);
+pub const SOURCE = groupedSource(false, false);
 const THREE_SOURCE = groupedSource(true, false);
 const TILED_SOURCE = groupedSource(false, true);
 fn pairSource(comptime source: []const u8) [:0]const u8 {
     return "const bool upper=threadgroup_position_in_grid.z!=0u;\nconst device half* x=upper?xu:xg;\nconst device ushort* trellis=upper?tu:tg;\ndevice half* y=upper?yu:yg;\n" ++
         replace(source, "uint split = uint(threadgroup_position_in_grid.z);", "uint split=0u;");
 }
-const PAIR_SOURCE = pairSource(SOURCE);
+pub const PAIR_SOURCE = pairSource(SOURCE);
 const TILED_PAIR_SOURCE = pairSource(TILED_SOURCE);
 fn laneSource(comptime source: []const u8) [:0]const u8 {
     @setEvalBranchQuota(1000000);

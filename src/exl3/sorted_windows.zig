@@ -7,7 +7,7 @@ const kernels = @import("expert_exl3_kernels.zig");
 
 pub const GpuWindowTable = struct { table: kernels.WindowTable, inverse: mlx.mlx_array };
 
-const GPU_WINDOW_SOURCE: [:0]const u8 =
+pub const GPU_WINDOW_SOURCE: [:0]const u8 =
     \\const uint tid = uint(thread_index_in_threadgroup);
     \\const uint n = uint(count[0]);
     \\const uint capacity = (n + uint(WIN) - 1u) / uint(WIN) + uint(EXPERTS);
@@ -121,7 +121,7 @@ fn gpuWindowCapacityCase(s: mlx.mlx_stream, experts: c_int) !void {
     }
 }
 
-const SORTED_INVERSE_SOURCE: [:0]const u8 = blk: {
+pub const SORTED_INVERSE_SOURCE: [:0]const u8 = blk: {
     const old = "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;";
     const at = std.mem.indexOf(u8, kernels.REDUCE_SOURCE, old).?;
     break :blk kernels.REDUCE_SOURCE[0..at] ++ "const size_t xb = (size_t)inverse[slot] * (size_t)(ODIM) + base;" ++ kernels.REDUCE_SOURCE[at + old.len ..];

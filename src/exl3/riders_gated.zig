@@ -123,11 +123,11 @@ const GATE_UP_BLOCK: [:0]const u8 =
     \\}
 ;
 
-const GATE_UP: [:0]const u8 = GATE_UP_OPEN ++ GATE_UP_BLOCK;
-const GATE_UP_LOGIT: [:0]const u8 = GATE_UP_OPEN ++ LOGIT_BRANCH ++ GATE_UP_BLOCK;
+pub const GATE_UP: [:0]const u8 = GATE_UP_OPEN ++ GATE_UP_BLOCK;
+pub const GATE_UP_LOGIT: [:0]const u8 = GATE_UP_OPEN ++ LOGIT_BRANCH ++ GATE_UP_BLOCK;
 
 /// Sixteen rows a threadgroup, a simdgroup of four each; `x` is [rows, K], `y` [rows, N].
-const DOWN: [:0]const u8 =
+pub const DOWN: [:0]const u8 =
     \\const uint lane = thread_index_in_simdgroup;
     \\const int row = int(threadgroup_position_in_grid.y);
     \\const int r0 = int(threadgroup_position_in_grid.x) * 16 + int(simdgroup_index_in_threadgroup) * 4;
@@ -195,7 +195,7 @@ pub fn geometryFits(geo: Geometry, sh: Shared) bool {
 
 /// The same logit as one more threadgroup along the trellis gate/up grid, past its `TILES` columns of blocks: row
 /// `x - TILES`.
-const LOGIT_ROW: [:0]const u8 = "if (threadgroup_position_in_grid.x >= uint(TILES)) {\n  if (threadgroup_position_in_grid.y == 0u && simdgroup_index_in_threadgroup == 0u) {\n" ++
+pub const LOGIT_ROW: [:0]const u8 = "if (threadgroup_position_in_grid.x >= uint(TILES)) {\n  if (threadgroup_position_in_grid.y == 0u && simdgroup_index_in_threadgroup == 0u) {\n" ++
     "const uint lane = thread_index_in_simdgroup;\nconst int row = int(threadgroup_position_in_grid.x) - TILES;\nconst device bfloat16_t* xr = x + size_t(row) * K;\n" ++ LOGIT_CALC ++ "  }\n} else\n";
 
 fn trellisGateUp(alloc: std.mem.Allocator, geo: Geometry, rows: c_int, with_logit: bool) !fuse.Part {

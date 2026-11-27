@@ -9454,7 +9454,7 @@ test "dsv41 grouped prefill heads reach the projection without a span join" {
             var joins: u64 = 0;
             for (core.kernelProfile()) |k| {
                 if (std.mem.indexOf(u8, k.name, "dsv41_attn_fused") != null or std.mem.indexOf(u8, k.name, "dsv41_attn_nax") != null) spans += k.dispatches;
-                if (std.mem.indexOf(u8, k.name, "sushi_concat3") != null) joins += k.dispatches;
+                if (std.mem.indexOf(u8, k.name, "sushi_ops_concat3") != null) joins += k.dispatches;
             }
             try testing.expectEqual(@as(u64, 3), spans);
             try testing.expectEqual(@as(u64, 0), joins);

@@ -108,7 +108,7 @@ fn vqmmColumnChain(a: std.mem.Allocator, m: usize, j: usize) std.mem.Allocator.E
     , .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
 }
 
-fn verifyQmmSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.Error![:0]const u8 {
+pub fn verifyQmmSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.Error![:0]const u8 {
     const nacc = bn * m;
     var body: []const u8 = "";
     // Row activation loads, all up front.
@@ -193,7 +193,7 @@ fn verifyQmmSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.
 /// heavier units — the split-K tiny-tile grid measurably thrashes there
 /// (2.1x stock at M=4), while this tile holds 1.18x off the weight-stream
 /// floor per the source ledger. Full-K per simdgroup, no barrier.
-fn verifyQmmMsgSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.Error![:0]const u8 {
+pub fn verifyQmmMsgSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocator.Error![:0]const u8 {
     const nacc = bn * m;
     var body: []const u8 = "";
     for (0..m) |r| {
@@ -253,7 +253,7 @@ fn verifyQmmMsgSource(a: std.mem.Allocator, m: usize, bn: usize) std.mem.Allocat
 
 /// msg column-tile width per M: 4 columns through M=6, 2 for M=7 (14
 /// accumulators — under the 24 ceiling; covers the depth-6 verify lm_head).
-fn vqmmMsgBn(m: c_int) c_int {
+pub fn vqmmMsgBn(m: c_int) c_int {
     return if (m <= 6) 4 else 2;
 }
 
@@ -659,7 +659,7 @@ fn runVerifyQmmMsg(
     return y;
 }
 
-const VQMM_NAX_HEADER: [:0]const u8 =
+pub const VQMM_NAX_HEADER: [:0]const u8 =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
     \\
 ;
@@ -677,7 +677,7 @@ const VQMM_NAX_HEADER: [:0]const u8 =
 /// the threadgroup. T/GS/KCONST arrive as template args (MLX name-mangles
 /// template values into the host_name, so one kernel object serves every
 /// specialization — the GDN Dk/Dv precedent).
-const VQMM_NAX_SOURCE: [:0]const u8 =
+pub const VQMM_NAX_SOURCE: [:0]const u8 =
     \\using namespace metal;
     \\using namespace mpp::tensor_ops;
     \\

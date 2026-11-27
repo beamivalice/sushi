@@ -2,7 +2,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 // Same subchunk and shuffle reduction as Apple's MLX qmv_wide_impl (MIT).
-const SOURCE =
+pub const SOURCE =
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint kl = lane % 8, r = threadgroup_position_in_grid.y * 8 + sg * 4 + lane / 8;
@@ -97,11 +97,11 @@ pub fn matmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx
 }
 
 // The per-matrix body of SOURCE for one weight row; both projections keep its exact order.
-const ACT_HEADER =
-    \\template <int NV, int M, int K>
-    \\METAL_FUNC void sushi_a4_rows(const device uint32_t* w, const device bfloat16_t* sc, const device bfloat16_t* bi, const device bfloat16_t* x, uint row, uint kl, uint v0, thread float* result) {
+pub const ACT_HEADER =
+    \\template <int NV>
+    \\METAL_FUNC void sushi_a4_rows(const device uint32_t* w, const device bfloat16_t* sc, const device bfloat16_t* bi, const device bfloat16_t* x, uint row, uint kl, uint v0, int M, int K, thread float* result) {
     \\    device const uchar* wr = reinterpret_cast<device const uchar*>(w) + size_t(row) * (K / 2);
-    \\    for (uint g = kl; g < K / 64; g += 8) {
+    \\    for (uint g = kl; g < uint(K / 64); g += 8) {
     \\        float scale = float(sc[size_t(row) * (K / 64) + g]);
     \\        float bias = float(bi[size_t(row) * (K / 64) + g]);
     \\        #pragma unroll
@@ -127,7 +127,7 @@ const ACT_HEADER =
     \\}
 ;
 // Gate and up rows of one output column, then MLX's BF16 sigmoid, gate*sigmoid and *up roundings.
-const ACT_SOURCE =
+pub const ACT_SOURCE =
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint kl = lane % 8, r = threadgroup_position_in_grid.y * 8 + sg * 4 + lane / 8;
@@ -135,8 +135,8 @@ const ACT_SOURCE =
     \\uint row = min(r, uint(N - 1));
     \\float rg[NV] = {0};
     \\float ru[NV] = {0};
-    \\sushi_a4_rows<NV, M, K>(gw, gsc, gbi, x, row, kl, v0, rg);
-    \\sushi_a4_rows<NV, M, K>(uw, usc, ubi, x, row, kl, v0, ru);
+    \\sushi_a4_rows<NV>(gw, gsc, gbi, x, row, kl, v0, M, K, rg);
+    \\sushi_a4_rows<NV>(uw, usc, ubi, x, row, kl, v0, M, K, ru);
     \\for (uint v = 0; v < NV; ++v) {
     \\    rg[v] += simd_shuffle_down(rg[v], 4);
     \\    rg[v] += simd_shuffle_down(rg[v], 2);

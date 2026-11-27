@@ -60,7 +60,7 @@ pub var prefill_dq_gemm_engaged: u64 = 0;
 
 
 // Preserve MLX's affine qmv K reduction while sharing each packed word across a pair.
-const VERIFY_EXPERT_REUSE_SOURCE =
+pub const VERIFY_EXPERT_REUSE_SOURCE =
     \\auto lane = thread_index_in_simdgroup;
     \\auto sg = simdgroup_index_in_threadgroup;
     \\auto tg = threadgroup_position_in_grid;
@@ -175,7 +175,7 @@ pub fn verifyExpertReuse(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, 
 }
 
 // Match the eight bf16 partial sums used by MLX col_reduce_small for top-10.
-const VERIFY_EXPERT_REDUCE_SOURCE =
+pub const VERIFY_EXPERT_REDUCE_SOURCE =
     \\uint p = thread_position_in_grid.x;
     \\uint row = p / 2560;
     \\uint col = p % 2560;
@@ -243,7 +243,7 @@ pub fn verifyExpertReduce(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.m
 }
 
 // MLX affine qmv-fast reduction, with one 3-bit weight read serving two rows.
-const MTP_COARSE_PAIRS_SOURCE =
+pub const MTP_COARSE_PAIRS_SOURCE =
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\auto tg = threadgroup_position_in_grid;
@@ -361,7 +361,7 @@ pub fn mtpCoarsePairs(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc:
 }
 
 // Preserve input order on ties so routing and the inverse permutation stay stable.
-const VERIFY_ROUTE_PACK_SOURCE =
+pub const VERIFY_ROUTE_PACK_SOURCE =
     \\threadgroup uint values[320];
     \\const uint n = uint(ids_shape[0]);
     \\const uint lane = thread_index_in_threadgroup;

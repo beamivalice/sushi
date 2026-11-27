@@ -114,6 +114,12 @@ pub fn build(b: *std.Build) void {
     // release tarball rewires @rpath/libmlxc.dylib to @executable_path.
     exe.headerpad_max_install_names = true;
 
+    const sushi_metallib = addSushiMetallib(b, target, build_options);
+    const install_metallib = b.addInstallFileWithDir(sushi_metallib, .lib, "sushi.metallib");
+    b.getInstallStep().dependOn(&install_metallib.step);
+    const metallib_step = b.step("sushi-metallib", "Compile and install zig-out/lib/sushi.metallib");
+    metallib_step.dependOn(&install_metallib.step);
+
     b.installArtifact(exe);
     b.installArtifact(addSushibar(b, target, optimize, macos_sdk_frameworks));
 
@@ -170,6 +176,7 @@ pub fn build(b: *std.Build) void {
     };
     if (test_log) |path| if (!std.fs.path.isAbsolute(path)) std.debug.panic("-Dtest-log={s} is not an absolute path", .{path});
     const test_build = b.step("test-build", "Compile unit tests without running them");
+    test_build.dependOn(&install_metallib.step);
     const test_step = b.step("test", "Run unit tests");
     // The host root links no MLX: a file in it that reaches MLX fails the link, so this tier can run beside a live server.
     const test_host_step = b.step("test-host", "Run the unit tests that link no MLX");
@@ -221,6 +228,7 @@ pub fn build(b: *std.Build) void {
             if (step.env) |kv| env.append(b.allocator, kv) catch @panic("OOM");
             if (qwen_preprocess_fixture) |fixture| env.append(b.allocator, .{ "QWEN_PREPROCESS_FIXTURE", fixture }) catch @panic("OOM");
             const run = runs.add(domain.compile, step.name, env.items, step.holds_cut orelse domain.domain.cut, step.run_gib orelse domain.domain.run_gib) orelse continue;
+            run.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
             if (qwen_preprocess_fixture) |fixture| {
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
                 run.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
@@ -244,6 +252,7 @@ pub fn build(b: *std.Build) void {
             if (std.mem.eql(u8, exl3_test.name, b.fmt("test-exl3-{s}", .{area.area}))) break area;
         } else unreachable;
         if (runs.add(exl3_test, exl3_test.name, &.{}, area.cut, area.run_gib)) |run_exl3| {
+            run_exl3.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
             test_step.dependOn(&run_exl3.step);
             test_step.dependOn(countGuard(b, count_guard, exl3_test));
         }
@@ -259,6 +268,7 @@ pub fn build(b: *std.Build) void {
     if ((test_model == null or test_model == .enc) and encoderSelected(b, test_filter)) {
         test_build.dependOn(&b.addInstallArtifact(encoder_tests, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
         if (runs.add(encoder_tests, encoder_tests.name, &.{}, false, 7)) |run_encoder| {
+            run_encoder.addFileArg2(sushi_metallib, .{ .prefix = "--env=SUSHI_METALLIB=", .make_absolute = true });
             test_step.dependOn(&run_encoder.step);
             test_step.dependOn(countGuard(b, count_guard, encoder_tests));
         }
@@ -283,10 +293,11 @@ pub fn build(b: *std.Build) void {
 
     guardBenchFiles(b, build_roots);
     const ubench_step = b.step("ubench", "Build zig-out/bin/sushi-ubench (always ReleaseFast): the microbenches, which no test step builds");
+    ubench_step.dependOn(&install_metallib.step);
     ubench_step.dependOn(&b.addInstallArtifact(addUbench(b, build_options, target, macos_sdk_frameworks), .{}).step);
 
     const host_check_step = b.step("exl3-host-check", "Compile the sushi_exl3 module and its tests against the minimal host root src/exl3/host_min.zig (nothing links or runs)");
-    for (addExl3HostCheck(b, target)) |check| host_check_step.dependOn(&check.step);
+    for (addExl3HostCheck(b, target, build_options)) |check| host_check_step.dependOn(&check.step);
 
     addArchSlice(b, target, optimize, build_options);
 }
@@ -859,6 +870,8 @@ fn addTestDomains(b: *std.Build, root: *std.Build.Module, model: ?TestModel, use
             if (runs_one) planned.append(b.allocator, .{ .domain = di, .step = .{ .name = s.name, .select = select.items, .env = s.env orelse d.env, .holds_cut = s.holds_cut }, .again = s.again }) catch @panic("OOM");
         }
         for (alone_tests) |t| {
+            const folder = testFolder(t.file);
+            if (folder.len > 0 and std.meta.isError(buildRootHandle(b).access(b.graph.io, b.fmt("src/{s}", .{folder}), .{}))) continue;
             const f = for (files) |f| {
                 if (!f.host and std.mem.eql(u8, f.path, t.file)) break f;
             } else std.debug.panic("alone_tests names src/{s}.zig, which holds no MLX test", .{t.file});
@@ -1243,8 +1256,13 @@ fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.Resol
 /// `sushi_exl3` compiled against `src/exl3/host_min.zig`, whose `mlx`, `log` and `io_util` are sushi's own files. A
 /// module that reaches any other host name fails here instead of in a host that lacks it. Two objects: the module's
 /// own tests, and host_min's walk over the module's public declarations.
-fn addExl3HostCheck(b: *std.Build, target: std.Build.ResolvedTarget) [2]*std.Build.Step.Compile {
-    const files = b.createModule(.{ .root_source_file = b.path("src/arch_host_stub.zig"), .target = target, .optimize = .Debug });
+fn addExl3HostCheck(b: *std.Build, target: std.Build.ResolvedTarget, build_options: *std.Build.Step.Options) [2]*std.Build.Step.Compile {
+    const files = b.createModule(.{
+        .root_source_file = b.path("src/arch_host_stub.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
+    });
     const host = b.createModule(.{
         .root_source_file = b.path("src/exl3/host_min.zig"),
         .target = target,
@@ -1436,12 +1454,187 @@ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/mlx/lib" });
 }
 
-/// Fail before linking if the local MLX stage is missing.
+/// Compile Sushi Cooler's Metal library (`sushi.metallib`) from our lean MLX stock
+/// instantiation files under `src/tensor/metallib/`, the small whole-file MLX
+/// kernels in `lib/mlx-src`, and the generated Sushi Cooler kernel units emitted by
+/// `src/metallib_gen_main.zig`. Stock MLX units use MLX's exact `-fno-fast-math`
+/// flags; generated custom units use `-fmetal-math-mode=safe` so their math mode
+/// and FP32 transcendental functions match `MTLCompileOptions.mathMode = Safe`
+/// (used by MLX's `fast::metal_kernel`) byte for byte.
+fn addSushiMetallib(b: *std.Build, target: std.Build.ResolvedTarget, build_options: *std.Build.Step.Options) std.Build.LazyPath {
+    const metal_flags = [_][]const u8{
+        "xcrun",
+        "-sdk",
+        "macosx",
+        "metal",
+        "-x",
+        "metal",
+        "-Wall",
+        "-Wextra",
+        "-fno-fast-math",
+        "-Wno-c++17-extensions",
+        "-Wno-c++20-extensions",
+        "-Wmetal-addr-spaces",
+        "-mmacosx-version-min=26.2",
+    };
+    const custom_metal_flags = [_][]const u8{
+        "xcrun",
+        "-sdk",
+        "macosx",
+        "metal",
+        "-x",
+        "metal",
+        "-Wall",
+        "-Wextra",
+        "-fmetal-math-mode=safe",
+        "-Wno-c++17-extensions",
+        "-Wno-c++20-extensions",
+        "-Wmetal-addr-spaces",
+        "-mmacosx-version-min=26.2",
+    };
+    const mlx_whole_files = [_][]const u8{
+        "arg_reduce",
+        "conv",
+        "dot",
+        "gather_mm_offsets",
+        "layer_norm",
+        "logsumexp",
+        "random",
+        "rms_norm",
+        "rope",
+        "softmax",
+    };
+    const sushi_units = [_][]const u8{
+        "unary",
+        "binary",
+        "reduce",
+        "scan",
+        "sort",
+        "steel_conv",
+        "gemv",
+        "steel_gemm_fused",
+        "steel_gemm_fused_nax",
+        "steel_gemm_splitk",
+        "steel_gemm_splitk_nax",
+        "steel_gemm_gather",
+        "sdpa_vector",
+        "steel_attention",
+        "steel_attention_nax",
+        "quantized",
+        "quantized_nax",
+        "fp_quantized",
+        "fp_quantized_nax",
+    };
+    var gen_units: std.ArrayList([]const u8) = .empty;
+    gen_units.appendSlice(b.allocator, &.{
+        "ops_copy_cast",
+        "ops_elem",
+        "ops_gather",
+        "ops_misc",
+        "shared_simd",
+        "shared_nax",
+        "exl3_simd",
+        "exl3_rows_simd",
+        "exl3_rg_simd",
+        "exl3_fz_simd",
+        "exl3_gemm_nax",
+        "exl3_rows_nax",
+        "exl3_fz_nax",
+    }) catch @panic("OOM");
+    for (srcFolders(b)) |folder| {
+        if (built_archs.len > 0) {
+            var included = false;
+            for (built_archs) |a| included = included or std.mem.eql(u8, a, folder);
+            if (!included) continue;
+        }
+        const mpath = b.fmt("src/{s}/metallib.zig", .{folder});
+        buildRootHandle(b).access(b.graph.io, mpath, .{}) catch continue;
+        gen_units.append(b.allocator, b.fmt("arch_{s}_simd", .{folder})) catch @panic("OOM");
+        gen_units.append(b.allocator, b.fmt("arch_{s}_nax", .{folder})) catch @panic("OOM");
+    }
+
+    const exl3_host_stub = b.createModule(.{
+        .root_source_file = b.path("src/metallib_exl3_host.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const exl3_gen_mod = b.createModule(.{
+        .root_source_file = b.path("src/exl3/root.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .imports = &.{.{ .name = "mlx_host", .module = exl3_host_stub }},
+    });
+    const gen_exe = b.addExecutable(.{
+        .name = "gen-metallib",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/metallib_gen_main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "build_options", .module = build_options.createModule() },
+                .{ .name = "sushi_exl3", .module = exl3_gen_mod },
+            },
+        }),
+    });
+    const gen_run = b.addRunArtifact(gen_exe);
+    gen_run.setName("generate sushi.metallib sources");
+
+    const link = b.addSystemCommand(&.{ "xcrun", "-sdk", "macosx", "metal", "-mmacosx-version-min=26.2" });
+    link.setName("metal link sushi.metallib");
+
+    for (gen_units.items) |unit| {
+        gen_run.addArg(unit);
+        const metal_src = gen_run.addOutputFileArg2(b.fmt("sushi_{s}.metal", .{unit}), .{});
+        const compile = b.addSystemCommand(&custom_metal_flags);
+        compile.setName(b.fmt("metal sushi_{s}.metal", .{unit}));
+        if (!std.mem.startsWith(u8, unit, "ops_")) {
+            compile.addArgs(&.{ "-Wno-unused-parameter", "-Wno-unused-variable", "-Wno-sign-compare", "-Wno-unused-function", "-Wno-unused-but-set-variable", "-Wno-unused-but-set-parameter", "-Wno-sometimes-uninitialized" });
+        }
+        compile.addArg("-c");
+        compile.addFileArg2(metal_src, .{});
+        compile.addArg("-o");
+        const air = compile.addOutputFileArg2(b.fmt("sushi_gen_{s}.air", .{unit}), .{});
+        link.addFileArg2(air, .{});
+    }
+
+    for (mlx_whole_files) |stem| {
+        const compile = b.addSystemCommand(&metal_flags);
+        compile.setName(b.fmt("metal mlx/{s}.metal", .{stem}));
+        compile.addArg("-MMD");
+        compile.addArg("-MF");
+        _ = compile.addDepFileOutputArg2(b.fmt("mlx_{s}.d", .{stem}), .{});
+        compile.addArg("-c");
+        compile.addFileArg2(b.path(b.fmt("lib/mlx-src/mlx/backend/metal/kernels/{s}.metal", .{stem})), .{});
+        compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
+        compile.addArg("-o");
+        const air = compile.addOutputFileArg2(b.fmt("mlx_{s}.air", .{stem}), .{});
+        link.addFileArg2(air, .{});
+    }
+    for (sushi_units) |stem| {
+        const compile = b.addSystemCommand(&metal_flags);
+        compile.setName(b.fmt("metal {s}.metal", .{stem}));
+        compile.addArg("-MMD");
+        compile.addArg("-MF");
+        _ = compile.addDepFileOutputArg2(b.fmt("sushi_{s}.d", .{stem}), .{});
+        compile.addArg("-c");
+        compile.addFileArg2(b.path(b.fmt("src/tensor/metallib/{s}.metal", .{stem})), .{});
+        compile.addDirectoryArg2(b.path("lib/mlx-src"), .{ .prefix = "-I" });
+        compile.addArg("-o");
+        const air = compile.addOutputFileArg2(b.fmt("sushi_{s}.air", .{stem}), .{});
+        link.addFileArg2(air, .{});
+    }
+
+    link.addArg("-o");
+    return link.addOutputFileArg2("sushi.metallib", .{});
+}
+
+/// Fail before linking if the local MLX stage or kernel headers are missing.
 fn verifyMlxStage(b: *std.Build) void {
     const stage_ok = blk: {
         buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlxc.dylib", .{}) catch break :blk false;
         buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/mlx.metallib", .{}) catch break :blk false;
         buildRootHandle(b).access(b.graph.io, "lib/mlx/.version", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx-src/mlx/backend/metal/kernels/utils.h", .{}) catch break :blk false;
         break :blk true;
     };
     if (!stage_ok) {

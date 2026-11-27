@@ -40,17 +40,14 @@ pub fn drain(s: mlx.mlx_stream) Error!void {
     try mlx.check(mlx.mlx_synchronize(s));
 }
 
-const scale_source =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\[[kernel]] void sushi_boundary_scale(
-    \\  const device float* x [[buffer(0)]],
-    \\  device float* out [[buffer(1)]],
-    \\  const constant float& scale [[buffer(2)]],
-    \\  uint3 at [[thread_position_in_grid]]) {
-    \\  out[at.x] = x[at.x] * scale;
-    \\}
-;
+const test_scale_fn = "sushi_k_sushi_test_scale_f32__f32_f32s__f32";
+
+fn loadTestScale(dev: *const metal.Device) !metal.Pipeline {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = @import("metallib_path.zig").forThisProcess(&buf) catch return error.MetalUnavailable;
+    const lib = try dev.load(path);
+    return dev.pipelineOf(lib, test_scale_fn);
+}
 
 /// `0, 1, .. n-1` as float32, computed by MLX on the GPU into memory MLX allocates.
 fn mlxRamp(n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -67,7 +64,7 @@ test "a pass of ours reads an array MLX allocated and computed, whatever its siz
     const dev = try metal.device();
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
-    const state = try dev.compile(scale_source, "sushi_boundary_scale");
+    const state = try loadTestScale(dev);
     defer state.release();
 
     // Under a page, a page and a bit, and many pages: MLX places these differently.
@@ -76,14 +73,14 @@ test "a pass of ours reads an array MLX allocated and computed, whatever its siz
         defer _ = mlx.mlx_array_free(ramp);
         try drain(s);
         const x = try bufferOf(ramp);
-            const out = try dev.alloc(n * 4);
+        const out = try dev.alloc(n * 4);
         defer out.release();
 
         const pass = dev.begin();
         pass.pipeline(state);
         pass.buffer(x.buffer, x.offset, 0);
-        pass.buffer(out, 0, 1);
-        pass.constant(@as(f32, 3), 2);
+        pass.constant(@as(f32, 3), 1);
+        pass.buffer(out, 0, 2);
         pass.dispatch(.{ .x = n }, .{ .x = @min(n, 64) });
         try pass.commit().wait();
         const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, out.bytes()[0 .. n * 4]));
@@ -97,7 +94,7 @@ test "what a pass of ours writes into an MLX array is what MLX then computes on"
     const dev = try metal.device();
     const s = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(s);
-    const state = try dev.compile(scale_source, "sushi_boundary_scale");
+    const state = try loadTestScale(dev);
     defer state.release();
 
     const n = 50_000;
@@ -110,8 +107,8 @@ test "what a pass of ours writes into an MLX array is what MLX then computes on"
     const pass = dev.begin();
     pass.pipeline(state);
     pass.buffer(x.buffer, x.offset, 0);
-    pass.buffer(x.buffer, x.offset, 1);
-    pass.constant(@as(f32, 2), 2);
+    pass.constant(@as(f32, 2), 1);
+    pass.buffer(x.buffer, x.offset, 2);
     pass.dispatch(.{ .x = n }, .{ .x = 64 });
     try pass.commit().wait();
 

@@ -24,15 +24,15 @@ const DOWN_STAGE_BUDGET_BYTES: c_int = 8192;
 pub var down_slot_groups: c_int = 0;
 pub var down_stage_activation: bool = true;
 
-const GATEUP_SOURCE: [:0]const u8 =
+pub const GATEUP_SOURCE: [:0]const u8 =
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint tile = threadgroup_position_in_grid.x;
     \\uint pair = threadgroup_position_in_grid.z;
     \\
-    \\constexpr uint ROWS = 32u / uint(LPR);
-    \\constexpr uint KV = uint(KDIM) / 8u;
-    \\constexpr int IT = int((KV + uint(LPR) - 1u) / uint(LPR));
+    \\const uint ROWS = 32u / uint(LPR);
+    \\const uint KV = uint(KDIM) / 8u;
+    \\const int IT = int((KV + uint(LPR) - 1u) / uint(LPR));
     \\
     \\uint sub = lane % uint(LPR);
     \\uint rl = lane / uint(LPR);
@@ -44,7 +44,7 @@ const GATEUP_SOURCE: [:0]const u8 =
     \\const device uint4* gp = (const device uint4*)(slab + gbase);
     \\const device uint4* pp = (const device uint4*)(slab + gbase + (size_t)NDIM * (size_t)KDIM);
     \\const device uint4* xp = (const device uint4*)(x + (size_t)r * (size_t)KDIM);
-    \\constexpr uint RSTRIDE = uint(KDIM) / 8u;
+    \\const uint RSTRIDE = uint(KDIM) / 8u;
     \\
     \\float4 gl[NPT], gh[NPT], ul[NPT], uh[NPT];
     \\#pragma clang loop unroll(full)
@@ -83,20 +83,20 @@ const GATEUP_SOURCE: [:0]const u8 =
     \\}
 ;
 
-const DOWNRED_SOURCE: [:0]const u8 =
-    \\threadgroup float partial[TOPK * (32 / LPR) * NPT];
-    \\threadgroup uint4 hstage[STAGE ? SSG * (KDIM / 8) : 1];
+pub const DOWNRED_SOURCE: [:0]const u8 =
+    \\threadgroup float partial[1024];
+    \\threadgroup uint4 hstage[STAGE ? 512 : 1];
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint tile = threadgroup_position_in_grid.x;
     \\uint r = threadgroup_position_in_grid.z;
     \\
-    \\constexpr uint ROWS = 32u / uint(LPR);
-    \\constexpr uint BLK = ROWS * uint(NPT);
-    \\constexpr uint KV = uint(KDIM) / 8u;
-    \\constexpr int IT = int((KV + uint(LPR) - 1u) / uint(LPR));
-    \\constexpr uint SPS = uint(TOPK) / uint(SSG);
-    \\constexpr uint RSTRIDE = uint(KDIM) / 8u;
+    \\const uint ROWS = 32u / uint(LPR);
+    \\const uint BLK = ROWS * uint(NPT);
+    \\const uint KV = uint(KDIM) / 8u;
+    \\const int IT = int((KV + uint(LPR) - 1u) / uint(LPR));
+    \\const uint SPS = uint(TOPK) / uint(SSG);
+    \\const uint RSTRIDE = uint(KDIM) / 8u;
     \\
     \\uint sub = lane % uint(LPR);
     \\uint rl = lane / uint(LPR);

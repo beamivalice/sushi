@@ -52,7 +52,7 @@ pub fn settle(vocab: usize, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !void {
 }
 
 // `sushi_draw_mix` is lowbias32, ported from hash-prospector (public domain): NOTICE.
-const HEADER =
+pub const HEADER =
     \\static inline uint sushi_draw_key(float x) {
     \\  const uint u = as_type<uint>(x);
     \\  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
@@ -93,12 +93,12 @@ const HEADER =
 /// - the descents, when the shortlist would not fit: a level (the top-k's last key, the nucleus's last key) is found
 ///   five key bits a round, every thread binning its ids of the live bucket.
 /// A barrier follows every shared write and every shared read.
-const SOURCE =
+pub const SOURCE =
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint row = threadgroup_position_in_grid.x;
     \\constexpr uint NSG = uint(TG) / 32u;
-    \\constexpr uint STRIPE = (uint(V) + uint(TG) - 1u) / uint(TG);
+    \\const uint STRIPE = (uint(V) + uint(TG) - 1u) / uint(TG);
     \\const uint i0 = (sg * 32u + lane) * STRIPE;
     \\const uint n = i0 < uint(V) ? metal::min(STRIPE, uint(V) - i0) : 0u;
     \\const device T* x = logits + size_t(row) * V + i0;

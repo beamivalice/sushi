@@ -1,5 +1,5 @@
 //! MLX's dense gathered product on the engine: `gather_mm` (mlx/ops.cpp) and `GatherMM::eval_gpu` with `gather_mv`,
-//! `gather_mm_wide` and `gather_mm` (mlx/backend/metal/matmul.cpp) over the compiled kernels of `mlx.metallib`, so a
+//! `gather_mm_wide` and `gather_mm` (mlx/backend/metal/matmul.cpp) over the compiled kernels of `sushi.metallib`, so a
 //! product here writes the bytes it writes under MLX. Ported from MLX's Metal backend (MIT, see NOTICE). Refused by name,
 //! each with its reason (`core.refusing`), and reached by no caller: the sorted kernels of a one-row product
 //! (`gather_mm_rhs`), operands of two dtypes (MLX's promotion), any but a float dtype, a 1-D operand, an empty one, and

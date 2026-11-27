@@ -155,7 +155,7 @@ pub fn qsaBatchedGatherFloor(seq_len: c_int, quantized: bool) c_int {
 /// RATIO tokens each, INT_MAX past the row's count) followed by its own
 /// incomplete tail — O(budget) per token, never O(kv). Fragment math,
 /// staging and online softmax mirror sushi_attn_p256.
-const ATTN_QSA256_KERNEL_SOURCE =
+pub const ATTN_QSA256_KERNEL_SOURCE =
     \\constexpr int BD = 256;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = BD + 8;
@@ -634,7 +634,7 @@ fn getQsaNaxKernel() !mlx.mlx_fast_metal_kernel {
 
 /// Prepended to a gather kernel's header to build its packed-cache variant: each staged row
 /// chunk of 8 is dequantized from the cache's affine words (the qsaSparseAttn arithmetic).
-const QSA_PACKED_HEADER = "#define QSA_PACKED 1\n" ++ KV_UNPACK_HEADER ++
+pub const QSA_PACKED_HEADER = "#define QSA_PACKED 1\n" ++ KV_UNPACK_HEADER ++
     \\template <typename T, int BITS, int GS>
     \\inline uint4 sushi_qsa_unpack8(const device uint32_t* wq, const device T* sc, const device T* bi, int c8) {
     \\  const int g = (c8 * 8) / GS;

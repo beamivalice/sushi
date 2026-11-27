@@ -21,8 +21,8 @@
 # this gate; one a stopped gate left is removed, and the gate says so.
 # Every zig build keeps its local cache in <gate dir>/zig-cache, so a fresh worktree is not a cold build; after a
 # toolchain or SDK change remove it (configure-time output is cached).
-# The worktree borrows this checkout's .zig-toolchain and lib/mlx (symlinks). SUSHI_GATE_PYTHON names the python3
-# the hermetic guards run with (default: python3 on PATH); it must have PyYAML, since the guards fail on its skip.
+# The worktree borrows this checkout's .zig-toolchain, lib/mlx, and lib/mlx-src/mlx (symlinks). SUSHI_GATE_PYTHON names
+# the python3 the hermetic guards run with (default: python3 on PATH); it must have PyYAML, since the guards fail on its skip.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -118,6 +118,12 @@ echo $$ > "$WT_PID"
 git -C "$ROOT" worktree add --quiet --detach "$WT" "$SHA"
 ln -s "$(cd "$ROOT/.zig-toolchain" && pwd -P)" "$WT/.zig-toolchain"
 ln -s "$(cd "$ROOT/lib/mlx" && pwd -P)" "$WT/lib/mlx"
+if [ -d "$WT/lib/mlx-src" ] && [ -z "$(ls -A "$WT/lib/mlx-src" 2> /dev/null)" ]; then
+  [ -d "$ROOT/lib/mlx-src/mlx" ] \
+    || die "refused: $ROOT/lib/mlx-src/mlx is missing; the gate's worktree borrows it to build sushi.metallib"
+  # Keep $WT/lib/mlx-src a real directory: replacing a submodule path with a symlink breaks `git status` (exit 128).
+  ln -s "$(cd "$ROOT/lib/mlx-src/mlx" && pwd -P)" "$WT/lib/mlx-src/mlx"
+fi
 cd "$WT"
 
 [ -f tests/lib/fixture_envs.sh ] || die "refused: $SHA has no tests/lib/fixture_envs.sh"

@@ -71,7 +71,7 @@ pub fn codebookHelpers(comptime cb: exl3.Codebook, comptime win: exl3.Window) [:
     return decodeHelpers(cb, win, foldScale(cb));
 }
 
-const HELPERS_TAIL: [:0]const u8 =
+pub const HELPERS_TAIL: [:0]const u8 =
     \\// Eight weights span N/2 whole bits, so weight j of an eight-weight group
     \\// ends exl3_end(N, j) bits past the group's first bit.
     \\static inline constexpr uint exl3_end(uint N, uint j) { return ((j + 1u) * N) >> 4u; }

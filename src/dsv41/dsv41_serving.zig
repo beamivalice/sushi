@@ -44,11 +44,6 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     // on MLX's stream would take one as a second buffer over its pages. The engine's hold, budget and seal are the
     // shared load scope's (`arch_cooler.LoadScope`).
     const model_stream = if (own_decode) mlx.engine.stream() else s;
-    if (own_decode) {
-        const dsv41 = &config.dsv41.?;
-        if (dsv41.expert_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
-        if (dsv41.trunk_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, .pack, model_stream);
-    }
     // What this function makes is its own until the shell takes it, and the shell's from then on: one owner at a time.
     var engine_mine: ?*expert_stream_mod.Engine = try Trunk.newExpertEngine(allocator, &config, model_stream);
     errdefer if (engine_mine) |e| {
@@ -63,6 +58,13 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     else
         beginPipelines(allocator, &config, engine, own_decode);
     defer plan.deinit();
+    // Settle the manifest before `prepareGemmNax` and `dsv41_model.init` so a warm load preloads their pipelines.
+    const settled = if (skip_warm) false else plan.settle();
+    if (own_decode) {
+        const dsv41 = &config.dsv41.?;
+        if (dsv41.expert_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, if (config.expert_tile_order == .pair_major) .tile_major else .pack, model_stream);
+        if (dsv41.trunk_dec) |dec| try expert_exl3_kernels.prepareGemmNax(dec, .pack, model_stream);
+    }
     // The pools a route makes follow the plan this load runs under, whatever the config said before it.
     var own_cfg = config.dsv41.?;
     own_cfg.spill_pools = !engine.plan.resident;
@@ -125,7 +127,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const had_error = mlx.errorPending();
     const warm_t0 = load_clock.now();
     const made_before = mlx.engine.pipelinesMade();
-    const scope = warmScopeOf(plan.settle());
+    const scope = warmScopeOf(settled);
     if (warmAll(&shell, mdl, shell.arch_state.dsv41.stq_experts, scope)) {
         log.info("[dsv41] kernels warmed for 1..{d} rows{s}{s} in {d} ms\n", .{ expert_exl3_kernels.DECODE_ROWS_MAX, if (mdl.dspark != null) " and the DSpark rounds" else "", if (scope == .mlx) " (the engine's from the manifest)" else "", clock.lap() / std.time.ns_per_ms });
         if (scope == .all and own_decode) plan.store();

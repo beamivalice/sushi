@@ -24,7 +24,7 @@ pub fn launchBlocks(n: usize) usize {
 
 /// `hadamard128` down a column: each output `c` the sum over `k` ascending of `had[k][c] · v[k]`, one product then
 /// one add a term. Thread (c, o, ch) writes block `o / 128`'s row `ch · 128 + c` at column `o % 128`.
-const COLS_SOURCE =
+pub const COLS_SOURCE =
     \\#pragma clang fp contract(off)
     \\const uint c = thread_position_in_grid.x, o = thread_position_in_grid.y, ch = thread_position_in_grid.z;
     \\const device half *col = d + (size_t)o * uint(DIM) + ch * 128u;
@@ -34,7 +34,7 @@ const COLS_SOURCE =
 ;
 
 /// `hadamard128` along a row at the token's column, then the row's `suh` times the column's `svh`.
-const ROWS_SOURCE =
+pub const ROWS_SOURCE =
     \\#pragma clang fp contract(off)
     \\const uint i = thread_position_in_grid.x, t = thread_position_in_grid.y;
     \\if (i >= uint(DIM)) return;

@@ -26,7 +26,7 @@ Two arms that trade speed, memory or exactness, or a policy a user may want to m
 | `SUSHI_QSA_SCORE_SHEET_MB` | `qwen4_qsa_attn.zig:1214` | QSA block-score sheet budget in MB (default 256); the memory bill reads it too, and a moved value is logged | once | no |
 | `SUSHI_ROUND_COST_PERSIST` | `round_cost.zig:759` | `1` persists the measured MTP round-cost table across boots (default off) | once | yes: engine-mtp, mimo2-perf, qwen4-perf, ... |
 
-## Diagnostics (68)
+## Diagnostics (69)
 
 Log, trace or dump output, off by default, and the knobs a correctness test needs (the test is named in the row).
 
@@ -36,6 +36,7 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `QWEN4_DEBUG_SCORES` | `qwen4_qsa.zig:1334, 1383` | prints QSA pooled shapes and score rows | once | no |
 | `QWEN4_DUMP_QSA_BLOCKS` | `qwen4_qsa.zig:627` | `<path>` dumps the selected QSA block indices | once | no |
 | `QWEN4_FIXTURE_ROWS` | `qwen4_fixture_test.zig` | prints per-row cos/margin in the Qwen4 fixture test | test | no |
+| `SUSHI_METALLIB` | `metallib_path.zig` (`forThisProcess`) | unset: `sushi.metallib` beside the binary (`lib/`, `../lib/`, flat); a path loads that file instead. The build's test steps set it to `zig-out/lib/sushi.metallib` | per load | yes: engine-own-forward |
 | `SUSHI_TEST_NO_GPU` | `mlx.zig` (`testNoGpuEnv`) | a test build sees no Metal backend, so `requireGpu` tests skip | test | yes: testsuite |
 | `SUSHI_TEST_LOG` | `scripts/test_runner.zig` (`main`) | `<abs path>` (`-Dtest-log` sets it): every test appends `<UTC>\t<step>\t<PASS\|SKIP\|FAIL>\t<ms>\t<name>`, its at-rest check included, and each process a `DONE` line with its totals; prints nothing; a relative path panics | test | yes: testsuite |
 | `SUSHI_TEST_STEP` | `scripts/test_runner.zig` (`main`) | the run step's name, which the log lines and a refusal carry (the build passes it on every test run step as `--env=`; the runner refuses a different value set at the invocation); `SUSHI_TEST_LOG` without it panics | test | yes: testsuite |

@@ -12,7 +12,7 @@ const max_heads = 32;
 const max_streams = 8;
 
 /// MLX's Sigmoid and Maximum functors on a float (`unary_ops.h`, `binary_ops.h`; the engine's `sushi_*`).
-const header: [:0]const u8 =
+pub const header: [:0]const u8 =
     \\inline float hy4_sigmoid(float x) {
     \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
     \\  return (x < 0) ? y : 1 - y;
@@ -24,14 +24,14 @@ const header: [:0]const u8 =
 ;
 
 /// The head norms' body after `HEAD_W` (the head's weight pointer) is chosen: `hy4_norm`'s single-row norm.
-const heads_body =
+pub const heads_body =
     \\constexpr int N_READS = 4;
     \\constexpr int SIMD_SIZE = 32;
     \\uint gid = threadgroup_position_in_grid.x;
     \\uint lid = thread_position_in_threadgroup.x;
     \\uint simd_lane_id = thread_index_in_simdgroup;
     \\uint simd_group_id = simdgroup_index_in_threadgroup;
-    \\constexpr uint axis_size = uint(D);
+    \\const uint axis_size = uint(D);
     \\uint t = gid / uint(NH);
     \\uint j = gid % uint(NH);
     \\threadgroup float local_inv_mean[1];
@@ -70,7 +70,7 @@ const heads_body =
 ;
 
 /// `v = lin + b` (the bias widened) and `v · v`.
-const value_source: [:0]const u8 =
+pub const value_source: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\uint i = thread_position_in_grid.x;
     \\uint t = thread_position_in_grid.y;
@@ -82,7 +82,7 @@ const value_source: [:0]const u8 =
 
 /// The delta's body (no contraction) after the stream's sum and scale pointers (`ds`, `sc`) are chosen: `INV_N` is
 /// `1 / D` as the mean takes it (in f64, stored f32), `INV_SQRT_D` the f32 `1 / √D`, both f32 bits.
-const delta_body =
+pub const delta_body =
     \\uint i = thread_position_in_grid.x;
     \\uint c = thread_position_in_grid.y;
     \\uint t = thread_position_in_grid.z;

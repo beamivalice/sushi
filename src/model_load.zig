@@ -2565,6 +2565,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
+    // Open and settle the pipeline manifest before weights/trunk/vision init so a warm load preloads
+    // every setup kernel (`prepareGemmNax`, `sushi_cast`, vision tower) with zero live compiles.
+    var pipelines = if (params.warmup_eager) beginPipelines(sch.io, sch.allocator, params.config) else null;
+    defer if (pipelines) |*p| p.deinit();
+
     // Weights — first mlx call. Binds the stream on this thread.
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
@@ -2999,8 +3004,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
     }
 
-    var pipelines = if (params.warmup_eager) beginPipelines(sch.io, sch.allocator, params.config) else null;
-    defer if (pipelines) |*p| p.deinit();
     // With its weights and expert cache resident, a load on the ledger reads its budget, once, and fixes its chunk and
     // its arena in it.
     try openLedger(params.config, xfm_ptr, engine_before, params.warmup_eager, if (pipelines) |*p| p.shapeCache() else null);

@@ -279,7 +279,9 @@ const o_norm =
     \\  for (uint blk = sg; blk < NB; blk += uint(TG) / 32u) {
     \\    const uint b = blk * 128u + lane;
     \\    float4 v = 0.0f;
+    \\#ifndef SUSHI_METALLIB
     \\    #pragma clang loop unroll(full)
+    \\#endif
     \\    for (uint s = 0u; s < uint(OSPLIT); s++) {
     \\      const device float *p = op + ((size_t)l * uint(OSPLIT) + s) * uint(D) + b;
     \\      v += float4(p[0], p[32], p[64], p[96]);
@@ -366,6 +368,28 @@ pub const Form = enum { plain, expand, back, back_inner, expand_norm, expand_par
 
 var kernels: [2][7]?mlx.mlx_fast_metal_kernel = @splat(@splat(null));
 
+/// The Metal body for `(form, wide)`. Shared between `kernel` and `metallib.zig`.
+pub fn kernelSource(comptime f: Form, comptime w: bool) [:0]const u8 {
+    const stream = switch (f) {
+        .plain => "#define STREAM(o, k) float(x[o])\n#define STORE_M (void)0\n",
+        .expand => "#define STREAM(o, k) (pin[l * HC + (k) / D] * float(y[size_t(l) * D + (k) % D]) + float(x[o]))\n#define STORE_M m[o] = v\n",
+        .back, .back_inner, .expand_norm, .expand_parts, .expand_rows => "#define STREAM(o, k) (pin[l * HC + (k) / D] * t_y[(k) % D] + float(x[o]))\n#define STORE_M m[o] = v\n",
+    };
+    const first = switch (f) {
+        .plain, .expand => "",
+        .back => back_norm,
+        .back_inner => back_inner_norm,
+        .expand_norm => comptime backNorm(false),
+        .expand_parts => o_norm,
+        .expand_rows => o_rows_norm,
+    };
+    // Where the collapse reads its stream values and norm weight: the wide launch's prefetch, else the inputs.
+    const sums = if (w) "#define SV(j, i, d) sv[(j) * DT + (i)]\n#define WV(i, d) wv[i]\n" ++ wide_sums else "#define SV(j, i, d) ((D % TG == 0) ? sv[(j) * DT + (i)] : STREAM((size_t(l) * HC + (j)) * D + (d), (j) * D + (d)))\n#define WV(i, d) w[d]\n" ++ mix_sums;
+    // A wide grid's padding row (`build`) returns before it reads.
+    const gate = if (w) "if (l >= x_shape[0]) return;\n" else "";
+    return stream ++ head ++ gate ++ first ++ "{\n#pragma clang fp contract(off)\n" ++ sums ++ mix_tail ++ "}\n";
+}
+
 /// The form's kernel: one threadgroup a row, or `wide`, `2·HC` threadgroups a row that count into the counter page.
 fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
     const slot = &kernels[@intFromBool(wide)][@backingInt(form)];
@@ -394,24 +418,7 @@ fn kernel(form: Form, wide: bool) !mlx.mlx_fast_metal_kernel {
     const k = switch (wide) {
         inline else => |w| switch (form) {
             inline else => |f| blk: {
-                const stream = switch (f) {
-                    .plain => "#define STREAM(o, k) float(x[o])\n#define STORE_M (void)0\n",
-                    .expand => "#define STREAM(o, k) (pin[l * HC + (k) / D] * float(y[size_t(l) * D + (k) % D]) + float(x[o]))\n#define STORE_M m[o] = v\n",
-                    .back, .back_inner, .expand_norm, .expand_parts, .expand_rows => "#define STREAM(o, k) (pin[l * HC + (k) / D] * t_y[(k) % D] + float(x[o]))\n#define STORE_M m[o] = v\n",
-                };
-                const first = switch (f) {
-                    .plain, .expand => "",
-                    .back => back_norm,
-                    .back_inner => back_inner_norm,
-                    .expand_norm => comptime backNorm(false),
-                    .expand_parts => o_norm,
-                    .expand_rows => o_rows_norm,
-                };
-                // Where the collapse reads its stream values and norm weight: the wide launch's prefetch, else the inputs.
-                const sums = if (w) "#define SV(j, i, d) sv[(j) * DT + (i)]\n#define WV(i, d) wv[i]\n" ++ wide_sums else "#define SV(j, i, d) ((D % TG == 0) ? sv[(j) * DT + (i)] : STREAM((size_t(l) * HC + (j)) * D + (d), (j) * D + (d)))\n#define WV(i, d) w[d]\n" ++ mix_sums;
-                // A wide grid's padding row (`build`) returns before it reads.
-                const gate = if (w) "if (l >= x_shape[0]) return;\n" else "";
-                const src = stream ++ head ++ gate ++ first ++ "{\n#pragma clang fp contract(off)\n" ++ sums ++ mix_tail ++ "}\n";
+                const src = comptime kernelSource(f, w);
                 const name = switch (f) {
                     .plain => "sushi_hy4_hc_mix_norm",
                     .expand => "sushi_hy4_hc_mix_expand_norm",

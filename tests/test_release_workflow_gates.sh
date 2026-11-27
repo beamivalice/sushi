@@ -161,9 +161,10 @@ with tempfile.TemporaryDirectory() as d:
 # and for months they did not: the packaging path shipped the binary alone.
 for f in ("LICENSE-APACHE-2.0", "NOTICE"):
     check(f in wf_text, f"release.yml packages {f} into the CLI tarball")
-# ── sushibar ships beside sushi: copied, signed with the same identity (so the notarized zip covers it), verified.
+# ── sushibar and sushi.metallib ship beside sushi: copied, signed (for binaries) with the same identity, verified.
 _pkg = str(steps.get("Package CLI binary", {}).get("run", ""))
 check(any(l.startswith("cp ") and "sushibar" in l for l in _pkg.splitlines()), "release.yml packages sushibar into the CLI tarball")
+check(any("sushi.metallib" in l and "$STAGING/lib/" in l for l in _pkg.splitlines()), "release.yml packages sushi.metallib into the CLI tarball")
 check('--sign "$SIGNING_IDENTITY" "$STAGING/sushibar"' in _pkg, "release.yml signs sushibar like sushi")
 check('--verbose=2 "$STAGING/sushibar"' in _pkg, "release.yml verifies sushibar's signature")
 # ── A host that pins a release as its guest engine checks the tarball's sha256

@@ -2358,7 +2358,7 @@ test "an engine concatenate of two to four parts is one dispatch with MLX's byte
     const gpu = mlx.gpuStream();
     defer _ = mlx.mlx_stream_free(gpu);
     const va = ramp(u16, 2 * 3 * 4, 7, 3);
-    const vb = ramp(u16, 2 * 5 * 4, 11, 5);
+    const vb = ramp(u16, 4 * 3 * 4, 11, 5);
     for ([_]c_int{ 0, 1, 2, -1 }) |axis| {
         // Part shapes that differ only along `axis`.
         var sa = [_]c_int{ 2, 3, 4 };
@@ -3009,7 +3009,7 @@ test "a custom kernel launched on the engine writes what it writes under MLX" {
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_engine_probe", iv, ov, source, "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_test_engine_probe", iv, ov, source, "", true, false);
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
 
     const xs = ramp(f32, 64, 10, -5);
@@ -3491,7 +3491,7 @@ test "a kernel and a config MLX made while the engine was off launch on the engi
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_made_before_probe", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_test_add", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -3533,7 +3533,7 @@ test "a kernel, its name lists and its config made while the engine is on call n
     const iv = mlx.mlx_vector_string_new_data(&names_in, 1);
     const ov = mlx.mlx_vector_string_new_data(&names_out, 1);
     try t_std.expectEqual(@as(usize, 1), mlx.mlx_vector_string_size(iv));
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_native_probe", iv, ov, source, "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_test_native_probe", iv, ov, source, "", true, false);
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
     _ = mlx.mlx_vector_string_free(iv);
     _ = mlx.mlx_vector_string_free(ov);
@@ -3716,7 +3716,7 @@ test "configs made and freed in turn launch the pipeline of their own template v
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&names_out, names_out.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_config_reuse_probe", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_test_add", iv, ov, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
     const xs = ramp(f32, 4, 1, 0);
     const x = hostArray(f32, &xs, &.{4}, .float32);
@@ -3769,7 +3769,7 @@ test "an op the engine lacks, and a threadgroup past the pipeline's limit, are r
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(&names_out, 1);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new("sushi_engine_wide", iv, ov, "out[thread_position_in_grid.x] = x[0];", "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_test_scale", iv, ov, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
     defer _ = mlx.mlx_fast_metal_kernel_free(k);
     active = true;
     defer active = false;
@@ -3778,6 +3778,7 @@ test "an op the engine lacks, and a threadgroup past the pipeline's limit, are r
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{4096}, 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SCALE", 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 4096, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 4096, 1, 1));
     var outs = mlx.mlx_vector_array_new();

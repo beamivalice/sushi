@@ -1,10 +1,11 @@
-//! MLX's stock kernels launched by the engine: the compiled functions of `mlx.metallib`, fetched by the names MLX
-//! gives them and dispatched with the buffers, constants and grids MLX's `eval_gpu` uses, so an op here writes the
-//! bytes it writes under MLX. Ported from MLX's Metal backend (MIT, see NOTICE).
+//! Sushi Cooler's stock kernels: the compiled functions of `sushi.metallib` (built from MLX's pinned MIT Metal kernel
+//! headers, see NOTICE), fetched by the names MLX gives them and dispatched with the buffers, constants and grids MLX's
+//! `eval_gpu` uses, so an op here writes the bytes it writes under MLX. Ported from MLX's Metal backend (MIT, see NOTICE).
 
 const std = @import("std");
-const mlx = @import("../mlx.zig");
 const metal = @import("../metal.zig");
+const metallib_path = @import("../metallib_path.zig");
+const log = @import("../log.zig");
 const core = @import("core.zig");
 const ops = @import("ops.zig");
 const registry = @import("pipeline_registry.zig");
@@ -15,25 +16,29 @@ const Dtype = core.Dtype;
 const Error = core.Error;
 const gpa = std.heap.c_allocator;
 
-const DlInfo = extern struct { fname: ?[*:0]const u8, fbase: ?*anyopaque, sname: ?[*:0]const u8, saddr: ?*anyopaque };
-extern "c" fn dladdr(addr: ?*const anyopaque, info: *DlInfo) c_int;
-
 var library: ?metal.Library = null;
 var pipelines: std.StringHashMapUnmanaged(metal.Pipeline) = .empty;
 
-/// `mlx.metallib` beside the MLX libraries this process loaded, as MLX finds it.
+/// This process's `sushi.metallib` (`metallib_path.forThisProcess`). A binary without one beside it says where it looked.
 pub fn metallibPath(buf: []u8) Error![:0]const u8 {
-    var info: DlInfo = undefined;
-    if (dladdr(mlx.libraryAnchor(), &info) == 0) return error.MetalUnavailable;
-    const binary = std.mem.span(info.fname orelse return error.MetalUnavailable);
-    const dir = std.fs.path.dirname(binary) orelse return error.MetalUnavailable;
-    return std.fmt.bufPrintSentinel(buf, "{s}/mlx.metallib", .{dir}, 0) catch return error.MetalUnavailable;
+    return metallib_path.forThisProcess(buf) catch {
+        log.err("[engine] sushi.metallib is not beside this binary (looked for {s}): reinstall sushi\n", .{metallib_path.searched});
+        return error.MetalUnavailable;
+    };
 }
+
+/// A binary without its library stays without it: the first miss is logged and every later ask fails at once.
+var library_missing = false;
 
 pub fn lib(dev: *const metal.Device) Error!metal.Library {
     if (library) |l| return l;
+    if (library_missing) return error.MetalUnavailable;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    library = try dev.load(try metallibPath(&buf));
+    const path = metallibPath(&buf) catch |e| {
+        library_missing = true;
+        return e;
+    };
+    library = try dev.load(path);
     return library.?;
 }
 
@@ -111,7 +116,7 @@ pub fn kernelFlags(name: []const u8, hash: []const u8, flags: []const metal.Flag
         return core.dry_pipeline;
     }
     const dev = try metal.device();
-    var buf: [192]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;
     if (registry.takeStock(hash)) |p| {
         core.preloadedPipeline(hash, p);
@@ -137,7 +142,7 @@ pub fn kernelConstants(name: []const u8, hash: []const u8, flags: []const metal.
         return core.dry_pipeline;
     }
     const dev = try metal.device();
-    var buf: [192]u8 = undefined;
+    var buf: [512]u8 = undefined;
     const function = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return error.TensorShape;
     if (registry.takeStock(hash)) |p| {
         core.preloadedPipeline(hash, p);
@@ -648,7 +653,7 @@ pub fn sign(x: *Tensor) Error!*Tensor {
 /// The dtypes `kernels/unary.metal` instantiates an op for: `instantiate_unary_float` or `instantiate_unary_types`.
 pub const UnaryTypes = enum { float, all };
 
-/// A unary op of `mlx.metallib` over a row-major input, as `unary_op_gpu` launches its contiguous kernels: `v` under
+/// A unary op of `sushi.metallib` over a row-major input, as `unary_op_gpu` launches its contiguous kernels: `v` under
 /// 65536 elements, `vn` (eight bytes a thread) from there. MLX's own kernel, so MLX's bytes.
 pub fn unaryOf(comptime op: []const u8, comptime types: UnaryTypes, x_in: *Tensor) Error!*Tensor {
     switch (x_in.dtype) {
@@ -682,7 +687,7 @@ pub fn unaryOf(comptime op: []const u8, comptime types: UnaryTypes, x_in: *Tenso
     return out;
 }
 
-/// A binary op of `mlx.metallib` over two operands of one dtype (`types` the ones MLX instantiates it for), under
+/// A binary op of `sushi.metallib` over two operands of one dtype (`types` the ones MLX instantiates it for), under
 /// `binary_op_gpu_inplace`: the scalar and vector kernels of one flat run. An operand pair MLX would run through its
 /// strided kernels is refused.
 pub fn binaryOf(comptime op: []const u8, comptime types: UnaryTypes, a: *Tensor, b: *Tensor) Error!*Tensor {
@@ -730,4 +735,320 @@ pub fn binaryOf(comptime op: []const u8, comptime types: UnaryTypes, a: *Tensor,
     if (!std.mem.eql(u8, kind, "ss")) p.constant(@as(u32, @intCast(size)), 3);
     core.dispatch(p, .{ .x = threads }, .{ .x = @min(k.max_threads, threads) });
     return out;
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+const matmul = @import("matmul.zig");
+const device = @import("sushi_exl3").device;
+
+test "stock metallib: metallibPath resolves sushi.metallib and never mlx.metallib" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try metallibPath(&buf);
+    try testing.expect(std.mem.endsWith(u8, path, "/sushi.metallib"));
+    try testing.expect(!std.mem.endsWith(u8, path, "/mlx.metallib"));
+    try testing.expect(std.c.access(path.ptr, std.c.F_OK) == 0);
+
+}
+
+test "stock metallib: every kernel src/tensor can construct across all GPU classes exists in sushi.metallib" {
+    try @import("../mlx.zig").requireGpu();
+    const dev = try metal.device();
+    const l = try lib(dev);
+    const names = try l.functionNames(testing.allocator);
+    defer {
+        for (names) |s| testing.allocator.free(s);
+        testing.allocator.free(names);
+    }
+    var have: std.StringHashMapUnmanaged(void) = .empty;
+    defer have.deinit(testing.allocator);
+    for (names) |s| try have.put(testing.allocator, s, {});
+
+    var missing: usize = 0;
+    var first_buf: [192]u8 = undefined;
+    var first_len: usize = 0;
+    const Check = struct {
+        map: *const std.StringHashMapUnmanaged(void),
+        missing: *usize,
+        first_buf: *[192]u8,
+        first_len: *usize,
+        fn has(self: @This(), name: []const u8) void {
+            if (!self.map.contains(name)) {
+                if (self.first_len.* == 0) {
+                    const n = @min(name.len, self.first_buf.len);
+                    @memcpy(self.first_buf[0..n], name[0..n]);
+                    self.first_len.* = n;
+                }
+                self.missing.* += 1;
+            }
+        }
+        fn fmt(self: @This(), comptime pattern: []const u8, args: anytype) void {
+            var buf: [192]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, pattern, args) catch unreachable;
+            self.has(s);
+        }
+    };
+    const check: Check = .{ .map = &have, .missing = &missing, .first_buf = &first_buf, .first_len = &first_len };
+    const floats = [_][]const u8{ "float16", "bfloat16", "float32" };
+    const c_floats = [_][]const u8{ "float", "float16_t", "bfloat16_t" };
+    const all_elem = [_][]const u8{ "bool_", "uint8", "uint16", "uint32", "int8", "int16", "int32", "float16", "bfloat16", "float32" };
+    const sortable = [_][]const u8{ "uint8", "uint16", "uint32", "int8", "int16", "int32", "float16", "float32", "bfloat16" };
+    const argmax_types = [_][]const u8{ "bool_", "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64", "float16", "float32", "bfloat16" };
+
+    // stock.zig: norms, softmax, logsumexp, conv1d, rope
+    for (floats) |t| {
+        check.fmt("rms{s}", .{t});
+        check.fmt("rms_looped{s}", .{t});
+        check.fmt("layer_norm{s}", .{t});
+        check.fmt("layer_norm_looped{s}", .{t});
+        check.fmt("block_softmax_{s}", .{t});
+        check.fmt("looped_softmax_{s}", .{t});
+        check.fmt("block_logsumexp_{s}", .{t});
+        check.fmt("looped_logsumexp_{s}", .{t});
+        check.fmt("depthwise_conv_1d_{s}", .{t});
+        check.fmt("implicit_gemm_conv_2d_{s}_bm32_bn8_bk16_wm4_wn1_channel_1_filter_l", .{t});
+        for ([_][]const u8{ "", "single_" }) |s| for ([_][]const u8{ "", "freqs_" }) |f| {
+            check.fmt("rope_{s}{s}{s}", .{ s, f, t });
+        };
+    }
+    for ([_][]const u8{ "float16", "bfloat16" }) |t| {
+        check.fmt("block_softmax_precise_{s}", .{t});
+        check.fmt("looped_softmax_precise_{s}", .{t});
+    }
+
+    // stock.zig / ops.zig / route.zig: unary & binary
+    for ([_][]const u8{ "Erf", "Tanh", "Cos", "Sin", "Log1p" }) |op| for (floats) |t| {
+        check.fmt("v_{s}{s}{s}", .{ op, t, t });
+        check.fmt("vn_{s}{s}{s}", .{ op, t, t });
+    };
+    for ([_][]const u8{ "Sign", "Abs", "Floor" }) |op| for (all_elem) |t| {
+        check.fmt("v_{s}{s}{s}", .{ op, t, t });
+        check.fmt("vn_{s}{s}{s}", .{ op, t, t });
+    };
+    for (floats) |t| for ([_][]const u8{ "ss", "sv", "vs", "vv", "svn", "vsn", "vvn" }) |k| {
+        check.fmt("{s}_LogAddExp{s}", .{ k, t });
+    };
+    for ([_][]const u8{ "Power", "Remainder" }) |op| for (all_elem) |t| for ([_][]const u8{ "ss", "sv", "vs", "vv", "svn", "vsn", "vvn" }) |k| {
+        check.fmt("{s}_{s}{s}", .{ k, op, t });
+    };
+
+    // matmul.zig: dot, gemv, gemv_wide, steel_gemm_fused{,_nax}, steel_gemm_splitk{,_nax}
+    for (floats) |t| {
+        check.fmt("dot_product_{s}_it32_tg512_sg16", .{t});
+        check.fmt("steel_gemm_splitk_accum_{s}_float32", .{t});
+    }
+    for ([_][]const u8{ "float16", "bfloat16" }) |t| for ([_]usize{ 2, 3, 4, 5 }) |nv| for ([_]usize{ 16, 32 }) |kl| {
+        check.fmt("gemv_wide_{s}_nv{d}_kl{d}", .{ t, nv, kl });
+        check.fmt("gemv_wide_gather_{s}_nv{d}_kl{d}", .{ t, nv, kl });
+    };
+    const gemv_blocks = [_][6]usize{
+        .{ 1, 8, 1, 32, 4, 4 }, .{ 1, 8, 1, 32, 1, 4 }, .{ 1, 1, 8, 4, 4, 4 }, .{ 1, 1, 8, 4, 1, 4 },
+        .{ 4, 1, 1, 32, 1, 4 }, .{ 4, 1, 1, 32, 4, 4 }, .{ 8, 1, 1, 32, 4, 4 },
+    };
+    const gemv_gather_blocks = [_][6]usize{
+        .{ 4, 1, 1, 32, 1, 4 }, .{ 4, 1, 1, 32, 4, 4 }, .{ 8, 1, 1, 32, 4, 4 },
+    };
+    const gemv_t_blocks = [_][6]usize{
+        .{ 1, 2, 8, 4, 4, 1 }, .{ 1, 2, 8, 4, 4, 4 }, .{ 1, 4, 8, 4, 4, 4 }, .{ 1, 16, 8, 4, 4, 4 }, .{ 1, 16, 4, 8, 4, 4 },
+    };
+    for (floats) |t| {
+        for (gemv_blocks) |b| for ([_]usize{ 0, 1 }) |nc| {
+            check.fmt("gemv_{s}_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}_nc{d}_axpby0", .{ t, b[0], b[1], b[2], b[3], b[4], b[5], nc });
+        };
+        for (gemv_gather_blocks) |b| {
+            check.fmt("gemv_gather_{s}_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}", .{ t, b[0], b[1], b[2], b[3], b[4], b[5] });
+        }
+        for (gemv_t_blocks) |b| {
+            for ([_]usize{ 0, 1 }) |nc| {
+                check.fmt("gemv_t_{s}_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}_nc{d}_axpby0", .{ t, b[0], b[1], b[2], b[3], b[4], b[5], nc });
+            }
+            check.fmt("gemv_t_gather_{s}_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}", .{ t, b[0], b[1], b[2], b[3], b[4], b[5] });
+        }
+    }
+    const classes = [_]device.Class{ .g, .p, .s, .c, .d };
+    const edge_sizes = [_]usize{ 16, 512, 1024, 2048, 2049, 4096, 8192, 12288, 1 << 20 };
+    const dtypes = [_]Dtype{ .float16, .bfloat16, .float32 };
+    for (classes) |class| {
+        const g: matmul.Gpu = .{ .class = class, .gen = 17, .nax = true, .tf32 = true };
+        for (dtypes) |dt| {
+            const tn = try typeName(dt);
+            for ([_]bool{ false, true }) |ta| for ([_]bool{ false, true }) |tb| {
+                const ca: u8 = if (ta) 't' else 'n';
+                const cb: u8 = if (tb) 't' else 'n';
+                for (edge_sizes) |m| for (edge_sizes) |n| for (edge_sizes) |k| {
+                    const ft = matmul.gemmTile(g, dt, ta, tb, 1, m, n, k);
+                    check.fmt("steel_gemm_fused_{c}{c}_{s}_{s}_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}", .{ ca, cb, tn, tn, ft.bm, ft.bn, ft.bk, ft.wm, ft.wn });
+                    check.fmt("steel_gather_mm_{c}{c}_{s}_{s}_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}", .{ ca, cb, tn, tn, ft.bm, ft.bn, ft.bk, ft.wm, ft.wn });
+                    const nt = matmul.fusedNaxTileFor(class, m, m, n, k).t;
+                    check.fmt("steel_gemm_fused_nax_{c}{c}_{s}_{s}_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}", .{ ca, cb, tn, tn, nt.bm, nt.bn, nt.bk, nt.wm, nt.wn });
+                    const sk = matmul.splitKNaxTileFor(class, m, n, k).t;
+                    check.fmt("steel_gemm_splitk_nax_{c}{c}_{s}_float32_bm{d}_bn{d}_bk{d}_wm{d}_wn{d}", .{ ca, cb, tn, sk.bm, sk.bn, sk.bk, sk.wm, sk.wn });
+                };
+            };
+        }
+    }
+    for (floats) |t| for ([_][2]u8{ .{ 'n', 'n' }, .{ 'n', 't' }, .{ 't', 'n' }, .{ 't', 't' } }) |tr| {
+        for ([_]usize{ 16, 32 }) |bm| for ([_]usize{ 16, 32 }) |bn| for ([_]u8{ 't', 'n' }) |amn| for ([_]u8{ 't', 'n' }) |ak| {
+            check.fmt("steel_gemm_splitk_{c}{c}_{s}_float32_bm{d}_bn{d}_bk16_wm2_wn2_MN_{c}aligned_K_{c}aligned", .{ tr[0], tr[1], t, bm, bn, amn, ak });
+        };
+    };
+
+    // quantized.zig + stock.zig quantize/dequantize
+    check.has("gather_mm_offsets");
+    for (c_floats) |ct| {
+        for ([_]usize{ 32, 64, 128 }) |gs| for ([_]usize{ 2, 3, 4, 5, 6, 8 }) |bits| {
+            check.fmt("affine_quantize_{s}_gs_{d}_b_{d}", .{ ct, gs, bits });
+            check.fmt("affine_dequantize_{s}_gs_{d}_b_{d}", .{ ct, gs, bits });
+            check.fmt("affine_gather_qmv_{s}_gs_{d}_b_{d}", .{ ct, gs, bits });
+            check.fmt("affine_gather_qmv_fast_{s}_gs_{d}_b_{d}", .{ ct, gs, bits });
+            check.fmt("affine_gather_qmm_rhs_nt_{s}_gs_{d}_b_{d}_bm_16_bn_32_bk_32_wm_1_wn_2", .{ ct, gs, bits });
+            for ([_]usize{ 32, 64 }) |bm| {
+                check.fmt("affine_gather_qmm_rhs_nax_nt_{s}_gs_{d}_b_{d}_bm_{d}_bn_64_bk_64_wm_2_wn_2", .{ ct, gs, bits, bm });
+            }
+            for ([_]usize{ 0, 1 }) |b| {
+                check.fmt("affine_qmv_{s}_gs_{d}_b_{d}_batch_{d}", .{ ct, gs, bits, b });
+                check.fmt("affine_qmv_fast_{s}_gs_{d}_b_{d}_batch_{d}", .{ ct, gs, bits, b });
+                if (std.math.isPowerOfTwo(bits)) for ([_]usize{ 64, 128 }) |d| {
+                    check.fmt("affine_qmv_quad_{s}_gs_{d}_b_{d}_d_{d}_batch_{d}", .{ ct, gs, bits, d, b });
+                };
+                for ([_]usize{ 2, 3, 4, 5 }) |nv| {
+                    check.fmt("affine_qmv_wide_{s}_gs_{d}_b_{d}_nv_{d}_kl_8_batch_{d}", .{ ct, gs, bits, nv, b });
+                }
+            }
+            for ([_][]const u8{ "true", "false" }) |al| {
+                check.fmt("affine_qmm_t_splitk_{s}_gs_{d}_b_{d}_alN_{s}", .{ ct, gs, bits, al });
+                check.fmt("affine_gather_qmm_t_{s}_gs_{d}_b_{d}_alN_{s}", .{ ct, gs, bits, al });
+                check.fmt("affine_gather_qmm_t_nax_{s}_gs_{d}_b_{d}_bm64_bn64_bk64_wm2_wn2_alN_{s}", .{ ct, gs, bits, al });
+                for ([_]usize{ 0, 1 }) |b| {
+                    check.fmt("affine_qmm_t_{s}_gs_{d}_b_{d}_alN_{s}_batch_{d}", .{ ct, gs, bits, al, b });
+                    for ([_]usize{ 32, 64 }) |bm| {
+                        check.fmt("affine_qmm_t_nax_{s}_gs_{d}_b_{d}_bm{d}_bn64_bk64_wm2_wn2_alN_{s}_batch_{d}", .{ ct, gs, bits, bm, al, b });
+                    }
+                }
+            }
+        };
+        const mx_modes = [_]struct { name: []const u8, bits: usize }{ .{ .name = "mxfp4", .bits = 4 }, .{ .name = "mxfp8", .bits = 8 } };
+        for (mx_modes) |mx| {
+            check.fmt("{s}_dequantize_{s}_gs_32_b_{d}_hgs_false", .{ mx.name, ct, mx.bits });
+            check.fmt("{s}_gather_qmv_{s}_gs_32_b_{d}", .{ mx.name, ct, mx.bits });
+            check.fmt("{s}_gather_qmv_fast_{s}_gs_32_b_{d}", .{ mx.name, ct, mx.bits });
+            check.fmt("{s}_gather_qmm_rhs_nt_{s}_gs_32_b_{d}_bm_16_bn_32_bk_32_wm_1_wn_2", .{ mx.name, ct, mx.bits });
+            for ([_]usize{ 32, 64 }) |bm| {
+                check.fmt("{s}_gather_qmm_rhs_nax_nt_{s}_gs_32_b_{d}_bm_{d}_bn_64_bk_64_wm_2_wn_2", .{ mx.name, ct, mx.bits, bm });
+            }
+            for ([_]usize{ 0, 1 }) |b| {
+                check.fmt("{s}_qmv_{s}_gs_32_b_{d}_batch_{d}", .{ mx.name, ct, mx.bits, b });
+                check.fmt("{s}_qmv_fast_{s}_gs_32_b_{d}_batch_{d}", .{ mx.name, ct, mx.bits, b });
+                for ([_]usize{ 64, 128 }) |d| {
+                    check.fmt("{s}_qmv_quad_{s}_gs_32_b_{d}_d_{d}_batch_{d}", .{ mx.name, ct, mx.bits, d, b });
+                }
+                for ([_]usize{ 2, 3, 4, 5 }) |nv| {
+                    check.fmt("{s}_qmv_wide_{s}_gs_32_b_{d}_nv_{d}_kl_16_batch_{d}", .{ mx.name, ct, mx.bits, nv, b });
+                }
+            }
+            for ([_][]const u8{ "true", "false" }) |al| {
+                check.fmt("{s}_qmm_t_splitk_{s}_gs_32_b_{d}_alN_{s}", .{ mx.name, ct, mx.bits, al });
+                check.fmt("{s}_gather_qmm_t_{s}_gs_32_b_{d}_alN_{s}", .{ mx.name, ct, mx.bits, al });
+                check.fmt("{s}_gather_qmm_t_nax_{s}_gs_32_b_{d}_bm64_bn64_bk64_wm2_wn2_alN_{s}", .{ mx.name, ct, mx.bits, al });
+                for ([_]usize{ 0, 1 }) |b| {
+                    check.fmt("{s}_qmm_t_{s}_gs_32_b_{d}_alN_{s}_batch_{d}", .{ mx.name, ct, mx.bits, al, b });
+                    for ([_]usize{ 32, 64 }) |bm| {
+                        check.fmt("{s}_qmm_t_nax_{s}_gs_32_b_{d}_bm{d}_bn64_bk64_wm2_wn2_alN_{s}_batch_{d}", .{ mx.name, ct, mx.bits, bm, al, b });
+                    }
+                }
+            }
+        }
+        check.fmt("nvfp4_dequantize_{s}_gs_16_b_4_hgs_false", .{ct});
+        check.fmt("nvfp4_dequantize_{s}_gs_16_b_4_hgs_true", .{ct});
+    }
+
+    // attention.zig: SIMD & NAX full attention + vector & 2-pass attention
+    for (floats) |t| {
+        check.fmt("steel_attention_{s}_bq32_bk32_bd64_bv64_wm4_wn1_mask{s}", .{ t, t });
+        check.fmt("steel_attention_{s}_bq64_bk32_bd64_bv64_wm4_wn1_mask{s}", .{ t, t });
+        check.fmt("steel_attention_dsplit_{s}_bq64_bk32_bd256_bv256_wm4_wn2_mask{s}", .{ t, t });
+    }
+    for (c_floats) |ct| {
+        for ([_]usize{ 64, 96, 128, 256 }) |d| {
+            check.fmt("sdpa_vector_{s}_{d}_{d}", .{ ct, d, d });
+            check.fmt("sdpa_vector_2pass_1_{s}_{d}_{d}", .{ ct, d, d });
+            check.fmt("sdpa_vector_2pass_2_{s}_{d}", .{ ct, d });
+        }
+        for ([_][2]usize{ .{ 8, 64 }, .{ 8, 128 }, .{ 12, 128 }, .{ 16, 128 } }) |gd| {
+            check.fmt("sdpa_vector_2pass_1_gqa_{d}_{s}_{d}_{d}", .{ gd[0], ct, gd[1], gd[1] });
+        }
+    }
+
+    // reduce.zig: sum, max, argmax
+    for ([_][]const u8{ "sum", "max" }) |op| for (floats) |t| {
+        check.fmt("all_reduce_{s}{s}", .{ op, t });
+        check.fmt("row_reduce_simple_{s}{s}", .{ op, t });
+        check.fmt("row_reduce_small_1_reduce_{s}{s}", .{ op, t });
+        check.fmt("row_reduce_looped_1_reduce_{s}{s}", .{ op, t });
+        check.fmt("col_reduce_small_1_reduce_{s}{s}", .{ op, t });
+        check.fmt("col_reduce_longcolumn_1_reduce_{s}{s}", .{ op, t });
+        check.fmt("col_reduce_2pass_1_32_32_reduce_{s}{s}", .{ op, t });
+        check.fmt("col_reduce_looped_1_32_32_reduce_{s}{s}", .{ op, t });
+    };
+    for (argmax_types) |t| check.fmt("argmax_{s}", .{t});
+
+    // scan.zig
+    for (sortable) |t| for ([_][]const u8{ "contig", "strided" }) |k| for ([_][]const u8{ "", "reverse_" }) |r| for ([_][]const u8{ "inclusive", "exclusive" }) |inc| {
+        check.fmt("{s}_scan_{s}{s}_sum_{s}_{s}", .{ k, r, inc, t, t });
+    };
+
+    // sort.zig
+    for (sortable) |t| {
+        for ([_][]const u8{ "c", "nc" }) |c| for ([_]usize{ 32, 64, 128, 256, 512 }) |bn| {
+            check.fmt("{s}_block_sort_{s}_{s}_bn{d}_tn4", .{ c, t, t, bn });
+            check.fmt("{s}arg_block_sort_{s}_uint32_bn{d}_tn4", .{ c, t, bn });
+        };
+        check.fmt("sort_mbsort_{s}_uint32_bn512_tn4", .{t});
+        check.fmt("partition_mbsort_{s}_uint32_bn512_tn4", .{t});
+        check.fmt("merge_mbsort_{s}_uint32_bn512_tn4", .{t});
+        check.fmt("searchsorted_{s}_left", .{t});
+        check.fmt("searchsorted_{s}_right", .{t});
+    }
+
+    // random.zig
+    check.has("rbitsc");
+
+    // ops.zig + chains.zig (derived by construction from metallib_spec.visitOps — never a hand list)
+    const spec = @import("metallib_spec.zig");
+    try spec.visitOps(&check, struct {
+        fn onElem(c: *const Check, _: spec.OpsUnit, name: []const u8, _: spec.ElemOp, _: spec.ElemVariant, _: []const spec.Dtype, _: spec.Dtype) !void {
+            c.has(name);
+        }
+    }.onElem, struct {
+        fn onSpecial(c: *const Check, _: spec.OpsUnit, name: []const u8, _: spec.SpecialOp, _: []const spec.Dtype, _: spec.Dtype) !void {
+            c.has(name);
+        }
+    }.onSpecial);
+
+    // Every precompiled custom kernel (shared, EXL3, and all built archs) — by construction from metallib_catalog.
+    const catalog = @import("../metallib_catalog.zig");
+    try catalog.visitAll(&check, struct {
+        fn onName(c: *const Check, name: []const u8) !void {
+            c.has(name);
+        }
+    }.onName);
+
+    try testing.expectEqualStrings("", first_buf[0..first_len]);
+    try testing.expectEqual(@as(usize, 0), missing);
+    try testing.expect(!have.contains("no_such_sushi_kernel"));
+    try testing.expectError(error.MetalCompile, dev.pipelineOf(l, "no_such_sushi_kernel"));
+
+    // An unregistered custom kernel launched on the engine is refused by name, never source-compiled.
+    const kernel_mod = @import("kernel.zig");
+    const bogus = try kernel_mod.Def.create("no_such_sushi_custom_kernel", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x];", "", true, false);
+    const x = try core.fromHost(std.mem.sliceAsBytes(&[_]f32{ 1, 2, 3, 4 }), .float32, &.{4});
+    defer core.release(x);
+    var cfg: kernel_mod.Config = .{};
+    try cfg.addOutput(&.{4}, .float32);
+    cfg.grid = .{ 4, 1, 1 };
+    cfg.group = .{ 4, 1, 1 };
+    var out: [1]*Tensor = undefined;
+    try testing.expectError(error.MetalCompile, kernel_mod.launch(bogus, &.{x}, &cfg, &out));
+    try testing.expect(std.mem.indexOf(u8, metal.lastError(), "no_such_sushi_custom_kernel") != null);
 }

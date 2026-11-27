@@ -40,7 +40,7 @@ fn f32Const(sc: *Scope, vals: []const f32) !A {
 /// Dot products of `R` rows of each of `NB` banks (`w0`/`s0`, then `w1`/`s1`) against `x` (K wide) on one
 /// simdgroup, a lane taking packed words `lane, lane + 32, ...`. `FP4`: mxfp4 (e2m1 nibbles, eight a word, low
 /// first); else mxfp8 (e4m3 bytes, four a word). One e8m0 scale per 32 columns; `rows` index every bank alike.
-const EXPERT_HEADER =
+pub const EXPERT_HEADER =
     \\inline float dsv41_e2m1(uint n) {
     \\  const uint m = n & 7u, e = m >> 1, f = m & 1u;
     \\  const float v = e == 0u ? 0.5f * float(f) : (1.0f + 0.5f * float(f)) * float(1u << (e - 1u));
@@ -54,11 +54,11 @@ const EXPERT_HEADER =
     \\inline float dsv41_e8m0(uint e) {
     \\  return as_type<float>(e == 0u ? 0x400000u : (e << 23));
     \\}
-    \\template <int K, int R, int NB, bool FP4, typename X>
+    \\template <int R, int NB, bool FP4, typename X>
     \\inline void dsv41_dots(const device uint32_t* w0, const device uint8_t* s0, const device uint32_t* w1, const device uint8_t* s1,
-    \\                       thread const size_t* rows, const device X* x, uint lane, thread float* acc) {
+    \\                       thread const size_t* rows, const device X* x, int K, uint lane, thread float* acc) {
     \\  constexpr int VPW = FP4 ? 8 : 4;
-    \\  constexpr int KP = K / VPW, KG = K / 32, KW = K / VPW;
+    \\  const int KP = K / VPW, KG = K / 32, KW = K / VPW;
     \\  for (int i = 0; i < NB * R; ++i) acc[i] = 0.0f;
     \\  for (int pk = int(lane); pk < KP; pk += 32) {
     \\    const int kb = pk * VPW, gi = kb / 32;
@@ -82,17 +82,17 @@ const EXPERT_HEADER =
 /// One token's routed gate and up (slots 0..TOPK-1, experts `inds`) and, as slot TOPK, the shared expert's; RPS
 /// output rows a simdgroup. Each dot rounds to T where `gather_qmm` writes it, then the clamped SwiGLU times the
 /// slot's routing weight (1 for the shared) in f32, rounded once to T.
-const MOE_GU_SOURCE =
+pub const MOE_GU_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint n0 = thread_position_in_grid.y * RPS, e = thread_position_in_grid.z;
     \\float a[2 * RPS];
     \\size_t rows[RPS];
     \\if (e < TOPK) {
     \\  for (int r = 0; r < RPS; ++r) rows[r] = size_t(inds[e]) * N + n0 + r;
-    \\  dsv41_dots<K, RPS, 2, true>(gw, gs, uw, us, rows, x, lane, a);
+    \\  dsv41_dots<RPS, 2, true>(gw, gs, uw, us, rows, x, K, lane, a);
     \\} else {
     \\  for (int r = 0; r < RPS; ++r) rows[r] = n0 + r;
-    \\  dsv41_dots<K, RPS, 2, false>(sgw, sgs, suw, sus, rows, x, lane, a);
+    \\  dsv41_dots<RPS, 2, false>(sgw, sgs, suw, sus, rows, x, K, lane, a);
     \\}
     \\const float wt = e < TOPK ? wts[e] : 1.0f;
     \\if (lane == 0) for (int r = 0; r < RPS; ++r) {
@@ -106,7 +106,7 @@ const MOE_GU_SOURCE =
 /// One token's routed down projections summed in f32 in slot order, plus the shared expert's, rounded to T
 /// where `moe` adds them, then the hyper-connection expand of the stream `res` into the new one; RPS rows a
 /// simdgroup.
-const MOE_DN_SOURCE =
+pub const MOE_DN_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint n0 = thread_position_in_grid.y * RPS;
     \\float tot[RPS], a[RPS];
@@ -114,11 +114,11 @@ const MOE_DN_SOURCE =
     \\for (int r = 0; r < RPS; ++r) tot[r] = 0.0f;
     \\for (int e = 0; e < TOPK; ++e) {
     \\  for (int r = 0; r < RPS; ++r) rows[r] = size_t(inds[e]) * N + n0 + r;
-    \\  dsv41_dots<K, RPS, 1, true>(dw, ds, dw, ds, rows, x + size_t(e) * K, lane, a);
+    \\  dsv41_dots<RPS, 1, true>(dw, ds, dw, ds, rows, x + size_t(e) * K, K, lane, a);
     \\  for (int r = 0; r < RPS; ++r) tot[r] += float(T(a[r]));
     \\}
     \\for (int r = 0; r < RPS; ++r) rows[r] = n0 + r;
-    \\dsv41_dots<K, RPS, 1, false>(sdw, sds, sdw, sds, rows, x + size_t(TOPK) * K, lane, a);
+    \\dsv41_dots<RPS, 1, false>(sdw, sds, sdw, sds, rows, x + size_t(TOPK) * K, K, lane, a);
     \\if (lane == 0) for (int r = 0; r < RPS; ++r) {
     \\  const uint d = n0 + r;
     \\  const float y = float(T(tot[r] + float(T(a[r]))));
@@ -132,7 +132,7 @@ const MOE_DN_SOURCE =
 
 /// A prefill MoE call's SwiGLU, one element a thread: row `r` of the sorted gate and up gathers `g` and `u`
 /// (`[n, N]`) times its routing weight, the f32 math of `clampedSwiglu` in its order, rounded once to T.
-const MOE_ACT_SOURCE =
+pub const MOE_ACT_SOURCE =
     \\const uint i = thread_position_in_grid.x;
     \\const uint row = i / N;
     \\if (row >= uint(g_shape[0])) return;
@@ -144,7 +144,7 @@ const MOE_ACT_SOURCE =
 
 /// A prefill MoE call's combine, one element a thread: the row's K sorted down rows (`inv` names them) summed in
 /// f32 plus the shared expert, rounded once to T.
-const MOE_COMBINE_SOURCE =
+pub const MOE_COMBINE_SOURCE =
     \\const uint i = thread_position_in_grid.x;
     \\const uint row = i / D, c = i % D;
     \\if (row >= uint(sh_shape[0])) return;
@@ -227,7 +227,7 @@ pub fn moeCombine(sc: *Scope, dn: A, inv: A, sh: A, k: usize) !A {
 // ── router, top-k, dense f32 ─────────────────────────────────────────────
 
 /// Router logits `[L, E]` in f32 from rows `x`: one simdgroup an expert, 8 inputs a lane per step.
-const GATE_SOURCE =
+pub const GATE_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const int e = threadgroup_position_in_grid.x * SGS + simdgroup_index_in_threadgroup;
     \\const int l = threadgroup_position_in_grid.y;
@@ -244,17 +244,22 @@ const GATE_SOURCE =
 
 /// One row a threadgroup, one expert a thread: sqrt-softplus scores, the bias-picked top K (lowest index on ties),
 /// their scores normalized (NORM) and scaled by scal[0].
-const ROUTE_SOURCE = "\n#define ROUTE_SLOT(i, e)\n" ++ ROUTE_BODY;
+pub const ROUTE_SOURCE = "\n#define ROUTE_SLOT(i, e)\n" ++ ROUTE_BODY;
 
 /// `ROUTE_SOURCE` that also writes `local[i] = map[pick]` beside each pick: a resident layer's slot of the expert.
-const ROUTE_SLOTS_SOURCE = "\n#define ROUTE_SLOT(i, e) local[i] = map[e]\n" ++ ROUTE_BODY;
+pub const ROUTE_SLOTS_SOURCE = "\n#define ROUTE_SLOT(i, e) local[i] = map[e]\n" ++ ROUTE_BODY;
 
 const ROUTE_BODY =
     \\const int e = thread_position_in_threadgroup.x, l = threadgroup_position_in_grid.y;
     \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int E = logits_shape[1];
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float t_s[1024], t_cv[32 * 32];
+    \\threadgroup int t_pick[32], t_ci[32 * 32];
+    \\#else
     \\threadgroup float t_s[1024], t_cv[32 * K];
     \\threadgroup int t_pick[K], t_ci[32 * K];
+    \\#endif
     \\float s = 0.0f, v = -INFINITY;
     \\if (e < E) {
     \\  const float z = logits[size_t(l) * E + e];
@@ -299,7 +304,7 @@ const ROUTE_BODY =
 
 /// `x` [L, K] times dense rows `w` [N, K] (any float dtypes) in f32, RPS rows a simdgroup: the product the
 /// reference computes after widening w, rounded once to OT. A row's sum never depends on L.
-const DENSE_F32X_SOURCE =
+pub const DENSE_F32X_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const int n0 = thread_position_in_grid.y * RPS, l = thread_position_in_grid.z;
     \\const int K = x_shape[1], N = w_shape[0];
@@ -331,8 +336,8 @@ const ROUTE_SPLIT_PRE =
     \\}
 ;
 
-const ROUTE_SPLIT_SOURCE = ROUTE_SPLIT_PRE ++ ROUTE_SOURCE;
-const ROUTE_SPLIT_SLOTS_SOURCE = ROUTE_SPLIT_PRE ++ ROUTE_SLOTS_SOURCE;
+pub const ROUTE_SPLIT_SOURCE = ROUTE_SPLIT_PRE ++ ROUTE_SOURCE;
+pub const ROUTE_SPLIT_SLOTS_SOURCE = ROUTE_SPLIT_PRE ++ ROUTE_SLOTS_SOURCE;
 
 var gate_def = Def{ .name = "dsv41_gate", .ins = &.{ "x", "w" }, .outs = &.{"logits"}, .source = GATE_SOURCE };
 var route_def = Def{ .name = "dsv41_route", .ins = &.{ "logits", "bias", "scal" }, .outs = &.{ "idx", "wts" }, .source = ROUTE_SOURCE };
@@ -457,7 +462,7 @@ pub fn denseF32x(sc: *Scope, x: A, w: A) !A {
 /// `rotate`'s math uncontracted, cos and sin as MLX's), rounded to T, then QK's activation round trip over blocks
 /// inside one simdgroup (0 none, 1 fp8 / 32 / ue8m0, 2 fp4 / 32 / ue8m0, 3 fp4 / 16 / e4m3), written as OT.
 /// INV turns the rotation back.
-const ROPE_TAIL_SOURCE =
+pub const ROPE_TAIL_SOURCE =
     \\#pragma clang fp contract(off)
     \\const uint i = thread_position_in_grid.x;
     \\if (QK == 0 && i >= threads_per_grid.x) return;
@@ -478,14 +483,14 @@ const ROPE_TAIL_BODY =
     \\if (QK != 0) {
     \\  float amax = metal::abs(r);
     \\  for (ushort m = (QK == 3 ? 8 : 16); m > 0; m >>= 1) amax = metal::max(amax, metal::simd_shuffle_xor(amax, m));
-    \\  r = qat_round<QK - 1>(r, qat_scale<QK - 1>(amax));
+    \\  r = qat_round_m(r, qat_scale_m(amax, QK - 1), QK - 1);
     \\}
     \\out[i] = OT(T(r));
 ;
 
 /// `kvRow` after its projection: MLX's rms_norm (four elements a thread, its accumulation order), the tail
 /// rotation, then (QAT) the fp8 / 32 / ue8m0 round trip. One threadgroup a row.
-const KV_ROW_SOURCE =
+pub const KV_ROW_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int l = threadgroup_position_in_grid.y;
     \\threadgroup float local_sums[32], inv_s[1];
@@ -540,7 +545,7 @@ const KV_ROW_BODY =
 /// `KV_ROW_BODY` over the window rows `kx` in the first threadgroups, one row a threadgroup, and `ROPE_TAIL_BODY` over the
 /// queries `qx` in the rest (the row walk's barriers start first and overlap the rotation); the two read and write nothing
 /// in common. QK is 0 and INV 0.
-const ROPE_KV_SOURCE =
+pub const ROPE_KV_SOURCE =
     \\#pragma clang fp contract(off)
     \\threadgroup float local_sums[32], inv_s[1];
     \\const uint tgid = threadgroup_position_in_grid.x, rows = kx_shape[0];
@@ -561,7 +566,7 @@ const ROPE_KV_SOURCE =
 /// `ROPE_KV_SOURCE` that also gives the window ring after the row's write: the row lands in its slot, `pos[row]` modulo
 /// the ring's rows, and threadgroups past the queries' copy the other rows 16 bytes a thread. QTG is the queries'
 /// threadgroups.
-const ROPE_KV_RING_SOURCE =
+pub const ROPE_KV_RING_SOURCE =
     \\#pragma clang fp contract(off)
     \\threadgroup float local_sums[32], inv_s[1];
     \\const uint tgid = threadgroup_position_in_grid.x, rows = kx_shape[0];
@@ -578,7 +583,7 @@ const ROPE_KV_RING_SOURCE =
     \\  device T* out = qout;
 ++ ROPE_TAIL_BODY ++
     \\} else {
-    \\  constexpr int U = D * sizeof(T) / 16;
+    \\  const int U = D * sizeof(T) / 16;
     \\  const uint u = (tgid - rows - QTG) * threads_per_threadgroup.x + thread_position_in_threadgroup.x;
     \\  if (u >= uint(cap * U)) return;
     \\  if ((int(u) / U + cap - int(pos[0]) % cap) % cap < int(rows)) return;
@@ -590,8 +595,8 @@ const ROPE_KV_RING_SOURCE =
 /// `(2p, 2p+1)`, leaving the leading `D - RD` untouched channels in place with zero copy. Bit-identical to
 /// `ROPE_TAIL_BODY` with `QK == 0` and `INV == 0`.
 const ROPE_TAIL_IP_BODY =
-    \\constexpr int HALF_RD = RD / 2;
-    \\constexpr int HEAD = D - RD;
+    \\const int HALF_RD = RD / 2;
+    \\const int HEAD = D - RD;
     \\const uint total_p = uint(rows) * uint(H * HALF_RD);
     \\if (p_idx < total_p) {
     \\  const uint row = p_idx / uint(H * HALF_RD);
@@ -607,14 +612,14 @@ const ROPE_TAIL_IP_BODY =
     \\}
 ;
 
-const ROPE_TAIL_IP_SOURCE =
+pub const ROPE_TAIL_IP_SOURCE =
     \\#pragma clang fp contract(off)
     \\const uint rows = uint(meta[0]);
     \\const int H = meta[1];
     \\const uint p_idx = thread_position_in_grid.x;
 ++ ROPE_TAIL_IP_BODY;
 
-const KV_ROW_RING_IP_SOURCE =
+pub const KV_ROW_RING_IP_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int l = int(threadgroup_position_in_grid.y);
     \\const int cap = meta[0];
@@ -623,7 +628,7 @@ const KV_ROW_RING_IP_SOURCE =
     \\device T* out = rout + ptrdiff_t(int(pos[l]) % cap - l) * D;
 ++ KV_ROW_BODY;
 
-const ROPE_KV_RING_IP_SOURCE =
+pub const ROPE_KV_RING_IP_SOURCE =
     \\#pragma clang fp contract(off)
     \\threadgroup float local_sums[32], inv_s[1];
     \\const uint tgid = threadgroup_position_in_grid.x, rows = kx_shape[0];
@@ -889,20 +894,20 @@ const ATTN_DEC_TAIL =
     \\for (int d = sg * 32 + lane; d < D; d += NSG * 32) {
     \\  float o = 0.0f;
     \\  for (int g = 0; g < NSG; ++g) o += t_acc[g * D + d] * w[g];
-    \\  OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, freqs);
+    \\  OT ov = dsv41_unrope<OT>(OT(o / total), d, p0 + i, freqs, RD, D);
     \\  if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
-    \\  out[dsv41_head_at<OG>(i, h, H, meta[1]) * D + d] = ov;
+    \\  out[dsv41_head_at(i, h, H, meta[1], OG) * D + d] = ov;
     \\}
 ;
-const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++ ATTN_DEC_TAIL;
-const ATTN_DEC_PACKED_SOURCE = ATTN_DEC_PACKED_BODY ++ ATTN_DEC_TAIL;
+pub const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++ ATTN_DEC_TAIL;
+pub const ATTN_DEC_PACKED_SOURCE = ATTN_DEC_PACKED_BODY ++ ATTN_DEC_TAIL;
 
 /// The inverse rotation of the tail channel `d` of a head row the attention just wrote (`v`, at position `pos`):
 /// pairs are adjacent lanes, so every lane of the simdgroup must call it. `P`: MLX passes a small input as a
 /// constant pointer, else a device one.
 const UNROPE_HEADER =
-    \\template <typename OT, int RD, int D, typename P>
-    \\inline OT dsv41_unrope(OT v, int d, int pos, P freqs) {
+    \\template <typename OT, typename P>
+    \\inline OT dsv41_unrope(OT v, int d, int pos, P freqs, int RD, int D) {
     \\  #pragma clang fp contract(off)
     \\  const float pv = metal::simd_shuffle_xor(float(v), ushort(1));
     \\  if (RD == 0 || d < D - RD) return v;
@@ -916,7 +921,7 @@ const UNROPE_HEADER =
 
 /// UNROPE_HEADER and the fp8 activation round trip of a simdgroup's 32 channels (one dsv41_qat group), for the
 /// kernels that write the heads attnOut rounds next.
-const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
+pub const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
     \\template <typename OT>
     \\inline OT dsv41_fp8_store(OT v) {
     \\  #pragma clang fp contract(off)
@@ -925,8 +930,7 @@ const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
     \\  return static_cast<OT>(qat_round<0>(float(v), s));
     \\}
     \\// Head h of row i among L rows: `[L, H]`, or grouped `[OG, L, H / OG]` as an output projection's banks read it.
-    \\template <int OG>
-    \\inline size_t dsv41_head_at(int i, int h, int H, int L) {
+    \\inline size_t dsv41_head_at(int i, int h, int H, int L, int OG) {
     \\  if (OG == 0) return size_t(i) * H + h;
     \\  const int per = H / metal::max(OG, 1);
     \\  return (size_t(h / per) * L + i) * per + h % per;
@@ -935,7 +939,7 @@ const HEADS_HEADER = qat_mod.QAT_HEADER ++ UNROPE_HEADER ++
 
 /// Before a decode attention's body: one more threadgroup a row, past the heads', splits the row's hyper-connection
 /// mixes `z` (`HC_SPLIT_BODY`). The attention neither waits for it nor feeds it, and outlasts it.
-const ATTN_RIDE_PRE =
+pub const ATTN_RIDE_PRE =
     \\if (threadgroup_position_in_grid.x == uint(q_shape[1])) {
     \\#pragma clang fp contract(off)
     \\  if (simdgroup_index_in_threadgroup != 0u || threadgroup_position_in_grid.z != 0u) return;
@@ -960,12 +964,17 @@ const ATTN_SPLIT_TAIL =
     \\}
     \\if (sg == 0 && lane == 0) { pm[base] = M; pl[base] = l; }
 ;
-const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++ ATTN_SPLIT_TAIL;
-const ATTN_SPLIT_PACKED_SOURCE = ATTN_DEC_PACKED_BODY ++ ATTN_SPLIT_TAIL;
+pub const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++ ATTN_SPLIT_TAIL;
+pub const ATTN_SPLIT_PACKED_SOURCE = ATTN_DEC_PACKED_BODY ++ ATTN_SPLIT_TAIL;
+
+pub const ATTN_DEC_RIDE_SOURCE = ATTN_RIDE_PRE ++ ATTN_DEC_SOURCE;
+pub const ATTN_DEC_PACKED_RIDE_SOURCE = ATTN_RIDE_PRE ++ ATTN_DEC_PACKED_SOURCE;
+pub const ATTN_SPLIT_RIDE_SOURCE = ATTN_RIDE_PRE ++ ATTN_SPLIT_SOURCE;
+pub const ATTN_SPLIT_PACKED_RIDE_SOURCE = ATTN_RIDE_PRE ++ ATTN_SPLIT_PACKED_SOURCE;
 
 /// The S partials of one (row, head) `ATTN_SPLIT_SOURCE` wrote, merged with the sink in the denominator, then the
 /// inverse rotation (as `ATTN_DEC_SOURCE` ends); one thread a channel.
-const ATTN_MERGE_SOURCE =
+pub const ATTN_MERGE_SOURCE =
     \\const int d = thread_position_in_threadgroup.x, h = threadgroup_position_in_grid.y, i = threadgroup_position_in_grid.z;
     \\const int H = pm_shape[1], S = pm_shape[2];
     \\const size_t base = (size_t(i) * H + h) * S;
@@ -977,16 +986,16 @@ const ATTN_MERGE_SOURCE =
     \\  total += pl[base + j] * w;
     \\  o += pacc[(base + j) * D + d] * w;
     \\}
-    \\OT ov = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, freqs);
+    \\OT ov = dsv41_unrope<OT>(OT(o / total), d, meta[0] + i, freqs, RD, D);
     \\if (QAT != 0) ov = dsv41_fp8_store<OT>(ov);
-    \\out[dsv41_head_at<OG>(i, h, H, meta[1]) * D + d] = ov;
+    \\out[dsv41_head_at(i, h, H, meta[1], OG) * D + d] = ov;
 ;
 
 /// A wide span's softmax, one simdgroup per (row, head): the raw window scores `lw` [L*H, Wk] under the band
 /// (query l sees columns (wp + l - window, wp + l]), the raw selected scores `lc` [L, H, K] where the pick is >= 0,
 /// scaled by `scal` here in f32, max and sum in f32 with the sink in the denominator only, the normalized
 /// probabilities written in `OT`. NJ columns a lane. meta = {wp, window, Wk, K}.
-const ATTN_SOFTMAX_SOURCE =
+pub const ATTN_SOFTMAX_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const int h = thread_position_in_grid.x / 32, l = thread_position_in_grid.y;
     \\const int H = sink_shape[1];
@@ -1410,18 +1419,20 @@ const ATTN_FUSED_TAIL =
     \\      const int c = d0 + d * 8 + fn;
     \\      if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[d][0], v[d][1], meta[4] + l, freqs[(c - (D - RD)) / 2]);
     \\    }
-    \\    #pragma clang loop unroll(full)
-    \\    for (int g = 0; g < DT / 4 && QAT; ++g) {
-    \\      float amax = 0.0f;
+    \\    if (QAT) {
     \\      #pragma clang loop unroll(full)
-    \\      for (int d = g * 4; d < g * 4 + 4; ++d) amax = metal::max(amax, metal::max(metal::abs(v[d][0]), metal::abs(v[d][1])));
-    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
-    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
-    \\      const float sc = qat_scale<0>(amax);
-    \\      #pragma clang loop unroll(full)
-    \\      for (int d = g * 4; d < g * 4 + 4; ++d) {
-    \\        v[d][0] = float(static_cast<OT>(qat_round<0>(v[d][0], sc)));
-    \\        v[d][1] = float(static_cast<OT>(qat_round<0>(v[d][1], sc)));
+    \\      for (int g = 0; g < DT / 4; ++g) {
+    \\        float amax = 0.0f;
+    \\        #pragma clang loop unroll(full)
+    \\        for (int d = g * 4; d < g * 4 + 4; ++d) amax = metal::max(amax, metal::max(metal::abs(v[d][0]), metal::abs(v[d][1])));
+    \\        amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+    \\        amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+    \\        const float sc = qat_scale<0>(amax);
+    \\        #pragma clang loop unroll(full)
+    \\        for (int d = g * 4; d < g * 4 + 4; ++d) {
+    \\          v[d][0] = float(static_cast<OT>(qat_round<0>(v[d][0], sc)));
+    \\          v[d][1] = float(static_cast<OT>(qat_round<0>(v[d][1], sc)));
+    \\        }
     \\      }
     \\    }
     \\    #pragma clang loop unroll(full)
@@ -1444,7 +1455,7 @@ const ATTN_FUSED_TAIL =
 ;
 
 /// The epilogue's rotation of one channel pair: `ROPE_TAIL_SOURCE`'s inverse rotation, rounded to T.
-const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
+pub const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
     \\template <typename T>
     \\inline void dsv41_rope_pair(thread float& a, thread float& b, int pos, float freq) {
     \\  #pragma clang fp contract(off)
@@ -1461,7 +1472,7 @@ const ATTN_EPI_HEADER = qat_mod.QAT_HEADER ++
 /// holds a 16 x 16 fragment as 8 elements, rows `dsv41_nax_r` (lane, i) and columns `dsv41_nax_c` (lane, i), four
 /// contiguous columns a row. `dsv41_nax_mma` runs one 16 x N x KK multiply-accumulate on register fragments (one of N and
 /// KK is 32): `a` is 16 x KK, `b` KK x N, a dimension of 32 two consecutive 16-wide fragments.
-const ATTN_NAX_HEADER = metal_def.NAX_HEADER;
+pub const ATTN_NAX_HEADER = metal_def.NAX_HEADER;
 
 /// `ATTN_FUSED_HEAD` with both products on the matrix units: the scores as 16 keys x 16 heads over 32-channel steps
 /// (keys the left operand, so a tile's key fragments are read once and serve P x V as its right operand), P x V as
@@ -1566,20 +1577,22 @@ const ATTN_NAX_TAIL =
     \\        if (RD > 0 && c >= D - RD) dsv41_rope_pair<OT>(v[f][p * 2], v[f][p * 2 + 1], meta[4] + l, freqs[(c - (D - RD)) / 2]);
     \\      }
     \\    }
-    \\    #pragma clang loop unroll(full)
-    \\    for (int g = 0; g < OF / 2 && QAT; ++g) {
-    \\      float amax = 0.0f;
+    \\    if (QAT) {
     \\      #pragma clang loop unroll(full)
-    \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\      for (int g = 0; g < OF / 2; ++g) {
+    \\        float amax = 0.0f;
     \\        #pragma clang loop unroll(full)
-    \\        for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
-    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
-    \\      amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
-    \\      const float sc = qat_scale<0>(amax);
-    \\      #pragma clang loop unroll(full)
-    \\      for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\        for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\          #pragma clang loop unroll(full)
+    \\          for (int j = 0; j < 4; ++j) amax = metal::max(amax, metal::abs(v[f][j]));
+    \\        amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(1)));
+    \\        amax = metal::max(amax, metal::simd_shuffle_xor(amax, ushort(8)));
+    \\        const float sc = qat_scale<0>(amax);
     \\        #pragma clang loop unroll(full)
-    \\        for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+    \\        for (int f = g * 2; f < g * 2 + 2; ++f)
+    \\          #pragma clang loop unroll(full)
+    \\          for (int j = 0; j < 4; ++j) v[f][j] = float(static_cast<OT>(qat_round<0>(v[f][j], sc)));
+    \\      }
     \\    }
     \\    #pragma clang loop unroll(full)
     \\    for (int f = 0; f < OF; ++f) {
@@ -1631,10 +1644,10 @@ const ATTN_TILE_SHUFFLE =
     \\  auto source_row = [&](int j) { return metal::simd_shuffle(row_source, ushort(j)); };
 ;
 
-const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
-const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
-const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_NAX_TAIL;
-const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_NAX_TAIL;
+pub const ATTN_FUSED_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_FUSED_TAIL;
+pub const ATTN_FUSED_FP4_SOURCE: [:0]const u8 = ATTN_FUSED_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_FUSED_TAIL;
+pub const ATTN_NAX_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SOURCES ++ ATTN_FUSED_LOAD_ROWS ++ ATTN_NAX_TAIL;
+pub const ATTN_NAX_FP4_SOURCE: [:0]const u8 = ATTN_NAX_HEAD ++ ATTN_TILE_SHUFFLE ++ ATTN_FUSED_LOAD_FP4 ++ ATTN_NAX_TAIL;
 
 var attn_fused_def = Def{ .name = "dsv41_attn_fused", .ins = &.{ "q", "keys", "comp", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_SOURCE, .header = ATTN_EPI_HEADER };
 var attn_fused_fp4_def = Def{ .name = "dsv41_attn_fused_fp4", .ins = &.{ "q", "keys", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_FUSED_FP4_SOURCE, .header = ATTN_EPI_HEADER ++ qat_mod.PACK_HEADER };
@@ -1803,7 +1816,7 @@ pub fn attnNaxTrial(a: std.mem.Allocator, s: mlx.mlx_stream, h: usize, d: usize,
 
 /// The same scores from packed index keys (`codes` `[nb, IHD / 2]`, `scales` `[nb, IHD / G]`, `qat_mod.packFp4`'s
 /// form), each key value decoded as `qat_mod.unpackFp4` does, so no unpacked copy of the keys exists.
-const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
+pub const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
     \\const int nb = codes_shape[0];
     \\
 ++ sel.IDX_SCORE_SECOND4 ++
@@ -1816,7 +1829,7 @@ const IDX_SCORE_PACKED_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
 /// The packed scores of candidate blocks only: score c of row l is key `blocks[l, c / BS] * BS + c % BS` (`blocks`
 /// `[L, KB]` int32, ascending, < 0 = none), -inf for no block or a key the query cannot see. A key scores the bits it
 /// does in `IDX_SCORE_PACKED_SOURCE`.
-const IDX_GATHER_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
+pub const IDX_GATHER_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
     \\const int nb = blocks_shape[1] * BS;
     \\
 ++ sel.IDX_SCORE_SECOND4 ++
@@ -1835,7 +1848,7 @@ const IDX_GATHER_SOURCE: [:0]const u8 = sel.IDX_SCORE_FIRST ++
 ;
 
 /// Key ids of the picks `pos` (`[L, K]` positions into a gathered score row) of `blocks`; ids of no block are past any query.
-const CAND_KEYS_SOURCE =
+pub const CAND_KEYS_SOURCE =
     \\const int j = thread_position_in_grid.x, l = thread_position_in_grid.y;
     \\const int k = pos_shape[1];
     \\if (j >= k) return;
@@ -1844,7 +1857,7 @@ const CAND_KEYS_SOURCE =
     \\out[l * k + j] = blk < 0 ? 0x7fffffff : blk * BS + p % BS;
 ;
 
-const IDX_PACKED_HEADER: [:0]const u8 = qat_mod.PACK_HEADER ++
+pub const IDX_PACKED_HEADER: [:0]const u8 = qat_mod.PACK_HEADER ++
     \\template <typename C, typename S>
     \\inline float dsv41_fp4_at(C codes, S scales, int j, int G, int MODE) {
     \\  const uint byte = uint(codes[j / 2]);
@@ -1906,7 +1919,7 @@ pub fn candidateKeys(sc: *Scope, pos: A, blocks: A, bs: usize) !A {
 /// order the key fragments pair them (`dsv41_index_scores_nax`); `pq` is 2^e0. `sqr[l]` is the widest spread of e across
 /// a head's groups, or 1000 when a group is not of that form (no FP4 grid, a range the products cannot hold) or a head
 /// weight is out of the range its products stay normal in: such a row scores on the scalar loop.
-const IDX_NAX_PREP_SOURCE =
+pub const IDX_NAX_PREP_SOURCE =
     \\const int l = threadgroup_position_in_grid.x;
     \\const uint t = thread_index_in_threadgroup;
     \\const int h = int(t) / 4, g = int(t) % 4;
@@ -1952,7 +1965,7 @@ const IDX_NAX_PREP_SOURCE =
 ;
 
 /// `dsv41_index_scores_fp4`'s loop for one key of one row, `q` read in place: the keys the matrix form cannot hold.
-const IDX_NAX_HEADER = IDX_PACKED_HEADER ++
+pub const IDX_NAX_HEADER = IDX_PACKED_HEADER ++
     \\template <typename Q, typename C, typename S, typename W, typename WS>
     \\inline float dsv41_idx_scalar(Q qf, C codes, S scales, W w, WS wsc, int l, int key) {
     \\  const auto qr = qf + size_t(l) * 32 * 128;
@@ -2104,13 +2117,13 @@ const IDX_NAX_COMMON =
     \\}
 ;
 
-const IDX_NAX_SOURCE: [:0]const u8 =
+pub const IDX_NAX_SOURCE: [:0]const u8 =
     \\const int NC = codes_shape[0];
     \\#define COLUMN(n, vis, key) { vis = (n) < NC && (n) < seen; key = metal::min((n), NC - 1); }
     \\
 ++ IDX_NAX_COMMON;
 
-const IDX_NAX_GATHER_SOURCE: [:0]const u8 =
+pub const IDX_NAX_GATHER_SOURCE: [:0]const u8 =
     \\const int NC = blocks_shape[1] * BS;
     \\#define COLUMN(n, vis, key) { const int blk = (n) < NC ? blocks[size_t(l) * blocks_shape[1] + (n) / BS] : -1; key = blk >= 0 ? blk * BS + (n) % BS : 0; vis = blk >= 0 && key < seen; }
     \\
@@ -2278,7 +2291,7 @@ pub fn indexScoresTile(sc: *Scope, q: A, keys: A, w: A, wscale: f32, p0: usize, 
 /// One token of the draft's Markov chain, a thread a vocabulary row: row `step` of `logits` plus the bigram bias (the
 /// bias row of `prev` in `embed` against the row of `head`), the threadgroup's first maximum, and from threadgroup 0
 /// the confidence logit of the block row and the bias row against `cw`.
-const MARKOV_ROW_SOURCE =
+pub const MARKOV_ROW_SOURCE =
     \\const uint tid = thread_index_in_threadgroup, tgx = threadgroup_position_in_grid.x;
     \\const int V = logits_shape[1], D = hout_shape[1], k = step[0];
     \\const device T* me = embed + size_t(prev[0]) * R;
@@ -2313,7 +2326,7 @@ const MARKOV_ROW_SOURCE =
 ;
 
 /// The first maximum over the threadgroups' maxima, which arrive in vocabulary order.
-const MARKOV_PICK_SOURCE =
+pub const MARKOV_PICK_SOURCE =
     \\if (thread_position_in_grid.x != 0u) return;
     \\const int n = part_val_shape[0];
     \\int best = 0;
@@ -2626,7 +2639,7 @@ fn mlxRowReduceThreads(n: usize) usize {
 /// three row sums in MLX's order (`mlxRowReduceThreads`: each thread its 4-wide blocks then its tail, simd sums, then
 /// the simdgroup partials), then every op of the chain in its order, uncontracted, so the bits are the chain's.
 /// cst = {1 / D, eps, 1 / sqrt(D)}.
-const ENGRAM_SOURCE =
+pub const ENGRAM_SOURCE =
     \\#pragma clang fp contract(off)
     \\const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int TG = threads_per_threadgroup.x, j = threadgroup_position_in_grid.y, l = threadgroup_position_in_grid.z;

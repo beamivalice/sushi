@@ -8,7 +8,7 @@ const mlx = @import("../mlx.zig");
 const Arr = mlx.mlx_array;
 const kcfg = @import("hy4_kcfg.zig");
 
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\uint j = thread_position_in_grid.x;
     \\uint t = thread_position_in_grid.y;
     \\uint a = thread_position_in_grid.z;

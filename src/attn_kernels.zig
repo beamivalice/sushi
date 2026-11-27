@@ -43,7 +43,7 @@ const swaMaxErr = trunk_helpers_test.swaMaxErr;
 const swaSinkTestConfig = trunk_helpers_test.swaSinkTestConfig;
 const swaSinkTruth = trunk_helpers_test.swaSinkTruth;
 
-const ATTN_PD_KERNEL_HEADER =
+pub const ATTN_PD_KERNEL_HEADER =
     \\#include <metal_simdgroup_matrix>
     \\
     \\// Fragment layout mirrors MLX steel BaseMMAFrag<float,8,8>: each thread
@@ -100,7 +100,7 @@ const ATTN_PD_KERNEL_HEADER =
 // ping-pong (per-block rescale doubles), V-from-global fragments (device
 // loads too slow), K-only double-buffer (barrier structure unchanged),
 // Q-smem BQ=32 with 2 threadgroups/core (SLC thrash at long kL).
-const ATTN_PD_KERNEL_SOURCE =
+pub const ATTN_PD_KERNEL_SOURCE =
     \\constexpr int BQ = 64;
     \\constexpr int BK = 32;
     \\constexpr int LDK = BK + 8;
@@ -840,13 +840,13 @@ pub const QSA_SCORE_KERNEL_HEADER =
     \\
 ;
 
-const QSA_ATTN_Q_SOURCE =
+pub const QSA_ATTN_Q_SOURCE =
     \\constexpr int KC = DK / 8;
     \\constexpr int VC = DV / 8;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = DV + 8;
     \\// Simdgroups past NSG only stage tiles: who loads an element never changes its value.
-    \\constexpr int NT = 32 * NSGT;
+    \\const int NT = 32 * NSGT;
     \\constexpr int KT = BK / 8;
     \\constexpr int KV_ELEMS = (DK * LDK > BK * LDV) ? DK * LDK : BK * LDV;
     \\// Per-length split counts ride the grid, never a template.
@@ -1064,7 +1064,7 @@ const QSA_ATTN_Q_SOURCE =
 /// sushi_attn_qsa256_qmerge: the split-K reduction, one threadgroup per (q head, query row).
 /// Standard flash-decoding merge in the log2 domain; `l_j == 0` marks an empty split and is
 /// skipped. NSPLIT, qL and DV ride `pacc_shape`, so the config depends on nothing per token.
-const QSA_ATTN_MERGE_SOURCE =
+pub const QSA_ATTN_MERGE_SOURCE =
     \\const int DV = pacc_shape[3];
     \\const int d = int(thread_index_in_threadgroup);
     \\const int s = int(threadgroup_position_in_grid.y);

@@ -92,15 +92,15 @@ pub const E4M3_HEADER =
 ;
 
 const GEOMETRY =
-    \\constexpr uint RPR = uint(P0 + P1 + P2);
-    \\constexpr uint NROWS = uint(TP) * RPR;
-    \\constexpr uint KC = uint(K) / 16u;
-    \\constexpr uint KB = uint(K) / 128u;
+    \\const uint RPR = uint(P0 + P1 + P2);
+    \\const uint NROWS = uint(TP) * RPR;
+    \\const uint KC = uint(K) / 16u;
+    \\const uint KB = uint(K) / 128u;
     \\
 ;
 
 /// One simdgroup owns NR stored rows for all M input rows.
-const GEMV_HEAD = GEOMETRY ++
+pub const GEMV_HEAD = GEOMETRY ++
     \\uint lane = thread_index_in_simdgroup;
     \\uint row0 = (threadgroup_position_in_grid.x * uint(SGS) + simdgroup_index_in_threadgroup) * uint(NR);
     \\const device uint4* wp[NR];
@@ -123,7 +123,7 @@ const GEMV_HEAD = GEOMETRY ++
 
 /// Lanes stride each row in 16-byte chunks (a chunk never straddles a tile)
 /// and read x from device memory: the narrow widths.
-const GEMV_DIRECT =
+pub const GEMV_DIRECT =
     \\for (uint c = lane; c < KC; c += 32u) {
     \\  uint4 wr[NR];
     \\  float sc[NR];
@@ -150,7 +150,7 @@ const GEMV_DIRECT =
 
 /// x staged per S tiles in threadgroup memory, shared by the SGS*NR rows of
 /// the threadgroup: past a few rows, re-reading x per row outweighs the weight.
-const GEMV_STAGED =
+pub const GEMV_STAGED =
     \\threadgroup float xs[M * 128 * S];
     \\uint tid = simdgroup_index_in_threadgroup * 32u + lane;
     \\for (uint k0 = 0; k0 < uint(K); k0 += 128u * uint(S)) {
@@ -178,7 +178,7 @@ const GEMV_STAGED =
     \\
 ;
 
-const GEMV_TAIL =
+pub const GEMV_TAIL =
     \\#pragma clang loop unroll(full)
     \\for (int m = 0; m < M; ++m) {
     \\  #pragma clang loop unroll(full)
@@ -191,14 +191,14 @@ const GEMV_TAIL =
     \\
 ;
 
-const GEMV_STORE_1 =
+pub const GEMV_STORE_1 =
     \\      y[(size_t)m * NROWS + o] = T(total);
     \\    }
     \\  }
     \\}
 ;
 
-const GEMV_STORE_3 =
+pub const GEMV_STORE_3 =
     \\      if (local < uint(P0)) yq[(size_t)m * (TP * P0) + rank * P0 + local] = T(total);
     \\      else if (local < uint(P0 + P1)) yk[(size_t)m * (TP * P1) + rank * P1 + (local - P0)] = T(total);
     \\      else yv[(size_t)m * (TP * P2) + rank * P2 + (local - P0 - P1)] = T(float(T(total)) * as_type<float>(uint(VSB)));
@@ -209,7 +209,7 @@ const GEMV_STORE_3 =
 
 /// One thread per 16-byte chunk: `bf16(code * scale)`, the value the bf16
 /// route stored, written row-major into the output its row belongs to.
-const DEQUANT_BODY = GEOMETRY ++
+pub const DEQUANT_BODY = GEOMETRY ++
     \\uint c = thread_position_in_grid.x;
     \\uint o = thread_position_in_grid.y;
     \\if (c >= KC || o >= NROWS) return;
@@ -220,26 +220,26 @@ const DEQUANT_BODY = GEOMETRY ++
     \\
 ;
 
-const DEQUANT_DST_1 =
+pub const DEQUANT_DST_1 =
     \\device T* dst = y + (size_t)o * (size_t)K;
     \\
 ;
 
-const DEQUANT_DST_3 =
+pub const DEQUANT_DST_3 =
     \\device T* dst = local < uint(P0) ? yq + (size_t)(rank * P0 + local) * (size_t)K
     \\    : local < uint(P0 + P1) ? yk + (size_t)(rank * P1 + local - P0) * (size_t)K
     \\    : yv + (size_t)(rank * P2 + local - P0 - P1) * (size_t)K;
     \\
 ;
 
-const DEQUANT_TAIL =
+pub const DEQUANT_TAIL =
     \\#pragma clang loop unroll(full)
     \\for (int i = 0; i < 4; ++i) {
     \\  *((device vec<T, 4>*)(dst + c * 16u + uint(i) * 4u)) = vec<T, 4>(sushi_e4m3_decode4(wr[i]) * sc);
     \\}
 ;
 
-const TILE_HEADER = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n" ++ E4M3_HEADER;
+pub const TILE_HEADER = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n" ++ E4M3_HEADER;
 
 const TILE_ROW_TILES = 8;
 
@@ -250,7 +250,7 @@ const TILE_BODY = GEOMETRY ++
     \\using namespace mpp::tensor_ops;
     \\constexpr uint NSG = 8u;
     \\constexpr uint BN = 32u;
-    \\constexpr uint KCH = uint(K) / NSG;
+    \\const uint KCH = uint(K) / NSG;
     \\uint tid = thread_position_in_threadgroup.x;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint lane = thread_index_in_simdgroup;
@@ -267,7 +267,7 @@ const TILE_BODY = GEOMETRY ++
     \\
 ++ tileRepeat(
     \\auto c$ = SUSHI_FP8_CT;
-    \\if constexpr (MT > $) { for (uint16_t i = 0; i < c$.get_capacity(); ++i) c$[i] = 0.0f; }
+    \\if (MT > $) { for (uint16_t i = 0; i < c$.get_capacity(); ++i) c$[i] = 0.0f; }
     \\
 ) ++
     \\uint o_read = metal::min(n0 + lane, NROWS - 1u);
@@ -289,7 +289,7 @@ const TILE_BODY = GEOMETRY ++
     \\  auto tb = B.template slice<32, 16>(0, 0);
     \\
 ++ tileRepeat(
-    \\  if constexpr (MT > $) { auto ta = A.template slice<16, 16>(int(k0), $ * 16); op.run(ta, tb, c$); }
+    \\  if (MT > $) { auto ta = A.template slice<16, 16>(int(k0), $ * 16); op.run(ta, tb, c$); }
     \\
 ) ++
     \\  simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -300,7 +300,7 @@ const TILE_BODY = GEOMETRY ++
 /// One 16-row tile's partials, reduced across the simdgroups in a fixed order, stored for
 /// input row `row` and stored row `o`.
 const TILE_REDUCE_HEAD =
-    \\if constexpr (MT > $) {
+    \\if (MT > $) {
     \\  c$.store(C.template slice<32, 16>(0, 0));
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
     \\  for (uint off = tid; off < 16u * BN; off += 32u * NSG) {
@@ -351,7 +351,7 @@ fn tileRepeat(comptime text: []const u8) []const u8 {
     }
 }
 
-fn tileSource(comptime three: bool) [:0]const u8 {
+pub fn tileSource(comptime three: bool) [:0]const u8 {
     comptime {
         const store = if (three) TILE_STORE_3 else TILE_STORE_1;
         const text = TILE_BODY ++ tileRepeat(TILE_REDUCE_HEAD ++ store ++ TILE_REDUCE_TAIL);

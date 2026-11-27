@@ -31,7 +31,7 @@ fn ints(vals: []const i32) !A {
 /// `n`, `xr`, `ELEM(i)` (the key of element i) and `EMIT(p, i)` (pick p is element i).
 pub const TOPK_BODY =
     \\threadgroup atomic_uint hist[256];
-    \\threadgroup uint t_sel[2], t_part[TG / 32];
+    \\threadgroup uint t_sel[2], t_part[32];
     \\const uint K = uint(kk[0]);
     \\uint prefix = 0, krem = K;
     \\for (int pass = 0; pass < 4; ++pass) {
@@ -94,7 +94,7 @@ pub const TOPK_PRE =
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 ;
 
-const TOPK_SOURCE = TOPK_PRE ++
+pub const TOPK_SOURCE = TOPK_PRE ++
     \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
     \\const auto xr = x + size_t(l) * n;
     \\#define ELEM(i) dsv41_key(xr[i])
@@ -103,7 +103,7 @@ const TOPK_SOURCE = TOPK_PRE ++
 ++ TOPK_BODY;
 
 /// Chunk g of G of each row: its K picks as row indices, `[L, G * K]`; kk = {K, G}.
-const TOPK_CHUNK_SOURCE = TOPK_PRE ++
+pub const TOPK_CHUNK_SOURCE = TOPK_PRE ++
     \\const int l = threadgroup_position_in_grid.y, g = threadgroup_position_in_grid.x, G = kk[1], N = x_shape[1];
     \\const size_t c0 = size_t(N) * g / G;
     \\const int n = int(size_t(N) * (g + 1) / G - c0);
@@ -114,7 +114,7 @@ const TOPK_CHUNK_SOURCE = TOPK_PRE ++
 ++ TOPK_BODY;
 
 /// `TOPK_SOURCE` that writes -1 for a pick not under its row's length `lens[l]`.
-const TOPK_BELOW_SOURCE = TOPK_PRE ++
+pub const TOPK_BELOW_SOURCE = TOPK_PRE ++
     \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
     \\const auto xr = x + size_t(l) * n;
     \\#define ELEM(i) dsv41_key(xr[i])
@@ -123,7 +123,7 @@ const TOPK_BELOW_SOURCE = TOPK_PRE ++
 ++ TOPK_BODY;
 
 /// The K largest of each row of `x` among its candidate indices `ids` `[L, C]` (ascending).
-const TOPK_MERGE_SOURCE = TOPK_PRE ++
+pub const TOPK_MERGE_SOURCE = TOPK_PRE ++
     \\const int l = threadgroup_position_in_grid.y, n = ids_shape[1];
     \\const auto xr = x + size_t(l) * x_shape[1];
     \\const auto ir = ids + size_t(l) * n;
@@ -202,7 +202,7 @@ pub const IDX_SCORE_TAIL =
 
 pub const IDX_SCORE_LAST = IDX_SCORE_DOT ++ IDX_SCORE_TAIL;
 
-const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
+pub const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
     \\const int nb = keys_shape[0];
     \\
 ++ IDX_SCORE_SECOND ++
@@ -216,7 +216,7 @@ const IDX_SCORE_SOURCE: [:0]const u8 = IDX_SCORE_FIRST ++
 /// summed as it completes, so no [L, IH, nb] scratch. A tile the query cannot see is -inf without the work. `q`
 /// arrives in the keys' dtype, so the cast is exact. meta = {p0, ratio, key offset}: `keys` may be a slice of a longer
 /// key list starting at that offset.
-const IDX_TILE_SOURCE =
+pub const IDX_TILE_SOURCE =
     \\const int l = threadgroup_position_in_grid.y, n0 = threadgroup_position_in_grid.x * KT;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int nb = keys_shape[0];

@@ -83,14 +83,14 @@ pub fn routerSwapLogits(out: *mlx.mlx_array, router_logits: mlx.mlx_array, kind:
 /// selected within `gap` (lowest index on ties) unless it is starved. Writes the
 /// picked ids and their slots. The host still runs its own pick and keeps the
 /// GPU result only when both agree.
-const EXPERT_PICK_SOURCE =
+pub const EXPERT_PICK_SOURCE =
     \\uint t = thread_position_in_threadgroup.x;
     \\uint T = threads_per_threadgroup.x;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
-    \\threadgroup bool taken[E];
-    \\threadgroup int sel[K];
-    \\threadgroup int order[K];
+    \\threadgroup bool taken[1024];
+    \\threadgroup int sel[32];
+    \\threadgroup int order[32];
     \\threadgroup int nmiss;
     \\threadgroup float red_v[32];
     \\threadgroup int red_i[32];

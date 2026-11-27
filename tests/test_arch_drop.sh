@@ -143,6 +143,9 @@ prepare_drop() {
   git worktree add --quiet --detach "$dir/wt" HEAD || return 1
   ln -s "$ROOT/.zig-toolchain" "$dir/wt/.zig-toolchain"
   ln -s "$ROOT/lib/mlx" "$dir/wt/lib/mlx"
+  if [ -d "$dir/wt/lib/mlx-src" ] && [ -z "$(ls -A "$dir/wt/lib/mlx-src" 2> /dev/null)" ] && [ -d "$ROOT/lib/mlx-src/mlx" ]; then
+    ln -s "$ROOT/lib/mlx-src/mlx" "$dir/wt/lib/mlx-src/mlx"
+  fi
   rm -rf "$dir/wt/src/$arch"
   sed -i.bak "/\/\/ arch:$arch\$/d" "$dir/wt/$REGISTRY" && rm -f "$dir/wt/$REGISTRY.bak"
   # lint fails an allowlist entry whose file is gone; arch-tests.allow names shared tests, which a drop leaves in place.

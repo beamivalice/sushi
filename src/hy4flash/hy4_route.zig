@@ -28,7 +28,7 @@ const bar = "threadgroup_barrier(mem_flags::mem_threadgroup);\n";
 /// The simdgroup helpers: ascending bitonic sort of 32 keys, the merge of a 32-lane bitonic sequence, and the 16 best of
 /// four sorted lists of 16 (`lists`, one after another), left in lanes 0 to 15 ascending. Every shuffle runs on all 32
 /// lanes: a lane a shuffle reads must be active.
-const header =
+pub const header =
     \\inline ulong sg_shuffle(ulong v, ushort l) {
     \\  return (ulong(metal::simd_shuffle(uint(v >> 32), l)) << 32) | ulong(metal::simd_shuffle(uint(v), l));
     \\}
@@ -64,11 +64,19 @@ const head =
     \\uint i = thread_position_in_threadgroup.x;
     \\uint row = threadgroup_position_in_grid.y;
     \\uint lane = i & 31;
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float sc[1024];
+    \\threadgroup ulong keys[FAST ? 1 : 1024];
+    \\threadgroup ulong cand[FAST ? 256 : 1];
+    \\threadgroup ulong cand2[FAST ? 64 : 1];
+    \\threadgroup uint picked_id[FAST ? 1 : 32];
+    \\#else
     \\threadgroup float sc[E];
     \\threadgroup ulong keys[(N > 32 && !FAST) ? N : 1];
     \\threadgroup ulong cand[FAST ? 256 : 1];
     \\threadgroup ulong cand2[FAST ? 64 : 1];
     \\threadgroup uint picked_id[FAST ? 1 : K];
+    \\#endif
     \\threadgroup float total[1];
     \\ulong key = ~0ul;
     \\if (i < uint(E)) {
@@ -163,7 +171,7 @@ const full_sort =
     \\
 ;
 
-const source: [:0]const u8 = head ++ fast_body ++ full_sort;
+pub const source: [:0]const u8 = head ++ fast_body ++ full_sort;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 

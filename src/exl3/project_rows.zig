@@ -28,10 +28,10 @@ pub const ROWS_HELPERS: [:0]const u8 =
     \\  const float s3 = v.z - v.w;
     \\  return float4(s0 + s2, s1 + s3, s0 - s2, s1 - s3);
     \\}
-    \\template <typename OutT, int HD, int RD>
-    \\static inline OutT exl3_rope_lane(OutT a, uint ch, uint lane, float pf, const device float *freqs) {
+    \\template <typename OutT>
+    \\static inline OutT exl3_rope_lane(OutT a, uint ch, uint lane, float pf, const device float *freqs, int HD, int RD) {
     \\  #pragma clang fp contract(off)
-    \\  constexpr uint HEAD = uint(HD - RD);
+    \\  const uint HEAD = uint(HD - RD);
     \\  if (ch < HEAD) return a;
     \\  const float xv = float(a);
     \\  const float partner = metal::simd_shuffle_xor(xv, ushort(1));
@@ -144,10 +144,10 @@ const ROWS_FOLD_ROPE: []const u8 =
     \\    const uint ch = (ot0 * TILE) % uint(HD) + lane;
     \\    const float pf = float(pos[r]);
     \\    const auto yr = y + exl3_seg_at(r, ob, uint(ROWS), uint(ODIM), uint(SB1), uint(SB2), uint(SB3));
-    \\    yr[0] = exl3_rope_lane<OutT, HD, RD>(OutT(v.x * psc * float(svh[ob])), ch, lane, pf, freqs);
-    \\    yr[32] = exl3_rope_lane<OutT, HD, RD>(OutT(v.y * psc * float(svh[ob + 32u])), ch + 32u, lane, pf, freqs);
-    \\    yr[64] = exl3_rope_lane<OutT, HD, RD>(OutT(v.z * psc * float(svh[ob + 64u])), ch + 64u, lane, pf, freqs);
-    \\    yr[96] = exl3_rope_lane<OutT, HD, RD>(OutT(v.w * psc * float(svh[ob + 96u])), ch + 96u, lane, pf, freqs);
+    \\    yr[0] = exl3_rope_lane<OutT>(OutT(v.x * psc * float(svh[ob])), ch, lane, pf, freqs, HD, RD);
+    \\    yr[32] = exl3_rope_lane<OutT>(OutT(v.y * psc * float(svh[ob + 32u])), ch + 32u, lane, pf, freqs, HD, RD);
+    \\    yr[64] = exl3_rope_lane<OutT>(OutT(v.z * psc * float(svh[ob + 64u])), ch + 64u, lane, pf, freqs, HD, RD);
+    \\    yr[96] = exl3_rope_lane<OutT>(OutT(v.w * psc * float(svh[ob + 96u])), ch + 96u, lane, pf, freqs, HD, RD);
     \\  }
     \\
 ;
@@ -388,7 +388,7 @@ const ROWS_FINISH_AT_ROW_MAJOR =
     \\
 ;
 
-const ROWS_FINISH_SOURCE: [:0]const u8 =
+pub const ROWS_FINISH_SOURCE: [:0]const u8 =
     \\const uint lane = uint(thread_index_in_simdgroup);
     \\const uint b = uint(threadgroup_position_in_grid.x) * 128u + lane;
     \\const uint r = uint(threadgroup_position_in_grid.z) * uint(ROWS) + uint(threadgroup_position_in_grid.y);
@@ -408,12 +408,12 @@ const ROWS_FINISH_SOURCE: [:0]const u8 =
 ;
 
 /// `ROWS_FINISH_SOURCE` storing each output as its OutT (bf16) rounding into f32 rows (`Mode.thru_bf16`).
-const ROWS_FINISH_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, "device OutT *yr", "device float *yr");
+pub const ROWS_FINISH_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, "device OutT *yr", "device float *yr");
 
-const ROWS_FINISH_ROW_MAJOR_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, ROWS_FINISH_AT, ROWS_FINISH_AT_ROW_MAJOR);
+pub const ROWS_FINISH_ROW_MAJOR_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_FINISH_SOURCE, ROWS_FINISH_AT, ROWS_FINISH_AT_ROW_MAJOR);
 
 /// `ROWS_FINISH_SOURCE` for a one-bank query projection whose `HD`-channel heads leave tail-rotated by `RD`.
-const ROWS_FINISH_ROPE_SOURCE: [:0]const u8 =
+pub const ROWS_FINISH_ROPE_SOURCE: [:0]const u8 =
     \\const uint lane = uint(thread_index_in_simdgroup);
     \\const uint tg = uint(threadgroup_position_in_grid.x);
     \\const uint b = tg * 128u + lane;
@@ -428,15 +428,15 @@ const ROWS_FINISH_ROPE_SOURCE: [:0]const u8 =
     \\const uint ch = (tg * 128u) % uint(HD) + lane;
     \\const float pf = float(pos[r]);
     \\device OutT *yr = y + (size_t)r * uint(ODIM) + b;
-    \\yr[0] = exl3_rope_lane<OutT, HD, RD>(OutT(v.x * psc * float(svh[b])), ch, lane, pf, freqs);
-    \\yr[32] = exl3_rope_lane<OutT, HD, RD>(OutT(v.y * psc * float(svh[b + 32u])), ch + 32u, lane, pf, freqs);
-    \\yr[64] = exl3_rope_lane<OutT, HD, RD>(OutT(v.z * psc * float(svh[b + 64u])), ch + 64u, lane, pf, freqs);
-    \\yr[96] = exl3_rope_lane<OutT, HD, RD>(OutT(v.w * psc * float(svh[b + 96u])), ch + 96u, lane, pf, freqs);
+    \\yr[0] = exl3_rope_lane<OutT>(OutT(v.x * psc * float(svh[b])), ch, lane, pf, freqs, HD, RD);
+    \\yr[32] = exl3_rope_lane<OutT>(OutT(v.y * psc * float(svh[b + 32u])), ch + 32u, lane, pf, freqs, HD, RD);
+    \\yr[64] = exl3_rope_lane<OutT>(OutT(v.z * psc * float(svh[b + 64u])), ch + 64u, lane, pf, freqs, HD, RD);
+    \\yr[96] = exl3_rope_lane<OutT>(OutT(v.w * psc * float(svh[b + 96u])), ch + 96u, lane, pf, freqs, HD, RD);
 ;
 
 /// `ROWS_FINISH_SOURCE` of a one-bank launch whose row `y` leaves as HC streams: stream i is
 /// `fma(post[i], y, sum over j of fma(comb[j][i], x[j], acc))` rounded to OutT, `y` rounded to OutT first.
-const ROWS_FINISH_EXPAND_SOURCE: [:0]const u8 =
+pub const ROWS_FINISH_EXPAND_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint lane = uint(thread_index_in_simdgroup);
     \\const uint b = uint(threadgroup_position_in_grid.x) * 128u + lane;
@@ -466,7 +466,7 @@ const ROWS_FINISH_EXPAND_SOURCE: [:0]const u8 =
 /// row. The norm is MLX's `rms_single_row` on the finished row, sum for sum: a thread squares four neighbours with a
 /// fused multiply-add (as MLX's compiled kernel does: f32 outputs show the ulp), a simdgroup sums its 128 columns,
 /// simdgroup 0 the simdgroups', and an output is `w * OutT(x * inv)`.
-const ROWS_FINISH_RMS_SOURCE: [:0]const u8 =
+pub const ROWS_FINISH_RMS_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint lane = uint(thread_index_in_simdgroup);
     \\const uint sg = uint(simdgroup_index_in_threadgroup);
@@ -524,7 +524,7 @@ const ROWS_FINISH_RMS_SOURCE: [:0]const u8 =
     \\}
 ;
 
-const ROWS_RING_HELPERS: [:0]const u8 = ROWS_HELPERS ++
+pub const ROWS_RING_HELPERS: [:0]const u8 = ROWS_HELPERS ++
     \\static inline float exl3_round_scale(float v) {
     \\  uint b = as_type<uint>(v);
     \\  int e = int((b >> 23) & 0xFFu) - 127 + ((b & 0x7FFFFFu) != 0u ? 1 : 0);
@@ -548,7 +548,7 @@ const ROWS_RING_HELPERS: [:0]const u8 = ROWS_HELPERS ++
 /// `ROWS_FINISH_RMS_SOURCE` for a 2-segment `[NORM, KV_D]` attention input (`wq_a` + `wkv`) that also applies
 /// `kv_norm` + tail RoPE + optional fp8 QAT on the `KV_D` segment in the idle simdgroups and copies unchanged rows
 /// of `ring` into `rout` in parallel threadgroups, eliminating the `ropeKvRing` barrier and DRAM roundtrip.
-const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
+pub const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint tgid = uint(threadgroup_position_in_grid.x);
     \\const int cap = ring_shape[0];
@@ -659,11 +659,11 @@ const ROWS_FINISH_RMS_RING_SOURCE: [:0]const u8 =
     \\}
 ;
 
-const ROWS_NAX_ROPE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_FOLD, ROWS_FOLD_ROPE);
+pub const ROWS_NAX_ROPE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_FOLD, ROWS_FOLD_ROPE);
 
 /// `ROWS_FINISH_RMS_SOURCE` of a launch through bf16 (`Mode.thru_bf16`): each finished output rounded to bf16 and widened,
 /// the norm in f32 over `w` widened as stored, the rows f32 (OutT): the through launch, then MLX's f32 rms norm.
-const ROWS_FINISH_RMS_THRU_SOURCE: [:0]const u8 = blk: {
+pub const ROWS_FINISH_RMS_THRU_SOURCE: [:0]const u8 = blk: {
     var t: []const u8 = ROWS_FINISH_RMS_SOURCE;
     for ([_][]const u8{ "o0", "o1", "o2", "o3" }) |o| t = kernels.metalReplaceFound(t, "const OutT " ++ o ++ " = OutT(", "const float " ++ o ++ " = THRU_BF16(");
     t = kernels.metalReplaceFound(t, "yr[i] = w[c0 + uint(i)] * OutT(tx[i] * inv_mean[0]);", "yr[i] = float(w[c0 + uint(i)]) * (tx[i] * inv_mean[0]);");
@@ -753,9 +753,9 @@ fn dynRowsSource(comptime src: []const u8, comptime rn: []const u8) [:0]const u8
     }
 }
 
-const ROWS_NAX_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_NAX_SOURCE, "uint(x_shape[0]) / uint(GROUPS)");
+pub const ROWS_NAX_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_NAX_SOURCE, "uint(x_shape[0]) / uint(GROUPS)");
 
-const ROWS_FINISH_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_FINISH_SOURCE, "uint(threadgroups_per_grid.y)");
+pub const ROWS_FINISH_DYN_SOURCE: [:0]const u8 = dynRowsSource(ROWS_FINISH_SOURCE, "uint(threadgroups_per_grid.y)");
 
 /// The rows a dynamic-rows launch of `rows` compiles at: eight or the cap, so a small total keeps a wide chunk.
 fn dynCap(rows: c_int) c_int {
@@ -916,9 +916,9 @@ const W32_FRAGS: [:0]const u8 =
 
 const ROWS_PEND_INS = ROWS_INS ++ [_][*:0]const u8{"xsvh"};
 
-const ROWS_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_SOURCE, ROWS_X_PLAIN, ROWS_X_PENDING);
+pub const ROWS_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_SOURCE, ROWS_X_PLAIN, ROWS_X_PENDING);
 
-const ROWS_NAX_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_X_PLAIN, ROWS_X_PENDING);
+pub const ROWS_NAX_PEND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_X_PLAIN, ROWS_X_PENDING);
 
 /// `rowsKernel` for a launch whose input is another launch's partials (`Pending`).
 pub fn rowsPendKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
@@ -926,9 +926,9 @@ pub fn rowsPendKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
     return kernel_src.codebookKernelWith(&rows_pend_kernel, "sushi_exl3_rows_pend", &ROWS_PEND_INS, &.{"y"}, ROWS_PEND_SOURCE, ROWS_HELPERS);
 }
 
-const ROWS_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_SOURCE, ROWS_X_PLAIN, ROWS_X_THRU);
+pub const ROWS_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_SOURCE, ROWS_X_PLAIN, ROWS_X_THRU);
 
-const ROWS_NAX_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_X_PLAIN, ROWS_X_THRU);
+pub const ROWS_NAX_THRU_SOURCE: [:0]const u8 = kernels.metalReplaceFound(ROWS_NAX_SOURCE, ROWS_X_PLAIN, ROWS_X_THRU);
 
 var rows_thru_kernel: kernel_src.KernelSlots = kernel_src.no_kernels;
 
@@ -946,7 +946,7 @@ pub fn rowsThruKernel(g: RowsGeom) !mlx.mlx_fast_metal_kernel {
 /// A counted launch's stores: a partial by a relaxed device atomic, which the block's last threadgroup reads back; a
 /// finished output as its output's type (`exl3_fin`), or by an atomic where the launch's last reads it back. The
 /// SwiGLU is MLX's ops': its Sigmoid functor, then `(g · σ(g)) · u` with no fma contraction.
-const COUNTED_STORE: [:0]const u8 =
+pub const COUNTED_STORE: [:0]const u8 =
     \\static inline void exl3_store_part(device float *p, float v) { metal::atomic_store_explicit((device metal::atomic_float *)p, v, metal::memory_order_relaxed); }
     \\template <typename T, typename V> static inline void exl3_fin(device T *p, V v) { *p = T(v); }
     \\template <typename V> static inline void exl3_fin_atomic(device float *p, V v) { exl3_store_part(p, float(v)); }
@@ -1169,12 +1169,12 @@ fn pairRows(comptime src: [:0]const u8) [:0]const u8 {
     );
 }
 
-const ROWS_THRU_COUNTED_SOURCE: [:0]const u8 = countedRows(ROWS_THRU_SOURCE) ++ COUNTED_TAIL;
-const ROWS_NAX_THRU_COUNTED_SOURCE: [:0]const u8 = countedRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_TAIL;
-const ROWS_THRU_COUNTED_RMS_SOURCE: [:0]const u8 = countedRows(ROWS_THRU_SOURCE) ++ COUNTED_NORM_TAIL;
-const ROWS_NAX_THRU_COUNTED_RMS_SOURCE: [:0]const u8 = countedRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_NORM_TAIL;
-const ROWS_THRU_COUNTED_PAIR_SOURCE: [:0]const u8 = pairRows(ROWS_THRU_SOURCE) ++ COUNTED_PAIR_TAIL;
-const ROWS_NAX_THRU_COUNTED_PAIR_SOURCE: [:0]const u8 = pairRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_PAIR_TAIL;
+pub const ROWS_THRU_COUNTED_SOURCE: [:0]const u8 = countedRows(ROWS_THRU_SOURCE) ++ COUNTED_TAIL;
+pub const ROWS_NAX_THRU_COUNTED_SOURCE: [:0]const u8 = countedRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_TAIL;
+pub const ROWS_THRU_COUNTED_RMS_SOURCE: [:0]const u8 = countedRows(ROWS_THRU_SOURCE) ++ COUNTED_NORM_TAIL;
+pub const ROWS_NAX_THRU_COUNTED_RMS_SOURCE: [:0]const u8 = countedRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_NORM_TAIL;
+pub const ROWS_THRU_COUNTED_PAIR_SOURCE: [:0]const u8 = pairRows(ROWS_THRU_SOURCE) ++ COUNTED_PAIR_TAIL;
+pub const ROWS_NAX_THRU_COUNTED_PAIR_SOURCE: [:0]const u8 = pairRows(ROWS_NAX_THRU_SOURCE) ++ COUNTED_PAIR_TAIL;
 
 /// A counted launch's kernels: [SIMD, NAX] of the one-bank, the normed and the pair's.
 var rows_counted_kernels: [3][2]kernel_src.KernelSlots = @splat(@splat(kernel_src.no_kernels));

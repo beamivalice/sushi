@@ -471,8 +471,11 @@ reducing in one dispatch. The batched coarse-head pair kernel
 quantized.h, sharing each packed read across two input rows.
 
 The engine of our own in `src/tensor/` launches MLX's compiled kernels from
-`mlx.metallib` and ports the host code that picks and dispatches them, from
-MLX's Metal backend (Copyright (c) 2023-2025 Apple Inc.):
+`sushi.metallib` — compiled at build time from our lean instantiation units in
+`src/tensor/metallib/` and the pinned MLX Metal kernel headers and whole-file
+kernels in `lib/mlx-src/mlx/backend/metal/kernels/` (MIT License,
+Copyright (c) 2023-2026 Apple Inc.) — and ports the host code that picks and
+dispatches them, from MLX's Metal backend (Copyright (c) 2023-2026 Apple Inc.):
   * `stock.zig`: the dispatch of RMS norm (`fast::RMSNorm::eval_gpu`), layer norm (`fast::LayerNorm::eval_gpu`,
     with `fast::layer_norm`'s result type and its default weight and bias), softmax
     (`Softmax::eval_gpu`), dequantize (`fast::Dequantize::eval_gpu`,

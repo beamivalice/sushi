@@ -88,9 +88,9 @@ fn ints(alloc: std.mem.Allocator, g: project_rows.RowsGeom, in_dim: c_int, out_d
 }
 
 /// The kernels write partials only, so the output type their folded branch names never stores.
-const OUT_TYPE = "typedef bfloat16_t OutT;\n";
+pub const OUT_TYPE = "typedef bfloat16_t OutT;\n";
 
-const MID_HEADER: [:0]const u8 =
+pub const MID_HEADER: [:0]const u8 =
     \\struct mid_row_t {
     \\  bfloat16_t v[4];
     \\  bfloat16_t operator[](uint i) const { return v[i >> 5u]; }
@@ -120,7 +120,7 @@ const MID_HEADER: [:0]const u8 =
 ;
 
 /// The down kernel, preparing its input from the gate/up partials instead of reading it.
-const DOWN_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
+pub const DOWN_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
     project_rows.ROWS_NAX_SOURCE,
     "const auto xr = x + (size_t)r * uint(IDIM) + k;",
     "const mid_row_t xr = mid_row(g1, g1svh, sigmoid, r, k, lane, uint(GNSPLIT), uint(GODIM), uint(GWIDTH));",
@@ -184,7 +184,7 @@ pub fn downInputs(b: Banks, x: mlx.mlx_array, partials: mlx.mlx_array, sigmoid: 
 
 /// The routed finish reduce with the shared down finish and the sigmoid-gated add: threadgroup `shv` holds the
 /// shared expert's block as `rowsFinish` stored it, summed from the `SNSPLIT` partials by one idle simdgroup.
-const REDUCE_SOURCE: [:0]const u8 = blk: {
+pub const REDUCE_SOURCE: [:0]const u8 = blk: {
     const gated = kernels.REDUCE_GATED_SHARED_SOURCE;
     const barrier = "threadgroup_barrier(mem_flags::mem_threadgroup);";
     const finish =

@@ -1,6 +1,6 @@
 //! MLX's fused scaled dot-product attention on the engine: `fast::scaled_dot_product_attention` (mlx/fast.cpp) and
 //! `ScaledDotProductAttention::eval_gpu` with `sdpa_full_self_attention_nax`, `sdpa_vector` and `sdpa_vector_2pass`
-//! (mlx/backend/metal/scaled_dot_product_attention.cpp) over the compiled kernels of `mlx.metallib`, so the output
+//! (mlx/backend/metal/scaled_dot_product_attention.cpp) over the compiled kernels of `sushi.metallib`, so the output
 //! has the bytes and the strides it has under MLX. Ported from MLX's Metal backend (MIT, see NOTICE). `routeOf` is
 //! MLX's choice between these kernels and its op chain (the route runs the chain on the engine's own ops). Ported, with
 //! no array mask and no sinks and one dtype: the vector kernels at head dimensions 64 to 256, causal or not; the full

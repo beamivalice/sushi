@@ -85,6 +85,7 @@ stage() {
     cp "$bin" "$dir/sushi"
     cp LICENSE LICENSE-APACHE-2.0 NOTICE "$dir/"
     cp lib/mlx/lib/*.dylib lib/mlx/lib/mlx.metallib "$dir/lib/"
+    [ -f "$(dirname "$bin")/../lib/sushi.metallib" ] && cp "$(dirname "$bin")/../lib/sushi.metallib" "$dir/lib/"
     install_name_tool -change @rpath/libmlxc.dylib @executable_path/lib/libmlxc.dylib "$dir/sushi" 2>/dev/null
     install_name_tool -change @rpath/libmlx.dylib @loader_path/libmlx.dylib "$dir/lib/libmlxc.dylib" 2>/dev/null
     install_name_tool -add_rpath @loader_path "$dir/lib/libmlx.dylib" 2>/dev/null

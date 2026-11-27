@@ -10,7 +10,7 @@ const kcfg = @import("hy4_kcfg.zig");
 
 pub const max_rows: c_int = 16;
 
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\constexpr int TM = 4;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_N = 32 * TN;
@@ -18,13 +18,15 @@ const source: [:0]const u8 =
     \\uint sg = simdgroup_index_in_threadgroup;
     \\int out_row = int(threadgroup_position_in_grid.x) * 4 * TM + int(sg) * TM;
     \\const device bfloat16_t* mat = w + (size_t)out_row * (size_t)K;
+    \\#ifndef SUSHI_METALLIB
     \\static_assert(K % BLOCK_N == 0, "a row off the gemv tile");
+    \\#endif
     \\float result[R][TM];
     \\for (int r = 0; r < R; ++r) {
     \\  for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
-    \\constexpr int n_iter = K / BLOCK_N;
+    \\const int n_iter = K / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  float inter[TM][TN];
     \\  for (int tm = 0; tm < TM; ++tm) {

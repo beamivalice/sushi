@@ -5,8 +5,8 @@ const std = @import("std");
 const metal = @import("../metal.zig");
 const core = @import("core.zig");
 const stock_reduce = @import("reduce.zig");
-const kernel = @import("kernel.zig");
 const stock = @import("stock.zig");
+const spec = @import("metallib_spec.zig");
 
 const Tensor = core.Tensor;
 const Dtype = core.Dtype;
@@ -212,8 +212,7 @@ pub fn astype(t: *Tensor, dtype: Dtype) Error!*Tensor {
         v.dtype = dtype;
         return v;
     }
-    if (dtype == .bool_ and (t.dtype == .float32 or t.dtype == .bfloat16)) return elementwise("cast", "sushi_true(x)", &.{t}, dtype, t.dims());
-    return elementwise("cast", "$O(x)", &.{t}, dtype, t.dims());
+    return elementwise("cast", 1, &.{t}, dtype, t.dims());
 }
 
 /// The same bytes read as another dtype (`mlx_view`): the last axis takes up the change in item size.
@@ -241,93 +240,38 @@ pub fn reinterpret(t: *Tensor, dtype: Dtype) Error!*Tensor {
     return base;
 }
 
-// ── Kernels of the engine's own ──
+// ── Precompiled kernels of the engine's own (`sushi.metallib` via `metallib_spec`) ──
 
-const helpers =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\typedef bfloat bfloat16_t;
-    \\typedef half float16_t;
-    \\inline long sushi_loc(uint3 at, const constant int* shape, const constant long* strides, int ndim) {
-    \\  long loc = long(at.x) * strides[ndim - 1] + long(at.y) * strides[ndim - 2];
-    \\  uint z = at.z;
-    \\  for (int d = ndim - 3; d >= 0; --d) {
-    \\    loc += long(z % uint(shape[d])) * strides[d];
-    \\    z /= uint(shape[d]);
-    \\  }
-    \\  return loc;
-    \\}
-    \\inline int sushi_loc32(uint3 at, const constant int* shape, const constant int* strides, int ndim) {
-    \\  int loc = int(at.x) * strides[ndim - 1] + int(at.y) * strides[ndim - 2];
-    \\  uint z = at.z;
-    \\  for (int d = ndim - 3; d >= 0; --d) {
-    \\    loc += int(z % uint(shape[d])) * strides[d];
-    \\    z /= uint(shape[d]);
-    \\  }
-    \\  return loc;
-    \\}
-    \\inline long sushi_flat(uint3 at, uint3 grid) {
-    \\  return long(at.x) + long(grid.x) * (long(at.y) + long(grid.y) * long(at.z));
-    \\}
-    \\// MLX's `cast_to<bool, T>` (mlx/backend/metal/kernels/utils.h): any bit under the sign, so a denormal is true.
-    \\inline bool sushi_true(float v) { return (as_type<uint>(v) & 0x7FFFFFFF) != 0; }
-    \\inline bool sushi_true(bfloat v) { return (as_type<ushort>(v) & 0x7FFF) != 0; }
-    \\// MLX's Sigmoid, Maximum and Minimum (mlx/backend/metal/kernels/{unary,binary}_ops.h), statement for statement.
-    \\template <typename T> T sushi_sigmoid(T x) {
-    \\  auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
-    \\  return T((x < 0) ? y : 1 - y);
-    \\}
-    \\// On bfloat16 MLX's math functions work in float and round their result (kernels/bf16_math.h); the rest is bfloat's.
-    \\inline bfloat sushi_sigmoid(bfloat x) {
-    \\  bfloat y = 1 / (1 + bfloat(metal::precise::exp(metal::abs(float(x)))));
-    \\  return (x < 0) ? y : 1 - y;
-    \\}
-    \\template <typename T> metal::enable_if_t<metal::is_integral_v<T>, T> sushi_maximum(T x, T y) { return metal::max(x, y); }
-    \\template <typename T> metal::enable_if_t<!metal::is_integral_v<T>, T> sushi_maximum(T x, T y) {
-    \\  if (metal::isnan(x)) return x;
-    \\  return x > y ? x : y;
-    \\}
-    \\template <typename T> metal::enable_if_t<metal::is_integral_v<T>, T> sushi_minimum(T x, T y) { return metal::min(x, y); }
-    \\template <typename T> metal::enable_if_t<!metal::is_integral_v<T>, T> sushi_minimum(T x, T y) {
-    \\  if (metal::isnan(x)) return x;
-    \\  return x < y ? x : y;
-    \\}
-    \\
-;
+fn specDtype(d: Dtype) Error!spec.Dtype {
+    return spec.Dtype.fromInt(@intFromEnum(d)) orelse error.TensorDtype;
+}
 
-var pipelines: std.StringHashMapUnmanaged(metal.Pipeline) = .empty;
-
-/// The pipeline of `source` with `$0`, `$1`, .. and `$O` standing for the input and output type names.
-fn pipelineFor(comptime tag: []const u8, source: []const u8, in_types: []const Dtype, out_type: Dtype) Error!metal.Pipeline {
+fn opsKernel(tag: []const u8, variant_suffix: []const u8, in_types: []const Dtype, out_type: Dtype) Error!metal.Pipeline {
     if (core.dryOn()) return core.dry_pipeline;
-    var key_buf: [96]u8 = undefined;
-    var key: std.ArrayList(u8) = .initBuffer(&key_buf);
-    key.appendSliceBounded(tag) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
-    for (in_types) |d| key.appendBounded(@intCast(@intFromEnum(d) + 'a')) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
-    key.appendBounded(@intCast(@intFromEnum(out_type) + 'A')) catch return core.refusing("a pipeline key past 96 bytes", error.TensorUnsupported);
-    if (pipelines.get(key.items)) |p| return p;
+    var s_ins: [3]spec.Dtype = undefined;
+    for (in_types, 0..) |d, i| s_ins[i] = try specDtype(d);
+    var name_buf: [128]u8 = undefined;
+    const name = spec.opsFnName(&name_buf, tag, variant_suffix, s_ins[0..in_types.len], try specDtype(out_type)) catch return error.TensorShape;
+    return stock.kernel(name);
+}
 
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
-    text.appendSlice(gpa, helpers) catch return error.OutOfMemory;
-    var at: usize = 0;
-    while (at < source.len) {
-        if (source[at] == '$' and at + 1 < source.len) {
-            const c = source[at + 1];
-            const name = if (c == 'O') try kernel.typeName(out_type) else if (c >= '0' and c <= '9' and c - '0' < in_types.len) try kernel.typeName(in_types[c - '0']) else null;
-            if (name) |n| {
-                text.appendSlice(gpa, n) catch return error.OutOfMemory;
-                at += 2;
-                continue;
-            }
-        }
-        text.append(gpa, source[at]) catch return error.OutOfMemory;
-        at += 1;
+fn flatKernel(tag: []const u8, scalars: u3, in_types: []const Dtype, out_type: Dtype) Error!metal.Pipeline {
+    if (core.dryOn()) return core.dry_pipeline;
+    var s_ins: [3]spec.Dtype = undefined;
+    for (in_types, 0..) |d, i| s_ins[i] = try specDtype(d);
+    const s_out = try specDtype(out_type);
+    var fn_buf: [128]u8 = undefined;
+    const fn_name = spec.opsFnName(&fn_buf, tag, "_v", s_ins[0..in_types.len], s_out) catch return error.TensorShape;
+    if (in_types.len == 0) return stock.kernel(fn_name);
+    var v_buf: [4]u8 = undefined;
+    const v_suf = std.fmt.bufPrint(&v_buf, "_v{d}", .{scalars}) catch unreachable;
+    var hash_buf: [128]u8 = undefined;
+    const hash = spec.opsFnName(&hash_buf, tag, v_suf, s_ins[0..in_types.len], s_out) catch return error.TensorShape;
+    var flags: [3]metal.Flag = undefined;
+    for (0..in_types.len) |i| {
+        flags[i] = .{ .index = spec.fc_bool_base + @as(u32, @intCast(i)), .value = ((scalars >> @intCast(i)) & 1) != 0 };
     }
-    text.append(gpa, 0) catch return error.OutOfMemory;
-    const pipeline = try core.pipelineFromSource("sushi_" ++ tag, text.items[0 .. text.items.len - 1 :0]);
-    pipelines.put(gpa, gpa.dupe(u8, key.items) catch return error.OutOfMemory, pipeline) catch return error.OutOfMemory;
-    return pipeline;
+    return stock.kernelFlags(fn_name, hash, flags[0..in_types.len]);
 }
 
 /// A shape as the grid kernels index it: at least three axes, the last two the grid's x and y.
@@ -378,24 +322,7 @@ fn block(size: metal.Size, max_threads: usize) metal.Size {
 }
 
 /// Elements one thread of the flat kernel takes.
-const flat_per_thread = 4;
-
-/// `elementwise` over inputs each row-major at the output's size or a single element: flat 32-bit indices, several
-/// elements a thread, MLX's contiguous kernels' shape. `scalars` bit `i` reads input `i` at element 0.
-fn flatSource(comptime tag: []const u8, comptime expr: []const u8, comptime n_in: usize, comptime scalars: u3) []const u8 {
-    const names = [_][]const u8{ "x", "y", "z" };
-    comptime var src: []const u8 = "[[kernel]] void sushi_" ++ tag ++ std.fmt.comptimePrint("_v{d}(\n", .{scalars});
-    inline for (0..n_in) |i| src = src ++ std.fmt.comptimePrint("  const device ${d}* in{d} [[buffer({d})]],\n", .{ i, i, i });
-    src = src ++ std.fmt.comptimePrint(
-        \\  device $O* out [[buffer({d})]],
-        \\  const constant uint& n [[buffer({d})]],
-        \\  uint at [[thread_position_in_grid]]) {{
-        \\  for (uint e = at * {d}u; e < min(n, at * {d}u + {d}u); ++e) {{
-        \\
-    , .{ n_in, n_in + 1, flat_per_thread, flat_per_thread, flat_per_thread });
-    inline for (0..n_in) |i| src = src ++ std.fmt.comptimePrint("    const ${d} {s} = in{d}[{s}];\n", .{ i, names[i], i, if ((scalars >> i) & 1 == 1) "0" else "e" });
-    return src ++ "    out[e] = " ++ expr ++ ";\n  }\n}\n";
-}
+const flat_per_thread = spec.flat_per_thread;
 
 /// The flat kernel's mask of single-element inputs, or null when an input is strided or broadcast along an axis.
 fn flatMask(inputs: []const *Tensor, size: usize) ?u3 {
@@ -409,7 +336,6 @@ fn flatMask(inputs: []const *Tensor, size: usize) ?u3 {
     return mask;
 }
 
-/// `out[i] = expr` over the broadcast of up to three inputs, each read as `x`, `y`, `z` in its own type.
 /// Inputs `expr` reads: `x` always, then `y` and `z` where it names them.
 fn exprInputs(comptime expr: []const u8) usize {
     const names = [_][]const u8{ "x", "y", "z" };
@@ -420,44 +346,16 @@ fn exprInputs(comptime expr: []const u8) usize {
     return n;
 }
 
-/// The strided kernel: each input read at its location in the output's grid, on 64-bit locations (`wide`) or 32-bit;
-/// `three`: a grid of three axes, each location read straight off the thread's position, as MLX's `g3` kernels.
-fn generalSource(comptime tag: []const u8, comptime expr: []const u8, comptime wide: bool, comptime three: bool) []const u8 {
-    const names = [_][]const u8{ "x", "y", "z" };
-    const n_in = exprInputs(expr);
-    const idx = if (wide) "long" else "int";
-    const loc = if (wide) "sushi_loc" else "sushi_loc32";
-    comptime var source: []const u8 = "[[kernel]] void sushi_" ++ tag ++ (if (wide) "" else if (three) "_g3" else "_i32") ++ "(\n";
-    inline for (0..n_in) |i| source = source ++ std.fmt.comptimePrint("  const device ${d}* in{d} [[buffer({d})]],\n  const constant {s}* s{d} [[buffer({d})]],\n", .{ i, i, 2 * i, idx, i, 2 * i + 1 });
-    const base = 2 * n_in;
-    source = source ++ std.fmt.comptimePrint(
-        \\  device $O* out [[buffer({d})]],
-        \\  const constant int* shape [[buffer({d})]],
-        \\  const constant int& ndim [[buffer({d})]],
-        \\  uint3 at [[thread_position_in_grid]],
-        \\  uint3 grid [[threads_per_grid]]) {{
-        \\
-    , .{ base, base + 1, base + 2 });
-    inline for (0..n_in) |i| source = source ++ if (three)
-        std.fmt.comptimePrint("  const ${d} {s} = in{d}[int(at.x) * s{d}[2] + int(at.y) * s{d}[1] + int(at.z) * s{d}[0]];\n", .{ i, names[i], i, i, i, i })
-    else
-        std.fmt.comptimePrint("  const ${d} {s} = in{d}[{s}(at, shape, s{d}, ndim)];\n", .{ i, names[i], i, loc, i });
-    const flat = if (wide) "sushi_flat(at, grid)" else "at.x + grid.x * (at.y + grid.y * at.z)";
-    return source ++ "  out[" ++ flat ++ "] = " ++ expr ++ ";\n}\n";
-}
-
-/// `out[i] = expr` over the broadcast of up to three inputs, each read as `x`, `y`, `z` in its own type.
 /// Before the seal: the contiguous copy and every concatenate part count at each dtype a model's state holds. A restore
 /// that rolls a live state back copies whole tensors, and a sampled draft joins rows of a dtype no warm width reaches.
 pub fn makeCopiesAhead() Error!void {
     inline for (.{ Dtype.bfloat16, Dtype.float16, Dtype.float32, Dtype.int32, Dtype.uint32, Dtype.uint8 }) |d| {
-        _ = try pipelineFor("copy_v0", comptime flatSource("copy", "x", 1, 0), &.{d}, d);
-        inline for (concat_widths) |k| _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ d, d }, d);
+        _ = try flatKernel("copy", 0, &.{d}, d);
+        inline for (concat_widths) |k| _ = try opsKernel(std.fmt.comptimePrint("concat{d}", .{k}), "", &.{d}, d);
     }
 }
 
-fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []const *Tensor, out_dtype: Dtype, out_shape: []const c_int) Error!*Tensor {
-    const n_in = comptime exprInputs(expr);
+fn elementwise(comptime tag: []const u8, comptime n_in: usize, inputs: []const *Tensor, out_dtype: Dtype, out_shape: []const c_int) Error!*Tensor {
     const base = 2 * n_in;
     if (inputs.len != n_in) return error.TensorShape;
 
@@ -467,9 +365,7 @@ fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []co
     errdefer core.release(out);
     if (out.size() == 0) return out;
     if (flatMask(inputs, out.size())) |mask| {
-        const pipeline = switch (mask) {
-            inline else => |m| try pipelineFor(tag ++ std.fmt.comptimePrint("_v{d}", .{m}), comptime flatSource(tag, expr, n_in, m), types[0..n_in], out_dtype),
-        };
+        const pipeline = try flatKernel(tag, mask, types[0..n_in], out_dtype);
         const p = try core.pass();
         p.pipeline(pipeline);
         for (inputs, 0..) |in, i| core.bind(p, in, i);
@@ -484,11 +380,11 @@ fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []co
     for (inputs) |in| narrow = narrow and in.reach() <= std.math.maxInt(i32);
     const g = Grid.of(out_shape);
     const pipeline = if (narrow and g.ndim == 3)
-        try pipelineFor(tag ++ "_g3", comptime generalSource(tag, expr, false, true), types[0..n_in], out_dtype)
+        try opsKernel(tag, "_g3", types[0..n_in], out_dtype)
     else if (narrow)
-        try pipelineFor(tag ++ "_i32", comptime generalSource(tag, expr, false, false), types[0..n_in], out_dtype)
+        try opsKernel(tag, "_i32", types[0..n_in], out_dtype)
     else
-        try pipelineFor(tag, comptime generalSource(tag, expr, true, false), types[0..n_in], out_dtype);
+        try opsKernel(tag, "_w", types[0..n_in], out_dtype);
     const p = try core.pass();
     p.pipeline(pipeline);
     for (inputs, 0..) |in, i| {
@@ -509,7 +405,7 @@ fn elementwise(comptime tag: []const u8, comptime expr: []const u8, inputs: []co
 
 /// A row-contiguous copy of `t` in a buffer of its own.
 pub fn contiguousCopy(t: *Tensor) Error!*Tensor {
-    return elementwise("copy", "x", &.{t}, t.dtype, t.dims());
+    return elementwise("copy", 1, &.{t}, t.dtype, t.dims());
 }
 
 pub fn contiguous(t: *Tensor) Error!*Tensor {
@@ -538,7 +434,7 @@ pub fn chain(comptime tag: []const u8, comptime expr: []const u8, inputs: []cons
     var buf: [max_dims]c_int = undefined;
     var shape: []const c_int = inputs[0].dims();
     for (inputs[1..]) |t| shape = try broadcastDims(shape, t.dims(), &buf);
-    return elementwise("chain_" ++ tag, expr, inputs, inputs[0].dtype, shape);
+    return elementwise("chain_" ++ tag, comptime exprInputs(expr), inputs, inputs[0].dtype, shape);
 }
 
 pub const Binary = enum { add, subtract, multiply, divide, floor_divide, remainder, maximum, minimum, less, less_equal, greater, greater_equal, equal, logical_and, logical_or, logaddexp };
@@ -590,43 +486,14 @@ pub fn binary(comptime op: Binary, a: *Tensor, b: *Tensor) Error!*Tensor {
         .less, .less_equal, .greater, .greater_equal, .equal => true,
         else => false,
     };
-    const expr = switch (op) {
-        .add => "x + y",
-        .subtract => "x - y",
-        .multiply => "x * y",
-        .divide => "x / y",
-        // MLX's `FloorDivide` for signed integers: truncate, then one less when the remainder and divisor differ in sign.
-        .floor_divide => "$O(x / y - $O((x % y) != 0 && ((x < 0) != (y < 0))))",
-        .maximum => "sushi_maximum(x, y)",
-        .minimum => "sushi_minimum(x, y)",
-        .less => "x < y",
-        .less_equal => "x <= y",
-        .greater => "x > y",
-        .greater_equal => "x >= y",
-        .equal => "x == y",
-        .logical_and => "x && y",
-        .logical_or => "x || y",
-        .logaddexp, .remainder => unreachable,
-    };
-    return elementwise("bin_" ++ @tagName(op), expr, &.{ a, b }, if (compare) .bool_ else a.dtype, shape);
+    return elementwise("bin_" ++ @tagName(op), 2, &.{ a, b }, if (compare) .bool_ else a.dtype, shape);
 }
 
 pub const Unary = enum { exp, log, abs, sigmoid, sqrt, rsqrt, square, floor, negative };
 
 pub fn unary(comptime op: Unary, a: *Tensor) Error!*Tensor {
     if ((op == .log or op == .abs) and a.dtype != .float32 and a.dtype != .float16 and a.dtype != .bfloat16) return core.refusing("log or abs of a non-float here: the seam casts it or takes MLX's integer kernel first", error.TensorDtype);
-    const expr = switch (op) {
-        .exp => "$O(metal::precise::exp(x))",
-        .log => "$O(metal::precise::log(x))",
-        .abs => "$O(metal::abs(float(x)))",
-        .sigmoid => "sushi_sigmoid(x)",
-        .sqrt => "$O(metal::precise::sqrt(x))",
-        .rsqrt => "$O(metal::precise::rsqrt(x))",
-        .square => "x * x",
-        .floor => "$O(floor(x))",
-        .negative => "-x",
-    };
-    return elementwise("un_" ++ @tagName(op), expr, &.{a}, a.dtype, a.dims());
+    return elementwise("un_" ++ @tagName(op), 1, &.{a}, a.dtype, a.dims());
 }
 
 /// `cond ? a : b`, the three broadcast together.
@@ -646,7 +513,7 @@ pub fn where(cond_in: *Tensor, a_in: *Tensor, b_in: *Tensor) Error!*Tensor {
     @memcpy(probe.shape[0..ab.len], ab);
     var buf: [max_dims]c_int = undefined;
     const shape = try broadcastShape(cond, &probe, &buf);
-    return elementwise("where", "x ? y : z", &.{ cond, a, b }, a.dtype, shape);
+    return elementwise("where", 3, &.{ cond, a, b }, a.dtype, shape);
 }
 
 pub const Reduce = enum { sum, max };
@@ -680,32 +547,10 @@ pub fn reduce(comptime op: Reduce, t: *Tensor, axis_in: c_int, keepdims: bool) E
         },
         else => {},
     }
-    const source =
-        "[[kernel]] void sushi_red_" ++ @tagName(op) ++ "(\n" ++
-        \\  const device $0* in [[buffer(0)]],
-        \\  const constant long* s0 [[buffer(1)]],
-        \\  device $O* out [[buffer(2)]],
-        \\  const constant int* shape [[buffer(3)]],
-        \\  const constant int& ndim [[buffer(4)]],
-        \\  const constant long& step [[buffer(5)]],
-        \\  const constant int& count [[buffer(6)]],
-        \\  uint3 at [[thread_position_in_grid]],
-        \\  uint3 grid [[threads_per_grid]]) {
-        \\  long loc = sushi_loc(at, shape, s0, ndim);
-        \\  $O acc = in[loc];
-        \\  for (int k = 1; k < count; ++k) {
-        \\    loc += step;
-        \\
-    ++ (if (op == .sum) "    acc += in[loc];\n" else "    acc = max(acc, $O(in[loc]));\n") ++
-        \\  }
-        \\  out[sushi_flat(at, grid)] = acc;
-        \\}
-        \\
-    ;
     var kept: [max_dims]c_int = undefined;
     @memcpy(kept[0..t.ndim], t.dims());
     kept[axis] = 1;
-    const pipeline = try pipelineFor("red_" ++ @tagName(op), source, &.{t.dtype}, t.dtype);
+    const pipeline = try opsKernel("red_" ++ @tagName(op), "", &.{t.dtype}, t.dtype);
     const g = Grid.of(kept[0..t.ndim]);
     const out = try core.fresh(t.dtype, kept[0..t.ndim]);
     errdefer core.release(out);
@@ -769,20 +614,7 @@ pub fn settle(t: *Tensor) Error!void {
 
 /// Writes `src` over the bytes `dst` views; the two have one shape.
 fn copyInto(dst: *Tensor, src: *Tensor) Error!void {
-    const source =
-        \\[[kernel]] void sushi_copy_into(
-        \\  const device $0* in [[buffer(0)]],
-        \\  const constant long* s0 [[buffer(1)]],
-        \\  device $O* out [[buffer(2)]],
-        \\  const constant long* so [[buffer(3)]],
-        \\  const constant int* shape [[buffer(4)]],
-        \\  const constant int& ndim [[buffer(5)]],
-        \\  uint3 at [[thread_position_in_grid]]) {
-        \\  out[sushi_loc(at, shape, so, ndim)] = in[sushi_loc(at, shape, s0, ndim)];
-        \\}
-        \\
-    ;
-    const pipeline = try pipelineFor("copy_into", source, &.{src.dtype}, dst.dtype);
+    const pipeline = try opsKernel("copy_into", "", &.{src.dtype}, dst.dtype);
     const g = Grid.of(dst.dims());
     if (dst.size() == 0) return;
     const p = try core.pass();
@@ -830,7 +662,7 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
         // Until the seal, a dtype's first concatenate makes every part count's kernel: a verify's joins take the count
         // its row groups have, which the warm's widths do not all reach.
         if (!core.sealed) inline for (concat_widths) |k| {
-            _ = try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype);
+            _ = try opsKernel(std.fmt.comptimePrint("concat{d}", .{k}), "", &.{dtype}, dtype);
         };
         const width = switch (parts.len) {
             2...4 => parts.len,
@@ -838,7 +670,7 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
             else => 16,
         };
         const pipeline = switch (width) {
-            inline 2, 3, 4, 8, 16 => |k| try pipelineFor(std.fmt.comptimePrint("concat{d}", .{k}), comptime concatSource(k), &.{ dtype, dtype }, dtype),
+            inline 2, 3, 4, 8, 16 => |k| try opsKernel(std.fmt.comptimePrint("concat{d}", .{k}), "", &.{dtype}, dtype),
             else => unreachable,
         };
         const p = try core.pass();
@@ -873,41 +705,7 @@ pub fn concatenate(parts: []const *Tensor, axis_in: c_int) Error!*Tensor {
     return out;
 }
 
-const concat_widths = [_]usize{ 2, 3, 4, 8, 16 };
-
-/// The kernel joining `k` row-contiguous parts along one axis: `inner` elements after the axis, each part's extent
-/// along it in `ext`.
-fn concatSource(comptime k: usize) []const u8 {
-    const names = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h", "p8", "p9", "p10", "p11", "p12", "p13", "p14", "p15" };
-    comptime var src: []const u8 = std.fmt.comptimePrint("[[kernel]] void sushi_concat{d}(\n", .{k});
-    inline for (0..k) |i| src = src ++ std.fmt.comptimePrint("  const device $0* {s} [[buffer({d})]],\n", .{ names[i], i });
-    src = src ++ std.fmt.comptimePrint(
-        \\  device $O* out [[buffer({d})]],
-        \\  const constant uint& inner [[buffer({d})]],
-        \\  const constant uint* ext [[buffer({d})]],
-        \\  const constant uint& n [[buffer({d})]],
-        \\  uint i [[thread_position_in_grid]]) {{
-        \\  if (i >= n) return;
-        \\  uint total = 0;
-        \\  for (uint j = 0; j < {d}u; ++j) total += ext[j];
-        \\  uint within = i % inner;
-        \\  uint row = i / inner;
-        \\  uint pos = row % total;
-        \\  uint outer = row / total;
-        \\
-    , .{ k, k + 1, k + 2, k + 3, k });
-    comptime var start: []const u8 = "0u";
-    inline for (0..k) |i| {
-        const at = std.fmt.comptimePrint("ext[{d}]", .{i});
-        const read = std.fmt.comptimePrint("{s}[(outer * {s} + pos - ({s})) * inner + within]", .{ names[i], at, start });
-        src = src ++ if (i + 1 < k)
-            std.fmt.comptimePrint("  if (pos < {s} + {s}) {{ out[i] = {s}; return; }}\n", .{ start, at, read })
-        else
-            std.fmt.comptimePrint("  out[i] = {s};\n", .{read});
-        start = start ++ " + " ++ at;
-    }
-    return src ++ "}\n";
-}
+const concat_widths = spec.concat_widths;
 
 /// `t[indices]` along `axis`: the result has `indices`' shape in that axis's place.
 pub fn take(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
@@ -934,26 +732,7 @@ pub fn take(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
         shape[n] = t.shape[i];
         n += 1;
     }
-    const source =
-        \\[[kernel]] void sushi_take(
-        \\  const device $0* table [[buffer(0)]],
-        \\  const constant long* st [[buffer(1)]],
-        \\  const device $1* index [[buffer(2)]],
-        \\  const constant long* si [[buffer(3)]],
-        \\  device $O* out [[buffer(4)]],
-        \\  const constant int* shape [[buffer(5)]],
-        \\  const constant int& ndim [[buffer(6)]],
-        \\  const constant long& axis_stride [[buffer(7)]],
-        \\  const constant int& axis_len [[buffer(8)]],
-        \\  uint3 at [[thread_position_in_grid]],
-        \\  uint3 grid [[threads_per_grid]]) {
-        \\  long pick = long(index[sushi_loc(at, shape, si, ndim)]);
-        \\  if (pick < 0) pick += axis_len;
-        \\  out[sushi_flat(at, grid)] = table[sushi_loc(at, shape, st, ndim) + pick * axis_stride];
-        \\}
-        \\
-    ;
-    const pipeline = try pipelineFor("take", source, &.{ t.dtype, indices.dtype }, t.dtype);
+    const pipeline = try opsKernel("take", "", &.{ t.dtype, indices.dtype }, t.dtype);
     const g = Grid.of(shape[0..n]);
     const out = try core.fresh(t.dtype, shape[0..n]);
     errdefer core.release(out);
@@ -1095,7 +874,7 @@ pub fn split(t: *Tensor, parts: c_int, axis_in: c_int, out: []*Tensor) Error!voi
 /// MLX's `isfinite`: neither infinite nor NaN; every integer and bool is.
 pub fn isFinite(t: *Tensor) Error!*Tensor {
     switch (t.dtype) {
-        .float32, .float16, .bfloat16 => return elementwise("isfinite", "bool(metal::isfinite(float(x)))", &.{t}, .bool_, t.dims()),
+        .float32, .float16, .bfloat16 => return elementwise("isfinite", 1, &.{t}, .bool_, t.dims()),
         .bool_, .uint8, .uint16, .uint32, .uint64, .int8, .int16, .int32, .int64 => {
             const yes: u8 = 1;
             const v = try core.fromHost(std.mem.asBytes(&yes), .bool_, &.{});
@@ -1131,11 +910,11 @@ pub fn allOf(t: *Tensor, keepdims: bool) Error!*Tensor {
     }
     const flat = try reshape(t, &.{@intCast(t.size())});
     defer core.release(flat);
-    const miss = try elementwise("all_miss", "$O(!x)", &.{flat}, .uint8, flat.dims());
+    const miss = try elementwise("all_miss", 1, &.{flat}, .uint8, flat.dims());
     defer core.release(miss);
     const any = try reduce(.max, miss, 0, false);
     defer core.release(any);
-    return wholeOf(try elementwise("all_none", "x == 0", &.{any}, .bool_, any.dims()), t, keepdims);
+    return wholeOf(try elementwise("all_none", 1, &.{any}, .bool_, any.dims()), t, keepdims);
 }
 
 /// MLX's `any` over `axes` of a bool array (`Reduce::Or`): some element true. A bool OR is exact, so the reduction of
@@ -1149,14 +928,14 @@ pub fn anyAxes(t: *Tensor, axes: []const c_int, keepdims: bool) Error!*Tensor {
         if (at < 0 or at >= t.ndim) return error.TensorShape;
         norm[i] = at;
     }
-    var x = try elementwise("any_bytes", "$O(x)", &.{t}, .uint8, t.dims());
+    var x = try elementwise("any_bytes", 1, &.{t}, .uint8, t.dims());
     defer core.release(x);
     for (norm[0..axes.len]) |at| {
         const r = try reduce(.max, x, at, true);
         core.release(x);
         x = r;
     }
-    const kept = try elementwise("any_true", "x != 0", &.{x}, .bool_, x.dims());
+    const kept = try elementwise("any_true", 1, &.{x}, .bool_, x.dims());
     if (keepdims) return kept;
     defer core.release(kept);
     return squeeze(kept, norm[0..axes.len]);
@@ -1177,9 +956,9 @@ pub fn arrayEqual(a: *Tensor, b: *Tensor, equal_nan: bool) Error!*Tensor {
     const cb = try astype(b, dtype);
     defer core.release(cb);
     const eq = if (equal_nan and af)
-        try elementwise("eq_nan", "x == y || (metal::isnan(float(x)) && metal::isnan(float(y)))", &.{ ca, cb }, .bool_, ca.dims())
+        try elementwise("eq_nan", 2, &.{ ca, cb }, .bool_, ca.dims())
     else
-        try elementwise("eq_all", "x == y", &.{ ca, cb }, .bool_, ca.dims());
+        try elementwise("eq_all", 2, &.{ ca, cb }, .bool_, ca.dims());
     defer core.release(eq);
     return allOf(eq, false);
 }
@@ -1199,7 +978,7 @@ pub fn zerosOnGpu(shape: []const c_int, dtype: Dtype) Error!*Tensor {
     if (out.size() == 0) return out;
     if (out.size() > std.math.maxInt(u32) - flat_per_thread) return core.refusing("GPU zeros past 2^32 elements", error.TensorShape);
     const p = try core.pass();
-    p.pipeline(try pipelineFor("zeros_v0", comptime flatSource("zeros", "0", 0, 0), &.{}, dtype));
+    p.pipeline(try flatKernel("zeros", 0, &.{}, dtype));
     core.bindOut(p, out, 0);
     const n: u32 = @intCast(out.size());
     p.constant(n, 1);
@@ -1250,26 +1029,7 @@ pub fn takeAlong(t: *Tensor, indices: *Tensor, axis_in: c_int) Error!*Tensor {
     for (0..t.ndim) |i| {
         if (i != axis and t.shape[i] != indices.shape[i]) return error.TensorShape;
     }
-    const source =
-        \\[[kernel]] void sushi_take_along(
-        \\  const device $0* table [[buffer(0)]],
-        \\  const constant long* st [[buffer(1)]],
-        \\  const device $1* index [[buffer(2)]],
-        \\  const constant long* si [[buffer(3)]],
-        \\  device $O* out [[buffer(4)]],
-        \\  const constant int* shape [[buffer(5)]],
-        \\  const constant int& ndim [[buffer(6)]],
-        \\  const constant long& axis_stride [[buffer(7)]],
-        \\  const constant int& axis_len [[buffer(8)]],
-        \\  uint3 at [[thread_position_in_grid]],
-        \\  uint3 grid [[threads_per_grid]]) {
-        \\  long pick = long(index[sushi_loc(at, shape, si, ndim)]);
-        \\  if (pick < 0) pick += axis_len;
-        \\  out[sushi_flat(at, grid)] = table[sushi_loc(at, shape, st, ndim) + pick * axis_stride];
-        \\}
-        \\
-    ;
-    const pipeline = try pipelineFor("take_along", source, &.{ t.dtype, indices.dtype }, t.dtype);
+    const pipeline = try opsKernel("take_along", "", &.{ t.dtype, indices.dtype }, t.dtype);
     const g = Grid.of(indices.dims());
     const out = try core.fresh(t.dtype, indices.dims());
     errdefer core.release(out);
@@ -1325,26 +1085,7 @@ fn putAlongTo(t: *Tensor, indices: *Tensor, values_in: *Tensor, axis_in: c_int, 
     const values = try broadcastTo(typed, indices.dims());
     defer core.release(values);
     if (indices.size() == 0) return;
-    const source =
-        \\[[kernel]] void sushi_put_along(
-        \\  const device $0* upd [[buffer(0)]],
-        \\  const constant long* su [[buffer(1)]],
-        \\  const device $1* index [[buffer(2)]],
-        \\  const constant long* si [[buffer(3)]],
-        \\  device $O* out [[buffer(4)]],
-        \\  const constant long* so [[buffer(5)]],
-        \\  const constant int* shape [[buffer(6)]],
-        \\  const constant int& ndim [[buffer(7)]],
-        \\  const constant long& axis_stride [[buffer(8)]],
-        \\  const constant int& axis_len [[buffer(9)]],
-        \\  uint3 at [[thread_position_in_grid]]) {
-        \\  long pick = long(index[sushi_loc(at, shape, si, ndim)]);
-        \\  if (pick < 0) pick += axis_len;
-        \\  out[sushi_loc(at, shape, so, ndim) + pick * axis_stride] = upd[sushi_loc(at, shape, su, ndim)];
-        \\}
-        \\
-    ;
-    const pipeline = try pipelineFor("put_along", source, &.{ t.dtype, indices.dtype }, t.dtype);
+    const pipeline = try opsKernel("put_along", "", &.{ t.dtype, indices.dtype }, t.dtype);
     const g = Grid.of(indices.dims());
     const lead = g.ndim - t.ndim;
     var so: [max_dims]i64 = @splat(0);
@@ -1382,38 +1123,7 @@ pub fn pad(t: *Tensor, axes: []const c_int, low: []const c_int, high: []const c_
     }
     const value = try astype(value_in, t.dtype);
     defer core.release(value);
-    const source =
-        \\[[kernel]] void sushi_pad(
-        \\  const device $0* in [[buffer(0)]],
-        \\  const constant long* ist [[buffer(1)]],
-        \\  const constant int* lo [[buffer(2)]],
-        \\  const constant int* extent [[buffer(3)]],
-        \\  const device $0* value [[buffer(4)]],
-        \\  device $O* out [[buffer(5)]],
-        \\  const constant int* shape [[buffer(6)]],
-        \\  const constant int& ndim [[buffer(7)]],
-        \\  uint3 at [[thread_position_in_grid]],
-        \\  uint3 grid [[threads_per_grid]]) {
-        \\  long loc = 0;
-        \\  bool inside = true;
-        \\  int c = int(at.x) - lo[ndim - 1];
-        \\  inside = inside && c >= 0 && c < extent[ndim - 1];
-        \\  loc += long(c) * ist[ndim - 1];
-        \\  c = int(at.y) - lo[ndim - 2];
-        \\  inside = inside && c >= 0 && c < extent[ndim - 2];
-        \\  loc += long(c) * ist[ndim - 2];
-        \\  uint z = at.z;
-        \\  for (int d = ndim - 3; d >= 0; --d) {
-        \\    c = int(z % uint(shape[d])) - lo[d];
-        \\    z /= uint(shape[d]);
-        \\    inside = inside && c >= 0 && c < extent[d];
-        \\    loc += long(c) * ist[d];
-        \\  }
-        \\  out[sushi_flat(at, grid)] = inside ? in[loc] : value[0];
-        \\}
-        \\
-    ;
-    const pipeline = try pipelineFor("pad", source, &.{t.dtype}, t.dtype);
+    const pipeline = try opsKernel("pad", "", &.{t.dtype}, t.dtype);
     const g = Grid.of(shape[0..t.ndim]);
     const out = try core.fresh(t.dtype, shape[0..t.ndim]);
     errdefer core.release(out);

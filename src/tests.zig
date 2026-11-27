@@ -143,6 +143,7 @@ test {
     _ = @import("mtp.zig");
     _ = @import("mtp_qmv.zig");
     _ = @import("mtp_dense_rows.zig");
+    _ = @import("metallib_path.zig");
     _ = @import("round_cost.zig");
     _ = @import("spec_cost_gate.zig");
     _ = @import("mtp_group_planner.zig");

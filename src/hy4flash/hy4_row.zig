@@ -15,20 +15,22 @@ const tm = 2;
 const nsg = 2;
 pub const max_rows: c_int = 16;
 
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\constexpr int TN = 4;
     \\constexpr int BLOCK_N = 32 * TN;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\int out_row = (int(threadgroup_position_in_grid.x) * NSG + int(sg)) * TM;
     \\const device bfloat16_t* mat = w + (size_t)out_row * (size_t)K;
+    \\#ifndef SUSHI_METALLIB
     \\static_assert(K % BLOCK_N == 0, "a row off the gemv tile");
+    \\#endif
     \\float result[R][TM];
     \\for (int r = 0; r < R; ++r) {
     \\  for (int t = 0; t < TM; ++t) result[r][t] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
-    \\constexpr int n_iter = K / BLOCK_N;
+    \\const int n_iter = K / BLOCK_N;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  float inter[TM][TN];
     \\  for (int t = 0; t < TM; ++t) {
@@ -60,7 +62,7 @@ const source: [:0]const u8 =
 /// threadgroup's 8 simdgroups each take every eighth block of 128 inputs for its 4 rows (the last partial block read
 /// safe, zeros past K, as MLX's `load_safe`), the lanes fold by `simd_shuffle_down`, and simdgroup 0 adds the others'
 /// sums in order.
-const wide_source: [:0]const u8 =
+pub const wide_source: [:0]const u8 =
     \\constexpr int TM = 4, TN = 4, BN = 8, SN = 32;
     \\constexpr int BLOCK_N = BN * SN * TN;
     \\uint lane = thread_index_in_simdgroup;
@@ -75,8 +77,8 @@ const wide_source: [:0]const u8 =
     \\const int out_row = int(threadgroup_position_in_grid.x) * TM;
     \\const device bfloat16_t* mat = w + (size_t)out_row * (size_t)K;
     \\int bn = (SN * int(sg) + int(lane)) * TN;
-    \\constexpr int n_iter = K / BLOCK_N;
-    \\constexpr int leftover = K - BLOCK_N * n_iter;
+    \\const int n_iter = K / BLOCK_N;
+    \\const int leftover = K - BLOCK_N * n_iter;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  int mat_offset = 0;
     \\  for (int tm = 0; tm < TM; tm++) {

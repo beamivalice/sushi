@@ -58,6 +58,11 @@ pub fn lastError() []const u8 {
     return error_text[0..error_len];
 }
 
+/// Records a human-readable error message for `lastError()` when a cooler refusal occurs outside a Metal API call.
+pub fn setError(what: []const u8) void {
+    noteError(null, what);
+}
+
 fn noteError(ns_error: id, what: []const u8) void {
     error_len = 0;
     const text: ?[*:0]const u8 = if (ns_error) |e| send(?[*:0]const u8, send(id, e, "localizedDescription", .{}), "UTF8String", .{}) else null;
@@ -188,22 +193,66 @@ pub const Flag = struct { index: usize, value: bool };
 /// An int function constant of a compiled kernel, by its index.
 pub const IntConstant = struct { index: usize, value: i32 };
 
+/// `MTLPipelineOptionFailOnBinaryArchiveMiss`: fail instead of compiling AIR when a pipeline is absent from the archive.
+pub const pipeline_opt_fail_on_archive_miss: usize = 1 << 2;
+
+/// A serialized GPU binary archive (`MTLBinaryArchive`) holding compiled machine code for one device and OS build.
+pub const BinaryArchive = struct {
+    raw: id,
+
+    pub fn release(a: BinaryArchive) void {
+        send(void, a.raw, "release", .{});
+    }
+
+    /// Writes the archive's compiled binaries to `path`.
+    pub fn serialize(a: BinaryArchive, path: [:0]const u8) Error!void {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        var ns_error: id = null;
+        const text = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{path.ptr});
+        const url = send(id, objc_getClass("NSURL"), "fileURLWithPath:", .{text});
+        if (send(u8, a.raw, "serializeToURL:error:", .{ url, &ns_error }) == 0) {
+            noteError(ns_error, "the binary archive did not serialize");
+            return error.MetalCompile;
+        }
+    }
+};
+
+fn functionOf(lib: Library, function: [:0]const u8, flags: []const Flag, ints: []const IntConstant) Error!id {
+    var ns_error: id = null;
+    const name = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{function.ptr});
+    if (flags.len == 0 and ints.len == 0) {
+        return send(id, lib.raw, "newFunctionWithName:", .{name}) orelse {
+            noteError(null, function);
+            return error.MetalCompile;
+        };
+    }
+    const values = send(id, send(id, objc_getClass("MTLFunctionConstantValues"), "alloc", .{}), "init", .{});
+    defer send(void, values, "release", .{});
+    const mtl_data_type_int: usize = 29;
+    const mtl_data_type_bool: usize = 53;
+    for (flags) |f| {
+        var v = f.value;
+        send(void, values, "setConstantValue:type:atIndex:", .{ @as(*const anyopaque, &v), mtl_data_type_bool, f.index });
+    }
+    for (ints) |c| {
+        var v = c.value;
+        send(void, values, "setConstantValue:type:atIndex:", .{ @as(*const anyopaque, &v), mtl_data_type_int, c.index });
+    }
+    return send(id, lib.raw, "newFunctionWithName:constantValues:error:", .{ name, values, &ns_error }) orelse {
+        noteError(ns_error, function);
+        return error.MetalCompile;
+    };
+}
+
 pub const Device = struct {
     raw: id,
     queue: id,
-    options: id,
 
     fn open() Error!Device {
         const raw = MTLCreateSystemDefaultDevice() orelse return error.MetalUnavailable;
         const queue = send(id, raw, "newCommandQueue", .{}) orelse return error.MetalUnavailable;
-        // MLX's compile settings, so a kernel source gives the code it gives under MLX: safe math and the newest
-        // language version the OS has.
-        const options = send(id, send(id, objc_getClass("MTLCompileOptions"), "alloc", .{}), "init", .{});
-        send(void, options, "setMathMode:", .{@as(isize, 0)});
-        const OsVersion = extern struct { major: isize, minor: isize, patch: isize };
-        const os = send(OsVersion, send(id, objc_getClass("NSProcessInfo"), "processInfo", .{}), "operatingSystemVersion", .{});
-        send(void, options, "setLanguageVersion:", .{@as(usize, if (os.major >= 27) (4 << 16) + 1 else 4 << 16)});
-        const dev: Device = .{ .raw = raw, .queue = queue, .options = options };
+        const dev: Device = .{ .raw = raw, .queue = queue };
         // Every buffer of ours is in a set: a command buffer then finds its buffers resident instead of making each
         // one so at commit. The first set is made now, so a refusal is the open's.
         set_cap = @max(send(usize, raw, "recommendedMaxWorkingSetSize", .{}) / 100 * set_percent, set_floor);
@@ -211,33 +260,9 @@ pub const Device = struct {
         return dev;
     }
 
-    /// The compute pipeline of `function` in `source`, compiled now. `lastError` holds the compiler's text on failure.
     /// What Metal has allocated for this process on the device: every buffer, heap and resource, MLX's included.
     pub fn currentAllocatedSize(dev: *const Device) usize {
         return send(usize, dev.raw, "currentAllocatedSize", .{});
-    }
-
-    pub fn compile(dev: *const Device, source: [:0]const u8, function: [:0]const u8) Error!Pipeline {
-        const pool = objc_autoreleasePoolPush();
-        defer objc_autoreleasePoolPop(pool);
-        var ns_error: id = null;
-        const text = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{source.ptr});
-        const library = send(id, dev.raw, "newLibraryWithSource:options:error:", .{ text, dev.options, &ns_error }) orelse {
-            noteError(ns_error, "the library did not build");
-            return error.MetalCompile;
-        };
-        defer send(void, library, "release", .{});
-        const name = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{function.ptr});
-        const entry = send(id, library, "newFunctionWithName:", .{name}) orelse {
-            noteError(null, "the library has no such kernel function");
-            return error.MetalCompile;
-        };
-        defer send(void, entry, "release", .{});
-        const state = send(id, dev.raw, "newComputePipelineStateWithFunction:error:", .{ entry, &ns_error }) orelse {
-            noteError(ns_error, "the pipeline did not build");
-            return error.MetalCompile;
-        };
-        return .{ .raw = state, .max_threads = send(usize, state, "maxTotalThreadsPerThreadgroup", .{}) };
     }
 
     /// The compiled library at `path` (a `.metallib`).
@@ -256,20 +281,7 @@ pub const Device = struct {
 
     /// The compute pipeline of `function`, a kernel `lib` holds.
     pub fn pipelineOf(dev: *const Device, lib: Library, function: [:0]const u8) Error!Pipeline {
-        const pool = objc_autoreleasePoolPush();
-        defer objc_autoreleasePoolPop(pool);
-        var ns_error: id = null;
-        const name = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{function.ptr});
-        const entry = send(id, lib.raw, "newFunctionWithName:", .{name}) orelse {
-            noteError(null, function);
-            return error.MetalCompile;
-        };
-        defer send(void, entry, "release", .{});
-        const state = send(id, dev.raw, "newComputePipelineStateWithFunction:error:", .{ entry, &ns_error }) orelse {
-            noteError(ns_error, "the pipeline did not build");
-            return error.MetalCompile;
-        };
-        return .{ .raw = state, .max_threads = send(usize, state, "maxTotalThreadsPerThreadgroup", .{}) };
+        return dev.pipelineOfConstants(lib, function, &.{}, &.{});
     }
 
     /// `pipelineOf` for a function specialized by boolean function constants, as MLX builds its matmul kernels.
@@ -282,26 +294,74 @@ pub const Device = struct {
         const pool = objc_autoreleasePoolPush();
         defer objc_autoreleasePoolPop(pool);
         var ns_error: id = null;
-        const values = send(id, send(id, objc_getClass("MTLFunctionConstantValues"), "alloc", .{}), "init", .{});
-        defer send(void, values, "release", .{});
-        const mtl_data_type_int: usize = 29;
-        const mtl_data_type_bool: usize = 53;
-        for (flags) |f| {
-            var v = f.value;
-            send(void, values, "setConstantValue:type:atIndex:", .{ @as(*const anyopaque, &v), mtl_data_type_bool, f.index });
-        }
-        for (ints) |c| {
-            var v = c.value;
-            send(void, values, "setConstantValue:type:atIndex:", .{ @as(*const anyopaque, &v), mtl_data_type_int, c.index });
-        }
-        const name = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{function.ptr});
-        const entry = send(id, lib.raw, "newFunctionWithName:constantValues:error:", .{ name, values, &ns_error }) orelse {
-            noteError(ns_error, function);
-            return error.MetalCompile;
-        };
+        const entry = try functionOf(lib, function, flags, ints);
         defer send(void, entry, "release", .{});
         const state = send(id, dev.raw, "newComputePipelineStateWithFunction:error:", .{ entry, &ns_error }) orelse {
             noteError(ns_error, "the pipeline did not build");
+            return error.MetalCompile;
+        };
+        return .{ .raw = state, .max_threads = send(usize, state, "maxTotalThreadsPerThreadgroup", .{}) };
+    }
+
+    /// Opens an existing `MTLBinaryArchive` from `path`, or creates an empty one when `path` is null.
+    pub fn newBinaryArchive(dev: *const Device, path: ?[:0]const u8) Error!BinaryArchive {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        var ns_error: id = null;
+        const desc = send(id, send(id, objc_getClass("MTLBinaryArchiveDescriptor"), "alloc", .{}), "init", .{});
+        defer send(void, desc, "release", .{});
+        if (path) |p| {
+            const text = send(id, objc_getClass("NSString"), "stringWithUTF8String:", .{p.ptr});
+            const url = send(id, objc_getClass("NSURL"), "fileURLWithPath:", .{text});
+            send(void, desc, "setUrl:", .{url});
+        }
+        const raw = send(id, dev.raw, "newBinaryArchiveWithDescriptor:error:", .{ desc, &ns_error }) orelse {
+            noteError(ns_error, "the binary archive did not open");
+            return error.MetalCompile;
+        };
+        return .{ .raw = raw };
+    }
+
+    /// Adds a compute pipeline function (with optional specialization constants) from `lib` into `archive`.
+    pub fn addComputeToArchive(_: *const Device, archive: BinaryArchive, lib: Library, function: [:0]const u8, flags: []const Flag, ints: []const IntConstant) Error!void {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        var ns_error: id = null;
+        const entry = try functionOf(lib, function, flags, ints);
+        defer send(void, entry, "release", .{});
+        const desc = send(id, send(id, objc_getClass("MTLComputePipelineDescriptor"), "alloc", .{}), "init", .{});
+        defer send(void, desc, "release", .{});
+        send(void, desc, "setComputeFunction:", .{entry});
+        if (send(u8, archive.raw, "addComputePipelineFunctionsWithDescriptor:error:", .{ desc, &ns_error }) == 0) {
+            noteError(ns_error, function);
+            return error.MetalCompile;
+        }
+    }
+
+    /// Builds a compute pipeline using `archive` for precompiled GPU binaries; when `fail_on_miss` is true, refuses
+    /// any kernel absent from `archive` instead of compiling AIR from `lib`.
+    pub fn pipelineFromArchive(
+        dev: *const Device,
+        archive: BinaryArchive,
+        lib: Library,
+        function: [:0]const u8,
+        flags: []const Flag,
+        ints: []const IntConstant,
+        fail_on_miss: bool,
+    ) Error!Pipeline {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        var ns_error: id = null;
+        const entry = try functionOf(lib, function, flags, ints);
+        defer send(void, entry, "release", .{});
+        const desc = send(id, send(id, objc_getClass("MTLComputePipelineDescriptor"), "alloc", .{}), "init", .{});
+        defer send(void, desc, "release", .{});
+        send(void, desc, "setComputeFunction:", .{entry});
+        const arr = send(id, objc_getClass("NSArray"), "arrayWithObject:", .{archive.raw});
+        send(void, desc, "setBinaryArchives:", .{arr});
+        const opts: usize = if (fail_on_miss) pipeline_opt_fail_on_archive_miss else 0;
+        const state = send(id, dev.raw, "newComputePipelineStateWithDescriptor:options:reflection:error:", .{ desc, opts, @as(id, null), &ns_error }) orelse {
+            noteError(ns_error, "the pipeline did not build from archive");
             return error.MetalCompile;
         };
         return .{ .raw = state, .max_threads = send(usize, state, "maxTotalThreadsPerThreadgroup", .{}) };
@@ -382,7 +442,34 @@ pub const Device = struct {
     }
 };
 
-pub const Library = struct { raw: id };
+pub const Library = struct {
+    raw: id,
+
+    pub fn release(l: Library) void {
+        send(void, l.raw, "release", .{});
+    }
+
+    /// Names of every kernel function compiled into `l`, owned by the caller.
+    pub fn functionNames(l: Library, a: std.mem.Allocator) error{OutOfMemory}![][]u8 {
+        const pool = objc_autoreleasePoolPush();
+        defer objc_autoreleasePoolPop(pool);
+        const arr = send(id, l.raw, "functionNames", .{});
+        const count = send(usize, arr, "count", .{});
+        const out = try a.alloc([]u8, count);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |s| a.free(s);
+            a.free(out);
+        }
+        for (0..count) |i| {
+            const ns = send(id, arr, "objectAtIndex:", .{i});
+            const ptr = send([*:0]const u8, ns, "UTF8String", .{});
+            out[i] = try a.dupe(u8, std.mem.span(ptr));
+            made += 1;
+        }
+        return out;
+    }
+};
 
 /// Orders two passes whose buffers Metal does not track: one updates it, a later one waits for it.
 pub const Fence = struct {
@@ -669,17 +756,18 @@ pub const Committed = struct {
     }
 };
 
-const probe_source =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\[[kernel]] void sushi_metal_probe(
-    \\  const device float* x [[buffer(0)]],
-    \\  device float* out [[buffer(1)]],
-    \\  const constant float& scale [[buffer(2)]],
-    \\  uint3 at [[thread_position_in_grid]]) {
-    \\  out[at.x] = x[at.x] * scale;
-    \\}
-;
+const test_scale_fn = "sushi_k_sushi_test_scale_f32__f32_f32s__f32";
+
+fn loadTestLibrary(dev: *const Device) !Library {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = @import("metallib_path.zig").forThisProcess(&buf) catch return error.MetalUnavailable;
+    return dev.load(path);
+}
+
+fn loadTestScale(dev: *const Device) !Pipeline {
+    const lib = try loadTestLibrary(dev);
+    return dev.pipelineOf(lib, test_scale_fn);
+}
 
 test "buffers are spread over residency sets of a capped size, a buffer over the cap takes a set of its own, and a release gives the bytes back" {
     const dev = device() catch return error.SkipZigTest;
@@ -753,13 +841,13 @@ test "a buffer over mapped memory is the memory itself, and a kernel reads it" {
     const src = try dev.wrap(ptr, 16 * 4);
     try std.testing.expectEqual(@intFromPtr(ptr), @intFromPtr(src.bytes().ptr));
     try std.testing.expectEqual(before + 16 * 4, residentSets().bytes);
-    const state = try dev.compile(probe_source, "sushi_metal_probe");
+    const state = try loadTestScale(dev);
     defer state.release();
     const pass = dev.begin();
     pass.pipeline(state);
     pass.buffer(src, 0, 0);
-    pass.buffer(dst, 0, 1);
-    pass.constant(@as(f32, 2), 2);
+    pass.constant(@as(f32, 2), 1);
+    pass.buffer(dst, 0, 2);
     pass.dispatch(.{ .x = 16 }, .{ .x = 16 });
     try pass.commit().wait();
     const got: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, dst.bytes()[0 .. 16 * 4]));
@@ -768,10 +856,10 @@ test "a buffer over mapped memory is the memory itself, and a kernel reads it" {
     try std.testing.expectEqual(before, residentSets().bytes);
 }
 
-test "a kernel compiled and dispatched from Zig reads one buffer and writes another" {
+test "a precompiled kernel dispatched from Zig reads one buffer and writes another" {
     const t = std.testing;
     const dev = device() catch return error.SkipZigTest;
-    const state = try dev.compile(probe_source, "sushi_metal_probe");
+    const state = try loadTestScale(dev);
     defer state.release();
     try t.expect(state.max_threads >= 64);
 
@@ -786,8 +874,8 @@ test "a kernel compiled and dispatched from Zig reads one buffer and writes anot
     const pass = dev.begin();
     pass.pipeline(state);
     pass.buffer(x, 0, 0);
-    pass.buffer(out, 0, 1);
-    pass.constant(@as(f32, 1.5), 2);
+    pass.constant(@as(f32, 1.5), 1);
+    pass.buffer(out, 0, 2);
     pass.dispatch(.{ .x = n }, .{ .x = 64 });
     try pass.commit().wait();
 
@@ -798,7 +886,7 @@ test "a kernel compiled and dispatched from Zig reads one buffer and writes anot
 test "a dispatch reads what the dispatch before it wrote" {
     const t = std.testing;
     const dev = device() catch return error.SkipZigTest;
-    const state = try dev.compile(probe_source, "sushi_metal_probe");
+    const state = try loadTestScale(dev);
     defer state.release();
     const n = 4096;
     const a = try dev.alloc(n * 4);
@@ -813,8 +901,8 @@ test "a dispatch reads what the dispatch before it wrote" {
     pass.pipeline(state);
     for ([_]f32{ 2, 3, 5 }, 0..) |scale, step| {
         pass.buffer(if (step % 2 == 0) a else b, 0, 0);
-        pass.buffer(if (step % 2 == 0) b else a, 0, 1);
-        pass.constant(scale, 2);
+        pass.constant(scale, 1);
+        pass.buffer(if (step % 2 == 0) b else a, 0, 2);
         pass.dispatch(.{ .x = n }, .{ .x = 256 });
     }
     try pass.commit().wait();
@@ -822,10 +910,40 @@ test "a dispatch reads what the dispatch before it wrote" {
     for (got, 0..) |v, i| try t.expectEqual(@as(f32, @floatFromInt(i % 97)) * 30, v);
 }
 
-test "a source that does not compile is an error that carries the compiler's text" {
+test "a missing metallib function is an error that names the function" {
     const t = std.testing;
     const dev = device() catch return error.SkipZigTest;
-    try t.expectError(error.MetalCompile, dev.compile("[[kernel]] void broken(uint3 at [[thread_position_in_grid]]) { not_a_thing(at); }", "broken"));
-    try t.expect(std.mem.indexOf(u8, lastError(), "not_a_thing") != null);
-    try t.expectError(error.MetalCompile, dev.compile(probe_source, "no_such_function"));
+    const lib = try loadTestLibrary(dev);
+    try t.expectError(error.MetalCompile, dev.pipelineOf(lib, "no_such_function"));
+    try t.expect(std.mem.indexOf(u8, lastError(), "no_such_function") != null);
+}
+
+test "a binary archive serializes compiled GPU pipelines and serves them with fail_on_miss" {
+    const t = std.testing;
+    const dev = device() catch return error.SkipZigTest;
+    const lib = try loadTestLibrary(dev);
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(t.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/archive.bin", .{dir_buf[0..dir_len]}, 0);
+
+    const flags = [_]Flag{ .{ .index = 1, .value = true }, .{ .index = 2, .value = false }, .{ .index = 3, .value = false } };
+    const writer = try dev.newBinaryArchive(null);
+    defer writer.release();
+    try dev.addComputeToArchive(writer, lib, "rms_loopedbfloat16", &.{}, &.{});
+    try dev.addComputeToArchive(writer, lib, "rope_float32", &flags, &.{});
+    try writer.serialize(archive_path);
+
+    const reader = try dev.newBinaryArchive(archive_path);
+    defer reader.release();
+    const p1 = try dev.pipelineFromArchive(reader, lib, "rms_loopedbfloat16", &.{}, &.{}, true);
+    defer p1.release();
+    try t.expect(p1.max_threads > 0);
+    const p2 = try dev.pipelineFromArchive(reader, lib, "rope_float32", &flags, &.{}, true);
+    defer p2.release();
+    try t.expect(p2.max_threads > 0);
+    // A function not added to the archive fails when fail_on_miss is enforced.
+    try t.expectError(error.MetalCompile, dev.pipelineFromArchive(reader, lib, "rms_loopedfloat16", &.{}, &.{}, true));
 }

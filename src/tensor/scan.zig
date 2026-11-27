@@ -1,5 +1,5 @@
 //! MLX's cumulative sum on the engine: `Scan::eval_gpu` and `scan_gpu_inplace` (mlx/backend/metal/scan.cpp) over the
-//! compiled kernels of `mlx.metallib`. A float scan taken in parts is other bytes than one in order, so this is MLX's
+//! compiled kernels of `sushi.metallib`. A float scan taken in parts is other bytes than one in order, so this is MLX's
 //! choice of kernel and its grid. Ported from MLX's Metal backend (MIT, see NOTICE).
 
 const std = @import("std");

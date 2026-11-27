@@ -24,7 +24,7 @@ fn ci(v: usize) c_int {
 
 
 /// A mix's index into the three scales (pre, post, comb) the checkpoint ships.
-const HC_HEADER =
+pub const HC_HEADER =
     \\template <int HC>
     \\inline int dsv41_scale_at(int m) { return m < HC ? 0 : (m < 2 * HC ? 1 : 2); }
 ;
@@ -33,7 +33,7 @@ const HC_HEADER =
 /// One threadgroup an R-row x M-mix tile, so each fn and stream load serves the tile; every (row, mix) dot keeps
 /// `HC_STAGE_SOURCE`'s order (thread tid the terms k = tid + c * TG in c order, one simd sum, the simdgroups in
 /// order), which is what makes the two agree to the bit.
-const HC_MIX_SOURCE =
+pub const HC_MIX_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int m0 = threadgroup_position_in_grid.x * M, l0 = threadgroup_position_in_grid.y * R;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
@@ -52,7 +52,7 @@ const HC_MIX_SOURCE =
     \\    ss[r] = metal::fma(v, v, ss[r]);
     \\  }
     \\}
-    \\threadgroup float t_d[R][M][TG / 32], t_s[R][TG / 32];
+    \\threadgroup float t_d[R][M][32], t_s[R][32];
     \\for (int r = 0; r < R; ++r) {
     \\  for (int j = 0; j < M; ++j) { const float v = metal::simd_sum(d[r][j]); if (lane == 0) t_d[r][j][sg] = v; }
     \\  const float v = metal::simd_sum(ss[r]);
@@ -70,12 +70,12 @@ const HC_MIX_SOURCE =
 /// `HC_MIX_SOURCE` on the matrix units: a threadgroup takes 16 rows and every mix, its simdgroups a k range each of
 /// 16 rows x 32 mix columns over 16-wide k steps, `fn` split into a high and a low half so the product keeps f32's
 /// bits. The sums' order differs from the ALU kernel's.
-const HC_MIX_NAX_SOURCE =
+pub const HC_MIX_NAX_SOURCE =
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
     \\const ushort lane = thread_index_in_simdgroup;
     \\const int MIX = fn_shape[0], L = x_shape[0];
     \\const int l0 = threadgroup_position_in_grid.x * 16;
-    \\constexpr int STEPS = NK / 16 / NSG;
+    \\const int STEPS = NK / 16 / NSG;
     \\const int k0 = int(sg) * STEPS * 16;
     \\const int ra = metal::min(l0 + int(dsv41_nax_r(lane, 0)), L - 1), rb = metal::min(l0 + int(dsv41_nax_r(lane, 4)), L - 1);
     \\const device T* xa = x + size_t(ra) * NK + k0 + dsv41_nax_c(lane, 0);
@@ -137,7 +137,7 @@ const HC_STAGE_HEAD =
     \\const int l = threadgroup_position_in_grid.y;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
     \\const int D = x_shape[2], N = fn_shape[1];
-    \\threadgroup float t_a[TG / 32], t_b[TG / 32];
+    \\threadgroup float t_a[32], t_b[32];
     \\const device auto* xr = x + size_t(l) * HC * D;
     \\float v[HC][ND];
     \\
@@ -286,11 +286,11 @@ pub const HC_SPLIT_GLOBAL =
     \\#define HC_SPLIT_COMB(i, v) comb[l * HC * HC + (i)] = (v)
     \\
 ;
-const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
+pub const HC_SPLIT_SOURCE = "#pragma clang fp contract(off)\nconst int l = threadgroup_position_in_grid.y;\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY;
 
 /// The hc split, then the stream collapsed with `cpre` (f32, rounded to T like `hcCollapse`) and rms-normed like
 /// MLX's `rms_norm`. One threadgroup a row.
-const HC_NORM_SOURCE =
+pub const HC_NORM_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int l = threadgroup_position_in_grid.y;
     \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
@@ -298,7 +298,7 @@ const HC_NORM_SOURCE =
     \\if (sg == 0) {
 ++ "\n" ++ HC_SPLIT_GLOBAL ++ HC_SPLIT_BODY ++
     \\}
-    \\float cp[HC];
+    \\float cp[8];
     \\for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
     \\float ss = 0.0f;
     \\for (int d = tid; d < D; d += TG) {
@@ -308,7 +308,7 @@ const HC_NORM_SOURCE =
     \\  h_out[size_t(l) * D + d] = hb;
     \\  ss += float(hb) * float(hb);
     \\}
-    \\threadgroup float t_s[TG / 32];
+    \\threadgroup float t_s[32];
     \\ss = metal::simd_sum(ss);
     \\if (thread_index_in_simdgroup == 0) t_s[sg] = ss;
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -321,9 +321,9 @@ const HC_NORM_SOURCE =
     \\}
 ;
 
-const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_COEF_PLAIN ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
-const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_COEF_ARRAYS ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
-const HC_STAGE_Z_SOURCE = HC_STAGE_HEAD ++ HC_COEF_Z ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
+pub const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_COEF_PLAIN ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
+pub const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_COEF_ARRAYS ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
+pub const HC_STAGE_Z_SOURCE = HC_STAGE_HEAD ++ HC_COEF_Z ++ HC_STAGE_LOOP ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
 
 var hc_mix_def = Def{ .name = "dsv41_hc_mix", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_SOURCE, .header = HC_HEADER };
 var hc_mix_nax_def = Def{ .name = "dsv41_hc_mix_nax", .ins = &.{ "x", "fn", "scale", "base", "eps" }, .outs = &.{"z"}, .source = HC_MIX_NAX_SOURCE, .header = metal_def.NAX_HEADER ++ HC_HEADER };
@@ -337,7 +337,7 @@ var hc_norm_def = Def{ .name = "dsv41_hc_norm", .ins = &.{ "z", "x", "cpre", "w"
 /// TF32-class on a NAX GPU: both operands keep their top 10 mantissa bits (truncated), the four products are exact, and
 /// the sum is `(p0 + p1) + (p2 + p3)`; a GPU whose matmul is true f32 fails the probe and keeps the chain. `COPY` sets
 /// how a thread maps to output: one element (`k` from the grid's z), or all HC copies of one column.
-const HC_EXPAND_SOURCE =
+pub const HC_EXPAND_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y);
     \\const int D = x_shape[2];
@@ -496,7 +496,7 @@ fn identitySplit(comptime with_post: bool) []const u8 {
         \\const int l = threadgroup_position_in_grid.y;
         \\const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup;
         \\const int D = x_shape[2];
-        \\threadgroup float t_pre[HC];
+        \\threadgroup float t_pre[8];
         \\if (tid < HC) {
         \\  const float pv = 1.0f / (1.0f + metal::precise::exp(-z[l * ZW + tid])) + eps[1];
         \\  t_pre[tid] = pv;
@@ -508,7 +508,7 @@ fn identitySplit(comptime with_post: bool) []const u8 {
     else "") ++
         \\}
         \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-        \\float cp[HC];
+        \\float cp[8];
         \\for (int j = 0; j < HC; ++j) cp[j] = t_pre[j];
         \\
     ;
@@ -524,7 +524,7 @@ const HC_COLLAPSE_NORM =
     \\  h_out[size_t(l) * D + d] = hb;
     \\  ss += float(hb) * float(hb);
     \\}
-    \\threadgroup float t_s[TG / 32];
+    \\threadgroup float t_s[32];
     \\ss = metal::simd_sum(ss);
     \\if (thread_index_in_simdgroup == 0) t_s[sg] = ss;
     \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -537,11 +537,11 @@ const HC_COLLAPSE_NORM =
     \\}
 ;
 
-const HC_IDENT_NORM_SOURCE = identitySplit(true) ++ HC_COLLAPSE_NORM;
-const HC_IDENT_HEAD_SOURCE = identitySplit(false) ++ HC_COLLAPSE_NORM;
+pub const HC_IDENT_NORM_SOURCE = identitySplit(true) ++ HC_COLLAPSE_NORM;
+pub const HC_IDENT_HEAD_SOURCE = identitySplit(false) ++ HC_COLLAPSE_NORM;
 
 /// One thread an output element: `out = post·y + h`, a product and a sum each rounded to f32.
-const HC_IDENT_EXPAND_SOURCE =
+pub const HC_IDENT_EXPAND_SOURCE =
     \\#pragma clang fp contract(off)
     \\const int d = int(thread_position_in_grid.x), l = int(thread_position_in_grid.y), k = int(thread_position_in_grid.z);
     \\const int D = h_shape[2];
@@ -602,7 +602,7 @@ fn sub(comptime src: []const u8, comptime old: []const u8, comptime new: []const
 
 /// `HC_MIX_SOURCE` over the stream `post·y + h` it expands as it reads, `HC_IDENT_EXPAND_SOURCE`'s two roundings; the
 /// mix tile at x 0 stores it as `m`.
-const HC_IDENT_MIX_EXPAND_SOURCE = sub(sub(HC_MIX_SOURCE, "L = x_shape[0];", "L = h_shape[0], D = h_shape[2];"),
+pub const HC_IDENT_MIX_EXPAND_SOURCE = sub(sub(HC_MIX_SOURCE, "L = x_shape[0];", "L = h_shape[0], D = h_shape[2];"),
     "const float v = l0 + r < L ? float(x[size_t(l0 + r) * N + k]) : 0.0f;",
     \\float v = 0.0f;
     \\    if (l0 + r < L) {

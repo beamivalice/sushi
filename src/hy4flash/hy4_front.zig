@@ -9,7 +9,7 @@ const kcfg = @import("hy4_kcfg.zig");
 
 // No contract pragma: the norm and the rotations are written as `hy4_norm` and `hy4_rope` write them, under the same
 // default.
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\constexpr int N_READS = 4;
     \\constexpr int SIMD_SIZE = 32;
     \\uint gid = threadgroup_position_in_grid.x;
@@ -19,7 +19,7 @@ const source: [:0]const u8 =
     \\threadgroup float local_inv_mean[1];
     \\threadgroup float local_sums[SIMD_SIZE];
     \\{
-    \\  constexpr uint axis_size = uint(LAT);
+    \\  const uint axis_size = uint(LAT);
     \\  float acc = 0;
     \\  float thread_x[N_READS];
     \\  const device T* xr = ckv + (size_t)gid * (size_t)CKW;

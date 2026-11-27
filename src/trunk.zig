@@ -307,7 +307,7 @@ pub const KvCacheChoice = kv_quant.KvCacheChoice;
 //     accept, which keeps `state_out` via the normal flow), so the last row was
 //     a redundant global write + forced the engine's final state to be a slice
 //     VIEW pinning the whole [T,...] capture buffer across rounds.
-fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]const u8 {
+pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]const u8 {
     const g_setup = if (vectorized)
         \\auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;
     else
@@ -5310,7 +5310,7 @@ pub const GDN_KERNEL_HEADER =
 // in the hot loop, 128 KB resident. The two multiplies need no such care: a
 // bf16/f16 product is exact in float, so one rounding is one rounding on any
 // compiler.
-const SWIGLU_SOURCE =
+pub const SWIGLU_SOURCE =
     \\uint i = thread_position_in_grid.x;
     \\if (i >= uint(N_size)) return;
     \\T g = gate[i];

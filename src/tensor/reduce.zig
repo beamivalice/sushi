@@ -1,5 +1,5 @@
 //! MLX's sum, max and argmax over one axis on the engine: `Reduce::eval_gpu` and its plan (mlx/backend/metal/reduce.cpp,
-//! mlx/backend/common/reduce.cpp) over the compiled kernels of `mlx.metallib`. A float sum depends on the order it is
+//! mlx/backend/common/reduce.cpp) over the compiled kernels of `sushi.metallib`. A float sum depends on the order it is
 //! taken in, and MLX takes a long row or column in parallel parts, so a reduction here is MLX's kernel under MLX's
 //! plan; argmax is `ArgReduce::eval_gpu` (mlx/backend/metal/primitives.cpp).
 //! Ported from MLX's Metal backend (MIT, see NOTICE). An input past 2^31 elements is not ported.

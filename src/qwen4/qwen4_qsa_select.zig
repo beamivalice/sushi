@@ -208,7 +208,7 @@ fn qsaScoreNsh(nslab: u32, ngrp: u32, layout: QsaScoreLayout) u32 {
     return nsh;
 }
 
-const QSA_SCORE_KERNEL_SOURCE =
+pub const QSA_SCORE_KERNEL_SOURCE =
     \\constexpr uint NSG = (uint)NSGVAL;
     \\constexpr uint TGN = NSG * 32u;
     \\static_assert(4096u % TGN == 0);
@@ -604,7 +604,7 @@ var qsa_pool_rope_tpl_switches: usize = 0;
 //   rope = the bf16 cos/sin table, bf16(bf16(x*cos) + bf16(rot*sin)) as MLX's binary kernels round.
 // One simdgroup per pooled row; lane l owns dims 4l..4l+3, so rotate_half's partner (d +- HALF) is
 // HALF/4 lanes away. The block count `nblk` varies per call and rides an INPUT.
-const QSA_POOL_ROPE_SOURCE =
+pub const QSA_POOL_ROPE_SOURCE =
     \\uint lane = thread_position_in_threadgroup.x;
     \\uint row = threadgroup_position_in_grid.y;
     \\uint blk = row % uint(nblk);

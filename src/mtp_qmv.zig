@@ -5,7 +5,7 @@ const device = @import("sushi_exl3").device;
 const dense_rows = @import("mtp_dense_rows.zig");
 
 // Each row retains MLX qmv's lane assignment, affine dot, accumulation order and bf16 rounding.
-const SOURCE =
+pub const SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const uint vec0 = threadgroup_position_in_grid.x * NV;
@@ -75,7 +75,7 @@ const SOURCE =
 
 // Row-streaming arm: O outputs per simdgroup keep their codes in registers while rows stream through, each
 // row's per-lane block chain being qmv's. SPLIT pairs simdgroups on the same outputs, MT rows each.
-const STREAM_SOURCE =
+pub const STREAM_SOURCE =
     \\const int lane = int(thread_index_in_simdgroup);
     \\const int sgi = int(simdgroup_index_in_threadgroup);
     \\const int output0 = (int(threadgroup_position_in_grid.x) * (SPLIT ? SG / 2 : SG) + (SPLIT ? sgi / 2 : sgi)) * O;
@@ -305,7 +305,7 @@ pub fn denseMatmul(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array) !?mlx.
 }
 
 // MLX v0.32.2 `gemv` (BM1 BN8 SM1 SN32 TM4 TN4) for f32, one threadgroup layer per row.
-const F32_GEMV_ROWS_SOURCE =
+pub const F32_GEMV_ROWS_SOURCE =
     \\constexpr int BN = 8;
     \\constexpr int SN = 32;
     \\constexpr int TM = 4;

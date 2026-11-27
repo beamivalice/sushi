@@ -157,9 +157,11 @@ jobs:
 
           # Self-built mlx + mlx-c (scripts/build-mlx.sh): libmlxc + libmlx +
           # sibling deps like libjaccl (@rpath-referenced — missing them causes
-          # a "no such file" dyld error at startup) + the NAX-enabled metallib.
+          # a "no such file" dyld error at startup) + the NAX-enabled metallib,
+          # plus Sushi Cooler's own compiled metallib (`zig-out/lib/sushi.metallib`).
           cp lib/mlx/lib/*.dylib "$STAGING/lib/"
           cp lib/mlx/lib/mlx.metallib "$STAGING/lib/"
+          cp zig-out/lib/sushi.metallib "$STAGING/lib/"
 
           # WebP libraries for vision pipeline
           WEBP_LIB="$(brew --prefix webp)/lib"

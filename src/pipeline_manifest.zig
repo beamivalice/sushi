@@ -7,14 +7,15 @@
 const std = @import("std");
 const metal = @import("metal.zig");
 
-pub const version: u32 = 2;
+pub const version: u32 = 3;
 const magic = "SUSHIPLM";
 pub const file_name = "manifest.bin";
+pub const archive_file_name = "archive.bin";
 /// A writer's temp file is its own (process and write), so two writers of one manifest never share bytes.
 var temp_seq = std.atomic.Value(u32).init(0);
 
 pub const Kind = enum(u8) {
-    /// A function of `mlx.metallib` made as it is: `function` is its name and `key` the engine's table key.
+    /// A function of `sushi.metallib` made as it is: `function` is its name and `key` the engine's table key.
     stock = 1,
     /// A metallib function specialised by boolean and int constants: `key` is MLX's name for the set.
     stock_flags = 2,
@@ -289,6 +290,12 @@ pub fn rootPath(buf: []u8, home: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.sushi/cache/pipelines", .{home});
 }
 
+/// `<root>/<scope>-<build>/archive.bin`, keyed beside `manifest.bin` by the same build/GPU/OS digest.
+pub fn archivePath(buf: []u8, root_path: []const u8, key: Key) ![:0]const u8 {
+    var name_buf: [Key.dir_len]u8 = undefined;
+    return std.fmt.bufPrintSentinel(buf, "{s}/{s}/{s}", .{ root_path, key.dirName(&name_buf), archive_file_name }, 0);
+}
+
 var configured_buf: [std.fs.max_path_bytes]u8 = undefined;
 var configured_len: usize = 0;
 
@@ -470,10 +477,10 @@ test "pipeline manifest: a marker recipe and a manifest of the format before int
     defer loaded.deinit();
     try testing.expect(loaded.recipes[0].eql(marker));
     // The format number is in the file and in the build key: a file of the older format is refused, and its key differs.
-    try testing.expectEqual(@as(u32, 2), version);
+    try testing.expectEqual(@as(u32, 3), version);
     const old = try testing.allocator.dupe(u8, bytes);
     defer testing.allocator.free(old);
-    std.mem.writeInt(u32, old[magic.len..][0..4], 1, .little);
+    std.mem.writeInt(u32, old[magic.len..][0..4], 2, .little);
     var sum: [digest_len]u8 = undefined;
     Sha256.hash(old[0 .. old.len - digest_len], &sum, .{});
     @memcpy(old[old.len - digest_len ..], &sum);
@@ -706,15 +713,15 @@ test "pipeline manifest: the build part of a key is stable in one process and fo
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(io, .{ .sub_path = "mlx.metallib", .data = "lib" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sushi.metallib", .data = "lib" });
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const n = try tmp.dir.realPath(io, &root_buf);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const lib = try std.fmt.bufPrint(&path_buf, "{s}/mlx.metallib", .{root_buf[0..n]});
+    const lib = try std.fmt.bufPrint(&path_buf, "{s}/sushi.metallib", .{root_buf[0..n]});
     const keys = [_][16]u8{ try buildKey("applegpu_g17s", lib), try buildKey("applegpu_g17s", lib), try buildKey("applegpu_g16s", lib) };
     try testing.expectEqualSlices(u8, &keys[0], &keys[1]);
     try testing.expect(!std.mem.eql(u8, &keys[0], &keys[2]));
-    try tmp.dir.writeFile(io, .{ .sub_path = "mlx.metallib", .data = "longer lib" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sushi.metallib", .data = "longer lib" });
     try testing.expect(!std.mem.eql(u8, &keys[0], &(try buildKey("applegpu_g17s", lib))));
 }
 

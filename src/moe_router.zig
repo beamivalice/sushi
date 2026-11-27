@@ -118,9 +118,9 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\uint tid = thread_position_in_threadgroup.x;
         \\uint lane = thread_index_in_simdgroup;
         \\
-        \\threadgroup float rk[NE];
+        \\threadgroup float rk[2048];
         \\{s}
-        \\threadgroup uint sel[NK];
+        \\threadgroup uint sel[32];
         \\{s}
         \\size_t rbase = (size_t)row * (size_t)NE;
         \\for (uint e = tid; e < NE; e += TG) {{
@@ -169,9 +169,9 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\{s}
     , .{
         if (grouped)
-            "threadgroup float rw[NE];\nthreadgroup float gs[NG];"
+            "threadgroup float rw[2048];\nthreadgroup float gs[32];"
         else if (sigmoid)
-            "threadgroup float rw[NE];"
+            "threadgroup float rw[2048];"
         else
             "",
         if (gate) "threadgroup float gp[16];" else "",
@@ -270,8 +270,8 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // reproduces the identical butterfly on identical values, which is
             // what makes the rounded bf16 probability bit-equal; a plain
             // strided sum over the same data was 1 ulp off on real inputs.
-            \\  constexpr int VT = (NE + 3) / 4;
-            \\  constexpr int SIMDS = (VT + 31) / 32;
+            \\  const int VT = (NE + 3) / 4;
+            \\  const int SIMDS = (VT + 31) / 32;
             \\  float lane_max = -INFINITY;
             \\  for (int g = 0; g < SIMDS; ++g) {
             \\    int vt = g * 32 + int(lane);
@@ -336,7 +336,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
     });
 }
 
-const ROUTER_SOURCES = [4][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate) };
+pub const ROUTER_SOURCES = [4][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate) };
 const ROUTER_NAMES = [4][*:0]const u8{ "sushi_moe_router_softmax", "sushi_moe_router_sigmoid", "sushi_moe_router_sigmoid_grouped", "sushi_moe_router_softmax_gate" };
 var router_kernels: [4]?mlx.mlx_fast_metal_kernel = @splat(null);
 

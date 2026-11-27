@@ -26,7 +26,7 @@ has() { # name  haystack  needle
   if printf '%s' "$2" | grep -qF -- "$3"; then PASS=$((PASS + 1)); echo "  PASS $1"
   else FAIL=$((FAIL + 1)); echo "  FAIL $1 — [$3] missing from: $(printf '%s' "$2" | tail -5)"; fi
 }
-g() { git -c user.name=t -c user.email=t@t "$@"; }
+g() { git -c user.name=t -c user.email=t@t -c protocol.file.allow=always "$@"; }
 field() { plutil -extract "$2" raw -o - "$1" 2> /dev/null; }
 
 REAL_PY="$(command -v python3)"
@@ -57,9 +57,17 @@ done
 chmod +x "$TMP/bin/taskpolicy" "$TMP/bin/sysctl" "$TMP/py-yes/python3" "$TMP/py-no/python3"
 
 # ---- the repo the gate runs from ----
+MLX_SRC="$TMP/mlx-src"
+g init -q "$MLX_SRC"
+mkdir -p "$MLX_SRC/mlx/backend/metal/kernels"
+echo '// kernel utils' > "$MLX_SRC/mlx/backend/metal/kernels/utils.h"
+g -C "$MLX_SRC" add -A
+g -C "$MLX_SRC" commit -qm mlx
+
 REPO="$TMP/repo"
 g init -q "$REPO"
 mkdir -p "$REPO/tests/lib" "$REPO/scripts" "$REPO/.zig-toolchain" "$REPO/lib/mlx"
+g -C "$REPO" submodule add -q "$MLX_SRC" lib/mlx-src
 cp "$ROOT/tests/gate.sh" "$REPO/tests/" 2> /dev/null
 cp "$ROOT/tests/lib/fixture_envs.sh" "$ROOT/tests/lib/test_log.py" "$ROOT/tests/lib/test_keys.py" "$REPO/tests/lib/" 2> /dev/null
 cp "$ROOT/scripts/gpu-lock.sh" "$REPO/scripts/" 2> /dev/null
@@ -81,13 +89,17 @@ cat > "$REPO/.zig-toolchain/zig" << 'EOF'
 #!/bin/bash
 if [ "$1" = version ]; then echo 0.17.1; exit 0; fi
 step=$2
-echo "zig $step $PWD QWEN4_STQ_TINY=${QWEN4_STQ_TINY:-unset} DSV41_EPI_TINY=${DSV41_EPI_TINY:-unset} args=$*" >> "$STUB_CALLS"
+mlx_src=$([ -f lib/mlx-src/mlx/backend/metal/kernels/utils.h ] && echo yes || echo no)
+gs_out=$(git status --porcelain --untracked-files=no 2>&1) || gs_out="ERR:$gs_out"
+git_status=$([ -z "$gs_out" ] && echo clean || echo "dirty:$gs_out")
+echo "zig $step $PWD mlx_src=$mlx_src git_status=$git_status QWEN4_STQ_TINY=${QWEN4_STQ_TINY:-unset} DSV41_EPI_TINY=${DSV41_EPI_TINY:-unset} args=$*" >> "$STUB_CALLS"
 [ "${STUB_FAIL:-}" = "$step" ] && { echo "error: stub $step failed"; exit 1; }
 # test-build + test-plan: the two binaries (their bytes from STUB_BIN_<name>) and the plan beside them.
 if [ "$step" = test-build ]; then
-  mkdir -p zig-out/tests
+  mkdir -p zig-out/tests zig-out/lib
   printf '%s' "${STUB_BIN_HOST:-host v1}" > zig-out/tests/test-host
   printf '%s' "${STUB_BIN_REST:-rest v1}" > zig-out/tests/test-rest
+  printf '%s' "${STUB_METALLIB:-metallib v1}" > zig-out/lib/sushi.metallib
   printf '%s' '[{"step":"test-host","binary":"tests/test-host","env":[["SUSHI_TEST_STEP","test-host"]]},' \
     '{"step":"test-rest","binary":"tests/test-rest","env":[["SUSHI_TEST_STEP","test-rest"]]}]' > zig-out/test-plan.json
 fi
@@ -186,6 +198,8 @@ ok "lint, then ubench, then the test binaries and plan, then the test step" "$(g
 has "  the binaries and plan built with the test step's flags" "$(grep '^zig test-build ' "$CALLS")" "args=build test-build test-plan -Doptimize=ReleaseFast"
 ok "the gate keeps each run step's key" "$(cut -f1 "$GATE_DIR/$SHA1.logs/step-keys.tsv" 2> /dev/null | tr '\n' ',')" "test-host,test-rest,"
 ok "the steps run in the gate dir's one worktree path, so a rebuild of the same code is the same binary" "$(sed -n 's/^zig lint \([^ ]*\) .*/\1/p' "$CALLS")" "$GATE_DIR/worktree"
+has "the worktree borrows lib/mlx-src/mlx for sushi.metallib" "$(grep '^zig lint ' "$CALLS")" "mlx_src=yes"
+has "  while keeping git status clean on the submodule path" "$(grep '^zig lint ' "$CALLS")" "git_status=clean"
 has "the guards run beside the test step" "$(grep '^guards ' "$CALLS")" "beside=yes"
 ok "every step runs under taskpolicy -a" "$(grep -c '^taskpolicy ' "$CALLS")" "5"
 WT_DIR="$(sed -n 's/^zig lint \([^ ]*\) .*/\1/p' "$CALLS")"
@@ -296,6 +310,8 @@ gate STUB_BIN_REST="rest v2" -- --continue "$PRIOR" HEAD
 ok "a step whose binary changed runs again" "$(skips)" "test-host,"
 ok "  and the record lists only the reused one" "$(field "$GATE_DIR/$SHA3.json" reused.steps.1 > /dev/null && echo two || echo one)" "one"
 ok "  and counts the rerun step's tests with the reused one's" "$(field "$GATE_DIR/$SHA3.json" summary | grep -c '2/3 tests passed (1 skipped)')" "1"
+gate STUB_METALLIB="metallib v2" -- --continue "$PRIOR" HEAD
+ok "a rebuilt sushi.metallib reruns every step" "$(skips)" ""
 gate STUB_FAIL=a-test -- HEAD
 echo 'pub const a = 2;' > "$REPO/src/a.zig"
 g -C "$REPO" commit -qam "another zig-only change"
@@ -360,6 +376,14 @@ mv "$TMP/models/test-fixtures" "$TMP/models/tiny-models"
 gate -- no-such-ref
 ok "a ref that names no commit refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
 has "  naming it" "$OUT" "no-such-ref"
+
+mv "$REPO/lib/mlx-src/mlx" "$REPO/lib/mlx-src/mlx.bak"
+gate -- HEAD
+ok "a missing lib/mlx-src/mlx refuses" "$([ "$RC" -ne 0 ] && echo yes || echo no)" "yes"
+has "  naming lib/mlx-src/mlx" "$OUT" "lib/mlx-src/mlx"
+ok "  before any step" "$(grep -c -E '^(zig|guards) ' "$CALLS")" "0"
+ok "  and removing its worktree" "$(worktrees)" "1"
+mv "$REPO/lib/mlx-src/mlx.bak" "$REPO/lib/mlx-src/mlx"
 
 echo 'const test_log = b.option([]const u8, "test-log", "");' > "$REPO/build.zig"
 g -C "$REPO" commit -qam "three"

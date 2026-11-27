@@ -20,9 +20,9 @@ const BODY =
     \\}
     \\
 ;
-const SOURCE = BODY ++ "y[i]=result;\n";
+pub const SOURCE = BODY ++ "y[i]=result;\n";
 // The sublayer's residual add rounds like MLX's BF16 add of the stored convolution output.
-const SOURCE_ADD = BODY ++ "y[i]=bfloat(float(residual[row*residual_strides[1]+col*residual_strides[2]])+float(result));\n";
+pub const SOURCE_ADD = BODY ++ "y[i]=bfloat(float(residual[row*residual_strides[1]+col*residual_strides[2]])+float(result));\n";
 var kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 const Key = struct { len: c_int, hidden: c_int, group: c_int };
 const Config = struct { key: Key, value: mlx.mlx_fast_metal_kernel_config };

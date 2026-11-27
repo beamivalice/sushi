@@ -12,7 +12,6 @@ const metal = @import("../metal.zig");
 const metal_mlx = @import("../metal_mlx.zig");
 const io_util = @import("../io_util.zig");
 const mlx = @import("../mlx.zig");
-const registry = @import("pipeline_registry.zig");
 const fill_marks = @import("../fill_marks.zig");
 const plan = @import("plan/plan_api.zig");
 
@@ -2496,20 +2495,6 @@ fn nameOf(name: []const u8, pipeline: metal.Pipeline) void {
 pub fn preloadedPipeline(name: []const u8, pipeline: metal.Pipeline) void {
     nameOf(name, pipeline);
     pipelines_preloaded += 1;
-}
-
-/// The pipeline of the kernel source `text`, entry point `function`: the one a manifest made ahead, else compiled now.
-pub fn pipelineFromSource(function: [:0]const u8, text: [:0]const u8) Error!metal.Pipeline {
-    if (dryOn()) return dry_pipeline;
-    if (registry.takeSource(function, text)) |p| {
-        preloadedPipeline(function, p);
-        return p;
-    }
-    const t0 = nowNs();
-    const pipeline = try (try metal.device()).compile(text, function);
-    madePipeline(function, t0, pipeline);
-    registry.record(.{ .kind = .source, .function = function, .text = text });
-    return pipeline;
 }
 
 pub fn nowNs() u64 {

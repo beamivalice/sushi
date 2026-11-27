@@ -9,7 +9,7 @@ pub fn enabled() bool {
 }
 
 // MLX v0.32.2 GEMV (BM4 BN1 SM1 SN32 TM4 TN4), with independent activation rows.
-const ROUTER_SOURCE =
+pub const ROUTER_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const uint row = threadgroup_position_in_grid.y;
@@ -31,7 +31,7 @@ const ROUTER_SOURCE =
 ;
 
 // MLX v0.32.2 dot_product BF16 (it32 tg512 sg16); the one-block sum is unchanged.
-const GATE_SOURCE =
+pub const GATE_SOURCE =
     \\const uint tid = thread_position_in_threadgroup.x;
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;

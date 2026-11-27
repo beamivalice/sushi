@@ -14,7 +14,7 @@ const tile_rows: c_int = 16;
 /// Vectors one matrix tile serves.
 pub const vectors: usize = 4;
 
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\constexpr int TM = 4;
     \\constexpr int TN = 4;
     \\constexpr int BLOCK = 32 * TN;
@@ -33,7 +33,7 @@ const source: [:0]const u8 =
     \\}
     \\float result[NV][TM];
     \\for (int v = 0; v < NV; ++v) for (int tm = 0; tm < TM; ++tm) result[v][tm] = 0.0f;
-    \\constexpr int n_iter = KDIM / BLOCK;
+    \\const int n_iter = KDIM / BLOCK;
     \\int bn = int(lane) * TN;
     \\for (int i = 0; i < n_iter; ++i) {
     \\  float inter[TM][TN];

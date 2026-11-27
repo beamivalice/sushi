@@ -118,11 +118,15 @@ def shared(repo):
 def keys(plan_path, repo):
     """The plan's binaries sit beside it (`tests/<binary>`) once `zig build test-build` has installed them."""
     plan = json.load(open(plan_path, encoding="utf-8"))
+    out_dir = os.path.dirname(os.path.abspath(plan_path))
     base = shared(repo)
+    sushi_metallib = os.path.join(out_dir, "lib", "sushi.metallib")
+    if os.path.isfile(sushi_metallib):
+        base = hashlib.sha256(f"{base}\nsushi.metallib {file_sha(sushi_metallib)}\n".encode()).hexdigest()
     for step in plan:
         h = hashlib.sha256()
         h.update(f"{base}\n{step['step']}\n".encode())
-        h.update(normalized(os.path.join(os.path.dirname(os.path.abspath(plan_path)), step["binary"])).encode())
+        h.update(normalized(os.path.join(out_dir, step["binary"])).encode())
         h.update(json.dumps(step["env"], sort_keys=True).encode())
         print(f"{step['step']}\t{h.hexdigest()}")
 

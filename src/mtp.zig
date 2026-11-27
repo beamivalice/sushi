@@ -772,7 +772,7 @@ pub const MropeContext = mrope.PositionContext;
 // above every number, -0.0 == +0.0). Real values never map to 0, so the
 // zero-initialized empty slots below can never be selected while a
 // simdgroup still has real candidates (guaranteed by rows >= TILES*TG).
-const TOP32_ORDINAL_HEADER =
+pub const TOP32_ORDINAL_HEADER =
     \\inline uint sushi_top32_ordinal(float v) {
     \\    if (isnan(v))  { return 0xFFFFFFFFu; }
     \\    if (v == 0.0f) { return 0x80000000u; }
@@ -786,25 +786,26 @@ const TOP32_ORDINAL_HEADER =
 // of simd_max over per-thread slots with a `taken` bitmask (hence the
 // PER_THREAD <= 32 static_assert), then one simdgroup reduces the
 // threadgroup's per-simd lists the same way.
-const TOP32_PARTIAL_SRC =
-    \\constexpr uint REAL_COUNT = (uint)RC;
+pub const TOP32_PARTIAL_SRC =
+    \\const uint REAL_COUNT = (uint)RC;
     \\constexpr uint TG_SIZE    = 256;
     \\constexpr uint STRIDE     = 64u * 256u;
-    \\constexpr uint PER_THREAD = (REAL_COUNT + STRIDE - 1u) / STRIDE;
+    \\const uint PER_THREAD = (REAL_COUNT + STRIDE - 1u) / STRIDE;
     \\constexpr uint TOPK       = 32;
     \\constexpr uint SIMD_SIZE  = 32;
     \\constexpr uint NSIMD      = TG_SIZE / SIMD_SIZE;
     \\constexpr uint PB         = (NSIMD * TOPK) / SIMD_SIZE;
-    \\static_assert(PER_THREAD <= 32, "PER_THREAD exceeds taken-bitmask width");
+    \\#ifndef SUSHI_METALLIB
     \\static_assert(PB <= 32, "PB exceeds tk2-bitmask width");
+    \\#endif
     \\
     \\uint tile = threadgroup_position_in_grid.x;
     \\uint tid  = thread_position_in_threadgroup.x;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg   = simdgroup_index_in_threadgroup;
     \\
-    \\uint ord[PER_THREAD];
-    \\uint idx[PER_THREAD];
+    \\uint ord[32];
+    \\uint idx[32];
     \\for (uint t = 0; t < PER_THREAD; ++t) { ord[t] = 0u; idx[t] = 0u; }
     \\uint n = 0;
     \\for (uint i = tile * TG_SIZE + tid; i < REAL_COUNT; i += STRIDE) {
@@ -869,7 +870,7 @@ const TOP32_PARTIAL_SRC =
 
 // Stage 2: one threadgroup reduces the TILES*32 candidates to the final 32
 // ids (written ascending by (value, index) — consumers are order-blind).
-const TOP32_FINAL_SRC =
+pub const TOP32_FINAL_SRC =
     \\constexpr uint TG_SIZE    = 256;
     \\constexpr uint PER_THREAD = 8;
     \\constexpr uint TOPK       = 32;

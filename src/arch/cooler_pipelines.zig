@@ -74,6 +74,9 @@ pub const Plan = struct {
     /// What the last `settle` spent making pipelines ahead, and how many it made.
     made_ns: u64 = 0,
     made_count: u64 = 0,
+    /// Whether `archive.bin` beside this key's manifest loaded cleanly and how many recipes it covered.
+    archive_loaded: bool = false,
+    archive_recipes: usize = 0,
 
     pub fn deinit(p: *Plan) void {
         p.found.deinit();
@@ -97,8 +100,26 @@ pub const Plan = struct {
             else => &.{},
         };
         if (recipes.len > 0) {
+            var archive: ?cache.Archive = null;
+            defer if (archive) |a| a.release();
+            if (p.case == .same and p.from_path) {
+                if (manifest.configuredRoot()) |root_path| {
+                    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    if (manifest.archivePath(&path_buf, root_path, p.key)) |apath| {
+                        if (std.c.access(apath.ptr, std.c.F_OK) == 0) {
+                            if (cache.openArchive(apath)) |a| {
+                                archive = a;
+                                p.archive_loaded = true;
+                                p.archive_recipes = recipes.len;
+                            } else |_| {
+                                log.warn("[pipelines] binary archive {s} unreadable ({s}); building from sushi.metallib\n", .{ dir, cache.lastMetalError() });
+                            }
+                        }
+                    } else |_| {}
+                }
+            }
             const t0 = load_clock.now();
-            const report = if (cache.start(recipes, p.threads)) |job| cache.finish(job) else |e| {
+            const report = if (cache.startWithArchive(recipes, p.threads, archive)) |job| cache.finish(job) else |e| {
                 log.warn("[pipelines] manifest {s}: the workers did not start ({s}); the warm forwards run and rebuild it\n", .{ dir, @errorName(e) });
                 p.case = .unreadable;
                 return false;
@@ -118,7 +139,7 @@ pub const Plan = struct {
                 // after a late warm keeps the ones this load never launched.
                 for (recipes) |r| registry.record(r);
                 remember(p);
-                log.info("[pipelines] made {d} pipelines from the manifest {s} on {d} threads in {d} ms; an arch may skip its warm forwards (key {d} ms)\n", .{ report.made, dir, p.threads, wall_ms, p.key_ms });
+                log.info("[pipelines] made {d} pipelines from the manifest {s}{s} on {d} threads in {d} ms; an arch may skip its warm forwards (key {d} ms)\n", .{ report.made, dir, if (archive != null) " (binary archive)" else "", p.threads, wall_ms, p.key_ms });
                 return true;
             }
             log.info("[pipelines] manifest of another build, recompiled {d} on {d} threads in {d} ms; the warm forwards run and the manifest {s} is rewritten (key {d} ms)\n", .{ report.made, p.threads, wall_ms, dir, p.key_ms });
@@ -150,8 +171,25 @@ pub const Plan = struct {
         defer removed.deinit(p.a);
         manifest.prune(p.a, p.io, root, p.key, &removed) catch |e| log.warn("[pipelines] older manifests not removed: {s}\n", .{@errorName(e)});
         var dir_buf: [manifest.Key.dir_len]u8 = undefined;
-        log.info("[pipelines] manifest {s} written: {d} recipes\n", .{ p.key.dirName(&dir_buf), registry.recipes().len });
+        const dir = p.key.dirName(&dir_buf);
+        const total = registry.recipes().len;
+        log.info("[pipelines] manifest {s} written: {d} recipes\n", .{ dir, total });
         for (removed.items) |name| log.info("[pipelines] removed the manifest {s} of an older build\n", .{name});
+        if (p.from_path and (!p.archive_loaded or total > p.archive_recipes)) {
+            if (manifest.configuredRoot()) |root_path| {
+                var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (manifest.archivePath(&path_buf, root_path, p.key)) |apath| {
+                    const t0 = load_clock.now();
+                    if (cache.writeArchive(p.io, registry.recipes(), apath)) |n| {
+                        p.archive_loaded = true;
+                        p.archive_recipes = total;
+                        log.info("[pipelines] binary archive {s} written: {d} pipelines in {d} ms\n", .{ dir, n, (load_clock.now() - t0) / std.time.ns_per_ms });
+                    } else |e| {
+                        log.warn("[pipelines] binary archive {s} not written ({s}: {s})\n", .{ dir, @errorName(e), cache.lastMetalError() });
+                    }
+                } else |_| {}
+            }
+        }
     }
 };
 

@@ -685,7 +685,7 @@ pub const picks_glue: report.Bench = .{
     .run = runPicksGlue,
 };
 
-const LINK_SOURCE: [:0]const u8 =
+pub const LINK_SOURCE: [:0]const u8 =
     \\const uint i = thread_position_in_grid.x;
     \\if (i >= uint(topk_shape[0]) * uint(topk_shape[1])) return;
     \\out[i] = topk[i];
@@ -1126,7 +1126,7 @@ pub const launch_fusions: report.Bench = .{
     .run = runLaunchFusions,
 };
 
-const FUSION_LINK_SOURCE: [:0]const u8 =
+pub const FUSION_LINK_SOURCE: [:0]const u8 =
     \\const uint i = thread_position_in_grid.x;
     \\if (i >= uint(N)) return;
     \\out[i] = base[i];

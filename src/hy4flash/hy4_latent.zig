@@ -8,7 +8,7 @@ const mlx_pages = @import("../mlx_pages.zig");
 const Arr = mlx.mlx_array;
 const kcfg = @import("hy4_kcfg.zig");
 
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\uint col_w = thread_position_in_grid.x;
     \\uint out_row = thread_position_in_grid.y;
     \\uint src_row = GATHER ? uint(idx[size_t(out_row) * size_t(idx_strides[0])]) : out_row;
@@ -25,7 +25,7 @@ const source: [:0]const u8 =
 ;
 
 /// The range read's rows left as the dequantize gives them: four BF16 values a thread.
-const source_bf16: [:0]const u8 =
+pub const source_bf16: [:0]const u8 =
     \\uint col_w = thread_position_in_grid.x;
     \\uint out_row = thread_position_in_grid.y;
     \\uint32_t word = q[size_t(out_row) * size_t(q_strides[0]) + size_t(col_w) * size_t(q_strides[1])];
@@ -135,7 +135,7 @@ pub fn gather(s: mlx.mlx_stream, q: Arr, scales: Arr, biases: Arr, idx: Arr, gro
 /// The most rows one `append` writes (a verify block).
 pub const append_rows_max: c_int = 8;
 
-const append_source: [:0]const u8 =
+pub const append_source: [:0]const u8 =
     \\constexpr float eps = 1e-7f;
     \\constexpr float n_bins = 255.0f;
     \\uint tid = thread_position_in_grid.x;
@@ -246,7 +246,7 @@ pub fn append(s: mlx.mlx_stream, c: Arr, k_pe: Arr, dsts: []const Arr, start_row
     try mlx.check(mlx.kernelApplyInPlace(try getAppendKernel(), iv, cfg, s, dsts) orelse return error.MlxError);
 }
 
-const ring_windows_source: [:0]const u8 =
+pub const ring_windows_source: [:0]const u8 =
     \\uint col_w = thread_position_in_grid.x;
     \\uint s = thread_position_in_grid.y;
     \\uint r = thread_position_in_grid.z;

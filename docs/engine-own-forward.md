@@ -23,7 +23,7 @@ chunk of any width included, and a pack that decodes on MLX prefills on MLX.
 | DeepSeek-V4.1, STQ or the release's own FP8 trunk and MXFP4 experts, any GPU | every forward: decode, DSpark draft and verify, every prefill chunk, wider than 16 rows or not, with image rows or without; on a GPU with matrix units (M5) the NAX arms, on one without (M1 to M4) the SIMD arms of the same kernels and of the stock tiles |
 | every other architecture | none: MLX |
 
-The release's own layout reaches two ops an STQ pack does not, both MLX's plans on `mlx.metallib`'s kernels
+The release's own layout reaches two ops an STQ pack does not, both MLX's plans on `sushi.metallib`'s kernels
 (`tensor/quantized.zig`): `quantized_matmul` in `mxfp8` (every trunk linear, the grouped output projection as a batch
 of weights) with the vector, quad, wide, split-K and tile plans MLX picks by rows, and `gather_qmm` in `mxfp4` (the
 routed experts: `gather_qmv` for a decode row, the tiles for many rows a pick, and the sorted `gather_qmm_rhs` with
@@ -720,7 +720,7 @@ rebuilds one.
   their bytes) and what shapes the warm (context, window, YaRN factor, candidate blocks, DSpark, tile order,
   expert-cache and SSD bytes, resident or streamed, dropped experts, and its `recipe_env` variables); for Qwen, the
   shapes and formats its kernels follow. Both add the shared kernels' `recipe_env`. `build` (16 hex) is the
-  SHA-256 of the running binary, the size and mtime of `mlx.metallib`, the GPU architecture, the OS build and the manifest
+  SHA-256 of the running binary, the size and mtime of `sushi.metallib`, the GPU architecture, the OS build and the manifest
   version. A diagnostic that changes no recipe (the kernel profile, the report, probe and profile switches) is not in it.
 - **Same key.** The recipes are made on up to 8 worker threads (our own Metal binding only, never MLX), after the model is built;
   the inference thread then installs them. A launch finds its pipeline

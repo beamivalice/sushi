@@ -22,11 +22,11 @@ const SSMCacheEntry = trunk_mod.SSMCacheEntry;
 
 const HEADER = @import("../trunk.zig").GDN_KERNEL_HEADER;
 
-const K1_SOURCE =
+pub const K1_SOURCE =
     \\constexpr int NSG = NT / 32;
     \\constexpr int RB = DV / SPLIT;       // dv rows per threadgroup
     \\constexpr int R = RB / NSG;          // dv rows per simdgroup
-    \\constexpr int GRP = HV / HK;
+    \\const int GRP = HV / HK;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint hv = threadgroup_position_in_grid.x / SPLIT;
@@ -109,7 +109,7 @@ const K1S_HEAD =
     \\constexpr int NSG = NT / 32;
     \\constexpr int RB = DV / SPLIT;
     \\constexpr int R = RB / NSG;
-    \\constexpr int GRP = HV / HK;
+    \\const int GRP = HV / HK;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint hv = threadgroup_position_in_grid.x / SPLIT;
@@ -205,7 +205,7 @@ const K1S_TAIL =
     \\}
 ;
 
-const K1S_SOURCE = K1S_HEAD ++ "\n" ++
+pub const K1S_SOURCE = K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
 ++ "\n" ++ K1S_TAIL;
 
@@ -222,13 +222,13 @@ const K1S_NOCAP_TAIL =
     \\}
 ;
 
-const K1S_NOCAP_SOURCE = K1S_HEAD ++ "\n" ++
+pub const K1S_NOCAP_SOURCE = K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
 ++ "\n" ++ K1S_NOCAP_TAIL;
 
 // One threadgroup owns a head. Its stored-precision y stays in shared memory
 // for the norm-gate reduction; rollback also receives the convolution inputs.
-const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
+pub const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
     \\    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));
 ++ "\n" ++ K1S_TAIL ++ "\n" ++
     \\if (sg < 3 && (sg == 2 || hv % GRP == 0)) {

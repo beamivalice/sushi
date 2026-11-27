@@ -14,7 +14,7 @@ pub var decoded_calls: u64 = 0;
 
 /// A one-bank trellis `[1, in/16, out/16, n]` decoded to its f16 weight `[out, in]`: the values the GEMMs' fragment
 /// reader hands their MMAs, each at its (output, input) place.
-const DENSE_SOURCE: [:0]const u8 =
+pub const DENSE_SOURCE: [:0]const u8 =
     \\constexpr uint N = uint(NHW);
     \\constexpr uint PACKED_W = N / 2u;
     \\constexpr uint OT = uint(ODIM) / 16u;

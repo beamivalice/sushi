@@ -1,50 +1,22 @@
 //! Custom kernels on the engine: the kernel a caller made with `mlx_fast_metal_kernel_new`, launched on tensors of
-//! ours. One instantiation (template values, each input's dtype and how it is passed, output dtypes) is written and
-//! compiled once and its pipeline kept.
-//!
-//! The signature is written as MLX's `metal_kernel` writes it (mlx/backend/common/metal_kernel.cpp, MIT), so a
-//! source compiles here to the code it compiles to under MLX.
+//! ours. Every instantiation resolves exclusively to a precompiled function in `sushi.metallib` via `metallib_catalog`,
+//! with zero runtime Metal source compilation; an unregistered kernel is refused by name.
 
 const std = @import("std");
 const metal = @import("../metal.zig");
+const log = @import("../log.zig");
+const catalog = @import("../metallib_catalog.zig");
 const core = @import("core.zig");
 const ops = @import("ops.zig");
+const stock = @import("stock.zig");
 
 const Tensor = core.Tensor;
 const Dtype = core.Dtype;
 const gpa = std.heap.c_allocator;
 
-
-/// What a kernel source may name that MLX's preamble declared for it.
-const preamble =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\typedef bfloat bfloat16_t;
-    \\typedef half float16_t;
-    \\
-++ @embedFile("mlx_bf16_math.metal");
-
-pub fn typeName(d: Dtype) core.Error![]const u8 {
-    return switch (d) {
-        .bool_ => "bool",
-        .uint8 => "uint8_t",
-        .uint16 => "uint16_t",
-        .uint32 => "uint32_t",
-        .uint64 => "uint64_t",
-        .int8 => "int8_t",
-        .int16 => "int16_t",
-        .int32 => "int32_t",
-        .int64 => "int64_t",
-        .float16 => "float16_t",
-        .float32 => "float",
-        .bfloat16 => "bfloat16_t",
-        .float64, .complex64 => error.TensorDtype,
-    };
-}
-
 pub const max_outputs = 8;
 pub const max_inputs = 32;
-pub const max_template_args = 32;
+pub const max_template_args = 48;
 
 pub const TemplateValue = union(enum) { int: c_int, boolean: bool, dtype: Dtype };
 
@@ -155,8 +127,6 @@ pub const Def = struct {
     atomic_outputs: bool,
     /// Per input: whether the source reads its `_shape`, `_strides`, `_ndim`, each one more buffer.
     shape_infos: [][3]bool,
-    /// The `[[attribute]]` parameters the source names, as signature lines.
-    attributes: [][]const u8,
     instances: std.StringHashMapUnmanaged(metal.Pipeline) = .empty,
     /// The instantiations launched last, compared field by field: a launch that finds its own skips the key.
     recent: [recent_slots]Recent = undefined,
@@ -177,7 +147,6 @@ pub const Def = struct {
             .ensure_row_contiguous = ensure_row_contiguous,
             .atomic_outputs = atomic_outputs,
             .shape_infos = try gpa.alloc([3]bool, inputs.len),
-            .attributes = &.{},
         };
         for (inputs, 0..) |n, i| {
             d.inputs[i] = try gpa.dupe(u8, n);
@@ -188,39 +157,9 @@ pub const Def = struct {
             }
         }
         for (outputs, 0..) |n, i| d.outputs[i] = try gpa.dupe(u8, n);
-        var attrs: std.ArrayList([]const u8) = .empty;
-        for (metal_attributes) |a| {
-            if (std.mem.indexOf(u8, source, a[0]) == null) continue;
-            try attrs.ensureUnusedCapacity(gpa, 1);
-            attrs.appendAssumeCapacity(try std.fmt.allocPrint(gpa, "  {s} {s} [[{s}]]", .{ a[1], a[0], a[0] }));
-        }
-        d.attributes = try attrs.toOwnedSlice(gpa);
         next_def += 1;
         return d;
     }
-};
-
-const metal_attributes = [_][2][]const u8{
-    .{ "dispatch_quadgroups_per_threadgroup", "uint" },
-    .{ "dispatch_simdgroups_per_threadgroup", "uint" },
-    .{ "dispatch_threads_per_threadgroup", "uint3" },
-    .{ "grid_origin", "uint3" },
-    .{ "grid_size", "uint3" },
-    .{ "quadgroup_index_in_threadgroup", "uint" },
-    .{ "quadgroups_per_threadgroup", "uint" },
-    .{ "simdgroup_index_in_threadgroup", "uint" },
-    .{ "simdgroups_per_threadgroup", "uint" },
-    .{ "thread_execution_width", "uint" },
-    .{ "thread_index_in_quadgroup", "uint" },
-    .{ "thread_index_in_simdgroup", "uint" },
-    .{ "thread_index_in_threadgroup", "uint" },
-    .{ "thread_position_in_grid", "uint3" },
-    .{ "thread_position_in_threadgroup", "uint3" },
-    .{ "threadgroup_position_in_grid", "uint3" },
-    .{ "threadgroups_per_grid", "uint3" },
-    .{ "threads_per_grid", "uint3" },
-    .{ "threads_per_simdgroup", "uint" },
-    .{ "threads_per_threadgroup", "uint3" },
 };
 
 /// How an input reaches the kernel: a 0-d one by reference, any other as a device pointer. MLX also puts an array
@@ -230,124 +169,14 @@ fn passing(t: *const Tensor) u8 {
     return if (t.ndim == 0) 's' else 'd';
 }
 
-/// The kernel function's name for one instantiation: MLX's for the same template values and dtypes.
-fn kernelName(out: *std.ArrayList(u8), def: *const Def, inputs: []const *Tensor, cfg: *const Config) !void {
-    try out.appendSlice(gpa, "custom_kernel_");
-    try out.appendSlice(gpa, def.name);
-    if (cfg.n_targs > 0) {
-        // MLX joins the name and the values with two underscores.
-        try out.appendSlice(gpa, "__");
-        for (cfg.targs[0..cfg.n_targs], 0..) |arg, i| {
-            if (i > 0) try out.append(gpa, '_');
-            try templateValue(out, arg);
-        }
-    }
-    for (inputs) |in| {
-        try out.append(gpa, '_');
-        try out.appendSlice(gpa, try typeName(in.dtype));
-        if (passing(in) == 's') try out.append(gpa, 's');
-    }
-    for (cfg.out_dtypes[0..cfg.n_out]) |d| {
-        try out.append(gpa, '_');
-        try out.appendSlice(gpa, try typeName(d));
-    }
-}
-
-fn templateValue(out: *std.ArrayList(u8), arg: TemplateArg) !void {
-    switch (arg.value) {
-        .int => |v| try out.print(gpa, "{d}", .{v}),
-        .boolean => |v| try out.append(gpa, if (v) '1' else '0'),
-        .dtype => |d| try out.appendSlice(gpa, try typeName(d)),
-    }
-}
-
-/// The whole Metal source of one instantiation.
-fn render(def: *const Def, name: []const u8, inputs: []const *Tensor, cfg: *const Config) ![:0]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, preamble);
-    try out.appendSlice(gpa, def.header);
-    const targs = cfg.targs[0..cfg.n_targs];
-    if (targs.len > 0) {
-        try out.appendSlice(gpa, "template <");
-        for (targs, 0..) |arg, i| {
-            if (i > 0) try out.appendSlice(gpa, ", ");
-            try out.appendSlice(gpa, switch (arg.value) {
-                .int => "int",
-                .boolean => "bool",
-                .dtype => "typename",
-            });
-            try out.append(gpa, ' ');
-            try out.appendSlice(gpa, arg.name[0..arg.name_len]);
-        }
-        try out.appendSlice(gpa, ">\n");
-    }
-    try out.print(gpa, "[[kernel]] void {s}(\n", .{name});
-
-    var index: usize = 0;
-    for (inputs, 0..) |in, i| {
-        try out.print(gpa, "  const {s} {s}{s} {s} [[buffer({d})]],\n", .{
-            if (in.ndim == 0) "constant" else "device",
-            try typeName(in.dtype),
-            if (in.ndim == 0) "&" else "*",
-            def.inputs[i],
-            index,
-        });
-        index += 1;
-        if (in.ndim == 0) continue;
-        if (def.shape_infos[i][0]) {
-            try out.print(gpa, "  const constant int* {s}_shape [[buffer({d})]],\n", .{ def.inputs[i], index });
-            index += 1;
-        }
-        if (def.shape_infos[i][1]) {
-            try out.print(gpa, "  const constant int64_t* {s}_strides [[buffer({d})]],\n", .{ def.inputs[i], index });
-            index += 1;
-        }
-        if (def.shape_infos[i][2]) {
-            try out.print(gpa, "  const constant int& {s}_ndim [[buffer({d})]],\n", .{ def.inputs[i], index });
-            index += 1;
-        }
-    }
-    for (def.outputs, 0..) |out_name, i| {
-        const t = try typeName(cfg.out_dtypes[i]);
-        if (def.atomic_outputs) {
-            try out.print(gpa, "  device atomic<{s}>* {s} [[buffer({d})]]", .{ t, out_name, index });
-        } else {
-            try out.print(gpa, "  device {s}* {s} [[buffer({d})]]", .{ t, out_name, index });
-        }
-        const last = i + 1 == def.outputs.len and def.attributes.len == 0;
-        try out.appendSlice(gpa, if (last) ") {\n" else ",\n");
-        index += 1;
-    }
-    for (def.attributes, 0..) |attr, i| {
-        try out.appendSlice(gpa, attr);
-        try out.appendSlice(gpa, if (i + 1 == def.attributes.len) ") {\n" else ",\n");
-    }
-    try out.appendSlice(gpa, def.source);
-    try out.appendSlice(gpa, "\n}\n");
-    if (targs.len > 0) {
-        try out.print(gpa, "\ntemplate [[host_name(\"{s}\")]] [[kernel]] decltype({s}<", .{ name, name });
-        for (targs, 0..) |arg, i| {
-            if (i > 0) try out.appendSlice(gpa, ", ");
-            try templateValue(&out, arg);
-        }
-        try out.print(gpa, ">) {s}<", .{name});
-        for (targs, 0..) |arg, i| {
-            if (i > 0) try out.appendSlice(gpa, ", ");
-            try templateValue(&out, arg);
-        }
-        try out.appendSlice(gpa, ">;\n");
-    }
-    return out.toOwnedSliceSentinel(gpa, 0);
-}
-
 threadlocal var key_buf: std.ArrayList(u8) = .empty;
 
 /// Instance keys built since the process began.
 pub var key_builds: u64 = 0;
 
-/// The pipeline of `def` at these inputs and this config, compiled at its first launch.
+/// The pipeline of `def` at these inputs and this config, fetched once from `sushi.metallib`.
 fn pipelineOf(def: *Def, inputs: []const *Tensor, cfg: *Config) !metal.Pipeline {
+    if (stock.noting != null) return instanceOf(def, inputs, cfg);
     if (cfg.last) |*l| if (l.def == def.id and l.n_in == inputs.len and sigMatches(&l.sig, inputs)) return l.pipeline;
     const pipeline = try pipelineByValue(def, inputs, cfg);
     var last: Config.Last = .{ .def = def.id, .n_in = @intCast(inputs.len), .sig = undefined, .pipeline = pipeline };
@@ -402,18 +231,76 @@ fn instanceOf(def: *Def, inputs: []const *Tensor, cfg: *const Config) !metal.Pip
         try key_buf.append(gpa, passing(in));
     }
     for (cfg.out_dtypes[0..cfg.n_out]) |d| try key_buf.append(gpa, @intCast(@intFromEnum(d)));
-    if (def.instances.get(key_buf.items)) |p| return p;
+    if (stock.noting == null) {
+        if (def.instances.get(key_buf.items)) |p| return p;
+    }
 
-    var name: std.ArrayList(u8) = .empty;
-    defer name.deinit(gpa);
-    try kernelName(&name, def, inputs, cfg);
-    try name.append(gpa, 0);
-    const name_z: [:0]const u8 = name.items[0 .. name.items.len - 1 :0];
-    const text = try render(def, name_z, inputs, cfg);
-    defer gpa.free(text);
-    const pipeline = try core.pipelineFromSource(name_z, text);
-    try def.instances.ensureUnusedCapacity(gpa, 1);
-    def.instances.putAssumeCapacity(try gpa.dupe(u8, key_buf.items), pipeline);
+    if (def.atomic_outputs) {
+        var msg: [256]u8 = undefined;
+        metal.setError(std.fmt.bufPrint(&msg, "atomic custom kernel not in sushi.metallib: {s}", .{def.name}) catch def.name);
+        log.err("[engine] atomic custom kernel not supported in sushi.metallib: {s}\n", .{def.name});
+        return error.MetalCompile;
+    }
+
+    var rt_in: [max_inputs]catalog.RuntimeInput = undefined;
+    for (inputs, 0..) |in, i| {
+        rt_in[i] = .{
+            .name = def.inputs[i],
+            .dtype = catalog.Dtype.fromInt(@intFromEnum(in.dtype)) orelse return core.refusing("a custom kernel input dtype not supported on Cooler", error.TensorDtype),
+            .scalar = in.ndim == 0,
+        };
+    }
+    var rt_out: [max_outputs]catalog.Dtype = undefined;
+    for (cfg.out_dtypes[0..cfg.n_out], 0..) |d, i| {
+        rt_out[i] = catalog.Dtype.fromInt(@intFromEnum(d)) orelse return core.refusing("a custom kernel output dtype not supported on Cooler", error.TensorDtype);
+    }
+    var rt_targs: [max_template_args]catalog.RuntimeTarg = undefined;
+    for (cfg.targs[0..cfg.n_targs], 0..) |*arg, i| {
+        rt_targs[i] = .{
+            .name = arg.name[0..arg.name_len],
+            .value = switch (arg.value) {
+                .int => |v| .{ .int = v },
+                .boolean => |v| .{ .boolean = v },
+                .dtype => |d| .{ .dtype = catalog.Dtype.fromInt(@intFromEnum(d)) orelse return core.refusing("a custom kernel template dtype not supported on Cooler", error.TensorDtype) },
+            },
+        };
+    }
+
+    var resolved: catalog.Resolved = .{};
+    if (!catalog.resolve(def.name, rt_in[0..inputs.len], rt_out[0..cfg.n_out], rt_targs[0..cfg.n_targs], &resolved)) {
+        var msg: [512]u8 = undefined;
+        var w: std.ArrayList(u8) = .initBuffer(&msg);
+        w.appendSliceBounded(def.name) catch {};
+        w.appendSliceBounded(" not in sushi.metallib (in:") catch {};
+        for (rt_in[0..inputs.len], 0..) |ri, idx| {
+            if (idx > 0) w.appendBounded(',') catch {};
+            w.appendSliceBounded(ri.dtype.shortName()) catch {};
+        }
+        w.appendSliceBounded(" out:") catch {};
+        for (rt_out[0..cfg.n_out], 0..) |od, idx| {
+            if (idx > 0) w.appendBounded(',') catch {};
+            w.appendSliceBounded(od.shortName()) catch {};
+        }
+        w.appendBounded(')') catch {};
+        metal.setError(w.items);
+        log.err("[engine] kernel not in sushi.metallib: {s}\n", .{w.items});
+        return error.MetalCompile;
+    }
+
+    const pipeline = if (resolved.n_flags == 0 and resolved.n_ints == 0)
+        try stock.kernel(resolved.fnName())
+    else blk: {
+        var flags: [catalog.max_fc_bools]metal.Flag = undefined;
+        for (resolved.flagSlice(), 0..) |f, i| flags[i] = .{ .index = f.index, .value = f.value };
+        var ints_fc: [catalog.max_fc_ints]metal.IntConstant = undefined;
+        for (resolved.intSlice(), 0..) |c, i| ints_fc[i] = .{ .index = c.index, .value = c.value };
+        break :blk try stock.kernelConstants(resolved.fnName(), resolved.hashKey(), flags[0..resolved.n_flags], ints_fc[0..resolved.n_ints]);
+    };
+
+    if (stock.noting == null) {
+        try def.instances.ensureUnusedCapacity(gpa, 1);
+        def.instances.putAssumeCapacity(try gpa.dupe(u8, key_buf.items), pipeline);
+    }
     return pipeline;
 }
 
@@ -646,16 +533,17 @@ fn run(def: *Def, x: *Tensor, cfg: *Config) ![4]f32 {
 
 test "kernel: a repeated launch builds no instance key, whether its config is kept or made anew" {
     try mlx.requireGpu();
-    const def = try Def.create("kn_memo_same", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    const def = try Def.create("sushi_test_scale", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
     const x = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(x);
     var cfg: Config = .{};
     try oneOutput(&cfg, 4);
+    try cfg.addTemplate("SCALE", .{ .int = 101 });
     const before = key_builds;
     const made = core.pipelines;
-    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &cfg));
-    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &cfg));
-    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 101, 202, 303, 404 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 101, 202, 303, 404 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 101, 202, 303, 404 }, try run(def, x, &cfg));
     try testing.expectEqual(before + 1, key_builds);
     try testing.expectEqual(made + 1, core.pipelines);
 
@@ -664,7 +552,8 @@ test "kernel: a repeated launch builds no instance key, whether its config is ke
     for (0..3) |_| {
         var again: Config = .{};
         try oneOutput(&again, 4);
-        try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(def, x, &again));
+        try again.addTemplate("SCALE", .{ .int = 101 });
+        try testing.expectEqual([4]f32{ 101, 202, 303, 404 }, try run(def, x, &again));
     }
     try testing.expectEqual(fresh_before, key_builds);
     try testing.expectEqual(made + 1, core.pipelines);
@@ -672,64 +561,66 @@ test "kernel: a repeated launch builds no instance key, whether its config is ke
 
 test "kernel: a changed input dtype launches the pipeline of that dtype" {
     try mlx.requireGpu();
-    const def = try Def.create("kn_memo_dtype", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 3;", "", true, false);
+    const def = try Def.create("sushi_test_scale", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
     const xf = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(xf);
     const xi = try ints(&.{ 10, 20, 30, 40 });
     defer core.release(xi);
     var cfg: Config = .{};
     try oneOutput(&cfg, 4);
-    try testing.expectEqual([4]f32{ 3, 6, 9, 12 }, try run(def, xf, &cfg));
+    try cfg.addTemplate("SCALE", .{ .int = 103 });
+    try testing.expectEqual([4]f32{ 103, 206, 309, 412 }, try run(def, xf, &cfg));
     const made = core.pipelines;
     const keys = key_builds;
-    try testing.expectEqual([4]f32{ 30, 60, 90, 120 }, try run(def, xi, &cfg));
+    try testing.expectEqual([4]f32{ 1030, 2060, 3090, 4120 }, try run(def, xi, &cfg));
     try testing.expectEqual(made + 1, core.pipelines);
     try testing.expectEqual(keys + 1, key_builds);
-    try testing.expectEqual([4]f32{ 3, 6, 9, 12 }, try run(def, xf, &cfg));
+    try testing.expectEqual([4]f32{ 103, 206, 309, 412 }, try run(def, xf, &cfg));
     try testing.expectEqual(made + 1, core.pipelines);
     try testing.expectEqual(keys + 1, key_builds);
 }
 
 test "kernel: two kernels launched in turn through one config each take their own pipeline" {
     try mlx.requireGpu();
-    const twice = try Def.create("kn_memo_twice", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
-    const thrice = try Def.create("kn_memo_thrice", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 3.0f;", "", true, false);
+    const scaled = try Def.create("sushi_test_scale", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
+    const native = try Def.create("sushi_test_native_probe", &.{"x"}, &.{"out"}, "uint i = thread_position_in_grid.x;\nout[i] = x[i] * float(SCALE) + float(threads_per_threadgroup.x > 0);", "", true, false);
     const x = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(x);
     var cfg: Config = .{};
     try oneOutput(&cfg, 4);
-    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(twice, x, &cfg));
-    try testing.expectEqual([4]f32{ 3, 6, 9, 12 }, try run(thrice, x, &cfg));
-    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(twice, x, &cfg));
+    try cfg.addTemplate("SCALE", .{ .int = 2 });
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(scaled, x, &cfg));
+    try testing.expectEqual([4]f32{ 3, 5, 7, 9 }, try run(native, x, &cfg));
+    try testing.expectEqual([4]f32{ 2, 4, 6, 8 }, try run(scaled, x, &cfg));
 }
 
 test "kernel: a template value added to a launched config changes the pipeline the next launch takes" {
     try mlx.requireGpu();
     const source = "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);";
-    const def = try Def.create("kn_memo_template", &.{"x"}, &.{"out"}, source, "", true, false);
+    const def = try Def.create("sushi_test_add", &.{"x"}, &.{"out"}, source, "", true, false);
     const x = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(x);
     var cfg: Config = .{};
     try oneOutput(&cfg, 4);
-    try cfg.addTemplate("K", .{ .int = 5 });
-    try testing.expectEqual([4]f32{ 6, 7, 8, 9 }, try run(def, x, &cfg));
+    try cfg.addTemplate("K", .{ .int = 105 });
+    try testing.expectEqual([4]f32{ 106, 107, 108, 109 }, try run(def, x, &cfg));
     const made = core.pipelines;
     try cfg.addTemplate("L", .{ .int = 1 });
-    try testing.expectEqual([4]f32{ 6, 7, 8, 9 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 106, 107, 108, 109 }, try run(def, x, &cfg));
     try testing.expectEqual(made + 1, core.pipelines);
 
     // Two configs of one kernel at different values keep their own pipelines.
     var other: Config = .{};
     try oneOutput(&other, 4);
-    try other.addTemplate("K", .{ .int = 9 });
-    try testing.expectEqual([4]f32{ 10, 11, 12, 13 }, try run(def, x, &other));
-    try testing.expectEqual([4]f32{ 6, 7, 8, 9 }, try run(def, x, &cfg));
-    try testing.expectEqual([4]f32{ 10, 11, 12, 13 }, try run(def, x, &other));
+    try other.addTemplate("K", .{ .int = 109 });
+    try testing.expectEqual([4]f32{ 110, 111, 112, 113 }, try run(def, x, &other));
+    try testing.expectEqual([4]f32{ 106, 107, 108, 109 }, try run(def, x, &cfg));
+    try testing.expectEqual([4]f32{ 110, 111, 112, 113 }, try run(def, x, &other));
 }
 
 test "kernel: more instantiations than a kernel remembers each launch their own pipeline" {
     try mlx.requireGpu();
-    const def = try Def.create("kn_recent_many", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
+    const def = try Def.create("sushi_test_add", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + float(K);", "", true, false);
     const x = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(x);
     for (0..2) |_| for (0..recent_slots + 4) |k| {
@@ -749,7 +640,7 @@ test "kernel: a launch with more template arguments than a kernel remembers buil
         for (0..wide) |i| text = text ++ std.fmt.comptimePrint(" + A{d}", .{i});
         break :blk text ++ ")";
     };
-    const def = try Def.create("kn_recent_wide", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + " ++ sum ++ ";", "", true, false);
+    const def = try Def.create("sushi_test_wide_targs", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] + " ++ sum ++ ";", "", true, false);
     const x = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(x);
     const want: f32 = wide;
@@ -766,8 +657,8 @@ test "kernel: a launch with more template arguments than a kernel remembers buil
 test "kernel: launches into one tensor over disjoint ranges run with no barrier between, and a reader after sees them all" {
     try mlx.requireGpu();
     const n: c_int = 1024;
-    const part = try Def.create("kn_into_part", &.{ "x", "r" }, &.{"out"}, "uint i = thread_position_in_grid.x; if (i >= uint(r[0]) && i < uint(r[1])) out[i] = x[i];", "", true, false);
-    const twice = try Def.create("kn_into_twice", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    const part = try Def.create("sushi_test_range_copy", &.{ "x", "r" }, &.{"out"}, "uint i = thread_position_in_grid.x; if (i >= uint(r[0]) && i < uint(r[1])) out[i] = x[i];", "", true, false);
+    const twice = try Def.create("sushi_test_scale", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
     var vals: [1024]f32 = undefined;
     for (&vals, 0..) |*v, i| v.* = @floatFromInt(i);
     const x = try floats(&vals);
@@ -776,6 +667,8 @@ test "kernel: launches into one tensor over disjoint ranges run with no barrier 
     try cfg.addOutput(&.{n}, .float32);
     cfg.grid = .{ n, 1, 1 };
     cfg.group = .{ 256, 1, 1 };
+    var scale_cfg = cfg;
+    try scale_cfg.addTemplate("SCALE", .{ .int = 2 });
     var ranges: [4]*Tensor = undefined;
     for (&ranges, 0..) |*r, k| r.* = try ints(&.{ @intCast(k * 256), @intCast(k * 256 + 256) });
     defer for (ranges) |r| core.release(r);
@@ -791,7 +684,7 @@ test "kernel: launches into one tensor over disjoint ranges run with no barrier 
     defer core.release(plane[0]);
     try testing.expectEqual(barriers, core.stats().barriers);
     var out: [1]*Tensor = undefined;
-    try launch(twice, &.{plane[0]}, &cfg, &out);
+    try launch(twice, &.{plane[0]}, &scale_cfg, &out);
     defer core.release(out[0]);
     const got = std.mem.bytesAsSlice(f32, try core.hostBytes(out[0]));
     for (got[0..1024], 0..) |v, i| try testing.expectEqual(@as(f32, @floatFromInt(2 * i)), v);
@@ -800,13 +693,14 @@ test "kernel: launches into one tensor over disjoint ranges run with no barrier 
 test "kernel: a launch's output is the tensor `core.into` names, recorded state-owned; a launch that reads it, an elementwise op and a recording begun with one armed are refused by name" {
     try mlx.requireGpu();
     const plan = @import("plan/plan_api.zig");
-    const def = try Def.create("kn_into_state", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f;", "", true, false);
+    const def = try Def.create("sushi_test_scale", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
     const x = try floats(&.{ 1, 2, 3, 4 });
     defer core.release(x);
     const dst = try core.fresh(.float32, &.{4});
     defer core.release(dst);
     var cfg: Config = .{};
     try oneOutput(&cfg, 4);
+    try cfg.addTemplate("SCALE", .{ .int = 2 });
     var rec = try plan.Recorder.begin(testing.allocator, .{ .site = 1 });
     defer rec.deinit();
     {
@@ -860,7 +754,7 @@ test "kernel: a counted launch's last threadgroup reads what every threadgroup w
         \\out[0] = sum;
         \\atomic_store_explicit(c, 0u, memory_order_relaxed);
     ;
-    const def = try Def.create("kn_counted_sum", &.{"x"}, &.{ "out", "ctr" }, src, "", true, false);
+    const def = try Def.create("sushi_test_counted_sum", &.{"x"}, &.{ "out", "ctr" }, src, "", true, false);
     var vals: [groups]u32 = undefined;
     for (&vals, 0..) |*v, i| v.* = @intCast(3 * i + 1);
     const x = try core.fromHost(std.mem.sliceAsBytes(&vals), .uint32, &.{groups});
@@ -882,4 +776,17 @@ test "kernel: a counted launch's last threadgroup reads what every threadgroup w
     // The second launch read nothing the first wrote but the page, and still waited for it.
     try testing.expect(core.stats().barriers > barriers);
     for (std.mem.bytesAsSlice(u32, try core.hostBytes(outs[1][1]))[0..core.counter_words]) |w| try testing.expectEqual(@as(u32, 0), w);
+}
+
+test "kernel: an unregistered custom kernel is refused with MetalCompile and compiles no source" {
+    try mlx.requireGpu();
+    const def = try Def.create("sushi_unregistered_kernel_probe", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = x[thread_position_in_grid.x];", "", true, false);
+    const x = try floats(&.{ 1, 2, 3, 4 });
+    defer core.release(x);
+    var cfg: Config = .{};
+    try oneOutput(&cfg, 4);
+    var out: [1]*Tensor = undefined;
+    const before = core.pipelines;
+    try testing.expectError(error.MetalCompile, launch(def, &.{x}, &cfg, &out));
+    try testing.expectEqual(before, core.pipelines);
 }

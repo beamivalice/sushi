@@ -234,7 +234,7 @@ const GDN_KERNEL_BLOCKED_BODY =
     \\}
 ;
 
-fn gdnBlockedSource(comptime tb: u32) [:0]const u8 {
+pub fn gdnBlockedSource(comptime tb: u32) [:0]const u8 {
     return std.fmt.comptimePrint("constexpr int TB = {d};\n", .{tb}) ++ GDN_KERNEL_BLOCKED_BODY;
 }
 
@@ -382,7 +382,7 @@ pub fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_arr
     return g;
 }
 
-const GDN_PREWORK_SOURCE =
+pub const GDN_PREWORK_SOURCE =
     \\uint lane = thread_position_in_threadgroup.x;
     \\// Grid row = b*S + r over the batch: q/k/v/g/beta/b/a are [B,S,..] flat
     \\// so `row` indexes them directly; the conv taps + next state are per batch.
@@ -390,9 +390,9 @@ const GDN_PREWORK_SOURCE =
     \\uint b = row / uint(seq);
     \\uint r = row - b * uint(seq);
     \\uint logical_head = threadgroup_position_in_grid.z;
-    \\constexpr uint q_heads = uint(HK);
-    \\constexpr uint k_head_base = uint(HK);
-    \\constexpr uint v_head_base = 2 * uint(HK);
+    \\const uint q_heads = uint(HK);
+    \\const uint k_head_base = uint(HK);
+    \\const uint v_head_base = 2 * uint(HK);
     \\bool is_q = logical_head < q_heads;
     \\bool is_k = logical_head >= k_head_base && logical_head < v_head_base;
     \\uint head = is_q ? logical_head
@@ -415,7 +415,7 @@ const GDN_PREWORK_SOURCE =
     \\    const T conv = T(acc);
     \\    // MLX's unary Sigmoid formula (unary_ops.h), verbatim, in the tensor dtype.
     \\    T sig;
-    \\    if constexpr (TAB) sig = sigtab[as_type<ushort>(conv)];
+    \\    if (TAB) sig = sigtab[as_type<ushort>(conv)];
     \\    else { T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); sig = conv < T(0) ? sy : T(1) - sy; }
     \\    const T act = conv * sig;
     \\    activated[i] = act;
@@ -449,7 +449,7 @@ const GDN_PREWORK_SOURCE =
     \\        // GT add, f32 precise exp / log1p / exp, GT store.
     \\        const T bv = b_in[row * uint(BSTRIDE) + uint(BOFF) + head];
     \\        T bsig;
-    \\        if constexpr (TAB) bsig = sigtab[as_type<ushort>(bv)];
+    \\        if (TAB) bsig = sigtab[as_type<ushort>(bv)];
     \\        else { T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); bsig = bv < T(0) ? by : T(1) - by; }
     \\        beta_out[row * uint(HV) + head] = bsig;
     \\        const GT apd = GT(float(a_in[row * uint(ASTRIDE) + uint(AOFF) + head]) + float(dt_bias[head]));
@@ -677,7 +677,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
 // `rms_single_row`'s reduction (per-lane 4-element partials, simd_sum,
 // precise rsqrt, `w * T(x * inv)`) and MLX's sigmoid, so it is bit-identical.
 // z is read at (ZOFF, ZSTRIDE) so a wider projection row can hand it over.
-const GDN_NORMGATE_SOURCE =
+pub const GDN_NORMGATE_SOURCE =
     \\uint lane = thread_position_in_threadgroup.x;
     \\uint row = threadgroup_position_in_grid.y;
     \\uint head = threadgroup_position_in_grid.z;
@@ -695,7 +695,7 @@ const GDN_NORMGATE_SOURCE =
     \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
     \\    const T zv = z[zbase + i];
     \\    T sig;
-    \\    if constexpr (TAB) sig = sigtab[as_type<ushort>(zv)];
+    \\    if (TAB) sig = sigtab[as_type<ushort>(zv)];
     \\    else { T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); sig = zv < T(0) ? sy : T(1) - sy; }
     \\    // swish gate: silu(z) * normed (qwen3.5); sigmoid gate: normed * sigmoid(z) (qwen4_exp, KDA)
     \\    out[base + i] = SWISH ? (zv * sig) * normed : normed * sig;

@@ -1045,11 +1045,11 @@ fn applyStage(s: mlx.mlx_stream, f: *const FusedStage, a: []const mlx.mlx_array,
 /// The finish reduce with the shared expert's down finish in one more simdgroup per threadgroup: its H128 and `svh`
 /// scale, rounded to the shared chain's dtype `ST`, then the routed sum's own `T` add, in the statements of the two
 /// reduces it replaces.
-const REDUCE_FUSED_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_PLAIN ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_PLAIN ++ REDUCE_FUSED_TAIL;
+pub const REDUCE_FUSED_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_PLAIN ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_PLAIN ++ REDUCE_FUSED_TAIL;
 
 /// The same reduce reading the planes of the picks `part` holds (`redo[slot]` is a row of `part`, -1 where the kept plane
 /// of `inner` stands): a settle that recomputed some picks sums over the kept planes and theirs, in the same order.
-const REDUCE_FUSED_REDO_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_REDO ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_REDO ++ REDUCE_FUSED_TAIL;
+pub const REDUCE_FUSED_REDO_SOURCE: [:0]const u8 = REDUCE_FUSED_HEAD ++ REDUCE_ROWS_REDO ++ REDUCE_FUSED_SCALE ++ REDUCE_XB_REDO ++ REDUCE_FUSED_TAIL;
 
 const REDUCE_FUSED_HEAD =
     \\threadgroup float vals[(uint(TOPK) + 1u) * 128u];
@@ -1170,7 +1170,7 @@ const REDUCE_EXPAND_STORE: [:0]const u8 =
     \\}
 ;
 
-const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const float scv = 0.08838834764831845f;", REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", REDUCE_EXPAND_STORE), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", ""), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", ""), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "");
+pub const REDUCE_EXPAND_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const float scv = 0.08838834764831845f;", REDUCE_EXPAND_PREFETCH ++ "const float scv = 0.08838834764831845f;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", REDUCE_EXPAND_STORE), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", ""), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", ""), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "");
 
 /// One for MLX's streams and one for the engine's: an array belongs to the side that made it.
 var unit_score: @import("side_cache.zig").SideCache(void, 1) = .{};
@@ -1703,7 +1703,7 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
 /// One threadgroup (a thread per expert) builds the window table with one segment per group, group g
 /// at `g * C + base_g` with room for `C + E_g` windows (C windows of all rows, plus one partial window
 /// per expert), the inverse sort order, and each sorted row's expert index inside its group.
-const GROUP_WINDOW_SOURCE: [:0]const u8 =
+pub const GROUP_WINDOW_SOURCE: [:0]const u8 =
     \\const uint tid = uint(thread_index_in_threadgroup);
     \\const uint tg = uint(threadgroup_position_in_grid.x);
     \\const uint n = uint(count[0]), groups = uint(count[1]), experts = uint(threads_per_threadgroup.x);
@@ -1779,12 +1779,12 @@ fn groupWindows(s: mlx.mlx_stream, rb: *const Ragged, sorted: mlx.mlx_array, ord
 }
 
 /// Planes a combine dispatch reads at most: Metal binds 31 buffers.
-const COMBINE_PLANES: usize = 24;
+pub const COMBINE_PLANES: usize = 24;
 var combine_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 /// Each sorted row of `planes` (group `first + i`'s GEMM output, valid on its own rows only), or of
 /// `prev` for a row of a group before `first`.
-fn combineSource(alloc: std.mem.Allocator, planes: usize, chained: bool) ![:0]u8 {
+pub fn combineSource(alloc: std.mem.Allocator, planes: usize, chained: bool) ![:0]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
     try out.appendSlice(alloc,
@@ -2132,7 +2132,7 @@ fn planeNames(comptime name: []const u8) [DIRECT_PLANES][*:0]const u8 {
 
 /// `MID_SOURCE` reading the gate and up rows from the plane of the row's rate group (`ig0..`, `iu0..`) instead of a
 /// combined one.
-const MID_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
+pub const MID_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
     kernels.MID_SOURCE,
     "const uint eid = uint(slots[slot]);",
     "const uint eid = uint(slots[slot]);\nconst uint pg = meta[eid * 8u + 3u];\nconst device half *ig;\nconst device half *iu;\n" ++ planePick("ig", "ig") ++ planePick("iu", "iu"),
@@ -2140,27 +2140,27 @@ const MID_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
 
 /// The shared expert's SwiGLU as the forward builds it from the shared linears' bf16 outputs: f32 ops, rounded to bf16
 /// once more before the down projection.
-const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
+pub const SHARED_MID_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(
     kernels.MID_SOURCE,
     "const uint eid = uint(slots[slot]);",
     "",
 ), "const size_t sb = (size_t)eid * (size_t)(ODIM) + base;", "const size_t sb = base;"), "v = float4(float(iu[xb + lane]),", "g0 = float(bfloat16_t(g0)); g1 = float(bfloat16_t(g1)); g2 = float(bfloat16_t(g2)); g3 = float(bfloat16_t(g3));\nv = float4(float(iu[xb + lane]),"), "if constexpr (CLAMP_LIMIT > 0) {", "u0 = float(bfloat16_t(u0)); u1 = float(bfloat16_t(u1)); u2 = float(bfloat16_t(u2)); u3 = float(bfloat16_t(u3));\nif constexpr (CLAMP_LIMIT > 0) {"), "const float h0 = silu0 * u0;", "const float h0 = float(bfloat16_t(silu0 * u0));"), "const float h1 = silu1 * u1;", "const float h1 = float(bfloat16_t(silu1 * u1));"), "const float h2 = silu2 * u2;", "const float h2 = float(bfloat16_t(silu2 * u2));"), "const float h3 = silu3 * u3;", "const float h3 = float(bfloat16_t(silu3 * u3));");
 
-const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
+pub const SHARED_PREPARE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.TOKEN_PAIR_PREPARE_SOURCE, "const uint orig = uint(order[slot]);", "const uint orig = slot;");
 
 /// `REDUCE_FUSED_SOURCE` over a sorted down plane: the routed slot's row is `inverse[slot]`, and the sum is the f32 add
 /// of the routed bf16 sum and the shared bf16 result, stored f32 (the add the forward makes after both).
 const PREFILL_REDUCE_SOURCE: [:0]const u8 = kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(kernels.metalReplaceFound(REDUCE_FUSED_SOURCE, "const size_t xb = (size_t)slot * (size_t)(ODIM) + base;", "const size_t xb = (own ? (size_t)slot : (size_t)inverse[slot]) * (size_t)(ODIM) + base;"), "y[yb + lane] = T(float(T(a0)) + float(ST(b0)));", "y[yb + lane] = float(T(a0)) + float(ST(b0));"), "y[yb + lane + 32u] = T(float(T(a1)) + float(ST(b1)));", "y[yb + lane + 32u] = float(T(a1)) + float(ST(b1));"), "y[yb + lane + 64u] = T(float(T(a2)) + float(ST(b2)));", "y[yb + lane + 64u] = float(T(a2)) + float(ST(b2));"), "y[yb + lane + 96u] = T(float(T(a3)) + float(ST(b3)));", "y[yb + lane + 96u] = float(T(a3)) + float(ST(b3));");
 
 /// `PREFILL_REDUCE_SOURCE` reading a routed row from the plane of its rate group (`inner0..`).
-const PREFILL_REDUCE_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
+pub const PREFILL_REDUCE_PLANES_SOURCE: [:0]const u8 = kernels.metalReplaceFound(
     PREFILL_REDUCE_SOURCE,
     "const device half *rows_in = own ? s_inner : inner;",
     "const uint pg = own ? 0u : meta[uint(slots[slot]) * 8u + 3u];\nconst device half *inner;\n" ++ planePick("inner", "inner") ++ "const device half *rows_in = own ? s_inner : inner;",
 );
 
-const MID_PLANES_INS = planeNames("ig") ++ planeNames("iu") ++ [_][*:0]const u8{ "svhg", "svhu", "suhd", "slots", "meta" };
-const REDUCE_PLANES_INS = planeNames("inner") ++ [_][*:0]const u8{ "svh", "slots", "sc", "s_inner", "s_svh", "unit", "inverse", "meta" };
+pub const MID_PLANES_INS = planeNames("ig") ++ planeNames("iu") ++ [_][*:0]const u8{ "svhg", "svhu", "suhd", "slots", "meta" };
+pub const REDUCE_PLANES_INS = planeNames("inner") ++ [_][*:0]const u8{ "svh", "slots", "sc", "s_inner", "s_svh", "unit", "inverse", "meta" };
 
 const PrefillStage = enum { prep, mid };
 

@@ -13,10 +13,11 @@ const score_tg = 256;
 
 // No contract pragma: the rope and the dots are written as `hy4_rope.tail` and `sparse.indexScores` write them, under
 // the same default.
-const score_source: [:0]const u8 =
+pub const score_source: [:0]const u8 =
     \\const int l = threadgroup_position_in_grid.y;
     \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup;
-    \\constexpr int KPT = TG / IH, W = NOPE + HALF, P = IHD + 1;
+    \\constexpr int KPT = TG / IH, P = IHD + 1;
+    \\const int W = NOPE + HALF;
     \\const int nb = keys_shape[0];
     \\const int n0 = int(threadgroup_position_in_grid.x) * KPT;
     \\threadgroup float qs[IH * P], ks[KPT * P];
@@ -164,7 +165,7 @@ pub fn scores(s: mlx.mlx_stream, q: Arr, keys: Arr, w: Arr, heads: c_int, rope_d
 /// `pick`: the top-k of each row's scores (`sparse.TOPK_BODY`, one threadgroup a row: the picks in ascending order,
 /// ties to the lower index), each pick written where `hy4_chain.recallGroups` and `recalledRows` write it (its group,
 /// its key rows and keep flags, in their f32 order), and the row's own group last.
-const pick_source: [:0]const u8 = "#pragma clang fp contract(off)\n" ++ sparse.TOPK_PRE ++
+pub const pick_source: [:0]const u8 = "#pragma clang fp contract(off)\n" ++ sparse.TOPK_PRE ++
     \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
     \\const auto xr = x + size_t(l) * n;
     \\const int KW = kk[0] + 1, ratio = meta[1];
@@ -267,7 +268,7 @@ pub fn pick(s: mlx.mlx_stream, scores_: Arr, k: c_int, p0: c_int, n: c_int, rati
 // 8 rows by 32 keys a threadgroup (a simdgroup a row, a lane a key), the queries and keys staged 16 channels at a
 // time: each head's dot sums its channels in order, as `sparse.indexScores` does, so the bytes are its. A tile past
 // every row's seen groups writes -inf and reads nothing.
-const wide_score_source: [:0]const u8 =
+pub const wide_score_source: [:0]const u8 =
     \\constexpr int QL = 8, KN = 32, BK = 16, TG = 256, BK4 = BK / 4, IH4 = IH / 4;
     \\const int l0 = int(threadgroup_position_in_grid.y) * QL;
     \\const int n0 = int(threadgroup_position_in_grid.x) * KN;

@@ -24,7 +24,8 @@ const head: [:0]const u8 =
     \\const int H = ql_shape[0];
     \\const int p0 = meta[0], window = meta[1], N = meta[2], S = meta[3], row0 = meta[5];
     \\const float scale = as_type<float>(meta[4]);
-    \\constexpr int NL = L / 64, QS = 2, NK = KT / 16, NJ = KT / 16;
+    \\const int NL = L / 64;
+    \\constexpr int QS = 2, NK = KT / 16, NJ = KT / 16;
     \\const bool rsg = int(sg) == NL, work = int(sg) < NSG;
     \\const int d0 = rsg ? 0 : int(sg) * 64;
     \\threadgroup float sp[NSG * HB * KT];
@@ -202,7 +203,7 @@ const key4_bf16: [:0]const u8 =
 ;
 
 /// The matrix-unit fragment layout and product of `metal_def.NAX_HEADER`.
-const header: [:0]const u8 = metal_def.NAX_HEADER ++
+pub const header: [:0]const u8 = metal_def.NAX_HEADER ++
     \\inline short hy4_nax_r(ushort lane, int i) { return dsv41_nax_r(lane, i); }
     \\inline short hy4_nax_c(ushort lane, int i) { return dsv41_nax_c(lane, i); }
     \\template <int N, int KK, typename AT, typename BT>
@@ -210,8 +211,8 @@ const header: [:0]const u8 = metal_def.NAX_HEADER ++
     \\
 ;
 
-const range_source: [:0]const u8 = head ++ "\n" ++ range_rows ++ "\n" ++ key4_bf16 ++ "\n" ++ tile_open ++ "\n" ++ tile_close;
-const picks_source: [:0]const u8 = head ++ "\n" ++ picks_rows ++ "\n" ++ key4_bf16 ++ "\n" ++ tile_open ++ "\n" ++ tile_close;
+pub const range_source: [:0]const u8 = head ++ "\n" ++ range_rows ++ "\n" ++ key4_bf16 ++ "\n" ++ tile_open ++ "\n" ++ tile_close;
+pub const picks_source: [:0]const u8 = head ++ "\n" ++ picks_rows ++ "\n" ++ key4_bf16 ++ "\n" ++ tile_open ++ "\n" ++ tile_close;
 
 const Kind = enum { range, picks };
 

@@ -286,6 +286,11 @@ stage_install() {
     cp "$SUSHI_BIN" "$dir/sushi"
     cp "$BAR" "$dir/sushibar"
     cp "$ROOT"/lib/mlx/lib/*.dylib "$ROOT"/lib/mlx/lib/mlx.metallib "$dir/lib/"
+    if [ -f "$(dirname "$SUSHI_BIN")/../lib/sushi.metallib" ]; then
+        cp "$(dirname "$SUSHI_BIN")/../lib/sushi.metallib" "$dir/lib/"
+    elif [ -f "$ROOT/zig-out/lib/sushi.metallib" ]; then
+        cp "$ROOT/zig-out/lib/sushi.metallib" "$dir/lib/"
+    fi
     install_name_tool -change @rpath/libmlxc.dylib @executable_path/lib/libmlxc.dylib "$dir/sushi" 2>/dev/null
     install_name_tool -change @rpath/libmlx.dylib @loader_path/libmlx.dylib "$dir/lib/libmlxc.dylib" 2>/dev/null
     install_name_tool -add_rpath @loader_path "$dir/lib/libmlx.dylib" 2>/dev/null

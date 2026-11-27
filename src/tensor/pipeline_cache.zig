@@ -29,10 +29,47 @@ fn zdup(bytes: []const u8) ![:0]u8 {
     return out;
 }
 
+pub const Archive = metal.BinaryArchive;
+
+var archive_temp_seq = std.atomic.Value(u32).init(0);
+
+pub fn openArchive(path: [:0]const u8) !Archive {
+    const dev = try metal.device();
+    return dev.newBinaryArchive(path);
+}
+
+pub fn lastMetalError() []const u8 {
+    return metal.lastError();
+}
+
+/// Builds and atomically writes an `MTLBinaryArchive` at `path` for every stock/specialized recipe in `recipes`.
+pub fn writeArchive(io: std.Io, recipes: []const Recipe, path: [:0]const u8) !usize {
+    const dev = try metal.device();
+    const lib = try stock.lib(dev);
+    const archive = try dev.newBinaryArchive(null);
+    defer archive.release();
+    var added: usize = 0;
+    for (recipes) |r| {
+        if (r.kind != .stock and r.kind != .stock_flags) continue;
+        const function = try zdup(r.function);
+        defer gpa.free(function);
+        dev.addComputeToArchive(archive, lib, function, r.flags, r.ints) catch continue;
+        added += 1;
+    }
+    if (added == 0) return 0;
+    var tmp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrintSentinel(&tmp_buf, "{s}.{d}-{d}.tmp", .{ path, std.c.getpid(), archive_temp_seq.fetchAdd(1, .monotonic) }, 0);
+    try archive.serialize(tmp_path);
+    errdefer std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
+    try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), path, io);
+    return added;
+}
+
 pub const Job = struct {
     recipes: []const Recipe,
     pipelines: []?metal.Pipeline,
     lib: ?metal.Library,
+    archive: ?Archive = null,
     next: std.atomic.Value(usize) = .init(0),
     failed: std.atomic.Value(usize) = .init(0),
     error_claimed: std.atomic.Value(bool) = .init(false),
@@ -71,13 +108,17 @@ pub const Job = struct {
         const function = try zdup(r.function);
         defer gpa.free(function);
         switch (r.kind) {
-            .source => {
-                const text = try zdup(r.text);
-                defer gpa.free(text);
-                return dev.compile(text, function);
+            .source => return error.MetalCompile,
+            .stock => {
+                const lib = job.lib orelse return error.MetalUnavailable;
+                if (job.archive) |arch| return dev.pipelineFromArchive(arch, lib, function, &.{}, &.{}, false);
+                return dev.pipelineOf(lib, function);
             },
-            .stock => return dev.pipelineOf(job.lib orelse return error.MetalUnavailable, function),
-            .stock_flags => return dev.pipelineOfConstants(job.lib orelse return error.MetalUnavailable, function, r.flags, r.ints),
+            .stock_flags => {
+                const lib = job.lib orelse return error.MetalUnavailable;
+                if (job.archive) |arch| return dev.pipelineFromArchive(arch, lib, function, r.flags, r.ints, false);
+                return dev.pipelineOfConstants(lib, function, r.flags, r.ints);
+            },
             .marker => unreachable,
         }
     }
@@ -85,9 +126,14 @@ pub const Job = struct {
 
 /// Starts making the pipelines of `recipes` on up to `threads` threads. The recipes outlive `finish`.
 pub fn start(recipes: []const Recipe, threads: usize) !*Job {
+    return startWithArchive(recipes, threads, null);
+}
+
+/// `start` backed by an optional `MTLBinaryArchive` (`archive` must outlive `finish`).
+pub fn startWithArchive(recipes: []const Recipe, threads: usize, archive: ?Archive) !*Job {
     const dev = try metal.device();
     var needs_lib = false;
-    for (recipes) |r| needs_lib = needs_lib or r.kind != .source;
+    for (recipes) |r| needs_lib = needs_lib or (r.kind == .stock or r.kind == .stock_flags);
     const job = try gpa.create(Job);
     errdefer gpa.destroy(job);
     const results = try gpa.alloc(?metal.Pipeline, recipes.len);
@@ -95,7 +141,7 @@ pub fn start(recipes: []const Recipe, threads: usize) !*Job {
     @memset(results, null);
     const handles = try gpa.alloc(std.Thread, @max(1, @min(threads, recipes.len)));
     errdefer gpa.free(handles);
-    job.* = .{ .recipes = recipes, .pipelines = results, .lib = if (needs_lib) try stock.lib(dev) else null, .handles = handles };
+    job.* = .{ .recipes = recipes, .pipelines = results, .lib = if (needs_lib) try stock.lib(dev) else null, .archive = archive, .handles = handles };
     for (handles) |*h| {
         h.* = std.Thread.spawn(.{}, Job.work, .{job}) catch break;
         job.started += 1;
@@ -124,9 +170,8 @@ pub fn finish(job: *Job) Report {
             continue;
         };
         const kept = switch (r.kind) {
-            .source => registry.putSource(r, p),
             .stock, .stock_flags => stock.preload(r, p),
-            .marker => unreachable,
+            .source, .marker => unreachable,
         } catch {
             report.failed += 1;
             continue;
@@ -143,13 +188,14 @@ pub fn finish(job: *Job) Report {
 const testing = std.testing;
 const kernel = @import("kernel.zig");
 
-fn launchOnce(name: []const u8, source: []const u8) !void {
+fn launchScaleOnce(scale: c_int) !void {
     try @import("../mlx.zig").requireGpu();
-    const def = try kernel.Def.create(name, &.{"x"}, &.{"out"}, source, "", true, false);
+    const def = try kernel.Def.create("sushi_test_scale", &.{"x"}, &.{"out"}, "out[thread_position_in_grid.x] = float(x[thread_position_in_grid.x]) * float(SCALE);", "", true, false);
     const x = try core.fromHost(std.mem.sliceAsBytes(&[_]f32{ 1, 2, 3, 4 }), .float32, &.{4});
     defer core.release(x);
     var cfg: kernel.Config = .{};
     try cfg.addOutput(&.{4}, .float32);
+    try cfg.addTemplate("SCALE", .{ .int = scale });
     cfg.grid = .{ 4, 1, 1 };
     cfg.group = .{ 4, 1, 1 };
     var out: [1]*core.Tensor = undefined;
@@ -157,18 +203,17 @@ fn launchOnce(name: []const u8, source: []const u8) !void {
     defer core.release(out[0]);
     const bytes = try core.hostBytes(out[0]);
     const got = std.mem.bytesAsSlice(f32, bytes);
-    try testing.expectEqual(@as(f32, 2), got[0]);
+    try testing.expectEqual(@as(f32, @floatFromInt(scale)), got[0]);
 }
 
-test "pipeline cache: a source kernel made from its recipe is what a launch finds, and nothing compiles" {
-    const source = "out[thread_position_in_grid.x] = x[thread_position_in_grid.x] * 2.0f; // pipeline cache probe";
+test "pipeline cache: a precompiled custom kernel made from its recipe is what a launch finds, and nothing compiles" {
     const before = core.pipelines;
-    try launchOnce("pc_probe", source);
+    try launchScaleOnce(77);
     try testing.expectEqual(before + 1, core.pipelines);
 
     var found: ?Recipe = null;
     for (registry.recipes()) |r| {
-        if (r.kind == .source and std.mem.indexOf(u8, r.function, "pc_probe") != null) found = r;
+        if (r.kind == .stock_flags and std.mem.indexOf(u8, r.key, "sushi_test_scale") != null and std.mem.indexOf(u8, r.key, "=77") != null) found = r;
     }
     const recipe = found orelse return error.RecipeNotRecorded;
     const bytes = try manifest.encode(testing.allocator, "k", &.{recipe});
@@ -176,18 +221,20 @@ test "pipeline cache: a source kernel made from its recipe is what a launch find
     var loaded = try manifest.decode(testing.allocator, bytes);
     defer loaded.deinit();
 
+    // Forget the in-process cache entry so the next launch exercises manifest preload.
+    stock.forget(recipe.key);
     const report = finish(try start(loaded.recipes, 2));
     try testing.expectEqual(@as(usize, 1), report.made);
     try testing.expectEqual(@as(usize, 0), report.failed);
 
-    // A second maker of the same source, as a new process has: its first launch finds the pipeline waiting.
+    // A second maker of the same kernel, as a new process has: its first launch finds the pipeline waiting.
     const made = core.pipelines;
     const late = core.pipelines_late;
     const preloaded = core.pipelines_preloaded;
     const was_sealed = core.sealed;
     core.sealed = true;
     defer core.sealed = was_sealed;
-    try launchOnce("pc_probe", source);
+    try launchScaleOnce(77);
     try testing.expectEqual(made, core.pipelines);
     try testing.expectEqual(late, core.pipelines_late);
     try testing.expectEqual(preloaded + 1, core.pipelines_preloaded);
@@ -210,13 +257,43 @@ test "pipeline cache: a stock kernel made from its recipe is the pipeline kernel
     try testing.expect(recorded);
 }
 
-test "pipeline cache: a recipe that does not compile is counted and named, and the others are still made" {
+test "pipeline cache: a source recipe and a missing stock recipe are refused, and the valid ones are still made" {
     try @import("../mlx.zig").requireGpu();
     const good: Recipe = .{ .kind = .stock, .function = "rms_loopedbfloat16", .key = "rms_loopedbfloat16" };
-    const bad: Recipe = .{ .kind = .source, .function = "broken", .text = "[[kernel]] void broken(uint3 at [[thread_position_in_grid]]) { not_a_thing(at); }" };
+    const source: Recipe = .{ .kind = .source, .function = "source_refused", .text = "[[kernel]] void source_refused() {}" };
     const missing: Recipe = .{ .kind = .stock, .function = "no_such_stock_function", .key = "no_such_stock_function" };
-    const report = finish(try start(&.{ good, bad, missing }, 3));
+    const report = finish(try start(&.{ good, source, missing }, 3));
     try testing.expectEqual(@as(usize, 1), report.made);
     try testing.expectEqual(@as(usize, 2), report.failed);
     try testing.expect(report.firstError().len > 0);
+}
+
+test "pipeline cache: writeArchive persists stock and specialized pipelines and startWithArchive loads them" {
+    try @import("../mlx.zig").requireGpu();
+    try launchScaleOnce(88);
+    var custom_recipe: ?Recipe = null;
+    for (registry.recipes()) |r| {
+        if (r.kind == .stock_flags and std.mem.indexOf(u8, r.key, "sushi_test_scale") != null and std.mem.indexOf(u8, r.key, "=88") != null) custom_recipe = r;
+    }
+    const r_custom = custom_recipe orelse return error.RecipeNotRecorded;
+    const r_stock: Recipe = .{ .kind = .stock, .function = "rms_loopedbfloat16", .key = "rms_loopedbfloat16" };
+    const both = [_]Recipe{ r_stock, r_custom };
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const archive_path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/archive.bin", .{dir_buf[0..dir_len]}, 0);
+
+    const added = try writeArchive(testing.io, &both, archive_path);
+    try testing.expectEqual(@as(usize, 2), added);
+
+    stock.forget(r_stock.key);
+    stock.forget(r_custom.key);
+    const arch = try openArchive(archive_path);
+    defer arch.release();
+    const report = finish(try startWithArchive(&both, 2, arch));
+    try testing.expectEqual(@as(usize, 2), report.made);
+    try testing.expectEqual(@as(usize, 0), report.failed);
 }

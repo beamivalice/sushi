@@ -266,7 +266,7 @@ pub fn buildRuns(alloc: std.mem.Allocator, experts: []const u32) !RunTable {
     return .{ .start = start, .len = len, .eid = eid, .n = n };
 }
 
-const GEMM_SORTED_SOURCE: [:0]const u8 =
+pub const GEMM_SORTED_SOURCE: [:0]const u8 =
     \\threadgroup float partial[2 * 256];
     \\uint ot = uint(threadgroup_position_in_grid.x);
     \\uint win = uint(threadgroup_position_in_grid.y);
@@ -374,7 +374,7 @@ const GEMM_SORTED_SOURCE: [:0]const u8 =
 /// The simdgroup-matrix body's 8x8 fragment readers. A lane at fragment coordinate (fm, fn)
 /// owns tile slot group g = 4*fm + fn/2: its pair j, slots (8g+2j, 8g+2j+1), is W^T block
 /// (n half j>>1, k half j&1) at (fm, fn) and (fm, fn+1).
-const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
+pub const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
     \\#define SMAT_UNROLL _Pragma("clang loop unroll(full)")
     \\template<uint N>
     \\static inline half2 smat_pair(uint f, uint s0, uint s1) {
@@ -414,7 +414,7 @@ const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
 ;
 /// A data-dependent block count spills the accumulators, so use compile-time WIN.
 /// Short runs repeat their last row; padded rows are never stored.
-const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
+pub const GEMM_SIMDMAT_SOURCE: [:0]const u8 =
     \\uint win = uint(threadgroup_position_in_grid.y);
     \\uint sg = uint(simdgroup_index_in_threadgroup);
     \\ushort lane = ushort(thread_index_in_simdgroup);
@@ -653,7 +653,7 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
 ;
 
 /// The branch-guarded NAX body GEMM_NAX_SOURCE must reproduce byte for byte (tests only).
-const GEMM_NAX_REFERENCE_SOURCE: [:0]const u8 =
+pub const GEMM_NAX_REFERENCE_SOURCE: [:0]const u8 =
     \\uint win = uint(threadgroup_position_in_grid.y);
     \\uint sg = uint(simdgroup_index_in_threadgroup);
     \\uint lane = uint(thread_index_in_simdgroup);
@@ -711,7 +711,7 @@ const GEMM_NAX_REFERENCE_SOURCE: [:0]const u8 =
 /// The NAX body. A lane's x rows are clamped into the input, so a padded row reads a live
 /// neighbour whose product is never stored and the loads carry no bounds branch; the k loop is
 /// unswitched on the window's second 16-row block. Bytes equal GEMM_NAX_REFERENCE_SOURCE's.
-const GEMM_NAX_SOURCE: [:0]const u8 = blk: {
+pub const GEMM_NAX_SOURCE: [:0]const u8 = blk: {
     const decode_lo =
         \\  const nfrag w0 = nax_wfrag_k<N>(words, lane);
         \\  const nfrag w1 = nax_wfrag_k<N>(words + PACKED_W, lane);
@@ -791,17 +791,17 @@ const GEMM_NAX_SOURCE: [:0]const u8 = blk: {
 /// K range is one run). Only the first tile and the k stride of a GEMM differ.
 pub const TileOrder = enum { pack, tile_major };
 
-const GEMM_NAX_TM_SOURCE: [:0]const u8 = metalReplaceFound(
+pub const GEMM_NAX_TM_SOURCE: [:0]const u8 = metalReplaceFound(
     metalReplaceFound(GEMM_NAX_SOURCE, "const device uint *wp = trellis_e + (size_t)(output_base / TILE) * PACKED_W;", "const device uint *wp = trellis_e + (size_t)(output_base / (2u * TILE)) * (size_t)IT * 2u * PACKED_W;"),
     "wp += (size_t)OT * PACKED_W;",
     "wp += 2u * PACKED_W;",
 );
-const GEMM_SIMDMAT_TM_SOURCE: [:0]const u8 = metalReplaceFound(
+pub const GEMM_SIMDMAT_TM_SOURCE: [:0]const u8 = metalReplaceFound(
     metalReplaceFound(GEMM_SIMDMAT_SOURCE, "(size_t)N) + (col0 / TILE) * PACKED_W;", "(size_t)N) + (col0 / (2u * TILE)) * (size_t)IT * 2u * PACKED_W;"),
     "tiles + (size_t)tk * (size_t)OT * (size_t)PACKED_W;",
     "tiles + (size_t)tk * 2u * (size_t)PACKED_W;",
 );
-const GEMM_SORTED_TM_SOURCE: [:0]const u8 = metalReplaceFound(
+pub const GEMM_SORTED_TM_SOURCE: [:0]const u8 = metalReplaceFound(
     GEMM_SORTED_SOURCE,
     "(trellis + ((((size_t)eid * (size_t)IT + tk) * (size_t)OT + ot) * PACKED_HW));",
     "(trellis + (((size_t)eid * (size_t)IT * (size_t)OT + ((((size_t)(ot >> 1u) * (size_t)IT + tk) << 1u) + (ot & 1u))) * PACKED_HW));",
@@ -877,7 +877,7 @@ pub const TOKEN_PAIR_PREPARE_SOURCE: [:0]const u8 =
     \\yu[yb + lane + 96u] = half((s1 - s3) * sc);
 ;
 
-const TOKEN_SCATTER_SOURCE: [:0]const u8 =
+pub const TOKEN_SCATTER_SOURCE: [:0]const u8 =
     \\uint col = uint(thread_position_in_grid.x);
     \\uint slot = uint(thread_position_in_grid.y);
     \\if (col >= uint(DIM)) return;
@@ -885,7 +885,7 @@ const TOKEN_SCATTER_SOURCE: [:0]const u8 =
     \\y[(size_t)orig * (size_t)(DIM) + col] = x[(size_t)slot * (size_t)(DIM) + col];
 ;
 
-const PREPARE_SOURCE: [:0]const u8 =
+pub const PREPARE_SOURCE: [:0]const u8 =
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
     \\ushort lane = thread_index_in_simdgroup;
@@ -920,7 +920,7 @@ const PREPARE_SOURCE: [:0]const u8 =
     \\y[xb + lane + 96u] = half((s1 - s3) * sc);
 ;
 
-const FINISH_SOURCE: [:0]const u8 =
+pub const FINISH_SOURCE: [:0]const u8 =
     \\uint block = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
     \\ushort lane = thread_index_in_simdgroup;
@@ -1700,7 +1700,7 @@ pub fn finishIndexedAs(s: mlx.mlx_stream, inner: mlx.mlx_array, svh: mlx.mlx_arr
     return applyUnary(s, try getFinishKernel(), &.{ inner, svh, slots }, cfg);
 }
 
-const INDEXED_COOP_SOURCE: [:0]const u8 =
+pub const INDEXED_COOP_SOURCE: [:0]const u8 =
     \\threadgroup float partial[4 * 256];
     \\uint ot = uint(threadgroup_position_in_grid.x);
     \\uint slot = uint(threadgroup_position_in_grid.y);
@@ -1798,7 +1798,7 @@ fn getIndexedCoopKernel() !mlx.mlx_fast_metal_kernel {
     return kernel_src.codebookKernel(&indexed_coop_kernel, "sushi_exl3_k4_mul1_gemv_indexed", &ins, &outs, INDEXED_COOP_SOURCE);
 }
 
-const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
+pub const INDEXED_PAIR_COOP_SOURCE: [:0]const u8 = blk: {
     const split = "uint split = uint(threadgroup_position_in_grid.z);";
     const at = std.mem.indexOf(u8, INDEXED_COOP_SOURCE, split).?;
     const pointers =
@@ -6228,7 +6228,7 @@ fn pairEpilogueRung(comptime size: u32, comptime mc: []const u8) []const u8 {
 
 /// `PAIR_GEMV_SOURCE`'s lane-funnel arm, grouped to `g` members. Members' prepared inputs are staged one
 /// projection and one k chunk at a time, so threadgroup memory stays the single-slot 8 KiB.
-fn pairGroupedSource(comptime g: u32) [:0]const u8 {
+pub fn pairGroupedSource(comptime g: u32) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     return
     \\constexpr uint TILE = 16u;
@@ -6323,7 +6323,7 @@ fn downGroupedBody(comptime size: u32, comptime mc: []const u8) []const u8 {
 }
 
 /// `DOWN_PREPARED_SOURCE`'s lane-funnel arm, grouped to `g` members; each member reads its own prepared middle.
-fn downGroupedSource(comptime g: u32) [:0]const u8 {
+pub fn downGroupedSource(comptime g: u32) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     return
     \\constexpr uint TILE = 16u;
@@ -6469,7 +6469,7 @@ fn pairPreparedGroupedBody(comptime size: u32, comptime mc: []const u8) []const 
 }
 
 /// `pairGroupedSource` on the prepared input: members read their own prepared rows.
-fn pairPreparedGroupedSource(comptime g: u32) [:0]const u8 {
+pub fn pairPreparedGroupedSource(comptime g: u32) [:0]const u8 {
     @setEvalBranchQuota(1000000);
     return laneQuadReads(
     \\constexpr uint TILE = 16u;
@@ -7891,7 +7891,7 @@ test "exl3 GLM sorted finish retains stride fallback bytes" {
     try clampedWindowBytes(128, 128, 36, false);
 }
 
-const CLAMPED_MIDDLE_DOWN_SOURCE: [:0]const u8 = blk: {
+pub const CLAMPED_MIDDLE_DOWN_SOURCE: [:0]const u8 = blk: {
     @setEvalBranchQuota(100000);
     const mid_begin = std.mem.indexOf(u8, MID_SOURCE, "const float sc =").?;
     const mid_end = std.mem.indexOf(u8, MID_SOURCE, "yd[xb + lane]").?;

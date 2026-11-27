@@ -88,7 +88,7 @@ const GQMV_BODY_AFFINE =
 // One packed unit of quantized values as a uint32: a word for 2/4/8-bit; at
 // 3-bit, mx.quantize packs 8 values into 3 bytes (value i at bit 3i), so the
 // unit is a byte triple and the body's `>> (i * BITS)` walk is unchanged.
-const GQMV_AFFINE_HEADER =
+pub const GQMV_AFFINE_HEADER =
     \\template <int B>
     \\inline uint32_t sushi_qpack(const device uint32_t* w, size_t wbase_words, int pack) {
     \\  if (B == 3) {
@@ -136,9 +136,9 @@ fn gatherQmvGateUpSource() [:0]const u8 {
         \\// Every lane's packed words are issued up front (KP = K_by_p is a
         \\// template constant): −0.7% per forward in idle same-boot pairs vs
         \\// the runtime-count loop. Same per-lane accumulation order.
-        \\constexpr int IT = (KP + 31) / 32;
-        \\uint32_t pg[IT];
-        \\uint32_t pu[IT];
+        \\const int IT = (KP + 31) / 32;
+        \\uint32_t pg[64];
+        \\uint32_t pu[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(lane) + 32 * i;
         \\  pg[i] = (pack < KP) ? sushi_qpack<BITS>(wg_q, wbase, pack) : 0u;
@@ -196,7 +196,7 @@ const GQMV_GATEUP_BODY_AFFINE =
     \\  }
 ;
 
-const GQMV_GATEUP_SOURCE = gatherQmvGateUpSource();
+pub const GQMV_GATEUP_SOURCE = gatherQmvGateUpSource();
 var gqmv_gateup_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getGatherQmvGateUpKernel() !mlx.mlx_fast_metal_kernel {
@@ -363,9 +363,9 @@ fn gatherQmvGateUpRowsSource() [:0]const u8 {
         \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
         \\size_t xrow = (size_t)row * (size_t)K;
         \\
-        \\constexpr int IT = (KP + 31) / 32;
-        \\uint32_t pg[IT];
-        \\uint32_t pu[IT];
+        \\const int IT = (KP + 31) / 32;
+        \\uint32_t pg[64];
+        \\uint32_t pu[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(lane) + 32 * i;
         \\  pg[i] = (pack < KP) ? sushi_qpack<BITS>(wg_q, wbase, pack) : 0u;
@@ -395,7 +395,7 @@ fn gatherQmvGateUpRowsSource() [:0]const u8 {
     });
 }
 
-const GQMV_GATEUP_ROWS_SOURCE = gatherQmvGateUpRowsSource();
+pub const GQMV_GATEUP_ROWS_SOURCE = gatherQmvGateUpRowsSource();
 var gqmv_gateup_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getGatherQmvGateUpRowsKernel() !mlx.mlx_fast_metal_kernel {
@@ -528,7 +528,7 @@ pub fn gatherQmvGateUpRows(
     return y;
 }
 
-const GQMV_SOURCES = [2][:0]const u8{ gatherQmvSource(false), gatherQmvSource(true) };
+pub const GQMV_SOURCES = [2][:0]const u8{ gatherQmvSource(false), gatherQmvSource(true) };
 const GQMV_NAMES = [2][*:0]const u8{ "sushi_moe_gather_qmv", "sushi_moe_gather_qmv_px" };
 var gqmv_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -692,15 +692,15 @@ fn gatherQmvDownReduceSource() [:0]const u8 {
         \\
         \\uint eid = inds[slot];
         \\size_t xoff = (size_t)slot * (size_t)K;
-        \\threadgroup T slot_vals[uint(TOPK) * uint(ROWS)];
+        \\threadgroup T slot_vals[32 * 4];
         \\uint r = lane / uint(LPR);
         \\uint sub = lane % uint(LPR);
         \\uint n = tile * uint(ROWS) + r;
         \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
         \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
         \\float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        \\constexpr int IT = (KP + LPR - 1) / LPR;
-        \\uint32_t pw[IT];
+        \\const int IT = (KP + LPR - 1) / LPR;
+        \\uint32_t pw[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(sub) + LPR * i;
         \\  pw[i] = (pack < KP) ? sushi_qpack<BITS>(w_q, wbase, pack) : 0u;
@@ -733,7 +733,7 @@ fn gatherQmvDownReduceSource() [:0]const u8 {
     });
 }
 
-const GQMV_DOWNRED_SOURCE = gatherQmvDownReduceSource();
+pub const GQMV_DOWNRED_SOURCE = gatherQmvDownReduceSource();
 var gqmv_downred_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getGatherQmvDownReduceKernel() !mlx.mlx_fast_metal_kernel {
@@ -870,15 +870,15 @@ fn gatherQmvDownReduceRowsSource() [:0]const u8 {
         \\
         \\uint eid = inds[(size_t)row * (size_t)TOPK + slot];
         \\size_t xoff = ((size_t)row * (size_t)TOPK + (size_t)slot) * (size_t)K;
-        \\threadgroup T slot_vals[uint(TOPK) * uint(ROWS)];
+        \\threadgroup T slot_vals[32 * 4];
         \\uint r = lane / uint(LPR);
         \\uint sub = lane % uint(LPR);
         \\uint n = tile * uint(ROWS) + r;
         \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
         \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
         \\float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        \\constexpr int IT = (KP + LPR - 1) / LPR;
-        \\uint32_t pw[IT];
+        \\const int IT = (KP + LPR - 1) / LPR;
+        \\uint32_t pw[64];
         \\for (int i = 0; i < IT; ++i) {{
         \\  int pack = int(sub) + LPR * i;
         \\  pw[i] = (pack < KP) ? sushi_qpack<BITS>(w_q, wbase, pack) : 0u;
@@ -910,7 +910,7 @@ fn gatherQmvDownReduceRowsSource() [:0]const u8 {
     });
 }
 
-const GQMV_DOWNRED_ROWS_SOURCE = gatherQmvDownReduceRowsSource();
+pub const GQMV_DOWNRED_ROWS_SOURCE = gatherQmvDownReduceRowsSource();
 var gqmv_downred_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getGatherQmvDownReduceRowsKernel() !mlx.mlx_fast_metal_kernel {
@@ -1039,7 +1039,7 @@ pub fn gatherQmvDownReduceRows(
     return y;
 }
 
-const SUSHI_QMV_ROWS_SOURCE =
+pub const SUSHI_QMV_ROWS_SOURCE =
     \\using U = float;
     \\auto simd_lid = thread_position_in_threadgroup.x;
     \\auto simd_gid = thread_position_in_threadgroup.y;
@@ -1051,7 +1051,7 @@ const SUSHI_QMV_ROWS_SOURCE =
     \\constexpr int bytes_per_pack = BITS == 3 ? 3 : 4;
     \\constexpr int values_per_thread = pack_factor * packs_per_thread;
     \\constexpr int block_size = values_per_thread * 32;
-    \\constexpr int scale_step_per_thread = GS / values_per_thread;
+    \\const int scale_step_per_thread = GS / values_per_thread;
     \\const device uint8_t* ws = (const device uint8_t*)w_q;
     \\const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
     \\const int in_vec_size_g = in_vec_size / GS;

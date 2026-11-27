@@ -636,7 +636,11 @@ pub const HC_FUSED_N_SOURCE =
     \\uint h = threadgroup_position_in_grid.x;
     \\uint row = threadgroup_position_in_grid.y;
     \\threadgroup float tgs[8];
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float tgi[64];
+    \\#else
     \\threadgroup float tgi[8 * HC];
+    \\#endif
     \\const int base = int(h) * H;
     \\const int PER = H / 256;
     \\// Rows (batch*seq) are independent: every per-row buffer is offset here once.
@@ -645,7 +649,11 @@ pub const HC_FUSED_N_SOURCE =
     \\device T* xs = xs_out + (WR ? (size_t)row * (size_t)(HC * H) : 0);
     \\device float* ipart = ipart_out + (size_t)row * (size_t)(HC * HC);
     \\const device T* wo = wo_in + (size_t)row * (size_t)H;
+    \\#ifdef SUSHI_METALLIB
+    \\float xv[16];
+    \\#else
     \\float xv[PER];
+    \\#endif
     \\if (WR) {
     \\  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings.
     \\  // (`wi_in` can be < 8 elements and land in `constant`: no pointer rebind.)
@@ -667,7 +675,11 @@ pub const HC_FUSED_N_SOURCE =
     \\float t = 0.0f;
     \\for (int g = 0; g < 8; ++g) t += tgs[g];
     \\float rsh = rsqrt(t / float(H) + eps[0]);
+    \\#ifdef SUSHI_METALLIB
+    \\float ip[8];
+    \\#else
     \\float ip[HC];
+    \\#endif
     \\for (int c = 0; c < HC; ++c) ip[c] = 0.0f;
     \\for (int i = 0; i < PER; ++i) {
     \\  int k = base + int(tid) + 256 * i;
@@ -707,7 +719,11 @@ pub const HC_FUSED_D_SOURCE =
     \\  size_t wbase = (size_t)n * (size_t)K_by_p;
     \\  size_t gbase = (size_t)n * (size_t)K_by_gs;
     \\  int p0 = int(sg) * SLICE + int(lane);
+    \\  #ifdef SUSHI_METALLIB
+    \\  uint32_t pw[16];
+    \\  #else
     \\  uint32_t pw[ITERS];
+    \\  #endif
     \\  for (int i = 0; i < ITERS; ++i) pw[i] = dw_q[wbase + (size_t)(p0 + 32 * i)];
     \\  float a0[ROWS], a1[ROWS], a2[ROWS], a3[ROWS];
     \\  for (int r = 0; r < ROWS; ++r) { a0[r] = 0.0f; a1[r] = 0.0f; a2[r] = 0.0f; a3[r] = 0.0f; }

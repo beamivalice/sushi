@@ -112,17 +112,23 @@ pub const QSA_SELECT_KERNEL_HEADER =
 /// born sorted. 3. Rows with `bounds[row] <= K` are `0 .. bounds-1` then INT_MAX.
 /// Threadgroup memory ~8.3 KiB at 2048 bins, ~1.3 KiB at 256.
 pub const QSA_SELECT_SHARED =
-    \\constexpr uint TGN   = (uint)TGS;
+    \\const uint TGN   = (uint)TGS;
     \\constexpr uint SIMDW = 32u;
-    \\constexpr uint NSIMD = TGN / SIMDW;
+    \\const uint NSIMD = TGN / SIMDW;
     \\constexpr uint BINS  = (DIGITS == 8) ? 256u : 2048u;
     \\constexpr uint NLEV  = (DIGITS == 8) ? 4u : 3u;
-    \\constexpr uint KTOP  = (uint)K;
+    \\const uint KTOP  = (uint)K;
     \\constexpr int  SENTINEL = 2147483647;
+    \\#ifndef SUSHI_METALLIB
     \\static_assert(NSIMD <= SIMDW);
+    \\#endif
     \\
     \\threadgroup metal::atomic_uint hist[BINS];
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup uint sgs[64];
+    \\#else
     \\threadgroup uint sgs[2u * NSIMD];
+    \\#endif
     \\threadgroup uint sh[4];
     \\
     \\const uint row  = threadgroup_position_in_grid.y;

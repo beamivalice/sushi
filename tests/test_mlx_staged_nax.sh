@@ -115,6 +115,18 @@ if [ -f "$BIN" ]; then
   else
     fail "sushi minos is '$BIN_MINOS' — must be >= 26.2 (build.zig os_version_min must match the libmlx floor)"
   fi
+  SUSHI_METALLIB="zig-out/lib/sushi.metallib"
+  if [ -f "$SUSHI_METALLIB" ]; then
+    ok "$SUSHI_METALLIB exists"
+    SUSHI_NAX_COUNT=$(strings "$SUSHI_METALLIB" | grep -c "_nax" || true)
+    if [ "$SUSHI_NAX_COUNT" -gt 0 ]; then
+      ok "sushi.metallib contains NAX kernels ($SUSHI_NAX_COUNT symbol hits)"
+    else
+      fail "sushi.metallib has ZERO *_nax kernels — check build.zig -mmacosx-version-min=26.2 and Metal Toolchain"
+    fi
+  else
+    fail "$SUSHI_METALLIB missing (zig build must install zig-out/lib/sushi.metallib)"
+  fi
 else
   echo "  NOTE: $BIN not built — linkage + minos checks skipped (build with: zig build -Doptimize=ReleaseFast)"
 fi

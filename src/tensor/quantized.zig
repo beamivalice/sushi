@@ -1,6 +1,6 @@
 //! MLX's quantized matrix product on the engine: `quantized_matmul` (mlx/ops.cpp) and `QuantizedMatmul::eval_gpu`
 //! with `dispatch_qmv`, `qmv_quad`, `qmv_wide`, `qmv`, `qmm_splitk`, `qmm` and `qmm_nax`
-//! (mlx/backend/metal/quantized.cpp) over the compiled kernels of `mlx.metallib`, so a product here writes the bytes it
+//! (mlx/backend/metal/quantized.cpp) over the compiled kernels of `sushi.metallib`, so a product here writes the bytes it
 //! writes under MLX; `gather_qmm` and `GatherQMM::eval_gpu` the same way, with `gather_qmv`, `gather_qmm{,_nax}` and
 //! `gather_qmm_rhs{,_nax}`. Ported from MLX's Metal backend (MIT, see NOTICE). Ported: a transposed weight in the
 //! affine, `mxfp4` or `mxfp8` mode, every plan MLX picks for it, one weight or a batch of them. Refused by name, each

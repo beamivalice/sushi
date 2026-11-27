@@ -3387,7 +3387,7 @@ var qk_fused_engaged: bool = false;
 // apart), f32 arithmetic, one T rounding — then the optional mscale multiply
 // reproduces the composed path's separate broadcast multiply (one more T
 // rounding, table value 1.0 on the pass-through tail).
-const QK_NORM_ROPE_SOURCE =
+pub const QK_NORM_ROPE_SOURCE =
     \\constexpr uint HD = 128;
     \\uint head = threadgroup_position_in_grid.x;
     \\uint lane = thread_position_in_threadgroup.x;
@@ -3407,7 +3407,7 @@ const QK_NORM_ROPE_SOURCE =
     \\for (uint i = 0; i < 4; ++i) {
     \\    nrm[i] = w[base + i] * T(float(src[base + i]) * inv);
     \\}
-    \\constexpr uint half_rd = uint(RD) / 2;
+    \\const uint half_rd = uint(RD) / 2;
     \\float partner[4];
     \\for (uint i = 0; i < 4; ++i) {
     \\    partner[i] = simd_shuffle(float(nrm[i]), lane ^ (half_rd / 4));
@@ -3543,9 +3543,9 @@ pub fn ropeAngleRow(
     return ropeAngleRows(s, rd, base, freqs, offset, 1, allocator, 1.0);
 }
 
-const QK_NORM_ROPE_256_SOURCE =
+pub const QK_NORM_ROPE_256_SOURCE =
     \\constexpr uint HD = 256;
-    \\constexpr uint half_rd = uint(RD) / 2;
+    \\const uint half_rd = uint(RD) / 2;
     \\uint S = uint(q_shape[1]);
     \\uint row = threadgroup_position_in_grid.x;
     \\uint tid = thread_position_in_threadgroup.x;

@@ -13,14 +13,14 @@ const kcfg = @import("hy4_kcfg.zig");
 const reads = 4;
 pub const max_cols: c_int = 4096;
 
-const source: [:0]const u8 =
+pub const source: [:0]const u8 =
     \\constexpr int N_READS = 4;
     \\constexpr int SIMD_SIZE = 32;
     \\uint gid = threadgroup_position_in_grid.x;
     \\uint lid = thread_position_in_threadgroup.x;
     \\uint simd_lane_id = thread_index_in_simdgroup;
     \\uint simd_group_id = simdgroup_index_in_threadgroup;
-    \\constexpr uint axis_size = uint(D);
+    \\const uint axis_size = uint(D);
     \\threadgroup float local_inv_mean[1];
     \\threadgroup float local_sums[SIMD_SIZE];
     \\float acc = 0;
@@ -192,20 +192,24 @@ fn launch(s: mlx.mlx_stream, x: Arr, y: ?Arr, z: ?Arr, w: Arr, eps: f32, out_dt:
     return out;
 }
 
-const expand_inner_source: [:0]const u8 =
+pub const expand_inner_source: [:0]const u8 =
     \\constexpr int N_READS = 4;
     \\constexpr int SIMD_SIZE = 32;
     \\uint gid = threadgroup_position_in_grid.x;
     \\uint lid = thread_position_in_threadgroup.x;
     \\uint simd_lane_id = thread_index_in_simdgroup;
     \\uint simd_group_id = simdgroup_index_in_threadgroup;
-    \\constexpr uint axis_size = uint(D);
+    \\const uint axis_size = uint(D);
+    \\#ifdef SUSHI_METALLIB
+    \\threadgroup float t_sum[4096];
+    \\#else
     \\threadgroup float t_sum[D];
+    \\#endif
     \\threadgroup float local_inv_mean[1];
     \\threadgroup float local_sums[SIMD_SIZE];
     \\{
     \\#pragma clang fp contract(off)
-    \\  constexpr uint NB = uint(D) / 128u;
+    \\  const uint NB = uint(D) / 128u;
     \\  const float psc = 0.08838834764831845f;
     \\  for (uint blk = simd_group_id; blk < NB; blk += uint(TG) / 32u) {
     \\    const uint col = blk * 128u + simd_lane_id;

@@ -55,43 +55,8 @@ pub fn record(r: Recipe) void {
     };
 }
 
-const SourceKey = struct { function: []const u8, text: []const u8 };
-
-const SourceContext = struct {
-    pub fn hash(_: SourceContext, k: SourceKey) u64 {
-        var h = std.hash.Wyhash.init(k.function.len);
-        h.update(k.function);
-        h.update(k.text);
-        return h.final();
-    }
-    pub fn eql(_: SourceContext, a: SourceKey, b: SourceKey) bool {
-        return std.mem.eql(u8, a.function, b.function) and std.mem.eql(u8, a.text, b.text);
-    }
-};
-
-/// Made ahead from a manifest, by what a launch will ask for: the entry point and the exact source.
-var sources: std.HashMapUnmanaged(SourceKey, metal.Pipeline, SourceContext, 80) = .empty;
-/// The same for a stock kernel, by its table key, with the recipe to record when it is first used.
+/// Made ahead from a manifest, by its table key, with the recipe to record when it is first used.
 var stock: std.StringHashMapUnmanaged(struct { pipeline: metal.Pipeline, recipe: Recipe }) = .empty;
-
-/// Keeps a source pipeline made ahead; false when the same one is already waiting, which keeps no copy of `r`.
-pub fn putSource(r: Recipe, pipeline: metal.Pipeline) !bool {
-    const entry = try sources.getOrPut(gpa, .{ .function = r.function, .text = r.text });
-    if (entry.found_existing) return false;
-    errdefer sources.removeByPtr(entry.key_ptr);
-    const function = try gpa.dupe(u8, r.function);
-    errdefer gpa.free(function);
-    entry.key_ptr.* = .{ .function = function, .text = try gpa.dupe(u8, r.text) };
-    entry.value_ptr.* = pipeline;
-    return true;
-}
-
-/// The pipeline made ahead for this source, now recorded as used.
-pub fn takeSource(function: []const u8, text: []const u8) ?metal.Pipeline {
-    const p = sources.get(.{ .function = function, .text = text }) orelse return null;
-    record(.{ .kind = .source, .function = function, .text = text });
-    return p;
-}
 
 pub fn putStock(r: Recipe, pipeline: metal.Pipeline) !bool {
     if (stock.contains(r.key)) return false;
@@ -228,7 +193,7 @@ test "pipeline registry: a load whose manifest is not trusted, or whose workers 
 test "pipeline registry: a marker one load's warm recorded is not among the recipes the next load's manifest is written with" {
     resetForTest();
     defer resetForTest();
-    record(.{ .kind = .source, .function = "kernel_a", .text = "source a" });
+    record(.{ .kind = .stock, .function = "kernel_a", .key = "kernel_a" });
     // Load 1 settled its manifest and its warm ran whole.
     settleMarkers(false);
     recordMarker("served warm", "K1");
@@ -240,9 +205,9 @@ test "pipeline registry: a marker one load's warm recorded is not among the reci
     try testing.expect(!markerRecorded("K1"));
     try testing.expect(takeMarker("K2"));
     try testing.expect(!takeMarker("K1"));
-    var has_source = false;
-    for (recipes()) |r| has_source = has_source or r.kind == .source;
-    try testing.expect(has_source);
+    var has_stock = false;
+    for (recipes()) |r| has_stock = has_stock or r.kind == .stock;
+    try testing.expect(has_stock);
 }
 
 test "pipeline registry: a marker recorded while no manifest stood settled is the next settle's, and an unload closes the manifest" {
@@ -292,16 +257,15 @@ test "pipeline registry: a pipeline put again, as a like-for-like reload's manif
     defer gpa = was;
     gpa = .{ .ptr = undefined, .vtable = &Live.vt };
     const fake: metal.Pipeline = .{ .raw = undefined, .max_threads = 1 };
-    const filler: [4096]u8 = @splat('x');
-    const source: Recipe = .{ .kind = .source, .function = "reload_probe_source", .text = &filler };
+    const plain: Recipe = .{ .kind = .stock, .function = "reload_probe_plain", .key = "reload_probe_plain" };
     const stocked: Recipe = .{ .kind = .stock_flags, .function = "reload_probe_stock", .key = "reload_probe_stock#1", .flags = &.{.{ .index = 1, .value = true }}, .ints = &.{.{ .index = 2, .value = 7 }} };
 
-    try testing.expect(try putSource(source, fake));
+    try testing.expect(try putStock(plain, fake));
     try testing.expect(try putStock(stocked, fake));
     const held = Live.bytes;
     var load: usize = 0;
     while (load < 3) : (load += 1) {
-        try testing.expect(!try putSource(source, fake));
+        try testing.expect(!try putStock(plain, fake));
         try testing.expect(!try putStock(stocked, fake));
     }
     try testing.expectEqual(held, Live.bytes);

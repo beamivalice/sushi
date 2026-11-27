@@ -1,5 +1,5 @@
 //! MLX's sort, argsort and searchsorted on the engine: `gpu_merge_sort` with its single-block and multi-block plans
-//! and `SearchSorted::eval_gpu` (mlx/backend/metal/sort.cpp) over the compiled kernels of `mlx.metallib`. A merge sort
+//! and `SearchSorted::eval_gpu` (mlx/backend/metal/sort.cpp) over the compiled kernels of `sushi.metallib`. A merge sort
 //! is stable, so the order of equal values is part of the bytes; this is MLX's kernel under MLX's plan.
 //! Ported from MLX's Metal backend (MIT, see NOTICE). Only the last axis is sorted.
 

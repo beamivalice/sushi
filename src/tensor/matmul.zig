@@ -1,5 +1,5 @@
 //! MLX's matrix product on the engine: `mlx::core::matmul` and `Matmul::eval_gpu` (mlx/ops.cpp,
-//! mlx/backend/metal/matmul.cpp), choice for choice, over the compiled kernels of `mlx.metallib`, so a product here
+//! mlx/backend/metal/matmul.cpp), choice for choice, over the compiled kernels of `sushi.metallib`, so a product here
 //! writes the bytes it writes under MLX. Ported from MLX's Metal backend (MIT, see NOTICE). An empty operand is not
 //! ported.
 
@@ -394,7 +394,7 @@ fn groupedFused(a: *Tensor, b: *Tensor, transposed_b: bool, out: *Tensor, one: C
     return fusedLaunch(c, family, t, swizzle);
 }
 
-const group_accum_source =
+pub const group_accum_source =
     \\const int mn = MN;
     \\const int at = int(thread_position_in_grid.x);
     \\const int g = at / mn;
@@ -759,8 +759,10 @@ fn steel(c: Call) Error!void {
 /// The widest product a request's rows make: a prefill chunk at its widest.
 const rows_ceiling: usize = 16384;
 
-/// The dtypes whose every tiled kernel is made (`completeFamily`).
-const FamilyKey = struct { dtype: core.Dtype };
+/// The (dtype, NAX-eligibility) pairs whose every tiled kernel is made (`completeFamily`).
+/// `float32` takes NAX tiles when `tf32` is on and SIMD tiles when `exact_f32` turns `tf32` off;
+/// keying by `use_nax` ensures a cold load that hits both saves both families into the manifest/archive.
+const FamilyKey = struct { dtype: core.Dtype, use_nax: bool };
 var families_done: std.AutoHashMapUnmanaged(FamilyKey, void) = .empty;
 
 /// A test that asserts a family is made from its first product starts from none made.
@@ -776,7 +778,8 @@ const family_sizes = [_]usize{ 16, 39, 40, 512, 1024, 2048, 2049, 4096, 4097, 81
 /// and K of it take: the sizes pick the path, its tile and its K step, a request's sizes (a context's keys, a narrower
 /// chunk) are not the warm's, and a request may take a layout no warm forward does (a restored prefix's keys).
 fn completeFamily(c: Call) void {
-    const seen = families_done.getOrPut(std.heap.c_allocator, .{ .dtype = c.out.dtype }) catch return;
+    const use_nax = c.g.nax and (c.g.tf32 or c.out.dtype != .float32);
+    const seen = families_done.getOrPut(std.heap.c_allocator, .{ .dtype = c.out.dtype, .use_nax = use_nax }) catch return;
     if (seen.found_existing) return;
     // The kernels not made yet are noted, made on worker threads as a manifest's are, then taken from the stock.
     var notes: stock.Notes = .{};

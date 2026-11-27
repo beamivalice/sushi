@@ -16,9 +16,9 @@ const opts = @import("build_options");
 // so the arch-slice build compiles the arch's own module graph alone.
 const archs = struct {
     pub const glm5 = struct { const name = "glm5"; const guest = true; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"glm5_next"}; const gate_rank = 2; const mod = @import("../glm5/arch.zig"); const tests = @import("../glm5/arch_tests.zig"); const chat = @import("../glm5/glm5_chat.zig"); }; // arch:glm5
-    pub const dsv41 = struct { const name = "dsv41"; const guest = true; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const tests = @import("../dsv41/arch_tests.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); }; // arch:dsv41
-    pub const qwen4 = struct { const name = "qwen4"; const guest = true; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const tests = @import("../qwen4/arch_tests.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); }; // arch:qwen4
-    pub const hy4flash = struct { const name = "hy4flash"; const guest = false; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"hy_v4_flash"}; const gate_rank = 4; const mod = @import("../hy4flash/arch.zig"); const tests = @import("../hy4flash/arch_tests.zig"); const chat = @import("../hy4flash/hy4_chat.zig"); }; // arch:hy4flash
+    pub const dsv41 = struct { const name = "dsv41"; const guest = true; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"deepseek_v41"}; const gate_rank = 3; const mod = @import("../dsv41/arch.zig"); const tests = @import("../dsv41/arch_tests.zig"); const chat = @import("../dsv41/dsv41_chat.zig"); pub const metallib = @import("../dsv41/metallib.zig"); }; // arch:dsv41
+    pub const qwen4 = struct { const name = "qwen4"; const guest = true; const seam_terms = [_][]const u8{ "qsa", "gdn", "ple", "compiled_hc" }; const model_types = [_][]const u8{"qwen4_exp"}; const gate_rank = 0; const mod = @import("../qwen4/arch.zig"); const tests = @import("../qwen4/arch_tests.zig"); const chat = @import("../qwen4/qwen4_chat.zig"); pub const metallib = @import("../qwen4/metallib.zig"); }; // arch:qwen4
+    pub const hy4flash = struct { const name = "hy4flash"; const guest = false; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"hy_v4_flash"}; const gate_rank = 4; const mod = @import("../hy4flash/arch.zig"); const tests = @import("../hy4flash/arch_tests.zig"); const chat = @import("../hy4flash/hy4_chat.zig"); pub const metallib = @import("../hy4flash/metallib.zig"); }; // arch:hy4flash
     pub const mimo2 = struct { const name = "mimo2"; const guest = false; const seam_terms = [_][]const u8{}; const model_types = [_][]const u8{"mimo_v2"}; const gate_rank = 1; const mod = @import("../mimo2/arch.zig"); const tests = @import("../mimo2/arch_tests.zig"); const chat = @import("../mimo2/mimo_chat.zig"); }; // arch:mimo2
 };
 
@@ -109,6 +109,16 @@ pub fn Tests(comptime tag: Tag) type {
 /// The arch's MLX-free chat face (`<arch>_chat.zig`): effort offer, pinned template, pre-tokenizer.
 pub fn Chat(comptime tag: Tag) type {
     return @field(archs, @tagName(tag)).chat;
+}
+
+/// Whether `tag` ships a Sushi Cooler precompiled kernel catalog (`src/<arch>/metallib.zig`).
+pub fn hasMetallib(comptime tag: Tag) bool {
+    return @hasDecl(@field(archs, @tagName(tag)), "metallib");
+}
+
+/// The arch's Sushi Cooler precompiled kernel catalog (`src/<arch>/metallib.zig`).
+pub fn Metallib(comptime tag: Tag) type {
+    return @field(archs, @tagName(tag)).metallib;
 }
 
 pub fn ofModelType(model_type: []const u8) ?Tag {

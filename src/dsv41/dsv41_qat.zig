@@ -34,24 +34,26 @@ pub const QAT_HEADER: [:0]const u8 =
     \\  float step = a < 2.0f ? 0.5f : (a < 4.0f ? 1.0f : 2.0f);
     \\  return min(rint(a / step) * step, 6.0f);
     \\}
-    \\template <int MODE>
-    \\inline float qat_scale(float amax) {
-    \\  if (MODE == 0) return round_scale(max(amax, 1e-4f) * (1.0f / 448.0f));
-    \\  if (MODE == 1) return round_scale(max(amax, 6.0f * 1.1754943508222875e-38f) * (1.0f / 6.0f));
+    \\inline float qat_scale_m(float amax, int mode) {
+    \\  if (mode == 0) return round_scale(max(amax, 1e-4f) * (1.0f / 448.0f));
+    \\  if (mode == 1) return round_scale(max(amax, 6.0f * 1.1754943508222875e-38f) * (1.0f / 6.0f));
     \\  return round_e4m3(max(amax, 6.0f * 0.001953125f) / 6.0f);
     \\}
     \\template <int MODE>
-    \\inline float qat_round(float v, float s) {
-    \\  if (MODE == 0) {
+    \\inline float qat_scale(float amax) { return qat_scale_m(amax, MODE); }
+    \\inline float qat_round_m(float v, float s, int mode) {
+    \\  if (mode == 0) {
     \\    const float t = clamp(precise::divide(v, s), -448.0f, 448.0f);
     \\    return copysign(round_e4m3(fabs(t)), t) * s;
     \\  }
     \\  const float t = clamp(precise::divide(v, s), -6.0f, 6.0f);
     \\  return copysign(round_e2m1(fabs(t)), t) * s;
     \\}
+    \\template <int MODE>
+    \\inline float qat_round(float v, float s) { return qat_round_m(v, s, MODE); }
 ;
 
-const QAT_SOURCE: [:0]const u8 =
+pub const QAT_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\#pragma clang fp reassociate(off)
     \\const uint gid = thread_position_in_grid.x;
@@ -59,8 +61,8 @@ const QAT_SOURCE: [:0]const u8 =
     \\const uint base = gid * uint(G);
     \\float amax = 0.0f;
     \\for (uint k = 0; k < uint(G); ++k) amax = max(amax, fabs(float(x[base + k])));
-    \\const float s = qat_scale<MODE>(amax);
-    \\for (uint k = 0; k < uint(G); ++k) y[base + k] = static_cast<T>(qat_round<MODE>(float(x[base + k]), s));
+    \\const float s = qat_scale_m(amax, MODE);
+    \\for (uint k = 0; k < uint(G); ++k) y[base + k] = static_cast<T>(qat_round_m(float(x[base + k]), s, MODE));
 ;
 
 var qat_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -160,7 +162,7 @@ pub const PACK_HEADER: [:0]const u8 =
     \\}
 ;
 
-const PACK_SOURCE: [:0]const u8 =
+pub const PACK_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint gid = thread_position_in_grid.x;
     \\if (gid >= uint(x_shape[0]) * uint(x_shape[1]) / uint(G)) return;
@@ -192,7 +194,7 @@ const PACK_SOURCE: [:0]const u8 =
     \\}
 ;
 
-const UNPACK_SOURCE: [:0]const u8 =
+pub const UNPACK_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint i = thread_position_in_grid.x;
     \\if (i >= uint(codes_shape[0]) * uint(codes_shape[1]) * 2u) return;
@@ -253,7 +255,7 @@ pub fn unpackFp4(sc: *Scope, p: Packed, mode: Qat, group: usize, dt: mlx.mlx_dty
 }
 
 // A thread unpacks four code bytes (eight values, inside one scale group), the arithmetic of UNPACK_SOURCE.
-const UNPACK_PICKS_SOURCE: [:0]const u8 =
+pub const UNPACK_PICKS_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\const uint hw = uint(codes_shape[1]);
     \\const uint w = hw * 2u;
@@ -305,7 +307,7 @@ pub fn unpackPicks(sc: *Scope, codes: A, scales: A, topk: A, mode: Qat, group: u
 
 // ── hyper-connection split ───────────────────────────────────────────────
 
-const HC_SPLIT_SOURCE: [:0]const u8 =
+pub const HC_SPLIT_SOURCE: [:0]const u8 =
     \\#pragma clang fp contract(off)
     \\#pragma clang fp reassociate(off)
     \\const uint row = thread_position_in_grid.x;
