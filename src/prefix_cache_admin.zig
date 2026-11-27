@@ -570,40 +570,33 @@ test "prefix cache admin: scan lists a namespace's entries, bytes and newest man
     defer cache.deinit();
     try kv_disk_cache.fillCache(&cache, s, 2, 600, 8, 0.0, .float32);
 
-    var tiers: [2]kv_disk_cache.DiskTier = undefined;
-    const names = [_][]const u8{ "00000000000000a1", "00000000000000b2" };
-    for (&tiers, names, [_]@import("kv_disk_fs.zig").Backend{ .real, .cas }) |*t, name, b| {
-        t.* = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, name, 0, 128, b);
-        t.ssd_first = true;
-        t.armTestSpace(1 << 40, 1 << 41);
-        t.enableBackgroundWriter();
-        // Two records diverging at 520: the second hard-links the four whole chunks they share.
-        for (0..2) |k| {
-            var tokens: [600]u32 = undefined;
-            for (&tokens, 0..) |*tk, i| tk.* = @intCast(if (i < 520) i + 7 else i + 7 + 10_000 * k);
-            _ = try t.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-        }
-        t.drainWriter();
+    const name = "00000000000000b2";
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, name, 0, 128);
+    tier.ssd_first = true;
+    tier.armTestSpace(1 << 40, 1 << 41);
+    tier.enableBackgroundWriter();
+    // Two records diverging at 520: the second hard-links the four whole chunks they share.
+    for (0..2) |k| {
+        var tokens: [600]u32 = undefined;
+        for (&tokens, 0..) |*tk, i| tk.* = @intCast(if (i < 520) i + 7 else i + 7 + 10_000 * k);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     }
-    defer for (&tiers) |*t| t.deinit();
-    const plain = scanNamespace(testing.allocator, io, base, 0xa1);
+    tier.drainWriter();
+    defer tier.deinit();
     const layer = scanNamespace(testing.allocator, io, base, 0xb2);
-    try testing.expectEqual(@as(u32, 2), plain.entries);
-    try testing.expectEqual(plain.entries, layer.entries);
-    // The layer reports what its folder holds: every byte the plain files hold, plus its journal and the pages its packs
-    // allocate.
-    try testing.expect(layer.bytes >= plain.bytes);
+    try testing.expectEqual(@as(u32, 2), layer.entries);
+    try testing.expect(layer.bytes >= tier.total_bytes);
     try testing.expect(layer.newest_ns > 0);
 
     // The scan read the live layer without changing it: the tier keeps writing and reopens whole.
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*tk, i| tk.* = @intCast(i + 50_000);
-    _ = try tiers[1].appendCommit(cache.entries, 600, cache.config, &tokens, false, null, s);
-    tiers[1].drainWriter();
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, &tokens, false, null, s);
+    tier.drainWriter();
     try testing.expectEqual(@as(u32, 3), scanNamespace(testing.allocator, io, base, 0xb2).entries);
-    tiers[1].deinit();
-    tiers[1] = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, names[1], 0, 128, .cas);
-    try testing.expectEqual(@as(usize, 3), tiers[1].entryCount());
+    tier.deinit();
+    tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, name, 0, 128);
+    try testing.expectEqual(@as(usize, 3), tier.entryCount());
 }
 
 test "prefix cache admin: deleteUnused: keeps the named namespaces and non-cache directories, refuses a symlink out of the root, skips a held root" {
@@ -795,7 +788,7 @@ test "prefix cache admin: clearDisk: the index, the files and the budget agree, 
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     var hc = prefix_cache_mod.HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-    hc.disk = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "00000000000000a1", 0, 128, .cas);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "00000000000000a1", 0, 128);
     defer hc.deinit();
 
     var cache = try KVCache.init(testing.allocator, 1);
@@ -814,7 +807,7 @@ test "prefix cache admin: clearDisk: the index, the files and the budget agree, 
     // What the tier reports holding on the volume (`used_bytes`): no journal of the records the clear dropped. The
     // layer's folder keeps one named record, its snapshot's state record, which that count leaves out.
     try testing.expectEqual(@as(u64, 0), hc.disk.?.diskBytes());
-    try testing.expectEqual(prefix_vfs.state_record_bytes, hc.disk.?.fs.vfs.?.physicalBytes());
+    try testing.expectEqual(prefix_vfs.state_record_bytes, hc.disk.?.fs.vfs.physicalBytes());
 
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 900);
     _ = try hc.commit(&cache, &tokens, false);
@@ -862,7 +855,7 @@ test "a stale clear never deletes the root a tier opens while the clear holds it
                     if (std.Io.Dir.cwd().statFile(testing.io, p, .{})) |_| {} else |_| break :outer;
                 }
             }
-            self.tier = kv_disk_cache.DiskTier.initBackend(testing.allocator, testing.io, self.root, "00000000000000a1", 0, 128, .real) catch |e| {
+            self.tier = kv_disk_cache.DiskTier.init(testing.allocator, testing.io, self.root, "00000000000000a1", 0, 128) catch |e| {
                 self.open_err = e;
                 return;
             };
@@ -881,7 +874,7 @@ test "a stale clear never deletes the root a tier opens while the clear holds it
     // The tier owns a root that exists, and a second tier on the namespace takes a private root, not a second lock on it.
     const gone = if (std.Io.Dir.cwd().access(io, tier.root, .{})) |_| false else |_| true;
     try testing.expect(!gone);
-    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, root, "00000000000000a1", 0, 128, .real);
+    var second = try kv_disk_cache.DiskTier.init(testing.allocator, io, root, "00000000000000a1", 0, 128);
     defer second.deinit();
     try testing.expect(second.private_root);
 }

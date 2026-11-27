@@ -29,6 +29,7 @@
 const std = @import("std");
 const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
+const safetensors = @import("safetensors.zig");
 const mlx_pages = @import("mlx_pages.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
@@ -2386,19 +2387,17 @@ pub const TinyFix = struct {
         return bf;
     }
 
-    pub fn put(map: mlx.mlx_map_string_to_array, key: []const u8, arr: mlx.mlx_array) !void {
-        const key_z = try std.fmt.allocPrintSentinel(testing.allocator, "{s}", .{key}, 0);
-        defer testing.allocator.free(key_z);
-        _ = mlx.mlx_map_string_to_array_insert(map, key_z.ptr, arr);
+    pub fn put(map: *safetensors.Loaded, key: []const u8, arr: mlx.mlx_array) !void {
+        try map.putRetained(key, arr);
     }
 
-    pub fn putW(map: mlx.mlx_map_string_to_array, key: []const u8, rows: usize, cols: usize, seed: usize, s: mlx.mlx_stream) !void {
+    pub fn putW(map: *safetensors.Loaded, key: []const u8, rows: usize, cols: usize, seed: usize, s: mlx.mlx_stream) !void {
         const arr = try bf16Arr(rows, cols, seed, s);
         defer _ = mlx.mlx_array_free(arr);
         try put(map, key, arr);
     }
 
-    pub fn putNorm(map: mlx.mlx_map_string_to_array, key: []const u8, n: usize, s: mlx.mlx_stream) !void {
+    pub fn putNorm(map: *safetensors.Loaded, key: []const u8, n: usize, s: mlx.mlx_stream) !void {
         const arr = try normArr(n, s);
         defer _ = mlx.mlx_array_free(arr);
         try put(map, key, arr);
@@ -2433,31 +2432,29 @@ pub const TinyFix = struct {
 
     pub fn writeTrunk(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
         try dir.writeFile(io, .{ .sub_path = "config.json", .data = TRUNK_CONFIG });
-        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        const st_path = try std.fmt.allocPrint(testing.allocator, "{s}/model.safetensors", .{dir_path});
         defer testing.allocator.free(st_path);
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        var map = safetensors.Loaded.init(testing.allocator);
+        defer map.deinit();
 
         const q_out = N_HEADS * HEAD_DIM;
         const kv_out = N_KV * HEAD_DIM;
-        try putW(map, "model.embed_tokens.weight", VOCAB, HIDDEN, 1, s);
-        try putNorm(map, "model.norm.weight", HIDDEN, s);
+        try putW(&map, "model.embed_tokens.weight", VOCAB, HIDDEN, 1, s);
+        try putNorm(&map, "model.norm.weight", HIDDEN, s);
         var key_buf: [128]u8 = undefined;
         var li: usize = 0;
         while (li < TRUNK_LAYERS) : (li += 1) {
-            try putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.input_layernorm.weight", .{li}), HIDDEN, s);
-            try putNorm(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.post_attention_layernorm.weight", .{li}), HIDDEN, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_proj.weight", .{li}), q_out, HIDDEN, 10 + li, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.k_proj.weight", .{li}), kv_out, HIDDEN, 20 + li, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.v_proj.weight", .{li}), kv_out, HIDDEN, 30 + li, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}), HIDDEN, q_out, 40 + li, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}), INTER, HIDDEN, 50 + li, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.up_proj.weight", .{li}), INTER, HIDDEN, 60 + li, s);
-            try putW(map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.down_proj.weight", .{li}), HIDDEN, INTER, 70 + li, s);
+            try putNorm(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.input_layernorm.weight", .{li}), HIDDEN, s);
+            try putNorm(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.post_attention_layernorm.weight", .{li}), HIDDEN, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.q_proj.weight", .{li}), q_out, HIDDEN, 10 + li, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.k_proj.weight", .{li}), kv_out, HIDDEN, 20 + li, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.v_proj.weight", .{li}), kv_out, HIDDEN, 30 + li, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.self_attn.o_proj.weight", .{li}), HIDDEN, q_out, 40 + li, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.gate_proj.weight", .{li}), INTER, HIDDEN, 50 + li, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.up_proj.weight", .{li}), INTER, HIDDEN, 60 + li, s);
+            try putW(&map, try std.fmt.bufPrint(&key_buf, "model.layers.{d}.mlp.down_proj.weight", .{li}), HIDDEN, INTER, 70 + li, s);
         }
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+        _ = try map.writeFile(io, st_path, s);
     }
 
     // Tiny assistant: hidden 64 (== trunk), 2 layers (sliding + full),
@@ -2490,21 +2487,19 @@ pub const TinyFix = struct {
 
     pub fn writeAssistantOpts(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, quantize: bool) !void {
         try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT_CONFIG });
-        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        const st_path = try std.fmt.allocPrint(testing.allocator, "{s}/model.safetensors", .{dir_path});
         defer testing.allocator.free(st_path);
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try putV1AssistantWeights(map, s, quantize);
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+        var map = safetensors.Loaded.init(testing.allocator);
+        defer map.deinit();
+        try putV1AssistantWeights(&map, s, quantize);
+        _ = try map.writeFile(io, st_path, s);
     }
 
-    fn putV1AssistantWeights(map: mlx.mlx_map_string_to_array, s: mlx.mlx_stream, quantize: bool) !void {
+    fn putV1AssistantWeights(map: *safetensors.Loaded, s: mlx.mlx_stream, quantize: bool) !void {
         const q_out = N_HEADS * HEAD_DIM;
         const kv_out = N_KV * HEAD_DIM;
         const putLin = struct {
-            fn f(m: mlx.mlx_map_string_to_array, key: []const u8, rows: usize, cols: usize, seed: usize, st: mlx.mlx_stream, q: bool) !void {
+            fn f(m: *safetensors.Loaded, key: []const u8, rows: usize, cols: usize, seed: usize, st: mlx.mlx_stream, q: bool) !void {
                 if (q) return putQuantW(m, key, rows, cols, seed, st);
                 return putW(m, key, rows, cols, seed, st);
             }
@@ -2584,18 +2579,16 @@ pub const TinyFix = struct {
 
     pub fn writeAssistant2(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
         try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT2_CONFIG });
-        const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
+        const st_path = try std.fmt.allocPrint(testing.allocator, "{s}/model.safetensors", .{dir_path});
         defer testing.allocator.free(st_path);
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try putV1AssistantWeights(map, s, false);
+        var map = safetensors.Loaded.init(testing.allocator);
+        defer map.deinit();
+        try putV1AssistantWeights(&map, s, false);
 
         // Selector: codebooks ship SUFFIX-LESS, like the real checkpoint.
-        try putW(map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
-        try putW(map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
-        try putW(map, "candidate_selector.hidden_projection.weight", SEL_RANK, HIDDEN, 302, s);
+        try putW(&map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
+        try putW(&map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
+        try putW(&map, "candidate_selector.hidden_projection.weight", SEL_RANK, HIDDEN, 302, s);
 
         // Dynamic convs per layer: base [2, ksize, H] + projection
         // [2*ksize*groups, H].
@@ -2607,16 +2600,16 @@ pub const TinyFix = struct {
                 const base_shape = [_]c_int{ 2, CONV_K, HIDDEN };
                 const base = try bf16ArrShaped(&base_shape, 310 + li * 7 + which.len, s);
                 defer _ = mlx.mlx_array_free(base);
-                try put(map, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".base_kernel", .{li}), base);
-                try putW(map, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".kernel_projection.weight", .{li}), 2 * CONV_K * groups, HIDDEN, 330 + li * 7 + which.len, s);
+                try put(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".base_kernel", .{li}), base);
+                try putW(&map, try std.fmt.bufPrint(&key_buf, "layers.{d}." ++ which ++ ".kernel_projection.weight", .{li}), 2 * CONV_K * groups, HIDDEN, 330 + li * 7 + which.len, s);
             }
         }
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+        _ = try map.writeFile(io, st_path, s);
     }
 
     /// A `<prefix>.weight` written PACKED, with its `.scales`/`.biases`
     /// siblings — the pre-quantized-sidecar shape.
-    pub fn putQuantW(map: mlx.mlx_map_string_to_array, key: []const u8, rows: usize, cols: usize, seed: usize, s: mlx.mlx_stream) !void {
+    pub fn putQuantW(map: *safetensors.Loaded, key: []const u8, rows: usize, cols: usize, seed: usize, s: mlx.mlx_stream) !void {
         const dense = try bf16Arr(rows, cols, seed, s);
         defer _ = mlx.mlx_array_free(dense);
         var lin = try quantizeDense(dense, 8, @intCast(@min(cols, 64)), s);

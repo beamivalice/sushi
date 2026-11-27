@@ -8,7 +8,13 @@ const rule = @import("rule.zig");
 pub const name = "cache-gpu-stream";
 pub const reason = "cache array work on MLX's stream is refused inside an engine forward; take the caller's stream";
 
-const scoped = [_][]const u8{ "prefix_cache.zig", "ssm_cache.zig" };
+const scoped = [_][]const u8{
+    "prefix_cache.zig",
+    "prefix_cache_index.zig",
+    "prefix_cache_evict.zig",
+    "prefix_cache_commit.zig",
+    "ssm_cache.zig",
+};
 
 pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !void {
     const base = std.fs.path.basename(report.file);

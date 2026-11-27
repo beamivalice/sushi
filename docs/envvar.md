@@ -72,7 +72,6 @@ Log, trace or dump output, off by default, and the knobs a correctness test need
 | `SUSHI_DFLASH_TRACE` | `generate.zig:4016` | `1` per-phase DFlash round wall-time trace | once | no |
 | `SUSHI_DISPATCH_PROBE` | `trunk.zig:4334` | `<n>` injects n small dependent dispatches per MoE layer to price a dispatch | once | yes: mimo2-perf, tests/CLAUDE |
 | `SUSHI_RESTORE_TAPE` | `restore_tape.zig` | `<abs file>` appends a JSONL row per lookup (what was restored, a SHA-256 per state family), per SSD flush (the tier's records) and per finished request (generated ids); the proof two builds restore the same bytes (`tests/diff_restore_tape.py`, `tests/replay_ssd_writes.py`) | once | yes: engine-prefix-cache, tests/CLAUDE |
-| `SUSHI_PREFIX_FS` | `kv_disk_fs.zig` (`backendFromEnv`, read by `DiskTier.init`) | unset or `cas`: the SSD tier's files live in the content-addressed layer (`<root>/v/`); `real`: the plain files; any other value fails the tier's start. The `background writer armed (fs=...)` line names the arm. The equivalence proof's knob: `zig build test` runs `test-prefix-cache` once per value (a `-Dtest-filter` run once, on the default), and the restore tapes run on both. A Sushi Cooler load has no tier on `real` (the plain files pass through MLX arrays; a warn names it). Leaves with the `real` backend (redesign stage S6) | once | yes: engine-prefix-cache |
 | `SUSHI_DUMP_RESTORE` | `restore_dump.zig:31` | `<dir>` dumps prefix-restore tensors | once | no |
 | `SUSHI_EXL3_STAGE_PROFILE` | `exl3/expert_exl3_kernels.zig:108` | syncs and times each stage of a routed MoE layer (pair GEMV, down, reduce, sort, token prepare, GEMMs), logged as `[exl3-stage]` | once | yes: engine-exl3-experts |
 | `SUSHI_EXL3_SWIGLU_MAXABS` | `exl3/expert_exl3_kernels.zig:130` | dumps SwiGLU activation maxima (f16 overflow hunt) | once | yes: engine-exl3-experts |
@@ -171,6 +170,10 @@ Kept because the launch flag cannot express what the env does.
 ## Reads to fix
 
 - *Stale scripts*: benches that export `SUSHI_ROUND_COST_PERSIST=0` set the default (persistence is opt-in); `SUSHI_QSA_NAX_PRECISION` is script-side only.
+
+## Removed 2026-11-28
+
+- `SUSHI_PREFIX_FS`: the SSD prefix tier now runs solely on the content-addressed VFS layer (`<root>/v/`); the legacy plain-file (`real`) backend and its `mlx_{load,save}_safetensors` path were removed in favor of native Zig `safetensors.zig`.
 
 ## Removed 2026-11-19
 

@@ -1179,18 +1179,17 @@ test "DiskTier: a restart on a nearly full volume keeps what the tier already ho
     const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
     const total: u64 = 1024 * 1024 * 1024 * 1024;
 
-    // The arithmetic below models a volume of plain files; the layer's twin is the test after this one.
     {
-        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-restart", 0, 128, .real);
+        var first = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-restart", 0, 128);
         defer first.deinit();
         first.ssd_first = true;
         first.armTestSpace(total / 2, total);
-        var cache = try KVCache.init(testing.allocator, 2);
-        defer cache.deinit();
-        try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
-        for ([_]u32{ 7, 90_000 }) |off| {
+        for ([_]struct { off: u32, seed: f32 }{ .{ .off = 7, .seed = 0.0 }, .{ .off = 90_000, .seed = 1000.0 } }) |rec| {
+            var cache = try KVCache.init(testing.allocator, 2);
+            defer cache.deinit();
+            try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, rec.seed, .float32);
             var tokens: [640]u32 = undefined;
-            for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
+            for (&tokens, 0..) |*t, i| t.* = @intCast(i + rec.off);
             _ = try first.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
         }
         first.drainWriter();
@@ -1208,18 +1207,18 @@ test "DiskTier: a restart on a nearly full volume keeps what the tier already ho
     try testing.expectEqual(DiskBound.free_disk, plan.bound);
     try testing.expectEqual(DEFAULT_DISK_CAP, plan.cap);
 
-    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-restart", plan.bytes, 128, .real);
+    var second = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-restart", plan.bytes, 128);
     defer second.deinit();
     second.operator_cap = plan.cap;
     try testing.expectEqual(@as(usize, 2), second.entryCount());
     // The live bound holds the entries it was given and follows the free space back up toward the cap.
     second.armTestSpace(free, total);
     second.refreshDiskBudget();
-    try testing.expectEqual(free - DISK_FREE_RESERVE + second.total_bytes, second.max_bytes);
+    try testing.expectEqual(second.fs.freeAsFiles(free) - DISK_FREE_RESERVE + second.total_bytes, second.max_bytes);
     try testing.expectEqual(@as(usize, 2), second.entryCount());
     second.armTestSpace(free + 8 * 1024 * 1024 * 1024, total);
     second.refreshDiskBudget();
-    try testing.expectEqual(free - DISK_FREE_RESERVE + second.total_bytes + 8 * 1024 * 1024 * 1024, second.max_bytes);
+    try testing.expectEqual(second.fs.freeAsFiles(free + 8 * 1024 * 1024 * 1024) - DISK_FREE_RESERVE + second.total_bytes, second.max_bytes);
 
     // An explicit flag is the budget as given, whatever the volume holds or leaves.
     const flag = resolveDiskBudget(true, 3 * held, 32, 262144, 18_400, free, held).?;
@@ -1228,18 +1227,22 @@ test "DiskTier: a restart on a nearly full volume keeps what the tier already ho
     try testing.expectEqual(3 * held, flag.cap);
 }
 
-/// Two plain-file records under `<base>/<fp>`, written by a `real` tier as a build before the layer left them.
-fn writePlainRecords(io: std.Io, base: []const u8, fp: []const u8, cache: *KVCache) !void {
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, 0, 128, .real);
-    defer tier.deinit();
-    for ([_]u32{ 7, 90_000 }) |off| {
-        var tokens: [640]u32 = undefined;
-        for (&tokens, 0..) |*t, i| t.* = @intCast(i + off);
-        _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, mlx.gpuStream());
+/// Two legacy plain-file records under `<base>/<fp>`, as an older build before the CAS layer left them.
+fn writePlainRecords(io: std.Io, base: []const u8, fp: []const u8) !void {
+    const payload: [4096]u8 = @splat(0x5A);
+    for ([_][]const u8{ "e1", "e2" }) |e| {
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const dir = try std.fmt.bufPrint(&dir_buf, "{s}/{s}/{s}", .{ base, fp, e });
+        try io_util.makeDirPath(io, dir);
+        var d = try std.Io.Dir.openDirAbsolute(io, dir, .{});
+        defer d.close(io);
+        try d.writeFile(io, .{ .sub_path = "meta.json", .data = "{\"version\":6,\"kv_len\":640,\"tokens\":640}" });
+        try d.writeFile(io, .{ .sub_path = "tokens.bin", .data = payload[0..2560] });
+        try d.writeFile(io, .{ .sub_path = "c000000.safetensors", .data = &payload });
     }
 }
 
-test "DiskTier: a content-addressed tier deletes the plain-file records under its root once at attach; a plain one keeps and restores them" {
+test "DiskTier: a content-addressed tier deletes legacy plain-file records under its root once at attach" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1249,25 +1252,16 @@ test "DiskTier: a content-addressed tier deletes the plain-file records under it
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
     try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
-    try writePlainRecords(io, base, "fp-up", &cache);
+    try writePlainRecords(io, base, "fp-up");
     // Foreign names beside the records: none is a plain record.
     try tmp.dir.createDirPath(io, "fp-up/notes");
     try tmp.dir.createDirPath(io, "fp-up/e1x");
     try tmp.dir.writeFile(io, .{ .sub_path = "fp-up/e7", .data = "a file, not a record" });
     try tmp.dir.writeFile(io, .{ .sub_path = "fp-up/notes/keep.txt", .data = "keep" });
-
-    {
-        var plain = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", 0, 128, .real);
-        defer plain.deinit();
-        try testing.expectEqual(@as(usize, 2), plain.entryCount());
-        var out = try KVCache.init(testing.allocator, 2);
-        defer out.deinit();
-        try testing.expectEqual(@as(u32, 640), try plain.restoreInto(&out, 0, s));
-    }
     try testing.expect(tmp.dir.statFile(io, "fp-up/e1/meta.json", .{}) catch null != null);
 
     {
-        var layer = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", 0, 128, .cas);
+        var layer = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-up", 0, 128);
         defer layer.deinit();
         try testing.expectEqual(@as(usize, 0), layer.entryCount());
         var tokens: [640]u32 = undefined;
@@ -1284,7 +1278,7 @@ test "DiskTier: a content-addressed tier deletes the plain-file records under it
     // The layer's own records and files survive its next attach.
     const held = tierBytes(io, base, "fp-up");
     {
-        var again = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", 0, 128, .cas);
+        var again = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-up", 0, 128);
         defer again.deinit();
         try testing.expectEqual(@as(usize, 1), again.entryCount());
     }
@@ -1293,15 +1287,11 @@ test "DiskTier: a content-addressed tier deletes the plain-file records under it
 
 test "DiskTier: after an attach that removed plain-file records, the refreshed budget is the one the attach resolved" {
     const io = std.testing.io;
-    const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
-    var cache = try KVCache.init(testing.allocator, 2);
-    defer cache.deinit();
-    try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
-    try writePlainRecords(io, base, "fp-up", &cache);
+    try writePlainRecords(io, base, "fp-up");
 
     // A volume tight enough that free space bounds the budget: the attach counts the old records as the tier's room.
     const held = tierBytes(io, base, "fp-up");
@@ -1309,7 +1299,7 @@ test "DiskTier: after an attach that removed plain-file records, the refreshed b
     const free = DISK_FREE_RESERVE + held / 2;
     const plan = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free, held).?;
     try testing.expectEqual(DiskBound.free_disk, plan.bound);
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-up", plan.bytes, 128, .cas);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-up", plan.bytes, 128);
     defer tier.deinit();
     // The live tier's root reads as 0 to `tierBytes`: count the records still on disk directly.
     var seen = InodeSet.init(testing.allocator);
@@ -1326,7 +1316,7 @@ test "DiskTier: after an attach that removed plain-file records, the refreshed b
     try testing.expectEqual(plan.bytes, tier.max_bytes);
 }
 
-test "DiskTier: on one volume the content-addressed layer resolves and refreshes the budget the plain files do" {
+test "DiskTier: on one volume the content-addressed layer deduplicates identical rows and refreshes its budget from physical space" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1337,9 +1327,9 @@ test "DiskTier: on one volume the content-addressed layer resolves and refreshes
     var cache = try KVCache.init(testing.allocator, 2);
     defer cache.deinit();
     try kv_disk_cache.fillCache(&cache, s, 2, 640, 8, 0.0, .float32);
-    var logical: [2]u64 = undefined;
-    for ([_]kv_disk_fs.Backend{ .real, .cas }, [_][]const u8{ "fp-vol-real", "fp-vol-cas" }, 0..) |b, fp, k| {
-        var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, 0, 128, b);
+    var logical_files: u64 = 0;
+    {
+        var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-vol-cas", 0, 128);
         defer tier.deinit();
         tier.enableBackgroundWriter();
         // Two records of the same rows: the layer stores those rows once.
@@ -1349,30 +1339,24 @@ test "DiskTier: on one volume the content-addressed layer resolves and refreshes
             _ = try tier.appendCommit(cache.entries, 640, cache.config, &tokens, false, null, s);
         }
         tier.drainWriter();
-        logical[k] = tier.total_bytes;
+        logical_files = tier.fs.vfs.logicalBytes();
     }
-    try testing.expectEqual(logical[0], logical[1]);
-    const held_real = tierBytes(io, base, "fp-vol-real");
     const held_cas = tierBytes(io, base, "fp-vol-cas");
-    try testing.expect(held_cas < held_real);
-    // The volume left the same files, so it has what the layer saved on top.
-    const free_real = DISK_FREE_RESERVE + held_real / 2;
-    const free_cas = free_real + held_real - held_cas;
-    const want = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free_real, held_real).?;
+    try testing.expect(held_cas > 0 and held_cas < logical_files);
+    // The volume has what deduplication saved on top of the undeduplicated logical files.
+    const free_plain = DISK_FREE_RESERVE + logical_files / 2;
+    const free_cas = free_plain + logical_files - held_cas;
+    const want = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free_plain, logical_files).?;
     const got = resolveDiskBudget(false, DEFAULT_DISK_CAP, 32, 262144, 18_400, free_cas, held_cas).?;
     try testing.expectEqual(want, got);
 
-    var budgets: [2]u64 = undefined;
-    for ([_]kv_disk_fs.Backend{ .real, .cas }, [_][]const u8{ "fp-vol-real", "fp-vol-cas" }, [_]u64{ free_real, free_cas }, 0..) |b, fp, free, k| {
-        var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, want.bytes, 128, b);
-        defer tier.deinit();
-        tier.operator_cap = want.cap;
-        tier.armTestSpace(free, total);
-        tier.refreshDiskBudget();
-        try testing.expectEqual(@as(usize, 2), tier.entryCount());
-        budgets[k] = tier.max_bytes;
-    }
-    try testing.expectEqual(budgets[0], budgets[1]);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-vol-cas", want.bytes, 128);
+    defer tier.deinit();
+    tier.operator_cap = want.cap;
+    tier.armTestSpace(free_cas, total);
+    tier.refreshDiskBudget();
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    try testing.expectEqual(free_plain - DISK_FREE_RESERVE + tier.total_bytes, tier.max_bytes);
 }
 
 test "DiskTier: the free-space probe runs only before a store, never for a copy already on disk" {
@@ -1509,7 +1493,7 @@ fn layerLengths(io: std.Io, root: []const u8) !u64 {
 /// A content-addressed sibling with three records of distinct rows, oldest first, closed again. Returns the root.
 fn threeLayerRecords(io: std.Io, base: []const u8, fp: []const u8, first_bytes: *u64) ![]u8 {
     const s = mlx.gpuStream();
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, fp, 0, 128, .cas);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, fp, 0, 128);
     defer tier.deinit();
     for (0..3) |k| {
         var cache = try KVCache.init(testing.allocator, 1);
@@ -1534,7 +1518,7 @@ test "DiskTier: tierBytes counts a content-addressed root by what its packs hold
     defer testing.allocator.free(root);
     var held: u64 = 0;
     {
-        var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-holes", 0, 128, .cas);
+        var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-holes", 0, 128);
         defer tier.deinit();
         // The two newer records' pages go as holes; the pack stays for the oldest.
         tier.invalidateNewest();
@@ -1583,7 +1567,7 @@ test "DiskTier: a lowered SSD budget on a restart cuts a sole over-budget entry,
 
     var held: u64 = 0;
     {
-        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered", 0, 128, .real);
+        var first = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-lowered", 0, 128);
         defer first.deinit();
         first.ssd_first = true;
         first.armTestSpace(total / 2, total);
@@ -1593,7 +1577,7 @@ test "DiskTier: a lowered SSD budget on a restart cuts a sole over-budget entry,
         try testing.expect(held > 0);
     }
     // The same root, restarted with a budget of half what the last boot stored.
-    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered", held / 2, 128, .real);
+    var second = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-lowered", held / 2, 128);
     defer second.deinit();
     second.ssd_first = true;
     second.armTestSpace(total / 2, total);
@@ -1635,7 +1619,7 @@ test "DiskTier: control — with two entries the same lowered budget evicts the 
 
     var held: u64 = 0;
     {
-        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered2", 0, 128, .real);
+        var first = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-lowered2", 0, 128);
         defer first.deinit();
         first.ssd_first = true;
         first.armTestSpace(total / 2, total);
@@ -1648,7 +1632,7 @@ test "DiskTier: control — with two entries the same lowered budget evicts the 
         try testing.expectEqual(@as(usize, 2), first.entryCount());
         held = first.total_bytes;
     }
-    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-lowered2", held / 2, 128, .real);
+    var second = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-lowered2", held / 2, 128);
     defer second.deinit();
     second.ssd_first = true;
     second.armTestSpace(total / 2, total);
@@ -1675,7 +1659,7 @@ test "DiskTier: a live cap lowered under a sole entry (admin set_cap path) leave
     var tokens: [640]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-livecap", 0, 128, .real);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-livecap", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(total / 2, total);
@@ -1700,7 +1684,7 @@ test "DiskTier: a failed chunk write leaves the tier's byte count with the entry
     var buf: [512]u8 = undefined;
     const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
 
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-phantom", 0, 128, .real);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-phantom", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
@@ -1748,7 +1732,7 @@ test "DiskTier: control — a chunk deleted from a healthy entry is credited fro
     var buf: [512]u8 = undefined;
     const base = try kv_disk_cache.tmpRoot(&tmp, io, &buf);
 
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-credit", 0, 128, .real);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-credit", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
@@ -1769,7 +1753,7 @@ test "DiskTier: control — a chunk deleted from a healthy entry is credited fro
     // Remove one of B's chunk files behind the index, then evict B whole.
     var nb: [128]u8 = undefined;
     const name = try std.fmt.bufPrint(&nb, "fp-credit/e{d}/c000003.safetensors", .{b_id});
-    tmp.dir.deleteFile(io, name) catch {};
+    kv_disk_fs.testDeleteAt(io, base, name);
     tier.invalidateNewest();
     var sum: u64 = 0;
     for (tier.entries.items) |e| sum += e.bytes;
@@ -1796,7 +1780,7 @@ test "DiskTier: a lowered budget on a restart cuts a sole entry to the chunks th
 
     var held: u64 = 0;
     {
-        var first = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-cut", 0, 128, .real);
+        var first = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-cut", 0, 128);
         defer first.deinit();
         first.ssd_first = true;
         first.armTestSpace(total / 2, total);
@@ -1806,7 +1790,7 @@ test "DiskTier: a lowered budget on a restart cuts a sole entry to the chunks th
     }
     // A cap that holds four of the five chunks: the record is cut to those, not evicted.
     const cap = held * 4 / 5 + 512;
-    var second = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-cut", cap, 128, .real);
+    var second = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-cut", cap, 128);
     defer second.deinit();
     second.ssd_first = true;
     second.armTestSpace(total / 2, total);
@@ -1840,7 +1824,7 @@ test "DiskTier: a lowered cap drops a sole poisoned entry instead of cutting it"
     var tokens: [640]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
-    var tier = try kv_disk_cache.DiskTier.initBackend(testing.allocator, io, base, "fp-dead-cap", 0, 128, .real);
+    var tier = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-dead-cap", 0, 128);
     defer tier.deinit();
     tier.ssd_first = true;
     tier.armTestSpace(total / 2, total);

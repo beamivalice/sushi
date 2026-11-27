@@ -21,7 +21,6 @@ const prefix_arch = @import("arch/prefix.zig");
 const arch_serve = @import("arch/serve.zig");
 const metrics_mod = @import("metrics.zig");
 const kv_disk_cache = @import("kv_disk_cache.zig");
-const kv_disk_fs = @import("kv_disk_fs.zig");
 const disk_placement = @import("disk_placement.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const segment_cache_mod = @import("segment_cache.zig");
@@ -2086,12 +2085,6 @@ pub const CacheAttach = struct {
 
 pub const AttachMode = enum { load, rearm };
 
-/// The plain-file backend reads and writes its tensor files through MLX arrays: a model whose arrays are the
-/// engine's has no tier there.
-fn plainFilesNeedMlx(backend: kv_disk_fs.Backend, arrays_on: ?mlx.mlx_stream) bool {
-    return backend == .real and arrays_on != null;
-}
-
 /// Brings up the model's SSD tier and the hot prefix cache hanging off it, and bills the tier on the config.
 /// `entry` has its config, path and handle; `disk_bytes` is the SSD ask. Infallible, as the load calls it after the
 /// entry took its pointers: a tier that fails to come up is declined. A re-arm of a declined tier logs nothing when it
@@ -2124,10 +2117,6 @@ pub fn attachPrefixCache(allocator: std.mem.Allocator, io: std.Io, entry: *Loade
         if (ask.explicit()) log.info("{s}\n", .{disk_placement.diskOffLine(&off_buf, 0, "", ask.sourceName())});
     }
     if (cache_applies and disk_bytes > 0 and disk_ok) attach: {
-        if (kv_disk_fs.backendFromEnv() catch null) |backend| if (plainFilesNeedMlx(backend, prefix_arch.arraysOn(config))) {
-            log.atLevel(failed, "[disk-cache] SUSHI_PREFIX_FS=real: the plain files pass through MLX arrays, which this model's load does not make — persistence off for this model\n", .{});
-            break :attach;
-        };
         const layout = diskLayoutKey(allocator, config, entry.path, xfm) catch |err| {
             log.atLevel(failed, "[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
             break :attach;
@@ -3953,14 +3942,6 @@ test "rearmDiskTier: an SSD size named in settings arms a declined tier on a ful
     try testing.expect(rearmDiskTier(testing.allocator, testing.io, f.entry, s, "test"));
     try testing.expect(!f.config.prefix_cache_disk_declined);
     try testing.expectEqual(@as(u64, 2 << 30), f.entry.prefix_cache.?.disk.?.max_bytes);
-}
-
-test "the plain-file SSD tier is declined for a model whose arrays are the engine's, and for no other" {
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    try std.testing.expect(plainFilesNeedMlx(.real, s));
-    try std.testing.expect(!plainFilesNeedMlx(.real, null));
-    try std.testing.expect(!plainFilesNeedMlx(.cas, s));
 }
 
 test "rearmDiskTier: a RAM cache the load built keeps its object and entries when the tier joins it" {

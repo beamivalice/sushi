@@ -29,6 +29,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const safetensors = @import("safetensors.zig");
 const log = @import("log.zig");
 const calib = @import("kld_calib.zig");
 const offline = @import("arch/offline.zig");
@@ -754,41 +755,28 @@ test "imatrix writes the converter's keys, shapes and layer-normalized values" {
     const bytes = try col.flush();
     try testing.expect(bytes > 0);
 
-    const path_z = try std.fmt.allocPrintSentinel(alloc, "{s}", .{out}, 0);
-    defer alloc.free(path_z);
-    var loaded = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(loaded);
-    var meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
-    // safetensors Load has no GPU eval — the reader runs on the CPU stream.
     const cpu = mlx.mlx_default_cpu_stream_new();
-    try mlx.check(mlx.mlx_load_safetensors(&loaded, &meta, path_z, cpu));
+    defer _ = mlx.mlx_stream_free(cpu);
+    var loaded = try safetensors.loadFile(alloc, io, out, cpu);
+    defer loaded.deinit();
 
-    var gu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gu);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&gu, loaded, FUSED_PREFIX ++ "1.mlp.experts.gate_up_proj"));
+    const gu = loaded.get(FUSED_PREFIX ++ "1.mlp.experts.gate_up_proj") orelse return error.TestExpectedEqual;
     try testing.expectEqualSlices(c_int, &[_]c_int{6}, mlx.getShape(gu));
     // 2 tokens in the layer: sum(x^2) per expert channel divided by that count.
     try testing.expectEqual(@as(f32, 0.5), try f32At(gu, 0));
     try testing.expectEqual(@as(f32, 9.5), try f32At(gu, 4));
 
-    var dn = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dn);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&dn, loaded, FUSED_PREFIX ++ "1.mlp.experts.down_proj"));
+    const dn = loaded.get(FUSED_PREFIX ++ "1.mlp.experts.down_proj") orelse return error.TestExpectedEqual;
     try testing.expectEqualSlices(c_int, &[_]c_int{6}, mlx.getShape(dn));
     try testing.expectEqual(@as(f32, 14.5), try f32At(dn, 4));
 
-    var rows = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&rows, loaded, FUSED_PREFIX ++ "1.mlp.experts.gate_up_proj.rows"));
+    const rows = loaded.get(FUSED_PREFIX ++ "1.mlp.experts.gate_up_proj.rows") orelse return error.TestExpectedEqual;
     try testing.expectEqualSlices(c_int, &[_]c_int{3}, mlx.getShape(rows));
     try testing.expectEqual(@as(f32, 1), try f32At(rows, 0));
     try testing.expectEqual(@as(f32, 3), try f32At(rows, 2));
 
     // A layer that never routed contributes no entries.
-    var absent = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(absent);
-    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, FUSED_PREFIX ++ "0.mlp.experts.gate_up_proj") != 0);
+    try testing.expect(loaded.get(FUSED_PREFIX ++ "0.mlp.experts.gate_up_proj") == null);
 }
 
 test "imatrix capture is off without the environment variable" {
@@ -831,35 +819,23 @@ test "a bare layer prefix keys the same per-layer layout by the checkpoint's own
     try col.observeDown(2, acta, aida);
     try testing.expect(try col.flush() > 0);
 
-    const path_z = try std.fmt.allocPrintSentinel(alloc, "{s}", .{out}, 0);
-    defer alloc.free(path_z);
-    var loaded = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(loaded);
-    var meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
     const cpu = mlx.mlx_default_cpu_stream_new();
-    try mlx.check(mlx.mlx_load_safetensors(&loaded, &meta, path_z, cpu));
+    defer _ = mlx.mlx_stream_free(cpu);
+    var loaded = try safetensors.loadFile(alloc, io, out, cpu);
+    defer loaded.deinit();
 
-    var gu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gu);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&gu, loaded, "model.layers.2.mlp.experts.gate_up_proj"));
+    const gu = loaded.get("model.layers.2.mlp.experts.gate_up_proj") orelse return error.TestExpectedEqual;
     try testing.expectEqualSlices(c_int, &[_]c_int{E * hidden}, mlx.getShape(gu));
     try testing.expectEqual(@as(f32, 0.5), try f32At(gu, 0));
-    var dn = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dn);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&dn, loaded, "model.layers.2.mlp.experts.down_proj"));
+    const dn = loaded.get("model.layers.2.mlp.experts.down_proj") orelse return error.TestExpectedEqual;
     try testing.expectEqualSlices(c_int, &[_]c_int{E * inter}, mlx.getShape(dn));
     try testing.expectEqual(@as(f32, 14.5), try f32At(dn, 2 * inter));
-    var rows = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_map_string_to_array_get(&rows, loaded, "model.layers.2.mlp.experts.gate_up_proj.rows"));
+    const rows = loaded.get("model.layers.2.mlp.experts.gate_up_proj.rows") orelse return error.TestExpectedEqual;
     try testing.expectEqualSlices(c_int, &[_]c_int{E}, mlx.getShape(rows));
     try testing.expectEqual(@as(f32, 3), try f32At(rows, 2));
 
     // The fused prefix is NOT what a flat-prefix file is keyed by.
-    var absent = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(absent);
-    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, FUSED_PREFIX ++ "2.mlp.experts.gate_up_proj") != 0);
+    try testing.expect(loaded.get(FUSED_PREFIX ++ "2.mlp.experts.gate_up_proj") == null);
 }
 
 test "imatrix records a dense linear's input rows under its source weight name" {
@@ -890,16 +866,12 @@ test "imatrix records a dense linear's input rows under its source weight name" 
     try testing.expectError(error.ImatrixLayerOutOfRange, col.observeLinear(.{ .o_proj = 3 }, xa));
     try testing.expect(try col.flush() > 0);
 
-    const path_z = try std.fmt.allocPrintSentinel(alloc, "{s}", .{out}, 0);
-    defer alloc.free(path_z);
-    var loaded = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(loaded);
-    var meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
     const cpu = mlx.mlx_default_cpu_stream_new();
-    try mlx.check(mlx.mlx_load_safetensors(&loaded, &meta, path_z, cpu));
+    defer _ = mlx.mlx_stream_free(cpu);
+    var loaded = try safetensors.loadFile(alloc, io, out, cpu);
+    defer loaded.deinit();
 
-    const Want = struct { key: [:0]const u8, vals: []const f32 };
+    const Want = struct { key: []const u8, vals: []const f32 };
     for ([_]Want{
         // (1+9)*2 / 4 rows, (4+16)*2 / 4 rows
         .{ .key = "model.layers.1.self_attn.o_proj.weight", .vals = &.{ 5, 10 } },
@@ -907,17 +879,13 @@ test "imatrix records a dense linear's input rows under its source weight name" 
         .{ .key = "lm_head.weight", .vals = &.{ 14.0 / 3.0, 12 } },
         .{ .key = "lm_head.weight.rows", .vals = &.{3} },
     }) |want| {
-        var arr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(arr);
-        try mlx.check(mlx.mlx_map_string_to_array_get(&arr, loaded, want.key));
+        const arr = loaded.get(want.key) orelse return error.TestExpectedEqual;
         try testing.expectEqualSlices(c_int, &[_]c_int{@intCast(want.vals.len)}, mlx.getShape(arr));
         for (want.vals, 0..) |v, i| try testing.expectApproxEqRel(v, try f32At(arr, i), 1e-6);
     }
     // A layer whose o_proj never ran, and the expert blocks nobody routed, write nothing.
-    var absent = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(absent);
-    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, "model.layers.0.self_attn.o_proj.weight") != 0);
-    try testing.expect(mlx.mlx_map_string_to_array_get(&absent, loaded, "model.layers.1.mlp.experts.gate_up_proj") != 0);
+    try testing.expect(loaded.get("model.layers.0.self_attn.o_proj.weight") == null);
+    try testing.expect(loaded.get("model.layers.1.mlp.experts.gate_up_proj") == null);
 }
 
 test "imatrix keeps the armed layer's MLP input rows and routing ids for the encoder" {

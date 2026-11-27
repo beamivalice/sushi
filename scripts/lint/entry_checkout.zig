@@ -1,5 +1,5 @@
 //! Rule `entry-checkout`: a write of a hot-cache entry's `checkout` (an assignment, a struct field set, a pointer
-//! capture, a write through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`.
+//! capture, a write through `.?`) outside `prefix_cache_evict.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`.
 //! A checkout is one slot's take of the entry's buffers; a caller that sets or clears a piece of it by hand leaves the
 //! rest describing another take. Tests, and fns only tests reach, are exempt. Token scan.
 const std = @import("std");
@@ -13,7 +13,7 @@ const owners_allowed = [_][]const u8{ "beginCheckout", "donateCheckout", "endChe
 
 pub fn check(arena: std.mem.Allocator, tree: *const Ast, report: rule.Report) !void {
     if (rule.testFile(report.file)) return;
-    const owner_file = std.mem.eql(u8, std.fs.path.basename(report.file), "prefix_cache.zig");
+    const owner_file = std.mem.eql(u8, std.fs.path.basename(report.file), "prefix_cache_evict.zig");
     var owners: ?std.ArrayList(rule.Owner) = null;
     var test_only: []const bool = &.{};
     const n = tree.tokens.len;

@@ -7,6 +7,7 @@ const expert_stream_mod = @import("../expert_stream.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const expert_exl3 = sushi_exl3.format;
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const kv_quant = @import("../kv_quant.zig");
 const KVQuantConfig = kv_quant.KVQuantConfig;
 const model_mod = @import("../model.zig");
@@ -87,27 +88,25 @@ fn expectSameBits(expected: mlx.mlx_array, actual: mlx.mlx_array) ![]const u8 {
 /// The fixture's routed bank as a one-shard EXL3 pack index the expert store opens.
 fn writeGlmExl3Bank(dir: std.Io.Dir, path: []const u8, weights: *const Weights) !void {
     const a = testing.allocator;
-    const map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(map);
+    var map = safetensors.Loaded.init(a);
+    defer map.deinit();
     var index: std.ArrayList(u8) = .empty;
     defer index.deinit(a);
     try index.appendSlice(a, "{\"weight_map\":{");
     for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
         for ([_][]const u8{ "trellis", "suh", "svh" }, 0..) |part, ci| {
-            const key = try std.fmt.allocPrintSentinel(a, "{s}.{s}.{s}", .{ glm5_mod.ROUTED_BANK_PREFIX, proj, part }, 0);
+            const key = try std.fmt.allocPrint(a, "{s}.{s}.{s}", .{ glm5_mod.ROUTED_BANK_PREFIX, proj, part });
             defer a.free(key);
-            try mlx.check(mlx.mlx_map_string_to_array_insert(map, key.ptr, weights.get(key) orelse return error.MissingFixtureTensor));
+            try map.putRetained(key, weights.get(key) orelse return error.MissingFixtureTensor);
             const entry = try std.fmt.allocPrint(a, "{s}\"{s}\":\"experts.safetensors\"", .{ if (pi + ci == 0) "" else ",", key });
             defer a.free(entry);
             try index.appendSlice(a, entry);
         }
     }
     try index.appendSlice(a, "}}");
-    const meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
-    const file = try std.fmt.allocPrintSentinel(a, "{s}/experts.safetensors", .{path}, 0);
+    const file = try std.fmt.allocPrint(a, "{s}/experts.safetensors", .{path});
     defer a.free(file);
-    try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
+    _ = try map.writeFile(testing.io, file, mlx.gpuStream());
     try dir.writeFile(testing.io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
 }
 

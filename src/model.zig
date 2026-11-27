@@ -1,6 +1,7 @@
 const std = @import("std");
 const test_note = @import("test_note.zig");
 const mlx = @import("mlx.zig");
+const safetensors = @import("safetensors.zig");
 const log = @import("log.zig");
 const load_clock = @import("load_clock.zig");
 
@@ -2932,11 +2933,6 @@ test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-pa
     // Build a tiny map: an f16 "scales", an f16 "biases", an f16 plain weight
     // (must NOT be cast), and a bf16 scales (no-op).
     {
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-
         const shape = [_]c_int{ 4, 4 };
         const data: [16]f32 = @splat(0.5);
         const f32_arr = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
@@ -2947,14 +2943,14 @@ test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-pa
         var bf16_arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(bf16_arr);
         try mlx.check(mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s));
-        try mlx.check(mlx.mlx_array_eval(f16_arr));
-        try mlx.check(mlx.mlx_array_eval(bf16_arr));
 
-        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.gate_proj.scales", f16_arr);
-        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.gate_proj.biases", f16_arr);
-        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.up_proj.weight", f16_arr);
-        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.down_proj.scales", bf16_arr);
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+        const tensors = [_]safetensors.Tensor{
+            .{ .key = "model.layers.0.mlp.gate_proj.scales", .arr = f16_arr },
+            .{ .key = "model.layers.0.mlp.gate_proj.biases", .arr = f16_arr },
+            .{ .key = "model.layers.0.mlp.up_proj.weight", .arr = f16_arr },
+            .{ .key = "model.layers.0.mlp.down_proj.scales", .arr = bf16_arr },
+        };
+        _ = try safetensors.saveFile(allocator, io, st_path, &tensors, &.{}, s);
     }
 
     var weights = try loadWeights(io, allocator, dir_path);
@@ -4502,19 +4498,12 @@ test "loadSafetensorsFile returns what MLX's own safetensors loader returns, dty
     defer weights.deinit();
     try loadSafetensorsFile(a, &weights, path, cpu, false);
 
-    var want = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(want);
-    var meta = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta);
-    try mlx.check(mlx.mlx_load_safetensors(&want, &meta, path, cpu));
+    var want = try safetensors.loadFile(a, t.io, path, cpu);
+    defer want.deinit();
     try t.expectEqual(specs.len - 1, weights.count());
     try t.expect(weights.get("vision_tower.dropped.weight") == null);
     for (specs[0 .. specs.len - 1]) |spec| {
-        const name = try a.dupeSentinel(u8, spec.name, 0);
-        defer a.free(name);
-        var ref = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ref);
-        try mlx.check(mlx.mlx_map_string_to_array_get(&ref, want, name));
+        const ref = want.get(spec.name).?;
         const got = weights.get(spec.name).?;
         try t.expectEqual(mlx.mlx_array_dtype(ref), mlx.mlx_array_dtype(got));
         try t.expectEqualSlices(c_int, mlx.getShape(ref), mlx.getShape(got));

@@ -1,6 +1,7 @@
 //! Independent oMLX MLA fixture checks; native attention remains separately tested.
 const std = @import("std");
 const mlx = @import("../mlx.zig");
+const safetensors = @import("../safetensors.zig");
 const model = @import("../model.zig");
 const base = @import("glm5_model.zig");
 const forward = @import("glm5_forward.zig");
@@ -9,33 +10,20 @@ const Arr = mlx.mlx_array;
 
 fn fixture() !model.Weights {
     const t = std.testing;
-    var tmp = t.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.writeFile(t.io, .{ .sub_path = "mla.safetensors", .data = @embedFile("../fixtures/glm5_mla.safetensors") });
-    var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const n = try tmp.dir.realPath(t.io, &buffer);
-    const path = try std.fmt.allocPrintSentinel(t.allocator, "{s}/mla.safetensors", .{buffer[0..n]}, 0);
-    defer t.allocator.free(path);
-    var tensors = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensors);
-    var metadata = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(metadata);
     const cpu = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(cpu);
-    try mlx.check(mlx.mlx_load_safetensors(&tensors, &metadata, path.ptr, cpu));
-    const it = mlx.mlx_map_string_to_array_iterator_new(tensors);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
+    var loaded = try safetensors.loadBytes(t.allocator, @embedFile("../fixtures/glm5_mla.safetensors"), cpu);
+    defer loaded.deinit();
     var out = model.Weights.init(t.allocator);
     errdefer out.deinit();
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var value = mlx.mlx_array_new();
-        if (mlx.mlx_map_string_to_array_iterator_next(&key, &value, it) != 0 or key == null) {
-            _ = mlx.mlx_array_free(value);
-            break;
-        }
-        try mlx.check(mlx.mlx_array_eval(value));
-        try out.map.put(try t.allocator.dupe(u8, std.mem.span(key.?)), value);
+    var it = loaded.tensors.iterator();
+    while (it.next()) |e| {
+        const value = e.value_ptr.*;
+        e.value_ptr.* = .{};
+        errdefer _ = mlx.mlx_array_free(value);
+        const k = try t.allocator.dupe(u8, e.key_ptr.*);
+        errdefer t.allocator.free(k);
+        try out.map.put(k, value);
     }
     return out;
 }

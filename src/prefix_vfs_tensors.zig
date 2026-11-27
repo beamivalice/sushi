@@ -1,27 +1,33 @@
-//! Tensor files on the prefix VFS: the MLX glue between arrays and `prefix_vfs.zig`'s byte blocks.
+//! Tensor files on the prefix VFS: content-addressed block codec between arrays and `prefix_vfs.zig`'s byte blocks.
 //!
-//! A file is the safetensors file the SSD tier writes today, stored as blocks:
+//! A file is a standard safetensors image stored as blocks:
 //!   - a tensor with a `RowMap` is cut at absolute token positions that are multiples of `GROUP_TOKENS`; one block holds
 //!     one group's rows of one tensor, head by head (`[outer, rows, inner]` gathered per outer index), so a file that
 //!     grows or shifts keeps the blocks of every group it holds whole;
 //!   - any other tensor is cut at `FIXED_PART` bytes;
 //!   - the header block comes last, so the unchanged blocks of a rewritten file are a prefix of its block list.
 //! Every segment is tagged `(tensor | axis + 1 << 24, group or part)`, so a load needs no row map: the file says how to
-//! put itself back. All MLX calls (the readback in `stageTensors`, the arrays `loadTensors` builds) run on the caller's
-//! thread; the VFS steps that follow a `stageTensors` touch bytes only.
+//! put itself back. `loadTensors` pins the file, releases the VFS lock, checks each block's XXH3 hash, and scatters block
+//! bytes directly into Cooler `metal.Buffer` tensors or MLX arrays via `safetensors.zig` without reconstructing any
+//! safetensors byte stream or calling `mlx_load_safetensors_reader`.
 
 const std = @import("std");
 const xxh3 = @import("xxh3.zig");
 const mlx = @import("mlx.zig");
 const prefix_vfs = @import("prefix_vfs.zig");
-const disk_format = @import("disk_format.zig");
+const st = @import("safetensors.zig");
 const log = @import("log.zig");
 
 const Allocator = std.mem.Allocator;
 const Vfs = prefix_vfs.Vfs;
 const Segment = prefix_vfs.Segment;
 
-pub const MetaPair = disk_format.MetaPair;
+pub const MetaPair = st.MetaPair;
+pub const Tensor = st.Tensor;
+pub const Loaded = st.Loaded;
+pub const Named = st.Named;
+pub const Sink = st.Sink;
+pub const bytesOf = st.bytesOf;
 
 /// Rows are grouped by absolute token position in groups of this many tokens.
 pub const GROUP_TOKENS: u64 = 256;
@@ -32,104 +38,15 @@ const AXIS_SHIFT = 24;
 const MAX_TENSORS: usize = 1 << AXIS_SHIFT;
 const MAX_AXIS = 16;
 
-pub const Tensor = struct { key: []const u8, arr: mlx.mlx_array };
-
 /// Which axis of a tensor holds rows, the absolute token position of row 0, and the tokens one row covers.
 pub const RowMap = struct { axis: u8, pos0: u64 = 0, per_row: u32 = 1 };
 
-/// What `mlx_load_safetensors` returns: the caller owns both maps.
-pub const Loaded = struct {
-    tensors: mlx.mlx_map_string_to_array,
-    meta: mlx.mlx_map_string_to_string,
-
-    pub fn deinit(self: Loaded) void {
-        _ = mlx.mlx_map_string_to_array_free(self.tensors);
-        _ = mlx.mlx_map_string_to_string_free(self.meta);
-    }
-};
-
-fn nbytesOf(a: mlx.mlx_array) u64 {
-    return @as(u64, mlx.mlx_array_size(a)) * @as(u64, mlx.mlx_array_itemsize(a));
-}
-
-fn dtypeName(d: mlx.mlx_dtype) ?[]const u8 {
-    return switch (d) {
-        .bool_ => "BOOL",
-        .uint8 => "U8",
-        .uint16 => "U16",
-        .uint32 => "U32",
-        .uint64 => "U64",
-        .int8 => "I8",
-        .int16 => "I16",
-        .int32 => "I32",
-        .int64 => "I64",
-        .float16 => "F16",
-        .float32 => "F32",
-        .bfloat16 => "BF16",
-        else => null,
-    };
-}
-
-fn dtypeFromName(name: []const u8) ?mlx.mlx_dtype {
-    for (std.enums.values(mlx.mlx_dtype)) |d| {
-        if (dtypeName(d)) |n| if (std.mem.eql(u8, n, name)) return d;
-    }
-    return null;
-}
-
-fn itemSize(d: mlx.mlx_dtype) usize {
-    return switch (d) {
-        .bool_, .uint8, .int8 => 1,
-        .uint16, .int16, .float16, .bfloat16 => 2,
-        .uint32, .int32, .float32 => 4,
-        .uint64, .int64, .float64, .complex64 => 8,
-    };
-}
-
-/// The bytes of an evaluated, contiguous array; null for a dtype the tier does not store.
-pub fn bytesOf(arr: mlx.mlx_array) ?[]const u8 {
-    const n: usize = @intCast(nbytesOf(arr));
-    if (n == 0) return &.{};
-    const p: [*]const u8 = switch (mlx.mlx_array_dtype(arr)) {
-        .bool_ => @ptrCast(mlx.mlx_array_data_bool(arr) orelse return null),
-        .uint8, .int8 => @ptrCast(mlx.mlx_array_data_uint8(arr) orelse return null),
-        .uint32, .int32 => @ptrCast(mlx.mlx_array_data_uint32(arr) orelse return null),
-        .float32 => @ptrCast(mlx.mlx_array_data_float32(arr) orelse return null),
-        .float16 => @ptrCast(mlx.mlx_array_data_float16(arr) orelse return null),
-        .bfloat16 => @ptrCast(mlx.mlx_array_data_bfloat16(arr) orelse return null),
-        else => return null,
-    };
-    return p[0..n];
-}
-
-const HeaderSource = struct {
-    tensors: []const Tensor,
-
-    pub fn len(self: HeaderSource) usize {
-        return self.tensors.len;
-    }
-
-    pub fn desc(self: HeaderSource, i: usize) !disk_format.TensorDesc {
-        const t = self.tensors[i];
-        return .{
-            .key = t.key,
-            .dtype = dtypeName(mlx.mlx_array_dtype(t.arr)) orelse return error.DiskCacheBadDtype,
-            .shape = mlx.getShape(t.arr),
-            .nbytes = nbytesOf(t.arr),
-        };
-    }
-};
-
-fn encodeHeader(allocator: Allocator, tensors: []const Tensor, meta: []const MetaPair) ![]u8 {
-    return disk_format.encodeHeader(allocator, HeaderSource{ .tensors = tensors }, meta);
-}
-
 /// The byte size of the safetensors file for `tensors` and `meta`, without reading any array back.
 pub fn encodedSize(allocator: Allocator, tensors: []const Tensor, meta: []const MetaPair) !u64 {
-    const head = try encodeHeader(allocator, tensors, meta);
+    const head = try st.encodeHeader(allocator, tensors, meta);
     defer allocator.free(head);
     var n: u64 = head.len;
-    for (tensors) |t| n += nbytesOf(t.arr);
+    for (tensors) |t| n += st.nbytesOf(t.arr);
     return n;
 }
 
@@ -145,28 +62,6 @@ fn validate(tensors: []const Tensor, row_maps: []const ?RowMap) !void {
         const m = m_opt orelse continue;
         if (m.per_row == 0 or m.axis >= MAX_AXIS or m.axis >= mlx.mlx_array_ndim(t.arr)) return error.DiskCacheBadShape;
     }
-}
-
-/// Every array contiguous and evaluated by one batched `mlx_eval`, as `mlx::core::save_safetensors` does.
-fn materialize(allocator: Allocator, tensors: []const Tensor, s: mlx.mlx_stream) ![]mlx.mlx_array {
-    const out = try allocator.alloc(mlx.mlx_array, tensors.len);
-    var made: usize = 0;
-    errdefer {
-        for (out[0..made]) |a| _ = mlx.mlx_array_free(a);
-        allocator.free(out);
-    }
-    const scope = mlx.engine.enter(s);
-    defer scope.end();
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    for (tensors, out) |t, *slot| {
-        slot.* = mlx.mlx_array_new();
-        made += 1;
-        try mlx.check(mlx.mlx_contiguous(slot, t.arr, false, s));
-        try mlx.check(mlx.mlx_vector_array_append_value(vec, slot.*));
-    }
-    try mlx.check(mlx.mlx_eval(vec));
-    return out;
 }
 
 const Cut = struct {
@@ -230,7 +125,7 @@ fn planPieces(allocator: Allocator, row_maps: []const ?RowMap, conts: []const ml
         const m = if (row_maps.len == 0) null else row_maps[ti];
         if (m) |map| {
             const shape = mlx.getShape(arr);
-            if (nbytesOf(arr) == 0) continue;
+            if (st.nbytesOf(arr) == 0) continue;
             try cutRows(&cuts, allocator, ti, map, @intCast(shape[map.axis]));
         }
     }
@@ -239,12 +134,12 @@ fn planPieces(allocator: Allocator, row_maps: []const ?RowMap, conts: []const ml
         const arr = conts[c.tensor];
         const map = row_maps[c.tensor].?;
         const rows: usize = @intCast(mlx.getShape(arr)[map.axis]);
-        const row_bytes: usize = @intCast(nbytesOf(arr) / rows);
+        const row_bytes: usize = @intCast(st.nbytesOf(arr) / rows);
         try pieces.append(allocator, .{ .what = .rows, .ti = c.tensor, .tag = rowTag(c.tensor, map.axis), .group = c.group, .from = c.from, .to = c.to, .len = (c.to - c.from) * row_bytes });
     }
     for (conts, 0..) |arr, ti| {
         if (row_maps.len != 0 and row_maps[ti] != null) continue;
-        const n: usize = @intCast(nbytesOf(arr));
+        const n: usize = @intCast(st.nbytesOf(arr));
         var off: usize = 0;
         var part: u32 = 0;
         while (off < n) : (part += 1) {
@@ -260,7 +155,7 @@ fn planPieces(allocator: Allocator, row_maps: []const ?RowMap, conts: []const ml
 /// The bytes of a rows or fixed piece, into `dst` (`p.len` bytes).
 fn fillPiece(p: Piece, row_maps: []const ?RowMap, conts: []const mlx.mlx_array, dst: []u8) !void {
     const arr = conts[p.ti];
-    const src = bytesOf(arr) orelse return error.DiskCacheUnreadable;
+    const src = st.bytesOf(arr) orelse return error.DiskCacheUnreadable;
     switch (p.what) {
         .rows => {
             const map = row_maps[p.ti].?;
@@ -268,7 +163,7 @@ fn fillPiece(p: Piece, row_maps: []const ?RowMap, conts: []const mlx.mlx_array, 
             const rows: usize = @intCast(shape[map.axis]);
             var outer: usize = 1;
             for (shape[0..map.axis]) |d| outer *= @intCast(d);
-            const inner_bytes: usize = @intCast(nbytesOf(arr) / (outer * rows));
+            const inner_bytes: usize = @intCast(st.nbytesOf(arr) / (outer * rows));
             gather(dst, src, outer, rows, inner_bytes, p.from, p.to);
         },
         .fixed => @memcpy(dst, src[p.from..p.to]),
@@ -291,10 +186,10 @@ pub const Parts = struct {
     /// `row_maps` is empty or parallel to `tensors`, and must outlive the `Parts`.
     pub fn init(allocator: Allocator, tensors: []const Tensor, meta: []const MetaPair, row_maps: []const ?RowMap, s: mlx.mlx_stream) !Parts {
         try validate(tensors, row_maps);
-        const head = try encodeHeader(allocator, tensors, meta);
+        const head = try st.encodeHeader(allocator, tensors, meta);
         errdefer allocator.free(head);
-        const conts = try materialize(allocator, tensors, s);
-        errdefer freeConts(allocator, conts);
+        const conts = try st.materialize(allocator, tensors, s);
+        errdefer st.freeArrays(allocator, conts);
         const pieces = try planPieces(allocator, row_maps, conts, head.len);
         var size: u64 = 0;
         for (pieces) |p| size += p.len;
@@ -303,7 +198,7 @@ pub const Parts = struct {
 
     pub fn deinit(self: *Parts) void {
         if (self.head) |h| self.allocator.free(h);
-        freeConts(self.allocator, self.conts);
+        st.freeArrays(self.allocator, self.conts);
         self.allocator.free(self.pieces);
     }
 
@@ -351,14 +246,9 @@ pub const Parts = struct {
     }
 };
 
-fn freeConts(allocator: Allocator, conts: []mlx.mlx_array) void {
-    for (conts) |c| _ = mlx.mlx_array_free(c);
-    allocator.free(conts);
-}
-
-/// Reads `tensors` back from MLX on the caller's thread and holds the file's blocks in `vfs`. The VFS steps that follow
-/// (`appendBlocks`, `fillBlocks`, `journalRecord`, `publishTicket`) never touch an array. `row_maps` is empty or parallel to `tensors`.
-/// The ticket's `size` is the safetensors file's size. A refused input stages nothing.
+/// Reads `tensors` back on the caller's thread and holds the file's blocks in `vfs`. The VFS steps that follow
+/// (`appendBlocks`, `fillBlocks`, `journalRecord`, `publishTicket`) never touch an array. `row_maps` is empty or
+/// parallel to `tensors`. The ticket's `size` is the safetensors file's size. A refused input stages nothing.
 pub fn stageTensors(
     vfs: *Vfs,
     path: []const u8,
@@ -374,7 +264,7 @@ pub fn stageTensors(
     return vfs.hold(path, mode, try parts.take(std.math.maxInt(u64), kind));
 }
 
-/// `stageTensors` and the four VFS steps in one call: the file is visible when it returns. Returns the file's size.
+/// `stageTensors` and the VFS publish in one call: the file is visible when it returns. Returns the file's size.
 pub fn saveTensors(
     vfs: *Vfs,
     path: []const u8,
@@ -396,6 +286,10 @@ const Entry = struct {
     /// 0 for a fixed tensor, `axis + 1` for a row tensor.
     code: u32 = 0,
     blocks: std.ArrayList(u32) = .empty,
+
+    fn named(self: *const Entry) Named {
+        return .{ .key = self.key, .dtype = self.dtype, .shape = self.shape };
+    }
 };
 
 /// A file's payload, parsed: the header's tensors and which blocks hold each.
@@ -466,10 +360,6 @@ const Decoded = struct {
     }
 };
 
-fn jsonInt(v: std.json.Value) ?i64 {
-    return if (v == .integer) v.integer else null;
-}
-
 fn decode(vfs: *Vfs, allocator: Allocator, path: []const u8) !Decoded {
     var payload = try vfs.readPayload(allocator, path);
     errdefer payload.deinit(allocator);
@@ -499,157 +389,62 @@ const Layout = struct { entries: []Entry, meta: []MetaPair };
 /// The header `head` (block `hi` of a file whose blocks carry `tags`) parsed: its tensors, each with the blocks that
 /// hold it, and its metadata. Allocated in `aa`.
 fn parseLayout(aa: Allocator, head: []const u8, tags: []const u32, hi: usize) !Layout {
-    if (head.len < 8 or std.mem.readInt(u64, head[0..8], .little) != head.len - 8) return error.VfsCorrupt;
-    const root = std.json.parseFromSliceLeaky(std.json.Value, aa, head[8..], .{ .allocate = .alloc_always }) catch return error.VfsCorrupt;
-    if (root != .object) return error.VfsCorrupt;
-
-    var entries: std.ArrayList(Entry) = .empty;
-    var meta: std.ArrayList(MetaPair) = .empty;
-    var it = root.object.iterator();
-    while (it.next()) |kv| {
-        if (std.mem.eql(u8, kv.key_ptr.*, "__metadata__")) {
-            if (kv.value_ptr.* != .object) return error.VfsCorrupt;
-            var mit = kv.value_ptr.object.iterator();
-            while (mit.next()) |m| {
-                if (m.value_ptr.* != .string) return error.VfsCorrupt;
-                try meta.append(aa, .{ .key = m.key_ptr.*, .value = m.value_ptr.string });
-            }
-            continue;
-        }
-        const obj = kv.value_ptr.*;
-        if (obj != .object) return error.VfsCorrupt;
-        const dt = obj.object.get("dtype") orelse return error.VfsCorrupt;
-        const sh = obj.object.get("shape") orelse return error.VfsCorrupt;
-        if (dt != .string or sh != .array) return error.VfsCorrupt;
-        const dtype = dtypeFromName(dt.string) orelse return error.VfsCorrupt;
-        const shape = try aa.alloc(c_int, sh.array.items.len);
-        var nbytes: usize = itemSize(dtype);
-        for (sh.array.items, shape) |d, *slot| {
-            const v = std.math.cast(c_int, jsonInt(d) orelse return error.VfsCorrupt) orelse return error.VfsCorrupt;
-            if (v < 0) return error.VfsCorrupt;
-            slot.* = v;
-            nbytes *= @intCast(v);
-        }
-        try entries.append(aa, .{ .key = kv.key_ptr.*, .dtype = dtype, .shape = shape, .nbytes = nbytes });
+    const parsed = st.parseHeader(aa, head) catch return error.VfsCorrupt;
+    const entries = try aa.alloc(Entry, parsed.entries.len);
+    for (parsed.entries, entries) |pe, *e| {
+        e.* = .{ .key = pe.key, .dtype = pe.dtype, .shape = pe.shape, .nbytes = pe.nbytes };
     }
-
     for (tags, 0..) |tag, i| {
         if (i == hi) continue;
         const ti = tag & (MAX_TENSORS - 1);
         const code = tag >> AXIS_SHIFT;
-        if (ti >= entries.items.len) return error.VfsCorrupt;
-        const e = &entries.items[ti];
+        if (ti >= entries.len) return error.VfsCorrupt;
+        const e = &entries[ti];
         if (e.blocks.items.len != 0 and e.code != code) return error.VfsCorrupt;
         e.code = code;
         try e.blocks.append(aa, @intCast(i));
     }
-    return .{ .entries = entries.items, .meta = meta.items };
+    return .{ .entries = entries, .meta = parsed.meta };
 }
 
-/// The file as `mlx_load_safetensors` would give it: same names, dtypes, shapes, bytes and metadata. A block whose
-/// checksum fails, or a file that does not parse, raises `error.MlxError`, the error a corrupt file raises today. The
-/// file's blocks are pinned and MLX reads them as it reads a plain file: lazily, on its IO threads, into its own
-/// buffers, with no layer lock held. Every tensor is evaluated before the load returns, so a bad block fails here.
-/// On the engine's stream the tensors and both maps are the engine's, filled from the blocks on this thread.
+/// Loads `path` directly from its VFS blocks into Cooler Metal buffers (when `s` is Cooler's stream) or evaluated MLX
+/// arrays, checking each block's XXH3 hash with no layer lock held. A block whose checksum fails, or a file that does
+/// not parse, raises `error.MlxError`.
 pub fn loadTensors(vfs: *Vfs, path: []const u8, s: mlx.mlx_stream) !Loaded {
     const src = Source.open(vfs, path) catch |e| return loadError(path, e);
-    if (mlx.engine.isStream(s)) {
-        defer src.close();
-        return loadOwn(src, s) catch |e| loadError(path, e);
-    }
-    const reader = mlx.mlx_io_reader_new(src, Source.vtable);
-    if (reader.ctx == null) {
-        src.close();
-        return error.MlxError;
-    }
-    // From here MLX owns `src`: it goes with the reader and the last tensor read from it.
-    defer _ = mlx.mlx_io_reader_free(reader);
-    return loadFrom(src, reader) catch |e| loadError(path, e);
+    defer src.close();
+    return loadPinned(src, s) catch |e| loadError(path, e);
 }
 
-/// A tensor file held in memory as its bytes (`serializeSafetensors`' encoding), loaded as `loadTensors` loads one from
-/// the layer: the same names, dtypes, shapes, bytes and metadata; on the engine's stream into the engine's buffers,
-/// else as MLX arrays on the CPU, evaluated. A buffer that does not parse raises `error.MlxError`, as a corrupt file does.
+fn loadPinned(src: *Source, s: mlx.mlx_stream) !Loaded {
+    const scope = if (mlx.engine.isStream(s)) mlx.engine.enter(s) else null;
+    defer if (scope) |sc| sc.end();
+    var loaded = Loaded.init(src.vfs.allocator);
+    errdefer loaded.deinit();
+    const BlockFill = struct {
+        src: *Source,
+        e: *const Entry,
+        fn run(ctx: @This(), dst: []u8) anyerror!void {
+            try fillEntry(ctx.src.vfs, ctx.src.pf, ctx.src.checked, ctx.e, dst);
+        }
+    };
+    for (src.entries) |*e| {
+        const arr = try st.makeArrayFilled(src.vfs.allocator, e.dtype, e.shape, e.nbytes, s, BlockFill{ .src = src, .e = e }, BlockFill.run);
+        errdefer _ = mlx.mlx_array_free(arr);
+        try loaded.put(e.key, arr);
+    }
+    for (src.meta) |m| try loaded.putMeta(m.key, m.value);
+    return loaded;
+}
+
+/// Loads an in-memory safetensors image directly into Cooler Metal buffers or MLX arrays. A buffer that does not parse
+/// raises `error.MlxError`.
 pub fn loadBytes(allocator: Allocator, bytes: []const u8, s: mlx.mlx_stream) !Loaded {
-    return loadBytesOr(allocator, bytes, s) catch |e| switch (e) {
+    return st.loadBytes(allocator, bytes, s) catch |e| switch (e) {
         error.OutOfMemory => e,
         else => error.MlxError,
     };
 }
-
-fn loadBytesOr(allocator: Allocator, bytes: []const u8, s: mlx.mlx_stream) !Loaded {
-    if (bytes.len < 8) return error.VfsCorrupt;
-    const head_len = std.mem.readInt(u64, bytes[0..8], .little);
-    if (head_len > bytes.len - 8) return error.VfsCorrupt;
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    const aa = arena.allocator();
-    const head = bytes[0 .. 8 + @as(usize, @intCast(head_len))];
-    const lay = try parseLayout(aa, head, &.{}, 0);
-    const own = mlx.engine.isStream(s);
-    const scope = if (own) mlx.engine.enter(s) else null;
-    defer if (scope) |sc| sc.end();
-    var loaded: Loaded = .{ .tensors = mlx.mlx_map_string_to_array_new(), .meta = mlx.mlx_map_string_to_string_new() };
-    errdefer loaded.deinit();
-    if (loaded.tensors.ctx == null or loaded.meta.ctx == null) return error.OutOfMemory;
-    var at: usize = head.len;
-    for (lay.entries) |*e| {
-        if (e.nbytes > bytes.len - at) return error.VfsCorrupt;
-        const src = bytes[at..][0..e.nbytes];
-        at += e.nbytes;
-        const arr = if (own) blk: {
-            var buf: []u8 = undefined;
-            const a = mlx.engine.hostFilled(e.dtype, e.shape, &buf) orelse return error.MlxError;
-            @memcpy(buf, src);
-            break :blk a;
-        } else mlx.newData(src.ptr, e.shape, e.dtype) catch return error.MlxError;
-        defer _ = mlx.mlx_array_free(arr);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(loaded.tensors, try aa.dupeSentinel(u8, e.key, 0), arr));
-    }
-    if (at != bytes.len) return error.VfsCorrupt;
-    for (lay.meta) |m| try mlx.check(mlx.mlx_map_string_to_string_insert(loaded.meta, try aa.dupeSentinel(u8, m.key, 0), try aa.dupeSentinel(u8, m.value, 0)));
-    return loaded;
-}
-
-/// One tensor of a file, as a reader into its caller's own bytes names it (`Sink`).
-pub const Named = struct { key: []const u8, dtype: mlx.mlx_dtype, shape: []const c_int };
-
-/// Where a file's tensors are read: the bytes the caller names for each, exactly its size, or null to pass it over.
-/// `meta`, when set, sees the file's metadata before any tensor is named.
-pub const Sink = struct {
-    ctx: *anyopaque,
-    dest: *const fn (ctx: *anyopaque, t: Named) anyerror!?[]u8,
-    meta: ?*const fn (ctx: *anyopaque, meta: []const MetaPair) anyerror!void = null,
-
-    pub fn begin(sink: Sink, meta: []const MetaPair) !void {
-        if (sink.meta) |f| try f(sink.ctx, meta);
-    }
-
-    fn take(sink: Sink, e: *const Entry) !?[]u8 {
-        const out = (try sink.dest(sink.ctx, .{ .key = e.key, .dtype = e.dtype, .shape = e.shape })) orelse return null;
-        if (out.len != e.nbytes) return error.VfsCorrupt;
-        return out;
-    }
-};
-
-/// A tensor file's parsed header (`head`: its length word and JSON): its tensors in the order their bytes follow it,
-/// each its byte count, and its metadata. In `aa`.
-pub const Head = struct {
-    tensors: []const Named,
-    nbytes: []const usize,
-    meta: []const MetaPair,
-
-    pub fn parse(aa: Allocator, head: []const u8) !Head {
-        const lay = try parseLayout(aa, head, &.{}, 0);
-        const tensors = try aa.alloc(Named, lay.entries.len);
-        const nbytes = try aa.alloc(usize, lay.entries.len);
-        for (lay.entries, tensors, nbytes) |e, *t, *n| {
-            t.* = .{ .key = e.key, .dtype = e.dtype, .shape = e.shape };
-            n.* = e.nbytes;
-        }
-        return .{ .tensors = tensors, .nbytes = nbytes, .meta = lay.meta };
-    }
-};
 
 /// The pinned file `path`'s tensors read into the bytes `sink` names, each block checked as `loadTensors` checks it, and
 /// no array made; its metadata, in `aa`. A file that does not parse or a block that fails raises `error.MlxError`.
@@ -661,91 +456,21 @@ fn readIntoOr(vfs: *Vfs, path: []const u8, aa: Allocator, sink: Sink) ![]const M
     const src = try Source.open(vfs, path);
     defer src.close();
     try sink.begin(src.meta);
-    for (src.entries) |*e| if (try sink.take(e)) |out| try fillEntry(src.vfs, src.pf, src.checked, e, out);
+    for (src.entries) |*e| if (try sink.take(e.named(), e.nbytes)) |out| try fillEntry(src.vfs, src.pf, src.checked, e, out);
     const meta = try aa.alloc(MetaPair, src.meta.len);
     for (src.meta, meta) |m, *d| d.* = .{ .key = try aa.dupe(u8, m.key), .value = try aa.dupe(u8, m.value) };
     return meta;
 }
 
-/// `readInto` for a tensor file held in memory as its bytes (`serializeSafetensors`' encoding).
+/// `readInto` for a tensor file held in memory as its safetensors bytes.
 pub fn readBytesInto(bytes: []const u8, aa: Allocator, sink: Sink) ![]const MetaPair {
-    return readBytesIntoOr(bytes, aa, sink) catch |e| switch (e) {
+    return st.readBytesInto(bytes, aa, sink) catch |e| switch (e) {
         error.OutOfMemory => e,
         else => error.MlxError,
     };
 }
 
-fn readBytesIntoOr(bytes: []const u8, aa: Allocator, sink: Sink) ![]const MetaPair {
-    if (bytes.len < 8) return error.VfsCorrupt;
-    const head_len = std.mem.readInt(u64, bytes[0..8], .little);
-    if (head_len > bytes.len - 8) return error.VfsCorrupt;
-    const head = bytes[0 .. 8 + @as(usize, @intCast(head_len))];
-    const lay = try parseLayout(aa, head, &.{}, 0);
-    try sink.begin(lay.meta);
-    var at: usize = head.len;
-    for (lay.entries) |*e| {
-        if (e.nbytes > bytes.len - at) return error.VfsCorrupt;
-        if (try sink.take(e)) |out| @memcpy(out, bytes[at..][0..e.nbytes]);
-        at += e.nbytes;
-    }
-    if (at != bytes.len) return error.VfsCorrupt;
-    return lay.meta;
-}
-
-/// The tensor names of a file held as its bytes, in the order its header lists them, and its metadata. In `aa`.
-pub fn headerOfBytes(aa: Allocator, bytes: []const u8) !struct { keys: []const []const u8, meta: []const MetaPair } {
-    if (bytes.len < 8) return error.VfsCorrupt;
-    const head_len = std.mem.readInt(u64, bytes[0..8], .little);
-    if (head_len > bytes.len - 8) return error.VfsCorrupt;
-    const lay = try parseLayout(aa, bytes[0 .. 8 + @as(usize, @intCast(head_len))], &.{}, 0);
-    const keys = try aa.alloc([]const u8, lay.entries.len);
-    for (lay.entries, keys) |e, *k| k.* = e.key;
-    return .{ .keys = keys, .meta = lay.meta };
-}
-
-fn loadOwn(src: *Source, s: mlx.mlx_stream) !Loaded {
-    const scope = mlx.engine.enter(s);
-    defer scope.end();
-    var loaded: Loaded = .{ .tensors = mlx.mlx_map_string_to_array_new(), .meta = mlx.mlx_map_string_to_string_new() };
-    errdefer loaded.deinit();
-    if (loaded.tensors.ctx == null or loaded.meta.ctx == null) return error.OutOfMemory;
-    const aa = src.arena.allocator();
-    for (src.entries) |*e| {
-        var bytes: []u8 = undefined;
-        const arr = mlx.engine.hostFilled(e.dtype, e.shape, &bytes) orelse return error.MlxError;
-        defer _ = mlx.mlx_array_free(arr);
-        try fillEntry(src.vfs, src.pf, src.checked, e, bytes);
-        try mlx.check(mlx.mlx_map_string_to_array_insert(loaded.tensors, try aa.dupeSentinel(u8, e.key, 0), arr));
-    }
-    for (src.meta) |m| try mlx.check(mlx.mlx_map_string_to_string_insert(loaded.meta, try aa.dupeSentinel(u8, m.key, 0), try aa.dupeSentinel(u8, m.value, 0)));
-    return loaded;
-}
-
-fn loadFrom(src: *Source, reader: mlx.mlx_io_reader) !Loaded {
-    const cpu = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(cpu);
-    var loaded: Loaded = .{ .tensors = mlx.mlx_map_string_to_array_new(), .meta = mlx.mlx_map_string_to_string_new() };
-    errdefer loaded.deinit();
-    try mlx.check(mlx.mlx_load_safetensors_reader(&loaded.tensors, &loaded.meta, reader, cpu));
-    const all = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(all);
-    const it = mlx.mlx_map_string_to_array_iterator_new(loaded.tensors);
-    defer _ = mlx.mlx_map_string_to_array_iterator_free(it);
-    while (true) {
-        var key: ?[*:0]const u8 = null;
-        var arr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(arr);
-        if (mlx.mlx_map_string_to_array_iterator_next(&key, &arr, it) != 0 or key == null) break;
-        try mlx.check(mlx.mlx_vector_array_append_value(all, arr));
-    }
-    try mlx.check(mlx.mlx_eval(all));
-    if (src.bad.load(.acquire)) return error.VfsCorrupt;
-    return loaded;
-}
-
-/// A pinned file served to MLX as its safetensors bytes: the header from memory, each tensor gathered from its blocks
-/// when MLX reads it, each block checked against its hash unless this process already has. A read that fails, or that
-/// is not one whole tensor, sets `bad` and leaves its bytes unwritten.
+/// A pinned VFS file's parsed header and block list, held across reads with no layer lock held.
 const Source = struct {
     vfs: *Vfs,
     arena: std.heap.ArenaAllocator,
@@ -754,22 +479,6 @@ const Source = struct {
     head: []u8,
     entries: []Entry,
     meta: []MetaPair = &.{},
-    starts: []u64,
-    size: u64,
-    pos: u64 = 0,
-    bad: std.atomic.Value(bool) = .init(false),
-
-    const vtable: mlx.mlx_io_vtable = .{
-        .is_open = isOpen,
-        .good = good,
-        .tell = tell,
-        .seek = seek,
-        .read = read,
-        .read_at_offset = readAtOffset,
-        .write = write,
-        .label = label,
-        .free = free,
-    };
 
     fn open(vfs: *Vfs, path: []const u8) !*Source {
         const a = vfs.allocator;
@@ -778,7 +487,7 @@ const Source = struct {
         errdefer if (pinned) vfs.unpinFile(a, pf, &.{});
         const self = try a.create(Source);
         errdefer a.destroy(self);
-        self.* = .{ .vfs = vfs, .arena = .init(a), .pf = pf, .checked = &.{}, .head = &.{}, .entries = &.{}, .starts = &.{}, .size = 0 };
+        self.* = .{ .vfs = vfs, .arena = .init(a), .pf = pf, .checked = &.{}, .head = &.{}, .entries = &.{} };
         errdefer self.arena.deinit();
         const aa = self.arena.allocator();
         self.checked = try aa.alloc(bool, pf.placed.len);
@@ -791,13 +500,6 @@ const Source = struct {
         const lay = try parseLayout(aa, self.head, tags, hi);
         self.entries = lay.entries;
         self.meta = lay.meta;
-        self.starts = try aa.alloc(u64, lay.entries.len);
-        var at: u64 = self.head.len;
-        for (lay.entries, self.starts) |e, *st| {
-            st.* = at;
-            at += e.nbytes;
-        }
-        self.size = at;
         pinned = false;
         return self;
     }
@@ -807,63 +509,6 @@ const Source = struct {
         self.vfs.unpinFile(a, self.pf, self.checked);
         self.arena.deinit();
         a.destroy(self);
-    }
-
-    fn of(desc: ?*anyopaque) *Source {
-        return @ptrCast(@alignCast(desc.?));
-    }
-
-    fn readAt(self: *Source, dst: []u8, off: u64) void {
-        if (dst.len == 0) return;
-        if (off + dst.len <= self.head.len) {
-            @memcpy(dst, self.head[@intCast(off)..][0..dst.len]);
-            return;
-        }
-        for (self.entries, self.starts) |*e, st| {
-            if (st != off or e.nbytes != dst.len) continue;
-            fillEntry(self.vfs, self.pf, self.checked, e, dst) catch break;
-            return;
-        }
-        self.bad.store(true, .release);
-    }
-
-    fn isOpen(_: ?*anyopaque) callconv(.c) bool {
-        return true;
-    }
-    fn good(desc: ?*anyopaque) callconv(.c) bool {
-        return !of(desc).bad.load(.acquire);
-    }
-    fn tell(desc: ?*anyopaque) callconv(.c) usize {
-        return @intCast(of(desc).pos);
-    }
-    fn seek(desc: ?*anyopaque, off: i64, whence: c_int) callconv(.c) void {
-        const self = of(desc);
-        const base: i64 = switch (whence) {
-            std.c.SEEK.SET => 0,
-            std.c.SEEK.CUR => @intCast(self.pos),
-            std.c.SEEK.END => @intCast(self.size),
-            else => return self.bad.store(true, .release),
-        };
-        const to = base + off;
-        if (to < 0) return self.bad.store(true, .release);
-        self.pos = @intCast(to);
-    }
-    fn read(desc: ?*anyopaque, data: [*]u8, n: usize) callconv(.c) void {
-        const self = of(desc);
-        self.readAt(data[0..n], self.pos);
-        self.pos += n;
-    }
-    fn readAtOffset(desc: ?*anyopaque, data: [*]u8, n: usize, off: usize) callconv(.c) void {
-        of(desc).readAt(data[0..n], off);
-    }
-    fn write(desc: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) void {
-        of(desc).bad.store(true, .release);
-    }
-    fn label(_: ?*anyopaque) callconv(.c) [*:0]const u8 {
-        return "prefix-vfs";
-    }
-    fn free(desc: ?*anyopaque) callconv(.c) void {
-        of(desc).close();
     }
 };
 
@@ -929,7 +574,7 @@ fn fillEntry(vfs: *Vfs, pf: Vfs.PinnedFile, checked: []bool, e: *const Entry, ou
 
 fn loadError(path: []const u8, err: anyerror) anyerror {
     return switch (err) {
-        error.VfsCorrupt => blk: {
+        error.VfsCorrupt, error.SafetensorsCorrupt => blk: {
             log.warn("  [prefix-vfs] {s}: {s}\n", .{ path, @errorName(err) });
             break :blk error.MlxError;
         },

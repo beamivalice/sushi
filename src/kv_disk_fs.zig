@@ -1,8 +1,5 @@
-//! The SSD tier's file operations, on one of two backends: `real`, the plain files under the tier root, or
-//! `cas`, the content-addressed layer (`prefix_vfs.zig`) at `<root>/v`. Every call takes an absolute path under
-//! the root and answers as the plain files would: a `cas` tier sees the same names, sizes, link counts, inode
-//! classes and mtime order, and loads bitwise the same arrays. One call here is one filesystem operation of the
-//! plain path, issued at the same point (the mirroring rule of docs/engine-prefix-cache.md).
+//! The SSD tier's file operations on the content-addressed layer (`prefix_vfs.zig`) at `<root>/v`.
+//! Every call takes an absolute path under the tier root and routes it through the VFS.
 
 const std = @import("std");
 const io_util = @import("io_util.zig");
@@ -11,33 +8,16 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const prefix_vfs = @import("prefix_vfs.zig");
 const vt = @import("prefix_vfs_tensors.zig");
+const safetensors = @import("safetensors.zig");
 const disk_writer = @import("kv_disk_writer.zig");
 const write_stats = @import("disk_write_stats.zig");
 
 const Allocator = std.mem.Allocator;
 const Vfs = prefix_vfs.Vfs;
 
-pub const Backend = enum { real, cas };
-
 /// What the tier reads of a file.
 pub const Stat = struct { size: u64, nlink: u64, inode: u64, mtime_ns: i128 };
 pub const DirEntry = prefix_vfs.DirEntry;
-
-var env_backend: ?(error{PrefixFsUnknown}!Backend) = null;
-
-/// `SUSHI_PREFIX_FS`, read once: unset or `cas` takes the content-addressed layer, `real` the plain files.
-pub fn backendFromEnv() !Backend {
-    if (env_backend == null) env_backend = parseBackend(std.c.getenv("SUSHI_PREFIX_FS"));
-    return env_backend.?;
-}
-
-pub fn parseBackend(raw: ?[*:0]const u8) error{PrefixFsUnknown}!Backend {
-    const v = std.mem.span(raw orelse return .cas);
-    if (v.len == 0 or std.mem.eql(u8, v, "cas")) return .cas;
-    if (std.mem.eql(u8, v, "real")) return .real;
-    log.warn("[disk-cache] SUSHI_PREFIX_FS={s} is neither real nor cas\n", .{v});
-    return error.PrefixFsUnknown;
-}
 
 pub const Fs = struct {
     allocator: Allocator,
@@ -47,48 +27,38 @@ pub const Fs = struct {
     own_root: bool = false,
     /// A view of another `Fs`'s layer: `close` leaves it open.
     borrowed: bool = false,
-    vfs: ?*Vfs = null,
+    vfs: *Vfs,
     /// Where a synchronous mutation of the layer counts the pack and journal bytes it added (the tier's `stored`).
     stats: ?*write_stats.Stats = null,
     /// The writer's `land_mutex` while it runs: held around a synchronous mutation so its bytes are its own.
     land: ?*std.Io.Mutex = null,
 
-    pub fn open(allocator: Allocator, io: std.Io, root: []const u8, which: Backend) !Fs {
-        var self: Fs = .{ .allocator = allocator, .io = io, .root = root };
-        if (which == .cas) {
-            self.vfs = try Vfs.open(allocator, io, root, .{});
-            if (builtin.is_test) testing_layers.append(std.heap.page_allocator, .{ .root = root, .vfs = self.vfs.? }) catch {};
-        }
-        return self;
+    pub fn open(allocator: Allocator, io: std.Io, root: []const u8) !Fs {
+        const vfs = try Vfs.open(allocator, io, root, .{});
+        if (builtin.is_test) testing_layers.append(std.heap.page_allocator, .{ .root = root, .vfs = vfs }) catch {};
+        return .{ .allocator = allocator, .io = io, .root = root, .vfs = vfs };
     }
 
     /// `open` on a copy of `root`, for a caller that holds no tier.
-    pub fn openCopy(allocator: Allocator, io: std.Io, root: []const u8, which: Backend) !Fs {
+    pub fn openCopy(allocator: Allocator, io: std.Io, root: []const u8) !Fs {
         const own = try allocator.dupe(u8, root);
         errdefer allocator.free(own);
-        var self = try open(allocator, io, own, which);
+        var self = try open(allocator, io, own);
         self.own_root = true;
         return self;
     }
 
     pub fn close(self: *Fs) void {
         if (self.borrowed) return;
-        if (self.vfs) |v| {
-            if (builtin.is_test) {
-                for (testing_layers.items, 0..) |l, i| if (l.vfs == v) {
-                    _ = testing_layers.swapRemove(i);
-                    break;
-                };
-            }
-            v.close();
+        if (builtin.is_test) {
+            for (testing_layers.items, 0..) |l, i| if (l.vfs == self.vfs) {
+                _ = testing_layers.swapRemove(i);
+                break;
+            };
         }
-        self.vfs = null;
+        self.vfs.close();
         if (self.own_root) self.allocator.free(self.root);
         self.own_root = false;
-    }
-
-    pub fn backend(self: *const Fs) Backend {
-        return if (self.vfs != null) .cas else .real;
     }
 
     /// `path` below the root, without its `\x00`; null for a path outside it.
@@ -104,11 +74,7 @@ pub const Fs = struct {
     // ── queries ──
 
     pub fn stat(self: *const Fs, path: []const u8) ?Stat {
-        const v = self.vfs orelse {
-            const st = statFile(self.io, path) orelse return null;
-            return .{ .size = st.size, .nlink = st.nlink, .inode = @intCast(st.inode), .mtime_ns = st.mtime.nanoseconds };
-        };
-        const st = v.stat(self.rel(path) orelse return null) orelse return null;
+        const st = self.vfs.stat(self.rel(path) orelse return null) orelse return null;
         if (st.is_dir) return null;
         return .{ .size = st.size, .nlink = st.nlink, .inode = st.ino, .mtime_ns = st.mtime_ns };
     }
@@ -119,57 +85,25 @@ pub const Fs = struct {
 
     /// The whole file, or null when it is missing or longer than `limit`.
     pub fn readAlloc(self: *const Fs, allocator: Allocator, path: []const u8, limit: usize) ?[]u8 {
-        const v = self.vfs orelse return readFileAlloc(allocator, self.io, path, limit);
         const r = self.rel(path) orelse return null;
-        const st = v.stat(r) orelse return null;
+        const st = self.vfs.stat(r) orelse return null;
         if (st.is_dir or st.size > limit) return null;
-        return v.readBytes(allocator, r) catch null;
+        return self.vfs.readBytes(allocator, r) catch null;
     }
 
     /// Does the file begin with `want`?
     pub fn startsWith(self: *const Fs, path: []const u8, want: []const u8) bool {
-        const v = self.vfs orelse {
-            const f = std.Io.Dir.openFileAbsolute(self.io, path, .{}) catch return false;
-            defer f.close(self.io);
-            var rbuf: [16 * 1024]u8 = undefined;
-            var r = f.reader(self.io, &rbuf);
-            var off: usize = 0;
-            while (off < want.len) {
-                const n = @min(rbuf.len, want.len - off);
-                const got = r.interface.take(n) catch return false;
-                if (!std.mem.eql(u8, got, want[off..][0..n])) return false;
-                off += n;
-            }
-            return true;
-        };
-        const bytes = v.readBytes(self.allocator, self.rel(path) orelse return false) catch return false;
+        const bytes = self.vfs.readBytes(self.allocator, self.rel(path) orelse return false) catch return false;
         defer self.allocator.free(bytes);
         return std.mem.startsWith(u8, bytes, want);
     }
 
     /// The names directly inside directory `dir`. The caller frees them with `freeEntries`.
     pub fn list(self: *const Fs, allocator: Allocator, dir: []const u8) ![]DirEntry {
-        if (self.vfs) |v| {
-            const got = v.iterate(allocator, self.rel(dir) orelse return error.FileNotFound) catch |e| switch (e) {
-                error.FileNotFound => return &.{},
-                else => return e,
-            };
-            return got;
-        }
-        var out: std.ArrayList(DirEntry) = .empty;
-        errdefer {
-            for (out.items) |e| allocator.free(e.name);
-            out.deinit(allocator);
-        }
-        var d = std.Io.Dir.openDirAbsolute(self.io, dir, .{ .iterate = true }) catch return &.{};
-        defer d.close(self.io);
-        var it = d.iterate();
-        while (it.next(self.io) catch null) |dent| {
-            const name = try allocator.dupe(u8, dent.name);
-            errdefer allocator.free(name);
-            try out.append(allocator, .{ .name = name, .is_dir = dent.kind == .directory });
-        }
-        return out.toOwnedSlice(allocator);
+        return self.vfs.iterate(allocator, self.rel(dir) orelse return error.FileNotFound) catch |e| switch (e) {
+            error.FileNotFound => return &.{},
+            else => return e,
+        };
     }
 
     pub fn freeEntries(allocator: Allocator, entries: []DirEntry) void {
@@ -182,68 +116,51 @@ pub const Fs = struct {
     /// Physical bytes before a synchronous mutation of the layer; `counted` ends it.
     fn begin(self: *const Fs) u64 {
         if (self.land) |m| m.lockUncancelable(self.io);
-        return self.vfs.?.physicalBytes();
+        return self.vfs.physicalBytes();
     }
 
     /// Counts the bytes the mutation since `before` added under `kind`.
     fn counted(self: *const Fs, before: u64, kind: write_stats.Kind) void {
-        const n = self.vfs.?.physicalBytes() -| before;
+        const n = self.vfs.physicalBytes() -| before;
         if (self.land) |m| m.unlock(self.io);
         if (self.stats) |st| st.recordStored(kind, n);
     }
 
     pub fn deleteFile(self: *const Fs, path: []const u8) void {
-        const v = self.vfs orelse {
-            std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
-            return;
-        };
         const r = self.rel(path) orelse return;
         const before = self.begin();
         defer self.counted(before, .meta);
-        v.unlink(r) catch {};
+        self.vfs.unlink(r) catch {};
     }
 
     pub fn hardLink(self: *const Fs, old: []const u8, new: []const u8) !void {
         const old_sub = self.rel(old) orelse return error.BadPathName;
         const new_sub = self.rel(new) orelse return error.BadPathName;
-        const v = self.vfs orelse {
-            var root_dir = try std.Io.Dir.openDirAbsolute(self.io, self.root, .{});
-            defer root_dir.close(self.io);
-            return std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{});
-        };
         const before = self.begin();
         defer self.counted(before, .meta);
-        return v.link(old_sub, new_sub);
+        return self.vfs.link(old_sub, new_sub);
     }
 
     pub fn deleteTree(self: *const Fs, dir: []const u8) void {
         const sub = self.rel(dir) orelse return;
-        const v = self.vfs orelse {
-            var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{ .iterate = true }) catch return;
-            defer root_dir.close(self.io);
-            root_dir.deleteTree(self.io, sub) catch {};
-            return;
-        };
         const before = self.begin();
         defer self.counted(before, .meta);
-        v.deleteTree(sub) catch {};
+        self.vfs.deleteTree(sub) catch {};
     }
 
     pub fn mkdirp(self: *const Fs, dir: []const u8) !void {
-        const v = self.vfs orelse return io_util.makeDirPath(self.io, dir);
         const r = self.rel(dir) orelse return error.BadPathName;
         const before = self.begin();
         defer self.counted(before, .meta);
-        return v.mkdirp(r);
+        return self.vfs.mkdirp(r);
     }
 
     /// Creates `dir`; `error.PathAlreadyExists` when it exists.
     pub fn mkdirExclusive(self: *const Fs, dir: []const u8) !void {
-        const v = self.vfs orelse return std.Io.Dir.createDirAbsolute(self.io, dir, .default_dir);
         const r = self.rel(dir) orelse return error.BadPathName;
         const before = self.begin();
         defer self.counted(before, .meta);
-        return v.mkdirExclusive(r);
+        return self.vfs.mkdirExclusive(r);
     }
 
     // ── bytes ──
@@ -251,129 +168,82 @@ pub const Fs = struct {
     /// Writes `bytes` at byte `off` of `path` (created; truncated first when `truncate`), then sets its length to
     /// `len`: the token record's in-place append.
     pub fn writeAt(self: *const Fs, path: []const u8, truncate: bool, off: u64, bytes: []const u8, len: u64) !void {
-        const v = self.vfs orelse {
-            const f = try std.Io.Dir.createFileAbsolute(self.io, path, .{ .truncate = truncate });
-            defer f.close(self.io);
-            var wb: [8192]u8 = undefined;
-            var fw = f.writer(self.io, &wb);
-            try fw.seekTo(off);
-            try fw.interface.writeAll(bytes);
-            try fw.interface.flush();
-            try f.setLength(self.io, len);
-            return;
-        };
         const r = self.rel(path) orelse return error.BadPathName;
         const before = self.begin();
         defer self.counted(before, .meta);
-        if (truncate or v.stat(r) == null) {
-            try v.writeBytes(r, .meta, &.{});
+        if (truncate or self.vfs.stat(r) == null) {
+            try self.vfs.writeBytes(r, .meta, &.{});
         }
-        try v.appendBytes(r, off, bytes);
-        try v.setLength(r, len);
+        try self.vfs.appendBytes(r, off, bytes);
+        try self.vfs.setLength(r, len);
     }
 
     /// Writes `bytes` to `tmp`, then renames it to `final`.
     pub fn writeRenamed(self: *const Fs, tmp: []const u8, final: []const u8, bytes: []const u8) !void {
-        const v = self.vfs orelse {
-            {
-                const f = try std.Io.Dir.createFileAbsolute(self.io, tmp, .{});
-                defer f.close(self.io);
-                var wb: [1024]u8 = undefined;
-                var fw = f.writer(self.io, &wb);
-                try fw.interface.writeAll(bytes);
-                try fw.interface.flush();
-            }
-            return std.Io.Dir.renameAbsolute(tmp, final, self.io);
-        };
         const t = self.rel(tmp) orelse return error.BadPathName;
         const f = self.rel(final) orelse return error.BadPathName;
         const before = self.begin();
         defer self.counted(before, .meta);
-        try v.writeBytes(t, .meta, bytes);
-        try v.rename(t, f);
+        try self.vfs.writeBytes(t, .meta, bytes);
+        try self.vfs.rename(t, f);
     }
 
-    /// Writes `bytes` over `path` in place, as `open(O_TRUNC)` does: an existing file keeps its inode.
+    /// Writes `bytes` over `path` in place, keeping its inode if it exists.
     pub fn writeInPlace(self: *const Fs, path: []const u8, bytes: []const u8, kind: write_stats.Kind) !void {
-        const v = self.vfs orelse {
-            const f = try std.Io.Dir.createFileAbsolute(self.io, path, .{});
-            defer f.close(self.io);
-            var wb: [64 * 1024]u8 = undefined;
-            var fw = f.writer(self.io, &wb);
-            try fw.interface.writeAll(bytes);
-            try fw.interface.flush();
-            return;
-        };
         const r = self.rel(path) orelse return error.BadPathName;
         const before = self.begin();
         defer self.counted(before, kind);
-        try v.writeBytes(r, kind, bytes);
+        try self.vfs.writeBytes(r, kind, bytes);
     }
 
-    // ── tensors (cas only; the real arms stay in the tier) ──
+    // ── tensors ──
 
-    /// `mlx_load_safetensors` for `path` (with or without its `\x00`): the maps it fills are replaced.
-    pub fn loadSafetensors(self: *const Fs, path: []const u8, tensors: *mlx.mlx_map_string_to_array, meta: *mlx.mlx_map_string_to_string, cpu: mlx.mlx_stream) !void {
-        const v = self.vfs orelse {
-            std.debug.assert(path.len > 0 and path[path.len - 1] == 0);
-            return mlx.check(mlx.mlx_load_safetensors(tensors, meta, @ptrCast(path.ptr), cpu));
-        };
+    /// Loads a safetensors file directly into Cooler Metal buffers (on Cooler stream) or MLX arrays.
+    pub fn loadTensors(self: *const Fs, path: []const u8, s: mlx.mlx_stream) !safetensors.Loaded {
         const r = self.rel(path) orelse return error.MlxError;
-        // A missing or unreadable file fails as `mlx_load_safetensors` fails on it.
-        const loaded = vt.loadTensors(v, r, cpu) catch |e| return switch (e) {
+        return vt.loadTensors(self.vfs, r, s) catch |e| switch (e) {
             error.OutOfMemory => e,
             else => error.MlxError,
         };
-        _ = mlx.mlx_map_string_to_array_free(tensors.*);
-        _ = mlx.mlx_map_string_to_string_free(meta.*);
-        tensors.* = loaded.tensors;
-        meta.* = loaded.meta;
     }
 
     /// The tensors of the file at `path` (without its `\x00`) read into the bytes `into` names, no array made; its
-    /// metadata, in `aa`. A missing, short or unparsable file fails as `loadSafetensors` fails on it.
+    /// metadata, in `aa`. A missing, short or unparsable file fails as `loadTensors` fails on it.
     pub fn readTensorsInto(self: *const Fs, path: []const u8, aa: Allocator, into: vt.Sink) ![]const vt.MetaPair {
-        if (self.vfs) |v| return vt.readInto(v, self.rel(path) orelse return error.MlxError, aa, into);
-        return readFileInto(self.io, path, aa, into) catch |e| switch (e) {
-            error.OutOfMemory => e,
-            else => error.MlxError,
-        };
+        return vt.readInto(self.vfs, self.rel(path) orelse return error.MlxError, aa, into);
     }
 
     /// Writes a tensor file in place on the calling thread. Returns its size. `maps` is empty or parallel to `tensors`.
     pub fn saveTensorsNow(self: *const Fs, path: []const u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, maps: []const ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
-        const v = self.vfs.?;
         const r = self.rel(path) orelse return error.BadPathName;
-        const t = try vt.stageTensors(v, r, .overwrite, tensors, meta, maps, kind, s);
+        const t = try vt.stageTensors(self.vfs, r, .overwrite, tensors, meta, maps, kind, s);
         const before = self.begin();
         defer self.counted(before, kind);
-        return (try v.publish(t)).size;
+        return (try self.vfs.publish(t)).size;
     }
 
-    /// Stages a tensor file behind the writer's queue; it lands as a `tmp` + `rename` does. A file past the writer's
-    /// part size goes as parts of one ticket, each waiting for room as the plain path's parts do, and only the last
-    /// publishes; the caller writes no block. Takes `path`. `maps` is empty or parallel to `tensors`.
+    /// Stages a tensor file behind the writer's queue; it lands as a replace. A file past the writer's part size goes
+    /// as parts of one ticket, each waiting for room, and only the last publishes; the caller writes no block. Takes
+    /// `path`. `maps` is empty or parallel to `tensors`.
     pub fn stageTensors(self: *const Fs, w: *disk_writer.Writer, path: []u8, tensors: []const vt.Tensor, meta: []const vt.MetaPair, maps: []const ?vt.RowMap, kind: write_stats.Kind, s: mlx.mlx_stream) !u64 {
         var path_owned: ?[]u8 = path;
         defer if (path_owned) |p| self.allocator.free(p);
-        const v = self.vfs.?;
         const r = self.rel(path) orelse return error.BadPathName;
-        // The readback stays here (mlx arrays are inference-thread-owned); the writer gets parts of bytes, as
-        // `stageSafetensors` hands it a file's.
+        // The readback stays here (arrays are inference-thread-owned); the writer gets parts of bytes.
         var parts = try vt.Parts.init(self.allocator, tensors, meta, maps, s);
         defer parts.deinit();
         const part_max = w.partBytes();
         var ticket: ?u64 = null;
         errdefer if (ticket) |t| {
             w.fence(path);
-            v.abortTicket(t);
+            self.vfs.abortTicket(t);
         };
         while (!parts.done()) {
             const n = parts.nextLen(part_max);
             w.waitForRoom(@intCast(n));
             const payload = try parts.take(part_max, kind);
             const first = ticket == null;
-            if (ticket) |t| _ = try v.holdPart(t, payload) else ticket = (try v.hold(r, .replace, payload)).id;
+            if (ticket) |t| _ = try self.vfs.holdPart(t, payload) else ticket = (try self.vfs.hold(r, .replace, payload)).id;
             const last = parts.done();
             const part: disk_writer.Part = if (first and last) .whole else if (first) .first else if (last) .last else .middle;
             const op_path = if (last) path else try self.allocator.dupe(u8, path);
@@ -393,7 +263,7 @@ pub const Fs = struct {
             defer a.free(bytes);
             break :blk try ownedBytes(a, bytes, kind);
         };
-        const t = try self.vfs.?.hold(self.rel(path) orelse {
+        const t = try self.vfs.hold(self.rel(path) orelse {
             payload.deinit(a);
             return error.BadPathName;
         }, .replace, payload);
@@ -402,36 +272,31 @@ pub const Fs = struct {
     }
 
     fn sink(self: *const Fs) disk_writer.OpSink {
-        return .{ .ctx = self.vfs.?, .hashBlocks = Vfs.opHashBlocks, .appendBlocks = Vfs.opAppendBlocks, .fillBlocks = Vfs.opFillBlocks, .journalRecord = Vfs.opJournalRecord, .publish = Vfs.opPublish, .abort = Vfs.opAbort };
+        return .{ .ctx = self.vfs, .hashBlocks = Vfs.opHashBlocks, .appendBlocks = Vfs.opAppendBlocks, .fillBlocks = Vfs.opFillBlocks, .journalRecord = Vfs.opJournalRecord, .publish = Vfs.opPublish, .abort = Vfs.opAbort };
     }
 
     // ── accounting ──
 
-    /// The volume's free bytes as the plain files would leave them: the layer holds `physical` bytes where the
-    /// files would hold `logical`.
+    /// The volume's free bytes expressed in logical file bytes: the layer holds `physical` bytes where the files hold
+    /// `logical`.
     pub fn freeAsFiles(self: *const Fs, free: u64) u64 {
-        const v = self.vfs orelse return free;
-        return (free +| v.physicalBytes()) -| v.logicalBytes();
+        return (free +| self.vfs.physicalBytes()) -| self.vfs.logicalBytes();
     }
 
-    /// Gives the volume back the layer's dead bytes, as a plain file's unlink already did.
+    /// Gives the volume back the layer's dead bytes.
     pub fn reclaim(self: *const Fs) void {
-        const v = self.vfs orelse return;
-        _ = v.reclaim();
+        _ = self.vfs.reclaim();
     }
 
     /// The bytes the tier's files hold on the volume: the layer's packs, journal and snapshot, less the snapshot's state
-    /// record an empty layer keeps (`prefix_vfs.state_record_bytes`); null on plain files, whose bytes are the tier's
-    /// own count.
-    pub fn heldBytes(self: *const Fs) ?u64 {
-        const v = self.vfs orelse return null;
-        return v.bytesBeyondEmpty();
+    /// record an empty layer keeps (`prefix_vfs.state_record_bytes`).
+    pub fn heldBytes(self: *const Fs) u64 {
+        return self.vfs.bytesBeyondEmpty();
     }
 
     /// Folds the layer's journal into its snapshot, so the records of what was deleted stop holding the volume.
     pub fn compact(self: *const Fs) void {
-        const v = self.vfs orelse return;
-        v.compact() catch |err| log.warn("  [prefix-vfs] compacting the journal failed: {s}\n", .{@errorName(err)});
+        self.vfs.compact() catch |err| log.warn("  [prefix-vfs] compacting the journal failed: {s}\n", .{@errorName(err)});
     }
 };
 
@@ -467,34 +332,12 @@ pub fn readFileAlloc(allocator: Allocator, io: std.Io, abs_path: []const u8, lim
     return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
 }
 
-/// A plain tensor file's header parsed, then each tensor `into` names read at its offset straight into its bytes.
-fn readFileInto(io: std.Io, path: []const u8, aa: Allocator, into: vt.Sink) ![]const vt.MetaPair {
-    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer f.close(io);
-    var word: [8]u8 = undefined;
-    if (try f.readPositionalAll(io, &word, 0) != word.len) return error.EndOfStream;
-    const head_len = std.mem.readInt(u64, &word, .little);
-    if (head_len > 1 << 30) return error.EndOfStream;
-    const head = try aa.alloc(u8, 8 + @as(usize, @intCast(head_len)));
-    if (try f.readPositionalAll(io, head, 0) != head.len) return error.EndOfStream;
-    const h = try vt.Head.parse(aa, head);
-    try into.begin(h.meta);
-    var at: u64 = head.len;
-    for (h.tensors, h.nbytes) |t, n| {
-        defer at += n;
-        const out = (try into.dest(into.ctx, t)) orelse continue;
-        if (out.len != n) return error.EndOfStream;
-        if (try f.readPositionalAll(io, out, at) != n) return error.EndOfStream;
-    }
-    return h.meta;
-}
-
 comptime {
     // The token record is written as its in-memory bytes.
     std.debug.assert(builtin.cpu.arch.endian() == .little);
 }
 
-// ── Test helpers: a tier's files by absolute path, on the backend the run takes ──
+// ── Test helpers: a tier's files by absolute path, on its CAS layer ──
 
 const Layer = struct { root: []const u8, vfs: *Vfs };
 /// Test builds: every open layer, so a test reads a live tier's files through the layer that holds them.
@@ -509,7 +352,7 @@ pub fn testFiles(io: std.Io, path: []const u8) !Fs {
     }
     const root = entryRoot(path);
     try io_util.makeDirPath(io, root);
-    return Fs.openCopy(std.testing.allocator, io, root, try backendFromEnv());
+    return Fs.openCopy(std.testing.allocator, io, root);
 }
 
 /// `path` cut before its `/e<digits>` component.
@@ -535,17 +378,16 @@ pub fn testSize(io: std.Io, path: []const u8) ?u64 {
     return (testStat(io, path) orelse return null).size;
 }
 
-/// The file's bytes as the plain files hold them: a tensor file of the layer is regenerated from its blocks.
+/// The file's bytes: a tensor file of the layer is regenerated from its blocks.
 pub fn testRead(io: std.Io, path: []const u8, limit: usize) ?[]u8 {
     var f = testFiles(io, path) catch return null;
     defer f.close();
-    const v = f.vfs orelse return f.readAlloc(std.testing.allocator, path, limit);
     if (!std.mem.endsWith(u8, path, ".safetensors")) return f.readAlloc(std.testing.allocator, path, limit);
     const r = f.rel(path) orelse return null;
-    const st = v.stat(r) orelse return null;
+    const st = f.vfs.stat(r) orelse return null;
     if (st.is_dir or st.size > limit) return null;
     // A file a test wrote as plain bytes is its own image.
-    return vt.regenerate(v, std.testing.allocator, r) catch f.readAlloc(std.testing.allocator, path, limit);
+    return vt.regenerate(f.vfs, std.testing.allocator, r) catch f.readAlloc(std.testing.allocator, path, limit);
 }
 
 /// Writes `bytes` as the whole of `path`, creating its directory.
@@ -569,14 +411,13 @@ pub fn testMkdir(io: std.Io, path: []const u8) !void {
 }
 
 /// Flips one byte inside the first tensor block of file `path` on the content-addressed layer: rot that only the
-/// block's hash can tell. The plain layer keeps no hash, so a test of it skips.
+/// block's hash can tell.
 pub fn testFlipTensorByte(fs: *const Fs, path: []const u8) !void {
-    const v = fs.vfs orelse return error.SkipZigTest;
-    const pf = try v.pinFile(fs.allocator, fs.rel(path) orelse return error.FileNotFound);
-    defer v.unpinFile(fs.allocator, pf, &.{});
+    const pf = try fs.vfs.pinFile(fs.allocator, fs.rel(path) orelse return error.FileNotFound);
+    defer fs.vfs.unpinFile(fs.allocator, pf, &.{});
     for (pf.placed) |pl| {
         if (pl.tensor == prefix_vfs.UNTAGGED) continue;
-        return v.testFlipPlacedByte(pl);
+        return fs.vfs.testFlipPlacedByte(pl);
     }
     return error.FileNotFound;
 }
@@ -629,15 +470,7 @@ pub fn testList(io: std.Io, dir: []const u8) ![]DirEntry {
 
 const testing = std.testing;
 
-test "kv_disk_fs: SUSHI_PREFIX_FS takes cas by default, real on request, and refuses anything else" {
-    try testing.expectEqual(Backend.cas, try parseBackend(null));
-    try testing.expectEqual(Backend.cas, try parseBackend(""));
-    try testing.expectEqual(Backend.cas, try parseBackend("cas"));
-    try testing.expectEqual(Backend.real, try parseBackend("real"));
-    try testing.expectError(error.PrefixFsUnknown, parseBackend("files"));
-}
-
-test "kv_disk_fs: a tensor file reads into the bytes its reader names on the layer, as plain files and from its bytes, its metadata seen first and a tensor passed over left unread" {
+test "kv_disk_fs: a tensor file reads into the bytes its reader names on the layer, from a file and from its bytes, its metadata seen first and a tensor passed over left unread" {
     try mlx.requireGpu();
     const io = testing.io;
     const s = mlx.gpuStream();
@@ -645,7 +478,7 @@ test "kv_disk_fs: a tensor file reads into the bytes its reader names on the lay
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
-    var cas = try Fs.open(testing.allocator, io, root, .cas);
+    var cas = try Fs.open(testing.allocator, io, root);
     defer cas.close();
     var dir_buf: [600]u8 = undefined;
     try cas.mkdirp(try std.fmt.bufPrint(&dir_buf, "{s}/e1", .{root}));
@@ -676,8 +509,6 @@ test "kv_disk_fs: a tensor file reads into the bytes its reader names on the lay
         defer f.close(io);
         try f.writePositionalAll(io, image, 0);
     }
-    var plain = try Fs.open(testing.allocator, io, plain_root, .real);
-    defer plain.close();
     const Into = struct {
         out: [12]f32 = @splat(-1),
         /// The metadata lives only for the read: its `layers` value is kept as read.
@@ -709,7 +540,7 @@ test "kv_disk_fs: a tensor file reads into the bytes its reader names on the lay
         const sink: vt.Sink = .{ .ctx = &into, .dest = Into.dest, .meta = Into.meta };
         _ = switch (how) {
             0 => try cas.readTensorsInto(path, arena.allocator(), sink),
-            1 => try plain.readTensorsInto(plain_path, arena.allocator(), sink),
+            1 => try safetensors.readFileInto(io, plain_path, arena.allocator(), sink),
             else => try vt.readBytesInto(image, arena.allocator(), sink),
         };
         try testing.expect(!into.named_before_meta);
@@ -726,7 +557,7 @@ test "kv_disk_fs: a file larger than half the writer's permit goes to the writer
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fs = try Fs.open(testing.allocator, io, root, .cas);
+    var fs = try Fs.open(testing.allocator, io, root);
     defer fs.close();
     var w = disk_writer.Writer.init(testing.allocator, io);
     // Parts of 256 KiB: the 400 KB file is two, and both fit the permit while the writer is held.
@@ -745,9 +576,9 @@ test "kv_disk_fs: a file larger than half the writer's permit goes to the writer
     const probe = try std.fmt.bufPrint(&probe_buf, "{s}", .{path});
 
     w.setPaused(true);
-    const phys0 = fs.vfs.?.physicalBytes();
+    const phys0 = fs.vfs.physicalBytes();
     const n = try fs.stageTensors(&w, path, &.{.{ .key = "a", .arr = arr }}, &.{}, &.{}, .ssm, s);
-    try testing.expectEqual(phys0, fs.vfs.?.physicalBytes());
+    try testing.expectEqual(phys0, fs.vfs.physicalBytes());
     try testing.expect(fs.stat(probe) == null);
     try testing.expect(w.isPending(probe));
     w.setPaused(false);
@@ -773,7 +604,7 @@ fn landsBesideInference(at: @FieldType(prefix_vfs.Gate, "at")) !void {
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
-    var fs = try Fs.open(testing.allocator, io, root, .cas);
+    var fs = try Fs.open(testing.allocator, io, root);
     defer fs.close();
     var w = disk_writer.Writer.init(testing.allocator, io);
     try w.start();
@@ -786,7 +617,7 @@ fn landsBesideInference(at: @FieldType(prefix_vfs.Gate, "at")) !void {
     try fs.writeAt(tokens, true, 0, "abcd", 4);
 
     var gate: prefix_vfs.Gate = .{ .at = at };
-    fs.vfs.?.gate = &gate;
+    fs.vfs.gate = &gate;
     const chunk = try std.fmt.allocPrint(testing.allocator, "{s}/e1/c000000.safetensors", .{root});
     const bytes = try testing.allocator.alloc(u8, 1 << 20);
     for (bytes, 0..) |*b, i| b.* = @truncate((i *% 2654435761) >> 7);

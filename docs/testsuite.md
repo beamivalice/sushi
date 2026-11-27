@@ -78,7 +78,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   | `test-generate` | generation, the scheduler, MTP and DFlash rounds, sampling, the KV and SSM caches, the trunk |
   | `test-load` | `src/arch/`, the model and its loader, registry, discovery, owned weights, expert I/O, Engram tables, the Cooler side, imatrix, KLD, live bills |
   | `test-server` | the HTTP server and its APIs, the CLI, launch and main |
-  | `test-prefix-cache` | the prefix cache and its SSD tier, run twice: `test-prefix-cache` and, on a run with no `-Dtest-filter`, `test-prefix-cache (SUSHI_PREFIX_FS=real)` |
+  | `test-prefix-cache` | the prefix cache and its CAS SSD tier |
 
   A domain holds the test files of its folders and the `src/` files it lists (a listed file leaves its folder's
   domain); a test file that no domain holds, or that two list, fails the configure by name, so a new shared file is
@@ -107,8 +107,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
 - **Tests run under sushi's runner** (`scripts/test_runner.zig`, std's with one check): after each test it asks
   `sushi_after_each` (`src/test_rest.zig`), which fails that test by name when it left a hold, a turn, a model's budget
   slot, a forward scope, a seal, an armed fault, an opt-out or a latched MLX error, then puts the engine back at rest.
-  `zig build test -Dtest-log=<abs path>` gives every test run step `SUSHI_TEST_LOG` and its name as `SUSHI_TEST_STEP`
-  (the second tier run: `test-prefix-cache (SUSHI_PREFIX_FS=real)`); each runner appends, under the file's lock,
+  `zig build test -Dtest-log=<abs path>` gives every test run step `SUSHI_TEST_LOG` and its name as `SUSHI_TEST_STEP`; each runner appends, under the file's lock,
   `<UTC>\t<step>\t<PASS|SKIP|FAIL>\t<ms>\t<test name>` per test and `<UTC>\t<step>\tDONE\t<ms>\t<p> pass, <s> skip,
   <f> fail` when its process ends, and prints nothing. A leak or a logged error is a FAIL, as the build runner counts
   it; a crashed test has no line (the build runner's error names it) and the restarted process ends on a DONE of its own.
@@ -122,7 +121,7 @@ Every test has exactly one of these purposes. A test that fits none is not writt
   while no test is active). A Cooler binary's start and exit outside a test take about 10 ms, measured beside
   two other Cooler binaries: a silent minute there is not slow work.
 - **An env set at the invocation reaches every test**: a run step gets only its own variables (`SUSHI_TEST_STEP`,
-  `SUSHI_TEST_SELECT`, `SUSHI_TEST_FIXTURE_CUT`, `SUSHI_TEST_LOG`, the step's `SUSHI_PREFIX_FS`, `QWEN_PREPROCESS_FIXTURE`) as
+  `SUSHI_TEST_SELECT`, `SUSHI_TEST_FIXTURE_CUT`, `SUSHI_TEST_LOG`, `QWEN_PREPROCESS_FIXTURE`) as
   `--env=NAME=VALUE` arguments, never through `run.setEnvironmentVariable`, which snapshots the build's whole environment
   into the cached configure and replays it over the next invocation's (`SUSHI_CONTRACT_FIXTURE`, the fixture envs, any
   `SUSHI_*` a test reads); the runner sets them over the live environment and refuses, naming it, one the invocation
@@ -283,7 +282,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   that reads `.activeBytes()` and never asks `bills.promisedActive`: a promise read off the raw active bytes counts the
   decoder pools a lease lent free ([engine-memory-admission](engine-memory-admission.md#gpu-memory-readers)); a report
   or the lent term's own measure is an allowlist entry. `cache-gpu-stream` flags a
-  `gpuStream()` call in `prefix_cache.zig` or `ssm_cache.zig` outside `arraysStream` and tests: cache array work takes
+  `gpuStream()` call in `prefix_cache*.zig` or `ssm_cache.zig` outside `arraysStream` and tests: cache array work takes
   its caller's stream ([engine-prefix-cache](engine-prefix-cache.md)). `response-store-field` flags
   the Responses store's map or LRU (`by_id`, `recency`) touched outside `responses.zig`: a record is held through
   `acquire`/`release`.
@@ -333,7 +332,7 @@ on, and it runs every time, so a new or edited file is always read. A report rea
   `Scheduler.initForTest` or `Slot.initForTest`, which set every field; the `= undefined` is read through grouping
   parentheses and `@as(_, x)`.
   `entry-checkout` flags a write of a hot-cache entry's `checkout` (assigned, set in a literal, captured by pointer,
-  written through `.?`) outside `prefix_cache.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
+  written through `.?`) outside `prefix_cache_evict.zig`'s `beginCheckout`, `donateCheckout` and `endCheckout`, tests exempt.
   `error-body-literal` flags an error envelope spelled outside `src/http.zig` (an `error` key whose object holds a
   `message`, or `"type":"error"` beside one; as a literal, a format, `objectField("error")` or a struct), whose
   `ErrorEnvelope` builds every error answer by the request's API (and a literal or declared-type init of it outside

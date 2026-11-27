@@ -553,14 +553,11 @@ const test_domains = [_]TestDomain{
         "request_media", "request_policy", "responses",   "responses_api", "server",      "server_test",    "settings_api",
         "sleep_inhibit", "status",         "version",     "vision_queue",
     } },
-    // The SSD tier's tests run once on each file backend (`SUSHI_PREFIX_FS`); a `-Dtest-filter` run, on the default.
     .{ .name = "prefix-cache", .files = &.{
-        "disk_placement",       "dsv41/dsv41_prefix_cache_test", "glm5/glm5_prefix_cache_test", "kv_disk_cache",
-        "kv_disk_fs",           "prefix_cache",                  "prefix_cache_admin",          "prefix_vfs_tensors_test",
-        "qwen4/qwen4_disk_qsa", "qwen4/qwen4_prefix_cache_test",
-    }, .steps = &.{
-        .{ .name = "test-prefix-cache" },
-        .{ .name = "test-prefix-cache (SUSHI_PREFIX_FS=real)", .env = .{ "SUSHI_PREFIX_FS", "real" }, .again = true },
+        "disk_placement",          "dsv41/dsv41_prefix_cache_test", "glm5/glm5_prefix_cache_test", "kv_disk_fs",
+        "kv_disk_index_test",      "kv_disk_persist_test",          "kv_disk_restore_test",        "prefix_cache",
+        "prefix_cache_admin",      "prefix_cache_commit_test",      "prefix_cache_evict_test",     "prefix_cache_index_test",
+        "prefix_vfs_tensors_test", "qwen4/qwen4_disk_qsa",          "qwen4/qwen4_prefix_cache_test", "safetensors",
     } },
 };
 

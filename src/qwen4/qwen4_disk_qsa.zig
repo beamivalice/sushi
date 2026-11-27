@@ -203,21 +203,17 @@ pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !trunk_mod.
     const rd = self.reading();
     defer rd.end();
     const cpu = rd.s;
-    const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors\x00", .{ self.root, id });
+    const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, id });
     defer self.allocator.free(path);
-    if (self.fs.size(path[0 .. path.len - 1]) == null) return error.DiskCacheNoCheckpoint;
-    var tensor_map = mlx.mlx_map_string_to_array_new();
-    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
-    var meta_map = mlx.mlx_map_string_to_string_new();
-    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try self.fs.loadSafetensors(path, &tensor_map, &meta_map, cpu);
+    if (self.fs.size(path) == null) return error.DiskCacheNoCheckpoint;
+    var loaded = try self.fs.loadTensors(path, cpu);
+    defer loaded.deinit();
     for (self.entries.items) |*e| {
         if (e.id != id or e.qsa_segs.len == 0) continue;
-        var ratio_s: [*:0]const u8 = undefined;
-        const ratio: u32 = if (mlx.mlx_map_string_to_string_get(&ratio_s, meta_map, "qsa_ratio") == 0) std.fmt.parseInt(u32, std.mem.span(ratio_s), 10) catch 4 else 4;
-        const joined = self.joinSegments(tensor_map, id, 'q', e.qsa_segs.len, qsaGrowth, ratio, cpu) orelse return error.DiskCacheQsaHistoryGap;
-        _ = mlx.mlx_map_string_to_array_free(tensor_map);
-        tensor_map = joined;
+        const ratio: u32 = if (loaded.getMeta("qsa_ratio")) |rs| std.fmt.parseInt(u32, rs, 10) catch 4 else 4;
+        const joined = self.joinSegments(&loaded, id, 'q', e.qsa_segs.len, qsaGrowth, ratio, cpu) orelse return error.DiskCacheQsaHistoryGap;
+        loaded.deinit();
+        loaded = joined;
         break;
     }
 
@@ -229,32 +225,19 @@ pub fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !trunk_mod.
     };
     var cp: trunk_mod.SSMCheckpoint = .{ .pos = 0, .layers = layers };
     errdefer cp.deinit(self.allocator);
+    var key_buf: [32]u8 = undefined;
     for (layers, 0..) |*l, li| {
-        const akey = try std.fmt.allocPrint(self.allocator, "l{d}.aux\x00", .{li});
-        defer self.allocator.free(akey);
-        var aux = mlx.mlx_array_new();
-        if (mlx.mlx_map_string_to_array_get(&aux, tensor_map, @ptrCast(akey.ptr)) == 0) {
-            l.aux_state = aux;
-        } else {
-            _ = mlx.mlx_array_free(aux);
-        }
-        const pkey = try std.fmt.allocPrint(self.allocator, "l{d}.pooled\x00", .{li});
-        defer self.allocator.free(pkey);
-        var pooled = mlx.mlx_array_new();
-        if (mlx.mlx_map_string_to_array_get(&pooled, tensor_map, @ptrCast(pkey.ptr)) == 0) {
-            l.qsa_pooled = pooled;
-        } else {
-            _ = mlx.mlx_array_free(pooled);
-        }
+        const akey = try std.fmt.bufPrint(&key_buf, "l{d}.aux", .{li});
+        if (loaded.take(akey)) |aux| l.aux_state = aux;
+        const pkey = try std.fmt.bufPrint(&key_buf, "l{d}.pooled", .{li});
+        if (loaded.take(pkey)) |pooled| l.qsa_pooled = pooled;
     }
-    var ratio_c: [*:0]const u8 = undefined;
-    if (mlx.mlx_map_string_to_string_get(&ratio_c, meta_map, "qsa_ratio") == 0) {
-        const ratio = std.fmt.parseInt(c_int, std.mem.span(ratio_c), 10) catch return error.DiskCacheCorruptSsm;
+    if (loaded.getMeta("qsa_ratio")) |ratio_s| {
+        const ratio = std.fmt.parseInt(c_int, ratio_s, 10) catch return error.DiskCacheCorruptSsm;
         for (layers) |*l| l.qsa_ratio = ratio;
     }
-    var rows_c: [*:0]const u8 = undefined;
-    if (mlx.mlx_map_string_to_string_get(&rows_c, meta_map, "qsa_rows") == 0) {
-        const rows = std.fmt.parseInt(c_int, std.mem.span(rows_c), 10) catch return error.DiskCacheCorruptSsm;
+    if (loaded.getMeta("qsa_rows")) |rows_s| {
+        const rows = std.fmt.parseInt(c_int, rows_s, 10) catch return error.DiskCacheCorruptSsm;
         for (layers) |*l| l.qsa_rows = rows;
         cp.pos = @intCast(rows);
     } else {
@@ -1955,7 +1938,7 @@ test "DiskTier: an extended QSA history writes only its new segments and the tai
 
 /// Block bytes the content-addressed layer has stored for `kind`.
 fn storedData(tier: *DiskTier, kind: write_stats.Kind) u64 {
-    return tier.fs.vfs.?.stats(kind).data_bytes;
+    return tier.fs.vfs.stats(kind).data_bytes;
 }
 
 /// Commits a 3-layer hybrid entry of `rows` tokens (a multiple of 4: no leftover) whose layer 2 holds a pooled bank of one
@@ -1980,7 +1963,7 @@ test "DiskTier row groups: a QSA history rewritten with more rows stores only th
         defer tmp.cleanup();
         var buf: [512]u8 = undefined;
         const base = try tmpRoot(&tmp, io, &buf);
-        var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-qsa-groups", 0, 128, .cas);
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-groups", 0, 128);
         defer tier.deinit();
         tier.seg_span = 512;
         if (writer) tier.enableBackgroundWriter();
@@ -2031,7 +2014,7 @@ test "DiskTier row groups: the MTP head's pooled bank and history rewritten with
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.initBackend(testing.allocator, io, base, "fp-head-groups", 0, 128, .cas);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-head-groups", 0, 128);
     defer tier.deinit();
     tier.enableBackgroundWriter();
     var cache = try KVCache.init(testing.allocator, 2);
