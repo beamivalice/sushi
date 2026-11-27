@@ -19,7 +19,7 @@ const Arr = mlx.mlx_array;
 
 /// A sample's root: its mix, a verdict's rows only as one row or a block (its rows are a size).
 pub fn root(mix: Mix) plan.FrameId {
-    return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ mix.entry, mix.rows <= 1, mix.suppress, mix.greedy, mix.think, mix.repeat, mix.additive, mix.grammar }) };
+    return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ mix.entry, mix.rows <= 1, mix.suppress, mix.greedy, mix.repeat, mix.additive, mix.grammar }) };
 }
 
 pub const token_slots = 32;
@@ -185,14 +185,14 @@ pub const shape_phase: u32 = 3;
 pub fn shapeOf(mix: Mix) plan_book.Shape {
     const flags: u64 = @as(u64, @intFromBool(mix.suppress)) | @as(u64, @intFromBool(mix.greedy)) << 1 | @as(u64, @intFromBool(mix.repeat)) << 2 |
         @as(u64, @intFromBool(mix.additive)) << 3 | @as(u64, @intFromBool(mix.grammar)) << 4;
-    return .{ .phase = shape_phase, .args = .{ @intFromEnum(mix.entry), mix.rows, @intFromEnum(mix.think), flags } };
+    // args[2] stays 0 so cached shapes written by older binaries still read cleanly (mixOf rejects non-zero).
+    return .{ .phase = shape_phase, .args = .{ @intFromEnum(mix.entry), mix.rows, 0, flags } };
 }
 
 /// The mix a kept shape names, or null when it names none.
 pub fn mixOf(s: plan_book.Shape) ?Mix {
-    if (s.phase != shape_phase or s.args[1] == 0 or s.args[1] > 255 or s.args[3] >> 5 != 0) return null;
+    if (s.phase != shape_phase or s.args[1] == 0 or s.args[1] > 255 or s.args[2] != 0 or s.args[3] >> 5 != 0) return null;
     const entry = std.enums.fromInt(Mix.Entry, s.args[0]) orelse return null;
-    if (s.args[2] != @intFromEnum(Mix.Think.off)) return null;
     const f = s.args[3];
     if (entry != .verdict and s.args[1] != 1) return null;
     return .{ .entry = entry, .rows = @intCast(s.args[1]), .suppress = f & 1 != 0, .greedy = f & 2 != 0, .repeat = f & 4 != 0, .additive = f & 8 != 0, .grammar = f & 16 != 0 };
@@ -205,8 +205,8 @@ fn missed(m: *Model, mix: Mix, miss: ?plan.binder.Miss) error{PlanMiss} {
     const st = &p.sample;
     st.misses += 1;
     if (miss) |x| {
-        log.warn("[plan] miss: a sample ({t}, {d} rows, think {t}) asked {d} B against {d} B ({t}, frame {d}/{d}, ordinal {d})\n", .{ mix.entry, mix.rows, mix.think, x.asked, x.cap, x.kind, x.id.site, x.id.key, x.ordinal });
-    } else log.warn("[plan] miss: a sample ({t}, {d} rows, think {t}) of a mix the load did not plan\n", .{ mix.entry, mix.rows, mix.think });
+        log.warn("[plan] miss: a sample ({t}, {d} rows) asked {d} B against {d} B ({t}, frame {d}/{d}, ordinal {d})\n", .{ mix.entry, mix.rows, x.asked, x.cap, x.kind, x.id.site, x.id.key, x.ordinal });
+    } else log.warn("[plan] miss: a sample ({t}, {d} rows) of a mix the load did not plan\n", .{ mix.entry, mix.rows });
     remakeTokens(st, m.s) catch |e| {
         log.warn("[plan] the token blocks of a missed sample were not made again ({t}); the next draw makes them or fails\n", .{e});
         return error.PlanMiss;
@@ -350,8 +350,8 @@ pub fn draw(m: *Model, st: *State, in: *const Inputs, mix: Mix) !Drawn {
             return .{ .step = try kept(m, st, try sampler.sampleStep(std.heap.page_allocator, step, s)) };
         },
         .sync => {
-            if (!std.meta.eql(sampler.syncMix(in.sampling, in.generated, null), mix)) return error.Hy4SampleProbeMix;
-            return .{ .sync = try sampler.sampleToken(in.logits, in.sampling, in.generated, null, s) };
+            if (!std.meta.eql(sampler.syncMix(in.sampling, in.generated), mix)) return error.Hy4SampleProbeMix;
+            return .{ .sync = try sampler.sampleToken(in.logits, in.sampling, in.generated, s) };
         },
         .verdict => {
             const rounds = @import("hy4_drafter.zig").rounds;

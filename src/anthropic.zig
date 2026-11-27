@@ -53,8 +53,6 @@ const prepareRequestMedia = request_media.prepareRequestMedia;
 const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
 const request_policy = @import("request_policy.zig");
 const servedModelId = request_policy.servedModelId;
-const resolveThinkPenalty = request_policy.resolveThinkPenalty;
-const armThinkPenalty = request_policy.armThinkPenalty;
 const launchMaxTokensDefault = request_policy.launchMaxTokensDefault;
 const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
 const maxTokensOrigin = request_policy.maxTokensOrigin;
@@ -530,13 +528,6 @@ pub fn handleAnthropicMessages(
 
     const req = (try checkedMessagesBody(allocator, stream, root, "/v1/messages")) orelse return;
 
-    var bias_buf: [160]u8 = undefined;
-    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
-        log.warn("POST /v1/messages -> 400 ({s})\n", .{why});
-        try sendAnthropicError(allocator, stream, "invalid_request_error", why, 400);
-        return;
-    }
-
     // The Anthropic API requires max_tokens; an omitted one takes the filled budget like every surface.
     const requested_max_tokens = req.requestedMaxTokens();
     const max_tokens: u32 = resolveRequestMaxTokens(requested_max_tokens, request_policy.filledMaxTokens(config));
@@ -644,7 +635,7 @@ pub fn handleAnthropicMessages(
 
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
-    const none_end = try server_mod.noneEndFor(allocator, config, lm.handle != null, tok, chat_config, prompt.tool_choice, config.eosTokenSlice());
+    const none_end = try server_mod.noneEndFor(allocator, lm.handle != null, tok, chat_config, prompt.tool_choice, config.eosTokenSlice());
     defer none_end.deinit(allocator);
     const eos_slice = none_end.eos_ids;
     var sampling = sampler.SamplingParams{
@@ -687,8 +678,6 @@ pub fn handleAnthropicMessages(
         }
     }
 
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
-    sampling.think_penalty.biases = none_end.biases();
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;

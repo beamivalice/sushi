@@ -225,7 +225,7 @@ route and the MLX arm still build the bank at prepare time.
   `Trunk.outStream` are one stream, every host array, scalar and vector made for the load is the engine's wherever it
   is made, and an op that reaches an MLX stream is refused by name instead of lending a tensor. What a held scope
   turned up, each of which had been a call or an import per round or per request: the `-inf` scalar of the greedy
-  verify's reserved-token mask (`spec_types.verifyArgmax`), the warm-up's token arrays, the think-marker mask, an
+  verify's reserved-token mask (`spec_types.verifyArgmax`), the warm-up's token arrays, an
   image's patch array, the trunk shell's scalar constants. The `[engine] since load` line counts the refusals; a
   served request counts none.
 - **MLX's allocator is not asked under a hold** (`mlx.zig`, "MLX's allocator"; `engine.MlxAtRest`). A hold begins
@@ -636,7 +636,7 @@ Each one cost a wrong result or a large slowdown before it was a rule.
   request differs only in its root.
 - **The serial sampler is warmed** (`warmSerialSampler`, with the sampled verdict): a first-token or serial draw,
   sampled and greedy, with and without the suppress mask, the three penalty mixes, a grammar mask,
-  and a verify block of every width under the penalties, the thinking penalty with and without a bias, and a row mask.
+  and a verify block of every width under the penalties and a row mask.
 - **A kernel reached only past a threshold of context is found by a bench at that context**, not by the tiny
   fixture: the 128k rung showed three compiles (0.26 s) inside its first decode step.
 - **Every Cooler load ends its warm with served requests** (`cooler_warm.warmServed`): the Generator as the scheduler

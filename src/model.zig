@@ -382,10 +382,8 @@ pub const ModelConfig = struct {
     /// Per-model `ssd_budget_gb` (GiB, the `--ssd-budget-gb` unit) from model-settings.json; 0 = none.
     ssd_budget_gb_override: u32 = 0,
     preserve_thinking_override: ?bool = null,
-    think_penalty_override: ?f32 = null,
     /// model-settings.json `expert_cache_bias`; `expertCacheBias` resolves it under the flag.
     expert_cache_bias_override: ?f32 = null,
-    logit_bias_file_override: ?@import("logit_bias.zig").FilePath = null,
     vision_override: ?bool = null,
     max_tokens_override: ?u32 = null,
     /// The per-model `yarn_factor` the config was parsed with; null = none applied (unset, or an arch that ignores it).

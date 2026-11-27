@@ -465,8 +465,8 @@ fn thinkBoundWithBudget(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *co
 
 pub const TOOL_CHOICE_UNDECLARED = "tool_choice names a function that is not in tools";
 
-/// The decode-time half of tool_choice "none": the template's call opener, banned when it is one
-/// token, so a model that sees earlier calls in the history cannot write one as plain text.
+/// The decode-time half of tool_choice "none": the template's call opener, appended to `eos_ids`
+/// when it is one token so a model that sees earlier calls in the history stops instead of writing one as plain text.
 fn noneCallOpener(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig) ?u32 {
     const opener = (chat_mod.callOpener(allocator, chat_config) catch null) orelse return null;
     defer allocator.free(opener);
@@ -475,9 +475,9 @@ fn noneCallOpener(allocator: std.mem.Allocator, tok: *const Tokenizer, chat_conf
 
 /// `request_policy.noneEnd` for one request on any surface: the template's call opener is looked up only under
 /// tool_choice none. The caller `deinit`s the result.
-pub fn noneEndFor(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, model_loaded: bool, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig, tool_choice: tool_calls_mod.ToolChoice, eos: []const u32) !request_policy.NoneEnd {
+pub fn noneEndFor(allocator: std.mem.Allocator, model_loaded: bool, tok: *const Tokenizer, chat_config: *const chat_mod.ChatConfig, tool_choice: tool_calls_mod.ToolChoice, eos: []const u32) !request_policy.NoneEnd {
     const opener = if (tool_choice == .none) noneCallOpener(allocator, tok, chat_config) else null;
-    return request_policy.noneEnd(allocator, config, tool_choice, model_loaded, opener, eos);
+    return request_policy.noneEnd(allocator, tool_choice, model_loaded, opener, eos);
 }
 
 /// Arm the decode-time half of a forced tool_choice (required or named), or
@@ -2490,13 +2490,6 @@ pub fn handleChatCompletions(
         .ok => |c| c,
     };
 
-    var bias_buf: [160]u8 = undefined;
-    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
-        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{why});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
-        return;
-    }
-
     // The messages and the tools are read with numbers as spelled (`request_parse.parseSpelled`).
     const spelled = try request_parse.parseSpelled(allocator, body);
     defer spelled.deinit();
@@ -2893,18 +2886,9 @@ pub fn handleChatCompletions(
 
     // A decode-time bound owns the budget; the surfaces then deliver the
     // whole (closed) thought instead of trimming it.
-    sampling.think_penalty = request_policy.armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, request_policy.resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
-    const request_bias: []const @import("logit_bias.zig").Bias = if (root.get("logit_bias")) |bias_value| @import("logit_bias.zig").request(allocator, bias_value, @min(config.vocab_size, tok.definedVocabSize())) catch |err| {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", @errorName(err), null);
-        return;
-    } else &.{};
-    defer allocator.free(request_bias);
-    const none_end = try noneEndFor(allocator, config, lm.handle != null, tok, chat_config, tool_choice, eos_slice);
+    const none_end = try noneEndFor(allocator, lm.handle != null, tok, chat_config, tool_choice, eos_slice);
     defer none_end.deinit(allocator);
     const eos_ids = none_end.eos_ids;
-    const biases = if (none_end.ban) |ban| try std.mem.concat(allocator, @import("logit_bias.zig").Bias, &.{ request_bias, &.{ban} }) else request_bias;
-    defer if (none_end.ban != null) allocator.free(biases);
-    sampling.think_penalty.biases = biases;
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
@@ -4131,7 +4115,7 @@ test "tool_choice auto and none arm no forced call" {
     try std.testing.expect(armCallForce(a, &tok, &config, ids, true, .none, null) == null);
 }
 
-test "tool_choice none bans each family's one-token call opener, and nothing else" {
+test "tool_choice none resolves each family's one-token call opener, and nothing else" {
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
@@ -4147,8 +4131,8 @@ test "tool_choice none bans each family's one-token call opener, and nothing els
         var config = chat_mod.ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
         try config.compile();
         defer config.dropCompiled();
-        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, noneCallOpener(a, &tok, &config) orelse return error.OpenerNotBanned);
-        // An opener the tokenizer splits would ban its first piece, a plain `<`, everywhere.
+        try std.testing.expectEqual(tok.special_tokens.get("<tool_call>").?, noneCallOpener(a, &tok, &config) orelse return error.OpenerNotFound);
+        // An opener the tokenizer splits would stop on its first piece, a plain `<`, everywhere.
         try std.testing.expect(noneCallOpener(a, &split, &config) == null);
     }
 }
@@ -4559,9 +4543,7 @@ test "stopServing does not fail at 0 ms when active_conn_threads rises after the
     try t.expect(stopServing(t.io, &accept_thread, &listener, &client_thread));
 }
 
-test "tool_choice none on any surface: the template's one-token opener is banned where bias is served and a stop id where it is not" {
-    const registry = @import("arch/registry.zig");
-    if (registry.ofModelType("hy_v4_flash") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
+test "tool_choice none on any surface: the template's one-token opener is a stop id" {
     const a = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(a);
     defer arena_state.deinit();
@@ -4572,22 +4554,13 @@ test "tool_choice none on any surface: the template's one-token opener is banned
     defer config.dropCompiled();
     const opener = tok.special_tokens.get("<tool_call>").?;
     const eos = [_]u32{ 5, 6 };
-    const hy4 = model_mod.ModelConfig{ .model_type = "hy_v4_flash" };
-    const qwen = model_mod.ModelConfig{ .model_type = "qwen4_exp" };
 
-    const stop = try noneEndFor(a, &hy4, true, &tok, &config, .none, &eos);
+    const stop = try noneEndFor(a, true, &tok, &config, .none, &eos);
     defer stop.deinit(a);
     try std.testing.expectEqualSlices(u32, &.{ 5, 6, opener }, stop.eos_ids);
-    try std.testing.expect(stop.ban == null);
-    const ban = try noneEndFor(a, &qwen, true, &tok, &config, .none, &eos);
-    defer ban.deinit(a);
-    try std.testing.expectEqualSlices(u32, &eos, ban.eos_ids);
-    try std.testing.expectEqual(opener, ban.ban.?.id);
-    try std.testing.expectEqual(opener, ban.biases()[0].id);
-    const auto = try noneEndFor(a, &hy4, true, &tok, &config, .auto, &eos);
+    const auto = try noneEndFor(a, true, &tok, &config, .auto, &eos);
     defer auto.deinit(a);
     try std.testing.expectEqualSlices(u32, &eos, auto.eos_ids);
-    try std.testing.expectEqual(@as(usize, 0), auto.biases().len);
 }
 
 test "serve: a launch folder the load gate refuses ends the boot with its reason, and one it admits boots as asked" {

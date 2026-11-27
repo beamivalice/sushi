@@ -982,10 +982,6 @@ pub fn servedDrafts(sv: *Served, prompt: []const u32, n: u32, sampling: @import(
 
 /// Two served requests decoded as rows of one tick through the scheduler, as serve runs them.
 pub fn servedRows(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, out: *[2]std.ArrayList(u32)) !void {
-    return servedRowsWith(sv, prompts, n, mtp, .{ .temperature = 0.0 }, out);
-}
-
-pub fn servedRowsWith(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, sampling: @import("sampler.zig").SamplingParams, out: *[2]std.ArrayList(u32)) !void {
     const scheduler = @import("scheduler.zig");
     const a = testing.allocator;
     const sch = &sv.sch;
@@ -998,7 +994,7 @@ pub fn servedRowsWith(sv: *Served, prompts: [2][]const u32, n: u32, mtp: bool, s
     }
     for (0..2) |i| {
         const head = if (mtp) @import("generate.zig").MtpHeadRef.fromModel(arch_handle.trunk(sv.entry.handle.?), true, null) else null;
-        slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompts[i], .sampling = sampling, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
+        slots[i] = try sch.submit(.{ .model = sv.entry, .prompt_ids = prompts[i], .sampling = .{ .temperature = 0.0 }, .eos_token_ids = &.{}, .max_tokens = n, .enable_mtp = mtp, .mtp = head });
         made += 1;
     }
     sch.pending.clearRetainingCapacity();

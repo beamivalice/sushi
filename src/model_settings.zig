@@ -18,15 +18,9 @@ const Source = settings_resolve.Source;
 /// request's `chat_template_kwargs.preserve_thinking` outranks it.
 pub var preserve_thinking_flag: ?bool = null;
 
-/// `--think-penalty <lambda>`; null = not given. A request's `think_penalty` outranks it.
-pub var think_penalty_flag: ?f32 = null;
-/// The largest think penalty any source may set, in logits.
-pub const think_penalty_max: f32 = 20;
-
 /// What a load picks for a key with no flag and no file value; the load sites and the settings API read these.
 pub const default_mtp = true;
 pub const default_preserve_thinking = true;
-pub const default_think_penalty: f32 = 0;
 pub const default_max_request_mb: u32 = 128;
 pub const max_request_mb_limit: u32 = 1024;
 /// The safety margin under the GPU memory limit, in GiB: `--wired-margin-gib` and `server.wired_margin_gib` share it.
@@ -176,8 +170,6 @@ pub const Override = struct {
     ssd_budget_gb: ?u32 = null,
     ssd_prefetch: ?u8 = null,
     preserve_thinking: ?bool = null,
-    think_penalty: ?f32 = null,
-    logit_bias_file: ?@import("logit_bias.zig").FilePath = null,
     vision: ?bool = null,
     /// Decode on Sushi Cooler (true, the default) or on MLX (false): one key per arch that has the engine, each read
     /// only by its own arch (`arch_flags.coolerSettingOf`).
@@ -200,7 +192,7 @@ pub const Override = struct {
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and
             o.ssd_budget_gb == null and o.ssd_prefetch == null and o.preserve_thinking == null and
-            o.think_penalty == null and o.logit_bias_file == null and o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null and o.expert_cache_bias == null and
+            o.vision == null and o.ds41_cooler == null and o.qwen_cooler == null and o.max_tokens == null and o.yarn_factor == null and o.expert_cache_bias == null and
             o.prefill_chunk_max == null and o.prefill_chunk_min == null and
             o.max_concurrent == null and o.max_kv_tokens == null;
     }
@@ -291,17 +283,6 @@ fn fromValue(v: std.json.Value) Override {
     if (obj.get("yarn_factor")) |g| if (accepts("yarn_factor", g)) {
         o.yarn_factor = std.fmt.parseInt(u8, yarnChoice(g).?, 10) catch unreachable;
     };
-    if (obj.get("logit_bias_file")) |path_value| switch (path_value) {
-        .string => |path| o.logit_bias_file = @import("logit_bias.zig").FilePath.from(path),
-        else => {},
-    };
-    if (obj.get("think_penalty")) |t| if (accepts("think_penalty", t)) {
-        o.think_penalty = @floatCast(switch (t) {
-            .float => |f| f,
-            .integer => |i| @as(f64, @floatFromInt(i)),
-            else => unreachable,
-        });
-    };
     if (obj.get("expert_cache_bias")) |b| if (accepts("expert_cache_bias", b)) {
         o.expert_cache_bias = @floatCast(switch (b) {
             .float => |f| f,
@@ -361,6 +342,8 @@ pub const removed_model_keys = [_]struct { name: []const u8, why: []const u8 }{
     .{ .name = "mtp_acceptance", .why = "MTP accepts drafts by the exact rule only" },
     .{ .name = "mtp_greedy_tail", .why = "MTP accepts drafts by the exact rule only" },
     .{ .name = "prefix_cache_entries", .why = "the hot cache keeps as many finished conversations as the model's max_concurrent; set max_concurrent, and max_kv_tokens to bound its memory" },
+    .{ .name = "think_penalty", .why = "bound a thought with reasoning_effort or reasoning_budget_tokens" },
+    .{ .name = "logit_bias_file", .why = "sushi applies no vocabulary biases" },
 };
 
 /// Why `key` is no longer a setting; null when it never was one or still is.
@@ -426,7 +409,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         _ = warnRejected(model_path, obj, &model_keys);
         _ = warnRemoved(model_path, obj);
     }
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} think_penalty={d} vision={s} ds41_cooler={s} qwen_cooler={s} max_tokens={d} yarn_factor={d} expert_cache_bias={d} prefill_chunk_max={?d} prefill_chunk_min={?d}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} ssd_budget_gb={d} ssd_prefetch={?d} preserve_thinking={s} vision={s} ds41_cooler={s} qwen_cooler={s} max_tokens={d} yarn_factor={d} expert_cache_bias={d} prefill_chunk_max={?d} prefill_chunk_min={?d}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -434,7 +417,6 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         o.ssd_budget_gb orelse 0,
         o.ssd_prefetch,
         if (o.preserve_thinking) |p| (if (p) "on" else "off") else "default",
-        o.think_penalty orelse 0,
         if (o.vision) |v| (if (v) "on" else "off") else "default",
         if (o.ds41_cooler) |v| (if (v) "on" else "off") else "default",
         if (o.qwen_cooler) |v| (if (v) "on" else "off") else "default",
@@ -506,7 +488,6 @@ pub const model_keys = [_]KeySpec{
     .{ .name = "ssd_budget_gb", .kind = .int, .min = 1, .max = 512 },
     .{ .name = "ssd_prefetch", .kind = .int, .min = 0, .max = 100 },
     .{ .name = "preserve_thinking", .kind = .bool },
-    .{ .name = "think_penalty", .kind = .number, .min = 0, .max = think_penalty_max },
     .{ .name = "vision", .kind = .bool },
     .{ .name = "ds41_cooler", .kind = .bool },
     .{ .name = "qwen_cooler", .kind = .bool },
@@ -571,8 +552,6 @@ pub const Fit = struct {
     /// The `--ctx-size` in force, which outranks the file's `ctx_size`; 0 = not given.
     ctx_flag: u32 = 0,
     template_preserves_thinking: bool = true,
-    template_thinks: bool = true,
-    serves_bias: bool = true,
     /// The arch's RoPE reads YaRN (`arch/config.zig` `Facts.reads_yarn`).
     reads_yarn: bool = true,
     /// What the config.json declares by itself: the window a YaRN factor extends from, and the window with no `yarn_factor`.
@@ -657,10 +636,6 @@ pub fn unavailable(key: []const u8, fit: Fit) ?[]const u8 {
     }
     if (eql(u8, key, "preserve_thinking")) return if (fit.template_preserves_thinking) null else "This model's chat template has no preserve-thinking switch.";
     if (eql(u8, key, "yarn_factor")) return if (fit.reads_yarn) null else "This model's RoPE has no YaRN context extension.";
-    if (eql(u8, key, "think_penalty")) {
-        if (!fit.serves_bias) return "This model does not support a think penalty.";
-        return if (fit.template_thinks) null else "This model's chat template has no thinking span to penalise.";
-    }
     if (eql(u8, key, "expert_cache_bias")) {
         // The pick runs in the arch's router, on the rate-grouped (STQ) layers whose cache map the GPU holds.
         if (!fit.cache_bias) return "This model's router cannot favour the experts already in memory.";
@@ -1133,8 +1108,6 @@ test "model_settings: the editor accepts exactly the values the loader applies" 
         .{ .key = "ssd_budget_gb", .body = "0" },
         .{ .key = "ssd_prefetch", .body = "101" },
         .{ .key = "ctx_size", .body = "0" },
-        .{ .key = "think_penalty", .body = "21" },
-        .{ .key = "think_penalty", .body = "2.5" },
         .{ .key = "kv_quant", .body = "\"16\"" },
         .{ .key = "kv_quant", .body = "\"0\"" },
         .{ .key = "kv_quant", .body = "16" },
@@ -1157,7 +1130,7 @@ test "model_settings: applies: a key shows only for a model the loader would hon
     const t = std.testing;
     const dsv: Fit = .{ .arch = "prefetcher", .prefetch = true, .streams_experts = true, .has_vision = true };
     try t.expect(!applies("kv_quant", dsv));
-    for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision", "mtp", "ctx_size", "preserve_thinking", "think_penalty" }) |k| try t.expect(applies(k, dsv));
+    for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision", "mtp", "ctx_size", "preserve_thinking" }) |k| try t.expect(applies(k, dsv));
 
     const resident: Fit = .{ .arch = "qwen4_exp", .streams_experts = false, .has_vision = false };
     for ([_][]const u8{ "ssd_budget_gb", "ssd_prefetch", "vision" }) |k| try t.expect(!applies(k, resident));
@@ -1282,19 +1255,6 @@ test "an explicit --ctx-size outranks the per-model ctx_size; 0 is auto on both 
     try t.expectEqual(Source.default, auto.source);
 }
 
-test "model_settings: think_penalty is a non-negative number, anything else is unset" {
-    var s = try parse(std.testing.allocator,
-        \\{"/m/a": {"think_penalty": 1.5}, "/m/b": {"think_penalty": 2}, "/m/c": {"think_penalty": -1}, "/m/d": {"think_penalty": "1"}, "/m/e": {"think_penalty": 0}}
-    );
-    defer s.deinit();
-    try std.testing.expectEqual(@as(?f32, 1.5), s.lookup("/m/a").think_penalty);
-    try std.testing.expectEqual(@as(?f32, 2), s.lookup("/m/b").think_penalty);
-    try std.testing.expect(s.lookup("/m/c").isEmpty());
-    try std.testing.expect(s.lookup("/m/d").isEmpty());
-    try std.testing.expectEqual(@as(?f32, 0), s.lookup("/m/e").think_penalty);
-    try std.testing.expect(!s.lookup("/m/e").isEmpty());
-}
-
 test "model_settings: expert_cache_bias is a number from 0 to 2, anything else is ignored by name, never clamped" {
     var s = try parse(std.testing.allocator,
         \\{"/m/a": {"expert_cache_bias": 0.2}, "/m/b": {"expert_cache_bias": 2}, "/m/c": {"expert_cache_bias": 2.5}, "/m/d": {"expert_cache_bias": -0.1}, "/m/e": {"expert_cache_bias": "0.2"}, "/m/f": {"expert_cache_bias": 0}, "/m/g": {"expert_cache_bias": 8}}
@@ -1341,12 +1301,6 @@ test "model_settings: preserve_thinking is a bool, anything else is unset" {
     try std.testing.expect(s.lookup("/m/c").isEmpty());
 }
 
-test "logit bias CPU: file setting is a populated override" {
-    var s = try parse(std.testing.allocator, "{\"/m/a\":{\"logit_bias_file\":\"bias.json\"}}");
-    defer s.deinit();
-    try std.testing.expect(!s.lookup("/m/a").isEmpty());
-}
-
 test "vision: a streamed load leaves the tower off unless --vision or the per-model vision asks; resident keeps it on" {
     const t = std.testing;
     try t.expect(VisionChoice.resolve(null, null, true).on);
@@ -1390,8 +1344,6 @@ test "model_settings: validate takes the values the loader reads and names the r
         .{ .k = "kv_quant", .v = .{ .integer = 0 } },
         .{ .k = "mtp", .v = .{ .bool = false } },
         .{ .k = "ssd_prefetch", .v = .{ .integer = 0 } },
-        .{ .k = "think_penalty", .v = .{ .integer = 2 } },
-        .{ .k = "think_penalty", .v = .{ .float = 0.5 } },
         .{ .k = "expert_cache_bias", .v = .{ .float = 0.2 } },
         .{ .k = "expert_cache_bias", .v = .{ .integer = 2 } },
     };
@@ -1402,7 +1354,6 @@ test "model_settings: validate takes the values the loader reads and names the r
         .{ .k = "mtp", .v = .{ .string = "on" } },
         .{ .k = "ssd_budget_gb", .v = .{ .integer = 513 } },
         .{ .k = "ssd_prefetch", .v = .{ .integer = 101 } },
-        .{ .k = "think_penalty", .v = .{ .float = 20.5 } },
         .{ .k = "expert_cache_bias", .v = .{ .float = 2.5 } },
         .{ .k = "expert_cache_bias", .v = .{ .integer = 8 } },
         .{ .k = "vision", .v = .{ .integer = 1 } },
@@ -1600,13 +1551,8 @@ test "model_settings: limits: each arch and pack variant is offered only what th
     forced.streaming_required = true;
     try t.expect(!applies("mtp", forced));
 
-    const plain: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .template_preserves_thinking = false, .template_thinks = false };
+    const plain: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .template_preserves_thinking = false };
     try t.expect(!applies("preserve_thinking", plain));
-    try t.expect(!applies("think_penalty", plain));
-
-    const unbiased: Fit = .{ .arch = "a", .streams_experts = false, .has_vision = false, .serves_bias = false };
-    try t.expect(!applies("think_penalty", unbiased));
-    try t.expect(applies("think_penalty", .{ .arch = "a", .streams_experts = false, .has_vision = false }));
 }
 
 test "model_settings: refuseEdits: a value or pair the model cannot honour is refused, a removal or a kept file value never" {
@@ -1779,6 +1725,10 @@ test "a removed key in a model section gets one warning naming it, and the rest 
         removedLine(&buf, "/m/a", "mtp_greedy_tail").?,
     );
     try t.expect(std.mem.indexOf(u8, removedLine(&buf, "/m/a", "mtp_acceptance").?, "mtp_acceptance is removed and ignored") != null);
+    try t.expect(std.mem.indexOf(u8, removedLine(&buf, "/m/a", "think_penalty").?, "think_penalty is removed and ignored") != null);
+    try t.expect(std.mem.indexOf(u8, removedLine(&buf, "/m/a", "logit_bias_file").?, "logit_bias_file is removed and ignored") != null);
+    try t.expect(findKey(&model_keys, "think_penalty") == null);
+    try t.expect(findKey(&model_keys, "logit_bias_file") == null);
     try t.expect(removedLine(&buf, "/m/a", "ctx_size") == null);
     var s = try parse(t.allocator, "{\"/m/a\":{\"mtp_acceptance\":\"exact\",\"mtp_greedy_tail\":true,\"ctx_size\":4096}}");
     defer s.deinit();

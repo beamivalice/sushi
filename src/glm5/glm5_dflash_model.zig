@@ -9,8 +9,6 @@ const attention = @import("glm5_attention.zig");
 const kda = @import("glm5_dflash_kda.zig");
 const tree = @import("glm5_dflash_tree.zig");
 const adapter = @import("glm5_dflash.zig");
-const think_penalty = @import("../think_penalty.zig");
-const sampler = @import("../sampler.zig");
 const Arr = mlx.mlx_array;
 const Ops = base.Ops;
 // Layers per asynchronous evaluation group; zero settles every layer synchronously.
@@ -352,11 +350,8 @@ pub fn verify(target: *const forward.Model, request: *const forward.Request, tok
     return out[0];
 }
 
-/// A request's logit policy (static biases, the think penalty) after its committed ids.
-pub const Penalty = struct { state: think_penalty.ThinkPenalty, markers: ?Arr };
-
-/// One request's tree in a grouped verification. A penalty shifts its rows' decisions and logits.
-pub const Group = struct { request: *const forward.Request, tokens: []const u32, parents: []const i32, penalty: ?Penalty = null };
+/// One request's tree in a grouped verification.
+pub const Group = struct { request: *const forward.Request, tokens: []const u32, parents: []const i32 };
 
 /// Rows a grouped verification carries: the row kernels' bound.
 pub const max_rows = 16;
@@ -509,7 +504,7 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
     defer ops.deinit();
     const normalized = try ops.rms(try ops.reduce(h, 2, true, false), target.norm, target.cfg.rms_norm_eps);
     const raw = try kda.linearRows(&ops, target.head, normalized, mode);
-    const logits = try target.samplingLogits(&ops, try penalized(&ops, raw, groups, starts[0 .. groups.len + 1]));
+    const logits = try target.samplingLogits(&ops, raw);
     const decisions = try ops.slot();
     try mlx.check(mlx.mlx_argmax_axis(decisions, logits, -1, false, target.s));
     const u = try ops.cast(decisions.*, .uint32);
@@ -528,34 +523,6 @@ pub fn verifyGroups(target: *const forward.Model, groups: []const Group, taps: [
         @memcpy(v.targets[0..v.count], targets[starts[g]..starts[g + 1]]);
         v.logits = try ops.result(if (groups.len == 1) logits else try ops.slice(logits, 1, @intCast(starts[g]), @intCast(starts[g + 1])));
     }
-}
-
-/// Each penalized group's head rows, every row at the span state its own ancestry reaches, before
-/// the reserved-id mask as serial sampling orders them.
-fn penalized(ops: *Ops, raw: Arr, groups: []const Group, starts: []const usize) !Arr {
-    for (groups) |group| {
-        if (group.penalty != null) break;
-    } else return raw;
-    var parts: [max_rows]Arr = undefined;
-    for (groups, 0..) |group, g| {
-        const rows = if (groups.len == 1) raw else try ops.slice(raw, 1, @intCast(starts[g]), @intCast(starts[g + 1]));
-        const penalty = group.penalty orelse {
-            parts[g] = rows;
-            continue;
-        };
-        var inside: [max_rows]bool = undefined;
-        for (0..group.tokens.len) |row| {
-            var path: [16]u32 = undefined;
-            var ids: [16]u32 = undefined;
-            const on_path = ancestry(group.parents, row, &path);
-            for (on_path, ids[0..on_path.len]) |r, *id| id.* = group.tokens[r];
-            inside[row] = penalty.state.phaseAfter(ids[0..on_path.len]) == .inside;
-        }
-        const out = try ops.slot();
-        try think_penalty.shiftDecided(out, rows, penalty.markers, penalty.state, inside[0..group.tokens.len], ops.s);
-        parts[g] = out.*;
-    }
-    return if (groups.len == 1) parts[0] else ops.concat(parts[0..groups.len], 1);
 }
 
 /// Commits a single-row verification as one decode step: the request takes the row in place.
@@ -979,92 +946,6 @@ fn distinctRowsFixture(weights: *@import("../model.zig").Weights, s: mlx.mlx_str
         value.* = mlx.mlx_array_new_data(&codes, &[_]c_int{ 4, 32 }, 2, .uint32);
     }
     return cfg;
-}
-
-test "GLM verify decides biased tree rows as serial decode under the same bias, per request" {
-    try mlx.requireGpu();
-    const a = std.testing.allocator;
-    const s = mlx.gpuStream();
-    const Bias = @import("../logit_bias.zig").Bias;
-    var weights = @import("../model.zig").Weights.init(a);
-    defer weights.deinit();
-    const cfg = try distinctRowsFixture(&weights, s);
-    var target = try forward.Model.load(a, cfg, &weights, s);
-    defer target.deinit();
-    const vocab: usize = cfg.vocab_size;
-    // Serial sampling masks reserved ids after the bias; a bias added after the mask rounds in its dtype.
-    const reserved = try think_penalty.buildMask(a, &.{0}, vocab);
-    defer _ = mlx.mlx_array_free(reserved);
-    target.suppress_mask = reserved;
-    const markers = try think_penalty.buildMask(a, &.{1}, vocab);
-    defer _ = mlx.mlx_array_free(markers);
-    var requests: [2]forward.Request = undefined;
-    for (&requests, [_][]const u32{ &.{ 3, 1, 2 }, &.{ 2, 0 } }) |*request, prompt| {
-        request.* = try forward.Request.init(a, target.layers.len);
-        const ids = mlx.mlx_array_new_data(prompt.ptr, &.{ 1, @intCast(prompt.len) }, 2, .uint32);
-        defer _ = mlx.mlx_array_free(ids);
-        const logits = try target.forwardLast(request, ids, true);
-        defer _ = mlx.mlx_array_free(logits);
-        try mlx.check(mlx.mlx_array_eval(logits));
-    }
-    defer for (&requests) |*request| request.deinit();
-    const close: u32 = 3;
-    const tokens = [_]u32{ 1, close, 2 };
-    var unbiased = try verify(&target, &requests[0], &tokens, &.{ -1, 0, 1 }, &.{}, .serial_rows);
-    defer unbiased.deinit();
-    const ban = [_]Bias{ .{ .id = unbiased.targets[0], .delta = -100 }, .{ .id = 2, .delta = 0.375 } };
-    const scoped = [_]Bias{ .{ .id = 2, .delta = 1, .scope = .reasoning }, .{ .id = 1, .delta = 0.625, .scope = .answer } };
-    const cases = [_]think_penalty.ThinkPenalty{
-        .{ .biases = &ban },
-        .{ .lambda = 1.5, .opener_id = 2, .closer_id = close, .phase = .inside, .file_biases = &scoped, .biases = &ban },
-        .{ .lambda = 1.5, .opener_id = 2, .closer_id = close, .phase = .inside },
-    };
-    for (cases) |case| {
-        var p = case;
-        try p.prepare(a, vocab, markers, s);
-        defer p.deinitPrepared();
-        // A chain crosses the closer once; the fork leaves one sibling inside the span.
-        for ([_][3]i32{ .{ -1, 0, 1 }, .{ -1, 0, 0 } }) |parents| for ([_]kda.ProjectionMode{ .serial_rows, .affine_rows_ffn }) |mode| {
-            const groups = [_]Group{
-                .{ .request = &requests[0], .tokens = &tokens, .parents = &parents, .penalty = .{ .state = p, .markers = markers } },
-                .{ .request = &requests[1], .tokens = &.{1}, .parents = &.{-1} },
-            };
-            var out: [2]Verified = undefined;
-            try verifyGroups(&target, &groups, &.{}, mode, &out);
-            defer for (&out) |*v| v.deinit();
-            var plain = try verify(&target, &requests[1], &.{1}, &.{-1}, &.{}, mode);
-            defer plain.deinit();
-            try std.testing.expectEqual(plain.targets[0], out[1].targets[0]);
-            try expectArrayBits(plain.logits, out[1].logits, s);
-            if (p.lambda == 0) try std.testing.expect(out[0].targets[0] != unbiased.targets[0]);
-            for (0..tokens.len) |row| {
-                var serial = try adapter.cloneRequest(&requests[0]);
-                defer serial.deinit();
-                var ops = Ops{ .s = s };
-                defer ops.deinit();
-                var path: [16]u32 = undefined;
-                var ids: [16]u32 = undefined;
-                var raw: Arr = undefined;
-                const rows_on_path = ancestry(&parents, row, &path);
-                for (rows_on_path, 0..) |r, k| {
-                    ids[k] = tokens[r];
-                    const one = mlx.mlx_array_new_data(&tokens[r], &.{ 1, 1 }, 2, .uint32);
-                    defer _ = mlx.mlx_array_free(one);
-                    raw = try ops.own(try target.forwardLast(&serial, one, true));
-                }
-                var state = p;
-                state.phase = p.phaseAfter(ids[0..rows_on_path.len]);
-                const shifted = try ops.slot();
-                try think_penalty.shiftScoped(shifted, raw, markers, state, null, s);
-                const decided = try ops.own(try sampler.sampleTokenLazy(shifted.*, .{ .temperature = 0, .suppress_mask = reserved }, s));
-                try mlx.check(mlx.mlx_array_eval(decided));
-                var want: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&want, decided));
-                try std.testing.expectEqual(@as(u32, @intCast(want)), out[0].targets[row]);
-                try expectArrayBits(try target.samplingLogits(&ops, shifted.*), try ops.slice(out[0].logits, 1, @intCast(row), @intCast(row + 1)), s);
-            }
-        };
-    }
 }
 
 test "GLM default verification schedule selects only three NAX rows" {

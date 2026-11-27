@@ -68,7 +68,6 @@ test {
     _ = @import("server_state.zig");
     _ = @import("settings_resolve.zig");
     _ = @import("stop_sequences.zig");
-    _ = @import("logit_bias.zig");
     _ = @import("log.zig");
     _ = @import("test_models.zig");
     _ = @import("test_expect.zig");

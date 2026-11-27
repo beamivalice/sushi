@@ -93,7 +93,7 @@ pub fn sampleJoinedRows(
         for (0..count) |j| {
             const i = base + j;
             const gen = gens[i];
-            const step = gen.stepFor(rows[i], .{ .decided = &.{gen.next_token_id} });
+            const step = gen.stepFor(rows[i]);
             const run = try @import("../arch/cooler.zig").beginSample(xfm, step.mix());
             const lazy = @import("../sampler.zig").sampleStep(std.heap.page_allocator, step, xfm.outStream()) catch |e| {
                 try run.fail();

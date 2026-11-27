@@ -538,7 +538,7 @@ const test_domains = [_]TestDomain{
         "arm_trial",     "degenerate",   "dflash",             "forward_diag", "generate",       "hc_prefill",   "kv_cache",
         "kv_quant",      "mtp",                "mtp_plan",     "mtp_policy",     "mtp_round",    "mtp_tick",
         "prefill_plan",  "restore_dump", "row_store",          "sampler",      "scheduler",      "slot_admission", "slot_outcome",
-        "ssm_cache",     "think_penalty", "trunk",             "trunk_helpers_test", "trunk_stq",
+        "ssm_cache",     "trunk",             "trunk_helpers_test", "trunk_stq",
     } },
     // `tests` is the MLX root: its own test only names the files the binaries reach.
     .{ .name = "load", .folders = &.{"arch"}, .compile_gib = 8, .run_gib = 7, .files = &.{

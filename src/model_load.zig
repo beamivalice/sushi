@@ -239,8 +239,6 @@ pub fn applyModelSettings(config: *ModelConfig, o: model_settings.Override) void
     config.cooler_setting_stray = arch_flags.strayCoolerSetting(config, o);
     config.stampCooler();
     config.preserve_thinking_override = o.preserve_thinking;
-    config.think_penalty_override = o.think_penalty;
-    config.logit_bias_file_override = o.logit_bias_file;
     config.vision_override = o.vision;
     config.max_tokens_override = o.max_tokens;
     config.expert_cache_bias_override = o.expert_cache_bias;
@@ -311,15 +309,6 @@ pub fn logConcurrency(config: *const ModelConfig) void {
 pub fn yarnFactorIgnoredLine(config: *const ModelConfig, saved: ?u8) ?[]const u8 {
     if (saved == null or config.yarn_factor_override != null) return null;
     return model_settings.unavailable("yarn_factor", arch_flags.settingsFit(config)) orelse "model-settings.json yarn_factor is ignored: the config.json was parsed without it";
-}
-
-/// The line saying `--think-penalty` does not apply to a model whose arch serves no bias; null when it does or none is given.
-pub fn thinkPenaltyFlagLine(buf: []u8, config: *const ModelConfig, flag: ?f32) ?[]const u8 {
-    const lambda = flag orelse return null;
-    if (lambda <= 0) return null;
-    var why_buf: [96]u8 = undefined;
-    const why = arch_flags.biasRefusal(&why_buf, config, "think_penalty") orelse return null;
-    return std.fmt.bufPrint(buf, "[think-penalty] --think-penalty {d} does not apply to this model: {s}", .{ lambda, why }) catch null;
 }
 
 /// A context the flag or the saved ctx_size asks above the model's `max_kv_tokens`: no request could ever hold it.
@@ -512,7 +501,6 @@ pub fn launchRefusal(buf: []u8, config: *const ModelConfig, kv_quant: ?trunk.KVQ
         .mtp_min_depth = if (depth_bounds.active.min > 1) depth_bounds.active.min else 0,
         .mtp_max_depth = depth_bounds.active.max,
     })) |why| return .{ .err = error.LaunchFlagUnsupported, .line = why };
-    if (arch_flags.biasLoadRefusal(buf, config)) |line| return .{ .err = error.LaunchFlagUnsupported, .line = line };
     switch (bills.prefillChunkBounds(buf, config)) {
         .refused => |line| return .{ .err = if (settings_resolve.chunkBounds(config).refused.fromFile()) error.PrefillChunkSettingRefused else error.LaunchFlagUnsupported, .line = line },
         .bounds => {},
@@ -2610,8 +2598,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     try params.tok.bindTemplate(params.chat_config.printedFacts(), params.config.eosTokenSlice(), &.{ params.config.image_token_id, params.config.video_token_id });
     try params.tok.enableSegmentCache(segment_cache_mod.default_budget);
     sampler.installSuppressMask(xfm_ptr, params.tok);
-    generate_mod.installThinkMarkers(xfm_ptr, params.tok);
-    try generate_mod.installLogitBias(sch.io, xfm_ptr, params.tok);
 
     // Propagate the kv-quant config to the Trunk's own cache. Slot
     // caches in serve mode honor this independently in `Slot.init`; this
@@ -2642,9 +2628,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const keep = settings_resolve.resolve(bool, model_settings.preserve_thinking_flag, params.config.preserve_thinking_override, model_settings.default_preserve_thinking);
         log.info("[chat] preserve_thinking {s} ({s})\n", .{ if (keep.value) "on" else "off", settings_resolve.sourceLabel(keep.source, "--preserve-thinking") });
     }
-    const think = settings_resolve.resolve(f32, model_settings.think_penalty_flag, params.config.think_penalty_override, model_settings.default_think_penalty);
-    var flag_line_buf: [192]u8 = undefined;
-    if (thinkPenaltyFlagLine(&flag_line_buf, params.config, model_settings.think_penalty_flag)) |line| log.info("{s}\n", .{line}) else if (think.value > 0) log.info("[think-penalty] lambda {d} ({s}); a request's think_penalty outranks it\n", .{ think.value, settings_resolve.sourceLabel(think.source, "--think-penalty") });
     if (kv_quant_config.scheme != .off) {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
@@ -4107,31 +4090,6 @@ test "a launch flag or saved kv_quant the arch cannot act on is refused with its
     try testing.expect(r.err == error.LaunchFlagUnsupported);
     try testing.expect(std.mem.startsWith(u8, r.line, "--kv-quant has no effect on "));
     try testing.expect(launchRefusal(&buf, &dsv, null, 0) == null);
-}
-
-test "a think penalty by flag or setting and a logit-bias file: the setting and the file are refused at load by the arch that serves no bias, the flag is a line saying it does not apply, and one that serves them loads" {
-    const registry = @import("arch/registry.zig");
-    if (registry.ofModelType("hy_v4_flash") == null or registry.ofModelType("qwen4_exp") == null) return error.SkipZigTest;
-    const saved = model_settings.think_penalty_flag;
-    defer model_settings.think_penalty_flag = saved;
-    var buf: [384]u8 = undefined;
-    var hy4 = ModelConfig{ .model_type = "hy_v4_flash" };
-    const qwen = ModelConfig{ .model_type = "qwen4_exp" };
-    model_settings.think_penalty_flag = 1.5;
-    try testing.expect(launchRefusal(&buf, &hy4, null, 0) == null);
-    try testing.expect(launchRefusal(&buf, &qwen, null, 0) == null);
-    try testing.expectEqualStrings("[think-penalty] --think-penalty 1.5 does not apply to this model: Hy4-Flash does not support think_penalty", thinkPenaltyFlagLine(&buf, &hy4, 1.5).?);
-    try testing.expect(thinkPenaltyFlagLine(&buf, &qwen, 1.5) == null);
-    try testing.expect(thinkPenaltyFlagLine(&buf, &hy4, 0) == null);
-    try testing.expect(thinkPenaltyFlagLine(&buf, &hy4, null) == null);
-    model_settings.think_penalty_flag = null;
-    hy4.think_penalty_override = 2;
-    try testing.expectEqualStrings("Hy4-Flash does not support think_penalty: remove it from this model's settings", launchRefusal(&buf, &hy4, null, 0).?.line);
-    hy4.think_penalty_override = null;
-    hy4.logit_bias_file_override = @import("logit_bias.zig").FilePath.from("bias.json");
-    try testing.expectEqualStrings("Hy4-Flash does not support logit_bias: remove logit_bias_file from this model's settings", launchRefusal(&buf, &hy4, null, 0).?.line);
-    hy4.logit_bias_file_override = null;
-    try testing.expect(launchRefusal(&buf, &hy4, null, 0) == null);
 }
 
 test "a model of no served arch is refused as such before any launch flag it cannot act on" {

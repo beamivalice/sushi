@@ -237,11 +237,6 @@ pub fn templateTakesPreserveThinking(chat_config: *const ChatConfig) bool {
     return asks.preserveThinking(chat_config.facts());
 }
 
-/// A template with a thinking span: the `think_penalty` needs its closing marker to arm.
-pub fn templateHasThinkSpan(chat_config: *const ChatConfig) bool {
-    return asks.thinkSpan(chat_config.facts());
-}
-
 /// Chat template configuration loaded from tokenizer_config.json.
 pub const ChatConfig = struct {
     chat_template: []const u8,
@@ -483,10 +478,6 @@ pub const asks = struct {
     /// It reads `preserve_thinking` (Qwen3.8) or `preserved_thinking` (Hy4-Flash): only then is the switch handed over.
     pub fn preserveThinking(f: *const Facts) bool {
         return f.reads("preserve_thinking") or f.reads("preserved_thinking");
-    }
-    /// It emits a think closer: the `think_penalty` needs one to arm.
-    pub fn thinkSpan(f: *const Facts) bool {
-        return f.emits("</think>");
     }
     /// It reads `tools`, so it renders the tool list itself.
     pub fn tools(f: *const Facts) bool {
@@ -4247,7 +4238,6 @@ test "chat: what the server asks of each served template is what searching its t
             }
         }.search;
         try testing.expectEqual(has(text, "preserve_thinking"), asks.preserveThinking(f));
-        try testing.expectEqual(has(text, "</think>"), asks.thinkSpan(f));
         try testing.expectEqual(has(text, "tools"), asks.tools(f));
         try testing.expectEqual(has(text, "'tool'") or has(text, "\"tool\""), asks.toolRole(f));
         try testing.expectEqual(has(text, "reasoning_effort"), asks.effort(f));
@@ -4313,7 +4303,6 @@ test "chat: preserve_thinking, a think closer and reasoning_effort named only in
     var cc = try loadChatConfig(io, testing.allocator, root, null);
     defer cc.deinit();
     try testing.expect(!templateTakesPreserveThinking(&cc));
-    try testing.expect(!templateHasThinkSpan(&cc));
     try testing.expect(!templateConsumesEffort(&cc));
 }
 
@@ -5011,7 +5000,6 @@ fn peekForPage(dir: []const u8) !void {
     var cc = try peekChatConfig(testing.io, std.heap.page_allocator, dir, null);
     defer cc.deinit();
     _ = templateTakesPreserveThinking(&cc);
-    _ = templateHasThinkSpan(&cc);
 }
 
 /// How a forked child that ran `f(arg)` ended: a crash is the failure the shape cases look for.

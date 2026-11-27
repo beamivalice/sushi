@@ -4362,7 +4362,7 @@ test "dsv41 engine: a request's first token and every serial step put no op on M
     }
 }
 
-test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit bias or a row mask puts no op on MLX (DSV41_STQ_TINY)" {
+test "dsv41 engine: a DSpark round with penalties puts no op on MLX (DSV41_STQ_TINY)" {
     try mlx.requireGpu();
     const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
     var fx: EngineFixture = undefined;
@@ -4374,22 +4374,9 @@ test "dsv41 engine: a DSpark round with penalties, a thinking penalty, a logit b
     defer tok.deinit();
     var buf: [48]u32 = undefined;
     const prompt = fx.prompt(&buf)[0..30];
-    const m = fx.model();
-    const think_ids = [_]u32{ 11, 12, 13 };
-    fx.xfm.think_marker_mask = try @import("../think_penalty.zig").buildMask(a, &think_ids, m.cfg.vocab);
-    defer {
-        _ = mlx.mlx_array_free(fx.xfm.think_marker_mask.?);
-        fx.xfm.think_marker_mask = null;
-    }
-    const bias = [_]@import("../logit_bias.zig").Bias{.{ .id = 14, .delta = 1.5, .scope = .reasoning }};
-    const think: SamplingParams = .{ .temperature = 0.8, .seed = 3, .think_penalty = .{ .lambda = 2, .opener_id = 5, .closer_id = 6, .phase = .inside } };
-    var biased = think;
-    biased.think_penalty.biases = &bias;
     const cases = [_]SamplingParams{
         .{ .temperature = 0.8, .repeat_penalty = 1.3, .seed = 5 },
         .{ .temperature = 0.0, .frequency_penalty = 0.4, .presence_penalty = 0.2 },
-        think,
-        biased,
     };
     for (cases) |c| {
         try fx.xfm.resetCache();

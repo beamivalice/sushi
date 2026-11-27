@@ -231,7 +231,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 
 - **An explicit launch flag outranks `model-settings.json`**, which outranks the default (`settings_resolve.resolve`,
   the one resolver: `Setting(T) = { value, source: flag | model_settings | default }`; `--ctx-size 0` = not given). Applies to `--mtp/--no-mtp`, `--kv-quant`, `--ctx-size`,
-  `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--think-penalty`, `--vision/--no-vision`, `--max-tokens`; a request's own field still applies on top. Design reviews reject "file beats
+  `--ssd-budget-gb`, `--ssd-prefetch`, `--preserve-thinking`, `--vision/--no-vision`, `--max-tokens`; a request's own field still applies on top. Design reviews reject "file beats
   flag".
 - **`--mtp-min-depth` / `--mtp-max-depth` are launch-only**: the range is a property of the machine, so it has no
   `model-settings.json` key ([engine-mtp](engine-mtp.md#depth-range)).
@@ -261,10 +261,9 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   flight before it plans its evictions, so a model switch queues behind it; a model still pinned by its requests then
   refuses as above.
 - Per-model settings live in `~/.sushi/model-settings.json` (`src/model_settings.zig`: `ctx_size`, `kv_quant`,
-  `mtp`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `think_penalty`, `logit_bias_file`, `vision`, `qwen_cooler` (bool, the same for Qwen3.8 and `--qwen-mlx-engine`; each arch reads only its own key, `arch_flags.coolerSettingOf`, and another arch's key is ignored with a log line), `ds41_cooler` (bool, default true: DeepSeek-V4.1 decodes on Sushi Cooler; false decodes on MLX, as `--ds41-mlx-engine` pins; ignored with a log line on other archs, disabled with its reason on the page for a pack or Mac Cooler cannot serve), `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), `expert_cache_bias` (0..2, one constant, `expert_cache_bias_max`: a value outside it is refused by name by the flag, the file and the API, never clamped; the web UI shows an enable toggle (off = 0, the default; enabling starts a slider at 0.2, turning it off saves 0); the twin of `--expert-cache-bias`, which wins; `ModelConfig.expertCacheBias` hands the load's own value to its expert engine and its prefix namespace; offered only to a DeepSeek-V4.1, Qwen3.8 or Hy4-Flash STQ pack that streams, `ExpertStreamTraits.cache_bias`), stamped at BOTH load construction sites and resolved
+  `mtp`, `ssd_budget_gb`, `ssd_prefetch` (0..100; ignored with a log line on an arch with no expert prefetcher, whereas the flag is refused there), `preserve_thinking`, `vision`, `qwen_cooler` (bool, the same for Qwen3.8 and `--qwen-mlx-engine`; each arch reads only its own key, `arch_flags.coolerSettingOf`, and another arch's key is ignored with a log line), `ds41_cooler` (bool, default true: DeepSeek-V4.1 decodes on Sushi Cooler; false decodes on MLX, as `--ds41-mlx-engine` pins; ignored with a log line on other archs, disabled with its reason on the page for a pack or Mac Cooler cannot serve), `max_tokens`: the per-model twin of `--max-tokens`, a positive integer at most the model's context, the omitted-`max_tokens` budget of `ModelConfig.defaultMaxTokens`), `expert_cache_bias` (0..2, one constant, `expert_cache_bias_max`: a value outside it is refused by name by the flag, the file and the API, never clamped; the web UI shows an enable toggle (off = 0, the default; enabling starts a slider at 0.2, turning it off saves 0); the twin of `--expert-cache-bias`, which wins; `ModelConfig.expertCacheBias` hands the load's own value to its expert engine and its prefix namespace; offered only to a DeepSeek-V4.1, Qwen3.8 or Hy4-Flash STQ pack that streams, `ExpertStreamTraits.cache_bias`), stamped at BOTH load construction sites and resolved
   ONCE in `doLoadOnInferenceThread` (`preserve_thinking` per render, where a request can override it, and logged as
-  `[chat] preserve_thinking on|off (source)` at load; `think_penalty` per request, logged as
-  `[think-penalty] lambda L (source)`); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
+  `[chat] preserve_thinking on|off (source)` at load); read via `server.manualContext(config)` / `configuredKvQuantFor(config)`, never the raw
   server config.
 - **`yarn_factor` ("2" or "4", Qwen only) shapes the config PARSE, not a stamp on it**: `model.parseConfig` and the
   discovery stub read it, so the load, the advertised context and the prefix-cache fingerprint agree
@@ -489,7 +488,7 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
 - **A request the admission tick holds (single-flight arch, memory) logs `[queue] waiting behind N request(s); running: P+G of
   max M tokens (~S s at R tok/s)` once, and `[queue] started after X s` when it starts**; the ETA is the running request's
   remaining max, an upper bound. Visibility only: no priority, preemption or queue limit.
-- **A turn that finishes `stop` on an EOS or a pad run logs `[stop] reason=eos|pad-run token=<id> "<text>" after=<id> "<text>"
+- **A turn that finishes `stop` on an EOS, a `tool_choice: "none"` call opener, or a pad run logs `[stop] reason=eos|tool-choice-none|pad-run token=<id> "<text>" after=<id> "<text>"
   completion=<n> path=serial|spec|batch`; a request's own stop sequence logs `[stop] reason=stop-seq match="..."`** (grep
   `[stop]`). The EOS is never pushed or counted, so `Slot.stop_token` / `Generator.stop_token` (set where the stop is
   decided) are the only record of it; a length finish or a disconnect logs nothing.

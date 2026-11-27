@@ -202,7 +202,7 @@ test "settings precedence: ctx_size is flag > file > auto, and 0 is auto on both
     for (rows) |r| try expectSetting(u32, r.want, r.source, model_settings.contextPick(r.flag, r.file));
 }
 
-test "settings precedence: preserve_thinking and think_penalty are flag > file > default" {
+test "settings precedence: preserve_thinking is flag > file > default" {
     const bool_rows = [_]struct { flag: ?bool, file: ?bool, want: bool, source: Source }{
         .{ .flag = null, .file = null, .want = true, .source = .default },
         .{ .flag = null, .file = false, .want = false, .source = .model_settings },
@@ -210,13 +210,6 @@ test "settings precedence: preserve_thinking and think_penalty are flag > file >
         .{ .flag = true, .file = false, .want = true, .source = .flag },
     };
     for (bool_rows) |r| try expectSetting(bool, r.want, r.source, resolve(bool, r.flag, r.file, model_settings.default_preserve_thinking));
-    const penalty_rows = [_]struct { flag: ?f32, file: ?f32, want: f32, source: Source }{
-        .{ .flag = null, .file = null, .want = 0, .source = .default },
-        .{ .flag = null, .file = 3, .want = 3, .source = .model_settings },
-        .{ .flag = 0, .file = 3, .want = 0, .source = .flag },
-        .{ .flag = 5, .file = null, .want = 5, .source = .flag },
-    };
-    for (penalty_rows) |r| try expectSetting(f32, r.want, r.source, resolve(f32, r.flag, r.file, model_settings.default_think_penalty));
 }
 
 test "settings precedence: vision is flag > file > the load's default" {

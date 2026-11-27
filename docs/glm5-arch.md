@@ -128,10 +128,8 @@ target layers 5, 14, 24, 33 and 42, before the final norm.
   are unchanged.
 - **Decisions**: greedy follows the target argmax; sampled requests draw only the visited target path with the
   request's sampling parameters, advancing the RNG exactly as serial decoding does (budgets and EOS included). Both
-  verify through the same batched rows, whose logits equal per-row serial projections bit for bit.
-  Logit biases (`logit_bias`, the `tool_choice: "none"` call-opener ban, `logit_bias_file`) and the think penalty
-  shift each tree row at the span state its own ancestry reaches, before the reserved-id mask, as serial sampling does
-  (`Generator.glmPenalty`); greedy output stays byte-identical to `--no-drafter`. Constrained, forced-tool-call,
+  verify through the same batched rows, whose logits equal per-row serial projections bit for bit; greedy output stays
+  byte-identical to `--no-drafter`. Constrained, forced-tool-call,
   repeat/presence-penalized or explicitly budgeted-thinking requests decode serially.
 - **A round's tree is cut to `min(output budget, positions left)` rows deep** (`proposeRoundAdaptive`): the verifier refuses an
   ancestry past the context, so a two-token tail never carries a three-row chain.

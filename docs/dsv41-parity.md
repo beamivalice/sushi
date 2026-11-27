@@ -14,7 +14,7 @@ item).
 |---|---|---|
 | Native speculative decode, greedy | works; text is the same at every round-width mix (`SUSHI_DSV41_DSPARK_EXACT=0` trades that for the faster arms) | `[spec-stats] mode=dspark` in the server log; `dsv41 generator: with exact DSpark rounds`. Adaptive DSpark picks plain or drafted rounds from measured timings, and each linear has one arm at every verify width, so greedy text does not depend on the mix; it can still part from `--no-mtp` at a near-tie, and a stream and a non-stream reply carry the same bytes ([dsv41-arch](dsv41-arch.md#dspark)) |
 | Spec decode for sampled requests | works | point-mass draft, exact accept rule (`Generator.dsparkSampledVerdict`); sampled determinism test |
-| Spec decode under repeat / presence / think penalty | works | verify rows shifted by `penaltyShiftRows`, `thinkShiftRows`; distinct-id test |
+| Spec decode under repeat / presence penalty | works | verify rows shifted by `penaltyShiftRows`; distinct-id test |
 | Spec decode under a thinking bound (Anthropic `budget_tokens`, `reasoning_budget_tokens`) | works | bound checked between rounds (a round is cut to the thought room), DSpark resumes for the answer; `a thinking bound that fires mid-round` |
 | Spec decode with a forced call | N/A | MTP refuses it (`mtp_plan.mtpRefusal`); it decodes serially |
 | Batched decode, several slots | done (resident) | a fully resident load joins up to `maxJoinedRows` slots as rows of one decode forward, each its solo step's bytes (`dsv41_sched.batchedForward`); a streamed load is one request at a time (`ownsModuleDecodeState`, `/props` `batching.reason = exclusive`) |

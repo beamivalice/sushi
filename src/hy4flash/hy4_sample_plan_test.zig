@@ -346,32 +346,6 @@ test "hy4 sample plan: a request whose stop set holds a token the model emits en
     try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
 }
 
-test "hy4 sample plan: a think penalty armed directly on a load that serves no bias is refused by name, never a plan miss (HY4_STQ_TINY)" {
-    try mlx.requireGpu();
-    const a = testing.allocator;
-    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
-    const ids = try @import("hy4_contract.zig").prompt(a, dir);
-    defer a.free(ids);
-    var ld: contract.Load = undefined;
-    try openMasked(&ld, dir);
-    defer _ = ld.close();
-    const turn = @import("../arch/handle.zig").turnFor(ld.h, &ld.config);
-    defer turn.end();
-    defer @import("../arch/sched.zig").endRequest(&ld.config);
-    const m = ld.xfm.arch_state.hy4flash.model.?;
-    defer m.reset();
-    const biases = [_]@import("../logit_bias.zig").Bias{.{ .id = 12, .delta = -2 }};
-    const armed = [_]sampler.SamplingParams{
-        .{ .temperature = 0, .think_penalty = .{ .lambda = 2, .opener_id = 3, .closer_id = 4, .phase = .inside } },
-        .{ .temperature = 0, .think_penalty = .{ .lambda = 1, .biases = &biases, .phase = .before } },
-    };
-    for (armed) |sampling| {
-        const refused = serve(a, &ld, ids[0..24], sampling, .{}, &.{}, true);
-        if (refused) |_| return error.TestExpectedRefusal else |e| try testing.expectEqualStrings("BiasUnserved", @errorName(e));
-    }
-    try testing.expectEqual(@as(u64, 0), m.plans.?.sample.misses);
-}
-
 test "hy4 sample plan: a request whose forced call ends samples on after the forced token with the pool's tokens, no draw missing (HY4_STQ_TINY)" {
     try mlx.requireGpu();
     const a = testing.allocator;

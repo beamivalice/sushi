@@ -78,6 +78,7 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"top_k\":1,\"
 for f in 'temperature|"temperature":-1' 'temperature|"temperature":100' 'top_p|"top_p":2' 'top_k|"top_k":-3' 'top_k|"top_k":5000' \
          'seed|"seed":9223372036854775808' 'max_tokens|"max_tokens":-5' 'presence_penalty|"presence_penalty":3' \
          'repeat_penalty|"repeat_penalty":-1' 'logprobs|"logprobs":true' 'top_logprobs|"top_logprobs":3' 'think_penalty|"think_penalty":99' \
+         'logit_bias|"logit_bias":{"1":-100}' \
          'min_p|"min_p":1.5' 'typical_p|"typical_p":0.9' 'tfs_z|"tfs_z":0.95' 'top_a|"top_a":0.1' 'mirostat|"mirostat":2' \
          'dry_multiplier|"dry_multiplier":0.8' 'xtc_probability|"xtc_probability":0.5'; do
     key=${f%%|*}; field=${f#*|}
@@ -85,7 +86,7 @@ for f in 'temperature|"temperature":-1' 'temperature|"temperature":100' 'top_p|"
     req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],$field$cap,$NT_CHAT}"
     [[ "$R" == 400 && "$(echo "$BODY" | J 'd["error"]["message"]')" == *"'$key'"* ]] && ok "out-of-range $field is refused naming $key" || bad "out-of-range $field" "$R ${BODY:0:120}"
 done
-for f in '"max_tokens":0' '"temperature":2,"top_p":0,"top_k":1000' '"logit_bias":{"1":-100}' '"presence_penalty":2,"frequency_penalty":-2' '"seed":-1' \
+for f in '"max_tokens":0' '"temperature":2,"top_p":0,"top_k":1000' '"logit_bias":{}' '"think_penalty":0' '"presence_penalty":2,"frequency_penalty":-2' '"seed":-1' \
          '"min_p":0.05,"temperature":0.8' '"min_p":1' '"service_tier":"auto"' \
          '"typical_p":1,"tfs_z":1,"top_a":0,"mirostat":0,"dry_multiplier":0,"xtc_probability":0'; do
     [[ "$f" == '"max_tokens"'* ]] && cap="" || cap=',"max_tokens":5'

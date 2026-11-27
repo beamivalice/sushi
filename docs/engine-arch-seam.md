@@ -126,7 +126,7 @@ without it. An arch added later joins the list in the landing that adds it.
 - **The engine holds a handle, not a trunk.** `LoadedModel.handle` is `arch/handle.zig`'s `Handle` (the registry's
   `Arch` union), and every read the engine makes of a loaded model goes through that file: `trunk(h)` (the engine state
   the generic paths run on: an arch's `host(m)` when its `Model` is not that state, else the `Model`), `destroy`,
-  `stream`, `config`, `ownsModuleDecodeState`, `moduleSpecWiring`, `moduleStateSpecRollback`, `logitBias`,
+  `stream`, `config`, `ownsModuleDecodeState`, `moduleSpecWiring`, `moduleStateSpecRollback`,
   `flushImatrix`. Each is one switch on the tag; a test fixture stores `handleOf(&trunk)`.
 - **Numbers and tables an arch owns are `Facts` or hooks.** The MTP numbers are `Facts` (`mtp_draft_temp`,
   `mtp_adaptive_min_kv`, `mtp_adaptive_calibrated`, `mtp_rollback_by_truncate`, `cost_layout`); the EV cost surface of a

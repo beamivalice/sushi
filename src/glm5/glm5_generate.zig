@@ -8,7 +8,6 @@ const mtp_lookup = @import("../mtp_lookup.zig");
 const round_cost = @import("../round_cost.zig");
 const dflash_policy = @import("../dflash_policy.zig");
 const dflash_native = @import("glm5_dflash.zig");
-const logit_bias = @import("../logit_bias.zig");
 const Trunk = trunk_mod.Trunk;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const SSMCheckpoint = trunk_mod.SSMCheckpoint;
@@ -105,7 +104,6 @@ pub const dflashGateShouldDisable = dflash_policy.dflashGateShouldDisable;
 pub const DflashGateWindow = dflash_policy.DflashGateWindow;
 pub const dflashSerialPrice = dflash_policy.dflashSerialPrice;
 
-/// Logit biases and the think penalty ride the verifier (`Generator.glmPenalty`).
 pub fn glmDflashEligible(sampling: sampler.SamplingParams) bool {
     return !mtp_plan.specDecodeUnsupported(sampling) and sampling.think_bound == null;
 }
@@ -227,7 +225,7 @@ pub fn nextGlmDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
     timer.reset();
     const request = glm5_state.requestOf(&self.ctx).?;
     // Batched rows keep every serial row's bits, so sampled decisions read the same logits.
-    const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count], .penalty = glmPenalty(self) };
+    const group = @import("glm5_dflash_model.zig").Group{ .request = request, .tokens = proposal.tokens[0..proposal.count], .parents = proposal.parents[0..proposal.count] };
     var verified: [1]@import("glm5_dflash_model.zig").Verified = undefined;
     try @import("glm5_dflash_model.zig").verifyGroups(glm5_state.modelOf(self.xfm).?, &.{group}, self.dflash.?.config.target_layer_ids, .affine_rows_ffn, &verified);
     const layerwise = &verified[0];
@@ -268,15 +266,6 @@ pub fn glmLookupChain(self: *Generator, allocator: std.mem.Allocator) !?@import(
     const chain = glmLookupProposal(got, self.next_token_id, self.max_tokens -| self.completion_tokens) orelse return null;
     if (self.native_lookup.rounds == 0) log.info("[glm-dflash] lookup chain engaged: {d} drafts, suffix {d}\n", .{ glm_lookup_drafts, got.?.suffix });
     return chain;
-}
-
-/// The logit policy this request's DFlash2 tree rows take in the verifier; null = none.
-pub fn glmPenalty(self: *Generator) ?@import("glm5_dflash_model.zig").Penalty {
-    const tp = &self.sampling.think_penalty;
-    if (!tp.active()) return null;
-    tp.observe(self.generated_ids.items);
-    if (!tp.hasBias() and (self.xfm.think_marker_mask == null or tp.phase == .after)) return null;
-    return .{ .state = tp.*, .markers = self.xfm.think_marker_mask };
 }
 
 /// A DFlash2 GLM round may run: not done, no stop due.
@@ -541,10 +530,6 @@ test "GLM serving DFlash2 arms only requests the native verifier can reproduce" 
     try testing.expect(glmDflashEligible(.{ .temperature = 1, .top_k = 1 }));
     try testing.expect(glmDflashEligible(.{ .temperature = 1 }));
     try testing.expect(!glmDflashEligible(.{ .temperature = 0, .presence_penalty = 1 }));
-    const ban = [_]logit_bias.Bias{.{ .id = 7, .delta = -100 }};
-    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .biases = &ban } }));
-    try testing.expect(glmDflashEligible(.{ .temperature = 1, .think_penalty = .{ .file_biases = &ban } }));
-    try testing.expect(glmDflashEligible(.{ .temperature = 0, .think_penalty = .{ .lambda = 1, .closer_id = 3, .phase = .inside } }));
 }
 
 test "GLM snapshot backoff lands the prompt-end checkpoint on a pool boundary" {
@@ -633,9 +618,9 @@ test "a serial step whose MLX call raises at any point ends the request by name 
         }
     };
     // Token 0 is the pad id three of which end a request, and the fixture's argmax is often 0.
-    const no_pad = [_]logit_bias.Bias{.{ .id = 0, .delta = -100, .scope = .all }};
+    xfm.suppress_mask = try sampler.buildSuppressMask(&.{0}, 0, cfg.vocab_size, xfm.outStream());
     var msg: [300]u8 = undefined;
-    for ([_]SamplingParams{ .{ .temperature = 0.0, .think_penalty = .{ .biases = &no_pad } }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 7, .think_penalty = .{ .biases = &no_pad } } }) |sampling| {
+    for ([_]SamplingParams{ .{ .temperature = 0.0 }, .{ .temperature = 0.8, .top_p = 0.95, .seed = 7 } }) |sampling| {
         var want: std.ArrayList(u32) = .empty;
         defer want.deinit(a);
         var fired = false;

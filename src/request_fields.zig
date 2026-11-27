@@ -6,7 +6,6 @@
 const std = @import("std");
 const request_parse = @import("request_parse.zig");
 const stop_sequences = @import("stop_sequences.zig");
-const model_settings = @import("model_settings.zig");
 const trunk = @import("trunk.zig");
 const chat_mod = @import("chat.zig");
 
@@ -105,7 +104,7 @@ pub const rows = [_]Row{
     .{ .key = "frequency_penalty", .kind = .{ .number = .{ .min = -2, .max = 2 } }, .on = &not_messages },
     .{ .key = "repeat_penalty", .kind = .{ .number = .{ .min = 0, .max = 10 } }, .on = &not_messages },
     .{ .key = "repetition_penalty", .kind = .{ .number = .{ .min = 0, .max = 10 } }, .on = &not_messages },
-    .{ .key = "think_penalty", .kind = .{ .number = .{ .min = 0, .max = model_settings.think_penalty_max } }, .on = &all },
+    .{ .key = "think_penalty", .kind = .{ .shaped = thinkPenaltyFault }, .on = &all },
     .{ .key = "typical_p", .kind = .{ .sampler_off = 1 }, .on = &all },
     .{ .key = "tfs_z", .kind = .{ .sampler_off = 1 }, .on = &all },
     .{ .key = "top_a", .kind = .{ .sampler_off = 0 }, .on = &all },
@@ -120,7 +119,7 @@ pub const rows = [_]Row{
     .{ .key = "max_output_tokens", .kind = .budget, .on = &.{.responses} },
     .{ .key = "kv_quant", .kind = .{ .shaped = kvQuantFault }, .on = &all },
     .{ .key = "n", .kind = .one_choice, .on = &all },
-    .{ .key = "logit_bias", .kind = .{ .shaped = anyShape }, .on = &chat_completions },
+    .{ .key = "logit_bias", .kind = .{ .shaped = logitBiasFault }, .on = &chat_completions },
     .{ .key = "logprobs", .kind = .{ .not_served = .flag }, .on = &.{.chat} },
     .{ .key = "logprobs", .kind = .{ .not_served = .absent }, .on = &.{.completions} },
     .{ .key = "top_logprobs", .kind = .{ .not_served = .count }, .on = &chat_responses },
@@ -184,6 +183,21 @@ fn numberOf(v: std.json.Value) ?f64 {
         .float => |f| if (std.math.isFinite(f)) f else null,
         else => null,
     };
+}
+
+fn thinkPenaltyFault(buf: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
+    if (numberOf(v) == 0) return null;
+    return fieldFault(buf, "'think_penalty' is not supported: this server does not apply a think penalty; omit it or send 0", .{});
+}
+
+fn logitBiasFault(buf: []u8, _: Surface, v: std.json.Value) ?[]const u8 {
+    const empty = switch (v) {
+        .object => |o| o.count() == 0,
+        .array => |a| a.items.len == 0,
+        else => false,
+    };
+    if (empty) return null;
+    return fieldFault(buf, "'logit_bias' is not supported: this server does not apply logit biases; omit it or send {{}}", .{});
 }
 
 fn kindFault(buf: []u8, r: Row, s: Surface, v: std.json.Value) ?[]const u8 {
@@ -324,11 +338,6 @@ pub fn Checked(comptime surface: Surface) type {
         /// The request's `min_p`: absent is 0, off.
         pub fn minP(self: Self) f32 {
             return self.number("min_p") orelse 0;
-        }
-
-        /// The request's own `think_penalty`; null when absent.
-        pub fn thinkPenalty(self: Self) ?f32 {
-            return self.number("think_penalty");
         }
 
         /// The first positive token budget among the surface's spellings, so an absent, null or 0 one (the app's
@@ -724,7 +733,7 @@ test "a scalar field of the wrong type or range is refused by name, on the surfa
         .{ .surface = .responses, .body = "{\"max_output_tokens\":\"1\"}", .field = "max_output_tokens" },
         .{ .body = "{\"think_penalty\":-4}", .field = "think_penalty" },
         .{ .body = "{\"think_penalty\":1e9}", .field = "think_penalty" },
-        .{ .body = "{\"reasoning_budget_tokens\":-1,\"think_penalty\":20}", .field = null },
+        .{ .body = "{\"reasoning_budget_tokens\":-1,\"think_penalty\":0}", .field = null },
         .{ .body = "{\"reasoning_budget_tokens\":1099511627776}", .field = "reasoning_budget_tokens" },
         .{ .body = "{\"reasoning_budget_tokens\":\"64\"}", .field = "reasoning_budget_tokens" },
         .{ .body = "{\"max_tokens\":7.9}", .field = "max_tokens" },
@@ -863,6 +872,25 @@ test "a field a surface does not read is refused by name, never dropped" {
         .{ .surface = .compact, .body = "{\"input\":\"x\",\"instructions\":\"y\",\"tools\":[],\"reasoning\":{},\"text\":{},\"parallel_tool_calls\":true,\"temperature\":5}", .field = null },
         .{ .surface = .compact, .body = "{\"instructions\":5}", .field = "instructions" },
         .{ .surface = .compact, .body = "{\"previous_response_id\":5}", .field = "previous_response_id" },
+    });
+}
+
+test "think_penalty and logit_bias are refused by name, accepted only when off or empty" {
+    for ([_]Surface{ .chat, .completions, .messages, .responses }) |s| try expectCases(&.{
+        .{ .surface = s, .body = "{\"think_penalty\":0}", .field = null },
+        .{ .surface = s, .body = "{\"think_penalty\":0.0}", .field = null },
+        .{ .surface = s, .body = "{\"think_penalty\":null}", .field = null },
+        .{ .surface = s, .body = "{\"think_penalty\":1}", .field = "think_penalty" },
+        .{ .surface = s, .body = "{\"think_penalty\":-1}", .field = "think_penalty" },
+        .{ .surface = s, .body = "{\"think_penalty\":\"0\"}", .field = "think_penalty" },
+    });
+    for ([_]Surface{ .chat, .completions }) |s| try expectCases(&.{
+        .{ .surface = s, .body = "{\"logit_bias\":null}", .field = null },
+        .{ .surface = s, .body = "{\"logit_bias\":{}}", .field = null },
+        .{ .surface = s, .body = "{\"logit_bias\":[]}", .field = null },
+        .{ .surface = s, .body = "{\"logit_bias\":{\"5\":-2}}", .field = "logit_bias" },
+        .{ .surface = s, .body = "{\"logit_bias\":[1]}", .field = "logit_bias" },
+        .{ .surface = s, .body = "{\"logit_bias\":\"x\"}", .field = "logit_bias" },
     });
 }
 

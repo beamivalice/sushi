@@ -518,8 +518,7 @@ script starts a server. `sushi_boot <label> <pack> [flags]` takes the GPU lock, 
 prompt), reads `sushi_log_since` (a line the engine logs once per process, such as an `engaged` line, is read over the whole
 `$SUSHI_LOG`, since an earlier script on the boot may have logged it), runs the binary as a client through `sushi_cli`
 (`launch`), and asks `sushi_require <mtp|vision|video|batching|stq|thinking|spec|ledger>`. A load on the static bill (`ledger`: `/props` carries `memory.ledger`, never told by the model name) serves one KV width, `sushi_kv_scheme`: a script that sends a per-request `kv_quant` asserts the named 400 for any other width. Profiles `api`, `exact`, `ram` and
-`knobs` are one boot each per model pass (`knobs` keeps every prefix cache off and boots with a model-settings file
-naming `lib/knobs-bias.json`, written by `sushi_profile_settings`); `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
+`knobs` are one boot each per model pass (`knobs` keeps every prefix cache off and sets `--think medium`); `SUSHI_TEST_PACK_<MODEL>` overrides a pack,
 `SUSHI_BOOT_TIMEOUT_S` and `SUSHI_STOP_WAIT_S` bound the waits.
 
 **A script that runs `--serve` without the helper names its `--port`** (a flag or refusal test whose model never

@@ -119,10 +119,6 @@ const shared =
     \\                      keep every turn's thinking (on, the template default)
     \\                      or only the latest user turn's (off). Request
     \\                      chat_template_kwargs > this flag > model-settings.json
-    \\  --think-penalty <f> Lower the logits of ~50 overthinking markers ("Wait",
-    \\                      "But", "Alternatively", ...) by f inside the reasoning
-    \\                      span (default 0 = off). Request think_penalty > this
-    \\                      flag > model-settings.json
     \\  --no-vision         Disable vision encoder (saves memory)
     \\  --vision-bf16       Keep a bf16 vision tower as stored instead of requantizing
     \\                      it to affine 8-bit at load (more memory, exact tower)

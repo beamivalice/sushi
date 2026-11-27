@@ -214,7 +214,6 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     self.ctx.capture_ssm_seq = false;
     var verify_logits = try verified;
     errdefer _ = mlx.mlx_array_free(verify_logits);
-    _ = try self.thinkShiftRows(&verify_logits, verify_input);
     self.dflash_attempted += 1;
     if (tracing) {
         // Captures ride the same forward — eval them here or their cost

@@ -23,7 +23,7 @@ forward and its parts are in [hy4-flash-arch](hy4-flash-arch.md); DeepSeek's own
 | Native speculative decode | MTP | DSpark | DFly2, on by default | engaged on every 1.8.0 release-bench sample of both packs |
 | Batched decode (several slots) | yes | resident loads | yes, up to 16 | joined rows, each the bytes it gets alone; two DFly2 requests run as a pair |
 | Chat template, effort words | yes | yes | yes | renders as transformers' `apply_chat_template` on the reference cases; effort words as the owner ruled |
-| Tool calls, forced `tool_choice` | yes | yes | yes | GLM's `arg_key` family under the `:opensource` spelling; `none` bans the call wrapper, a forced call commits once the thought closes |
+| Tool calls, forced `tool_choice` | yes | yes | yes | GLM's `arg_key` family under the `:opensource` spelling; `none` ends the turn at the call opener, a forced call commits once the thought closes |
 | `sushi kld` | yes | yes | yes | capture at f32 products (lossless teacher), compare as served; KLD 0 on readback, kv8 small on the tiny |
 | Warm and pipeline manifest | yes | yes | yes | a load writes its manifest; the next load makes its kernels from it |
 | Memory bill | yes | yes | yes | forward, state a token and the load billed as held; one open contract cell (below) |

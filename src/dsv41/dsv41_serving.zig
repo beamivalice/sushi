@@ -20,8 +20,6 @@ const manifest_mod = @import("../pipeline_manifest.zig");
 const load_clock = @import("../load_clock.zig");
 const sampler = @import("../sampler.zig");
 const seen_penalty = @import("../seen_penalty.zig");
-const think_penalty = @import("../think_penalty.zig");
-const logit_bias = @import("../logit_bias.zig");
 const spec_types = @import("../spec_types.zig");
 const io_util_mod = @import("../io_util.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -395,7 +393,7 @@ pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
             const drawn = try sampler.penalizedSampleLazy(a, logits, sampling, &seen, s);
             defer _ = mlx.mlx_array_free(drawn);
             try mlx.check(mlx.mlx_array_eval(drawn));
-            _ = try sampler.sampleToken(logits, sampling, &seen, null, s);
+            _ = try sampler.sampleToken(logits, sampling, &seen, s);
         }
     }
     const grammar = try a.alloc(bool, mdl.cfg.vocab);
@@ -406,11 +404,11 @@ pub fn warmSerialSampler(mdl: *dsv41_model.Model) !void {
     defer _ = mlx.mlx_array_free(masked_logits);
     try sampler.applyGrammarMask(a, &masked_logits, logits, grammar, s);
     try mlx.check(mlx.mlx_array_eval(masked_logits));
-    for (1..dsv41_config.ring_slack + 1) |rows| try warmShiftRows(mdl, rows, mask);
+    for (1..dsv41_config.ring_slack + 1) |rows| try warmShiftRows(mdl, rows);
 }
 
-/// A verify block of `rows` rows under the penalties, the thinking penalty and its logit bias, and a row mask.
-fn warmShiftRows(mdl: *dsv41_model.Model, rows: usize, marker_mask: mlx.mlx_array) !void {
+/// A verify block of `rows` rows under the penalties and a row mask.
+fn warmShiftRows(mdl: *dsv41_model.Model, rows: usize) !void {
     const s = mlx.engine.stream();
     const a = std.heap.page_allocator;
     const vocab: c_int = @intCast(mdl.cfg.vocab);
@@ -423,7 +421,6 @@ fn warmShiftRows(mdl: *dsv41_model.Model, rows: usize, marker_mask: mlx.mlx_arra
     defer _ = mlx.mlx_array_free(ids);
     const committed = try seen_penalty.buildCounts(a, &.{ 1, 2, 2 }, mdl.cfg.vocab);
     defer _ = mlx.mlx_array_free(committed);
-    const bias = [_]logit_bias.Bias{.{ .id = 3, .delta = 1 }};
     const pens = [_]seen_penalty.Penalties{ .{ .repeat = 1.1 }, .{ .presence = 0.5, .frequency = 0.5 }, .{ .repeat = 1.1, .presence = 0.5, .frequency = 0.5 } };
     for (pens) |pen| {
         var out = mlx.mlx_array_new();
@@ -431,15 +428,6 @@ fn warmShiftRows(mdl: *dsv41_model.Model, rows: usize, marker_mask: mlx.mlx_arra
         try seen_penalty.shiftRows(&out, block, ids, committed, pen, s);
         try mlx.check(mlx.mlx_array_eval(out));
     }
-    for ([_]think_penalty.ThinkPenalty.Phase{ .before, .inside }) |phase| for ([_][]const logit_bias.Bias{ &.{}, &bias }) |biases| {
-        var p: think_penalty.ThinkPenalty = .{ .lambda = 1, .opener_id = 1, .closer_id = 2, .phase = phase, .biases = biases };
-        try p.prepare(a, mdl.cfg.vocab, marker_mask, s);
-        defer p.deinitPrepared();
-        var out = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(out);
-        try think_penalty.shiftScoped(&out, block, marker_mask, p, ids, s);
-        try mlx.check(mlx.mlx_array_eval(out));
-    };
     const rows_mask = try a.alloc(bool, rows * mdl.cfg.vocab);
     defer a.free(rows_mask);
     @memset(rows_mask, true);

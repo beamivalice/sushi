@@ -43,8 +43,6 @@ const prepareRequestMedia = request_media.prepareRequestMedia;
 const visionPreprocFromConfig = request_media.visionPreprocFromConfig;
 const request_policy = @import("request_policy.zig");
 const servedModelId = request_policy.servedModelId;
-const resolveThinkPenalty = request_policy.resolveThinkPenalty;
-const armThinkPenalty = request_policy.armThinkPenalty;
 const filledMaxTokens = request_policy.filledMaxTokens;
 const resolveRequestMaxTokens = request_policy.resolveRequestMaxTokens;
 const effortWordOnly = request_policy.effortWordOnly;
@@ -468,13 +466,6 @@ fn handleResponsesInner(
         .ok => |c| c,
     };
 
-    var bias_buf: [160]u8 = undefined;
-    if (@import("request_policy.zig").unservedBias(&bias_buf, config, root)) |why| {
-        log.warn("POST /v1/responses -> 400 ({s})\n", .{why});
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
-        return;
-    }
-
     // ── input (required) ──
     const input_val = spelled.value.object.get("input") orelse {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
@@ -829,7 +820,6 @@ fn handleResponsesInner(
     }
 
     // Enforced at decode: the bound closes the thought, so this surface parses a closed block.
-    sampling.think_penalty = armThinkPenalty(allocator, lm, tok, prompt_ids, enable_thinking, resolveThinkPenalty(config, req.thinkPenalty(), model_settings.think_penalty_flag, config.think_penalty_override));
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
@@ -924,10 +914,9 @@ fn handleResponsesInner(
     }
 
     // ── generate (streaming path: emit deltas live; non-streaming: existing) ──
-    const none_end = try server_mod.noneEndFor(allocator, config, lm.handle != null, tok, chat_config, tool_choice, config.eosTokenSlice());
+    const none_end = try server_mod.noneEndFor(allocator, lm.handle != null, tok, chat_config, tool_choice, config.eosTokenSlice());
     defer none_end.deinit(allocator);
     const eos_slice = none_end.eos_ids;
-    sampling.think_penalty.biases = none_end.biases();
 
     // Streaming bookkeeping. When we live-stream a reasoning or message item,
     // we record its id + index so the post-loop block emits just the END

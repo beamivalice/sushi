@@ -95,7 +95,6 @@ The map is the code's: every argument the parsers accept, at `main` 393228b9 les
 | `--top-p` | above 0, at most 1; model config → serve default for requests that omit it (main.zig:657) | operator | help; 1 test | keep |
 | `--top-k` | model config → serve default for requests that omit it (main.zig:660) | operator | help; 1 test | keep |
 | `--preserve-thinking` | template default → keep every turn's thinking, `on` or `off`; also in settings (main.zig:876) | user | help, usage; 0 tests (settings test) | keep |
-| `--think-penalty` | `0` off → lower overthinking-marker logits inside the reasoning span; also in settings (main.zig:868) | user | help, server-http-apis; 2 tests | keep |
 
 ## Logging, diagnostics and info
 
@@ -241,7 +240,8 @@ Landed; their rows are gone from the tables above. A removed flag now fails as `
 | `--ssm-checkpoint-stride` | a fixed 256 (`server.SSM_CHECKPOINT_STRIDE_DEFAULT`); only tests move it |
 | `--expert-cache-gb` (also `kld`) | `--ssd-budget-gb` |
 | `--embedding-max-length` | the model's window |
-| `--logit-bias-file` | request `logit_bias`; the `logit_bias_file` key in `model-settings.json` stays (a settings twin, left alone) |
+| `--logit-bias-file` | nothing: logit biases and the `logit_bias_file` setting are removed; a `model-settings.json` holding `logit_bias_file` loads with one warning (`model_settings.removed_model_keys`) and a non-empty request `logit_bias` returns 400 |
+| `--think-penalty` | nothing: the think penalty, its `think_penalty` setting and WebUI control are removed; a `model-settings.json` holding `think_penalty` loads with one warning (`model_settings.removed_model_keys`) and a non-zero request `think_penalty` returns 400 |
 | `--mtp-typical`, `--mtp-tokenv3`, `--mtp-greedy-tail` | nothing: once drafts and verify rows draw at the position they predict, MTP has one acceptance rule, the exact one (argmax at temperature 0), and seeded sampled output repeats. The lossy typical and TokenV3 rules, the greedy tail, their settings keys `mtp_acceptance` and `mtp_greedy_tail` and their Settings controls are gone; a `model-settings.json` that still holds either key loads with one warning naming it (`model_settings.removed_model_keys`) |
 
 ## Owner calls
