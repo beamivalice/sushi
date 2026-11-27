@@ -376,6 +376,95 @@ const ROWS_NAX_BODY: [:0]const u8 =
     \\}
 ;
 
+const ROWS_PREPPED_HEAD: []const u8 =
+    \\constexpr uint TILE = 16u;
+    \\constexpr uint N = uint(NHW);
+    \\constexpr uint PACKED_W = N / 2u;
+    \\constexpr uint OT = uint(ODIM) / TILE;
+    \\constexpr uint KT = uint(IDIM) / uint(NSPLIT) / TILE;
+    \\threadgroup float tgm[(FOLD || KPARTS > 1u) ? PART_F : 1u];
+    \\const uint ot0 = uint(threadgroup_position_in_grid.x) * TGT;
+    \\const uint split = uint(threadgroup_position_in_grid.y);
+    \\const uint sg = uint(simdgroup_index_in_threadgroup);
+    \\const uint lane = uint(thread_index_in_simdgroup);
+    \\const uint tk0 = split * KT;
+    \\const float psc = 0.08838834764831845f;
+    \\
+;
+
+/// `ROWS_NAX_SOURCE` reading already Hadamard-prepared `[ROWS, IDIM]` f16 rows directly in linear `lane` order
+/// (no `suh`, no input H128, no threadgroup prep buffer).
+pub const ROWS_NAX_PREPPED_SOURCE: [:0]const u8 =
+    \\static_assert(UNR == 1 || KPH == 1, "an unrolled walk steps whole chunks of one slice");
+    \\constexpr uint SGS = 4u * uint(KPH);
+    \\constexpr uint KPARTS = uint(KPH);
+    \\constexpr uint TGT = 8u;
+    \\constexpr uint PART_F = uint(ROWS) * KPARTS * 128u;
+    \\
+++ ROWS_PREPPED_HEAD ++
+    \\constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, true, true, matmul2d_descriptor::mode::multiply_accumulate);
+    \\matmul2d<desc, execution_simdgroup> op;
+    \\auto left = op.get_left_input_cooperative_tensor<half, half, float>();
+    \\auto right = op.get_right_input_cooperative_tensor<half, half, float>();
+    \\auto destination = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(left)>, metal::remove_addrspace_t<decltype(right)>, float>();
+    \\nax_zero(destination);
+    \\const short2 origin = nax_origin(lane);
+    \\const uint xrow = min(uint(origin.y), uint(ROWS) - 1u);
+    \\const uint xrow8 = min(uint(origin.y) + 8u, uint(ROWS) - 1u);
+    \\const uint lid = uint(thread_index_in_threadgroup);
+    \\const uint col0 = sg & 3u;
+    \\const uint kslice = sg >> 2u;
+    \\const device uint *wcol = (const device uint *)trellis + ((size_t)tk0 * OT + ot0 + 2u * col0) * PACKED_W;
+    \\const device half *pl = (const device half *)x + (size_t)xrow * uint(IDIM) + uint(origin.x);
+    \\const device half *pl8 = (const device half *)x + (size_t)xrow8 * uint(IDIM) + uint(origin.x);
+    \\for (uint tk = tk0 + kslice; tk < tk0 + KT; tk += uint(UNR) * uint(KPH)) {
+    \\  nfrag wf[UNR][2];
+    \\  for (uint u = 0u; u < uint(UNR); u++) {
+    \\    const device uint *wp = wcol + (size_t)(tk + u * uint(KPH) - tk0) * OT * PACKED_W;
+    \\    wf[u][0] = rows_wfrag<N, R32, SW>(wp, lane);
+    \\    wf[u][1] = rows_wfrag<N, R32, SW>(wp + PACKED_W, lane);
+    \\  }
+    \\  for (uint u = 0u; u < uint(UNR); u++) {
+    \\    for (short s = 0; s < 8; s++) {
+    \\      right[s] = wf[u][0][s];
+    \\      right[8 + s] = wf[u][1][s];
+    \\    }
+    \\    const half4 v = *((const device half4 *)(pl + (tk + u * uint(KPH)) * TILE));
+    \\    const half4 v8 = ROWS > 8 ? *((const device half4 *)(pl8 + (tk + u * uint(KPH)) * TILE)) : half4(0.0h);
+    \\    for (uint c = 0u; c < 4u; c++) {
+    \\      left[c] = v[c];
+    \\      left[4 + c] = v8[c];
+    \\    }
+    \\    op.run(left, right, destination);
+    \\  }
+    \\}
+    \\for (uint h = 0u; h < (ROWS > 8 ? 2u : 1u); h++) {
+    \\  const uint row = uint(origin.y) + 8u * h;
+    \\  if (row >= uint(ROWS)) continue;
+    \\  for (uint ct = 0u; ct < 2u; ct++) {
+    \\    for (uint c = 0u; c < 4u; c++) {
+    \\      const uint col = col0 * 32u + ct * 16u + uint(origin.x) + c;
+    \\      if constexpr (FOLD || KPARTS > 1u) tgm[(row * KPARTS + kslice) * 128u + col] = destination[ct * 8u + 4u * h + c];
+    \\      else exl3_store(y + (size_t)(row * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + col, float(destination[ct * 8u + 4u * h + c]));
+    \\    }
+    \\  }
+    \\}
+    \\if constexpr (FOLD) {
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+++ ROWS_FOLD ++
+    \\} else if constexpr (KPARTS > 1u) {
+    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\  for (uint i = lid; i < uint(ROWS) * 128u; i += SGS * 32u) {
+    \\    const uint r = i / 128u;
+    \\    const uint c = i - r * 128u;
+    \\    float sum = 0.0f;
+    \\    for (uint k = 0u; k < KPARTS; k++) sum += tgm[(r * KPARTS + k) * 128u + c];
+    \\    exl3_store(y + (size_t)(r * uint(NSPLIT) + split) * uint(ODIM) + ot0 * TILE + c, sum);
+    \\  }
+    \\}
+;
+
 /// Sums a row's k-split partials, then applies the output H128 + svh.
 /// Where a finished block of a bank's row lands: bank-major rows, segmented.
 const ROWS_FINISH_AT =
