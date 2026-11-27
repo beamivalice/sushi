@@ -3535,6 +3535,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     const ring_cps = slot.ring_cps;
     slot.ring_cps = .{};
     hc.commit_restored = slot.restored_disk;
+    hc.commit_media_chain = slot.media_chain;
     const finish_st = hc.commitWithRing(&slot.cache, total_tokens, slot.has_tools, slot.vision_key, slot.cache_key, slot.media_start, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len, ring_cps) catch |err| {
         // Ownership of the checkpoints transferred to the cache regardless of
         // the outcome — its error paths free them (#330 adjacent: freeing
@@ -3614,6 +3615,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     slot.cancelled_prefill = .{};
     if (sched.commitOwn(hc, slot, null, slot.full_prompt[0..len], cps, len)) return;
     hc.commit_restored = slot.restored_disk;
+    hc.commit_media_chain = slot.media_chain;
     const st = hc.commitWithMediaState(&slot.cache, slot.full_prompt[0..len], slot.has_tools, media.key, slot.cache_key, media_start, cps, null, null, len) catch |err| {
         log.warn("[hot-cache] cancelled-prefill commit failed: {s}\n", .{mlx.settledErrorName(err)});
         return;
@@ -3731,6 +3733,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []trunk
     // A chunk record covers a prefix, so it may claim only the media blocks inside it.
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, abs_kv_pos);
     if (sched.writeThrough(hc, slot, &wc.entry_id, slot.full_prompt[0..abs_kv_pos], media, cps, s)) return;
+    hc.commit_media_chain = slot.media_chain;
     // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
     // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     hc.writeThroughHybrid(

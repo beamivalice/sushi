@@ -260,6 +260,67 @@ pub fn restoreWouldPinEntry(kv_bytes: u64, min_bytes: u64, entry_tokens: usize, 
     return entry_tokens > shared *| RESTORE_PIN_RATIO;
 }
 
+/// One media block of a prompt: where its placeholder rows start, and a key
+/// over that block and every block before it (pixels and positions).
+pub const MediaSpan = struct { start: usize, key: u64 };
+
+/// The key of a whole media chain: its last block's (0 = no media).
+pub fn chainKey(chain: []const MediaSpan) u64 {
+    return if (chain.len == 0) 0 else chain[chain.len - 1].key;
+}
+
+/// Rows an entry keyed `entry_key` may share with a request under a different
+/// key. An entry whose media is the request's first k blocks shares up to the
+/// request's block k+1; any other pair shares only the text before either
+/// side's first media row. Null = nothing is provably shared.
+pub fn crossKeyBoundary(entry_key: u64, entry_start: ?usize, request_start: ?usize, chain: []const MediaSpan) ?usize {
+    if (entry_key != 0 and chain.len > 1) {
+        for (chain[0 .. chain.len - 1], chain[1..]) |span, next| {
+            if (span.key == entry_key) return next.start;
+        }
+    }
+    const es = entry_start orelse return request_start;
+    return if (request_start) |rs| @min(es, rs) else es;
+}
+
+/// What a disk record claims about media: the chain's last covered key and the first placeholder,
+/// in the tier's own width. `.{}` is a record with no media row.
+pub const MediaStamp = struct {
+    key: u64 = 0,
+    start: ?u32 = null,
+
+    pub fn of(vision_key: u64, media_start: ?usize) MediaStamp {
+        const ms = media_start orelse return .{ .key = vision_key };
+        // A boundary the tier's width cannot hold keeps the key and drops the boundary, which is
+        // the shape `diskTextLen` persists nothing for. Stamping the text key instead would hand
+        // a text prompt rows that only these pixels explain.
+        const narrowed = std.math.cast(u32, ms) orelse return .{ .key = vision_key };
+        return .{ .key = vision_key, .start = narrowed };
+    }
+};
+
+/// The media identity a record covering `covered_len` of `chain`'s prompt may claim: the chain
+/// truncated to the blocks whose placeholder rows are inside it. A record must never claim a block
+/// it does not hold -- overclaiming is safe (an equal-key request is clamped by `kv_len`, a
+/// differing one falls back to the pre-media text) but it costs the reuse of the blocks it does
+/// hold. A record with no media row at all claims nothing, so a text request can share it whole.
+pub fn truncatedMediaKey(
+    chain: []const MediaSpan,
+    vision_key: u64,
+    media_start: ?usize,
+    covered_len: usize,
+) MediaStamp {
+    const ms = media_start orelse return MediaStamp.of(vision_key, null);
+    if (ms >= covered_len) return .{};
+    if (chain.len == 0) return MediaStamp.of(vision_key, ms);
+    var last: u64 = 0;
+    for (chain) |span| {
+        if (span.start >= covered_len) break;
+        last = span.key;
+    }
+    return if (last == 0) .{} else MediaStamp.of(last, ms);
+}
+
 const testing = std.testing;
 
 const CheckpointStub = struct { pos: usize };

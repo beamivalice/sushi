@@ -242,28 +242,10 @@ pub fn ringMarkPositions(prompt: []const u32, restored: usize, mark_id: u32, out
     return prefix_policy.ringMarkPositions(prompt, restored, mark_id, model_mod.ModelConfig.SWA_RING_CHECKPOINT_BACKOFF, out);
 }
 
-/// One media block of a prompt: where its placeholder rows start, and a key
-/// over that block and every block before it (pixels and positions).
-pub const MediaSpan = struct { start: usize, key: u64 };
-
-/// The key of a whole media chain: its last block's (0 = no media).
-pub fn chainKey(chain: []const MediaSpan) u64 {
-    return if (chain.len == 0) 0 else chain[chain.len - 1].key;
-}
-
-/// Rows an entry keyed `entry_key` may share with a request under a different
-/// key. An entry whose media is the request's first k blocks shares up to the
-/// request's block k+1; any other pair shares only the text before either
-/// side's first media row. Null = nothing is provably shared.
-pub fn crossKeyBoundary(entry_key: u64, entry_start: ?usize, request_start: ?usize, chain: []const MediaSpan) ?usize {
-    if (entry_key != 0 and chain.len > 1) {
-        for (chain[0 .. chain.len - 1], chain[1..]) |span, next| {
-            if (span.key == entry_key) return next.start;
-        }
-    }
-    const es = entry_start orelse return request_start;
-    return if (request_start) |rs| @min(es, rs) else es;
-}
+/// Re-exported from `prefix_policy.zig` so the SSD tier shares the exact same media rules.
+pub const MediaSpan = prefix_policy.MediaSpan;
+pub const chainKey = prefix_policy.chainKey;
+pub const crossKeyBoundary = prefix_policy.crossKeyBoundary;
 
 /// A request's media identity, as the rule the SSD tier applies to each stored record. Both tiers
 /// share one rule (`crossKeyBoundary`): an equal key shares the whole token prefix, a record whose
@@ -300,43 +282,8 @@ fn diskTextLen(tokens_len: usize, vision_key: u64, media_start: ?usize) usize {
     return tokens_len;
 }
 
-/// What a disk record claims about media: the chain's last covered key and the first placeholder,
-/// in the tier's own width. `.{}` is a record with no media row.
-pub const MediaStamp = struct {
-    key: u64 = 0,
-    start: ?u32 = null,
-
-    pub fn of(vision_key: u64, media_start: ?usize) MediaStamp {
-        const ms = media_start orelse return .{ .key = vision_key };
-        // A boundary the tier's width cannot hold keeps the key and drops the boundary, which is
-        // the shape `diskTextLen` persists nothing for. Stamping the text key instead would hand
-        // a text prompt rows that only these pixels explain.
-        const narrowed = std.math.cast(u32, ms) orelse return .{ .key = vision_key };
-        return .{ .key = vision_key, .start = narrowed };
-    }
-};
-
-/// The media identity a record covering `covered_len` of `chain`'s prompt may claim: the chain
-/// truncated to the blocks whose placeholder rows are inside it. A record must never claim a block
-/// it does not hold -- overclaiming is safe (an equal-key request is clamped by `kv_len`, a
-/// differing one falls back to the pre-media text) but it costs the reuse of the blocks it does
-/// hold. A record with no media row at all claims nothing, so a text request can share it whole.
-pub fn truncatedMediaKey(
-    chain: []const MediaSpan,
-    vision_key: u64,
-    media_start: ?usize,
-    covered_len: usize,
-) MediaStamp {
-    const ms = media_start orelse return MediaStamp.of(vision_key, null);
-    if (ms >= covered_len) return .{};
-    if (chain.len == 0) return MediaStamp.of(vision_key, ms);
-    var last: u64 = 0;
-    for (chain) |span| {
-        if (span.start >= covered_len) break;
-        last = span.key;
-    }
-    return if (last == 0) .{} else MediaStamp.of(last, ms);
-}
+pub const MediaStamp = prefix_policy.MediaStamp;
+pub const truncatedMediaKey = prefix_policy.truncatedMediaKey;
 
 pub const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
@@ -513,6 +460,7 @@ const PendingDiskFlush = struct {
     tokens: []u32,
     has_tools: bool,
     media: MediaStamp = .{},
+    media_chain: []MediaSpan = &.{},
     ssm_cps: ?[]SSMCheckpoint = null,
     ring_cps: ?[]KVCacheSnapshot = null,
     dflash: ?DflashSnap = null,
@@ -524,6 +472,7 @@ const PendingDiskFlush = struct {
         self.snapshot.deinit();
         if (self.rows) |*rows| rows.deinit();
         allocator.free(self.tokens);
+        allocator.free(self.media_chain);
         if (self.ssm_cps) |cps| {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
@@ -666,6 +615,9 @@ pub const HotPrefixCache = struct {
     commit_end_note: []const u8 = "",
     /// The next commit's SSD restore source (`LookupResult.disk_restore`); the commit consumes it.
     commit_restored: ?kv_disk_cache.RestoredRows = null,
+    /// The next commit's media chain (`MediaSpan`), borrowed from the request's slot. A consumer takes it
+    /// (`takeMediaChain`) before any return, so it never outlives the request that set it.
+    commit_media_chain: []const MediaSpan = &.{},
     /// Running total of `kv_bytes` across all live entries. Updated on
     /// commit/evict/invalidate.
     current_kv_bytes: u64,
@@ -723,6 +675,13 @@ pub const HotPrefixCache = struct {
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
+    }
+
+    /// The chain the committer set for this call, which the cache no longer holds.
+    pub fn takeMediaChain(self: *HotPrefixCache) []const MediaSpan {
+        const chain = self.commit_media_chain;
+        self.commit_media_chain = &.{};
+        return chain;
     }
 
     pub fn initWithMem(allocator: std.mem.Allocator, max_entries: u32, max_kv_bytes: u64) HotPrefixCache {
@@ -2104,6 +2063,7 @@ pub const HotPrefixCache = struct {
         self.commit_end_note = "";
         const restored = self.commit_restored;
         self.commit_restored = null;
+        const media_chain = self.takeMediaChain();
         // Freed on every path that does not move it into an entry.
         var new_rings = ownRingCps(self.allocator, ring_cps);
         defer if (new_rings) |r| freeRingCps(self.allocator, r);
@@ -2140,7 +2100,7 @@ pub const HotPrefixCache = struct {
         var record_taken = false;
         if (self.capturesLiveForDisk() and disk_len > 0) {
             const rows: ?*const prefix_arch.Rows = if (disk_rows) |*r| r else if (new_rows) |*r| r else null;
-            self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, restored, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
+            self.capturePendingDisk(source_cache, tokens, disk_len, has_tools, eff_vision_key, eff_media_start, media_chain, restored, prompt_len, ssm_cps, dflash, mtp, new_rings, rows);
             // Whatever the RAM tier then does with the candidate, the record is flushed.
             record_taken = self.pending_disk != null;
             if (record_taken) self.disk_dirty = true;
@@ -2423,7 +2383,7 @@ pub const HotPrefixCache = struct {
         // resident, so this costs GPU memory only in the accounting, and only
         // until the donor is evicted.
         if (replace_idx == null) inherit: {
-            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, quant_config) orelse
+            const donor = self.bestCheckpointDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, media_chain, quant_config) orelse
                 break :inherit;
             const budget: ?u64 = if (self.max_kv_bytes == 0)
                 null
@@ -2483,7 +2443,7 @@ pub const HotPrefixCache = struct {
         // later request diverging there restores after the donor is gone.
         if (replace_idx == null) ring_inherit: {
             const cap = @min(if (prompt_len == 0) eff_tokens.len else prompt_len, eff_tokens.len);
-            const donor = self.bestRingDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, quant_config, cap) orelse
+            const donor = self.bestRingDonor(eff_tokens, has_tools, eff_vision_key, eff_media_start, media_chain, quant_config, cap) orelse
                 break :ring_inherit;
             const budget: ?u64 = if (self.max_kv_bytes == 0)
                 null
@@ -2809,6 +2769,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         vision_key: u64,
         media_start: ?usize,
+        media_chain: []const MediaSpan,
         restored: ?kv_disk_cache.RestoredRows,
         prompt_len: usize,
         ssm_cps: ?[]SSMCheckpoint,
@@ -2838,6 +2799,7 @@ pub const HotPrefixCache = struct {
             },
             .has_tools = has_tools,
             .media = MediaStamp.of(vision_key, media_start),
+            .media_chain = if (media_chain.len > 0) self.allocator.dupe(MediaSpan, media_chain) catch &.{} else &.{},
             .restored = restored,
         };
         if (ring_cps) |cps| rec.ring_cps = shareRingCpsUpTo(self.allocator, cps, std.math.maxInt(usize), null) catch null;
@@ -2850,12 +2812,12 @@ pub const HotPrefixCache = struct {
         }
         const quant = source_cache.config;
         const cap = @min(if (prompt_len == 0) text_len else prompt_len, text_len);
-        if (self.bestCheckpointDonor(tokens, has_tools, vision_key, media_start, quant)) |donor| inherit: {
+        if (self.bestCheckpointDonor(tokens, has_tools, vision_key, media_start, media_chain, quant)) |donor| inherit: {
             const limit = @min(donor.shared, cap);
             const inherited = (cloneCheckpointsUpTo(self.allocator, self.entries.items[donor.idx].ssm_checkpoints.?, limit, null) catch break :inherit) orelse break :inherit;
             rec.ssm_cps = mergeDiskCheckpoints(self.allocator, inherited, rec.ssm_cps) catch null;
         }
-        if (self.bestRingDonor(tokens, has_tools, vision_key, media_start, quant, cap)) |donor| inherit: {
+        if (self.bestRingDonor(tokens, has_tools, vision_key, media_start, media_chain, quant, cap)) |donor| inherit: {
             const inherited = (shareRingCpsUpTo(self.allocator, self.entries.items[donor.idx].ring_cps.?, donor.limit, null) catch break :inherit) orelse break :inherit;
             rec.ring_cps = mergeRingCps(self.allocator, inherited, rec.ring_cps) catch null;
         }
@@ -3045,6 +3007,7 @@ pub const HotPrefixCache = struct {
         flush_bound: u64,
         s: mlx.mlx_stream,
     ) void {
+        const media_chain = self.takeMediaChain();
         const d = if (self.disk) |*dd| dd else return;
         // A hybrid record restores only at a stored SSM point: before the prefill holds one (or extends a record that
         // does), a chunk waits for the next record, which writes it too, instead of leaving an entry nothing restores.
@@ -3067,6 +3030,7 @@ pub const HotPrefixCache = struct {
             .ssm_checkpoints = if (cps.len > 0) cps else null,
             .vision_key = media.key,
             .media_start = media.start,
+            .media_chain = media_chain,
             .restored = restored,
         }, s, .{ .flush_bound = flush_bound }) catch |err| {
             log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
@@ -3107,6 +3071,7 @@ pub const HotPrefixCache = struct {
             .ring = ringCommitOf(&pending.snapshot, pending.ring_cps),
             .vision_key = pending.media.key,
             .media_start = pending.media.start,
+            .media_chain = pending.media_chain,
             .restored = pending.restored,
         }, s, .{ .whole = true })) catch |err| {
             log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
@@ -3368,6 +3333,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         vision_key: u64,
         media_start: ?usize,
+        media_chain: []const MediaSpan,
         quant_config: kv_quant.KVQuantConfig,
     ) ?RamMatch {
         var best_idx: ?usize = null;
@@ -3375,7 +3341,7 @@ pub const HotPrefixCache = struct {
         var best_pos: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             const cps = e.ssm_checkpoints orelse continue;
-            const shared = donorShared(e, tokens, has_tools, vision_key, media_start, quant_config) orelse continue;
+            const shared = donorShared(e, tokens, has_tools, vision_key, media_start, media_chain, quant_config) orelse continue;
             const cp = highestCheckpointAtOrBelow(cps, shared) orelse continue;
             if (cp.pos > best_pos) {
                 best_pos = cp.pos;
@@ -3394,15 +3360,16 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         vision_key: u64,
         media_start: ?usize,
+        media_chain: []const MediaSpan,
         quant_config: kv_quant.KVQuantConfig,
     ) ?usize {
         if (e.has_tools != has_tools) return null;
         if (!std.meta.eql(e.quant_config, quant_config)) return null;
         var max_shared = @min(e.tokens.len, tokens.len);
         if (e.vision_key != vision_key) {
-            // Same rule as `findBestRestorableMatch`: rows before the
-            // earliest media placeholder are ordinary text and cross keys.
-            const safe_boundary = crossKeyBoundary(e.vision_key, e.media_start, media_start, &.{}) orelse return null;
+            // Same rule as `findBestRestorableMatch`: rows before the first
+            // media block the two prompts do not share cross keys.
+            const safe_boundary = crossKeyBoundary(e.vision_key, e.media_start, media_start, media_chain) orelse return null;
             max_shared = @min(max_shared, safe_boundary);
         }
         var shared: usize = 0;
@@ -3421,6 +3388,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         vision_key: u64,
         media_start: ?usize,
+        media_chain: []const MediaSpan,
         quant_config: kv_quant.KVQuantConfig,
         cap: usize,
     ) ?RingDonor {
@@ -3428,7 +3396,7 @@ pub const HotPrefixCache = struct {
         var best_step: usize = 0;
         for (self.entries.items, 0..) |*e, i| {
             const cps = e.ring_cps orelse continue;
-            const shared = donorShared(e, tokens, has_tools, vision_key, media_start, quant_config) orelse continue;
+            const shared = donorShared(e, tokens, has_tools, vision_key, media_start, media_chain, quant_config) orelse continue;
             const limit = @min(shared, cap);
             for (cps) |*cp| {
                 if (cp.step < RING_RESTORE_MIN_TOKENS or cp.step > limit or cp.step <= best_step) continue;
@@ -11551,4 +11519,57 @@ test "a write-through under other pixels never extends the record that holds the
     const res = try hc.lookupAndRestoreWithMedia(&dst, &moe, null, s, &tokens, false, kb, at, &chain, null, null, null, false);
     try testing.expect(res.matched > at);
     for (0..3) |li| try pcExpectRowsEqual(s, dst.entries[li].keys.array, rows_b.entries[li].keys.array, res.matched);
+}
+
+test "HotPrefixCache: commit_media_chain inherits RAM checkpoints past image 1 when a follow-up appends image 2" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    const k1: u64 = 0x1111_AAAA;
+    const k2: u64 = 0x2222_BBBB;
+    const img1_at: usize = 8;
+    const img2_at: usize = 40;
+    const chain = [_]MediaSpan{
+        .{ .start = img1_at, .key = k1 },
+        .{ .start = img2_at, .key = k2 },
+    };
+    var tokens: [64]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1);
+
+    // Turn 1: image 1 at 8, checkpoint at 32 (past image 1, before image 2).
+    var c1 = try KVCache.init(testing.allocator, 3);
+    defer c1.deinit();
+    try kv_disk_cache.fillCache(&c1, s, 3, 36, 4, 0.0, .float32);
+    var src1 = pcBuildHybrid(s, 10.0, 20.0);
+    defer pcFreeHybrid(&src1);
+    const cps1 = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps1[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src1, 32, s);
+    hc.commit_media_chain = chain[0..1];
+    _ = try hc.commitWithMediaState(&c1, tokens[0..36], false, k1, 0, img1_at, cps1, null, null, 36);
+
+    // Turn 2: appends image 2 at 40, checkpoint at 60 -> must inherit checkpoint at 32 from turn 1.
+    var c2 = try KVCache.init(testing.allocator, 3);
+    defer c2.deinit();
+    try kv_disk_cache.fillCache(&c2, s, 3, 64, 4, 0.0, .float32);
+    var src2 = pcBuildHybrid(s, 30.0, 40.0);
+    defer pcFreeHybrid(&src2);
+    const cps2 = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps2[0] = try trunk_mod.captureSsmCheckpoint(testing.allocator, &src2, 60, s);
+    hc.commit_media_chain = &chain;
+    _ = try hc.commitWithMediaState(&c2, &tokens, false, k2, 0, img1_at, cps2, null, null, 64);
+
+    try testing.expectEqual(@as(usize, 2), hc.entries.items.len);
+    const kept = hc.entries.items[1].ssm_checkpoints orelse return error.TestExpectedCheckpoints;
+    try testing.expectEqual(@as(usize, 2), kept.len);
+    try testing.expectEqual(@as(usize, 32), kept[0].pos);
+    try testing.expectEqual(@as(usize, 60), kept[1].pos);
+}
+
+test "HotPrefixCache: a write-through that returns before writing leaves no media chain for the next consumer" {
+    var hc = HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    const chain = [_]MediaSpan{.{ .start = 8, .key = 0x1111_AAAA }};
+    hc.commit_media_chain = &chain;
+    hc.writeThroughHybrid(&.{}, kv_quant.KVQuantConfig.dense, &.{}, false, .{}, null, &.{}, &.{}, std.math.maxInt(u64), mlx.gpuStream());
+    try testing.expectEqual(@as(usize, 0), hc.commit_media_chain.len);
 }

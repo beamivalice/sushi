@@ -2059,3 +2059,172 @@ test "DeepSeek joined rows: a request that restored from a stored entry links th
     try testing.expectEqual(@as(usize, 5), heir.grown.len);
     try testing.expectEqual(@as(usize, 0), dsv41_prefix.liveOf(&hc).points.items.len);
 }
+
+test "DeepSeek SSD tier: restoring from SSD reports disk_restore so a follow-up turn adding a second image inherits row segments past the first image (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var tokens_buf: [800]u32 = undefined;
+    const tokens = dsv41LongPrompt(&net, &tokens_buf, null, 0);
+    const k1: u64 = 0x1111_2222_3333_4444;
+    const k2: u64 = 0x5555_6666_7777_8888;
+    const img1_at: u32 = 40;
+    const img2_at: u32 = 540;
+    const chain = [_]pc.MediaSpan{
+        .{ .start = img1_at, .key = k1 },
+        .{ .start = img2_at, .key = k2 },
+    };
+
+    var hc = try dsv41SplitCache(io, base, "dsv41-multi-image-segs", &net, 128);
+    defer hc.deinit();
+    net.m.serves_rows = true;
+    defer net.m.serves_rows = false;
+
+    // Turn 1: image 1 at token 40, persisted through 512 (4 segments: 128, 256, 384, 512).
+    var req1: dsv41_model.Request = .{};
+    defer req1.deinit();
+    var donor_id: u64 = 0;
+    {
+        const l = dsv41_model.lend(net.m, &req1);
+        defer l.end();
+        var cps: std.ArrayList(SSMCheckpoint) = .empty;
+        try net.prefill(tokens[0..512], &.{ 128, 128, 128, 128 }, 0, &.{ 0, 1, 2, 3 }, &cps);
+        defer {
+            for (cps.items) |*cp| cp.deinit(a);
+            cps.deinit(a);
+        }
+        var cache = try KVCache.initWithConfig(a, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+        defer cache.deinit();
+        cache.step = 512;
+        hc.commit_media_chain = chain[0..1];
+        dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, tokens[0..512], false, .{ .key = k1, .start = img1_at }, cps.items, "prefill");
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        donor_id = hc.disk.?.entries.items[0].id;
+    }
+
+    // Turn 2: same prefix + image 2 at token 540; lookup restores 512, reports disk_restore, and write-through
+    // inherits all 4 row segments past image 1 by hard link instead of rewriting them.
+    var req2: dsv41_model.Request = .{};
+    defer req2.deinit();
+    const l = dsv41_model.lend(net.m, &req2);
+    defer l.end();
+    var target = try KVCache.initWithConfig(a, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, net.m, s, tokens, false, k2, img1_at, &chain, 9, false);
+    try testing.expectEqual(@as(usize, 512), res.matched);
+    const dr = res.disk_restore orelse return error.TestExpectedDiskRestore;
+    try testing.expectEqual(donor_id, dr.id);
+    try testing.expectEqual(@as(u32, 512), dr.rows);
+
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, tokens[512..640], .last));
+    var cp640 = [1]SSMCheckpoint{try dsv41_prefix.captureShared(a, net.m, 640)};
+    defer cp640[0].deinit(a);
+    var cache2 = try KVCache.initWithConfig(a, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache2.deinit();
+    cache2.step = 640;
+    hc.commit_restored = dr;
+    hc.commit_media_chain = &chain;
+    dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache2, tokens[0..640], false, .{ .key = k2, .start = img1_at }, &cp640, "prefill");
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(usize, 2), hc.disk.?.entryCount());
+    const heir = &hc.disk.?.entries.items[1];
+    try testing.expectEqual(@as(u32, 4), heir.inherited_grown);
+    try testing.expectEqual(@as(usize, 5), heir.grown.len);
+}
+
+test "DeepSeek live record: rolling back before a later image and flushing truncates the stored vision key to the images still covered (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var tokens_buf: [700]u32 = undefined;
+    const tokens = dsv41LongPrompt(&net, &tokens_buf, null, 0);
+    const k1: u64 = 0x1111_2222_3333_4444;
+    const k2: u64 = 0x5555_6666_7777_8888;
+    const img1_at: u32 = 40;
+    const img2_at: u32 = 580;
+    const chain = [_]pc.MediaSpan{
+        .{ .start = img1_at, .key = k1 },
+        .{ .start = img2_at, .key = k2 },
+    };
+
+    var hc = try dsv41SplitCache(io, base, "dsv41-live-rollback-media", &net, 128);
+    defer hc.deinit();
+    dsv41_model.resetState(net.m);
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, tokens[0..540], .last));
+    {
+        var cp540 = try dsv41_prefix.captureShared(a, net.m, 540);
+        defer cp540.deinit(a);
+        try dsv41_prefix.liveOf(&hc).keep(a, net.m, &cp540, null);
+    }
+    _ = mlx.mlx_array_free(try dsv41_model.extend(net.m, tokens[540..660], .last));
+    {
+        var cp660 = try dsv41_prefix.captureShared(a, net.m, 660);
+        defer cp660.deinit(a);
+        try dsv41_prefix.liveOf(&hc).keep(a, net.m, &cp660, null);
+    }
+    hc.commit_media_chain = &chain;
+    _ = try dsv41_prefix.publishLiveDsv41(&hc, net.m, tokens[0..660], false, .{ .key = k2, .start = img1_at }, kv_quant.KVQuantConfig.dense);
+
+    // Roll back to 540 (before image 2 at 580), then flush without publishing (simulating a failed/cancelled turn).
+    try dsv41_prefix.liveOf(&hc).rollback(a, net.m, 0, tokens[0..600]);
+    try testing.expectEqual(k1, dsv41_prefix.liveOf(&hc).vision_key);
+    dsv41_prefix.flushLiveDsv41(&hc, net.m, "handover");
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expectEqual(k1, hc.disk.?.entries.items[0].vision_key);
+
+    // A follow-up with image 1 and a DIFFERENT image 2 restores all 540 tokens instead of dropping to image 1 (40).
+    const k2_alt: u64 = 0x9999_AAAA_BBBB_CCCC;
+    const alt_chain = [_]pc.MediaSpan{
+        .{ .start = img1_at, .key = k1 },
+        .{ .start = img2_at, .key = k2_alt },
+    };
+    dsv41_prefix.liveOf(&hc).clear(a);
+    dsv41_model.resetState(net.m);
+    var target = try KVCache.initWithConfig(a, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = try dsv41_prefix.lookupAndRestoreDsv41(&hc, &target, &moe, net.m, s, tokens[0..640], false, k2_alt, img1_at, &alt_chain, null, false);
+    try testing.expectEqual(@as(usize, 540), res.matched);
+}
+
+test "DeepSeek write-through and decode point: one that stops before writing leaves no media chain for the next consumer (DSV41_TINY)" {
+    if (comptime !prefix_arch.has("dsv41")) return error.SkipZigTest;
+    try mlx.requireGpu();
+    var net: Dsv41Net = undefined;
+    try net.load();
+    defer net.deinit();
+    var hc = pc.HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    const chain = [_]pc.MediaSpan{.{ .start = 8, .key = 0x1111_AAAA }};
+    var cache = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
+    defer cache.deinit();
+    // No SSD tier: the write-through has nothing to write to.
+    hc.commit_media_chain = &chain;
+    dsv41_prefix.writeThroughDsv41(&hc, net.m, &cache, net.ids[0..16], false, .{}, &.{}, "prefill");
+    try testing.expectEqual(@as(usize, 0), hc.commit_media_chain.len);
+    // The model stands at no position, so the point cannot be captured.
+    hc.commit_media_chain = &chain;
+    try testing.expectError(error.Dsv41CachePositionMismatch, dsv41_prefix.writeDecodePointDsv41(&hc, &cache, net.m, net.ids[0..16], false, .{}));
+    try testing.expectEqual(@as(usize, 0), hc.commit_media_chain.len);
+}

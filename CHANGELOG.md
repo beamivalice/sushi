@@ -6,6 +6,7 @@ earlier history is mlx-serve's, in that project's changelog.
 
 ## Unreleased
 
+- **Long image conversations keep their cache**: a DeepSeek-V4.1 conversation with many images no longer fails its prefill over the memory cap after restoring from the SSD, and a follow-up turn that adds an image reuses the cached rows past the earlier images instead of prefilling half the context again, and Hy4-Flash reuses them the same way (thanks @InfernalDread for the report and @lin16303 for the log, #135).
 - **Faster model loads with no kernel compiles**: every Sushi Cooler kernel ships precompiled in `sushi.metallib`, and a repeat load of a pack makes its GPU pipelines from a cache on disk instead of compiling them, so Hy4-Flash STQ 2.25bpw is ready in 53 s on a first load (84 s before) and a repeat load compiles nothing; the download grows by about 84 MB.
 - **DeepSeek-V4.1-Flash STQ 2.7bpw on 64 GB Macs**: `sushi pull` and `sushi list` count it as fitting from 64 GB, where its experts stream with `--expert-cache-bias` as Samuel Reed's guide shows; it is still recommended from 256 GB, where every expert stays resident.
 

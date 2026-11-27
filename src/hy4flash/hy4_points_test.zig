@@ -461,3 +461,154 @@ test "hy4 points: a restore from SSD reads the point's files straight into the r
     errdefer std.debug.print("[hy4-points] a restore from SSD asked the closed pool {d} times at 512, {d} at 602\n", .{ asks[0], asks[1] });
     try testing.expectEqualSlices(u64, &@as([points.len]u64, @splat(0)), &asks);
 }
+
+/// A tiny pack's model on the engine's stream, its arrays and ids as the cells above set them.
+const Session = struct {
+    r: Rig,
+    was: bool,
+    scope: @typeInfo(@TypeOf(mlx.engine.enter)).@"fn".return_type.?,
+    ids: []u32,
+
+    fn begin(s: *Session, ids_len: usize) !void {
+        const a = testing.allocator;
+        s.r = .{ .t = try Tiny.open(), .m = undefined, .hc = undefined, .es = undefined, .o = undefined };
+        errdefer s.r.t.close();
+        fwd.products = .bf16;
+        s.was = mlx.engine.enabled;
+        mlx.engine.enabled = true;
+        errdefer @import("../test_support.zig").restoreEngine(s.was);
+        s.r.es = mlx.engine.stream();
+        s.scope = mlx.engine.enter(s.r.es);
+        s.r.o = .{ .s = s.r.es };
+        s.ids = try a.alloc(u32, ids_len);
+        for (s.ids, 0..) |*d, i| d.* = @intCast((i * 7919 + 17) % 120000);
+        s.r.m = try hy4_model.Model.init(a, s.r.t.config, &s.r.t.pack, s.r.es);
+        s.r.m.req().kv = .engine_default;
+    }
+
+    fn end(s: *Session) void {
+        s.r.m.deinit();
+        testing.allocator.free(s.ids);
+        s.r.o.deinit();
+        s.scope.end();
+        @import("../test_support.zig").restoreEngine(s.was);
+        s.r.t.close();
+    }
+
+    /// Runs `ids[from..to]` through the model and keeps a live point at its end.
+    fn prefillKeep(s: *Session, from: usize, to: usize) !void {
+        _ = mlx.mlx_array_free(try s.r.m.forwardReadout(s.ids[from..to], .none));
+        try s.r.m.keepLivePoint();
+    }
+};
+
+const k_img1: u64 = 0x1111_2222_3333_4444;
+const k_img2: u64 = 0x5555_6666_7777_8888;
+
+test "hy4 points: a write-through or end point that stops before writing leaves no media chain for the next consumer (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    var s: Session = undefined;
+    try s.begin(64);
+    defer s.end();
+    var hc = pc.HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    var kv = try KVCache.initWithConfig(testing.allocator, s.r.m.config.layers, .engine_default);
+    defer kv.deinit();
+    const chain = [_]pc.MediaSpan{.{ .start = 8, .key = k_img1 }};
+    // No SSD tier: nothing is written, whatever the chain.
+    hc.commit_media_chain = &chain;
+    prefix.writeThrough(&hc, s.r.m, &kv, s.ids[0..16], false, .{}, null, &.{}, s.r.es);
+    try testing.expectEqual(@as(usize, 0), hc.commit_media_chain.len);
+    hc.commit_media_chain = &chain;
+    prefix.writeEndPoint(&hc, s.r.m, &kv, s.ids[0..16], false, .{}, null);
+    try testing.expectEqual(@as(usize, 0), hc.commit_media_chain.len);
+}
+
+test "hy4 points: a restore from SSD reports disk_restore, so a turn cut before its second image links the row segments it restored from the two-image record (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var s: Session = undefined;
+    try s.begin(1024);
+    defer s.end();
+    const m = s.r.m;
+    s.r.hc = try diskCache(std.testing.io, base, &s.r.t.config, 256);
+    defer s.r.hc.deinit();
+    const hc = &s.r.hc;
+    const d = &hc.disk.?;
+    const img1_at: usize = 40;
+    const chain = [_]pc.MediaSpan{ .{ .start = img1_at, .key = k_img1 }, .{ .start = 540, .key = k_img2 } };
+
+    // Turn 1: images at 40 and 540, points at 256, 512 and 700, the record flushed to SSD under both images' key.
+    try m.reserveFor(1024);
+    try s.prefillKeep(0, 256);
+    try s.prefillKeep(256, 512);
+    _ = mlx.mlx_array_free(try m.forwardReadout(s.ids[512..700], .none));
+    hc.commit_media_chain = &chain;
+    prefix.publishLive(hc, m, s.ids[0..700], false, .{ .key = k_img2, .start = img1_at });
+    prefix.flushLive(hc, m, "test");
+    d.drainWriter();
+    try testing.expectEqual(@as(usize, 1), d.entryCount());
+    const donor_id = d.entries.items[0].id;
+
+    // Turn 2 repeats the first 520 tokens: it restores the point at 512 from SSD.
+    _ = mlx.mlx_array_free(try m.forwardReadout(s.ids[700..730], .none));
+    var target = try KVCache.initWithConfig(testing.allocator, m.config.layers, .engine_default);
+    defer target.deinit();
+    const res = prefix.restoreDisk(hc, d, m, &target, 0, s.ids[0..521], false, .{}, null, s.r.es) orelse return error.TestNoDiskRestore;
+    try testing.expectEqual(@as(usize, 512), res.matched);
+    const dr = res.disk_restore orelse return error.TestExpectedDiskRestore;
+    try testing.expectEqual(donor_id, dr.id);
+    try testing.expectEqual(@as(u32, 512), dr.rows);
+    try testing.expectEqual(dr, prefix.liveOf(hc).restored_disk orelse return error.TestExpectedRestoredDisk);
+
+    // It ends at 520, before the second image: its stamp is image 1's, which the record does not carry, so only the
+    // restored rows say its first two segments are the record's.
+    try s.prefillKeep(512, 520);
+    hc.commit_media_chain = &chain;
+    prefix.publishLive(hc, m, s.ids[0..520], false, .{ .key = k_img2, .start = img1_at });
+    prefix.flushLive(hc, m, "test");
+    d.drainWriter();
+    try testing.expectEqual(@as(usize, 2), d.entryCount());
+    try testing.expectEqual(@as(u32, 2), d.entries.items[1].inherited_grown);
+}
+
+test "hy4 points: a rollback before the second image restamps the published record to the images it still covers, and its flush stores that stamp (HY4_BF16_TINY)" {
+    try mlx.requireGpu();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(std.testing.io, &buf)];
+    var s: Session = undefined;
+    try s.begin(1024);
+    defer s.end();
+    const m = s.r.m;
+    s.r.hc = try diskCache(std.testing.io, base, &s.r.t.config, 256);
+    defer s.r.hc.deinit();
+    const hc = &s.r.hc;
+    const live = prefix.liveOf(hc);
+    const img1_at: usize = 40;
+    const chain = [_]pc.MediaSpan{ .{ .start = img1_at, .key = k_img1 }, .{ .start = 580, .key = k_img2 } };
+
+    try m.reserveFor(1024);
+    try s.prefillKeep(0, 540);
+    _ = mlx.mlx_array_free(try m.forwardReadout(s.ids[540..660], .none));
+    hc.commit_media_chain = &chain;
+    prefix.publishLive(hc, m, s.ids[0..660], false, .{ .key = k_img2, .start = img1_at });
+    try testing.expectEqual(k_img2, live.vision_key);
+
+    // The next prompt shares 600 tokens: the state rolls back to its point at 540, before the second image.
+    var target = try KVCache.initWithConfig(testing.allocator, m.config.layers, .engine_default);
+    defer target.deinit();
+    var moe: usize = 0;
+    const res = prefix.rollbackLive(hc, m, &target, &moe, s.r.es, s.ids[0..600], false, .{}, null) orelse return error.TestExpectedRollback;
+    try testing.expectEqual(@as(usize, 540), res.matched);
+    try testing.expectEqual(@as(usize, 540), live.tokens.items.len);
+    try testing.expectEqual(k_img1, live.vision_key);
+    prefix.flushLive(hc, m, "handover");
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    try testing.expectEqual(k_img1, hc.disk.?.entries.items[0].vision_key);
+}

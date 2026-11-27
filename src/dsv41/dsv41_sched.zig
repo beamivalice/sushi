@@ -703,6 +703,8 @@ pub fn writeThrough(
     const dsv = arch_handle.trunk(slot.model.handle orelse return false).arch_state.dsv41.model orelse return false;
     const lent = lendSlot(slot);
     defer if (lent) |l| l.end();
+    hc.commit_restored = slot.restored_disk;
+    hc.commit_media_chain = slot.media_chain;
     dsv41_prefix.writeThroughDsv41(hc, dsv, &slot.cache, prompt, slot.has_tools, media, cps, "prefill");
     return true;
 }

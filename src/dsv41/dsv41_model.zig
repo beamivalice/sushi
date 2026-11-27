@@ -2956,11 +2956,14 @@ fn router(sc: *Scope, m: *const Model, li: usize, h: A, img: A, mix: ?*HcMix, qu
     const norm = c.norm_topk and K > 1;
     const rows = dim(h, 0);
     // `img` rows pick by the image bias; the kernel reads a `[L, E]` bias row by row.
-    var bias = if (img.ctx != null and ly.gate_bias_vl.ctx != null) try sc.where(try sc.expand(img, -1), ly.gate_bias_vl, ly.gate_bias) else ly.gate_bias;
+    // Scoped to the router so the `[L, E]` bias does not stay pinned in the layer scope through `moe`.
+    var bsc = sc.child();
+    defer bsc.deinit();
+    var bias = if (img.ctx != null and ly.gate_bias_vl.ctx != null) try bsc.where(try bsc.expand(img, -1), ly.gate_bias_vl, ly.gate_bias) else ly.gate_bias;
     // An expert the layer's cache lacks scores lower in a decode-width text pick; the weights stay unbiased.
     if (img.ctx == null and li < c.layers and rows <= exl3.kernels.DECODE_ROWS_MAX) switch (m.experts) {
         .hook => |hk| if (hk.penalty) |pen_fn| {
-            if (try pen_fn(hk.ctx, li)) |pen| bias = try sc.add(bias, pen);
+            if (try pen_fn(hk.ctx, li)) |pen| bias = try bsc.add(bias, pen);
         },
         .resident => {},
     };
@@ -3485,10 +3488,14 @@ fn engramApply(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A
 }
 
 /// `engramApply`, except on an image span's rows (`img`, none for text): the reference shuts their gate, so
-/// they pass through.
+/// they pass through. The image branch runs `engramApply` in a child scope so the unmasked `[L, hc, D]` copy
+/// is freed before `attention` and `moe` run, keeping the layer's pool peak within `dsv41_wide_bytes`.
 fn engramWrite(sc: *Scope, m: *const Model, e: *const EngramLayer, x: A, rows: A, img: A) !A {
-    const y = try engramApply(sc, m, e, x, rows);
-    return if (img.ctx != null) sc.where(try sc.expand(try sc.expand(img, -1), -1), x, y) else y;
+    if (img.ctx == null) return engramApply(sc, m, e, x, rows);
+    var sub = sc.child();
+    defer sub.deinit();
+    const y = try engramApply(&sub, m, e, x, rows);
+    return sc.where(try sub.expand(try sub.expand(img, -1), -1), x, y);
 }
 
 /// `engramApply` after `wkv`, as the op chain.

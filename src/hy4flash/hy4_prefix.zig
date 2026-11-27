@@ -47,6 +47,8 @@ pub const Live = struct {
     has_tools: bool = false,
     vision_key: u64 = 0,
     media_start: ?u32 = null,
+    media_chain: std.ArrayList(pc.MediaSpan) = .empty,
+    restored_disk: ?kv_disk_cache.RestoredRows = null,
     /// The model's `version` the record was published at: the model's own state is the record's tokens while it holds.
     version: ?u64 = null,
     /// The model's `epoch` the points were taken in: they stand on the model's rows while it holds (`Model.epoch`).
@@ -62,6 +64,7 @@ pub const Live = struct {
         const gpa = self.gpa orelse return;
         self.points.deinit(gpa);
         self.tokens.deinit(gpa);
+        self.media_chain.deinit(gpa);
     }
 
     /// Lets go of the record, its points' slots given back to `m`, whose they are.
@@ -69,6 +72,10 @@ pub const Live = struct {
         for (self.points.items) |*p| m.releasePoint(p);
         self.points.clearRetainingCapacity();
         self.tokens.clearRetainingCapacity();
+        self.media_chain.clearRetainingCapacity();
+        self.vision_key = 0;
+        self.media_start = null;
+        self.restored_disk = null;
         self.version = null;
         self.epoch = null;
         self.base = 0;
@@ -91,6 +98,10 @@ pub const Live = struct {
     /// record's (those of an earlier turn it continued, which stand on the same rows), the newest `record_point_cap`
     /// kept; its tokens are copied, and the record is the model's state as it stands now.
     pub fn publish(self: *Live, m: State, tokens: []const u32, has_tools: bool, media: pc.MediaStamp) void {
+        self.publishWithChain(m, tokens, has_tools, media, &.{});
+    }
+
+    pub fn publishWithChain(self: *Live, m: State, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, chain: []const pc.MediaSpan) void {
         if (self.gpa == null) self.gpa = m.gpa;
         const gpa = self.gpa.?;
         const r = m.req();
@@ -108,9 +119,12 @@ pub const Live = struct {
         }
         self.tokens.clearRetainingCapacity();
         self.tokens.appendSlice(gpa, tokens) catch return self.clear(m);
+        self.media_chain.clearRetainingCapacity();
+        self.media_chain.appendSlice(gpa, chain) catch return self.clear(m);
+        const stamped = pc.truncatedMediaKey(self.media_chain.items, media.key, if (media.start) |v| @as(usize, v) else null, tokens.len);
         self.has_tools = has_tools;
-        self.vision_key = media.key;
-        self.media_start = media.start;
+        self.vision_key = stamped.key;
+        self.media_start = stamped.start;
         self.version = r.version;
         self.epoch = r.epoch;
     }
@@ -120,12 +134,13 @@ pub const Live = struct {
 /// repeats, so a turn that restores it after a handover prefills only what is new) joins its own, and the record is
 /// published.
 pub fn publishLive(hc: *pc.HotPrefixCache, m: State, tokens: []const u32, has_tools: bool, media: pc.MediaStamp) void {
+    const chain = hc.takeMediaChain();
     const r = m.req();
     const newest: usize = if (r.live_points.items.len > 0) r.live_points.items[r.live_points.items.len - 1].pos else 0;
     if (r.pos <= tokens.len and r.pos > newest) m.keepLivePoint() catch |err| {
         log.warn("  [hy4-prefix] restore point behind the reply at {d} not kept: {s}\n", .{ r.pos, @errorName(err) });
     };
-    liveOf(hc).publish(m, tokens, has_tools, media);
+    liveOf(hc).publishWithChain(m, tokens, has_tools, media, chain);
 }
 
 pub fn liveOf(hc: *pc.HotPrefixCache) *Live {
@@ -282,6 +297,10 @@ pub fn captureCheckpoint(allocator: std.mem.Allocator, xfm: *trunk.Trunk, ctx: *
 /// copied what it stages: one that outlived this call would make the next forward copy every store. A point off the
 /// grid is its live point only, and reaches the tier at the handover (`flushLive`).
 pub fn writeThrough(hc: *pc.HotPrefixCache, m: State, cache: *const trunk.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, restored: ?kv_disk_cache.RestoredRows, cps: []ssm_cache.SSMCheckpoint, s: mlx.mlx_stream) void {
+    writeThroughChain(hc, m, cache, prompt, has_tools, media, hc.takeMediaChain(), restored, cps, s);
+}
+
+fn writeThroughChain(hc: *pc.HotPrefixCache, m: State, cache: *const trunk.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, chain: []const pc.MediaSpan, restored: ?kv_disk_cache.RestoredRows, cps: []ssm_cache.SSMCheckpoint, s: mlx.mlx_stream) void {
     defer for (cps) |*cp| cp.release();
     defer if (m.serves_requests) m.dropLive();
     const d = if (hc.disk) |*dd| dd else return;
@@ -293,12 +312,13 @@ pub fn writeThrough(hc: *pc.HotPrefixCache, m: State, cache: *const trunk.KVCach
         if (!any) return;
     }
     const base = if (m.serves_requests) m.reqConst().rows_base else liveOf(hc).base;
-    const w = live_points.write(hc, cache.entries, cache.config, prompt, has_tools, media, restored, cps, base, s);
+    const w = live_points.write(hc, cache.entries, cache.config, prompt, has_tools, media, chain, restored, cps, base, s);
     if (!m.serves_requests) if (w.id) |id| for ([_][]hy4_model.Model.Point{ liveOf(hc).points.items, m.req().live_points.items }) |list| live_points.markOnDisk(list, d, id);
     log.info("[hy4-prefix] restore points to SSD at {d}: {d:.2} MB staged\n", .{ prompt.len, @as(f64, @floatFromInt(w.bytes)) / 1e6 });
 }
 
 pub fn writeEndPoint(hc: *pc.HotPrefixCache, m: State, cache: *const trunk.KVCache, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, restored: ?kv_disk_cache.RestoredRows) void {
+    const chain = hc.takeMediaChain();
     if (hc.disk == null or !hc.ssd_first or tokens.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
     const r = m.liveReqConst() catch |e| {
         log.err("[hy4-prefix] no restore point behind the reply: {s}\n", .{@errorName(e)});
@@ -312,7 +332,7 @@ pub fn writeEndPoint(hc: *pc.HotPrefixCache, m: State, cache: *const trunk.KVCac
         return;
     }};
     defer cps[0].deinit(hc.allocator);
-    writeThrough(hc, m, cache, tokens, has_tools, media, restored, &cps, m.s);
+    writeThroughChain(hc, m, cache, tokens, has_tools, media, chain, restored, &cps, m.s);
 }
 
 /// Writes the live record's points that are not on SSD yet, while the rows they stand on are still the state's own:
@@ -327,7 +347,7 @@ pub fn flushLive(hc: *pc.HotPrefixCache, m: State, why: []const u8) void {
     if (live.vision_key != 0 and live.media_start == null) return;
     const had = mlx.errorPending();
     defer mlx.dropLatchedErrorUnless(had);
-    const rec: live_points.Record = .{ .tokens = live.tokens.items, .has_tools = live.has_tools, .vision_key = live.vision_key, .media_start = if (live.media_start) |v| @as(usize, v) else null, .base = live.base };
+    const rec: live_points.Record = .{ .tokens = live.tokens.items, .has_tools = live.has_tools, .vision_key = live.vision_key, .media_start = if (live.media_start) |v| @as(usize, v) else null, .media_chain = live.media_chain.items, .restored = live.restored_disk, .base = live.base };
     const f = live_points.flush(FlushCtx{ .m = m }, hc, live.points.items, rec, @min(live.tokens.items.len, r.pos), m.config.layers, r.kv, m.s, "[hy4-prefix]");
     if (f.id) |id| live_points.markOnDisk(r.live_points.items, &hc.disk.?, id);
     if (f.points == 0) return;
@@ -428,6 +448,10 @@ fn rollbackLiveInPlace(
         };
     }
     live.dropPointsPast(pos, m);
+    if (live.tokens.items.len > pos) live.tokens.shrinkRetainingCapacity(pos);
+    const stamped = pc.truncatedMediaKey(live.media_chain.items, live.vision_key, if (live.media_start) |v| @as(usize, v) else null, pos);
+    live.vision_key = stamped.key;
+    live.media_start = stamped.start;
     live.base = pos;
     target_cache.truncate(0, s) catch {};
     target_cache.step = pos;
@@ -662,12 +686,16 @@ pub fn restoreDisk(
         mlx.dropLatchedErrorUnless(had);
         return null;
     };
-    hc.last_restored_disk_id = d.entries.items[hm.idx].id;
+    const entry_id = d.entries.items[hm.idx].id;
+    hc.last_restored_disk_id = entry_id;
     const r = m.req();
-    if (m.serves_requests) r.rows_base = hm.cp else liveOf(hc).base = hm.cp;
+    if (m.serves_requests) r.rows_base = hm.cp else {
+        liveOf(hc).base = hm.cp;
+        liveOf(hc).restored_disk = .{ .id = entry_id, .rows = hm.cp };
+    }
     // The point the request restored is on SSD where it was read.
-    if (r.live_points.items.len > 0) r.live_points.items[r.live_points.items.len - 1].disk_id = d.entries.items[hm.idx].id;
-    return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
+    if (r.live_points.items.len > 0) r.live_points.items[r.live_points.items.len - 1].disk_id = entry_id;
+    return .{ .matched = hm.cp, .full_match = false, .slot_owned = true, .disk_restore = .{ .id = entry_id, .rows = hm.cp } };
 }
 
 test "hy4 prefix: a cache-biased load's SSD tier is its own namespace, apart from an exact load's, and the flag off keeps the exact one (HY4_STQ_TINY)" {

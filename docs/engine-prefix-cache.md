@@ -111,18 +111,24 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
   record's pre-media text, never given its image rows.
 - **A commit reuses a record only under its own media key** (`DiskTier.commitShares`, the rule with no chain): it is
   superseded by, extends or tops up a record only where that record's rows are its rows, an equal key or text wholly
-  below both sides' first media row; a chunk-share donor lends only whole chunks below that bound. Two same-size images
-  render the same placeholder ids, so a token-only match let image B's commit extend image A's record and restore A's
-  state. A turn that appends a second image gets a fresh record (donor chunks below the first image), not an extend.
-- **Past the donor's share, a record links the whole chunks below its restored rows** (`CommitParams.restored`,
-  `LookupResult.disk_restore`, `restoredSource`): the slot read those rows from that entry's files, and re-serialized
-  they are the same bytes (the re-serialization test), so the record holds what it would have written. A row the
-  request recomputed (past its restore point) is written, never linked. An image turn used to rewrite its whole
-  restored prefix past the first image: 66 MB a turn of a 100k-token conversation with a screenshot every other turn.
-- **A record claims only the media blocks its rows cover** (`truncatedMediaKey`): a write-through chunk or a cancelled
-  prefill that stops between two blocks claims the chain up to the last block inside it. Key 0 means no media row at
-  all, which is what lets a text prompt share a record whole. Overclaiming is safe (an equal key is clamped by
-  `kv_len`, a different one falls to the pre-media text) but costs the reuse of the blocks the record does hold.
+  below both sides' first media row. Two same-size images render the same placeholder ids, so a token-only match let
+  image B's commit extend image A's record and restore A's state. A turn that appends a second image gets a fresh record
+  (not an extend, so earlier branches keep their key), while its chunk and row-segment donors (`commitSharesWithChain`,
+  `chunkShareDonor`, `segmentDonor`) and RAM checkpoint donors (`donorShared`) apply the request's `media_chain` to
+  hard-link chunks and row segments and inherit checkpoints up to the new image's start.
+- **Past the donor's share, a record links the whole chunks and row segments below its restored rows**
+  (`CommitParams.restored`, `LookupResult.disk_restore`, `restoredSource`, `restoredSegmentSource`): the slot read
+  those rows from that entry's files, and re-serialized they are the same bytes (the re-serialization test), so the
+  record holds what it would have written. A row the request recomputed (past its restore point) is written, never
+  linked. An image turn used to rewrite its whole restored prefix past the first image: 66 MB a turn of a 100k-token
+  conversation with a screenshot every other turn, and ~170 MB of row segments per image turn on DeepSeek-V4.1.
+- **`HotPrefixCache.commit_media_chain` is a borrow of the slot's chain**: a consumer takes it first (`takeMediaChain`),
+  before any return, so a path that writes nothing never leaves it for the next request's consumer to apply.
+- **A record claims only the media blocks its rows cover** (`truncatedMediaKey`): a write-through chunk, a budget cut,
+  a live rollback/flush, or a cancelled prefill that stops between two blocks claims the chain up to the last block
+  inside it. Key 0 means no media row at all, which is what lets a text prompt share a record whole. Overclaiming is
+  safe (an equal key is clamped by `kv_len`, a different one falls to the pre-media text) but costs the reuse of the
+  blocks the record does hold.
 - **The media key is a PERSISTED format.** It is `mediaChain`'s Wyhash over each block's preprocessed pixels, grid and
   position (`request_media.zig`), stored as hex because a u64 key runs past JSON's i64. Changing what it hashes without
   changing the hash would make a stale record match a prompt it does not describe; a changed hash only costs misses.
@@ -250,9 +256,10 @@ The scheduler, the server and the arch tests still call GLM's and DeepSeek's ent
 - Checkpoint retention thins the INTERIOR with a dense newest quarter (`spanPreservingDropIndex`, `ThinPolicy`).
 - **An evicted SSD record hands its highest point inside a survivor's shared prefix to that survivor**
   (`bequeathPoint`, by hard link, its bytes moved to the survivor's bill): only when the survivor holds the same
-  chunk inodes and equal QSA segment hashes below it, and has no point as high there. An heir keeps points only past
-  where it diverged, so once the oldest record went, a client that changed an early image (the newest-24-images
-  window) found no point below it and prefilled about 300k tokens cold.
+  chunk inodes (and on a split-row tier, the same row-segment inodes `g*`, on-grid past `commitShares`) and equal QSA
+  segment hashes below it, and has no point as high there. An heir keeps points only past where it diverged, so once
+  the oldest record went, a client that changed an early image (the newest-24-images window) found no point below it
+  and prefilled about 300k tokens cold.
 - **A Sushi Cooler commit holds the rows a request used, not its reservation**: the slot's cache (and the MTP head's history) is cut to its rows before the commit snapshots it (`KVCache.shrinkToRows`, from `scheduler.shrinkForCommit`), because `snapshotBytes` bills buffer capacity and a request reserves its last row; the copy is one buffer at a time and billed (`bills.commitTrimBytes`).
 - An oversized candidate is TRIMMED to the longest restorable prefix that fits (`trimLenForBudget`,
   `KVCacheSnapshot.trimmedCopy` is a REAL copy); a QSA trim bills the bank on the final retained checkpoint.

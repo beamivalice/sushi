@@ -55,6 +55,7 @@ pub fn write(
     tokens: []const u32,
     has_tools: bool,
     media: pc.MediaStamp,
+    media_chain: []const pc.MediaSpan,
     restored: ?kv_disk_cache.RestoredRows,
     cps: []trunk.SSMCheckpoint,
     base: usize,
@@ -64,6 +65,7 @@ pub fn write(
     const before = d.point_bytes_written;
     d.rows_base = @intCast(@min(base, std.math.maxInt(u32)));
     defer d.rows_base = std.math.maxInt(u32);
+    hc.commit_media_chain = media_chain;
     hc.writeThroughHybrid(kv_entries, config, tokens, has_tools, media, restored, cps, &.{}, std.math.maxInt(u64), s);
     return .{ .bytes = d.point_bytes_written - before, .id = d.last_store_id };
 }
@@ -74,6 +76,8 @@ pub const Record = struct {
     has_tools: bool,
     vision_key: u64,
     media_start: ?usize,
+    media_chain: []const pc.MediaSpan = &.{},
+    restored: ?kv_disk_cache.RestoredRows = null,
     /// Rows below this position are a restore's or a rollback's (`write`).
     base: usize,
 };
@@ -114,8 +118,8 @@ pub fn flush(ctx: anytype, hc: *pc.HotPrefixCache, points: anytype, rec: Record,
         log.warn("  " ++ tag ++ " live points not flushed, rows not marked: {s}\n", .{@errorName(err)});
         return .{};
     };
-    const media = pc.truncatedMediaKey(&.{}, rec.vision_key, rec.media_start, top);
-    const w = write(hc, cache.entries, cache.config, rec.tokens[0..top], rec.has_tools, media, null, cps.items, rec.base, s);
+    const media = pc.truncatedMediaKey(rec.media_chain, rec.vision_key, rec.media_start, top);
+    const w = write(hc, cache.entries, cache.config, rec.tokens[0..top], rec.has_tools, media, rec.media_chain, rec.restored, cps.items, rec.base, s);
     if (w.id) |id| markOnDisk(points, &hc.disk.?, id);
     return .{ .points = cps.items.len, .top = top, .bytes = w.bytes, .id = w.id };
 }

@@ -49,6 +49,7 @@ pub fn writeThrough(
     const m = @import("../arch/handle.zig").trunk(slot.model.handle orelse return false).arch_state.hy4flash.model orelse return false;
     const lent = lendSlot(slot);
     defer if (lent) |l| l.end();
+    hc.commit_media_chain = slot.media_chain;
     hy4_prefix.writeThrough(hc, m, &slot.cache, prompt, slot.has_tools, media, slot.restored_disk, cps, s);
     return true;
 }
@@ -949,9 +950,11 @@ pub fn publishLive(sch: *@import("../scheduler.zig").Scheduler, slot: *@import("
     if (m.serves_requests) {
         const lent = lendSlot(slot);
         defer if (lent) |l| l.end();
+        hc.commit_media_chain = slot.media_chain;
         hy4_prefix.writeEndPoint(hc, m, &slot.cache, tokens, slot.has_tools, media, slot.restored_disk);
         return;
     }
+    hc.commit_media_chain = slot.media_chain;
     hy4_prefix.publishLive(hc, m, tokens, slot.has_tools, media);
     // A point only in RAM reaches SSD on the idle flush, if no other request takes the state first.
     if (hy4_prefix.liveOf(hc).unflushed(if (hc.disk) |*d| d else null)) sch.live_unflushed.store(true, .release);

@@ -205,6 +205,10 @@ pub const Live = struct {
     has_tools: bool = false,
     vision_key: u64 = 0,
     media_start: ?u32 = null,
+    /// Media blocks of the published turn, so rollback and partial flushes truncate `vision_key` cleanly.
+    media_chain: []pc.MediaSpan = &.{},
+    /// SSD entry and rows this live state restored from, for segment linking on flush.
+    restored_disk: ?kv_disk_cache.RestoredRows = null,
     /// The KV scheme of the slot cache the record was published from: the SSD tier keys its entries on it.
     quant: kv_quant.KVQuantConfig = .dense,
     state_id: u64 = 0,
@@ -226,6 +230,11 @@ pub const Live = struct {
         self.points.clearRetainingCapacity();
         allocator.free(self.tokens);
         self.tokens = &.{};
+        allocator.free(self.media_chain);
+        self.media_chain = &.{};
+        self.vision_key = 0;
+        self.media_start = null;
+        self.restored_disk = null;
         self.ready = false;
         self.open = false;
         self.base = 0;
@@ -281,6 +290,7 @@ pub const Live = struct {
     pub fn keepRestored(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, cp: *const transformer.SSMCheckpoint, disk_id: ?u64) !void {
         try self.keep(allocator, m, cp, disk_id);
         self.base = cp.pos;
+        self.restored_disk = if (disk_id) |id| .{ .id = id, .rows = @intCast(cp.pos) } else null;
     }
 
     /// Whether a point of the record is still only here, not on `disk`.
@@ -290,6 +300,10 @@ pub const Live = struct {
 
     /// The request over the state finished with `tokens` as its history: its points become what the next one may roll back to.
     pub fn publish(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, tokens: []const u32, has_tools: bool, vision_key: u64, media_start: ?u32) !void {
+        return self.publishWithChain(allocator, m, tokens, has_tools, vision_key, media_start, &.{});
+    }
+
+    pub fn publishWithChain(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, tokens: []const u32, has_tools: bool, vision_key: u64, media_start: ?u32, media_chain: []const pc.MediaSpan) !void {
         const st = (try model.currentState(m)) orelse return self.clear(allocator);
         const covered = @min(st.n, tokens.len);
         while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos > covered) {
@@ -298,11 +312,15 @@ pub const Live = struct {
         }
         allocator.free(self.tokens);
         self.tokens = &.{};
+        allocator.free(self.media_chain);
+        self.media_chain = &.{};
         if (self.points.items.len == 0) return self.clear(allocator);
         self.tokens = allocator.dupe(u32, tokens[0..covered]) catch return self.clear(allocator);
+        self.media_chain = if (media_chain.len > 0) allocator.dupe(pc.MediaSpan, media_chain) catch return self.clear(allocator) else &.{};
+        const stamped = pc.truncatedMediaKey(self.media_chain, vision_key, if (media_start) |v| @as(usize, v) else null, covered);
         self.has_tools = has_tools;
-        self.vision_key = vision_key;
-        self.media_start = media_start;
+        self.vision_key = stamped.key;
+        self.media_start = stamped.start;
         self.state_id = st.id;
         self.ready = true;
         self.open = false;
@@ -339,6 +357,9 @@ pub const Live = struct {
         }
         allocator.free(self.tokens);
         self.tokens = kept;
+        const stamped = pc.truncatedMediaKey(self.media_chain, self.vision_key, if (self.media_start) |v| @as(usize, v) else null, p.pos);
+        self.vision_key = stamped.key;
+        self.media_start = stamped.start;
         self.open = true;
         self.base = p.pos;
     }
@@ -593,11 +614,12 @@ pub fn restoreDisk(
         handled.drop();
         return null;
     };
-    self.last_restored_disk_id = d.entries.items[hm.idx].id;
+    const entry_id = d.entries.items[hm.idx].id;
+    self.last_restored_disk_id = entry_id;
     restoredAt(m, cp.pos);
-    if (!m.serves_rows) liveOf(self).keepRestored(self.allocator, m, &cp, d.entries.items[hm.idx].id) catch handled.drop();
+    if (!m.serves_rows) liveOf(self).keepRestored(self.allocator, m, &cp, entry_id) catch handled.drop();
     log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
-    return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
+    return .{ .matched = hm.cp, .full_match = false, .slot_owned = true, .disk_restore = .{ .id = entry_id, .rows = hm.cp } };
 }
 
 /// Installs the entry's checkpoint under `restore_cap` into the model; 0 when none serves.
@@ -630,6 +652,10 @@ const Handled = struct {
 /// is written: the points stay for the commit and are kept live, so the next turn rolls back to them as above it.
 /// `held` names the phase that waited on the writer, for the log.
 pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, held: []const u8) void {
+    writeThroughChain(self, m, cache, prompt, has_tools, media, self.takeMediaChain(), cps, held);
+}
+
+fn writeThroughChain(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, chain: []const pc.MediaSpan, cps: []SSMCheckpoint, held: []const u8) void {
     const s = dsv41_model.stateStream(m);
     if (self.disk == null) return;
     const handled = Handled.begin();
@@ -651,7 +677,9 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
         _ = live_points.releaseOffGrid(&self.disk.?, cps);
     }
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    const w = live_points.write(self, cache.entries, cache.config, prompt, has_tools, media, null, cps, restoredBase(self, m), s);
+    const restored = self.commit_restored;
+    self.commit_restored = null;
+    const w = live_points.write(self, cache.entries, cache.config, prompt, has_tools, media, chain, restored, cps, restoredBase(self, m), s);
     if (w.id) |id| live_points.markOnDisk(liveOf(self).points.items, &self.disk.?, id);
     // The prefill waits here while the writer's bounded buffer is full: the stall a slow SSD costs.
     log.info("[dsv41-prefix] restore points to SSD at {d}: {d:.2} GB staged, {s} held {d} ms\n", .{ prompt.len, @as(f64, @floatFromInt(w.bytes)) / 1e9, held, sw.read() / std.time.ns_per_ms });
@@ -680,9 +708,10 @@ fn keepLive(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cps: []SSMChe
 /// The request's state at `tokens.len`, which must be where the model stands, as one restore point straight to the
 /// SSD tier: shared rows, staged and released before the next forward appends.
 pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp) !void {
+    const chain = self.takeMediaChain();
     var cps = [1]SSMCheckpoint{try captureShared(self.allocator, m, tokens.len)};
     defer cps[0].deinit(self.allocator);
-    writeThroughDsv41(self, m, cache, tokens, has_tools, media, &cps, "decode");
+    writeThroughChain(self, m, cache, tokens, has_tools, media, chain, &cps, "decode");
 }
 
 /// A finished request's state stands right behind `pos`, the reply the next prompt repeats: one more point of the
@@ -710,7 +739,8 @@ pub fn keepEndPointDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, pos: u
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
 /// True when the record holds points that are not on SSD.
 pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, quant: kv_quant.KVQuantConfig) !bool {
-    try liveOf(self).publish(self.allocator, m, tokens, has_tools, media.key, media.start);
+    const chain = self.takeMediaChain();
+    try liveOf(self).publishWithChain(self.allocator, m, tokens, has_tools, media.key, media.start, chain);
     liveOf(self).quant = quant;
     return liveOf(self).unflushed(if (self.disk) |*d| d else null);
 }
@@ -745,7 +775,7 @@ pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, why: []co
     const handled = Handled.begin();
     defer handled.drop();
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    const rec: live_points.Record = .{ .tokens = live.tokens, .has_tools = live.has_tools, .vision_key = live.vision_key, .media_start = if (live.media_start) |v| @as(usize, v) else null, .base = live.base };
+    const rec: live_points.Record = .{ .tokens = live.tokens, .has_tools = live.has_tools, .vision_key = live.vision_key, .media_start = if (live.media_start) |v| @as(usize, v) else null, .media_chain = live.media_chain, .restored = live.restored_disk, .base = live.base };
     const f = live_points.flush(FlushCtx{ .m = m, .s = s }, self, live.points.items, rec, @min(live.tokens.len, st.n), m.cfg.layers, live.quant, s, "[dsv41-prefix]");
     if (f.points == 0) return;
     log.info("[dsv41-prefix] live points to SSD ({s}): {d} points to {d}, {d:.2} GB staged, held {d} ms\n", .{ why, f.points, f.top, @as(f64, @floatFromInt(f.bytes)) / 1e9, sw.read() / std.time.ns_per_ms });

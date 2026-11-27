@@ -144,6 +144,7 @@ pub fn publishLive(sch: *Scheduler, slot: *Slot, hc: *prefix_cache_mod.HotPrefix
     if (!owned) return log.err("[dsv41-prefix] the request's record not published: Dsv41StateNotOwned (another request has moved the state since)\n", .{});
     const kept = dsv41_prefix.keepEndPointDsv41(hc, dsv, tokens.len) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});
     if (kept) log.info("[dsv41-prefix] restore point behind the reply at {d}\n", .{tokens.len});
+    hc.commit_media_chain = slot.media_chain;
     const unflushed = dsv41_prefix.publishLiveDsv41(hc, dsv, tokens, slot.has_tools, media, slot.cache.config) catch |e| return log.err("[dsv41-prefix] the request's record not published: {s}\n", .{@errorName(e)});
     if (unflushed) sch.live_unflushed.store(true, .release);
 }
@@ -156,6 +157,8 @@ fn writeEndPoint(hc: *prefix_cache_mod.HotPrefixCache, dsv: *dsv41_model.Model, 
     defer if (lent) |l| l.end();
     const st = (dsv41_model.currentState(dsv) catch |e| return log.err("[dsv41-prefix] no restore point behind the reply: {s}\n", .{@errorName(e)})) orelse return;
     if (st.n != tokens.len) return;
+    hc.commit_restored = slot.restored_disk;
+    hc.commit_media_chain = slot.media_chain;
     dsv41_prefix.writeDecodePointDsv41(hc, &slot.cache, dsv, tokens, slot.has_tools, media) catch |e| return log.warn("[dsv41-prefix] no restore point behind the reply: {s}\n", .{@errorName(e)});
     log.info("[dsv41-prefix] restore point behind the reply at {d}, to SSD\n", .{tokens.len});
 }
@@ -205,6 +208,8 @@ pub fn writeDsv41ThoughtPoint(slot: *Slot, gen: *Generator, block: []const u32) 
     @memcpy(tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(tokens[slot.full_prompt.len..], generated);
     const media = prefix_cache_mod.truncatedMediaKey(slot.media_chain, slot.vision_key, slot.media_start, pos);
+    hc.commit_restored = slot.restored_disk;
+    hc.commit_media_chain = slot.media_chain;
     dsv41_prefix.writeDecodePointDsv41(hc, &slot.cache, dsv, tokens, slot.has_tools, media) catch |err| {
         log.warn("[dsv41-prefix] decode restore point not written: {s}\n", .{@errorName(err)});
     };

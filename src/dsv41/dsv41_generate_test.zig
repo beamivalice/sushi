@@ -6653,6 +6653,32 @@ test "dsv41 engine: a wide forward's in-use peak is its cap's shape sum, a resid
             }
         }
 
+        // A wide forward with image rows stays within the same shape sum: `engramWrite` and `router` must not leave
+        // unbilled image-branch intermediates pinned in the layer scope past their own use.
+        {
+            var image = try ImageStandIn.give(a, &fx);
+            defer image.drop();
+            const w: usize = top;
+            const ids = try a.alloc(u32, w + 1);
+            defer a.free(ids);
+            _ = fx.prompt(ids);
+            for (ids[11..21]) |*t| t.* = c.image_token_id;
+            try fx.xfm.resetCache();
+            var ctx = fx.xfm.defaultCtx();
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[0..1]));
+            mlx.engine.close();
+            ctx.vision_embeddings = image.rows;
+            const s = mlx.engine.stats();
+            const in0 = s.pool_bytes - s.pool_free;
+            mlx.engine.resetPoolPeak(.process);
+            _ = mlx.mlx_array_free(try forwardIds(&fx.xfm, &ctx, ids[1 .. 1 + w]));
+            const peak = mlx.engine.poolPeak(.process) - in0 - pool_class.poolBytes(4 * w);
+            const seq = 1 + w;
+            const shape_sum = wide_bytes.bytes(c, w, seq);
+            errdefer std.debug.print("{s} image {d} rows: peak {d}, shape sum {d}\n", .{ env, w, peak, shape_sum });
+            try testing.expect(peak <= shape_sum);
+        }
+
         // Between two 2,048-row chunks: what the pool holds against the state's bill.
         {
             const chunk: usize = 2048;
