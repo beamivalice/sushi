@@ -53,8 +53,17 @@ pub fn smallerPack(dir: []const u8) ?bool {
     const own = for (aliases) |a| {
         if (std.ascii.eqlIgnoreCase(std.fs.path.basename(a.repo), base)) break a;
     } else return null;
-    for (aliases) |a| if (std.mem.eql(u8, a.name, own.name) and a.tier_gb < own.tier_gb) return true;
+    for (aliases) |a| if (std.mem.eql(u8, a.name, own.name) and bitsPerWeight(a) < bitsPerWeight(own)) return true;
     return false;
+}
+
+/// The bits per weight a pack's tag names ("2.7bpw"): its size, which its RAM tier is not once its experts stream.
+fn bitsPerWeight(a: Alias) f64 {
+    return std.fmt.parseFloat(f64, a.tag[0 .. std.mem.indexOf(u8, a.tag, "bpw") orelse a.tag.len]) catch std.math.inf(f64);
+}
+
+test "every published pack's tag names its bits per weight" {
+    for (aliases) |a| try std.testing.expect(std.math.isFinite(bitsPerWeight(a)));
 }
 
 /// "qwen4_exp (Qwen3.8-Flash-Next), mimo_v2 (MiMo-V2.6-Flash), and ...": what a build loads, for the load refusal.
@@ -110,7 +119,7 @@ test "the alias table lists every arch's packs, in the arch gate's order, with t
         .{ .name = "glm-5.3-flash", .tag = "2bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2bpw", .is_default = false, .tier_gb = 96, .recommend_gb = 96, .streams = false, .flags = "" },
         .{ .name = "glm-5.3-flash", .tag = "2.4bpw", .repo = "beamster/GLM-5.3-Flash-Sushi-2.4bpw", .is_default = true, .tier_gb = 128, .recommend_gb = 128, .streams = false, .flags = "" },
         .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams = true, .flags = "" },
-        .{ .name = "deepseek-v4.1-flash", .tag = "2.7bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", .is_default = false, .tier_gb = 256, .recommend_gb = 256, .streams = true, .flags = "" },
+        .{ .name = "deepseek-v4.1-flash", .tag = "2.7bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", .is_default = false, .tier_gb = 64, .recommend_gb = 256, .streams = true, .flags = "" },
         .{ .name = "hy4-flash", .tag = "4bpw", .repo = "beamster/Hy4-Flash-Sushi-STQ-4bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams = false, .flags = "" },
         .{ .name = "hy4-flash", .tag = "2.25bpw", .repo = "beamster/Hy4-Flash-Sushi-STQ-2.25bpw", .is_default = false, .tier_gb = 64, .recommend_gb = 48, .streams = false, .flags = "" },
     };
@@ -136,17 +145,9 @@ test "every arch declares a product name and at least one pack" {
 }
 
 test "a published pack knows whether a smaller pack of its model exists, and a pack it does not list is unknown" {
-    var smallest: ?Alias = null;
-    var larger: ?Alias = null;
-    for (aliases) |a| {
-        if (!std.mem.eql(u8, a.name, aliases[0].name)) continue;
-        if (smallest == null or a.tier_gb < smallest.?.tier_gb) smallest = a;
-    }
-    for (aliases) |a| if (std.mem.eql(u8, a.name, smallest.?.name) and a.tier_gb > smallest.?.tier_gb) {
-        larger = a;
-    };
-    var buf: [256]u8 = undefined;
-    try std.testing.expectEqual(@as(?bool, false), smallerPack(try std.fmt.bufPrint(&buf, "/models/{s}/", .{std.fs.path.basename(smallest.?.repo)})));
-    if (larger) |l| try std.testing.expectEqual(@as(?bool, true), smallerPack(std.fs.path.basename(l.repo)));
+    try std.testing.expectEqual(@as(?bool, false), smallerPack("/models/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw/"));
+    try std.testing.expectEqual(@as(?bool, true), smallerPack("DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw"));
+    try std.testing.expectEqual(@as(?bool, false), smallerPack("/models/Hy4-Flash-Sushi-STQ-2.25bpw"));
+    try std.testing.expectEqual(@as(?bool, true), smallerPack("/models/Hy4-Flash-Sushi-STQ-4bpw"));
     try std.testing.expectEqual(@as(?bool, null), smallerPack("/models/My-Own-Quant"));
 }

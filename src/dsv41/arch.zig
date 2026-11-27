@@ -21,7 +21,7 @@ pub const packs = struct { // slot:packs (S2h)
     pub const product = "DeepSeek-V4.1-Flash";
     pub const aliases = [_]@import("../arch/packs.zig").Alias{
         .{ .name = "deepseek-v4.1-flash", .tag = "1.75bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw", .is_default = true, .tier_gb = 96, .recommend_gb = 96, .streams_experts = true },
-        .{ .name = "deepseek-v4.1-flash", .tag = "2.7bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", .tier_gb = 256, .recommend_gb = 256, .streams_experts = true },
+        .{ .name = "deepseek-v4.1-flash", .tag = "2.7bpw", .repo = "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-2.7bpw", .tier_gb = 64, .recommend_gb = 256, .streams_experts = true },
     };
 };
 pub const flags = @import("dsv41_flags.zig"); // slot:flags (S2h)

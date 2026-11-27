@@ -10,8 +10,8 @@ at each context see [README, Memory](../README.md#memory).
 |---|---|---|
 | 32 GB | Qwen Sushi-2bpw, streamed | |
 | 48 GB | Qwen Sushi-2bpw | |
-| 64 GB | **Qwen Sushi-STQ-2.75bpw** | Qwen Sushi-4bpw, streamed: closer to the original model, about half the speed |
-| 96 GB | Qwen Sushi-4bpw, GLM Sushi-2bpw, DeepSeek (streamed) | |
+| 64 GB | **Qwen Sushi-STQ-2.75bpw** | Qwen Sushi-4bpw, streamed: closer to the original model, about half the speed; DeepSeek Sushi-STQ-2.7bpw, streamed ([guide](dsv41-64gb-mac.md)) |
+| 96 GB | Qwen Sushi-4bpw, GLM Sushi-2bpw, DeepSeek (streamed) | DeepSeek Sushi-STQ-2.7bpw with `--expert-cache-bias` ([guide](dsv41-64gb-mac.md)) |
 | 128 GB | any pack; GLM Sushi-2.4bpw and DeepSeek are the largest | |
 | 256 GB | **DeepSeek Sushi-STQ-2.7bpw**, every expert resident | DeepSeek Sushi-STQ-1.75bpw: smaller, lower quality |
 

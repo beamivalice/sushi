@@ -4,6 +4,12 @@ sushi began as a fork of [mlx-serve](https://github.com/ddalcu/mlx-serve) and wa
 mlx-serve commit `ef5e667` (two commits after mlx-serve v26.9.4). This file covers sushi's own changes since then;
 earlier history is mlx-serve's, in that project's changelog.
 
+## Unreleased
+
+- **DeepSeek-V4.1-Flash STQ 2.7bpw on 64 GB Macs**: `sushi pull` and `sushi list` count it as fitting from 64 GB, where its experts stream with `--expert-cache-bias` as Samuel Reed's guide shows; it is still recommended from 256 GB, where every expert stays resident.
+
+---
+
 ## v1.8.1 — Hy4-Flash on 64 GB Macs
 
 - **Hy4-Flash 2.25bpw runs on 64 GB Macs with no extra flags**: a 48 or 64 GB Mac now picks its own SSD budget for a streamed
