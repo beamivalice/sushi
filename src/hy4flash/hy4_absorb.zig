@@ -19,15 +19,16 @@ const q_source: [:0]const u8 =
     \\constexpr int BLOCK_N = NSG * SN * TN;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint h = threadgroup_position_in_grid.z;
-    \\const size_t h_off = (size_t)h * (size_t)R;
+    \\uint z = threadgroup_position_in_grid.z;
+    \\uint h = z % uint(HEADS);
+    \\int r0 = int(z / uint(HEADS)) * RT;
     \\const device TW* mat = kvb + (size_t)h * (size_t)ROWS * (size_t)LAT;
     \\int thr_m = int(lane) / SN;
     \\int thr_n = int(lane) % SN;
     \\int bm = thr_m * TM;
     \\int out_col = int(threadgroup_position_in_grid.x) * BLOCK_N + (SN * int(sg) + thr_n) * TN;
-    \\float result[R][TN];
-    \\for (int r = 0; r < R; ++r) {
+    \\float result[RT][TN];
+    \\for (int r = 0; r < RT; ++r) {
     \\  for (int tn = 0; tn < TN; ++tn) result[r][tn] = 0.0f;
     \\}
     \\constexpr int n_iter = NOPE / BLOCK_M;
@@ -36,22 +37,29 @@ const q_source: [:0]const u8 =
     \\  for (int tm = 0; tm < TM; ++tm) {
     \\    float inter[TN];
     \\    for (int tn = 0; tn < TN; ++tn) inter[tn] = static_cast<float>(mat[(size_t)(bm + tm) * (size_t)LAT + out_col + tn]);
-    \\    for (int r = 0; r < R; ++r) {
-    \\      float vc = q[(h_off + (size_t)r) * (size_t)QS + bm + tm];
-    \\      for (int tn = 0; tn < TN; ++tn) result[r][tn] += vc * inter[tn];
+    \\    for (int r = 0; r < RT; ++r) {
+    \\      int rr = r0 + r;
+    \\      if (rr < R) {
+    \\        float vc = q[(size_t)h * (size_t)q_strides[0] + (size_t)rr * (size_t)q_strides[1] + bm + tm];
+    \\        for (int tn = 0; tn < TN; ++tn) result[r][tn] += vc * inter[tn];
+    \\      }
     \\    }
     \\  }
     \\  bm += BLOCK_M;
     \\}
-    \\for (int r = 0; r < R; ++r) {
+    \\for (int r = 0; r < RT; ++r) {
     \\  for (int tn = 0; tn < TN; ++tn) {
     \\    for (ushort sm = SM / 2; sm >= 1; sm >>= 1) result[r][tn] += simd_shuffle_down(result[r][tn], ushort(SN) * sm);
     \\  }
     \\}
     \\if (thr_m == 0) {
-    \\  for (int r = 0; r < R; ++r) {
-    \\    device float* o = out + (h_off + (size_t)r) * (size_t)LAT + out_col;
-    \\    for (int tn = 0; tn < TN; ++tn) o[tn] = result[r][tn];
+    \\  for (int r = 0; r < RT; ++r) {
+    \\    int rr = r0 + r;
+    \\    if (rr < R) {
+    \\      const size_t dst_row = ROW_MAJOR ? ((size_t)rr * (size_t)HEADS + (size_t)h) : ((size_t)h * (size_t)R + (size_t)rr);
+    \\      device float* o = out + dst_row * (size_t)LAT + out_col;
+    \\      for (int tn = 0; tn < TN; ++tn) o[tn] = result[r][tn];
+    \\    }
     \\  }
     \\}
 ;
@@ -64,13 +72,14 @@ const v_main: [:0]const u8 =
     \\constexpr int BLOCK_N = 32 * TN;
     \\uint lane = thread_index_in_simdgroup;
     \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint h = threadgroup_position_in_grid.z;
-    \\const size_t h_off = (size_t)h * (size_t)R;
+    \\uint z = threadgroup_position_in_grid.z;
+    \\uint h = z % uint(HEADS);
+    \\int r0 = int(z / uint(HEADS)) * RT;
     \\int out_row = int(threadgroup_position_in_grid.x) * 4 * TM + int(sg) * TM;
     \\const device TW* mat = kvb + ((size_t)h * (size_t)ROWS + (size_t)NOPE + (size_t)out_row) * (size_t)LAT;
     \\static_assert(LAT % BLOCK_N == 0 && VDIM % (4 * TM) == 0, "an absorbed shape off the gemv tile");
-    \\float result[R][TM];
-    \\for (int r = 0; r < R; ++r) {
+    \\float result[RT][TM];
+    \\for (int r = 0; r < RT; ++r) {
     \\  for (int tm = 0; tm < TM; ++tm) result[r][tm] = 0.0f;
     \\}
     \\int bn = int(lane) * TN;
@@ -80,17 +89,20 @@ const v_main: [:0]const u8 =
     \\  for (int tm = 0; tm < TM; ++tm) {
     \\    for (int tn = 0; tn < TN; ++tn) inter[tm][tn] = static_cast<float>(mat[(size_t)tm * (size_t)LAT + bn + tn]);
     \\  }
-    \\  for (int r = 0; r < R; ++r) {
-    \\    const device float* vec = u + (size_t)h * (size_t)u_strides[0] + (size_t)r * (size_t)u_strides[1];
-    \\    float coeff[TN];
-    \\    for (int tn = 0; tn < TN; ++tn) coeff[tn] = vec[bn + tn];
-    \\    for (int tm = 0; tm < TM; ++tm) {
-    \\      for (int tn = 0; tn < TN; ++tn) result[r][tm] += inter[tm][tn] * coeff[tn];
+    \\  for (int r = 0; r < RT; ++r) {
+    \\    int rr = r0 + r;
+    \\    if (rr < R) {
+    \\      const device float* vec = u + (size_t)h * (size_t)u_strides[0] + (size_t)rr * (size_t)u_strides[1];
+    \\      float coeff[TN];
+    \\      for (int tn = 0; tn < TN; ++tn) coeff[tn] = vec[bn + tn];
+    \\      for (int tm = 0; tm < TM; ++tm) {
+    \\        for (int tn = 0; tn < TN; ++tn) result[r][tm] += inter[tm][tn] * coeff[tn];
+    \\      }
     \\    }
     \\  }
     \\  bn += BLOCK_N;
     \\}
-    \\for (int r = 0; r < R; ++r) {
+    \\for (int r = 0; r < RT; ++r) {
     \\  for (int tm = 0; tm < TM; ++tm) {
     \\    for (ushort sn = 16; sn >= 1; sn >>= 1) result[r][tm] += simd_shuffle_down(result[r][tm], sn);
     \\  }
@@ -99,17 +111,27 @@ const v_main: [:0]const u8 =
 
 const v_out_plain: [:0]const u8 =
     \\if (lane == 0u) {
-    \\  for (int r = 0; r < R; ++r) {
-    \\    device float* o = out + (h_off + (size_t)r) * (size_t)VDIM + out_row;
-    \\    for (int tm = 0; tm < TM; ++tm) o[tm] = result[r][tm];
+    \\  for (int r = 0; r < RT; ++r) {
+    \\    int rr = r0 + r;
+    \\    if (rr < R) {
+    \\      device float* o = out + ((size_t)h * (size_t)R + (size_t)rr) * (size_t)VDIM + out_row;
+    \\      for (int tm = 0; tm < TM; ++tm) o[tm] = result[r][tm];
+    \\    }
     \\  }
     \\}
 ;
 
 const v_out_gated: [:0]const u8 =
     \\if (lane == 0u) {
-    \\  device float* o = out + h_off * (size_t)VDIM + out_row;
-    \\  for (int tm = 0; tm < TM; ++tm) o[tm] = result[0][tm] * hy4_sigmoid(static_cast<float>(gate[h_off * (size_t)VDIM + out_row + tm]));
+    \\  for (int r = 0; r < RT; ++r) {
+    \\    int rr = r0 + r;
+    \\    if (rr < R) {
+    \\      const size_t row_off = ((size_t)rr * (size_t)HEADS + (size_t)h) * (size_t)VDIM + (size_t)out_row;
+    \\      const size_t g_off = (size_t)rr * (size_t)gate_strides[0] + (size_t)h * (size_t)VDIM + (size_t)out_row;
+    \\      device float* o = out + row_off;
+    \\      for (int tm = 0; tm < TM; ++tm) o[tm] = result[r][tm] * hy4_sigmoid(static_cast<float>(gate[g_off + tm]));
+    \\    }
+    \\  }
     \\}
 ;
 
@@ -143,14 +165,24 @@ fn getKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, inputs: []c
 /// The geometry of one layer's `kv_b` [heads · (nope + v), latent].
 pub const Geometry = struct { heads: c_int, nope: c_int, v: c_int, latent: c_int };
 pub const max_rows: c_int = 8;
+pub const joined_max_rows: c_int = 16;
+
+fn appliesCap(s: mlx.mlx_stream, kv_b: Arr, g: Geometry, rows: c_int, cap: c_int) bool {
+    return rows >= 1 and rows <= cap and mlx.streamIsGpu(s) and mlx.mlx_array_dtype(kv_b) == .bfloat16 and
+        g.nope < 8192 and @rem(g.nope, 32) == 0 and @rem(g.latent, gemvTSimdgroups(g.latent) * 16) == 0 and
+        g.latent > 64 and @rem(g.latent, 128) == 0 and g.v < 4096 and @rem(g.v, 16) == 0 and g.latent < 16 * g.v;
+}
 
 /// Whether the products run here: one to `max_rows` rows, a BF16 `kv_b`, a GPU stream, and shapes on the tiles MLX picks for them
 /// (`gemv_t` with 8 x 4 lanes, under 8192 inputs; `gemv` with 4 x 4 rows a simdgroup, more than 64 inputs and under 4096
 /// rows, fewer inputs than 16 times its rows).
 pub fn applies(s: mlx.mlx_stream, kv_b: Arr, g: Geometry, rows: c_int) bool {
-    return rows >= 1 and rows <= max_rows and mlx.streamIsGpu(s) and mlx.mlx_array_dtype(kv_b) == .bfloat16 and
-        g.nope < 8192 and @rem(g.nope, 32) == 0 and @rem(g.latent, gemvTSimdgroups(g.latent) * 16) == 0 and
-        g.latent > 64 and @rem(g.latent, 128) == 0 and g.v < 4096 and @rem(g.v, 16) == 0 and g.latent < 16 * g.v;
+    return appliesCap(s, kv_b, g, rows, max_rows);
+}
+
+/// Whether a joined/grouped tick of `rows` rows (up to `joined_max_rows`, tiled in `max_rows`-row chunks) runs here.
+pub fn appliesJoined(s: mlx.mlx_stream, kv_b: Arr, g: Geometry, rows: c_int) bool {
+    return appliesCap(s, kv_b, g, rows, joined_max_rows);
 }
 
 /// The simdgroups a `gemv_t` threadgroup spans for `out` outputs (MLX's `bn`).
@@ -158,7 +190,7 @@ fn gemvTSimdgroups(out: c_int) c_int {
     return if (out >= 2048) 16 else if (out >= 512) 4 else 2;
 }
 
-const Key = struct { g: Geometry, rows: c_int, qs: c_int, out_cols: c_int, groups_x: c_int, simdgroups: c_int, gated: bool = false };
+const Key = struct { g: Geometry, rows: c_int, qs: c_int, out_cols: c_int, groups_x: c_int, simdgroups: c_int, gated: bool = false, row_major: bool = false };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(k: Key) !kcfg.Config {
@@ -166,29 +198,35 @@ fn build(k: Key) !kcfg.Config {
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const g = k.g;
     if (k.gated) {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.heads * k.out_cols }, 2, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, g.heads * k.out_cols }, 2, .float32));
+    } else if (k.row_major) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, g.heads, k.out_cols }, 3, .float32));
     } else {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ g.heads, k.rows, k.out_cols }, 3, .float32));
     }
-    // A block's rows ride the grid's y (one threadgroup a row), so a row's bytes are its one-row launch's.
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * k.groups_x, k.simdgroups, g.heads));
+    const rt: c_int = @min(k.rows, max_rows);
+    const r_tiles: c_int = @divTrunc(k.rows + rt - 1, rt);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * k.groups_x, k.simdgroups, g.heads * r_tiles));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, k.simdgroups, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", k.simdgroups));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "TW", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HEADS", g.heads));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", g.nope + g.v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NOPE", g.nope));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "VDIM", g.v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LAT", g.latent));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "QS", k.qs));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "R", k.rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "RT", rt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "ROW_MAJOR", k.row_major));
     return cfg;
 }
 
-fn run(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const Arr, g: Geometry, out_cols: c_int, groups_x: c_int, simdgroups: c_int, gated: bool) !Arr {
+fn run(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const Arr, g: Geometry, out_cols: c_int, groups_x: c_int, simdgroups: c_int, gated: bool, row_major: bool) !Arr {
     // The vector's [H, T, width] (a plain row [1, K] is one head's one row).
     const sh = mlx.getShape(inputs[1]);
     const rows: c_int = if (sh.len == 3) sh[1] else 1;
-    const cfg = try cfgs.get(.{ .g = g, .rows = rows, .qs = sh[sh.len - 1], .out_cols = out_cols, .groups_x = groups_x, .simdgroups = simdgroups, .gated = gated }, build);
+    const cfg = try cfgs.get(.{ .g = g, .rows = rows, .qs = sh[sh.len - 1], .out_cols = out_cols, .groups_x = groups_x, .simdgroups = simdgroups, .gated = gated, .row_major = row_major }, build);
     const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(in_vec);
     var outputs = mlx.mlx_vector_array_new();
@@ -200,34 +238,50 @@ fn run(s: mlx.mlx_stream, kernel: mlx.mlx_fast_metal_kernel, inputs: []const Arr
     return out;
 }
 
-/// The query's first `nope` dims of each of `q`'s [H, T, ≥ nope] f32 rows (contiguous; a rope part past them is not
-/// read) into the latent through `kv_b`'s key rows: [H, T, latent] f32, each row its one-row launch's bytes.
+/// The query's first `nope` dims of each of `q`'s [H, T, ≥ nope] f32 rows (strided along H/T, contiguous along last
+/// axis; a rope part past them is not read) into the latent through `kv_b`'s key rows: [H, T, latent] f32.
 pub fn queryLatent(s: mlx.mlx_stream, q_nope: Arr, kv_b: Arr, g: Geometry) !Arr {
-    const k = try getKernel(&q_kernel, "sushi_hy4_absorb_q", &.{ "kvb", "q" }, q_source, "", true);
+    const k = try getKernel(&q_kernel, "sushi_hy4_absorb_q", &.{ "kvb", "q" }, q_source, "", false);
     const bn = gemvTSimdgroups(g.latent);
-    return run(s, k, &.{ kv_b, q_nope }, g, g.latent, @divExact(g.latent, bn * 16), bn, false);
+    return run(s, k, &.{ kv_b, q_nope }, g, g.latent, @divExact(g.latent, bn * 16), bn, false, false);
 }
 
-/// `u_lat` [H, T, latent] f32 (contiguous) out through `kv_b`'s value rows: [H, T, v] f32.
+/// `queryLatent` laid out row-major [T, H, latent] f32.
+pub fn queryLatentRows(s: mlx.mlx_stream, q_nope: Arr, kv_b: Arr, g: Geometry) !Arr {
+    const k = try getKernel(&q_kernel, "sushi_hy4_absorb_q", &.{ "kvb", "q" }, q_source, "", false);
+    const bn = gemvTSimdgroups(g.latent);
+    return run(s, k, &.{ kv_b, q_nope }, g, g.latent, @divExact(g.latent, bn * 16), bn, false, true);
+}
+
+/// `u_lat` [H, T, latent] f32 out through `kv_b`'s value rows: [H, T, v] f32.
 pub fn valueOut(s: mlx.mlx_stream, u_lat: Arr, kv_b: Arr, g: Geometry) !Arr {
     const k = try getKernel(&v_kernel, "sushi_hy4_absorb_v", &.{ "kvb", "u" }, v_source, "", false);
-    return run(s, k, &.{ kv_b, u_lat }, g, g.v, @divExact(g.v, 16), 4, false);
+    return run(s, k, &.{ kv_b, u_lat }, g, g.v, @divExact(g.v, 16), 4, false, false);
 }
 
-/// Whether `valueOutGated` takes a decode row: `valueOut`'s shapes and a BF16 or f32 gate as wide as the heads' values.
-pub fn valueOutGatedApplies(s: mlx.mlx_stream, u_lat: Arr, kv_b: Arr, g: Geometry, gate: Arr) bool {
+fn valueOutGatedAppliesCap(s: mlx.mlx_stream, u_lat: Arr, kv_b: Arr, g: Geometry, gate: Arr, cap: c_int) bool {
     const us = mlx.getShape(u_lat);
     const gs = mlx.getShape(gate);
     const gd = mlx.mlx_array_dtype(gate);
-    return applies(s, kv_b, g, 1) and us.len == 3 and us[1] == 1 and gs.len == 2 and gs[0] == 1 and gs[1] == g.heads * g.v and
-        (gd == .bfloat16 or gd == .float32);
+    return us.len == 3 and us[0] == g.heads and us[2] == g.latent and appliesCap(s, kv_b, g, us[1], cap) and
+        gs.len == 2 and gs[0] == us[1] and gs[1] == g.heads * g.v and (gd == .bfloat16 or gd == .float32);
 }
 
-/// `valueOut` with the attention output gate in the same launch: each value times `σ(gate)`, written [1, H·v] as `W_o`
+/// Whether `valueOutGated` takes 1..`max_rows` rows: `valueOut`'s shapes and a BF16 or f32 gate as wide as the heads' values.
+pub fn valueOutGatedApplies(s: mlx.mlx_stream, u_lat: Arr, kv_b: Arr, g: Geometry, gate: Arr) bool {
+    return valueOutGatedAppliesCap(s, u_lat, kv_b, g, gate, max_rows);
+}
+
+/// Whether `valueOutGated` takes 1..`joined_max_rows` rows for a joined/grouped tick.
+pub fn valueOutGatedJoinedApplies(s: mlx.mlx_stream, u_lat: Arr, kv_b: Arr, g: Geometry, gate: Arr) bool {
+    return valueOutGatedAppliesCap(s, u_lat, kv_b, g, gate, joined_max_rows);
+}
+
+/// `valueOut` with the attention output gate in the same launch: each value times `σ(gate)`, written [T, H·v] as `W_o`
 /// reads it, the bytes of `valueOut` then `hy4_chain.gated`.
 pub fn valueOutGated(s: mlx.mlx_stream, u_lat: Arr, kv_b: Arr, g: Geometry, gate: Arr) !Arr {
     const k = try getKernel(&v_gated_kernel, "sushi_hy4_absorb_v_gated", &.{ "kvb", "u", "gate" }, v_source_gated, sigmoid_header, false);
-    return run(s, k, &.{ kv_b, u_lat, gate }, g, g.v, @divExact(g.v, 16), 4, true);
+    return run(s, k, &.{ kv_b, u_lat, gate }, g, g.v, @divExact(g.v, 16), 4, true, false);
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
@@ -437,6 +491,64 @@ test "hy4 absorb: a decode row's value product gated in the same launch is the b
             const got = try o.own(try valueOutGated(es, u, kv_b, g, gate));
             try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
             try expectSameBytes(got, want);
+        }
+    }
+}
+
+test "hy4 absorb: multi-row queryLatentRows (strided transposed input) and multi-row valueOutGated match single-row launches byte for byte up to 16 rows" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
+    const chain = @import("hy4_chain.zig");
+    const gpa = testing.allocator;
+    const g: Geometry = .{ .heads = 64, .nope = 192, .v = 256, .latent = 512 };
+    const qk = g.nope + 64;
+    for ([_]c_int{ 4, 8, 12, 16 }, 0..) |t, ti| {
+        var prng = std.Random.DefaultPrng.init(0x51a7 + ti);
+        const rnd = prng.random();
+        const w_bits = try randomBf16(gpa, rnd, @intCast(g.heads * (g.nope + g.v) * g.latent));
+        defer gpa.free(w_bits);
+        const q_rm = try randomF32(gpa, rnd, @intCast(t * g.heads * qk));
+        defer gpa.free(q_rm);
+        const u_rm = try randomF32(gpa, rnd, @intCast(t * g.heads * g.latent));
+        defer gpa.free(u_rm);
+        const g_host = try randomF32(gpa, rnd, @intCast(t * g.heads * g.v));
+        defer gpa.free(g_host);
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const kv_b = try o.own(mlx.mlx_array_new_data(w_bits.ptr, &[_]c_int{ g.heads * (g.nope + g.v), g.latent }, 2, .bfloat16));
+        const q_rows = try o.own(mlx.mlx_array_new_data(q_rm.ptr, &[_]c_int{ t, g.heads, qk }, 3, .float32));
+        const q_t = try o.transpose(q_rows, &.{ 1, 0, 2 }); // strided [H, T, qk]
+        const u_rows = try o.own(mlx.mlx_array_new_data(u_rm.ptr, &[_]c_int{ t, g.heads, g.latent }, 3, .float32));
+        const u_t = try o.transpose(u_rows, &.{ 1, 0, 2 }); // strided [H, T, LAT]
+        const gate_bf = try o.cast(try o.own(mlx.mlx_array_new_data(g_host.ptr, &[_]c_int{ t, g.heads * g.v }, 2, .float32)), .bfloat16);
+        try testing.expect(appliesJoined(es, kv_b, g, t));
+        try testing.expect(valueOutGatedJoinedApplies(es, u_t, kv_b, g, gate_bf));
+        try mlx.check(mlx.mlx_array_eval(kv_b));
+        try mlx.check(mlx.mlx_array_eval(q_rows));
+        try mlx.check(mlx.mlx_array_eval(u_rows));
+        try mlx.check(mlx.mlx_array_eval(gate_bf));
+        const before = mlx.engine.stats().dispatches;
+        const ql_got = try o.own(try queryLatentRows(es, q_t, kv_b, g));
+        const vg_got = try o.own(try valueOutGated(es, u_t, kv_b, g, gate_bf));
+        try mlx.check(mlx.mlx_array_eval(ql_got));
+        try mlx.check(mlx.mlx_array_eval(vg_got));
+        try testing.expectEqual(@as(u64, 2), mlx.engine.stats().dispatches - before);
+        for (0..@intCast(t)) |r| {
+            const ri: c_int = @intCast(r);
+            const q_one = try o.contiguous(try o.slice(q_t, 1, ri, ri + 1));
+            const ql_want = try o.transpose(try o.own(try queryLatent(es, q_one, kv_b, g)), &.{ 1, 0, 2 });
+            try expectSameBytes(try o.contiguous(try o.slice(ql_got, 0, ri, ri + 1)), try o.contiguous(ql_want));
+            const u_one = try o.contiguous(try o.slice(u_t, 1, ri, ri + 1));
+            const g_one = try o.contiguous(try o.slice(gate_bf, 0, ri, ri + 1));
+            const vg_want = try o.own(try chain.gated(es, try o.own(try valueOut(es, u_one, kv_b, g)), g_one));
+            try expectSameBytes(try o.contiguous(try o.slice(vg_got, 0, ri, ri + 1)), vg_want);
         }
     }
 }

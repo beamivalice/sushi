@@ -146,6 +146,21 @@ pub fn enterRows(seqs: []const u64, config: *const ModelConfig, c: *const Config
     return moveCap(rowsCap(seqs.len, config), config, ops);
 }
 
+/// `enterRows` for a joined multi-row verify/decode forward where request `i` runs `rows[i]` tokens ending at `seqs[i]`.
+pub fn enterGroupRows(rows: []const u64, seqs: []const u64, config: *const ModelConfig, c: *const Config, ops: PoolOps) bool {
+    if (!arch_config.isOf(config, "dsv41")) return false;
+    const cap = c.joinedGroupsCapOn(cooler_side.onEngine(config), rows, seqs);
+    if (cooler_side.onEngine(config)) {
+        ops.set_own(ownBudget(cap));
+        return false;
+    }
+    if (pool_ram_cap == 0) return false;
+    var total: u64 = 0;
+    for (rows) |r| total += r;
+    setTransient(phaseLimit(cap, config), ops);
+    return moveCap(rowsCap(total, config), config, ops);
+}
+
 /// Released pools are a lease of the request whose prefill-width forwards run over them (`Model.lessee`): only its own
 /// decode-width forward or its end gives them back, so another request's forward between its chunks runs over them
 /// released (the union path) instead of reading back what the next chunk releases again.
@@ -185,6 +200,16 @@ pub fn beforeRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: 
     if (engine.borrow_from >= engine.layers.len) return;
     if (!lease.readsBack()) return;
     return restore(engine, config, headroom, c.joinedCap(seqs));
+}
+
+/// `beforeRowsForward` for a joined multi-row verify/decode forward (`enterGroupRows`).
+pub fn beforeGroupRowsForward(engine: *stream.Engine, config: *const ModelConfig, c: *const Config, rows: []const u64, seqs: []const u64, lease: Lease) !void {
+    try engine.healReleased();
+    _ = enterGroupRows(rows, seqs, config, c, mlx_ops);
+    const headroom = headroom_fn orelse return;
+    if (engine.borrow_from >= engine.layers.len) return;
+    if (!lease.readsBack()) return;
+    return restore(engine, config, headroom, c.joinedGroupsCap(rows, seqs));
 }
 
 /// The engine's budget of a forward that bills `bytes`; the warm's, which `endWarm` lifts, while it runs.

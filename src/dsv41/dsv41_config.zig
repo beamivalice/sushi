@@ -16,6 +16,16 @@ pub const max_block = 16;
 /// still rolls back to any accepted prefix.
 pub const ring_slack: u32 = 16;
 
+/// Maximum joined decode rows for a streamed DeepSeek Cooler load whose expert cache holds `slots` experts per layer:
+/// requires at least `2 * top_k` slots so >= 2 rows fit in one cache working set without intra-tick eviction, capped
+/// at `min(hw_max, slots / top_k)`. Tighter caches (`slots < 2 * top_k` or unset) stay exclusive (1 row).
+pub fn streamedRowsCap(experts: usize, top_k: usize, slots: usize, hw_max: usize) usize {
+    if (experts == 0 or top_k == 0 or hw_max <= 1) return 1;
+    const by_slots = slots / top_k;
+    if (by_slots < 2) return 1;
+    return @min(hw_max, by_slots);
+}
+
 /// The widest decode pass that queues its routed chains before their picks are read (`dsv41_model.specOn`). The queue
 /// saves a wait a layer and loses a layer's work when a pick is outside the cache map; each row brings `top_k` picks.
 pub const route_spec_rows: u32 = 8;
@@ -325,6 +335,17 @@ pub const Config = struct {
     pub fn joinedCapOn(self: *const Config, engine: bool, seqs: []const u64) u64 {
         var sum: u64 = 0;
         for (seqs) |seq| sum +|= self.forwardCapOn(engine, 1, seq) - cap_fixed_bytes;
+        return sum +| cap_fixed_bytes;
+    }
+
+    /// `joinedCapOn` for a joined multi-row verify/decode forward where request `i` advances by `rows[i]` tokens to `seqs[i]`.
+    pub fn joinedGroupsCap(self: *const Config, rows: []const u64, seqs: []const u64) u64 {
+        return self.joinedGroupsCapOn(true, rows, seqs);
+    }
+
+    pub fn joinedGroupsCapOn(self: *const Config, engine: bool, rows: []const u64, seqs: []const u64) u64 {
+        var sum: u64 = 0;
+        for (rows, seqs) |r, seq| sum +|= self.forwardCapOn(engine, r, seq) - cap_fixed_bytes;
         return sum +| cap_fixed_bytes;
     }
 

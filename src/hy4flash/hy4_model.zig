@@ -249,6 +249,7 @@ pub const Model = struct {
     /// The Engram token map, as compressed ids; an id at or past its length hashes as itself (llama.cpp).
     token_map: []u32 = &.{},
     engram_store: []EngramW = &.{},
+    engram_pool: ?*engram_mod.ReadPool = null,
     own: Request = .{},
     bound: ?*Request = null,
     own_lent: bool = false,
@@ -591,6 +592,8 @@ pub const Model = struct {
     }
 
     fn freeEngram(self: *Model) void {
+        if (self.engram_pool) |pool| pool.destroy();
+        self.engram_pool = null;
         if (self.token_map.len > 0) self.gpa.free(self.token_map);
         self.token_map = &.{};
         for (self.engram_store) |*e| if (e.disk) |*d| d.close();
@@ -608,6 +611,17 @@ pub const Model = struct {
 
     pub fn dropHidden(self: *Model) void {
         self.req().dropHidden();
+    }
+
+    /// Whether `req_` holds a valid DFly2 handover from its last forward (`last_hidden`, plus every sparse layer's
+    /// `last_picks` past the indexer threshold). False after a `keep_hidden=false` plain step.
+    pub fn hasHandover(self: *const Model, req_: *const Request) bool {
+        if (req_.last_hidden == null) return false;
+        const thr: usize = @as(usize, self.config.indexer.group_topk) * self.config.indexer.group;
+        if (req_.pos > thr) {
+            for (0..self.config.layers) |l| if (self.layers[l].indexer != null and req_.last_picks[l] == null) return false;
+        }
+        return true;
     }
 
     fn dropPicks(self: *Model) void {
@@ -825,6 +839,8 @@ pub const Model = struct {
                     return error.Hy4TensorMissing;
                 };
                 store.disk = try engram_mod.Table.openBf16(self.gpa, from, table_name, e.rows[i], e.head_dim);
+                if (self.engram_pool == null) self.engram_pool = engram_mod.ReadPool.create(self.gpa) catch null;
+                store.disk.?.pool = self.engram_pool;
             }
             store.tensors = .{
                 .head_norms = store.norms[0..cols],
@@ -954,6 +970,7 @@ pub const Model = struct {
         defer freeMixed(ahead);
         // The selection DFly2 shares is this forward's last row's, or none below the threshold.
         self.dropPicks();
+        if (!self.keep_hidden) self.dropHidden();
         for (0..self.config.layers) |l| {
             // A layer is a frame of its own, keyed by its index: each layer's kinds and geometry are its own. Inside it,
             // the facts of this forward's rows that decide its structure (`layerKey`) pick a variant: one iteration of
@@ -982,6 +999,133 @@ pub const Model = struct {
 
     pub const Seg = struct { request: *Request, id: u32 };
 
+    fn engramRowsJoined(self: *Model, segs: []const Seg, pf_ids_out: *?[]u32) !?EngramRows {
+        const hash = self.hash orelse return null;
+        const n = segs.len;
+        const cols = hash.cols();
+        const mods = hash.n_layers;
+        const out = try self.gpa.alloc(u32, n * mods * cols);
+        errdefer self.gpa.free(out);
+        const live = try self.gpa.alloc(f32, n);
+        errdefer self.gpa.free(live);
+        const pf_ids = try self.gpa.alloc(u32, n * mods * cols);
+        errdefer self.gpa.free(pf_ids);
+        const row_mixed = try self.gpa.alloc(u32, mods * cols);
+        defer self.gpa.free(row_mixed);
+        for (segs, 0..) |sg, i| {
+            const comp = [_]u32{self.historyId(sg.id)};
+            hash.rows(sg.request.history.items, &comp, row_mixed);
+            @memcpy(pf_ids[i * mods * cols ..][0 .. mods * cols], row_mixed);
+            for (0..mods) |m| {
+                @memcpy(out[(m * n + i) * cols ..][0..cols], row_mixed[m * cols ..][0..cols]);
+            }
+            live[i] = if (self.engramId(sg.id) == self.config.engram.pad_id) 0 else 1;
+        }
+        pf_ids_out.* = pf_ids;
+        return .{ .ids = out, .live = live };
+    }
+
+    fn startEngramPrefetch(self: *Model, pf_ids: []const u32, total: usize) ?*engram_mod.Prefetch {
+        if (total == 0 or mlx.engine.dryOn()) return null;
+        const hash = self.hash orelse return null;
+        const mods = hash.n_layers;
+        var tables_buf: [16]*const engram_mod.Table = undefined;
+        if (mods == 0 or mods > tables_buf.len) return null;
+        var found: usize = 0;
+        for (self.layers[0..self.config.layers]) |*L| if (L.engram) |e| {
+            const d = if (e.disk) |*tbl| tbl else return null;
+            if (e.module >= mods) return null;
+            tables_buf[e.module] = d;
+            found += 1;
+        };
+        if (found != mods) return null;
+        const cols = hash.cols();
+        if (total <= 16 and cols <= engram_mod.MAX_COLS) {
+            var all_cached = true;
+            var mine_buf: [16 * engram_mod.MAX_COLS]u32 = undefined;
+            for (0..mods) |mi| {
+                const cache = tables_buf[mi].cache orelse {
+                    all_cached = false;
+                    break;
+                };
+                const mine = mine_buf[0 .. total * cols];
+                for (0..total) |t| @memcpy(mine[t * cols ..][0..cols], pf_ids[(t * mods + mi) * cols ..][0..cols]);
+                if (!cache.hasAll(mine)) {
+                    all_cached = false;
+                    break;
+                }
+            }
+            if (all_cached) return null;
+        }
+        const spec = [_]engram_mod.Prefetch.Spec{.{ .at = 0, .len = total, .ids = pf_ids }};
+        return engram_mod.Prefetch.startWithPool(self.engram_pool, self.gpa, tables_buf[0..mods], &spec, cols, total) catch null;
+    }
+
+    /// Runs one request's single-row attention core (sparse or non-joined sliding) over pre-absorbed `q_lat_rows`
+    /// `[N, H, latent]`, `q_pe_rows` `[N, H, rope]`, and hoisted sparse indexer projections, returning `[1, H, latent]`
+    /// owned by `o`.
+    fn attendLatentSingleRow(
+        self: *Model,
+        o: *Ops,
+        l: usize,
+        q_lat_rows: Arr,
+        q_pe_rows: Arr,
+        c_all: Arr,
+        kpe_all: Arr,
+        keys_joined: ?Arr,
+        idx_q_joined: ?Arr,
+        idx_hw_joined: ?Arr,
+        ri: c_int,
+        p0_i: c_int,
+    ) !Arr {
+        var row: Ops = .{ .s = self.s };
+        defer row.deinit();
+        const L = &self.layers[l];
+        const req_ = self.req();
+        const st = &req_.state[l];
+        const kv = req_.kv;
+        req_.version += 1;
+        const c_i = try row.slice(c_all, 0, ri, ri + 1);
+        const kpe_i = try row.slice(kpe_all, 0, ri, ri + 1);
+        const ql_i = try row.reshape(try row.slice(q_lat_rows, 0, ri, ri + 1), &.{ L.geometry.heads, 1, L.geometry.latent });
+        const qp_i = try row.reshape(try row.slice(q_pe_rows, 0, ri, ri + 1), &.{ L.geometry.heads, 1, L.geometry.rope });
+        const u: Arr = if (L.indexer) |iw| blk: {
+            try self.appendLatent(&row, st, c_i, kpe_i);
+            const ig = self.indexerGeometry();
+            const keys_i = try row.slice(keys_joined.?, 0, ri, ri + 1);
+            try poolClosed(&row, st, keys_i, iw, ig);
+            var keys = self.sparseKeys(st);
+            const n_pos = p0_i + 1;
+            const thr = ig.group_topk * ig.ratio;
+            if (n_pos <= thr or st.pooled == null) {
+                break :blk try fwd.causalLatent(&row, ql_i, qp_i, try self.latentRange(&row, &keys, 0, n_pos), try row.slice(keys.k_pe.?, 0, 0, n_pos), L.attn, L.geometry, .{ .causal = .{ .p0 = p0_i, .window = 0 } });
+            }
+            const all = try row.slice(st.pooled.?.buf(0), 0, 0, @intCast(st.pooled.?.used));
+            const idx_q_i = try row.slice(idx_q_joined.?, 0, ri, ri + 1);
+            const idx_hw_i = try row.slice(idx_hw_joined.?, 0, ri, ri + 1);
+            const sel = try fwd.recalledFromProjected(&row, idx_q_i, idx_hw_i, all, ig, p0_i, n_pos);
+            if (self.keep_hidden) try self.keepPicks(&row, l, sel.rows, sel.keep, 0, false);
+            const flat = try row.reshape(sel.rows, &.{fwd.selectedWidth(sel.rows)});
+            break :blk try fwd.rowsLatent(&row, ql_i, qp_i, try self.latentAt(&row, &keys, flat), try row.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry);
+        } else blk: {
+            const w: c_int = @intCast(self.config.window);
+            const c_bf = try row.cast(c_i, .bfloat16);
+            const pe_bf = try row.cast(kpe_i, .bfloat16);
+            if (kv.scheme != .off and hy4_latent.appendApplies(row.s, c_bf, pe_bf, kv.group_size, kv.bits, w)) {
+                try self.writeRingLatent(st, c_bf, pe_bf, p0_i, 1);
+            } else {
+                const fresh = try self.freshRows(&row, &row, c_bf, pe_bf);
+                try self.writeRing(st, &fresh, p0_i, 1);
+            }
+            const n_pos = p0_i + 1;
+            const k = @min(n_pos, w);
+            const keys_c = try self.latentRange(&row, st, 0, k);
+            const keys_pe = try row.slice(st.k_pe.?, 0, 0, k);
+            break :blk try fwd.causalLatent(&row, ql_i, qp_i, keys_c, keys_pe, L.attn, L.geometry, .{ .causal = .{ .p0 = k - 1, .window = 0, .steel = n_pos > w } });
+        };
+        return o.own(try row.result(try row.reshape(try row.contiguous(u), &.{ 1, L.geometry.heads, L.geometry.latent })));
+    }
+
     pub fn extendRows(self: *Model, segs: []const Seg) !Arr {
         const max_rows: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
         const n = segs.len;
@@ -993,177 +1137,378 @@ pub const Model = struct {
             for (segs) |sg| sg.request.reset();
         }
         const c = self.config;
-        var ops: Ops = .{ .s = self.s };
-        defer ops.deinit();
-        var hs: [max_rows]Arr = undefined;
-        var hs_made: usize = 0;
-        defer {
-            for (hs[0..hs_made]) |h| _ = mlx.mlx_array_free(h);
-        }
-        var engram: [max_rows]?EngramRows = @splat(null);
-        defer {
-            for (&engram) |*r| if (r.*) |v| v.deinit(self.gpa);
-        }
+        const hc: c_int = @intCast(c.hc_mult);
+        var ids_buf: [max_rows]u32 = undefined;
         var p0: [max_rows]c_int = undefined;
         for (segs, 0..) |sg, i| {
             p0[i] = @intCast(sg.request.pos);
-            hs[i] = try self.embedStreams(&.{sg.id});
-            hs_made += 1;
-            engram[i] = try self.engramRowsAfter(sg.request.history.items, &.{sg.id});
+            ids_buf[i] = sg.id;
             sg.request.dropPicks();
         }
+        var hs = try self.embedStreams(ids_buf[0..n]);
+        defer _ = mlx.mlx_array_free(hs);
+        var pf_ids: ?[]u32 = null;
+        defer if (pf_ids) |b| self.gpa.free(b);
+        const engram_joined = try self.engramRowsJoined(segs, &pf_ids);
+        defer if (engram_joined) |r| r.deinit(self.gpa);
+        const engram_pf = if (pf_ids) |ids| self.startEngramPrefetch(ids, n) else null;
+        defer if (engram_pf) |pf| pf.finish();
+        var ahead: ?fwd.Mixed = null;
+        defer freeMixed(ahead);
+        const kv = segs[0].request.kv;
+        const same_kv = for (segs[1..]) |sg| {
+            if (!std.meta.eql(sg.request.kv, kv)) break false;
+        } else true;
+        const win_w: c_int = @intCast(c.window);
+        const all_past_pos = blk: {
+            var ok = true;
+            for (p0[0..n]) |p| ok = ok and p + 1 > win_w;
+            break :blk ok;
+        };
         for (0..c.layers) |l| {
+            const exact = mlx.engine.exactF32();
+            defer exact.end();
             const L = &self.layers[l];
             const layer_frame = try plan.frame(@src(), .{l});
             defer layer_frame.end();
-            if (L.engram != null) {
-                for (0..n) |i| {
-                    const d = try self.engramDelta(l, hs[i], engram[i], 1);
-                    _ = mlx.mlx_array_free(hs[i]);
-                    hs[i] = d;
+            if (L.engram != null and engram_joined != null) {
+                const d = try self.engramDeltaWith(l, hs, engram_joined, @intCast(n), engram_pf);
+                _ = mlx.mlx_array_free(hs);
+                hs = d;
+            }
+            // Phases 1-3 in a tight Ops scope so attention temporaries release before MoE runs.
+            var mid: Arr = none;
+            var post_f: Arr = none;
+            var fx: Arr = none;
+            defer {
+                _ = mlx.mlx_array_free(mid);
+                _ = mlx.mlx_array_free(post_f);
+                _ = mlx.mlx_array_free(fx);
+            }
+            {
+                var o: Ops = .{ .s = self.s };
+                defer o.deinit();
+                const mixed = ahead orelse try fwd.mixNorm(&o, hs, L.mix_attn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.input_norm);
+                const x_joined = mixed.x;
+                const proj = try fwd.projectRowsJoined(&o, x_joined, L.attn, L.geometry, p0[0..n], .bfloat16, .float32);
+                const gate_joined = try fwd.linearSpans(&o, x_joined, L.attn.gate, self.span_rows);
+                const keys_joined: ?Arr = if (L.indexer) |iw| try fwd.tokenKeys(&o, x_joined, iw, self.indexerGeometry()) else null;
+                const can_join = (!@import("builtin").is_test or fwd.joined_attention_on) and n >= 2 and L.indexer == null and self.tap == null and same_kv and kv.scheme != .off and
+                    hy4_latent.appendFits(self.s, 1, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits, win_w);
+                const all_past = all_past_pos or self.warm_grouped;
+                // A dry recording runs the choice both ways: only where the layer can join at all.
+                const one_arm = @import("../tensor/core.zig").dryOn() and self.joined_grouped_at != null and p0[0] != self.joined_grouped_at.?;
+                const joined_attn = can_join and !one_arm and plan.choose(@src(), bool, all_past);
+                var gated_joined: Arr = undefined;
+                if (proj.q_pe_rows != null and self.tap == null) {
+                    const q_lat_rows = try fwd.absorbQueryRows(&o, proj.q_raw.?, L.attn, L.geometry);
+                    const idx_q_joined: ?Arr = if (L.indexer) |iw| try fwd.linearF32(&o, proj.q_resid, iw.query) else null;
+                    const idx_hw_joined: ?Arr = if (L.indexer) |iw| try o.cast(try fwd.linearF32(&o, x_joined, iw.head_weight), .float32) else null;
+                    var u_rows: [max_rows]Arr = @splat(none);
+                    var u_made: usize = 0;
+                    defer for (u_rows[0..u_made]) |u| {
+                        _ = mlx.mlx_array_free(u);
+                    };
+                    if (joined_attn) {
+                        const joined_var = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = n, .join = true }) else plan.Frame.none;
+                        defer joined_var.end();
+                        var cs: [max_rows]Arr = @splat(none);
+                        var pes: [max_rows]Arr = @splat(none);
+                        defer for (cs[0..n], pes[0..n]) |a, b| {
+                            _ = mlx.mlx_array_free(a);
+                            _ = mlx.mlx_array_free(b);
+                        };
+                        for (segs, 0..) |sg, i| {
+                            var row: Ops = .{ .s = self.s };
+                            defer row.deinit();
+                            const lent = self.lend(sg.request);
+                            defer lent.end();
+                            const ri: c_int = @intCast(i);
+                            const st = &sg.request.state[l];
+                            const c_bf = try row.cast(try row.slice(proj.c, 0, ri, ri + 1), .bfloat16);
+                            const pe_bf = try row.cast(try row.slice(proj.k_pe, 0, ri, ri + 1), .bfloat16);
+                            sg.request.version += 1;
+                            try self.writeRingLatent(st, c_bf, pe_bf, p0[i], 1);
+                            cs[i] = try Ops.share(try self.latentRange(&row, st, 0, win_w));
+                            pes[i] = try Ops.share(try row.slice(st.k_pe.?, 0, 0, win_w));
+                        }
+                        const u_all = try fwd.attendJoinedLatent(self.gpa, &o, q_lat_rows, proj.q_pe_rows.?, cs[0..n], pes[0..n], L.attn, L.geometry);
+                        for (0..n) |i| {
+                            const ri: c_int = @intCast(i);
+                            try mlx.check(mlx.mlx_array_set(&u_rows[i], try o.slice(u_all, 0, ri, ri + 1)));
+                            u_made = i + 1;
+                        }
+                    } else {
+                        var row_o: Ops = .{ .s = self.s };
+                        defer row_o.deinit();
+                        for (segs, 0..) |sg, i| {
+                            const ri: c_int = @intCast(i);
+                            const lent = self.lend(sg.request);
+                            defer lent.end();
+                            const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], 1)) else plan.Frame.none;
+                            defer variant.end();
+                            const u_i = try self.attendLatentSingleRow(&row_o, l, q_lat_rows, proj.q_pe_rows.?, proj.c, proj.k_pe, keys_joined, idx_q_joined, idx_hw_joined, ri, p0[i]);
+                            try mlx.check(mlx.mlx_array_set(&u_rows[i], u_i));
+                            u_made = i + 1;
+                        }
+                    }
+                    const u_joined = try o.concat(u_rows[0..n], 0);
+                    gated_joined = try fwd.absorbValueGatedRows(&o, u_joined, gate_joined, L.attn, L.geometry);
+                } else {
+                    var gated: [max_rows]Arr = undefined;
+                    var gated_made: usize = 0;
+                    defer for (gated[0..gated_made]) |g| {
+                        _ = mlx.mlx_array_free(g);
+                    };
+                    var front: [max_rows]Front = undefined;
+                    var front_made: usize = 0;
+                    defer for (front[0..front_made]) |*f| f.deinit();
+                    const q_full = proj.q_full.?;
+                    if (joined_attn) {
+                        const joined_var = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = n, .join = true }) else plan.Frame.none;
+                        defer joined_var.end();
+                        var qs: [max_rows]Arr = undefined;
+                        var raws: [max_rows]?Arr = undefined;
+                        var gts: [max_rows]Arr = @splat(none);
+                        var cs: [max_rows]Arr = @splat(none);
+                        var pes: [max_rows]Arr = @splat(none);
+                        defer for (cs[0..n], pes[0..n], gts[0..n]) |a, b, d| {
+                            _ = mlx.mlx_array_free(a);
+                            _ = mlx.mlx_array_free(b);
+                            _ = mlx.mlx_array_free(d);
+                        };
+                        for (segs, 0..) |sg, i| {
+                            var row: Ops = .{ .s = self.s };
+                            defer row.deinit();
+                            const lent = self.lend(sg.request);
+                            defer lent.end();
+                            const ri: c_int = @intCast(i);
+                            const st = &sg.request.state[l];
+                            const c_bf = try row.cast(try row.slice(proj.c, 0, ri, ri + 1), .bfloat16);
+                            const pe_bf = try row.cast(try row.slice(proj.k_pe, 0, ri, ri + 1), .bfloat16);
+                            sg.request.version += 1;
+                            try self.writeRingLatent(st, c_bf, pe_bf, p0[i], 1);
+                            qs[i] = try o.slice(q_full, 1, ri, ri + 1);
+                            raws[i] = if (proj.q_raw) |qr| try o.slice(qr, 1, ri, ri + 1) else null;
+                            gts[i] = try Ops.share(try row.slice(gate_joined, 0, ri, ri + 1));
+                            cs[i] = try Ops.share(try self.latentRange(&row, st, 0, win_w));
+                            pes[i] = try Ops.share(try row.slice(st.k_pe.?, 0, 0, win_w));
+                        }
+                        @memset(gated[0..n], none);
+                        gated_made = n;
+                        try fwd.attendJoinedGated(self.gpa, &o, gated[0..n], qs[0..n], raws[0..n], gts[0..n], cs[0..n], pes[0..n], L.attn, L.geometry);
+                    } else for (segs, 0..) |sg, i| {
+                        const ri: c_int = @intCast(i);
+                        gated[i] = none;
+                        gated_made += 1;
+                        const fi: FrontIn = .{
+                            .h = try o.slice(hs, 0, ri, ri + 1),
+                            .post_a = try o.slice(mixed.post, 0, ri, ri + 1),
+                            .x = try o.slice(x_joined, 0, ri, ri + 1),
+                            .x_bf = null,
+                            .p = .{
+                                .q = try o.slice(q_full, 1, ri, ri + 1),
+                                .c = try o.slice(proj.c, 0, ri, ri + 1),
+                                .k_pe = try o.slice(proj.k_pe, 0, ri, ri + 1),
+                                .q_resid = try o.slice(proj.q_resid, 0, ri, ri + 1),
+                                .q_raw = if (proj.q_raw) |qr| try o.slice(qr, 1, ri, ri + 1) else null,
+                            },
+                            .gate = try o.slice(gate_joined, 0, ri, ri + 1),
+                            .keys = if (keys_joined) |k| try o.slice(k, 0, ri, ri + 1) else null,
+                            .gated = &gated[i],
+                        };
+                        const lent = self.lend(sg.request);
+                        const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], 1)) else plan.Frame.none;
+                        defer variant.end();
+                        front[i] = try self.layerFrontWith(l, fi.h, null, null, 1, p0[i] + 1, p0[i], fi);
+                        lent.end();
+                        front_made += 1;
+                    }
+                    gated_joined = try o.concat(gated[0..n], 0);
                 }
+                var o_left: fwd.OLeft = .normed;
+                const offered = if (fwd.oPartsReady(&o, hs, L.mix_ffn, L.attn)) &o_left else null;
+                const y_joined = try fwd.outputWhole(&o, gated_joined, L.attn, L.geometry, offered);
+                const em = try fwd.expandWhole(&o, hs, mixed.post, y_joined, o_left, L.attn, L.geometry.eps, L.mix_ffn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm);
+                mid = try o.result(em.m);
+                post_f = try o.result(em.mixed.post);
+                fx = try o.result(em.mixed.x);
             }
-            var o: Ops = .{ .s = self.s };
-            defer o.deinit();
-            const hs_joined = try o.concat(hs[0..n], 0);
-            const hc: c_int = @intCast(c.hc_mult);
-            const mixed = try fwd.mixNorm(&o, hs_joined, L.mix_attn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.input_norm);
-            const x_joined = mixed.x;
-            var positions: [max_rows]c_int = undefined;
-            for (0..n) |i| positions[i] = p0[i];
-            const projected = try fwd.projectRows(self.gpa, &o, x_joined, L.attn, L.geometry, positions[0..n], .bfloat16, .float32);
-            defer self.gpa.free(projected);
-            const gate_joined = try fwd.linearSpans(&o, x_joined, L.attn.gate, self.span_rows);
-            var keys_joined: ?Arr = null;
-            if (L.indexer) |iw| keys_joined = try fwd.tokenKeys(&o, x_joined, iw, self.indexerGeometry());
-            var gated: [max_rows]Arr = undefined;
-            var gated_made: usize = 0;
-            defer {
-                for (gated[0..gated_made]) |g| _ = mlx.mlx_array_free(g);
+            const want_ahead = l + 1 < c.layers and (self.layers[l + 1].engram == null or engram_joined == null);
+            const next_mix: ?fwd.NextMix = if (want_ahead) .{ .mix = self.layers[l + 1].mix_attn, .n = hc, .magnitude = c.hc_magnitude, .eps = c.hc_eps, .norm_eps = c.eps, .norm_w = self.layers[l + 1].input_norm } else null;
+            const fy = try self.ffnFor(l, fx, .{ .h = mid, .post = post_f, .next = next_mix });
+            var next_hs: Arr = undefined;
+            var next_ahead: ?fwd.Mixed = null;
+            if (fy.expanded) {
+                next_hs = fy.y;
+                next_ahead = fy.next;
+            } else {
+                defer _ = mlx.mlx_array_free(fy.y);
+                var bo: Ops = .{ .s = self.s };
+                defer bo.deinit();
+                next_hs = try bo.result(try fwd.expand(&bo, mid, post_f, fy.y));
             }
-            var front: [max_rows]Front = undefined;
-            var front_made: usize = 0;
-            defer {
-                for (front[0..front_made]) |*f| f.deinit();
-            }
-            // Rows all past the window on a sliding layer attend as one grouped chain over each row's full ring; the
-            // choice is data's, so it is a plan choice and its variant keyed by the tick's width.
-            // The rows' own KV, which they must share: no request is lent here, so the model's would be its own.
-            const kv = segs[0].request.kv;
-            const same_kv = for (segs[1..]) |sg| {
-                if (!std.meta.eql(sg.request.kv, kv)) break false;
-            } else true;
-            const win_w: c_int = @intCast(c.window);
-            const can_join = (!@import("builtin").is_test or fwd.joined_attention_on) and n >= 2 and L.indexer == null and self.tap == null and same_kv and kv.scheme != .off and
-                hy4_latent.appendFits(self.s, 1, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits, win_w);
-            var all_past = true;
-            for (p0[0..n]) |p| all_past = all_past and p + 1 > win_w;
-            all_past = all_past or self.warm_grouped;
-            // A dry recording runs the choice both ways: only where the layer can join at all.
-            const one_arm = @import("../tensor/core.zig").dryOn() and self.joined_grouped_at != null and p0[0] != self.joined_grouped_at.?;
-            const joined_attn = can_join and !one_arm and plan.choose(@src(), bool, all_past);
-            if (joined_attn) {
-                const joined_var = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = n, .join = true }) else plan.Frame.none;
-                defer joined_var.end();
-                var qs: [max_rows]Arr = undefined;
-                var raws: [max_rows]?Arr = undefined;
-                var gts: [max_rows]Arr = @splat(none);
-                var cs: [max_rows]Arr = @splat(none);
-                var pes: [max_rows]Arr = @splat(none);
-                defer for (cs[0..n], pes[0..n], gts[0..n]) |a, b, d| {
-                    _ = mlx.mlx_array_free(a);
-                    _ = mlx.mlx_array_free(b);
-                    _ = mlx.mlx_array_free(d);
-                };
-                for (segs, 0..) |sg, i| {
-                    // A row's temporaries die with its scratch `Ops`; the ring reads outlive it as shared handles.
-                    var row: Ops = .{ .s = self.s };
-                    defer row.deinit();
-                    const lent = self.lend(sg.request);
-                    defer lent.end();
-                    const st = &sg.request.state[l];
-                    const c_bf = try row.cast(projected[i].c, .bfloat16);
-                    const pe_bf = try row.cast(projected[i].k_pe, .bfloat16);
-                    sg.request.version += 1;
-                    try self.writeRingLatent(st, c_bf, pe_bf, p0[i], 1);
-                    qs[i] = projected[i].q;
-                    raws[i] = projected[i].q_raw;
-                    gts[i] = try Ops.share(try row.slice(gate_joined, 0, @intCast(i), @intCast(i + 1)));
-                    cs[i] = try Ops.share(try self.latentRange(&row, st, 0, win_w));
-                    pes[i] = try Ops.share(try row.slice(st.k_pe.?, 0, 0, win_w));
-                }
-                @memset(gated[0..n], none);
-                gated_made = n;
-                try fwd.attendJoinedGated(self.gpa, &o, gated[0..n], qs[0..n], raws[0..n], gts[0..n], cs[0..n], pes[0..n], L.attn, L.geometry);
-            } else for (segs, 0..) |sg, i| {
-                const ri: c_int = @intCast(i);
-                gated[i] = none;
-                gated_made += 1;
-                const fi: FrontIn = .{
-                    .h = try o.slice(hs_joined, 0, ri, ri + 1),
-                    .post_a = try o.slice(mixed.post, 0, ri, ri + 1),
-                    .x = try o.slice(x_joined, 0, ri, ri + 1),
-                    .x_bf = null,
-                    .p = projected[i],
-                    .gate = try o.slice(gate_joined, 0, ri, ri + 1),
-                    .keys = if (keys_joined) |k| try o.slice(k, 0, ri, ri + 1) else null,
-                    .gated = &gated[i],
-                };
-                const lent = self.lend(sg.request);
-                const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], 1)) else plan.Frame.none;
-                defer variant.end();
-                front[i] = try self.layerFrontWith(l, fi.h, null, null, 1, p0[i] + 1, p0[i], fi);
-                lent.end();
-                front_made += 1;
-            }
-            const gated_joined = try o.concat(gated[0..n], 0);
-            var o_left: fwd.OLeft = .normed;
-            const offered = if (fwd.oPartsReady(&o, hs_joined, L.mix_ffn, L.attn)) &o_left else null;
-            const y_joined = try fwd.outputWhole(&o, gated_joined, L.attn, L.geometry, offered);
-            const em = try fwd.expandWhole(&o, hs_joined, mixed.post, y_joined, o_left, L.attn, L.geometry.eps, L.mix_ffn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm);
-            const fx_joined = em.mixed.x;
-            for (segs, 0..) |_, i| {
-                const ri: c_int = @intCast(i);
-                front[i] = try rowFront(&o, em.m, em.mixed.post, fx_joined, ri);
-                front_made = @max(front_made, i + 1);
-            }
-            const fy_joined = try self.ffnOne(l, fx_joined);
-            defer _ = mlx.mlx_array_free(fy_joined);
-            var next: [max_rows]Arr = undefined;
-            var next_made: usize = 0;
-            defer {
-                for (next[0..next_made]) |h| _ = mlx.mlx_array_free(h);
-            }
-            for (segs, 0..) |sg, i| {
-                const fy_i = try ops.slice(fy_joined, 0, @intCast(i), @intCast(i + 1));
-                const lent = self.lend(sg.request);
-                next[i] = try self.layerBack(front[i], fy_i);
-                lent.end();
-                next_made += 1;
-            }
-            for (hs[0..hs_made]) |h| _ = mlx.mlx_array_free(h);
-            @memcpy(hs[0..n], next[0..n]);
-            hs_made = n;
-            next_made = 0;
+            freeMixed(ahead);
+            ahead = next_ahead;
+            _ = mlx.mlx_array_free(hs);
+            hs = next_hs;
         }
-        const hs_joined = try ops.concat(hs[0..n], 0);
-        const logits = try self.readoutStreams(hs_joined, .all);
+        const logits = try self.readoutStreams(hs, .all);
+        errdefer _ = mlx.mlx_array_free(logits);
         for (segs, 0..) |sg, i| {
             const lent = self.lend(sg.request);
             defer lent.end();
             if (self.keep_hidden) {
                 var o: Ops = .{ .s = self.s };
                 defer o.deinit();
-                try self.keepHiddenRow(&o, try o.slice(hs_joined, 0, @intCast(i), @intCast(i + 1)));
+                try self.keepHiddenRow(&o, try o.slice(hs, 0, @intCast(i), @intCast(i + 1)));
             }
-            try self.submitState(logits);
             try self.appendHistory(&.{sg.id});
             sg.request.pos += 1;
         }
+        try self.submitStates(segs, logits);
         return logits;
     }
 
+    fn submitStates(self: *Model, segs: []const Seg, logits: ?Arr) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var count: usize = 0;
+        if (logits) |l| {
+            try mlx.check(mlx.mlx_vector_array_append_value(vec, l));
+            count += 1;
+        }
+        var arrays: [max_state_arrays]Arr = undefined;
+        for (segs) |sg| {
+            for (sg.request.state[0..self.config.layers]) |*st| for (stateArrays(st, &arrays)) |arr| {
+                var ready = false;
+                try mlx.check(mlx._mlx_array_is_available(&ready, arr));
+                if (!ready) {
+                    try mlx.check(mlx.mlx_vector_array_append_value(vec, arr));
+                    count += 1;
+                }
+            };
+        }
+        if (count > 0) try mlx.check(mlx.mlx_async_eval(vec));
+    }
+
     pub const Group = struct { request: *Request, ids: []const u32 };
+
+    fn engramRowsJoinedGroups(self: *Model, groups: []const Group, total: usize, pf_ids_out: *?[]u32) !?EngramRows {
+        const hash = self.hash orelse return null;
+        const cols = hash.cols();
+        const mods = hash.n_layers;
+        const out = try self.gpa.alloc(u32, total * mods * cols);
+        errdefer self.gpa.free(out);
+        const live = try self.gpa.alloc(f32, total);
+        errdefer self.gpa.free(live);
+        const pf_ids = try self.gpa.alloc(u32, total * mods * cols);
+        errdefer self.gpa.free(pf_ids);
+        const max_t: usize = @intCast(fwd.verify_rows_max);
+        var comp_buf: [max_t]u32 = undefined;
+        const row_mixed = try self.gpa.alloc(u32, max_t * mods * cols);
+        defer self.gpa.free(row_mixed);
+        var row_off: usize = 0;
+        for (groups) |g| {
+            const t = g.ids.len;
+            for (g.ids, 0..) |id, k| {
+                comp_buf[k] = self.historyId(id);
+                live[row_off + k] = if (self.engramId(id) == self.config.engram.pad_id) 0 else 1;
+            }
+            const g_mixed = row_mixed[0 .. t * mods * cols];
+            hash.rows(g.request.history.items, comp_buf[0..t], g_mixed);
+            @memcpy(pf_ids[row_off * mods * cols ..][0 .. t * mods * cols], g_mixed);
+            for (0..t) |k| {
+                for (0..mods) |m| {
+                    @memcpy(out[(m * total + row_off + k) * cols ..][0..cols], g_mixed[(k * mods + m) * cols ..][0..cols]);
+                }
+            }
+            row_off += t;
+        }
+        pf_ids_out.* = pf_ids;
+        return .{ .ids = out, .live = live };
+    }
+
+    /// Runs one group's multi-row (1..`verify_rows_max`) attention core over pre-absorbed `q_lat_rows` `[total, H, latent]`,
+    /// `q_pe_rows` `[total, H, rope]`, and hoisted sparse indexer projections, journaling sparse keys/picks for `keepRows`
+    /// and returning `[t, H, latent]` owned by `o`.
+    fn attendLatentGroup(
+        self: *Model,
+        o: *Ops,
+        l: usize,
+        q_lat_rows: Arr,
+        q_pe_rows: Arr,
+        c_all: Arr,
+        kpe_all: Arr,
+        keys_joined: ?Arr,
+        idx_q_joined: ?Arr,
+        idx_hw_joined: ?Arr,
+        r0: c_int,
+        r1: c_int,
+        p0_i: c_int,
+    ) !Arr {
+        const t = r1 - r0;
+        if (t == 1) return self.attendLatentSingleRow(o, l, q_lat_rows, q_pe_rows, c_all, kpe_all, keys_joined, idx_q_joined, idx_hw_joined, r0, p0_i);
+        var row: Ops = .{ .s = self.s };
+        defer row.deinit();
+        const L = &self.layers[l];
+        const req_ = self.req();
+        const st = &req_.state[l];
+        const kv = req_.kv;
+        req_.version += 1;
+        const n_pos = p0_i + t;
+        const c_g = try row.slice(c_all, 0, r0, r1);
+        const kpe_g = try row.slice(kpe_all, 0, r0, r1);
+        const ql_g = try row.transpose(try row.slice(q_lat_rows, 0, r0, r1), &.{ 1, 0, 2 });
+        const qp_g = try row.transpose(try row.slice(q_pe_rows, 0, r0, r1), &.{ 1, 0, 2 });
+        const u: Arr = if (L.indexer) |iw| blk: {
+            try self.appendLatent(&row, st, c_g, kpe_g);
+            const ig = self.indexerGeometry();
+            const keys_g = try row.slice(keys_joined.?, 0, r0, r1);
+            if (self.journals(t)) try writeFixed(&req_.key_journal[l], keys_g, &.{ fwd.verify_rows_max, mlx.getShape(keys_g)[1] }, self.s);
+            try poolClosed(&row, st, keys_g, iw, ig);
+            var keys = self.sparseKeys(st);
+            const thr = ig.group_topk * ig.ratio;
+            if (n_pos <= thr or st.pooled == null) {
+                break :blk try fwd.causalLatent(&row, ql_g, qp_g, try self.latentRange(&row, &keys, 0, n_pos), try row.slice(keys.k_pe.?, 0, 0, n_pos), L.attn, L.geometry, .{ .causal = .{ .p0 = p0_i, .window = 0 } });
+            }
+            const all = try row.slice(st.pooled.?.buf(0), 0, 0, @intCast(st.pooled.?.used));
+            if (p0_i < thr) {
+                const cut = thr - p0_i;
+                const idx_q_s = try row.slice(idx_q_joined.?, 0, r0 + cut, r1);
+                const idx_hw_s = try row.slice(idx_hw_joined.?, 0, r0 + cut, r1);
+                const sel = try fwd.recalledFromProjected(&row, idx_q_s, idx_hw_s, all, ig, thr, n_pos);
+                if (self.keep_hidden) try self.keepPicks(&row, l, sel.rows, sel.keep, cut, self.journals(t));
+                const flat = try row.reshape(sel.rows, &.{ (t - cut) * fwd.selectedWidth(sel.rows) });
+                const u_dense = try fwd.causalLatent(&row, try row.slice(ql_g, 1, 0, cut), try row.slice(qp_g, 1, 0, cut), try self.latentRange(&row, &keys, 0, thr), try row.slice(keys.k_pe.?, 0, 0, thr), L.attn, L.geometry, .{ .causal = .{ .p0 = p0_i, .window = 0 } });
+                const u_sparse = try fwd.rowsLatent(&row, try row.slice(ql_g, 1, cut, t), try row.slice(qp_g, 1, cut, t), try self.latentAt(&row, &keys, flat), try row.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry);
+                break :blk try row.concat(&.{ u_dense, u_sparse }, 1);
+            }
+            const idx_q_g = try row.slice(idx_q_joined.?, 0, r0, r1);
+            const idx_hw_g = try row.slice(idx_hw_joined.?, 0, r0, r1);
+            const sel = try fwd.recalledFromProjected(&row, idx_q_g, idx_hw_g, all, ig, p0_i, n_pos);
+            if (self.keep_hidden) try self.keepPicks(&row, l, sel.rows, sel.keep, 0, self.journals(t));
+            const flat = try row.reshape(sel.rows, &.{ t * fwd.selectedWidth(sel.rows) });
+            break :blk try fwd.rowsLatent(&row, ql_g, qp_g, try self.latentAt(&row, &keys, flat), try row.take(keys.k_pe.?, flat, 0), sel.keep, L.attn, L.geometry);
+        } else blk: {
+            const w: c_int = @intCast(self.config.window);
+            const c_bf = try row.cast(c_g, .bfloat16);
+            const pe_bf = try row.cast(kpe_g, .bfloat16);
+            const fresh = try self.freshRows(&row, &row, c_bf, pe_bf);
+            var win = try self.windowKeys(&row, st, &fresh, p0_i);
+            const s0: c_int = @max(0, p0_i - w + 1);
+            const c_win = try self.latentRange(&row, &win, s0 - win.base, n_pos - win.base);
+            const pe_win = try row.slice(win.k_pe.?, 0, s0 - win.base, n_pos - win.base);
+            const out_u = try fwd.causalLatent(&row, ql_g, qp_g, c_win, pe_win, L.attn, L.geometry, .{ .causal = .{ .p0 = p0_i - s0, .window = w, .ring_p0 = p0_i } });
+            if (kv.scheme != .off and hy4_latent.appendApplies(row.s, c_bf, pe_bf, kv.group_size, kv.bits, w)) {
+                try self.writeRingLatent(st, c_bf, pe_bf, p0_i, t);
+            } else {
+                try self.writeRing(st, &fresh, p0_i, t);
+            }
+            break :blk out_u;
+        };
+        return o.own(try row.result(try row.contiguous(try row.transpose(u, &.{ 1, 0, 2 }))));
+    }
 
     pub fn extendGroups(self: *Model, groups: []const Group) !Arr {
         const max_rows: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
@@ -1182,82 +1527,261 @@ pub const Model = struct {
             for (groups) |g| g.request.reset();
         }
         const c = self.config;
-        var ops: Ops = .{ .s = self.s };
-        defer ops.deinit();
-        var hs: [max_rows]Arr = undefined;
-        var hs_made: usize = 0;
-        defer {
-            for (hs[0..hs_made]) |h| _ = mlx.mlx_array_free(h);
-        }
-        var engram: [max_rows]?EngramRows = @splat(null);
-        defer {
-            for (&engram) |*r| if (r.*) |v| v.deinit(self.gpa);
-        }
+        const hc: c_int = @intCast(c.hc_mult);
+        var ids_buf: [max_rows]u32 = undefined;
+        var flat_pos: [max_rows]c_int = undefined;
         var p0: [max_rows]c_int = undefined;
         var start: [max_rows + 1]usize = undefined;
         var at: usize = 0;
         for (groups, 0..) |g, i| {
             p0[i] = @intCast(g.request.pos);
             start[i] = at;
+            for (g.ids, 0..) |id, k| {
+                ids_buf[at + k] = id;
+                flat_pos[at + k] = p0[i] + @as(c_int, @intCast(k));
+            }
             at += g.ids.len;
-            hs[i] = try self.embedStreams(g.ids);
-            hs_made += 1;
-            engram[i] = try self.engramRowsAfter(g.request.history.items, g.ids);
             g.request.dropPicks();
         }
         start[n] = at;
+        var hs = try self.embedStreams(ids_buf[0..total]);
+        defer _ = mlx.mlx_array_free(hs);
+        var pf_ids: ?[]u32 = null;
+        defer if (pf_ids) |b| self.gpa.free(b);
+        const engram_joined = try self.engramRowsJoinedGroups(groups, total, &pf_ids);
+        defer if (engram_joined) |r| r.deinit(self.gpa);
+        const engram_pf = if (pf_ids) |ids| self.startEngramPrefetch(ids, total) else null;
+        defer if (engram_pf) |pf| pf.finish();
+        var ahead: ?fwd.Mixed = null;
+        defer freeMixed(ahead);
+        const kv = groups[0].request.kv;
+        const same_kv = for (groups[1..]) |g| {
+            if (!std.meta.eql(g.request.kv, kv)) break false;
+        } else true;
+        const win_w: c_int = @intCast(c.window);
+        const all_past_pos = blk: {
+            var ok = true;
+            for (p0[0..n]) |p| ok = ok and p >= win_w;
+            break :blk ok;
+        };
+        var max_t: c_int = 0;
+        for (groups) |g| max_t = @max(max_t, @as(c_int, @intCast(g.ids.len)));
         for (0..c.layers) |l| {
+            const exact = mlx.engine.exactF32();
+            defer exact.end();
+            const L = &self.layers[l];
             const layer_frame = try plan.frame(@src(), .{l});
             defer layer_frame.end();
-            var front: [max_rows]Front = undefined;
-            var front_made: usize = 0;
+            if (L.engram != null and engram_joined != null) {
+                const d = try self.engramDeltaWith(l, hs, engram_joined, @intCast(total), engram_pf);
+                _ = mlx.mlx_array_free(hs);
+                hs = d;
+            }
+            var mid: Arr = none;
+            var post_f: Arr = none;
+            var fx: Arr = none;
             defer {
-                for (front[0..front_made]) |*f| f.deinit();
+                _ = mlx.mlx_array_free(mid);
+                _ = mlx.mlx_array_free(post_f);
+                _ = mlx.mlx_array_free(fx);
             }
-            for (groups, 0..) |g, i| {
-                const t: c_int = @intCast(g.ids.len);
-                const lent = self.lend(g.request);
-                defer lent.end();
-                const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], t)) else plan.Frame.none;
-                defer variant.end();
-                front[i] = try self.layerFrontWith(l, hs[i], null, engram[i], t, p0[i] + t, p0[i], null);
-                front_made += 1;
+            {
+                var o: Ops = .{ .s = self.s };
+                defer o.deinit();
+                const mixed = ahead orelse try fwd.mixNorm(&o, hs, L.mix_attn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.input_norm);
+                const x_joined = mixed.x;
+                const proj = try fwd.projectRowsJoined(&o, x_joined, L.attn, L.geometry, flat_pos[0..total], .bfloat16, .float32);
+                const gate_joined = try fwd.linearSpans(&o, x_joined, L.attn.gate, self.span_rows);
+                const keys_joined: ?Arr = if (L.indexer) |iw| try fwd.tokenKeys(&o, x_joined, iw, self.indexerGeometry()) else null;
+                const can_join = (!@import("builtin").is_test or fwd.joined_attention_on) and total >= 2 and L.indexer == null and self.tap == null and same_kv and kv.scheme != .off and
+                    hy4_latent.appendFits(self.s, max_t, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits, win_w) and
+                    hy4_latent.ringWindowsFits(self.s, @intCast(c.kv_lora), @intCast(c.rope_dim), kv.group_size, kv.bits);
+                const all_past = all_past_pos or self.warm_grouped;
+                const joined_attn = can_join and (if (@import("../tensor/core.zig").dryOn() and self.joined_grouped_at != null)
+                    @as(usize, @intCast(p0[0])) == self.joined_grouped_at.?
+                else
+                    all_past);
+                var gated_joined: Arr = undefined;
+                if (proj.q_pe_rows != null and self.tap == null) {
+                    const q_lat_rows = try fwd.absorbQueryRows(&o, proj.q_raw.?, L.attn, L.geometry);
+                    const idx_q_joined: ?Arr = if (L.indexer) |iw| try fwd.linearF32(&o, proj.q_resid, iw.query) else null;
+                    const idx_hw_joined: ?Arr = if (L.indexer) |iw| try o.cast(try fwd.linearF32(&o, x_joined, iw.head_weight), .float32) else null;
+                    const u_joined: Arr = blk_attn: {
+                        const attn_arm = if (plan.planned()) try plan.each(@src(), .{ .layer = l, .rows = total, .join = joined_attn }) else plan.Frame.none;
+                        defer attn_arm.end();
+                        if (joined_attn) {
+                            var c_parts: [max_rows]Arr = @splat(none);
+                            var pe_parts: [max_rows]Arr = @splat(none);
+                            defer for (c_parts[0..n], pe_parts[0..n]) |a, b| {
+                                _ = mlx.mlx_array_free(a);
+                                _ = mlx.mlx_array_free(b);
+                            };
+                            for (groups, 0..) |g, i| {
+                                var row: Ops = .{ .s = self.s };
+                                defer row.deinit();
+                                const lent = self.lend(g.request);
+                                defer lent.end();
+                                const r0: c_int = @intCast(start[i]);
+                                const r1: c_int = @intCast(start[i + 1]);
+                                const t: c_int = r1 - r0;
+                                const st = &g.request.state[l];
+                                const c_bf = try row.cast(try row.slice(proj.c, 0, r0, r1), .bfloat16);
+                                const pe_bf = try row.cast(try row.slice(proj.k_pe, 0, r0, r1), .bfloat16);
+                                g.request.version += 1;
+                                if (t == 1) {
+                                    try self.writeRingLatent(st, c_bf, pe_bf, p0[i], 1);
+                                    c_parts[i] = try Ops.share(try row.reshape(try self.latentRange(&row, st, 0, win_w), &.{ 1, win_w, L.geometry.latent }));
+                                    pe_parts[i] = try Ops.share(try row.reshape(try row.slice(st.k_pe.?, 0, 0, win_w), &.{ 1, win_w, L.geometry.rope }));
+                                } else {
+                                    var idx_vals: [fwd.verify_rows_max]u32 = undefined;
+                                    const n_save: usize = @intCast(t - 1);
+                                    for (0..n_save) |k| idx_vals[k] = @intCast(@mod(p0[i] + 1 + @as(c_int, @intCast(k)), win_w));
+                                    const idx_arr = try row.own(try mlx.newData(&idx_vals, &[_]c_int{@intCast(n_save)}, .uint32));
+                                    const saved_c = try self.latentAt(&row, st, idx_arr);
+                                    const saved_pe = try row.take(st.k_pe.?, idx_arr, 0);
+                                    try self.writeRingLatent(st, c_bf, pe_bf, p0[i], t);
+                                    const built = try hy4_latent.ringWindows(row.s, st.c.?, st.c_scales.?, st.c_biases.?, st.k_pe.?, saved_c, saved_pe, p0[i], t, win_w, kv.group_size);
+                                    c_parts[i] = built.c;
+                                    pe_parts[i] = built.pe;
+                                }
+                            }
+                            var join_o: Ops = .{ .s = self.s };
+                            defer join_o.deinit();
+                            const c_l = if (n == 1) c_parts[0] else try join_o.concat(c_parts[0..n], 0);
+                            const pe_l = if (n == 1) pe_parts[0] else try join_o.concat(pe_parts[0..n], 0);
+                            break :blk_attn try o.own(try join_o.result(try fwd.attendJoinedLatentStacked(&join_o, q_lat_rows, proj.q_pe_rows.?, c_l, pe_l, L.attn, L.geometry)));
+                        }
+                        var u_rows: [max_rows]Arr = @splat(none);
+                        var u_made: usize = 0;
+                        defer for (u_rows[0..u_made]) |u| {
+                            _ = mlx.mlx_array_free(u);
+                        };
+                        var row_o: Ops = .{ .s = self.s };
+                        defer row_o.deinit();
+                        {
+                            const rows_loop = try plan.frame(@src(), .{});
+                            defer rows_loop.end();
+                            for (groups, 0..) |g, i| {
+                                const r0: c_int = @intCast(start[i]);
+                                const r1: c_int = @intCast(start[i + 1]);
+                                const t: c_int = r1 - r0;
+                                const lent = self.lend(g.request);
+                                defer lent.end();
+                                const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], t)) else plan.Frame.none;
+                                defer variant.end();
+                                const u_i = try self.attendLatentGroup(&row_o, l, q_lat_rows, proj.q_pe_rows.?, proj.c, proj.k_pe, keys_joined, idx_q_joined, idx_hw_joined, r0, r1, p0[i]);
+                                try mlx.check(mlx.mlx_array_set(&u_rows[i], u_i));
+                                u_made = i + 1;
+                            }
+                        }
+                        break :blk_attn try o.concat(u_rows[0..n], 0);
+                    };
+                    gated_joined = try fwd.absorbValueGatedRows(&o, u_joined, gate_joined, L.attn, L.geometry);
+                } else {
+                    var gated: [max_rows]Arr = undefined;
+                    var gated_made: usize = 0;
+                    defer for (gated[0..gated_made]) |g| {
+                        _ = mlx.mlx_array_free(g);
+                    };
+                    var front: [max_rows]Front = undefined;
+                    var front_made: usize = 0;
+                    defer for (front[0..front_made]) |*f| f.deinit();
+                    const q_full = proj.q_full.?;
+                    for (groups, 0..) |g, i| {
+                        const r0: c_int = @intCast(start[i]);
+                        const r1: c_int = @intCast(start[i + 1]);
+                        const t: c_int = r1 - r0;
+                        gated[i] = none;
+                        gated_made += 1;
+                        const fi: FrontIn = .{
+                            .h = try o.slice(hs, 0, r0, r1),
+                            .post_a = try o.slice(mixed.post, 0, r0, r1),
+                            .x = try o.slice(x_joined, 0, r0, r1),
+                            .x_bf = null,
+                            .p = .{
+                                .q = try o.slice(q_full, 1, r0, r1),
+                                .c = try o.slice(proj.c, 0, r0, r1),
+                                .k_pe = try o.slice(proj.k_pe, 0, r0, r1),
+                                .q_resid = try o.slice(proj.q_resid, 0, r0, r1),
+                                .q_raw = if (proj.q_raw) |qr| try o.slice(qr, 1, r0, r1) else null,
+                            },
+                            .gate = try o.slice(gate_joined, 0, r0, r1),
+                            .keys = if (keys_joined) |k| try o.slice(k, 0, r0, r1) else null,
+                            .gated = &gated[i],
+                        };
+                        const lent = self.lend(g.request);
+                        const variant = if (plan.planned()) try plan.each(@src(), self.layerKey(l, p0[i], t)) else plan.Frame.none;
+                        defer variant.end();
+                        front[i] = try self.layerFrontWith(l, fi.h, null, null, t, p0[i] + t, p0[i], fi);
+                        lent.end();
+                        front_made += 1;
+                    }
+                    gated_joined = try o.concat(gated[0..n], 0);
+                }
+                var o_left: fwd.OLeft = .normed;
+                const offered = if (fwd.oPartsReady(&o, hs, L.mix_ffn, L.attn)) &o_left else null;
+                const y_joined = try fwd.outputWhole(&o, gated_joined, L.attn, L.geometry, offered);
+                const em = try fwd.expandWhole(&o, hs, mixed.post, y_joined, o_left, L.attn, L.geometry.eps, L.mix_ffn, hc, c.hc_magnitude, c.hc_eps, c.eps, L.post_norm);
+                mid = try o.result(em.m);
+                post_f = try o.result(em.mixed.post);
+                fx = try o.result(em.mixed.x);
             }
-            var fx: [max_rows]Arr = undefined;
-            for (groups, 0..) |_, i| fx[i] = front[i].x;
-            const fx_joined = try ops.concat(fx[0..n], 0);
-            const fy_joined = try self.ffnOne(l, fx_joined);
-            defer _ = mlx.mlx_array_free(fy_joined);
-            var next: [max_rows]Arr = undefined;
-            var next_made: usize = 0;
-            defer {
-                for (next[0..next_made]) |h| _ = mlx.mlx_array_free(h);
+            const want_ahead = l + 1 < c.layers and (self.layers[l + 1].engram == null or engram_joined == null);
+            const next_mix: ?fwd.NextMix = if (want_ahead) .{ .mix = self.layers[l + 1].mix_attn, .n = hc, .magnitude = c.hc_magnitude, .eps = c.hc_eps, .norm_eps = c.eps, .norm_w = self.layers[l + 1].input_norm } else null;
+            const fy = try self.ffnFor(l, fx, .{ .h = mid, .post = post_f, .next = next_mix });
+            var next_hs: Arr = undefined;
+            var next_ahead: ?fwd.Mixed = null;
+            if (fy.expanded) {
+                next_hs = fy.y;
+                next_ahead = fy.next;
+            } else {
+                defer _ = mlx.mlx_array_free(fy.y);
+                var bo: Ops = .{ .s = self.s };
+                defer bo.deinit();
+                next_hs = try bo.result(try fwd.expand(&bo, mid, post_f, fy.y));
             }
-            for (groups, 0..) |g, i| {
-                const fy_i = try ops.slice(fy_joined, 0, @intCast(start[i]), @intCast(start[i + 1]));
-                const lent = self.lend(g.request);
-                next[i] = try self.layerBack(front[i], fy_i);
-                lent.end();
-                next_made += 1;
-            }
-            for (front[0..front_made]) |*f| f.deinit();
-            front_made = 0;
-            for (hs[0..hs_made]) |h| _ = mlx.mlx_array_free(h);
-            @memcpy(hs[0..n], next[0..n]);
-            hs_made = n;
-            next_made = 0;
+            freeMixed(ahead);
+            ahead = next_ahead;
+            _ = mlx.mlx_array_free(hs);
+            hs = next_hs;
         }
-        const hs_joined = try ops.concat(hs[0..n], 0);
-        const logits = try self.readoutStreams(hs_joined, .all);
+        const logits = try self.readoutStreams(hs, .all);
+        errdefer _ = mlx.mlx_array_free(logits);
         for (groups, 0..) |g, i| {
             const lent = self.lend(g.request);
             defer lent.end();
-            if (self.keep_hidden) try self.keepHidden(hs[i]);
-            try self.submitState(logits);
+            if (self.keep_hidden) {
+                var o: Ops = .{ .s = self.s };
+                defer o.deinit();
+                try self.keepHidden(try o.slice(hs, 0, @intCast(start[i]), @intCast(start[i + 1])));
+            }
             try self.appendHistory(g.ids);
             g.request.pos += g.ids.len;
         }
+        try self.submitGroupStates(groups, logits);
         return logits;
+    }
+
+    fn submitGroupStates(self: *Model, groups: []const Group, logits: ?Arr) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var count: usize = 0;
+        if (logits) |l| {
+            try mlx.check(mlx.mlx_vector_array_append_value(vec, l));
+            count += 1;
+        }
+        var arrays: [max_state_arrays]Arr = undefined;
+        for (groups) |g| {
+            for (g.request.state[0..self.config.layers]) |*st| for (stateArrays(st, &arrays)) |arr| {
+                var ready = false;
+                try mlx.check(mlx._mlx_array_is_available(&ready, arr));
+                if (!ready) {
+                    try mlx.check(mlx.mlx_vector_array_append_value(vec, arr));
+                    count += 1;
+                }
+            };
+        }
+        if (count > 0) try mlx.check(mlx.mlx_async_eval(vec));
     }
 
     /// Submits the state arrays that are still graphs (a ring's write after the spans, the pooled keys and open group no
@@ -1587,6 +2111,25 @@ pub const Model = struct {
         }
         try req_.history.appendNTimes(req_.gpa orelse self.gpa, self.historyId(0), n);
         req_.pos = n;
+    }
+
+    /// Populates `last_hidden` and (past the indexer threshold) `last_picks` directly from the dry state's reserved
+    /// handover blocks without running a 42-layer forward. Only inside a dry recording.
+    pub fn dryHandover(self: *Model) !void {
+        if (!mlx.engine.dryOn()) return error.Hy4DryStateNotDry;
+        const req_ = self.req();
+        try shareInto(&req_.last_hidden, req_.hidden_fixed);
+        const thr: usize = @as(usize, self.config.indexer.group_topk) * self.config.indexer.group;
+        if (req_.pos > thr) {
+            for (0..self.config.layers) |l| if (self.layers[l].indexer != null) {
+                var kept: [2]?Arr = .{ null, null };
+                errdefer for (kept) |h| if (h) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
+                for (&kept, req_.picks_fixed[l]) |*h, b| try shareInto(h, b);
+                req_.last_picks[l] = .{ .rows = kept[0].?, .keep = kept[1].? };
+            };
+        }
     }
 
     /// Room for a request whose rows reach `reach`, made between its forwards: each sparse layer's rows and pooled keys
@@ -2384,6 +2927,8 @@ pub const Model = struct {
             reqs[i].kv = kv;
             const lent = self.lend(&reqs[i]);
             defer lent.end();
+            if (self.experts) |e| e.beginForward();
+            defer if (self.experts) |e| e.finishForward(1);
             const logits = try self.forward(&.{0});
             _ = mlx.mlx_array_free(logits);
         }
@@ -2394,7 +2939,93 @@ pub const Model = struct {
             for ([_]bool{ false, true }) |grouped| {
                 self.warm_grouped = grouped;
                 defer self.warm_grouped = false;
+                if (self.experts) |e| e.beginForward();
+                defer if (self.experts) |e| e.finishForward(w);
                 const out = try self.extendRows(segs[0..w]);
+                defer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_array_eval(out));
+            }
+        }
+    }
+
+    /// Warms `draftBatch` and `extendGroups` across every planned grouped-DFly2 width `(slots, n_use)` and every
+    /// distinct template row width `w >= 2` so no grouped speculative tick ever compiles a late Metal pipeline.
+    pub fn warmJoinedGroups(self: *Model, drafter: *const @import("hy4_dfly.zig").Drafter, rows: usize, kv: kv_quant.KVQuantConfig) !void {
+        const cap = @min(rows, @as(usize, @intCast(fwd.joinedRowsMax())));
+        if (cap < 2) return;
+        const Drafter = @import("hy4_dfly.zig").Drafter;
+        const hy4_plan = @import("hy4_plan.zig");
+        const GemmScope = @import("sushi_exl3").linear.GemmScope;
+        const max_g: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+        const max_slots = @min(cap, Drafter.max_batch_slots);
+        var reqs: [Drafter.max_batch_slots]Request = undefined;
+        var made: usize = 0;
+        defer for (reqs[0..made]) |*r| r.deinit();
+        const keep_was = self.keep_hidden;
+        self.keep_hidden = true;
+        defer self.keep_hidden = keep_was;
+        for (0..max_slots) |i| {
+            reqs[i] = try Request.init(self.gpa, 0);
+            made = i + 1;
+            reqs[i].kv = kv;
+            const lent = self.lend(&reqs[i]);
+            defer lent.end();
+            if (self.experts) |e| e.beginForward();
+            defer if (self.experts) |e| e.finishForward(1);
+            const logits = try self.forward(&.{0});
+            _ = mlx.mlx_array_free(logits);
+        }
+        var req_ptrs: [Drafter.max_batch_slots]*Request = undefined;
+        var t1s: [Drafter.max_batch_slots]u32 = @splat(0);
+        var zeros: [fwd.verify_rows_max]u32 = @splat(0);
+        var groups: [Drafter.max_batch_slots]Group = undefined;
+        var drafts: [Drafter.max_batch_slots]Drafter.Draft = undefined;
+        var seen_w: u32 = 0;
+        var warmed_w: u32 = 0;
+        for (2..max_slots + 1) |slots| {
+            const n_use = hy4_plan.groupDraftWidth(@as(usize, self.config.dfly.draft), cap, slots);
+            if (n_use > 0 and slots * (n_use + 1) <= 64) {
+                for (0..slots) |i| req_ptrs[i] = &reqs[i];
+                const scope = try GemmScope.begin();
+                defer scope.end();
+                try drafter.draftBatch(self, req_ptrs[0..slots], t1s[0..slots], n_use, drafts[0..slots]);
+                for (drafts[0..slots]) |*d| d.deinit();
+            }
+            var templates: [20][max_g]u16 = undefined;
+            const n_tpl = hy4_plan.groupWidthTemplates(@as(usize, self.config.dfly.draft), cap, slots, &templates);
+            for (templates[0..n_tpl]) |tpl| for (tpl[0..slots]) |tw| if (tw >= 2 and tw <= fwd.verify_rows_max) {
+                seen_w |= @as(u32, 1) << @intCast(tw);
+            };
+            const w = fwd.groupRows(@as(usize, self.config.dfly.draft), cap, slots);
+            if (w < 2 or slots * w > cap) continue;
+            warmed_w |= @as(u32, 1) << @intCast(w);
+            for (0..slots) |i| groups[i] = .{ .request = &reqs[i], .ids = zeros[0..w] };
+            const scope = try GemmScope.begin();
+            defer scope.end();
+            for ([_]bool{ false, true }) |grouped| {
+                self.warm_grouped = grouped;
+                defer self.warm_grouped = false;
+                if (self.experts) |e| e.beginForward();
+                defer if (self.experts) |e| e.finishForward(slots * w);
+                const out = try self.extendGroups(groups[0..slots]);
+                defer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_array_eval(out));
+            }
+        }
+        // Warm any non-uniform template width `w >= 2` (e.g. `ringWindows(ROWS)` for `w = 3/5/6` when `cap = 8`).
+        for (2..@as(usize, @intCast(fwd.verify_rows_max)) + 1) |w| {
+            const bit = @as(u32, 1) << @intCast(w);
+            if ((seen_w & bit) == 0 or (warmed_w & bit) != 0 or w + 1 > cap) continue;
+            groups[0] = .{ .request = &reqs[0], .ids = zeros[0..w] };
+            groups[1] = .{ .request = &reqs[1], .ids = zeros[0..1] };
+            const scope = try GemmScope.begin();
+            defer scope.end();
+            for ([_]bool{ false, true }) |grouped| {
+                self.warm_grouped = grouped;
+                defer self.warm_grouped = false;
+                if (self.experts) |e| e.beginForward();
+                defer if (self.experts) |e| e.finishForward(w + 1);
+                const out = try self.extendGroups(groups[0..2]);
                 defer _ = mlx.mlx_array_free(out);
                 try mlx.check(mlx.mlx_array_eval(out));
             }
@@ -2472,7 +3103,24 @@ pub const Model = struct {
         // The prepared gated write's pipeline, made at load as a chunk's spans take it.
         if (mlx.engine.isStream(self.s)) {
             const hy4_chain = @import("hy4_chain.zig");
+            const hy4_absorb = @import("hy4_absorb.zig");
+            var warmed_v: [2]bool = .{ false, false };
             for (self.layers[0..self.config.layers]) |*layer| {
+                const kind: usize = @intFromBool(layer.indexer != null);
+                if (!warmed_v[kind]) {
+                    warmed_v[kind] = true;
+                    const ag: hy4_absorb.Geometry = .{ .heads = layer.geometry.heads, .nope = layer.geometry.nope, .v = layer.geometry.v, .latent = layer.geometry.latent };
+                    var rows: c_int = 1;
+                    while (rows <= fwd.verify_rows_max) : (rows += 1) {
+                        if (!hy4_absorb.applies(self.s, layer.attn.kv_b, ag, rows)) break;
+                        var o: Ops = .{ .s = self.s };
+                        defer o.deinit();
+                        const u = try o.slot();
+                        try mlx.check(mlx.mlx_zeros(u, &[_]c_int{ ag.heads, rows, ag.latent }, 3, .float32, self.s));
+                        const out = try o.own(try hy4_absorb.valueOut(self.s, u.*, layer.attn.kv_b, ag));
+                        try mlx.check(mlx.mlx_array_eval(out));
+                    }
+                }
                 const bank = layer.attn.o.stq orelse continue;
                 const h = layer.geometry.heads;
                 const v = layer.geometry.v;
@@ -2507,7 +3155,7 @@ pub const Model = struct {
     /// How rows `p0..p0 + t` meet the edges where a layer's structure changes: a sparse layer's open group and pooled
     /// keys before them, its groups closing and its selection threshold (`attendSpan`), a sliding layer's window filling
     /// and its ring wrapping. A plan frame's key.
-    pub const LayerKey = struct { layer: usize, open: bool, pooled: bool, closes: c_int, arm: enum { dense, straddle, selected }, cut: c_int, split: bool, lone: bool, first: bool, full: bool, wraps: bool, ring: bool, edge: c_int };
+    pub const LayerKey = struct { layer: usize, rows: c_int, open: bool, pooled: bool, closes: c_int, arm: enum { dense, straddle, selected }, cut: c_int, split: bool, lone: bool, first: bool, full: bool, wraps: bool, ring: bool, edge: c_int };
 
     pub fn layerKey(self: *const Model, l: usize, p0: c_int, t: c_int) LayerKey {
         const ig = self.indexerGeometry();
@@ -2516,6 +3164,7 @@ pub const Model = struct {
         const sparse = self.layers[l].indexer != null;
         return .{
             .layer = l,
+            .rows = t,
             .open = sparse and @rem(p0, ig.ratio) != 0,
             .pooled = sparse and p0 >= ig.ratio,
             // How many groups close: the pool takes their rows one at a time from two (`fwd.mmByRow`).
@@ -2648,6 +3297,10 @@ pub const Model = struct {
     }
 
     fn engramDelta(self: *Model, l: usize, hs: Arr, rows: ?EngramRows, t: c_int) !Arr {
+        return self.engramDeltaWith(l, hs, rows, t, null);
+    }
+
+    fn engramDeltaWith(self: *Model, l: usize, hs: Arr, rows: ?EngramRows, t: c_int, pf: ?*engram_mod.Prefetch) !Arr {
         const e = self.layers[l].engram orelse return hs;
         const r = rows orelse return hs;
         var o: Ops = .{ .s = self.s };
@@ -2655,10 +3308,19 @@ pub const Model = struct {
         const cols: c_int = @intCast(self.hash.?.cols());
         const n_ids: usize = @intCast(t * cols);
         const mine = r.ids[e.module * n_ids ..][0..n_ids];
-        const gathered = if (e.disk) |*d|
-            try o.own(try d.gather(self.gpa, mine, self.s))
-        else
-            try o.take(e.table, try o.own(mlx.mlx_array_new_data(mine.ptr, &[_]c_int{t * cols}, 1, .uint32)), 0);
+        const gathered = if (e.disk) |*d| blk: {
+            if (pf) |p| {
+                if (p.take(0, e.module, 0)) |raw| {
+                    defer raw.deinit(self.gpa);
+                    break :blk try o.own(try d.dequant(raw, n_ids, self.s));
+                } else |_| {}
+            }
+            if (try d.tryReadCached(self.gpa, mine)) |raw| {
+                defer raw.deinit(self.gpa);
+                break :blk try o.own(try d.dequant(raw, n_ids, self.s));
+            }
+            break :blk try o.own(try d.gather(self.gpa, mine, self.s));
+        } else try o.take(e.table, try o.own(mlx.mlx_array_new_data(mine.ptr, &[_]c_int{t * cols}, 1, .uint32)), 0);
         const table_rows = try o.reshape(gathered, &.{ t, cols, @intCast(self.config.engram.head_dim) });
         const live = try o.own(mlx.mlx_array_new_data(r.live.ptr, &[_]c_int{t}, 1, .float32));
         return o.result(try fwd.engramAdd(&o, hs, table_rows, live, e.tensors, null));
@@ -3230,15 +3892,14 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     defer self.gpa.free(host);
     if (at) |a| try a.tap.routes(a.tap.ctx, a.layer, host, r.weights);
     const slots_per_layer = engine.slotsPerLayer();
+    const max_groups = mostGroups(host.len, experts, slots_per_layer);
     const groups = try expertGroups(self.gpa, host, slots_per_layer);
     defer self.gpa.free(groups);
-    const n_groups = try plan.bound(groupCount(groups), mostGroups(host.len, experts, slots_per_layer));
+    const n_groups = try plan.bound(groupCount(groups), max_groups);
     const occurrences = try self.gpa.alloc(u16, host.len);
     defer self.gpa.free(occurrences);
     const slots = try self.gpa.alloc(u32, host.len);
     defer self.gpa.free(slots);
-    const mask_v = try self.gpa.alloc(f32, host.len);
-    defer self.gpa.free(mask_v);
     const lat = try fwd.expertLatent(o, x, m.lat_down, at);
     try fwd.At.input(at, .expert_in, lat);
     const shape = mlx.getShape(r.weights);
@@ -3246,6 +3907,43 @@ fn moeStqStreamed(self: *Model, o: *Ops, l: usize, x: Arr, m: fwd.Moe, g: fwd.Mo
     const row_ids = try self.gpa.alloc(u32, @intCast(shape[0]));
     defer self.gpa.free(row_ids);
     for (row_ids, 0..) |*d, i| d.* = @intCast(i);
+    // Single-group decode fast path (`host.len <= slots_per_layer`): launch `lat_down` and `shared` on GPU so they
+    // overlap SSD expert fills in `prepareHost`, and skip the zero-init, all-ones weight mask, and redundant sum add.
+    if (max_groups == 1 and at == null) {
+        const shared = try fwd.moeShared(o, x, m, null);
+        var sum = try fwd.placedZeros(o.s, shape[0], 1, mlx.getShape(lat)[1]);
+        var handed = false;
+        errdefer if (!handed) {
+            _ = mlx.mlx_array_free(sum);
+        };
+        if (mlx.engine.isStream(o.s) and !mlx.engine.dryOn()) try mlx.engine.submit();
+        for (host, occurrences) |v, *d| d.* = @intCast(v);
+        const loop = try plan.frame(@src(), .{});
+        defer loop.end();
+        const it = if (plan.planned()) try plan.each(@src(), false) else plan.Frame.none;
+        defer it.end();
+        var prepared = try prepareRoute(engine, @intCast(l), occurrences, @min(host.len, slots_per_layer));
+        defer prepared.deinit();
+        const rb = prepared.ragged orelse {
+            std.log.err("hy_v4_flash: layer {d}'s streamed experts are not a rate-group bank", .{l});
+            return error.Hy4ExpertLayout;
+        };
+        for (prepared.remapped, slots) |v, *d| d.* = v;
+        var go: Ops = .{ .s = o.s };
+        defer go.deinit();
+        const pk = try go.own(mlx.mlx_array_new_data(slots.ptr, &[_]c_int{ shape[0], shape[1] }, 2, .uint32));
+        const kind = try routeKind(&prepared);
+        defer kind.end();
+        var ko: Ops = .{ .s = o.s };
+        defer ko.deinit();
+        const part = try ko.own(try hy4_stq.routed(ko.s, dec, g.swiglu_limit, rb, lat, pk, r.weights));
+        try fwd.landRows(&ko, &sum, part, row_ids);
+        handed = true;
+        const acc = try o.own(sum);
+        return o.contiguous(try fwd.moeFinishWithShared(o, x, m, g, acc, shared, null));
+    }
+    const mask_v = try self.gpa.alloc(f32, host.len);
+    defer self.gpa.free(mask_v);
     // The groups' sum, made before them and written in place: no group, and no arm of a route's `plan.choose`, hands
     // up what it made (`choicesAgree`).
     var sum = try fwd.placedZeros(o.s, shape[0], 1, mlx.getShape(lat)[1]);

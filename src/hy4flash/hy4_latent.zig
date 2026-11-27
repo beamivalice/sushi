@@ -246,6 +246,117 @@ pub fn append(s: mlx.mlx_stream, c: Arr, k_pe: Arr, dsts: []const Arr, start_row
     try mlx.check(mlx.kernelApplyInPlace(try getAppendKernel(), iv, cfg, s, dsts) orelse return error.MlxError);
 }
 
+const ring_windows_source: [:0]const u8 =
+    \\uint col_w = thread_position_in_grid.x;
+    \\uint s = thread_position_in_grid.y;
+    \\uint r = thread_position_in_grid.z;
+    \\uint p0_mod = uint(meta[0]);
+    \\uint w_len = uint(meta[1]);
+    \\uint d = (s + w_len - p0_mod) % w_len;
+    \\bool use_saved = (d >= 1u) && (d < uint(ROWS)) && (r < d);
+    \\float4 cv;
+    \\if (use_saved) {
+    \\  const device float4* src = reinterpret_cast<const device float4*>(saved_c + size_t(d - 1u) * size_t(saved_c_strides[0]) + size_t(col_w) * 4);
+    \\  cv = *src;
+    \\} else {
+    \\  uint32_t word = q[size_t(s) * size_t(q_strides[0]) + size_t(col_w) * size_t(q_strides[1])];
+    \\  uint g = col_w / uint(GS_WORDS);
+    \\  bfloat16_t scale = scales[size_t(s) * size_t(scales_strides[0]) + size_t(g) * size_t(scales_strides[1])];
+    \\  bfloat16_t bias = biases[size_t(s) * size_t(biases_strides[0]) + size_t(g) * size_t(biases_strides[1])];
+    \\  bfloat16_t v0 = scale * uint8_t(word & 0xffu) + bias;
+    \\  bfloat16_t v1 = scale * uint8_t((word >> 8) & 0xffu) + bias;
+    \\  bfloat16_t v2 = scale * uint8_t((word >> 16) & 0xffu) + bias;
+    \\  bfloat16_t v3 = scale * uint8_t((word >> 24) & 0xffu) + bias;
+    \\  cv = float4(float(v0), float(v1), float(v2), float(v3));
+    \\}
+    \\device float4* cdst = reinterpret_cast<device float4*>(c_out + ((size_t(r) * size_t(w_len) + size_t(s)) * size_t(WORDS) + size_t(col_w)) * 4);
+    \\*cdst = cv;
+    \\for (uint j = col_w; j < uint(ROPE); j += uint(WORDS)) {
+    \\  bfloat16_t pv = use_saved
+    \\      ? saved_pe[size_t(d - 1u) * size_t(saved_pe_strides[0]) + size_t(j) * size_t(saved_pe_strides[1])]
+    \\      : k_pe[size_t(s) * size_t(k_pe_strides[0]) + size_t(j) * size_t(k_pe_strides[1])];
+    \\  pe_out[(size_t(r) * size_t(w_len) + size_t(s)) * size_t(ROPE) + size_t(j)] = pv;
+    \\}
+;
+
+var ring_windows_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getRingWindowsKernel() !mlx.mlx_fast_metal_kernel {
+    if (ring_windows_kernel) |k| return k;
+    const ins = [_][*:0]const u8{ "q", "scales", "biases", "k_pe", "saved_c", "saved_pe", "meta" };
+    const outs = [_][*:0]const u8{ "c_out", "pe_out" };
+    const iv = mlx.mlx_vector_string_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_string_free(iv);
+    const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
+    defer _ = mlx.mlx_vector_string_free(ov);
+    const k = mlx.mlx_fast_metal_kernel_new("sushi_hy4_latent_ring_windows", iv, ov, ring_windows_source, "", false, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    ring_windows_kernel = k;
+    return k;
+}
+
+const RingWindowsKey = struct { rows: c_int, win: c_int, words: c_int, gs_words: c_int, rope: c_int };
+var ring_windows_cfgs: kcfg.Cache(RingWindowsKey) = .{};
+
+fn buildRingWindows(k: RingWindowsKey) !kcfg.Config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const tg_x: c_int = @min(k.words, 128);
+    const tg_y: c_int = @min(k.win, @divTrunc(256, tg_x));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, k.win, k.words * 4 }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ k.rows, k.win, k.rope }, 3, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, k.words, k.win, k.rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg_x, tg_y, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", k.rows));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "WORDS", k.words));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS_WORDS", k.gs_words));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROPE", k.rope));
+    return cfg;
+}
+
+pub fn ringWindowsFits(s: mlx.mlx_stream, width: c_int, rope: c_int, group_size: u32, bits: u8) bool {
+    if (!mlx.streamIsGpu(s) or !mlx.engine.isStream(s) or bits != 8 or group_size == 0 or group_size % 4 != 0) return false;
+    return width > 0 and @rem(width, @as(c_int, @intCast(group_size))) == 0 and rope > 0;
+}
+
+/// Builds all `rows` (`2..append_rows_max`) causal ring-order windows `[rows, win, width]` f32 and `[rows, win, rope]` bf16
+/// in one launch from the post-update kv8 ring (`q, scales, biases, k_pe`) plus the `rows - 1` pre-update saved rows
+/// overwritten at `(p0 + 1) % win .. (p0 + rows - 1) % win`. Caller frees both returned arrays.
+pub fn ringWindows(
+    s: mlx.mlx_stream,
+    q: Arr,
+    scales: Arr,
+    biases: Arr,
+    k_pe: Arr,
+    saved_c: Arr,
+    saved_pe: Arr,
+    p0: c_int,
+    rows: c_int,
+    win: c_int,
+    group_size: u32,
+) !struct { c: Arr, pe: Arr } {
+    const words = mlx.getShape(q)[1];
+    const gs_words: c_int = @intCast(group_size / 4);
+    const rope = mlx.getShape(k_pe)[1];
+    const cfg = try ring_windows_cfgs.get(.{ .rows = rows, .win = win, .words = words, .gs_words = gs_words, .rope = rope }, buildRingWindows);
+    const mv = [_]i32{ @mod(p0, win), win };
+    const meta = try mlx.newData(&mv, &.{2}, .int32);
+    defer _ = mlx.mlx_array_free(meta);
+    const ins = [_]Arr{ q, scales, biases, k_pe, saved_c, saved_pe, meta };
+    const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try getRingWindowsKernel(), iv, cfg, s));
+    var c_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(c_out);
+    var pe_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(pe_out);
+    try mlx.check(mlx.mlx_vector_array_get(&c_out, ov, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&pe_out, ov, 1));
+    return .{ .c = c_out, .pe = pe_out };
+}
+
 const testing = std.testing;
 const Ops = @import("../mlx_ops.zig").Ops;
 const kv_quant = @import("../kv_quant.zig");
@@ -594,4 +705,90 @@ test "hy4 latent append: a layer append runs in one launch instead of five" {
 
     try testing.expectEqual(@as(u64, 5), old_d);
     try testing.expectEqual(@as(u64, 1), new_d);
+}
+
+test "hy4 latent ringWindows: multi-row causal ring windows match sequential one-row ring writes byte for byte including wrap-around" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+
+    const win: c_int = 512;
+    const width: c_int = 512;
+    const rope: c_int = 64;
+    const a = testing.allocator;
+    const init_n: usize = @intCast(win);
+    const max_t: usize = 6;
+    const vals = try a.alloc(f32, (init_n + max_t) * @as(usize, @intCast(width)));
+    defer a.free(vals);
+    const pe_vals = try a.alloc(f32, (init_n + max_t) * @as(usize, @intCast(rope)));
+    defer a.free(pe_vals);
+    var rng = std.Random.DefaultPrng.init(0x51a9e0);
+    for (vals) |*v| v.* = @floatCast(rng.random().floatNorm(f64) * 2.0);
+    for (pe_vals) |*v| v.* = @floatCast(rng.random().floatNorm(f64) * 1.0);
+
+    for ([_]struct { p0: c_int, t: c_int }{ .{ .p0 = 520, .t = 4 }, .{ .p0 = 510 + win, .t = 5 }, .{ .p0 = 511 + win, .t = 2 } }) |case| {
+        const words = kv_quant.packedWords(width, 8);
+        const groups = @divExact(width, 64);
+        const ring_q = (try mlx_pages.ringBuffer(&.{ win, words }, .uint32, es)).array;
+        defer _ = mlx.mlx_array_free(ring_q);
+        const ring_s = (try mlx_pages.ringBuffer(&.{ win, groups }, .bfloat16, es)).array;
+        defer _ = mlx.mlx_array_free(ring_s);
+        const ring_b = (try mlx_pages.ringBuffer(&.{ win, groups }, .bfloat16, es)).array;
+        defer _ = mlx.mlx_array_free(ring_b);
+        const ring_pe = (try mlx_pages.ringBuffer(&.{ win, rope }, .bfloat16, es)).array;
+        defer _ = mlx.mlx_array_free(ring_pe);
+
+        const ref_q = (try mlx_pages.ringBuffer(&.{ win, words }, .uint32, es)).array;
+        defer _ = mlx.mlx_array_free(ref_q);
+        const ref_s = (try mlx_pages.ringBuffer(&.{ win, groups }, .bfloat16, es)).array;
+        defer _ = mlx.mlx_array_free(ref_s);
+        const ref_b = (try mlx_pages.ringBuffer(&.{ win, groups }, .bfloat16, es)).array;
+        defer _ = mlx.mlx_array_free(ref_b);
+        const ref_pe = (try mlx_pages.ringBuffer(&.{ win, rope }, .bfloat16, es)).array;
+        defer _ = mlx.mlx_array_free(ref_pe);
+
+        var o: Ops = .{ .s = es };
+        defer o.deinit();
+        const all_c = try o.cast(try o.own(try mlx.newData(vals.ptr, &[_]c_int{ @intCast(init_n + max_t), width }, .float32)), .bfloat16);
+        const all_pe = try o.cast(try o.own(try mlx.newData(pe_vals.ptr, &[_]c_int{ @intCast(init_n + max_t), rope }, .float32)), .bfloat16);
+        // Populate both rings identically with `win` rows before `case.p0`.
+        var off: c_int = 0;
+        while (off < win) : (off += append_rows_max) {
+            const step: c_int = @min(append_rows_max, win - off);
+            const c_sl = try o.slice(all_c, 0, off, off + step);
+            const pe_sl = try o.slice(all_pe, 0, off, off + step);
+            try append(es, c_sl, pe_sl, &.{ ring_q, ring_s, ring_b, ring_pe }, case.p0 - win + off, win);
+            try append(es, c_sl, pe_sl, &.{ ref_q, ref_s, ref_b, ref_pe }, case.p0 - win + off, win);
+        }
+
+        // Fast path: save `t - 1` overwritten rows, append all `t` rows at once, build all `t` windows via `ringWindows`.
+        const tu: usize = @intCast(case.t);
+        var idx_vals: [max_t]u32 = undefined;
+        for (0..tu - 1) |k| idx_vals[k] = @intCast(@mod(case.p0 + 1 + @as(c_int, @intCast(k)), win));
+        const idx_arr = try o.own(try mlx.newData(&idx_vals, &[_]c_int{@intCast(tu - 1)}, .uint32));
+        const saved_c = try o.own(try gather(es, ring_q, ring_s, ring_b, idx_arr, 64));
+        const saved_pe = try o.take(ring_pe, idx_arr, 0);
+        const new_c = try o.slice(all_c, 0, win, win + case.t);
+        const new_pe = try o.slice(all_pe, 0, win, win + case.t);
+        try append(es, new_c, new_pe, &.{ ring_q, ring_s, ring_b, ring_pe }, case.p0, win);
+        const built = try ringWindows(es, ring_q, ring_s, ring_b, ring_pe, saved_c, saved_pe, case.p0, case.t, win, 64);
+        defer _ = mlx.mlx_array_free(built.c);
+        defer _ = mlx.mlx_array_free(built.pe);
+
+        // Reference: append one row at a time into `ref_*` and compare each window `r = 0..t-1` byte-for-byte.
+        for (0..tu) |r| {
+            const ri: c_int = @intCast(r);
+            try append(es, try o.slice(all_c, 0, win + ri, win + ri + 1), try o.slice(all_pe, 0, win + ri, win + ri + 1), &.{ ref_q, ref_s, ref_b, ref_pe }, case.p0 + ri, win);
+            const want_c = try o.own(try range(es, ref_q, ref_s, ref_b, 64));
+            const got_c = try o.reshape(try o.slice(built.c, 0, ri, ri + 1), &.{ win, width });
+            try testing.expectEqualSlices(u8, try bytesOf(&o, want_c), try bytesOf(&o, got_c));
+            const want_pe = try o.cast(ref_pe, .float32);
+            const got_pe = try o.cast(try o.reshape(try o.slice(built.pe, 0, ri, ri + 1), &.{ win, rope }), .float32);
+            try testing.expectEqualSlices(u8, try bytesOf(&o, want_pe), try bytesOf(&o, got_pe));
+        }
+    }
 }

@@ -6869,3 +6869,286 @@ test "dsv41 engine: a full stage block found in history verifies its continuatio
         }
     }
 }
+
+test "dsv41 engine: draftBatch matches solo draftMeasured bit-for-bit across ragged positions and widths (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const dsv41_model = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    if (m.dspark == null) return error.SkipZigTest;
+    fx.xfm.config.expert_resident = true;
+    defer fx.xfm.config.expert_resident = false;
+    m.serves_rows = true;
+    defer m.serves_rows = false;
+    try dsv41_serving.warmAll(&fx.xfm, m, null, .all);
+
+    var buf: [48]u32 = undefined;
+    const base = fx.prompt(&buf);
+    const n = 4;
+    const lens = [n]usize{ 9, 14, 19, 25 };
+    var solo: [n]dsv41_model.Request = @splat(.{});
+    defer for (&solo) |*r| r.deinit();
+    var joined: [n]dsv41_model.Request = @splat(.{});
+    defer for (&joined) |*r| r.deinit();
+    var t1s: [n]u32 = undefined;
+    for (0..n) |i| {
+        var pr: [25]u32 = undefined;
+        for (pr[0..lens[i]], 0..) |*t, j| t.* = base[(j * (i + 2) + i) % base.len];
+        const l0 = try forwardOn(&fx, &solo[i], pr[0..lens[i]]);
+        defer _ = mlx.mlx_array_free(l0);
+        const l1 = try forwardOn(&fx, &joined[i], pr[0..lens[i]]);
+        defer _ = mlx.mlx_array_free(l1);
+        t1s[i] = try argmaxHost(&fx.xfm, l0);
+    }
+
+    const blk = m.cfg.dspark.block;
+    const Case = struct { count: usize, widths: [n]u32 };
+    const cases = [_]Case{
+        .{ .count = 2, .widths = .{ 1, @min(blk, 2), 1, 1 } },
+        .{ .count = 3, .widths = .{ @min(blk, 2), 1, blk, 1 } },
+        .{ .count = 4, .widths = .{ 1, @min(blk, 2), @min(blk, 3), blk } },
+    };
+    const late_before = mlx.engine.latePipelines();
+    for (cases) |case| {
+        var reqs: [n]*dsv41_model.Request = undefined;
+        for (0..case.count) |i| reqs[i] = &joined[i];
+        var got: [n]dsv41_model.Draft = undefined;
+        var made: usize = 0;
+        defer for (got[0..made]) |*d| d.deinit();
+        try dsv41_serving.dsv41DraftBatch(&fx.xfm, reqs[0..case.count], t1s[0..case.count], case.widths[0..case.count], got[0..case.count]);
+        made = case.count;
+        for (0..case.count) |i| {
+            const scope = try dsv41_model.enterForward(m, &solo[i]);
+            defer scope.endForward();
+            const own = dsv41_model.ownBegin(m);
+            defer dsv41_model.ownEnd(m, fx.xfm.s);
+            _ = own;
+            var want = try dsv41_model.draftMeasured(m, t1s[i], .conf, case.widths[i], null);
+            defer want.deinit();
+            try testing.expectEqualSlices(u32, want.ids, got[i].ids);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(want.conf), std.mem.sliceAsBytes(got[i].conf));
+        }
+    }
+    try testing.expectEqual(late_before, mlx.engine.latePipelines());
+}
+
+test "dsv41 engine: grouped DSpark multi-row verify + finishVerifyJoined reproduces solo decode across partial acceptance, rollback, and mixed plain+drafting slots (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const dsv41_model = @import("dsv41_model.zig");
+    var fx: EngineFixture = undefined;
+    try fx.open(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    if (m.dspark == null) return error.SkipZigTest;
+    fx.xfm.config.expert_resident = true;
+    defer fx.xfm.config.expert_resident = false;
+    m.serves_rows = true;
+    defer m.serves_rows = false;
+    try dsv41_serving.warmAll(&fx.xfm, m, null, .all);
+
+    var buf: [48]u32 = undefined;
+    const base = fx.prompt(&buf);
+    const n = 3;
+    const lens = [n]usize{ 9, 14, 19 };
+    var solo: [n]dsv41_model.Request = @splat(.{});
+    defer for (&solo) |*r| r.deinit();
+    var joined: [n]dsv41_model.Request = @splat(.{});
+    defer for (&joined) |*r| r.deinit();
+    var next: [n]u32 = undefined;
+    for (0..n) |i| {
+        var pr: [19]u32 = undefined;
+        for (pr[0..lens[i]], 0..) |*t, j| t.* = base[(j * (i + 3) + i) % base.len];
+        const l0 = try forwardOn(&fx, &solo[i], pr[0..lens[i]]);
+        defer _ = mlx.mlx_array_free(l0);
+        const l1 = try forwardOn(&fx, &joined[i], pr[0..lens[i]]);
+        defer _ = mlx.mlx_array_free(l1);
+        next[i] = try argmaxHost(&fx.xfm, l0);
+    }
+
+    const Round = struct { widths: [n]usize, accept: [n]usize, drafting: [n]bool };
+    const rounds = [_]Round{
+        // All 3 drafting: 0-accept, partial-accept, full-accept.
+        .{ .widths = .{ 3, 3, 3 }, .accept = .{ 0, 1, 2 }, .drafting = .{ true, true, true } },
+        // Mixed: slot 1 is plain (no verify snapshot), slots 0 & 2 draft at ragged widths.
+        .{ .widths = .{ 4, 1, 3 }, .accept = .{ 2, 0, 1 }, .drafting = .{ true, false, true } },
+        // Another drafting round after mixed rollback.
+        .{ .widths = .{ 2, 3, 2 }, .accept = .{ 1, 0, 1 }, .drafting = .{ true, true, true } },
+        // Final plain joined tick to confirm every slot's state matches solo after all rollbacks.
+        .{ .widths = .{ 1, 1, 1 }, .accept = .{ 0, 0, 0 }, .drafting = .{ false, false, false } },
+    };
+
+    const late_before = mlx.engine.latePipelines();
+    for (rounds, 0..) |rd, r_idx| {
+        var ids_buf: [n][4]u32 = undefined;
+        var draft_reqs: [n]*dsv41_model.Request = undefined;
+        var draft_t1s: [n]u32 = undefined;
+        var draft_w: [n]u32 = undefined;
+        var draft_idx: [n]usize = undefined;
+        var nd: usize = 0;
+        for (0..n) |i| {
+            if (rd.drafting[i]) {
+                draft_reqs[nd] = &joined[i];
+                draft_t1s[nd] = next[i];
+                draft_w[nd] = @intCast(rd.widths[i] - 1);
+                draft_idx[nd] = i;
+                nd += 1;
+            }
+        }
+        var drafts: [n]dsv41_model.Draft = undefined;
+        var d_made: usize = 0;
+        defer for (drafts[0..d_made]) |*d| d.deinit();
+        if (nd > 0) {
+            try dsv41_serving.dsv41DraftBatch(&fx.xfm, draft_reqs[0..nd], draft_t1s[0..nd], draft_w[0..nd], drafts[0..nd]);
+            d_made = nd;
+        }
+
+        var segs: [n]dsv41_model.Seg = undefined;
+        var d_pos: usize = 0;
+        for (0..n) |i| {
+            if (rd.drafting[i]) {
+                @memcpy(ids_buf[i][0..rd.widths[i]], drafts[d_pos].ids[0..rd.widths[i]]);
+                try dsv41_model.beginVerifyReq(m, &joined[i], rd.widths[i]);
+                d_pos += 1;
+            } else {
+                ids_buf[i][0] = next[i];
+            }
+            segs[i] = .{ .request = &joined[i], .ids = ids_buf[i][0..rd.widths[i]] };
+        }
+        const out = try dsv41_serving.forwardRows(&fx.xfm, &segs);
+        defer _ = mlx.mlx_array_free(out);
+        var got_all: std.ArrayList(u8) = .empty;
+        defer got_all.deinit(a);
+        try logitBytes(a, &got_all, out);
+        var total_rows: usize = 0;
+        for (rd.widths) |w| total_rows += w;
+        const row_bytes = got_all.items.len / total_rows;
+
+        // Check every kept row's logits bit-for-bit against solo 1-row steps, and advance solo by the kept rows.
+        var row_off: usize = 0;
+        for (0..n) |i| {
+            const keep = rd.accept[i] + 1;
+            for (0..keep) |k| {
+                const solo_row = try forwardOn(&fx, &solo[i], ids_buf[i][k .. k + 1]);
+                defer _ = mlx.mlx_array_free(solo_row);
+                var want_b: std.ArrayList(u8) = .empty;
+                defer want_b.deinit(a);
+                try logitBytes(a, &want_b, solo_row);
+                errdefer std.debug.print("round {d} slot {d} row k={d}/{d} pos={d}\n", .{ r_idx, i, k, rd.widths[i], solo[i].position() });
+                try testing.expectEqualSlices(u8, want_b.items, got_all.items[(row_off + k) * row_bytes ..][0..row_bytes]);
+                if (k + 1 == keep) next[i] = try argmaxHost(&fx.xfm, solo_row);
+            }
+            row_off += rd.widths[i];
+        }
+
+        if (nd > 0) {
+            var accs: [n]usize = undefined;
+            for (0..nd) |di| accs[di] = rd.accept[draft_idx[di]];
+            try dsv41_serving.dsv41FinishGroupVerify(&fx.xfm, draft_reqs[0..nd], accs[0..nd]);
+        }
+        // Positions AND next DSpark drafts must match solo identically after rollback + commitMain!
+        for (0..n) |i| {
+            try testing.expectEqual(solo[i].position(), joined[i].position());
+            const sc_s = try dsv41_model.enterForward(m, &solo[i]);
+            _ = dsv41_model.ownBegin(m);
+            var ds_solo = try dsv41_model.draftMeasured(m, next[i], .conf, 2, null);
+            dsv41_model.ownEnd(m, fx.xfm.s);
+            sc_s.endForward();
+            defer ds_solo.deinit();
+            const sc_j = try dsv41_model.enterForward(m, &joined[i]);
+            _ = dsv41_model.ownBegin(m);
+            var ds_join = try dsv41_model.draftMeasured(m, next[i], .conf, 2, null);
+            dsv41_model.ownEnd(m, fx.xfm.s);
+            sc_j.endForward();
+            defer ds_join.deinit();
+            try testing.expectEqualSlices(u32, ds_solo.ids, ds_join.ids);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ds_solo.conf), std.mem.sliceAsBytes(ds_join.conf));
+        }
+    }
+    try testing.expectEqual(late_before, mlx.engine.latePipelines());
+}
+
+test "dsv41 engine: a streamed expert cache holding >= 2 * top_k slots/layer unlocks joined decode with bit-for-bit solo parity while a tight cache refuses rows (DSV41_STQ_TINY)" {
+    try mlx.requireGpu();
+    const dir = std.mem.span(std.c.getenv("DSV41_STQ_TINY") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const dsv41_model = @import("dsv41_model.zig");
+    const dsv41_sched = @import("dsv41_sched.zig");
+
+    // A streamed cache (6..7/8 slots/layer on DSV41_STQ_TINY, not resident): tight slots (< 2 * top_k) refuse rows,
+    // >= 2 * top_k joins rows and reproduces solo decode bit-for-bit across live SSD fills.
+    const streamed = 3 * 10 * (256 * 128 * 3 * 64 / 128);
+    var fx: EngineFixture = undefined;
+    try fx.prepare(dir, null, streamed);
+    fx.config.expert_resident = false;
+    try fx.load(dir);
+    defer fx.deinit();
+    const m = fx.model();
+    const eng = fx.xfm.expert_stream.?;
+    const slots = eng.plan.slots_per_layer;
+    errdefer std.debug.print("streamed test: resident={} slots={d}/{d} top_k={d} fills={d}\n", .{ eng.plan.resident, slots, m.cfg.experts, m.cfg.top_k, eng.fill_experts_total });
+    try testing.expect(!eng.plan.resident);
+    try testing.expect(slots >= 2 * m.cfg.top_k and slots < m.cfg.experts);
+    // Tight cache (< 2 * top_k) is refused by name; rows past the cache-aware cap are refused too.
+    try testing.expectError(error.Dsv41ResidencyMismatch, dsv41_serving.applyRowsWithSlots(m, 2, false, 2 * m.cfg.top_k - 1));
+    try testing.expect(!m.serves_rows);
+    fx.xfm.config.expert_cache_slots = @intCast(slots);
+    const rows = dsv41_sched.coolerRows(&fx.xfm.config);
+    try testing.expect(rows.rows >= 2);
+    try testing.expectError(error.Dsv41ResidencyMismatch, dsv41_serving.applyRowsWithSlots(m, rows.rows + 1, eng.plan.resident, slots));
+    try dsv41_serving.applyRowsWithSlots(m, rows.rows, eng.plan.resident, slots);
+    defer {
+        m.serves_rows = false;
+        m.joined_rows_cap = 0;
+    }
+    try testing.expect(m.serves_rows);
+    try testing.expectEqual(rows.rows, m.servedJoinedRows());
+    try testing.expect(!fx.xfm.ownsModuleDecodeState());
+
+    var buf: [48]u32 = undefined;
+    const base = fx.prompt(&buf);
+    var solo: [2]dsv41_model.Request = @splat(.{});
+    defer for (&solo) |*r| r.deinit();
+    var joined: [2]dsv41_model.Request = @splat(.{});
+    defer for (&joined) |*r| r.deinit();
+    var next: [2]u32 = undefined;
+    for (0..2) |i| {
+        const len: usize = 9 + i * 5;
+        var pr: [16]u32 = undefined;
+        for (pr[0..len], 0..) |*t, j| t.* = base[(j * (i + 3) + i) % base.len];
+        const l0 = try forwardOn(&fx, &solo[i], pr[0..len]);
+        defer _ = mlx.mlx_array_free(l0);
+        const l1 = try forwardOn(&fx, &joined[i], pr[0..len]);
+        defer _ = mlx.mlx_array_free(l1);
+        next[i] = try argmaxHost(&fx.xfm, l0);
+    }
+
+    // 3 plain joined decode steps over the streamed cache: exact byte parity vs solo.
+    for (0..3) |_| {
+        const ids0 = [_]u32{next[0]};
+        const ids1 = [_]u32{next[1]};
+        const out = try dsv41_serving.forwardRows(&fx.xfm, &.{
+            .{ .request = &joined[0], .ids = &ids0 },
+            .{ .request = &joined[1], .ids = &ids1 },
+        });
+        defer _ = mlx.mlx_array_free(out);
+        var got_all: std.ArrayList(u8) = .empty;
+        defer got_all.deinit(a);
+        try logitBytes(a, &got_all, out);
+        const row_bytes = got_all.items.len / 2;
+        for (0..2) |i| {
+            const solo_row = try forwardOn(&fx, &solo[i], &.{next[i]});
+            defer _ = mlx.mlx_array_free(solo_row);
+            var want_b: std.ArrayList(u8) = .empty;
+            defer want_b.deinit(a);
+            try logitBytes(a, &want_b, solo_row);
+            try testing.expectEqualSlices(u8, want_b.items, got_all.items[i * row_bytes ..][0..row_bytes]);
+            next[i] = try argmaxHost(&fx.xfm, solo_row);
+        }
+    }
+    try testing.expect(eng.fill_experts_total > 0);
+}

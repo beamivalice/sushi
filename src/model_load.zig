@@ -1205,6 +1205,7 @@ pub fn applyStreamingPlan(config: *ModelConfig, plan: StreamingPlan, budget_byte
     config.expert_layout = plan.layout;
     config.expert_streaming = true;
     config.expert_resident = plan.cache.resident;
+    config.expert_cache_slots = plan.cache.slots_per_layer;
     arch_config.adoptPlan(config);
     resolveConcurrency(config);
     config.expert_cache_bytes = plan.cache.cache_bytes;

@@ -63,7 +63,7 @@ const source: [:0]const u8 =
     \\    device bfloat16_t* dst = k_out + (size_t)t * (size_t)(2 * HALF);
     \\    float d = static_cast<float>(i) / static_cast<float>(HALF);
     \\    float inv_freq = metal::exp2(-d * as_type<float>(BASE));
-    \\    float L = as_type<float>(SCALE) * static_cast<float>(pos[0] + int(t));
+    \\    float L = as_type<float>(SCALE) * static_cast<float>(PER_ROW ? pos[t] : (pos[0] + int(t)));
     \\    float theta = L * inv_freq;
     \\    float costheta = metal::fast::cos(theta);
     \\    float sintheta = metal::fast::sin(theta);
@@ -110,7 +110,7 @@ pub fn applies(s: mlx.mlx_stream, ckv: Arr, w: Arr, latent: c_int, rope: c_int) 
         (cd == .float32 or cd == .bfloat16) and (wd == .float32 or wd == .bfloat16);
 }
 
-const Key = struct { t: c_int, lat: c_int, half: c_int, in_dt: mlx.mlx_dtype, c_dt: mlx.mlx_dtype, w_dt: mlx.mlx_dtype, base: c_int, eps: c_int };
+const Key = struct { t: c_int, lat: c_int, half: c_int, in_dt: mlx.mlx_dtype, c_dt: mlx.mlx_dtype, w_dt: mlx.mlx_dtype, base: c_int, eps: c_int, per_row: bool = false };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(k: Key) !kcfg.Config {
@@ -125,6 +125,7 @@ fn build(k: Key) !kcfg.Config {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, n, v));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", k.in_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "OT", k.c_dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "PER_ROW", k.per_row));
     return cfg;
 }
 
@@ -133,9 +134,20 @@ pub const Front = struct { c: Arr, k_pe: Arr };
 /// `applies`' operands at positions `pos0..`: `c` [T, latent] = `RMSNorm_w(ckv[:, :latent])` (ε `eps`) as `c_dt`,
 /// and `k_pe` [T, rope] BF16 = `ckv[:, latent:]` rotated (θ `theta`). The caller frees both.
 pub fn run(s: mlx.mlx_stream, ckv: Arr, w: Arr, latent: c_int, rope: c_int, theta: f32, eps: f32, pos0: c_int, c_dt: mlx.mlx_dtype) !Front {
-    const cfg = try cfgs.get(.{ .t = mlx.getShape(ckv)[0], .lat = latent, .half = @divExact(rope, 2), .in_dt = mlx.mlx_array_dtype(ckv), .c_dt = c_dt, .w_dt = mlx.mlx_array_dtype(w), .base = kcfg.bits(std.math.log2(theta)), .eps = kcfg.bits(eps) }, build);
     const pv = [_]i32{pos0};
-    const pos = try mlx.newData(&pv, &.{1}, .int32);
+    return runWith(s, ckv, w, latent, rope, theta, eps, &pv, c_dt, false);
+}
+
+/// `run` with row `t` rotated at its own `positions[t]`.
+pub fn runPerRow(s: mlx.mlx_stream, ckv: Arr, w: Arr, latent: c_int, rope: c_int, theta: f32, eps: f32, positions: []const c_int, c_dt: mlx.mlx_dtype) !Front {
+    return runWith(s, ckv, w, latent, rope, theta, eps, positions, c_dt, true);
+}
+
+fn runWith(s: mlx.mlx_stream, ckv: Arr, w: Arr, latent: c_int, rope: c_int, theta: f32, eps: f32, positions: []const c_int, c_dt: mlx.mlx_dtype, per_row: bool) !Front {
+    const t = mlx.getShape(ckv)[0];
+    if (per_row and positions.len != @as(usize, @intCast(t))) return error.Hy4RowsPositionsLen;
+    const cfg = try cfgs.get(.{ .t = t, .lat = latent, .half = @divExact(rope, 2), .in_dt = mlx.mlx_array_dtype(ckv), .c_dt = c_dt, .w_dt = mlx.mlx_array_dtype(w), .base = kcfg.bits(std.math.log2(theta)), .eps = kcfg.bits(eps), .per_row = per_row }, build);
+    const pos = try mlx.newData(positions.ptr, &.{@intCast(positions.len)}, .int32);
     defer _ = mlx.mlx_array_free(pos);
     const ins = [_]Arr{ ckv, w, pos };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -237,4 +249,34 @@ test "hy4 front: bf16 ckv widens in register and matches f32 ckv byte for byte i
     try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
     try testing.expectEqualSlices(u8, wc, try bytesOf(&o, gc));
     try testing.expectEqualSlices(u8, wk, try bytesOf(&o, gk));
+}
+
+test "hy4 front: per-row positions match per-row single launches byte for byte" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const positions = [_]c_int{ 0, 511, 512, 4097, 2048, 100_003, 7, 65_535 };
+    const t: c_int = positions.len;
+    const ckv = try o.contiguous(try randomArr(&o, &.{ t, 576 }, .float32, 314, 1.5));
+    const w = try o.contiguous(try randomArr(&o, &.{512}, .bfloat16, 315, 0.3));
+    try mlx.check(mlx.mlx_array_eval(ckv));
+    try mlx.check(mlx.mlx_array_eval(w));
+    const before = mlx.engine.stats().dispatches;
+    const got = try runPerRow(es, ckv, w, 512, 64, 1e4, 1e-5, &positions, .bfloat16);
+    const gc = try o.own(got.c);
+    const gk = try o.own(got.k_pe);
+    try mlx.check(mlx.mlx_array_eval(gk));
+    try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
+    for (positions, 0..) |pos, r| {
+        const ri: c_int = @intCast(r);
+        const want = try run(es, try o.contiguous(try o.slice(ckv, 0, ri, ri + 1)), w, 512, 64, 1e4, 1e-5, pos, .bfloat16);
+        try testing.expectEqualSlices(u8, try bytesOf(&o, try o.own(want.c)), try bytesOf(&o, try o.slice(gc, 0, ri, ri + 1)));
+        try testing.expectEqualSlices(u8, try bytesOf(&o, try o.own(want.k_pe)), try bytesOf(&o, try o.slice(gk, 0, ri, ri + 1)));
+    }
 }

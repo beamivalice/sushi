@@ -63,8 +63,11 @@ pub fn commitBytes(config: *const model_mod.ModelConfig, prompt_len: usize, max_
     _ = chunk;
     _ = mtp_on;
     const c = config.dsv41 orelse return null;
-    // As `dsv41_sched.coolerRows`: rows are a resident load's on Sushi Cooler.
-    if (!config.expert_resident or !@import("../cooler_side.zig").onEngine(config)) return null;
+    // Every Cooler load that joins rows (resident or cache-generous streamed, exact layout only) gives each concurrent
+    // request its own decode state, which admission must bill. Matches `dsv41_sched.coolerRows`.
+    if (!@import("../cooler_side.zig").onEngine(config) or !c.widthExactLayout()) return null;
+    const joins = config.expert_resident or dsv41_config.streamedRowsCap(c.experts, c.top_k, config.expert_cache_slots, 2) > 1;
+    if (!joins) return null;
     return c.stateReservedBytes(true, @as(u64, prompt_len) +| max_tokens) +| c.stateFixedBytes(config.drafterOn());
 }
 

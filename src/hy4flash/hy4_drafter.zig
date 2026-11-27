@@ -36,6 +36,27 @@ pub fn draftBlock(xfm: *Trunk, ctx: *ForwardCtx, t1: u32) !Hooks.Draft {
     return Hooks.draft(xfm, ctx, t1);
 }
 
+pub fn draftBatch(
+    xfm: *Trunk,
+    ctxs: []const *ForwardCtx,
+    t1s: []const u32,
+    max_drafts: usize,
+    out: []Hooks.Draft,
+) !void {
+    const st = &xfm.arch_state.hy4flash;
+    const m = st.model orelse return error.Hy4ModelMissing;
+    const d = &(st.drafter orelse return error.Hy4DflyMissing);
+    const n = ctxs.len;
+    if (n == 0 or n > hy4_dfly.Drafter.max_batch_slots or t1s.len != n or out.len != n) return error.Hy4RowsWidth;
+    var reqs: [hy4_dfly.Drafter.max_batch_slots]*@import("hy4_model.zig").Request = undefined;
+    for (ctxs, 0..) |ctx, i| {
+        const req = @import("hy4_state.zig").requestOf(ctx) orelse return error.Hy4NoRequest;
+        if (req.pos != ctx.cache.step) return error.Hy4CachePositionMismatch;
+        reqs[i] = req;
+    }
+    return @import("hy4_plan.zig").runDraftBatch(m, d, reqs[0..n], t1s, max_drafts, out);
+}
+
 pub fn beginGroupVerify(xfm: *Trunk, ctx: *ForwardCtx, ids: []const u32) !void {
     const st = &xfm.arch_state.hy4flash;
     const m = st.model orelse return error.Hy4ModelMissing;
@@ -48,6 +69,10 @@ pub fn beginGroupVerify(xfm: *Trunk, ctx: *ForwardCtx, ids: []const u32) !void {
     var v: @import("hy4_state.zig").State.Verify = .{ .mark = if (ids.len > 1) try m.mark() else null, .ids = undefined, .n = ids.len };
     @memcpy(v.ids[0..ids.len], ids);
     r.verify = v;
+}
+
+pub fn finishGroupVerify(xfm: *Trunk, ctx: *ForwardCtx, accepted: usize) !void {
+    return Hooks.finish(xfm, ctx, accepted);
 }
 
 const Hooks = struct {
@@ -83,9 +108,9 @@ const Hooks = struct {
         errdefer if (v.mark) |*mk| m.dropMark(mk);
         @memcpy(v.ids[0..ids.len], ids);
         if (xfm.expert_stream) |engine| engine.beginForward();
+        defer if (xfm.expert_stream) |engine| engine.finishForward(ids.len);
         const logits = try @import("hy4_plan.zig").run(m, ids, null, .all);
         defer _ = mlx.mlx_array_free(logits);
-        if (xfm.expert_stream) |engine| engine.finishForward(ids.len);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, logits, &[_]c_int{ 1, @intCast(ids.len), mlx.getShape(logits)[1] }, 3, xfm.s));
@@ -110,9 +135,9 @@ const Hooks = struct {
         defer m.keep_hidden = was_keep;
         m.dropHidden();
         if (xfm.expert_stream) |engine| engine.beginForward();
+        defer if (xfm.expert_stream) |engine| engine.finishForward(1);
         const logits = try @import("hy4_plan.zig").run(m, &.{id}, null, .last);
         defer _ = mlx.mlx_array_free(logits);
-        if (xfm.expert_stream) |engine| engine.finishForward(1);
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, logits, &[_]c_int{ 1, 1, mlx.getShape(logits)[1] }, 3, xfm.s));
@@ -127,6 +152,12 @@ const Hooks = struct {
         m.keep_hidden = keep;
         if (!keep and (!m.serves_requests or m.bound != null)) m.dropHidden();
         return was;
+    }
+
+    pub fn hasHandover(xfm: *Trunk, ctx: *ForwardCtx) bool {
+        const m = xfm.arch_state.hy4flash.model orelse return false;
+        const r = @import("hy4_state.zig").requestOf(ctx) orelse &m.own;
+        return m.hasHandover(r);
     }
 
     /// The round failed between `verify` and `finish`: the open verify's mark is dropped and the model reset, as its
@@ -155,8 +186,8 @@ const Hooks = struct {
                 try m.keepRows(&v.mark.?, keep);
             } else {
                 if (xfm.expert_stream) |engine| engine.beginForward();
+                defer if (xfm.expert_stream) |engine| engine.finishForward(keep);
                 try m.rollbackTo(&v.mark.?, v.ids[0..keep]);
-                if (xfm.expert_stream) |engine| engine.finishForward(keep);
             }
         }
         ctx.cache.step = r.pos;

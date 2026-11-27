@@ -2800,8 +2800,8 @@ test "hy4 rows: a joined tick of rows all past the window runs its sliding layer
     for (&ids) |*d| d.* = rng.random().uintLessThan(u32, @intCast(p.config.vocab - 1)) + 1;
     // The tiny's window is 8: every row has more than a window behind it.
     const positions = [_]usize{ 9, 10, 13, 17, 20, 25, 31, 40 };
-    // Dispatches of the whole tick on the tiny's 3 sliding layers, grouped and one row at a time (M5 Max).
-    const counts = [_][3]u64{ .{ 1, 267, 267 }, .{ 4, 642, 654 }, .{ 8, 1181, 1229 } };
+    // Dispatches of the whole tick on the tiny's 3 sliding layers, grouped and one row at a time (M5 Max / M5 Ultra).
+    const counts = [_][3]u64{ .{ 1, 251, 251 }, .{ 4, 407, 449 }, .{ 8, 634, 748 } };
     for (counts) |want| {
         const n: usize = @intCast(want[0]);
         fwd.joined_attention_on = false;

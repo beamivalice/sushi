@@ -145,6 +145,8 @@ pub const ModelConfig = struct {
     expert_streaming: bool = false,
     /// The streaming plan holds every routed expert (`CachePlan.resident`): no union workspace, no misses.
     expert_resident: bool = false,
+    /// Cached expert slots per MoE layer (`CachePlan.slots_per_layer`, 0 when unset); used for cache-aware concurrency.
+    expert_cache_slots: u16 = 0,
     /// The load keeps its drafting head: a streamed load that serves `--mtp` (the head and its own routed experts
     /// resident), or a resident load whose arch reads the head from the pack (`arch_load.shipsHead`).
     stream_mtp_head: bool = false,

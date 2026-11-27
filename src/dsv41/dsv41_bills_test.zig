@@ -368,7 +368,7 @@ test "DeepSeek's request bill on a Cooler load is its exact state and one forwar
 
 test "DeepSeek: a request's decode state is billed as growth after admission only on a fully resident load, which joins rows" {
     var config = model_mod.ModelConfig{ .model_type = "deepseek_v41", .expert_streaming = true, .stream_mtp_head = true };
-    config.dsv41 = try dsv41_config.parseText(dsv41_config.release_config);
+    config.dsv41 = try dsv41_config.releaseStqForTest();
     // A streamed load serves one row: the model's parked state is resident before the request is admitted.
     try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
     // A fully resident load joins rows: the request makes its own state at its first forward, all of it after admission.
@@ -379,6 +379,19 @@ test "DeepSeek: a request's decode state is billed as growth after admission onl
     const c = &config.dsv41.?;
     const state = c.stateReservedBytes(true, 4096 + 512) + c.stateFixedBytes(config.drafterOn());
     try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
+    // A streamed Cooler load whose expert cache holds >= 2 * top_k slots/layer (release top_k == 6) also joins rows and bills every request's state.
+    config.expert_resident = false;
+    config.expert_cache_slots = 11;
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
+    config.expert_cache_slots = 48;
+    try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
+    config.expert_cache_slots = 262;
+    try std.testing.expectEqual(state, bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
+    // A non-width-exact layout (FP8 trunk / FP4 experts) never joins rows, even with generous streamed slots or resident.
+    config.dsv41.?.trunk_dec = null;
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
+    config.expert_resident = true;
+    try std.testing.expectEqual(@as(u64, 0), bills.admissionCommitBytes(&config, 4096, 512, 16, 2048, .{}));
 }
 
 /// What the served warm reads as its headroom right after a streamed load took what it holds under `ceiling`, the

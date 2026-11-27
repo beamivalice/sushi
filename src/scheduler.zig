@@ -3855,6 +3855,19 @@ fn waitPassesOut(io: std.Io, mu: *std.Io.Mutex, in_pass: *std.atomic.Value(u32))
     mu.lockUncancelable(io);
 }
 
+fn hasActiveDecoders(sch: *Scheduler) bool {
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    for (sch.decoding.items) |s| if (s.joinsTick()) return true;
+    return false;
+}
+
+fn interleaveChunkCapCb(opaque_ctx: *anyopaque) usize {
+    const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
+    const static_chunk: usize = if (ic.slot.model.config) |c| c.static_prefill_chunk else 0;
+    return sched_policy.interleaveChunkCap(hasActiveDecoders(ic.sch), slotOnEngine(ic.slot), static_chunk);
+}
+
 fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const ic: *InterleaveCtx = @ptrCast(@alignCast(opaque_ctx));
     ic.chunks_seen += 1;
@@ -3865,6 +3878,11 @@ fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
         log.debug("[interleave] engaged: decode ticks between prefill chunks\n", .{});
     }
     if (ic.cancelled.load(.acquire)) return;
+    // Cooler prefill chunks may submit asynchronously (e.g. Hy4's submitState): wait for the chunk's GPU passes
+    // before reading chunk_ns so the prefill's GPU wait is not misbilled to hosted decode and starving owed ticks.
+    if (slotOnEngine(ic.slot) and hasActiveDecoders(ic.sch)) {
+        _ = mlx.mlx_synchronize(mlx.engine.stream());
+    }
     const chunk_ns = ic.chunk_sw.read();
     const first_ns = interleaveDecodeTick(ic.sch);
     const owed = runOwedDecodeTicks(prefillDecodeShare(), chunk_ns, first_ns, ic, interleaveDecodeTickOpaque);
@@ -4420,6 +4438,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
     // nothing between here and `initWithOptions` may fail.
     if (slot.model.prefix_cache) |*hc| hc.donateCheckout(@intFromPtr(slot));
     if (hot_checked_out) slot.cache.adoptRestored();
+    interleave_ctx.chunk_sw.reset();
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -4476,7 +4495,7 @@ fn prefillSteps(sch: *Scheduler, slot: *Slot) !void {
             .prefill_progress_ms = if (watch_prefill) &slot.prefill_progress.elapsed_ms else null,
             .prefill_wake = if (slot.return_progress) .{ .ctx = slot, .call = prefillProgressWake } else null,
             .interleave_hook = if (prefillInterleaveEnabled())
-                .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
+                .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb, .chunk_cap = interleaveChunkCapCb }
             else
                 null,
             .write_through_hook = if (write_through_on)

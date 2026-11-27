@@ -974,7 +974,7 @@ fn dsparkCompany(ld: *Load, dir: []const u8, prompts: []const []const u32, max: 
     return run;
 }
 
-test "cooler contract: three DeepSeek DSpark requests decoding at once run as joined plain rows, each its solo DSpark text greedy and seeded, and the one left alone drafts again" {
+test "cooler contract: three DeepSeek DSpark requests decoding at once run grouped DSpark rounds, each its solo DSpark text greedy and seeded, and the one left alone drafts again" {
     try mlx.requireGpu();
     const D = ContractOf("dsv41");
     if (comptime !@hasDecl(D, "prompt")) return error.SkipZigTest;
@@ -1010,9 +1010,19 @@ test "cooler contract: three DeepSeek DSpark requests decoding at once run as jo
         var together = try dsparkCompany(&ld, dir, &prompts, &max, sampling);
         defer together.deinit();
         try testing.expectEqual(@as(usize, 0), together.failed);
+        errdefer std.debug.print("dsparkCompany temp={d:.2}: before={any} after={any} alone={d} end={d} lens={d},{d},{d}\n", .{
+            sampling.temperature,
+            together.rounds_before_joined_tick,
+            together.rounds_after_joined_tick,
+            together.last_alone_rounds,
+            together.last_end_rounds,
+            together.tokens[0].items.len,
+            together.tokens[1].items.len,
+            together.tokens[2].items.len,
+        });
+        // Joined: requests decoding at once run grouped DSpark rounds and match solo DSpark token-for-token.
+        try testing.expect(together.last_alone_rounds > 0);
         for (0..3) |i| {
-            // Joined: three requests decoding at once run no DSpark round, each its plain row.
-            try testing.expectEqual(together.rounds_before_joined_tick[i], together.rounds_after_joined_tick[i]);
             try testing.expectEqualSlices(u32, solo[i].tokens[0].items, together.tokens[i].items);
         }
         // Left alone, the last request drafts again.

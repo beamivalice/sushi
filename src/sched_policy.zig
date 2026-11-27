@@ -434,6 +434,16 @@ pub fn specTickMode(
 }
 
 pub const PREFILL_DECODE_SHARE_MAX: f32 = 0.9;
+/// Cooler prefill chunk cap while active decoders are interleaving: halves 4k/8k chunks to 2048 so worst-case
+/// inter-token stall stays ~1 s without doubling MoE expert-weight reads during prefill. Solo prefills keep full chunk.
+pub const INTERLEAVE_CHUNK_CAP_STATIC: usize = 2048;
+pub const INTERLEAVE_CHUNK_CAP_DYNAMIC: usize = 2048;
+
+pub fn interleaveChunkCap(has_decoders: bool, on_engine: bool, static_chunk: usize) usize {
+    if (!has_decoders or !on_engine) return 0;
+    return if (static_chunk != 0) INTERLEAVE_CHUNK_CAP_STATIC else INTERLEAVE_CHUNK_CAP_DYNAMIC;
+}
+
 pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
     const v = std.fmt.parseFloat(f32, text) catch return error.InvalidDecodeShare;
     if (!(v >= 0 and v <= PREFILL_DECODE_SHARE_MAX)) return error.InvalidDecodeShare;
@@ -1132,6 +1142,15 @@ test "decode share: 0.25 owes a third of the chunk time in ticks" {
     const r = runOwedDecodeTicks(0.25, 3000 * ms, 10 * ms, &f, FakeDecodeTicks.tick);
     try testing.expectEqual(@as(u32, 100), r.ticks);
     try testing.expectEqual(@as(u64, 1000 * ms), r.spent_ns);
+}
+
+test "interleaveChunkCap: solo prefills and off-engine loads stay uncapped; co-tenant Cooler prefills cap static and dynamic widths" {
+    try testing.expectEqual(@as(usize, 0), interleaveChunkCap(false, true, 0));
+    try testing.expectEqual(@as(usize, 0), interleaveChunkCap(false, true, 4096));
+    try testing.expectEqual(@as(usize, 0), interleaveChunkCap(true, false, 0));
+    try testing.expectEqual(@as(usize, 0), interleaveChunkCap(true, false, 4096));
+    try testing.expectEqual(INTERLEAVE_CHUNK_CAP_DYNAMIC, interleaveChunkCap(true, true, 0));
+    try testing.expectEqual(INTERLEAVE_CHUNK_CAP_STATIC, interleaveChunkCap(true, true, 4096));
 }
 
 test "takeFront moves the taken items to the front in their order and keeps every item" {

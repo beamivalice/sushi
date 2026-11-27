@@ -228,8 +228,9 @@ test "dsv41 queries: a decode token (DSV41_TINY, DSV41_STQ_TINY)" {
             const got = (try decodeTokens(env)) orelse continue;
             ran = true;
             try testing.expectEqual(folds, kernels.hcExpandProbed());
-            // The two counts alternate with the compressed-attention cycle. The Engram gate reads no width.
-            const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1160, 1209, 1160, 1209, 1160, 1209 } else if (folds) .{ 2250, 2306, 2250, 2306, 2250, 2306 } else .{ 2138, 2194, 2138, 2194, 2138, 2194 };
+            // The two counts alternate with the compressed-attention cycle (shared unpacked-picks cache across non-owner
+            // layers; fused STQ decode attention checks array metadata once per layer). The Engram gate reads no width.
+            const want: [6]u64 = if (std.mem.eql(u8, env, "DSV41_TINY")) .{ 1142, 1191, 1142, 1191, 1142, 1191 } else if (folds) .{ 2298, 2354, 2298, 2354, 2298, 2354 } else .{ 2186, 2242, 2186, 2242, 2186, 2242 };
             try testing.expectEqual(want, got);
         }
     }

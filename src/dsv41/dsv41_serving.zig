@@ -80,7 +80,7 @@ pub fn initDsv41(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     try dsv41_model.setIndexNax(mdl);
     try dsv41_model.setHcMixNax(mdl, kernels.hc_mix_nax_bar);
     dsv41_model.setReadDiag(diagEnvOn("SUSHI_DSV41_READ_DIAG"));
-    try applyRows(mdl, @import("dsv41_sched.zig").coolerRows(&config).rows, engine.plan.resident);
+    try applyRowsWithSlots(mdl, @import("dsv41_sched.zig").coolerRows(&config).rows, engine.plan.resident, engine.plan.slots_per_layer);
     if (mdl.ced_split) |split|
         log.info("[dsv41] CED: layers {d}..{d} run the last {d} rows of a prefill chunk\n", .{ split, mdl.cfg.layers - 1, mdl.cfg.window });
     log.info("[dsv41] prefill pipeline: {d} layers in flight\n", .{mdl.pipe_depth});
@@ -514,6 +514,7 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
         try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, n, st.n + n, ctx.prefill_rest, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
         engine.beginForward();
     }
+    defer if (self.expert_stream) |engine| engine.finishForward(n);
     // The model splices the image rows itself: the span's embedding never leaves it.
     const vision: ?dsv41_model.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
     const ahead = try m.gpa.alloc(u32, ctx.ahead_ids.len);
@@ -525,7 +526,6 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
         const state_only = dsv41_model.extendState(m, host, dsv41_model.SPAN, vision, ahead);
         if (own) dsv41_model.ownEnd(m, self.s);
         try state_only;
-        if (self.expert_stream) |engine| engine.finishForward(n);
         ctx.cache.step = st.n;
         return mlx.mlx_array_new();
     }
@@ -537,7 +537,6 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
     if (own) dsv41_model.ownEnd(m, self.s);
     const last = try forwarded;
     defer _ = mlx.mlx_array_free(last);
-    if (self.expert_stream) |engine| engine.finishForward(n);
     ctx.cache.step = st.n;
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
@@ -552,45 +551,112 @@ pub fn forwardDsv41With(self: *Trunk, ctx: *ForwardCtx, ids: mlx.mlx_array, m: *
 /// them (`serves_rows`); a config that says so over a streamed plan, or more rows than a joined forward carries, is
 /// refused by name.
 pub fn applyRows(mdl: *dsv41_model.Model, rows: usize, plan_resident: bool) !void {
+    return applyRowsWithSlots(mdl, rows, plan_resident, 0);
+}
+
+pub fn applyRowsWithSlots(mdl: *dsv41_model.Model, rows: usize, plan_resident: bool, slots_per_layer: usize) !void {
     if (rows <= 1) return;
+    const hw_max = mdl.maxJoinedRows();
     if (!plan_resident) {
-        log.err("[cooler] the DeepSeek config claims every expert resident, but the expert plan streams them\n", .{});
-        return error.Dsv41ResidencyMismatch;
+        const allowed = @import("dsv41_config.zig").streamedRowsCap(mdl.cfg.experts, mdl.cfg.top_k, slots_per_layer, hw_max);
+        if (allowed <= 1 or rows > allowed) {
+            log.err("[cooler] the DeepSeek config claims {d} joined rows over a streamed plan ({d}/{d} slots/layer, allows {d})\n", .{ rows, slots_per_layer, mdl.cfg.experts, allowed });
+            return error.Dsv41ResidencyMismatch;
+        }
     }
-    if (rows > mdl.maxJoinedRows()) {
-        log.err("[cooler] {d} DeepSeek rows: a joined forward carries at most {d} on this GPU\n", .{ rows, mdl.maxJoinedRows() });
+    if (rows > hw_max) {
+        log.err("[cooler] {d} DeepSeek rows: a joined forward carries at most {d} on this GPU\n", .{ rows, hw_max });
         return error.Dsv41RowsPastJoinCap;
     }
     if (!mdl.widthExact()) {
         log.err("[cooler] DeepSeek rows: a linear of this pack takes a product plan by row count, so a joined row is not its request's step\n", .{});
         return error.Dsv41RowsNotWidthExact;
     }
+    mdl.joined_rows_cap = if (rows < hw_max) rows else 0;
     mdl.serves_rows = true;
 }
 
 pub fn forwardRows(self: *Trunk, segs: []const dsv41_model.Seg) !mlx.mlx_array {
+    return forwardRowsWith(self, segs, false);
+}
+
+/// `forwardRows` deferring the head eval (`lazy_head`) so `sampler.sampleRows` chains directly onto the logits with
+/// one GPU wait per tick.
+pub fn forwardRowsDeferred(self: *Trunk, segs: []const dsv41_model.Seg) !mlx.mlx_array {
+    return forwardRowsWith(self, segs, true);
+}
+
+fn forwardRowsWith(self: *Trunk, segs: []const dsv41_model.Seg, lazy_head: bool) !mlx.mlx_array {
     const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoModel;
-    if (self.expert_stream) |engine| if (!engine.plan.resident) return error.Dsv41RowsStreamed;
+    if (!m.serves_rows) return error.Dsv41RowsStreamed;
     m.s = self.s;
-    // The ledger bills each request's own terms at its position (`Config.joinedCap`).
+    // The ledger bills each request's own terms at its position (`Config.joinedCap` / `joinedGroupsCap`).
     var seqs: [16]u64 = undefined;
+    var row_counts: [16]u64 = undefined;
+    var total_rows: usize = 0;
+    var multi_row = false;
     if (segs.len > seqs.len) return error.Dsv41RowsWidth;
-    for (segs, seqs[0..segs.len]) |sg, *seq| seq.* = (sg.request.state orelse return error.Dsv41NoLiveState).n + sg.ids.len;
+    for (segs, seqs[0..segs.len], row_counts[0..segs.len]) |sg, *seq, *rc| {
+        seq.* = (sg.request.state orelse return error.Dsv41NoLiveState).n + sg.ids.len;
+        rc.* = sg.ids.len;
+        total_rows += sg.ids.len;
+        if (sg.ids.len > 1) multi_row = true;
+    }
     const armed = m.arm(.rows);
     defer armed.end();
+    armed.lazyHead(lazy_head);
     if (self.expert_stream) |engine| {
-        try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len], .{ .model = m, .rows = segs });
+        if (multi_row)
+            try dsv41_borrow.beforeGroupRowsForward(engine, &self.config, &m.cfg, row_counts[0..segs.len], seqs[0..segs.len], .{ .model = m, .rows = segs })
+        else
+            try dsv41_borrow.beforeRowsForward(engine, &self.config, &m.cfg, seqs[0..segs.len], .{ .model = m, .rows = segs });
         engine.beginForward();
     }
+    defer if (self.expert_stream) |engine| engine.finishForward(total_rows);
     const own = m.onEngine();
     if (own) _ = dsv41_model.ownBegin(m);
     if (own) mlx.engine.phase(1);
     defer mlx.engine.phase(0);
     const joined = dsv41_model.extendRows(m, segs);
     if (own) dsv41_model.ownEnd(m, self.s);
-    const out = try joined;
-    if (self.expert_stream) |engine| engine.finishForward(segs.len);
-    return out;
+    return try joined;
+}
+
+/// Batched DSpark draft across `reqs` in ONE stage pass and ONE shared LM head projection (`dsv41_model.draftBatch`).
+pub fn dsv41DraftBatch(self: *Trunk, reqs: []const *dsv41_model.Request, t1s: []const u32, widths: []const u32, out_drafts: []dsv41_model.Draft) !void {
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    if (m.onEngine()) _ = dsv41_model.ownBegin(m);
+    defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
+    mlx.engine.phase(2);
+    defer mlx.engine.phase(0);
+    try dsv41_model.draftBatch(m, reqs, t1s, widths, .conf, out_drafts);
+}
+
+/// Opens a verify snapshot on `ctx`'s request before a grouped multi-row `forwardRowsDeferred`.
+pub fn dsv41BeginGroupVerify(self: *Trunk, ctx: *ForwardCtx, rows: usize) !void {
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
+    const req = dsv41_state.requestOf(ctx) orelse return error.Dsv41NoRequest;
+    const st = req.state orelse return error.Dsv41NoLiveState;
+    if (st.n != ctx.cache.step) return error.Dsv41CachePositionMismatch;
+    try dsv41_model.beginVerifyReq(m, req, rows);
+}
+
+/// Aborts an open group verify snapshot on `ctx`'s request.
+pub fn dsv41DropGroupVerify(ctx: *ForwardCtx) void {
+    const req = dsv41_state.requestOf(ctx) orelse return;
+    dsv41_model.dropVerifyReq(req);
+}
+
+/// Cuts back all grouped verify requests to `accepteds[i] + 1` rows and commits their kept main rows in ONE joined pass.
+pub fn dsv41FinishGroupVerify(self: *Trunk, reqs: []const *dsv41_model.Request, accepteds: []const usize) !void {
+    const m = dsv41_state.modelOf(self) orelse return error.Dsv41NoDspark;
+    m.s = self.s;
+    if (m.onEngine()) _ = dsv41_model.ownBegin(m);
+    defer if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
+    mlx.engine.phase(4);
+    defer mlx.engine.phase(0);
+    try dsv41_model.finishVerifyJoined(m, reqs, accepteds);
 }
 
 /// DeepSeek-V4.1's DSpark round on the request's state (`ctx.cache.step` mirrors it): the drafter's block from `t1`.
@@ -623,6 +689,7 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
         try dsv41_borrow.beforeForward(engine, &self.config, &m.cfg, ids.len, st.n + ids.len, 0, .{ .model = m, .request = dsv41_state.requestOf(ctx) });
         engine.beginForward();
     }
+    defer if (self.expert_stream) |engine| engine.finishForward(ids.len);
     if (m.onEngine()) _ = dsv41_model.ownBegin(m);
     mlx.engine.phase(3);
     defer mlx.engine.phase(0);
@@ -630,7 +697,6 @@ pub fn dsv41VerifyImpl(self: *Trunk, ctx: *ForwardCtx, ids: []const u32) !mlx.ml
     if (m.onEngine()) dsv41_model.ownEnd(m, self.s);
     const all = try verified;
     defer _ = mlx.mlx_array_free(all);
-    if (self.expert_stream) |engine| engine.finishForward(ids.len);
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     // On the stream that made the logits: MLX's would wait for the head here, ahead of the verdict built on them.

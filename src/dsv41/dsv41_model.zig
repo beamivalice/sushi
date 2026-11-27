@@ -857,6 +857,8 @@ pub const Model = struct {
     dspark_exact: bool = true,
     /// The load joins requests as rows of one decode forward (`extendRows`), so a one-row step takes the exact arm.
     serves_rows: bool = false,
+    /// Cache-aware joined row ceiling (0 = full hardware `maxJoinedRows`); set on streamed loads with partial expert caches.
+    joined_rows_cap: usize = 0,
     /// With joined rows, the model's own state is lent (`lendOwn`): a forward that carries no slot request (a warm, a
     /// test, a tool's run) runs it, as every forward does at one row.
     own_lent: bool = false,
@@ -944,10 +946,17 @@ pub const Model = struct {
         };
     }
 
-    /// The most requests one joined forward takes: on a `widthExact` layout, the widest whose rows are their one-row
-    /// steps' bits.
+    /// The most requests one joined forward takes on this GPU: on a `widthExact` layout, the widest whose rows are their
+    /// one-row steps' bits. Reads no runtime cap field so uninitialized-model unit tests remain valid.
     pub fn maxJoinedRows(self: *const Model) usize {
         return @intCast(exl3.project_rows.rowsMax(self.rowsOf(.rows)));
+    }
+
+    /// The live joined-row ceiling for this load: `maxJoinedRows()` on resident loads, or `joined_rows_cap` on streamed
+    /// loads with partial expert caches.
+    pub fn servedJoinedRows(self: *const Model) usize {
+        const hw = self.maxJoinedRows();
+        return if (self.joined_rows_cap > 0) @min(hw, self.joined_rows_cap) else hw;
     }
 
     /// The widest verify the trellis arm keeps exact: 16 on a machine with matrix units, 8 without, where the trunk
@@ -1746,7 +1755,8 @@ fn indexWeights(sc: *Scope, fused: bool, l: *const Lin, x: A) !A {
 /// gate in f32 above ratio 1), publishes index keys from the latent before rope when this layer owns
 /// them, then ropes the latent at its group's first position and stores it fp4-simulated.
 /// `kv_in`: a ratio-1 compressor's projection of `x` when the stacked attention bank made it, else none.
-fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize, kv_in: A, sh: *Shared) !void {
+/// `pre_proj`: a ratio>1 compressor's `{ kv, gate }` projections already computed across joined rows, else null.
+fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize, kv_in: A, sh: *Shared, pre_proj: ?[2]A) !void {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const cw = &ly.comp.?;
@@ -1760,12 +1770,16 @@ fn compress(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, p0: usize,
         latent = try sc.rms(if (kv_in.ctx != null) kv_in else try cw.wkv.apply(sc, x), cw.norm, c.eps);
     } else {
         const hd = c.head_dim;
-        const xf = try sc.astype(x, .float32);
         var proj: [2]A = undefined;
-        if (cw.shared != null and dim(xf, 0) <= exl3.project_rows.PROJECT_ROWS_MAX)
-            try sharedApply(sc, cw.shared.?, cw.wkv.stq.?.dec, xf, &proj)
-        else
-            proj = .{ try denseLin(sc, m, &cw.wkv, xf), try denseLin(sc, m, &cw.wgate.?, xf) };
+        if (pre_proj) |pp| {
+            proj = pp;
+        } else {
+            const xf = try sc.astype(x, .float32);
+            if (cw.shared != null and dim(xf, 0) <= @as(usize, @intCast(exl3.project_rows.rowsMax(sc.rows))))
+                try sharedApply(sc, cw.shared.?, cw.wkv.stq.?.dec, xf, &proj)
+            else
+                proj = .{ try denseLin(sc, m, &cw.wkv, xf), try denseLin(sc, m, &cw.wgate.?, xf) };
+        }
         var kv = proj[0];
         var gate = proj[1];
         var pend_rows: usize = 0;
@@ -1991,10 +2005,13 @@ pub fn indexStream(sc: *Scope, rows: *const Rows, nb: usize, q: A, w: A, wscale:
     return .{ .idx = idx, .cand = cand };
 }
 
+/// Precomputed indexer queries and head weights sliced from a joined layer's shared projections.
+const PreIdx = struct { q: A, wts: A };
+
 /// The top-`index_topk` compressed groups each of a span's queries keeps (`[Ls, k]` int32, -1 = none),
 /// scored against the latest index-key owner's keys. The candidate source also publishes its pinned
 /// blocks in `cand`; later index sources score only inside them.
-fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: usize, cand: *A, sh: *Shared) !A {
+fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: usize, cand: *A, sh: *Shared, pre: ?PreIdx) !A {
     const c = &m.cfg;
     const Ls = dim(x, 0);
     const r: usize = m.ratio(li);
@@ -2004,10 +2021,12 @@ fn indexer(sc: *Scope, m: *const Model, st: *State, li: usize, x: A, qr: A, p0: 
     const iw = &m.layers[li].idx.?;
     const owner = c.latest(li, Config.isOwner);
     const rows = &st.layers[owner].idx_k.?;
-    const pos = try sh.pos(sc, p0, Ls, 1);
-    const q = try ropeQ(sc, m, try sc.reshape(try iw.wq_b.apply(sc, qr), &.{ ci(Ls), ci(ih), ci(ihd) }), m.rope_yarn.freqs, pos, false, .fp4_ue8m0, .float32);
+    const q = if (pre) |p| p.q else blk: {
+        const pos = try sh.pos(sc, p0, Ls, 1);
+        break :blk try ropeQ(sc, m, try sc.reshape(try iw.wq_b.apply(sc, qr), &.{ ci(Ls), ci(ih), ci(ihd) }), m.rope_yarn.freqs, pos, false, .fp4_ue8m0, .float32);
+    };
     const wscale = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd))) / @sqrt(@as(f32, @floatFromInt(ih)));
-    const wts = try indexWeights(sc, fusedOn(sc, m), &iw.weights_proj, x);
+    const wts = if (pre) |p| p.wts else try indexWeights(sc, fusedOn(sc, m), &iw.weights_proj, x);
     const lens = try sh.lens(sc, p0, Ls, r);
     const ninf = try sc.f(-std.math.inf(f32));
     const kk = @min(c.index_topk, nb);
@@ -2256,14 +2275,14 @@ pub const Picks = struct {
 /// The compressed rows span `si` (chunk rows [a, b)) attends to and the groups it picked: the indexer's top-k
 /// when this layer owns one, else the one a layer above handed down (`sh`). `raw`: a packed store is handed over
 /// as it is, for the kernel that decodes the picks itself.
-fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr: A, p0: usize, a: usize, b: usize, sh: *Shared, si: usize, raw: bool) !Picks {
+fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr: A, p0: usize, a: usize, b: usize, sh: *Shared, si: usize, raw: bool, pre_idx: ?PreIdx) !Picks {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const r = ly.ratio;
     if (r == 0) return .{};
     const clen = (p0 + b) / r;
     if (ly.idx != null and clen > 0) {
-        const sp = try indexer(sc, m, st, li, try sc.slice(h, 0, a, b), try sc.slice(qr, 0, a, b), p0 + a, &sh.cand[si], sh);
+        const sp = try indexer(sc, m, st, li, try sc.slice(h, 0, a, b), try sc.slice(qr, 0, a, b), p0 + a, &sh.cand[si], sh, pre_idx);
         if (sh.topk[si].ctx != null) _ = mlx.mlx_array_free(sh.topk[si]);
         sh.topk[si] = sc.out(sp);
         sh.topk_ratio[si] = ly.ratio;
@@ -2272,16 +2291,16 @@ fn compressedPicks(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, qr:
     if (clen == 0 or sh.topk[si].ctx == null) return .{};
     const src = c.latest(li, Config.isKvSource);
     const comp = &st.layers[src].comp.?;
-    const want_raw = raw and comp.dtype == .bfloat16;
+    const cache_unpacked = b - a <= NARROW_ROWS;
     var picks: Picks = if (comp.pack == null)
         .{ .topk = sh.topk[si], .comp_rows = try comp.rows(sc, clen) }
-    else if (want_raw)
+    else if (raw)
         .{ .topk = sh.topk[si], .store = comp }
-    else if (sh.usrc[si] == src and sh.uclen[si] == clen and sh.urows[si].ctx != null)
+    else if (cache_unpacked and sh.usrc[si] == src and sh.uclen[si] == clen and sh.urows[si].ctx != null)
         .{ .topk = sh.uids[si], .comp_rows = sh.urows[si] }
     else blk: {
         const p = try packedPicks(sc, comp, sh.topk[si], false);
-        sh.setUnpacked(si, src, clen, sc.out(p.comp_rows), sc.out(p.topk));
+        if (cache_unpacked) sh.setUnpacked(si, src, clen, sc.out(p.comp_rows), sc.out(p.topk));
         break :blk p;
     };
     picks.ratio = sh.topk_ratio[si];
@@ -2345,11 +2364,12 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     if (pf) |p| try p.mark(.attn_in, &in);
     const qr = in[0];
     try tapInput(m, li, .q_lora, qr);
-    const q_proj = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(H), ci(hd) });
+    const q_flat = try ly.wq_b.apply(sc, qr);
     if (decodeAttnFits(sc, m, st, li, L)) {
-        const dh = try decodeHeads(sc, m, st, li, h, L, in, q_proj, p0, sh, if (ride) |rs| rs.z else null);
+        const dh = try decodeHeads(sc, m, st, li, h, L, in, q_flat, p0, sh, if (ride) |rs| rs.z else null, .{});
         return decodeOut(sc, m, li, dh, ride);
     }
+    const q_proj = try sc.reshape(q_flat, &.{ ci(L), ci(H), ci(hd) });
     const joint = fus and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
     const window = c.window;
     const rk: ?kernels.QKv = if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
@@ -2358,7 +2378,7 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
     const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
     if (pf) |p| try p.mark(.kv_row, &.{kv});
 
-    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, in[2], sh);
+    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, in[2], sh, null);
     if (pf) |p| {
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(sc.a);
@@ -2395,7 +2415,8 @@ fn attention(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, p0: usize
         parts[np] = try ssc.slice(kv, 0, if (lo > p0) lo - p0 else 0, b);
         np += 1;
         const keys_w = try ssc.concat(parts[0..np], 0);
-        const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, one_pass);
+        const raw_wide = one_pass and (if (ly.ratio > 0) st.layers[c.latest(li, Config.isKvSource)].comp.?.dtype == .bfloat16 else false);
+        const picks = try compressedPicks(&ssc, m, st, li, h, qr, p0, a, b, sh, si, raw_wide, null);
         if (pf) |p| try p.mark(.indexer, &.{ keys_w, picks.comp_rows, picks.topk });
         const K = if (picks.any()) dim(picks.topk, 1) else 0;
         const epilogue: ?kernels.Epilogue = if (fold) .{
@@ -2489,9 +2510,9 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
         const qp = try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(L), ci(c.heads), ci(hd) });
         break :blk try kernels.ropeTail(sc, qp, rope, pos, rd, false, .none, null);
     };
-    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, none, sh);
+    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, none, sh, null);
     ls.win.replace(sc.out(next_ring));
-    const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
+    const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false, null);
     if (width_probe) |t| {
         try t.put("a_q_{d}", .{li}, q);
         if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
@@ -2522,33 +2543,59 @@ fn attentionDecodeFused(sc: *Scope, m: *const Model, st: *State, li: usize, h: A
     return try decodeOut(sc, m, li, .{ .o = o, .grouped = grouped, .split = rode_split }, ride);
 }
 
+/// Precomputed per-segment slices hoisted across a joined layer in `attentionRowsJoined`.
+const PreJoined = struct {
+    q_roped: A = none,
+    comp_proj: ?[2]A = null,
+    comp_done: bool = false,
+    idx: ?PreIdx = null,
+};
+
 /// The decode branch of `attention` up to its heads, for one request's rows `h` over its state: `in` (`attnQuery`) and
-/// `q_proj` (`wq_b`, `[L, H, hd]`) are its rows of projections that read no state, so a joined layer makes them once
-/// for every request (`attentionRows`); `z` the mixes the kernel rides.
-fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usize, in: [3]A, q_proj: A, p0: usize, sh: *Shared, z: ?A) !DecodeHeads {
+/// `q_flat` (`wq_b`, `[L, H*hd]`, or none when `pre.q_roped` is supplied) are its rows of projections that read no
+/// state, so a joined layer makes them once for every request (`attentionRows`); `z` the mixes the kernel rides.
+fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usize, in: [3]A, q_flat: A, p0: usize, sh: *Shared, z: ?A, pre: PreJoined) !DecodeHeads {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const ls = &st.layers[li];
     const hd = c.head_dim;
+    const H = c.heads;
     const rd = c.rope_dim;
     const rope = m.ropeFor(li).freqs;
     const pos = try sh.pos(sc, p0, L, 1);
     const pf = prof(m, L);
     const qr = in[0];
-    const joint = fusedOn(sc, m) and pf == null and kernels.kvRowFits(hd) and mlx.mlx_array_dtype(q_proj) == mlx.mlx_array_dtype(in[1]);
+    const joint = fusedOn(sc, m) and pf == null and kernels.kvRowFits(hd) and (pre.q_roped.ctx != null or mlx.mlx_array_dtype(q_flat) == mlx.mlx_array_dtype(in[1]));
     const ring_joint = joint and ls.win.dt == mlx.mlx_array_dtype(in[1]) and ls.win.width == hd and hd % 8 == 0;
-    var next_ring = none;
-    const rk: ?kernels.QKv = if (ring_joint) blk: {
-        const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf.array, ls.win.cap, ls.win.width);
-        next_ring = r.ring;
-        break :blk .{ .q = r.q, .kv = none };
-    } else if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
-    const q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
-    if (pf) |p| try p.mark(.q, &.{ qr, q });
-    const kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
-    if (pf) |p| try p.mark(.kv_row, &.{kv});
 
-    if (ly.comp != null and sh.floor == null) try compress(sc, m, st, li, h, p0, in[2], sh);
+    var q: A = none;
+    var kv: A = none;
+    var next_ring = none;
+    var ring_in_place = false;
+    if (pre.q_roped.ctx != null) {
+        q = pre.q_roped;
+        if (ring_joint and try kernels.kvRowRingInPlace(sc, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf.array, ls.win.cap)) {
+            ring_in_place = true;
+        } else {
+            kv = try windowRow(sc, m, ly, in[1], rope, pos);
+        }
+    } else if (ring_joint and try kernels.ropeKvRingInPlace(sc, q_flat, in[1], ly.kv_norm, rope, pos, H, rd, c.eps, m.qat_on, ls.win.buf.array, ls.win.cap)) {
+        q = try sc.reshape(q_flat, &.{ ci(L), ci(H), ci(hd) });
+        ring_in_place = true;
+    } else {
+        const q_proj = try sc.reshape(q_flat, &.{ ci(L), ci(H), ci(hd) });
+        const rk: ?kernels.QKv = if (ring_joint) blk: {
+            const r = try kernels.ropeKvRing(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on, ls.win.buf.array, ls.win.cap, ls.win.width);
+            next_ring = r.ring;
+            break :blk .{ .q = r.q, .kv = none };
+        } else if (joint) try kernels.ropeKv(sc, q_proj, in[1], ly.kv_norm, rope, pos, rd, c.eps, m.qat_on) else null;
+        q = if (rk) |r| r.q else try ropeQ(sc, m, q_proj, rope, pos, false, .none, null);
+        if (pf) |p| try p.mark(.q, &.{ qr, q });
+        kv = if (rk) |r| r.kv else try windowRow(sc, m, ly, in[1], rope, pos);
+        if (pf) |p| try p.mark(.kv_row, &.{kv});
+    }
+
+    if (ly.comp != null and sh.floor == null and !pre.comp_done) try compress(sc, m, st, li, h, p0, in[2], sh, pre.comp_proj);
     if (pf) |p| {
         var ev: std.ArrayList(A) = .empty;
         defer ev.deinit(sc.a);
@@ -2557,9 +2604,17 @@ fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usiz
     }
 
     // The ring holds this chunk's rows before the kernel reads them; the heads leave inverse-rotated.
-    if (ring_joint) ls.win.replace(sc.out(next_ring)) else try ls.win.write(kv, p0, sc.s);
-    const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false);
-    if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf.array, picks.comp_rows, picks.topk });
+    if (ring_in_place) {
+        // `ls.win.buf.array` was updated directly (with automatic CoW if shared).
+    } else if (next_ring.ctx != null) {
+        ls.win.replace(sc.out(next_ring));
+    } else {
+        try ls.win.write(kv, p0, sc.s);
+    }
+    // Unpack once at KV/index-owner layers and reuse via `Shared`'s per-span cache across all 64 MQA heads and
+    // non-owner layers: beats per-head in-register FP4 unpacking at 4k+ contexts where K=2048 picks repeat 256x.
+    const picks = try compressedPicks(sc, m, st, li, h, qr, p0, 0, L, sh, 0, false, pre.idx);
+    if (pf) |p| try p.mark(.indexer, &.{ ls.win.buf.array, if (picks.store) |st_c| st_c.buf.array else picks.comp_rows, picks.topk });
     if (width_probe) |t| {
         try t.put("a_q_{d}", .{li}, q);
         if (picks.topk.ctx != null) try t.put("a_topk_{d}", .{li}, picks.topk);
@@ -2569,7 +2624,11 @@ fn decodeHeads(sc: *Scope, m: *const Model, st: *State, li: usize, h: A, L: usiz
     const o = try kernels.attnDecode(sc, .{
         .q = q,
         .ring = ls.win.buf.array,
-        .comp = picks.comp_rows,
+        .comp = if (picks.store) |st_c| st_c.buf.array else picks.comp_rows,
+        .comp_scales = if (picks.store) |st_c| st_c.sbuf.array else none,
+        .comp_n = if (picks.store != null) (p0 + L) / ly.ratio else 0,
+        .pack_mode = if (picks.store) |st_c| st_c.pack.?.mode else .fp4_e4m3,
+        .pack_group = if (picks.store) |st_c| st_c.pack.?.group else 0,
         .topk = picks.topk,
         .sink = ly.sink,
         .p0 = p0,
@@ -2608,9 +2667,10 @@ fn decodeOut(sc: *Scope, m: *const Model, li: usize, dh: DecodeHeads, ride: ?Rid
     return if (dh.grouped) attnOutGrouped(sc, m, li, ly, dh.o, null) else attnOut(sc, m, li, ly, dh.o, m.qat_on, null);
 }
 
-/// `attentionRows` at decode widths with the projections that read no state joined: `attnQuery` and `wq_b` over every
-/// row, each request's heads over its own state (`decodeHeads`), then one output projection. Null where a request's
-/// rows are not decode rows, or a probe or the profile reads the layer per request.
+/// `attentionRows` at decode widths with every projection that reads no state joined: `attnQuery`, `wq_b`, in-place Q
+/// RoPE, `hcSplitZ`, compressor linear projections and indexer query/weight projections run once across all rows, then
+/// each request attends over its own state (`decodeHeads`), followed by one grouped output projection. Null where a
+/// request's rows are not decode rows, or a probe or the profile reads the layer per request.
 fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []const AttnSeg, ride: ?RideSplit) !?A {
     const L = dim(h, 0);
     if (prof(m, L) != null or m.tap != null or m.trace != null or width_probe != null) return null;
@@ -2618,39 +2678,121 @@ fn attentionRowsJoined(sc: *Scope, m: *const Model, li: usize, h: A, segs: []con
     const c = &m.cfg;
     const ly = &m.layers[li];
     const n = segs.len;
+    const fus = fusedOn(sc, m);
+    const rope = m.ropeFor(li).freqs;
     const in = try attnQuery(sc, m, ly, h, m.maxJoinedRows());
-    const q_all = try sc.reshape(try ly.wq_b.apply(sc, in[0]), &.{ ci(L), ci(c.heads), ci(c.head_dim) });
+
+    // One flat position vector across every segment's rows feeds fused wq_b tail RoPE, ratio-1 compression, and indexer Q RoPE.
+    const pos_host = try sc.a.alloc(i32, L);
+    defer sc.a.free(pos_host);
+    var all_no_floor = true;
+    var any_clen = false;
+    for (segs) |sg| {
+        if (sg.sh.floor != null) all_no_floor = false;
+        if (ly.ratio > 0 and (sg.p0 + sg.rows) / ly.ratio > 0) any_clen = true;
+        for (0..sg.rows) |t| pos_host[sg.row + t] = @intCast(sg.p0 + t);
+    }
+    const pos_all = try sc.ints(pos_host, &.{ci(L)});
+
+    // Fuse Q tail RoPE directly into wq_b in registers across all joined rows; fall back to in-place tail RoPE when unavailable.
+    const q_all = blk: {
+        if (ly.wq_b.stq) |qb| if (try exl3.linear.linearRope(sc.s, in[0], qb.p, qb.dec, .{ .rows = sc.rows }, .{ .freqs = rope, .pos = pos_all, .hd = ci(c.head_dim), .rd = ci(c.rope_dim) })) |q_flat| {
+            break :blk try sc.reshape(try sc.keep(q_flat), &.{ ci(L), ci(c.heads), ci(c.head_dim) });
+        };
+        const q_flat = try ly.wq_b.apply(sc, in[0]);
+        if (fus and try kernels.ropeTailInPlace(sc, q_flat, rope, pos_all, L, c.heads, c.head_dim, c.rope_dim)) {
+            break :blk try sc.reshape(q_flat, &.{ ci(L), ci(c.heads), ci(c.head_dim) });
+        }
+        const q3 = try sc.reshape(q_flat, &.{ ci(L), ci(c.heads), ci(c.head_dim) });
+        break :blk try ropeQ(sc, m, q3, rope, pos_all, false, .none, null);
+    };
+
+    // Hoist compressor projections across all joined rows.
+    var comp_done_all = false;
+    var comp_proj_all: ?[2]A = null;
+    if (ly.comp) |*cw| if (all_no_floor) {
+        if (ly.ratio == 1) {
+            const wkv_ok = in[2].ctx != null or cw.wkv.stq != null;
+            const wk_ok = ly.idx == null or ly.idx.?.wk == null or ly.idx.?.wk.?.stq != null;
+            if (wkv_ok and wk_ok) {
+                const latent_all = try sc.rms(if (in[2].ctx != null) in[2] else try cw.wkv.apply(sc, h), cw.norm, c.eps);
+                var k_all = none;
+                if (ly.idx) |*iw| if (iw.wk) |*wk| {
+                    k_all = try ropeQ(sc, m, try sc.rms(try wk.apply(sc, latent_all), iw.k_norm, c.eps), m.rope_yarn.freqs, pos_all, false, .fp4_ue8m0, null);
+                };
+                const rot_all = try ropeQ(sc, m, latent_all, m.rope_yarn.freqs, pos_all, false, .fp4_e4m3, null);
+                for (segs) |sg| {
+                    const r0 = sg.row;
+                    const r1 = sg.row + sg.rows;
+                    const ls = &sg.st.layers[li];
+                    if (k_all.ctx != null) try ls.idx_k.?.append(sc, try sc.slice(k_all, 0, r0, r1));
+                    try ls.comp.?.append(sc, try sc.slice(rot_all, 0, r0, r1));
+                }
+                comp_done_all = true;
+            }
+        } else if (L <= @as(usize, @intCast(exl3.project_rows.rowsMax(sc.rows)))) {
+            if (cw.shared) |sh| {
+                const xf = try sc.astype(h, .float32);
+                var proj: [2]A = undefined;
+                try sharedApply(sc, sh, cw.wkv.stq.?.dec, xf, &proj);
+                comp_proj_all = proj;
+            } else if (denseNarrow(fus, &cw.wkv, h) and denseNarrow(fus, &cw.wgate.?, h)) {
+                const xf = try sc.astype(h, .float32);
+                comp_proj_all = .{ try denseLin(sc, m, &cw.wkv, xf), try denseLin(sc, m, &cw.wgate.?, xf) };
+            }
+        }
+    };
+
+    // Hoist indexer query & head-weight projections across all joined rows when any segment scores compressed keys.
+    var idx_all: ?PreIdx = null;
+    if (ly.idx) |*iw| if (any_clen and L <= NARROW_ROWS and iw.wq_b.stq != null and (iw.weights_proj.stq != null or denseNarrow(fus, &iw.weights_proj, h))) {
+        const iq = try ropeQ(sc, m, try sc.reshape(try iw.wq_b.apply(sc, in[0]), &.{ ci(L), ci(c.index_heads), ci(c.index_head_dim) }), m.rope_yarn.freqs, pos_all, false, .fp4_ue8m0, .float32);
+        const iwts = try indexWeights(sc, fus, &iw.weights_proj, h);
+        idx_all = .{ .q = iq, .wts = iwts };
+    };
+
+    // Split hyper-connection mixes once for all rows (replaces N per-request riding splits and 3 N-way concats).
+    const split_all: ?kernels.HcSplit = if (ride) |rs|
+        try kernels.hcSplitZ(sc, rs.z, c.hc_mult, c.hc_iters, try kernels.hcEps(sc, c.eps, c.hc_eps))
+    else
+        null;
+
     const os = try sc.a.alloc(A, n);
     defer sc.a.free(os);
-    const parts = try sc.a.alloc(A, 3 * n);
-    defer sc.a.free(parts);
-    var grouped: ?bool = null;
-    var rode: ?bool = null;
+    const seg_grouped = try sc.a.alloc(bool, n);
+    defer sc.a.free(seg_grouped);
+    var any_grouped = false;
     for (segs, 0..) |sg, i| {
         const r0 = sg.row;
         const r1 = sg.row + sg.rows;
         var mine: [3]A = .{ none, none, none };
         for (in, &mine) |a, *o| if (a.ctx != null) {
-            o.* = try sc.contiguous(try sc.slice(a, 0, r0, r1));
+            o.* = try sc.slice(a, 0, r0, r1);
         };
-        const z: ?A = if (ride) |rs| try sc.slice(rs.z, 0, r0, r1) else null;
-        const dh = try decodeHeads(sc, m, sg.st, li, try sc.slice(h, 0, r0, r1), r1 - r0, mine, try sc.contiguous(try sc.slice(q_all, 0, r0, r1)), sg.p0, sg.sh, z);
-        // Every request takes the same road: the joined output projection reads one layout.
-        if (grouped) |g| if (g != dh.grouped) return error.Dsv41RowsRoadsDiffer;
-        grouped = dh.grouped;
-        if (rode) |r| if (r != (dh.split != null)) return error.Dsv41RowsRoadsDiffer;
-        rode = dh.split != null;
+        const pre: PreJoined = .{
+            .q_roped = try sc.slice(q_all, 0, r0, r1),
+            .comp_proj = if (comp_proj_all) |cp| .{ try sc.slice(cp[0], 0, r0, r1), try sc.slice(cp[1], 0, r0, r1) } else null,
+            .comp_done = comp_done_all,
+            .idx = if (idx_all) |ia| .{ .q = try sc.slice(ia.q, 0, r0, r1), .wts = try sc.slice(ia.wts, 0, r0, r1) } else null,
+        };
+        const dh = try decodeHeads(sc, m, sg.st, li, try sc.slice(h, 0, r0, r1), r1 - r0, mine, none, sg.p0, sg.sh, null, pre);
+        seg_grouped[i] = dh.grouped;
+        any_grouped = any_grouped or dh.grouped;
         os[i] = dh.o;
-        if (dh.split) |sp| {
-            parts[i] = sp.pre;
-            parts[n + i] = sp.post;
-            parts[2 * n + i] = sp.comb;
-        }
+    }
+    // If a multi-row verify segment crossed an attention split count and returned ungrouped `[Ls, H, hd]` while
+    // peer segments returned grouped `[og, Ls, H/og*hd]`, transpose the ungrouped slice to match the grouped banks.
+    if (any_grouped) {
+        const og = c.o_groups;
+        const gin = c.heads * c.head_dim / og;
+        for (segs, 0..) |sg, i| if (!seg_grouped[i]) {
+            os[i] = try sc.transpose(try sc.reshape(os[i], &.{ ci(sg.rows), ci(og), ci(gin) }), &.{ 1, 0, 2 });
+        };
     }
     const joined: DecodeHeads = .{
-        .o = try sc.concat(os, if (grouped.?) 1 else 0),
-        .grouped = grouped.?,
-        .split = if (rode.?) .{ .pre = try sc.concat(parts[0..n], 0), .post = try sc.concat(parts[n .. 2 * n], 0), .comb = try sc.concat(parts[2 * n ..], 0) } else null,
+        .o = try sc.concat(os, if (any_grouped) 1 else 0),
+        .grouped = any_grouped,
+        .split = split_all,
     };
     return try decodeOut(sc, m, li, joined, ride);
 }
@@ -2662,10 +2804,17 @@ pub fn fusedHeads(sc: *Scope, sink: A, q: A, keys_w: A, wp: usize, window: usize
     return kernels.attnFusedPacked(sc, sink, q, keys_w, wp, window, rows.buf.array, rows.sbuf.array, pk.mode, pk.group, picks.topk, scale, out_dt, epi, nax);
 }
 
+/// Per-request DSpark stage windows joined into one `draftBatch` stage pass.
+pub const DsBatch = struct {
+    keys: []const A,
+    rows: []const usize,
+    pos: A,
+};
+
 /// What a DSpark stage's block attends over: `keys`, its window of committed main rows, then the block's own rows.
 /// `band` (`[rows, keys + rows]` bool) and `pos` (the rows' positions) default to one block at [p0, p0 + B) that sees
-/// everything.
-pub const DsKeys = struct { keys: A, band: A = none, pos: A = none };
+/// everything. With `batch` set, runs the stage projections once across multiple requests' draft blocks.
+pub const DsKeys = struct { keys: A = none, band: A = none, pos: A = none, batch: ?DsBatch = null };
 
 /// The attention input's projections: wq_a, wkv and (none past the stacked bank) a ratio-1 compressor's wkv, from one
 /// launch at decode widths.
@@ -2698,13 +2847,33 @@ fn attnQuery(sc: *Scope, m: *const Model, ly: *const Layer, h: A, max_rows: usiz
 }
 
 /// A DSpark stage's attention for the draft block `h` `[B, dim]`: every row sees the stage's window of committed main
-/// rows and every row of the block, its own too (there is no causal mask).
+/// rows and every row of the block, its own too (there is no causal mask). With `ds.batch`, hoists `attnQuery`,
+/// `wq_b`, RoPE, `windowRow`, and `attnOut` once across all requests' draft blocks.
 fn dsparkAttention(sc: *Scope, m: *const Model, li: usize, h: A, ds: DsKeys, p0: usize) !A {
     const c = &m.cfg;
     const ly = &m.layers[li];
     const B = dim(h, 0);
     const hd = c.head_dim;
     const rope = m.rope_plain.freqs;
+    if (ds.batch) |batch| {
+        const in = try attnQuery(sc, m, ly, h, m.maxJoinedRows());
+        const qr = in[0];
+        const q_all = try ropeQ(sc, m, try sc.reshape(try ly.wq_b.apply(sc, qr), &.{ ci(B), ci(c.heads), ci(hd) }), rope, batch.pos, false, .none, null);
+        const kv_all = try windowRow(sc, m, ly, in[1], rope, batch.pos);
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const n = batch.rows.len;
+        const heads = try sc.a.alloc(A, n);
+        defer sc.a.free(heads);
+        var r0: usize = 0;
+        for (batch.rows, batch.keys, 0..) |br, win_k, i| {
+            const r1 = r0 + br;
+            const keys_i = try sc.concat(&.{ win_k, try sc.slice(kv_all, 0, r0, r1) }, 0);
+            const band_i = try sc.ge(try sc.zeros(&.{ ci(br), ci(dim(keys_i, 0)) }, .float32), try sc.f(0));
+            heads[i] = try attnCore(sc, ly.sink, try sc.slice(q_all, 0, r0, r1), keys_i, band_i, none, none, scale, m.act);
+            r0 = r1;
+        }
+        return attnOut(sc, m, li, ly, try ropeQ(sc, m, try sc.concat(heads, 0), rope, batch.pos, true, .none, null), false, null);
+    }
     const pos = if (ds.pos.ctx != null) ds.pos else try posArray(sc, p0, B, 1);
     const in = try attnQuery(sc, m, ly, h, exl3.project_rows.PROJECT_ROWS_MAX);
     const qr = in[0];
@@ -3273,8 +3442,9 @@ fn moe(sc: *Scope, m: *const Model, li: usize, h: A, sh: *Shared, r: kernels.Rou
         }
         // At decode widths the GPU runs the shared expert while the host reads the picks and fills the misses, and the
         // layer is only submitted: the next layer's picks depend on it, so their read is the one wait per layer.
+        // On Cooler resident layers the host never reads the picks, so skip the per-layer CB split.
         const early = !m.sync_layers and dim(h, 0) <= exl3.kernels.DECODE_ROWS_MAX;
-        if (early) try submitWith(r.idx, ride);
+        if (early and !(mlx.engine.isStream(m.s) and residentLayer(m, li))) try submitWith(r.idx, ride);
         // A wide chunk's shared expert rides the routed launches when the trellis chain takes it there, and so does a
         // resident layer's at decode widths: no host read of its picks waits for a chain of its own to hide behind.
         const wide = m.tap == null and m.shared_fold and dim(h, 0) > exl3.kernels.DECODE_ROWS_MAX and ly.shared[0].stq != null;
@@ -3818,7 +3988,7 @@ fn warmOwnRows(m: *Model, t1: u32) !void {
     if (!m.serves_rows) return;
     var reqs: [16]Request = @splat(.{});
     defer for (&reqs) |*r| r.deinit();
-    const most = m.maxJoinedRows();
+    const most = m.servedJoinedRows();
     if (most > reqs.len) return error.Dsv41RowsWidth;
     const was = ownBegin(m);
     defer ownEnd(m, was);
@@ -3840,6 +4010,48 @@ fn warmOwnRows(m: *Model, t1: u32) !void {
         defer armed.end();
         dsv41_borrow.enterWarmRowsMlx(seqs[0..n], &m.cfg);
         try warmRun(try extendRows(m, segs[0..n]));
+    }
+    if (m.dspark != null and most >= 2) {
+        // Warm grouped DSpark `draftBatch` for every total draft width `2..most`, plus one grouped multi-row verify
+        // and `finishVerifyJoined`, so mixed speculating/plain group ticks compile nothing after warm.
+        const block_max: usize = m.cfg.dspark.block;
+        var rptrs_buf: [16]*Request = undefined;
+        var t1s_buf: [16]u32 = undefined;
+        var widths_buf: [16]u32 = undefined;
+        var drafts_buf: [16]Draft = undefined;
+        for (2..most + 1) |total_b| {
+            const k: usize = @max(2, (total_b + block_max - 1) / @max(block_max, 1));
+            if (k > most) continue;
+            var rem = total_b;
+            for (0..k) |i| {
+                const slots_left = k - i;
+                const w = @min(block_max, (rem + slots_left - 1) / slots_left);
+                rptrs_buf[i] = &reqs[i];
+                t1s_buf[i] = t1;
+                widths_buf[i] = @intCast(w);
+                rem -= w;
+            }
+            const armed = m.arm(.rows);
+            defer armed.end();
+            dsv41_borrow.enterWarmRowsMlx(seqs[0..k], &m.cfg);
+            try draftBatch(m, rptrs_buf[0..k], t1s_buf[0..k], widths_buf[0..k], .conf, drafts_buf[0..k]);
+            for (drafts_buf[0..k]) |*d| d.deinit();
+        }
+        if (most >= 4 and cfg_mod.ring_slack >= 2) {
+            var rptrs: [2]*Request = .{ &reqs[0], &reqs[1] };
+            const v_ids = [2]u32{ t1, t1 };
+            try beginVerifyReq(m, &reqs[0], 2);
+            errdefer dropVerifyReq(&reqs[0]);
+            try beginVerifyReq(m, &reqs[1], 2);
+            errdefer dropVerifyReq(&reqs[1]);
+            const v_segs = [2]Seg{ .{ .request = &reqs[0], .ids = &v_ids }, .{ .request = &reqs[1], .ids = &v_ids } };
+            const v_seqs = [2]u64{ reqs[0].position() + 2, reqs[1].position() + 2 };
+            const armed = m.arm(.rows);
+            defer armed.end();
+            dsv41_borrow.enterWarmRowsMlx(&v_seqs, &m.cfg);
+            try warmRun(try extendRows(m, &v_segs));
+            try finishVerifyJoined(m, &rptrs, &.{ 0, 1 });
+        }
     }
 }
 
@@ -4534,7 +4746,7 @@ pub fn imageRows(m: *const Model, ids: []const u32) usize {
 
 /// `beginPass` with the images of the request: the span positions of `ids` take `vision`'s rows.
 pub fn beginPassWith(m: *Model, st: *State, ids: []const u32, p0: usize, span: usize, vision: ?VisionRows) !Pass {
-    try flushMain(st);
+    try flushMain(m, st);
     const gpa = m.gpa;
     const c = &m.cfg;
     const L = ids.len;
@@ -4961,6 +5173,9 @@ fn buildLayer(m: *Model, p: *Pass, li: usize) !void {
     if (prof(m, L)) |pf| return pf.mark(.expand, ev.items);
     if (piped) return pipeSubmit(m, ev.items, p.x);
     if (wait) return evalAll(ev.items);
+    // Submit layer 0 immediately (overlaps with `extendLazy`/Engram) and flush every 4 resident layers so the GPU stays
+    // fed without per-layer CB split overhead or 20-layer tail stalls.
+    if (li > 0 and (li & 3) != 3 and mlx.engine.isStream(m.s) and residentLayer(m, li) and p.unresolved == null) return;
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try asyncEval(vec);
@@ -5096,20 +5311,22 @@ pub fn extendAhead(m: *Model, ids: []const u32, want: Want, span: usize, vision:
 /// One request in a joined forward: its own state, and the ids it steps by.
 pub const Seg = struct { request: *Request, ids: []const u32 };
 
-/// Advances each request of `segs` by its one id in one forward, and returns the logits of its row (f32
-/// `[segs.len, vocab]` in `segs` order; the caller frees). Each request keeps its own pass, so its embedding, Engram
-/// rows, DSpark targets, head and state's advance are its one-row step's; a layer joins the rows for everything but
-/// the attention, which runs per request over its state. A row is its request's one-row step bit for bit (the
-/// model's `.rows` arm, `serves_rows`). Solo only, by design: the lazy first layer, layer pipelining and the CED
-/// decoder (none runs at one row of a resident load) and route speculation (a streamed load's).
+/// Advances each request of `segs` by its `ids` (1 row for plain decode, or `1..ring_slack` rows for grouped DSpark
+/// verify) in one forward, and returns the logits of every row (f32 `[sum(sg.ids.len), vocab]` in `segs` order; the
+/// caller frees). Each request keeps its own pass and attention state; a layer joins all rows for every projection and
+/// routed MoE. A row is its request's solo step/verify bit for bit (`serves_rows`).
 pub fn extendRows(m: *Model, segs: []const Seg) !A {
     const n = segs.len;
-    if (n == 0 or n > m.maxJoinedRows()) return error.Dsv41RowsWidth;
+    const cap = m.servedJoinedRows();
+    if (n == 0 or n > cap) return error.Dsv41RowsWidth;
+    var total_rows: usize = 0;
     for (segs, 0..) |sg, i| {
-        if (sg.ids.len != 1) return error.Dsv41RowsOneIdEach;
+        if (sg.ids.len == 0 or sg.ids.len > cfg_mod.ring_slack) return error.Dsv41RowsWidth;
+        total_rows += sg.ids.len;
         if (sg.request.state == null) return error.Dsv41NoLiveState;
         for (segs[0..i]) |other| if (other.request == sg.request) return error.Dsv41RowsSameRequest;
     }
+    if (total_rows == 0 or total_rows > cap) return error.Dsv41RowsWidth;
     const gpa = m.gpa;
     errdefer m.dropAhead();
     transient_peak.begin();
@@ -5126,15 +5343,25 @@ pub fn extendRows(m: *Model, segs: []const Seg) !A {
     defer joined.deinit(gpa);
     var rows: JoinedRows = .{};
     defer rows.deinit();
-    for (0..m.cfg.layers) |li| try buildLayerRows(m, passes, &joined, li, &rows);
+    prefetchJoinedEngram(m, passes, &rows, total_rows);
+    for (0..m.cfg.layers) |li| try passLayerRows(m, passes, &joined, li, &rows, total_rows);
+    _ = try settleLastRows(m, &rows);
     // One vocabulary projection and one wait for every joined row; a tap, trace or profile keeps each pass's own head.
     if (m.head.stq != null and m.tap == null and m.trace == null and m.profile == null and width_probe == null) {
         var sc = m.scope();
         defer sc.deinit();
-        for (passes) |*p| try advancePass(m, p);
+        if (!try commitMainJoined(&sc, m, passes)) {
+            for (passes) |*p| try advancePass(m, p);
+        }
         const out = try projectHead(&sc, m, rows.x, rows.pre);
-        try waitHead(m, out, n);
-        transient_peak.end(.decode, n, null);
+        if (m.defer_head) {
+            try submit(out);
+            m.heads_deferred += 1;
+            reportReads(total_rows);
+        } else {
+            try waitHead(m, out, total_rows);
+        }
+        transient_peak.end(.decode, total_rows, null);
         return sc.out(out);
     }
     try rows.split(m, passes);
@@ -5145,10 +5372,10 @@ pub fn extendRows(m: *Model, segs: []const Seg) !A {
         _ = mlx.mlx_array_free(h);
     };
     for (passes, heads) |*p, *h| {
-        h.* = try finishPass(m, p, .last);
+        h.* = try finishPass(m, p, if (p.ids.len > 1) .all else .last);
         made += 1;
     }
-    transient_peak.end(.decode, n, null);
+    transient_peak.end(.decode, total_rows, null);
     var sc = m.scope();
     defer sc.deinit();
     const out = sc.out(try sc.concat(heads, 0));
@@ -5160,12 +5387,31 @@ pub fn extendRows(m: *Model, segs: []const Seg) !A {
 /// Test seam: true splits a joined forward's rows at every layer, as it did before `layerTakesOwnInput`.
 pub var split_every_layer: bool = false;
 
-/// Whether layer `li` reads or writes a request's own rows before its block: its Engram rows, a DSpark target, the tap.
+/// Whether layer `li` reads or writes a request's own rows before its block: its Engram rows or the tap.
+/// DSpark targets are captured directly from joined `x` without splitting/concatting rows.
 pub fn layerTakesOwnInput(m: *const Model, li: usize) bool {
-    if (split_every_layer or m.tap != null or m.cfg.engram.layerAt(li) != null) return true;
+    return split_every_layer or m.tap != null or m.cfg.engram.layerAt(li) != null;
+}
+
+/// Captures DSpark target `mean(x, axis=1)` directly from joined `x` `[L, hc, dim]` into each pass's `p.targets[t]`,
+/// avoiding per-layer `rows.split` + `concat` on target layers.
+fn captureJoinedTargets(sc: *Scope, m: *const Model, ps: []Pass, segs: []const AttnSeg, li: usize, x: A, ev: *std.ArrayList(A)) !void {
     const c = &m.cfg;
-    for (c.dspark.targets[0..c.dspark.n_targets]) |tl| if (tl == li) return true;
-    return false;
+    const ti: usize = for (c.dspark.targets[0..c.dspark.n_targets], 0..) |tl, t| {
+        if (tl == li) break t;
+    } else return;
+    var any = false;
+    for (ps) |*p| if (p.st.ds.len > 0) {
+        any = true;
+        break;
+    };
+    if (!any) return;
+    const mean_all = try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act);
+    for (ps, segs) |*p, sg| if (p.st.ds.len > 0) {
+        if (p.targets[ti].ctx != null) _ = mlx.mlx_array_free(p.targets[ti]);
+        p.targets[ti] = sc.out(try sc.slice(mean_all, 0, sg.row, sg.row + sg.rows));
+        if (!mlx.engine.isStream(m.s)) try ev.append(m.gpa, p.targets[ti]);
+    };
 }
 
 /// A joined forward's rows between layers: every request's rows in one array, split per request (`Pass.x`, `Pass.cpre`)
@@ -5173,11 +5419,28 @@ pub fn layerTakesOwnInput(m: *const Model, li: usize) bool {
 const JoinedRows = struct {
     x: A = none,
     pre: A = none,
+    unresolved: ?Unresolved = null,
+    rollbacks: usize = 0,
+    engram_pf: ?*engram.Prefetch = null,
+    engram_rows: [cfg_mod.max_engram]A = @splat(none),
 
-    fn deinit(self: *JoinedRows) void {
+    fn deinitArrays(self: *JoinedRows) void {
         if (self.x.ctx != null) _ = mlx.mlx_array_free(self.x);
         if (self.pre.ctx != null) _ = mlx.mlx_array_free(self.pre);
-        self.* = .{};
+        self.x = none;
+        self.pre = none;
+    }
+
+    fn deinit(self: *JoinedRows) void {
+        self.deinitArrays();
+        if (self.unresolved) |*u| u.deinit();
+        self.unresolved = null;
+        if (self.engram_pf) |pf| pf.finish();
+        self.engram_pf = null;
+        for (&self.engram_rows) |*r| if (r.ctx != null) {
+            _ = mlx.mlx_array_free(r.*);
+            r.* = none;
+        };
     }
 
     /// Each request's rows back into its pass, owned there.
@@ -5191,32 +5454,146 @@ const JoinedRows = struct {
             p.cpre = sc.out(try sc.contiguous(try sc.slice(self.pre, 0, row, r1)));
             row = r1;
         }
-        self.deinit();
+        self.deinitArrays();
     }
 };
 
+/// Starts a background `engram.Prefetch` on `m.engram_pool` for all joined rows before layer 0 whenever any joined
+/// Engram row misses `RowCache`, hiding SSD reads behind layer 0 (for layer 1) and layers 0..13 (for layer 14).
+fn prefetchJoinedEngram(m: *Model, ps: []const Pass, rows: *JoinedRows, total_rows: usize) void {
+    const hs = &(m.hash orelse return);
+    if (m.engrams.len == 0 or !m.decode_engram_ahead or ps.len <= 1 or split_every_layer or
+        m.tap != null or m.profile != null or total_rows == 0 or total_rows > NARROW_ROWS) return;
+    for (m.engrams) |*e| if (e.wkv.stq == null) return;
+    const cols = hs.cols();
+    const n_layers = hs.n_layers;
+    if (n_layers != m.engrams.len or cols > engram.MAX_COLS) return;
+    var all_ids_buf: [NARROW_ROWS * cfg_mod.max_engram * engram.MAX_COLS]u32 = undefined;
+    const all_ids = all_ids_buf[0 .. total_rows * n_layers * cols];
+    var off: usize = 0;
+    for (ps) |p| {
+        @memcpy(all_ids[off..][0..p.rows.len], p.rows);
+        off += p.rows.len;
+    }
+    var mine_buf: [NARROW_ROWS * engram.MAX_COLS]u32 = undefined;
+    var all_cached = true;
+    for (m.engrams, 0..) |*e, ei| {
+        const cache = e.table.cache orelse {
+            all_cached = false;
+            break;
+        };
+        const mine = mine_buf[0 .. total_rows * cols];
+        for (0..total_rows) |t| @memcpy(mine[t * cols ..][0..cols], all_ids[(t * n_layers + ei) * cols ..][0..cols]);
+        if (!cache.hasAll(mine)) {
+            all_cached = false;
+            break;
+        }
+    }
+    if (all_cached) return;
+    var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
+    for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
+    rows.engram_pf = engram.Prefetch.startWithPool(m.engram_pool, m.gpa, tables[0..m.engrams.len], &.{.{ .at = 0, .len = total_rows, .ids = all_ids }}, cols, total_rows) catch null;
+}
+
 /// An Engram layer of a joined forward with an STQ table: every request's ids in one gather and one projection, in
 /// request order, the bytes each request's own lookup gives. Null where a request must take its own input.
-fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, li: usize, x: A) !?A {
+fn joinedEngram(sc: *Scope, m: *Model, ps: []const Pass, rows: *JoinedRows, li: usize, x: A) !?A {
     const ei = m.cfg.engram.layerAt(li) orelse return null;
     const e = &m.engrams[ei];
     if (x.ctx == null or ps.len == 1 or e.wkv.stq == null or split_every_layer or
-        m.tap != null or m.profile != null or m.cfg.isDsparkTarget(li)) return null;
+        m.tap != null or m.profile != null) return null;
 
     const cols = m.hash.?.cols();
-    const ids = try sc.a.alloc(u32, ps.len * cols);
-    defer sc.a.free(ids);
-    for (ps, 0..) |p, i| @memcpy(ids[i * cols ..][0..cols], p.rows[ei * cols ..][0..cols]);
+    var total_tokens: usize = 0;
+    for (ps) |p| total_tokens += p.ids.len;
 
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const t0 = std.Io.Timestamp.now(io, .boot);
-    defer m.engram_wait_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
-    const table = blk: {
+    if (rows.engram_rows[ei].ctx == null) {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(io, .boot);
+        defer m.engram_wait_ns += @intCast(t0.untilNow(io, .boot).nanoseconds);
         const rt = readStart();
         defer readDone(.engram, rt);
-        break :blk try sc.keep(try e.table.gather(sc.a, ids, m.s));
+        rows.engram_rows[ei] = if (rows.engram_pf) |pf| blk: {
+            const raw = try pf.take(0, ei, 0);
+            defer raw.deinit(m.gpa);
+            break :blk sc.out(try sc.keep(try e.table.dequant(raw, total_tokens * cols, m.s)));
+        } else blk: {
+            const ids = try sc.a.alloc(u32, total_tokens * cols);
+            defer sc.a.free(ids);
+            const n_layers = m.hash.?.n_layers;
+            var dst: usize = 0;
+            for (ps) |p| {
+                for (0..p.ids.len) |t| {
+                    @memcpy(ids[dst * cols ..][0..cols], p.rows[(t * n_layers + ei) * cols ..][0..cols]);
+                    dst += 1;
+                }
+            }
+            if (try e.table.tryReadCached(sc.a, ids)) |raw| {
+                defer raw.deinit(sc.a);
+                break :blk sc.out(try sc.keep(try e.table.dequant(raw, ids.len, m.s)));
+            }
+            // Hand off the open GPU pass before reading Engram table rows from SSD so GPU work overlaps disk I/O.
+            if (mlx.engine.isStream(m.s)) try mlx.engine.submit();
+            break :blk sc.out(try sc.keep(try e.table.gather(sc.a, ids, m.s)));
+        };
+    }
+    return try engramApply(sc, m, e, x, rows.engram_rows[ei]);
+}
+
+/// Whether layer `li` of a joined forward queues its routed chain speculatively from the stream's cache map.
+fn specOnRows(m: *const Model, total_rows: usize, rollbacks: usize, li: usize) bool {
+    if (!m.route_spec or m.sync_layers or total_rows > exl3.kernels.DECODE_ROWS_MAX or rollbacks >= m.route_spec_rebuilds + li / 3) return false;
+    if (m.trace != null or m.profile != null or m.tap != null) return false;
+    const hk = switch (m.experts) {
+        .resident => return false,
+        .hook => |hk| hk,
     };
-    return try engramApply(sc, m, e, x, table);
+    const sp = hk.spec orelse return false;
+    return sp.can(hk.ctx, li);
+}
+
+/// Settles the joined forward's last unresolved speculative routed layer, if any.
+fn settleLastRows(m: *Model, rows: *JoinedRows) !bool {
+    var u = rows.unresolved orelse return false;
+    rows.unresolved = null;
+    defer u.deinit();
+    settle_site = .settle_last;
+    defer settle_site = .settle;
+    const exact = try settleRecord(m, &u) orelse return false;
+    if (rows.x.ctx != null) _ = mlx.mlx_array_free(rows.x);
+    rows.x = exact;
+    return true;
+}
+
+/// Layer `li` of a joined forward with overlapped route speculation (`passLayer` over all joined requests): submits
+/// layer `li` before settling layer `li - 1`'s streamed cache map, rolling back every pass's layer-`li` state on miss.
+fn passLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *JoinedRows, total_rows: usize) !void {
+    const on = specOnRows(m, total_rows, rows.rollbacks, li);
+    if (rows.unresolved != null and !on) _ = try settleLastRows(m, rows);
+    var prior = rows.unresolved;
+    rows.unresolved = null;
+    defer if (prior) |*u| u.deinit();
+    var undos: [16]Undo = undefined;
+    const n_undo: usize = if (prior != null) ps.len else 0;
+    if (prior != null) {
+        for (ps, undos[0..n_undo]) |*p, *u| u.* = Undo.take(p.st, li, p.ids.len);
+    }
+    defer for (undos[0..n_undo]) |*u| u.deinit();
+    joined.spec_on = on;
+    try buildLayerRows(m, ps, joined, li, rows);
+    if (prior == null) return;
+    const u = &prior.?;
+    const exact = try settleRecord(m, u) orelse return;
+    if (rows.unresolved) |*next| next.deinit();
+    rows.unresolved = null;
+    for (undos[0..n_undo]) |*un| un.restore();
+    for (ps) |*p| p.sh.clearUnpackedAll();
+    rows.deinitArrays();
+    rows.x = exact;
+    rows.pre = handle(u.pre);
+    rows.rollbacks += 1;
+    try submit(rows.x);
+    return passLayerRows(m, ps, joined, li, rows, total_rows);
 }
 
 /// Layer `li` of a joined forward: each request's own input, then one block over all rows.
@@ -5235,8 +5612,9 @@ fn buildLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *Join
     }
     var x = rows.x;
     var pre = rows.pre;
-    if (try joinedEngram(&sc, m, ps, li, x)) |written| {
+    if (try joinedEngram(&sc, m, ps, rows, li, x)) |written| {
         x = written;
+        try captureJoinedTargets(&sc, m, ps, segs, li, x, &ev);
     } else if (x.ctx == null or layerTakesOwnInput(m, li)) {
         if (x.ctx != null) try rows.split(m, ps);
         const xs = try gpa.alloc(A, ps.len);
@@ -5256,10 +5634,17 @@ fn buildLayerRows(m: *Model, ps: []Pass, joined: *Shared, li: usize, rows: *Join
             p.x = none;
             p.cpre = none;
         }
+    } else {
+        try captureJoinedTargets(&sc, m, ps, segs, li, x, &ev);
     }
     const out = try block(&sc, m, ps[0].st, li, x, pre, 0, joined, SPAN, null, segs);
-    rows.deinit();
-    rows.* = .{ .x = out.x, .pre = out.pre };
+    rows.deinitArrays();
+    rows.x = out.x;
+    rows.pre = out.pre;
+    rows.unresolved = joined.spec;
+    joined.spec = null;
+    if (rows.unresolved) |u| try ev.append(gpa, u.idx);
+    if (li > 0 and (li & 3) != 3 and mlx.engine.isStream(m.s) and residentLayer(m, li) and rows.unresolved == null) return;
     try ev.append(gpa, rows.x);
     try ev.append(gpa, rows.pre);
     for (ps) |*p| {
@@ -5284,7 +5669,7 @@ pub fn extendLazy(m: *Model, id: A, host: *[1]u32) !A {
     const st = try ensureState(m);
     transient_peak.begin();
     defer transient_peak.end(.decode, 1, null);
-    try flushMain(st);
+    try flushMain(m, st);
     var pass: Pass = .{ .st = st, .ids = host, .p0 = st.n, .span = SPAN, .rows = &.{}, .x = none, .cpre = none, .sh = try Shared.init(m.gpa, 1) };
     defer pass.deinit(m.gpa);
     {
@@ -5476,7 +5861,7 @@ pub fn extendState(m: *Model, ids: []const u32, span: usize, vision: ?VisionRows
 fn cedCompress(sc: *Scope, m: *Model, p: *Pass, li: usize) !void {
     const ly = &m.layers[li];
     const pa = try hcPre(sc, m, p.x, null, p.cpre, &ly.hc_attn, ly.attn_norm);
-    try compress(sc, m, p.st, li, pa.h, p.p0, none, &p.sh);
+    try compress(sc, m, p.st, li, pa.h, p.p0, none, &p.sh, null);
 }
 
 /// CED: the decoder's first layer `li` compresses every row of the pass (the ratio-1 rows every later layer reads),
@@ -5531,15 +5916,23 @@ const Commit = enum { wait, lazy };
 /// `main_norm(main_proj(rows))`, `rows` `[n, targets * dim]`, through each stage's own key path.
 fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, how: Commit) !void {
     const ds = &m.dspark.?;
+    const c = &m.cfg;
     const n = dim(rows, 0);
-    const main_x = try sc.rms(try ds.main_proj.apply(sc, rows), ds.main_norm, m.cfg.eps);
+    const main_x = try sc.rms(try ds.main_proj.apply(sc, rows), ds.main_norm, c.eps);
     if (m.trace) |t| try t.put("ds_mainx", .{}, main_x);
     const pos = try posArray(sc, p0, n, 1);
+    const fus = fusedOn(sc, m) and kernels.kvRowFits(c.head_dim);
     for (st.ds, 0..) |*ring, si| {
-        const ly = &m.layers[m.cfg.layers + si];
-        try ring.write(try windowRow(sc, m, ly, try ly.wkv.apply(sc, main_x), m.rope_plain.freqs, pos), p0, sc.s);
+        const ly = &m.layers[c.layers + si];
+        const kv_proj = try ly.wkv.apply(sc, main_x);
+        if (fus and ring.dt == mlx.mlx_array_dtype(kv_proj) and ring.width == c.head_dim and
+            try kernels.kvRowRingInPlace(sc, kv_proj, ly.kv_norm, m.rope_plain.freqs, pos, c.rope_dim, c.eps, m.qat_on, ring.buf.array, ring.cap))
+        {
+            continue;
+        }
+        try ring.write(try windowRow(sc, m, ly, kv_proj, m.rope_plain.freqs, pos), p0, sc.s);
     }
-    st.main_lazy = how == .lazy;
+    st.main_lazy = how == .lazy and !mlx.engine.isStream(sc.s);
     if (how == .lazy) return;
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(sc.a);
@@ -5549,10 +5942,72 @@ fn commitMain(sc: *Scope, m: *Model, st: *State, rows: A, p0: usize, how: Commit
     try evalAll(ev.items);
 }
 
+/// Joins `advancePass` + `commitMain` across all non-verify passes of `extendRows` so the ~40 MB `ds.main_proj` and
+/// every stage `wkv` are read once instead of N times. Returns false to fall back to per-pass `advancePass`.
+fn commitMainJoined(sc: *Scope, m: *Model, passes: []Pass) !bool {
+    const ds = &(m.dspark orelse return false);
+    if (passes.len <= 1 or m.trace != null or ds.main_proj.stq == null) return false;
+    const c = &m.cfg;
+    const n_stages = c.n_mtp;
+    for (0..n_stages) |si| if (m.layers[c.layers + si].wkv.stq == null) return false;
+
+    var commit_rows: usize = 0;
+    var commit_passes: usize = 0;
+    for (passes) |*p| {
+        if (p.st.ds.len > 0 and p.st.verify == null) {
+            commit_rows += p.ids.len;
+            commit_passes += 1;
+        }
+    }
+    if (commit_passes <= 1 or commit_rows > m.maxJoinedRows()) return false;
+
+    const parts = try sc.a.alloc(A, commit_passes);
+    defer sc.a.free(parts);
+    var pi: usize = 0;
+    for (passes) |*p| {
+        reportEngramWait(m, p.ids.len);
+        p.st.n = p.p0 + p.ids.len;
+        if (p.st.ds.len == 0) continue;
+        const main_rows = try sc.concat(p.targets[0..c.dspark.n_targets], -1);
+        if (p.st.verify) |*v| {
+            v.mh = sc.out(main_rows);
+        } else {
+            parts[pi] = main_rows;
+            pi += 1;
+        }
+    }
+    const all_rows = try sc.concat(parts, 0);
+    const main_x = try sc.rms(try ds.main_proj.apply(sc, all_rows), ds.main_norm, c.eps);
+    const fus = fusedOn(sc, m) and kernels.kvRowFits(c.head_dim);
+    for (0..n_stages) |si| {
+        const ly = &m.layers[c.layers + si];
+        const kv_all = try ly.wkv.apply(sc, main_x);
+        var r0: usize = 0;
+        for (passes) |*p| {
+            if (p.st.ds.len == 0 or p.st.verify != null) continue;
+            const r1 = r0 + p.ids.len;
+            const ring = &p.st.ds[si];
+            const kv_mine = try sc.slice(kv_all, 0, r0, r1);
+            const pos = try posArray(sc, p.p0, p.ids.len, 1);
+            if (!(fus and ring.dt == mlx.mlx_array_dtype(kv_mine) and ring.width == c.head_dim and
+                try kernels.kvRowRingInPlace(sc, kv_mine, ly.kv_norm, m.rope_plain.freqs, pos, c.rope_dim, c.eps, m.qat_on, ring.buf.array, ring.cap)))
+            {
+                try ring.write(try windowRow(sc, m, ly, kv_mine, m.rope_plain.freqs, pos), p.p0, sc.s);
+            }
+            r0 = r1;
+        }
+    }
+    for (passes) |*p| if (p.st.ds.len > 0 and p.st.verify == null) {
+        p.st.main_lazy = !mlx.engine.isStream(sc.s);
+    };
+    return true;
+}
+
 /// Submits the commit a step left lazy, so the GPU runs it while the host builds the next pass.
-fn flushMain(st: *State) !void {
+fn flushMain(m: *const Model, st: *State) !void {
     if (!st.main_lazy) return;
     st.main_lazy = false;
+    if (mlx.engine.isStream(m.s)) return;
     var bufs: [cfg_mod.max_targets]A = undefined;
     if (st.ds.len > bufs.len) return error.Dsv41NoDspark;
     for (st.ds, bufs[0..st.ds.len]) |r, *b| b.* = r.buf.array;
@@ -5675,6 +6130,266 @@ fn draftPass(m: *Model, t1: u32, heads_wanted: Heads, B: u32, meter: ?*@import("
     if (with_heads) @memcpy(out.logits, try sc_mod.hostF32(heads));
     if (with_conf) @memcpy(out.conf, try sc_mod.hostF32(conf));
     return out;
+}
+
+/// Batched DSpark draft across `reqs.len` concurrent requests in ONE joined pass through the DSpark stages and ONE
+/// shared `m.head.apply` (reading the ~1.2 GB LM head once instead of N times), with ONE GPU wait for all drafts.
+/// Each request `i` drafts `widths[i]` tokens starting from `t1s[i]` (`sum(widths) <= maxJoinedRows()`).
+pub fn draftBatch(
+    m: *Model,
+    reqs: []const *Request,
+    t1s: []const u32,
+    widths: []const u32,
+    heads_wanted: Heads,
+    out_drafts: []Draft,
+) !void {
+    const n_reqs = reqs.len;
+    if (n_reqs == 0 or t1s.len != n_reqs or widths.len != n_reqs or out_drafts.len != n_reqs) return error.Dsv41RowsWidth;
+    if (n_reqs == 1) {
+        const scope = try enterForward(m, reqs[0]);
+        defer scope.endForward();
+        out_drafts[0] = try draftMeasured(m, t1s[0], heads_wanted, widths[0], null);
+        return;
+    }
+    const c = &m.cfg;
+    const ds = &(m.dspark orelse return error.Dsv41NoDspark);
+    const cap = m.servedJoinedRows();
+    var total_b: usize = 0;
+    var rows_usize: [16]usize = undefined;
+    if (n_reqs > rows_usize.len) return error.Dsv41RowsWidth;
+    for (reqs, widths, 0..) |req, b, i| {
+        if (b == 0 or b > c.dspark.block) return error.Dsv41RowsWidth;
+        if (req.state == null) return error.Dsv41NoLiveState;
+        rows_usize[i] = b;
+        total_b += b;
+    }
+    if (total_b == 0 or total_b > cap) return error.Dsv41RowsWidth;
+
+    const gpa = m.gpa;
+    const saved_profile = m.profile;
+    m.profile = null;
+    defer m.profile = saved_profile;
+    const armed = m.arm(.rows);
+    defer armed.end();
+    transient_peak.begin();
+    defer transient_peak.end(.draft, total_b, null);
+
+    for (reqs) |req| try flushMain(m, &req.state.?);
+    const with_conf = heads_wanted != .none;
+    const with_heads = heads_wanted == .full;
+    const hc = c.hc_mult;
+    var sc = m.scope();
+    defer sc.deinit();
+
+    var in_ids: [16]i32 = undefined;
+    var pos_host: [16]i32 = undefined;
+    var off: usize = 0;
+    for (reqs, t1s, widths) |req, t1, b| {
+        const p0 = req.state.?.n;
+        for (0..b) |k| {
+            in_ids[off] = @intCast(if (k == 0) t1 else c.dspark.noise_id);
+            pos_host[off] = @intCast(p0 + k);
+            off += 1;
+        }
+    }
+    const pos_all = try sc.ints(pos_host[0..total_b], &.{ci(total_b)});
+    const emb = try m.embed.rows(&sc, try sc.ints(in_ids[0..total_b], &.{ci(total_b)}), m.act);
+    var x = try sc.contiguous(try sc.broadcast(try sc.expand(emb, 1), &.{ ci(total_b), ci(hc), ci(c.dim) }));
+    var pre = try sc.broadcast(try sc.astype(try sc.op2(mlx.mlx_equal, try sc.arange(0, hc), try sc.i(0)), .float32), &.{ ci(total_b), ci(hc) });
+    var dummy = try Shared.init(gpa, 1);
+    defer dummy.deinit(gpa);
+
+    var stage_keys: [16]A = undefined;
+    for (0..c.n_mtp) |si| {
+        for (reqs, 0..) |req, i| {
+            const st_i = &req.state.?;
+            const win = @min(c.window, st_i.n);
+            stage_keys[i] = try st_i.ds[si].read(&sc, st_i.n - win, st_i.n);
+        }
+        const out = try block(&sc, m, &reqs[0].state.?, c.layers + si, x, pre, 0, &dummy, SPAN, .{
+            .batch = .{ .keys = stage_keys[0..n_reqs], .rows = rows_usize[0..n_reqs], .pos = pos_all },
+        }, &.{});
+        x = try sc.keep(out.x);
+        pre = try sc.keep(out.pre);
+    }
+
+    const hout = try hcCollapse(&sc, x, pre); // [total_b, dim]
+    const logits = try m.head.apply(&sc, try sc.astype(try sc.rms(hout, ds.norm, c.eps), .float32)); // [total_b, vocab] f32
+
+    var picks_all: [16]A = undefined;
+    var rows_all: [16]A = undefined;
+    var confs_all: [16]A = undefined;
+    const fused = fusedOn(&sc, m);
+    var r0: usize = 0;
+    for (t1s, widths) |t1, b| {
+        const r1 = r0 + b;
+        const lg_i = try sc.slice(logits, 0, r0, r1);
+        const h_i = try sc.slice(hout, 0, r0, r1);
+        var cur = try sc.reshape(try sc.i(@intCast(t1)), &.{1});
+        for (0..b) |k| {
+            if (fused) {
+                const step = try kernels.markovStep(&sc, lg_i, ds.markov_head, ds.markov_embed, cur, h_i, ds.conf, k);
+                rows_all[r0 + k] = step.row;
+                if (with_conf) confs_all[r0 + k] = step.conf;
+                cur = step.pick;
+                picks_all[r0 + k] = cur;
+            } else {
+                const me = try sc.astype(try sc.take(ds.markov_embed, cur, 0), .float32);
+                const row = try sc.add(try sc.slice(lg_i, 0, k, k + 1), try sc.matmul(me, try sc.t2(try sc.astype(ds.markov_head, .float32))));
+                rows_all[r0 + k] = row;
+                if (with_conf) confs_all[r0 + k] = try sc.matmul(try sc.concat(&.{ try sc.slice(try sc.astype(h_i, .float32), 0, k, k + 1), me }, -1), try sc.t2(ds.conf));
+                var am = mlx.mlx_array_new();
+                cur = try sc.astype(try sc.reshape(try sc.res(mlx.mlx_argmax_axis(&am, row, -1, false, sc.s), &am), &.{1}), .int32);
+                picks_all[r0 + k] = cur;
+            }
+        }
+        r0 = r1;
+    }
+    const all_p = try sc.concat(picks_all[0..total_b], 0);
+    const all_h = if (with_heads) try sc.concat(rows_all[0..total_b], 0) else all_p;
+    const all_c = if (with_conf) try sc.reshape(try sc.concat(confs_all[0..total_b], 0), &.{ci(total_b)}) else all_p;
+    try evalAll(&.{ all_p, all_h, all_c });
+
+    const p_host = try sc_mod.hostI32(all_p);
+    const h_host = if (with_heads) try sc_mod.hostF32(all_h) else &[_]f32{};
+    const c_host = if (with_conf) try sc_mod.hostF32(all_c) else &[_]f32{};
+
+    var filled: usize = 0;
+    errdefer for (out_drafts[0..filled]) |*d| d.deinit();
+    r0 = 0;
+    for (t1s, widths, out_drafts) |t1, b, *dst| {
+        var d: Draft = .{ .gpa = gpa, .ids = &.{}, .logits = &.{}, .conf = &.{} };
+        errdefer d.deinit();
+        d.ids = try gpa.alloc(u32, b + 1);
+        d.ids[0] = t1;
+        for (p_host[r0 .. r0 + b], d.ids[1..]) |v, *o| o.* = @intCast(v);
+        d.logits = try gpa.alloc(f32, if (with_heads) b * c.vocab else 0);
+        d.conf = try gpa.alloc(f32, if (with_conf) b else 0);
+        if (with_heads) @memcpy(d.logits, h_host[r0 * c.vocab .. (r0 + b) * c.vocab]);
+        if (with_conf) @memcpy(d.conf, c_host[r0 .. r0 + b]);
+        dst.* = d;
+        filled += 1;
+        r0 += b;
+    }
+}
+
+/// Opens a verify snapshot on `req`'s state before a grouped multi-row `extendRows` (no-op when `rows == 1`).
+pub fn beginVerifyReq(m: *Model, req: *Request, rows: usize) !void {
+    const st = &(req.state orelse return error.Dsv41NoLiveState);
+    if (st.verify != null) return error.Dsv41VerifyOpen;
+    if (rows <= 1) return;
+    if (rows > cfg_mod.ring_slack) return error.Dsv41VerifyTooWide;
+    const nl = m.cfg.layers;
+    var v: Verify = .{
+        .n0 = st.n,
+        .rows = rows,
+        .comp_used = try m.gpa.alloc(usize, nl),
+        .idx_used = try m.gpa.alloc(usize, nl),
+        .pend_kv = try m.gpa.alloc(A, nl),
+        .pend_gate = try m.gpa.alloc(A, nl),
+    };
+    for (st.layers, 0..) |*ls, li| {
+        v.comp_used[li] = if (ls.comp) |r| r.used else 0;
+        v.idx_used[li] = if (ls.idx_k) |r| r.used else 0;
+        v.pend_kv[li] = none;
+        v.pend_gate[li] = none;
+    }
+    st.verify = v;
+}
+
+/// Aborts an open verify snapshot on `req` (on error before `finishVerifyJoined`).
+pub fn dropVerifyReq(req: *Request) void {
+    if (req.state) |*st| st.dropVerify();
+}
+
+/// Cuts back every request's open verify snapshot to `accepteds[i] + 1` rows in O(1), and joins all kept main-row
+/// commits into ONE `ds.main_proj` + stage `wkv` pass (reading the ~40 MB `ds.main_proj` once instead of N times).
+pub fn finishVerifyJoined(m: *Model, reqs: []const *Request, accepteds: []const usize) !void {
+    if (reqs.len != accepteds.len) return error.Dsv41RowsWidth;
+    var sc = m.scope();
+    defer sc.deinit();
+    const c = &m.cfg;
+    const armed = m.arm(.rows);
+    defer armed.end();
+
+    var kept_mh: [16]A = undefined;
+    var kept_st: [16]*State = undefined;
+    var kept_n0: [16]usize = undefined;
+    var kept_len: [16]usize = undefined;
+    var n_commit: usize = 0;
+    var total_kept: usize = 0;
+
+    for (reqs, accepteds) |req, accepted| {
+        const st = &(req.state orelse return error.Dsv41NoLiveState);
+        const v = &(st.verify orelse {
+            if (accepted != 0) return error.Dsv41NoVerify;
+            continue;
+        });
+        const keep = accepted + 1;
+        if (keep > v.rows) return error.Dsv41VerifyTooWide;
+        const end = v.n0 + keep;
+        if (keep < v.rows) {
+            for (st.layers, 0..) |*ls, li| {
+                const r = m.ratio(li);
+                if (r == 0) continue;
+                if (ls.comp) |*rows| rows.used = v.comp_used[li] + (end / r - v.n0 / r);
+                if (ls.idx_k) |*rows| rows.used = v.idx_used[li] + (end / r - v.n0 / r);
+                if (r > 1 and v.pend_kv[li].ctx != null) {
+                    const first = v.n0 - v.n0 % r;
+                    const lo = end - end % r - first;
+                    const hi = end - first;
+                    const tail: [2]mlx.mlx_array = if (hi > lo) .{ try sc.slice(v.pend_kv[li], 0, lo, hi), try sc.slice(v.pend_gate[li], 0, lo, hi) } else .{ none, none };
+                    if (ls.pend_kv.ctx != null) _ = mlx.mlx_array_free(ls.pend_kv);
+                    if (ls.pend_gate.ctx != null) _ = mlx.mlx_array_free(ls.pend_gate);
+                    ls.pend_kv = if (hi > lo) sc.out(tail[0]) else none;
+                    ls.pend_gate = if (hi > lo) sc.out(tail[1]) else none;
+                }
+            }
+            st.n = end;
+            if (st.hist.items.len > end) st.hist.shrinkRetainingCapacity(end);
+        }
+        if (v.mh.ctx != null) {
+            kept_mh[n_commit] = try sc.slice(v.mh, 0, 0, keep);
+            kept_st[n_commit] = st;
+            kept_n0[n_commit] = v.n0;
+            kept_len[n_commit] = keep;
+            n_commit += 1;
+            total_kept += keep;
+        }
+    }
+    defer for (reqs) |req| if (req.state) |*st| st.dropVerify();
+
+    if (n_commit == 0) return;
+    const ds = &(m.dspark orelse return);
+    var stage_stq = ds.main_proj.stq != null and n_commit > 1 and total_kept <= m.maxJoinedRows() and m.trace == null;
+    if (stage_stq) for (0..c.n_mtp) |si| {
+        if (m.layers[c.layers + si].wkv.stq == null) stage_stq = false;
+    };
+    if (stage_stq) {
+        const all_rows = try sc.concat(kept_mh[0..n_commit], 0);
+        const main_x = try sc.rms(try ds.main_proj.apply(&sc, all_rows), ds.main_norm, c.eps);
+        const fus = fusedOn(&sc, m) and kernels.kvRowFits(c.head_dim);
+        for (0..c.n_mtp) |si| {
+            const ly = &m.layers[c.layers + si];
+            const kv_all = try ly.wkv.apply(&sc, main_x);
+            var r0: usize = 0;
+            for (0..n_commit) |i| {
+                const r1 = r0 + kept_len[i];
+                const ring = &kept_st[i].ds[si];
+                const kv_mine = try sc.slice(kv_all, 0, r0, r1);
+                const pos = try posArray(&sc, kept_n0[i], kept_len[i], 1);
+                if (!(fus and ring.dt == mlx.mlx_array_dtype(kv_mine) and ring.width == c.head_dim and
+                    try kernels.kvRowRingInPlace(&sc, kv_mine, ly.kv_norm, m.rope_plain.freqs, pos, c.rope_dim, c.eps, m.qat_on, ring.buf.array, ring.cap)))
+                {
+                    try ring.write(try windowRow(&sc, m, ly, kv_mine, m.rope_plain.freqs, pos), kept_n0[i], sc.s);
+                }
+                r0 = r1;
+            }
+        }
+        for (0..n_commit) |i| kept_st[i].main_lazy = !mlx.engine.isStream(sc.s);
+        return;
+    }
+    for (0..n_commit) |i| try commitMain(&sc, m, kept_st[i], kept_mh[i], kept_n0[i], .lazy);
 }
 
 /// The DSpark stages over one window's stored main rows `main_rows` `[T, targets * dim]`, for the converter's

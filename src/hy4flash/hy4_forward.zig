@@ -359,18 +359,22 @@ pub fn isVerifyBlock(rows: c_int) bool {
     return rows >= 2 and rows <= verify_rows_max;
 }
 
-/// `a · b` with each of `a`'s 2..8 rows its own one-row product, so a verify row has the bytes its decode step has
-/// (MLX's kernel and tile change with the row count). The head reads its widened block once a row.
-fn mmByRow(o: *Ops, a: Arr, b: Arr, rows_as: ?c_int) !Arr {
+/// `a · b` with each of `a`'s rows its own one-row product up to `cap`, so a verify or joined row has the bytes its
+/// decode step has (MLX's kernel and tile change with the row count).
+fn mmByRowCap(o: *Ops, a: Arr, b: Arr, rows_as: ?c_int, cap: c_int) !Arr {
     const t = mlx.getShape(a)[0];
-    if (rows_as != null or !isVerifyBlock(t)) return mmAs(o, a, b, rows_as);
+    if (rows_as != null or t < 2 or t > cap) return mmAs(o, a, b, rows_as);
     const tu: usize = @intCast(t);
-    var rows: [verify_rows_max]Arr = undefined;
+    var rows: [hy4_absorb.joined_max_rows]Arr = undefined;
     for (0..tu) |r| {
         const ri: c_int = @intCast(r);
         rows[r] = try o.binary(.mm, try o.slice(a, 0, ri, ri + 1), b);
     }
     return o.concat(rows[0..tu], 0);
+}
+
+fn mmByRow(o: *Ops, a: Arr, b: Arr, rows_as: ?c_int) !Arr {
+    return mmByRowCap(o, a, b, rows_as, verify_rows_max);
 }
 
 /// `a · b` per head with each of `a`'s 2..8 rows its own one-row product: the absorb and value-out fallbacks when
@@ -462,12 +466,13 @@ fn linearF32As(o: *Ops, x: Arr, w: Arr, rows_as: ?c_int) !Arr {
     const x32 = try o.cast(x, .float32);
     // One row reads a BF16 weight as stored, with the widened product's bytes.
     if ((rows_as == null or mlx.getShape(x32)[0] == 1) and hy4_row.applies(o.s, x32, w)) return o.own(try hy4_row.rowF32(o.s, try o.contiguous(x32), w));
+    const by_row_cap: c_int = @min(joinedRowsMax(), hy4_absorb.joined_max_rows);
     var per: usize = @max(1, widen_block_bytes / (k * 4));
     if (per >= n) {
         var ob: Ops = .{ .s = o.s };
         defer ob.deinit();
         const wf = try ob.cast(w, .float32);
-        return o.own(try ob.result(try mmByRow(&ob, x32, try ob.transpose(wf, &.{ 1, 0 }), rows_as)));
+        return o.own(try ob.result(try mmByRowCap(&ob, x32, try ob.transpose(wf, &.{ 1, 0 }), rows_as, by_row_cap)));
     }
     const max_blocks = 128;
     if ((n + per - 1) / per > max_blocks) per = (n + max_blocks - 1) / max_blocks;
@@ -479,7 +484,7 @@ fn linearF32As(o: *Ops, x: Arr, w: Arr, rows_as: ?c_int) !Arr {
         var ob: Ops = .{ .s = o.s };
         defer ob.deinit();
         const wb = try ob.cast(try ob.slice(w, 0, @intCast(r0), @intCast(r1)), .float32);
-        parts[count] = try o.own(try ob.result(try mmByRow(&ob, x32, try ob.transpose(wb, &.{ 1, 0 }), rows_as)));
+        parts[count] = try o.own(try ob.result(try mmByRowCap(&ob, x32, try ob.transpose(wb, &.{ 1, 0 }), rows_as, by_row_cap)));
         count += 1;
     }
     return o.concat(parts[0..count], -1);
@@ -638,10 +643,24 @@ pub fn moeTail(gpa: std.mem.Allocator, o: *Ops, x: Arr, w: Moe, g: MoeGeometry, 
     return moeFinish(o, x, w, g, routed, at);
 }
 
+/// The shared expert alone, for callers that start it ahead of a host wait (`moeStqStreamed`).
+pub fn moeShared(o: *Ops, x: Arr, w: Moe, at: ?At) !Arr {
+    const narrow = norm_kernel_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
+    return if (narrow and storedCheap(x, w.shared.down)) try swigluStored(o, x, w.shared, at) else try swiglu(o, x, w.shared, at);
+}
+
 /// The MoE after its routed sum `routed` (in the latent): out through W_lat_up, the shared expert added, the combine
 /// norm. The routed sum is linear in the picks, so a caller may build it from groups of picks.
 pub fn moeFinish(o: *Ops, x: Arr, w: Moe, g: MoeGeometry, routed: Arr, at: ?At) !Arr {
     return (try moeFinishBack(o, x, w, g, routed, at, null)).y;
+}
+
+/// `moeFinish` reusing a precomputed `shared` expert output (from `moeShared`).
+pub fn moeFinishWithShared(o: *Ops, x: Arr, w: Moe, g: MoeGeometry, routed: Arr, shared: Arr, at: ?At) !Arr {
+    try At.input(at, .lat_up_in, routed);
+    const narrow = norm_kernel_on and mlx.streamIsGpu(o.s) and mlx.getShape(x)[0] > 1;
+    const up = if (narrow and storedCheap(routed, w.lat_up)) try linearStored(o, routed, w.lat_up) else try linear(o, routed, w.lat_up);
+    return normAs(o, up, shared, w.combine, g.eps, .float32);
 }
 
 /// The next layer's attention mix and norm (`mixNorm`'s operands), which a layer's write-back may run in its launch.
@@ -1077,6 +1096,77 @@ fn projectWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, pos0: c_int, c_dt: mlx
     return .{ .q = try rope(o, q, g.rope, g.theta, pos0), .c = c, .k_pe = k_rot, .q_resid = q_resid };
 }
 
+/// Joined attention projections for `T` rows at distinct positions `positions[0..T]`:
+/// on the GPU fast path (`q_pe_rows != null`), `q_raw` is the zero-copy `[H, T, qk]` view of `qb_raw` for
+/// `hy4_absorb.queryLatentRows`, and `q_pe_rows` is the rotated rope tail `[T, H, rope]` contiguous f32 (skipping
+/// any copy of the unrotated `nope` part). On the fallback path, `q_full` holds `[H, T, qk]` rotated.
+pub const ProjectedJoined = struct {
+    q_raw: ?Arr,
+    q_pe_rows: ?Arr,
+    q_full: ?Arr,
+    c: Arr,
+    k_pe: Arr,
+    q_resid: Arr,
+};
+
+pub fn projectRowsJoined(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, positions: []const c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) !ProjectedJoined {
+    return projectRowsJoinedWith(o, x, w, g, positions, c_dt, q_dt, false);
+}
+
+/// `projectRowsJoined` always returning full rotated queries `q_full` `[H, T, qk]` (used by batched DFly2 drafting).
+pub fn projectRowsJoinedFull(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, positions: []const c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) !ProjectedJoined {
+    return projectRowsJoinedWith(o, x, w, g, positions, c_dt, q_dt, true);
+}
+
+fn projectRowsJoinedWith(o: *Ops, x: Arr, w: Attn, g: AttnGeometry, positions: []const c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype, want_full: bool) !ProjectedJoined {
+    const t = mlx.getShape(x)[0];
+    if (positions.len != @as(usize, @intCast(t))) return error.Hy4RowsPositionsLen;
+    const qk = g.nope + g.rope;
+    const q_resid = try linearNormedAs(o, x, w.q_a, w.q_a_norm, g.eps, q_dt);
+    const qb_raw = try linear(o, q_resid, w.q_b);
+    const ckv = try linear(o, x, w.kv_a);
+    const q_raw = try o.transpose(try o.reshape(qb_raw, &.{ t, g.heads, qk }), &.{ 1, 0, 2 });
+    const use_front = front_kernel_on and norm_kernel_on and rope_kernel_on and hy4_front.applies(o.s, ckv, w.kv_a_norm, g.latent, g.rope);
+    if (use_front and hy4_rope.applies(o.s, q_raw, g.rope)) {
+        const f = try hy4_front.runPerRow(o.s, try o.contiguous(ckv), w.kv_a_norm, g.latent, g.rope, g.theta, g.eps, positions, c_dt);
+        const c = o.own(f.c) catch |e| {
+            _ = mlx.mlx_array_free(f.k_pe);
+            return e;
+        };
+        const k_pe = try o.own(f.k_pe);
+        if (!want_full and hy4_absorb.appliesJoined(o.s, w.kv_b, absorbGeometry(g), t)) {
+            const q_tail = try o.slice(q_raw, 2, g.nope, qk);
+            const q_pe_rows = try o.own(try hy4_rope.tailRowsPerRow(o.s, q_tail, g.rope, g.theta, positions, 1, .float32));
+            return .{ .q_raw = q_raw, .q_pe_rows = q_pe_rows, .q_full = null, .c = c, .k_pe = k_pe, .q_resid = q_resid };
+        }
+        const q_full = try o.own(try hy4_rope.tailPerRow(o.s, q_raw, g.rope, g.theta, positions, 1, .float32));
+        return .{ .q_raw = q_raw, .q_pe_rows = null, .q_full = q_full, .c = c, .k_pe = k_pe, .q_resid = q_resid };
+    }
+    const tu: usize = @intCast(t);
+    var qs: [64]Arr = undefined;
+    var cs: [64]Arr = undefined;
+    var kpes: [64]Arr = undefined;
+    if (tu > qs.len) return error.Hy4RowsWidth;
+    for (0..tu) |r| {
+        const ri: c_int = @intCast(r);
+        const qb_r = try o.contiguous(try o.slice(qb_raw, 0, ri, ri + 1));
+        const q_r = try o.transpose(try o.reshape(qb_r, &.{ 1, g.heads, qk }), &.{ 1, 0, 2 });
+        qs[r] = try rope(o, q_r, g.rope, g.theta, positions[r]);
+        const ckv_r = try o.contiguous(try o.slice(ckv, 0, ri, ri + 1));
+        cs[r] = try normAs(o, try o.slice(ckv_r, 1, 0, g.latent), null, w.kv_a_norm, g.eps, c_dt);
+        const kpe = try o.reshape(try o.slice(ckv_r, 1, g.latent, g.latent + g.rope), &.{ 1, 1, g.rope });
+        kpes[r] = try o.reshape(try ropeScaledAs(o, kpe, g.rope, g.theta, positions[r], 1, .bfloat16), &.{ 1, g.rope });
+    }
+    return .{
+        .q_raw = q_raw,
+        .q_pe_rows = null,
+        .q_full = try o.concat(qs[0..tu], 1),
+        .c = try o.concat(cs[0..tu], 0),
+        .k_pe = try o.concat(kpes[0..tu], 0),
+        .q_resid = q_resid,
+    };
+}
+
 pub fn projectRows(gpa: std.mem.Allocator, o: *Ops, x: Arr, w: Attn, g: AttnGeometry, positions: []const c_int, c_dt: mlx.mlx_dtype, q_dt: mlx.mlx_dtype) ![]Projected {
     const t = mlx.getShape(x)[0];
     if (positions.len != t) return error.Hy4RowsPositionsLen;
@@ -1086,6 +1176,28 @@ pub fn projectRows(gpa: std.mem.Allocator, o: *Ops, x: Arr, w: Attn, g: AttnGeom
     const ckv = try linear(o, x, w.kv_a);
     const out = try gpa.alloc(Projected, @intCast(t));
     errdefer gpa.free(out);
+    const q_all_raw = try o.transpose(try o.reshape(qb_raw, &.{ t, g.heads, qk }), &.{ 1, 0, 2 });
+    const use_front = front_kernel_on and norm_kernel_on and rope_kernel_on and hy4_front.applies(o.s, ckv, w.kv_a_norm, g.latent, g.rope);
+    if (use_front and hy4_rope.applies(o.s, q_all_raw, g.rope)) {
+        const f = try hy4_front.runPerRow(o.s, try o.contiguous(ckv), w.kv_a_norm, g.latent, g.rope, g.theta, g.eps, positions, c_dt);
+        const c_all = o.own(f.c) catch |e| {
+            _ = mlx.mlx_array_free(f.k_pe);
+            return e;
+        };
+        const kpe_all = try o.own(f.k_pe);
+        const q_all_rot = try o.own(try hy4_rope.tailPerRow(o.s, q_all_raw, g.rope, g.theta, positions, 1, .float32));
+        for (0..@as(usize, @intCast(t))) |r| {
+            const ri: c_int = @intCast(r);
+            out[r] = .{
+                .q = try o.slice(q_all_rot, 1, ri, ri + 1),
+                .c = try o.slice(c_all, 0, ri, ri + 1),
+                .k_pe = try o.slice(kpe_all, 0, ri, ri + 1),
+                .q_resid = try o.slice(q_resid, 0, ri, ri + 1),
+                .q_raw = try o.slice(q_all_raw, 1, ri, ri + 1),
+            };
+        }
+        return out;
+    }
     for (0..@as(usize, @intCast(t))) |r| {
         const ri: c_int = @intCast(r);
         const qb_r = try o.contiguous(try o.slice(qb_raw, 0, ri, ri + 1));
@@ -1452,86 +1564,128 @@ pub var joined_attention_on = true;
 /// Grouped chains run (`attendJoinedGated` calls): counted and read only by a test build.
 pub var grouped_chains_for_test: u64 = 0;
 
-pub fn attendJoinedGated(gpa: std.mem.Allocator, o: *Ops, out: []Arr, qs: []const Arr, q_raws: []const ?Arr, gates: []const Arr, cs: []const Arr, pes: []const Arr, w: Attn, g: AttnGeometry) !void {
+/// Grouped sliding-layer attention core over `n` full rings: takes pre-absorbed `q_lat_rows` `[N, H, latent]` f32 and
+/// `q_pe_rows` `[N, H, rope]` f32, returns attended latents `[N, H, latent]` f32. On the release geometry (steel), this
+/// runs in 3 launches (`steelScoresGroups` + `sinkSoftmaxCausal(heads_first=false)` + `steelValuesGroups`) with zero
+/// per-row slices or copies of scores/probabilities. All internal temporaries are freed before returning.
+/// Runs batched sliding-window attention across `total` rows (1..16 across concurrent slots/groups) given pre-stacked
+/// `[total, W, latent]` f32 keys `c_l` and `[total, W, rope]` bf16 keys `pe_l` in 3 launches (`steelScoresGroups` +
+/// `sinkSoftmaxCausal(heads_first=false)` + `steelValuesGroups`).
+pub fn attendJoinedLatentStacked(o: *Ops, q_lat_rows: Arr, q_pe_rows: Arr, c_l: Arr, pe_l: Arr, w: Attn, g: AttnGeometry) !Arr {
     const exact = mlx.engine.exactF32();
     defer exact.end();
     if (@import("builtin").is_test) grouped_chains_for_test += 1;
+    const n_i = mlx.getShape(c_l)[0];
+    const keys = mlx.getShape(c_l)[1];
+    if (n_i < 2) return error.Hy4JoinedWidth;
+    var work: Ops = .{ .s = o.s };
+    defer work.deinit();
+    const steel = chain_kernels_on and mlx.engine.isStream(o.s) and
+        mlx.mlx_array_dtype(q_lat_rows) == .float32 and mlx.mlx_array_dtype(q_pe_rows) == .float32 and
+        hy4_chain.steelScoresGroupsFits(g.heads, keys, g.latent, g.rope);
+    if (steel) {
+        const ql4 = try work.reshape(q_lat_rows, &.{ n_i, g.heads, 1, g.latent });
+        const qp4 = try work.reshape(q_pe_rows, &.{ n_i, g.heads, 1, g.rope });
+        const sc = try hy4_chain.steelScoresGroups(o.s, n_i, ql4, qp4, c_l, pe_l);
+        const s1 = try work.own(sc.s1);
+        const s2 = try work.own(sc.s2);
+        const p = if (hy4_chain.sinkSoftmaxCausalApplies(o.s, s1, s2, w.sinks, false))
+            try work.own(try hy4_chain.sinkSoftmaxCausal(o.s, s1, s2, w.sinks, scaleOf(g), keys - 1, 0, false))
+        else
+            try sinkSoftmax(&work, try work.binary(.add, try work.binary(.mul, try work.binary(.add, s1, s2), try work.scalar(scaleOf(g), .float32)), try causalMask(&work, 1, keys, keys - 1, 0)), w.sinks, g.heads, n_i, keys, false);
+        const u = if (hy4_chain.steelValuesGroupsFits(g.heads, keys, g.latent))
+            try work.own(try hy4_chain.steelValuesGroups(o.s, n_i, try work.reshape(p, &.{ n_i, g.heads, 1, keys }), c_l))
+        else
+            try mmGrouped(&work, p, c_l, false);
+        return o.own(try work.result(u));
+    }
+    const s1 = try mmGrouped(&work, q_lat_rows, c_l, true);
+    const s2 = try mmGrouped(&work, q_pe_rows, try work.cast(pe_l, .float32), true);
+    const p = if (chain_kernels_on and hy4_chain.sinkSoftmaxCausalApplies(o.s, s1, s2, w.sinks, false))
+        try work.own(try hy4_chain.sinkSoftmaxCausal(o.s, s1, s2, w.sinks, scaleOf(g), keys - 1, 0, false))
+    else
+        try sinkSoftmax(&work, try work.binary(.add, try work.binary(.mul, try work.binary(.add, s1, s2), try work.scalar(scaleOf(g), .float32)), try causalMask(&work, 1, keys, keys - 1, 0)), w.sinks, g.heads, n_i, keys, false);
+    const u = try mmGrouped(&work, p, c_l, false);
+    return o.own(try work.result(u));
+}
+
+pub fn attendJoinedLatent(gpa: std.mem.Allocator, o: *Ops, q_lat_rows: Arr, q_pe_rows: Arr, cs: []const Arr, pes: []const Arr, w: Attn, g: AttnGeometry) !Arr {
+    const n = cs.len;
+    if (n < 2 or pes.len != n) return error.Hy4JoinedWidth;
+    const keys: c_int = mlx.getShape(cs[0])[0];
+    for (0..n) |i| {
+        if (mlx.getShape(cs[i])[0] != keys or mlx.getShape(pes[i])[0] != keys) return error.Hy4JoinedWidth;
+    }
+    var work: Ops = .{ .s = o.s };
+    defer work.deinit();
+    const c_l = try stackRows(gpa, &work, cs);
+    const pe_l = try stackRows(gpa, &work, pes);
+    return o.own(try work.result(try attendJoinedLatentStacked(&work, q_lat_rows, q_pe_rows, c_l, pe_l, w, g)));
+}
+
+pub fn attendJoinedGated(gpa: std.mem.Allocator, o: *Ops, out: []Arr, qs: []const Arr, q_raws: []const ?Arr, gates: []const Arr, cs: []const Arr, pes: []const Arr, w: Attn, g: AttnGeometry) !void {
+    const exact = mlx.engine.exactF32();
+    defer exact.end();
     const n = qs.len;
     if (n < 2 or out.len != n or q_raws.len != n or gates.len != n or cs.len != n or pes.len != n) return error.Hy4JoinedWidth;
     const keys: c_int = mlx.getShape(cs[0])[0];
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
+    for (0..n) |i| {
         if (mlx.getShape(cs[i])[0] != keys or mlx.getShape(pes[i])[0] != keys) return error.Hy4JoinedWidth;
         if (mlx.getShape(qs[i])[1] != 1) return error.Hy4JoinedWidth;
     }
-    // Each row's temporaries live on a scratch `Ops` of the row, so `o` is asked a count that does not follow `n`;
-    // what outlives a row (its latent query, rope part, probabilities) is held in `kept`, freed at the end.
-    const kept = try gpa.alloc(Arr, 3 * n);
-    defer gpa.free(kept);
-    for (kept) |*k| k.* = mlx.mlx_array_new();
-    defer for (kept) |k| {
-        _ = mlx.mlx_array_free(k);
-    };
-    const lat = kept[0..n];
-    const pe = kept[n .. 2 * n];
-    const ps = kept[2 * n ..];
-    for (0..n) |j| {
-        var row: Ops = .{ .s = o.s };
-        defer row.deinit();
-        const ab = try absorb(&row, qs[j], w, g, null, null, q_raws[j]);
-        try mlx.check(mlx.mlx_array_set(&lat[j], ab.q_lat));
-        try mlx.check(mlx.mlx_array_set(&pe[j], ab.q_pe));
-    }
-    const c_l = try stackRows(gpa, o, cs);
-    const steel = chain_kernels_on and mlx.engine.isStream(o.s) and
-        mlx.mlx_array_dtype(lat[0]) == .float32 and mlx.mlx_array_dtype(pe[0]) == .float32 and
-        hy4_chain.steelScoresGroupsFits(g.heads, keys, g.latent, g.rope);
-    var s2_joined: ?Arr = null;
-    var s1: Arr = undefined;
-    if (steel) {
-        const sc = try hy4_chain.steelScoresGroups(o.s, @intCast(n), try stackRows4(gpa, o, lat), try stackRows4(gpa, o, pe), c_l, try stackRows(gpa, o, pes));
-        s1 = try o.own(sc.s1);
-        s2_joined = try o.own(sc.s2);
+    var work: Ops = .{ .s = o.s };
+    defer work.deinit();
+    var q_lat_rows: Arr = undefined;
+    var q_pe_rows: Arr = undefined;
+    const n_i: c_int = @intCast(n);
+    if (hy4_absorb.appliesJoined(o.s, w.kv_b, absorbGeometry(g), n_i)) {
+        const raw_parts = try gpa.alloc(Arr, n);
+        defer gpa.free(raw_parts);
+        const pe_parts = try gpa.alloc(Arr, n);
+        defer gpa.free(pe_parts);
+        for (0..n) |j| {
+            const q32 = try work.cast(qs[j], .float32);
+            raw_parts[j] = if (q_raws[j]) |r| r else q32;
+            pe_parts[j] = try work.transpose(try work.slice(q32, 2, g.nope, g.nope + g.rope), &.{ 1, 0, 2 });
+        }
+        const q_raw_all = try work.concat(raw_parts, 1);
+        q_lat_rows = try work.own(try hy4_absorb.queryLatentRows(o.s, q_raw_all, w.kv_b, absorbGeometry(g)));
+        q_pe_rows = try work.concat(pe_parts, 0);
     } else {
-        s1 = try mmGrouped(o, try stackRows(gpa, o, lat), c_l, true);
+        const lat_parts = try gpa.alloc(Arr, n);
+        defer gpa.free(lat_parts);
+        const pe_parts = try gpa.alloc(Arr, n);
+        defer gpa.free(pe_parts);
+        for (0..n) |j| {
+            const ab = try absorb(&work, qs[j], w, g, null, null, q_raws[j]);
+            lat_parts[j] = try work.reshape(try work.contiguous(ab.q_lat), &.{ 1, g.heads, g.latent });
+            pe_parts[j] = try work.reshape(try work.contiguous(ab.q_pe), &.{ 1, g.heads, g.rope });
+        }
+        q_lat_rows = try work.concat(lat_parts, 0);
+        q_pe_rows = try work.concat(pe_parts, 0);
+    }
+    const u = try attendJoinedLatent(gpa, &work, q_lat_rows, q_pe_rows, cs, pes, w, g);
+    const gate_all = try work.concat(gates, 0);
+    const u_h = try work.transpose(u, &.{ 1, 0, 2 });
+    if (chain_kernels_on and hy4_absorb.valueOutGatedJoinedApplies(o.s, u_h, w.kv_b, absorbGeometry(g), gate_all)) {
+        const gated_all = try work.own(try hy4_absorb.valueOutGated(o.s, u_h, w.kv_b, absorbGeometry(g), gate_all));
+        for (0..n) |j| {
+            const ji: c_int = @intCast(j);
+            try mlx.check(mlx.mlx_array_set(&out[j], try work.contiguous(try work.slice(gated_all, 0, ji, ji + 1))));
+        }
+        return;
     }
     for (0..n) |j| {
-        var row: Ops = .{ .s = o.s };
-        defer row.deinit();
-        const s1_j = try row.reshape(try row.contiguous(try row.slice(s1, 0, @intCast(j), @intCast(j + 1))), &.{ g.heads, 1, keys });
-        const s2_j = if (s2_joined) |sj|
-            try row.reshape(try row.contiguous(try row.slice(sj, 0, @intCast(j), @intCast(j + 1))), &.{ g.heads, 1, keys })
-        else
-            try row.binary(.mm, pe[j], try row.transpose(try row.cast(pes[j], .float32), &.{ 1, 0 }));
-        const p_j = if (chain_kernels_on and hy4_chain.sinkSoftmaxCausalApplies(o.s, s1_j, s2_j, w.sinks, true))
-            try row.own(try hy4_chain.sinkSoftmaxCausal(o.s, s1_j, s2_j, w.sinks, scaleOf(g), keys - 1, 0, true))
-        else
-            try sinkSoftmax(&row, try row.binary(.add, try row.binary(.mul, try row.binary(.add, s1_j, s2_j), try row.scalar(scaleOf(g), .float32)), try causalMask(&row, 1, keys, keys - 1, 0)), w.sinks, g.heads, 1, keys, true);
-        try mlx.check(mlx.mlx_array_set(&ps[j], p_j));
-    }
-    const u = if (steel and hy4_chain.steelValuesGroupsFits(g.heads, keys, g.latent))
-        try o.own(try hy4_chain.steelValuesGroups(o.s, @intCast(n), try stackRows4(gpa, o, ps), c_l))
-    else
-        try mmGrouped(o, try stackRows(gpa, o, ps), c_l, false);
-    for (0..n) |j| {
-        var row: Ops = .{ .s = o.s };
-        defer row.deinit();
-        const u_j = try row.reshape(try row.contiguous(try row.slice(u, 0, @intCast(j), @intCast(j + 1))), &.{ g.heads, 1, g.latent });
-        const served = chain_kernels_on and hy4_absorb.valueOutGatedApplies(o.s, u_j, w.kv_b, absorbGeometry(g), gates[j]);
-        const gated_row = if (served)
-            try hy4_absorb.valueOutGated(o.s, u_j, w.kv_b, absorbGeometry(g), gates[j])
+        const ji: c_int = @intCast(j);
+        const u_j = try work.reshape(try work.contiguous(try work.slice(u, 0, ji, ji + 1)), &.{ g.heads, 1, g.latent });
+        const uv = try work.own(try hy4_absorb.valueOut(o.s, u_j, w.kv_b, absorbGeometry(g)));
+        const gated_row = if (chain_kernels_on and hy4_chain.gatedApplies(o.s, uv, gates[j]))
+            try work.own(try hy4_chain.gated(o.s, uv, gates[j]))
         else blk: {
-            const uv = try row.own(try hy4_absorb.valueOut(o.s, u_j, w.kv_b, absorbGeometry(g)));
-            break :blk if (chain_kernels_on and hy4_chain.gatedApplies(o.s, uv, gates[j]))
-                try row.own(try hy4_chain.gated(o.s, uv, gates[j]))
-            else inner: {
-                const gate = try row.unary(.sigmoid, try row.transpose(try row.reshape(try row.cast(gates[j], .float32), &.{ 1, g.heads, g.v }), &.{ 1, 0, 2 }));
-                break :inner try row.reshape(try row.transpose(try row.binary(.mul, uv, gate), &.{ 1, 0, 2 }), &.{ 1, g.heads * g.v });
-            };
+            const gate = try work.unary(.sigmoid, try work.transpose(try work.reshape(try work.cast(gates[j], .float32), &.{ 1, g.heads, g.v }), &.{ 1, 0, 2 }));
+            break :blk try work.reshape(try work.transpose(try work.binary(.mul, uv, gate), &.{ 1, 0, 2 }), &.{ 1, g.heads * g.v });
         };
         try mlx.check(mlx.mlx_array_set(&out[j], gated_row));
-        // The served launch's result is the caller's to release; the other arms' are `row`'s.
-        if (served) _ = mlx.mlx_array_free(gated_row);
     }
 }
 
@@ -1630,6 +1784,23 @@ fn absorbGeometry(g: AttnGeometry) hy4_absorb.Geometry {
 
 pub fn absorbServes(s: mlx.mlx_stream, kv_b: Arr, g: AttnGeometry, rows: c_int) bool {
     return hy4_absorb.applies(s, kv_b, absorbGeometry(g), rows);
+}
+
+pub fn absorbQueryRows(o: *Ops, q_raw: Arr, w: Attn, g: AttnGeometry) !Arr {
+    return o.own(try hy4_absorb.queryLatentRows(o.s, q_raw, w.kv_b, absorbGeometry(g)));
+}
+
+/// Attended latents `u_rows` `[T, H, latent]` f32 out through `W_v` and gated by `gate_rows` `[T, H·v]`: `[T, H·v]` f32.
+pub fn absorbValueGatedRows(o: *Ops, u_rows: Arr, gate_rows: Arr, w: Attn, g: AttnGeometry) !Arr {
+    const u_h = try o.transpose(u_rows, &.{ 1, 0, 2 });
+    if (chain_kernels_on and hy4_absorb.valueOutGatedJoinedApplies(o.s, u_h, w.kv_b, absorbGeometry(g), gate_rows)) {
+        return o.own(try hy4_absorb.valueOutGated(o.s, u_h, w.kv_b, absorbGeometry(g), gate_rows));
+    }
+    const uv = try o.own(try hy4_absorb.valueOut(o.s, u_h, w.kv_b, absorbGeometry(g)));
+    if (chain_kernels_on and hy4_chain.gatedApplies(o.s, uv, gate_rows)) return o.own(try hy4_chain.gated(o.s, uv, gate_rows));
+    const t = mlx.getShape(u_rows)[0];
+    const gate = try o.unary(.sigmoid, try o.transpose(try o.reshape(try o.cast(gate_rows, .float32), &.{ t, g.heads, g.v }), &.{ 1, 0, 2 }));
+    return o.reshape(try o.transpose(try o.binary(.mul, uv, gate), &.{ 1, 0, 2 }), &.{ t, g.heads * g.v });
 }
 
 /// The attended latent [H, T, latent] out through `W_v`, gated by `σ` of its rows' `gate` (as stored), as `W_o` reads it.
@@ -1823,11 +1994,10 @@ pub fn recallAt(o: *Ops, x: Arr, q_resid: Arr, pooled: Arr, w: Indexer, g: Index
     return .{ .groups = try o.concat(&.{ try o.cast(try o.slice(order.*, 1, 0, take), .float32), own }, 1), .logits = masked.* };
 }
 
-/// `recallAt`'s scores on a GPU stream over the query projection's rows `q_rows` [T, H·d] f32.
-fn indexLogits(o: *Ops, x: Arr, q_rows: Arr, pooled: Arr, w: Indexer, g: IndexerGeometry, p0: c_int) !Arr {
-    const t = mlx.getShape(x)[0];
+/// `recallAt`'s scores on a GPU stream over pre-projected `q_rows` [T, H·d] f32 and `hw` [T, H] f32.
+fn indexLogitsFrom(o: *Ops, q_rows: Arr, hw: Arr, pooled: Arr, g: IndexerGeometry, p0: c_int) !Arr {
+    const t = mlx.getShape(q_rows)[0];
     const scale = std.math.pow(f32, @floatFromInt(g.heads * g.dim), -0.5);
-    const hw = try o.cast(try linearF32(o, x, w.head_weight), .float32);
     // The query's and the keys' rotations ride the score launch.
     if (index_kernel_on and hy4_index.scoresApply(o.s, q_rows, pooled, g.heads, g.rope))
         return o.own(try hy4_index.scores(o.s, try o.contiguous(q_rows), try o.contiguous(pooled), try o.contiguous(hw), g.heads, g.rope, g.theta, scale, p0, g.ratio));
@@ -1839,6 +2009,46 @@ fn indexLogits(o: *Ops, x: Arr, q_rows: Arr, pooled: Arr, w: Indexer, g: Indexer
     if (index_kernel_on and hy4_index.wideScoresApply(o.s, qt, k_rot, hw))
         return o.own(try hy4_index.wideScores(o.s, qt, k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
     return o.own(try sparse.indexScores(o.s, qt, k_rot, hw, scale, p0 - 1, @intCast(g.ratio)));
+}
+
+/// `recallAt`'s scores on a GPU stream over the query projection's rows `q_rows` [T, H·d] f32.
+fn indexLogits(o: *Ops, x: Arr, q_rows: Arr, pooled: Arr, w: Indexer, g: IndexerGeometry, p0: c_int) !Arr {
+    const hw = try o.cast(try linearF32(o, x, w.head_weight), .float32);
+    return indexLogitsFrom(o, q_rows, hw, pooled, g, p0);
+}
+
+/// `recalledAt` using pre-projected `q_rows` [T, H·d] f32 and `hw` [T, H] f32 (hoisted across joined rows).
+pub fn recalledFromProjected(o: *Ops, q_rows: Arr, hw: Arr, pooled: Arr, g: IndexerGeometry, p0: c_int, n: c_int) !Recalled {
+    const t = mlx.getShape(q_rows)[0];
+    const groups = mlx.getShape(pooled)[0];
+    const take = @min(g.group_topk - 1, groups);
+    if (index_kernel_on and chain_kernels_on and select_kernels_on and mlx.streamIsGpu(o.s) and take > 0) {
+        const logits = try indexLogitsFrom(o, q_rows, hw, pooled, g, p0);
+        if (hy4_index.pickApplies(o.s, logits, take)) {
+            const r = try hy4_index.pick(o.s, logits, take, p0, n, g.ratio);
+            _ = try o.own(r.groups);
+            return .{ .rows = try o.own(r.rows), .keep = try o.own(r.keep) };
+        }
+        const order = try o.own(try sparse.topkIndices(o.s, logits, @intCast(take)));
+        const sel = try recalledRows(o, t, n, p0, try o.own(try hy4_chain.recallGroups(o.s, order, p0, g.ratio)), g.ratio);
+        return .{ .rows = sel.rows, .keep = sel.keep };
+    }
+    const scale = std.math.pow(f32, @floatFromInt(g.heads * g.dim), -0.5);
+    const q = try rope(o, try o.transpose(try o.reshape(q_rows, &.{ t, g.heads, g.dim }), &.{ 1, 0, 2 }), g.rope, g.theta, p0);
+    const k = try rotateGroupKeys(o, pooled, g);
+    const relu = try o.binary(.max, try o.binary(.mm, q, try o.transpose(try o.cast(k, .float32), &.{ 1, 0 })), try o.scalar(0, .float32));
+    const hw_s = try o.binary(.mul, hw, try o.scalar(scale, .float32));
+    const logits = try o.reduce(try o.binary(.mul, relu, try o.reshape(try o.transpose(hw_s, &.{ 1, 0 }), &.{ g.heads, t, 1 })), 0, false, false);
+    const own = try o.reshape(try o.binary(.floor_div, try arangeFrom(o, p0, t), try o.scalar(@floatFromInt(g.ratio), .float32)), &.{ t, 1 });
+    const later = try o.slot();
+    try mlx.check(mlx.mlx_greater_equal(later, try o.reshape(try arange(o, groups), &.{ 1, groups }), own, o.s));
+    const masked = try o.slot();
+    try mlx.check(mlx.mlx_where(masked, later.*, try o.scalar(-std.math.inf(f32), .float32), logits, o.s));
+    const order = try o.slot();
+    try mlx.check(mlx.mlx_argpartition_axis(order, try o.unary(.negative, masked.*), take - 1, -1, o.s));
+    const rec_groups = try o.concat(&.{ try o.cast(try o.slice(order.*, 1, 0, take), .float32), own }, 1);
+    const sel = try recalledRows(o, t, n, p0, rec_groups, g.ratio);
+    return .{ .rows = sel.rows, .keep = sel.keep };
 }
 
 /// Whether the selection of the rows at `p0..p0+t` splits its top-k over the groups closed by then

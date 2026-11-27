@@ -10,8 +10,14 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 ## Scope
 
 - It serves `deepseek_v41` from the ORIGINAL checkpoint (`config.json`, `model-*.safetensors`, the index). Text in,
-  text out; a streamed load one request at a time (`ownsModuleDecodeState`), a fully resident one up to
-  `maxJoinedRows` requests as rows of one decode forward ([below](#prefix-cache)).
+  text out; a fully resident Cooler load joins up to `maxJoinedRows` (16 on NAX, 8 on SIMD) requests as rows of one
+  decode forward, and a streamed Cooler load whose expert cache holds at least `2 * top_k` slots per layer
+  (`dsv41_config.streamedRowsCap`) joins up to `min(maxJoinedRows, slots / top_k)` requests so one tick fits in the
+  cache without intra-tick eviction; tighter streamed budgets and MLX opt-out loads serve one request at a time
+  (`ownsModuleDecodeState`, [below](#prefix-cache)). Joined decode shares batched hyper-connections, projections,
+  Engram gathers (inline `RowCache.tryReadCached` fast path when hot), fused per-row RoPE + KV-ring updates
+  (`ropeKvRingInPlace`), deferred logit evaluation (`forwardRowsDeferred`), and overlapped `route_spec` + partial redo
+  + lookahead prefetch up to `DECODE_ROWS_MAX` (16) rows (`passLayerRows`).
 - Off, by name: `--kv-quant` (the state is the activation dtype;
   `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16` or `--mtp-head-kv-quant` refuses the load, a settings `kv_quant` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
@@ -740,6 +746,13 @@ accept), the serial sampler's distribution (`Generator.dsparkSampledVerdict`, MT
   row never overwrites a row a later query reads; the compressed rows and index keys roll back by their row count; an open
   pooling group is re-cut from the concatenation the verify saved; Engram history is truncated; the stage rings take the main rows of the
   kept positions only. The tests check every accepted count 0..block against serial decode, then a second round, then the next draft.
+- **Grouped DSpark** (`dsv41_sched.groupForward`, `dsv41_model.draftBatch`, `finishVerifyJoined`): when two or more
+  slots decode together (`rows_company_min = 2`), eligible DSpark slots draft in one batched stage + shared LM-head
+  pass (`draftBatch`), verify rows are allocated across slots by calibrated marginal-gain confidence knapsack
+  (`allocateGroupWidths`, pruning low-confidence slots to 1 plain row with zero rollback overhead while concentrating
+  rows on high-confidence slots), all slots verify in one joined trunk forward with one batched GPU verdict eval
+  (`verdictBegin` + single `mlx_eval`) and one joined `finishVerifyJoined` main-row commit, guarded by per-concurrency
+  cost gates (`group_gates[n]`) with fresh-batch reset.
 - **Memory.** Resident, always (`dsv41_source.dsparkBytes`): 3 x 128 mxfp4 experts are 7.2 GB, the stages' trunk tensors
   0.58 GB and the two Markov tables 0.13 GB (both as stored, bf16), about 7.9 GB out of the SSD budget's expert cache. The state bill adds the
   stage windows and the backbone slack (`Config.stateFixedBytes(true)`). The load is exact against the arrays the model holds

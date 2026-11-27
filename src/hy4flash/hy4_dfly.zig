@@ -207,6 +207,160 @@ pub const Drafter = struct {
             .best = try o.concat(parts[2 * n_draft ..], 0),
         };
     }
+
+    pub const max_batch_slots: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+
+    /// Batched DFly2 draft across `reqs.len` concurrent requests in ONE joined pass through all 5 DFly2 layers
+    /// (reading DFly2 weights once instead of N times) and only `n_use = @min(max_drafts, c.dfly.draft)` steps of the
+    /// hidden correction chain + shared `m.lmHead` (e.g. 1 LM head read at N=8 instead of 40), with ONE GPU wait.
+    pub fn draftBatch(
+        self: *const Drafter,
+        m: *Model,
+        reqs: []const *hy4_model.Request,
+        t1s: []const u32,
+        max_drafts: usize,
+        out_drafts: []Draft,
+    ) !void {
+        const n = reqs.len;
+        if (n == 0 or n > max_batch_slots or t1s.len != n or out_drafts.len != n) return error.Hy4RowsWidth;
+        const c = m.config;
+        const n_draft: usize = c.dfly.draft;
+        const n_use: usize = @min(max_drafts, n_draft);
+        if (n_use == 0) return error.Hy4RowsWidth;
+        if (n == 1) {
+            const lent = m.lend(reqs[0]);
+            defer lent.end();
+            out_drafts[0] = try self.draft(m, t1s[0]);
+            return;
+        }
+        // `blockMask` is causal within each slot's block (`dflash_causal_attn`), so rows `0..n_use` never attend to
+        // mask positions past `n_use`: running `n_use + 1` rows/slot matches `n_draft + 1` bit-for-bit while cutting
+        // N=8 draft rows 3x (48 -> 16, staying inside the NAX decode arm).
+        const t: c_int = @intCast(n_use + 1);
+        const tu: usize = n_use + 1;
+        const total: usize = n * tu;
+        if (total > 64) return error.Hy4RowsWidth;
+        const dim: c_int = @intCast(c.dim);
+        var o: Ops = .{ .s = m.s };
+        defer o.deinit();
+
+        // Gather N anchors + 1 shared mask embedding in one call (data-independent plan bound).
+        var embed_ids: [max_batch_slots + 1]u32 = undefined;
+        @memcpy(embed_ids[0..n], t1s);
+        embed_ids[n] = c.dfly.mask_id;
+        const e_in = try embedRows(&o, m, embed_ids[0 .. n + 1]);
+        const e0_all = try o.slice(e_in, 0, 0, @intCast(n));
+        const mask_row = try o.slice(e_in, 0, @intCast(n), @intCast(n + 1));
+        const mask_block = try o.broadcast(mask_row, &.{ @intCast(n_use), dim });
+
+        var h_parts: [max_batch_slots]Arr = undefined;
+        var flat_pos: [64]c_int = undefined;
+        for (reqs, 0..) |req_i, i| {
+            const h = req_i.last_hidden orelse return error.Hy4DflyNoHandover;
+            h_parts[i] = try o.reshape(h, &.{ 1, dim });
+            const p0: c_int = @intCast(req_i.pos);
+            for (0..tu) |k| flat_pos[i * tu + k] = p0 + @as(c_int, @intCast(k));
+        }
+        const h_all = try o.concat(h_parts[0..n], 0);
+        const hn = try fwd.norm(&o, try fwd.norm(&o, h_all, m.final_norm, c.eps), self.hnorm, c.eps);
+        const fused = try fwd.linear(&o, try o.concat(&.{ try fwd.norm(&o, e0_all, self.enorm, c.eps), hn }, 1), self.eh_proj);
+        const row0_all = try o.binary(.add, e0_all, try o.binary(.mul, fused, try o.reshape(try o.cast(self.fusion_gate, .float32), &.{ 1, dim })));
+        var x_parts: [2 * max_batch_slots]Arr = undefined;
+        for (0..n) |i| {
+            const ri: c_int = @intCast(i);
+            x_parts[2 * i] = try o.slice(row0_all, 0, ri, ri + 1);
+            x_parts[2 * i + 1] = mask_block;
+        }
+        var x = try o.concat(x_parts[0 .. 2 * n], 0);
+
+        for (self.layers, 0..) |*ly, li| {
+            const f = try plan.frame(@src(), .{li});
+            defer f.end();
+            var ol: Ops = .{ .s = o.s };
+            defer ol.deinit();
+            const a = try fwd.norm(&ol, x, ly.input_norm, c.eps);
+            const pr = try fwd.projectRowsJoinedFull(&ol, a, ly.attn, ly.geometry, flat_pos[0..total], .float32, .float32);
+            const gate_all = try fwd.linearStored(&ol, a, ly.attn.gate);
+            var gated_parts: [max_batch_slots]Arr = undefined;
+            {
+                const slots_f = try plan.frame(@src(), .{});
+                defer slots_f.end();
+                for (reqs, 0..) |req_i, i| {
+                    const lent = m.lend(req_i);
+                    defer lent.end();
+                    const v = if (plan.planned()) try plan.each(@src(), req_i.last_picks[ly.target] != null) else plan.Frame.none;
+                    defer v.end();
+                    var sl: Ops = .{ .s = ol.s };
+                    defer sl.deinit();
+                    const r0: c_int = @intCast(i * tu);
+                    const r1: c_int = r0 + t;
+                    const shared = try m.sharedRows(&sl, ly.target);
+                    const keys_c = try sl.concat(&.{ shared.c, try sl.slice(pr.c, 0, r0, r1) }, 0);
+                    const keys_pe = try sl.concat(&.{ shared.k_pe, try sl.slice(pr.k_pe, 0, r0, r1) }, 0);
+                    const mask = try blockMask(&sl, t, mlx.getShape(shared.c)[0], shared.keep);
+                    const q_i = try sl.slice(pr.q_full.?, 1, r0, r1);
+                    const q_raw_i = if (pr.q_raw) |qr| try sl.slice(qr, 1, r0, r1) else null;
+                    const gate_i = try sl.slice(gate_all, 0, r0, r1);
+                    const g_i = try fwd.attendGated(&sl, .{ .gate = gate_i, .whole = false, .q_raw = q_raw_i }, q_i, keys_c, keys_pe, ly.attn, ly.geometry, mask, null);
+                    gated_parts[i] = try ol.own(try sl.result(g_i));
+                }
+            }
+            const attn_out = try fwd.output(&ol, try ol.concat(gated_parts[0..n], 0), ly.attn, ly.geometry, null);
+            const x1 = try ol.binary(.add, x, attn_out);
+            const x2 = try ol.binary(.add, x1, try fwd.swiglu(&ol, try fwd.norm(&ol, x1, ly.post_norm, c.eps), ly.mlp, null));
+            x = try o.own(try ol.result(x2));
+        }
+
+        // Gather the first `n_use` mask slots of every request laid out as `[n_use, n, dim]` -> `[n_use * n, dim]`.
+        const x3 = try o.reshape(x, &.{ @intCast(n), t, dim });
+        const masks_only = try o.slice(x3, 1, 1, @intCast(1 + n_use));
+        const masks_t = try o.contiguous(try o.transpose(masks_only, &.{ 1, 0, 2 }));
+        const hf_all = try fwd.norm(&o, try o.reshape(masks_t, &.{ @intCast(n_use * n), dim }), self.final_norm, c.eps);
+
+        var best_steps: [max_probe_slots]Arr = undefined;
+        var conf_steps: [max_probe_slots]Arr = undefined;
+        var prev_e = e0_all;
+        for (0..n_use) |j| {
+            var os: Ops = .{ .s = o.s };
+            defer os.deinit();
+            const r0: c_int = @intCast(j * n);
+            const r1: c_int = @intCast((j + 1) * n);
+            const hj = try os.slice(hf_all, 0, r0, r1);
+            const z = try os.concat(&.{ try fwd.norm(&os, hj, self.hidden_norm, c.eps), try fwd.norm(&os, prev_e, self.embed_norm, c.eps) }, 1);
+            const hc = try os.binary(.add, hj, try fwd.swiglu(&os, z, self.correction, null));
+            const logits = try m.lmHead(&os, hc);
+            const am = try os.slot();
+            try mlx.check(mlx.mlx_argmax_axis(am, logits, 1, false, os.s));
+            const best = try os.contiguous(try os.cast(am.*, .uint32));
+            const conf = try os.reshape(try os.unary(.sigmoid, try os.binary(.add, try fwd.linearF32(&os, hc, self.conf_w), try os.cast(self.conf_b, .float32))), &.{@intCast(n)});
+            best_steps[j] = try o.own(try os.result(best));
+            conf_steps[j] = try o.own(try os.result(conf));
+            if (j + 1 < n_use) prev_e = try o.own(try os.result(try embedRowIds(&os, m, best, n)));
+        }
+
+        const all_best = try o.contiguous(try o.concat(best_steps[0..n_use], 0));
+        const all_conf = try o.contiguous(try o.concat(conf_steps[0..n_use], 0));
+        const vec = mlx.mlx_vector_array_new_data(&[_]Arr{ all_best, all_conf }, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_eval(vec));
+        const best_host = try mlx.hostResult(u32, all_best, @intCast(c.vocab));
+        const conf_host = try mlx.hostResult(f32, all_conf, null);
+
+        var made: usize = 0;
+        errdefer for (out_drafts[0..made]) |*d| d.deinit();
+        for (0..n) |i| {
+            const ids = try self.gpa.alloc(u32, n_use + 1);
+            errdefer self.gpa.free(ids);
+            const conf = try self.gpa.alloc(f32, n_use);
+            ids[0] = t1s[i];
+            for (0..n_use) |j| {
+                ids[1 + j] = best_host[j * n + i];
+                conf[j] = conf_host[j * n + i];
+            }
+            out_drafts[i] = .{ .gpa = self.gpa, .ids = ids, .conf = conf };
+            made = i + 1;
+        }
+    }
 };
 
 /// The block `ids` (its drafts filled from the host rows `best`) with the confidence rows `conf` copied; null rows are
@@ -342,6 +496,23 @@ fn embedRowId(o: *Ops, m: *Model, id: Arr) !Arr {
         return embedRows(o, m, &.{host_id});
     }
     return o.cast(try o.take(m.embed, id, 0), .float32);
+}
+
+fn embedRowIds(o: *Ops, m: *Model, ids: Arr, n: usize) !Arr {
+    if (m.embed_gpu) |g| {
+        var parts: [Drafter.max_batch_slots]Arr = undefined;
+        for (0..n) |i| {
+            const ri: c_int = @intCast(i);
+            parts[i] = try o.own(try g.rowFromId(o.s, try o.slice(ids, 0, ri, ri + 1)));
+        }
+        return o.concat(parts[0..n], 0);
+    }
+    if (m.embed_gather) |_| {
+        try mlx.check(mlx.mlx_array_eval(ids));
+        const host_ptr = try mlx.hostResult(u32, ids, @intCast(m.config.vocab));
+        return embedRows(o, m, host_ptr[0..n]);
+    }
+    return o.cast(try o.take(m.embed, ids, 0), .float32);
 }
 
 /// The block's mask [T, p0 + T] over the `p0` shared rows and the block: the shared rows the target read (`keep`), and

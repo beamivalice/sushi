@@ -1246,6 +1246,8 @@ pub const Generator = struct {
     pub const InterleaveHook = struct {
         ctx: *anyopaque,
         call: *const fn (ctx: *anyopaque) void,
+        /// Optional chunk width cap while co-tenant decoders are active (0 = uncapped).
+        chunk_cap: ?*const fn (ctx: *anyopaque) usize = null,
     };
 
     /// Wakes a reader parked on the slot's live prefill progress, once per chunk right after its stores.
@@ -1622,15 +1624,17 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
+                const interleave_cap = if (options.interleave_hook) |hk| (if (hk.chunk_cap) |f| f(hk.ctx) else 0) else 0;
+                const step_chunk = if (interleave_cap > 0) @min(cur_chunk, interleave_cap) else cur_chunk;
                 const end = if (arch_request != null)
-                    prefix_arch.requestChunkEnd(pos, loop_end, cur_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                    prefix_arch.requestChunkEnd(pos, loop_end, step_chunk, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                 else
-                    prefill_plan.chunkEndFor(xfm.config.static_prefill_chunk != 0, pos, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
+                    prefill_plan.chunkEndFor(xfm.config.static_prefill_chunk != 0, pos, loop_end, step_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive);
                 if (has_vision) ctx.vision_splice_offset = vision_rows_consumed;
                 // The model reads the next forward's Engram rows while this chunk runs: the next chunk, or the final span.
                 if (prefix_arch.restorePointModel(xfm)) {
                     const ahead_end = if (end < loop_end)
-                        prefill_plan.chunkEndFor(xfm.config.static_prefill_chunk != 0, end, loop_end, cur_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
+                        prefill_plan.chunkEndFor(xfm.config.static_prefill_chunk != 0, end, loop_end, step_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, width_is_adaptive)
                     else
                         prompt_ids.len;
                     ctx.ahead_ids = ids_i32[end..ahead_end];

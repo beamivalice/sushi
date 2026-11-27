@@ -398,16 +398,19 @@ A `--model` boot (`server.serve`) serves before its model is loaded:
   to existing decoders during another request's prefill. Values above 0.9 clamp; negative values and NaN refuse.
   Zero preserves one decode tick per boundary; a nonzero share adds ticks until `chunk_ns*S/(1-S)` is spent or
   decoders finish. `SUSHI_PREFILL_INTERLEAVE=0` disables the share.
-- **The share never narrows a prefill chunk** (any arch): a request's chunk width, bill and numerics do not depend on
-  what else decodes; decoders get time only between whole chunks. Hosted decode time is excluded from prefill compute
-  time but remains part of request latency.
+- **Chunk cap during decode interleaving** (`sched_policy.interleaveChunkCap`): while active decoders are waiting,
+  cold prefill chunks cap at `2048` rows so decoder inter-token latency stays bounded while preserving prefill
+  throughput. Hosted decode time is excluded from prefill compute time but remains part of request latency.
 - **Serial ≠ exclusive**: only a slot driving a module-owned decode state is exclusive (`slotExclusiveDecode`);
   qwen4's state is read-only shared and batches freely. The batched-decode gate reads DISPATCH, not ARMED flags
   (`slotTicksRegular` asks `specTickMode`). A batched decode guard that only runs at N=1 pins nothing:
   `tests/test_batched_equivalence.sh` runs a real two-stream arm.
 - **A GLM slot owns its `glm5_forward.Request`** (`Slot.request`, handed to the forward as
   `ForwardCtx.arch_ctx.glm5.request`; a GLM forward without one is `GlmRequestMissing`), so GLM requests share a model; only a
-  streamed GLM load stays exclusive. The boot line and `/props batching.reason` (`ok` vs `exclusive`) say which.
+  streamed GLM load stays exclusive. Streamed DeepSeek and Hy4-Flash Cooler loads whose expert cache holds at least
+  `2 * top_k` slots per layer (`dsv41_config.streamedRowsCap`, `hy4_plan.streamedRowsCap`) batch concurrently up to
+  `min(hw_max, slots / top_k)` rows so each tick fits in the cache without intra-tick eviction; tighter streamed
+  budgets stay exclusive. The boot line and `/props batching.reason` (`ok` vs `exclusive`) say which.
 - **An exclusive slot blocks admission until the inference thread releases it** (`heldExclusive`: `decoding` plus
   `cleanup_queue`; `complete()` keeps a slot in `decoding` until its pass is out): a disconnect must not let the next
   request prefill while the slot still owns the stream (`GlmStreamRequestBusy`).

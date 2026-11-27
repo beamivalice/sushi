@@ -68,3 +68,20 @@ pub const drafterObserve = R.drafterObserve;
 pub const drafterEmitPending = R.drafterEmitPending;
 pub const DrafterResume = R.DrafterResume;
 pub const drafterResumeAfterForced = R.drafterResumeAfterForced;
+pub const roundRows = R.roundRows;
+pub const Verdict = R.Verdict;
+pub const LazyVerdict = R.LazyVerdict;
+pub const verdictBegin = R.verdictBegin;
+pub const verdictInFor = R.verdictInFor;
+pub const commitVerdict = R.commitVerdict;
+pub const settleDrafted = R.settleDrafted;
+
+/// Whether a decoding slot can join a grouped DSpark speculative tick.
+pub fn groupEligible(gen: *const @import("../generate.zig").Generator) bool {
+    if (!gen.drafter_on or gen.done or gen.spec_disabled_runtime) return false;
+    if (gen.sampling.constraint != null or @import("../sampler.zig").penaltyActive(gen.sampling)) return false;
+    if (gen.sampling.think_bound != null or gen.sampling.call_force != null) return false;
+    if (gen.max_tokens <= gen.completion_tokens + 1) return false;
+    if (!@import("../mtp.zig").mtpCtxWithinLimit(gen.opts.max_mtp_ctx, gen.mtpKvLen())) return false;
+    return !gen.samplesSync();
+}

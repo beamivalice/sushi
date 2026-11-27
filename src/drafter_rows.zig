@@ -219,6 +219,16 @@ pub const Policy = struct {
         } else self.period = 1;
     }
 
+    /// A grouped drafted round that verified `verified` rows and kept `accepted` of their drafts: calibrates the
+    /// request's acceptance model without feeding N-slot batch wall times into its solo cost model or solo cost gate.
+    pub fn observeGroupedRound(self: *Policy, conf: []const f32, verified: u32, accepted: u32) void {
+        var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
+        const n = @min(conf.len, p.len);
+        for (conf[0..n], p[0..n]) |c, *o| o.* = sigmoid(c);
+        self.low_stages = if (accepted < short_drafts) self.low_stages +| 1 else 0;
+        if (verified > 1) self.calib.observeRound(p[0..n], verified - 1, accepted);
+    }
+
     /// A plain one-row step.
     pub fn observePlain(self: *Policy, ms: f32) void {
         self.cost.observePlain(ms);

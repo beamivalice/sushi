@@ -1550,7 +1550,7 @@ test "exl3 Ultra pins the K5 query projection geometry at every decode width" {
         const geo = try Geo.init(weight, null, .{ .exact = true });
         for (geo.rows) |slot| {
             const g = slot.?.g;
-            try std.testing.expectEqual(@as(c_int, if (n == 80) 2 else 4), g.kph);
+            try std.testing.expectEqual(@as(c_int, if (n == 80) 1 else 4), g.kph);
             try std.testing.expectEqual(@as(c_int, 1), g.nsplit);
         }
     }

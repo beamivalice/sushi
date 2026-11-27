@@ -26,7 +26,11 @@ const joined_rows_max: usize = @intCast(@import("sushi_exl3").project_rows.NAX_R
 /// request may name its own), each of which decides its structure.
 pub fn root(p: Probe) plan.FrameId {
     // A draft's root is its own: the block `[t1, mask x draft]`, its width the config's, read from the handover.
-    if (p.phase == .draft) return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.kv.scheme, p.kv.bits, p.kv.group_size }) };
+    // A batched draft (`groups.len > 0`) keys by `(slots, max_drafts, kv)`.
+    if (p.phase == .draft) {
+        if (p.groups.len > 0) return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.groups.len, p.rows, p.kv.scheme, p.kv.bits, p.kv.group_size }) };
+        return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.kv.scheme, p.kv.bits, p.kv.group_size }) };
+    }
     if (p.phase == .joined) return joinedId(p);
     return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.rows, p.readout, p.keep_hidden, p.kv.scheme, p.kv.bits, p.kv.group_size }) };
 }
@@ -42,9 +46,23 @@ fn joinedId(p: Probe) plan.FrameId {
     return .{ .site = plan.siteOf(@src()), .key = plan.keyOf(.{ p.rows, p.readout, p.keep_hidden, p.kv.scheme, p.kv.bits, p.kv.group_size, h.final() >> 1 }) };
 }
 
+/// Maximum joined rows for a streamed Cooler load whose expert cache holds `slots` experts per layer:
+/// requires at least `2 * top_k` slots so >= 2 concurrent rows fit in one cache working set without intra-tick
+/// eviction (guaranteeing a single route group in `moeStqStreamed`/`streamedSum`), capped at `min(hw_max, slots / top_k)`.
+/// Tighter caches (`slots < 2 * top_k`, or `slots == 0` when unset) stay exclusive (1 row).
+pub fn streamedRowsCap(experts: usize, top_k: usize, slots: usize, hw_max: usize) usize {
+    if (experts == 0 or top_k == 0 or hw_max <= 1) return 1;
+    const by_slots = slots / top_k;
+    if (by_slots < 2) return 1;
+    return @min(hw_max, by_slots);
+}
+
 pub fn joinedRows(config: *const @import("../model.zig").ModelConfig) usize {
-    if (!config.expert_resident or !@import("../cooler_side.zig").onEngine(config)) return 1;
-    return @intCast(@import("hy4_forward.zig").joinedRowsMax());
+    if (!@import("../cooler_side.zig").onEngine(config)) return 1;
+    const hw_max: usize = @intCast(@import("hy4_forward.zig").joinedRowsMax());
+    if (config.expert_resident) return hw_max;
+    const c = config.hy4flash orelse return 1;
+    return streamedRowsCap(c.experts, c.top_k, config.expert_cache_slots, hw_max);
 }
 
 /// One shape a root is recorded at: its rows after a state `n` rows deep; a target's forward, or DFly2's draft
@@ -293,7 +311,7 @@ fn recordPasses(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, f
 /// (`Model.dryState`), under `fill`, its choices `driver`'s: its trace. The model's state is reset on every path, and
 /// its drafter flag left as it was.
 fn recordPass(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fill: core.Fill, ids_kind: Ids, driver: *plan.Driver) !plan_trace.Trace {
-    if (probe.phase == .draft) return recordDraft(m, gpa, probe, reach, fill, driver);
+    if (probe.phase == .draft) return if (probe.groups.len > 0) recordDraftBatch(m, gpa, probe, reach, fill, ids_kind, driver) else recordDraft(m, gpa, probe, reach, fill, driver);
     if (probe.phase == .joined) return if (probe.groups.len > 0) recordJoinedGroups(m, gpa, probe, reach, fill, ids_kind, driver) else recordJoined(m, gpa, probe, reach, fill, ids_kind, driver);
     const own = m.lendOwn();
     defer own.end();
@@ -448,7 +466,8 @@ fn recordJoinedGroups(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: us
             reqs[i].kv = probe.kv;
             const lent = m.lend(&reqs[i]);
             defer lent.end();
-            try m.dryState(probe.n, reach);
+            const ni = if (probe.ns.len > 0) probe.ns[i] else probe.n;
+            try m.dryState(ni, reach);
             try m.makeRequestLogits(&reqs[i]);
         }
         if (held[0] != null) try m.makeLogitsBlocks();
@@ -458,6 +477,8 @@ fn recordJoinedGroups(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: us
     {
         try core.beginRecording(.{ .dry = .{ .driver = driver, .fill = fill } }, &rec);
         defer core.endRecording() catch {};
+        const scope = try GemmScope.begin();
+        defer scope.end();
         for (0..n) |i| {
             const w: usize = probe.groups[i];
             spreadIds(&m.config, ids[i][0..w], ids_kind);
@@ -507,6 +528,59 @@ fn recordDraft(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fi
         defer core.endRecording() catch {};
         var drafted = try d.draft(m, 0);
         drafted.deinit();
+    }
+    return rec.end();
+}
+
+/// A batched draft probe recorded dry (`Drafter.draftBatch`): `probe.groups.len` concurrent requests each with handover
+/// kept, drafting `probe.rows` tokens in one joined DFly2 pass.
+fn recordDraftBatch(m: *Model, gpa: std.mem.Allocator, probe: Probe, reach: usize, fill: core.Fill, ids_kind: Ids, driver: *plan.Driver) !plan_trace.Trace {
+    const d = probe.drafter orelse return error.Hy4DflyMissing;
+    const n = probe.groups.len;
+    if (n < 2 or n > Drafter.max_batch_slots) return error.Hy4RowsWidth;
+    const own = m.lendOwn();
+    defer own.end();
+    const keep_was = m.keep_hidden;
+    defer m.keep_hidden = keep_was;
+    m.keep_hidden = true;
+    var reqs: [Drafter.max_batch_slots]hy4_model.Request = undefined;
+    var made: usize = 0;
+    defer for (reqs[0..made]) |*r| r.deinit();
+    m.reset();
+    defer m.reset();
+    {
+        var rec = try plan.Recorder.begin(gpa, .{ .site = plan.siteOf(@src()) });
+        defer rec.deinit();
+        var state_driver: plan.Driver = .{ .gpa = gpa };
+        defer state_driver.deinit();
+        try core.beginRecording(.{ .dry = .{ .driver = &state_driver } }, &rec);
+        defer core.endRecording() catch {};
+        for (0..n) |i| {
+            const ni = if (probe.ns.len > 0) probe.ns[i] else probe.n;
+            if (ni == 0) return error.Hy4DflyNoContext;
+            reqs[i] = try hy4_model.Request.init(gpa, 0);
+            made = i + 1;
+            reqs[i].kv = probe.kv;
+            const lent = m.lend(&reqs[i]);
+            defer lent.end();
+            try m.dryState(ni, reach);
+            try m.dryHandover();
+        }
+    }
+    var rec = try plan.Recorder.begin(gpa, root(probe));
+    defer rec.deinit();
+    {
+        try core.beginRecording(.{ .dry = .{ .driver = driver, .fill = fill } }, &rec);
+        defer core.endRecording() catch {};
+        const scope = try GemmScope.begin();
+        defer scope.end();
+        var req_ptrs: [Drafter.max_batch_slots]*hy4_model.Request = undefined;
+        for (0..n) |i| req_ptrs[i] = &reqs[i];
+        var t1s: [Drafter.max_batch_slots]u32 = undefined;
+        spreadIds(&m.config, t1s[0..n], ids_kind);
+        var out: [Drafter.max_batch_slots]Drafter.Draft = undefined;
+        try d.draftBatch(m, req_ptrs[0..n], t1s[0..n], probe.rows, out[0..n]);
+        for (out[0..n]) |*dr| dr.deinit();
     }
     return rec.end();
 }
@@ -655,6 +729,16 @@ fn addProbe(m: *Model, gpa: std.mem.Allocator, p: *Plans, probe: Probe, reach: u
     };
 }
 
+/// `probe` recorded once (`.zeros` fill) when an adjacent probe on the same root already proved data-independence via `addProbe`.
+fn addProbeFast(m: *Model, gpa: std.mem.Allocator, p: *Plans, probe: Probe, reach: usize) !void {
+    const passes = try recordPasses(m, gpa, probe, reach, .zeros, .zeros);
+    defer gpa.free(passes.traces);
+    for (passes.traces, 0..) |t, i| p.book.add(root(probe), t) catch |e| {
+        for (passes.traces[i + 1 ..]) |*rest| rest.deinit();
+        return e;
+    };
+}
+
 /// The plans of `m` for requests that reach at most `reach` rows, recorded before the load's warm (D98): the wide
 /// pipelines latched first (D20), then each root recorded at every decode position, merged and packed, the shapes
 /// earlier misses kept learned, and the logits blocks made (D19). No arena is made: `makeArena` makes it with the
@@ -675,7 +759,7 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
     const positions = try decodePositions(gpa, &m.config, reach);
     defer gpa.free(positions);
     // Made first: each recording writes the logits into blocks of their shape, as a served forward does.
-    m.logits_rows = @intCast(@max(@as(usize, @intCast(@import("hy4_forward.zig").verify_rows_max)), joined));
+    m.logits_rows = @intCast(@max(@as(usize, @intCast(@import("hy4_forward.zig").verify_rows_max)), p.joined));
     try m.makeLogitsBlocks();
     try m.makeIdsBlock();
     var roots: [4]Probe = undefined;
@@ -724,20 +808,75 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
             }
         }
     };
-    if (joined > 1 and drafts) for (2..@min(joined, @as(usize, @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX))) + 1) |slots| {
-        const w = @import("hy4_forward.zig").groupRows(@as(usize, m.config.dfly.draft), joined, slots);
-        if (w < 2 or slots * w > joined) continue;
-        var widths: [@import("sushi_exl3").project_rows.NAX_ROWS_MAX]u16 = @splat(@intCast(w));
-        const at = try blockPositions(gpa, m, reach, w);
-        defer gpa.free(at);
-        for (at) |n| {
-            var probe = joinedRoot(slots * w, m.keep_hidden, kv);
-            probe.n = n;
-            probe.groups = widths[0..slots];
-            try addProbe(m, gpa, p, probe, reach);
-            probes += 1;
+    if (p.joined > 1 and drafts) {
+        const max_g: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+        const max_w_all: usize = @min(@as(usize, m.config.dfly.draft) + 1, verify_max);
+        var pos_by_w: [max_g + 1]?[]usize = @splat(null);
+        defer for (pos_by_w[1 .. max_w_all + 1]) |opt| if (opt) |sl| gpa.free(sl);
+        pos_by_w[1] = try compactDecodePositions(gpa, m, positions);
+        for (2..max_w_all + 1) |w| pos_by_w[w] = try blockPositions(gpa, m, reach, w);
+
+        for (2..@min(p.joined, max_g) + 1) |slots| {
+            var templates: [20][max_g]u16 = undefined;
+            const n_tpl = groupWidthTemplates(@as(usize, m.config.dfly.draft), p.joined, slots, &templates);
+            for (0..n_tpl) |ti| {
+                const widths = templates[ti][0..slots];
+                var total_w: usize = 0;
+                var valid = true;
+                for (widths) |w| {
+                    total_w += w;
+                    if (w == 0 or w > max_w_all or pos_by_w[w] == null) valid = false;
+                }
+                if (!valid or total_w > p.joined) continue;
+                // Count slots per distinct width to pack `pos_by_w[w]` across slots of width `w`.
+                var count_w: [max_g + 1]usize = @splat(0);
+                for (widths) |w| count_w[w] += 1;
+                var n_probes: usize = 1;
+                for (1..max_w_all + 1) |w| if (count_w[w] > 0) {
+                    const len_w = pos_by_w[w].?.len;
+                    n_probes = @max(n_probes, (len_w + count_w[w] - 1) / count_w[w]);
+                };
+                m.joined_grouped_at = std.math.maxInt(usize);
+                for (0..n_probes) |pi| {
+                    var seen_w: [max_g + 1]usize = @splat(0);
+                    var ns: [max_g]usize = undefined;
+                    for (widths, 0..) |w, i| {
+                        const at_w = pos_by_w[w].?;
+                        const idx = pi * count_w[w] + seen_w[w];
+                        seen_w[w] += 1;
+                        ns[i] = at_w[@min(idx, at_w.len - 1)];
+                    }
+                    var probe = joinedRoot(total_w, m.keep_hidden, kv);
+                    probe.n = ns[0];
+                    probe.ns = ns[0..slots];
+                    probe.groups = widths;
+                    try addProbeFast(m, gpa, p, probe, reach);
+                    probes += 1;
+                }
+                // One simultaneous deepest-context probe guarantees peak scratch when all slots reach `reach`, recording
+                // both the unjoined arm (mixed shallow+deep batches) and the batched sliding-window arm (`joined_attn`).
+                var deep_ns: [max_g]usize = undefined;
+                var all_deep_past = true;
+                for (widths, 0..) |w, i| {
+                    const at_w = pos_by_w[w].?;
+                    deep_ns[i] = at_w[at_w.len - 1];
+                    if (deep_ns[i] < m.config.window) all_deep_past = false;
+                }
+                var deep_probe = joinedRoot(total_w, m.keep_hidden, kv);
+                deep_probe.n = deep_ns[0];
+                deep_probe.ns = deep_ns[0..slots];
+                deep_probe.groups = widths;
+                m.joined_grouped_at = std.math.maxInt(usize);
+                try addProbe(m, gpa, p, deep_probe, reach);
+                probes += 1;
+                if (all_deep_past) {
+                    m.joined_grouped_at = deep_ns[0];
+                    try addProbe(m, gpa, p, deep_probe, reach);
+                    probes += 1;
+                }
+            }
         }
-    };
+    }
     // A one-row replay takes the one-row forward's structures, a wider one a block's.
     const replay_max: usize = @min(@as(usize, @intCast(@import("hy4_forward.zig").verify_rows_max)) - 1, reach);
     if (drafts) for (1..replay_max + 1) |rows| {
@@ -757,6 +896,24 @@ pub fn record(m: *Model, gpa: std.mem.Allocator, reach: usize, drafter: ?*const 
             try addProbe(m, gpa, p, draftProbe(d, &m.config, kv, n), reach);
             probes += 1;
         }
+        if (p.joined > 1) for (2..@min(p.joined, Drafter.max_batch_slots) + 1) |slots| {
+            const n_use = groupDraftWidth(@as(usize, m.config.dfly.draft), p.joined, slots);
+            if (n_use == 0 or slots * (n_use + 1) > 64) continue;
+            var widths: [Drafter.max_batch_slots]u16 = @splat(@intCast(n_use));
+            for ([_]usize{ at[0], at[at.len - 1] }) |edge_n| {
+                const probe: Probe = .{ .rows = n_use, .readout = .all, .keep_hidden = true, .kv = kv, .n = edge_n, .phase = .draft, .drafter = d, .groups = widths[0..slots] };
+                try addProbe(m, gpa, p, probe, reach);
+                probes += 1;
+            }
+            var idx: usize = 0;
+            while (idx < at.len) : (idx += slots) {
+                var ns: [Drafter.max_batch_slots]usize = undefined;
+                for (ns[0..slots], 0..) |*dst, k| dst.* = at[@min(idx + k, at.len - 1)];
+                const probe: Probe = .{ .rows = n_use, .readout = .all, .keep_hidden = true, .kv = kv, .n = ns[0], .phase = .draft, .drafter = d, .groups = widths[0..slots], .ns = ns[0..slots] };
+                try addProbeFast(m, gpa, p, probe, reach);
+                probes += 1;
+            }
+        };
     };
     if (encode) |e| p.encode = try @import("hy4_encode_plan.zig").need(e.tower, gpa, e.max_patches, p.book.alignment);
     p.book.build() catch |e| {
@@ -1214,6 +1371,71 @@ pub fn runDraft(m: *Model, d: *const Drafter, t1: u32) !Drafter.Draft {
     return drafted;
 }
 
+/// Batched DFly2 draft (`Drafter.draftBatch`) across `reqs` on the static arena where planned, falling back to per-slot
+/// planned `runDraft` if the shape is not planned (e.g., mixed KV widths or single slot).
+pub fn runDraftBatch(
+    m: *Model,
+    d: *const Drafter,
+    reqs: []const *hy4_model.Request,
+    t1s: []const u32,
+    max_drafts: usize,
+    out_drafts: []Drafter.Draft,
+) !void {
+    const n = reqs.len;
+    if (n == 0 or t1s.len != n or out_drafts.len != n) return error.Hy4RowsWidth;
+    const n_use = @min(max_drafts, @as(usize, m.config.dfly.draft));
+    if (n == 1 or n * (n_use + 1) > 64) {
+        var made: usize = 0;
+        errdefer for (out_drafts[0..made]) |*b| b.deinit();
+        for (reqs, t1s, out_drafts) |r, t1, *dst| {
+            const lent = m.lend(r);
+            defer lent.end();
+            dst.* = try runDraft(m, d, t1);
+            made += 1;
+        }
+        return;
+    }
+    const p = m.plans orelse {
+        const scope = try GemmScope.begin();
+        defer scope.end();
+        return d.draftBatch(m, reqs, t1s, n_use, out_drafts);
+    };
+    var same_kv = true;
+    for (reqs) |r| if (!std.meta.eql(r.kv, p.kv)) {
+        same_kv = false;
+        break;
+    };
+    var widths: [Drafter.max_batch_slots]u16 = @splat(@intCast(n_use));
+    const probe: Probe = .{ .rows = n_use, .readout = .all, .keep_hidden = true, .kv = p.kv, .n = reqs[0].pos, .phase = .draft, .drafter = d, .groups = widths[0..n] };
+    const tables = if (same_kv) p.tables(probe) else null;
+    if (tables == null) {
+        var made: usize = 0;
+        errdefer for (out_drafts[0..made]) |*b| b.deinit();
+        for (reqs, t1s, out_drafts) |r, t1, *dst| {
+            const lent = m.lend(r);
+            defer lent.end();
+            dst.* = try runDraft(m, d, t1);
+            made += 1;
+        }
+        return;
+    }
+    try core.beginExecution(tables.?, root(probe));
+    const scope = GemmScope.begin() catch |e| {
+        core.abortExecution();
+        return e;
+    };
+    d.draftBatch(m, reqs, t1s, n_use, out_drafts) catch |e| {
+        scope.end();
+        core.abortExecution();
+        return if (core.executionMiss()) |miss| missed(m, p, probe, miss) else e;
+    };
+    scope.end();
+    core.endExecution() catch |e| {
+        for (out_drafts) |*b| b.deinit();
+        return if (core.executionMiss()) |miss| missed(m, p, probe, miss) else e;
+    };
+}
+
 /// A joined tick of requests as rows of one forward (`Model.extendRows`) on a load that planned it: it begins as an
 /// execution of the tick's root (D97: a 2..8-row decode tick is a narrow phase). null where the load plans no tick, or
 /// where the rows do not share the load's KV width: that tick runs in the region, as a request at another KV width does.
@@ -1242,6 +1464,119 @@ pub fn endJoined(m: *Model, probe: Probe, segs: []const Model.Seg) !void {
         for (segs) |sg| sg.request.reset();
         return missed(m, m.plans.?, probe, miss);
     };
+}
+
+fn compactDecodePositions(gpa: std.mem.Allocator, m: *const Model, positions: []const usize) ![]usize {
+    const c = &m.config;
+    var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer seen.deinit(gpa);
+    var kept: std.ArrayList(usize) = .empty;
+    errdefer kept.deinit(gpa);
+    var idx = positions.len;
+    while (idx > 0) {
+        idx -= 1;
+        const p = positions[idx];
+        var h = std.hash.Wyhash.init(0);
+        for (0..c.layers) |l| std.hash.autoHash(&h, m.layerKey(l, @intCast(p), 1));
+        std.hash.autoHash(&h, p + 1 > c.kv_lora);
+        if ((try seen.getOrPut(gpa, h.final())).found_existing) continue;
+        try kept.append(gpa, p);
+    }
+    std.mem.sort(usize, kept.items, {}, std.sort.asc(usize));
+    return kept.toOwnedSlice(gpa);
+}
+
+/// Sorted-descending group verify width templates recorded for `slots` concurrent slots inside `joined` total rows.
+/// Caps per-slot width at `uniform_max` (`groupRows`) so `draftBatch` stays inside `joined` rows (`<= 16` NAX decode
+/// arm) with at most `uniform_max - 1` serial DFly2 LM-head calls, while still covering mixed code+prose subsets.
+pub fn groupWidthTemplates(drafts: usize, joined: usize, slots: usize, out: *[20][@as(usize, @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX))]u16) usize {
+    const max_g: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+    if (slots < 2 or slots > max_g or slots >= joined) return 0;
+    const uniform_max = @import("hy4_forward.zig").groupRows(drafts, joined, slots);
+    if (uniform_max < 2) return 0;
+    const max_w = uniform_max;
+    var count: usize = 0;
+    const Helper = struct {
+        fn add(dst: *[20][max_g]u16, cnt: *usize, sl: usize, lim: usize, cap_w: usize, vals: []const u16) void {
+            if (cnt.* >= dst.len or vals.len != sl) return;
+            var sum: usize = 0;
+            var any_multi = false;
+            for (vals, 0..) |v, i| {
+                if (v == 0 or v > cap_w) return;
+                if (i > 0 and v > vals[i - 1]) return;
+                if (v >= 2) any_multi = true;
+                sum += v;
+            }
+            if (!any_multi or sum > lim) return;
+            for (0..cnt.*) |j| if (std.mem.eql(u16, dst[j][0..sl], vals)) return;
+            @memcpy(dst[cnt.*][0..sl], vals);
+            cnt.* += 1;
+        }
+        fn addFill(dst: *[20][max_g]u16, cnt: *usize, sl: usize, lim: usize, cap_w: usize, k: usize, hi: u16) void {
+            if (k == 0 or k > sl) return;
+            var row: [max_g]u16 = @splat(1);
+            @memset(row[0..k], hi);
+            add(dst, cnt, sl, lim, cap_w, row[0..sl]);
+        }
+    };
+    // 1. Uniform widths 2..uniform_max (always includes the fair budget root).
+    for (2..uniform_max + 1) |w| {
+        var row: [max_g]u16 = @splat(@intCast(w));
+        Helper.add(out, &count, slots, joined, max_w, row[0..slots]);
+    }
+    // 2. Heterogeneous code+prose mixes sorted descending within `uniform_max`.
+    switch (slots) {
+        2 => {
+            for ([_]u16{ 2, 4, 6 }) |w0| {
+                Helper.add(out, &count, 2, joined, max_w, &.{ w0, 1 });
+            }
+            Helper.add(out, &count, 2, joined, max_w, &.{ 6, 2 });
+        },
+        3 => {
+            for ([_]u16{ 2, 4, 5 }) |w| {
+                Helper.add(out, &count, 3, joined, max_w, &.{ w, w, 1 });
+            }
+            for ([_]u16{ 2, 4, 5 }) |w| {
+                Helper.add(out, &count, 3, joined, max_w, &.{ w, 1, 1 });
+            }
+        },
+        4 => {
+            for ([_]u16{ 2, 3, 4 }) |w| {
+                Helper.add(out, &count, 4, joined, max_w, &.{ w, w, 1, 1 });
+            }
+            Helper.add(out, &count, 4, joined, max_w, &.{ 4, 4, 4, 1 });
+            Helper.add(out, &count, 4, joined, max_w, &.{ 3, 3, 3, 1 });
+            for ([_]u16{ 2, 3, 4 }) |w| {
+                Helper.add(out, &count, 4, joined, max_w, &.{ w, 1, 1, 1 });
+            }
+        },
+        else => {
+            for ([_]usize{ 1, 2, 3, 4 }) |k| {
+                if (k < slots) Helper.addFill(out, &count, slots, joined, max_w, k, 3);
+            }
+            for ([_]usize{ 1, 2, slots / 2, slots -| 2, slots -| 1 }) |k| {
+                if (k >= 1 and k < slots) Helper.addFill(out, &count, slots, joined, max_w, k, 2);
+            }
+        },
+    }
+    return count;
+}
+
+/// Per-slot draft token count handed to `draftBatch` for `slots` drafting slots inside `joined` total rows:
+/// uses the widest width appearing in `groupWidthTemplates` minus 1, capped so `slots * (n_use + 1) <= 64`.
+pub fn groupDraftWidth(drafts: usize, joined: usize, slots: usize) usize {
+    const max_g: usize = @intCast(@import("sushi_exl3").project_rows.NAX_ROWS_MAX);
+    if (drafts == 0 or slots < 2 or slots > Drafter.max_batch_slots or slots >= joined) return 0;
+    var templates: [20][max_g]u16 = undefined;
+    const n_tpl = groupWidthTemplates(drafts, joined, slots, &templates);
+    var max_w: usize = 0;
+    for (templates[0..n_tpl]) |tpl| {
+        if (tpl[0] > max_w) max_w = tpl[0];
+    }
+    if (max_w < 2) return 0;
+    const by_batch = 64 / slots;
+    if (by_batch < 2) return 0;
+    return @min(drafts, @min(max_w - 1, by_batch - 1));
 }
 
 pub fn joinedGroupsProbe(m: *Model, reqs: []const *hy4_model.Request, widths: []const u16) ?Probe {

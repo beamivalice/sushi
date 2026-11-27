@@ -179,7 +179,12 @@ pub fn coolerPipelineScope(config: *const Config) [16]u8 {
 
 pub fn warmup(xfm: Model) !void {
     if (xfm.arch_state.hy4flash.model) |m| try m.warmKernels();
-    if (xfm.arch_state.hy4flash.model) |m| try m.warmJoined(@import("hy4_plan.zig").joinedRows(&xfm.config), @import("../bills.zig").configuredKvQuantFor(&xfm.config));
+    if (xfm.arch_state.hy4flash.model) |m| {
+        const joined = @import("hy4_plan.zig").joinedRows(&xfm.config);
+        const kv = @import("../bills.zig").configuredKvQuantFor(&xfm.config);
+        try m.warmJoined(joined, kv);
+        if (xfm.arch_state.hy4flash.drafter) |*d| try m.warmJoinedGroups(d, joined, kv);
+    }
     return xfm.warmupTrunk();
 }
 

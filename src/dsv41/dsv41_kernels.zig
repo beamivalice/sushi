@@ -586,7 +586,63 @@ const ROPE_KV_RING_SOURCE =
     \\}
 ;
 
+/// In-place tail rotation of `qout` (`[L, H, D]` or `[L, H*D]`, `RD` even, `RD > 0`): one thread per rotated pair
+/// `(2p, 2p+1)`, leaving the leading `D - RD` untouched channels in place with zero copy. Bit-identical to
+/// `ROPE_TAIL_BODY` with `QK == 0` and `INV == 0`.
+const ROPE_TAIL_IP_BODY =
+    \\constexpr int HALF_RD = RD / 2;
+    \\constexpr int HEAD = D - RD;
+    \\const uint total_p = uint(rows) * uint(H * HALF_RD);
+    \\if (p_idx < total_p) {
+    \\  const uint row = p_idx / uint(H * HALF_RD);
+    \\  const uint rem = p_idx - row * uint(H * HALF_RD);
+    \\  const uint h = rem / uint(HALF_RD);
+    \\  const uint p = rem - h * uint(HALF_RD);
+    \\  const size_t off = (size_t(row) * uint(H) + h) * uint(D) + uint(HEAD) + p * 2u;
+    \\  const float x1 = float(qout[off]), x2 = float(qout[off + 1]);
+    \\  const float theta = float(pos[row]) * freqs[p];
+    \\  const float cs = metal::precise::cos(theta), sn = metal::precise::sin(theta);
+    \\  qout[off]     = T(x1 * cs - x2 * sn);
+    \\  qout[off + 1] = T(x1 * sn + x2 * cs);
+    \\}
+;
+
+const ROPE_TAIL_IP_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\const uint rows = uint(meta[0]);
+    \\const int H = meta[1];
+    \\const uint p_idx = thread_position_in_grid.x;
+++ ROPE_TAIL_IP_BODY;
+
+const KV_ROW_RING_IP_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\const int l = int(threadgroup_position_in_grid.y);
+    \\const int cap = meta[0];
+    \\threadgroup float local_sums[32], inv_s[1];
+    \\const device T* x = kx;
+    \\device T* out = rout + ptrdiff_t(int(pos[l]) % cap - l) * D;
+++ KV_ROW_BODY;
+
+const ROPE_KV_RING_IP_SOURCE =
+    \\#pragma clang fp contract(off)
+    \\threadgroup float local_sums[32], inv_s[1];
+    \\const uint tgid = threadgroup_position_in_grid.x, rows = kx_shape[0];
+    \\const int cap = meta[0], H = meta[1];
+    \\if (tgid < rows) {
+    \\  const int l = int(tgid);
+    \\  const device T* x = kx;
+    \\  device T* out = rout + ptrdiff_t(int(pos[l]) % cap - l) * D;
+++ KV_ROW_BODY ++
+    \\} else {
+    \\  const uint p_idx = (tgid - rows) * threads_per_threadgroup.x + thread_position_in_threadgroup.x;
+++ ROPE_TAIL_IP_BODY ++
+    \\}
+;
+
 var rope_kv_ring_def = Def{ .name = "dsv41_rope_kv_ring", .ins = &.{ "qx", "kx", "w", "freqs", "pos", "eps", "ring" }, .outs = &.{ "qout", "rout" }, .source = ROPE_KV_RING_SOURCE, .header = qat_mod.QAT_HEADER };
+var rope_kv_ring_ip_def = Def{ .name = "dsv41_rope_kv_ring_ip", .ins = &.{ "kx", "w", "freqs", "pos", "eps", "meta" }, .outs = &.{ "qout", "rout" }, .source = ROPE_KV_RING_IP_SOURCE, .header = qat_mod.QAT_HEADER };
+var rope_tail_ip_def = Def{ .name = "dsv41_rope_tail_ip", .ins = &.{ "freqs", "pos", "meta" }, .outs = &.{"qout"}, .source = ROPE_TAIL_IP_SOURCE };
+var kv_row_ring_ip_def = Def{ .name = "dsv41_kv_row_ring_ip", .ins = &.{ "kx", "w", "freqs", "pos", "eps", "meta" }, .outs = &.{"rout"}, .source = KV_ROW_RING_IP_SOURCE, .header = qat_mod.QAT_HEADER };
 var rope_kv_def = Def{ .name = "dsv41_rope_kv", .ins = &.{ "qx", "kx", "w", "freqs", "pos", "eps" }, .outs = &.{ "qout", "kout" }, .source = ROPE_KV_SOURCE, .header = qat_mod.QAT_HEADER };
 var rope_tail_def = Def{ .name = "dsv41_rope_tail", .ins = &.{ "x", "freqs", "pos" }, .outs = &.{"out"}, .source = ROPE_TAIL_SOURCE, .header = qat_mod.QAT_HEADER };
 var kv_row_def = Def{ .name = "dsv41_kv_row", .ins = &.{ "x", "w", "freqs", "pos", "eps" }, .outs = &.{"out"}, .source = KV_ROW_SOURCE, .header = qat_mod.QAT_HEADER };
@@ -666,6 +722,69 @@ pub fn ropeKvRing(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, rd: usize, ep
     return .{ .q = o[0], .ring = o[1] };
 }
 
+/// In-place tail rotation of `q` (`[L, H, D]` or `[L, H*D]`, `rd > 0` even) at per-row `pos` `[L]`: leaves the
+/// leading `D - rd` untouched channels in place with zero copy. Returns false off the engine stream.
+pub fn ropeTailInPlace(sc: *Scope, q: A, freqs: A, pos: A, L: usize, H: usize, D: usize, rd: usize) !bool {
+    if (!mlx.engine.isStream(sc.s)) return false;
+    if (rd == 0 or rd % 2 != 0) return false;
+    const dt = mlx.mlx_array_dtype(q);
+    const total_p = L * H * (rd / 2);
+    if (total_p == 0) return false;
+    const meta_v = [_]i32{ ci(L), ci(H) };
+    const meta = try sc.ints(&meta_v, &.{meta_v.len});
+    return metal_def.launchInPlace(sc.s, &rope_tail_ip_def, &.{ freqs, pos, meta }, &.{
+        .{ .shape = mlx.getShape(q), .dt = dt },
+    }, .{ total_p, 1, 1 }, .{ @min(total_p, 256), 1, 1 }, &.{
+        .{ .name = "RD", .v = ci(rd) },
+        .{ .name = "D", .v = ci(D) },
+    }, &.{.{ .name = "T", .dt = dt }}, &.{q});
+}
+
+/// Writes `kvRow(kv)` directly into `ring` `[cap, D]` at slot `pos[l] % cap` in place (automatic CoW if `ring` is
+/// shared). Returns false off the engine stream.
+pub fn kvRowRingInPlace(sc: *Scope, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat: bool, ring: A, cap: usize) !bool {
+    if (!mlx.engine.isStream(sc.s)) return false;
+    const L = dim(kv, 0);
+    const D = dim(kv, 1);
+    const dt = mlx.mlx_array_dtype(kv);
+    if (mlx.mlx_array_dtype(ring) != dt) return false;
+    const tg = ((D + 3) / 4 + 31) / 32 * 32;
+    const meta_v = [_]i32{ci(cap)};
+    const meta = try sc.ints(&meta_v, &.{meta_v.len});
+    return metal_def.launchInPlace(sc.s, &kv_row_ring_ip_def, &.{ kv, w, freqs, pos, try f32Const(sc, &.{eps}), meta }, &.{
+        .{ .shape = &.{ ci(cap), ci(D) }, .dt = dt },
+    }, .{ tg, L, 1 }, .{ tg, 1, 1 }, &.{
+        .{ .name = "RD", .v = ci(rd) },
+        .{ .name = "D", .v = ci(D) },
+        .{ .name = "QAT", .v = @intFromBool(qat) },
+    }, &.{.{ .name = "T", .dt = dt }}, &.{ring});
+}
+
+/// In-place `ropeKvRing` on the engine stream: rotates `q` (`[L, H, D]` or `[L, H*D]`) tail pairs in place and writes
+/// the `L` KV rows directly into `ring` `[cap, D]` without copying the untouched ring rows. Returns false off the
+/// engine stream or when `rd` is 0/odd.
+pub fn ropeKvRingInPlace(sc: *Scope, q: A, kv: A, w: A, freqs: A, pos: A, H: usize, rd: usize, eps: f32, qat: bool, ring: A, cap: usize) !bool {
+    if (!mlx.engine.isStream(sc.s)) return false;
+    if (rd == 0 or rd % 2 != 0) return false;
+    const L = dim(kv, 0);
+    const D = dim(kv, 1);
+    const dt = mlx.mlx_array_dtype(kv);
+    if (mlx.mlx_array_dtype(q) != dt or mlx.mlx_array_dtype(ring) != dt) return false;
+    const tg = ((D + 3) / 4 + 31) / 32 * 32;
+    const total_p = L * H * (rd / 2);
+    const qtgs = (total_p + tg - 1) / tg;
+    const meta_v = [_]i32{ ci(cap), ci(H) };
+    const meta = try sc.ints(&meta_v, &.{meta_v.len});
+    return metal_def.launchInPlace(sc.s, &rope_kv_ring_ip_def, &.{ kv, w, freqs, pos, try f32Const(sc, &.{eps}), meta }, &.{
+        .{ .shape = mlx.getShape(q), .dt = dt },
+        .{ .shape = &.{ ci(cap), ci(D) }, .dt = dt },
+    }, .{ (L + qtgs) * tg, 1, 1 }, .{ tg, 1, 1 }, &.{
+        .{ .name = "RD", .v = ci(rd) },
+        .{ .name = "D", .v = ci(D) },
+        .{ .name = "QAT", .v = @intFromBool(qat) },
+    }, &.{.{ .name = "T", .dt = dt }}, &.{ q, ring });
+}
+
 /// Whether `kvRow` serves rows of `D` channels.
 pub fn kvRowFits(d: usize) bool {
     return d % 32 == 0 and d <= 4096;
@@ -688,49 +807,80 @@ pub fn kvRow(sc: *Scope, kv: A, w: A, freqs: A, pos: A, rd: usize, eps: f32, qat
 // ── attention ────────────────────────────────────────────────────────────
 
 /// Decode attention for one (row, head) per threadgroup: the window rows the query sees (read from the ring after
-/// this step's write) then its selected compressed rows, f32 online softmax split over NSG simdgroups, the sink in
-/// the denominator only. meta = {p0, L, K, window, cap, n_comp, ratio}; `topk` entries < 0 or >= n_comp are skipped,
+/// this step's write) then its selected compressed rows (either unpacked `comp` or packed FP4 `ccodes`/`cscales`
+/// decoded in registers to `KT` bit-identically), f32 online softmax split over NSG simdgroups, the sink in the
+/// denominator only. meta = {p0, L, K, window, cap, n_comp, ratio}; `topk` entries < 0 or >= n_comp are skipped,
 /// and a row under a ratio splits only its own min(K, (pos + 1) / ratio) picks.
-const ATTN_DEC_BODY =
-    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int i = threadgroup_position_in_grid.y, h = threadgroup_position_in_grid.x;
-    \\const int p0 = meta[0], K = meta[2], window = meta[3], cap = meta[4], nc = meta[5];
-    \\const int H = q_shape[1];
-    \\constexpr int V = D / 32;
-    \\const int pos = p0 + i;
-    \\const int lo = metal::max(0, pos - window + 1);
-    \\const int nw = pos - lo + 1;
-    \\float qv[V], acc[V];
-    \\for (int v = 0; v < V; ++v) { qv[v] = float(q[(i * H + h) * D + lane * V + v]); acc[v] = 0.0f; }
-    \\float mx = -INFINITY, den = 0.0f;
-    \\const float scale = scal[0];
-    \\const int Ki = meta[6] > 0 ? metal::min(K, (pos + 1) / meta[6]) : K;
-    \\const int S = int(threadgroups_per_grid.z), sp = threadgroup_position_in_grid.z, chunk = (nw + Ki + S - 1) / S;
-    \\const int t_lo = sp * chunk, t_hi = metal::min(nw + Ki, t_lo + chunk);
-    \\for (int t = t_lo + sg; t < t_hi; t += NSG) {
-    \\  const device KT* row;
-    \\  if (t < nw) row = ring + size_t((lo + t) % cap) * D;
-    \\  else {
-    \\    const int c = topk[i * K + t - nw];
-    \\    if (c < 0 || c >= nc) continue;
-    \\    row = comp + size_t(c) * D;
-    \\  }
-    \\  float kv[V], dot = 0.0f;
-    \\  for (int v = 0; v < V; ++v) { kv[v] = float(row[lane * V + v]); dot += qv[v] * kv[v]; }
-    \\  const float s = metal::simd_sum(dot) * scale;
-    \\  const float nm = metal::max(mx, s);
-    \\  const float corr = metal::precise::exp(mx - nm), p = metal::precise::exp(s - nm);
-    \\  den = den * corr + p;
-    \\  for (int v = 0; v < V; ++v) acc[v] = acc[v] * corr + p * kv[v];
-    \\  mx = nm;
-    \\}
-    \\threadgroup float t_acc[NSG * D];
-    \\threadgroup float t_mx[NSG], t_den[NSG];
-    \\for (int v = 0; v < V; ++v) t_acc[sg * D + lane * V + v] = acc[v];
-    \\if (lane == 0) { t_mx[sg] = mx; t_den[sg] = den; }
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-;
-const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++
+fn attnDecBody(comptime packed_comp: bool) [:0]const u8 {
+    return
+        \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+        \\const int i = threadgroup_position_in_grid.y, h = threadgroup_position_in_grid.x;
+        \\const int p0 = meta[0], K = meta[2], window = meta[3], cap = meta[4], nc = meta[5];
+        \\const int H = q_shape[1];
+        \\constexpr int V = D / 32;
+        \\const int pos = p0 + i;
+        \\const int lo = metal::max(0, pos - window + 1);
+        \\const int nw = pos - lo + 1;
+        \\float qv[V], acc[V];
+        \\for (int v = 0; v < V; ++v) { qv[v] = float(q[(i * H + h) * D + lane * V + v]); acc[v] = 0.0f; }
+        \\float mx = -INFINITY, den = 0.0f;
+        \\const float scale = scal[0];
+        \\const int Ki = meta[6] > 0 ? metal::min(K, (pos + 1) / meta[6]) : K;
+        \\const int S = int(threadgroups_per_grid.z), sp = threadgroup_position_in_grid.z, chunk = (nw + Ki + S - 1) / S;
+        \\const int t_lo = sp * chunk, t_hi = metal::min(nw + Ki, t_lo + chunk);
+        \\for (int t = t_lo + sg; t < t_hi; t += NSG) {
+        \\  float kv[V], dot = 0.0f;
+        ++ (if (packed_comp)
+            \\  if (t < nw) {
+            \\    const device KT* row = ring + size_t((lo + t) % cap) * D;
+            \\    for (int v = 0; v < V; ++v) { kv[v] = float(row[lane * V + v]); dot += qv[v] * kv[v]; }
+            \\  } else {
+            \\    const int c = topk[i * K + t - nw];
+            \\    if (c < 0 || c >= nc) continue;
+            \\    const device uchar* cp = ccodes + size_t(c) * (D / 2) + lane * (V / 2);
+            \\    const device uchar* sc_row = cscales + size_t(c) * (D / G);
+            \\    const float sc0 = (G >= V) ? scale_of(uint(sc_row[(lane * V) / G]), MODE) : 0.0f;
+            \\    for (int b = 0; b < V / 2; ++b) {
+            \\      const float sv = (G >= V) ? sc0 : scale_of(uint(sc_row[(lane * V + b * 2) / G]), MODE);
+            \\      const uint byte = uint(cp[b]);
+            \\      const float lv = E2M1[byte & 7u] * sv;
+            \\      const float hv = E2M1[(byte >> 4) & 7u] * sv;
+            \\      const float v0 = float(KT((byte & 8u) ? -lv : lv));
+            \\      const float v1 = float(KT((byte & 128u) ? -hv : hv));
+            \\      kv[2 * b] = v0;
+            \\      kv[2 * b + 1] = v1;
+            \\      dot += qv[2 * b] * v0;
+            \\      dot += qv[2 * b + 1] * v1;
+            \\    }
+            \\  }
+        else
+            \\  const device KT* row;
+            \\  if (t < nw) row = ring + size_t((lo + t) % cap) * D;
+            \\  else {
+            \\    const int c = topk[i * K + t - nw];
+            \\    if (c < 0 || c >= nc) continue;
+            \\    row = comp + size_t(c) * D;
+            \\  }
+            \\  for (int v = 0; v < V; ++v) { kv[v] = float(row[lane * V + v]); dot += qv[v] * kv[v]; }
+        ) ++
+        \\  const float s = metal::simd_sum(dot) * scale;
+        \\  const float nm = metal::max(mx, s);
+        \\  const float corr = metal::precise::exp(mx - nm), p = metal::precise::exp(s - nm);
+        \\  den = den * corr + p;
+        \\  for (int v = 0; v < V; ++v) acc[v] = acc[v] * corr + p * kv[v];
+        \\  mx = nm;
+        \\}
+        \\threadgroup float t_acc[NSG * D];
+        \\threadgroup float t_mx[NSG], t_den[NSG];
+        \\for (int v = 0; v < V; ++v) t_acc[sg * D + lane * V + v] = acc[v];
+        \\if (lane == 0) { t_mx[sg] = mx; t_den[sg] = den; }
+        \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    ;
+}
+
+const ATTN_DEC_BODY = attnDecBody(false);
+const ATTN_DEC_PACKED_BODY = attnDecBody(true);
+const ATTN_DEC_TAIL =
     \\float M = sink[h];
     \\for (int g = 0; g < NSG; ++g) M = metal::max(M, t_mx[g]);
     \\float total = metal::precise::exp(sink[h] - M);
@@ -744,6 +894,8 @@ const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++
     \\  out[dsv41_head_at<OG>(i, h, H, meta[1]) * D + d] = ov;
     \\}
 ;
+const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++ ATTN_DEC_TAIL;
+const ATTN_DEC_PACKED_SOURCE = ATTN_DEC_PACKED_BODY ++ ATTN_DEC_TAIL;
 
 /// The inverse rotation of the tail channel `d` of a head row the attention just wrote (`v`, at position `pos`):
 /// pairs are adjacent lanes, so every lane of the simdgroup must call it. `P`: MLX passes a small input as a
@@ -796,7 +948,7 @@ const ATTN_RIDE_PRE =
 
 /// `ATTN_DEC_SOURCE` over one of S splits of its rows: the split's max, sum and unnormalized output
 /// (`ATTN_MERGE_SOURCE` finishes it).
-const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++
+const ATTN_SPLIT_TAIL =
     \\float M = -INFINITY, l = 0.0f, w[NSG];
     \\for (int g = 0; g < NSG; ++g) M = metal::max(M, t_mx[g]);
     \\for (int g = 0; g < NSG; ++g) { w[g] = t_den[g] > 0.0f ? metal::precise::exp(t_mx[g] - M) : 0.0f; l += t_den[g] * w[g]; }
@@ -808,6 +960,8 @@ const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++
     \\}
     \\if (sg == 0 && lane == 0) { pm[base] = M; pl[base] = l; }
 ;
+const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++ ATTN_SPLIT_TAIL;
+const ATTN_SPLIT_PACKED_SOURCE = ATTN_DEC_PACKED_BODY ++ ATTN_SPLIT_TAIL;
 
 /// The S partials of one (row, head) `ATTN_SPLIT_SOURCE` wrote, merged with the sink in the denominator, then the
 /// inverse rotation (as `ATTN_DEC_SOURCE` ends); one thread a channel.
@@ -868,6 +1022,10 @@ var attn_dec_def = Def{ .name = "dsv41_attn_decode", .ins = &.{ "q", "ring", "co
 var attn_split_def = Def{ .name = "dsv41_attn_split", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_SOURCE };
 var attn_dec_ride_def = Def{ .name = "dsv41_attn_decode_ride", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_RIDE_PRE ++ ATTN_DEC_SOURCE, .header = HEADS_HEADER };
 var attn_split_ride_def = Def{ .name = "dsv41_attn_split_ride", .ins = &.{ "q", "ring", "comp", "topk", "sink", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_RIDE_PRE ++ ATTN_SPLIT_SOURCE };
+var attn_dec_packed_def = Def{ .name = "dsv41_attn_decode_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs" }, .outs = &.{"out"}, .source = ATTN_DEC_PACKED_SOURCE, .header = HEADS_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+var attn_split_packed_def = Def{ .name = "dsv41_attn_split_packed", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal" }, .outs = &.{ "pacc", "pm", "pl" }, .source = ATTN_SPLIT_PACKED_SOURCE, .header = qat_mod.PACK_HEADER };
+var attn_dec_packed_ride_def = Def{ .name = "dsv41_attn_decode_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "freqs", "z", "eps" }, .outs = &.{ "out", "pre", "post", "comb" }, .source = ATTN_RIDE_PRE ++ ATTN_DEC_PACKED_SOURCE, .header = HEADS_HEADER ++ "\n" ++ qat_mod.PACK_HEADER };
+var attn_split_packed_ride_def = Def{ .name = "dsv41_attn_split_packed_ride", .ins = &.{ "q", "ring", "ccodes", "cscales", "topk", "sink", "meta", "scal", "z", "eps" }, .outs = &.{ "pacc", "pm", "pl", "pre", "post", "comb" }, .source = ATTN_RIDE_PRE ++ ATTN_SPLIT_PACKED_SOURCE, .header = qat_mod.PACK_HEADER };
 var attn_merge_def = Def{ .name = "dsv41_attn_merge", .ins = &.{ "pacc", "pm", "pl", "sink", "meta", "freqs" }, .outs = &.{"out"}, .source = ATTN_MERGE_SOURCE, .header = HEADS_HEADER };
 var attn_softmax_def = Def{ .name = "dsv41_attn_softmax", .ins = &.{ "lw", "lc", "topk", "sink", "meta", "scal" }, .outs = &.{ "pw", "pc" }, .source = ATTN_SOFTMAX_SOURCE };
 
@@ -883,8 +1041,14 @@ pub const DecodeArgs = struct {
     q: A,
     /// The window ring `[cap, D]`, already holding this step's rows.
     ring: A,
-    /// `[n_comp, D]` compressed rows with `topk` `[L, K]` int32 picks (-1 = none), or none.
+    /// `[n_comp, D]` compressed rows (or packed codes `[cap_comp, D/2]` when `comp_scales` is set) with `topk` `[L, K]`
+    /// int32 picks (-1 = none), or none.
     comp: A = sc_mod.none,
+    /// When set, `comp` holds packed FP4 codes and `comp_scales` holds their `[cap_comp, D / pack_group]` u8 scales.
+    comp_scales: A = sc_mod.none,
+    comp_n: usize = 0,
+    pack_mode: qat_mod.Qat = .fp4_e4m3,
+    pack_group: usize = 0,
     topk: A = sc_mod.none,
     /// `[1, H, 1]` f32.
     sink: A,
@@ -919,6 +1083,13 @@ pub const StageMixes = struct { z: A, hc: usize, iters: usize, eps: A };
 /// Whether `attnDecode` serves head rows of `d` channels.
 pub fn attnDecodeFits(d: usize) bool {
     return d % 32 == 0 and d <= 1024;
+}
+
+/// Whether `attnDecode` can unpack FP4 compressed rows in registers for head dim `d` and scale group `group`.
+pub fn attnDecodePackedFits(d: usize, group: usize) bool {
+    if (!attnDecodeFits(d) or group < 2 or group % 2 != 0) return false;
+    const v = d / 32;
+    return v % 2 == 0 and d % group == 0 and (group % v == 0 or v % group == 0);
 }
 
 /// The splits row `r` of the block takes: those of its one-row step.
@@ -959,10 +1130,12 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     const D = dim(a.q, 2);
     const K = if (a.topk.ctx != null) dim(a.topk, 1) else 0;
     const kt = mlx.mlx_array_dtype(a.ring);
-    const meta_v = [_]i32{ ci(a.p0), ci(L), ci(K), ci(a.window), ci(dim(a.ring, 0)), if (K > 0) ci(dim(a.comp, 0)) else 0, ci(a.ratio) };
+    const packed_comp = K > 0 and a.comp_scales.ctx != null;
+    const nc: usize = if (K == 0) 0 else if (packed_comp and a.comp_n > 0) a.comp_n else dim(a.comp, 0);
+    const meta_v = [_]i32{ ci(a.p0), ci(L), ci(K), ci(a.window), ci(dim(a.ring, 0)), ci(nc), ci(a.ratio) };
     const meta = try sc.ints(&meta_v, &.{meta_v.len});
     const scal = try f32Const(sc, &.{a.scale});
-    const comp = if (K > 0) try sc.astype(a.comp, kt) else a.ring;
+    const comp = if (K > 0 and !packed_comp) try sc.astype(a.comp, kt) else a.ring;
     const ids = if (K > 0) try sc.astype(a.topk, .int32) else meta;
     const freqs = if (a.rd > 0) a.freqs else try sc.zeros(&.{1}, .float32);
     const og = a.groups;
@@ -976,6 +1149,7 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
     const tg: Grid = .{ attn_dec_nsg * 32, 1, 1 };
     // The split count is the grid's depth, read by the kernels, so a context crossing a split step compiles nothing.
     const common = [_]Tmpl{ .{ .name = "D", .v = ci(D) }, .{ .name = "NSG", .v = attn_dec_nsg } };
+    const pack_tm = [_]Tmpl{ .{ .name = "G", .v = ci(a.pack_group) }, .{ .name = "MODE", .v = qat_mod.packMode(a.pack_mode) } };
     const hc = if (ride) |r| r.hc else 0;
     const rides = [_]Tmpl{ .{ .name = "HC", .v = ci(hc) }, .{ .name = "ITERS", .v = ci(if (ride) |r| r.iters else 0) } };
     const split_outs = [_]OutSpec{
@@ -988,7 +1162,12 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
         const dts: []const TDtype = &.{ .{ .name = "KT", .dt = kt }, .{ .name = "OT", .dt = a.out_dt } };
         const out = [_]OutSpec{.{ .shape = out_shape, .dt = a.out_dt }};
         var o: [4]A = undefined;
-        if (ride) |r| {
+        if (packed_comp) {
+            if (ride) |r| {
+                try launch(sc, &attn_dec_packed_ride_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, a.sink, meta, scal, freqs, r.z, r.eps }, &(out ++ split_outs), grid, tg, &(tm ++ pack_tm ++ rides), dts, &o);
+                if (a.split) |sp| sp.* = .{ .pre = o[1], .post = o[2], .comb = o[3] };
+            } else try launch(sc, &attn_dec_packed_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, a.sink, meta, scal, freqs }, &out, grid, tg, &(tm ++ pack_tm), dts, o[0..1]);
+        } else if (ride) |r| {
             try launch(sc, &attn_dec_ride_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs, r.z, r.eps }, &(out ++ split_outs), grid, tg, &(tm ++ rides), dts, &o);
             if (a.split) |sp| sp.* = .{ .pre = o[1], .post = o[2], .comb = o[3] };
         } else try launch(sc, &attn_dec_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, freqs }, &out, grid, tg, &tm, dts, o[0..1]);
@@ -1000,7 +1179,12 @@ pub fn attnDecodeSplit(sc: *Scope, a: DecodeArgs, splits: usize) !A {
         .{ .shape = &.{ ci(L), ci(H), ci(splits) }, .dt = .float32 },
     };
     var parts: [6]A = undefined;
-    if (ride) |r| {
+    if (packed_comp) {
+        if (ride) |r| {
+            try launch(sc, &attn_split_packed_ride_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, a.sink, meta, scal, r.z, r.eps }, &(part_outs ++ split_outs), grid, tg, &(common ++ pack_tm ++ rides), &.{.{ .name = "KT", .dt = kt }}, &parts);
+            if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
+        } else try launch(sc, &attn_split_packed_def, &.{ a.q, a.ring, a.comp, a.comp_scales, ids, a.sink, meta, scal }, &part_outs, grid, tg, &(common ++ pack_tm), &.{.{ .name = "KT", .dt = kt }}, parts[0..3]);
+    } else if (ride) |r| {
         try launch(sc, &attn_split_ride_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal, r.z, r.eps }, &(part_outs ++ split_outs), grid, tg, &(common ++ rides), &.{.{ .name = "KT", .dt = kt }}, &parts);
         if (a.split) |sp| sp.* = .{ .pre = parts[3], .post = parts[4], .comb = parts[5] };
     } else try launch(sc, &attn_split_def, &.{ a.q, a.ring, comp, ids, a.sink, meta, scal }, &part_outs, grid, tg, &common, &.{.{ .name = "KT", .dt = kt }}, parts[0..3]);
@@ -4035,5 +4219,185 @@ test "dsv41 topk: the load's probe launches every top-k kernel, so one the GPU g
         defer scope.end();
         try probeTopk(testing.allocator, mlx.engine.stream());
         try testing.expectEqual(@as(usize, 512), sel.topk_tg);
+    }
+}
+
+test "dsv41 ropeKvRingInPlace, ropeTailInPlace, kvRowRingInPlace match ropeKvRing bit for bit and CoW shared rings" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const scope = mlx.engine.enter(mlx.engine.stream());
+    defer scope.end();
+    var sc = Scope.plain(testing.allocator, mlx.engine.stream());
+    defer sc.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0x5150);
+    const rand = prng.random();
+    const fill = struct {
+        fn f32s(a: std.mem.Allocator, r: std.Random, n: usize, scale: f32) ![]f32 {
+            const buf = try a.alloc(f32, n);
+            for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * scale;
+            return buf;
+        }
+    };
+
+    for ([_]struct { L: usize, H: usize, D: usize, rd: usize, cap: usize }{
+        .{ .L = 1, .H = 16, .D = 512, .rd = 64, .cap = 16 },
+        .{ .L = 4, .H = 4, .D = 64, .rd = 16, .cap = 12 },
+    }) |g| {
+        const q_h = try fill.f32s(testing.allocator, rand, g.L * g.H * g.D, 1.5);
+        defer testing.allocator.free(q_h);
+        const kv_h = try fill.f32s(testing.allocator, rand, g.L * g.D, 1.5);
+        defer testing.allocator.free(kv_h);
+        const w_h = try fill.f32s(testing.allocator, rand, g.D, 1.0);
+        defer testing.allocator.free(w_h);
+        const fr_h = try fill.f32s(testing.allocator, rand, g.rd / 2, 0.25);
+        defer testing.allocator.free(fr_h);
+        const ring_h = try fill.f32s(testing.allocator, rand, g.cap * g.D, 1.0);
+        defer testing.allocator.free(ring_h);
+
+        const q_ref_in = try sc.astype(try sc.floats(q_h, &.{ ci(g.L), ci(g.H), ci(g.D) }), .bfloat16);
+        const kv_in = try sc.astype(try sc.floats(kv_h, &.{ ci(g.L), ci(g.D) }), .bfloat16);
+        const w_in = try sc.astype(try sc.floats(w_h, &.{ci(g.D)}), .bfloat16);
+        const fr_in = try sc.floats(fr_h, &.{ci(g.rd / 2)});
+        const ring_ref_in = try sc.astype(try sc.floats(ring_h, &.{ ci(g.cap), ci(g.D) }), .bfloat16);
+
+        var pos_buf: [8]i32 = undefined;
+        for (0..g.L) |i| pos_buf[i] = @intCast(g.cap - 2 + i);
+        const pos_in = try sc.ints(pos_buf[0..g.L], &.{ci(g.L)});
+
+        const want = try ropeKvRing(&sc, q_ref_in, kv_in, w_in, fr_in, pos_in, g.rd, 1e-6, true, ring_ref_in, g.cap, g.D);
+
+        // 1. Joint in-place on sole tensors.
+        const q_ip = try sc.contiguous(q_ref_in);
+        const ring_ip = try sc.contiguous(ring_ref_in);
+        try testing.expect(try ropeKvRingInPlace(&sc, q_ip, kv_in, w_in, fr_in, pos_in, g.H, g.rd, 1e-6, true, ring_ip, g.cap));
+        try expectBitEqual("ropeKvRingInPlace q", try hostOf(&sc, q_ip), try hostOf(&sc, want.q));
+        try expectBitEqual("ropeKvRingInPlace ring", try hostOf(&sc, ring_ip), try hostOf(&sc, want.ring));
+
+        // 2. Separate ropeTailInPlace + kvRowRingInPlace, with a shared handle keeping the original ring untouched (CoW).
+        const q_sep = try sc.contiguous(q_ref_in);
+        const ring_sep = try sc.contiguous(ring_ref_in);
+        var ring_snap = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&ring_snap, ring_sep));
+        defer _ = mlx.mlx_array_free(ring_snap);
+        const orig_bytes = try testing.allocator.dupe(f32, try hostOf(&sc, ring_ref_in));
+        defer testing.allocator.free(orig_bytes);
+
+        try testing.expect(try ropeTailInPlace(&sc, q_sep, fr_in, pos_in, g.L, g.H, g.D, g.rd));
+        try testing.expect(try kvRowRingInPlace(&sc, kv_in, w_in, fr_in, pos_in, g.rd, 1e-6, true, ring_sep, g.cap));
+        try expectBitEqual("ropeTailInPlace q", try hostOf(&sc, q_sep), try hostOf(&sc, want.q));
+        try expectBitEqual("kvRowRingInPlace ring", try hostOf(&sc, ring_sep), try hostOf(&sc, want.ring));
+        try expectBitEqual("CoW preserved snapshot", try hostOf(&sc, ring_snap), orig_bytes);
+    }
+}
+
+test "dsv41 attnDecode packed FP4 matches unpackPicks + attnDecode bit for bit across splits and rides" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const scope = mlx.engine.enter(mlx.engine.stream());
+    defer scope.end();
+    var sc = Scope.plain(testing.allocator, mlx.engine.stream());
+    defer sc.deinit();
+
+    var prng = std.Random.DefaultPrng.init(0xA774);
+    const rand = prng.random();
+    const fill = struct {
+        fn f32s(a: std.mem.Allocator, r: std.Random, n: usize, scale: f32) ![]f32 {
+            const buf = try a.alloc(f32, n);
+            for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * scale;
+            return buf;
+        }
+    };
+
+    for ([_]struct { L: usize, H: usize, D: usize, rd: usize, K: usize, nc: usize, window: usize, splits: usize }{
+        .{ .L = 1, .H = 16, .D = 512, .rd = 64, .K = 32, .nc = 48, .window = 32, .splits = 1 },
+        .{ .L = 3, .H = 16, .D = 512, .rd = 64, .K = 64, .nc = 96, .window = 160, .splits = 2 },
+        .{ .L = 2, .H = 4, .D = 64, .rd = 16, .K = 16, .nc = 24, .window = 16, .splits = 1 },
+    }) |g| {
+        try testing.expect(attnDecodePackedFits(g.D, 16));
+        const q_h = try fill.f32s(testing.allocator, rand, g.L * g.H * g.D, 0.5);
+        defer testing.allocator.free(q_h);
+        const ring_h = try fill.f32s(testing.allocator, rand, (g.window + 8) * g.D, 0.5);
+        defer testing.allocator.free(ring_h);
+        const comp_h = try fill.f32s(testing.allocator, rand, g.nc * g.D, 0.5);
+        defer testing.allocator.free(comp_h);
+        const sink_h = try fill.f32s(testing.allocator, rand, g.H, 1.0);
+        defer testing.allocator.free(sink_h);
+        const fr_h = try fill.f32s(testing.allocator, rand, g.rd / 2, 0.25);
+        defer testing.allocator.free(fr_h);
+        const z_h = try fill.f32s(testing.allocator, rand, g.L * 24, 1.0);
+        defer testing.allocator.free(z_h);
+
+        const q = try sc.astype(try sc.floats(q_h, &.{ ci(g.L), ci(g.H), ci(g.D) }), .bfloat16);
+        const ring = try sc.astype(try sc.floats(ring_h, &.{ ci(g.window + 8), ci(g.D) }), .bfloat16);
+        const comp_raw = try sc.astype(try sc.floats(comp_h, &.{ ci(g.nc), ci(g.D) }), .bfloat16);
+        const comp_q = try qat_mod.qat(&sc, comp_raw, .fp4_e4m3, 16);
+        const pk = try qat_mod.packFp4(&sc, comp_q, .fp4_e4m3, 16);
+        const sink = try sc.floats(sink_h, &.{ 1, ci(g.H), 1 });
+        const freqs = try sc.floats(fr_h, &.{ci(g.rd / 2)});
+        const z = try sc.floats(z_h, &.{ ci(g.L), 24 });
+        const eps = try hcEps(&sc, 1e-6, 1e-6);
+
+        const topk_h = try testing.allocator.alloc(i32, g.L * g.K);
+        defer testing.allocator.free(topk_h);
+        for (topk_h, 0..) |*v, idx| v.* = if (idx % 11 == 0) -1 else @intCast(rand.uintLessThan(usize, g.nc));
+        const topk = try sc.ints(topk_h, &.{ ci(g.L), ci(g.K) });
+
+        const u = try qat_mod.unpackPicks(&sc, pk.codes, pk.scales, topk, .fp4_e4m3, 16, .bfloat16);
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(g.D)));
+
+        for ([_]bool{ false, true }) |with_ride| {
+            var sp_want: ?HcSplit = null;
+            var sp_got: ?HcSplit = null;
+            const mixes: ?StageMixes = if (with_ride) .{ .z = z, .hc = 4, .iters = 20, .eps = eps } else null;
+            const want = try attnDecodeSplit(&sc, .{
+                .q = q,
+                .ring = ring,
+                .comp = u.rows,
+                .topk = u.ids,
+                .sink = sink,
+                .p0 = g.window + 2,
+                .window = g.window,
+                .scale = scale,
+                .freqs = freqs,
+                .rd = g.rd,
+                .qat_fp8 = true,
+                .out_dt = .bfloat16,
+                .groups = if (g.H % 4 == 0) 4 else 0,
+                .mixes = mixes,
+                .split = &sp_want,
+            }, g.splits);
+            const got = try attnDecodeSplit(&sc, .{
+                .q = q,
+                .ring = ring,
+                .comp = pk.codes,
+                .comp_scales = pk.scales,
+                .comp_n = g.nc,
+                .pack_mode = .fp4_e4m3,
+                .pack_group = 16,
+                .topk = topk,
+                .sink = sink,
+                .p0 = g.window + 2,
+                .window = g.window,
+                .scale = scale,
+                .freqs = freqs,
+                .rd = g.rd,
+                .qat_fp8 = true,
+                .out_dt = .bfloat16,
+                .groups = if (g.H % 4 == 0) 4 else 0,
+                .mixes = mixes,
+                .split = &sp_got,
+            }, g.splits);
+            try expectBitEqual("attnDecode packed out", try hostOf(&sc, got), try hostOf(&sc, want));
+            if (with_ride) {
+                try expectBitEqual("attnDecode packed pre", try sc_mod.hostF32(sp_got.?.pre), try sc_mod.hostF32(sp_want.?.pre));
+                try expectBitEqual("attnDecode packed post", try sc_mod.hostF32(sp_got.?.post), try sc_mod.hostF32(sp_want.?.post));
+                try expectBitEqual("attnDecode packed comb", try sc_mod.hostF32(sp_got.?.comb), try sc_mod.hostF32(sp_want.?.comb));
+            }
+        }
     }
 }

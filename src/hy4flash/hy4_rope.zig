@@ -22,7 +22,7 @@ const source: [:0]const u8 =
     \\uint i = j - uint(NOPE);
     \\float d = static_cast<float>(i) / static_cast<float>(HALF);
     \\float inv_freq = metal::exp2(-d * as_type<float>(BASE));
-    \\float L = as_type<float>(SCALE) * static_cast<float>(pos[0] + int(t));
+    \\float L = as_type<float>(SCALE) * static_cast<float>(PER_ROW ? pos[t] : (pos[0] + int(t)));
     \\float theta = L * inv_freq;
     \\float costheta = metal::fast::cos(theta);
     \\float sintheta = metal::fast::sin(theta);
@@ -60,7 +60,7 @@ pub fn applies(s: mlx.mlx_stream, x: Arr, rope_dims: c_int) bool {
         rope_dims > 0 and rope_dims <= sh[2];
 }
 
-const Key = struct { a: c_int, t: c_int, nope: c_int, half: c_int, in_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, base: c_int, scale: c_int, row_major: bool = false };
+const Key = struct { a: c_int, t: c_int, nope: c_int, half: c_int, in_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, base: c_int, scale: c_int, row_major: bool = false, per_row: bool = false };
 var cfgs: kcfg.Cache(Key) = .{};
 
 fn build(k: Key) !kcfg.Config {
@@ -78,28 +78,41 @@ fn build(k: Key) !kcfg.Config {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BASE", k.base));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SCALE", k.scale));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "ROW_MAJOR", k.row_major));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "PER_ROW", k.per_row));
     return cfg;
 }
 
 /// `x` [A, T, D] with its trailing `rope_dims` rotated, row t at position `(pos0 + t) · step`, as `out_dt` [A, T, D]
 /// (contiguous). The caller frees the result.
 pub fn tail(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, pos0: c_int, step: c_int, out_dt: mlx.mlx_dtype) !Arr {
-    return tailWith(s, x, rope_dims, theta, pos0, step, out_dt, false);
+    const pv = [_]i32{pos0};
+    return tailWith(s, x, rope_dims, theta, &pv, step, out_dt, false, false);
 }
 
 /// `tail` over rows laid out row-major [T, H, d] (each row's heads together), in `out_dt`.
 pub fn tailRows(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, pos0: c_int, step: c_int, out_dt: mlx.mlx_dtype) !Arr {
-    return tailWith(s, x, rope_dims, theta, pos0, step, out_dt, true);
+    const pv = [_]i32{pos0};
+    return tailWith(s, x, rope_dims, theta, &pv, step, out_dt, true, false);
 }
 
-fn tailWith(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, pos0: c_int, step: c_int, out_dt: mlx.mlx_dtype, row_major: bool) !Arr {
+/// `tail` with row `t` rotated at its own `positions[t] · step`, as `out_dt` [A, T, D] (contiguous).
+pub fn tailPerRow(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, positions: []const c_int, step: c_int, out_dt: mlx.mlx_dtype) !Arr {
+    return tailWith(s, x, rope_dims, theta, positions, step, out_dt, false, true);
+}
+
+/// `tailPerRow` laid out row-major [T, A, D], in `out_dt`.
+pub fn tailRowsPerRow(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, positions: []const c_int, step: c_int, out_dt: mlx.mlx_dtype) !Arr {
+    return tailWith(s, x, rope_dims, theta, positions, step, out_dt, true, true);
+}
+
+fn tailWith(s: mlx.mlx_stream, x: Arr, rope_dims: c_int, theta: f32, positions: []const c_int, step: c_int, out_dt: mlx.mlx_dtype, row_major: bool, per_row: bool) !Arr {
     const sh = mlx.getShape(x);
+    if (per_row and positions.len != @as(usize, @intCast(sh[1]))) return error.Hy4RowsPositionsLen;
     const half = @divExact(rope_dims, 2);
     const k = try getKernel();
     // The base and scale as MLX's rope takes them (log2 θ in f32, the step as a float), as the bits of template ints.
-    const cfg = try cfgs.get(.{ .a = sh[0], .t = sh[1], .nope = sh[2] - rope_dims, .half = half, .in_dt = mlx.mlx_array_dtype(x), .out_dt = out_dt, .base = kcfg.bits(std.math.log2(theta)), .scale = kcfg.bits(@floatFromInt(step)), .row_major = row_major }, build);
-    const pv = [_]i32{pos0};
-    const pos = try mlx.newData(&pv, &.{1}, .int32);
+    const cfg = try cfgs.get(.{ .a = sh[0], .t = sh[1], .nope = sh[2] - rope_dims, .half = half, .in_dt = mlx.mlx_array_dtype(x), .out_dt = out_dt, .base = kcfg.bits(std.math.log2(theta)), .scale = kcfg.bits(@floatFromInt(step)), .row_major = row_major, .per_row = per_row }, build);
+    const pos = try mlx.newData(positions.ptr, &.{@intCast(positions.len)}, .int32);
     defer _ = mlx.mlx_array_free(pos);
     const ins = [_]Arr{ x, pos };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -228,4 +241,35 @@ test "hy4 rope: bf16 input widens in register and matches f32 input byte for byt
     try mlx.check(mlx.mlx_array_eval(got));
     try testing.expectEqual(@as(u64, 1), mlx.engine.stats().dispatches - before);
     try testing.expectEqualSlices(u8, want, try hostBytes(&o, got));
+}
+
+test "hy4 rope: per-row positions match per-row single launches byte for byte (full and rope-only, heads-first and row-major)" {
+    try mlx.requireGpu();
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const es = mlx.engine.stream();
+    const scope = mlx.engine.enter(es);
+    defer scope.end();
+    var o: Ops = .{ .s = es };
+    defer o.deinit();
+    const positions = [_]c_int{ 0, 511, 512, 4097, 2048, 100_003, 7, 65_535 };
+    const t: c_int = positions.len;
+    const raw = try randomRows(&o, &.{ t, 64, 256 }, 123);
+    const q = try o.transpose(raw, &.{ 1, 0, 2 }); // [H, T, 256] strided view
+    const q_tail = try o.slice(q, 2, 192, 256); // [H, T, 64] strided view
+    try mlx.check(mlx.mlx_array_eval(raw));
+    const b1 = mlx.engine.stats().dispatches;
+    const got_hf = try o.own(try tailPerRow(es, q, 64, 1e4, &positions, 1, .float32));
+    const got_rm = try o.own(try tailRowsPerRow(es, q_tail, 64, 1e4, &positions, 1, .float32));
+    try mlx.check(mlx.mlx_array_eval(got_hf));
+    try mlx.check(mlx.mlx_array_eval(got_rm));
+    try testing.expectEqual(@as(u64, 2), mlx.engine.stats().dispatches - b1);
+    for (positions, 0..) |pos, r| {
+        const ri: c_int = @intCast(r);
+        const want = try o.own(try tail(es, try o.slice(q, 1, ri, ri + 1), 64, 1e4, pos, 1, .float32));
+        try testing.expectEqualSlices(u8, try hostBytes(&o, want), try hostBytes(&o, try o.slice(got_hf, 1, ri, ri + 1)));
+        const want_pe = try o.transpose(try o.slice(want, 2, 192, 256), &.{ 1, 0, 2 });
+        try testing.expectEqualSlices(u8, try hostBytes(&o, want_pe), try hostBytes(&o, try o.slice(got_rm, 0, ri, ri + 1)));
+    }
 }

@@ -1339,3 +1339,318 @@ test "hy4 request: a served reply's end point serves the next turn that adds to 
 fn kv_floor() u32 {
     return @import("../kv_disk_cache.zig").MIN_PERSIST_TOKENS;
 }
+
+test "hy4 request: batched DFly2 draftBatch + grouped verify at N=2, 4, 8 across ragged depths runs on the arena with zero pool asks and zero late pipelines (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 16;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    const m = xfm.arch_state.hy4flash.model.?;
+    if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
+    const d = &xfm.arch_state.hy4flash.drafter.?;
+    const core = @import("../tensor/core.zig");
+
+    // 8 slots with ragged depths spanning below and above the tiny fixture's sparse selection threshold.
+    const max_n: usize = @min(8, @as(usize, @intCast(@import("hy4_forward.zig").joinedRowsMax())) / 2);
+    if (max_n < 2) return error.SkipZigTest;
+    const max_toks: u32 = 8;
+    var solos: [8]SoloResult = undefined;
+    var solos_made: usize = 0;
+    defer for (0..solos_made) |i| {
+        solos[i].tokens.deinit(a);
+        solos[i].state.deinit(a);
+    };
+    var prompts_buf: [8][48]u32 = undefined;
+    var prompts: [8][]const u32 = undefined;
+    for (0..max_n) |i| {
+        const len: usize = 10 + i * 5;
+        for (prompts_buf[i][0..len], 0..) |*t, j| t.* = ids[(j * (i + 3) + i) % ids.len];
+        prompts[i] = prompts_buf[i][0..len];
+        solos[i] = try soloRun(&sv, prompts[i], max_toks, true);
+        solos_made = i + 1;
+    }
+
+    const turn = @import("../test_support.zig").openTurn(ld.h, &ld.config);
+    defer turn.end();
+    var slots: [8]*scheduler.Slot = undefined;
+    var made: usize = 0;
+    defer for (0..made) |i| endSlot(&sv, slots[i]);
+    for (0..max_n) |i| {
+        slots[i] = try submitPending(&sv, prompts[i], max_toks, true);
+        made = i + 1;
+        try scheduler.runPrefill(&sv.sch, slots[i]);
+        try sv.sch.decoding.append(a, slots[i]);
+    }
+    try testing.expect(m.plans != null);
+
+    // Direct `runDraftBatch` at N=2, 4, max_n inside the sealed turn: zero closed/wide asks, zero misses, valid ids/conf.
+    const late_before = mlx.engine.latePipelines();
+    const st_before = core.stats();
+    for ([_]usize{ 2, @min(4, max_n), max_n }) |k| {
+        if (k < 2) continue;
+        const n_use = @import("hy4_plan.zig").groupDraftWidth(@as(usize, m.config.dfly.draft), @intCast(@import("hy4_forward.zig").joinedRowsMax()), k);
+        if (n_use == 0) continue;
+        var reqs: [8]*hy4_model.Request = undefined;
+        var t1s: [8]u32 = undefined;
+        var out: [8]@import("hy4_dfly.zig").Drafter.Draft = undefined;
+        for (0..k) |i| {
+            reqs[i] = slots[i].request.?.as(.hy4flash).?;
+            t1s[i] = slots[i].legacy_gen.?.next_token_id;
+        }
+        try @import("hy4_plan.zig").runDraftBatch(m, d, reqs[0..k], t1s[0..k], n_use, out[0..k]);
+        defer for (out[0..k]) |*dr| dr.deinit();
+        for (0..k) |i| {
+            try testing.expectEqual(n_use + 1, out[i].ids.len);
+            try testing.expectEqual(t1s[i], out[i].ids[0]);
+            for (out[i].ids[1..]) |id| try testing.expect(id < m.config.vocab);
+            for (out[i].conf) |cf| try testing.expect(std.math.isFinite(cf) and cf >= 0 and cf <= 1);
+        }
+    }
+    const st_after = core.stats();
+    try testing.expectEqual(st_before.closed_asks, st_after.closed_asks);
+    try testing.expectEqual(st_before.wide_asks, st_after.wide_asks);
+    try testing.expectEqual(st_before.wide_executions, st_after.wide_executions);
+    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
+
+    // Now drive all `max_n` slots to completion under grouped DFly2: every slot matches solo tokens bit-for-bit!
+    hy4_sched_knobs.groups_on_for_test = true;
+    defer hy4_sched_knobs.groups_on_for_test = false;
+    hy4_sched_knobs.group_ticks_for_test = 0;
+    var rounds: usize = 0;
+    while (rounds < 64) : (rounds += 1) {
+        var act: [8]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for (0..max_n) |i| if (slots[i].joinsTick()) {
+            act[k] = slots[i];
+            k += 1;
+        };
+        if (k == 0) break;
+        try scheduler.runDecodeTick(&sv.sch, act[0..k]);
+        scheduler.cullDecoding(&sv.sch);
+    }
+    try testing.expect(hy4_sched_knobs.group_ticks_for_test > 0);
+    try testing.expectEqual(late_before, mlx.engine.latePipelines());
+    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
+    for (0..max_n) |i| {
+        try testing.expectEqual(@as(?[]const u8, null), slots[i].error_code);
+        try testing.expectEqualSlices(u32, solos[i].tokens.items, slots[i].legacy_gen.?.generated_ids.items);
+    }
+}
+
+test "hy4 request: a slot without handover past the sparse threshold joins grouped DFly2 with zero PlanMiss and matches solo (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(ResidentHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 8;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    const m = xfm.arch_state.hy4flash.model.?;
+    if (xfm.arch_state.hy4flash.drafter == null) return error.SkipZigTest;
+    const core = @import("../tensor/core.zig");
+
+    const thr: usize = @as(usize, m.config.indexer.group_topk) * m.config.indexer.group;
+    const prompt_len: usize = @max(thr + 6, 16);
+    var p0_buf: [64]u32 = undefined;
+    var p1_buf: [64]u32 = undefined;
+    if (prompt_len > p0_buf.len) return error.SkipZigTest;
+    for (0..prompt_len) |j| {
+        p0_buf[j] = ids[(j * 3 + 1) % ids.len];
+        p1_buf[j] = ids[(j * 5 + 2) % ids.len];
+    }
+    const max_toks: u32 = 8;
+    var solo0 = try soloRun(&sv, p0_buf[0..prompt_len], max_toks, true);
+    defer {
+        solo0.tokens.deinit(a);
+        solo0.state.deinit(a);
+    }
+    var solo1 = try soloRun(&sv, p1_buf[0..prompt_len], max_toks, true);
+    defer {
+        solo1.tokens.deinit(a);
+        solo1.state.deinit(a);
+    }
+
+    const turn = @import("../test_support.zig").openTurn(ld.h, &ld.config);
+    defer turn.end();
+    var slot0 = try submitPending(&sv, p0_buf[0..prompt_len], max_toks, true);
+    defer endSlot(&sv, slot0);
+    var slot1 = try submitPending(&sv, p1_buf[0..prompt_len], max_toks, true);
+    defer endSlot(&sv, slot1);
+    try scheduler.runPrefill(&sv.sch, slot0);
+    try scheduler.runPrefill(&sv.sch, slot1);
+    try sv.sch.decoding.append(a, slot0);
+    try sv.sch.decoding.append(a, slot1);
+
+    // Simulate slot0 having completed a `keep_hidden = false` plain-pipeline step past `thr` before joining slot1:
+    // drop its handover (`last_hidden` and sparse `last_picks`), leaving slot1 with intact handover so `[1, budget]`
+    // must permute to `[budget, 1]` and refresh slot0's handover without hitting `PlanMiss`.
+    const req0 = slot0.request.?.as(.hy4flash).?;
+    const req1 = slot1.request.?.as(.hy4flash).?;
+    req0.dropHidden();
+    req0.dropPicks();
+    try testing.expect(!m.hasHandover(req0));
+    try testing.expect(m.hasHandover(req1));
+
+    const misses_before = m.plans.?.misses;
+    const late_before = mlx.engine.latePipelines();
+    hy4_sched_knobs.groups_on_for_test = true;
+    defer hy4_sched_knobs.groups_on_for_test = false;
+    hy4_sched_knobs.group_ticks_for_test = 0;
+
+    // First grouped tick: slot0 rides as plain 1 row (refreshing handover), slot1 verifies at full budget.
+    var pair = [_]*scheduler.Slot{ slot0, slot1 };
+    try scheduler.runDecodeTick(&sv.sch, &pair);
+    scheduler.cullDecoding(&sv.sch);
+    try testing.expectEqual(misses_before, m.plans.?.misses);
+    try testing.expectEqual(@as(?@import("../tensor/plan/plan_binder.zig").Miss, null), core.executionMiss());
+    try testing.expect(m.hasHandover(req0));
+    try testing.expect(hy4_sched_knobs.group_ticks_for_test >= 1);
+
+    // Drive both slots to completion under grouped DFly2.
+    var rounds: usize = 0;
+    while (rounds < 32) : (rounds += 1) {
+        var act: [2]*scheduler.Slot = undefined;
+        var k: usize = 0;
+        for ([_]*scheduler.Slot{ slot0, slot1 }) |sl| if (sl.joinsTick()) {
+            act[k] = sl;
+            k += 1;
+        };
+        if (k == 0) break;
+        try scheduler.runDecodeTick(&sv.sch, act[0..k]);
+        scheduler.cullDecoding(&sv.sch);
+    }
+    try testing.expectEqual(misses_before, m.plans.?.misses);
+    try testing.expectEqual(late_before, mlx.engine.latePipelines());
+    try testing.expectEqual(@as(?[]const u8, null), slot0.error_code);
+    try testing.expectEqual(@as(?[]const u8, null), slot1.error_code);
+    try testing.expectEqualSlices(u32, solo0.tokens.items, slot0.legacy_gen.?.generated_ids.items);
+    try testing.expectEqualSlices(u32, solo1.tokens.items, slot1.legacy_gen.?.generated_ids.items);
+}
+
+const StreamedHy4 = struct {
+    pub fn prepare(a: std.mem.Allocator, config: *@import("../model.zig").ModelConfig, dir: []const u8) !void {
+        try hy4_contract.prepare(a, config, dir);
+        config.expert_resident = false;
+        // 6 of 8 slots/layer on HY4_STQ_TINY (not resident): >= 2 * top_k (= 4) unlocks joinedRows == 3.
+        config.expert_cache_bytes = 6 * @as(u64, config.hy4flash.?.layers) * 26_112;
+        config.expert_cache_slots = 6;
+    }
+};
+
+test "hy4 request: a streamed Cooler load with >= 2 * top_k slots/layer joins concurrent requests with exact solo parity, zero PlanMiss, zero late pipelines, and exact ledger balance (HY4_STQ_TINY)" {
+    try mlx.requireGpu();
+    const a = testing.allocator;
+    const was = mlx.engine.enabled;
+    mlx.engine.enabled = true;
+    defer @import("../test_support.zig").restoreEngine(was);
+    const dir = std.mem.span(std.c.getenv("HY4_STQ_TINY") orelse return error.SkipZigTest);
+    const ids = try hy4_contract.prompt(a, dir);
+    defer a.free(ids);
+    var ld: Load = undefined;
+    try ld.open(StreamedHy4, dir, true);
+    defer _ = ld.close();
+    defer static_bill.close(&ld.config);
+
+    const eng = ld.xfm.expert_stream.?;
+    try testing.expect(!eng.plan.resident);
+    try testing.expect(eng.residentRoute(1) == null);
+    try testing.expect(eng.plan.slots_per_layer >= 4 and eng.plan.slots_per_layer < 8);
+    const joined_cap = @import("hy4_plan.zig").joinedRows(&ld.config);
+    try testing.expectEqual(@as(usize, 3), joined_cap);
+    try testing.expect(@import("hy4_sched.zig").batches(&ld.config));
+
+    var sv: Served = undefined;
+    try sv.init(&ld, dir);
+    defer sv.deinit();
+    sv.sch.queue_cap = 8;
+    const xfm = @import("../arch/handle.zig").trunk(sv.entry.handle.?);
+    const m = xfm.arch_state.hy4flash.model.?;
+    try testing.expect(m.streamed);
+    try testing.expect(m.plans != null);
+    try testing.expectEqual(@as(usize, 3), m.plans.?.joined);
+
+    const max_toks: u32 = 8;
+    var prompts_buf: [3][40]u32 = undefined;
+    var prompts: [3][]const u32 = undefined;
+    var solos: [3]SoloResult = undefined;
+    var solos_made: usize = 0;
+    defer for (0..solos_made) |i| {
+        solos[i].tokens.deinit(a);
+        solos[i].state.deinit(a);
+    };
+    for (0..3) |i| {
+        const len: usize = 10 + i * 6;
+        for (prompts_buf[i][0..len], 0..) |*t, j| t.* = ids[(j * (i + 3) + i) % ids.len];
+        prompts[i] = prompts_buf[i][0..len];
+        solos[i] = try soloRun(&sv, prompts[i], max_toks, false);
+        solos_made = i + 1;
+    }
+
+    const misses_before = m.plans.?.misses;
+    const late_before = mlx.engine.latePipelines();
+    const fills_before = eng.fill_experts_total;
+    hy4_state.joined_ticks_for_test = 0;
+    {
+        const turn = @import("../test_support.zig").openTurn(ld.h, &ld.config);
+        defer turn.end();
+        var slots: [3]*scheduler.Slot = undefined;
+        var made: usize = 0;
+        defer for (0..made) |i| endSlot(&sv, slots[i]);
+        for (0..3) |i| {
+            slots[i] = try submitPending(&sv, prompts[i], max_toks, false);
+            made = i + 1;
+            try scheduler.runPrefill(&sv.sch, slots[i]);
+            try sv.sch.decoding.append(a, slots[i]);
+        }
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            var act: [3]*scheduler.Slot = undefined;
+            var k: usize = 0;
+            for (0..3) |i| if (slots[i].joinsTick()) {
+                act[k] = slots[i];
+                k += 1;
+            };
+            if (k == 0) break;
+            try scheduler.runDecodeTick(&sv.sch, act[0..k]);
+            scheduler.cullDecoding(&sv.sch);
+        }
+        for (0..3) |i| {
+            try testing.expectEqual(@as(?[]const u8, null), slots[i].error_code);
+            try testing.expectEqualSlices(u32, solos[i].tokens.items, slots[i].legacy_gen.?.generated_ids.items);
+        }
+    }
+    try testing.expect(hy4_state.joined_ticks_for_test > 0);
+    try testing.expect(eng.fill_experts_total > fills_before);
+    try testing.expectEqual(misses_before, m.plans.?.misses);
+    try testing.expectEqual(late_before, mlx.engine.latePipelines());
+
+    // Exact ledger balance after all streamed concurrent requests close.
+    mlx.engine.close();
+    const l = ld.config.static_ledger.?;
+    const snap = l.snapshot();
+    const lines = snap.committed - snap.of(.margin) - snap.of(.host) - snap.of(.media) - snap.of(.pipelines);
+    try testing.expectEqual(lines, ld.before.heldSince());
+}

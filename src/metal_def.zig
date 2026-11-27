@@ -76,6 +76,26 @@ pub fn launch(s: mlx.mlx_stream, def: *Def, inputs: []const A, outs: []const Out
     try applyKernel(s, k, inputs, cfg, result, outs[0].into);
 }
 
+/// Launches `def` on `s` writing its outputs directly into `dsts` (`mlx.kernelApplyInPlace`, the engine's stream only).
+/// Returns false when `s` is not the engine's stream or any destination is not an engine tensor, so the caller can fall
+/// back to fresh outputs.
+pub fn launchInPlace(s: mlx.mlx_stream, def: *Def, inputs: []const A, outs: []const OutSpec, grid: Grid, tg: Grid, ints: []const Tmpl, dts: []const TDtype, dsts: []const A) !bool {
+    if (!mlx.engine.isStream(s)) return false;
+    for (dsts) |d| if (!mlx.engine.isOurs(d)) return false;
+    const k = try kernelNew(&def.built, def.name, def.ins, def.outs, def.source, def.header);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(grid[0]), ci(grid[1]), ci(grid[2])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg[0]), ci(tg[1]), ci(tg[2])));
+    for (ints) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t.name, t.v));
+    for (dts) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t.name, t.dt));
+    const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    try mlx.check(mlx.kernelApplyInPlace(k, iv, cfg, s, dsts) orelse return false);
+    return true;
+}
+
 /// The fragment layout and the 16-row matrix-unit product the NAX kernels share.
 pub const NAX_HEADER =
     \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>

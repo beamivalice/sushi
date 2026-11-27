@@ -1619,6 +1619,15 @@ fn preparedOn(rb: *const Ragged) bool {
     return rb.hidden == 5120 and rb.inter == 2304;
 }
 
+/// `preparedOn` for standalone `moeDecodeClamped`: also enables prepared + expert-grouped decode for multi-row
+/// Hy4-scale MoEs (`hidden >= 1536, inter >= 1536`, multiples of 128) where Hadamard reuse and `group = 2` expert
+/// deduplication across concurrent/speculative rows cut routed expert memory traffic.
+fn preparedOnRows(rb: *const Ragged, rows: c_int) bool {
+    if (prepared_force) |v| return v;
+    if (rb.hidden == 5120 and rb.inter == 2304) return true;
+    return rows >= 2 and rb.hidden >= 1536 and rb.inter >= 1536 and @rem(rb.hidden, 128) == 0 and @rem(rb.inter, 128) == 0;
+}
+
 var engaged: [2]bool = @splat(false);
 /// Grouped prefill chains built: what a warm-up ran, for a test.
 pub var prefill_chains: u64 = 0;
@@ -1668,7 +1677,7 @@ pub fn moeDecodeClamped(s: mlx.mlx_stream, x: mlx.mlx_array, rb: *const Ragged, 
     const pair = classesOf(rb, false, &pc);
     const downs = classesOf(rb, true, &dc);
     logEngaged(.decode, rb, pair.len, downs.len);
-    const prepared = preparedOn(rb);
+    const prepared = preparedOnRows(rb, rows);
     const group = if (prepared) groupFor(@intCast(rows), @intCast(mlx.mlx_array_size(slots))) else 0;
     if (group > 0) kernels.logGroupedEngaged(group);
     const inner = if (prepared) blk: {
@@ -3651,5 +3660,41 @@ test "exl3 rate groups: rg_windows fans inverse and local scatter across threadg
             try t.expectEqual(@min(@as(u32, win), counts[e] - off), nl[wi]);
             wi += 1;
         }
+    }
+}
+
+test "exl3 rate groups: Hy4 1536x1536 multi-row MoE engages prepared + group=2 and matches self-preparing byte for byte" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    defer prepared_force = null;
+    const dec: exl3.Decode = .{ .codebook = .pair1, .window = .w16 };
+    kernels.setDecodeParams(dec);
+    defer kernels.setDecodeParams(.mul1);
+    const rates = [_][3]u32{.{ 64, 64, 64 }};
+    const experts = [_]u32{24};
+    for ([_]usize{ 1, 2, 4, 8 }) |rows| {
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+        var f = try Fixture.init(alloc, s, .{ .hidden = 1536, .inter = 1536, .rates = &rates, .experts = &experts, .rows = rows, .topk = 16, .banks = .{ 0.0126, 1.03, 0.0083, 1.009 }, .x_scale = 20 });
+        defer f.deinit();
+        var tm = try tileMajorCopy(s, &f.rb);
+        defer tm.deinit();
+        try t.expectEqual(rows >= 2, preparedOnRows(&tm, @intCast(rows)));
+
+        prepared_force = false;
+        const want = try moeDecodeClamped(s, f.x, &tm, f.slots, f.scores, f.topk(), .float32, null, null, 10);
+        defer _ = mlx.mlx_array_free(want);
+        var cw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cw);
+        const want_bytes = try bytesOf(s, want, &cw);
+
+        prepared_force = null;
+        const got = try moeDecodeClamped(s, f.x, &tm, f.slots, f.scores, f.topk(), .float32, null, null, 10);
+        defer _ = mlx.mlx_array_free(got);
+        var cg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cg);
+        try t.expectEqualSlices(u8, want_bytes, try bytesOf(s, got, &cg));
     }
 }

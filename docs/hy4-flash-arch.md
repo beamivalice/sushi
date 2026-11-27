@@ -541,6 +541,14 @@ Engram runs before the layer's attention pre-mix and adds into the four streams.
     slot 1 and slot j-1's draft (its argmax) after that.
   - Each slot's logits are the target's head over `h'_j`, with no other norm. Its confidence is `σ(proj(h'_j))`.
   - The chain is 5 head passes and 5 host reads a draft, one after another.
+- **Grouped DFly2** (`hy4_sched.groupForward`, `hy4_dfly.draftBatch`, `hy4_plan.groupWidthTemplates`, `hy4_model.extendGroups`):
+  when two or more slots decode together on a resident Cooler load, eligible handover-ready slots (`Model.hasHandover`)
+  draft in one batched 5-layer DFly2 pass running `n_use + 1` causal rows/slot on the static arena (`runDraftBatch`),
+  verify widths are allocated by calibrated marginal-gain confidence knapsack (`allocateGroupWidths` +
+  `pickPlannedTemplate`) and ordered descending to match recorded `groupWidthTemplates`, and sliding-window layers
+  past the window run batched attention across all verify rows in three launches (`hy4_latent.ringWindows` +
+  `attendJoinedLatentStacked`). Any slot missing handover (e.g. joining mid-plain-pipeline) rides as a plain 1-row slot
+  for one tick to refresh `last_hidden` and sparse `last_picks` with zero `PlanMiss`.
 - **Parity**: proven against AngelSpec's own modules in f32 on CPU, on the tiny's drafter weights over the target
   state the engine hands over: each slot's logits 6.6e-7 of their peak, the drafts exact, the confidence 5.4e-7 off.
   The test is retired: a drafter changes speed, never text, so `hy4 dfly: greedy rounds` holds the output and the
@@ -1132,14 +1140,18 @@ reference difference (the Engram norm ε and rows, the streams' dtype, image pos
 
 1. **Indexer ties**: torch's `topk` order among equal scores. Exact ties are common, since relu zeroes whole groups.
    DeepSeek's kernels tie to the lower index; the tiny oracle's ties are held to the reference's own margins.
-2. **Batched decode**: a streamed load serves one request at a time, as DeepSeek's does. Joining requests as rows on a
-   fully resident pack follows DeepSeek's `coolerRows`, after the core.
-   The `max_concurrent` fit answers by load, as DeepSeek's does: a load that joins rows is held to
-   `hy4_plan.joinedRows`, one that cannot stays at 1 (`Facts.exclusive_decode_of`).
+2. **Batched decode**: a resident Cooler load joins up to `joinedRowsMax` (16 on NAX, 8 on SIMD) rows, and a streamed
+   Cooler load whose expert cache holds at least `2 * top_k` slots per layer (`hy4_plan.streamedRowsCap`) joins up to
+   `min(joinedRowsMax, slots / top_k)` rows so every joined tick fits in a single route group without intra-tick
+   eviction while amortizing dense trunk reads and coalescing SSD expert fills; tighter streamed caches stay at 1
+   (`Facts.exclusive_decode_of`). The `max_concurrent` fit answers by load, as DeepSeek's does: a load that joins rows
+   is held to `hy4_plan.joinedRows`, one that cannot stays at 1.
    A joined tick runs from two rows (`hy4_sched.joined_rows_min`, the widths the plans record): a group a drain or an
    entry stop leaves with one row ticks that row serially, and `batchedForward` refuses one row by name (`Hy4RowsWidth`).
-   Two drafting requests in company join as plain rows (`hy4_sched.rows_company_min` is 2): two serial DFly2 rounds in
-   turn gave 61.0 and 61.3 tok/s total on the M5 Ultra STQ 4bpw pack, the same two as plain joined rows 75.9.
+   Drafting requests in company run grouped DFly2 (`hy4_dfly.draftBatch` + `hy4_model.extendGroups` with batched
+   sliding-window attention `hy4_latent.ringWindows` + `attendJoinedLatentStacked`, calibrated marginal-gain width
+   knapsack `hy4_sched.allocateGroupWidths`, descending planned width templates, and online `GroupCost` / `group_gates`
+   gating), on both resident and concurrent streamed loads.
 
 ## Implementation plan
 

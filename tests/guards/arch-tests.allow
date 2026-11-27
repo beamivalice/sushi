@@ -126,7 +126,7 @@ cooler contract: a streamed Qwen Cooler load decodes one row per forward, so a r
 cooler contract: every exit of a DeepSeek pool's release, read-back and heal, one refused step or two included, and of an unload mid-lease, on Sushi Cooler and on MLX, publishes as lent what the pools left free in admission's reading and, at a stranded layer, the workspace its heal makes, and admission never reads more than at rest nor than a heal leaves
 cooler contract: held Qwen restore points give way to a staged write that needs the writer's permit
 cooler contract: the first served DeepSeek request after a Cooler load's warm starts from the state the second does, and a streamed load's first wide prefill is served through a late-unwiring borrow (issue 107)
-cooler contract: three DeepSeek DSpark requests decoding at once run as joined plain rows, each its solo DSpark text greedy and seeded, and the one left alone drafts again
+cooler contract: three DeepSeek DSpark requests decoding at once run grouped DSpark rounds, each its solo DSpark text greedy and seeded, and the one left alone drafts again
 deepseek pre-tokenizer: a split that runs out of memory at any allocation frees all it made
 deepseek pre-tokenizer: digits, CJK and the punctuation grammar split as HF's Splits do
 deepseek_v41 refuses the launch flags it cannot act on, and ignores a model-settings kv_quant with one line
