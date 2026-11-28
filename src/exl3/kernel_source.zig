@@ -200,9 +200,10 @@ pub const HELPERS_TAIL: [:0]const u8 =
     \\    ? (exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 64u + (low < 32u ? low : 32u))
     \\    : (exl3_lane_sh(N, EXL3_LANE_FIRST) + 16u > 32u + (low < 32u ? low : 32u));
     \\  const uint end = W * lane + W;
-    \\  // At K3.5 the W bits under a lane's 32-bit window are the high W bits of the preceding lane's
-    \\  // window, so a shuffle stands in for their loads. Every caller runs it with the simdgroup in step.
-    \\  if constexpr (N == 56u && EXL3_LANE_FIRST == 1u) {
+    \\  // Whenever a PAIR1 lane needs a third word and W < 32, the W bits under its 32-bit window are
+    \\  // the high W bits of the preceding lane's window, so a shuffle stands in for the third load and
+    \\  // second funnel (n = 46, 50, 52, 54, 56, 58, 60, 62). Every caller runs the simdgroup in step.
+    \\  if constexpr (EXL3_LANE_FIRST == 1u && full && W < 32u && exl3_lane_sh(N, 1u) + 16u <= W + 32u) {
     \\    const uint low_bits = uint(exl3_window(words, end, W, false));
     \\    const uint prior = simd_shuffle(low_bits, ushort((lane + 31u) & 31u));
     \\    return uint2(low_bits, prior >> (32u - W));
@@ -633,13 +634,11 @@ test "exl3 n48 funnel readers preserve codewords and weights" {
 }
 
 // PAIR1's pair reads the odd weight's window alone; every reader hands exl3_pairh a trellis-adjacent
-// (even, odd) pair, so each decodes each rate's weights as the host does. The raw readers hold every rate's bits and
-// the decode helpers every rate's row: here K1.5, the last two-word and the first three-word lane read of an odd
-// first codeword, and K4.
+// (even, odd) pair, so each decodes each rate's weights bit-identical to the host across all 21 PAIR1 rates.
 test "exl3 PAIR1 weight readers decode K1.5 to K4 exactly" {
-    inline for (.{ 24, 44, 46, 64 }) |n| {
-        if (n != 64) try kernels.weightReaderExact(n, .pair1, .w16, false, .lane);
-        inline for (.{ .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, .pair1, .w16, false, reader);
+    var n: u32 = 24;
+    while (n <= 64) : (n += 2) {
+        inline for (.{ .lane, .nax, .simdmat }) |reader| try kernels.weightReaderExact(n, .pair1, .w16, false, reader);
     }
 }
 

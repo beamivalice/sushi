@@ -395,6 +395,33 @@ pub const GEMM_SIMDMAT_FRAGS: [:0]const u8 =
     \\}
     \\template<uint N, bool Scaled = false>
     \\__attribute__((always_inline)) static inline void smat_group(const device uint *words, uint g, thread half2 *p) {
+    \\  if constexpr (EXL3_LANE_FIRST == 1u) {
+    \\    if constexpr (N == 64u) {
+    \\      const uint curr = words[g];
+    \\      const uint prev = words[(g + 31u) & 31u];
+    \\      p[0] = smat_pairh<N, Scaled>(uint2(0u, (prev << 8u) | (curr >> 24u)));
+    \\      p[1] = smat_pairh<N, Scaled>(uint2(0u, curr >> 16u));
+    \\      p[2] = smat_pairh<N, Scaled>(uint2(0u, curr >> 8u));
+    \\      p[3] = smat_pairh<N, Scaled>(uint2(0u, curr));
+    \\    } else if constexpr (N <= 42u) {
+    \\      constexpr uint W = N / 2u;
+    \\      const uint lo = uint(exl3_window(words, W * g + W, W, false));
+    \\      p[0] = smat_pair<N, Scaled>(lo, 0u, W - exl3_end(N, 1u));
+    \\      p[1] = smat_pair<N, Scaled>(lo, 0u, W - exl3_end(N, 3u));
+    \\      p[2] = smat_pair<N, Scaled>(lo, 0u, W - exl3_end(N, 5u));
+    \\      p[3] = smat_pair<N, Scaled>(lo, 0u, 0u);
+    \\    } else {
+    \\      constexpr uint W = N / 2u;
+    \\      constexpr uint E = exl3_end(N, 5u);
+    \\      const uint lo = uint(exl3_window(words, W * g + E, W, false));
+    \\      const uint hi = uint(exl3_window(words, W * g + W, W, false));
+    \\      p[0] = smat_pair<N, Scaled>(lo, 0u, E - exl3_end(N, 1u));
+    \\      p[1] = smat_pair<N, Scaled>(lo, 0u, E - exl3_end(N, 3u));
+    \\      p[2] = smat_pair<N, Scaled>(lo, 0u, 0u);
+    \\      p[3] = smat_pair<N, Scaled>(hi, 0u, 0u);
+    \\    }
+    \\    return;
+    \\  }
     \\  if constexpr (N == 64u) {
     \\    const uint cur = words[g];
     \\    const uint prev = words[(g + 31u) & 31u];
@@ -588,17 +615,47 @@ pub const GEMM_NAX_FRAGS: [:0]const u8 =
     \\}
     \\template<uint N, bool Scaled = false>
     \\__attribute__((always_inline)) static inline nfrag nax_wfrag_k(const device uint *words, uint lane) {
-    \\  // A PAIR1 lane's four odd codewords at K2.5 to K3.5 lie in three adjacent words, each read once.
-    \\  if constexpr (EXL3_LANE_FIRST == 1u && (N == 40u || N == 48u || N == 56u)) {
-    \\    constexpr uint P = N / 8u;
-    \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
-    \\    const uint end = group * N + P * (7u + ((lane >> 3u) & 1u));
-    \\    const uint last = (end - 1u) >> 5u;
-    \\    const uint s = (0u - end) & 31u;
-    \\    const uint prev = words[last - 1u];
-    \\    const uint lo = nax_funnel(words[last], prev, s);
-    \\    const uint hi = nax_funnel(prev, words[last == 1u ? N / 2u - 1u : last - 2u], s);
-    \\    return nax_quads<N, Scaled>(nax_funnel(lo, hi, 4u * P), lo, 0u, 2u * P, 0u);
+    \\  // Every PAIR1 rate (n = 24..64): a lane's four odd codewords lie in 2 words at K1.5/K2, 3 words
+    \\  // at n = 26..62, or one aligned uint2 + previous word with pure 32-bit funnels at K4.
+    \\  if constexpr (EXL3_LANE_FIRST == 1u && N >= 24u && N <= 64u) {
+    \\    if constexpr (N == 64u) {
+    \\      const uint source0 = (lane & 16u) + ((lane & 7u) << 1u);
+    \\      const uint2 current = *(const device uint2 *)(words + source0);
+    \\      const uint previous = words[(source0 + 31u) & 31u];
+    \\      const uint s = 8u - (((lane >> 3u) & 1u) << 3u);
+    \\      return nax_quads<64u, Scaled>(nax_funnel(current.x, previous, s), nax_funnel(current.y, current.x, s), 0u, 16u, 0u);
+    \\    } else if constexpr (N == 32u) {
+    \\      const uint b = (lane >> 3u) & 1u;
+    \\      const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+    \\      const uint a = words[group];
+    \\      const uint pw = words[(group + 15u) & 15u];
+    \\      const uint s = 4u - (b << 2u);
+    \\      return nax_quads<32u, Scaled>(nax_funnel(a, pw, s + 16u), nax_funnel(a, pw, s), 0u, 8u, 0u);
+    \\    } else {
+    \\      constexpr uint W = N / 2u;
+    \\      const uint b = (lane >> 3u) & 1u;
+    \\      const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
+    \\      const uint end = group * N + W + nax_end(N, 0u, 5u) + b * (nax_end(N, 1u, 5u) - nax_end(N, 0u, 5u));
+    \\      const uint last = (end - 1u) >> 5u;
+    \\      const uint s = (0u - end) & 31u;
+    \\      const uint d = nax_sh(N, b, 1u);
+    \\      if constexpr (N == 24u) {
+    \\        const uint pw = words[last == 0u ? W - 1u : last - 1u];
+    \\        const uint lo = nax_funnel(words[last], pw, s);
+    \\        return nax_quads<N, Scaled>(nax_funnel(lo, pw >> s, W), lo, 0u, d, 0u);
+    \\      } else if constexpr (N >= 38u) {
+    \\        const uint pw = words[last - 1u];
+    \\        const uint lo = nax_funnel(words[last], pw, s);
+    \\        const uint hi = nax_funnel(pw, words[last == 1u ? W - 1u : last - 2u], s);
+    \\        return nax_quads<N, Scaled>(nax_funnel(lo, hi, W), lo, 0u, d, 0u);
+    \\      } else {
+    \\        const uint prev_i = last == 0u ? W - 1u : last - 1u;
+    \\        const uint pw = words[prev_i];
+    \\        const uint lo = nax_funnel(words[last], pw, s);
+    \\        const uint hi = nax_funnel(pw, words[prev_i == 0u ? W - 1u : prev_i - 1u], s);
+    \\        return nax_quads<N, Scaled>(nax_funnel(lo, hi, W), lo, 0u, d, 0u);
+    \\      }
+    \\    }
     \\  }
     \\  if constexpr (N == 32u) {
     \\    const uint group = ((lane & 16u) >> 1u) + (lane & 7u);
