@@ -2,6 +2,7 @@
 //! Covers every DSv41 custom kernel across `src/dsv41/{dsv41_qat,dsv41_kernels,ubench}.zig`.
 //! Single source of truth for `gen-metallib`, runtime `kernel.zig` resolution, and `stock.zig` completeness test.
 
+const std = @import("std");
 const custom = @import("../tensor/metallib_custom.zig");
 const qat = @import("dsv41_qat.zig");
 const k = @import("dsv41_kernels.zig");
@@ -22,8 +23,18 @@ fn fix(d: Dtype) custom.TypeRef {
 fn par(n: []const u8) custom.TypeRef {
     return .{ .param = n };
 }
-fn ci(v: i32) CtVal {
-    return .{ .int = v };
+
+fn findIntTarg(targs: []const custom.RuntimeTarg, name: []const u8) ?i32 {
+    for (targs) |ta| {
+        if (std.mem.eql(u8, ta.name, name)) {
+            return switch (ta.value) {
+                .int => |v| v,
+                .boolean => |b| @intFromBool(b),
+                .dtype => null,
+            };
+        }
+    }
+    return null;
 }
 
 fn sameFirstTwoDtypes(vals: []const CtVal) bool {
@@ -31,18 +42,167 @@ fn sameFirstTwoDtypes(vals: []const CtVal) bool {
 }
 
 fn attnDecFilter(vals: []const CtVal) bool {
-    // vals: [D, NSG, KT, OT, QT, ST]
-    const kt = vals[2].dtype;
-    const ot = vals[3].dtype;
-    const qt = vals[4].dtype;
+    // vals: [NSG, KT, OT, QT, ST]
+    const kt = vals[1].dtype;
+    const ot = vals[2].dtype;
+    const qt = vals[3].dtype;
     return qt == kt or qt == ot;
 }
 
 fn attnSplitFilter(vals: []const CtVal) bool {
-    // vals: [D, NSG, KT, QT, ST]
-    const kt = vals[2].dtype;
-    const qt = vals[3].dtype;
+    // vals: [NSG, KT, QT, ST]
+    const kt = vals[1].dtype;
+    const qt = vals[2].dtype;
     return qt == kt;
+}
+
+fn rideOk(targs: []const custom.RuntimeTarg) bool {
+    const hc = findIntTarg(targs, "HC") orelse return false;
+    const iters = findIntTarg(targs, "ITERS") orelse return false;
+    return hc >= 1 and hc <= 5 and iters >= 1;
+}
+
+fn attnDecFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    const rd = findIntTarg(targs, "RD") orelse return false;
+    const og = findIntTarg(targs, "OG") orelse return false;
+    return d >= 32 and d <= 512 and @rem(d, 32) == 0 and rd >= 0 and rd <= d and @rem(rd, 2) == 0 and og >= 0;
+}
+
+fn attnDecRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnDecFcFilter(targs) and rideOk(targs);
+}
+
+fn attnDecPackedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!attnDecFcFilter(targs)) return false;
+    const d = findIntTarg(targs, "D") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    if (d < 64 or @rem(d, 64) != 0 or g < 2 or @rem(g, 2) != 0 or @rem(d, g) != 0) return false;
+    const v = @divExact(d, 32);
+    return @rem(g, v) == 0 or @rem(v, g) == 0;
+}
+
+fn attnDecPackedRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnDecPackedFcFilter(targs) and rideOk(targs);
+}
+
+fn attnSplitFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    return d >= 32 and d <= 512 and @rem(d, 32) == 0;
+}
+
+fn attnSplitRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnSplitFcFilter(targs) and rideOk(targs);
+}
+
+fn attnSplitPackedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    if (d < 64 or d > 512 or @rem(d, 64) != 0 or g < 2 or @rem(g, 2) != 0 or @rem(d, g) != 0) return false;
+    const v = @divExact(d, 32);
+    return @rem(g, v) == 0 or @rem(v, g) == 0;
+}
+
+fn attnSplitPackedRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnSplitPackedFcFilter(targs) and rideOk(targs);
+}
+
+fn attnSoftmaxFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const nj = findIntTarg(targs, "NJ") orelse return false;
+    return nj >= 1 and nj <= 32;
+}
+
+fn attnFusedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    const epi = findIntTarg(targs, "EPI") orelse return false;
+    const rd = findIntTarg(targs, "RD") orelse return false;
+    const gin = findIntTarg(targs, "GIN") orelse return false;
+    return d >= 64 and d <= 512 and @rem(d, 64) == 0 and rd >= 0 and rd <= d and @rem(rd, 2) == 0 and (epi == 0 or gin >= 1);
+}
+
+fn attnFusedFp4FcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!attnFusedFcFilter(targs)) return false;
+    const d = findIntTarg(targs, "D") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    return g >= 8 and @rem(g, 8) == 0 and @rem(d, g) == 0;
+}
+
+fn attnNaxFcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!attnFusedFcFilter(targs)) return false;
+    const d = findIntTarg(targs, "D") orelse return false;
+    return d == 256 or d == 512;
+}
+
+fn attnNaxFp4FcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!attnNaxFcFilter(targs)) return false;
+    const d = findIntTarg(targs, "D") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    return g >= 8 and @rem(g, 8) == 0 and @rem(d, g) == 0;
+}
+
+fn attnDecNaxFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    const rd = findIntTarg(targs, "RD") orelse return false;
+    const og = findIntTarg(targs, "OG") orelse return false;
+    return (d == 256 or d == 512) and rd >= 0 and rd <= d and @rem(rd, 2) == 0 and og >= 0;
+}
+
+fn attnDecNaxRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnDecNaxFcFilter(targs) and rideOk(targs);
+}
+
+fn attnDecNaxPackedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    if (!attnDecNaxFcFilter(targs)) return false;
+    const d = findIntTarg(targs, "D") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    return g >= 8 and @rem(g, 8) == 0 and @rem(d, g) == 0;
+}
+
+fn attnDecNaxPackedRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnDecNaxPackedFcFilter(targs) and rideOk(targs);
+}
+
+fn attnSplitNaxFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    return d == 256 or d == 512;
+}
+
+fn attnSplitNaxRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnSplitNaxFcFilter(targs) and rideOk(targs);
+}
+
+fn attnSplitNaxPackedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const d = findIntTarg(targs, "D") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    return (d == 256 or d == 512) and g >= 8 and @rem(g, 8) == 0 and @rem(d, g) == 0;
+}
+
+fn attnSplitNaxPackedRideFcFilter(targs: []const custom.RuntimeTarg) bool {
+    return attnSplitNaxPackedFcFilter(targs) and rideOk(targs);
+}
+
+fn idxPackedFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const ih = findIntTarg(targs, "IH") orelse return false;
+    const ihd = findIntTarg(targs, "IHD") orelse return false;
+    const g = findIntTarg(targs, "G") orelse return false;
+    return ih >= 1 and ih <= 32 and ihd >= 4 and ihd <= 128 and @rem(ihd, 4) == 0 and
+        g >= 2 and @rem(g, 2) == 0 and @rem(ihd, g) == 0;
+}
+
+fn idxGatherFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const bs = findIntTarg(targs, "BS") orelse return false;
+    return idxPackedFcFilter(targs) and bs >= 1;
+}
+
+fn idxNaxFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const rb = findIntTarg(targs, "RB") orelse return false;
+    const spr = findIntTarg(targs, "SPR") orelse return false;
+    return rb >= 1 and rb <= 4 and spr >= 1 and @as(i64, rb) * @as(i64, spr) <= 6;
+}
+
+fn idxNaxGatherFcFilter(targs: []const custom.RuntimeTarg) bool {
+    const bs = findIntTarg(targs, "BS") orelse return false;
+    return idxNaxFcFilter(targs) and bs >= 1;
 }
 
 const attn_dec_ins = [_]InputSlot{
@@ -185,17 +345,6 @@ const idx_nax_ins = [_]InputSlot{
     .{ .name = "w", .ty = par("W") },
     .{ .name = "meta", .ty = fix(.int32) },
     .{ .name = "wsc", .ty = fix(.float32) },
-};
-
-const idx_nax_tuples = [_][]const CtVal{
-    &.{ ci(1), ci(6), .{ .dtype = .bfloat16 } },
-    &.{ ci(2), ci(3), .{ .dtype = .bfloat16 } },
-    &.{ ci(3), ci(2), .{ .dtype = .bfloat16 } },
-    &.{ ci(4), ci(1), .{ .dtype = .bfloat16 } },
-    &.{ ci(1), ci(6), .{ .dtype = .float32 } },
-    &.{ ci(2), ci(3), .{ .dtype = .float32 } },
-    &.{ ci(3), ci(2), .{ .dtype = .float32 } },
-    &.{ ci(4), ci(1), .{ .dtype = .float32 } },
 };
 
 pub const specs: []const KernelSpec = &.{
@@ -630,7 +779,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_dec_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = &bf_f32 },
@@ -641,6 +790,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "OG", .kind = .fc_int },
         },
         .filter = attnDecFilter,
+        .fc_filter = attnDecFcFilter,
     },
     .{
         .name = "dsv41_attn_decode_ride",
@@ -649,7 +799,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &(attn_dec_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{.{ .name = "out", .ty = par("OT") }} ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = &bf_f32 },
@@ -662,6 +812,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "ITERS", .kind = .fc_int },
         },
         .filter = attnDecFilter,
+        .fc_filter = attnDecRideFcFilter,
     },
     .{
         .name = "dsv41_attn_split",
@@ -673,13 +824,14 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         },
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "QT", .kind = .io_dtype, .dtypes = &bf_f32 },
             .{ .name = "ST", .kind = .io_dtype, .dtypes = &bf_f32 },
         },
         .filter = attnSplitFilter,
+        .fc_filter = attnSplitFcFilter,
     },
     .{
         .name = "dsv41_attn_split_ride",
@@ -691,7 +843,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         } ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "QT", .kind = .io_dtype, .dtypes = &bf_f32 },
@@ -700,6 +852,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "ITERS", .kind = .fc_int },
         },
         .filter = attnSplitFilter,
+        .fc_filter = attnSplitRideFcFilter,
     },
     .{
         .name = "dsv41_attn_decode_packed",
@@ -708,7 +861,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_dec_packed_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = &bf_f32 },
@@ -721,6 +874,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "MODE", .kind = .fc_int },
         },
         .filter = attnDecFilter,
+        .fc_filter = attnDecPackedFcFilter,
     },
     .{
         .name = "dsv41_attn_decode_packed_ride",
@@ -729,7 +883,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &(attn_dec_packed_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{.{ .name = "out", .ty = par("OT") }} ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = &bf_f32 },
@@ -744,6 +898,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "ITERS", .kind = .fc_int },
         },
         .filter = attnDecFilter,
+        .fc_filter = attnDecPackedRideFcFilter,
     },
     .{
         .name = "dsv41_attn_split_packed",
@@ -756,7 +911,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         },
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "QT", .kind = .io_dtype, .dtypes = &bf_f32 },
@@ -765,6 +920,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "MODE", .kind = .fc_int },
         },
         .filter = attnSplitFilter,
+        .fc_filter = attnSplitPackedFcFilter,
     },
     .{
         .name = "dsv41_attn_split_packed_ride",
@@ -777,7 +933,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         } ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_dtype, .dtypes = &bf_f32 },
             .{ .name = "QT", .kind = .io_dtype, .dtypes = &bf_f32 },
@@ -788,6 +944,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "ITERS", .kind = .fc_int },
         },
         .filter = attnSplitFilter,
+        .fc_filter = attnSplitPackedRideFcFilter,
     },
     .{
         .name = "dsv41_attn_merge",
@@ -828,9 +985,10 @@ pub const specs: []const KernelSpec = &.{
         },
         .params = &.{
             .{ .name = "OT", .kind = .ct_dtype, .dtypes = &.{.float16} },
-            .{ .name = "NJ", .kind = .ct_int, .ints = &.{ 4, 8, 12, 16, 20, 24, 28, 32 } },
+            .{ .name = "NJ", .kind = .fc_int },
             .{ .name = "ST", .kind = .io_dtype, .dtypes = &bf_f32 },
         },
+        .fc_filter = attnSoftmaxFcFilter,
     },
 
     // ── dsv41_kernels.zig: fused prefill attention (2 SIMD + 2 NAX) ──
@@ -841,7 +999,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_fused_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -853,6 +1011,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "QAT", .kind = .fc_int },
             .{ .name = "GIN", .kind = .fc_int },
         },
+        .fc_filter = attnFusedFcFilter,
     },
     .{
         .name = "dsv41_attn_fused_fp4",
@@ -861,7 +1020,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_fused_fp4_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 64, 128, 256, 512 } },
+            .{ .name = "D", .kind = .fc_int },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -875,6 +1034,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "G", .kind = .fc_int },
             .{ .name = "MODE", .kind = .fc_int },
         },
+        .fc_filter = attnFusedFp4FcFilter,
     },
     .{
         .name = "dsv41_attn_nax",
@@ -884,7 +1044,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_fused_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{ 16, 32 } },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -896,6 +1056,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "QAT", .kind = .fc_int },
             .{ .name = "GIN", .kind = .fc_int },
         },
+        .fc_filter = attnNaxFcFilter,
     },
     .{
         .name = "dsv41_attn_nax_fp4",
@@ -905,7 +1066,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_fused_fp4_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{ 16, 32 } },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -919,6 +1080,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "G", .kind = .fc_int },
             .{ .name = "MODE", .kind = .fc_int },
         },
+        .fc_filter = attnNaxFp4FcFilter,
     },
     .{
         .name = "dsv41_attn_dec_nax",
@@ -928,7 +1090,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_dec_nax_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -939,6 +1101,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "QAT", .kind = .fc_int },
             .{ .name = "OG", .kind = .fc_int },
         },
+        .fc_filter = attnDecNaxFcFilter,
     },
     .{
         .name = "dsv41_attn_dec_nax_ride",
@@ -948,7 +1111,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &(attn_dec_nax_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{.{ .name = "out", .ty = par("OT") }} ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -961,6 +1124,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "HC", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
         },
+        .fc_filter = attnDecNaxRideFcFilter,
     },
     .{
         .name = "dsv41_attn_split_nax",
@@ -974,12 +1138,13 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         },
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "T", .kind = .ct_dtype, .dtypes = &.{.bfloat16} },
         },
+        .fc_filter = attnSplitNaxFcFilter,
     },
     .{
         .name = "dsv41_attn_split_nax_ride",
@@ -993,7 +1158,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         } ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1001,6 +1166,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "HC", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
         },
+        .fc_filter = attnSplitNaxRideFcFilter,
     },
     .{
         .name = "dsv41_attn_dec_nax_packed",
@@ -1010,7 +1176,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_dec_nax_packed_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1023,6 +1189,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "G", .kind = .fc_int },
             .{ .name = "MODE", .kind = .fc_int },
         },
+        .fc_filter = attnDecNaxPackedFcFilter,
     },
     .{
         .name = "dsv41_attn_dec_nax_packed_ride",
@@ -1032,7 +1199,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &(attn_dec_nax_packed_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{.{ .name = "out", .ty = par("OT") }} ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1047,6 +1214,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "HC", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
         },
+        .fc_filter = attnDecNaxPackedRideFcFilter,
     },
     .{
         .name = "dsv41_attn_split_nax_packed",
@@ -1060,7 +1228,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         },
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1068,6 +1236,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "G", .kind = .fc_int },
             .{ .name = "MODE", .kind = .fc_int },
         },
+        .fc_filter = attnSplitNaxPackedFcFilter,
     },
     .{
         .name = "dsv41_attn_split_nax_packed_ride",
@@ -1081,7 +1250,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "pl", .ty = fix(.float32) },
         } ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1091,6 +1260,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "HC", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
         },
+        .fc_filter = attnSplitNaxPackedRideFcFilter,
     },
 
     // ── dsv41_kernels.zig: indexer (4 SIMD + 2 NAX) ──
@@ -1108,12 +1278,13 @@ pub const specs: []const KernelSpec = &.{
         },
         .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
         .params = &.{
-            .{ .name = "IH", .kind = .ct_int, .ints = &.{ 4, 8, 16, 32 } },
-            .{ .name = "IHD", .kind = .ct_int, .ints = &.{ 32, 64, 128 } },
+            .{ .name = "IH", .kind = .fc_int },
+            .{ .name = "IHD", .kind = .fc_int },
             .{ .name = "W", .kind = .io_dtype, .dtypes = &bf_f32 },
             .{ .name = "G", .kind = .fc_int },
             .{ .name = "MODE", .kind = .fc_int },
         },
+        .fc_filter = idxPackedFcFilter,
     },
     .{
         .name = "dsv41_index_scores_gather",
@@ -1130,13 +1301,14 @@ pub const specs: []const KernelSpec = &.{
         },
         .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
         .params = &.{
-            .{ .name = "IH", .kind = .ct_int, .ints = &.{ 4, 8, 16, 32 } },
-            .{ .name = "IHD", .kind = .ct_int, .ints = &.{ 32, 64, 128 } },
+            .{ .name = "IH", .kind = .fc_int },
+            .{ .name = "IHD", .kind = .fc_int },
             .{ .name = "W", .kind = .io_dtype, .dtypes = &bf_f32 },
             .{ .name = "G", .kind = .fc_int },
             .{ .name = "MODE", .kind = .fc_int },
             .{ .name = "BS", .kind = .fc_int },
         },
+        .fc_filter = idxGatherFcFilter,
     },
     .{
         .name = "dsv41_cand_keys",
@@ -1175,12 +1347,12 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &idx_nax_ins,
         .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
         .params = &.{
-            .{ .name = "RB", .kind = .ct_int },
-            .{ .name = "SPR", .kind = .ct_int },
-            .{ .name = "W", .kind = .io_dtype },
+            .{ .name = "RB", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4 } },
+            .{ .name = "SPR", .kind = .fc_int, .ints = &.{ 1, 2, 3, 6 } },
+            .{ .name = "W", .kind = .io_dtype, .dtypes = &bf_f32 },
             .{ .name = "BS", .kind = .ignored },
         },
-        .ct_tuples = &idx_nax_tuples,
+        .fc_filter = idxNaxFcFilter,
     },
     .{
         .name = "dsv41_index_scores_nax_gather",
@@ -1190,12 +1362,12 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &(idx_nax_ins ++ [_]InputSlot{.{ .name = "blocks", .ty = fix(.int32) }}),
         .outputs = &.{.{ .name = "scores", .ty = fix(.float32) }},
         .params = &.{
-            .{ .name = "RB", .kind = .ct_int },
-            .{ .name = "SPR", .kind = .ct_int },
-            .{ .name = "W", .kind = .io_dtype },
+            .{ .name = "RB", .kind = .fc_int, .ints = &.{ 1, 2, 3, 4 } },
+            .{ .name = "SPR", .kind = .fc_int, .ints = &.{ 1, 2, 3, 6 } },
+            .{ .name = "W", .kind = .io_dtype, .dtypes = &bf_f32 },
             .{ .name = "BS", .kind = .fc_int },
         },
-        .ct_tuples = &idx_nax_tuples,
+        .fc_filter = idxNaxGatherFcFilter,
     },
 
     // ── dsv41_kernels.zig: DSpark draft & Engram (3 SIMD kernels) ──
@@ -1207,7 +1379,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &attn_dspark_nax_ins,
         .outputs = &.{.{ .name = "out", .ty = par("OT") }},
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1218,6 +1390,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "QAT", .kind = .fc_int },
             .{ .name = "OG", .kind = .fc_int },
         },
+        .fc_filter = attnDecNaxFcFilter,
     },
     .{
         .name = "dsv41_attn_dspark_nax_ride",
@@ -1227,7 +1400,7 @@ pub const specs: []const KernelSpec = &.{
         .inputs = &(attn_dspark_nax_ins ++ ride_extra_ins),
         .outputs = &([_]OutputSlot{.{ .name = "out", .ty = par("OT") }} ++ ride_extra_outs),
         .params = &.{
-            .{ .name = "D", .kind = .ct_int, .ints = &.{ 256, 512 } },
+            .{ .name = "D", .kind = .fc_int, .ints = &.{ 256, 512 } },
             .{ .name = "HB", .kind = .ct_int, .ints = &.{16} },
             .{ .name = "NSG", .kind = .ct_int, .ints = &.{8} },
             .{ .name = "KT", .kind = .ct_int, .ints = &.{16} },
@@ -1240,6 +1413,7 @@ pub const specs: []const KernelSpec = &.{
             .{ .name = "HC", .kind = .fc_int },
             .{ .name = "ITERS", .kind = .fc_int },
         },
+        .fc_filter = attnDecNaxRideFcFilter,
     },
     .{
         .name = "dsv41_markov_row",
